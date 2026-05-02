@@ -1,3 +1,4 @@
+#define _USE_MATH_DEFINES
 /*
  * TurboQuant: KV cache compression via PolarQuant + QJL
  * Based on: arXiv 2504.19874 (ICLR 2026)
@@ -16,7 +17,7 @@
 #include <stdlib.h>
 
 /* Global: WHT group size for CPU quantize path (set by CPU SET_ROWS handler) */
-int turbo3_cpu_wht_group_size = 0;
+GGML_API int turbo3_cpu_wht_group_size = 0;
 
 /* ---------- constants ---------- */
 
