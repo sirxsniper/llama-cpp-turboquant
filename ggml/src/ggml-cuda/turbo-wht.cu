@@ -63,18 +63,28 @@ static __global__ void k_turbo_wht_f32(const float * __restrict__ src,
     // In stage h, threads where (t % (2h)) < h read x[t] and x[t+h],
     // then write x[t] = a+b and x[t+h] = a-b.  Each active thread
     // owns a disjoint pair, so no intra-stage conflicts exist.
-#define WHT_STAGE(h) \
+    //
+    // PERF: stages with h < WARP_SIZE (1, 2, 4, 8, 16) only swap pairs WITHIN a single
+    // warp — __syncwarp() is sufficient (~1 cycle) instead of __syncthreads()
+    // (whole-block barrier, ~10+ cycles). Stages h=32, h=64 cross warp boundaries
+    // and need full __syncthreads. WHT runs 128 times per token (64 layers × Q+V),
+    // so each saved barrier matters.
+#define WHT_STAGE_WARP(h) \
+    if (t % (2*(h)) < (h)) { float a = x[t], b = x[t+(h)]; x[t] = a+b; x[t+(h)] = a-b; } \
+    __syncwarp();
+#define WHT_STAGE_BLOCK(h) \
     if (t % (2*(h)) < (h)) { float a = x[t], b = x[t+(h)]; x[t] = a+b; x[t+(h)] = a-b; } \
     __syncthreads();
 
-    WHT_STAGE(1)
-    WHT_STAGE(2)
-    WHT_STAGE(4)
-    WHT_STAGE(8)
-    WHT_STAGE(16)
-    WHT_STAGE(32)
-    if (group_size == 128) { WHT_STAGE(64) }
-#undef WHT_STAGE
+    WHT_STAGE_WARP(1)
+    WHT_STAGE_WARP(2)
+    WHT_STAGE_WARP(4)
+    WHT_STAGE_WARP(8)
+    WHT_STAGE_WARP(16)
+    WHT_STAGE_BLOCK(32)
+    if (group_size == 128) { WHT_STAGE_BLOCK(64) }
+#undef WHT_STAGE_WARP
+#undef WHT_STAGE_BLOCK
 
     // Normalize and apply second sign array, write to output
     constexpr float inv_sqrt = (group_size == 128) ? 0.08838834764831845f : 0.125f;

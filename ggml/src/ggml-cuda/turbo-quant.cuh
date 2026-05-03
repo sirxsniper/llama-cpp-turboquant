@@ -9,7 +9,7 @@
 #pragma once
 
 #include "common.cuh"
-#include "turbo-innerq.cuh"
+#include "ggml-turbo-innerq.h"
 #include <cstdlib>
 #include <cmath>
 
@@ -300,6 +300,20 @@ static __constant__ float TURBO_CENTROIDS_4BIT[16] = {
      0.006938f,  0.020989f,  0.035597f,  0.051262f,
      0.068756f,  0.089527f,  0.117195f,  0.173926f
 };
+
+// PERF (int8 / __dp4a path): pre-quantized 4-bit centroids as int8 in [-127, 127].
+// Each value = round(centroid[i] / max_abs_centroid * 127). Allows turbo4 K dot to
+// use the Blackwell __dp4a hardware instruction (same path q8 uses) instead of
+// per-element float multiplies. Final scale factor TURBO_INT8_4BIT_SCALE recovers
+// real value: float_K = int8_K * (norm * TURBO_INT8_4BIT_SCALE).
+//   max_abs_centroid = 0.173926
+//   int8 centroids   = round(centroid / 0.173926 * 127)
+static __constant__ int8_t TURBO_CENTROIDS_4BIT_INT8[16] = {
+    -127, -86, -65, -50, -37, -26, -15,  -5,
+       5,  15,  26,  37,  50,  65,  86, 127
+};
+// SCALE_REVERSE = 0.173926 / 127.0 — used to recover float dot product from int sum
+#define TURBO_INT8_4BIT_SCALE_REVERSE (0.173926f / 127.0f)
 
 // ---- Midpoints for nearest 4-bit centroid lookup ----
 
