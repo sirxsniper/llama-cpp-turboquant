@@ -306,35 +306,52 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_turbo3_0(
     GGML_UNUSED(Q_ds_v);
 
     constexpr int cpy_nb = ggml_cuda_get_max_cpy_bytes();
-    constexpr int cpy_ne = cpy_nb / 4;
+    constexpr int cpy_ne_max = cpy_nb / 4;
+    // CORRECTNESS: cap cpy_ne so nthreads*cpy_ne <= D/2 (matches per-thread element count).
+    constexpr int cpy_ne = (nthreads*cpy_ne_max > D/2) ? (D/(2*nthreads)) : cpy_ne_max;
+    static_assert(cpy_ne >= 1, "cpy_ne must be at least 1");
 
     float sum = 0.0f;
 
+    // PERF: norm hoist + warp-cooperative scaled-centroid sharing (turbo3 = 8 entries).
 #pragma unroll
     for (int k_KQ_0 = 0; k_KQ_0 < D/2; k_KQ_0 += nthreads*cpy_ne) {
+        const int k_KQ_base  = k_KQ_0 + (threadIdx.x % nthreads)*cpy_ne;
+        const int elem0_base = k_KQ_base * 2;
+        const int ib         = elem0_base / QK_TURBO3;
+        const int j0_base    = elem0_base % QK_TURBO3;
+        const float norm     = __half2float(K_turbo[ib].norm);
+
+        // Generalized warp_coop: works for both nthreads=32 (1 group/warp) and
+        // nthreads=16 (2 groups/warp). Each group cooperates on its own K block.
+        constexpr bool warp_coop = (nthreads == 32 || nthreads == 16);
+        float my_scaled_centroid_3 = 0.0f;
+        if constexpr (warp_coop) {
+            const unsigned lane = threadIdx.x & (nthreads - 1u);
+            if (lane < 8u) {
+                my_scaled_centroid_3 = TURBO_CENTROIDS_3BIT[lane] * norm;
+            }
+        }
+
 #pragma unroll
         for (int k_KQ_1 = 0; k_KQ_1 < cpy_ne; ++k_KQ_1) {
-            const int k_KQ = k_KQ_0 + (threadIdx.x % nthreads)*cpy_ne + k_KQ_1;
+            const int elem0 = elem0_base + k_KQ_1 * 2;
+            const int j0    = elem0 % QK_TURBO3;
+            const uint8_t qs_byte  = K_turbo[ib].qs[j0 / 4];
+            const uint8_t sgn_byte = K_turbo[ib].signs[j0 / 8];
 
-            // elem0 is always even; elem0 and elem1 are always in the same block,
-            // the same qs byte (j0%4 ∈ {0,2}), and the same signs byte (j0%8 ∈ {0,2,4,6}).
-            const int elem0 = k_KQ * 2;                  // always even
-            const int ib    = elem0 / QK_TURBO3;          // shared block index
-            const int j0    = elem0 % QK_TURBO3;          // always even, 0..30
-
-            // Single loads for the shared block fields
-            const float     norm     = __half2float(K_turbo[ib].norm);
-            const uint8_t   qs_byte  = K_turbo[ib].qs[j0 / 4];      // covers both j0 and j0+1
-            const uint8_t   sgn_byte = K_turbo[ib].signs[j0 / 8];   // covers both j0 and j0+1
-
-            // Extract 3-bit indices for elem0 and elem1 from shared bytes
-            const int     shift  = (j0 % 4) * 2;                     // 0 or 4
-            const uint8_t idx0   = ((qs_byte >> shift)     & 0x3) | (((sgn_byte >> (j0 % 8))     & 0x1) << 2);
-            const uint8_t idx1   = ((qs_byte >> (shift+2)) & 0x3) | (((sgn_byte >> (j0 % 8 + 1)) & 0x1) << 2);
+            const int     shift  = (j0 % 4) * 2;
+            const unsigned idx0  = ((qs_byte >> shift)     & 0x3u) | (((sgn_byte >> (j0 % 8))     & 0x1u) << 2);
+            const unsigned idx1  = ((qs_byte >> (shift+2)) & 0x3u) | (((sgn_byte >> (j0 % 8 + 1)) & 0x1u) << 2);
 
             float2 kv;
-            kv.x = TURBO_CENTROIDS_3BIT[idx0] * norm;
-            kv.y = TURBO_CENTROIDS_3BIT[idx1] * norm;
+            if constexpr (warp_coop) {
+                kv.x = __shfl_sync(0xFFFFFFFFu, my_scaled_centroid_3, idx0, nthreads);
+                kv.y = __shfl_sync(0xFFFFFFFFu, my_scaled_centroid_3, idx1, nthreads);
+            } else {
+                kv.x = TURBO_CENTROIDS_3BIT[idx0] * norm;
+                kv.y = TURBO_CENTROIDS_3BIT[idx1] * norm;
+            }
 
 #ifdef V_DOT2_F32_F16_AVAILABLE
             const half2 qv = ((const half2 *) Q_v)[k_KQ_0/nthreads + k_KQ_1];
@@ -360,30 +377,50 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_turbo2_0(
     GGML_UNUSED(Q_ds_v);
 
     constexpr int cpy_nb = ggml_cuda_get_max_cpy_bytes();
-    constexpr int cpy_ne = cpy_nb / 4;
+    constexpr int cpy_ne_max = cpy_nb / 4;
+    // CORRECTNESS: cap cpy_ne so nthreads*cpy_ne <= D/2 (matches per-thread element count).
+    constexpr int cpy_ne = (nthreads*cpy_ne_max > D/2) ? (D/(2*nthreads)) : cpy_ne_max;
+    static_assert(cpy_ne >= 1, "cpy_ne must be at least 1");
 
     float sum = 0.0f;
 
+    // PERF: norm hoist + warp-cooperative scaled-centroid sharing (turbo2 = 4 entries).
 #pragma unroll
     for (int k_KQ_0 = 0; k_KQ_0 < D/2; k_KQ_0 += nthreads*cpy_ne) {
+        const int k_KQ_base  = k_KQ_0 + (threadIdx.x % nthreads)*cpy_ne;
+        const int elem0_base = k_KQ_base * 2;
+        const int ib         = elem0_base / QK_TURBO2;
+        const int j0_base    = elem0_base % QK_TURBO2;
+        const float norm     = __half2float(K_turbo[ib].norm);
+
+        // Generalized warp_coop: 32 = whole-warp on 1 K block, 16 = 2 groups/warp on 2 K blocks.
+        constexpr bool warp_coop = (nthreads == 32 || nthreads == 16);
+        float my_scaled_centroid_2 = 0.0f;
+        if constexpr (warp_coop) {
+            const unsigned lane = threadIdx.x & (nthreads - 1u);
+            if (lane < 4u) {
+                my_scaled_centroid_2 = TURBO_CENTROIDS_2BIT[lane] * norm;
+            }
+        }
+
 #pragma unroll
         for (int k_KQ_1 = 0; k_KQ_1 < cpy_ne; ++k_KQ_1) {
-            const int k_KQ = k_KQ_0 + (threadIdx.x % nthreads)*cpy_ne + k_KQ_1;
-
-            const int elem0 = k_KQ * 2;
-            const int ib    = elem0 / QK_TURBO2;
+            const int elem0 = elem0_base + k_KQ_1 * 2;
             const int j0    = elem0 % QK_TURBO2;
 
-            const float     norm     = __half2float(K_turbo[ib].norm);
-            const uint8_t   qs_byte  = K_turbo[ib].qs[j0 / 4];
-
-            const int     shift  = (j0 % 4) * 2;
-            const uint8_t idx0   = (qs_byte >> shift)     & 0x3;
-            const uint8_t idx1   = (qs_byte >> (shift+2)) & 0x3;
+            const uint8_t qs_byte = K_turbo[ib].qs[j0 / 4];
+            const int     shift   = (j0 % 4) * 2;
+            const unsigned idx0   = (qs_byte >> shift)     & 0x3u;
+            const unsigned idx1   = (qs_byte >> (shift+2)) & 0x3u;
 
             float2 kv;
-            kv.x = TURBO_CENTROIDS_2BIT[idx0] * norm;
-            kv.y = TURBO_CENTROIDS_2BIT[idx1] * norm;
+            if constexpr (warp_coop) {
+                kv.x = __shfl_sync(0xFFFFFFFFu, my_scaled_centroid_2, idx0, nthreads);
+                kv.y = __shfl_sync(0xFFFFFFFFu, my_scaled_centroid_2, idx1, nthreads);
+            } else {
+                kv.x = TURBO_CENTROIDS_2BIT[idx0] * norm;
+                kv.y = TURBO_CENTROIDS_2BIT[idx1] * norm;
+            }
 
 #ifdef V_DOT2_F32_F16_AVAILABLE
             const half2 qv = ((const half2 *) Q_v)[k_KQ_0/nthreads + k_KQ_1];
@@ -398,41 +435,159 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_turbo2_0(
     return sum;
 }
 
-// Turbo4 KQ dot product: dequantize K from turbo4 blocks, dot with Q (float2/half2)
-// 4-bit nibble packed: qs[j/2] >> ((j%2)*4) & 0xF
+// Turbo4 KQ dot product via __dp4a (int8 hardware path, like q8 uses).
+// Pre-quantized centroids in TURBO_CENTROIDS_4BIT_INT8 + Q_q8 from main kernel.
+// Final scale = norm * (max_centroid_abs / 127) * Q_d.
+template <int D, int nthreads>
+static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_turbo4_0_int(
+    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
+
+    const block_turbo4_0 * K_turbo = (const block_turbo4_0 *) K_c;
+    GGML_UNUSED(Q_v);
+
+    // Per-thread element count: each dp4a does 4 elements, so we need elems_per_thread/4 dp4a calls.
+    constexpr int elems_per_thread = D / nthreads;
+    static_assert(elems_per_thread >= 4 && (elems_per_thread % 4) == 0, "elems_per_thread must be multiple of 4");
+    constexpr int n_dp4a = elems_per_thread / 4;
+
+    const int tid = (nthreads == WARP_SIZE) ? threadIdx.x : (threadIdx.x % nthreads);
+
+    int sumi = 0;
+    int ib_first = -1;
+
+#pragma unroll
+    for (int g = 0; g < n_dp4a; ++g) {
+        // Each thread: groups of 4 elements (one dp4a per group).
+        const int elem0 = tid * elems_per_thread + g * 4;
+        const int ib    = elem0 / QK_TURBO4;
+        const int j0    = elem0 % QK_TURBO4;
+        if (g == 0) ib_first = ib;
+
+        // Load 2 qs bytes (4 nibbles = 4 elements). qs[] is at offset 2 in struct → align 2.
+        uint16_t qs_pair;
+        ggml_cuda_memcpy_1<2, 2>(&qs_pair, K_turbo[ib].qs + (j0 >> 1));
+        const uint8_t qs0 = qs_pair & 0xFFu;
+        const uint8_t qs1 = (qs_pair >> 8) & 0xFFu;
+
+        // Lookup int8 K values from precomputed table
+        const int8_t k_int8_0 = TURBO_CENTROIDS_4BIT_INT8[(qs0 >> 0) & 0xF];
+        const int8_t k_int8_1 = TURBO_CENTROIDS_4BIT_INT8[(qs0 >> 4) & 0xF];
+        const int8_t k_int8_2 = TURBO_CENTROIDS_4BIT_INT8[(qs1 >> 0) & 0xF];
+        const int8_t k_int8_3 = TURBO_CENTROIDS_4BIT_INT8[(qs1 >> 4) & 0xF];
+
+        // Pack 4 int8 K values into one int (little-endian byte ordering)
+        int v_packed = (int(uint8_t(k_int8_0)) <<  0) |
+                       (int(uint8_t(k_int8_1)) <<  8) |
+                       (int(uint8_t(k_int8_2)) << 16) |
+                       (int(uint8_t(k_int8_3)) << 24);
+
+        // Hardware-accelerated dot product (Blackwell: __dp4a is 1 instruction for 4 int8 elements)
+        sumi = ggml_cuda_dp4a(v_packed, Q_q8[g], sumi);
+    }
+
+    // K block norm (same for all elements covered by this thread when elems_per_thread <= QK_TURBO4)
+    const float norm = __half2float(K_turbo[ib_first].norm);
+
+    // Q's d scale (one per cpy_ne_KQ-sized chunk in Q_ds; for nthreads=32 D=128, just Q_ds[0])
+    const float2 * Q_ds = (const float2 *) Q_ds_v;
+    const float Q_d = Q_ds[0].x;
+
+    // Recover float result: int sum * (max_centroid_abs / 127) * norm * Q_d
+    return float(sumi) * (norm * TURBO_INT8_4BIT_SCALE_REVERSE) * Q_d;
+}
+
+// Turbo4 KQ dot product — optimized for sm_120 (Blackwell) on this fork.
+// Two changes vs original:
+//   1) hoist norm load outside the cpy_ne inner loop (ib is constant within
+//      one outer iter — block-spread math: max k_KQ_1*2 = (cpy_ne-1)*2 = 6,
+//      far less than QK_TURBO4=128).
+//   2) single vector load of cpy_ne consecutive qs bytes via ggml_cuda_memcpy_1
+//      (alignment=2 because qs[] sits at offset 2 inside block_turbo4_0).
+//      Reduces 4 byte-load memory transactions per outer iter to one 32-bit
+//      transaction → frees the LSU to keep math units fed instead of stalling.
 template <int D, int nthreads>
 static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_turbo4_0(
     const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
 
-    const block_turbo4_0 * K_turbo = (const block_turbo4_0 *) K_c;
+    // Explicit __restrict__ on the cast destination so NVCC uses LDG.E (read-only L1
+    // texture cache) for K block reads. Without this, the cast can lose the restrict
+    // qualifier and NVCC may fall back to standard LDG.E (no texture-cache route).
+    const block_turbo4_0 * __restrict__ K_turbo = (const block_turbo4_0 * __restrict__) K_c;
     GGML_UNUSED(Q_q8);
     GGML_UNUSED(Q_ds_v);
 
     constexpr int cpy_nb = ggml_cuda_get_max_cpy_bytes();
-    constexpr int cpy_ne = cpy_nb / 4;
+    constexpr int cpy_ne_max = cpy_nb / 4;
+    // CORRECTNESS: when nthreads*cpy_ne_max > D/2, the inner loop would over-iterate
+    // and read OOB into Q_reg (sized D/2/nthreads) and into adjacent K blocks.
+    // For D=128 + nthreads=32 + cpy_ne_max=4 this caused 2× oversampling.
+    // Cap inner loop to the true per-thread element count: D/(2*nthreads).
+    constexpr int cpy_ne = (nthreads*cpy_ne_max > D/2) ? (D/(2*nthreads)) : cpy_ne_max;
+    static_assert(cpy_ne >= 1, "cpy_ne must be at least 1");
+    static_assert(cpy_ne == 1 || cpy_ne == 2 || cpy_ne == 4, "unexpected cpy_ne");
 
     float sum = 0.0f;
 
 #pragma unroll
     for (int k_KQ_0 = 0; k_KQ_0 < D/2; k_KQ_0 += nthreads*cpy_ne) {
+        // Per-block setup, hoisted out of the cpy_ne inner loop.
+        const int k_KQ_base  = k_KQ_0 + (threadIdx.x % nthreads)*cpy_ne;
+        const int elem0_base = k_KQ_base * 2;
+        const int ib         = elem0_base / QK_TURBO4;
+        const int j0_base    = elem0_base % QK_TURBO4;       // always even
+        const int byte_base  = j0_base >> 1;                 // floor(j0_base/2)
+
+        const float norm     = __half2float(K_turbo[ib].norm);
+
+        // PERF (warp-cooperative): a group of `nthreads` cooperates on the SAME K block.
+        // Each thread precomputes (centroid * norm) for index (lane % 16), then
+        // __shfl_sync broadcasts on demand within the group. **Confirmed +7 t/s @ 50K
+        // depth** vs letting threads independently hit constant memory (which serializes
+        // for divergent idx0/idx1 lookups). DON'T DISABLE.
+        // For nthreads=16: each warp has 2 groups, each on its own K block with its own
+        // norm — shfl uses width=16 to keep groups isolated. (lane & 15) covers all
+        // 16 centroid indices since group has 16 threads.
+        constexpr bool warp_coop = (nthreads == 32 || nthreads == 16);
+        float my_scaled_centroid = 0.0f;
+        if constexpr (warp_coop) {
+            const unsigned lane = threadIdx.x & (nthreads - 1u);
+            if (lane < 16u) {
+                my_scaled_centroid = TURBO_CENTROIDS_4BIT[lane] * norm;
+            }
+        }
+
+        // Single vector load of cpy_ne qs bytes packed into a 32-bit register.
+        uint32_t qs_pack = 0;
+        if constexpr (cpy_ne == 4) {
+            // alignment=4: byte_base = tid*cpy_ne = tid*4 with nthreads_KQ=16 → all
+            // threads' offsets are 4-byte aligned. Block stride 68 = 17×4 → block start
+            // is 4-byte aligned, qs offset 4 within block → 4-byte aligned. Single LDG.E.32.
+            ggml_cuda_memcpy_1<4, 4>(&qs_pack, K_turbo[ib].qs + byte_base);
+        } else if constexpr (cpy_ne == 2) {
+            uint16_t tmp16;
+            ggml_cuda_memcpy_1<2, 2>(&tmp16, K_turbo[ib].qs + byte_base);
+            qs_pack = tmp16;
+        } else { // cpy_ne == 1
+            qs_pack = K_turbo[ib].qs[byte_base];
+        }
+
 #pragma unroll
         for (int k_KQ_1 = 0; k_KQ_1 < cpy_ne; ++k_KQ_1) {
-            const int k_KQ = k_KQ_0 + (threadIdx.x % nthreads)*cpy_ne + k_KQ_1;
+            const uint8_t qs_byte = (qs_pack >> (k_KQ_1 * 8)) & 0xFFu;
 
-            const int elem0 = k_KQ * 2;                   // always even
-            const int ib    = elem0 / QK_TURBO4;           // block index
-            const int j0    = elem0 % QK_TURBO4;           // always even
-
-            const float   norm    = __half2float(K_turbo[ib].norm);
-            // Both j0 and j0+1 are adjacent nibbles: j0/2 == (j0+1)/2 when j0 is even
-            const uint8_t qs_byte = K_turbo[ib].qs[j0 / 2];
-
-            const uint8_t idx0 = (qs_byte >> 0) & 0xF;    // low nibble = j0
-            const uint8_t idx1 = (qs_byte >> 4) & 0xF;    // high nibble = j0+1
+            const unsigned idx0 = (qs_byte >> 0) & 0xFu;   // low nibble = j0
+            const unsigned idx1 = (qs_byte >> 4) & 0xFu;   // high nibble = j0+1
 
             float2 kv;
-            kv.x = TURBO_CENTROIDS_4BIT[idx0] * norm;
-            kv.y = TURBO_CENTROIDS_4BIT[idx1] * norm;
+            if constexpr (warp_coop) {
+                // Each thread reads from the lane within its group (width=nthreads)
+                // that holds the desired centroid value.
+                kv.x = __shfl_sync(0xFFFFFFFFu, my_scaled_centroid, idx0, nthreads);
+                kv.y = __shfl_sync(0xFFFFFFFFu, my_scaled_centroid, idx1, nthreads);
+            } else {
+                kv.x = TURBO_CENTROIDS_4BIT[idx0] * norm;
+                kv.y = TURBO_CENTROIDS_4BIT[idx1] * norm;
+            }
 
 #ifdef V_DOT2_F32_F16_AVAILABLE
             const half2 qv = ((const half2 *) Q_v)[k_KQ_0/nthreads + k_KQ_1];
@@ -749,7 +904,58 @@ static __device__ __forceinline__ void dequantize_V_turbo3_0(const void * __rest
     const int     j0   = i0 % QK_TURBO3;
     const float   norm = __half2float(x[ib].norm);
 
-    static_assert(ne == 2 || ne == 4, "bad ne");
+    static_assert(ne == 2 || ne == 4 || ne == 8, "bad ne");
+
+    if constexpr (ne == 8) {
+        // PERF 8-wide: matches f16/bf16 V parallelism. 8 elements share two qs bytes (4 elt/byte)
+        // and one signs byte (8 elt/byte). j0 is multiple of 8 from VEC kernel.
+        // alignment=2: j0/4 is multiple of 2, qs starts at offset 2 within block,
+        // block stride 14 = even → qs+j0/4 is 2-byte aligned. Single LDG.E.16 instead of 2 byte loads.
+        uint16_t qs_pair;
+        ggml_cuda_memcpy_1<2, 2>(&qs_pair, x[ib].qs + j0 / 4);
+        const uint8_t qs0     = qs_pair & 0xFFu;
+        const uint8_t qs1     = (qs_pair >> 8) & 0xFFu;
+        const uint8_t sgn_byte = x[ib].signs[j0 / 8];
+        const uint8_t idx[8] = {
+            uint8_t(((qs0 >> 0) & 0x3) | (((sgn_byte >> 0) & 0x1) << 2)),
+            uint8_t(((qs0 >> 2) & 0x3) | (((sgn_byte >> 1) & 0x1) << 2)),
+            uint8_t(((qs0 >> 4) & 0x3) | (((sgn_byte >> 2) & 0x1) << 2)),
+            uint8_t(((qs0 >> 6) & 0x3) | (((sgn_byte >> 3) & 0x1) << 2)),
+            uint8_t(((qs1 >> 0) & 0x3) | (((sgn_byte >> 4) & 0x1) << 2)),
+            uint8_t(((qs1 >> 2) & 0x3) | (((sgn_byte >> 5) & 0x1) << 2)),
+            uint8_t(((qs1 >> 4) & 0x3) | (((sgn_byte >> 6) & 0x1) << 2)),
+            uint8_t(((qs1 >> 6) & 0x3) | (((sgn_byte >> 7) & 0x1) << 2)),
+        };
+        // PERF (sub-warp cooperative scaled-centroid sharing for V dequant) — same fix
+        // applied to turbo4 ne=8. turbo3 has 8 centroids, so 8 threads each compute 1.
+        constexpr int V_NTHREADS_TURBO = 8;
+        const unsigned sub_lane = threadIdx.x % V_NTHREADS_TURBO;
+        const float my_scaled = (sub_lane < 8u) ? (TURBO_CENTROIDS_3BIT[sub_lane] * norm) : 0.0f;
+        auto get_scaled = [&] (unsigned i) -> float {
+            return __shfl_sync(0xFFFFFFFFu, my_scaled, i, V_NTHREADS_TURBO);
+        };
+        float s[8];
+#pragma unroll
+        for (int k = 0; k < 8; ++k) s[k] = get_scaled(idx[k]);
+
+#ifdef FP16_AVAILABLE
+        if constexpr (std::is_same_v<T, half>) {
+#pragma unroll
+            for (int p = 0; p < 4; ++p) {
+                ((half2 *) dst)[p] = make_half2(__float2half(s[2*p+0]), __float2half(s[2*p+1]));
+            }
+        } else
+#endif
+        if constexpr (std::is_same_v<T, float>) {
+#pragma unroll
+            for (int p = 0; p < 4; ++p) {
+                ((float2 *) dst)[p] = make_float2(s[2*p+0], s[2*p+1]);
+            }
+        } else {
+            static_assert(std::is_same_v<T, void>, "unsupported type");
+        }
+        return;
+    }
 
     if constexpr (ne == 4) {
         // When j0 % 4 == 0 (always true from VEC kernel), all 4 elements share one
@@ -809,7 +1015,51 @@ static __device__ __forceinline__ void dequantize_V_turbo2_0(const void * __rest
     const int     j0   = i0 % QK_TURBO2;
     const float   norm = __half2float(x[ib].norm);
 
-    static_assert(ne == 2 || ne == 4, "bad ne");
+    static_assert(ne == 2 || ne == 4 || ne == 8, "bad ne");
+
+    if constexpr (ne == 8) {
+        // PERF 8-wide for turbo2: 8 elements share two qs bytes (4 elt/byte each).
+        // alignment=2: same logic as turbo3 — qs+j0/4 always 2-byte aligned.
+        uint16_t qs_pair;
+        ggml_cuda_memcpy_1<2, 2>(&qs_pair, x[ib].qs + j0 / 4);
+        const uint8_t qs0 = qs_pair & 0xFFu;
+        const uint8_t qs1 = (qs_pair >> 8) & 0xFFu;
+        const uint8_t idx[8] = {
+            uint8_t((qs0 >> 0) & 0x3), uint8_t((qs0 >> 2) & 0x3),
+            uint8_t((qs0 >> 4) & 0x3), uint8_t((qs0 >> 6) & 0x3),
+            uint8_t((qs1 >> 0) & 0x3), uint8_t((qs1 >> 2) & 0x3),
+            uint8_t((qs1 >> 4) & 0x3), uint8_t((qs1 >> 6) & 0x3),
+        };
+        // PERF (sub-warp cooperative scaled-centroid sharing for V dequant) — same fix.
+        // turbo2 has only 4 centroids, so 4 threads precompute (others idle).
+        constexpr int V_NTHREADS_TURBO = 8;
+        const unsigned sub_lane = threadIdx.x % V_NTHREADS_TURBO;
+        const float my_scaled = (sub_lane < 4u) ? (TURBO_CENTROIDS_2BIT[sub_lane] * norm) : 0.0f;
+        auto get_scaled = [&] (unsigned i) -> float {
+            return __shfl_sync(0xFFFFFFFFu, my_scaled, i, V_NTHREADS_TURBO);
+        };
+        float s[8];
+#pragma unroll
+        for (int k = 0; k < 8; ++k) s[k] = get_scaled(idx[k]);
+
+#ifdef FP16_AVAILABLE
+        if constexpr (std::is_same_v<T, half>) {
+#pragma unroll
+            for (int p = 0; p < 4; ++p) {
+                ((half2 *) dst)[p] = make_half2(__float2half(s[2*p+0]), __float2half(s[2*p+1]));
+            }
+        } else
+#endif
+        if constexpr (std::is_same_v<T, float>) {
+#pragma unroll
+            for (int p = 0; p < 4; ++p) {
+                ((float2 *) dst)[p] = make_float2(s[2*p+0], s[2*p+1]);
+            }
+        } else {
+            static_assert(std::is_same_v<T, void>, "unsupported type");
+        }
+        return;
+    }
 
     if constexpr (ne == 4) {
         const uint8_t qs_byte = x[ib].qs[j0 / 4];
@@ -858,6 +1108,9 @@ static __device__ __forceinline__ void dequantize_V_turbo2_0(const void * __rest
 
 // Turbo4 V dequantize: extract `ne` float/half values at position i0.
 // 4-bit nibble packed, block size 128.
+//
+// PERF (this fork): vector load of 2 qs bytes via uint16_t (alignment 2 — qs
+// sits at offset 2 in block_turbo4_0). Replaces 2 byte loads with 1 short load.
 template <typename T, int ne>
 static __device__ __forceinline__ void dequantize_V_turbo4_0(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
     const block_turbo4_0 * x = (const block_turbo4_0 *) vx;
@@ -866,13 +1119,84 @@ static __device__ __forceinline__ void dequantize_V_turbo4_0(const void * __rest
     const int     j0   = i0 % QK_TURBO4;
     const float   norm = __half2float(x[ib].norm);
 
-    static_assert(ne == 2 || ne == 4, "bad ne");
+    static_assert(ne == 2 || ne == 4 || ne == 8, "bad ne");
+
+    if constexpr (ne == 8) {
+        // PERF: 8-wide path. 8 consecutive elements span 4 qs bytes — single int load.
+        // alignment=4 because: block stride is 68 bytes (multiple of 4) AND qs[] starts
+        // at offset 4 inside block AND j0 is always multiple of 8 (so j0/2 is multiple
+        // of 4). All threads' qs offsets are 4-byte aligned → emit single LDG.E.32
+        // instead of two LDG.E.16. Halves memory transactions for V dequant.
+        uint32_t qs_word;
+        ggml_cuda_memcpy_1<4, 4>(&qs_word, x[ib].qs + j0 / 2);
+        const uint8_t qs_byte0 = (qs_word >>  0) & 0xFFu;
+        const uint8_t qs_byte1 = (qs_word >>  8) & 0xFFu;
+        const uint8_t qs_byte2 = (qs_word >> 16) & 0xFFu;
+        const uint8_t qs_byte3 = (qs_word >> 24) & 0xFFu;
+
+        const unsigned idx[8] = {
+            unsigned((qs_byte0 >> 0) & 0xF), unsigned((qs_byte0 >> 4) & 0xF),
+            unsigned((qs_byte1 >> 0) & 0xF), unsigned((qs_byte1 >> 4) & 0xF),
+            unsigned((qs_byte2 >> 0) & 0xF), unsigned((qs_byte2 >> 4) & 0xF),
+            unsigned((qs_byte3 >> 0) & 0xF), unsigned((qs_byte3 >> 4) & 0xF),
+        };
+
+        // PERF (sub-warp cooperative scaled-centroid sharing for V dequant):
+        // After my V dispatch fix, nthreads_V=8 for turbo. Each group of 8 threads in
+        // the warp processes ONE V position cooperatively. They all share the same norm
+        // and the same 16-entry centroid table. Original code did 8 const-mem lookups
+        // per thread per call (×8 threads = 64 lookups per V position, 16-way serialized
+        // since only 16 distinct centroid addresses exist) → big bottleneck at depth.
+        // Fix: each thread precomputes 2 of the 16 scaled centroids (norm × centroid),
+        // then per element shfl_sync within the 8-thread sub-group to broadcast.
+        // Replaces the const-mem serialization with register-fast shfl. Same per-element
+        // op count BUT avoids LSU stall on divergent constant-memory access.
+        // PERF + CORRECTNESS (turbo4 V dequant): with nthreads_V=16 (set in fattn-vec.cuh
+        // for turbo), each warp has 2 groups of 16 threads. Each group cooperates on
+        // ONE V position. The 16 lanes hold the 16 centroids one-per-lane (matching
+        // turbo4's 16-entry centroid table) — single shfl per centroid lookup with
+        // CORRECT semantics. Previously V_NTHREADS_TURBO=8 forced 2 centroids per lane
+        // and used a buggy select-before-shfl pattern that returned ~50% wrong halves.
+        constexpr int V_NTHREADS_TURBO = 16;
+        const unsigned sub_lane = threadIdx.x % V_NTHREADS_TURBO;
+        const float my_scaled = TURBO_CENTROIDS_4BIT[sub_lane] * norm;
+
+        auto get_scaled = [&] (unsigned i) -> float {
+            return __shfl_sync(0xFFFFFFFFu, my_scaled, i, V_NTHREADS_TURBO);
+        };
+
+        // Compute all 8 scaled values via shfl (1 shfl per element, CORRECT)
+        float s[8];
+#pragma unroll
+        for (int k = 0; k < 8; ++k) s[k] = get_scaled(idx[k]);
+
+#ifdef FP16_AVAILABLE
+        if constexpr (std::is_same_v<T, half>) {
+#pragma unroll
+            for (int p = 0; p < 4; ++p) {
+                ((half2 *) dst)[p] = make_half2(__float2half(s[2*p+0]), __float2half(s[2*p+1]));
+            }
+        } else
+#endif
+        if constexpr (std::is_same_v<T, float>) {
+#pragma unroll
+            for (int p = 0; p < 4; ++p) {
+                ((float2 *) dst)[p] = make_float2(s[2*p+0], s[2*p+1]);
+            }
+        } else {
+            static_assert(std::is_same_v<T, void>, "unsupported type");
+        }
+        return;
+    }
 
     if constexpr (ne == 4) {
         // j0 is always a multiple of 4 from the VEC kernel access pattern.
         // 4 consecutive elements span 2 qs bytes: j0/2 and j0/2+1.
-        const uint8_t qs_byte0 = x[ib].qs[j0 / 2];      // elements j0, j0+1
-        const uint8_t qs_byte1 = x[ib].qs[j0 / 2 + 1];  // elements j0+2, j0+3
+        // Single short load (alignment 2) replaces 2 byte loads.
+        uint16_t qs_pair;
+        ggml_cuda_memcpy_1<2, 2>(&qs_pair, x[ib].qs + j0 / 2);
+        const uint8_t qs_byte0 = qs_pair & 0xFFu;       // elements j0, j0+1
+        const uint8_t qs_byte1 = (qs_pair >> 8) & 0xFFu; // elements j0+2, j0+3
 
         const uint8_t idx0 = (qs_byte0 >> 0) & 0xF;
         const uint8_t idx1 = (qs_byte0 >> 4) & 0xF;
@@ -937,6 +1261,10 @@ constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
     } else if constexpr (type_K == GGML_TYPE_TURBO2_0) {
         return vec_dot_fattn_vec_KQ_turbo2_0<D, nthreads>;
     } else if constexpr (type_K == GGML_TYPE_TURBO4_0) {
+        // Tested int8/__dp4a path: was 6-8 t/s SLOWER at depth than the float path
+        // because per-thread divergent indices into TURBO_CENTROIDS_4BIT_INT8 (constant
+        // memory) serialize, costing more than the dp4a-vs-float-mul saving. Float path
+        // wins because warp-cooperative shfl-broadcast eliminates the divergent const-mem hit.
         return vec_dot_fattn_vec_KQ_turbo4_0<D, nthreads>;
     } else {
         static_assert(type_K == -1, "bad type");
@@ -1027,9 +1355,96 @@ static __global__ void flash_attn_mask_to_KV_max(
 
 template<int D, int ncols1, int ncols2> // D == head size
 __launch_bounds__(D, 1)
-static __global__ void flash_attn_stream_k_fixup(
-        float * __restrict__ dst, const float2 * __restrict__ dst_fixup, const int ne01, const int ne02, const int ne03,
-        const int ne11, const int ne12, const int nbatch_fa) {
+static __global__ void flash_attn_stream_k_fixup_uniform(
+        float * __restrict__ dst,
+        const float2 * __restrict__ dst_fixup,
+        const int ne01, const int ne02,
+        const int ne12, const int nblocks_stream_k,
+        const int gqa_ratio,
+        const int blocks_per_tile,
+        const uint3 fd_iter_j_z_ne12,
+        const uint3 fd_iter_j_z,
+        const uint3 fd_iter_j) {
+    constexpr int ncols = ncols1*ncols2;
+
+    const int tile_idx = blockIdx.x; // One block per output tile.
+    const int j        = blockIdx.y;
+    const int c        = blockIdx.z;
+    const int jc       = j*ncols2 + c;
+    const int tid      = threadIdx.x;
+
+    // nblocks_stream_k is a multiple of ntiles_dst (== gridDim.x), so each tile gets the same number of blocks.
+    const int b_first = tile_idx * blocks_per_tile;
+    const int b_last  = b_first + blocks_per_tile - 1;
+
+    const float * dst_fixup_data = ((const float *) dst_fixup) + nblocks_stream_k*(2*2*ncols);
+
+    // z_KV == K/V head index, zt_gqa = Q head start index per K/V head, jt = token position start index
+    const uint2 dm0 = fast_div_modulo(tile_idx, fd_iter_j_z_ne12);
+    const uint2 dm1 = fast_div_modulo(dm0.y,    fd_iter_j_z);
+    const uint2 dm2 = fast_div_modulo(dm1.y,    fd_iter_j);
+
+    const int sequence = dm0.x;
+    const int z_KV     = dm1.x;
+    const int zt_gqa   = dm2.x;
+    const int jt       = dm2.y;
+
+    const int zt_Q = z_KV*gqa_ratio + zt_gqa*ncols2; // Global Q head start index.
+
+    if (jt*ncols1 + j >= ne01 || zt_gqa*ncols2 + c >= gqa_ratio) {
+        return;
+    }
+
+    dst += sequence*ne02*ne01*D + jt*ne02*(ncols1*D) + zt_Q*D + (j*ne02 + c)*D + tid;
+
+    // Load the partial result that needs a fixup
+    float dst_val = *dst;
+    float max_val;
+    float rowsum;
+    {
+        const float2 tmp = dst_fixup[b_last*ncols + jc];
+        max_val = tmp.x;
+        rowsum  = tmp.y;
+    }
+
+    // Combine with all previous blocks in this tile.
+    for (int bidx = b_last - 1; bidx >= b_first; --bidx) {
+        const float dst_add = dst_fixup_data[bidx*ncols*D + jc*D + tid];
+
+        const float2 tmp = dst_fixup[(nblocks_stream_k + bidx)*ncols + jc];
+
+        const float max_val_new = fmaxf(max_val, tmp.x);
+
+        const float diff_val = max_val - max_val_new;
+        const float diff_add = tmp.x   - max_val_new;
+
+        const float scale_val = diff_val >= SOFTMAX_FTZ_THRESHOLD ? expf(diff_val) : 0.0f;
+        const float scale_add = diff_add >= SOFTMAX_FTZ_THRESHOLD ? expf(diff_add) : 0.0f;
+
+        dst_val = scale_val*dst_val + scale_add*dst_add;
+        rowsum  = scale_val*rowsum  + scale_add*tmp.y;
+
+        max_val = max_val_new;
+    }
+
+    // Write back final result:
+    *dst = dst_val / rowsum;
+}
+
+// General fixup kernel for the case where the number of blocks per tile is not uniform across tiles
+// (blocks_num.x not a multiple of ntiles_dst)
+template <int D, int ncols1, int ncols2> // D == head size
+__launch_bounds__(D, 1)
+static __global__ void flash_attn_stream_k_fixup_general(
+        float * __restrict__ dst,
+        const float2 * __restrict__ dst_fixup,
+        const int ne01, const int ne02,
+        const int gqa_ratio,
+        const int total_work,
+        const uint3 fd_iter_k_j_z_ne12,
+        const uint3 fd_iter_k_j_z,
+        const uint3 fd_iter_k_j,
+        const uint3 fd_iter_k) {
     constexpr int ncols = ncols1*ncols2;
 
     const int bidx0 = blockIdx.x;
@@ -1040,27 +1455,26 @@ static __global__ void flash_attn_stream_k_fixup(
 
     const float * dst_fixup_data = ((const float *) dst_fixup) + gridDim.x*(2*2*ncols);
 
-    const int gqa_ratio = ne02 / ne12; // With grouped query attention there are > 1 Q matrices per K, V matrix.
-
-    const int iter_k     = (ne11      + (nbatch_fa - 1)) / nbatch_fa;
-    const int iter_j     = (ne01      + (ncols1    - 1)) / ncols1;
-    const int iter_z_gqa = (gqa_ratio + (ncols2    - 1)) / ncols2;
-
-    const int kbc0      = int64_t(bidx0 + 0)*(iter_k*iter_j*iter_z_gqa*ne12*ne03) / gridDim.x;
-    const int kbc0_stop = int64_t(bidx0 + 1)*(iter_k*iter_j*iter_z_gqa*ne12*ne03) / gridDim.x;
+    const int kbc0      = int64_t(bidx0 + 0)*total_work / gridDim.x;
+    const int kbc0_stop = int64_t(bidx0 + 1)*total_work / gridDim.x;
 
     const bool did_not_have_any_data   = kbc0 == kbc0_stop;
-    const bool wrote_beginning_of_tile = kbc0 % iter_k == 0;
-    const bool did_not_write_last      = kbc0/iter_k == kbc0_stop/iter_k && kbc0_stop % iter_k != 0;
+    const bool wrote_beginning_of_tile = fastmodulo(kbc0, fd_iter_k) == 0;
+    const bool did_not_write_last      = fastdiv(kbc0, fd_iter_k) == fastdiv(kbc0_stop, fd_iter_k) && fastmodulo(kbc0_stop, fd_iter_k) != 0;
     if (did_not_have_any_data || wrote_beginning_of_tile || did_not_write_last) {
         return;
     }
 
     // z_KV == K/V head index, zt_gqa = Q head start index per K/V head, jt = token position start index
-    const int sequence =  kbc0 /(iter_k*iter_j*iter_z_gqa*ne12);
-    const int z_KV     = (kbc0 - iter_k*iter_j*iter_z_gqa*ne12 * sequence)/(iter_k*iter_j*iter_z_gqa);
-    const int zt_gqa   = (kbc0 - iter_k*iter_j*iter_z_gqa*ne12 * sequence - iter_k*iter_j*iter_z_gqa * z_KV)/(iter_k*iter_j);
-    const int jt       = (kbc0 - iter_k*iter_j*iter_z_gqa*ne12 * sequence - iter_k*iter_j*iter_z_gqa * z_KV - iter_k*iter_j * zt_gqa) / iter_k;
+    const uint2 dm0 = fast_div_modulo(kbc0, fd_iter_k_j_z_ne12);
+    const uint2 dm1 = fast_div_modulo(dm0.y, fd_iter_k_j_z);
+    const uint2 dm2 = fast_div_modulo(dm1.y, fd_iter_k_j);
+    const uint2 dm3 = fast_div_modulo(dm2.y, fd_iter_k);
+
+    const int sequence = dm0.x;
+    const int z_KV     = dm1.x;
+    const int zt_gqa   = dm2.x;
+    const int jt       = dm3.x;
 
     const int zt_Q = z_KV*gqa_ratio + zt_gqa*ncols2; // Global Q head start index.
 
@@ -1084,10 +1498,11 @@ static __global__ void flash_attn_stream_k_fixup(
 
     // Iterate over previous blocks and compute the combined results.
     // All CUDA blocks that get here must have a previous block that needs a fixup.
+    const int tile_kbc0 = fastdiv(kbc0, fd_iter_k);
     int bidx = bidx0 - 1;
     int kbc_stop = kbc0;
     while(true) {
-        const int kbc = int64_t(bidx)*(iter_k*iter_j*iter_z_gqa*ne12*ne03) / gridDim.x;
+        const int kbc = int64_t(bidx)*total_work / gridDim.x;
         if (kbc == kbc_stop) { // Did not have any data.
             bidx--;
             kbc_stop = kbc;
@@ -1113,7 +1528,7 @@ static __global__ void flash_attn_stream_k_fixup(
         max_val = max_val_new;
 
         // If this block started in a previous tile we are done and don't need to combine additional partial results.
-        if (kbc % iter_k == 0 || kbc/iter_k < kbc0/iter_k) {
+        if (fastmodulo(kbc, fd_iter_k) == 0 || fastdiv(kbc, fd_iter_k) < tile_kbc0) {
             break;
         }
         bidx--;
@@ -1327,13 +1742,27 @@ void launch_fattn(
         const int tiles_nwaves = (ntiles_dst + max_blocks - 1) / max_blocks;
         const int tiles_efficiency_percent = 100 * ntiles_dst / (max_blocks*tiles_nwaves);
 
-        const int nblocks_stream_k = std::min(max_blocks, ntiles_KV*ntiles_dst);
-
         const bool use_stream_k = cc >= GGML_CUDA_CC_ADA_LOVELACE || amd_wmma_available(cc) || tiles_efficiency_percent < 75;
 
-        blocks_num.x = use_stream_k ? nblocks_stream_k : ntiles_dst;
+        blocks_num.x = ntiles_dst;
         blocks_num.y = 1;
         blocks_num.z = 1;
+
+        if(use_stream_k) {
+            const int nblocks_stream_k_raw = std::min(max_blocks, ntiles_KV*ntiles_dst);
+            // Round down to a multiple of ntiles_dst so that each output tile gets the same number of blocks (avoids fixup).
+            // Only do this if the occupancy loss from rounding is acceptable.
+            const int nblocks_stream_k_rounded = (nblocks_stream_k_raw / ntiles_dst) * ntiles_dst;
+            const int max_efficiency_loss_percent = 5;
+            const int efficiency_loss_percent = nblocks_stream_k_rounded > 0
+                ? 100 * (nblocks_stream_k_raw - nblocks_stream_k_rounded) / nblocks_stream_k_raw
+                : 100;
+            const int nblocks_stream_k = efficiency_loss_percent <= max_efficiency_loss_percent
+                ? nblocks_stream_k_rounded
+                : nblocks_stream_k_raw;
+
+            blocks_num.x = nblocks_stream_k;
+        }
 
         if (ntiles_dst % blocks_num.x != 0) { // Fixup is only needed if the SMs work on fractional tiles.
             dst_tmp_meta.alloc((size_t(blocks_num.x) * ncols * (2 + DV/2)));
@@ -1414,13 +1843,40 @@ void launch_fattn(
     CUDA_CHECK(cudaGetLastError());
 
     if (stream_k) {
-        if (ntiles_dst % blocks_num.x != 0) { // Fixup is only needed if the SMs work on fractional tiles.
+        if ((int)blocks_num.x % ntiles_dst == 0 && (int)blocks_num.x > ntiles_dst) {
+            // Optimized fixup: nblocks_stream_k is a multiple of ntiles_dst, launch one block per tile.
+            const int nblocks_sk  = (int)blocks_num.x;
+            const int bpt         = nblocks_sk / ntiles_dst;
+
+            const uint3 fd0 = init_fastdiv_values(ntiles_x * ntiles_z_gqa * K->ne[2]);
+            const uint3 fd1 = init_fastdiv_values(ntiles_x * ntiles_z_gqa);
+            const uint3 fd2 = init_fastdiv_values(ntiles_x);
+
+            const dim3 block_dim_combine(DV, 1, 1);
+            const dim3 blocks_num_combine = {(unsigned)ntiles_dst, ncols1, ncols2};
+
+            flash_attn_stream_k_fixup_uniform<DV, ncols1, ncols2>
+                <<<blocks_num_combine, block_dim_combine, 0, main_stream>>>
+                ((float *) KQV->data, dst_tmp_meta.ptr,
+                 Q->ne[1], Q->ne[2], K->ne[2], nblocks_sk,
+                 gqa_ratio, bpt, fd0, fd1, fd2);
+        } else if (ntiles_dst % blocks_num.x != 0) {
+            // General fixup for the cases where nblocks_stream_k < ntiles_dst.
+            const int total_work = ntiles_KV * ntiles_dst;
+
+            const uint3 fd_k_j_z_ne12 = init_fastdiv_values(ntiles_KV * ntiles_x * ntiles_z_gqa * K->ne[2]);
+            const uint3 fd_k_j_z      = init_fastdiv_values(ntiles_KV * ntiles_x * ntiles_z_gqa);
+            const uint3 fd_k_j        = init_fastdiv_values(ntiles_KV * ntiles_x);
+            const uint3 fd_k          = init_fastdiv_values(ntiles_KV);
+
             const dim3 block_dim_combine(DV, 1, 1);
             const dim3 blocks_num_combine = {blocks_num.x, ncols1, ncols2};
 
-            flash_attn_stream_k_fixup<DV, ncols1, ncols2>
+            flash_attn_stream_k_fixup_general<DV, ncols1, ncols2>
                 <<<blocks_num_combine, block_dim_combine, 0, main_stream>>>
-                ((float *) KQV->data, dst_tmp_meta.ptr, Q->ne[1], Q->ne[2], Q->ne[3], K->ne[1], K->ne[2], nbatch_fa);
+                ((float *) KQV->data, dst_tmp_meta.ptr,
+                 Q->ne[1], Q->ne[2], gqa_ratio, total_work,
+                 fd_k_j_z_ne12, fd_k_j_z, fd_k_j, fd_k);
         }
     } else if (parallel_blocks > 1) {
         const dim3 block_dim_combine(DV, 1, 1);

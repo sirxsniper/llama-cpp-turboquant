@@ -1,5 +1,6 @@
 #include "hf-cache.h"
 
+#include "build-info.h"
 #include "common.h"
 #include "log.h"
 #include "http.h"
@@ -26,6 +27,8 @@ namespace nl = nlohmann;
 #include <windows.h>
 #else
 #define HOME_DIR "HOME"
+#include <unistd.h>
+#include <pwd.h>
 #endif
 
 namespace hf_cache {
@@ -51,6 +54,13 @@ static fs::path get_cache_directory() {
                 return entry.path.empty() ? base : base / entry.path;
             }
         }
+#ifndef _WIN32
+        const struct passwd * pw = getpwuid(getuid());
+
+        if (pw && pw->pw_dir && *pw->pw_dir) {
+            return fs::path(pw->pw_dir) / ".cache" / "huggingface" / "hub";
+        }
+#endif
         throw std::runtime_error("Failed to determine HF cache directory");
     }();
 
@@ -191,7 +201,7 @@ static nl::json api_get(const std::string & url,
     auto [cli, parts] = common_http_client(url);
 
     httplib::Headers headers = {
-        {"User-Agent", "llama-cpp/" + build_info},
+        {"User-Agent", "llama-cpp/" + std::string(llama_build_info())},
         {"Accept", "application/json"}
     };
 
@@ -220,7 +230,7 @@ static nl::json api_get(const std::string & url,
 static std::string get_repo_commit(const std::string & repo_id,
                                    const std::string & token) {
     try {
-        auto endpoint = get_model_endpoint();
+        auto endpoint = common_get_model_endpoint();
         auto json = api_get(endpoint + "api/models/" + repo_id + "/refs", token);
 
         if (!json.is_object() ||
@@ -298,7 +308,7 @@ hf_files get_repo_files(const std::string & repo_id,
     hf_files files;
 
     try {
-        auto endpoint = get_model_endpoint();
+        auto endpoint = common_get_model_endpoint();
         auto json = api_get(endpoint + "api/models/" + repo_id + "/tree/" + commit + "?recursive=true", token);
 
         if (!json.is_array()) {
