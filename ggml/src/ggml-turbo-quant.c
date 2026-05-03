@@ -513,7 +513,7 @@ void quantize_row_turbo4_0_ref(const float * GGML_RESTRICT x, block_turbo4_0 * G
         for (int i = 0; i < d; i++) {
             y[block].qs[i / 2] |= (uint8_t)((indices[i] & 0xF) << ((i % 2) * 4));
         }
-        y[block].rnorm = GGML_FP32_TO_FP16(0.0f);
+        y[block].pad = GGML_FP32_TO_FP16(0.0f);  // alignment pad — keeps qs[] 4-byte aligned
 #else
         /* Legacy 3-bit + QJL: pack 3-bit indices + QJL signs */
         memset(y[block].qs, 0, d * 3 / 8);

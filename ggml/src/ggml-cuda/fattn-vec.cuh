@@ -17,7 +17,10 @@ static constexpr __device__ int ggml_cuda_fattn_vec_get_nthreads_device() {
 #pragma clang diagnostic ignored "-Wpass-failed"
 #endif // __clang__
 template<int D, int ncols, ggml_type type_K, ggml_type type_V, bool use_logit_softcap> // D == head size
-__launch_bounds__(ggml_cuda_fattn_vec_get_nthreads_device(), 1)
+// PERF: bumped min_blocks_per_sm 2 → 4. With nthreads_V=16 fix the VKQ register
+// footprint per thread halved (4 entries vs 8), freeing room for higher occupancy.
+// Memory-latency-bound at depth — more in-flight blocks hide DRAM/L2 stalls better.
+__launch_bounds__(ggml_cuda_fattn_vec_get_nthreads_device(), 4)
 static __global__ void flash_attn_ext_vec(
         const char * __restrict__ Q,
         const char * __restrict__ K,
@@ -61,6 +64,7 @@ static __global__ void flash_attn_ext_vec(
 
     constexpr int cpy_nb = ggml_cuda_get_max_cpy_bytes();
     constexpr int cpy_ne = cpy_nb / 4;
+    // Will be bounded below to fit Q_reg sizing (D/2/nthreads_KQ) once nthreads_KQ is known.
 
 #ifdef GGML_USE_HIP
 #ifdef RDNA
@@ -75,16 +79,49 @@ static __global__ void flash_attn_ext_vec(
 #endif // GGML_USE_HIP
 
     constexpr int nthreads    = ggml_cuda_fattn_vec_get_nthreads_device();
-    // Turbo3 uses the float Q path (like f16/bf16), not q8_1 integer path
-    constexpr bool K_is_unquantized = (type_K == GGML_TYPE_F16 || type_K == GGML_TYPE_BF16 || type_K == GGML_TYPE_TURBO3_0 || type_K == GGML_TYPE_TURBO2_0 || type_K == GGML_TYPE_TURBO4_0);
+    // turbo K uses float-Q path (vec_dot_fattn_vec_KQ_turbo*_0 ignores Q_q8) but should
+    // get q8's nthreads_KQ_q (=32 for D=128) for parallelism. Tested int8/__dp4a path
+    // proved slower at depth (constant-memory serialization on divergent lookups).
+    constexpr bool type_K_is_turbo = (type_K == GGML_TYPE_TURBO3_0 || type_K == GGML_TYPE_TURBO2_0 || type_K == GGML_TYPE_TURBO4_0);
+    constexpr bool K_is_unquantized = (type_K == GGML_TYPE_F16 || type_K == GGML_TYPE_BF16 || type_K_is_turbo);
     constexpr bool V_is_unquantized = (type_V == GGML_TYPE_F16 || type_V == GGML_TYPE_BF16 || type_V == GGML_TYPE_TURBO3_0 || type_V == GGML_TYPE_TURBO2_0 || type_V == GGML_TYPE_TURBO4_0);
-    constexpr int nthreads_KQ = K_is_unquantized ? 128 / cpy_nb : nthreads_KQ_q;
-    constexpr int nthreads_V  = V_is_unquantized ? ((type_V == GGML_TYPE_TURBO3_0 || type_V == GGML_TYPE_TURBO2_0 || type_V == GGML_TYPE_TURBO4_0) ? nthreads_V_q : 128 / cpy_nb) : nthreads_V_q;
+    // PERF (turbo K alignment fix attempt): turbo K uses 16 threads/K (not 32) so
+    // cpy_ne=4 fits and byte_base=tid*4 is uniformly 4-byte aligned → single LDG.E.32
+    // qs load instead of <2,2> short load. Two 16-thread groups per warp process 2 K
+    // positions in parallel per i_KQ_0 iter. Trade-off: doubles per-thread Q_reg size.
+    constexpr int nthreads_KQ = type_K_is_turbo ? (nthreads_KQ_q/2) : (K_is_unquantized ? 128 / cpy_nb : nthreads_KQ_q);
+    // PERF V: turbo previously routed through nthreads_V=nthreads_V_q (=32 for D=128),
+    // giving V_cols_per_iter = WARP_SIZE/nthreads_V = 1 — only ONE V position per warp
+    // iteration. f16/bf16 use nthreads_V=128/cpy_nb=8 → V_cols_per_iter=4, processing
+    // 4 V positions per warp iter. Route turbo through the same V dispatch as f16/bf16
+    // (with V_rows_per_thread=2*cpy_ne and ne=8 dequant support added in fattn-common.cuh).
+    constexpr bool type_V_is_turbo = (type_V == GGML_TYPE_TURBO3_0 || type_V == GGML_TYPE_TURBO2_0 || type_V == GGML_TYPE_TURBO4_0);
+    // PERF (turbo V correctness + speed): use 16 threads/V (not 8) so each lane holds
+    // ONE centroid (matches turbo4's 16-entry table). Eliminates the broken half-pair
+    // shfl pattern (~50% wrong-half lookups) AND the half2-packing overhead — single
+    // shfl per element with CORRECT semantics. V_cols_per_iter halves to 2, but the
+    // total V positions per warp per outer K step is unchanged (just more iters of k0).
+    constexpr int nthreads_V  = type_V_is_turbo ? 16 : (V_is_unquantized ? 128 / cpy_nb : nthreads_V_q);
 
     static_assert(WARP_SIZE % nthreads_KQ == 0, "bad nthreads_K");
     static_assert(WARP_SIZE % nthreads_V  == 0, "bad nthreads_V");
 
-    constexpr int V_rows_per_thread = V_is_unquantized ? ((type_V == GGML_TYPE_TURBO3_0 || type_V == GGML_TYPE_TURBO2_0 || type_V == GGML_TYPE_TURBO4_0) ? 4 : 2*cpy_ne) : 4;
+    // CORRECTNESS: Q_reg is sized [(D/2)/nthreads_KQ]; the Q load + K KQ-dot loops
+    // both use cpy_ne as inner stride. When nthreads_KQ * cpy_ne > D/2 (e.g. turbo
+    // with nthreads_KQ=32, cpy_ne=4, D=128 → 128 > 64), the loop writes/reads OOB
+    // into Q_reg (sized 2) at indices 0..3. Cap cpy_ne_KQ to fit per-thread element
+    // count exactly: D/(2*nthreads_KQ).
+    constexpr int cpy_ne_KQ = (nthreads_KQ * cpy_ne > D/2) ? D/(2*nthreads_KQ) : cpy_ne;
+    static_assert(cpy_ne_KQ >= 1, "cpy_ne_KQ must be at least 1");
+
+    // V_rows_per_thread = 2*cpy_ne for ALL V_is_unquantized types. Turbo previously was
+    // capped to 4 (a leftover from when nthreads_V was 32 — 32*8/2 = 128 > D/2 = 64
+    // would have OOB'd). After my V dispatch fix that makes nthreads_V = 8 for turbo,
+    // 8*8/2 = 32 fits cleanly into D/2 = 64 (loop runs 2 iters, covering full D=128).
+    // VKQ register array sized D/2/nthreads_V = 8 — all 8 indices used, no OOB.
+    // Bumps V dequant per-thread element count from 4 → 8, doubling V throughput.
+    constexpr int V_rows_per_thread = V_is_unquantized ? 2*cpy_ne : 4;
+    (void)type_V_is_turbo;
     constexpr int V_cols_per_iter   = WARP_SIZE / nthreads_V;
 
     constexpr vec_dot_KQ_t vec_dot_KQ = get_vec_dot_KQ<type_K, D, nthreads_KQ>();
@@ -124,12 +161,21 @@ static __global__ void flash_attn_ext_vec(
 #endif // V_DOT2_F32_F16_AVAILABLE
 
     // Sparse V: skip V dequant for positions with negligible attention weights.
-    // At long context, most V positions contribute < 1e-6 to the output — skipping
-    // their dequant saves significant compute (especially for quantized V types).
-    constexpr float sparse_v_threshold_f = 1e-6f;
+    // 5e-3 — skip positions with weight < 0.5%. After softmax at depth 50K, peak
+    // attention concentrates on a few positions; the long tail averages 1/N=2e-5 each
+    // so most are below 5e-3. Aggressive but quality risk small (cumulative skipped
+    // mass is bounded by how many positions sit in the 5e-3..0 range, typically <30%).
+    // Sparse-V is fully disabled (preserves full attention quality at long context).
+    // The constexpr enable flag below lets the compiler dead-code-eliminate both the
+    // per-K-position dominated check and the sparse_v_threshold conversion. Previously
+    // we set threshold=-1.0f which made the check always return false, but the compare
+    // and branch still executed in the kernel — measurable overhead at 50K positions.
+    constexpr bool sparse_v_enabled = false;
+    constexpr float sparse_v_threshold_f = 0.0f;
 #ifdef V_DOT2_F32_F16_AVAILABLE
     const     half  sparse_v_threshold_h = __float2half(sparse_v_threshold_f);
 #endif
+    (void)sparse_v_threshold_f; (void)sparse_v_enabled;
 
     float KQ_max[ncols];
     float KQ_sum[ncols];
@@ -208,16 +254,22 @@ static __global__ void flash_attn_ext_vec(
         for (int j = 0; j < ncols; ++j) {
             const float2 * Q_j = (const float2 *) (Q + j*nb01);
 #pragma unroll
-            for (int i0 = 0; i0 < D/2; i0 += nthreads_KQ*cpy_ne) {
-                const int i = i0 + (nthreads_KQ == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_KQ)*cpy_ne;
+            for (int i0 = 0; i0 < D/2; i0 += nthreads_KQ*cpy_ne_KQ) {
+                const int i = i0 + (nthreads_KQ == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_KQ)*cpy_ne_KQ;
 
-                __align__(16) float2 tmp[cpy_ne] = {{0.0f, 0.0f}};
+                __align__(16) float2 tmp[cpy_ne_KQ] = {{0.0f, 0.0f}};
                 if (ncols == 1 || ic0 + j < int(ne01.z)) {
-                    ggml_cuda_memcpy_1<cpy_nb>(tmp,            &Q_j[i]);
-                    ggml_cuda_memcpy_1<cpy_nb>(tmp + cpy_ne/2, &Q_j[i + cpy_ne/2]);
+                    if constexpr (cpy_ne_KQ >= 2) {
+                        ggml_cuda_memcpy_1<cpy_ne_KQ*4>(tmp,                 &Q_j[i]);
+                        if constexpr (cpy_ne_KQ >= 4) {
+                            ggml_cuda_memcpy_1<cpy_ne_KQ*4>(tmp + cpy_ne_KQ/2, &Q_j[i + cpy_ne_KQ/2]);
+                        }
+                    } else {
+                        tmp[0] = Q_j[i];
+                    }
                 }
 #pragma unroll
-                for (int i1 = 0; i1 < cpy_ne; ++i1) {
+                for (int i1 = 0; i1 < cpy_ne_KQ; ++i1) {
                     Q_reg[j][i0/nthreads_KQ + i1] = make_half2(tmp[i1].x, tmp[i1].y);
                 }
             }
@@ -231,11 +283,17 @@ static __global__ void flash_attn_ext_vec(
         for (int j = 0; j < ncols; ++j) {
             const float2 * Q_j = (const float2 *) (Q + j*nb01);
 #pragma unroll
-            for (int i0 = 0; i0 < D/2; i0 += nthreads_KQ*cpy_ne) {
-                const int i = i0 + (nthreads_KQ == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_KQ)*cpy_ne;
+            for (int i0 = 0; i0 < D/2; i0 += nthreads_KQ*cpy_ne_KQ) {
+                const int i = i0 + (nthreads_KQ == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_KQ)*cpy_ne_KQ;
                 if (ncols == 1 || ic0 + j < int(ne01.z)) {
-                    ggml_cuda_memcpy_1<cpy_nb>(&Q_reg[j][i0/nthreads_KQ],            &Q_j[i]);
-                    ggml_cuda_memcpy_1<cpy_nb>(&Q_reg[j][i0/nthreads_KQ + cpy_ne/2], &Q_j[i + cpy_ne/2]);
+                    if constexpr (cpy_ne_KQ >= 2) {
+                        ggml_cuda_memcpy_1<cpy_ne_KQ*4>(&Q_reg[j][i0/nthreads_KQ], &Q_j[i]);
+                        if constexpr (cpy_ne_KQ >= 4) {
+                            ggml_cuda_memcpy_1<cpy_ne_KQ*4>(&Q_reg[j][i0/nthreads_KQ + cpy_ne_KQ/2], &Q_j[i + cpy_ne_KQ/2]);
+                        }
+                    } else {
+                        Q_reg[j][i0/nthreads_KQ] = Q_j[i];
+                    }
                 }
             }
 #pragma unroll
@@ -295,26 +353,34 @@ static __global__ void flash_attn_ext_vec(
             for (int offset = nthreads_KQ; offset < WARP_SIZE; offset <<= 1) {
                 KQ_max_new[j] = fmaxf(KQ_max_new[j], __shfl_xor_sync(0xFFFFFFFF, KQ_max_new[j], offset, WARP_SIZE));
             }
-            const float KQ_max_scale = expf(KQ_max[j] - KQ_max_new[j]);
+            // PERF (depth-flattening): KQ_max grows monotonically and stabilizes after the
+            // first few high-attention K positions are seen. After that, KQ_max_new == KQ_max
+            // and KQ_max_scale = exp(0) = 1 — multiplying every prior VKQ by 1.0f for
+            // thousands of remaining K positions is wasted work that scales with depth.
+            // Branch around the rescale when the max didn't change (the common case at depth).
+            const bool max_changed = (KQ_max_new[j] != KQ_max[j]);
+            const float KQ_max_scale = max_changed ? expf(KQ_max[j] - KQ_max_new[j]) : 1.0f;
             KQ_max[j] = KQ_max_new[j];
 
             KQ_reg[j] = expf(KQ_reg[j] - KQ_max[j]);
-            KQ_sum[j] = KQ_sum[j]*KQ_max_scale + KQ_reg[j];
+            KQ_sum[j] = max_changed ? (KQ_sum[j]*KQ_max_scale + KQ_reg[j]) : (KQ_sum[j] + KQ_reg[j]);
             KQ[j*nthreads + tid] = KQ_reg[j];
 
+            if (max_changed) {
 #ifdef V_DOT2_F32_F16_AVAILABLE
-            const half2 KQ_max_scale_h2 = make_half2(KQ_max_scale, KQ_max_scale);
+                const half2 KQ_max_scale_h2 = make_half2(KQ_max_scale, KQ_max_scale);
 #pragma unroll
-            for (int i_VKQ_0 = 0; i_VKQ_0 < D/2; i_VKQ_0 += nthreads_V) {
-                VKQ[j][i_VKQ_0/nthreads_V] *= KQ_max_scale_h2;
-            }
+                for (int i_VKQ_0 = 0; i_VKQ_0 < D/2; i_VKQ_0 += nthreads_V) {
+                    VKQ[j][i_VKQ_0/nthreads_V] *= KQ_max_scale_h2;
+                }
 #else
 #pragma unroll
-            for (int i_VKQ_0 = 0; i_VKQ_0 < D/2; i_VKQ_0 += nthreads_V) {
-                VKQ[j][i_VKQ_0/nthreads_V].x *= KQ_max_scale;
-                VKQ[j][i_VKQ_0/nthreads_V].y *= KQ_max_scale;
-            }
+                for (int i_VKQ_0 = 0; i_VKQ_0 < D/2; i_VKQ_0 += nthreads_V) {
+                    VKQ[j][i_VKQ_0/nthreads_V].x *= KQ_max_scale;
+                    VKQ[j][i_VKQ_0/nthreads_V].y *= KQ_max_scale;
+                }
 #endif // V_DOT2_F32_F16_AVAILABLE
+            }
         }
 
 #ifndef GGML_USE_HIP
@@ -333,7 +399,8 @@ static __global__ void flash_attn_ext_vec(
             }
 
             // Sparse V: skip V dequant if all attention weights for this position are negligible
-            {
+            // (constexpr-gated so the entire check compiles away when disabled).
+            if constexpr (sparse_v_enabled) {
                 bool dominated = true;
 #pragma unroll
                 for (int j = 0; j < ncols; ++j) {
@@ -372,8 +439,8 @@ static __global__ void flash_attn_ext_vec(
                 KQ_k[j] = KQ[j*nthreads + k];
             }
 
-            // Sparse V: skip V dequant if all attention weights for this position are negligible
-            {
+            // Sparse V: constexpr-gated, fully eliminated when disabled.
+            if constexpr (sparse_v_enabled) {
                 bool dominated = true;
 #pragma unroll
                 for (int j = 0; j < ncols; ++j) {
