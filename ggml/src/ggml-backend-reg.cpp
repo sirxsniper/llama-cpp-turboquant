@@ -181,6 +181,12 @@ struct ggml_backend_registry {
             return;
         }
 
+        for (auto & entry : backends) {
+            if (entry.reg == reg) {
+                return;
+            }
+        }
+
 #ifndef NDEBUG
         GGML_LOG_DEBUG("%s: registered backend %s (%zu devices)\n",
             __func__, ggml_backend_reg_name(reg), ggml_backend_reg_dev_count(reg));
@@ -192,6 +198,12 @@ struct ggml_backend_registry {
     }
 
     void register_device(ggml_backend_dev_t device) {
+        for (auto & dev : devices) {
+            if (dev == device) {
+                return;
+            }
+        }
+
 #ifndef NDEBUG
         GGML_LOG_DEBUG("%s: registered device %s (%s)\n", __func__, ggml_backend_dev_name(device), ggml_backend_dev_description(device));
 #endif
@@ -217,8 +229,13 @@ struct ggml_backend_registry {
 
         auto backend_init_fn = (ggml_backend_init_t) dl_get_sym(handle.get(), "ggml_backend_init");
         if (!backend_init_fn) {
+            // The merged TurboQuant fork builds backends with GGML_BACKEND_DL=OFF (the default),
+            // so ggml-cuda.dll/ggml-cpu.dll are statically linked and don't expose this symbol.
+            // The dynamic loader probes them anyway and "fails" silently here — backend init has
+            // already happened at static-link time, so this is purely cosmetic. Demote to DEBUG.
             if (!silent) {
-                GGML_LOG_ERROR("%s: failed to find ggml_backend_init in %s\n", __func__, path_str(path).c_str());
+                GGML_LOG_DEBUG("%s: skipping %s — no ggml_backend_init export (statically linked)\n",
+                    __func__, path_str(path).c_str());
             }
             return nullptr;
         }

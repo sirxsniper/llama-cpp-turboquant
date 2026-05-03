@@ -93,6 +93,10 @@ typedef sycl::half2 ggml_half2;
 // QR = QK / number of values before dequantization
 // QI = number of 32 bit integers before dequantization
 
+#define QI1_0 (QK1_0 / 32)
+#define QR1_0 1
+
+
 #define QI4_0 (QK4_0 / (4 * QR4_0))
 #define QR4_0 2
 
@@ -169,6 +173,13 @@ typedef sycl::half2 ggml_half2;
 #else // _MSC_VER
 #define GGML_EXTENSION __extension__
 #endif // _MSC_VER
+
+#define QK1_0 128
+typedef struct {
+    ggml_half d;           // delta
+    uint8_t qs[QK1_0 / 8]; // bits / quants
+} block_q1_0;
+static_assert(sizeof(block_q1_0) == sizeof(ggml_half) + QK1_0 / 8, "wrong q1_0 block size/padding");
 
 #define QK4_0 32
 typedef struct {
@@ -294,12 +305,20 @@ static_assert(sizeof(block_turbo3_0) == sizeof(ggml_half) + QK_TURBO3/4 + QK_TUR
 #define QK_TURBO4 128
 
 #if TURBO4_USE_4BIT
-// 4-bit PolarQuant: 16 optimal centroids, nibble packed, no QJL
-// Per block: norm(fp16) + rnorm(fp16, reserved) + 4-bit indices (64 bytes)
-// = 68 bytes per 128 values = 4.25 bits/value → 3.8× compression vs fp16
+// 4-bit PolarQuant: 16 optimal centroids, nibble packed, no QJL.
+// Per block: norm(fp16) + pad(fp16, 0) + 4-bit indices (64 bytes) = 68 bytes per 128 values
+// = 4.25 bits/value → 3.76× compression vs fp16.
+//
+// PERF (CRITICAL): the `pad` field is intentional — it makes qs[] start at offset 4
+// inside each block, AND because 68 = 17 × 4, every block's qs[] is naturally 4-byte
+// aligned regardless of block index. This lets the readers use ggml_cuda_memcpy_1<4,4>
+// (single 4-byte load) instead of ggml_cuda_memcpy_1<4,2> (two short loads), halving
+// memory transactions for the qs read in K vec_dot and V dequant. **Tried 66-byte
+// (no pad) — was measurably slower because qs alignment alternated 2-byte/4-byte
+// between consecutive blocks, forcing alignment=2 reads everywhere.**
 typedef struct {
     ggml_half  norm;                    //  2 bytes
-    ggml_half  rnorm;                   //  2 bytes (reserved, unused in 4-bit mode)
+    ggml_half  pad;                     //  2 bytes (alignment pad — see PERF note above)
     uint8_t    qs[QK_TURBO4 / 2];      // 64 bytes: 4-bit PolarQuant indices (nibble packed)
 } block_turbo4_0;                       // 68 bytes total
 static_assert(sizeof(block_turbo4_0) == 68, "wrong turbo4_0 block size");
