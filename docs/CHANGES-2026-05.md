@@ -1,0 +1,444 @@
+# Changes, May 2026 update cycle
+
+This file lists everything added on top of the previous public snapshot of
+this fork (branch `feature/triattention`, commit `75016369` from 2026-04-08,
+"docs: replace README with TurboQuant + TriAttention fork description").
+
+The changes were authored between **2026-05-02** and **2026-05-05** by
+[@atomicmilkshake](https://github.com/atomicmilkshake).
+
+In short:
+
+* Three substantive code commits. MSVC build fixes. A deep perf refactor of
+  the turbo K/V flash-attention path. A chat-parser robustness patch.
+* Four upstream-merge commits bringing this fork from llama.cpp `b8650`
+  through to `d5003b6e` (b9033, 2026-05-05). Roughly 480 mainline commits,
+  including PR #22004 (per-model `load_hparams` / `load_tensors` refactor),
+  PR #22654 (autoparser fixes), PR #22649 (server `get_datetime`),
+  PR #22666 / #22625 (webui), and PR #22590 (diffusion examples).
+* The first merge in the run (`1619a8ce3`) also introduced two new files,
+  `ggml/include/ggml-turbo-innerq.h` and `ggml/src/ggml-turbo-innerq.cpp`,
+  so the InnerQ host-side state is exported from `ggml-base` instead of
+  from `ggml-cuda`. This makes `GGML_BACKEND_DL=ON` builds work, where
+  `ggml-cuda` is loaded as a runtime plugin and its symbols are not visible
+  to `llama.dll`.
+
+The head of `merge-d8794e` (`fd0a94a4f`) is the build that produced the
+binaries shipped today.
+
+---
+
+## 1. `ccdce708f`, build: MSVC compatibility (2026-05-02)
+
+Three small but load-bearing fixes for building the fork with the Microsoft
+compiler.
+
+### `ggml/src/ggml-turbo-quant.c`
+
+```c
++#define _USE_MATH_DEFINES        // expose M_PI on MSVC
+ ...
+-int turbo3_cpu_wht_group_size = 0;
++GGML_API int turbo3_cpu_wht_group_size = 0;
+```
+
+`M_PI` is not in C99. MSVC only defines it when `_USE_MATH_DEFINES` is set
+*before* `<math.h>` is included. The CPU WHT path uses `M_PI` for the
+centroid table, so without the define the file fails to compile on Windows.
+
+`turbo3_cpu_wht_group_size` is read by the CPU `set_rows` op handler in
+`ggml-cpu`, so it crosses the `ggml-base.dll` to `ggml-cpu.dll` boundary.
+Tagging the definition `GGML_API` adds the right `__declspec(dllexport)` so
+the symbol is exported.
+
+### `ggml/src/ggml-cpu/ops.cpp`
+
+```cpp
++extern "C" { GGML_API int turbo3_cpu_wht_group_size; }
+ ...
+-        extern int turbo3_cpu_wht_group_size;   // (was inline at point-of-use)
+```
+
+Matching `extern "C"` declaration with the `dllimport` side of `GGML_API`.
+The inline `extern int ...;` inside the function body had C++ linkage,
+which on MSVC mangles the name and fails to resolve against the C-linkage
+definition in `ggml-turbo-quant.c`. Hoisting it to file scope inside
+`extern "C" { }` fixes the link.
+
+### `ggml/src/ggml-cuda/turbo-innerq.cuh`
+
+Wrapping the host-side InnerQ state declarations in:
+
+```cpp
+#if defined(_WIN32)
+#  ifdef ggml_cuda_EXPORTS
+#    define TURBO_INNERQ_API __declspec(dllexport)
+#  else
+#    define TURBO_INNERQ_API __declspec(dllimport)
+#  endif
+#else
+#  define TURBO_INNERQ_API __attribute__((visibility("default")))
+#endif
+
+extern "C" {
+extern TURBO_INNERQ_API bool  g_innerq_finalized;
+extern TURBO_INNERQ_API float g_innerq_scale_inv_host[INNERQ_MAX_CHANNELS];
+TURBO_INNERQ_API bool turbo_innerq_needs_tensor_update(void);
+TURBO_INNERQ_API void turbo_innerq_mark_tensor_updated(void);
+}
+```
+
+These symbols live in `ggml-cuda.dll` but are read by `llama.dll`. Without
+the export annotations, the import side links to nothing on Windows.
+`llama-kv-cache.cpp` checks `turbo_innerq_needs_tensor_update()` once per
+generated token.
+
+> Note: this file was later removed by `3f160d33f` and replaced by
+> `ggml/include/ggml-turbo-innerq.h` plus `ggml/src/ggml-turbo-innerq.cpp`,
+> which puts the same state in `ggml-base.dll` instead. The newer location
+> works for both `GGML_BACKEND_DL=ON` and `OFF` builds. The old approach
+> only worked for static-link builds.
+
+---
+
+## 2. `1619a8ce3`, merge upstream `63d93d1` (b8672 to b9008) plus turbo4 fixes (2026-05-03)
+
+Merge body:
+
+```
+Brings in 469 commits from upstream master (b8672 → ~b9008):
+  - Llama 4 / Granite 4 / Qwen 3.6 model support refinements
+  - FA-MMA kernel improvements
+  - Various ggml-cuda speedups
+  - Tile kernel updates
+```
+
+Beyond the upstream propagation, this merge introduced **new files** as
+part of the conflict-resolution and "turbo4 fixes" work.
+
+### New: `ggml/include/ggml-turbo-innerq.h`
+
+Public C header for InnerQ host-side shared state. Replaces the
+CUDA-internal `turbo-innerq.cuh` so the state can be exported from
+`ggml-base.dll` (always present) instead of `ggml-cuda.dll` (a runtime
+plugin under `GGML_BACKEND_DL=ON`).
+
+### New: `ggml/src/ggml-turbo-innerq.cpp`
+
+Definitions of the symbols declared in `ggml-turbo-innerq.h`:
+
+```cpp
+bool  g_innerq_finalized = false;
+float g_innerq_scale_inv_host[INNERQ_MAX_CHANNELS] = { /* 128 x 1.0f */ };
+static bool g_innerq_tensor_needs_update = false;
+
+void turbo_innerq_publish(const float * scale_inv, int group_size) { ... }
+bool turbo_innerq_needs_tensor_update(void) { ... }
+void turbo_innerq_mark_tensor_updated(void) { ... }
+```
+
+### Modified: `ggml/include/ggml.h`
+
+Type-id renumbering. Upstream b9008 added `GGML_TYPE_Q1_0 = 41`, which
+collided with `GGML_TYPE_TURBO3_0 = 41`. Resolution:
+
+```diff
+-        GGML_TYPE_TURBO3_0 = 41, // 2-bit PolarQuant + 1-bit QJL
+-        GGML_TYPE_TURBO4_0 = 42, // 3-bit PolarQuant + 1-bit QJL
+-        GGML_TYPE_TURBO2_0 = 43, // 2-bit PolarQuant (no QJL)
+-        GGML_TYPE_COUNT   = 44,
++        GGML_TYPE_Q1_0    = 41,
++        GGML_TYPE_TURBO3_0 = 42,
++        GGML_TYPE_TURBO4_0 = 43,
++        GGML_TYPE_TURBO2_0 = 44,
++        GGML_TYPE_COUNT   = 45,
+```
+
+> GGUF compat note: any GGUF files quantized to turbo on the previous
+> version of this fork (with the old type ids 41/42/43) need to be
+> re-quantized against the new ids 42/43/44, or fixed up by patching the
+> metadata. We do not carry a back-compat shim. Turbo is intended for live
+> KV cache, not persisted weights, so in practice this only affects
+> regenerable calibration data.
+
+### Modified: `ggml/src/ggml-cuda/fattn-common.cuh`
+
+Added turbo-specific `vec_dot_KQ_*` and dequant template specialisations to
+support 16-thread-per-position turbo K/V dispatch.
+
+### Modified: `src/llama-kv-cache.cpp` and `src/llama-kv-cache.h`
+
+Turbo K/V tensor wiring. Detection of turbo `cache-type-{k,v}` arguments,
+allocation of the `scale_inv` tensor on the device for InnerQ, and the
+once-per-token check for `turbo_innerq_needs_tensor_update()`.
+
+---
+
+## 3. `7194e167f`, merge upstream `d05fe1d` (b9008 to b9010) (2026-05-03)
+
+Three upstream commits, none touching FA kernels or turbo code. Clean
+auto-merge.
+
+* `d05fe1d`, fix: CUDA device PCI bus ID de-dupe OOMing (#22533)
+* `0754b7b`, server: avoid checkpoint data host copies (#22558)
+* `0929436`, ggml-virtgpu: fix circular dependency in headers (#22557)
+
+---
+
+## 4. `3f160d33f`, turbo: complete K vec_dot, V dequant, InnerQ refactor (2026-05-03)
+
+The big perf-work commit. Seven files. Several are annotated heavily with
+`PERF:` comments explaining each non-obvious choice.
+
+### `ggml/src/ggml-cuda/fattn-vec.cuh`
+
+The flash-attention kernel for vector-shape attention (single-row Q, the
+path used for token-by-token generation). Substantial rework:
+
+1. `__launch_bounds__` minBlocksPerSM bumped 2 to 4. With the
+   `nthreads_V=16` fix below, the `VKQ` register footprint per thread
+   halves (4 entries vs 8). The freed register budget allows higher SM
+   occupancy, which hides DRAM and L2 stalls better at depth (TG is
+   memory-latency-bound).
+
+2. `nthreads_KQ` for turbo K halved (`nthreads_KQ_q/2 = 16`). Was 32. With
+   16 threads-per-K, the per-thread byte base `tid*4` is uniformly 4-byte
+   aligned, so the `qs` load compiles to a single `LDG.E.32` instead of
+   two `LDG.E.16`. Two 16-thread groups per warp now process two K
+   positions in parallel per `i_KQ_0` iter.
+
+3. `cpy_ne_KQ` cap to fit the per-thread Q-register array. Previously a
+   correctness bug. When `nthreads_KQ * cpy_ne > D/2` (turbo with
+   `nthreads_KQ=32`, `cpy_ne=4`, `D=128`, that's `128 > 64`), the load
+   loop wrote out-of-bounds into `Q_reg` (sized 2) at indices 0..3. The
+   fix caps `cpy_ne_KQ = D/(2*nthreads_KQ)`.
+
+4. `nthreads_V` for turbo V set to 16 explicitly. Previously routed
+   through `nthreads_V_q = 32`, which meant `V_cols_per_iter = 1` (only
+   ONE V position per warp iteration). The earlier "8 threads / V"
+   experiment broke because each lane held a half-pair, and the shfl
+   pattern was wrong. With 16 threads/V, each lane holds one centroid
+   (turbo4's table is 16 entries). Single shfl per element with correct
+   semantics, half of the half2-packing overhead, and `V_cols_per_iter = 2`.
+   V dequant throughput roughly doubles versus the old path.
+
+5. `V_rows_per_thread = 2*cpy_ne` unconditionally for `V_is_unquantized`.
+   The previous `? 4 : 2*cpy_ne` ternary was a leftover safeguard from
+   when turbo had `nthreads_V=32`. With `nthreads_V=16`, `8*8/2 = 32 <= D/2 = 64`
+   fits cleanly, the loop runs 2 iters covering full `D=128`, and per-thread
+   V-dequant element count goes 4 to 8.
+
+6. Sparse-V skip is now `constexpr`-disabled. Was at threshold `1e-6f`,
+   raised to a tested `5e-3` (skip positions with weight under 0.5%) but
+   ultimately switched off entirely (`sparse_v_enabled = false`,
+   `sparse_v_threshold_f = 0.0f`). The compiler can dead-code-eliminate
+   both the threshold conversion and the per-K dominated-position check.
+   Quality is preserved at long context. The saved compute is not the
+   bottleneck.
+
+7. Branch around the rescale when `KQ_max_new == KQ_max`. After the first
+   few high-attention K positions are seen, `KQ_max` stabilises and
+   `KQ_max_scale = exp(0) = 1`. Multiplying every prior `VKQ` by 1.0f for
+   thousands of remaining positions is wasted work that scales with depth.
+   The new code skips the rescale (and the half2 broadcast) entirely on
+   the common no-change path:
+
+   ```cpp
+   const bool max_changed = (KQ_max_new[j] != KQ_max[j]);
+   const float KQ_max_scale = max_changed ? expf(KQ_max[j] - KQ_max_new[j]) : 1.0f;
+   KQ_sum[j] = max_changed ? (KQ_sum[j]*KQ_max_scale + KQ_reg[j]) : (KQ_sum[j] + KQ_reg[j]);
+   if (max_changed) { /* rescale all VKQ entries */ }
+   ```
+
+### `ggml/src/ggml-cuda/turbo-quant.cuh`
+
+* Switched the include from the (now-removed) CUDA-internal
+  `turbo-innerq.cuh` to the public `ggml-turbo-innerq.h`.
+* Added `TURBO_CENTROIDS_4BIT_INT8[16]`, the same 4-bit centroid table
+  pre-quantised to int8 in `[-127, 127]`. This lets the turbo4 K-dot path
+  use `__dp4a` (Blackwell hardware 8-bit dot) instead of per-element
+  float multiplies. Final scale recovery uses
+  `TURBO_INT8_4BIT_SCALE_REVERSE = 0.173926f / 127.0f`.
+
+  > Empirical note: in current builds the float path is still preferred,
+  > because constant-memory serialization on divergent lookups outweighs
+  > the `__dp4a` win at depth. The int8 table is kept ready for
+  > re-evaluation on future architectures. Switching paths is a one-line
+  > change in `fattn-vec.cuh`.
+
+### `ggml/src/ggml-cuda/turbo-wht.cu`
+
+Walsh-Hadamard transform splits its `__syncthreads()` barriers based on
+which warp boundary the stage crosses:
+
+```c
+#define WHT_STAGE_WARP(h)   /* h in {1,2,4,8,16}: pairs swap WITHIN one warp */ \
+    if (t % (2*(h)) < (h)) { float a = x[t], b = x[t+(h)]; x[t] = a+b; x[t+(h)] = a-b; } \
+    __syncwarp();
+#define WHT_STAGE_BLOCK(h)  /* h in {32, 64}: cross-warp */ \
+    if (t % (2*(h)) < (h)) { float a = x[t], b = x[t+(h)]; x[t] = a+b; x[t+(h)] = a-b; } \
+    __syncthreads();
+
+    WHT_STAGE_WARP(1) WHT_STAGE_WARP(2) WHT_STAGE_WARP(4)
+    WHT_STAGE_WARP(8) WHT_STAGE_WARP(16)
+    WHT_STAGE_BLOCK(32)
+    if (group_size == 128) { WHT_STAGE_BLOCK(64) }
+```
+
+`__syncwarp()` is roughly 1 cycle. `__syncthreads()` is 10 or more cycles.
+WHT runs 128 times per generated token (64 layers times Q+V), so each
+saved barrier matters.
+
+### `ggml/src/ggml-cuda/set-rows.cu` and `ggml/src/ggml-turbo-quant.c`
+
+Renamed the unused `block_turbo4_0::rnorm` field to `pad`. It only existed
+to keep `qs[]` 4-byte aligned (see the alignment note in `ggml-common.h`).
+The new name is honest about that.
+
+### Removed: `ggml/src/ggml-cuda/turbo-innerq.cu`, `turbo-innerq.cuh`
+
+Replaced by the public-header version introduced in `1619a8ce3`. The old
+files put the host-side state in `ggml-cuda.dll`, which is invisible to
+`llama.dll` under `GGML_BACKEND_DL=ON`.
+
+---
+
+## 5. `af4fc6008`, merge upstream `846262d` (b9010 to b9016) (2026-05-04)
+
+13 files of upstream propagation. No turbo or FA kernel changes. Clean
+auto-merge.
+
+---
+
+## 6. `b541f338a`, jarvis: chat parser falls back to raw content on malformed tool-call XML (2026-05-05)
+
+When `common_chat_peg_parse` fails to parse a model's tool-call output
+(most commonly: duplicate `</parameter>` tags from Qwen / Hermes-style
+replies), the old behaviour was to throw an exception, which the server
+surfaces as a 500.
+
+The patch returns the raw text as plain assistant content with a stderr
+warning instead:
+
+```diff
+- throw std::runtime_error("Failed to parse input at pos " + ...);
++ // Fallback (jarvis patch): when the model emits malformed tool-call XML
++ // (e.g. duplicate </parameter> tags from Qwen / Hermes-style outputs),
++ // don't throw. Return the raw text as plain assistant content so the
++ // client still gets what the model said and can retry on the next turn.
++ // Log a warning so genuine parser bugs aren't silenced.
++ fprintf(stderr,
++     "[chat-parse] WARN: parser failed at pos %zu (format=%s); falling back "
++     "to raw content. Snippet: %.120s\n",
++     (size_t)result.end,
++     common_chat_format_name(params.format),
++     effective_input.substr(result.end).c_str());
++ fflush(stderr);
++ common_chat_msg msg_fb;
++ msg_fb.role = "assistant";
++ msg_fb.content = effective_input;
++ return msg_fb;
+```
+
+This keeps the chat client functional (raw text reaches the user, who can
+retry on the next turn) while still flagging genuine parser bugs in
+stderr.
+
+---
+
+## 7. `fd0a94a4f`, merge upstream `d5003b6e` (b9016 to b9033) (2026-05-05)
+
+Six upstream commits. Notable:
+
+* PR #22004, refactor `model: move load_hparams and load_tensors to
+  per-model definition`. Touches 129 files (+11k, -8k lines), includes
+  file renames in `src/models/` (`qwen3vl-moe.cpp` to `qwen3vlmoe.cpp`,
+  `pangu-embedded.cpp` to `pangu-embed.cpp`, `step35-iswa.cpp` to
+  `step35.cpp`, `openai-moe-iswa.cpp` to `openai-moe.cpp`). Despite its
+  size, no conflict with turbo code. The refactor only touches model
+  loading paths, never the FA or KV cache.
+* PR #22654, `common/autoparser` tool-call parser fixes for newline
+  handling and forced tool calls. Auto-merged with the jarvis fallback
+  patch above without conflict.
+* PR #22649, `server: get_datetime` server tool.
+* PR #22666 / #22625, webui settings and circular-dep fixes.
+* PR #22590, examples diffusion refactor.
+* PR #22701, rpc graph uid fix.
+
+---
+
+## Performance verification
+
+Smoke-tested on **RTX 5090 + 5060 Ti** with `Qwen3.6-27B-UD-Q6_K_XL.gguf`,
+`turbo4` KV cache, FA on, `--no-mmap`, `ngl 99`, single-GPU (CUDA0):
+
+| Context fill | Generation t/s | Prompt-process t/s |
+|--------------|----------------|---------------------|
+| empty (5-rep tg128) | **52.42 +/- 0.70** | (empty) |
+| 8k | 51.45 | 3265 |
+| 32k | 49.20 | 2963 |
+| 64k | 45.47 | 2489 |
+| 128k | 39.58 | 1761 |
+
+131k-context needle-in-a-haystack (subtle exact-token recall against
+needles inserted in WikiText-2 padding): 3 of 3 hits at depths 25%, 50%,
+75%. See `scripts/utilities/needle_test_v2_turbo.py`.
+
+---
+
+## Credits
+
+All non-merge changes in this cycle authored by
+[@atomicmilkshake](https://github.com/atomicmilkshake). For a complete
+per-file, per-function inventory of work in this fork (this cycle and
+prior), see **[../CREDITS.md](../CREDITS.md)** at the repo root.
+
+May 2026 cycle, by @atomicmilkshake:
+
+* **Commit `ccdce708f`** (MSVC build): `_USE_MATH_DEFINES` for `M_PI` in
+  `ggml-turbo-quant.c`. `GGML_API` export on
+  `turbo3_cpu_wht_group_size`. `extern "C" { GGML_API ... }` declaration
+  fix in `ggml-cpu/ops.cpp`. Interim `dllimport`/`dllexport` shim on
+  InnerQ symbols in `turbo-innerq.cuh` (later replaced by the public
+  header).
+* **Commit `1619a8ce3`** (merge + new public InnerQ ABI): authored
+  `ggml/include/ggml-turbo-innerq.h` (38 lines, public C ABI for InnerQ
+  host state). Authored `ggml/src/ggml-turbo-innerq.cpp` (40 lines,
+  implementation in `ggml-base.dll`). Renumbered `GGML_TYPE_TURBO{3,4,2}_0`
+  IDs from 41/42/43 to 42/43/44 to make room for upstream's
+  `GGML_TYPE_Q1_0=41`. Conflict-resolution against PR #21038 / #21513 /
+  #21352 (Hadamard rotation infrastructure) so the new upstream code
+  coexists with turbo K/V cache.
+* **Commit `7194e167f`**: clean upstream merge b9008 -> b9010.
+* **Commit `3f160d33f`** (perf rework, the headline of this cycle):
+  * `fattn-vec.cuh`: 7 distinct optimizations / fixes documented in
+    detail in section 4 above (launch_bounds 2->4, `nthreads_KQ=16`
+    aligned-load fix, `cpy_ne_KQ` cap correctness fix, `nthreads_V=16`
+    one-centroid-per-lane V dequant rework, unconditional
+    `V_rows_per_thread = 2*cpy_ne`, sparse-V constexpr-disabled,
+    `KQ_max_scale` skip on no-change).
+  * `turbo-wht.cu`: `__syncwarp` vs `__syncthreads` barrier split for
+    intra-warp WHT stages. Roughly 10x cheaper per warp-internal stage,
+    runs 128 times per generated token.
+  * `turbo-quant.cuh`: `TURBO_CENTROIDS_4BIT_INT8` table set up for a
+    future `__dp4a` path. New `vec_dot_fattn_vec_KQ_turbo4_0_int` in
+    `fattn-common.cuh`.
+  * `set-rows.cu` / `ggml-turbo-quant.c`: renamed `block_turbo4_0::rnorm`
+    to `pad`. Honest naming for the alignment field.
+  * Removed `ggml/src/ggml-cuda/turbo-innerq.{cu,cuh}`. Replaced by the
+    public-header version in `1619a8ce3`.
+* **Commit `af4fc6008`**: clean upstream merge b9010 -> b9016.
+* **Commit `b541f338a`** (chat parser robustness): in
+  `common/chat.cpp`, `common_chat_peg_parse` now returns raw assistant
+  content with a stderr warning when tool-call XML is malformed,
+  instead of throwing.
+* **Commit `fd0a94a4f`**: clean upstream merge b9016 -> b9033 (PR #22004
+  load_hparams refactor, PR #22654 autoparser, others).
+* **Build infrastructure**: authored `build-tq-env.bat` and
+  `build-tq-go.bat` at the repo root. Canonical CMake recipe with all
+  release flags (`CMAKE_CUDA_ARCHITECTURES=120a`,
+  `GGML_CUDA_FA_ALL_QUANTS=ON`, etc.).
+
+The four upstream merges propagate work by the upstream llama.cpp team
+and contributors. Specific upstream PR numbers are referenced inline
+above. All conflict resolution by @atomicmilkshake.

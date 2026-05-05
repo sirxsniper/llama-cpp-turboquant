@@ -86,6 +86,8 @@
 /tools/server/*.mjs.hpp
 /tools/server/*.gz.hpp
 !/build_64.sh
+!/build-tq-env.bat
+!/build-tq-go.bat
 !/examples/*.bat
 !/examples/*/*.kts
 !/examples/*/*/*.kts
