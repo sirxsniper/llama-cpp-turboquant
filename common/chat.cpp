@@ -2360,8 +2360,21 @@ common_chat_msg common_chat_peg_parse(const common_peg_arena &          src_pars
             }
             return msg;
         }
-        throw std::runtime_error(std::string("Failed to parse input at pos ") + std::to_string(result.end) + ": " +
-                                 effective_input.substr(result.end));
+        // Fallback (jarvis patch): when the model emits malformed tool-call XML
+        // (e.g. duplicate </parameter> tags from Qwen / Hermes-style outputs),
+        // don't throw — return the raw text as plain assistant content so the
+        // client still gets what the model said and can retry on the next turn.
+        // Log a warning so genuine parser bugs aren't silenced.
+        fprintf(stderr,
+                "[chat-parse] WARN: parser failed at pos %zu (format=%s); falling back to raw content. Snippet: %.120s\n",
+                (size_t)result.end,
+                common_chat_format_name(params.format),
+                effective_input.substr(result.end).c_str());
+        fflush(stderr);
+        common_chat_msg msg_fb;
+        msg_fb.role = "assistant";
+        msg_fb.content = effective_input;
+        return msg_fb;
     }
 
     common_chat_msg msg;
