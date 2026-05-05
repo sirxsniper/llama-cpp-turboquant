@@ -1,8 +1,8 @@
 # llama.cpp — TurboQuant + TriAttention
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://opensource.org/licenses/MIT)
-[![GitHub](https://img.shields.io/badge/github-atomicmilkshake%2Fllama--cpp--turboquant-blue?logo=github)](https://github.com/atomicmilkshake/llama-cpp-turboquant)
-[![HuggingFace](https://img.shields.io/badge/🤗%20HuggingFace-binaries-yellow)](https://huggingface.co/atomicmilkshake/llama-cpp-turboquant-binaries)
+[![GitHub](https://img.shields.io/badge/github-sirxsniper%2Fllama--cpp--turboquant-blue?logo=github)](https://github.com/sirxsniper/llama-cpp-turboquant)
+[![HuggingFace](https://img.shields.io/badge/🤗%20HuggingFace-binaries-yellow)](https://huggingface.co/sirxsniper/llama-cpp-turboquant-binaries)
 
 A fork of [llama.cpp](https://github.com/ggml-org/llama.cpp) with two major additions:
 
@@ -13,7 +13,7 @@ A fork of [llama.cpp](https://github.com/ggml-org/llama.cpp) with two major addi
 
 Download the latest Release build (Windows x64, CUDA 13, RTX 2000+) from Hugging Face:
 
-**[🤗 atomicmilkshake/llama-cpp-turboquant-binaries](https://huggingface.co/atomicmilkshake/llama-cpp-turboquant-binaries)**
+**[🤗 sirxsniper/llama-cpp-turboquant-binaries](https://huggingface.co/sirxsniper/llama-cpp-turboquant-binaries)**
 
 > Requires CUDA 13.x runtime (`cublasLt64_13.dll`). Install the [CUDA Toolkit](https://developer.nvidia.com/cuda-downloads) or the CUDA runtime redistributable if you don't have it.
 
@@ -82,7 +82,9 @@ TurboQuant provides three custom quantization formats that outperform standard G
 | `turbo3_0` | ~3.0 | Sub-byte with Hadamard pre-rotation |
 | `turbo2_0` | ~2.0 | Aggressive compression with WHT-space centroids |
 
-All formats have CUDA kernels optimised for Turing+ (SM75) and Ampere (SM80/86) architectures.
+All formats have CUDA kernels optimised for Turing+ (SM75), Ampere (SM80/86), Ada (SM89), and Blackwell (SM120/121).
+
+For implementation details (type IDs, file map, the InnerQ cross-DLL handshake, FA-vec dispatch, and how to add a new turbo type) see [docs/TURBOQUANT-INTERNALS.md](docs/TURBOQUANT-INTERNALS.md).
 
 ---
 
@@ -91,19 +93,13 @@ All formats have CUDA kernels optimised for Turing+ (SM75) and Ampere (SM80/86) 
 ### Requirements
 
 - Windows 10/11 or Linux
-- CUDA Toolkit 12.x or 13.x
-- Visual Studio 2022+ with C++ workload (Windows) or GCC 11+ (Linux)
-- CMake 3.21+
+- CUDA Toolkit 13.1 (13.2 untested, see notes in build guide)
+- Visual Studio 2022 BuildTools with C++ workload + Win 11 SDK (Windows) or GCC 11+ (Linux)
+- CMake 3.27+, Ninja 1.11+
 
 ### Windows (CUDA)
 
-```powershell
-cmake -B build -G "Visual Studio 18 2022" -A x64 `
-  -DGGML_CUDA=ON `
-  -DCMAKE_CUDA_ARCHITECTURES="75;80;86;89;120;121"
-
-cmake --build build --config Release --target llama-server -j
-```
+See **[docs/BUILD-WINDOWS.md](docs/BUILD-WINDOWS.md)** for the verified-working recipe with toolchain pins (VS 2022 BuildTools, CUDA 13.1, CMake, Ninja), the full CMake invocation, and known gotchas (CUDA component selection, MSVC version, ninja install, power-plan tuning).
 
 ### Linux (CUDA)
 
@@ -128,12 +124,34 @@ cmake --build build --target llama-server -j$(nproc)
 
 ---
 
+## Recent changes
+
+The May 2026 update cycle (commits `ccdce708f` to `fd0a94a4f`) brought this fork from upstream `b8650` to `b9033` and reworked the turbo K/V flash-attention path. See **[docs/CHANGES-2026-05.md](docs/CHANGES-2026-05.md)** for the full per-commit changelog with rationale and perf numbers.
+
+Reference TG speeds on RTX 5090, `Qwen3.6-27B-UD-Q6_K_XL`, turbo4 KV, FA on:
+
+| Context fill | Generation t/s |
+|--------------|----------------|
+| empty | 52.4 |
+| 8k | 51.4 |
+| 32k | 49.2 |
+| 64k | 45.5 |
+| 128k | 39.6 |
+
+131k needle-in-a-haystack: 3 of 3 hits at 25, 50, 75 percent depths.
+
+---
+
 ## Credits
 
-- [llama.cpp](https://github.com/ggml-org/llama.cpp) — Georgi Gerganov and contributors
-- [TurboQuant](https://github.com/TheTom/llama-cpp-turboquant) — original TurboQuant fork
-- TriAttention algorithm — [arXiv 2604.04921](https://arxiv.org/abs/2604.04921)
-- GPU integration and KV cache implementation — [@atomicmilkshake](https://github.com/atomicmilkshake)
+For a per-file inventory of every function, kernel, and modification authored on this fork (TurboQuant CUDA/CPU/Metal integration, KV-cache wiring, TriAttention pruning, the May 2026 perf rework, and build infrastructure), see **[CREDITS.md](CREDITS.md)**.
+
+Short version:
+
+- [llama.cpp](https://github.com/ggml-org/llama.cpp), Georgi Gerganov and contributors. Upstream base.
+- TurboQuant method paper, [arXiv 2504.19874](https://arxiv.org/abs/2504.19874) (ICLR 2026). The algorithm.
+- TriAttention method paper, [arXiv 2604.04921](https://arxiv.org/abs/2604.04921). The algorithm.
+- [@sirxsniper](https://github.com/sirxsniper): full GPU integration of TurboQuant (CUDA + CPU + Metal), TriAttention KV-cache pruning, all turbo CUDA kernels (`k_set_rows_turbo*`, `k_turbo_wht_*`, `vec_dot_fattn_vec_KQ_turbo*`, `dequantize_V_turbo*`), the public InnerQ cross-DLL ABI, TURBO type id allocation, KV cache wiring, the May 2026 perf rework (turbo K/V FA dispatch, Walsh-Hadamard barrier split, KQ_max scale skip, alignment fixes), MSVC build compatibility, chat-parser robustness fix, the verified-working CMake build recipe, and conflict-resolution work across upstream merges b8650 to b9033.
 
 ---
 

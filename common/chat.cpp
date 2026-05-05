@@ -2360,11 +2360,11 @@ common_chat_msg common_chat_peg_parse(const common_peg_arena &          src_pars
             }
             return msg;
         }
-        // Fallback (jarvis patch): when the model emits malformed tool-call XML
-        // (e.g. duplicate </parameter> tags from Qwen / Hermes-style outputs),
-        // don't throw — return the raw text as plain assistant content so the
-        // client still gets what the model said and can retry on the next turn.
-        // Log a warning so genuine parser bugs aren't silenced.
+        // Fallback: when the model emits malformed tool-call XML (e.g. duplicate
+        // </parameter> tags from Qwen / Hermes-style outputs), don't throw.
+        // Return the raw text as plain assistant content so the client still
+        // gets what the model said and can retry on the next turn. Log a
+        // warning so genuine parser bugs aren't silenced.
         fprintf(stderr,
                 "[chat-parse] WARN: parser failed at pos %zu (format=%s); falling back to raw content. Snippet: %.120s\n",
                 (size_t)result.end,
