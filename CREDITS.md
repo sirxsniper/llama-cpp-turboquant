@@ -9,10 +9,10 @@ The shorthand is:
 * **Method paper** = TurboQuant: KV cache compression via PolarQuant + QJL
   ([arXiv 2504.19874](https://arxiv.org/abs/2504.19874), ICLR 2026). The
   algorithm. Not the code.
-* **@atomicmilkshake** = author of the GPU integration, KV-cache wiring,
+* **@sirxsniper** = author of the GPU integration, KV-cache wiring,
   multi-backend port (CUDA + CPU + Metal), TriAttention pruning, and the
   full May 2026 update cycle. Everything listed below was authored by
-  @atomicmilkshake unless explicitly noted.
+  @sirxsniper unless explicitly noted.
 * **Upstream llama.cpp** = anything not listed here. The fork is rebased on
   current llama.cpp master and inherits everything mainline does, plus the
   PRs noted in `docs/CHANGES-2026-05.md`.
@@ -38,7 +38,7 @@ Block layouts in `ggml/src/ggml-common.h`:
 ### `ggml/src/ggml-turbo-quant.c`
 
 Reference quantize / dequantize / vec_dot for all three turbo types.
-628 lines, every function below is by @atomicmilkshake:
+628 lines, every function below is by @sirxsniper:
 
 * `quantize_row_turbo2_0_ref`, `quantize_row_turbo3_0_ref`,
   `quantize_row_turbo4_0_ref`
@@ -185,7 +185,7 @@ May 2026 perf rework (commit `3f160d33f`, see source for the inline
 ### `ggml/src/ggml-cuda/template-instances/fattn-vec-instance-*.cu`
 
 Cross-product instantiation files for every K/V type pair. By
-@atomicmilkshake:
+@sirxsniper:
 
 * `fattn-vec-instance-q8_0-turbo{2,3,4}_0.cu` (q8 K with turbo V)
 * `fattn-vec-instance-turbo{2,3,4}_0-q8_0.cu` (turbo K with q8 V)
@@ -242,7 +242,7 @@ move was complete.
 The KV cache wiring for turbo K/V tensors. ~427 lines added vs upstream
 and ~50 lines of header changes.
 
-By @atomicmilkshake (in this fork's history, includes the May 2026
+By @sirxsniper (in this fork's history, includes the May 2026
 merge-resolution work):
 
 * Detection of `--cache-type-{k,v}` turbo arguments
@@ -261,7 +261,7 @@ Parsing of the `turbo2`, `turbo3`, `turbo4` string tokens for
 
 ## TriAttention
 
-(Inherited from `feature/triattention`, by @atomicmilkshake. Documented
+(Inherited from `feature/triattention`, by @sirxsniper. Documented
 fully in the existing `docs/TRIATTENTION.md` and `docs/TRIATTENTION-API.md`.)
 
 * GPU-accelerated KV cache pruning, ~1000x faster than CPU scoring
@@ -299,7 +299,7 @@ flagging genuine parser bugs in the log.
 
 ## Upstream merges in the May 2026 cycle
 
-(All conflict resolution by @atomicmilkshake. Upstream content credited
+(All conflict resolution by @sirxsniper. Upstream content credited
 to upstream llama.cpp authors, see PR threads on
 github.com/ggml-org/llama.cpp.)
 
@@ -317,16 +317,12 @@ github.com/ggml-org/llama.cpp.)
 
 ---
 
-## Build infrastructure (May 2026)
+## Build configuration (May 2026)
 
-By @atomicmilkshake. Lives at the repo root:
-
-* `build-tq-env.bat`: VS 2022 BuildTools env source plus CUDA 13.1,
-  CMake, Ninja `PATH` setup.
-* `build-tq-go.bat`: Configure / build / clean wrapper. Single source
-  of truth for the CMake invocation and the build flag set
-  (`CMAKE_CUDA_ARCHITECTURES=120a`, `GGML_CUDA_FA_ALL_QUANTS=ON`,
-  `GGML_CUDA_GRAPHS=ON`, full release config).
+By @sirxsniper. Documented in `docs/BUILD-WINDOWS.md`. The
+verified-working CMake invocation (`CMAKE_CUDA_ARCHITECTURES=120a`,
+`GGML_CUDA_FA_ALL_QUANTS=ON`, `GGML_CUDA_GRAPHS=ON`, full release
+config) is captured in section 3 of that doc.
 
 ---
 
@@ -340,7 +336,7 @@ By @atomicmilkshake. Lives at the repo root:
   TurboQuant code paths, type-id table, InnerQ handshake diagram,
   FA-vec dispatch table, recipe for adding a new turbo type.
 
-(Documentation drafted from @atomicmilkshake's commits and inline code
+(Documentation drafted from @sirxsniper's commits and inline code
 comments per the AGENTS.md "Documentation drafts: For components the
 contributor already understands thoroughly" provision.)
 

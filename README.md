@@ -1,8 +1,8 @@
 # llama.cpp — TurboQuant + TriAttention
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://opensource.org/licenses/MIT)
-[![GitHub](https://img.shields.io/badge/github-atomicmilkshake%2Fllama--cpp--turboquant-blue?logo=github)](https://github.com/atomicmilkshake/llama-cpp-turboquant)
-[![HuggingFace](https://img.shields.io/badge/🤗%20HuggingFace-binaries-yellow)](https://huggingface.co/atomicmilkshake/llama-cpp-turboquant-binaries)
+[![GitHub](https://img.shields.io/badge/github-sirxsniper%2Fllama--cpp--turboquant-blue?logo=github)](https://github.com/sirxsniper/llama-cpp-turboquant)
+[![HuggingFace](https://img.shields.io/badge/🤗%20HuggingFace-binaries-yellow)](https://huggingface.co/sirxsniper/llama-cpp-turboquant-binaries)
 
 A fork of [llama.cpp](https://github.com/ggml-org/llama.cpp) with two major additions:
 
@@ -13,7 +13,7 @@ A fork of [llama.cpp](https://github.com/ggml-org/llama.cpp) with two major addi
 
 Download the latest Release build (Windows x64, CUDA 13, RTX 2000+) from Hugging Face:
 
-**[🤗 atomicmilkshake/llama-cpp-turboquant-binaries](https://huggingface.co/atomicmilkshake/llama-cpp-turboquant-binaries)**
+**[🤗 sirxsniper/llama-cpp-turboquant-binaries](https://huggingface.co/sirxsniper/llama-cpp-turboquant-binaries)**
 
 > Requires CUDA 13.x runtime (`cublasLt64_13.dll`). Install the [CUDA Toolkit](https://developer.nvidia.com/cuda-downloads) or the CUDA runtime redistributable if you don't have it.
 
@@ -99,14 +99,7 @@ For implementation details (type IDs, file map, the InnerQ cross-DLL handshake, 
 
 ### Windows (CUDA)
 
-Use the helper scripts at the repo root:
-
-```cmd
-build-tq-go.bat configure
-build-tq-go.bat buildall
-```
-
-For the full prerequisites list, toolchain pins, and known gotchas (CUDA component selection, MSVC version, ninja install, power-plan tuning, etc.), see **[docs/BUILD-WINDOWS.md](docs/BUILD-WINDOWS.md)**.
+See **[docs/BUILD-WINDOWS.md](docs/BUILD-WINDOWS.md)** for the verified-working recipe with toolchain pins (VS 2022 BuildTools, CUDA 13.1, CMake, Ninja), the full CMake invocation, and known gotchas (CUDA component selection, MSVC version, ninja install, power-plan tuning).
 
 ### Linux (CUDA)
 
@@ -158,7 +151,7 @@ Short version:
 - [llama.cpp](https://github.com/ggml-org/llama.cpp), Georgi Gerganov and contributors. Upstream base.
 - TurboQuant method paper, [arXiv 2504.19874](https://arxiv.org/abs/2504.19874) (ICLR 2026). The algorithm.
 - TriAttention method paper, [arXiv 2604.04921](https://arxiv.org/abs/2604.04921). The algorithm.
-- [@atomicmilkshake](https://github.com/atomicmilkshake): full GPU integration of TurboQuant (CUDA + CPU + Metal), TriAttention KV-cache pruning, all turbo CUDA kernels (`k_set_rows_turbo*`, `k_turbo_wht_*`, `vec_dot_fattn_vec_KQ_turbo*`, `dequantize_V_turbo*`), the public InnerQ cross-DLL ABI, TURBO type id allocation, KV cache wiring, the May 2026 perf rework (turbo K/V FA dispatch, Walsh-Hadamard barrier split, KQ_max scale skip, alignment fixes), build system (`build-tq-env.bat`, `build-tq-go.bat`), MSVC build compatibility, chat-parser robustness fix, and conflict-resolution work across upstream merges b8650 to b9033.
+- [@sirxsniper](https://github.com/sirxsniper): full GPU integration of TurboQuant (CUDA + CPU + Metal), TriAttention KV-cache pruning, all turbo CUDA kernels (`k_set_rows_turbo*`, `k_turbo_wht_*`, `vec_dot_fattn_vec_KQ_turbo*`, `dequantize_V_turbo*`), the public InnerQ cross-DLL ABI, TURBO type id allocation, KV cache wiring, the May 2026 perf rework (turbo K/V FA dispatch, Walsh-Hadamard barrier split, KQ_max scale skip, alignment fixes), MSVC build compatibility, chat-parser robustness fix, the verified-working CMake build recipe, and conflict-resolution work across upstream merges b8650 to b9033.
 
 ---
 
