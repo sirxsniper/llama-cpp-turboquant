@@ -710,7 +710,7 @@ class ModelBase:
                 self._repack_nvfp4(name, weight, scale, scale2, input_scale)
 
         # Flush any remaining experts (fallback if n_experts was unknown)
-        for bid, proj_type in expert_blocks.keys():
+        for bid, proj_type in list(expert_blocks.keys()):
             self._flush_nvfp4_experts((bid, proj_type), expert_blocks, expert_scales, expert_input_scales, expert_shapes, bid, proj_type)
 
         # Remove consumed tensors so get_tensors/modify_tensors won't see them
@@ -718,7 +718,7 @@ class ModelBase:
             self.model_tensors.pop(name, None)
 
         # Remove any remaining unused auxiliary tensors
-        for name in self.model_tensors.keys():
+        for name in list(self.model_tensors.keys()):
             if name.endswith((".k_scale", ".v_scale")):
                 del self.model_tensors[name]
 
@@ -13684,6 +13684,27 @@ class DotsOCRVisionModel(MmprojModel):
         yield from super().modify_tensors(data_torch, name, bid)
 
 
+@ModelBase.register("Sarashina2VisionForCausalLM")
+class Sarashina2VLTextModel(LlamaModel):
+    model_arch = gguf.MODEL_ARCH.LLAMA
+
+    @classmethod
+    def filter_tensors(cls, item: tuple[str, Callable[[], Tensor]]) -> tuple[str, Callable[[], Tensor]] | None:
+        name, gen = item
+        if name.startswith("llm."):
+            name = name.replace("llm.", "", 1)
+        elif name.startswith("norm."):
+            return None
+        return super().filter_tensors((name, gen))
+
+
+@ModelBase.register("Sarashina2VisionForCausalLM")
+class Sarashina2VLVisionModel(Qwen2VLVisionModel):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.global_config['model_type'] = "qwen2_vl"
+
+
 ###### CONVERSION LOGIC ######
 
 
@@ -13940,7 +13961,7 @@ def get_model_architecture(hparams: dict[str, Any], model_type: ModelType) -> st
     # Step3-VL keeps text config under text_config but uses a custom top-level architecture.
     # For text conversion we route to a dedicated text-only class.
     # TODO: refactor this later to avoid adding exception here
-    if model_type == ModelType.TEXT and arch == "StepVLForConditionalGeneration":
+    if model_type == ModelType.TEXT and arch in ("StepVLForConditionalGeneration", "Sarashina2VisionForCausalLM"):
         return arch
 
     # if "architectures" is found in the sub-config, use that instead
