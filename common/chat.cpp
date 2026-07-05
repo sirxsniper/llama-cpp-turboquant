@@ -2682,10 +2682,9 @@ common_chat_msg common_chat_peg_parse(const common_peg_arena &          src_pars
         // </parameter> tags from Qwen / Hermes-style outputs), don't throw.
         // Return the raw text as plain assistant content so the client still
         // gets what the model said and can retry on the next turn. Log a
-        // warning so genuine parser bugs aren't silenced.
-        LOG_WRN("%s: unparsed %s output at pos %zu; falling back to raw content: %.120s\n",
-                __func__, common_chat_format_name(params.format), (size_t)result.end,
-                effective_input.substr(result.end).c_str());
+        // warning (and full output at debug) so genuine parser bugs aren't silenced.
+        LOG_WRN("%s: unparsed %s output: %s\n", __func__, common_chat_format_name(params.format), effective_input.substr(result.end).c_str());
+        LOG_DBG("%s: full %s output triggering fallback:\n=== BEGIN ===\n%s\n=== END ===\n", __func__, common_chat_format_name(params.format), effective_input.c_str());
         common_chat_msg msg_fb;
         msg_fb.role = "assistant";
         msg_fb.content = effective_input;
