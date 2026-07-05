@@ -843,6 +843,7 @@ void process_shaders() {
 
     string_to_spv("repeat_i32", "repeat.comp", {{"A_TYPE", "int32_t"}, {"D_TYPE", "int32_t"}});
     string_to_spv("repeat_back_f32", "repeat_back.comp", {{"A_TYPE", "float"}, {"D_TYPE", "float"}});
+    string_to_spv("get_rows_back_f32", "get_rows_back.comp", {{"A_TYPE", "float"}, {"B_TYPE", "int"}, {"D_TYPE", "float"}});
 
     string_to_spv("repeat_i16", "repeat.comp", {{"A_TYPE", "int16_t"}, {"D_TYPE", "int16_t"}});
 
@@ -1050,6 +1051,31 @@ void process_shaders() {
                 }
 #endif
             }
+        }
+    }
+
+    for (auto unroll : {false, true}) {
+        for (auto a_f16 : {false, true}) {
+            std::map<std::string, std::string> defines = {
+                {"A_TYPE", a_f16 ? "float16_t" : "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"},
+                {"UNROLL", unroll ? "[[unroll]]" : ""},
+            };
+            std::string name = std::string("conv3d") + (a_f16 ? "_f16" : "") + "_f32";
+            string_to_spv(name + (unroll ? "_unroll" : ""), "conv3d_mm.comp", defines);
+#if defined(GGML_VULKAN_COOPMAT2_GLSLC_SUPPORT)
+            if (unroll) {
+                auto cm2_defines = defines;
+                cm2_defines["COOPMAT2"] = "1";
+                string_to_spv(name, "conv3d_mm.comp", cm2_defines, true, false, true);
+            }
+#endif
+#if defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
+            if (unroll) {
+                auto cm1_defines = defines;
+                cm1_defines["COOPMAT"] = "1";
+                string_to_spv(name, "conv3d_mm.comp", cm1_defines, true, true, false);
+            }
+#endif
         }
     }
 
