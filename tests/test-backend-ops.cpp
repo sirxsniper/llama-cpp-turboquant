@@ -7745,6 +7745,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32, 1, 8, 2, 1, 1, false));
+    // TurboQuant pure-dequant isolation (fork): get_rows dequantizes only, no flash-attn.
+    for (ggml_type type : {GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO4_0}) {
+        test_cases.emplace_back(new test_get_rows(type, 256, 5, 4, 1, 1, false));
+    }
     for (ggml_type type : all_types) {
         for (int b : {1, 7}) {
             for (bool v : {false, true}) {
@@ -9175,6 +9179,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(128, 64, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q1_0, GGML_TYPE_Q4_0));
     test_cases.emplace_back(new test_flash_attn_ext(64, 128, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q1_0));
     test_cases.emplace_back(new test_flash_attn_ext(128, 64, 4, {1, 1}, 64, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q1_0, GGML_TYPE_F16));
+
+    // TurboQuant KV cache FA correctness (fork): head_dim 128, multi-token KV.
+    // Compares CUDA turbo kernels vs CPU reference to catch turbo4-specific bugs.
+    for (int64_t kv : {128, 256, 512}) {
+        for (ggml_type tkv : {GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO4_0}) {
+            test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1}, kv, 8, true, false, 0, 0, GGML_PREC_F32, tkv, tkv));
+        }
+        // mixed: turbo4 K with q8 V and vice versa (Jarvis uses turbo4/turbo4 but also mixed)
+        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1}, kv, 8, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_Q8_0));
+        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1}, kv, 8, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_TURBO4_0));
+    }
 
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {   10, 5, 4, 3}));
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {30000, 1, 1, 1}));

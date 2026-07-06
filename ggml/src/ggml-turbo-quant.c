@@ -538,15 +538,17 @@ void quantize_row_turbo4_0_ref(const float * GGML_RESTRICT x, block_turbo4_0 * G
 }
 
 void dequantize_row_turbo4_0(const block_turbo4_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
-    turbo_init_rotation();
-
     assert(k % QK_TURBO4 == 0);
     const int nb = k / QK_TURBO4;
     const int d  = QK_TURBO4;
 
 #if TURBO4_USE_4BIT
-    /* 4-bit PolarQuant: nibble unpack → centroid → inverse rotate → scale */
-    /* TODO: add proper 4-bit centroid table to C code (currently only in Metal) */
+    /* 4-bit PolarQuant: nibble unpack -> centroid -> scale.
+     * NOTE: like turbo3, dequant returns WHT-ROTATED values. K is stored rotated and
+     * the matching rotation is applied to Q in the graph (build_attn), so the inverse
+     * rotation must NOT be applied here — doing so (a) mismatches the CUDA K-dot / V-dequant
+     * which return centroid*norm, and (b) called turbo_init_rotation() which races under
+     * multi-threaded CPU flash-attention (-> corrupted rotation matrix -> NaN). */
     static const float CENTROIDS_4BIT[16] = {
         -0.173926f, -0.117195f, -0.089527f, -0.068756f,
         -0.051262f, -0.035597f, -0.020989f, -0.006938f,
@@ -555,14 +557,11 @@ void dequantize_row_turbo4_0(const block_turbo4_0 * GGML_RESTRICT x, float * GGM
     };
     for (int block = 0; block < nb; block++) {
         float norm = GGML_FP16_TO_FP32(x[block].norm);
-        float rotated[QK_TURBO4];
+        float * dst = y + block * d;
         for (int i = 0; i < d; i++) {
             uint8_t idx = (x[block].qs[i / 2] >> ((i % 2) * 4)) & 0xF;
-            rotated[i] = CENTROIDS_4BIT[idx];
+            dst[i] = CENTROIDS_4BIT[idx] * norm;
         }
-        float * dst = y + block * d;
-        matvec(turbo_rotation_t, rotated, dst, d);
-        for (int i = 0; i < d; i++) dst[i] *= norm;
     }
 #else
     /* Legacy 3-bit + QJL dequant */
