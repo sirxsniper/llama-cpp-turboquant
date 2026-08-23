@@ -506,9 +506,18 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
         }
     }
     if (table_id == MMVQ_PARAMETERS_BLACKWELL) {
-        // sm_120 previously fell through to GENERIC, which leaves the ncols_dst==1
-        // decode path at nwarps=4 regardless of how long the K loop actually is.
-        // A wider block halves the trip count on the types this model is built from.
+        // sm_120 falls through to GENERIC, which leaves the ncols_dst==1 decode path
+        // at nwarps=4 regardless of how long the K loop actually is. Doubling the block
+        // to halve the trip count (the GB10 trick) was expected to help here too.
+        //
+        // MEASURED NEUTRAL on RTX 5090, Qwen3.8-27B, warm back-to-back llama-bench:
+        //     Q4_K_XL  tg128 61.07 -> 59.85 (-2.0%)   pp2048 3617.8 -> 3496.8 (-3.3%)
+        //     Q6_K     tg128 51.31 -> 52.07 (+1.5%)   pp2048 2942.8 -> 2961.4 (+0.6%)
+        // Mixed signs, all inside run-to-run spread. Decode here is bandwidth-bound,
+        // so block width does not move it. Kept behind TURBO_MMVQ_BLACKWELL (off by
+        // default) as a documented negative result - do not enable expecting a win.
+        //
+        // NB measure warm-to-warm: a cold GPU reads ~11% high on tg128 (68.1 vs 61.1).
         const int generic = calc_nwarps(type, ncols_dst, MMVQ_PARAMETERS_GENERIC);
         if (ncols_dst == 1 && !small_k && halve_iters) {
             switch (type) {
