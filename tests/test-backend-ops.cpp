@@ -10152,6 +10152,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
 
+    // TurboQuant KV perf at the real deployed geometry (Qwen3.8-27B / qwen35:
+    // head_dim 256, 24 heads / 4 kv-heads -> nr23 {6,1}). f16 and q8_0 are included
+    // at identical shapes so turbo2/3/4 can be compared directly against them —
+    // without this, turbo kernel perf regressions are invisible to `test-backend-ops perf`.
+    for (int64_t kv : { 4096, 16384 }) {
+        for (int64_t nb : { 1, 512 }) {   // nb=1 -> decode (TG), nb=512 -> prefill (PP)
+            for (ggml_type tkv : { GGML_TYPE_F16, GGML_TYPE_Q8_0,
+                                   GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO4_0 }) {
+                test_cases.emplace_back(new test_flash_attn_ext(
+                    256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, tkv, tkv));
+            }
+        }
+    }
+
     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
     // note: same bytes either way, so a backend that indexes them differently shows it here
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
