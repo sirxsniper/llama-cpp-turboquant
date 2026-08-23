@@ -2945,8 +2945,6 @@ ggml_tensor * llama_kv_cache_context::get_v(ggml_context * ctx, int32_t il) cons
     return kv->get_v(ctx, il, n_kv, sinfos[i_cur]);
 }
 
-}
-
 ggml_tensor * llama_kv_cache_context::get_turbo_rotation() const {
     return kv->get_turbo_rotation();
 }
