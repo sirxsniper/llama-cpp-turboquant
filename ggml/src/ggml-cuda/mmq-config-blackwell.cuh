@@ -53,9 +53,20 @@ static constexpr __host__ __device__ ggml_cuda_mmq_config ggml_cuda_mmq_get_conf
     //                    and no upstream config uses I=256 for any type or arch.
     //                    Do not reintroduce it without reworking the SRAM layout,
     //                    stream-k fixup and write-back paths.
-    //   Remaining knobs that stay inside supported territory: nthreads at I=128,
-    //   K_vram, stream_k. The has_ids split below is kept so dense and MoE can be
-    //   tuned independently.
+    //   nthreads 256->512 at I=128: REJECTED. CUDA "illegal memory access", crashes
+    //                    test-backend-ops outright. Upstream does ship 148 configs at
+    //                    nthreads=512/occ=1/I=128, but every one is in mmq-config-cdna.cuh:
+    //                    CDNA is AMD with a 64-wide warp, so 512 threads is 8 warps there,
+    //                    the same warp count NVIDIA gets from 256. The tile code is written
+    //                    in warps and does not go past 8. No NVIDIA arch uses 512 anywhere.
+    //                    (The dp4a vec_dot also declares y_df[J/nwarps] while stepping j by
+    //                    nwarps, so J must be a non-zero multiple of nwarps - J=8,24,40 fail
+    //                    to compile outright at nwarps=16.)
+    //   K_vram is MMQ_ITER_K in every table for every arch and type, and stream_k is
+    //   pinned to occupancy (occ 1 <-> stream_k true). With I, nthreads and occupancy
+    //   all spent, this table has no headroom left for K-quants on sm_120: the Ampere
+    //   fallthrough is effectively already the tuned answer. The has_ids split is kept
+    //   so dense and MoE can still be tuned apart if a future kernel allows it.
 
     // Dense matmul only. I=256 corrupts MUL_MAT_ID (MoE): the ids path
     // has an internal invariant that assumes I<=128, and no upstream
@@ -72,6 +83,8 @@ static constexpr __host__ __device__ ggml_cuda_mmq_config ggml_cuda_mmq_get_conf
     // Dense matmul only. I=256 corrupts MUL_MAT_ID (MoE): the ids path
     // has an internal invariant that assumes I<=128, and no upstream
     // config uses I=256 anywhere. MoE falls through to the Ampere table.
+
+
 
     return ggml_cuda_mmq_get_config_ampere(type, J, fallback, has_ids);
 }
