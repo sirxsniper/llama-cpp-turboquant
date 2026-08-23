@@ -41,54 +41,25 @@ static constexpr __host__ __device__ ggml_cuda_mmq_config ggml_cuda_mmq_get_conf
     // Tuning history on RTX 5090 (sm_120), Qwen3.8-27B shapes:
     //   occupancy 1->2 : Q6_K -27%, Q4_K -40%. These kernels are register-limited,
     //                    not latency-limited.
-    //   tile I 128->256: Q6_K +49%, Q4_K +50% on MUL_MAT, BUT it corrupts
-    //                    MUL_MAT_ID (MoE) - ERR ~1.0 on 39 cases. No upstream
-    //                    config uses I=256 anywhere; the ids path does not
-    //                    support it. Reverted.
-    //   nthreads 256->512 at the supported I=128: under test here.
-    // Dense matmul only. I=256 corrupts MUL_MAT_ID (MoE): the ids path
-    // has an internal invariant that assumes I<=128, and no upstream
-    // config uses I=256 anywhere. MoE falls through to the Ampere table.
-    if (!has_ids) {
-    CASE(GGML_TYPE_Q6_K, 256, 1, 256,   8, GGML_CUDA_MMQ_SRAM_LAYOUT_Q6_K, MMQ_ITER_K, true, true);
-    CASE(GGML_TYPE_Q6_K, 256, 1, 256,  16, GGML_CUDA_MMQ_SRAM_LAYOUT_Q6_K, MMQ_ITER_K, true, true);
-    CASE(GGML_TYPE_Q6_K, 256, 1, 256,  32, GGML_CUDA_MMQ_SRAM_LAYOUT_Q6_K, MMQ_ITER_K, true, true);
-    CASE(GGML_TYPE_Q6_K, 256, 1, 256,  64, GGML_CUDA_MMQ_SRAM_LAYOUT_Q6_K, MMQ_ITER_K, true, true);
-    CASE(GGML_TYPE_Q6_K, 256, 1, 256, 128, GGML_CUDA_MMQ_SRAM_LAYOUT_Q6_K, MMQ_ITER_K, true, true);
-    CASE(GGML_TYPE_Q6_K, 256, 1, 256,   8, GGML_CUDA_MMQ_SRAM_LAYOUT_Q6_K, MMQ_ITER_K, true, false);
-    CASE(GGML_TYPE_Q6_K, 256, 1, 256,  16, GGML_CUDA_MMQ_SRAM_LAYOUT_Q6_K, MMQ_ITER_K, true, false);
-    CASE(GGML_TYPE_Q6_K, 256, 1, 256,  24, GGML_CUDA_MMQ_SRAM_LAYOUT_Q6_K, MMQ_ITER_K, true, false);
-    CASE(GGML_TYPE_Q6_K, 256, 1, 256,  32, GGML_CUDA_MMQ_SRAM_LAYOUT_Q6_K, MMQ_ITER_K, true, false);
-    CASE(GGML_TYPE_Q6_K, 256, 1, 256,  40, GGML_CUDA_MMQ_SRAM_LAYOUT_Q6_K, MMQ_ITER_K, true, false);
-    CASE(GGML_TYPE_Q6_K, 256, 1, 256,  48, GGML_CUDA_MMQ_SRAM_LAYOUT_Q6_K, MMQ_ITER_K, true, false);
-    CASE(GGML_TYPE_Q6_K, 256, 1, 256,  64, GGML_CUDA_MMQ_SRAM_LAYOUT_Q6_K, MMQ_ITER_K, true, false);
-    CASE(GGML_TYPE_Q6_K, 256, 1, 256,  80, GGML_CUDA_MMQ_SRAM_LAYOUT_Q6_K, MMQ_ITER_K, true, false);
-    CASE(GGML_TYPE_Q6_K, 256, 1, 256,  96, GGML_CUDA_MMQ_SRAM_LAYOUT_Q6_K, MMQ_ITER_K, true, false);
-    CASE(GGML_TYPE_Q6_K, 256, 1, 256, 112, GGML_CUDA_MMQ_SRAM_LAYOUT_Q6_K, MMQ_ITER_K, true, false);
-    CASE(GGML_TYPE_Q6_K, 256, 1, 256, 128, GGML_CUDA_MMQ_SRAM_LAYOUT_Q6_K, MMQ_ITER_K, true, false);
-    }
+    //   tile I 128->256: REJECTED. It reported +49%/+50% on MUL_MAT microbenchmarks
+    //                    and was first thought to break only MUL_MAT_ID (MoE), so
+    //                    it was gated to the dense path. That was wrong: I=256
+    //                    also corrupts DENSE matmul at production (m, k) with
+    //                    n >= ~11, producing NaN / ERR ~1.0 (127 of 128 cases at
+    //                    Qwen3.8-27B shapes). End to end the model emitted pure
+    //                    garbage tokens, and the corrupted hidden state poisoned
+    //                    the KV cache for every later request in the process.
+    //                    The MMQ kernel has internal invariants assuming I <= 128
+    //                    and no upstream config uses I=256 for any type or arch.
+    //                    Do not reintroduce it without reworking the SRAM layout,
+    //                    stream-k fixup and write-back paths.
+    //   Remaining knobs that stay inside supported territory: nthreads at I=128,
+    //   K_vram, stream_k. The has_ids split below is kept so dense and MoE can be
+    //   tuned independently.
 
     // Dense matmul only. I=256 corrupts MUL_MAT_ID (MoE): the ids path
     // has an internal invariant that assumes I<=128, and no upstream
     // config uses I=256 anywhere. MoE falls through to the Ampere table.
-    if (!has_ids) {
-    CASE(GGML_TYPE_Q4_K, 256, 1, 256,   8, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1, MMQ_ITER_K, true, true);
-    CASE(GGML_TYPE_Q4_K, 256, 1, 256,  16, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1, MMQ_ITER_K, true, true);
-    CASE(GGML_TYPE_Q4_K, 256, 1, 256,  32, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1, MMQ_ITER_K, true, true);
-    CASE(GGML_TYPE_Q4_K, 256, 1, 256,  64, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1, MMQ_ITER_K, true, true);
-    CASE(GGML_TYPE_Q4_K, 256, 1, 256, 128, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1, MMQ_ITER_K, true, true);
-    CASE(GGML_TYPE_Q4_K, 256, 1, 256,   8, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1, MMQ_ITER_K, true, false);
-    CASE(GGML_TYPE_Q4_K, 256, 1, 256,  16, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1, MMQ_ITER_K, true, false);
-    CASE(GGML_TYPE_Q4_K, 256, 1, 256,  24, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1, MMQ_ITER_K, true, false);
-    CASE(GGML_TYPE_Q4_K, 256, 1, 256,  32, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1, MMQ_ITER_K, true, false);
-    CASE(GGML_TYPE_Q4_K, 256, 1, 256,  40, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1, MMQ_ITER_K, true, false);
-    CASE(GGML_TYPE_Q4_K, 256, 1, 256,  48, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1, MMQ_ITER_K, true, false);
-    CASE(GGML_TYPE_Q4_K, 256, 1, 256,  64, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1, MMQ_ITER_K, true, false);
-    CASE(GGML_TYPE_Q4_K, 256, 1, 256,  80, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1, MMQ_ITER_K, true, false);
-    CASE(GGML_TYPE_Q4_K, 256, 1, 256,  96, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1, MMQ_ITER_K, true, false);
-    CASE(GGML_TYPE_Q4_K, 256, 1, 256, 112, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1, MMQ_ITER_K, true, false);
-    CASE(GGML_TYPE_Q4_K, 256, 1, 256, 128, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1, MMQ_ITER_K, true, false);
-    }
 
 
     // Q5_K and IQ4_XS: these dominate the Unsloth Dynamic "Q4_K_XL" mixes
@@ -97,46 +68,10 @@ static constexpr __host__ __device__ ggml_cuda_mmq_config ggml_cuda_mmq_get_conf
     // Dense matmul only. I=256 corrupts MUL_MAT_ID (MoE): the ids path
     // has an internal invariant that assumes I<=128, and no upstream
     // config uses I=256 anywhere. MoE falls through to the Ampere table.
-    if (!has_ids) {
-    CASE(GGML_TYPE_Q5_K, 256, 1, 256,   8, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1, MMQ_ITER_K, true, true);
-    CASE(GGML_TYPE_Q5_K, 256, 1, 256,  16, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1, MMQ_ITER_K, true, true);
-    CASE(GGML_TYPE_Q5_K, 256, 1, 256,  32, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1, MMQ_ITER_K, true, true);
-    CASE(GGML_TYPE_Q5_K, 256, 1, 256,  64, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1, MMQ_ITER_K, true, true);
-    CASE(GGML_TYPE_Q5_K, 256, 1, 256, 128, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1, MMQ_ITER_K, true, true);
-    CASE(GGML_TYPE_Q5_K, 256, 1, 256,   8, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1, MMQ_ITER_K, true, false);
-    CASE(GGML_TYPE_Q5_K, 256, 1, 256,  16, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1, MMQ_ITER_K, true, false);
-    CASE(GGML_TYPE_Q5_K, 256, 1, 256,  24, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1, MMQ_ITER_K, true, false);
-    CASE(GGML_TYPE_Q5_K, 256, 1, 256,  32, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1, MMQ_ITER_K, true, false);
-    CASE(GGML_TYPE_Q5_K, 256, 1, 256,  40, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1, MMQ_ITER_K, true, false);
-    CASE(GGML_TYPE_Q5_K, 256, 1, 256,  48, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1, MMQ_ITER_K, true, false);
-    CASE(GGML_TYPE_Q5_K, 256, 1, 256,  64, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1, MMQ_ITER_K, true, false);
-    CASE(GGML_TYPE_Q5_K, 256, 1, 256,  80, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1, MMQ_ITER_K, true, false);
-    CASE(GGML_TYPE_Q5_K, 256, 1, 256,  96, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1, MMQ_ITER_K, true, false);
-    CASE(GGML_TYPE_Q5_K, 256, 1, 256, 112, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1, MMQ_ITER_K, true, false);
-    CASE(GGML_TYPE_Q5_K, 256, 1, 256, 128, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1, MMQ_ITER_K, true, false);
-    }
 
     // Dense matmul only. I=256 corrupts MUL_MAT_ID (MoE): the ids path
     // has an internal invariant that assumes I<=128, and no upstream
     // config uses I=256 anywhere. MoE falls through to the Ampere table.
-    if (!has_ids) {
-    CASE(GGML_TYPE_IQ4_XS, 256, 1, 256,   8, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, true, true);
-    CASE(GGML_TYPE_IQ4_XS, 256, 1, 256,  16, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, true, true);
-    CASE(GGML_TYPE_IQ4_XS, 256, 1, 256,  32, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, true, true);
-    CASE(GGML_TYPE_IQ4_XS, 256, 1, 256,  64, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, true, true);
-    CASE(GGML_TYPE_IQ4_XS, 256, 1, 256, 128, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, true, true);
-    CASE(GGML_TYPE_IQ4_XS, 256, 1, 256,   8, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, true, false);
-    CASE(GGML_TYPE_IQ4_XS, 256, 1, 256,  16, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, true, false);
-    CASE(GGML_TYPE_IQ4_XS, 256, 1, 256,  24, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, true, false);
-    CASE(GGML_TYPE_IQ4_XS, 256, 1, 256,  32, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, true, false);
-    CASE(GGML_TYPE_IQ4_XS, 256, 1, 256,  40, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, true, false);
-    CASE(GGML_TYPE_IQ4_XS, 256, 1, 256,  48, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, true, false);
-    CASE(GGML_TYPE_IQ4_XS, 256, 1, 256,  64, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, true, false);
-    CASE(GGML_TYPE_IQ4_XS, 256, 1, 256,  80, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, true, false);
-    CASE(GGML_TYPE_IQ4_XS, 256, 1, 256,  96, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, true, false);
-    CASE(GGML_TYPE_IQ4_XS, 256, 1, 256, 112, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, true, false);
-    CASE(GGML_TYPE_IQ4_XS, 256, 1, 256, 128, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, true, false);
-    }
 
     return ggml_cuda_mmq_get_config_ampere(type, J, fallback, has_ids);
 }

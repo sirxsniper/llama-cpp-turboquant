@@ -71,7 +71,8 @@ enum mmvq_parameter_table_id {
     MMVQ_PARAMETERS_RDNA2,
     MMVQ_PARAMETERS_RDNA3_0,
     MMVQ_PARAMETERS_RDNA4,
-    MMVQ_PARAMETERS_GB10
+    MMVQ_PARAMETERS_GB10,
+    MMVQ_PARAMETERS_BLACKWELL
 };
 
 static constexpr __device__ mmvq_parameter_table_id get_device_table_id() {
@@ -87,6 +88,8 @@ static constexpr __device__ mmvq_parameter_table_id get_device_table_id() {
     return MMVQ_PARAMETERS_TURING;
 #elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ == GGML_CUDA_CC_DGX_SPARK
     return MMVQ_PARAMETERS_GB10;
+#elif defined(TURBO_MMVQ_BLACKWELL) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ == GGML_CUDA_CC_BLACKWELL
+    return MMVQ_PARAMETERS_BLACKWELL;
 #else
     return MMVQ_PARAMETERS_GENERIC;
 #endif
@@ -108,6 +111,11 @@ static __host__ mmvq_parameter_table_id get_device_table_id(int cc) {
     if (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_TURING && ggml_cuda_highest_compiled_arch(cc) < GGML_CUDA_CC_AMPERE) {
         return MMVQ_PARAMETERS_TURING;
     }
+#ifdef TURBO_MMVQ_BLACKWELL
+    if (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) == GGML_CUDA_CC_BLACKWELL) {
+        return MMVQ_PARAMETERS_BLACKWELL;
+    }
+#endif
     if (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) == GGML_CUDA_CC_DGX_SPARK) {
         return MMVQ_PARAMETERS_GB10;
     }
@@ -497,6 +505,30 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
                 return 1;
         }
     }
+    if (table_id == MMVQ_PARAMETERS_BLACKWELL) {
+        // sm_120 previously fell through to GENERIC, which leaves the ncols_dst==1
+        // decode path at nwarps=4 regardless of how long the K loop actually is.
+        // A wider block halves the trip count on the types this model is built from.
+        const int generic = calc_nwarps(type, ncols_dst, MMVQ_PARAMETERS_GENERIC);
+        if (ncols_dst == 1 && !small_k && halve_iters) {
+            switch (type) {
+                case GGML_TYPE_Q4_0:
+                case GGML_TYPE_Q4_1:
+                case GGML_TYPE_Q5_0:
+                case GGML_TYPE_Q5_1:
+                case GGML_TYPE_Q8_0:
+                case GGML_TYPE_Q4_K:
+                case GGML_TYPE_Q5_K:
+                case GGML_TYPE_Q6_K:
+                case GGML_TYPE_IQ4_NL:
+                case GGML_TYPE_IQ4_XS:
+                    return 2 * generic;
+                default:
+                    break;
+            }
+        }
+        return generic;
+    }
     if (table_id == MMVQ_PARAMETERS_GB10) {
         const int generic = calc_nwarps(type, ncols_dst, MMVQ_PARAMETERS_GENERIC);
         // Only worth the wider block when it actually retires the K loop in half the trips (Observation)
@@ -522,7 +554,8 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
 }
 
 static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int table_id, bool small_k = false, int nwarps = 1) {
-    if (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_GCN || table_id == MMVQ_PARAMETERS_TURING || table_id == MMVQ_PARAMETERS_GB10) {
+    if (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_GCN || table_id == MMVQ_PARAMETERS_TURING || table_id == MMVQ_PARAMETERS_GB10 ||
+        table_id == MMVQ_PARAMETERS_BLACKWELL) {
         switch (ncols_dst) {
             case 1:
                 return small_k ? nwarps : 1;
@@ -970,7 +1003,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
 
     // Whether doubling nwarps pays off on the ncols_dst == 1 path, where K sets the K loop trip count.
     const auto should_halve_iters = [&] {
-        if (table_id != MMVQ_PARAMETERS_GB10) {
+        if (table_id != MMVQ_PARAMETERS_GB10 && table_id != MMVQ_PARAMETERS_BLACKWELL) {
             return false;
         }
 
@@ -1011,7 +1044,9 @@ static void mul_mat_vec_q_switch_ncols_dst(
                 // Types the table does not promote would compile a second, identical kernel.
                 constexpr bool c_promoted =
                     calc_nwarps(type, c_ncols_dst, MMVQ_PARAMETERS_GB10, false, true) !=
-                    calc_nwarps(type, c_ncols_dst, MMVQ_PARAMETERS_GB10, false, false);
+                    calc_nwarps(type, c_ncols_dst, MMVQ_PARAMETERS_GB10, false, false) ||
+                    calc_nwarps(type, c_ncols_dst, MMVQ_PARAMETERS_BLACKWELL, false, true) !=
+                    calc_nwarps(type, c_ncols_dst, MMVQ_PARAMETERS_BLACKWELL, false, false);
 
                 constexpr bool c_halve_iters = decltype(halve_iters_tag)::value && c_promoted;
 

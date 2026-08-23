@@ -9205,6 +9205,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 1, n, 2048, {1, 1}, {1, 1}));
     }
 
+    // Real decoder shapes at small-but-not-tiny batch. The generic sweep uses
+    // n in {1,4,5,17,32,129} against synthetic dimensions, so the region just
+    // above the MMVQ/MMQ crossover was never exercised at a production
+    // (m, k) pair. A tile-config defect there corrupts the hidden state on a
+    // short prompt while every existing case still passes.
+    for (int64_t n : {8, 10, 11, 12, 16, 23, 24, 32}) {
+        for (ggml_type ta : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ4_XS}) {
+            test_cases.emplace_back(new test_mul_mat(ta, GGML_TYPE_F32,  5120, n,  5120, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(ta, GGML_TYPE_F32, 17408, n,  5120, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(ta, GGML_TYPE_F32,  5120, n, 17408, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(ta, GGML_TYPE_F32,  6144, n,  5120, {1, 1}, {1, 1}));
+        }
+    }
+
 #if 0
     {
         // Test paths in OpenCL
@@ -10115,6 +10129,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 32, 4, 1, 1, false, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 2, 1, false, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 8, 32, 4, 2, 2, false, true));
+
+    // Chunk-eligible geometry. The CUDA chunked GDN kernel only engages at
+    // head_size == 128 && S_v == 128 && n_tokens >= 128, so every case above
+    // (n_seq_tokens <= 2) exercises only the sequential path and cannot catch a
+    // numerical defect in chunking. These cover the prefill path the model
+    // actually takes.
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 128, 1));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 129, 1));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 256, 1));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 512, 1));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 300, 1));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 256, 1));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 256, 2));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 256, 1, 2));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 256, 1, 1, true));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 256, 1, 1, false, false, 1, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 2, 1, true,  true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 16, 4, 2, 1, true,  true));
     // Recurrent path: multi-chunk and non-multiple-of-chunk-size (chunk_size=64 GDN, 16 KDA)
