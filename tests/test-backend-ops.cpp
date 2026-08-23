@@ -9992,6 +9992,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         // mixed: turbo4 K with q8 V and vice versa (Jarvis uses turbo4/turbo4 but also mixed)
         test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1}, kv, 8, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_Q8_0));
         test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1}, kv, 8, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_TURBO4_0));
+
+        // Real deployed geometry: Qwen3.8-27B (qwen35) is head_dim=256, 24 heads / 4 kv-heads.
+        // D=256 turbo was previously untested — the 128-only cases above miss it entirely.
+        for (ggml_type tkv : {GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO4_0}) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, 8, true, false, 0, 0, GGML_PREC_F32, tkv, tkv));
+        }
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, 8, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_Q8_0));
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, 8, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_TURBO4_0));
     }
 
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {   10, 5, 4, 3}));
