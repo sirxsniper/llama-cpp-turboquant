@@ -429,10 +429,13 @@ extern "C" {
         GGML_TYPE_MXFP4   = 39, // MXFP4 (1 block)
         GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
         GGML_TYPE_Q1_0    = 41,
-        GGML_TYPE_TURBO3_0 = 42, // TurboQuant 3-bit KV cache: 2-bit PolarQuant + 1-bit QJL
+        GGML_TYPE_Q2_0    = 42,
         GGML_TYPE_TURBO4_0 = 43, // TurboQuant 4-bit KV cache: 3-bit PolarQuant + 1-bit QJL
         GGML_TYPE_TURBO2_0 = 44, // TurboQuant 2-bit KV cache: 2-bit PolarQuant (no QJL)
-        GGML_TYPE_COUNT   = 45,
+        // NOTE: TURBO3_0 moved 42 -> 45; upstream claimed 42 for Q2_0 (b9913).
+        // turbo4/turbo2 ids are deliberately left untouched to keep existing KV state files valid.
+        GGML_TYPE_TURBO3_0 = 45, // TurboQuant 3-bit KV cache: 2-bit PolarQuant + 1-bit QJL
+        GGML_TYPE_COUNT   = 46,
     };
 
     // precision
@@ -476,6 +479,7 @@ extern "C" {
         GGML_FTYPE_MOSTLY_MXFP4   = 25, // except 1d tensors
         GGML_FTYPE_MOSTLY_NVFP4   = 26, // except 1d tensors
         GGML_FTYPE_MOSTLY_Q1_0    = 27, // except 1d tensors
+        GGML_FTYPE_MOSTLY_Q2_0    = 28, // except 1d tensors
     };
 
     // available tensor operations:
