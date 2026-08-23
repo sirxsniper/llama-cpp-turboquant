@@ -10152,6 +10152,29 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
 
+    // ---- Qwen3.8-27B (qwen35) PREFILL-scale coverage -----------------------
+    // The perf list only exercised n<=5 (decode). Prefill is where the gap to
+    // specialised engines shows, and it was completely unmeasured.
+    // Real shapes: n_embd 5120, ffn 17408, qkv 10240, attn_gate/ssm_out 6144.
+    for (int64_t n : { 512, 1024, 2048 }) {
+        for (ggml_type ta : { GGML_TYPE_NVFP4, GGML_TYPE_MXFP4, GGML_TYPE_Q4_K,
+                              GGML_TYPE_Q6_K, GGML_TYPE_F16 }) {
+            test_cases.emplace_back(new test_mul_mat(ta, GGML_TYPE_F32, 17408, n, 5120, {1,1}, {1,1}));  // ffn gate/up
+            test_cases.emplace_back(new test_mul_mat(ta, GGML_TYPE_F32,  5120, n, 17408, {1,1}, {1,1})); // ffn down
+            test_cases.emplace_back(new test_mul_mat(ta, GGML_TYPE_F32, 10240, n, 5120, {1,1}, {1,1}));  // attn qkv
+            test_cases.emplace_back(new test_mul_mat(ta, GGML_TYPE_F32,  6144, n, 5120, {1,1}, {1,1}));  // attn gate
+        }
+    }
+
+    // ---- gated delta net at prefill batch --------------------------------
+    // 64 of this model's 65 layers are GDN/SSM, so if this op is slow it
+    // dominates prefill regardless of how fast the matmuls are.
+    // ssm: state_size 128, group_count 16, time_step_rank 48, inner 6144.
+    for (int64_t toks : { 512, 1024, 2048 }) {
+        test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 48, 128, toks, 1));
+        test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, toks, 1));
+    }
+
     // TurboQuant KV perf at the real deployed geometry (Qwen3.8-27B / qwen35:
     // head_dim 256, 24 heads / 4 kv-heads -> nr23 {6,1}). f16 and q8_0 are included
     // at identical shapes so turbo2/3/4 can be compared directly against them —
