@@ -755,6 +755,8 @@ struct common_params {
     bool        triattention_log          = false;  // log pruning events to stderr
 
     bool no_alloc = false; // Don't allocate model buffers
+
+    bool is_gen_docs = false; // whether we are running inside llama-gen-docs
 };
 
 // call once at the start of a program if it uses libcommon
