@@ -526,8 +526,35 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
                     return BEST_FATTN_KERNEL_VEC;
                 }
             } else {
+                // Quantized K/V. The MMA path cannot read a quantized cache: launch_fattn
+                // materialises the WHOLE K (and V) as F16 first, on EVERY call, via
+                //     to_fp16(K_data, K_f16, ggml_nelements(K), stream)
+                // That is O(context) work per decode step and it re-does the entire cache
+                // each token. For turbo types it also re-runs the inverse WHT rotation, so
+                // it costs far more than for q8_0.
+                //
+                // Speculative decoding sets Q->ne[1] = draft_width + 1, which pushed every
+                // drafted step onto that path. Measured on RTX 5090, Qwen3.8-27B at ~90K
+                // context: turbo4 + MTP n3 (MMA) 36.0 tok/s vs turbo4 with NO speculation
+                // (VEC) 42.0 - i.e. speculation made turbo4 SLOWER, because the conversion
+                // outweighed the drafting gain. turbo4 is half the size of q8_0 and should
+                // win at depth; the conversion was throwing that away.
+                //
+                // The VEC kernel reads the quantized cache natively and launch_fattn already
+                // grids over Q columns (ntiles_x = ceil(ne1 / ncols1)), so it handles wide Q
+                // at cols_per_block=2 without any kernel change. Per value that is
+                // ceil(ne1/2) * 4.25 bits against the MMA path's 4.25 read + 16 write + 16
+                // read, so VEC stays ahead for the draft widths speculation actually uses.
+                //
+                // Restricted to turbo types: those are the ones measured here, and the
+                // trade-off differs for a cache whose dequant is a plain scale multiply.
+                const bool kv_is_turbo =
+                    K->type == GGML_TYPE_TURBO2_0 || K->type == GGML_TYPE_TURBO3_0 || K->type == GGML_TYPE_TURBO4_0 ||
+                    V->type == GGML_TYPE_TURBO2_0 || V->type == GGML_TYPE_TURBO3_0 || V->type == GGML_TYPE_TURBO4_0;
+                const int vec_ncols_max = kv_is_turbo ? 16 : 2;
+
                 if (cc >= GGML_CUDA_CC_ADA_LOVELACE) {
-                    if (Q->ne[1] <= 2) {
+                    if (Q->ne[1] <= vec_ncols_max) {
                         return BEST_FATTN_KERNEL_VEC;
                     }
                 } else {
