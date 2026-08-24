@@ -260,6 +260,73 @@ static void dequantize_block_cont_cuda(const void * __restrict__ vx, dst_t * __r
     dequantize_block_cuda<qk, qr, dequantize_kernel, dst_t>(vx, y, k, 1, 1, 1, k/qk, k/qk, k/qk, stream);
 }
 
+// ---- turbo4 -> dst bulk conversion, warp-cooperative centroid lookup ----
+//
+// The generic path (dequantize_block_cont_cuda + turbo4_dequant_element) does
+//     TURBO_CENTROIDS_4BIT[idx] * norm
+// once per element. TURBO_CENTROIDS_4BIT is __constant__, and constant memory
+// SERIALISES when lanes in a warp read different addresses: with random 4-bit
+// indices one access can degenerate into up to 16 broadcasts. q8_0's dequant is a
+// plain scale multiply with no lookup, which is why the two conversions cost wildly
+// different amounts even though they move the same number of elements.
+//
+// The flash-attention kernels already solved this (see the "warp-cooperative"
+// comments in fattn-common.cuh, measured +7 t/s at 50K depth): give each lane ONE
+// centroid in a register and use __shfl_sync to broadcast it. Registers have no
+// divergence penalty. This applies the same trick to the bulk conversion, which is
+// the path the MMA flash-attention kernel takes for a quantized KV cache.
+template <typename dst_t>
+static __global__ void dequantize_block_turbo4_0_coop(
+        const void * __restrict__ vx, dst_t * __restrict__ y, const int64_t k) {
+
+    const block_turbo4_0 * __restrict__ x = (const block_turbo4_0 *) vx;
+
+    // one warp per block of QK_TURBO4 (=128) elements
+    const int64_t ib = (int64_t)blockIdx.x * (blockDim.x / WARP_SIZE) + (threadIdx.x / WARP_SIZE);
+    if (ib * QK_TURBO4 >= k) {
+        return;
+    }
+    const int lane = threadIdx.x % WARP_SIZE;
+
+    const float norm = __half2float(x[ib].norm);
+
+    // Lane L < 16 holds centroid L already scaled by this block's norm. One
+    // constant-memory read per lane, uniform across the warp for L < 16.
+    const float my_scaled = (lane < 16) ? TURBO_CENTROIDS_4BIT[lane] * norm : 0.0f;
+
+    // 128 elements / 32 lanes = 4 elements per lane, contiguous pairs so the qs
+    // byte load is one access per pair.
+    constexpr int per_lane = QK_TURBO4 / WARP_SIZE;   // 4
+#pragma unroll
+    for (int e = 0; e < per_lane; e += 2) {
+        const int j    = lane * per_lane + e;
+        const uint8_t qb = x[ib].qs[j >> 1];
+        const unsigned idx0 = (qb >> 0) & 0xFu;
+        const unsigned idx1 = (qb >> 4) & 0xFu;
+
+        const float v0 = __shfl_sync(0xFFFFFFFFu, my_scaled, idx0, WARP_SIZE);
+        const float v1 = __shfl_sync(0xFFFFFFFFu, my_scaled, idx1, WARP_SIZE);
+
+        const int64_t o = ib * QK_TURBO4 + j;
+        if (o + 1 < k) {
+            y[o + 0] = (dst_t) v0;
+            y[o + 1] = (dst_t) v1;
+        } else if (o < k) {
+            y[o + 0] = (dst_t) v0;
+        }
+    }
+}
+
+template<typename dst_t>
+static void dequantize_row_turbo4_0_cuda(const void * __restrict__ vx, dst_t * __restrict__ y,
+                                         const int64_t k, cudaStream_t stream) {
+    constexpr int warps_per_block = 4;
+    const int64_t nblocks = (k + QK_TURBO4 - 1) / QK_TURBO4;
+    const int64_t grid    = (nblocks + warps_per_block - 1) / warps_per_block;
+    dequantize_block_turbo4_0_coop<dst_t>
+        <<<grid, warps_per_block*WARP_SIZE, 0, stream>>>(vx, y, k);
+}
+
 static void dequantize_block_q8_0_f16_cuda(const void * __restrict__ vx, half * __restrict__ y, const int64_t k, cudaStream_t stream) {
     const int num_blocks = (k + CUDA_Q8_0_NE_ALIGN - 1) / CUDA_Q8_0_NE_ALIGN;
     if (k % CUDA_Q8_0_NE_ALIGN == 0) {
@@ -569,7 +636,7 @@ to_fp16_cuda_t ggml_get_to_fp16_cuda(ggml_type type) {
         case GGML_TYPE_TURBO2_0:
             return dequantize_block_cont_cuda<QK_TURBO2, QR_TURBO2, dequantize_turbo2_0>;
         case GGML_TYPE_TURBO4_0:
-            return dequantize_block_cont_cuda<QK_TURBO4, QR_TURBO4, dequantize_turbo4_0>;
+            return dequantize_row_turbo4_0_cuda;
         case GGML_TYPE_F32:
             return convert_unary_cont_cuda<float>;
         case GGML_TYPE_BF16:
@@ -632,7 +699,7 @@ to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type) {
         case GGML_TYPE_TURBO2_0:
             return dequantize_block_cont_cuda<QK_TURBO2, QR_TURBO2, dequantize_turbo2_0>;
         case GGML_TYPE_TURBO4_0:
-            return dequantize_block_cont_cuda<QK_TURBO4, QR_TURBO4, dequantize_turbo4_0>;
+            return dequantize_row_turbo4_0_cuda;
         case GGML_TYPE_F16:
             return convert_unary_cont_cuda<half>;
         case GGML_TYPE_BF16:
