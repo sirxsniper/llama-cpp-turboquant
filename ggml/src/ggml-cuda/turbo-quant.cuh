@@ -327,22 +327,22 @@ static __constant__ float TURBO_MID_4BIT[15] = {
 // ---- Nearest 4-bit centroid index ----
 
 static __device__ __forceinline__ uint8_t turbo_nearest_centroid_4bit(float val) {
-    if      (val < TURBO_MID_4BIT[ 0]) return  0;
-    else if (val < TURBO_MID_4BIT[ 1]) return  1;
-    else if (val < TURBO_MID_4BIT[ 2]) return  2;
-    else if (val < TURBO_MID_4BIT[ 3]) return  3;
-    else if (val < TURBO_MID_4BIT[ 4]) return  4;
-    else if (val < TURBO_MID_4BIT[ 5]) return  5;
-    else if (val < TURBO_MID_4BIT[ 6]) return  6;
-    else if (val < TURBO_MID_4BIT[ 7]) return  7;
-    else if (val < TURBO_MID_4BIT[ 8]) return  8;
-    else if (val < TURBO_MID_4BIT[ 9]) return  9;
-    else if (val < TURBO_MID_4BIT[10]) return 10;
-    else if (val < TURBO_MID_4BIT[11]) return 11;
-    else if (val < TURBO_MID_4BIT[12]) return 12;
-    else if (val < TURBO_MID_4BIT[13]) return 13;
-    else if (val < TURBO_MID_4BIT[14]) return 14;
-    else                               return 15;
+    // Branchless. TURBO_MID_4BIT is sorted ascending, so the index the if/else chain
+    // returned is exactly "how many midpoints val is >= to" - identical semantics.
+    //
+    // Why it matters: this runs once per element for every K and V written, i.e. on
+    // every token of prefill. The if/else form is a 15-deep DEPENDENT branch chain,
+    // and because lanes in a warp exit at different depths the warp executes all 15
+    // branches anyway - the early-out never pays, only the serial dependency costs.
+    // This is 15 INDEPENDENT compare+add ops the scheduler can pipeline, with no
+    // divergence. Every TURBO_MID_4BIT index is a compile-time constant, so each read
+    // is a uniform constant-memory broadcast rather than a divergent lookup.
+    int idx = 0;
+#pragma unroll
+    for (int i = 0; i < 15; ++i) {
+        idx += (val >= TURBO_MID_4BIT[i]);
+    }
+    return (uint8_t) idx;
 }
 
 // ---- Per-block quantize for turbo4 (128 elements, expects already-rotated input) ----

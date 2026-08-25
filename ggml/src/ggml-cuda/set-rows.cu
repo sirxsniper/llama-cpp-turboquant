@@ -1039,15 +1039,34 @@ static __global__ void k_set_rows_turbo4(
     x[j] *= TURBO_WHT_SIGNS1[j];
     __syncthreads();
 
+    // Butterfly stages. The original ran all 7 through shared memory:
+    //     if (j % (2h) < h) { a = x[j]; b = x[j+h]; x[j] = a+b; x[j+h] = a-b; }
+    //     __syncthreads();
+    // which leaves HALF the threads idle in every stage and costs 7 barriers.
+    //
+    // For h < 32 the partner j^h is always in the same warp (j and j^h differ only
+    // in bits below 5), so those stages run in registers via __shfl_xor_sync: every
+    // lane computes its own output, no idle threads and no barrier. Only h = 32 and
+    // h = 64 cross a warp and still need shared memory.
+    //
+    // Equivalence: the lane holding the LOW element ((j & h) == 0) wants a+b; the
+    // lane holding the high element wants a-b where a is the low element, which for
+    // that lane is exactly (partner - self).
+    {
+        float v = x[j];
+#pragma unroll
+        for (int h = 1; h < 32; h <<= 1) {
+            const float partner = __shfl_xor_sync(0xffffffffu, v, h);
+            v = (j & h) ? (partner - v) : (v + partner);
+        }
+        x[j] = v;
+    }
+    __syncthreads();
+
 #define WHT_STAGE_SHARED_T4(h) \
     if (j % (2*(h)) < (h)) { float a = x[j], b = x[j+(h)]; x[j] = a+b; x[j+(h)] = a-b; } \
     __syncthreads();
 
-    WHT_STAGE_SHARED_T4(1)
-    WHT_STAGE_SHARED_T4(2)
-    WHT_STAGE_SHARED_T4(4)
-    WHT_STAGE_SHARED_T4(8)
-    WHT_STAGE_SHARED_T4(16)
     WHT_STAGE_SHARED_T4(32)
     WHT_STAGE_SHARED_T4(64)
 #undef WHT_STAGE_SHARED_T4
