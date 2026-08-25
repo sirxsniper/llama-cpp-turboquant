@@ -269,6 +269,52 @@ bool ggml_cuda_gdn_op_is_chunked(const ggml_tensor * dst) {
         && ggml_is_contiguous(src_beta) && ggml_is_contiguous(src_state);
 }
 
+// Diagnostic: report ONCE per process which GDN path a run actually takes, and when
+// it is the slow sequential kernel, which eligibility term rejected it.
+//
+// Why this exists: the sequential kernel loops `for (t = 0; t < n_tokens; t++)` and is
+// therefore latency-bound - measured 3.49 TFLOPS against MUL_MAT's 260 on the same
+// device. Whether a prefill runs on it or on the chunked kernel is the single largest
+// question about GDN cost, and it currently has to be inferred by reading source. One
+// log line settles it. Set TURBO_PATH_PROBE=0 to silence.
+static void turbo_probe_gdn(const ggml_tensor * dst, bool chunked) {
+    static bool done = false;
+    if (done) {
+        return;
+    }
+    const char * e = getenv("TURBO_PATH_PROBE");
+    if (e && e[0] == '0' && e[1] == '\0') {
+        done = true;
+        return;
+    }
+    done = true;
+
+    const ggml_tensor * q  = dst->src[0];
+    const ggml_tensor * k  = dst->src[1];
+    const ggml_tensor * v  = dst->src[2];
+    const ggml_tensor * g  = dst->src[3];
+    const ggml_tensor * b  = dst->src[4];
+    const ggml_tensor * st = dst->src[5];
+    const int64_t S_v = v->ne[0];
+
+    GGML_LOG_INFO("turbo-probe: GDN path = %s  (n_tokens=%d S_v=%d neq0=%d)\n",
+                  chunked ? "CHUNKED (fast)" : "SEQUENTIAL (slow)",
+                  (int) v->ne[2], (int) S_v, (int) q->ne[0]);
+    if (!chunked) {
+        GGML_LOG_INFO("turbo-probe:   kda=%d K=%d neq0_128=%d S_v_128=%d ntok_ge_128=%d\n",
+                      (int) (g->ne[0] == S_v), ggml_get_op_params_i32(dst, 0),
+                      (int) (q->ne[0] == 128), (int) (S_v == 128), (int) (v->ne[2] >= 128));
+        GGML_LOG_INFO("turbo-probe:   contig q=%d k=%d g=%d beta=%d state=%d\n",
+                      (int) ggml_is_contiguous(q),  (int) ggml_is_contiguous(k),
+                      (int) ggml_is_contiguous(g),  (int) ggml_is_contiguous(b),
+                      (int) ggml_is_contiguous(st));
+        GGML_LOG_INFO("turbo-probe:   v nb0ok=%d nb1ok=%d nb3ok=%d\n",
+                      (int) (v->nb[0] == ggml_type_size(v->type)),
+                      (int) (v->nb[1] == (size_t) S_v * ggml_type_size(v->type)),
+                      (int) (v->nb[3] == (size_t) v->ne[2] * v->nb[2]));
+    }
+}
+
 static void ggml_cuda_op_gated_delta_net_impl(
         ggml_backend_cuda_context & ctx, ggml_tensor * dst, const ggml_cuda_gated_delta_net_fused_cache * cache) {
     ggml_tensor * src_q     = dst->src[0];
@@ -337,10 +383,12 @@ static void ggml_cuda_op_gated_delta_net_impl(
 
     // Route to the chunked prefill kernel when eligible.
     if (cache == nullptr && ggml_cuda_gdn_op_is_chunked(dst)) {
+        turbo_probe_gdn(dst, true);
         ggml_cuda_op_gated_delta_net_chunked(ctx, dst);
         return;
     }
 
+    turbo_probe_gdn(dst, false);
     // recurrent state -> gdn_out tail (after attention scores), or the cache when fusing
     float * state_d           = dst_d + S_v * H * n_tokens * n_seqs;
     int64_t state_slot_stride = S_v * S_v * H * n_seqs;
