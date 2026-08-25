@@ -1157,8 +1157,32 @@ private:
 
         int n_ctx_slot = llama_n_ctx_seq(ctx_tgt);
         if (n_ctx_slot > n_ctx_train) {
-            SRV_WRN("the slot context (%d) exceeds the training context of the model (%d) - using rope scaling to extend\n", n_ctx_slot, n_ctx_train);
-            // Do not cap: caller has configured rope scaling (--rope-scale / --rope-scaling yarn) to handle extended context.
+            // Upstream caps n_ctx_slot to n_ctx_train here. We deliberately do not, because a
+            // caller running YaRN / linear rope scaling legitimately wants the longer window.
+            //
+            // But the previous version of this branch ASSERTED that scaling was configured and
+            // said so in the log, without checking. If it is not configured, the model is being
+            // run past its trained length with no extension at all and quality degrades silently
+            // - the worst kind of failure, because the log claimed the opposite. So check.
+            // Defaults are UNSPECIFIED / 0.0f / -1.0f, so "configured" means moved off those.
+            // rope_scale_train != 1.0f covers a model that ships its own scaling in the GGUF.
+            const float rope_scale_train = llama_model_rope_freq_scale_train(model_tgt);
+            const auto  rst              = params_base.rope_scaling_type;
+            const bool  scaling_active   =
+                   (rst != LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED && rst != LLAMA_ROPE_SCALING_TYPE_NONE)
+                || params_base.rope_freq_scale != 0.0f
+                || params_base.yarn_ext_factor >  0.0f
+                || rope_scale_train           != 1.0f;
+
+            if (scaling_active) {
+                SRV_WRN("the slot context (%d) exceeds the training context (%d) - rope scaling is active, extending\n",
+                        n_ctx_slot, n_ctx_train);
+            } else {
+                SRV_WRN("the slot context (%d) exceeds the training context (%d) and NO rope scaling is configured.\n",
+                        n_ctx_slot, n_ctx_train);
+                SRV_WRN("%s", "    output quality will degrade beyond the trained length. Either lower -c, or set\n");
+                SRV_WRN("%s", "    --rope-scaling yarn together with --yarn-ext-factor / --rope-scale.\n");
+            }
         }
 
         slots.clear();

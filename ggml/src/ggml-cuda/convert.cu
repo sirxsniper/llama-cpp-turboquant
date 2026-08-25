@@ -255,6 +255,86 @@ static void dequantize_block_cuda(const void * vx, dst_t * y,
         (vx, y, ne00, ne01, ne0203, ne02_fdv, s01, s02, s03);
 }
 
+// ---- turbo4 -> dst, NON-CONTIGUOUS (strided) source ----
+//
+// Same defect and same cure as the contiguous kernel above: the generic path calls
+// turbo4_dequant_element once per element, which does TURBO_CENTROIDS_4BIT[idx] * norm
+// with a data-dependent index into __constant__ memory. Constant memory serialises
+// when lanes in a warp read different addresses, so a random 4-bit index degenerates
+// into up to 16 broadcasts. On the contiguous path fixing this was worth +57%
+// (45.2 -> 70.8 tok/s at ~90K context).
+//
+// This variant handles the strided layout used by ggml_get_to_fp16_nc_cuda: a row of
+// ne00 elements with row/slice strides s01/s02/s03 in ELEMENTS. One warp per turbo4
+// block (QK_TURBO4 = 128 elements); rows are processed independently so an arbitrary
+// row stride costs nothing beyond the base offset.
+template <typename dst_t>
+static __global__ void dequantize_block_turbo4_0_nc(
+        const void * __restrict__ vx, dst_t * __restrict__ y,
+        const int64_t ne00, const int64_t ne01, const int64_t ne0203,
+        const uint3 ne02_fdv, const int64_t s01, const int64_t s02, const int64_t s03) {
+
+    const int64_t blocks_per_row = ne00 / QK_TURBO4;
+
+    const int64_t i01   = blockIdx.y;
+    const int64_t i0203 = blockIdx.z;
+    if (i01 >= ne01 || i0203 >= ne0203) {
+        return;
+    }
+    // s01/s02/s03 are strides in BLOCKS, not elements (dequantize_block_cont_cuda passes
+    // k/qk), and the destination is indexed by the flattened i0203 - both exactly as the
+    // generic dequantize_block kernel above does it.
+    const uint2   dm  = fast_div_modulo((uint32_t) i0203, ne02_fdv);
+    const int64_t i02 = dm.y;
+    const int64_t i03 = dm.x;
+
+    const int warps_per_block = blockDim.x / WARP_SIZE;
+    const int64_t ib_in_row = (int64_t) blockIdx.x * warps_per_block + (threadIdx.x / WARP_SIZE);
+    if (ib_in_row >= blocks_per_row) {
+        return;
+    }
+    const int lane = threadIdx.x % WARP_SIZE;
+
+    // Source: block strides, then the block this warp owns.
+    const int64_t ibx0 = i03 * s03 + i02 * s02 + i01 * s01;
+    const block_turbo4_0 * __restrict__ x = (const block_turbo4_0 *) vx + ibx0 + ib_in_row;
+
+    // Destination is packed [ne00, ne01, ne02*ne03].
+    dst_t * __restrict__ yrow = y + (i0203 * ne01 + i01) * ne00 + ib_in_row * QK_TURBO4;
+
+    const float norm = __half2float(x->norm);
+
+    // Lane L < 16 holds centroid L pre-scaled by this block's norm; __shfl_sync then
+    // broadcasts it. Registers have no divergence penalty, unlike constant memory.
+    const float my_scaled = (lane < 16) ? TURBO_CENTROIDS_4BIT[lane] * norm : 0.0f;
+
+    constexpr int per_lane = QK_TURBO4 / WARP_SIZE;   // 4
+#pragma unroll
+    for (int e = 0; e < per_lane; e += 2) {
+        const int j = lane * per_lane + e;
+        const uint8_t qb = x->qs[j >> 1];
+        const float v0 = __shfl_sync(0xFFFFFFFFu, my_scaled, (qb >> 0) & 0xFu, WARP_SIZE);
+        const float v1 = __shfl_sync(0xFFFFFFFFu, my_scaled, (qb >> 4) & 0xFu, WARP_SIZE);
+        yrow[j + 0] = (dst_t) v0;
+        yrow[j + 1] = (dst_t) v1;
+    }
+}
+
+template<typename dst_t>
+static void dequantize_row_turbo4_0_nc_cuda(const void * vx, dst_t * y,
+        const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t ne03,
+        const int64_t s01, const int64_t s02, const int64_t s03, cudaStream_t stream) {
+    GGML_ASSERT(ne00 % QK_TURBO4 == 0 && "turbo4 nc dequant needs block-aligned rows");
+    const int64_t ne0203 = ne02*ne03;
+    const uint3 ne02_fdv = init_fastdiv_values(ne02);
+    constexpr int warps_per_block = 4;
+    const int64_t blocks_per_row = ne00 / QK_TURBO4;
+    const dim3 num_blocks((unsigned) ((blocks_per_row + warps_per_block - 1) / warps_per_block),
+                          (unsigned) std::min(ne01,   (int64_t) 65535),
+                          (unsigned) std::min(ne0203, (int64_t) 65535));
+    dequantize_block_turbo4_0_nc<dst_t><<<num_blocks, warps_per_block*WARP_SIZE, 0, stream>>>
+        (vx, y, ne00, ne01, ne0203, ne02_fdv, s01, s02, s03);
+}
 template <int qk, int qr, dequantize_kernel_t dequantize_kernel, typename dst_t>
 static void dequantize_block_cont_cuda(const void * __restrict__ vx, dst_t * __restrict__ y, const int64_t k, cudaStream_t stream) {
     dequantize_block_cuda<qk, qr, dequantize_kernel, dst_t>(vx, y, k, 1, 1, 1, k/qk, k/qk, k/qk, stream);
@@ -732,7 +812,7 @@ to_fp16_nc_cuda_t ggml_get_to_fp16_nc_cuda(ggml_type type) {
         case GGML_TYPE_TURBO2_0:
             return dequantize_block_cuda<QK_TURBO2, QR_TURBO2, dequantize_turbo2_0>;
         case GGML_TYPE_TURBO4_0:
-            return dequantize_block_cuda<QK_TURBO4, QR_TURBO4, dequantize_turbo4_0>;
+            return dequantize_row_turbo4_0_nc_cuda;
         case GGML_TYPE_BF16:
             return convert_unary_cuda<nv_bfloat16>;
         default:
@@ -788,7 +868,7 @@ to_fp32_nc_cuda_t ggml_get_to_fp32_nc_cuda(ggml_type type) {
         case GGML_TYPE_TURBO2_0:
             return dequantize_block_cuda<QK_TURBO2, QR_TURBO2, dequantize_turbo2_0>;
         case GGML_TYPE_TURBO4_0:
-            return dequantize_block_cuda<QK_TURBO4, QR_TURBO4, dequantize_turbo4_0>;
+            return dequantize_row_turbo4_0_nc_cuda;
         case GGML_TYPE_BF16:
             return convert_unary_cuda<nv_bfloat16, float>;
         default:

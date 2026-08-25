@@ -4096,6 +4096,18 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_CPU_MOE"));
 
     add_opt(common_arg(
+        {"--spec-rs-seq"}, "N",
+        string_format(
+            "recurrent-state snapshots kept per sequence for speculative rollback "
+            "(default: automatic = draft n-max; 0 disables partial rollback)\n"
+            "on hybrid recurrent models (Qwen3.5/3.8, Nemotron-H, LFM2, ...) this also "
+            "decides GDN prefill speed: any value > 0 makes K > 1, which disables the "
+            "chunked GDN kernel and forces the slower sequential one on every prefill"),
+        [](common_params & params, int value) {
+            params.speculative.rs_seq_override = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_RS_SEQ"));
+    add_opt(common_arg(
         {"--spec-draft-n-max"}, "N",
         string_format("number of tokens to draft for speculative decoding (default: %d)", params.speculative.draft.n_max),
         [](common_params & params, int value) {

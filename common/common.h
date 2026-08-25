@@ -383,10 +383,31 @@ struct common_params_speculative {
         return !draft.mparams.empty();
     }
 
+    // -1 = automatic (draft.n_max when a draft model needs rollback). Anything >= 0
+    // overrides it.
+    //
+    // Why this is exposed: n_rs_seq feeds K = n_rs_seq + 1 in the gated-delta-net graph
+    // (delta-net-base.cpp:564), and the CUDA chunked GDN prefill kernel is only eligible
+    // when K == 1 (gated_delta_net.cu:262). So enabling a draft model silently forces
+    // every prefill onto the sequential GDN kernel, measured at 3.49 TFLOPS against
+    // MUL_MAT's 260 on the same device.
+    //
+    // Partial rollback is an OPTIMISATION, not a correctness requirement - without it the
+    // server truncates the draft and replays (server-context.cpp, spec_is_replay). So on a
+    // hybrid recurrent model this is a real trade: --spec-rs-seq 0 gives up partial
+    // rollback (and fine-grained prompt-cache reuse within the last n_rs_seq tokens) to get
+    // the fast chunked GDN prefill back. Which side wins is workload-dependent and must be
+    // measured, so it is a knob rather than a hard-coded choice.
+    int32_t rs_seq_override = -1;
+
     uint32_t need_n_rs_seq() const {
         bool needs_rs_seq = std::any_of(types.begin(), types.end(), [&](auto t) {
             return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP || t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 || t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
         });
+
+        if (rs_seq_override >= 0) {
+            return (uint32_t) rs_seq_override;
+        }
 
         return needs_rs_seq ? draft.n_max : 0u;
     }
