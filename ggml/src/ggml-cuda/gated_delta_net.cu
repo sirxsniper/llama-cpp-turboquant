@@ -54,13 +54,30 @@ gated_delta_net_cuda(const float * q,
     static_assert(S_v % warp_size == 0, "S_v must be a multiple of warp_size");
     constexpr int rows_per_lane = (S_v + warp_size - 1) / warp_size;
     float         s_shard[rows_per_lane];
+
+    // Row mapping. The reduction below sums over ALL i, so the lane->i assignment is free
+    // to choose; only read and write must agree, and the external [S_v][S_v] layout is
+    // untouched because we still address state[col*S_v + i].
+    //
+    // Lane-contiguous (i = lane*rows_per_lane + r) lets each lane move its whole shard in
+    // ONE float4 instead of four scalar loads, for k, q and the state. The old strided
+    // mapping (i = r*warp_size + lane) was equally coalesced but issued 4x the load
+    // instructions - which matters here because this kernel is latency-bound, not
+    // bandwidth-bound: GATED_DELTA_NET measures 1.8-3.9 TFLOPS on a card that does ~250
+    // on dense matmul, and Qwen3.8-Flash-Next runs 36 of its 48 layers through it.
+    constexpr bool vec4 = (rows_per_lane == 4) && (S_v % (4*warp_size) == 0);
+    auto row_of = [&] (int r) { return vec4 ? (lane*rows_per_lane + r) : (r*warp_size + lane); };
     // state is stored transposed: M[col][i] = S[i][col], row col is contiguous
 
     ggml_cuda_pdl_sync();
+    if constexpr (vec4) {
+        const float4 sv = *(const float4 *) (curr_state + lane*4);
+        s_shard[0] = sv.x; s_shard[1] = sv.y; s_shard[2] = sv.z; s_shard[3] = sv.w;
+    } else {
 #pragma unroll
-    for (int r = 0; r < rows_per_lane; r++) {
-        const int i = r * warp_size + lane;
-        s_shard[r]  = curr_state[i];
+        for (int r = 0; r < rows_per_lane; r++) {
+            s_shard[r] = curr_state[r * warp_size + lane];
+        }
     }
 
     for (int t = 0; t < n_tokens; t++) {
@@ -77,11 +94,18 @@ gated_delta_net_cuda(const float * q,
         // Cache k and q in registers
         float k_reg[rows_per_lane];
         float q_reg[rows_per_lane];
+        if constexpr (vec4) {
+            const float4 kv4 = *(const float4 *) (k_t + lane*4);
+            const float4 qv4 = *(const float4 *) (q_t + lane*4);
+            k_reg[0]=kv4.x; k_reg[1]=kv4.y; k_reg[2]=kv4.z; k_reg[3]=kv4.w;
+            q_reg[0]=qv4.x; q_reg[1]=qv4.y; q_reg[2]=qv4.z; q_reg[3]=qv4.w;
+        } else {
 #pragma unroll
-        for (int r = 0; r < rows_per_lane; r++) {
-            const int i = r * warp_size + lane;
-            k_reg[r] = k_t[i];
-            q_reg[r] = q_t[i];
+            for (int r = 0; r < rows_per_lane; r++) {
+                const int i = row_of(r);
+                k_reg[r] = k_t[i];
+                q_reg[r] = q_t[i];
+            }
         }
 
         if constexpr (!KDA) {
@@ -117,7 +141,7 @@ gated_delta_net_cuda(const float * q,
             float kv_shard = 0.0f;
 #pragma unroll
             for (int r = 0; r < rows_per_lane; r++) {
-                const int i = r * warp_size + lane;
+                const int i = row_of(r);
                 kv_shard += expf(g_t[i]) * s_shard[r] * k_reg[r];
             }
 
@@ -131,7 +155,7 @@ gated_delta_net_cuda(const float * q,
             float attn_partial = 0.0f;
 #pragma unroll
             for (int r = 0; r < rows_per_lane; r++) {
-                const int i = r * warp_size + lane;
+                const int i = row_of(r);
                 s_shard[r]  = expf(g_t[i]) * s_shard[r] + k_reg[r] * delta_col;
                 attn_partial += s_shard[r] * q_reg[r];
             }
@@ -153,7 +177,7 @@ gated_delta_net_cuda(const float * q,
                 float * curr_state = state + target_slot * state_slot_stride;
 #pragma unroll
                 for (int r = 0; r < rows_per_lane; r++) {
-                    const int i = r * warp_size + lane;
+                    const int i = row_of(r);
                     curr_state[col * S_v + i] = s_shard[r];
                 }
             }
@@ -161,10 +185,14 @@ gated_delta_net_cuda(const float * q,
     }
 
     if constexpr (!keep_rs_t) {
+        if constexpr (vec4) {
+            float4 sv; sv.x=s_shard[0]; sv.y=s_shard[1]; sv.z=s_shard[2]; sv.w=s_shard[3];
+            *(float4 *) (state + col*S_v + lane*4) = sv;
+        } else {
 #pragma unroll
-        for (int r = 0; r < rows_per_lane; r++) {
-            const int i          = r * warp_size + lane;
-            state[col * S_v + i] = s_shard[r];
+            for (int r = 0; r < rows_per_lane; r++) {
+                state[col * S_v + r * warp_size + lane] = s_shard[r];
+            }
         }
     }
 }
