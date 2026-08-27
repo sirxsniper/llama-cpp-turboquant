@@ -52,8 +52,22 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
 
         LLAMA_LOG_INFO("%s: creating indexer KV cache, size = %u cells\n", __func__, kv_size);
 
+        // The indexer cache inherits the attention cache type. This was briefly pinned to
+        // F16 while chasing turbo4 corruption on Qwen3.8-Flash-Next - that was the wrong
+        // call: the real cause was build_attn_qsa skipping the WHT rotation on Q
+        // (models/qwen4exp.cpp). With that fixed, turbo4 here is correct AND saves ~1.5 GiB
+        // of VRAM at 262144 context, so inheriting is both right and cheaper.
+        // TURBO_IDX_F16=1 forces F16 if a future arch turns out to need it.
+        const char * idx_f16 = getenv("TURBO_IDX_F16");
+        const bool force_f16 = idx_f16 && idx_f16[0] == '1';
+        const ggml_type idx_type_k = force_f16 ? GGML_TYPE_F16 : type_k;
+        const ggml_type idx_type_v = force_f16 ? GGML_TYPE_F16 : type_v;
+        LLAMA_LOG_INFO("%s: indexer cache type = %s/%s%s\n", __func__,
+                       ggml_type_name(idx_type_k), ggml_type_name(idx_type_v),
+                       force_f16 ? " (forced by TURBO_IDX_F16)" : "");
+
         return new llama_kv_cache(
-            model, hparams_idx, type_k, type_v, v_trans, offload, unified,
+            model, hparams_idx, idx_type_k, idx_type_v, v_trans, offload, unified,
             kv_size, n_seq_max, n_pad, n_swa, swa_type,
             nullptr, filter_idx, nullptr, nullptr, "idx_");
     }()) {}

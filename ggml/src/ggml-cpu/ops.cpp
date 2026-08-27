@@ -5045,6 +5045,19 @@ void ggml_compute_forward_get_rows(
         case GGML_TYPE_IQ4_XS:
         case GGML_TYPE_IQ3_S:
         case GGML_TYPE_IQ2_S:
+        // TurboQuant KV types reach get_rows on hybrid models: qwen4exp looks up
+        // per_layer_token_embd with GGML_OP_GET_ROWS, and with -ot pinning that table
+        // (and the experts) to CPU the lookup runs on the CPU backend. Without these
+        // cases the switch falls through to GGML_ABORT("fatal error") - which is exactly
+        // what -ctk turbo4 hit on Qwen3.8-Flash-Next. It never showed on the 27B because
+        // every tensor there lives on the GPU.
+        //
+        // get_rows_q is type-generic - it dequantizes through
+        // ggml_get_type_traits(type)->to_float - and all three turbo types define that
+        // (ggml.c: dequantize_row_turbo{2,3,4}_0), so they need no special handling.
+        case GGML_TYPE_TURBO2_0:
+        case GGML_TYPE_TURBO3_0:
+        case GGML_TYPE_TURBO4_0:
             {
                 ggml_compute_forward_get_rows_q(params, dst);
             } break;

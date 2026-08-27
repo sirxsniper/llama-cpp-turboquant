@@ -344,6 +344,27 @@ static void ggml_cuda_get_rows_switch_src0_type(
             get_rows_cuda_q<QK8_0, QR8_0, dequantize_q8_0>(src0_d, src1_d, dst_d,
                 ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
             break;
+        // TurboQuant KV types. qwen4exp's sparse attention gathers K-cache blocks with
+        // ggml_get_rows (models/qwen4exp.cpp: ggml_get_rows(ctx0, k_all, inp->blk_cells)),
+        // so -ctk turbo4 lands here on the live decode path. The switch below has no
+        // default arm, which meant an unhandled type silently ran NO kernel and left the
+        // destination buffer as-is - the model answered the previous question, or emitted
+        // an empty string, with no error anywhere. Both the cases and the abort matter.
+        //
+        // Like q8_0 these use qr == 1: one call yields two CONSECUTIVE elements, which is
+        // what the turbo packing gives (element j lives in byte j/2, nibble j%2).
+        case GGML_TYPE_TURBO4_0:
+            get_rows_cuda_q<QK_TURBO4, QR_TURBO4, dequantize_turbo4_0>(src0_d, src1_d, dst_d,
+                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+            break;
+        case GGML_TYPE_TURBO3_0:
+            get_rows_cuda_q<QK_TURBO3, QR_TURBO3, dequantize_turbo3_0>(src0_d, src1_d, dst_d,
+                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+            break;
+        case GGML_TYPE_TURBO2_0:
+            get_rows_cuda_q<QK_TURBO2, QR_TURBO2, dequantize_turbo2_0>(src0_d, src1_d, dst_d,
+                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+            break;
         case GGML_TYPE_Q2_K:
             get_rows_cuda_kq<64, dst_t, dequantize_q2_K<dst_t>>(src0_d, src1_d, dst_d,
                 ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);

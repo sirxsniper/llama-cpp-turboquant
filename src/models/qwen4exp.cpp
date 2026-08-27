@@ -615,8 +615,44 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
+    // TurboQuant pre-rotate-queries. This MUST mirror llm_graph_context::build_attn:
+    // a turbo KV cache stores K already WHT-rotated, so Q has to be rotated into the
+    // same basis or every score is computed against a mismatched basis.
+    //
+    // build_attn_qsa calls build_attn_mha directly and therefore bypassed the rotation
+    // that build_attn applies. The failure was subtle: sparse attention only engages
+    // once n_kv exceeds the QSA budget, so short prompts took the dense build_attn path
+    // and answered correctly while longer generations silently derailed. Measured on
+    // Qwen3.8-Flash-Next with -ctk turbo4: '17 * 23' -> '2 x 1 = 2', banana -> 'Blue',
+    // while q8_0 answered every probe correctly.
+    if (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0) {
+        if (q->ne[0] % 128 != 0) {
+            const int64_t pad = ((q->ne[0] + 127) / 128) * 128 - q->ne[0];
+            q = ggml_pad(ctx0, q, pad, 0, 0, 0);
+        }
+        if (!ggml_is_contiguous(q)) { q = ggml_cont(ctx0, q); }
+        ggml_tensor * innerq_scale = mctx_cur->get_turbo_innerq_scale_inv();
+        q = ggml_turbo_wht(ctx0, q, 0, 0, innerq_scale);  // 0 = forward, 0 = auto group size
+    }
+
     ggml_tensor * cur = build_attn_mha(q, k, v, nullptr, kq_mask_top_k, nullptr, nullptr, kq_scale, il);
     cb(cur, "kqv_out", il);
+
+    // If V was padded to a 128 multiple for the turbo cache, trim the output back to the
+    // real head dim (build_attn does the same after its own build_attn_mha).
+    if (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0) {
+        const int64_t orig_v_head   = hparams.n_embd_head_v(il);
+        const int64_t padded_v_head = v->ne[0];
+        if (padded_v_head != orig_v_head) {
+            const int64_t n_head_v     = hparams.n_head_kv(il);
+            const int64_t n_tokens_cur = cur->ne[1];
+            cur = ggml_reshape_3d(ctx0, cur, padded_v_head, n_head_v, n_tokens_cur);
+            cur = ggml_view_3d(ctx0, cur, orig_v_head, n_head_v, n_tokens_cur,
+                               cur->nb[1], cur->nb[2], 0);
+            cur = ggml_cont(ctx0, cur);
+            cur = ggml_reshape_2d(ctx0, cur, orig_v_head * n_head_v, n_tokens_cur);
+        }
+    }
 
     // the rotation is its own inverse, so undo it on the value side of the output
     if (inp->self_v_rot) {
