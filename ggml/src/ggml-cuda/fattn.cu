@@ -5,6 +5,8 @@
 #include "fattn-vec.cuh"
 #include "fattn.cuh"
 
+#include <set>
+
 template <int DKQ, int DV, int ncols2>
 static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
@@ -541,7 +543,25 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
                 // So MMA is the right target once the conversion is not pathological;
                 // routing turbo to VEC for wide Q was a workaround and is not needed.
                 if (cc >= GGML_CUDA_CC_ADA_LOVELACE) {
-                    if (Q->ne[1] <= 2) {
+                    // VEC dequantizes every KV cell inline, so its cost grows with n_kv.
+                    // For q8_0 that per-cell work is a cheap scale; for the turbo types it is
+                    // a centroid lookup and the cost dominates. Measured on Qwen3.8-Flash-Next
+                    // (turbo4, ncmoe 36, 262144 ctx) decode collapsed 23 -> 4 tok/s from 0.5K
+                    // to 80K context while q8_0 stayed flat at ~22-26. Both took VEC here.
+                    //
+                    // MMA pays a full-cache F16 conversion but then runs on tensor cores, and
+                    // the fork's own numbers already favoured it for turbo (27B, ~90K ctx:
+                    // MMA 70.8 tok/s vs VEC native 46.6). So send the turbo types to MMA once
+                    // the cache is deep enough for the per-cell cost to matter; keep VEC for
+                    // short contexts where the conversion would not pay for itself.
+                    const bool turbo_K = K->type == GGML_TYPE_TURBO2_0 ||
+                                         K->type == GGML_TYPE_TURBO3_0 ||
+                                         K->type == GGML_TYPE_TURBO4_0;
+                    const char * force = getenv("TURBO_FA_VEC");
+                    const bool force_vec = force && force[0] == '1';
+                    if (turbo_K && !force_vec && K->ne[1] >= 4096) {
+                        // fall through to MMA
+                    } else if (Q->ne[1] <= 2) {
                         return BEST_FATTN_KERNEL_VEC;
                     }
                 } else {
@@ -645,6 +665,28 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
 
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
+    // Diagnostic: report ONCE per (kernel, K type, decode/prefill) which FA kernel runs.
+    // Decode with a turbo KV cache collapses linearly with context (23 -> 4 tok/s from
+    // 0.5K to 80K on Qwen3.8-Flash-Next) while q8_0 stays flat, pointing at the MMA path's
+    // full-cache F16 materialisation (fattn-common.cuh: to_fp16 over ggml_nelements(K) on
+    // EVERY call). This says which path each type actually takes. TURBO_PATH_PROBE=0 silences.
+    {
+        static std::set<int> seen;
+        const best_fattn_kernel kprobe = ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst);
+        const ggml_tensor * Kp = dst->src[1];
+        const ggml_tensor * Qp = dst->src[0];
+        const int key = ((int) kprobe << 16) | ((int) Kp->type << 4) | (Qp->ne[1] <= 2 ? 1 : 0);
+        const char * e = getenv("TURBO_PATH_PROBE");
+        if (!(e && e[0] == '0') && seen.insert(key).second) {
+            const char * kn = kprobe == BEST_FATTN_KERNEL_VEC     ? "VEC (reads KV natively)"        :
+                              kprobe == BEST_FATTN_KERNEL_MMA_F16 ? "MMA_F16 (full-cache F16 copy)" :
+                              kprobe == BEST_FATTN_KERNEL_TILE    ? "TILE (full-cache F16 copy)"    : "NONE";
+            fprintf(stderr, "turbo-probe: FA kernel = %s | K=%s Q->ne[1]=%d n_kv=%d kq_stride_ok=%d\n",
+                    kn, ggml_type_name(Kp->type), (int) Qp->ne[1], (int) Kp->ne[1],
+                    (int) (Kp->ne[1] % FATTN_KQ_STRIDE == 0));
+            fflush(stderr);
+        }
+    }
     switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
         case BEST_FATTN_KERNEL_NONE:
             GGML_ABORT("fatal error");
