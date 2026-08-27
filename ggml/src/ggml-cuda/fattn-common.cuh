@@ -475,6 +475,41 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_turbo2_0(
     return sum;
 }
 
+// 16-entry int8 centroid table held in FOUR REGISTERS, selected arithmetically.
+//
+// Why not just index TURBO_CENTROIDS_4BIT_INT8[idx]: constant memory broadcasts only
+// when every lane reads the SAME address. A 4-bit quant index is data-dependent, so a
+// warp hits up to 16 distinct addresses and the access replays up to 16 times. That
+// cost is paid per KV element, so it grows with context depth - which is exactly why
+// this int8 path was measured slower than the float path and abandoned. Packing the
+// table into registers removes the memory access entirely, so there is nothing to
+// serialise and no shuffle/sync needed either.
+//
+// The four packing reads below use COMPILE-TIME indices, so every lane reads the same
+// address and they broadcast; they happen once per call, not once per element.
+struct turbo4_int8_lut {
+    uint32_t w0, w1, w2, w3;
+
+    static __device__ __forceinline__ uint32_t pack(int b0, int b1, int b2, int b3) {
+        return  (uint32_t) (uint8_t) TURBO_CENTROIDS_4BIT_INT8[b0]        |
+               ((uint32_t) (uint8_t) TURBO_CENTROIDS_4BIT_INT8[b1] <<  8) |
+               ((uint32_t) (uint8_t) TURBO_CENTROIDS_4BIT_INT8[b2] << 16) |
+               ((uint32_t) (uint8_t) TURBO_CENTROIDS_4BIT_INT8[b3] << 24);
+    }
+
+    __device__ __forceinline__ void init() {
+        w0 = pack( 0,  1,  2,  3);
+        w1 = pack( 4,  5,  6,  7);
+        w2 = pack( 8,  9, 10, 11);
+        w3 = pack(12, 13, 14, 15);
+    }
+
+    // Select entry i (0..15) with predicated moves and a shift - pure ALU.
+    __device__ __forceinline__ uint32_t byte_of(unsigned i) const {
+        const uint32_t w = (i < 4u) ? w0 : (i < 8u) ? w1 : (i < 12u) ? w2 : w3;
+        return (w >> ((i & 3u) * 8u)) & 0xFFu;
+    }
+};
 // Turbo4 KQ dot product via __dp4a (int8 hardware path, like q8 uses).
 // Pre-quantized centroids in TURBO_CENTROIDS_4BIT_INT8 + Q_q8 from main kernel.
 // Final scale = norm * (max_centroid_abs / 127) * Q_d.
@@ -482,58 +517,55 @@ template <int D, int nthreads>
 static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_turbo4_0_int(
     const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
 
+    // int8 __dp4a KQ dot for turbo4 - the same hardware path q8_0 uses.
+    //
+    // The element mapping MUST mirror vec_dot_fattn_vec_KQ_q8_0: Q_q8 and Q_ds are laid
+    // out for the interleaved access k_KQ = k_KQ_0 + tid, indexed by k_KQ_0/nthreads.
+    // An earlier version of this function walked contiguous per-thread blocks and read
+    // Q_ds[0] for every group, which silently used the wrong Q scale for all but the
+    // first group whenever elems_per_thread spanned more than one quant block (D=256,
+    // nthreads=16). The model then answered a different question than it was asked.
+    //
+    // Centroids come from a register LUT (turbo4_int8_lut) rather than
+    // TURBO_CENTROIDS_4BIT_INT8[idx], because a data-dependent index into constant
+    // memory replays up to 16x per warp and that cost is paid per KV element - which is
+    // what made this path measure slower than the float one and get abandoned.
     const block_turbo4_0 * K_turbo = (const block_turbo4_0 *) K_c;
     GGML_UNUSED(Q_v);
 
-    // Per-thread element count: each dp4a does 4 elements, so we need elems_per_thread/4 dp4a calls.
-    constexpr int elems_per_thread = D / nthreads;
-    static_assert(elems_per_thread >= 4 && (elems_per_thread % 4) == 0, "elems_per_thread must be multiple of 4");
-    constexpr int n_dp4a = elems_per_thread / 4;
+    turbo4_int8_lut lut;
+    lut.init();
 
-    const int tid = (nthreads == WARP_SIZE) ? threadIdx.x : (threadIdx.x % nthreads);
-
-    int sumi = 0;
-    int ib_first = -1;
+    float sum = 0.0f;
 
 #pragma unroll
-    for (int g = 0; g < n_dp4a; ++g) {
-        // Each thread: groups of 4 elements (one dp4a per group).
-        const int elem0 = tid * elems_per_thread + g * 4;
+    for (int k_KQ_0 = 0; k_KQ_0 < int(D/sizeof(int)); k_KQ_0 += nthreads) {
+        const int k_KQ = k_KQ_0 + (nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads);
+
+        // each k_KQ covers 4 consecutive elements = 2 packed qs bytes
+        const int elem0 = k_KQ * 4;
         const int ib    = elem0 / QK_TURBO4;
         const int j0    = elem0 % QK_TURBO4;
-        if (g == 0) ib_first = ib;
 
-        // Load 2 qs bytes (4 nibbles = 4 elements). qs[] is at offset 2 in struct → align 2.
         uint16_t qs_pair;
         ggml_cuda_memcpy_1<2, 2>(&qs_pair, K_turbo[ib].qs + (j0 >> 1));
-        const uint8_t qs0 = qs_pair & 0xFFu;
-        const uint8_t qs1 = (qs_pair >> 8) & 0xFFu;
+        const uint32_t qs0 = qs_pair & 0xFFu;
+        const uint32_t qs1 = (qs_pair >> 8) & 0xFFu;
 
-        // Lookup int8 K values from precomputed table
-        const int8_t k_int8_0 = TURBO_CENTROIDS_4BIT_INT8[(qs0 >> 0) & 0xF];
-        const int8_t k_int8_1 = TURBO_CENTROIDS_4BIT_INT8[(qs0 >> 4) & 0xF];
-        const int8_t k_int8_2 = TURBO_CENTROIDS_4BIT_INT8[(qs1 >> 0) & 0xF];
-        const int8_t k_int8_3 = TURBO_CENTROIDS_4BIT_INT8[(qs1 >> 4) & 0xF];
+        const int v_packed = (int) ( lut.byte_of((qs0 >> 0) & 0xFu)        |
+                                   (lut.byte_of((qs0 >> 4) & 0xFu) <<  8) |
+                                   (lut.byte_of((qs1 >> 0) & 0xFu) << 16) |
+                                   (lut.byte_of((qs1 >> 4) & 0xFu) << 24) );
 
-        // Pack 4 int8 K values into one int (little-endian byte ordering)
-        int v_packed = (int(uint8_t(k_int8_0)) <<  0) |
-                       (int(uint8_t(k_int8_1)) <<  8) |
-                       (int(uint8_t(k_int8_2)) << 16) |
-                       (int(uint8_t(k_int8_3)) << 24);
+        const float2 * Q_ds = (const float2 *) Q_ds_v;
+        const float    Q_d  = Q_ds[k_KQ_0/nthreads].x;
+        const float    norm = __half2float(K_turbo[ib].norm);
 
-        // Hardware-accelerated dot product (Blackwell: __dp4a is 1 instruction for 4 int8 elements)
-        sumi = ggml_cuda_dp4a(v_packed, Q_q8[g], sumi);
+        const int sumi = ggml_cuda_dp4a(v_packed, Q_q8[k_KQ_0/nthreads], 0);
+        sum += float(sumi) * (norm * TURBO_INT8_4BIT_SCALE_REVERSE) * Q_d;
     }
 
-    // K block norm (same for all elements covered by this thread when elems_per_thread <= QK_TURBO4)
-    const float norm = __half2float(K_turbo[ib_first].norm);
-
-    // Q's d scale (one per cpy_ne_KQ-sized chunk in Q_ds; for nthreads=32 D=128, just Q_ds[0])
-    const float2 * Q_ds = (const float2 *) Q_ds_v;
-    const float Q_d = Q_ds[0].x;
-
-    // Recover float result: int sum * (max_centroid_abs / 127) * norm * Q_d
-    return float(sumi) * (norm * TURBO_INT8_4BIT_SCALE_REVERSE) * Q_d;
+    return sum;
 }
 
 // Turbo4 KQ dot product — optimized for sm_120 (Blackwell) on this fork.
@@ -1242,24 +1274,39 @@ static __device__ __forceinline__ void dequantize_V_turbo4_0(const void * __rest
         const uint8_t idx1 = (qs_byte0 >> 4) & 0xF;
         const uint8_t idx2 = (qs_byte1 >> 0) & 0xF;
         const uint8_t idx3 = (qs_byte1 >> 4) & 0xF;
+        
+        // Same warp-cooperative fix the ne == 8 path above already carries; this branch
+        // never received it. Four TURBO_CENTROIDS_4BIT[idx] reads per call with
+        // data-dependent indices serialise - constant memory broadcasts only when every
+        // lane reads the SAME address, so 16 distinct centroids can mean 16-way replay,
+        // and that cost is paid per V element per KV cell, i.e. it grows with context.
+        // Measured on Qwen3.8-Flash-Next (turbo4, ncmoe 36): decode fell 23 -> 4 tok/s
+        // from 0.5K to 80K context while q8_0 stayed flat.
+        constexpr int V_NT4 = 16;
+        const unsigned sl4  = threadIdx.x % V_NT4;
+        const float    msc4 = TURBO_CENTROIDS_4BIT[sl4] * norm;
+        const float s0 = __shfl_sync(0xFFFFFFFFu, msc4, idx0, V_NT4);
+        const float s1 = __shfl_sync(0xFFFFFFFFu, msc4, idx1, V_NT4);
+        const float s2 = __shfl_sync(0xFFFFFFFFu, msc4, idx2, V_NT4);
+        const float s3 = __shfl_sync(0xFFFFFFFFu, msc4, idx3, V_NT4);
 
 #ifdef FP16_AVAILABLE
         if constexpr (std::is_same_v<T, half>) {
             ((half2 *) dst)[0] = make_half2(
-                __float2half(TURBO_CENTROIDS_4BIT[idx0] * norm),
-                __float2half(TURBO_CENTROIDS_4BIT[idx1] * norm));
+                __float2half(s0),
+                __float2half(s1));
             ((half2 *) dst)[1] = make_half2(
-                __float2half(TURBO_CENTROIDS_4BIT[idx2] * norm),
-                __float2half(TURBO_CENTROIDS_4BIT[idx3] * norm));
+                __float2half(s2),
+                __float2half(s3));
         } else
 #endif // FP16_AVAILABLE
         if constexpr (std::is_same_v<T, float>) {
             ((float2 *) dst)[0] = make_float2(
-                TURBO_CENTROIDS_4BIT[idx0] * norm,
-                TURBO_CENTROIDS_4BIT[idx1] * norm);
+                s0,
+                s1);
             ((float2 *) dst)[1] = make_float2(
-                TURBO_CENTROIDS_4BIT[idx2] * norm,
-                TURBO_CENTROIDS_4BIT[idx3] * norm);
+                s2,
+                s3);
         } else {
             static_assert(std::is_same_v<T, void>, "unsupported type");
         }
@@ -1305,7 +1352,12 @@ constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
         // because per-thread divergent indices into TURBO_CENTROIDS_4BIT_INT8 (constant
         // memory) serialize, costing more than the dp4a-vs-float-mul saving. Float path
         // wins because warp-cooperative shfl-broadcast eliminates the divergent const-mem hit.
-        return vec_dot_fattn_vec_KQ_turbo4_0<D, nthreads>;
+        // turbo4 uses the int8 __dp4a path, the same hardware dot product q8_0 uses.
+        // The float path costs far more per KV element, and because that cost is paid
+        // per element it compounds with context depth: measured on Qwen3.8-Flash-Next
+        // (turbo4, ncmoe 36, 262144 ctx) decode fell 23 -> 4 tok/s from 0.5K to 80K
+        // while q8_0 - which already used __dp4a - stayed flat at 22-26.
+        return vec_dot_fattn_vec_KQ_turbo4_0_int<D, nthreads>;
     } else {
         static_assert(type_K == -1, "bad type");
         return nullptr;

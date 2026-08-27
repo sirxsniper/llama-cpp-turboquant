@@ -92,7 +92,12 @@ static __global__ void flash_attn_ext_vec(
     // get q8's nthreads_KQ_q (=32 for D=128) for parallelism. Tested int8/__dp4a path
     // proved slower at depth (constant-memory serialization on divergent lookups).
     constexpr bool type_K_is_turbo = (type_K == GGML_TYPE_TURBO3_0 || type_K == GGML_TYPE_TURBO2_0 || type_K == GGML_TYPE_TURBO4_0);
-    constexpr bool K_is_unquantized = (type_K == GGML_TYPE_F16 || type_K == GGML_TYPE_BF16 || type_K_is_turbo);
+    // turbo4 now takes the int8 __dp4a KQ path, so it needs the int8-quantized Q that
+    // Q_q8_1 (= !K_is_unquantized) produces - the same Q q8_0 gets. turbo2/turbo3 keep
+    // the float path and stay classed as unquantized.
+    constexpr bool type_K_is_turbo_int = (type_K == GGML_TYPE_TURBO4_0);
+    constexpr bool K_is_unquantized = (type_K == GGML_TYPE_F16 || type_K == GGML_TYPE_BF16 ||
+                                       (type_K_is_turbo && !type_K_is_turbo_int));
     constexpr bool V_is_unquantized = (type_V == GGML_TYPE_F16 || type_V == GGML_TYPE_BF16 || type_V == GGML_TYPE_TURBO3_0 || type_V == GGML_TYPE_TURBO2_0 || type_V == GGML_TYPE_TURBO4_0);
     // PERF (turbo K alignment fix attempt): turbo K uses 16 threads/K (not 32) so
     // cpy_ne=4 fits and byte_base=tid*4 is uniformly 4-byte aligned → single LDG.E.32
