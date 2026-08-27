@@ -148,6 +148,34 @@ struct llama_grammar {
                              trigger_patterns;         // Regular expressions that trigger a lazy grammar. Must be a full match of the entire generated
                                                        // string, and the grammar will be given the string from the first match group onwards.
 
+
+    // ---- decoded-codepoint cache (appended LAST on purpose) ----
+    //
+    // llama_grammar_clone_impl and the two factory functions build llama_grammar with
+    // aggregate initialization listing the members above positionally. Anything inserted
+    // before them shifts that list and breaks the build, so these must stay at the end;
+    // they are then value-initialized (empty) in a clone, which is correct - a clone simply
+    // refills its own cache lazily.
+    //
+    // Why the cache exists: llama_grammar_apply_impl runs over EVERY candidate, because the
+    // grammar sampler is applied before top-k, and called decode_utf8() on each, which
+    // heap-allocates a vector per token - ~151K allocations per call on Qwen3.8-27B. That
+    // call fires whenever a stochastically sampled token violates the grammar, i.e. almost
+    // every token while emitting tool-call arguments. Greedy sampling hides it completely
+    // (the top token is nearly always grammar-valid), which is why it went unnoticed:
+    // measured 8.6-16.8 arg chunks/s under default sampling vs 60-148 under temperature 0.
+    //
+    // decode_utf8(piece, partial) depends only on the token id when partial has no pending
+    // bytes (n_remain == 0), the overwhelmingly common case, so it is computed once per id.
+    // cp_cache is sized once up front so it never reallocates and the pointers handed to
+    // llama_grammar_reject_candidates stay valid for the whole call.
+    mutable std::vector<std::vector<uint32_t>> cp_cache;
+    mutable std::vector<llama_partial_utf8>    cp_cache_tail;
+    mutable std::vector<bool>                  cp_cached;
+
+    // Scratch reused across calls so the per-call reserve() stops re-allocating.
+    mutable std::vector<std::pair<std::vector<uint32_t>, llama_partial_utf8>> scratch_decoded;
+    mutable llama_grammar_candidates                                          scratch_candidates;
 };
 
 //

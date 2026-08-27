@@ -1,4 +1,6 @@
 #include "gated_delta_net.cuh"
+
+#include <cstdio>   // probe writes to stderr: GGML_LOG_INFO is filtered out by llama-server
 #include "chunk_gated_delta_net.cuh"
 #include "ggml-cuda/common.cuh"
 
@@ -278,7 +280,14 @@ bool ggml_cuda_gdn_op_is_chunked(const ggml_tensor * dst) {
 // question about GDN cost, and it currently has to be inferred by reading source. One
 // log line settles it. Set TURBO_PATH_PROBE=0 to silence.
 static void turbo_probe_gdn(const ggml_tensor * dst, bool chunked) {
-    static bool done = false;
+    // Report once per BATCH CLASS, not once per process. The first GDN op in a run is a
+    // 2-token warm-up from memory fitting, which is trivially sequential (n_tokens < 128)
+    // and says nothing about prefill - the earlier version of this probe reported exactly
+    // that and answered the wrong question.
+    static bool done_large = false;   // n_tokens >= 128: prefill, chunk-eligible size
+    static bool done_small = false;   // n_tokens <  128: decode / verify / warm-up
+    const bool  is_large   = dst->src[2]->ne[2] >= 128;
+    bool &      done       = is_large ? done_large : done_small;
     if (done) {
         return;
     }
@@ -297,22 +306,23 @@ static void turbo_probe_gdn(const ggml_tensor * dst, bool chunked) {
     const ggml_tensor * st = dst->src[5];
     const int64_t S_v = v->ne[0];
 
-    GGML_LOG_INFO("turbo-probe: GDN path = %s  (n_tokens=%d S_v=%d neq0=%d)\n",
+    fprintf(stderr, "turbo-probe: GDN path = %s  (n_tokens=%d S_v=%d neq0=%d)\n",
                   chunked ? "CHUNKED (fast)" : "SEQUENTIAL (slow)",
                   (int) v->ne[2], (int) S_v, (int) q->ne[0]);
     if (!chunked) {
-        GGML_LOG_INFO("turbo-probe:   kda=%d K=%d neq0_128=%d S_v_128=%d ntok_ge_128=%d\n",
+        fprintf(stderr, "turbo-probe:   kda=%d K=%d neq0_128=%d S_v_128=%d ntok_ge_128=%d\n",
                       (int) (g->ne[0] == S_v), ggml_get_op_params_i32(dst, 0),
                       (int) (q->ne[0] == 128), (int) (S_v == 128), (int) (v->ne[2] >= 128));
-        GGML_LOG_INFO("turbo-probe:   contig q=%d k=%d g=%d beta=%d state=%d\n",
+        fprintf(stderr, "turbo-probe:   contig q=%d k=%d g=%d beta=%d state=%d\n",
                       (int) ggml_is_contiguous(q),  (int) ggml_is_contiguous(k),
                       (int) ggml_is_contiguous(g),  (int) ggml_is_contiguous(b),
                       (int) ggml_is_contiguous(st));
-        GGML_LOG_INFO("turbo-probe:   v nb0ok=%d nb1ok=%d nb3ok=%d\n",
+        fprintf(stderr, "turbo-probe:   v nb0ok=%d nb1ok=%d nb3ok=%d\n",
                       (int) (v->nb[0] == ggml_type_size(v->type)),
                       (int) (v->nb[1] == (size_t) S_v * ggml_type_size(v->type)),
                       (int) (v->nb[3] == (size_t) v->ne[2] * v->nb[2]));
     }
+    fflush(stderr);
 }
 
 static void ggml_cuda_op_gated_delta_net_impl(

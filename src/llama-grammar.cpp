@@ -1365,10 +1365,22 @@ void llama_grammar_apply_impl(const struct llama_grammar & grammar, llama_token_
         }
     }
 
-    std::vector<std::pair<std::vector<uint32_t>, llama_partial_utf8>> candidates_decoded;
-    candidates_decoded.reserve(cur_p->size);
+    // Fast path: with no pending UTF-8 bytes the decode of a token depends only on its id,
+    // so it is cached across calls. Otherwise fall back to decoding per candidate.
+    const bool use_cache = grammar.partial_utf8.n_remain == 0 && grammar.vocab != nullptr;
 
-    llama_grammar_candidates candidates_grammar;
+    if (use_cache && grammar.cp_cache.empty()) {
+        const size_t n_vocab = (size_t) grammar.vocab->n_tokens();
+        grammar.cp_cache.resize(n_vocab);
+        grammar.cp_cache_tail.resize(n_vocab);
+        grammar.cp_cached.assign(n_vocab, false);
+    }
+
+    std::vector<std::pair<std::vector<uint32_t>, llama_partial_utf8>> & candidates_decoded = grammar.scratch_decoded;
+    llama_grammar_candidates & candidates_grammar = grammar.scratch_candidates;
+    candidates_decoded.clear();
+    candidates_grammar.clear();
+    candidates_decoded.reserve(cur_p->size);
     candidates_grammar.reserve(cur_p->size);
 
     for (size_t i = 0; i < cur_p->size; ++i) {
@@ -1381,6 +1393,15 @@ void llama_grammar_apply_impl(const struct llama_grammar & grammar, llama_token_
             }
         } else if (piece.empty() || piece[0] == 0) {
             cur_p->data[i].logit = -INFINITY;
+        } else if (use_cache) {
+            const size_t uid = (size_t) id;
+            if (!grammar.cp_cached[uid]) {
+                auto decoded = decode_utf8(piece, grammar.partial_utf8);
+                grammar.cp_cache[uid]      = std::move(decoded.first);
+                grammar.cp_cache_tail[uid] = decoded.second;
+                grammar.cp_cached[uid]     = true;
+            }
+            candidates_grammar.push_back({ i, grammar.cp_cache[uid].data(), grammar.cp_cache_tail[uid], id });
         } else {
             candidates_decoded.push_back(decode_utf8(piece, grammar.partial_utf8));
             candidates_grammar.push_back({ i, candidates_decoded.back().first.data(), candidates_decoded.back().second, id });
