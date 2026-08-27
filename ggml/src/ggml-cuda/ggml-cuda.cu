@@ -1,4 +1,6 @@
 #include "ggml-cuda.h"
+
+#include <set>
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
 
@@ -2059,6 +2061,29 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 }
 
 static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst) {
+    // turbo-op-probe: report ONCE per (op, src0 type) every op that consumes a turbo
+    // tensor, so we can see which kernel actually touches the KV/indexer caches instead
+    // of inferring it. TURBO_OP_PROBE=0 silences.
+    {
+        static std::set<int> seen;
+        const ggml_tensor * a = dst->src[0];
+        const ggml_tensor * b = dst->src[1];
+        auto is_turbo = [](const ggml_tensor * t) {
+            return t && (t->type == GGML_TYPE_TURBO2_0 || t->type == GGML_TYPE_TURBO3_0 ||
+                         t->type == GGML_TYPE_TURBO4_0);
+        };
+        const char * e = getenv("TURBO_OP_PROBE");
+        if (e && e[0] == '1' && (is_turbo(a) || is_turbo(b))) {
+            const int key = ((int) dst->op << 8) | (int) (a ? a->type : GGML_TYPE_COUNT);
+            if (seen.insert(key).second) {
+                fprintf(stderr, "turbo-op: %s src0=%s[%d,%d] src1=%s dst=%s\n",
+                        ggml_op_name(dst->op),
+                        a ? ggml_type_name(a->type) : "-", a ? (int) a->ne[0] : 0, a ? (int) a->ne[1] : 0,
+                        b ? ggml_type_name(b->type) : "-", ggml_type_name(dst->type));
+                fflush(stderr);
+            }
+        }
+    }
     switch (dst->op) {
         case GGML_OP_ARGMAX:
             ggml_cuda_argmax(ctx, dst);

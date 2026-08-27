@@ -70,8 +70,13 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
         const bool  inherit_idx  = idx_inherit && idx_inherit[0] == '1';
         const bool  k_is_turbo   = (type_k == GGML_TYPE_TURBO2_0 || type_k == GGML_TYPE_TURBO3_0 ||
                                     type_k == GGML_TYPE_TURBO4_0);
-        const ggml_type idx_type_k = (k_is_turbo && !inherit_idx) ? GGML_TYPE_F16 : type_k;
-        const ggml_type idx_type_v = (k_is_turbo && !inherit_idx) ? GGML_TYPE_F16 : type_v;
+        // q8_0, not F16: half the memory (1.5 GiB vs 3.0 at 262144) and measured just as
+        // fast on this path, which buys back a whole expert layer on the GPU.
+        // TURBO_IDX_TYPE=f16 forces F16 if a future arch needs the precision.
+        const char * idx_ty = getenv("TURBO_IDX_TYPE");
+        const ggml_type idx_fallback = (idx_ty && idx_ty[0] == 'f') ? GGML_TYPE_F16 : GGML_TYPE_Q8_0;
+        const ggml_type idx_type_k = (k_is_turbo && !inherit_idx) ? idx_fallback : type_k;
+        const ggml_type idx_type_v = (k_is_turbo && !inherit_idx) ? idx_fallback : type_v;
         LLAMA_LOG_INFO("%s: indexer cache type = %s/%s%s\n", __func__,
                        ggml_type_name(idx_type_k), ggml_type_name(idx_type_v),
                        k_is_turbo && !inherit_idx ? " (F16 by default: turbo indexer is O(n_kv)/token in QSA)" : "");
