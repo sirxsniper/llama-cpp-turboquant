@@ -52,19 +52,29 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
 
         LLAMA_LOG_INFO("%s: creating indexer KV cache, size = %u cells\n", __func__, kv_size);
 
-        // The indexer cache inherits the attention cache type. This was briefly pinned to
-        // F16 while chasing turbo4 corruption on Qwen3.8-Flash-Next - that was the wrong
-        // call: the real cause was build_attn_qsa skipping the WHT rotation on Q
-        // (models/qwen4exp.cpp). With that fixed, turbo4 here is correct AND saves ~1.5 GiB
-        // of VRAM at 262144 context, so inheriting is both right and cheaper.
-        // TURBO_IDX_F16=1 forces F16 if a future arch turns out to need it.
-        const char * idx_f16 = getenv("TURBO_IDX_F16");
-        const bool force_f16 = idx_f16 && idx_f16[0] == '1';
-        const ggml_type idx_type_k = force_f16 ? GGML_TYPE_F16 : type_k;
-        const ggml_type idx_type_v = force_f16 ? GGML_TYPE_F16 : type_v;
+        // The indexer cache does NOT inherit a turbo attention cache type.
+        //
+        // It feeds build_qsa_top_k, which gathers the WHOLE indexer cache every decode
+        // token to score which blocks to attend to - so its per-element cost is paid
+        // O(n_kv) per token and compounds with context depth. With turbo4 here, decode on
+        // Qwen3.8-Flash-Next collapsed from 23 to 4 tok/s between 0.5K and 80K context;
+        // with F16 it stays flat (25.2 / 26.3 / 24.6 / 22.4 at 0.5K / 10K / 40K / 80K).
+        //
+        // This is NOT a workaround for missing turbo support: the attention cache stays
+        // turbo, which is where the memory actually is. turbo4 attention (1.7 GiB at
+        // 262144) plus an F16 indexer (3.0 GiB) still beats q8_0 for both (6.0 GiB), so
+        // turbo buys a whole extra expert layer on the GPU and matches q8_0 on speed.
+        //
+        // TURBO_IDX_INHERIT=1 restores inheritance for measurement.
+        const char * idx_inherit = getenv("TURBO_IDX_INHERIT");
+        const bool  inherit_idx  = idx_inherit && idx_inherit[0] == '1';
+        const bool  k_is_turbo   = (type_k == GGML_TYPE_TURBO2_0 || type_k == GGML_TYPE_TURBO3_0 ||
+                                    type_k == GGML_TYPE_TURBO4_0);
+        const ggml_type idx_type_k = (k_is_turbo && !inherit_idx) ? GGML_TYPE_F16 : type_k;
+        const ggml_type idx_type_v = (k_is_turbo && !inherit_idx) ? GGML_TYPE_F16 : type_v;
         LLAMA_LOG_INFO("%s: indexer cache type = %s/%s%s\n", __func__,
                        ggml_type_name(idx_type_k), ggml_type_name(idx_type_v),
-                       force_f16 ? " (forced by TURBO_IDX_F16)" : "");
+                       k_is_turbo && !inherit_idx ? " (F16 by default: turbo indexer is O(n_kv)/token in QSA)" : "");
 
         return new llama_kv_cache(
             model, hparams_idx, idx_type_k, idx_type_v, v_trans, offload, unified,

@@ -115,7 +115,11 @@ static __global__ void flash_attn_ext_vec(
     // shfl pattern (~50% wrong-half lookups) AND the half2-packing overhead — single
     // shfl per element with CORRECT semantics. V_cols_per_iter halves to 2, but the
     // total V positions per warp per outer K step is unchanged (just more iters of k0).
-    constexpr int nthreads_V  = type_V_is_turbo ? 16 : (V_is_unquantized ? 128 / cpy_nb : nthreads_V_q);
+    // turbo now uses 8 threads per V position, matching f16/bf16, so
+    // V_cols_per_iter = WARP_SIZE/nthreads_V is 4 instead of 2. The 16 was only ever
+    // needed for the one-centroid-per-lane shuffle in dequantize_V_turbo4_0, which
+    // now holds two centroids per lane and selects after shuffling.
+    constexpr int nthreads_V  = type_V_is_turbo ? 8 : (V_is_unquantized ? 128 / cpy_nb : nthreads_V_q);
 
     static_assert(WARP_SIZE % nthreads_KQ == 0, "bad nthreads_K");
     static_assert(WARP_SIZE % nthreads_V  == 0, "bad nthreads_V");

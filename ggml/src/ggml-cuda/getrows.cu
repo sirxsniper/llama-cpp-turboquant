@@ -1,4 +1,6 @@
 #include "getrows.cuh"
+
+#include <set>
 #include "dequantize.cuh"
 #include "convert.cuh"
 
@@ -156,6 +158,99 @@ static __global__ void k_get_rows_back_float(
     }
 }
 
+// ---- turbo4 get_rows: warp-cooperative centroid broadcast ----
+//
+// qwen4exp's sparse attention gathers the ENTIRE indexer cache every decode token
+// (models/qwen4exp.cpp, build_qsa_top_k: ggml_get_rows(ctx0, k_all, inp->blk_cells)),
+// so this kernel runs O(n_kv) per token and its per-element cost compounds with context.
+//
+// The generic get_rows_cuda_q path calls dequantize_turbo4_0 per element, which reads
+// TURBO_CENTROIDS_4BIT[idx] with a data-dependent index. Constant memory broadcasts only
+// when every lane reads the SAME address, so a 4-bit index means up to 16-way replay.
+// Measured on Qwen3.8-Flash-Next (turbo4, ncmoe 36, 262144 ctx): decode fell 23 -> 4
+// tok/s from 0.5K to 80K, while the same run with an F16 indexer stayed at 20 -> 16.7.
+//
+// Cure is the one that worked in convert.cu (+57% there): each lane holds ONE centroid
+// pre-scaled by the block norm and __shfl_sync broadcasts it from registers, which has
+// no divergence penalty. One warp per turbo4 block (QK_TURBO4 = 128 elements).
+template <typename dst_t>
+static __global__ void k_get_rows_turbo4(
+        const void * __restrict__ src0, const int32_t * __restrict__ src1, dst_t * __restrict__ dst,
+        const int64_t ne00, const int64_t ne11, const uint3 ne12_fdv,
+        const size_t s1, const size_t s2, const size_t s3,
+        const size_t nb01, const size_t nb02, const size_t nb03,
+        const size_t s10, const size_t s11, const size_t s12) {
+
+    const int64_t blocks_per_row = ne00 / QK_TURBO4;
+
+    const int     i10 = blockIdx.x;
+    const int64_t z   = blockIdx.z;
+    const uint2   dm  = fast_div_modulo((uint32_t) z, ne12_fdv);
+    const int     i11 = dm.x;
+    const int     i12 = dm.y;
+
+    const int warps_per_block = blockDim.x / WARP_SIZE;
+    const int64_t ib = (int64_t) blockIdx.y * warps_per_block + (threadIdx.x / WARP_SIZE);
+    if (ib >= blocks_per_row) {
+        return;
+    }
+    const int lane = threadIdx.x % WARP_SIZE;
+
+    const int i01 = src1[i10*s10 + i11*s11 + i12*s12];
+
+    const block_turbo4_0 * __restrict__ x =
+        (const block_turbo4_0 *) ((const char *) src0 + i01*nb01 + i11*nb02 + i12*nb03) + ib;
+    dst_t * __restrict__ y = dst + i10*s1 + i11*s2 + i12*s3 + ib*QK_TURBO4;
+
+    const float norm = __half2float(x->norm);
+
+    // lane L < 16 holds centroid L already scaled by this block's norm
+    const float my_scaled = (lane < 16) ? TURBO_CENTROIDS_4BIT[lane] * norm : 0.0f;
+
+    constexpr int per_lane = QK_TURBO4 / WARP_SIZE;   // 4 elements per lane
+#pragma unroll
+    for (int e = 0; e < per_lane; e += 2) {
+        const int j = lane * per_lane + e;
+        const uint8_t qb = x->qs[j >> 1];
+        const float v0 = __shfl_sync(0xFFFFFFFFu, my_scaled, (qb >> 0) & 0xFu, WARP_SIZE);
+        const float v1 = __shfl_sync(0xFFFFFFFFu, my_scaled, (qb >> 4) & 0xFu, WARP_SIZE);
+        y[j + 0] = ggml_cuda_cast<dst_t>(v0);
+        y[j + 1] = ggml_cuda_cast<dst_t>(v1);
+    }
+}
+
+template<typename dst_t>
+static void get_rows_cuda_turbo4(
+        const void * src0_d, const int32_t * src1_d, dst_t * dst_d,
+        const int64_t ne00, const size_t nb01, const size_t nb02, const size_t nb03,
+        const int64_t ne10, const int64_t ne11, const int64_t ne12,
+        const size_t nb10, const size_t nb11, const size_t nb12,
+        const size_t nb1, const size_t nb2, const size_t nb3,
+        cudaStream_t stream) {
+    GGML_ASSERT(ne00 % QK_TURBO4 == 0 && "turbo4 get_rows needs block-aligned rows");
+
+    constexpr int warps_per_block = 4;
+    const int64_t blocks_per_row  = ne00 / QK_TURBO4;
+
+    const dim3 block_dims(warps_per_block*WARP_SIZE, 1, 1);
+    const dim3 block_nums((unsigned) ne10,
+                          (unsigned) MIN((blocks_per_row + warps_per_block - 1) / warps_per_block, (int64_t) UINT16_MAX),
+                          (unsigned) MIN(ne11*ne12, (int64_t) UINT16_MAX));
+
+    const size_t s1 = nb1 / sizeof(dst_t);
+    const size_t s2 = nb2 / sizeof(dst_t);
+    const size_t s3 = nb3 / sizeof(dst_t);
+    const size_t s10 = nb10 / sizeof(int32_t);
+    const size_t s11 = nb11 / sizeof(int32_t);
+    const size_t s12 = nb12 / sizeof(int32_t);
+
+    GGML_ASSERT(ne12 > 0);
+    const uint3 ne12_fdv = init_fastdiv_values(ne12);
+
+    k_get_rows_turbo4<dst_t><<<block_nums, block_dims, 0, stream>>>(
+        src0_d, src1_d, dst_d, ne00, ne11, ne12_fdv,
+        s1, s2, s3, nb01, nb02, nb03, s10, s11, s12);
+}
 template<int qk, int qr, dequantize_kernel_t dq, typename dst_t>
 static void get_rows_cuda_q(
         const void * src0_d, const int32_t * src1_d, dst_t * dst_d,
@@ -354,7 +449,7 @@ static void ggml_cuda_get_rows_switch_src0_type(
         // Like q8_0 these use qr == 1: one call yields two CONSECUTIVE elements, which is
         // what the turbo packing gives (element j lives in byte j/2, nibble j%2).
         case GGML_TYPE_TURBO4_0:
-            get_rows_cuda_q<QK_TURBO4, QR_TURBO4, dequantize_turbo4_0>(src0_d, src1_d, dst_d,
+            get_rows_cuda_turbo4(src0_d, src1_d, dst_d,
                 ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
             break;
         case GGML_TYPE_TURBO3_0:
@@ -461,6 +556,18 @@ void get_rows_cuda(
 }
 
 void ggml_cuda_op_get_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    // one-shot: which src0 types actually flow through get_rows, and how big.
+    {
+        static std::set<int> seen;
+        const ggml_tensor * s0 = dst->src[0];
+        const char * e = getenv("TURBO_PATH_PROBE");
+        if (!(e && e[0] == '0') && seen.insert((int) s0->type).second) {
+            fprintf(stderr, "turbo-probe: get_rows src0=%s ne=[%d,%d] dst=%s\n",
+                    ggml_type_name(s0->type), (int) s0->ne[0], (int) s0->ne[1],
+                    ggml_type_name(dst->type));
+            fflush(stderr);
+        }
+    }
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
 

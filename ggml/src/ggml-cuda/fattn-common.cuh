@@ -1229,12 +1229,29 @@ static __device__ __forceinline__ void dequantize_V_turbo4_0(const void * __rest
         // turbo4's 16-entry centroid table) — single shfl per centroid lookup with
         // CORRECT semantics. Previously V_NTHREADS_TURBO=8 forced 2 centroids per lane
         // and used a buggy select-before-shfl pattern that returned ~50% wrong halves.
-        constexpr int V_NTHREADS_TURBO = 16;
+        // 8 lanes per V position, each holding TWO of the 16 centroids.
+        //
+        // This used to be 16 so that each lane could hold exactly one centroid, which
+        // made the shuffle trivial. But nthreads_V feeds V_cols_per_iter =
+        // WARP_SIZE/nthreads_V (fattn-vec.cuh), so 16 processes only 2 V positions per
+        // warp iteration where f16/bf16 - which use 8 - process 4. The 16 was never a
+        // requirement of the algorithm, only of that one-centroid-per-lane shortcut, and
+        // it cost half the V throughput.
+        //
+        // Two centroids per lane is correct as long as the SELECT happens after both
+        // shuffles: lane L holds centroids L and L+8, every lane shuffles both halves
+        // from source lane (i & 7), and only then picks by (i < 8). The earlier attempt
+        // selected before shuffling, which is why it returned ~50% wrong halves.
+        // Group width stays 8 so every lane in a group shares the same block norm.
+        constexpr int V_NTHREADS_TURBO = 8;
         const unsigned sub_lane = threadIdx.x % V_NTHREADS_TURBO;
-        const float my_scaled = TURBO_CENTROIDS_4BIT[sub_lane] * norm;
+        const float my_scaled_lo = TURBO_CENTROIDS_4BIT[sub_lane]     * norm;  // 0..7
+        const float my_scaled_hi = TURBO_CENTROIDS_4BIT[sub_lane + 8] * norm;  // 8..15
 
         auto get_scaled = [&] (unsigned i) -> float {
-            return __shfl_sync(0xFFFFFFFFu, my_scaled, i, V_NTHREADS_TURBO);
+            const float lo = __shfl_sync(0xFFFFFFFFu, my_scaled_lo, i & 7u, V_NTHREADS_TURBO);
+            const float hi = __shfl_sync(0xFFFFFFFFu, my_scaled_hi, i & 7u, V_NTHREADS_TURBO);
+            return (i < 8u) ? lo : hi;   // select AFTER both shuffles
         };
 
         // Compute all 8 scaled values via shfl (1 shfl per element, CORRECT)
