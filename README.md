@@ -79,13 +79,27 @@ TurboQuant provides three custom quantization formats that outperform standard G
 
 | Format | Bits/weight | Notes |
 |--------|------------|-------|
-| `turbo4_0` | ~4.0 | Drop-in replacement for `q4_0`, with rotation-based clustering |
+| `turbo4_0` | 4.25 | 16 Lloyd-Max centroids, nibble packed, WHT pre-rotation |
 | `turbo3_0` | ~3.0 | Sub-byte with Hadamard pre-rotation |
 | `turbo2_0` | ~2.0 | Aggressive compression with WHT-space centroids |
 
 All formats have CUDA kernels optimised for Turing+ (SM75), Ampere (SM80/86), Ada (SM89), and Blackwell (SM120/121).
 
 For implementation details (type IDs, file map, the InnerQ cross-DLL handshake, FA-vec dispatch, and how to add a new turbo type) see [docs/TURBOQUANT-INTERNALS.md](docs/TURBOQUANT-INTERNALS.md).
+
+### KV cache at depth
+
+The primary use of the turbo formats here is the **KV cache**, where they cut VRAM enough to hold a full 256K context on a single 32 GB card. At 262144 tokens on Qwen3.8-27B the cache costs 4.3 GiB as `turbo4` against 8.0 GiB as `q8_0` and 16.0 GiB as `f16`.
+
+Decode reads the quantized cache **natively at every context depth**. This matters more than it sounds: the flash-attention MMA kernel cannot read a quantized cache, so anything routed to it must first materialise the entire cache as F16 — once per layer, per token. Keeping decode on the path that reads `turbo4` directly is worth up to **+45% at full context** (see [Recent changes](#recent-changes)).
+
+Two escape hatches exist for A/B testing:
+
+| Variable | Effect |
+|----------|--------|
+| `TURBO_FA_MMA=1` | restore the old depth-based MMA routing |
+| `TURBO_MMA_NATIVE=0` | disable native turbo reads in the MMA tile loader |
+| `TURBO_IDX_INHERIT=1` | let the sparse-attention indexer cache inherit the turbo type |
 
 ---
 
@@ -119,13 +133,49 @@ cmake --build build --target llama-server -j$(nproc)
 
 | Branch | Description |
 |--------|-------------|
-| `feature/triattention` | **Default** — TurboQuant + TriAttention (latest) |
+| `turbo4-depth-fix-2026-08-28` | **Latest** — turbo4 KV at depth, native MMA tile loading |
+| `feature/triattention` | TurboQuant + TriAttention |
 | `feature/turboquant-kv-cache` | TurboQuant base (pre-TriAttention) |
 | `master` | Upstream llama.cpp base |
 
 ---
 
+## Current focus
+
+Long-context throughput on a single RTX 5090: holding a full **262144-token** context with `turbo4` KV while keeping decode and prefill as close to the hardware ceiling as possible. Work is measured with `llama-bench -d <depth>` (repeated, with stddev) rather than through the server, because with a speculative drafter attached the decode rate tracks draft acceptance, which varies with prompt text and swamps the effects being measured.
+
+Open items:
+
+- **Prefill cost of speculation.** Attaching a drafter costs ~13% of prefill throughput. Measurement attributes ~10% to the target's `nextn` hidden-state machinery (an MTP drafter, which loads no second model, costs the same) and ~3% to the drafter's own forward passes. Not yet resolved — skipping the drafter's prompt prefill, the `nextn` GPU→host copy, and the `nextn` flag itself each recovered ~nothing.
+- **Prefill decay with depth.** Effective throughput falls from ~206 to ~67 TFLOPS between `pp512` and `pp512 @ d245760`. Attention FLOPs (~11% of FFN at max depth) do not account for it.
+- **Wide-Q native turbo reads.** The MMA tile loader reads `turbo4` natively for narrow Q only; prefill still uses the F16 conversion because that conversion is amortised across many Q tiles and wins there.
+
 ## Recent changes
+
+### August 2026 — turbo4 KV at depth
+
+Upstream base `b10655`. Decode with a `turbo4` KV cache was being routed away from the kernel that can read it: a turbo-specific rule sent decode to MMA past 4096 tokens, and MMA requires an F16 copy of the whole cache, rebuilt once per layer per token. `q8_0` and `f16` never had that rule, which is why `q8_0` measured *faster* than `turbo4` at depth despite reading twice the bytes.
+
+Removing the rule required first making the native path competitive:
+
+- the centroid lookup in the FA-vec `turbo4` dot product was a chain of three dependent selects called four times per four KV elements; replaced with two hardware byte-permutes (`PRMT`) plus a per-byte blend, verified bit-exact over all 65,536 possible inputs
+- the `turbo4` dequant kernels wrote four consecutive elements as two 4-byte stores, discarding half of every 32-byte memory sector; now one wide store per lane
+- a dequantizing tile loader lets the MMA kernel read `turbo4` directly for narrow Q, so speculative verification no longer pays the F16 materialisation either
+
+`llama-bench` tg64, `Qwen3.8-27B-UD-Q4_K_XL`, RTX 5090, turbo4 KV, r=3:
+
+| Context depth | Before | After | |
+|---------------|--------|-------|---|
+| 0 | 65.58 | 66.41 | |
+| 65,536 | 45.10 | **53.82** | +19.3% |
+| 131,072 | 33.61 | **44.39** | +32.1% |
+| 245,760 | 23.14 | **33.64** | **+45.4%** |
+
+For reference `q8_0`, which never had the bug, measures 35.33 at 245,760 — `turbo4` now sits just under it at half the KV VRAM. Speculative decode gains a further 11–15%. Prefill is unchanged.
+
+Verified with `test-backend-ops -o FLASH_ATTN_EXT` on both routings, and needle-in-a-haystack at 32K / 128K / 245K; old and new routing produce identical output on an identical 240K prompt.
+
+### May 2026
 
 The May 2026 update cycle (commits `ccdce708f` to `fd0a94a4f`) brought this fork from upstream `b8650` to `b9033` and reworked the turbo K/V flash-attention path. See **[docs/CHANGES-2026-05.md](docs/CHANGES-2026-05.md)** for the full per-commit changelog with rationale and perf numbers.
 
