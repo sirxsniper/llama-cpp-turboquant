@@ -138,7 +138,15 @@ static __global__ void flash_attn_ext_vec(
     // 8*8/2 = 32 fits cleanly into D/2 = 64 (loop runs 2 iters, covering full D=128).
     // VKQ register array sized D/2/nthreads_V = 8 — all 8 indices used, no OOB.
     // Bumps V dequant per-thread element count from 4 → 8, doubling V throughput.
-    constexpr int V_rows_per_thread = V_is_unquantized ? 2*cpy_ne : 4;
+    // [TAG_TURBO4_WIDE_V] turbo4 takes 16 elements per dequant call rather than 2*cpy_ne=8.
+    // 16 nibbles is 8 contiguous qs bytes, so each call is one wide load and one norm load;
+    // at 8 it was two calls, two loads and two norms for the same elements. The V loop owns
+    // most of this kernel's load instructions, which an ablation showed to be the binding
+    // constraint rather than the dequant arithmetic. Other types keep 2*cpy_ne.
+    constexpr bool type_V_is_turbo4 = (type_V == GGML_TYPE_TURBO4_0);
+    // Measured: 16 rows/thread halves the V load instructions but costs occupancy through
+    // the larger per-call register footprint, and lost 2% at d131072 against 8. Kept at 8.
+    constexpr int V_rows_per_thread = (V_is_unquantized ? 2*cpy_ne : 4);
     (void)type_V_is_turbo;
     constexpr int V_cols_per_iter   = WARP_SIZE / nthreads_V;
 
@@ -259,10 +267,18 @@ static __global__ void flash_attn_ext_vec(
 
 #pragma unroll
             for (int i0 = 0; i0 < int(D/sizeof(int)); i0 += nthreads_KQ) {
-                const int i = i0 + (nthreads_KQ == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_KQ);
+                const int slot = i0/nthreads_KQ;
+                // [TAG_TURBO4_WIDE_KQ] turbo4's int8 dot gives each thread a CONTIGUOUS run
+                // of element groups so its whole share of the K row is one wide load. Q must
+                // be gathered with the same mapping or every group past the first pairs with
+                // the wrong q8_1 scale. Every other type keeps the interleaved mapping.
+                const int lane = (nthreads_KQ == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_KQ);
+                const int i = type_K_is_turbo_int
+                    ? turbo4_kq_group<D, nthreads_KQ>(slot, lane)
+                    : i0 + lane;
 
-                Q_i32[j][i0/nthreads_KQ] = tmp_q_i32[i];
-                Q_ds[j][i0/nthreads_KQ]  = tmp_q_ds[i/QI8_1];
+                Q_i32[j][slot] = tmp_q_i32[i];
+                Q_ds[j][slot]  = tmp_q_ds[i/QI8_1];
             }
         }
 
@@ -564,7 +580,16 @@ static __global__ void flash_attn_ext_vec(
         for (int i_VKQ_0 = 0; i_VKQ_0 < D/2; i_VKQ_0 += nthreads_V*V_rows_per_thread/2) {
             const int i_VKQ = i_VKQ_0 + (nthreads_V == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_V)*(V_rows_per_thread/2);
 
-            ggml_cuda_memcpy_1<V_rows_per_thread*sizeof(half)>(VKQ_tmp + i_VKQ, &VKQ[j_VKQ][i_VKQ_0/nthreads_V]);
+            // [TAG_TURBO4_WIDE_V] Copy width is capped at ggml_cuda_get_max_cpy_bytes()
+            // rather than tied to V_rows_per_thread. turbo4 now dequantizes 16 rows per
+            // call, which would make this a single 32-byte copy the helper cannot emit.
+            constexpr int n_h2   = V_rows_per_thread/2;
+            constexpr int h2_cpy = n_h2 < 4 ? n_h2 : 4;   // 4 half2 = 16 B
+#pragma unroll
+            for (int c = 0; c < n_h2/h2_cpy; ++c) {
+                ggml_cuda_memcpy_1<h2_cpy*int(sizeof(half2))>(
+                    VKQ_tmp + i_VKQ + c*h2_cpy, &VKQ[j_VKQ][i_VKQ_0/nthreads_V + c*h2_cpy]);
+            }
         }
 #else
         float2 * VKQ_tmp = (float2 *) KQ + threadIdx.y*(V_cols_per_iter*D/2)
@@ -579,8 +604,13 @@ static __global__ void flash_attn_ext_vec(
         for (int i_VKQ_0 = 0; i_VKQ_0 < D/2; i_VKQ_0 += nthreads_V*V_rows_per_thread/2) {
             const int i_VKQ = i_VKQ_0 + (nthreads_V == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_V)*(V_rows_per_thread/2);
 
-            ggml_cuda_memcpy_1<V_rows_per_thread/2*sizeof(float)>(VKQ_tmp + i_VKQ,                       &VKQ[j_VKQ][i_VKQ_0/nthreads_V]);
-            ggml_cuda_memcpy_1<V_rows_per_thread/2*sizeof(float)>(VKQ_tmp + i_VKQ + V_rows_per_thread/4, &VKQ[j_VKQ][i_VKQ_0/nthreads_V + V_rows_per_thread/4]);
+            constexpr int n_f2   = V_rows_per_thread/2;
+            constexpr int f2_cpy = n_f2 < 2 ? n_f2 : 2;   // 2 float2 = 16 B
+#pragma unroll
+            for (int c = 0; c < n_f2/f2_cpy; ++c) {
+                ggml_cuda_memcpy_1<f2_cpy*int(sizeof(float2))>(
+                    VKQ_tmp + i_VKQ + c*f2_cpy, &VKQ[j_VKQ][i_VKQ_0/nthreads_V + c*f2_cpy]);
+            }
         }
 #endif // V_DOT2_F32_F16_AVAILABLE
 

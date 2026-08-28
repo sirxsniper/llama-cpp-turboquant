@@ -490,18 +490,14 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_turbo2_0(
 struct turbo4_int8_lut {
     uint32_t w0, w1, w2, w3;
 
-    static __device__ __forceinline__ uint32_t pack(int b0, int b1, int b2, int b3) {
-        return  (uint32_t) (uint8_t) TURBO_CENTROIDS_4BIT_INT8[b0]        |
-               ((uint32_t) (uint8_t) TURBO_CENTROIDS_4BIT_INT8[b1] <<  8) |
-               ((uint32_t) (uint8_t) TURBO_CENTROIDS_4BIT_INT8[b2] << 16) |
-               ((uint32_t) (uint8_t) TURBO_CENTROIDS_4BIT_INT8[b3] << 24);
-    }
-
+    // Setup is four immediates, not sixteen constant-memory reads plus packing. The words
+    // are derived in turbo-quant.cuh from the same centroid list the __constant__ table
+    // uses, and static_asserted there, so the two cannot fall out of step.
     __device__ __forceinline__ void init() {
-        w0 = pack( 0,  1,  2,  3);
-        w1 = pack( 4,  5,  6,  7);
-        w2 = pack( 8,  9, 10, 11);
-        w3 = pack(12, 13, 14, 15);
+        w0 = TURBO_C4_LUT_W0;
+        w1 = TURBO_C4_LUT_W1;
+        w2 = TURBO_C4_LUT_W2;
+        w3 = TURBO_C4_LUT_W3;
     }
 
     // PERF (CRITICAL): look up FOUR centroids at once using the hardware byte-permute
@@ -533,56 +529,85 @@ struct turbo4_int8_lut {
         return lo ^ ((lo ^ hi) & m);
     }
 };
+// [TAG_TURBO4_WIDE_KQ] Element-group mapping shared by the turbo4 int8 KQ dot and the
+// Q quantization that feeds it. Both MUST use this function or the dot silently pairs K
+// elements with the wrong Q scales.
+//
+// The default FA-vec mapping is interleaved: thread `lane` owns groups {lane, lane+n,
+// lane+2n, ...}, four elements per group. For an 8-bit cache that is fine - each group is
+// a 4-byte load. For turbo4 a group is four 4-bit nibbles, so it is a *2-byte* load, and
+// the kernel ends up issuing exactly as many load instructions per element as q8_0 while
+// moving half the bytes. That is why the two measured identical times at depth despite
+// turbo4 reading half the cache: the kernel is load-instruction bound, not bandwidth bound.
+//
+// Giving each thread a contiguous run of groups instead makes its whole share of the row a
+// single wide load. For D=256 with 16 threads that is 4 groups = 16 elements = 8 bytes,
+// one LDG.E.64 replacing four LDG.E.U16, and the block norm is loaded once instead of once
+// per group. Coalescing is unchanged: 16 lanes x 8 bytes still covers 128 contiguous bytes.
+template <int D, int nthreads>
+static __device__ __forceinline__ int turbo4_kq_group(const int slot, const int lane) {
+    constexpr int groups_per_thread = (D/int(sizeof(int))) / nthreads;
+    return lane*groups_per_thread + slot;
+}
+
 // Turbo4 KQ dot product via __dp4a (int8 hardware path, like q8 uses).
 // Pre-quantized centroids in TURBO_CENTROIDS_4BIT_INT8 + Q_q8 from main kernel.
 // Final scale = norm * (max_centroid_abs / 127) * Q_d.
 template <int D, int nthreads>
 static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_turbo4_0_int(
     const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
-
     // int8 __dp4a KQ dot for turbo4 - the same hardware path q8_0 uses.
     //
-    // The element mapping MUST mirror vec_dot_fattn_vec_KQ_q8_0: Q_q8 and Q_ds are laid
-    // out for the interleaved access k_KQ = k_KQ_0 + tid, indexed by k_KQ_0/nthreads.
-    // An earlier version of this function walked contiguous per-thread blocks and read
-    // Q_ds[0] for every group, which silently used the wrong Q scale for all but the
-    // first group whenever elems_per_thread spanned more than one quant block (D=256,
-    // nthreads=16). The model then answered a different question than it was asked.
+    // Element mapping comes from turbo4_kq_group so that this dot and the Q quantization
+    // in fattn-vec.cuh cannot drift apart. An earlier version walked contiguous per-thread
+    // blocks while Q was still laid out interleaved, and read Q_ds[0] for every group -
+    // which silently used the wrong Q scale for all but the first group. The model then
+    // answered a different question than it was asked, at full speed.
     //
     // Centroids come from a register LUT (turbo4_int8_lut) rather than
-    // TURBO_CENTROIDS_4BIT_INT8[idx], because a data-dependent index into constant
-    // memory replays up to 16x per warp and that cost is paid per KV element - which is
-    // what made this path measure slower than the float one and get abandoned.
+    // TURBO_CENTROIDS_4BIT_INT8[idx], because a data-dependent index into constant memory
+    // replays up to 16x per warp and that cost is paid per KV element.
     const block_turbo4_0 * __restrict__ K_turbo = (const block_turbo4_0 * __restrict__) K_c;
     GGML_UNUSED(Q_v);
+
+    constexpr int groups_per_thread = (D/int(sizeof(int))) / nthreads;
+    constexpr int qs_bytes          = groups_per_thread * 2;   // 4 nibbles per group
 
     turbo4_int8_lut lut;
     lut.init();
 
+    const int lane = (nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads);
+    const float2 * Q_ds = (const float2 *) Q_ds_v;
+
     float sum = 0.0f;
 
+    // One contiguous run of groups per thread => ONE wide qs load for the whole run.
+    const int elem_first = turbo4_kq_group<D, nthreads>(0, lane) * 4;
+    const int ib_first   = elem_first / QK_TURBO4;
+    const int j_first    = elem_first % QK_TURBO4;
+
+    // The run never straddles a turbo4 block: groups_per_thread*4 elements divides
+    // QK_TURBO4 for every configuration this kernel is instantiated with.
+    static_assert(QK_TURBO4 % (groups_per_thread*4) == 0, "turbo4 KQ run straddles a block");
+
+    uint8_t qs_run[qs_bytes];
+    ggml_cuda_memcpy_1<qs_bytes, 2>(qs_run, K_turbo[ib_first].qs + (j_first >> 1));
+
+    // Block norm is uniform across the run, so it is loaded once rather than per group.
+    const float norm_scaled = __half2float(K_turbo[ib_first].norm) * TURBO_INT8_4BIT_SCALE_REVERSE;
+
 #pragma unroll
-    for (int k_KQ_0 = 0; k_KQ_0 < int(D/sizeof(int)); k_KQ_0 += nthreads) {
-        const int k_KQ = k_KQ_0 + (nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads);
-
-        // each k_KQ covers 4 consecutive elements = 2 packed qs bytes
-        const int elem0 = k_KQ * 4;
-        const int ib    = elem0 / QK_TURBO4;
-        const int j0    = elem0 % QK_TURBO4;
-
+    for (int slot = 0; slot < groups_per_thread; ++slot) {
         uint16_t qs_pair;
-        ggml_cuda_memcpy_1<2, 2>(&qs_pair, K_turbo[ib].qs + (j0 >> 1));
+        qs_pair  = (uint16_t) qs_run[2*slot];
+        qs_pair |= (uint16_t) ((uint16_t) qs_run[2*slot + 1] << 8);
 
-        // The two qs bytes already hold the four indices as nibbles i0,i1,i2,i3 from
-        // bit 0 up, which is precisely gather4's input format - no unpacking needed.
+        // The two qs bytes already hold the four indices as nibbles i0..i3 from bit 0 up,
+        // which is precisely gather4's input format - no unpacking needed.
         const int v_packed = (int) lut.gather4((uint32_t) qs_pair);
 
-        const float2 * Q_ds = (const float2 *) Q_ds_v;
-        const float    Q_d  = Q_ds[k_KQ_0/nthreads].x;
-        const float    norm = __half2float(K_turbo[ib].norm);
-
-        const int sumi = ggml_cuda_dp4a(v_packed, Q_q8[k_KQ_0/nthreads], 0);
-        sum += float(sumi) * (norm * TURBO_INT8_4BIT_SCALE_REVERSE) * Q_d;
+        const int   sumi = ggml_cuda_dp4a(v_packed, Q_q8[slot], 0);
+        sum += float(sumi) * norm_scaled * Q_ds[slot].x;
     }
 
     return sum;
@@ -1211,7 +1236,66 @@ static __device__ __forceinline__ void dequantize_V_turbo4_0(const void * __rest
     const int     j0   = i0 % QK_TURBO4;
     const float   norm = __half2float(x[ib].norm);
 
-    static_assert(ne == 2 || ne == 4 || ne == 8, "bad ne");
+    static_assert(ne == 2 || ne == 4 || ne == 8 || ne == 16, "bad ne");
+
+    if constexpr (ne == 16) {
+        // [TAG_TURBO4_WIDE_V] 16-wide path. The V loop dominates load-instruction count:
+        // at D=256 with nthreads_V=8 each thread owns 32 elements, and at 8 per call that
+        // is four 4-byte qs loads plus four separate norm loads - eight instructions to
+        // move 16 bytes. K, after [TAG_TURBO4_WIDE_KQ], needs only two for its whole share.
+        //
+        // An ablation that deleted every dequant gather but kept all loads still left
+        // turbo4 at ~590 GB/s effective, well under q8_0's 807, which is what identified
+        // the load instructions rather than the arithmetic as the binding constraint.
+        //
+        // 16 elements is 8 contiguous qs bytes: one load, one norm, four gathers. Runs
+        // never straddle a block, so the norm is genuinely uniform across all 16.
+        uint32_t qs_lo, qs_hi;
+        {
+            uint32_t tmp2[2];
+            ggml_cuda_memcpy_1<8, 4>(tmp2, x[ib].qs + j0 / 2);
+            qs_lo = tmp2[0];
+            qs_hi = tmp2[1];
+        }
+
+        turbo4_int8_lut lut;
+        lut.init();
+        const float nscale = norm * TURBO_INT8_4BIT_SCALE_REVERSE;
+
+        const int g[4] = {
+            (int) lut.gather4( qs_lo        & 0xFFFFu),
+            (int) lut.gather4((qs_lo >> 16) & 0xFFFFu),
+            (int) lut.gather4( qs_hi        & 0xFFFFu),
+            (int) lut.gather4((qs_hi >> 16) & 0xFFFFu),
+        };
+
+        float s[16];
+#pragma unroll
+        for (int q = 0; q < 4; ++q) {
+            s[4*q + 0] = (float) (int8_t) (g[q]      ) * nscale;
+            s[4*q + 1] = (float) (int8_t) (g[q] >>  8) * nscale;
+            s[4*q + 2] = (float) (int8_t) (g[q] >> 16) * nscale;
+            s[4*q + 3] = (float) (int8_t) (g[q] >> 24) * nscale;
+        }
+
+#ifdef FP16_AVAILABLE
+        if constexpr (std::is_same_v<T, half>) {
+#pragma unroll
+            for (int q = 0; q < 8; ++q) {
+                ((half2 *) dst)[q] = make_half2(__float2half(s[2*q+0]), __float2half(s[2*q+1]));
+            }
+        } else
+#endif
+        if constexpr (std::is_same_v<T, float>) {
+#pragma unroll
+            for (int q = 0; q < 8; ++q) {
+                ((float2 *) dst)[q] = make_float2(s[2*q+0], s[2*q+1]);
+            }
+        } else {
+            static_assert(std::is_same_v<T, void>, "unsupported type");
+        }
+        return;
+    }
 
     if constexpr (ne == 8) {
         // PERF: 8-wide path. 8 consecutive elements span 4 qs bytes — single int load.
@@ -1327,7 +1411,7 @@ static __device__ __forceinline__ void dequantize_V_turbo4_0(const void * __rest
         } else {
             static_assert(std::is_same_v<T, void>, "unsupported type");
         }
-    } else { // ne == 2
+    } else if constexpr (ne == 2) { // ne == 2 (ne == 16 returns above)
 #ifdef FP16_AVAILABLE
         if constexpr (std::is_same_v<T, half>) {
             float v0 = turbo4_dequant_element(&x[ib], j0,   norm);

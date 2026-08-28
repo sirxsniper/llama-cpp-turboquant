@@ -308,10 +308,37 @@ static __constant__ float TURBO_CENTROIDS_4BIT[16] = {
 // real value: float_K = int8_K * (norm * TURBO_INT8_4BIT_SCALE).
 //   max_abs_centroid = 0.173926
 //   int8 centroids   = round(centroid / 0.173926 * 127)
-static __constant__ int8_t TURBO_CENTROIDS_4BIT_INT8[16] = {
-    -127, -86, -65, -50, -37, -26, -15,  -5,
-       5,  15,  26,  37,  50,  65,  86, 127
-};
+// Single source of truth for the int8 centroids. The __constant__ array below and the
+// pre-packed LUT words are both derived from this, so they cannot drift apart.
+#define TURBO_C4_I8_LIST -127, -86, -65, -50, -37, -26, -15,  -5, \
+                            5,  15,  26,  37,  50,  65,  86, 127
+
+static __constant__ int8_t TURBO_CENTROIDS_4BIT_INT8[16] = { TURBO_C4_I8_LIST };
+
+// Host-side mirror, used only to compute the packed LUT words at compile time.
+static constexpr int8_t TURBO_CENTROIDS_4BIT_I8_CE[16] = { TURBO_C4_I8_LIST };
+
+// Four centroids packed per word, in the byte order turbo4_int8_lut::gather4 expects.
+// Building these with constexpr rather than reading the __constant__ array at run time
+// turns LUT setup from 16 constant-memory loads plus ~24 ALU ops per call into four
+// immediates the compiler materialises with MOV32I - no memory traffic at all. Setup is
+// paid once per dequant call, i.e. once per few KV elements, so it scales with depth.
+static constexpr uint32_t turbo4_i8_pack(int b0, int b1, int b2, int b3) {
+    return  (uint32_t) (uint8_t) TURBO_CENTROIDS_4BIT_I8_CE[b0]        |
+           ((uint32_t) (uint8_t) TURBO_CENTROIDS_4BIT_I8_CE[b1] <<  8) |
+           ((uint32_t) (uint8_t) TURBO_CENTROIDS_4BIT_I8_CE[b2] << 16) |
+           ((uint32_t) (uint8_t) TURBO_CENTROIDS_4BIT_I8_CE[b3] << 24);
+}
+static constexpr uint32_t TURBO_C4_LUT_W0 = turbo4_i8_pack( 0,  1,  2,  3);
+static constexpr uint32_t TURBO_C4_LUT_W1 = turbo4_i8_pack( 4,  5,  6,  7);
+static constexpr uint32_t TURBO_C4_LUT_W2 = turbo4_i8_pack( 8,  9, 10, 11);
+static constexpr uint32_t TURBO_C4_LUT_W3 = turbo4_i8_pack(12, 13, 14, 15);
+
+// Guards against a silent change to the centroid list reordering the packed bytes.
+static_assert(TURBO_C4_LUT_W0 == 0xCEBFAA81u, "turbo4 LUT w0 changed");
+static_assert(TURBO_C4_LUT_W1 == 0xFBF1E6DBu, "turbo4 LUT w1 changed");
+static_assert(TURBO_C4_LUT_W2 == 0x251A0F05u, "turbo4 LUT w2 changed");
+static_assert(TURBO_C4_LUT_W3 == 0x7F564132u, "turbo4 LUT w3 changed");
 // SCALE_REVERSE = 0.173926 / 127.0 — used to recover float dot product from int sum
 #define TURBO_INT8_4BIT_SCALE_REVERSE (0.173926f / 127.0f)
 
