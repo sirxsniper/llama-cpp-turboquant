@@ -23,11 +23,13 @@ That target pulls in two directions at once. The KV cache has to be small enough
 
 `Qwen3.8-27B-UD-Q4_K_XL` &middot; RTX 5090 &middot; `turbo4` KV &middot; flash attention &middot; `llama-bench -r 3`
 
+*All six figures from a single run on the shipped build, stock defaults.*
+
 | Context depth | Prefill | Decode | KV cache size |
 |:--------------|--------:|-------:|--------------:|
-| **0** | 3582.93 t/s | 65.29 t/s | &mdash; |
-| **131,072** | 1196.84 t/s | 46.93 t/s | 2.2 GiB |
-| **245,760** | 758.91 t/s | 36.50 t/s | 4.1 GiB |
+| **0** | 3722.70 t/s | 66.57 t/s | &mdash; |
+| **131,072** | 1242.29 t/s | 47.03 t/s | 2.2 GiB |
+| **245,760** | 760.75 t/s | 36.70 t/s | 4.1 GiB |
 | **262,144** | &mdash; | &mdash; | **4.3 GiB** |
 
 </div>
