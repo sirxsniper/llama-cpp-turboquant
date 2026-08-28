@@ -1221,63 +1221,43 @@ static __device__ __forceinline__ void dequantize_V_turbo4_0(const void * __rest
         // instead of two LDG.E.16. Halves memory transactions for V dequant.
         uint32_t qs_word;
         ggml_cuda_memcpy_1<4, 4>(&qs_word, x[ib].qs + j0 / 2);
-        const uint8_t qs_byte0 = (qs_word >>  0) & 0xFFu;
-        const uint8_t qs_byte1 = (qs_word >>  8) & 0xFFu;
-        const uint8_t qs_byte2 = (qs_word >> 16) & 0xFFu;
-        const uint8_t qs_byte3 = (qs_word >> 24) & 0xFFu;
-
-        const unsigned idx[8] = {
-            unsigned((qs_byte0 >> 0) & 0xF), unsigned((qs_byte0 >> 4) & 0xF),
-            unsigned((qs_byte1 >> 0) & 0xF), unsigned((qs_byte1 >> 4) & 0xF),
-            unsigned((qs_byte2 >> 0) & 0xF), unsigned((qs_byte2 >> 4) & 0xF),
-            unsigned((qs_byte3 >> 0) & 0xF), unsigned((qs_byte3 >> 4) & 0xF),
-        };
-
-        // PERF (sub-warp cooperative scaled-centroid sharing for V dequant):
-        // After my V dispatch fix, nthreads_V=8 for turbo. Each group of 8 threads in
-        // the warp processes ONE V position cooperatively. They all share the same norm
-        // and the same 16-entry centroid table. Original code did 8 const-mem lookups
-        // per thread per call (×8 threads = 64 lookups per V position, 16-way serialized
-        // since only 16 distinct centroid addresses exist) → big bottleneck at depth.
-        // Fix: each thread precomputes 2 of the 16 scaled centroids (norm × centroid),
-        // then per element shfl_sync within the 8-thread sub-group to broadcast.
-        // Replaces the const-mem serialization with register-fast shfl. Same per-element
-        // op count BUT avoids LSU stall on divergent constant-memory access.
-        // PERF + CORRECTNESS (turbo4 V dequant): with nthreads_V=16 (set in fattn-vec.cuh
-        // for turbo), each warp has 2 groups of 16 threads. Each group cooperates on
-        // ONE V position. The 16 lanes hold the 16 centroids one-per-lane (matching
-        // turbo4's 16-entry centroid table) — single shfl per centroid lookup with
-        // CORRECT semantics. Previously V_NTHREADS_TURBO=8 forced 2 centroids per lane
-        // and used a buggy select-before-shfl pattern that returned ~50% wrong halves.
-        // 8 lanes per V position, each holding TWO of the 16 centroids.
+        // PERF (V centroid gather): this used to spread the 16 scaled centroids across an
+        // 8-lane sub-group and broadcast them with __shfl_sync - two shuffles per element,
+        // so 16 warp-serializing shuffles per 8-element call. SHFL issues at a fraction of
+        // ALU throughput and carries sync semantics, and the cost is paid per V element per
+        // layer per token, so it scales with context depth.
         //
-        // This used to be 16 so that each lane could hold exactly one centroid, which
-        // made the shuffle trivial. But nthreads_V feeds V_cols_per_iter =
-        // WARP_SIZE/nthreads_V (fattn-vec.cuh), so 16 processes only 2 V positions per
-        // warp iteration where f16/bf16 - which use 8 - process 4. The 16 was never a
-        // requirement of the algorithm, only of that one-centroid-per-lane shortcut, and
-        // it cost half the V throughput.
+        // Measured at d131072 on Qwen3.8-27B, subtracting the 15.12 ms d0 decode to isolate
+        // the KV read: turbo4 moved 2.42 GB in 7.86 ms = 308 GB/s effective, while f16 moved
+        // 3.8x the bytes in LESS time (9.13 GB in 5.63 ms = 1621 GB/s). Reading fewer bytes
+        // and taking longer is the signature of a compute-bound gather, not a bandwidth-
+        // bound one - the cache was never the limit, the lookup was.
         //
-        // Two centroids per lane is correct as long as the SELECT happens after both
-        // shuffles: lane L holds centroids L and L+8, every lane shuffles both halves
-        // from source lane (i & 7), and only then picks by (i < 8). The earlier attempt
-        // selected before shuffling, which is why it returned ~50% wrong halves.
-        // Group width stays 8 so every lane in a group shares the same block norm.
-        constexpr int V_NTHREADS_TURBO = 8;
-        const unsigned sub_lane = threadIdx.x % V_NTHREADS_TURBO;
-        const float my_scaled_lo = TURBO_CENTROIDS_4BIT[sub_lane]     * norm;  // 0..7
-        const float my_scaled_hi = TURBO_CENTROIDS_4BIT[sub_lane + 8] * norm;  // 8..15
+        // The K dot already solved this with turbo4_int8_lut::gather4: two hardware byte-
+        // permutes plus a per-byte blend, four centroids per gather. qs_word holds the eight
+        // nibbles in exactly gather4's input layout, so it applies here unchanged - two
+        // gathers replace sixteen shuffles, with no warp synchronization.
+        //
+        // Precision: this reads the same int8 centroid table the K dot already uses, each
+        // entry within 0.5% of its float value. That sits far inside the error already
+        // introduced by binning to one of 16 centroids, and averages down further across
+        // the thousands of positions summed into every output element.
+        turbo4_int8_lut lut;
+        lut.init();
+        const float nscale = norm * TURBO_INT8_4BIT_SCALE_REVERSE;
 
-        auto get_scaled = [&] (unsigned i) -> float {
-            const float lo = __shfl_sync(0xFFFFFFFFu, my_scaled_lo, i & 7u, V_NTHREADS_TURBO);
-            const float hi = __shfl_sync(0xFFFFFFFFu, my_scaled_hi, i & 7u, V_NTHREADS_TURBO);
-            return (i < 8u) ? lo : hi;   // select AFTER both shuffles
-        };
+        const int g0 = (int) lut.gather4( qs_word        & 0xFFFFu);  // elements 0..3
+        const int g1 = (int) lut.gather4((qs_word >> 16) & 0xFFFFu);  // elements 4..7
 
-        // Compute all 8 scaled values via shfl (1 shfl per element, CORRECT)
         float s[8];
-#pragma unroll
-        for (int k = 0; k < 8; ++k) s[k] = get_scaled(idx[k]);
+        s[0] = (float) (int8_t) (g0      ) * nscale;
+        s[1] = (float) (int8_t) (g0 >>  8) * nscale;
+        s[2] = (float) (int8_t) (g0 >> 16) * nscale;
+        s[3] = (float) (int8_t) (g0 >> 24) * nscale;
+        s[4] = (float) (int8_t) (g1      ) * nscale;
+        s[5] = (float) (int8_t) (g1 >>  8) * nscale;
+        s[6] = (float) (int8_t) (g1 >> 16) * nscale;
+        s[7] = (float) (int8_t) (g1 >> 24) * nscale;
 
 #ifdef FP16_AVAILABLE
         if constexpr (std::is_same_v<T, half>) {
