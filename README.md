@@ -12,7 +12,7 @@
 
 <br>
 
-### 262,144 tokens · 4.52 GiB of KV cache · 36.7 tok/s at 245K depth
+### 262,144 tokens · 4.52 GiB of KV cache · 43.6 tok/s at 245K depth
 
 </div>
 
@@ -27,8 +27,8 @@ That target pulls in two directions at once. The KV cache has to be small enough
 | | Prefill | Decode | KV cache |
 |:--|--:|--:|--:|
 | **Empty context** | 3722.70 t/s | 66.57 t/s | — |
-| **131,072 tokens** | 1242.29 t/s | 47.03 t/s | 2.26 GiB |
-| **245,760 tokens** | 760.75 t/s | 36.70 t/s | 4.24 GiB |
+| **131,072 tokens** | 1242.29 t/s | 52.13 t/s | 2.26 GiB |
+| **245,760 tokens** | 760.75 t/s | 43.55 t/s | 4.24 GiB |
 | **262,144 tokens** | — | — | **4.52 GiB** |
 
 <sub>All six throughput figures from a single <code>llama-bench -r 3</code> run on the shipped build, stock defaults.</sub>
@@ -481,6 +481,39 @@ Choosing by exact divisor instead (6 % 2 == 0, so 2) fixed it.
 ---
 
 ## Engineering log
+
+<details open>
+<summary><b>August 2026 — GQA head packing in FA-vec</b> &nbsp;·&nbsp; <code>+21.9% decode</code></summary>
+
+<br>
+
+The flash-attention vec kernel bound one CUDA block to one query head:
+
+```c
+const int head = blockIdx.z - sequence*ne02;
+K += nb13*sequence + nb12*(head / gqa_ratio);
+```
+
+So every query head in a group read **and dequantized** the same cache region — six times on this model, twelve on Qwen3.8-Flash-Next.
+
+**Why it hid.** L2 absorbs most of the re-reads, so DRAM traffic is not `gqa_ratio` times higher and throughput was not `gqa_ratio` times worse. Only the dequant arithmetic is genuinely repeated, because each block dequantizes independently regardless of where the bytes came from.
+
+**What exposed it.** On Flash-Next, `turbo4` measured *slower* than `q8_0` at identical settings — 27.20 against 29.39 — despite reading half the bytes. A format that reads less losing to one that reads more only makes sense if its per-element cost is being multiplied.
+
+The kernel now takes an `ncols2` parameter: query heads packed per block, mirroring what the MMA path always did. Column `jc` addresses (token `jc/ncols2`, head `jc%ncols2`), with the Q pointer, alibi slope, attention sink, mask row, bounds test and both output writes resolved per column. `launch_fattn` already derived its grid from `ncols2` and was simply being passed a hardcoded `1`.
+
+**The dependency that made it work.** Two-way packing helped; three- and four-way *collapsed*, to 26.28 and 13.97 against 49.18 — roughly halving per step, the signature of a register spill rather than of extra work. A packed column costs about 36 registers, dominated by `VKQ[(D/2)/nthreads_V]`. Raising `nthreads_V` for `ncols2 >= 3` halves that to ~18 and three-way then measured **52.19**, twice its spilled figure. The packing was never the problem; its register footprint was.
+
+| Depth | `ncols2=1` | `ncols2=2` | `ncols2=3` | |
+|------:|-----------:|-----------:|-----------:|:--|
+| 131,072 | 46.53 | 49.75 | **52.13** | +12.2% |
+| 245,760 | 35.96 | 41.57 | **43.55** | **+21.9%** |
+
+The gain grows with depth because the redundant work scales with cache size. On Flash-Next the ordering flipped: `turbo4` went 25.13 → 27.91 and now beats `q8_0`'s 27.36 while using half the VRAM.
+
+Selection is by **exact divisor**, never rounded up — at `gqa_ratio` 6, three-way needs two blocks and wastes nothing while four-way needs the same two blocks and wastes a quarter of its columns. Capped at 3: six-way **fails** `test-backend-ops` (1/2 backends), and without a cap the divisor rule would have selected exactly 6 for the very common `gqa_ratio` 6. `FA_VEC_GQA=<1..6>` overrides for measurement.
+
+</details>
 
 <details open>
 <summary><b>August 2026 — turbo4 KV at depth</b> &nbsp;·&nbsp; <code>+45.4% decode</code></summary>

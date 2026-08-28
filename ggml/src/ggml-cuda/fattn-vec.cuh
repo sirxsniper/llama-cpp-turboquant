@@ -119,7 +119,18 @@ static __global__ void flash_attn_ext_vec(
     // V_cols_per_iter = WARP_SIZE/nthreads_V is 4 instead of 2. The 16 was only ever
     // needed for the one-centroid-per-lane shuffle in dequantize_V_turbo4_0, which
     // now holds two centroids per lane and selects after shuffling.
-    constexpr int nthreads_V  = type_V_is_turbo ? 8 : (V_is_unquantized ? 128 / cpy_nb : nthreads_V_q);
+    // [TAG_FA_VEC_GQA] Spreading each column over MORE threads shrinks its private state,
+    // which is what makes deeper GQA packing possible at all. VKQ is [ncols][(D/2)/nthreads_V]
+    // and is the largest per-column array, so doubling nthreads_V halves the dominant term.
+    //
+    // Measured why this is needed: with nthreads_V=8, ncols2=3 and 4 collapsed to 26.28 and
+    // 13.97 tg64 at d131072 against 49.18 at ncols2=2 - roughly halving per step, the
+    // signature of a register spill to local memory rather than of extra work.
+    //
+    // 8 remains right for ncols2<=2, where the packing is cheap and V throughput matters more
+    // (V_cols_per_iter = WARP_SIZE/nthreads_V drops from 4 to 2 at 16).
+    constexpr int nthreads_V  = type_V_is_turbo ? (ncols2 >= 3 ? 16 : 8)
+                                                : (V_is_unquantized ? 128 / cpy_nb : nthreads_V_q);
 
     static_assert(WARP_SIZE % nthreads_KQ == 0, "bad nthreads_K");
     static_assert(WARP_SIZE % nthreads_V  == 0, "bad nthreads_V");
@@ -731,7 +742,7 @@ static int ggml_cuda_fattn_vec_ncols2(const ggml_tensor * dst) {
     static const int forced = [] {
         const char * e = getenv("FA_VEC_GQA");
         const int v = e ? atoi(e) : 0;
-        return (v == 1 || v == 2) ? v : 0;
+        return (v >= 1 && v <= 6) ? v : 0;
     }();
     if (forced) {
         return forced;
@@ -739,7 +750,31 @@ static int ggml_cuda_fattn_vec_ncols2(const ggml_tensor * dst) {
     const ggml_tensor * Q = dst->src[0];
     const ggml_tensor * K = dst->src[1];
     const int gqa_ratio = Q->ne[2] / K->ne[2];
-    return (gqa_ratio % 2 == 0) ? 2 : 1;
+
+    // Largest EXACT divisor, never a rounded-up value. Rounding up leaves dead columns:
+    // gqa_ratio 6 with 4-way packing needs 2 blocks of 4 and wastes a quarter of the work,
+    // where 3-way needs the same 2 blocks and wastes none. This is the same mistake the MMA
+    // ladder made with ncols2 before it was fixed to select by divisor.
+    // Raising nthreads_V for ncols2>=3 cuts a packed column to ~18 registers, which is what
+    // makes three- and four-way viable at all; at the old footprint both spilled.
+    // CAP AT 3, deliberately, and lower than the code can build.
+    //
+    // Six-way FAILS test-backend-ops (1/2 backends) as well as being slow - tg64 27.20 at
+    // d131072 against 52.13 at three-way - so it is wrong, not merely a poor trade. Without a
+    // cap the divisor rule below would select exactly 6 for the very common gqa_ratio 6.
+    //
+    // Four-way builds and passed the op tests at the OLD nthreads_V, but has not been
+    // re-validated since nthreads_V was raised for ncols2>=3, and 4 is what a gqa_ratio 12
+    // model would select. Shipping an unvalidated numerical path is not worth the ~1 pass it
+    // would save there, so the cap stays at 3 until FA_VEC_GQA=4 is re-run against the op
+    // tests. Three-way already measured FASTER than four-way at gqa_ratio 6 anyway
+    // (52.13 vs 51.01 at d131072), because 4 leaves a quarter of its columns dead.
+    for (int n = 3; n >= 2; --n) {
+        if (gqa_ratio % n == 0) {
+            return n;
+        }
+    }
+    return 1;
 }
 
 template <int D, ggml_type type_K, ggml_type type_V>
@@ -754,14 +789,26 @@ void ggml_cuda_flash_attn_ext_vec_case(ggml_backend_cuda_context & ctx, ggml_ten
         const int ncols2 = ggml_cuda_fattn_vec_ncols2(dst);
         if (logit_softcap == 0.0f) {
             constexpr bool use_logit_softcap = false;
-            if (ncols2 == 2) {
+            if (ncols2 == 6) {
+                ggml_cuda_flash_attn_ext_vec_case_impl<D, 1, 6, type_K, type_V, use_logit_softcap>(ctx, dst);
+            } else if (ncols2 == 4) {
+                ggml_cuda_flash_attn_ext_vec_case_impl<D, 1, 4, type_K, type_V, use_logit_softcap>(ctx, dst);
+            } else if (ncols2 == 3) {
+                ggml_cuda_flash_attn_ext_vec_case_impl<D, 1, 3, type_K, type_V, use_logit_softcap>(ctx, dst);
+            } else if (ncols2 == 2) {
                 ggml_cuda_flash_attn_ext_vec_case_impl<D, 1, 2, type_K, type_V, use_logit_softcap>(ctx, dst);
             } else {
                 ggml_cuda_flash_attn_ext_vec_case_impl<D, 1, 1, type_K, type_V, use_logit_softcap>(ctx, dst);
             }
         } else {
             constexpr bool use_logit_softcap = true;
-            if (ncols2 == 2) {
+            if (ncols2 == 6) {
+                ggml_cuda_flash_attn_ext_vec_case_impl<D, 1, 6, type_K, type_V, use_logit_softcap>(ctx, dst);
+            } else if (ncols2 == 4) {
+                ggml_cuda_flash_attn_ext_vec_case_impl<D, 1, 4, type_K, type_V, use_logit_softcap>(ctx, dst);
+            } else if (ncols2 == 3) {
+                ggml_cuda_flash_attn_ext_vec_case_impl<D, 1, 3, type_K, type_V, use_logit_softcap>(ctx, dst);
+            } else if (ncols2 == 2) {
                 ggml_cuda_flash_attn_ext_vec_case_impl<D, 1, 2, type_K, type_V, use_logit_softcap>(ctx, dst);
             } else {
                 ggml_cuda_flash_attn_ext_vec_case_impl<D, 1, 1, type_K, type_V, use_logit_softcap>(ctx, dst);
