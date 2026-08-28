@@ -543,25 +543,60 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
                 // So MMA is the right target once the conversion is not pathological;
                 // routing turbo to VEC for wide Q was a workaround and is not needed.
                 if (cc >= GGML_CUDA_CC_ADA_LOVELACE) {
-                    // VEC dequantizes every KV cell inline, so its cost grows with n_kv.
-                    // For q8_0 that per-cell work is a cheap scale; for the turbo types it is
-                    // a centroid lookup and the cost dominates. Measured on Qwen3.8-Flash-Next
-                    // (turbo4, ncmoe 36, 262144 ctx) decode collapsed 23 -> 4 tok/s from 0.5K
-                    // to 80K context while q8_0 stayed flat at ~22-26. Both took VEC here.
+                    // [TAG_TURBO_FA_ROUTING]
                     //
-                    // MMA pays a full-cache F16 conversion but then runs on tensor cores, and
-                    // the fork's own numbers already favoured it for turbo (27B, ~90K ctx:
-                    // MMA 70.8 tok/s vs VEC native 46.6). So send the turbo types to MMA once
-                    // the cache is deep enough for the per-cell cost to matter; keep VEC for
-                    // short contexts where the conversion would not pay for itself.
+                    // Turbo K/V now go to VEC at ANY depth for narrow Q. VEC reads the
+                    // quantized cache natively; MMA cannot, so it materialises the WHOLE
+                    // cache as F16 on every call (fattn-common.cuh, to_fp16 over
+                    // ggml_nelements(K)) - a decode -> re-encode -> decode round trip paid
+                    // once per layer per token.
+                    //
+                    // This used to route to MMA past 4096 because VEC's per-cell centroid
+                    // lookup dominated (the old note here cited MMA 70.8 vs VEC 46.6 at
+                    // ~90K). Two fixes inverted that: a PRMT-based 4-at-a-time centroid
+                    // gather in the VEC KQ dot (replacing a ~12-deep dependent select
+                    // chain) and coalesced stores in the turbo4 dequant kernels.
+                    //
+                    // Re-measured, RTX 5090, Qwen3.8-27B-UD-Q4_K_XL, llama-bench tg64 r=3:
+                    //   depth        MMA+convert   VEC native
+                    //        0        66.11         66.36
+                    //    65536        47.61         53.87   (+13%)
+                    //   131072        35.50         44.40   (+25%)
+                    //   245760        24.57         33.73   (+37%)
+                    // VEC wins at every depth and ties at 0, so the depth cutoff is gone.
+                    //
+                    // Only narrow Q is affected: the VEC kernel is instantiated for
+                    // cols_per_block 1 and 2 only (fattn-vec.cuh), so a speculative batch
+                    // (Q->ne[1] == n_draft+1) still takes MMA exactly as before.
+                    //
+                    // TURBO_FA_MMA=1 restores the old depth-based MMA routing for A/B.
                     const bool turbo_K = K->type == GGML_TYPE_TURBO2_0 ||
                                          K->type == GGML_TYPE_TURBO3_0 ||
                                          K->type == GGML_TYPE_TURBO4_0;
-                    const char * force = getenv("TURBO_FA_VEC");
-                    const bool force_vec = force && force[0] == '1';
-                    if (turbo_K && !force_vec && K->ne[1] >= 4096) {
-                        // fall through to MMA
-                    } else if (Q->ne[1] <= 2) {
+                    const char * force_mma = getenv("TURBO_FA_MMA");
+                    const bool want_mma = force_mma && force_mma[0] == '1';
+
+                    // How wide a Q batch may still go to VEC. Default 2 = upstream
+                    // behaviour. For the turbo types this is tunable because a wider Q
+                    // (speculative verification, Q->ne[1] == n_draft+1) is handled by VEC
+                    // as ceil(ncols/2) tiles, each re-reading the cache - which can still
+                    // beat MMA, since MMA's full-cache F16 materialisation costs far more
+                    // than the turbo4 cache is big. Whether it does is a measurement, so
+                    // it is exposed rather than guessed: TURBO_FA_VEC_MAXCOLS.
+                    int vec_max_cols = 2;
+                    if (turbo_K) {
+                        const char * mc = getenv("TURBO_FA_VEC_MAXCOLS");
+                        if (mc) {
+                            const int v = atoi(mc);
+                            if (v >= 1 && v <= 64) {
+                                vec_max_cols = v;
+                            }
+                        }
+                    }
+
+                    if (turbo_K && want_mma && K->ne[1] >= 4096) {
+                        // fall through to MMA (previous behaviour)
+                    } else if (Q->ne[1] <= vec_max_cols) {
                         return BEST_FATTN_KERNEL_VEC;
                     }
                 } else {

@@ -509,6 +509,35 @@ struct turbo4_int8_lut {
         const uint32_t w = (i < 4u) ? w0 : (i < 8u) ? w1 : (i < 12u) ? w2 : w3;
         return (w >> ((i & 3u) * 8u)) & 0xFFu;
     }
+
+    // PERF (CRITICAL): look up FOUR centroids at once using the hardware byte-permute
+    // (PRMT). `nib` holds the four 4-bit indices as nibbles i0,i1,i2,i3 from bit 0 up -
+    // which is exactly the layout of the two packed qs bytes, so no unpacking is needed.
+    //
+    // Why this replaces four byte_of() calls: byte_of is a chain of THREE dependent
+    // selects, and calling it four times in a row built a ~12-deep dependent ALU chain
+    // per 4 KV elements. That chain is paid once per KV element per layer per token, so
+    // it scales with context depth - which is why turbo4 lost to q8_0 at depth despite
+    // reading half the bytes (q8_0 reads more but has almost no dependent work).
+    //
+    // PRMT indexes an 8-byte pool {y:x}, so 16 centroids need two permutes plus a
+    // per-byte blend on index bit 3. The blend operands are independent of the permutes,
+    // so the whole thing is ~2 dependent levels instead of ~12.
+    __device__ __forceinline__ uint32_t gather4(uint32_t nib) const {
+        const uint32_t sel = nib & 0x7777u;              // low 3 bits of each index
+        const uint32_t lo  = __byte_perm(w0, w1, sel);   // centroids 0..7
+        const uint32_t hi  = __byte_perm(w2, w3, sel);   // centroids 8..15
+
+        // Spread the four nibbles into four bytes so bit 3 can drive a per-byte select.
+        uint32_t bytes = nib;
+        bytes = (bytes | (bytes << 8)) & 0x00FF00FFu;   // {i0,i1} -> byte0, {i2,i3} -> byte2
+        bytes = (bytes | (bytes << 4)) & 0x0F0F0F0Fu;   // one index per byte
+        // 0xFF in each byte whose index had bit 3 set. The multiply cannot carry across
+        // byte lanes because each lane contributes at most 0xFF.
+        const uint32_t m = ((bytes & 0x08080808u) >> 3) * 0xFFu;
+
+        return lo ^ ((lo ^ hi) & m);
+    }
 };
 // Turbo4 KQ dot product via __dp4a (int8 hardware path, like q8 uses).
 // Pre-quantized centroids in TURBO_CENTROIDS_4BIT_INT8 + Q_q8 from main kernel.
@@ -530,7 +559,7 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_turbo4_0_int(
     // TURBO_CENTROIDS_4BIT_INT8[idx], because a data-dependent index into constant
     // memory replays up to 16x per warp and that cost is paid per KV element - which is
     // what made this path measure slower than the float one and get abandoned.
-    const block_turbo4_0 * K_turbo = (const block_turbo4_0 *) K_c;
+    const block_turbo4_0 * __restrict__ K_turbo = (const block_turbo4_0 * __restrict__) K_c;
     GGML_UNUSED(Q_v);
 
     turbo4_int8_lut lut;
@@ -549,13 +578,10 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_turbo4_0_int(
 
         uint16_t qs_pair;
         ggml_cuda_memcpy_1<2, 2>(&qs_pair, K_turbo[ib].qs + (j0 >> 1));
-        const uint32_t qs0 = qs_pair & 0xFFu;
-        const uint32_t qs1 = (qs_pair >> 8) & 0xFFu;
 
-        const int v_packed = (int) ( lut.byte_of((qs0 >> 0) & 0xFu)        |
-                                   (lut.byte_of((qs0 >> 4) & 0xFu) <<  8) |
-                                   (lut.byte_of((qs1 >> 0) & 0xFu) << 16) |
-                                   (lut.byte_of((qs1 >> 4) & 0xFu) << 24) );
+        // The two qs bytes already hold the four indices as nibbles i0,i1,i2,i3 from
+        // bit 0 up, which is precisely gather4's input format - no unpacking needed.
+        const int v_packed = (int) lut.gather4((uint32_t) qs_pair);
 
         const float2 * Q_ds = (const float2 *) Q_ds_v;
         const float    Q_d  = Q_ds[k_KQ_0/nthreads].x;
@@ -1773,6 +1799,17 @@ void launch_fattn(
 
         GGML_ASSERT(f16_extra.K != 0);
         half * K_f16 = (half *) f16_extra.K;
+        {   // one-shot probe: which conversion path does K take, and how big is the grid?
+            static bool probed = false;
+            const char * e = getenv("TURBO_CONV_PROBE");
+            if (!probed && e && e[0] == '1') {
+                probed = true;
+                fprintf(stderr, "conv-probe K: type=%s contig=%d ne=[%lld,%lld,%lld,%lld] nelem=%lld\n",
+                    ggml_type_name(K->type), (int) ggml_is_contiguously_allocated(K),
+                    (long long) K->ne[0], (long long) K->ne[1], (long long) K->ne[2], (long long) K->ne[3],
+                    (long long) ggml_nelements(K));
+            }
+        }
         if (ggml_is_contiguously_allocated(K)) {
             to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(K->type);
             to_fp16(K_data, K_f16, ggml_nelements(K), main_stream);
@@ -1807,6 +1844,17 @@ void launch_fattn(
 
             GGML_ASSERT(f16_extra.V != 0);
             half * V_f16 = (half *) f16_extra.V;
+            {   // one-shot probe, mirroring the K probe above
+                static bool probed = false;
+                const char * e = getenv("TURBO_CONV_PROBE");
+                if (!probed && e && e[0] == '1') {
+                    probed = true;
+                    fprintf(stderr, "conv-probe V: type=%s contig=%d ne=[%lld,%lld,%lld,%lld] nelem=%lld\n",
+                        ggml_type_name(V->type), (int) ggml_is_contiguously_allocated(V),
+                        (long long) V->ne[0], (long long) V->ne[1], (long long) V->ne[2], (long long) V->ne[3],
+                        (long long) ggml_nelements(V));
+                }
+            }
             if (ggml_is_contiguously_allocated(V)) {
                 to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(V->type);
                 to_fp16(V_data, V_f16, ggml_nelements(V), main_stream);

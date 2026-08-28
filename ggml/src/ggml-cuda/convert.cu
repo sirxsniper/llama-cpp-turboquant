@@ -308,16 +308,37 @@ static __global__ void dequantize_block_turbo4_0_nc(
     // broadcasts it. Registers have no divergence penalty, unlike constant memory.
     const float my_scaled = (lane < 16) ? TURBO_CENTROIDS_4BIT[lane] * norm : 0.0f;
 
+    // 128 elements / 32 lanes = 4 CONSECUTIVE elements per lane.
+    //
+    // PERF (write coalescing): the four values are gathered first and written with ONE
+    // wide store. The previous shape wrote them as two separate 4-byte stores, which
+    // left an 8-byte gap between neighbouring lanes - so each store instruction touched
+    // 32 lanes x 4 B scattered over 256 B and discarded half of every memory
+    // transaction. This kernel rewrites the ENTIRE f16 KV copy on every decode step, so
+    // the write path is its dominant cost and that waste was close to a 2x penalty on
+    // it. Measured against q8_0 (whose dequant is a plain scale and whose writes were
+    // already coalesced): turbo4 was 53% SLOWER at 245K depth despite reading half the
+    // KV bytes - the gap was conversion cost, not bandwidth.
+    //
+    // The two qs bytes are likewise read as a single aligned 2-byte load rather than two
+    // 1-byte loads, and hold the four nibbles in element order from bit 0 up.
     constexpr int per_lane = QK_TURBO4 / WARP_SIZE;   // 4
+    const int j0 = lane * per_lane;
+
+    uint16_t qs2;
+    ggml_cuda_memcpy_1<2>(&qs2, x->qs + (j0 >> 1));
+
+    dst_t v[per_lane];
 #pragma unroll
-    for (int e = 0; e < per_lane; e += 2) {
-        const int j = lane * per_lane + e;
-        const uint8_t qb = x->qs[j >> 1];
-        const float v0 = __shfl_sync(0xFFFFFFFFu, my_scaled, (qb >> 0) & 0xFu, WARP_SIZE);
-        const float v1 = __shfl_sync(0xFFFFFFFFu, my_scaled, (qb >> 4) & 0xFu, WARP_SIZE);
-        yrow[j + 0] = (dst_t) v0;
-        yrow[j + 1] = (dst_t) v1;
+    for (int e = 0; e < per_lane; ++e) {
+        const unsigned idx = (qs2 >> (4*e)) & 0xFu;
+        v[e] = (dst_t) __shfl_sync(0xFFFFFFFFu, my_scaled, idx, WARP_SIZE);
     }
+
+    // yrow starts at a multiple of QK_TURBO4 elements and j0 is a multiple of 4, so this
+    // store is 8-byte (half) / 16-byte (float) aligned. Rows are block-aligned (asserted
+    // by the launcher) so a full per_lane group is always in bounds here.
+    ggml_cuda_memcpy_1<sizeof(dst_t)*per_lane>(&yrow[j0], v);
 }
 
 template<typename dst_t>
@@ -374,25 +395,43 @@ static __global__ void dequantize_block_turbo4_0_coop(
     // constant-memory read per lane, uniform across the warp for L < 16.
     const float my_scaled = (lane < 16) ? TURBO_CENTROIDS_4BIT[lane] * norm : 0.0f;
 
-    // 128 elements / 32 lanes = 4 elements per lane, contiguous pairs so the qs
-    // byte load is one access per pair.
+    // 128 elements / 32 lanes = 4 CONSECUTIVE elements per lane.
+    //
+    // PERF (write coalescing): the four values are gathered first and written with ONE
+    // wide store. The previous shape wrote them as two separate 4-byte stores, which
+    // left an 8-byte gap between neighbouring lanes - so each store instruction touched
+    // 32 lanes x 4 B scattered over 256 B and discarded half of every memory
+    // transaction. This kernel rewrites the ENTIRE f16 KV copy on every decode step, so
+    // the write path is its dominant cost and that waste was close to a 2x penalty on
+    // it. Measured against q8_0 (whose dequant is a plain scale and whose writes were
+    // already coalesced): turbo4 was 53% SLOWER at 245K depth despite reading half the
+    // KV bytes - the gap was conversion cost, not bandwidth.
+    //
+    // The two qs bytes are likewise read as a single aligned 2-byte load rather than two
+    // 1-byte loads, and hold the four nibbles in element order from bit 0 up.
     constexpr int per_lane = QK_TURBO4 / WARP_SIZE;   // 4
+    const int     j0 = lane * per_lane;
+    const int64_t o0 = ib * QK_TURBO4 + j0;
+
+    uint16_t qs2;
+    ggml_cuda_memcpy_1<2>(&qs2, x[ib].qs + (j0 >> 1));
+
+    dst_t v[per_lane];
 #pragma unroll
-    for (int e = 0; e < per_lane; e += 2) {
-        const int j    = lane * per_lane + e;
-        const uint8_t qb = x[ib].qs[j >> 1];
-        const unsigned idx0 = (qb >> 0) & 0xFu;
-        const unsigned idx1 = (qb >> 4) & 0xFu;
+    for (int e = 0; e < per_lane; ++e) {
+        const unsigned idx = (qs2 >> (4*e)) & 0xFu;
+        v[e] = (dst_t) __shfl_sync(0xFFFFFFFFu, my_scaled, idx, WARP_SIZE);
+    }
 
-        const float v0 = __shfl_sync(0xFFFFFFFFu, my_scaled, idx0, WARP_SIZE);
-        const float v1 = __shfl_sync(0xFFFFFFFFu, my_scaled, idx1, WARP_SIZE);
-
-        const int64_t o = ib * QK_TURBO4 + j;
-        if (o + 1 < k) {
-            y[o + 0] = (dst_t) v0;
-            y[o + 1] = (dst_t) v1;
-        } else if (o < k) {
-            y[o + 0] = (dst_t) v0;
+    if (o0 + per_lane <= k) {
+        // o0 is a multiple of 4 elements, so this is 8-byte (half) / 16-byte (float) aligned.
+        ggml_cuda_memcpy_1<sizeof(dst_t)*per_lane>(&y[o0], v);
+    } else {
+#pragma unroll
+        for (int e = 0; e < per_lane; ++e) {
+            if (o0 + e < k) {
+                y[o0 + e] = v[e];
+            }
         }
     }
 }
