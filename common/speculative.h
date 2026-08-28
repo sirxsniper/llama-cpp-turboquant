@@ -90,6 +90,11 @@ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, co
 // process the batch and update the internal state of the speculative context
 bool common_speculative_process(common_speculative * spec, const llama_batch & batch);
 
+// tell the speculative context how many prompt tokens still follow the ubatch that is
+// about to be passed to common_speculative_process(); 0 during generation. Lets a
+// sliding-window drafter skip prompt ubatches whose KV would be evicted unused.
+void common_speculative_set_prefill_after(common_speculative * spec, int32_t n_after);
+
 // generate drafts for the sequences specified with `common_speculative_get_draft_params`
 void common_speculative_draft(common_speculative * spec);
 

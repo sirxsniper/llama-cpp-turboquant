@@ -3723,6 +3723,26 @@ private:
         //       for now, always re-evaluate for simplicity
         //       ref: https://github.com/ggml-org/llama.cpp/pull/22728#issuecomment-4400925384
         if (spec) {
+            // [TAG_SPEC_PREFILL_TAIL]
+            // Tell the drafter how many prompt tokens still follow this ubatch. A drafter
+            // whose attention is a sliding window (DFlash2: 2048) only needs a warm KV for
+            // the tail, so it can skip the earlier ones - which is otherwise a full encode
+            // and decode of the draft model per prompt ubatch.
+            //
+            // Reported as the max over the slots still processing their prompt; 0 once
+            // every slot is generating, so generation is never skipped.
+            {
+                int32_t n_after = 0;
+                for (const auto & slot : slots) {
+                    if (slot.state == SLOT_STATE_PROCESSING_PROMPT && slot.task) {
+                        const int32_t total = (int32_t) slot.task->n_tokens();
+                        const int32_t done  = (int32_t) slot.prompt.n_tokens();
+                        n_after = std::max(n_after, total - done);
+                    }
+                }
+                common_speculative_set_prefill_after(spec.get(), n_after);
+            }
+
             bool ok = true;
             queue_tasks.yield_to_queue([&]() {
                 ok = common_speculative_process(spec.get(), batch_view);

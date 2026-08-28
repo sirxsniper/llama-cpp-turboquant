@@ -169,6 +169,16 @@ struct common_speculative_impl {
 
     virtual bool process(const llama_batch & batch) = 0;
 
+    // [TAG_SPEC_PREFILL_TAIL]
+    // How many prompt tokens still follow the ubatch currently being processed.
+    // Set by the server before each common_speculative_process() call during prompt
+    // processing; 0 during generation and whenever the caller does not know.
+    //
+    // A drafter whose attention is a sliding window only needs a warm KV for the last
+    // n_swa positions - everything earlier is evicted before it is ever drafted from -
+    // so an implementation may use this to skip work on early prefill ubatches.
+    int32_t n_prefill_after = 0;
+
     virtual void draft(common_speculative_draft_params_vec & dparams) = 0;
 
     virtual void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) = 0;
@@ -1090,6 +1100,41 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         const bool has_embeddings = batch_in.embd  != nullptr;
         if (has_tokens == has_embeddings) {
             return true;
+        }
+
+        // [TAG_SPEC_PREFILL_TAIL]
+        // Skip prompt ubatches that end more than the drafter's sliding window from the
+        // end of the prompt: their KV entries are evicted before any draft reads them.
+        //
+        // This is not free work being skipped - per prompt ubatch this hook runs a full
+        // encode AND decode over the drafter (1.9B x 2 flops x n_ubatch x 2 passes, ~49 ms
+        // against a ~620 ms ubatch at 124K), pulls the target's hidden states at every
+        // dflash.target_layers entry (5 layers x n_ubatch x n_embd x 4 B = ~131 MB per
+        // ubatch, GPU->host), and memcpys ~33 MB on the CPU. Measured cost of attaching a
+        // drafter is ~13% of prefill throughput (2043 -> 1785 t/s at 124K).
+        //
+        // Measured on Qwen3.8-27B-UD-Q4_K_XL at ~124K, two independent runs:
+        //   prefill 1772.2 -> 1948.3 t/s  (+9.9%)
+        //   prefill 1749.4 -> 1924.0 t/s  (+10.0%)
+        // i.e. it recovers ~70% of what attaching a drafter costs prefill. Draft
+        // acceptance does NOT degrade (25.8% -> 30.2% in one run, 28.6% -> 26.8% in
+        // the other) - a drafter reading a holed KV would collapse toward zero, so
+        // this also confirms the skip is functionally sound.
+        {
+            // Default 2048 = one DFlash2 sliding window. SPEC_PREFILL_TAIL=0 disables
+            // the skip and restores the old behaviour; a larger value is more
+            // conservative (keeps more of the prompt warm in the draft KV).
+            static const int32_t tail = [] {
+                const char * e = getenv("SPEC_PREFILL_TAIL");
+                if (e == nullptr) {
+                    return (int32_t) 2048;
+                }
+                const int v = atoi(e);
+                return (int32_t) (v > 0 ? v : 0);
+            }();
+            if (tail > 0 && n_prefill_after > tail) {
+                return true;
+            }
         }
 
         const int32_t n_tokens = batch_in.n_tokens;
@@ -2800,6 +2845,16 @@ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, co
         common_time_meas tm(impl->t_begin_us, !impl->gen_perf);
         impl->begin(seq_id, prompt);
         impl->n_call_begin++;
+    }
+}
+
+void common_speculative_set_prefill_after(common_speculative * spec, int32_t n_after) {
+    if (spec == nullptr) {
+        return;
+    }
+
+    for (auto & impl : spec->impls) {
+        impl->n_prefill_after = n_after;
     }
 }
 
