@@ -538,7 +538,7 @@ This fork stands on work by several people. Attribution follows the commit histo
 
 **The long-context performance work** — [@sirxsniper](https://github.com/sirxsniper). Everything documented above: native `turbo4` reads at depth, the MMA shared-tile loader, the K and V byte-permute centroid gathers, coalesced dequant stores, GQA packing by exact divisor, the `nbatch_fa` retune, the speculative prefill tail, memory-fit estimation for unmeasurable drafters, GDN decode-shape test coverage, the Windows CUDA build recipe, and upstream merge and conflict resolution across `b8650` to `b10655`.
 
-<sub><a href="CREDITS.md">CREDITS.md</a> holds a per-file inventory, but predates this audit and over-attributes the original TurboQuant and TriAttention work.</sub>
+<sub><a href="CREDITS.md">CREDITS.md</a> holds the per-file inventory, with authorship derived from the commit history.</sub>
 
 <div align="center">
 <sub>MIT licensed, as is upstream llama.cpp.</sub>
