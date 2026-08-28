@@ -5,6 +5,7 @@
 #include "../src/llama-ext.h"
 
 #include <array>
+#include <fstream>
 #include <cassert>
 #include <stdexcept>
 #include <cinttypes>
@@ -222,9 +223,36 @@ static void common_params_fit_impl(
                 measured = common_get_device_memory_data_impl(
                     extra->path_model, extra->mparams, extra->cparams, devs_extra, ngl_extra, nct_extra, nex_extra, log_level);
             } catch (const std::runtime_error & e) {
-                // the extra model is optional, fit the main model alone rather than giving up
-                LOG_WRN("%s: failed to measure the memory of the extra model, fitting without it: %s\n", __func__, e.what());
+                // The extra model is optional, so fit the main model rather than giving up -
+                // but do NOT pretend it is free. Some drafters (DFlash2/EAGLE3) cannot build
+                // a standalone context because they need ctx_other, so this path is taken on
+                // EVERY fit for them. Counting them as 0 bytes over-commits VRAM by the whole
+                // size of the draft model and can push the main model into a spill at long
+                // context.
+                //
+                // Fall back to the weight file on disk: it is the dominant term and is always
+                // available. A draft model's context and compute are small next to it.
+                size_t est = 0;
+                {
+                    std::ifstream f(extra->path_model, std::ios::binary | std::ios::ate);
+                    if (f) {
+                        const std::streamoff sz = f.tellg();
+                        if (sz > 0) {
+                            est = (size_t) sz;
+                        }
+                    }
+                }
+
+                LOG_WRN("%s: failed to measure the memory of the extra model (%s); estimating "
+                        "%.2f GiB from its weight file rather than ignoring it\n",
+                        __func__, e.what(), est/1024.0/1024.0/1024.0);
+
                 dmds_extra = dmds_t(devs.size() + 1);
+                if (est > 0 && !dmds_extra.empty()) {
+                    // charge it to the first device of the main model, which is where a draft
+                    // model sharing those devices actually lands
+                    dmds_extra[0].mb.model += est;
+                }
                 n_ctx_extra = cparams->n_ctx;
                 return;
             }
