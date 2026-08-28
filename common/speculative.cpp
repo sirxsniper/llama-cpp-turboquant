@@ -1133,6 +1133,41 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 return (int32_t) (v > 0 ? v : 0);
             }();
             if (tail > 0 && n_prefill_after > tail) {
+                // Skipping is only safe if it cannot leave a HOLE in the draft KV.
+                //
+                // On a cold prompt the draft cache is empty, so skipping the early ubatches
+                // and then feeding only the tail simply starts the draft KV at the tail's
+                // first position, which works. But when the server reuses a cached prompt
+                // prefix - every follow-up turn in a conversation - the draft cache still
+                // holds positions from the PREVIOUS request. Skipping ahead then asks the
+                // drafter to decode at a position far past its last one, and the batch is
+                // rejected:
+                //
+                //   the last position stored in the memory module ... for sequence 0 is X = 31120
+                //   srv update_slots: decode() failed: failed to process speculative batch
+                //
+                // which surfaces as HTTP 500 on the request. Dropping the stale draft KV for
+                // the sequences in this ubatch makes the reuse case behave exactly like the
+                // cold case. Nothing is lost: everything before the tail is outside the
+                // drafter's sliding window and would have been evicted before any draft read
+                // it, which is the premise this skip rests on to begin with.
+                auto * mem_dft = llama_get_memory(this->params.ctx_dft);
+
+                llama_seq_id prev = -1;
+                for (int32_t i = 0; i < batch_in.n_tokens; ++i) {
+                    if (batch_in.n_seq_id == nullptr || batch_in.n_seq_id[i] <= 0) {
+                        continue;
+                    }
+                    const llama_seq_id s = batch_in.seq_id[i][0];
+                    if (s == prev) {
+                        continue;
+                    }
+                    prev = s;
+                    if (llama_memory_seq_pos_max(mem_dft, s) >= 0) {
+                        llama_memory_seq_rm(mem_dft, s, -1, -1);
+                    }
+                }
+
                 return true;
             }
         }
