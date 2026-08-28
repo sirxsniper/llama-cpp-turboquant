@@ -2600,6 +2600,18 @@ common_speculative_init_result::common_speculative_init_result(
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
 
+    // A draft model and MTP both want the single draft context this struct owns, and
+    // common_memory mirrors every sequence operation (seq_rm/seq_cp/seq_add) plus the
+    // speculative checkpoint to exactly one ctx_dft. Requesting both used to set
+    // ctx_type = MTP and then build the DRAFT MODEL's context with it, which fails
+    // later as an opaque "failed to create llama_context". Say so plainly instead.
+    if (spec_mtp && has_draft) {
+        LOG_ERR("%s: draft-mtp cannot be combined with a draft model (--spec-draft-model). "
+                "Both need the single draft context. Pick one: draft-mtp uses the target's "
+                "own MTP head, a draft model uses its own weights.\n", __func__);
+        return;
+    }
+
     if (spec_mtp) {
         cparams.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
     }
