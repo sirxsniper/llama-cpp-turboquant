@@ -763,13 +763,12 @@ static int ggml_cuda_fattn_vec_ncols2(const ggml_tensor * dst) {
     // d131072 against 52.13 at three-way - so it is wrong, not merely a poor trade. Without a
     // cap the divisor rule below would select exactly 6 for the very common gqa_ratio 6.
     //
-    // Four-way builds and passed the op tests at the OLD nthreads_V, but has not been
-    // re-validated since nthreads_V was raised for ncols2>=3, and 4 is what a gqa_ratio 12
-    // model would select. Shipping an unvalidated numerical path is not worth the ~1 pass it
-    // would save there, so the cap stays at 3 until FA_VEC_GQA=4 is re-run against the op
-    // tests. Three-way already measured FASTER than four-way at gqa_ratio 6 anyway
-    // (52.13 vs 51.01 at d131072), because 4 leaves a quarter of its columns dead.
-    for (int n = 3; n >= 2; --n) {
+    // Four-way is re-validated against the op tests at the current nthreads_V (2/2 backends)
+    // and is enabled. It only ever wins where it divides exactly: at gqa_ratio 6 three-way
+    // measured FASTER (52.13 vs 51.01 at d131072) because 4 leaves a quarter of its columns
+    // dead, and the divisor rule below picks 3 there. At gqa_ratio 12 four-way divides
+    // cleanly and saves a whole pass over the cache.
+    for (int n = 4; n >= 2; --n) {
         if (gqa_ratio % n == 0) {
             return n;
         }
