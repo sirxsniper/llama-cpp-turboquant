@@ -90,19 +90,61 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
         }
     }
 
-    if (use_gqa_opt && gqa_ratio > 4) {
-        ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 8>(ctx, dst);
-        return;
+    // [TAG_FA_NCOLS2_PROBE] ncols2 is the GQA packing factor: how many query heads share
+    // one K/V tile read. The ladder below rounds UP, so a gqa_ratio that is not a power
+    // of two packs slots it cannot fill - gqa_ratio 6 takes the >4 branch and packs 8,
+    // computing 8 columns for 6 real heads (33% extra attention work). Packing smaller
+    // is exact but re-reads K/V more often, so which wins is a measurement, not a
+    // derivation. FA_NCOLS2=<1|2|4|8> forces it for that measurement.
+    {
+        static const int forced = [] {
+            const char * e = getenv("FA_NCOLS2");
+            const int v = e ? atoi(e) : 0;
+            return (v == 1 || v == 2 || v == 4 || v == 8) ? v : 0;
+        }();
+        if (forced && use_gqa_opt) {
+            switch (forced) {
+                case 8: ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 8>(ctx, dst); return;
+                case 4: ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 4>(ctx, dst); return;
+                case 2: ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 2>(ctx, dst); return;
+                default: ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 1>(ctx, dst); return;
+            }
+        }
     }
 
-    if (use_gqa_opt && gqa_ratio > 2) {
-        ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 4>(ctx, dst);
-        return;
-    }
-
-    if (use_gqa_opt && gqa_ratio > 1) {
-        ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 2>(ctx, dst);
-        return;
+    // [TAG_FA_NCOLS2_DIVISOR]
+    // ncols2 is the GQA packing factor: how many query heads share one K/V tile read.
+    // This ladder used to round UP (`> 4` -> 8), so a gqa_ratio that is not a power of
+    // two packed slots it could not fill: gqa_ratio 6 took the `> 4` branch and computed
+    // 8 columns for 6 real heads - 33% of the attention work thrown away, every tile.
+    //
+    // Packing the largest power of two that DIVIDES gqa_ratio is exact. It costs more
+    // K/V tile reads (6/2 = 3 passes instead of 1), and the reasonable guess is that at
+    // long context the extra reads outweigh the wasted compute. Measured, they do not:
+    //
+    //   Qwen3.8-27B (gqa_ratio 6), RTX 5090, pp512, turbo4 KV, r=2
+    //     ncols2   d131072    d245760
+    //          8   1047.04     596.80   <- rounding up (was the default)
+    //          4   1005.79     607.95
+    //          2   1223.53     746.21   <- exact divisor: +16.9% / +25.0%
+    //
+    // Powers of two are unaffected (8 divides 8, 4 divides 4), so this only changes
+    // behaviour for ratios like 6, 12 or 5 that the old ladder over-packed.
+    //
+    // FA_NCOLS2=<1|2|4|8> overrides it for measurement.
+    if (use_gqa_opt) {
+        if (gqa_ratio % 8 == 0) {
+            ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 8>(ctx, dst);
+            return;
+        }
+        if (gqa_ratio % 4 == 0) {
+            ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 4>(ctx, dst);
+            return;
+        }
+        if (gqa_ratio % 2 == 0) {
+            ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 2>(ctx, dst);
+            return;
+        }
     }
 
     if constexpr (DKQ <= 256) {
