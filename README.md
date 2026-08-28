@@ -2,7 +2,6 @@
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 [![GitHub](https://img.shields.io/badge/github-sirxsniper%2Fllama--cpp--turboquant-blue?logo=github)](https://github.com/sirxsniper/llama-cpp-turboquant)
-[![HuggingFace](https://img.shields.io/badge/🤗%20HuggingFace-binaries-yellow)](https://huggingface.co/sirxsniper/llama-cpp-turboquant-binaries)
 
 **A full 262,144-token context on a single 32 GB GPU, at speed.**
 
@@ -105,7 +104,7 @@ The primary use of the turbo formats here is the **KV cache**, where they cut VR
 
 Decode reads the quantized cache **natively at every context depth**. This matters more than it sounds: the flash-attention MMA kernel cannot read a quantized cache, so anything routed to it must first materialise the entire cache as F16 — once per layer, per token. Keeping decode on the path that reads `turbo4` directly is worth up to **+45% at full context** (see [Recent changes](#recent-changes)).
 
-Two escape hatches exist for A/B testing:
+Escape hatches for A/B testing:
 
 | Variable | Effect |
 |----------|--------|
