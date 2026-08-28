@@ -338,7 +338,7 @@ llama-server -m Qwen3.8-27B-UD-Q4_K_XL.gguf \
   -ctk turbo4 -ctv turbo4 \
   --kv-unified \
   -md Qwen3.8-27B-DFlash2-Q4_K_M.gguf \
-  --spec-type draft-dflash --draft-max 7 \
+  --spec-type draft-dflash --spec-draft-n-max 7 \
   --host 0.0.0.0 --port 8080
 ```
 
@@ -364,7 +364,7 @@ llama-server -m Qwen3.8-27B-UD-Q4_K_XL.gguf \
 Copy-paste runnable on a 32 GB Blackwell card. This is the configuration the benchmarks above were produced with.
 
 ```bash
-llama-server   -m  Qwen3.8-27B-UD-Q4_K_XL.gguf   -md Qwen3.8-27B-DFlash2-Q4_K_M.gguf   --spec-type draft-dflash --draft-max 7   -c 262144 -ngl 99 -fa 1   -ctk turbo4 -ctv turbo4   --kv-unified   -b 2048 -ub 512   -t 16 --threads-batch 16   --parallel 1   --no-mmap   --jinja --chat-template-file qwen-fixed-chat-template.jinja   --host 0.0.0.0 --port 8080 --metrics
+llama-server   -m  Qwen3.8-27B-UD-Q4_K_XL.gguf   -md Qwen3.8-27B-DFlash2-Q4_K_M.gguf   --spec-type draft-dflash --spec-draft-n-max 7   -c 262144 -ngl 99 -fa 1   -ctk turbo4 -ctv turbo4   --kv-unified   -b 2048 -ub 512   -t 16 --threads-batch 16   --parallel 1   --load-mode none   --jinja --chat-template-file qwen-fixed-chat-template.jinja   --host 0.0.0.0 --port 8080 --metrics
 ```
 
 <details>
@@ -375,12 +375,12 @@ llama-server   -m  Qwen3.8-27B-UD-Q4_K_XL.gguf   -md Qwen3.8-27B-DFlash2-Q4_K_M.
 | Block | Why |
 |:--|:--|
 | `-md` + `--spec-type draft-dflash` | The 1.06 GiB DFlash2 drafter. Yields ~3.05 tokens per step. Drop both lines to save its VRAM at roughly 40% of decode. |
-| `--draft-max 7` | DFlash2 trains at `block_size` 8, so 7 is its ceiling. Higher is wasted work. |
+| `--spec-draft-n-max 7` | DFlash2 trains at `block_size` 8, so 7 is its ceiling. Higher is wasted work. |
 | `-c 262144 -ctk/-ctv turbo4` | The full context, at 4.52 GiB of cache. `f16` here needs 17.00 GiB and is refused. |
 | `--kv-unified` | One shared cache instead of per-sequence. Needed to fit at max context. |
 | `-b 2048 -ub 512` | `-ub` is the cheap VRAM lever — 1024 → 512 frees roughly 360 MiB at this context for very little throughput. Raise it if you have headroom. |
 | `-t 16 --threads-batch 16` | Physical cores. Everything heavy is on the GPU; these only feed it. |
-| `--no-mmap` | Load resident. On Windows, mmap lets the model page under memory pressure and decode falls off a cliff. |
+| `--load-mode none` | Load resident, no mmap. Measured worth +17.7% on a CPU-offloaded MoE and it removes most of the run-to-run variance. Replaces the removed `--no-mmap`. |
 | `--parallel 1` | One slot. Concurrent slots divide the context, and this configuration exists to give one request all of it. |
 
 </details>
@@ -435,7 +435,7 @@ llama-server -m Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf   -c 131072 -ng
 | `-fa 1` | Flash attention. Everything in this fork assumes it. |
 | `--kv-unified` | One shared cache rather than per-sequence. Needed to fit at max context. |
 | `--spec-type draft-dflash` | Block-diffusion drafting, ~3.05 tokens accepted per step. |
-| `--draft-max 7` | DFlash2 trains at `block_size` 8, so 7 is its natural ceiling. |
+| `--spec-draft-n-max 7` | DFlash2 trains at `block_size` 8, so 7 is its natural ceiling. |
 | `-ngl 99` | All layers on the GPU. |
 
 > **Qwen3.8 and MTP.** Every Qwen3.8 GGUF ships an MTP head, and it is **silently ignored** unless you pass `--spec-type draft-mtp`. It cannot be combined with a draft model — `common_memory` owns a single draft context — and this fork now rejects that pairing with an explicit reason rather than an opaque failure. DFlash2 yields more per step (3.05 vs 2.55), so prefer it when the VRAM is there.
