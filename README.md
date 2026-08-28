@@ -1,14 +1,36 @@
-# llama.cpp — TurboQuant + TriAttention
+# TurboQuant
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 [![GitHub](https://img.shields.io/badge/github-sirxsniper%2Fllama--cpp--turboquant-blue?logo=github)](https://github.com/sirxsniper/llama-cpp-turboquant)
 [![HuggingFace](https://img.shields.io/badge/🤗%20HuggingFace-binaries-yellow)](https://huggingface.co/sirxsniper/llama-cpp-turboquant-binaries)
 
-A fork of [llama.cpp](https://github.com/ggml-org/llama.cpp) with two major additions:
-[ggml](https://github.com/ggml-org/ggml) / [ops](https://github.com/ggml-org/llama.cpp/blob/master/docs/ops.md) / [maintainer PRs](https://github.com/ggml-org/llama.cpp/issues?q=is%3Apr%20is%3Aopen%20draft%3AFalse%20(author%3Argerganov%20OR%20author%3AKitaitiMakoto%20OR%20author%3Adanbev%20OR%20author%3Aaldehir%20OR%20author%3Amax-krasnyansky%20OR%20author%3ACISC%20OR%20author%3Aggerganov%20OR%20author%3Aam17an%20OR%20author%3Abartowski1182%20OR%20author%3Anikwen%20OR%20author%3Ahipudding%20OR%20author%3AServeurpersoCom%20OR%20author%3Apwilkin%20OR%20author%3Areeselevine%20OR%20author%3Angxson%20OR%20author%3Ajeffbolznv%20OR%20author%3Amarty1885%20OR%20author%3A0cc4m%20OR%20author%3ATitaniumtown%20OR%20author%3Aangt%20OR%20author%3AIMbackK%20OR%20author%3Aarthw%20OR%20author%3AJohannesGaessler%20OR%20author%3AORippler%20OR%20author%3Aruixiang63%20OR%20author%3Axctan%20OR%20author%3Aallozaur%20OR%20author%3Ayomaytk%20OR%20author%3Aaendk%20OR%20author%3Agaugarg-nv%20OR%20author%3Ataronaeo%20OR%20author%3Aforforever73%20OR%20author%3Alhez%20OR%20author%3Anetrunnereve%20OR%20author%3Afairydreaming)%20sort%3Aupdated-desc) / [dev stats](https://github.com/ggml-org/llama.cpp-dev) / [lib llama API](https://github.com/ggml-org/llama.cpp/issues/9289) / [llama-server REST API](https://github.com/ggml-org/llama.cpp/issues/9291)
+**A full 262,144-token context on a single 32 GB GPU, at speed.**
 
-- **TurboQuant** — custom low-bit quantization formats (turbo2, turbo3, turbo4) with hardware-optimised CUDA kernels for faster inference with smaller memory footprint
-- **TriAttention** — GPU-accelerated KV cache pruning ([arXiv 2604.04921](https://arxiv.org/abs/2604.04921)) that scores token importance using RoPE-inverted key vectors and evicts low-value tokens, enabling long-context inference within a fixed memory budget
+A performance fork of [llama.cpp](https://github.com/ggml-org/llama.cpp) built around one target: run a 27B model at its full 256K context on one RTX 5090 without giving up throughput or output quality. That needs two things that pull against each other — a KV cache small enough to fit, and an attention path fast enough that the small cache doesn't cost you anything to read.
+
+### What's in it
+
+**TurboQuant KV cache.** Custom low-bit formats (`turbo4` at 4.25 bpw, plus `turbo3` and `turbo2`) with hand-written CUDA kernels for Turing through Blackwell. A 262,144-token cache on Qwen3.8-27B costs **4.3 GiB** as `turbo4`, against 8.0 GiB as `q8_0` and 16.0 GiB as `f16` — the difference between holding a full context on a 32 GB card and not holding it.
+
+**Native quantized attention.** Decode reads the quantized cache directly at every depth instead of materialising it as F16 first. Worth **+45% decode at full context**.
+
+**Attention tuned for the model's real shape.** Grouped-query packing chosen by exact divisor rather than rounded up, and a re-tuned softmax batch size. Worth **+15–17% prefill at depth**.
+
+**Speculative decoding that doesn't tax prefill.** DFlash2 block-diffusion drafting, with the drafter skipped on the part of a long prompt where it cannot pay for itself. Worth **+10% prefill** with a drafter attached.
+
+**TriAttention.** GPU-accelerated KV-cache pruning ([arXiv 2604.04921](https://arxiv.org/abs/2604.04921)) that scores token importance from RoPE-inverted key vectors and evicts low-value tokens, for inference inside a fixed memory budget.
+
+### Where it lands
+
+`Qwen3.8-27B-UD-Q4_K_XL`, RTX 5090, `turbo4` KV, flash attention on, `llama-bench -r 3`:
+
+| Context depth | Prefill (t/s) | Decode (t/s) |
+|--------------:|--------------:|-------------:|
+| 0 | 3582.93 | 63.97 |
+| 131,072 | 1196.84 | 42.92 |
+| 245,760 | 758.91 | 33.60 |
+
+Decode at 245,760 tokens started this work at 23.14 t/s. Quality is held to the same bar as the speed: needle-in-a-haystack passes at 32K / 128K / 245K, and the old and new attention routings produce identical output on an identical 240K prompt.
 
 ## Pre-built Windows Binaries
 
@@ -142,13 +164,23 @@ cmake --build build --target llama-server -j$(nproc)
 
 ## Current focus
 
-Long-context throughput on a single RTX 5090: holding a full **262144-token** context with `turbo4` KV while keeping decode and prefill as close to the hardware ceiling as possible. Work is measured with `llama-bench -d <depth>` (repeated, with stddev) rather than through the server, because with a speculative drafter attached the decode rate tracks draft acceptance, which varies with prompt text and swamps the effects being measured.
+Long-context throughput on a single RTX 5090: holding a full **262,144-token** context with `turbo4` KV while keeping decode and prefill as close to the hardware ceiling as possible. Work is measured with `llama-bench -d <depth>` (repeated, with stddev) rather than through the server, because with a speculative drafter attached the decode rate tracks draft acceptance, which varies with prompt text and swamps the effects being measured.
+
+Where prefill time goes at `d245760` (675 ms per 512-token batch), on a model with 17 full-attention layers and 48 Gated DeltaNet layers:
+
+| Component | Time | Share |
+|-----------|-----:|------:|
+| Attention (17 layers, 5.3e13 flops) | ~521 ms | 77% |
+| FFN | ~143 ms | 21% |
+| Gated DeltaNet (48 layers) | ~10 ms | 1.5% |
+
+Attention runs at ~101 TFLOPS there. That is roughly half of the card's realistic ceiling for FP16 tensor ops with FP32 accumulation, which is normal-to-good for flash attention but leaves room.
 
 Open items:
 
-- **Prefill cost of speculation.** Attaching a drafter costs ~13% of prefill throughput. Measurement attributes ~10% to the target's `nextn` hidden-state machinery (an MTP drafter, which loads no second model, costs the same) and ~3% to the drafter's own forward passes. Not yet resolved — skipping the drafter's prompt prefill, the `nextn` GPU→host copy, and the `nextn` flag itself each recovered ~nothing.
-- **Prefill decay with depth.** Effective throughput falls from ~206 to ~67 TFLOPS between `pp512` and `pp512 @ d245760`. Attention FLOPs (~11% of FFN at max depth) do not account for it.
-- **Wide-Q native turbo reads.** The MMA tile loader reads `turbo4` natively for narrow Q only; prefill still uses the F16 conversion because that conversion is amortised across many Q tiles and wins there.
+- **Attention efficiency at depth.** The MMA config knobs are now exhausted: `ncols2` by exact GQA divisor and `nbatch_fa` 32 to 64 both won, while `nthreads` 128 to 256 (−15%), `occupancy` 2 to 3 (−8%), and wider `ncols1` all lose. Further gain needs kernel work, not tuning.
+- **Wide-Q native turbo reads.** The MMA tile loader reads `turbo4` natively for narrow Q only; prefill still uses the F16 conversion, because that conversion is amortised across many Q tiles and wins there. Measured directly: an `f16` cache prefills only ~3% faster than `turbo4` at 131K, so the conversion is close to free and this is not a promising lever.
+- **Stacking MTP with a draft model.** Blocked structurally rather than by policy: `common_memory` owns a single `ctx_dft` and mirrors sequence operations to it, so two drafters cannot coexist. DFlash2 alone already yields more tokens per step (3.05) than MTP alone (2.55), so the payoff would be small.
 
 ## Recent changes
 
@@ -175,6 +207,27 @@ For reference `q8_0`, which never had the bug, measures 35.33 at 245,760 — `tu
 
 Verified with `test-backend-ops -o FLASH_ATTN_EXT` on both routings, and needle-in-a-haystack at 32K / 128K / 245K; old and new routing produce identical output on an identical 240K prompt.
 
+### August 2026 — prefill at depth
+
+Two independent bugs, both found by asking why attention was running so far under the card's ceiling.
+
+**Grouped-query packing rounded the wrong way.** `ncols2` controls how many query heads share one K/V tile read. The selection ladder rounded *up* to the next power of two, so a model with `gqa_ratio = 24/4 = 6` was assigned 8 columns and computed 8 heads' worth of work for 6 real heads — 25% of the attention math thrown away, at every depth. Choosing by exact divisor instead (6 % 2 == 0, so 2) fixed it.
+
+**The softmax batch size was tuned for a different shape.** `nbatch_fa` sets how many KV rows are processed per softmax rescaling. Raising it 32 to 64 for the 256/256 head-dimension case cut rescaling overhead; 128 exceeds the shared-memory budget and aborts, so 64 is the ceiling.
+
+**The drafter was prefilling prompt it could never help with.** With speculative decoding attached, the draft model prefilled the entire prompt, but drafting only ever begins at the tail. `SPEC_PREFILL_TAIL` (default 2048) skips the drafter's forward passes over everything earlier.
+
+`llama-bench` pp512, same model and card, r=3:
+
+| Context depth | Before | After | |
+|---------------|--------|-------|---|
+| 131,072 | 1023.15 | **1196.84** | +17.0% |
+| 245,760 | 645.31 | **758.91** | +17.6% |
+
+With a drafter attached, `SPEC_PREFILL_TAIL` recovers a further ~10% on top of that, and draft acceptance is unchanged (29.6% to 29.4%) — the skipped work was genuinely dead.
+
+Verified with `test-backend-ops -o FLASH_ATTN_EXT` and needle retrieval at 245K.
+
 ### May 2026
 
 The May 2026 update cycle (commits `ccdce708f` to `fd0a94a4f`) brought this fork from upstream `b8650` to `b9033` and reworked the turbo K/V flash-attention path. See **[docs/CHANGES-2026-05.md](docs/CHANGES-2026-05.md)** for the full per-commit changelog with rationale and perf numbers.
@@ -193,22 +246,11 @@ Reference TG speeds on RTX 5090, `Qwen3.6-27B-UD-Q6_K_XL`, turbo4 KV, FA on:
 
 ---
 
-## Credits
-
-For a per-file inventory of every function, kernel, and modification authored on this fork (TurboQuant CUDA/CPU/Metal integration, KV-cache wiring, TriAttention pruning, the May 2026 perf rework, and build infrastructure), see **[CREDITS.md](CREDITS.md)**.
-
-Short version:
-
-- [llama.cpp](https://github.com/ggml-org/llama.cpp), Georgi Gerganov and contributors. Upstream base.
-- TurboQuant method paper, [arXiv 2504.19874](https://arxiv.org/abs/2504.19874) (ICLR 2026). The algorithm.
-- TriAttention method paper, [arXiv 2604.04921](https://arxiv.org/abs/2604.04921). The algorithm.
-- [@sirxsniper](https://github.com/sirxsniper): full GPU integration of TurboQuant (CUDA + CPU + Metal), TriAttention KV-cache pruning, all turbo CUDA kernels (`k_set_rows_turbo*`, `k_turbo_wht_*`, `vec_dot_fattn_vec_KQ_turbo*`, `dequantize_V_turbo*`), the public InnerQ cross-DLL ABI, TURBO type id allocation, KV cache wiring, the May 2026 perf rework (turbo K/V FA dispatch, Walsh-Hadamard barrier split, KQ_max scale skip, alignment fixes), MSVC build compatibility, chat-parser robustness fix, the verified-working CMake build recipe, and conflict-resolution work across upstream merges b8650 to b9033.
-
 ---
 
-*For the original llama.cpp documentation, see [docs/](docs/) or [github.com/ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp).*
+# Upstream llama.cpp
 
-LLM inference in C/C++
+Everything below this line is upstream llama.cpp documentation, kept for reference: supported models and backends, the tool guides, and build/packaging notes. It describes the base project, not the work in this fork.
 
 ## Recent API changes
 
@@ -800,3 +842,18 @@ $ echo "source ~/.llama-completion.bash" >> ~/.bashrc
 - [nlohmann/json](https://github.com/nlohmann/json) - Single-header JSON library, used by various tools/examples - MIT License
 - [mackron/miniaudio](https://github.com/mackron/miniaudio) - Single-header audio format decoder, used by multimodal subsystem - Public domain
 - [sheredom/subprocess.h](https://github.com/sheredom/subprocess.h) - Single-header process launching solution for C and C++ - Public domain
+
+---
+
+## Credits
+
+For a per-file inventory of every function, kernel, and modification authored on this fork (TurboQuant CUDA/CPU/Metal integration, KV-cache wiring, TriAttention pruning, the May 2026 perf rework, and build infrastructure), see **[CREDITS.md](CREDITS.md)**.
+
+Short version:
+
+- [llama.cpp](https://github.com/ggml-org/llama.cpp), Georgi Gerganov and contributors. Upstream base.
+- TurboQuant method paper, [arXiv 2504.19874](https://arxiv.org/abs/2504.19874) (ICLR 2026). The algorithm.
+- TriAttention method paper, [arXiv 2604.04921](https://arxiv.org/abs/2604.04921). The algorithm.
+- [@sirxsniper](https://github.com/sirxsniper): full GPU integration of TurboQuant (CUDA + CPU + Metal), TriAttention KV-cache pruning, all turbo CUDA kernels (`k_set_rows_turbo*`, `k_turbo_wht_*`, `vec_dot_fattn_vec_KQ_turbo*`, `dequantize_V_turbo*`), the public InnerQ cross-DLL ABI, TURBO type id allocation, KV cache wiring, the May 2026 perf rework (turbo K/V FA dispatch, Walsh-Hadamard barrier split, KQ_max scale skip, alignment fixes), the August 2026 long-context rework (native turbo4 reads at depth, PRMT centroid gather, coalesced dequant stores, GQA packing by exact divisor, `nbatch_fa` retune, speculative prefill tail), MSVC build compatibility, chat-parser robustness fix, the verified-working CMake build recipe, and conflict-resolution work across upstream merges b8650 to b10655.
+
+---
