@@ -404,6 +404,29 @@ If you have no corrected template, run without `--chat-template-file`; everythin
 
 </details>
 
+### MoE models: `--load-mode none` is not optional
+
+For a mixture-of-experts model with expert layers offloaded to CPU (`-ncmoe`), the loader prints this and it should be obeyed:
+
+```
+tensor overrides to CPU are used with mmap enabled - consider using --load-mode none
+```
+
+Measured on Qwen3.8-Flash-Next (87 GiB, 512 experts, 31 layers on CPU):
+
+| load mode | decode |
+|:--|--:|
+| `auto` (mmap) | 26.72 ± 3.52 |
+| **`none`** | **31.46 ± 0.36** |
+
+**+17.7%, and the error bar collapses by an order of magnitude.** That second number is the tell: the variance *was* mmap page-fault jitter. With CPU-resident experts the decode path re-reads roughly 809 MB of expert weights per token, and serving that through a memory mapping costs both throughput and predictability.
+
+```bash
+llama-server -m Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf   -c 131072 -ngl 99 -fa 1   -ctk turbo4 -ctv turbo4 --kv-unified   -ncmoe 31 --load-mode none   -t 16 --parallel 1 --port 8080
+```
+
+> `-ncmoe` is a fit decision, not a speed dial, and the right value depends on the context you actually use. At short prompts 30 is faster than 31 (32.37 against 31.43), but at `d131072` the KV cache is real and 30 spills — decode collapses to 6.46 t/s. Use 31 for long context.
+
 ### Flags that carry real weight
 
 | Flag | Why it matters |
