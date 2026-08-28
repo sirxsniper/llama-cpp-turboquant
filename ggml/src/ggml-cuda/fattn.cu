@@ -576,27 +576,12 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
                     const char * force_mma = getenv("TURBO_FA_MMA");
                     const bool want_mma = force_mma && force_mma[0] == '1';
 
-                    // How wide a Q batch may still go to VEC. Default 2 = upstream
-                    // behaviour. For the turbo types this is tunable because a wider Q
-                    // (speculative verification, Q->ne[1] == n_draft+1) is handled by VEC
-                    // as ceil(ncols/2) tiles, each re-reading the cache - which can still
-                    // beat MMA, since MMA's full-cache F16 materialisation costs far more
-                    // than the turbo4 cache is big. Whether it does is a measurement, so
-                    // it is exposed rather than guessed: TURBO_FA_VEC_MAXCOLS.
-                    int vec_max_cols = 2;
-                    if (turbo_K) {
-                        const char * mc = getenv("TURBO_FA_VEC_MAXCOLS");
-                        if (mc) {
-                            const int v = atoi(mc);
-                            if (v >= 1 && v <= 64) {
-                                vec_max_cols = v;
-                            }
-                        }
-                    }
-
                     if (turbo_K && want_mma && K->ne[1] >= 4096) {
                         // fall through to MMA (previous behaviour)
-                    } else if (Q->ne[1] <= vec_max_cols) {
+                    } else if (Q->ne[1] <= 2) {
+                        // VEC is instantiated for cols_per_block 1 and 2 only. Forcing a
+                        // wider Q onto it tiles into ceil(ncols/2) passes that each re-read
+                        // the whole cache: measured 80 -> 12 t/s at 247K. Do not widen.
                         return BEST_FATTN_KERNEL_VEC;
                     }
                 } else {

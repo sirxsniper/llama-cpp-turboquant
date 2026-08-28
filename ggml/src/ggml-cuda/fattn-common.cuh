@@ -504,18 +504,12 @@ struct turbo4_int8_lut {
         w3 = pack(12, 13, 14, 15);
     }
 
-    // Select entry i (0..15) with predicated moves and a shift - pure ALU.
-    __device__ __forceinline__ uint32_t byte_of(unsigned i) const {
-        const uint32_t w = (i < 4u) ? w0 : (i < 8u) ? w1 : (i < 12u) ? w2 : w3;
-        return (w >> ((i & 3u) * 8u)) & 0xFFu;
-    }
-
     // PERF (CRITICAL): look up FOUR centroids at once using the hardware byte-permute
     // (PRMT). `nib` holds the four 4-bit indices as nibbles i0,i1,i2,i3 from bit 0 up -
     // which is exactly the layout of the two packed qs bytes, so no unpacking is needed.
     //
-    // Why this replaces four byte_of() calls: byte_of is a chain of THREE dependent
-    // selects, and calling it four times in a row built a ~12-deep dependent ALU chain
+    // Why this shape: the obvious 16-entry lookup is a chain of three dependent selects,
+    // and doing that once per nibble builds a ~12-deep dependent ALU chain
     // per 4 KV elements. That chain is paid once per KV element per layer per token, so
     // it scales with context depth - which is why turbo4 lost to q8_0 at depth despite
     // reading half the bytes (q8_0 reads more but has almost no dependent work).
@@ -1799,17 +1793,6 @@ void launch_fattn(
 
         GGML_ASSERT(f16_extra.K != 0);
         half * K_f16 = (half *) f16_extra.K;
-        {   // one-shot probe: which conversion path does K take, and how big is the grid?
-            static bool probed = false;
-            const char * e = getenv("TURBO_CONV_PROBE");
-            if (!probed && e && e[0] == '1') {
-                probed = true;
-                fprintf(stderr, "conv-probe K: type=%s contig=%d ne=[%lld,%lld,%lld,%lld] nelem=%lld\n",
-                    ggml_type_name(K->type), (int) ggml_is_contiguously_allocated(K),
-                    (long long) K->ne[0], (long long) K->ne[1], (long long) K->ne[2], (long long) K->ne[3],
-                    (long long) ggml_nelements(K));
-            }
-        }
         if (ggml_is_contiguously_allocated(K)) {
             to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(K->type);
             to_fp16(K_data, K_f16, ggml_nelements(K), main_stream);
@@ -1844,17 +1827,6 @@ void launch_fattn(
 
             GGML_ASSERT(f16_extra.V != 0);
             half * V_f16 = (half *) f16_extra.V;
-            {   // one-shot probe, mirroring the K probe above
-                static bool probed = false;
-                const char * e = getenv("TURBO_CONV_PROBE");
-                if (!probed && e && e[0] == '1') {
-                    probed = true;
-                    fprintf(stderr, "conv-probe V: type=%s contig=%d ne=[%lld,%lld,%lld,%lld] nelem=%lld\n",
-                        ggml_type_name(V->type), (int) ggml_is_contiguously_allocated(V),
-                        (long long) V->ne[0], (long long) V->ne[1], (long long) V->ne[2], (long long) V->ne[3],
-                        (long long) ggml_nelements(V));
-                }
-            }
             if (ggml_is_contiguously_allocated(V)) {
                 to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(V->type);
                 to_fp16(V_data, V_f16, ggml_nelements(V), main_stream);
