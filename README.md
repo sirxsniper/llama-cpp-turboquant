@@ -12,7 +12,7 @@
 
 <br>
 
-### 262,144 tokens · 4.52 GiB of KV cache · 43.6 tok/s at 245K depth
+### 262,144 tokens · 4.52 GiB of KV cache · turbo4 faster than f16 at depth
 
 </div>
 
@@ -26,9 +26,9 @@ That target pulls in two directions at once. The KV cache has to be small enough
 
 | | Prefill | Decode | KV cache |
 |:--|--:|--:|--:|
-| **Empty context** | 3722.70 t/s | 66.57 t/s | — |
-| **131,072 tokens** | 1242.29 t/s | 52.13 t/s | 2.26 GiB |
-| **245,760 tokens** | 760.75 t/s | 43.55 t/s | 4.24 GiB |
+| **Empty context** | 3456.32 t/s | 58.89 t/s | — |
+| **131,072 tokens** | 1136.72 t/s | 51.02 t/s | 2.26 GiB |
+| **245,760 tokens** | 671.90 t/s | 43.03 t/s | 4.24 GiB |
 | **262,144 tokens** | — | — | **4.52 GiB** |
 
 <sub>All six throughput figures from a single <code>llama-bench -r 3</code> run on the shipped build, stock defaults.</sub>
@@ -197,11 +197,13 @@ Subtracting the empty-context decode time from the decode time at depth isolates
 
 | KV type | bytes read @131K | added time | effective bandwidth |
 |:--|--:|--:|--:|
-| `turbo4` *(before fix)* | 2.42 GB | 7.86 ms | 308 GB/s |
-| `q8_0` | 4.85 GB | 6.01 ms | 807 GB/s |
-| `f16` | 9.13 GB | 5.63 ms | 1621 GB/s |
-| **`turbo4` *(shipped)*** | **2.42 GB** | **6.00 ms** | **403 GB/s** |
-| `turbo4` *(dequant ablated)* | 2.42 GB | 4.09 ms | 592 GB/s |
+| `turbo4` *(session start)* | 2.42 GB | 7.86 ms | 308 GB/s |
+| `turbo4` *(after the gather fix)* | 2.42 GB | 6.00 ms | 403 GB/s |
+| `q8_0` | 4.85 GB | 3.95 ms | 1228 GB/s |
+| `f16` | 9.13 GB | 4.30 ms | 2123 GB/s |
+| **`turbo4` *(shipped)*** | **2.42 GB** | **2.45 ms** | **988 GB/s** |
+
+`turbo4` now reads its cache **faster in wall-clock than either `q8_0` or `f16`**, at a quarter of `f16`'s memory. Its KV read went 7.86 ms to 2.45 ms over this work, a 3.2x reduction, and the ordering against `f16` inverted.
 
 `f16` moved **3.8× the bytes in less time**. Reading fewer bytes while taking longer is the signature of a compute-bound gather, not a bandwidth-bound one — which is what localised the problem to the centroid lookup rather than the cache.
 
