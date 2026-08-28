@@ -201,8 +201,28 @@ Subtracting the empty-context decode time from the decode time at depth isolates
 | `q8_0` | 4.85 GB | 6.01 ms | 807 GB/s |
 | `f16` | 9.13 GB | 5.63 ms | 1621 GB/s |
 | **`turbo4` *(shipped)*** | **2.42 GB** | **6.00 ms** | **403 GB/s** |
+| `turbo4` *(dequant ablated)* | 2.42 GB | 4.09 ms | 592 GB/s |
 
-`f16` moved **3.8× the bytes in less time**. Reading fewer bytes while taking longer is the signature of a compute-bound gather, not a bandwidth-bound one — which is what localised the problem to the centroid lookup rather than the cache. After the fix `turbo4` matches `q8_0` in absolute time at **half the VRAM**, and sits 6% off `f16` at **3.8× less memory**.
+`f16` moved **3.8× the bytes in less time**. Reading fewer bytes while taking longer is the signature of a compute-bound gather, not a bandwidth-bound one — which is what localised the problem to the centroid lookup rather than the cache.
+
+> **Read that effective-bandwidth column carefully.** It divides by bytes moved, so a format that reads very little is punished by it even when it is fast. In wall-clock — which is what a token costs — `turbo4` reads its cache in 6.00 ms against `f16`'s 5.63 ms while using **3.8× less memory**, and against `q8_0`'s 6.01 ms at **half** the VRAM. Chasing `f16`'s GB/s number is chasing an artefact of the metric; the real target is wall-clock, and there the gap is 6%.
+
+### What is left, and why
+
+An ablation that deletes every dequant gather but keeps all loads intact measured **51.76** at `d131072` against 47.03 at the time. So roughly a third of the KV read cost is arithmetic, and even with that arithmetic entirely free the kernel would land near 4.09 ms — not the ~3 ms that matching `q8_0`'s GB/s would require. Cheaper arithmetic alone cannot get there.
+
+The reason the arithmetic costs so much is that it is done six times. FA-vec launches with `ncols2 = 1`, so one block serves exactly one query head:
+
+```
+const int head = blockIdx.z - sequence*ne02;    // ne02 = 24 query heads
+K += nb13*sequence + nb12*(head / gqa_ratio);   // gqa_ratio = 6
+```
+
+With 24 query heads over 4 KV heads, **six blocks read and dequantize the same cache**. DRAM is spared — L2 absorbs most of the re-reads, which is why measured throughput is not 6× worse — but every block dequantizes independently, so the gather is paid six times over. That is the amplifier that turns turbo4's slightly-more-expensive lookup into a 2× gap against `q8_0` per byte.
+
+Packing GQA heads into one block, the way the MMA kernel already does, is the remaining structural fix. It is bounded by registers: `VKQ[ncols][16]` half2 makes six-way packing infeasible at head dim 256, so two- or three-way is the realistic range, worth an estimated 5–12%.
+
+Routing decode through the MMA kernel instead — which does pack GQA — was measured and rejected: **22.18 vs 46.91** at `d131072`, because at query width 1 it computes a 64-column tile for a single real column.
 
 ### Where prefill time goes
 
