@@ -10259,7 +10259,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // 64 of this model's 65 layers are GDN/SSM, so if this op is slow it
     // dominates prefill regardless of how fast the matmuls are.
     // ssm: state_size 128, group_count 16, time_step_rank 48, inner 6144.
-    for (int64_t toks : { 512, 1024, 2048 }) {
+    // toks 1 and 8 are the DECODE shapes and they matter most: dispatch sends
+    // n_tokens < 128 to the SEQUENTIAL kernel, which this sweep never exercised -
+    // every entry below 128 was missing, so the decode cost of 49 of 65 layers was
+    // unmeasured. 1 = plain decode, 8 = a DFlash2 speculative verification batch.
+    for (int64_t toks : { 1, 8, 512, 1024, 2048 }) {
         test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 48, 128, toks, 1));
         test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, toks, 1));
     }
