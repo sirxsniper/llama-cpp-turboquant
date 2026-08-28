@@ -842,6 +842,13 @@ ggml_type llama_ftype_get_default_type(llama_ftype ftype) {
 
         case LLAMA_FTYPE_MOSTLY_MXFP4_MOE: return GGML_TYPE_MXFP4;
 
+        // NVFP4: 64 values -> 4 UE4M3 sub-block scales + 32 packed E2M1 nibbles = 4.5 bpw.
+        // The enum, the ggml quantize/dequantize kernels and the Blackwell MMQ tensor-core
+        // path (mma.sync...kind::mxf4nvf4...m16n8k64, 16 CASEs in mmq-config-blackwell.cuh)
+        // all already existed - only this mapping and the CLI entry were missing, so the
+        // format could be executed but never produced.
+        case LLAMA_FTYPE_MOSTLY_NVFP4:     return GGML_TYPE_NVFP4;
+
         // K-quants
         case LLAMA_FTYPE_MOSTLY_Q2_K_S:
         case LLAMA_FTYPE_MOSTLY_Q2_K:    return GGML_TYPE_Q2_K;
