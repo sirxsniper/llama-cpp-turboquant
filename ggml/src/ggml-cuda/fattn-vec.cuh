@@ -129,7 +129,10 @@ static __global__ void flash_attn_ext_vec(
     //
     // 8 remains right for ncols2<=2, where the packing is cheap and V throughput matters more
     // (V_cols_per_iter = WARP_SIZE/nthreads_V drops from 4 to 2 at 16).
-    constexpr int nthreads_V  = type_V_is_turbo ? (ncols2 >= 3 ? 16 : 8)
+    // Each step up in packing needs a proportionally smaller column to stay in registers:
+    // VKQ is [ncols][(D/2)/nthreads_V], so nthreads_V is the only lever on the dominant term.
+    // 8 -> 16 is what made three- and four-way viable; six-way needs 32 for the same reason.
+    constexpr int nthreads_V  = type_V_is_turbo ? (ncols2 >= 6 ? 32 : (ncols2 >= 3 ? 16 : 8))
                                                 : (V_is_unquantized ? 128 / cpy_nb : nthreads_V_q);
 
     static_assert(WARP_SIZE % nthreads_KQ == 0, "bad nthreads_K");
@@ -555,6 +558,14 @@ static __global__ void flash_attn_ext_vec(
                 break;
             }
 
+            // A packed block can hold more column slots than the group has heads, when
+            // ncols2 does not divide gqa_ratio. Those slots have no head, so reading a sink
+            // for them runs off the end of the array. Skip them; their accumulators are
+            // never written out anyway.
+            if (FA_VEC_HD(j) >= col_gqa_lim) {
+                continue;
+            }
+
             const float sink = ((const float *) sinks)[head0 + FA_VEC_HD(j)];
 
             const float kqmax_new_j = fmaxf(sink, KQ_max[j]);
@@ -744,12 +755,25 @@ static int ggml_cuda_fattn_vec_ncols2(const ggml_tensor * dst) {
         const int v = e ? atoi(e) : 0;
         return (v >= 1 && v <= 6) ? v : 0;
     }();
-    if (forced) {
-        return forced;
-    }
     const ggml_tensor * Q = dst->src[0];
     const ggml_tensor * K = dst->src[1];
     const int gqa_ratio = Q->ne[2] / K->ne[2];
+
+    // INVARIANT: ncols2 must divide gqa_ratio exactly.
+    //
+    // A block owns ncols2 column slots and maps slot c to query head head0 + c. If ncols2
+    // exceeds what the group has, the surplus slots address heads belonging to OTHER K/V
+    // groups. This kernel skips them, but the combine kernel in launch_fattn does not - it
+    // is templated on ncols2 and reduces all of them, writing results into those foreign
+    // heads from tmp buffers this kernel never filled. The corruption lands in a different
+    // head than the one being computed, which is why it shows up as a plain numerical
+    // mismatch rather than a crash.
+    //
+    // The override is clamped for the same reason, so forcing a value cannot produce wrong
+    // output - it can only fall back to something legal.
+    if (forced && gqa_ratio % forced == 0) {
+        return forced;
+    }
 
     // Largest EXACT divisor, never a rounded-up value. Rounding up leaves dead columns:
     // gqa_ratio 6 with 4-way packing needs 2 blocks of 4 and wastes a quarter of the work,
@@ -763,12 +787,18 @@ static int ggml_cuda_fattn_vec_ncols2(const ggml_tensor * dst) {
     // d131072 against 52.13 at three-way - so it is wrong, not merely a poor trade. Without a
     // cap the divisor rule below would select exactly 6 for the very common gqa_ratio 6.
     //
-    // Four-way is re-validated against the op tests at the current nthreads_V (2/2 backends)
-    // and is enabled. It only ever wins where it divides exactly: at gqa_ratio 6 three-way
-    // measured FASTER (52.13 vs 51.01 at d131072) because 4 leaves a quarter of its columns
-    // dead, and the divisor rule below picks 3 there. At gqa_ratio 12 four-way divides
-    // cleanly and saves a whole pass over the cache.
-    for (int n = 4; n >= 2; --n) {
+    // Take the largest exact divisor. Because it must divide exactly, the chosen value never
+    // leaves dead columns, and at gqa_ratio 6 that means six-way - one single pass over the
+    // cache with no redundant dequantization at all.
+    //
+    // Six-way was previously believed broken. It was not: the op-test failures came from
+    // FORCING it onto gqa_ratio 1 cases, which violates the invariant above. With the clamp
+    // in place it passes 2/2 at every factor, and on Qwen3.8-27B UD-Q5_K_XL with turbo4 it
+    // measures tg64 44.98 at d245760 against 41.58 for three-way, +8.2%.
+    for (int n = 6; n >= 2; --n) {
+        if (n == 5) {
+            continue;               // not instantiated; no common gqa_ratio needs it
+        }
         if (gqa_ratio % n == 0) {
             return n;
         }
