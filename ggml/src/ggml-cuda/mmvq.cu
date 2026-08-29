@@ -294,39 +294,29 @@ int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
     return MMVQ_MAX_BATCH_SIZE;
 }
 
-// [TAG_MMVQ_KQUANT_DECODE] The k-quant ceilings below decide when a matmul leaves the
-// MMVQ vector kernel for the MMQ tiled kernel. They were 5 for Q4_K/Q5_K and 7 for Q6_K.
+// [TAG_MMVQ_KQUANT_DECODE] NEGATIVE RESULT, recorded so it is not retried.
 //
-// Those are too high. MMVQ redoes the k-quant block decode once per column, so its cost
-// grows with ne11 while MMQ dequantizes a tile once and reuses it; MMQ is flat from
-// ne11 = 2 up. Measured with test-backend-ops perf on the deployed shape
-// (m=17408, k=5120, the ffn gate/up matmul), us/run, default ceilings against forcing
-// MMQ from ne11 = 2:
+// The k-quant ceilings below were tuned for plain decode, where ne11 is 1. Speculative
+// decode makes ne11 = n_draft+1, and with DFlash2 n_max 7 that is 8 - past the Q5_K/Q4_K
+// ceiling of 5 and past the Q6_K ceiling of 7. A Q5_K_XL model is almost entirely those
+// two types, so every matmul in every layer falls off MMVQ onto MMQ, which first
+// quantizes the activations to q8_1 and then runs a tiled GEMM. That looked like an
+// obvious cliff to remove.
 //
-//          q5_K                        q6_K
-//   n   MMVQ    MMQ                 MMVQ    MMQ
-//   1  23.01  22.44   -2.5%        30.26  29.43   -2.7%
-//   2  28.40  26.43   -6.9%        32.11  31.15   -3.0%
-//   4  45.86  27.04  -41.0%        46.79  31.13  -33.5%
-//   5  54.02  26.59  -50.8%        52.68  31.19  -40.8%
-//   6  28.68  26.47   -7.7%        60.90  31.23  -48.7%
-//   7  28.80  26.59   -7.7%        68.80  31.22  -54.6%
-//   8  28.65  26.47   -7.6%        34.16  31.14   -8.8%
+// It is not. Raising the ceiling to 8 so the whole speculative batch stays on MMVQ is
+// SLOWER. Measured, Qwen3.8-27B-UD-Q5_K_XL, RTX 5090, DFlash2 n_max 7, d131072:
 //
-// MMVQ costs up to 2.1x MMQ inside the band the old ceilings reserved for it, and the
-// band lines up exactly with them: q5_K degrades through n=5 then jumps back when MMQ
-// takes over at 6, q6_K degrades all the way through n=7. This matters for a speculative
-// verification batch, for prompt remainder ubatches, and for MTP-style drafters.
+//     ceiling   target decode   step       tok/s
+//           5      55.35 ms     60.44 ms   52.16   <- tuned default, MMQ at batch 8
+//           8      61.12 ms     66.54 ms   50.57   <- forced MMVQ, +10% on target decode
 //
-// Ceiling set to 2. At n=1 the two are within noise and MMVQ is the well-tuned plain
-// decode path, so it keeps it; from n=3 MMQ wins by a wide margin.
+// MMQ genuinely wins at batch 8 for k-quants: the q8_1 quantization is cheap next to the
+// tiled GEMM it enables. The tuned ceilings are right and should be left alone.
 //
-// Note the earlier experiment in the other direction: RAISING the ceiling to 8 so a
-// whole speculative batch stayed on MMVQ measured SLOWER end to end (target decode
-// 61.12 against 55.35 ms/step at d131072). Same conclusion from both sides - MMVQ is the
-// wrong kernel above a couple of columns.
+// The real cost of a wide verification batch was not here - it was the flash attention
+// GQA packing, see [TAG_FA_NCOLS2_QWIDTH] in fattn.cu.
 //
-// GGML_CUDA_MMVQ_MAX_K overrides the ceiling to re-measure on other hardware.
+// GGML_CUDA_MMVQ_MAX_K is kept so the trade can be re-measured on other hardware.
 static int64_t ggml_cuda_mmvq_max_k() {
     static const int64_t v = [] {
         const char * e = getenv("GGML_CUDA_MMVQ_MAX_K");
@@ -362,9 +352,9 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
             case GGML_TYPE_Q3_K:
             case GGML_TYPE_Q4_K:
             case GGML_TYPE_Q5_K:
-                return ne11 <= (ovr ? ovr : 2);
+                return ne11 <= (ovr ? ovr : 5);
             case GGML_TYPE_Q6_K:
-                return ne11 <= (ovr ? ovr : 2);
+                return ne11 <= (ovr ? ovr : 7);
             default:
                 return ne11 <= MMVQ_MAX_BATCH_SIZE;
         }
