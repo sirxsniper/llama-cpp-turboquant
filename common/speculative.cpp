@@ -2984,7 +2984,10 @@ bool common_speculative_process(common_speculative * spec, const llama_batch & b
         return result;
     }
 
-    spec_phase_timer tm_probe(COMMON_SPEC_PHASE_PROCESS);
+    // Count only generation-sized batches: this runs after every llama_decode,
+    // prefill ubatches included, which would otherwise be averaged into the
+    // per-step figure and made this phase look like it scales with context.
+    spec_phase_timer tm_probe(batch.n_tokens <= 64 ? COMMON_SPEC_PHASE_PROCESS : -1);
 
     for (auto & impl : spec->impls) {
         result = result && impl->process(batch);

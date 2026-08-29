@@ -114,33 +114,44 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
 
     // [TAG_FA_NCOLS2_QWIDTH]
     // ncols2 is the GQA packing factor: how many query heads share one K/V tile read.
-    // ntiles_z_gqa = ceil(gqa_ratio / ncols2) is therefore how many times the kernel
-    // re-reads the whole K/V region. Which ncols2 is right depends on the Q width,
-    // because the two regimes are bound by different things.
+    // ntiles_z_gqa = ceil(gqa_ratio / ncols2) is how many times the kernel re-reads the
+    // whole K/V region, so at gqa_ratio 6 the exact-divisor ladder below picks 2 and
+    // reads the cache three times. Rounding up to 8 reads it once, at the cost of
+    // computing eight head slots for six real heads.
     //
-    // WIDE Q (prefill, Q = 512) is compute-bound. Rounding ncols2 up past gqa_ratio
-    // computes columns for heads that do not exist - at gqa_ratio 6, ncols2 8 throws
-    // away a quarter of every tile - so the exact divisor wins. See the ladder below.
+    // Which is right depends on the Q width, and the boundary is sharp. Measured with
+    // test-backend-ops perf, D=256, GQA 6:1, turbo4 K and V, as us/run:
     //
-    // NARROW Q (speculative decode, Q = n_draft+1) is bound by the K/V read and has
-    // almost no compute to waste, so the pass count dominates instead. Measured on the
-    // server, Qwen3.8-27B-UD-Q5_K_XL, turbo4 KV, DFlash2 n_max 7, at d131072:
+    //           kv=32768          kv=131072         kv=245760
+    //   nb   divisor roundup   divisor roundup   divisor roundup
+    //    1     62.53   62.79    197.40  198.02    339.82  340.49   (VEC, unaffected)
+    //    2    159.44  161.52    570.09  573.67   1031.46 1033.35   (VEC, unaffected)
+    //    4    131.55   49.78    874.56  213.33   1632.41  379.17   <- -62% to -77%
+    //    8     95.51   80.83    523.78  344.64    950.33  597.21   <- -15% to -37%
+    //   12    119.95  129.98    590.50  612.91   1085.07 1125.78      +4% to +8%
+    //   16    121.90  134.24    600.88  621.55   1088.72 1131.98      +3% to +10%
+    //   32    200.37  247.23    946.29 1201.18   1702.72 2202.90     +23% to +29%
     //
-    //     ncols2   passes   ms/step    tok/s
-    //          1        6    120.52    30.00
-    //          2        3     60.51    64.93   <- what the divisor ladder picks
-    //          4        2     53.39    89.02
-    //          8        1     43.58   107.00   <- round up: -28% step time
+    // Round-up wins only for nb 4..8 and loses from 12 up, because ncols1 is capped at
+    // 64/ncols2: past 8 the kernel starts re-tiling over Q as well, so it pays the
+    // wasted head slots AND more than one pass. Below 4 the VEC kernel takes the call
+    // and this never runs. So the useful window is exactly a speculative verification
+    // batch, and the gate is the largest width measured to win, not a round number.
     //
-    // Monotonic in the pass count, and it holds even though ncols2 8 computes 8 head
-    // slots for 6 real heads. So round UP for narrow Q and keep the exact divisor for
-    // wide Q. 32 sits between a speculative batch and any real prefill ubatch, and
-    // matches the Q-width gate in fattn-mma-f16.cuh. FA_NCOLS2_MAXQ overrides it.
+    // End to end on the server, Qwen3.8-27B-UD-Q5_K_XL, turbo4 KV, DFlash2 n_max 7
+    // (Q = 8), greedy so draft acceptance is comparable:
+    //
+    //     depth    tok/s before   tok/s after      ms/step
+    //     32768        79.50         135.03      38.04 -> 34.22
+    //    131072        56.81          92.30      60.58 -> 43.25
+    //    245760        39.35          63.41      86.67 -> 53.32
+    //
+    // FA_NCOLS2_MAXQ overrides the gate; 0 disables the rule entirely.
     if (use_gqa_opt) {
         static const int narrow_q_max = [] {
             const char * e = getenv("FA_NCOLS2_MAXQ");
             const int v = e ? atoi(e) : -1;
-            return (v >= 0 && v <= 4096) ? v : 32;   // 0 disables the narrow-Q rule
+            return (v >= 0 && v <= 4096) ? v : 8;    // 0 disables the narrow-Q rule
         }();
         if (Q->ne[1] <= narrow_q_max) {
             // smallest power of two >= gqa_ratio, capped at 8 (the instantiated ladder).
