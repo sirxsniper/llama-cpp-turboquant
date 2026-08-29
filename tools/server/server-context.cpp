@@ -3659,12 +3659,20 @@ private:
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
+        // [TAG_SPEC_PHASE_PROBE]
+        const auto t_dec0 = std::chrono::steady_clock::now();
         queue_tasks.yield_to_queue([&]() {
             ret = llama_decode(ctx_tgt, batch_view);
             if (ret == 0 && has_output) {
                 llama_synchronize(ctx_tgt);
             }
         });
+        // Count only generation-sized batches. A prefill ubatch (512) also lands here
+        // and would otherwise be averaged into the per-step figure.
+        if (common_speculative_probe_enabled() && batch_view.n_tokens <= 64) {
+            common_speculative_probe_add(COMMON_SPEC_PHASE_TGT_DECODE,
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_dec0).count());
+        }
 
         if (ret != 0) {
             {
@@ -3923,6 +3931,7 @@ private:
                 const bool can_rollback =
                     ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_PART ||
                     (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && n_draft <= llama_n_rs_seq(ctx_tgt));
+                const auto t_smp0 = std::chrono::steady_clock::now();
                 const auto & synth_probs = common_speculative_get_synth_probs(spec.get());
                 auto accepted =
                     !synth_probs.empty()
@@ -3933,6 +3942,11 @@ private:
                        slot.spec_dists.size() == slot.spec_draft.size())
                         ? common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft, slot.spec_dists)
                         : common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
+                if (common_speculative_probe_enabled()) {
+                    common_speculative_probe_add(COMMON_SPEC_PHASE_SAMPLE,
+                        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_smp0).count());
+                    common_speculative_probe_step();
+                }
                 slot.spec_i_batch.clear();
 
                 GGML_ASSERT(accepted.size() >= 1);

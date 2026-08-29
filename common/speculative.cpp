@@ -1234,8 +1234,29 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                         __func__, rc, (int) n_chunk, (int) offset);
                 return false;
             }
-            // The server may switch contexts before the next draft decode.
-            llama_synchronize(ctx_dft);
+            // [TAG_SPEC_DFT_SYNC] The server may switch contexts before the next draft
+            // decode, so this drains the drafter queue to be safe.
+            //
+            // It is also a full pipeline stall, paid once per chunk - and during GENERATION
+            // that is once per token step, where a chunk is only the 1-8 accepted tokens.
+            // Measured on a real session at ~91K context: a speculative step costs 45.2 ms
+            // against ~19 ms for the target forward, so ~26 ms goes to the drafter path -
+            // about 12x what streaming the drafter's 1.06 GiB three times would cost. The
+            // work is not compute-bound or bandwidth-bound; it is overhead, and a per-step
+            // synchronize is the largest single candidate.
+            //
+            // Gated for measurement rather than removed: the sync is a correctness guard and
+            // is only obviously redundant when nothing switches contexts between here and
+            // the draft decode, which reads drafter output and synchronizes anyway.
+            // SPEC_DFT_SYNC=0 skips it during generation only; prefill always syncs.
+            static const bool dft_sync_always = [] {
+                const char * e = getenv("SPEC_DFT_SYNC");
+                return !(e && e[0] == '0');
+            }();
+            const bool is_prefill = n_prefill_after > 0 || n_tokens > 8;
+            if (dft_sync_always || is_prefill) {
+                llama_synchronize(ctx_dft);
+            }
         }
 
         return true;
@@ -2905,12 +2926,65 @@ void common_speculative_set_prefill_after(common_speculative * spec, int32_t n_a
     }
 }
 
+// [TAG_SPEC_PHASE_PROBE] see speculative.h
+static double g_spec_phase_ms[COMMON_SPEC_PHASE_COUNT] = {0};
+static unsigned g_spec_phase_steps = 0;
+
+bool common_speculative_probe_enabled() {
+    static const bool v = [] {
+        const char * e = getenv("SPEC_PHASE_PROBE");
+        return e && e[0] == '1';
+    }();
+    return v;
+}
+
+void common_speculative_probe_add(int phase, double ms) {
+    if (phase >= 0 && phase < COMMON_SPEC_PHASE_COUNT) {
+        g_spec_phase_ms[phase] += ms;
+    }
+}
+
+void common_speculative_probe_step() {
+    if (!common_speculative_probe_enabled()) {
+        return;
+    }
+    if (++g_spec_phase_steps % 128u != 0u) {
+        return;
+    }
+    const char * nm[COMMON_SPEC_PHASE_COUNT] = {"tgt_decode","spec_process","spec_draft","spec_accept","sample"};
+    double tot = 0.0;
+    for (int i = 0; i < COMMON_SPEC_PHASE_COUNT; ++i) tot += g_spec_phase_ms[i];
+    fprintf(stderr, "turbo-probe: spec-phase over %u steps (%.2f ms/step total)\n",
+            g_spec_phase_steps, tot / g_spec_phase_steps);
+    for (int i = 0; i < COMMON_SPEC_PHASE_COUNT; ++i) {
+        fprintf(stderr, "turbo-probe:   %-12s %8.3f ms/step  %5.1f%%\n",
+                nm[i], g_spec_phase_ms[i] / g_spec_phase_steps,
+                tot > 0.0 ? 100.0 * g_spec_phase_ms[i] / tot : 0.0);
+    }
+    fflush(stderr);
+}
+
+namespace {
+struct spec_phase_timer {
+    int phase; std::chrono::steady_clock::time_point t0; bool on;
+    explicit spec_phase_timer(int p) : phase(p), on(common_speculative_probe_enabled()) {
+        if (on) t0 = std::chrono::steady_clock::now();
+    }
+    ~spec_phase_timer() {
+        if (on) common_speculative_probe_add(phase,
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+    }
+};
+}
+
 bool common_speculative_process(common_speculative * spec, const llama_batch & batch) {
     bool result = true;
 
     if (spec == nullptr) {
         return result;
     }
+
+    spec_phase_timer tm_probe(COMMON_SPEC_PHASE_PROCESS);
 
     for (auto & impl : spec->impls) {
         result = result && impl->process(batch);
@@ -2923,6 +2997,8 @@ void common_speculative_draft(common_speculative * spec) {
     if (spec == nullptr) {
         return;
     }
+
+    spec_phase_timer tm_probe(COMMON_SPEC_PHASE_DRAFT);
 
     auto & dparams = spec->dparams;
 

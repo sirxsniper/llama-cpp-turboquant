@@ -4304,6 +4304,13 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
 
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
+    // [TAG_CUDA_GRAPH_PROBE] why a call did or did not run as a CUDA graph.
+    // Windows WDDM charges ~7us of CPU per kernel launch, and a decode step issues
+    // thousands of them, so whether graphs engage is the single biggest lever on
+    // decode speed. Any change in a node property (a tensor ne/nb or a src data
+    // pointer) resets warmup and drops the step back to raw launches.
+    // TURBO_GRAPH_PROBE=0 silences; it prints every 512 calls.
+    int gp_reason = 0; // 0=graph used, 1=disabled, 2=incompatible, 3=props changed, 4=warmup
     if (graph->is_enabled()) {
         const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
         if (graph_compatible) {
@@ -4316,18 +4323,42 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                     GGML_LOG_DEBUG("%s: CUDA graph warmup complete\n", __func__);
                     use_cuda_graph = true;
                     cuda_graph_update_required = true;
+                } else {
+                    gp_reason = 4;
                 }
-                // else: properties changed or first call - execute directly (use_cuda_graph stays false)
             } else {
                 // Post-warmup: normal CUDA graph operation
                 if (properties_changed) {
                     // Properties changed - reset warmup, execute directly until stable again
                     graph->warmup_complete = false;
                     GGML_LOG_DEBUG("%s: CUDA graph warmup reset\n", __func__);
+                    gp_reason = 3;
                 } else {
                     use_cuda_graph = true;
                     cuda_graph_update_required = graph->instance == nullptr;
                 }
+            }
+        } else {
+            gp_reason = 2;
+        }
+    } else {
+        gp_reason = 1;
+    }
+    {
+        static const bool probe_on = [] {
+            const char * e = getenv("TURBO_GRAPH_PROBE");
+            return !(e && e[0] == '0');
+        }();
+        if (probe_on) {
+            static std::atomic<unsigned> n_call{0}, n_reason[5]{};
+            n_reason[gp_reason].fetch_add(1, std::memory_order_relaxed);
+            const unsigned n = n_call.fetch_add(1, std::memory_order_relaxed) + 1;
+            if ((n & 511u) == 0u) {
+                fprintf(stderr,
+                        "turbo-probe: cuda-graph calls=%u used=%u disabled=%u incompatible=%u props-changed=%u warmup=%u nodes=%d\n",
+                        n, n_reason[0].load(), n_reason[1].load(), n_reason[2].load(),
+                        n_reason[3].load(), n_reason[4].load(), cgraph->n_nodes);
+                fflush(stderr);
             }
         }
     }

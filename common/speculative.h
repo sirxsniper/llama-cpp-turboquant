@@ -106,6 +106,24 @@ bool common_speculative_get_state(common_speculative * spec, llama_seq_id seq_id
 void common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id, const std::vector<uint8_t> & data);
 
 // print statistics about the speculative decoding
+
+// [TAG_SPEC_PHASE_PROBE] Wall-clock accounting of one speculative decode step.
+// Measured: the speculative overhead per step is 12.7 ms at ~0 context but 38.9 ms at
+// 131K, while plain decode only moves 18.1 -> 21.3 ms. Something in the speculative
+// path scales with context and this says which phase it is.
+// Enable with SPEC_PHASE_PROBE=1; it prints a breakdown every 128 steps.
+enum common_spec_phase {
+    COMMON_SPEC_PHASE_TGT_DECODE = 0, // llama_decode(ctx_tgt) + its synchronize
+    COMMON_SPEC_PHASE_PROCESS,        // common_speculative_process: layer extract + drafter encode/inject
+    COMMON_SPEC_PHASE_DRAFT,          // common_speculative_draft: drafter decode + lattice read
+    COMMON_SPEC_PHASE_ACCEPT,         // common_speculative_accept
+    COMMON_SPEC_PHASE_SAMPLE,         // target sampling / draft verification
+    COMMON_SPEC_PHASE_COUNT
+};
+bool common_speculative_probe_enabled();
+void common_speculative_probe_add(int phase, double ms);
+void common_speculative_probe_step();
+
 void common_speculative_print_stats(const common_speculative * spec);
 
 struct common_speculative_deleter {

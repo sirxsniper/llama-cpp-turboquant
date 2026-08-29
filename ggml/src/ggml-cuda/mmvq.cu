@@ -294,6 +294,38 @@ int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
     return MMVQ_MAX_BATCH_SIZE;
 }
 
+// [TAG_MMVQ_KQUANT_DECODE] NEGATIVE RESULT, recorded so it is not retried.
+//
+// The k-quant ceilings below were tuned for plain decode, where ne11 is 1. Speculative
+// decode makes ne11 = n_draft+1, and with DFlash2 n_max 7 that is 8 - past the Q5_K/Q4_K
+// ceiling of 5 and past the Q6_K ceiling of 7. A Q5_K_XL model is almost entirely those
+// two types, so every matmul in every layer falls off MMVQ onto MMQ, which first
+// quantizes the activations to q8_1 and then runs a tiled GEMM. That looked like an
+// obvious cliff to remove.
+//
+// It is not. Raising the ceiling to 8 so the whole speculative batch stays on MMVQ is
+// SLOWER. Measured, Qwen3.8-27B-UD-Q5_K_XL, RTX 5090, DFlash2 n_max 7, d131072:
+//
+//     ceiling   target decode   step       tok/s
+//           5      55.35 ms     60.44 ms   52.16   <- tuned default, MMQ at batch 8
+//           8      61.12 ms     66.54 ms   50.57   <- forced MMVQ, +10% on target decode
+//
+// MMQ genuinely wins at batch 8 for k-quants: the q8_1 quantization is cheap next to the
+// tiled GEMM it enables. The tuned ceilings are right and should be left alone.
+//
+// The real cost of a wide verification batch was not here - it was the flash attention
+// GQA packing, see [TAG_FA_NCOLS2_QWIDTH] in fattn.cu.
+//
+// GGML_CUDA_MMVQ_MAX_K is kept so the trade can be re-measured on other hardware.
+static int64_t ggml_cuda_mmvq_max_k() {
+    static const int64_t v = [] {
+        const char * e = getenv("GGML_CUDA_MMVQ_MAX_K");
+        const int x = e ? atoi(e) : 0;
+        return (int64_t) ((x >= 1 && x <= 8) ? x : 0);   // 0 = keep the tuned defaults
+    }();
+    return v;
+}
+
 bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
     if (!ggml_is_quantized(type)) {
         return false;
@@ -314,14 +346,15 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
         }
     }
     if (GGML_CUDA_CC_IS_NVIDIA(cc) && cc == GGML_CUDA_CC_BLACKWELL) {
+        const int64_t ovr = ggml_cuda_mmvq_max_k();
         switch (type) { // tuned on RTX 5090
             case GGML_TYPE_Q2_K:
             case GGML_TYPE_Q3_K:
             case GGML_TYPE_Q4_K:
             case GGML_TYPE_Q5_K:
-                return ne11 <= 5;
+                return ne11 <= (ovr ? ovr : 5);
             case GGML_TYPE_Q6_K:
-                return ne11 <= 7;
+                return ne11 <= (ovr ? ovr : 7);
             default:
                 return ne11 <= MMVQ_MAX_BATCH_SIZE;
         }

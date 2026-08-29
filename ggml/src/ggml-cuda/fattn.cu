@@ -112,6 +112,51 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
         }
     }
 
+    // [TAG_FA_NCOLS2_QWIDTH]
+    // ncols2 is the GQA packing factor: how many query heads share one K/V tile read.
+    // ntiles_z_gqa = ceil(gqa_ratio / ncols2) is therefore how many times the kernel
+    // re-reads the whole K/V region. Which ncols2 is right depends on the Q width,
+    // because the two regimes are bound by different things.
+    //
+    // WIDE Q (prefill, Q = 512) is compute-bound. Rounding ncols2 up past gqa_ratio
+    // computes columns for heads that do not exist - at gqa_ratio 6, ncols2 8 throws
+    // away a quarter of every tile - so the exact divisor wins. See the ladder below.
+    //
+    // NARROW Q (speculative decode, Q = n_draft+1) is bound by the K/V read and has
+    // almost no compute to waste, so the pass count dominates instead. Measured on the
+    // server, Qwen3.8-27B-UD-Q5_K_XL, turbo4 KV, DFlash2 n_max 7, at d131072:
+    //
+    //     ncols2   passes   ms/step    tok/s
+    //          1        6    120.52    30.00
+    //          2        3     60.51    64.93   <- what the divisor ladder picks
+    //          4        2     53.39    89.02
+    //          8        1     43.58   107.00   <- round up: -28% step time
+    //
+    // Monotonic in the pass count, and it holds even though ncols2 8 computes 8 head
+    // slots for 6 real heads. So round UP for narrow Q and keep the exact divisor for
+    // wide Q. 32 sits between a speculative batch and any real prefill ubatch, and
+    // matches the Q-width gate in fattn-mma-f16.cuh. FA_NCOLS2_MAXQ overrides it.
+    if (use_gqa_opt) {
+        static const int narrow_q_max = [] {
+            const char * e = getenv("FA_NCOLS2_MAXQ");
+            const int v = e ? atoi(e) : -1;
+            return (v >= 0 && v <= 4096) ? v : 32;   // 0 disables the narrow-Q rule
+        }();
+        if (Q->ne[1] <= narrow_q_max) {
+            // smallest power of two >= gqa_ratio, capped at 8 (the instantiated ladder).
+            int n2 = 1;
+            while (n2 < gqa_ratio && n2 < 8) {
+                n2 *= 2;
+            }
+            switch (n2) {
+                case 8: ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 8>(ctx, dst); return;
+                case 4: ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 4>(ctx, dst); return;
+                case 2: ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 2>(ctx, dst); return;
+                default: break;   // gqa_ratio 1: no packing possible, fall through
+            }
+        }
+    }
+
     // [TAG_FA_NCOLS2_DIVISOR]
     // ncols2 is the GQA packing factor: how many query heads share one K/V tile read.
     // This ladder used to round UP (`> 4` -> 8), so a gqa_ratio that is not a power of
@@ -737,15 +782,34 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         const best_fattn_kernel kprobe = ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst);
         const ggml_tensor * Kp = dst->src[1];
         const ggml_tensor * Qp = dst->src[0];
-        const int key = ((int) kprobe << 16) | ((int) Kp->type << 4) | (Qp->ne[1] <= 2 ? 1 : 0);
+        // Key on the ACTUAL Q width, not a narrow/wide bit. The old key collapsed every
+        // Q->ne[1] > 2 call into a single entry, so a speculative batch and a prefill
+        // ubatch were indistinguishable - which is what hid whether speculative decode
+        // clears the turbo_ok Q <= 32 gate in fattn-mma-f16.cuh.
+        const int qw  = (int) Qp->ne[1];
+        const int key = ((int) kprobe << 20) | ((int) Kp->type << 12) | (qw < 4095 ? qw : 4095);
         const char * e = getenv("TURBO_PATH_PROBE");
         if (!(e && e[0] == '0') && seen.insert(key).second) {
             const char * kn = kprobe == BEST_FATTN_KERNEL_VEC     ? "VEC (reads KV natively)"        :
                               kprobe == BEST_FATTN_KERNEL_MMA_F16 ? "MMA_F16 (full-cache F16 copy)" :
                               kprobe == BEST_FATTN_KERNEL_TILE    ? "TILE (full-cache F16 copy)"    : "NONE";
-            fprintf(stderr, "turbo-probe: FA kernel = %s | K=%s Q->ne[1]=%d n_kv=%d kq_stride_ok=%d\n",
+            // Mirrors [TAG_TURBO_MMA_NATIVE] in fattn-mma-f16.cuh. If this reports
+            // native=0 on an MMA_F16 call with a turbo4 cache, that call is paying a
+            // full-cache F16 materialisation (to_fp16 over ggml_nelements(K)).
+            const ggml_tensor * Vp = dst->src[2];
+            const char * nenv = getenv("TURBO_MMA_NATIVE");
+            const char * nmq  = getenv("TURBO_MMA_NATIVE_MAXQ");
+            const int maxq_env = nmq ? atoi(nmq) : 0;
+            const int maxq = (maxq_env >= 1 && maxq_env <= 4096) ? maxq_env : 32;
+            const bool native = !(nenv && nenv[0] == '0') &&
+                                Qp->ne[0] == 256 && Vp && Vp->ne[0] == 256 &&
+                                Qp->ne[1] <= maxq &&
+                                Kp->type == GGML_TYPE_TURBO4_0 && Vp->type == GGML_TYPE_TURBO4_0;
+            fprintf(stderr, "turbo-probe: FA kernel = %s | K=%s Q->ne[1]=%d n_kv=%d kq_stride_ok=%d gqa=%d native=%d\n",
                     kn, ggml_type_name(Kp->type), (int) Qp->ne[1], (int) Kp->ne[1],
-                    (int) (Kp->ne[1] % FATTN_KQ_STRIDE == 0));
+                    (int) (Kp->ne[1] % FATTN_KQ_STRIDE == 0),
+                    (int) (Qp->ne[2] / Kp->ne[2]),
+                    kprobe == BEST_FATTN_KERNEL_MMA_F16 ? (native ? 1 : 0) : -1);
             fflush(stderr);
         }
     }

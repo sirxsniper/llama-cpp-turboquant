@@ -10523,6 +10523,30 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1}, 10000, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1}, 20000, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
 
+    // [TAG_FA_PERF_DEPTH] The deployed geometry at real depth: Qwen3.8-27B is
+    // head_dim 256, 24 q heads / 4 kv heads (GQA 6:1), turbo4 K and V.
+    //
+    // nb is the query width. Plain decode is nb=1; a DFlash2 speculative step is
+    // nb = n_draft+1 = 8. Those two take DIFFERENT kernels - nb<=2 goes to VEC with
+    // six-way GQA packing (one pass over the cache), nb>2 goes to MMA, whose ncols2
+    // ladder is powers of two only, so gqa_ratio 6 packs 2 and makes three passes.
+    // This sweep is what makes that cost visible without running a server.
+    for (int64_t kv : {32768, 131072, 245760}) {
+        for (int64_t nb : {1, 2, 4, 8, 16}) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0,
+                        GGML_PREC_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0));
+        }
+    }
+    // q8_0 and f16 at the same shapes, as the reference this fork is measured against.
+    for (int64_t kv : {131072, 245760}) {
+        for (int64_t nb : {1, 8}) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0,
+                        GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0,
+                        GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+        }
+    }
+
     for (int kv : { 4096, 8192, 16384, }) {
         for (int hs : { 64, 128, }) {
             for (int nr : { 1, 4, }) {
