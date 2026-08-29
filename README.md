@@ -183,37 +183,37 @@ Every number in this README comes from this machine. Nothing is inherited, estim
 
 ### Speculative decode — the deployed path
 
-The figures above are `llama-bench`, which does not speculate. This is the path the
-server actually runs: DFlash2 drafting seven tokens, `turbo4` K and V, greedy sampling
-so draft acceptance is comparable across runs, median of four samples on one cached
-prompt. `ms/step` is a full verification step; `tok/step` is how many tokens it retired.
+The figures above are `llama-bench`, which does not speculate. This is the path the server
+actually runs: DFlash2 drafting seven tokens, `turbo4` K and V, greedy sampling, median of
+four samples on one cached prompt.
 
-| Depth | Decode | `ms/step` | `tok/step` |
-|------:|-------:|----------:|-----------:|
-| 32,768 | **126.17 t/s** | 34.30 | 4.36 |
-| 131,072 | **87.89 t/s** | 43.56 | 3.84 |
-| 245,760 | **65.28 t/s** | 53.54 | 3.49 |
+**Read `ms/step` as the result, not `t/s`.** A verification step costs the same no matter how
+much of the draft survives — measured, it holds to within 0.5% across samples — but how many
+tokens it *retires* swings with how predictable the text is. The same build on the same prompt
+measured 79.68 t/s on one run and 105.43 on another purely because one generated reasoning
+(34-38% draft acceptance) and the other code (50-57%). That spread is a property of the
+content, not of the build, and it is why throughput alone is a poor way to compare two builds.
 
-Against the same build with the narrow-Q GQA rule disabled (`FA_NCOLS2_MAXQ=0`), which
-is where this path stood before that fix:
+| Depth | `ms/step` | | Decode, observed | at matched acceptance |
+|------:|----------:|--:|-----------------:|----------------------:|
+| 32,768 | 38.29 → **34.30** | **-10.4%** | 94.0 → 127.1 t/s | 105.0 t/s · **+11.6%** |
+| 131,072 | 60.98 → **43.21** | **-29.1%** | 53.8 → 88.9 t/s | 75.9 t/s · **+41.1%** |
+| 245,760 | 86.52 → **53.54** | **-38.1%** | 46.0 → 65.2 t/s | 74.3 t/s · **+61.6%** |
 
-| Depth | Before | After | | `ms/step` |
-|------:|-------:|------:|--:|:--|
-| 32,768 | 93.67 | **126.17** | +34.7% | 38.29 → 34.30 |
-| 131,072 | 53.68 | **87.89** | +63.7% | 60.98 → 43.56 |
-| 245,760 | 45.77 | **65.28** | +42.6% | 86.52 → 53.54 |
+<sub>Against the same build with the narrow-Q GQA rule disabled (<code>FA_NCOLS2_MAXQ=0</code>).
+The last column divides the <i>old</i> run's tokens-per-step by the <i>new</i> run's step time,
+which is the gain the kernel change is actually responsible for. The raw <code>t/s</code> column
+is what a session felt like, acceptance luck included.</sub>
 
-<sub>Throughput moves with draft acceptance, which varies run to run; step time does not,
-and it holds to within 0.5% across samples. The step-time column is the honest measure of
-the kernel change: <b>-10.4%, -28.6%, -38.1%</b>.</sub>
+Prefill is untouched at every depth — 12.4s → 12.5s, 77.6s → 77.9s, 210.3s → 210.5s — because
+the rule is gated on Q width and a prefill ubatch is far wider than the gate.
 
-Prefill is untouched at every depth — 12.4s → 12.5s, 77.6s → 77.9s, 210.3s → 210.5s —
-because the rule is gated on Q width and a prefill ubatch is far wider than the gate.
-
-> Draft width matters and is not obvious. `n_max 7` (Q=8) measures 81.46 t/s median at
-> 131K against 71.51 for `n_max 3` (Q=4): the shorter draft accepts far more of what it
-> writes (74.8% against 37.2%) but retires fewer tokens per step. **Do not raise `n_max`
-> past 7** — Q would exceed 8 and silently fall off the packing rule below.
+> **Two settings not to change.** `n_max 7` (Q=8) measures 81.46 t/s median at 131K against
+> 71.51 for `n_max 3`: the shorter draft accepts far more of what it writes (74.8% against
+> 37.2%) but retires fewer tokens per step. Raising it past 7 is worse still — Q would exceed 8
+> and silently fall off the packing rule below. And leave `--spec-draft-p-min` at 0: truncating
+> low-confidence drafts sounds like it should save the verification, but measured 47.50 ms/step
+> at 0.4 and 49.47 at 0.6 against **43.21** at 0.
 
 ### KV cache footprint
 
@@ -547,7 +547,7 @@ Choosing by exact divisor instead (6 % 2 == 0, so 2) fixed it.
 ## Engineering log
 
 <details open>
-<summary><b>August 2026 — FA GQA packing chosen by Q width</b> &nbsp;·&nbsp; <code>+63.7% speculative decode</code></summary>
+<summary><b>August 2026 — FA GQA packing chosen by Q width</b> &nbsp;·&nbsp; <code>-29% step time at 131K</code></summary>
 
 <br>
 
@@ -574,7 +574,9 @@ and has almost no compute to waste, so the same rule inverts.
 | 4 | 2 | 53.39 | 89.02 |
 | **8** | **1** | **43.58** | **107.00** |
 
-Monotonic in the pass count, and eight wins despite the wasted slots.
+Monotonic in the pass count, and eight wins despite the wasted slots. End to end that is
+60.98 ms/step to 43.21 at 131K, a 29% cut; in throughput terms +41% at matched draft
+acceptance, and more than that whenever the drafter happens to be doing well.
 
 **The tail.** Gating this at `Q <= 32` — a number borrowed from the neighbouring
 `TURBO_MMA_NATIVE` gate rather than measured — made widths 12, 16 and 32 *slower*, by up to

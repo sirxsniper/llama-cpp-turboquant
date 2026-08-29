@@ -1363,6 +1363,21 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     } else {
                         predecessor = (int32_t) std::distance(scores,
                                 std::max_element(scores, scores + selector_top_k));
+                        // [TAG_SPEC_PMIN] NEGATIVE RESULT. Truncating a low-confidence
+                        // draft here sounds like it should pay for itself twice - fewer
+                        // tokens to verify, and a narrower batch through attention. It
+                        // does not. Measured, Qwen3.8-27B-UD-Q5_K_XL, turbo4 KV, DFlash2
+                        // n_max 7, d131072, median of four greedy samples:
+                        //
+                        //     p_min   ms/step   tok/s
+                        //      0.0     43.21    79.7 .. 105.4
+                        //      0.4     47.50    98.5
+                        //      0.6     49.47    84.0
+                        //
+                        // Steps get MORE expensive, not less, so leave p_min at 0.
+                        // (An early reading of 169 t/s at 0.6 was the model looping:
+                        // repeated text drafts at 100% acceptance. Always check the
+                        // generated text before believing a speculative benchmark.)
                         if (params.p_min > 0.0f) {
                             // softmax(scores) at the argmax, i.e. 1 / sum(exp(s_k - s_max))
                             float sum = 0.0f;
