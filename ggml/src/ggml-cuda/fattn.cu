@@ -502,6 +502,21 @@ static bool ggml_cuda_fattn_kv_type_supported(ggml_type type) {
     }
 }
 
+// [TAG_FA_VEC_Q2] Whether a two-token batch should leave the VEC kernel for MMA.
+// VEC has no GQA packing at ncols1=2, so it pays gqa_ratio passes over the cache where
+// MMA now pays one. Only worth it when there is more than one head to share.
+// FA_VEC_Q2_MMA=0 restores the old routing for A/B.
+static bool vec_q2_to_mma(int gqa_ratio) {
+    static const int forced = [] {
+        const char * e = getenv("FA_VEC_Q2_MMA");
+        return e ? atoi(e) : -1;
+    }();
+    if (forced == 0) {
+        return false;
+    }
+    return gqa_ratio >= 2;
+}
+
 static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const ggml_tensor * dst) {
 #ifndef FLASH_ATTN_AVAILABLE
     GGML_UNUSED(device); GGML_UNUSED(dst);
@@ -676,10 +691,24 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
                     if (turbo_K && want_mma && K->ne[1] >= 4096) {
                         // fall through to MMA (previous behaviour)
-                    } else if (Q->ne[1] <= 2) {
-                        // VEC is instantiated for cols_per_block 1 and 2 only. Forcing a
-                        // wider Q onto it tiles into ceil(ncols/2) passes that each re-read
-                        // the whole cache: measured 80 -> 12 t/s at 247K. Do not widen.
+                    } else if (Q->ne[1] == 1 || (Q->ne[1] <= 2 && !vec_q2_to_mma(gqa_ratio))) {
+                        // [TAG_FA_VEC_Q2] VEC is instantiated for cols_per_block 1 and 2
+                        // only, and its two-column instance is <ncols1=2, ncols2=1> - no
+                        // GQA packing at all, so it reads the cache gqa_ratio times. At
+                        // Q=1 the kernel packs six ways and reads it once, so the two are
+                        // not comparable and the old `<= 2` lumped them together.
+                        //
+                        // Measured, D=256, GQA 6:1, turbo4, us/run:
+                        //            nb=1    nb=2    nb=4
+                        //   kv 32768  62.5   159.6    49.7
+                        //   kv 131072 196.9  568.9   212.4
+                        //   kv 245760 339.0 1030.2   377.7
+                        //
+                        // Two tokens cost ~2.7x four tokens, because four goes to MMA and
+                        // reads the cache once while two stays on VEC and reads it six
+                        // times. Send Q=2 to MMA as well when the group is wide enough for
+                        // that to matter. Forcing a WIDER Q onto VEC is still wrong - it
+                        // tiles into ceil(ncols/2) passes, measured 80 -> 12 t/s at 247K.
                         return BEST_FATTN_KERNEL_VEC;
                     }
                 } else {
