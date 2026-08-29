@@ -194,9 +194,34 @@ What matters is the floor, not the average. A fifth of `Q4_K_XL` sits in IQ4_XS 
 
 Q5 costs **9.1% of decode** and 2.14 GiB of VRAM. The third column is the one that matters: all
 three land within 4% of the same effective bandwidth, so decode here is memory-bound and the cost
-of the switch is simply the extra bytes. There is no per-quant kernel penalty.
+of the switch is simply the extra bytes. **For decode there is no per-quant kernel penalty.**
 
-That last point corrected an earlier claim in this README. A first pass compared decode figures
+**Prefill is a different story, and it does have one.** Decode is memory-bound; prefill is
+compute-bound, so the tensor-core throughput of each format matters there and the quant mix stops
+being neutral. `pp512` at empty context, five repetitions:
+
+| | prefill | vs Q4 |
+|:--|--:|--:|
+| `UD-Q4_K_XL` | **3286.29** ± 21.49 t/s | — |
+| `UD-Q5_K_XL` | 2976.86 ± 17.61 t/s | **-9.4%** |
+| `Q6_K` (plain) | 2720.77 ± 25.48 t/s | -17.2% |
+
+Measured three times in both orders; the gap held at 8.5 to 11.1% every time, so call it **~10%**.
+Absolute figures drift with GPU clock state, the ratio does not.
+
+The cause is `Q6_K`, which is the slowest MMQ format on this card. At this model's FFN shape
+(m=17408, k=5120) it reaches **103.7 TFLOPS** against `Q4_K`'s 140.3 and `NVFP4`'s 293.3, and it is
+beaten by `Q2_K`, `Q3_K`, `Q4_0`, `Q8_0` and every IQ format. `UD-Q5_K_XL` is 37.6% `Q6_K`, so it
+computes at roughly 119 TFLOPS weighted against `UD-Q4_K_XL`'s 142. The plain `Q6_K` row above is
+the control: 100% of the slow format, and duly the slowest of the three.
+
+That is a real kernel gap rather than a tuning one. `Q6_K` uses an identical MMQ config to `NVFP4`
+(256 threads, occupancy 1, I=128, stream-k on), sits on the same tensor-core path and needs
+comparable shared memory, so the whole deficit is in its unpack, which has to combine 4-bit `ql`,
+2-bit `qh` and 16 scales per 256-block. `Q4_K` hitting 140.3 at the same shape is the proof that
+more is available.
+
+The decode half of that corrected an earlier claim in this README. A first pass compared decode figures
 taken from different runs, read the gap as a Q6_K kernel weakness, and said so. Measured properly,
 in one run, `Q6_K` reads at the same GB/s as everything else. Isolated `MUL_MAT` benchmarks appear
 to disagree and show `Q6_K` at half speed for batch widths 4 to 7, but a 73 MB weight tensor fits
