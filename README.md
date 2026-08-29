@@ -45,6 +45,7 @@ That target pulls in two directions at once. The KV cache has to be small enough
 |:--|:--|
 | [Highlights](#highlights) | what this fork adds, and what each part bought |
 | [Test bench](#test-bench) | the exact hardware and software behind every number |
+| [Why Q5_K_XL](#why-the-bench-moved-to-q5_k_xl) | what the quant labels hide, and what the switch cost |
 | [Benchmarks](#benchmarks) | full results, with methodology |
 | [Build](#build) | Windows and Linux, from source |
 | [Configuration](#configuration) | launch recipes, flag reference, tuning knobs |
@@ -160,20 +161,99 @@ Every number in this README comes from this machine. Nothing is inherited, estim
 
 | | |
 |:--|:--|
-| File | `Qwen3.8-27B-UD-Q4_K_XL.gguf`, 16.69 GiB, 27.32 B params |
+| File | `Qwen3.8-27B-UD-Q5_K_XL.gguf`, 18.82 GiB, 27.32 B params |
 | Architecture | 65 blocks — **17 full-attention**, 48 Gated DeltaNet |
 | Attention shape | 24 query heads / 4 KV heads (GQA 6:1), head dim 256 |
-| Drafter | `Qwen3.8-27B-DFlash2-Q4_K_M.gguf`, 1.06 GiB |
+| Drafter | `Qwen3.8-27B-DFlash2-Q8_0.gguf`, 1.92 GiB |
 
-> **The quant label is misleading, and it is worth knowing.** This file reports as `Q4_K - Small` because that is the nominal `general.file_type` stamped into the GGUF. The actual tensor mix is **68.9% Q5_K**, 21.2% IQ4_XS, 5.2% Q6_K, 4.7% Q4_K — roughly **5.2 bpw**, which is why it is 16.69 GiB rather than the ~14.6 GiB a true Q4_K_S would be. These benchmarks are on a 5-bit-class model.
+> **Neither quant label means what it says.** `general.file_type` is one nominal stamp and Unsloth Dynamic quants do not honour it. Measured over the actual tensors, `UD-Q4_K_XL` is **5.25 bpw** and `UD-Q5_K_XL` is **5.92 bpw**. Both are 5-bit-class files, and the real gap between them is 13%, not a whole bit.
+
+### Why the bench moved to Q5_K_XL
+
+The label is the least informative thing about either file. Read as tensors:
+
+| | effective bpw | file | tensor mix |
+|:--|--:|--:|:--|
+| `UD-Q4_K_XL` | 5.25 | 16.68 GiB | Q5_K 68.9%, **IQ4_XS 21.2%**, Q6_K 5.2%, Q4_K 4.7% |
+| `UD-Q5_K_XL` | 5.92 | 18.82 GiB | Q5_K 61.8%, **Q6_K 37.6%**, Q8_0 0.5% |
+
+What matters is the floor, not the average. A fifth of `Q4_K_XL` sits in IQ4_XS at 4.25 bpw. `Q5_K_XL` has nothing below Q5_K and puts 37.6% of the model in Q6_K, so its least precise weight is still more precise than a fifth of the Q4 file.
+
+**What that costs.** Same build, same flags, same frozen prompt, same Q8_0 drafter, 131,072 tokens deep, three samples of 1500 tokens each:
+
+| | `ms/step` | acceptance | decode | VRAM at 262K |
+|:--|--:|--:|--:|--:|
+| `UD-Q4_K_XL` | 41.23 | 55.0% | 118.53 t/s | 29,358 MiB |
+| `UD-Q5_K_XL` | 57.27 | 63.8% | 96.94 t/s | 31,437 MiB |
+
+Q5 costs **18.2% of decode** and 2.03 GiB. It actually drafts better, 63.8% acceptance against 55.0%, because a more faithful target agrees more often with the same drafter. It loses anyway because the step itself is 38.9% dearer, which is more than its 12.8% extra bytes can explain. The excess is the Q6_K share, which is the weakest k-quant decode path on this card and makes up 37.6% of this file against 5.2% of the other.
+
+**An honest note on quality.** No local perplexity run has been able to separate these two files. The sweep that was run put `Q8_0` last, which is not a credible ordering and means it was measuring something other than quality. The case for Q5 rests on the precision floor above and on the fact that it still fits, not on a quality number this bench can defend.
+
+> **Match the drafter to the target.** Moving the target to Q5 and leaving the drafter at `Q4_K_M` gives up most of the benefit. Measured at 131K, the `Q8_0` drafter reaches **63.8%** acceptance against **54.6%** for `Q4_K_M` at the same step cost of 57.3 ms, worth about 6% of end-to-end decode for 871 MiB. On a five-layer drafter `Q8_0` also has a cheaper dequant path than `Q4_K_M`, so the larger file is not the slower one.
 
 ---
 
 ## Benchmarks
 
+### Speeds with the full flag set
+
+This is the fork running as it is meant to run: `turbo4` K and V, flash attention on, all
+65 layers on the GPU. The comparison row is the same binary and the same model with the
+stock `f16` KV cache, so the only variable is the cache format.
+
+```bash
+llama-bench -m Qwen3.8-27B-UD-Q5_K_XL.gguf   -ctk turbo4 -ctv turbo4 -fa 1 -ngl 99 -t 16   -p 512 -n 64 -d 0,131072,245760 -r 3
+```
+
+| Depth | KV cache | Prefill (pp512) | Decode (tg64) | KV size |
+|------:|:--|----------------:|--------------:|--------:|
+| 0 | **`turbo4`** | 2380.29 ± 7.43 | **41.35** ± 0.17 | 0 |
+| 0 | `f16` | 2429.09 ± 15.87 | 38.59 ± 0.28 | 0 |
+| 131,072 | **`turbo4`** | 943.48 ± 1.45 | **39.21** ± 0.28 | **2.26 GiB** |
+| 131,072 | `f16` | 921.55 ± 94.69 | 35.93 ± 2.29 | 8.50 GiB |
+| 245,760 | **`turbo4`** | 503.73 ± 36.31 | **31.89** ± 0.24 | **4.23 GiB** |
+| 245,760 | `f16` | does not fit | does not fit | 15.94 GiB |
+
+**`turbo4` is faster than `f16` at every depth while using a quarter of the memory.** Decode
+is 7.2% ahead at zero depth and 9.1% ahead at 131K. That ordering is the point of this fork
+and it is the opposite of what a compressed cache is supposed to do, because the win comes
+from reading four times fewer bytes rather than from cheaper arithmetic.
+
+The last row is the reason the fork exists. At 245,760 tokens an `f16` cache needs 15.94 GiB
+on top of an 18.82 GiB model, which does not fit in 32 GiB and is refused at allocation. There
+is no `f16` number to compare against because that configuration cannot be run on this card.
+
+<sub>Error bars are the spread over three repetitions. <code>llama-bench</code> does not
+speculate, so these are the raw kernel numbers with no drafter involved. Add the DFlash2
+drafter from <a href="#the-exact-production-config">the production config</a> and decode roughly
+triples, at the cost of a figure that moves with the text being generated. See
+<a href="#a-note-on-quoting-decode-numbers">the note on quoting decode numbers</a>.</sub>
+
+### A note on quoting decode numbers
+
+Speculative decode makes throughput depend on the content being written, which makes single
+headline figures unreproducible. Measured on one build, one config and one cached 131K prompt,
+varying nothing but the run:
+
+| run | `ms/step` | draft acceptance | decode |
+|--:|--:|--:|--:|
+| A | 57.27 | 63.8% | 96.94 t/s |
+| B | 43.48 | 67.5% | 131.50 t/s |
+| C | 51.80 | 44.4% | 79.06 t/s |
+
+Decode swings from 79 to 132 t/s on identical settings. A verification step costs the same
+whatever survives of the draft, but how many tokens it retires depends on how predictable the
+text is, and code is far more predictable than prose. Anything in this README that compares two
+builds therefore reports `ms/step` from one session, and anything meant to be reproduced by
+someone else is `llama-bench`.
+
 ### Throughput vs context depth
 
-`llama-bench -r 3`, stock defaults, single run.
+`llama-bench -r 3`, stock defaults, single run. Measured on `UD-Q4_K_XL`, which is the file
+the kernel work in this fork was developed and regression-tested against. `llama-bench` does not
+speculate, so these are the raw kernel numbers with no drafter involved. For the model and flags
+actually deployed, see [the deployed configuration](#the-deployed-configuration-end-to-end).
 
 | Depth | Prefill (pp512) | Decode (tg64) |
 |------:|----------------:|--------------:|
@@ -185,7 +265,8 @@ Every number in this README comes from this machine. Nothing is inherited, estim
 
 The figures above are `llama-bench`, which does not speculate. This is the path the server
 actually runs: DFlash2 drafting seven tokens, `turbo4` K and V, greedy sampling, median of
-four samples on one cached prompt.
+four samples on one cached prompt. Also measured on `UD-Q4_K_XL`, since the point of the table
+is the before and after of one kernel change and both columns must come from the same file.
 
 **Read `ms/step` as the result, not `t/s`.** A verification step costs the same no matter how
 much of the draft survives — measured, it holds to within 0.5% across samples — but how many
@@ -369,11 +450,11 @@ Expect `2/2 backends passed`. This covers the turbo K/V flash-attention paths, i
 `turbo4` KV is what makes the context fit; the DFlash2 drafter is what makes it fast.
 
 ```bash
-llama-server -m Qwen3.8-27B-UD-Q4_K_XL.gguf \
+llama-server -m Qwen3.8-27B-UD-Q5_K_XL.gguf \
   -c 262144 -ngl 99 -fa 1 \
   -ctk turbo4 -ctv turbo4 \
   --kv-unified \
-  -md Qwen3.8-27B-DFlash2-Q4_K_M.gguf \
+  -md Qwen3.8-27B-DFlash2-Q8_0.gguf \
   --spec-type draft-dflash --spec-draft-n-max 7 \
   --host 0.0.0.0 --port 8080
 ```
@@ -386,7 +467,7 @@ llama-server -m Qwen3.8-27B-UD-Q4_K_XL.gguf \
 <br>
 
 ```bash
-llama-server -m Qwen3.8-27B-UD-Q4_K_XL.gguf \
+llama-server -m Qwen3.8-27B-UD-Q5_K_XL.gguf \
   -c 262144 -ngl 99 -fa 1 \
   -ctk turbo4 -ctv turbo4 \
   --kv-unified \
@@ -400,7 +481,7 @@ llama-server -m Qwen3.8-27B-UD-Q4_K_XL.gguf \
 Copy-paste runnable on a 32 GB Blackwell card. This is the configuration the benchmarks above were produced with.
 
 ```bash
-llama-server   -m  Qwen3.8-27B-UD-Q4_K_XL.gguf   -md Qwen3.8-27B-DFlash2-Q4_K_M.gguf   --spec-type draft-dflash --spec-draft-n-max 7   -c 262144 -ngl 99 -fa 1   -ctk turbo4 -ctv turbo4   --kv-unified   -b 2048 -ub 512   -t 16 --threads-batch 16   --parallel 1   --load-mode none   --jinja --chat-template-file qwen-fixed-chat-template.jinja   --host 0.0.0.0 --port 8080 --metrics
+llama-server   -m  Qwen3.8-27B-UD-Q5_K_XL.gguf   -md Qwen3.8-27B-DFlash2-Q8_0.gguf   --spec-type draft-dflash --spec-draft-n-max 7   -c 262144 -ngl 99 -fa 1   -ctk turbo4 -ctv turbo4   --kv-unified   -b 2048 -ub 512   -t 16 --threads-batch 16   --parallel 1   --load-mode none   --jinja --chat-template-file qwen-fixed-chat-template.jinja   --host 0.0.0.0 --port 8080 --metrics
 ```
 
 <details>
@@ -410,7 +491,7 @@ llama-server   -m  Qwen3.8-27B-UD-Q4_K_XL.gguf   -md Qwen3.8-27B-DFlash2-Q4_K_M.
 
 | Block | Why |
 |:--|:--|
-| `-md` + `--spec-type draft-dflash` | The 1.06 GiB DFlash2 drafter. Yields ~3.05 tokens per step. Drop both lines to save its VRAM at roughly 40% of decode. |
+| `-md` + `--spec-type draft-dflash` | The 1.92 GiB DFlash2 drafter at `Q8_0`. Yields 4.8 to 5.4 tokens per step. Drop both lines to save its VRAM at roughly 40% of decode. Use the `Q8_0` build of the drafter and not `Q4_K_M`, which measures 9 points of acceptance worse against a Q5 target at identical step cost. |
 | `--spec-draft-n-max 7` | DFlash2 trains at `block_size` 8, so 7 is its ceiling. Higher is wasted work. |
 | `-c 262144 -ctk/-ctv turbo4` | The full context, at 4.52 GiB of cache. `f16` here needs 17.00 GiB and is refused. |
 | `--kv-unified` | One shared cache instead of per-sequence. Needed to fit at max context. |
