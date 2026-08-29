@@ -181,6 +181,40 @@ Every number in this README comes from this machine. Nothing is inherited, estim
 | 131,072 | **1242.29** ± 3.63 | **47.03** ± 0.41 |
 | 245,760 | **760.75** ± 1.26 | **36.70** ± 0.19 |
 
+### Speculative decode — the deployed path
+
+The figures above are `llama-bench`, which does not speculate. This is the path the
+server actually runs: DFlash2 drafting seven tokens, `turbo4` K and V, greedy sampling
+so draft acceptance is comparable across runs, median of four samples on one cached
+prompt. `ms/step` is a full verification step; `tok/step` is how many tokens it retired.
+
+| Depth | Decode | `ms/step` | `tok/step` |
+|------:|-------:|----------:|-----------:|
+| 32,768 | **126.17 t/s** | 34.30 | 4.36 |
+| 131,072 | **87.89 t/s** | 43.56 | 3.84 |
+| 245,760 | **65.28 t/s** | 53.54 | 3.49 |
+
+Against the same build with the narrow-Q GQA rule disabled (`FA_NCOLS2_MAXQ=0`), which
+is where this path stood before that fix:
+
+| Depth | Before | After | | `ms/step` |
+|------:|-------:|------:|--:|:--|
+| 32,768 | 93.67 | **126.17** | +34.7% | 38.29 → 34.30 |
+| 131,072 | 53.68 | **87.89** | +63.7% | 60.98 → 43.56 |
+| 245,760 | 45.77 | **65.28** | +42.6% | 86.52 → 53.54 |
+
+<sub>Throughput moves with draft acceptance, which varies run to run; step time does not,
+and it holds to within 0.5% across samples. The step-time column is the honest measure of
+the kernel change: <b>-10.4%, -28.6%, -38.1%</b>.</sub>
+
+Prefill is untouched at every depth — 12.4s → 12.5s, 77.6s → 77.9s, 210.3s → 210.5s —
+because the rule is gated on Q width and a prefill ubatch is far wider than the gate.
+
+> Draft width matters and is not obvious. `n_max 7` (Q=8) measures 81.46 t/s median at
+> 131K against 71.51 for `n_max 3` (Q=4): the shorter draft accepts far more of what it
+> writes (74.8% against 37.2%) but retires fewer tokens per step. **Do not raise `n_max`
+> past 7** — Q would exceed 8 and silently fall off the packing rule below.
+
 ### KV cache footprint
 
 | KV type | bits/weight | @131,072 | @262,144 | Fits on 32 GB? |
@@ -451,6 +485,11 @@ Environment variables, for A/B testing rather than daily use.
 | `SPEC_PREFILL_TAIL` | `2048` | Prompt tail the drafter actually prefills. `0` disables the skip. |
 | `TURBO_MMA_NATIVE` | `1` | Native turbo reads in the MMA tile loader. `0` restores F16 conversion. |
 | `TURBO_MMA_NATIVE_MAXQ` | `32` | Q width below which native reads are used. |
+| `FA_NCOLS2_MAXQ` | `8` | Q width up to which FA rounds GQA packing up instead of using the exact divisor. `0` disables the rule. |
+| `FA_NCOLS2` | off | `1\|2\|4\|8` forces the MMA GQA packing factor outright. |
+| `FA_VEC_GQA` | off | `1..6` forces the VEC GQA packing factor. |
+| `GGML_CUDA_MMVQ_MAX_K` | off | `1..8` overrides the k-quant MMVQ batch ceiling. Raising it measured slower here. |
+| `SPEC_PHASE_PROBE` | off | `1` prints a wall-clock phase breakdown of a speculative step every 128 steps. |
 | `TURBO_FA_MMA` | off | `1` restores the old depth-based MMA routing. |
 | `TURBO_IDX_INHERIT` | off | `1` lets the sparse-attention indexer cache inherit the turbo type. |
 
@@ -506,6 +545,58 @@ Choosing by exact divisor instead (6 % 2 == 0, so 2) fixed it.
 ---
 
 ## Engineering log
+
+<details open>
+<summary><b>August 2026 — FA GQA packing chosen by Q width</b> &nbsp;·&nbsp; <code>+63.7% speculative decode</code></summary>
+
+<br>
+
+Plain decode and speculative decode take different flash-attention kernels, and only one
+of them was reading the cache once.
+
+A speculative step submits `n_draft + 1` tokens for verification, so `Q->ne[1]` is 8 rather
+than 1. That is wide enough to leave the VEC kernel — which packs six query heads per block
+on this model and reads the cache **once** — and land on MMA, whose `ncols2` ladder picks the
+largest power of two that *divides* `gqa_ratio`. At `gqa_ratio` 6 that is 2, so
+`ntiles_z_gqa = 3` and every attention layer read the whole K/V region **three times per
+step**, 17 layers deep.
+
+**Why it hid.** The divisor rule is right, and there is a measured table in the source
+saying so: at prefill it beats rounding up by 16.9% and 25.0%. But that was measured with
+`Q = 512`, where the kernel is compute-bound and packing eight slots for six real heads
+throws away a quarter of every tile. A verification batch is bound by the K/V read instead
+and has almost no compute to waste, so the same rule inverts.
+
+| `ncols2` | passes | `ms/step` | tok/s |
+|---------:|-------:|----------:|------:|
+| 1 | 6 | 120.52 | 30.00 |
+| 2 | 3 | 60.51 | 64.93 |
+| 4 | 2 | 53.39 | 89.02 |
+| **8** | **1** | **43.58** | **107.00** |
+
+Monotonic in the pass count, and eight wins despite the wasted slots.
+
+**The tail.** Gating this at `Q <= 32` — a number borrowed from the neighbouring
+`TURBO_MMA_NATIVE` gate rather than measured — made widths 12, 16 and 32 *slower*, by up to
+29%, because `ncols1` is capped at `64/ncols2`: past Q=8 the kernel re-tiles over Q as well
+and pays the wasted slots **and** extra passes. Sweeping the width found a sharp boundary:
+
+| `nb` | 4 | 8 | 12 | 16 | 32 |
+|:--|--:|--:|--:|--:|--:|
+| @131,072 | **-75.7%** | **-34.5%** | +3.8% | +3.4% | +26.9% |
+| @245,760 | **-76.9%** | **-37.3%** | +3.8% | +4.0% | +29.4% |
+
+Gated at 8 instead, every width outside 4..8 is neutral to within 0.6%. Widths below 4
+never reach the code at all — `Q <= 2` is taken by VEC. The useful window is exactly a
+speculative verification batch, which is what it was for.
+
+This also removed an anomaly the width sweep exposed on the way in: `nb=4` used to cost
+*more* than `nb=8` (874.56 µs against 523.78 at 131K). It is now 213.33.
+
+`test-backend-ops FLASH_ATTN_EXT` passes 2/2 and a three-needle retrieval returns all
+three codes exactly at both 131K and 245K context. `FA_NCOLS2_MAXQ` overrides the gate.
+
+</details>
 
 <details open>
 <summary><b>August 2026 — GQA head packing in FA-vec</b> &nbsp;·&nbsp; <code>+21.9% decode</code></summary>
