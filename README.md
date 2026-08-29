@@ -262,6 +262,28 @@ text is, and code is far more predictable than prose. Anything in this README th
 builds therefore reports `ms/step` from one session, and anything meant to be reproduced by
 someone else is `llama-bench`.
 
+### Draft length: pin it, do not let it float
+
+`--spec-draft-n-min 7` is worth about **6%** and costs nothing. It is the one setting here that
+is easy to miss.
+
+A verification step reads the whole model whether the draft holds 2 tokens or 7. Measured
+directly, a matmul at width 8 costs only 5 to 12% more than the same matmul at width 1 once the
+weights are streaming from DRAM rather than sitting in L2. So the step is priced almost entirely
+by weight traffic, and a short draft does not make it cheaper, it just retires fewer tokens.
+
+Left to itself the drafter sometimes emits fewer than 7. Forcing the full block fills the step
+that is being paid for either way. Four samples of 2000 tokens per arm at 131K:
+
+| | `ms/step` | tokens/step | decode |
+|:--|--:|--:|--:|
+| default | 43.02 | 4.72 | 109.63 t/s |
+| **`--spec-draft-n-min 7`** | **42.46** | **4.95** | **116.43 t/s** |
+
+An earlier run of the same pair measured +11.2% rather than +6.2%, so treat the size as a band.
+The direction held in both, and in the second the worst pinned sample still beat the median
+unpinned one.
+
 ### Two settings not to change
 
 > `n_max 7` (Q=8) measures 81.46 t/s median at 131K against
@@ -394,7 +416,7 @@ llama-server -m Qwen3.8-27B-UD-Q5_K_XL.gguf \
   -ctk turbo4 -ctv turbo4 \
   --kv-unified \
   -md Qwen3.8-27B-DFlash2-Q8_0.gguf \
-  --spec-type draft-dflash --spec-draft-n-max 7 \
+  --spec-type draft-dflash --spec-draft-n-max 7 --spec-draft-n-min 7 \
   --host 0.0.0.0 --port 8080
 ```
 
@@ -420,7 +442,7 @@ llama-server -m Qwen3.8-27B-UD-Q5_K_XL.gguf \
 Copy-paste runnable on a 32 GB Blackwell card. This is the configuration the benchmarks above were produced with.
 
 ```bash
-llama-server   -m  Qwen3.8-27B-UD-Q5_K_XL.gguf   -md Qwen3.8-27B-DFlash2-Q8_0.gguf   --spec-type draft-dflash --spec-draft-n-max 7   -c 262144 -ngl 99 -fa 1   -ctk turbo4 -ctv turbo4   --kv-unified   -b 2048 -ub 512   -t 16 --threads-batch 16   --parallel 1   --load-mode none   --jinja --chat-template-file qwen-fixed-chat-template.jinja   --host 0.0.0.0 --port 8080 --metrics
+llama-server   -m  Qwen3.8-27B-UD-Q5_K_XL.gguf   -md Qwen3.8-27B-DFlash2-Q8_0.gguf   --spec-type draft-dflash --spec-draft-n-max 7 --spec-draft-n-min 7   -c 262144 -ngl 99 -fa 1   -ctk turbo4 -ctv turbo4   --kv-unified   -b 2048 -ub 512   -t 16 --threads-batch 16   --parallel 1   --load-mode none   --jinja --chat-template-file qwen-fixed-chat-template.jinja   --host 0.0.0.0 --port 8080 --metrics
 ```
 
 <details>

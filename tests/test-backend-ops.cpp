@@ -10269,6 +10269,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // k-quants at 5 (Q4_K/Q5_K) and 7 (Q6_K) on Blackwell, so a Q5_K_XL model switches
     // kernel partway through the range. Neither the prefill block above nor the decode
     // cases elsewhere cover it, and it is where a verification step actually spends.
+    // [TAG_PERF_STREAMING] The shapes below are deliberately larger than this card's L2
+    // (96 MB on sm_120). A 73 MB weight tensor rerun in a loop stays resident and reports
+    // 2500+ GB/s on a 1792 GB/s card, which ranks kernels by compute cost rather than by
+    // the streaming behaviour a real decode hits. These force DRAM traffic.
+    for (int64_t n : { 1, 8 }) {
+        for (ggml_type ta : { GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K }) {
+            test_cases.emplace_back(new test_mul_mat(ta, GGML_TYPE_F32, 262144, n, 5120, {1,1}, {1,1}));
+        }
+    }
+
     for (int64_t n : { 1, 2, 4, 5, 6, 7, 8 }) {
         for (ggml_type ta : { GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ4_XS }) {
             test_cases.emplace_back(new test_mul_mat(ta, GGML_TYPE_F32, 17408, n, 5120, {1,1}, {1,1}));  // ffn gate/up
