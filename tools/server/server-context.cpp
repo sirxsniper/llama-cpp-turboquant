@@ -1243,6 +1243,16 @@ private:
         slots.clear();
 
         ctx_tgt_seq_rm_type = common_context_can_seq_rm(ctx_tgt);
+        {
+            // [TAG_SPEC_CKPT_PROBE] Which rollback mechanism the target supports decides
+            // whether every speculative step has to checkpoint the whole sequence state.
+            const char * rmn = ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_NO   ? "NO"   :
+                               ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ? "FULL" :
+                               ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_PART ? "PART" : "RS";
+            fprintf(stderr, "turbo-probe: ctx_tgt seq_rm = %s, n_rs_seq = %d\n",
+                    rmn, (int) llama_n_rs_seq(ctx_tgt));
+            fflush(stderr);
+        }
         if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
             SRV_WRN("%s", "speculative decoding not supported by this context\n");
         }
@@ -2300,6 +2310,28 @@ private:
     }
 
     // n_tokens_cur: the number of tokens added to the batch for the current slot
+    // [TAG_SPEC_CKPT_PROBE] cumulative accounting for the per-step speculative
+    // checkpoint work. 0 = update_tgt, 1 = load_dft, 2 = seq_rm(dft).
+    static void spec_ckpt_probe_add(int which, double ms, size_t bytes) {
+        static const bool on = [] {
+            const char * e = getenv("SPEC_CKPT_PROBE");
+            return e && e[0] == '1';
+        }();
+        if (!on) { return; }
+        static double acc[3] = {0,0,0};
+        static unsigned n[3] = {0,0,0};
+        static size_t last_bytes = 0;
+        acc[which] += ms; n[which]++;
+        if (bytes) { last_bytes = bytes; }
+        if (which == 0 && (n[0] & 127u) == 0u) {
+            fprintf(stderr,
+                "spec-ckpt-probe: update_tgt n=%u %.3f ms/call (%.2f MiB) | load_dft n=%u %.3f | seq_rm n=%u %.3f\n",
+                n[0], acc[0]/n[0], (double) last_bytes / 1024.0 / 1024.0,
+                n[1], n[1] ? acc[1]/n[1] : 0.0, n[2], n[2] ? acc[2]/n[2] : 0.0);
+            fflush(stderr);
+        }
+    }
+
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
         const int id_task = slot.task->id;
 
@@ -3040,10 +3072,17 @@ private:
 
             if (ctx_dft) {
                 if (use_ckpt_dft) {
+                    const auto ck_d0 = std::chrono::steady_clock::now();
                     ckpt.load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                    spec_ckpt_probe_add(1, std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - ck_d0).count(), 0);
                 }
 
-                if (!llama_memory_seq_rm(llama_get_memory(ctx_dft), slot.id, ckpt.pos_max + 1, -1)) {
+                const auto ck_r0 = std::chrono::steady_clock::now();
+                const bool ck_rm_ok = llama_memory_seq_rm(llama_get_memory(ctx_dft), slot.id, ckpt.pos_max + 1, -1);
+                spec_ckpt_probe_add(2, std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - ck_r0).count(), 0);
+                if (!ck_rm_ok) {
                     GGML_ABORT("failed to remove sequence %d\n", slot.id);
                 }
             }
@@ -3059,7 +3098,15 @@ private:
                 if (use_ckpt_tgt) {
                     //const int64_t t_start = ggml_time_us();
 
+                    // [TAG_SPEC_CKPT_PROBE] This saves the target sequence state EVERY
+                    // speculative step when the draft is longer than the recurrent-state
+                    // rollback capacity. Qwen3.8-27B is 48 Gated DeltaNet layers, whose
+                    // state cannot be partially rolled back, so the cost scales with the
+                    // context. SPEC_CKPT_PROBE=1 reports it.
+                    const auto ck_t0 = std::chrono::steady_clock::now();
                     ckpt.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                    spec_ckpt_probe_add(0, std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - ck_t0).count(), ckpt.size());
 
                     //const int64_t t_total = ggml_time_us() - t_start;
                     //printf("checkpoint total: %f ms\n", t_total / 1000.0);
@@ -3660,7 +3707,9 @@ private:
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
         // [TAG_SPEC_PHASE_PROBE]
-        const auto t_dec0 = std::chrono::steady_clock::now();
+        const auto t_dec0 = common_speculative_probe_enabled()
+                              ? std::chrono::steady_clock::now()
+                              : std::chrono::steady_clock::time_point{};
         queue_tasks.yield_to_queue([&]() {
             ret = llama_decode(ctx_tgt, batch_view);
             if (ret == 0 && has_output) {
@@ -3931,7 +3980,9 @@ private:
                 const bool can_rollback =
                     ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_PART ||
                     (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && n_draft <= llama_n_rs_seq(ctx_tgt));
-                const auto t_smp0 = std::chrono::steady_clock::now();
+                const auto t_smp0 = common_speculative_probe_enabled()
+                                      ? std::chrono::steady_clock::now()
+                                      : std::chrono::steady_clock::time_point{};
                 const auto & synth_probs = common_speculative_get_synth_probs(spec.get());
                 auto accepted =
                     !synth_probs.empty()

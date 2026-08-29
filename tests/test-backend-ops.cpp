@@ -10255,6 +10255,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
+    // ---- Qwen3.8-27B at SPECULATIVE VERIFICATION width ---------------------
+    // A speculative step submits n_draft+1 columns, so the whole model runs at n = 2..8.
+    // That range sits exactly on the MMVQ/MMQ boundary: ggml_cuda_should_use_mmvq caps
+    // k-quants at 5 (Q4_K/Q5_K) and 7 (Q6_K) on Blackwell, so a Q5_K_XL model switches
+    // kernel partway through the range. Neither the prefill block above nor the decode
+    // cases elsewhere cover it, and it is where a verification step actually spends.
+    for (int64_t n : { 1, 2, 4, 5, 6, 7, 8 }) {
+        for (ggml_type ta : { GGML_TYPE_Q5_K, GGML_TYPE_Q6_K }) {
+            test_cases.emplace_back(new test_mul_mat(ta, GGML_TYPE_F32, 17408, n, 5120, {1,1}, {1,1}));  // ffn gate/up
+            test_cases.emplace_back(new test_mul_mat(ta, GGML_TYPE_F32,  5120, n, 17408, {1,1}, {1,1})); // ffn down
+            test_cases.emplace_back(new test_mul_mat(ta, GGML_TYPE_F32, 10240, n, 5120, {1,1}, {1,1}));  // attn qkv
+        }
+    }
+
     // ---- gated delta net at prefill batch --------------------------------
     // 64 of this model's 65 layers are GDN/SSM, so if this op is slow it
     // dominates prefill regardless of how fast the matmuls are.
@@ -10537,6 +10551,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
                         GGML_PREC_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0));
         }
     }
+    // [TAG_FA_PERF_LAYOUT] The cases above build K and V as plain contiguous tensors, so
+    // one head reads a single unbroken run. The real KV cache does not look like that: it
+    // is [n_embd_k_gqa, n_ctx], all heads interleaved per position, so one head reads
+    // head_dim bytes and then skips over the other heads. At D=256 GQA 6:1 with turbo4
+    // that is 136 bytes read per 544. permute {0,2,1,3} reproduces it, and the difference
+    // between the two is how much of the contiguous figure is an artefact of the harness.
+    for (int64_t kv : {131072, 245760}) {
+        for (int64_t nb : {1, 2, 4, 8}) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0,
+                        GGML_PREC_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0, {0, 2, 1, 3}));
+        }
+    }
+
     // q8_0 and f16 at the same shapes, as the reference this fork is measured against.
     for (int64_t kv : {131072, 245760}) {
         for (int64_t nb : {1, 8}) {

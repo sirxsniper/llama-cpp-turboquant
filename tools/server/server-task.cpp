@@ -165,16 +165,43 @@ common_chat_msg task_result_state::update_chat_msg(
         std::vector<common_chat_msg_diff> & diffs,
         bool filter_tool_calls) {
     generated_text += text_added;
+    // [TAG_CHAT_PARSE_PROBE] CHAT_PARSE_PROBE=1 reports where streaming-parse time goes.
+    // This runs once per streamed token over the WHOLE accumulated output, so anything
+    // O(n) here is O(n^2) over a turn.
+    static const bool cp_probe = [] {
+        const char * e = getenv("CHAT_PARSE_PROBE");
+        return e && e[0] == '1';
+    }();
+    static double cp_ms_copy = 0.0, cp_ms_parse = 0.0, cp_ms_diff = 0.0;
+    static unsigned cp_calls = 0; static size_t cp_bytes = 0;
+    const auto cp_t0 = cp_probe ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     auto msg_prv_copy = chat_msg;
+    const auto cp_t1 = cp_probe ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     //SRV_DBG("Parsing chat message: %s\n", generated_text.c_str());
     auto new_msg = common_chat_parse(
         generated_text,
         is_partial,
         chat_parser_params);
+    const auto cp_t2 = cp_probe ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     if (!new_msg.empty()) {
         new_msg.set_tool_call_ids(generated_tool_call_ids, gen_tool_call_id);
         chat_msg = new_msg;
         auto all_diffs = common_chat_msg_diff::compute_diffs(msg_prv_copy, chat_msg);
+        if (cp_probe) {
+            using msd = std::chrono::duration<double, std::milli>;
+            const auto cp_t3 = std::chrono::steady_clock::now();
+            cp_ms_copy  += msd(cp_t1 - cp_t0).count();
+            cp_ms_parse += msd(cp_t2 - cp_t1).count();
+            cp_ms_diff  += msd(cp_t3 - cp_t2).count();
+            cp_bytes     = generated_text.size();
+            if ((++cp_calls & 255u) == 0u) {
+                fprintf(stderr,
+                    "chat-parse-probe: calls=%u bytes=%zu | copy %.3f  parse %.3f  diff %.3f  total %.3f ms/tok\n",
+                    cp_calls, cp_bytes, cp_ms_copy/cp_calls, cp_ms_parse/cp_calls,
+                    cp_ms_diff/cp_calls, (cp_ms_copy+cp_ms_parse+cp_ms_diff)/cp_calls);
+                fflush(stderr);
+            }
+        }
 
         if (!filter_tool_calls) {
             diffs = std::move(all_diffs);
