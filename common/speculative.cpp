@@ -1249,12 +1249,20 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             // is only obviously redundant when nothing switches contexts between here and
             // the draft decode, which reads drafter output and synchronizes anyway.
             // SPEC_DFT_SYNC=0 skips it during generation only; prefill always syncs.
-            static const bool dft_sync_always = [] {
+            // Default is now AUTO: the sync is only needed when something can switch the
+            // drafter context between here and the draft decode, which cannot happen with a
+            // single sequence. Prefill always syncs. Measured at d32768, median of three
+            // 1500-token samples: 34.00 ms/step with the sync against 33.22 without, -2.3%.
+            //   SPEC_DFT_SYNC=1 forces the old always-sync behaviour.
+            //   SPEC_DFT_SYNC=0 forces it off even for multiple sequences (measurement only).
+            static const int dft_sync_mode = [] {
                 const char * e = getenv("SPEC_DFT_SYNC");
-                return !(e && e[0] == '0');
+                return (e && e[0]) ? atoi(e) : -1;   // -1 = auto
             }();
             const bool is_prefill = n_prefill_after > 0 || n_tokens > 8;
-            if (dft_sync_always || is_prefill) {
+            const bool sync_needed = dft_sync_mode == 1 || is_prefill ||
+                                     (dft_sync_mode != 0 && n_seq > 1);
+            if (sync_needed) {
                 llama_synchronize(ctx_dft);
             }
         }
