@@ -341,6 +341,11 @@ struct common_params_speculative_draft {
     ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
     ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
 
+    // [TAG_SPEC_KV_INHERIT] Set only when -ctkd/-ctvd are passed explicitly. When they are
+    // not, the draft cache inherits the target's -ctk/-ctv rather than silently staying f16.
+    bool cache_type_k_set = false;
+    bool cache_type_v_set = false;
+
     common_cpu_params cpuparams;
     common_cpu_params cpuparams_batch;
 

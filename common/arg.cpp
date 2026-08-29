@@ -572,6 +572,18 @@ void common_models_handler_apply(common_models_handler & handler, common_params 
         }
     }
 
+    // [TAG_SPEC_KV_INHERIT] The draft cache defaulted to f16 no matter what the target used,
+    // so -ctk turbo4 quietly left the drafter on f16. That is not a rounding error: an MTP
+    // draft context spans the full target context, measured 1024 MiB at 256K against 272 MiB
+    // for turbo4, on a card where the deployed config already sits at 31.2 of 32.6 GiB.
+    // Inherit unless the user asked for something specific.
+    if (!params.speculative.draft.cache_type_k_set) {
+        params.speculative.draft.cache_type_k = params.cache_type_k;
+    }
+    if (!params.speculative.draft.cache_type_v_set) {
+        params.speculative.draft.cache_type_v = params.cache_type_v;
+    }
+
     // when a sidecar type is requested, the draft repo resolves to its sidecar instead of a full model
     const bool spec_sidecar_found = !plan_spec.mtp.local_path.empty() ||
                                     !plan_spec.dflash.local_path.empty() ||
@@ -4091,7 +4103,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             ggml_type_name(params.speculative.draft.cache_type_k)
         ),
         [](common_params & params, const std::string & value) {
-            params.speculative.draft.cache_type_k = kv_cache_type_from_str(value);
+            params.speculative.draft.cache_type_k     = kv_cache_type_from_str(value);
+            params.speculative.draft.cache_type_k_set = true;
         }
     ).set_env("LLAMA_ARG_SPEC_DRAFT_CACHE_TYPE_K"));
     add_opt(common_arg(
@@ -4104,7 +4117,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             ggml_type_name(params.speculative.draft.cache_type_v)
         ),
         [](common_params & params, const std::string & value) {
-            params.speculative.draft.cache_type_v = kv_cache_type_from_str(value);
+            params.speculative.draft.cache_type_v     = kv_cache_type_from_str(value);
+            params.speculative.draft.cache_type_v_set = true;
         }
     ).set_env("LLAMA_ARG_SPEC_DRAFT_CACHE_TYPE_V"));
     add_opt(common_arg(

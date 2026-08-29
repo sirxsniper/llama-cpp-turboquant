@@ -10245,7 +10245,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // The perf list only exercised n<=5 (decode). Prefill is where the gap to
     // specialised engines shows, and it was completely unmeasured.
     // Real shapes: n_embd 5120, ffn 17408, qkv 10240, attn_gate/ssm_out 6144.
+    // [TAG_PERF_SKIP_PREFILL] The prefill block below is ~60 large cases and dominates a
+    // perf run. TBO_SKIP_PREFILL=1 skips it when only the decode-width cases are wanted.
+    // Unset behaves exactly as before.
+    const bool skip_prefill = [] {
+        const char * e = getenv("TBO_SKIP_PREFILL");
+        return e && e[0] && !(e[0] == '0' && e[1] == '\0');
+    }();
     for (int64_t n : { 512, 1024, 2048 }) {
+        if (skip_prefill) { break; }
         for (ggml_type ta : { GGML_TYPE_NVFP4, GGML_TYPE_MXFP4, GGML_TYPE_Q4_K,
                               GGML_TYPE_Q6_K, GGML_TYPE_F16 }) {
             test_cases.emplace_back(new test_mul_mat(ta, GGML_TYPE_F32, 17408, n, 5120, {1,1}, {1,1}));  // ffn gate/up
@@ -10262,7 +10270,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // kernel partway through the range. Neither the prefill block above nor the decode
     // cases elsewhere cover it, and it is where a verification step actually spends.
     for (int64_t n : { 1, 2, 4, 5, 6, 7, 8 }) {
-        for (ggml_type ta : { GGML_TYPE_Q5_K, GGML_TYPE_Q6_K }) {
+        for (ggml_type ta : { GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ4_XS }) {
             test_cases.emplace_back(new test_mul_mat(ta, GGML_TYPE_F32, 17408, n, 5120, {1,1}, {1,1}));  // ffn gate/up
             test_cases.emplace_back(new test_mul_mat(ta, GGML_TYPE_F32,  5120, n, 17408, {1,1}, {1,1})); // ffn down
             test_cases.emplace_back(new test_mul_mat(ta, GGML_TYPE_F32, 10240, n, 5120, {1,1}, {1,1}));  // attn qkv
