@@ -662,7 +662,52 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     llama_sampler_apply(rbudget, &cur_p);
 
     if (grammar_first && grammar_should_apply(gsmpl)) {
-        llama_sampler_apply(grmr, &cur_p);
+        // [TAG_GRAMMAR_FIRST_PRETRIM] Trim to the top-K by logit before walking the
+        // grammar, for the same reason the rejection path below does.
+        //
+        // llama_grammar_apply_impl is O(n_vocab): it decodes every candidate and walks it
+        // against the grammar stacks. grammar_first makes that run on EVERY sampled
+        // position rather than only on a rejection - and the speculative residual-sampling
+        // path passes grammar_first = true once per draft position, so a single decode step
+        // pays it up to n_draft+1 times. With a 248K vocabulary that is the dominant cost
+        // of streaming a tool call's arguments.
+        //
+        // Measured, Qwen3.8-27B UD-Q5_K_XL, DFlash2 n_max 7, tool-call arguments streaming:
+        //   stochastic sampling   20-25 ms/chunk   40-50 tok/s
+        //   greedy (no residual)   5.3-6.3 ms/chunk 159-187 tok/s
+        // Greedy is unaffected because it takes the non-residual overload, which leaves
+        // grammar_first false and only grammar-checks the single sampled token.
+        //
+        // The trim is exact under the same argument used below: every token outside the
+        // top-K has a lower logit than every token inside it, so once at least top_k
+        // grammar-valid candidates survive, the chain's own top_k selects exactly the set
+        // it would have selected from the full vocabulary. When fewer survive, that
+        // guarantee does not hold and we redo the full pass.
+        bool grammar_applied = false;
+
+        if (gsmpl->grmr_pretrim) {
+            llama_sampler_apply(gsmpl->grmr_pretrim, &cur_p);
+            llama_sampler_apply(grmr,                &cur_p);
+
+            size_t n_valid = 0;
+            for (size_t i = 0; i < cur_p.size; ++i) {
+                if (cur_p.data[i].logit != -INFINITY) {
+                    ++n_valid;
+                }
+            }
+
+            grammar_applied = n_valid >= (size_t) gsmpl->params.top_k;
+
+            if (!grammar_applied) {
+                // not enough survived to guarantee exactness - restore and do it properly
+                gsmpl->set_logits(ctx, idx);
+                llama_sampler_apply(rbudget, &cur_p);
+            }
+        }
+
+        if (!grammar_applied) {
+            llama_sampler_apply(grmr, &cur_p);
+        }
     }
 
     llama_sampler_apply(chain, &cur_p);
