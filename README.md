@@ -12,7 +12,7 @@
 
 <br>
 
-### 262,144 tokens · 4.52 GiB of KV cache · turbo4 faster than f16 at depth
+### 262,144 tokens · 4.52 GiB of KV cache · 117 t/s at 131K
 
 </div>
 
@@ -24,18 +24,18 @@ That target pulls in two directions at once. The KV cache has to be small enough
 
 <div align="center">
 
-| | Prefill | Decode | KV cache |
+| | Prefill | **Decode** | KV cache |
 |:--|--:|--:|--:|
-| **Empty context** | 3247.29 t/s | 50.57 t/s | — |
-| **131,072 tokens** | 1161.05 t/s | 50.50 t/s | 2.26 GiB |
-| **245,760 tokens** | 649.30 t/s | 39.60 t/s | 4.24 GiB |
+| **131,072 tokens** | 1161 t/s | **117.7 t/s** | 2.26 GiB |
+| **245,760 tokens** | 649 t/s | **91.4 t/s** | 4.24 GiB |
 | **262,144 tokens** | — | — | **4.52 GiB** |
 
-<sub><code>Qwen3.8-27B-UD-Q5_K_XL.gguf</code> on an RTX 5090, with this fork's flags, not stock defaults:<br>
-<code>llama-bench -ctk turbo4 -ctv turbo4 -fa 1 -ngl 99 -t 16 -p 512 -n 64 -d 0,131072,245760 -r 3</code><br>
-Prefill reproduces to within 2% across runs. Decode moves about 10% with GPU clock state, so treat
-those as approximate. Add the drafter from <a href="#the-exact-production-config">the production
-config</a> and decode roughly doubles, at the cost of a number that depends on the text.</sub>
+<sub><code>Qwen3.8-27B-UD-Q5_K_XL.gguf</code> on one RTX 5090, running
+<a href="#the-exact-production-config">the production config</a> in full: <code>turbo4</code> K and V,
+flash attention, and the DFlash2 drafter. Prefill is 3247 t/s at empty context. Decode is the median
+of three 1500-token samples on a fixed prompt and moves with how predictable the text is, so read it
+as a band rather than a constant. Strip the drafter out and the same build decodes 50.5 and 39.6 t/s
+at those depths.</sub>
 
 </div>
 
@@ -214,38 +214,35 @@ and measured **43.31 ms/step against 42.44**, a 2% regression both times.
 
 ### Speeds with the full flag set
 
-This is the fork running as it is meant to run: `turbo4` K and V, flash attention on, all
-65 layers on the GPU. The comparison row is the same binary and the same model with the
-stock `f16` KV cache, so the only variable is the cache format.
+Everything below is `turbo4` K and V, flash attention, all 65 layers on the GPU. Two ways of
+measuring it, because they answer different questions.
+
+**The speed you get.** Full production config, drafter included, median of three 1500-token
+samples on a fixed prompt:
+
+| Depth | Prefill | Decode | `ms/step` | tokens/step | KV size |
+|------:|--------:|-------:|----------:|------------:|--------:|
+| 131,072 | 1161 t/s | **117.7 t/s** | 42.44 | 4.97 | **2.26 GiB** |
+| 245,760 | 649 t/s | **91.4 t/s** | 50.55 | 4.62 | **4.23 GiB** |
+
+**The reproducible floor.** Same flags without the drafter, so anyone can check it:
 
 ```bash
 llama-bench -m Qwen3.8-27B-UD-Q5_K_XL.gguf   -ctk turbo4 -ctv turbo4 -fa 1 -ngl 99 -t 16   -p 512 -n 64 -d 0,131072,245760 -r 3
 ```
 
-| Depth | KV cache | Prefill (pp512) | Decode (tg64) | KV size |
-|------:|:--|----------------:|--------------:|--------:|
-| 0 | **`turbo4`** | **3247.29** ± 8.19 | **50.57** ± 1.28 | 0 |
-| 0 | `f16` | 2892.31 ± 122.89 | 48.01 ± 0.14 | 0 |
-| 131,072 | **`turbo4`** | **1161.05** ± 30.39 | **50.50** ± 0.83 | **2.26 GiB** |
-| 131,072 | `f16` | 1084.79 ± 2.52 | 38.18 ± 4.06 | 8.50 GiB |
-| 245,760 | **`turbo4`** | **649.30** ± 8.65 | **39.60** ± 0.28 | **4.23 GiB** |
-| 245,760 | `f16` | will not fit | will not fit | 15.94 GiB |
+| Depth | Prefill (pp512) | Decode (tg64) |
+|------:|----------------:|--------------:|
+| 0 | 3247.29 ± 8.19 | 50.57 ± 1.28 |
+| 131,072 | 1161.05 ± 30.39 | 50.50 ± 0.83 |
+| 245,760 | 649.30 ± 8.65 | 39.60 ± 0.28 |
 
-**`turbo4` is faster than `f16` at both depths that `f16` can reach, while using a quarter of
-the memory.** Decode is 5.3% ahead at zero depth and **32.3% ahead at 131,072**, and prefill is
-ahead at both. That ordering is the point of this fork, and it is the opposite of what a
-compressed cache is supposed to do: the win comes from reading four times fewer bytes, not from
-cheaper arithmetic, and it grows with depth because that is where cache traffic dominates.
+The drafter is worth **2.3x** on top of that floor at both depths.
 
-The last row is why the fork exists. At 245,760 tokens an `f16` cache needs 15.94 GiB on top of
-an 18.82 GiB model. That is about 35 GB on a 32.6 GB card, so there is no `f16` figure to compare
-against at this depth on this hardware.
-
-<sub>Error bars are the spread over three repetitions. <code>llama-bench</code> does not
-speculate, so these are the raw kernel numbers with no drafter involved. Add the DFlash2
-drafter from <a href="#the-exact-production-config">the production config</a> and decode roughly
-triples, at the cost of a figure that moves with the text being generated. See
-<a href="#a-note-on-quoting-decode-numbers">the note on quoting decode numbers</a>.</sub>
+The one comparison worth printing: at 262,144 tokens `turbo4` holds the cache in **4.52 GiB**
+where `f16` needs **17.00 GiB**, which does not fit beside an 18.8 GiB model on a 32 GB card.
+Where `f16` does fit, `turbo4` is still ahead of it, by 5.3% decode at empty context and 32.3%
+at 131,072, on a quarter of the memory.
 
 ### A note on quoting decode numbers
 
@@ -265,35 +262,9 @@ text is, and code is far more predictable than prose. Anything in this README th
 builds therefore reports `ms/step` from one session, and anything meant to be reproduced by
 someone else is `llama-bench`.
 
-### Speculative decode — the deployed path
+### Two settings not to change
 
-The figures above are `llama-bench`, which does not speculate. This is the path the server
-actually runs: DFlash2 drafting seven tokens, `turbo4` K and V, greedy sampling, median of
-four samples on one cached prompt. Also measured on `UD-Q4_K_XL`, since the point of the table
-is the before and after of one kernel change and both columns must come from the same file.
-
-**Read `ms/step` as the result, not `t/s`.** A verification step costs the same no matter how
-much of the draft survives — measured, it holds to within 0.5% across samples — but how many
-tokens it *retires* swings with how predictable the text is. The same build on the same prompt
-measured 79.68 t/s on one run and 105.43 on another purely because one generated reasoning
-(34-38% draft acceptance) and the other code (50-57%). That spread is a property of the
-content, not of the build, and it is why throughput alone is a poor way to compare two builds.
-
-| Depth | `ms/step` | | Decode, observed | at matched acceptance |
-|------:|----------:|--:|-----------------:|----------------------:|
-| 32,768 | 38.29 → **34.30** | **-10.4%** | 94.0 → 127.1 t/s | 105.0 t/s · **+11.6%** |
-| 131,072 | 60.98 → **43.21** | **-29.1%** | 53.8 → 88.9 t/s | 75.9 t/s · **+41.1%** |
-| 245,760 | 86.52 → **53.54** | **-38.1%** | 46.0 → 65.2 t/s | 74.3 t/s · **+61.6%** |
-
-<sub>Against the same build with the narrow-Q GQA rule disabled (<code>FA_NCOLS2_MAXQ=0</code>).
-The last column divides the <i>old</i> run's tokens-per-step by the <i>new</i> run's step time,
-which is the gain the kernel change is actually responsible for. The raw <code>t/s</code> column
-is what a session felt like, acceptance luck included.</sub>
-
-Prefill is untouched at every depth — 12.4s → 12.5s, 77.6s → 77.9s, 210.3s → 210.5s — because
-the rule is gated on Q width and a prefill ubatch is far wider than the gate.
-
-> **Two settings not to change.** `n_max 7` (Q=8) measures 81.46 t/s median at 131K against
+> `n_max 7` (Q=8) measures 81.46 t/s median at 131K against
 > 71.51 for `n_max 3`: the shorter draft accepts far more of what it writes (74.8% against
 > 37.2%) but retires fewer tokens per step. Raising it past 7 is worse still — Q would exceed 8
 > and silently fall off the packing rule below. And leave `--spec-draft-p-min` at 0: truncating
@@ -305,45 +276,9 @@ the rule is gated on Q width and a prefill ubatch is far wider than the gate.
 | KV type | bits/weight | @131,072 | @262,144 | Fits on 32 GB? |
 |:--|--:|--:|--:|:--|
 | **`turbo4`** | **4.25** | **2.26 GiB** | **4.52 GiB** | **yes, with room** |
-| `q8_0` | 8.5 | 4.52 GiB | 9.03 GiB | marginal |
-| `f16` | 16.0 | 8.50 GiB | 17.00 GiB | **no** — allocation refused |
+| `f16` | 16.0 | 8.50 GiB | 17.00 GiB | **no**, 17 GiB of cache plus an 18.8 GiB model |
 
 <sub>Sizes are exact for the geometry above: 17 attention layers × 4 KV heads × 256 dims × 2 (K and V). <code>turbo4</code> packs 128 elements into a 68-byte block.</sub>
-
-### Where decode time actually goes
-
-Subtracting the empty-context decode time from the decode time at depth isolates the cost of the KV traffic alone. Dividing by the bytes each type actually reads converts them all to one comparable number.
-
-| KV type | bytes read @131K | added time | effective bandwidth |
-|:--|--:|--:|--:|
-| `turbo4` *(session start)* | 2.42 GB | 7.86 ms | 308 GB/s |
-| `turbo4` *(after the gather fix)* | 2.42 GB | 6.00 ms | 403 GB/s |
-| `q8_0` | 4.85 GB | 3.95 ms | 1228 GB/s |
-| `f16` | 9.13 GB | 4.30 ms | 2123 GB/s |
-| **`turbo4` *(shipped)*** | **2.42 GB** | **2.45 ms** | **988 GB/s** |
-
-`turbo4` now reads its cache **faster in wall-clock than either `q8_0` or `f16`**, at a quarter of `f16`'s memory. Its KV read went 7.86 ms to 2.45 ms over this work, a 3.2x reduction, and the ordering against `f16` inverted.
-
-`f16` moved **3.8× the bytes in less time**. Reading fewer bytes while taking longer is the signature of a compute-bound gather, not a bandwidth-bound one — which is what localised the problem to the centroid lookup rather than the cache.
-
-> **Read that effective-bandwidth column carefully.** It divides by bytes moved, so a format that reads very little is punished by it even when it is fast. In wall-clock — which is what a token costs — `turbo4` reads its cache in 6.00 ms against `f16`'s 5.63 ms while using **3.8× less memory**, and against `q8_0`'s 6.01 ms at **half** the VRAM. Chasing `f16`'s GB/s number is chasing an artefact of the metric; the real target is wall-clock, and there the gap is 6%.
-
-### What is left, and why
-
-An ablation that deletes every dequant gather but keeps all loads intact measured **51.76** at `d131072` against 47.03 at the time. So roughly a third of the KV read cost is arithmetic, and even with that arithmetic entirely free the kernel would land near 4.09 ms — not the ~3 ms that matching `q8_0`'s GB/s would require. Cheaper arithmetic alone cannot get there.
-
-The reason the arithmetic costs so much is that it is done six times. FA-vec launches with `ncols2 = 1`, so one block serves exactly one query head:
-
-```
-const int head = blockIdx.z - sequence*ne02;    // ne02 = 24 query heads
-K += nb13*sequence + nb12*(head / gqa_ratio);   // gqa_ratio = 6
-```
-
-With 24 query heads over 4 KV heads, **six blocks read and dequantize the same cache**. DRAM is spared — L2 absorbs most of the re-reads, which is why measured throughput is not 6× worse — but every block dequantizes independently, so the gather is paid six times over. That is the amplifier that turns turbo4's slightly-more-expensive lookup into a 2× gap against `q8_0` per byte.
-
-Packing GQA heads into one block, the way the MMA kernel already does, is the remaining structural fix. It is bounded by registers: `VKQ[ncols][16]` half2 makes six-way packing infeasible at head dim 256, so two- or three-way is the realistic range, worth an estimated 5–12%.
-
-Routing decode through the MMA kernel instead — which does pack GQA — was measured and rejected: **22.18 vs 46.91** at `d131072`, because at query width 1 it computes a 64-column tile for a single real column.
 
 ### Where prefill time goes
 
