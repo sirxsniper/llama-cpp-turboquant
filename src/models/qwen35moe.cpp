@@ -198,7 +198,14 @@ llama_model_qwen35moe::graph::graph(const llama_model & model, const llm_graph_p
             cur = build_layer_attn(inp->get_attn(), cur, inp_pos, sections, il);
         }
 
-        if (il == n_layer - 1 && inp_out_ids && cparams.embeddings_nextn_masked) {
+        // [TAG_LAST_LAYER_CROP] Crop to the output rows unless h_nextn is needed for EVERY
+        // token. Testing embeddings_nextn_masked alone got this backwards: it defaults to
+        // false, so with no drafter attached the crop was skipped and the last block's
+        // attention, norms and FFN ran on the whole ubatch instead of the few output rows.
+        // mimo2.cpp and nemotron-h-moe.cpp already use this form.
+        const bool crop_last_layer = inp_out_ids &&
+            (!cparams.embeddings_nextn || cparams.embeddings_nextn_masked);
+        if (il == n_layer - 1 && crop_last_layer) {
             cur   = ggml_get_rows(ctx0, cur, inp_out_ids);
             inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
         }
