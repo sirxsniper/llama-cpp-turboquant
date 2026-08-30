@@ -563,7 +563,22 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
 
         uint32_t new_head = cells.size();
 
-        for (uint32_t i = 0; i < cells.size(); ++i) {
+        // [TAG_SEQ_RM_BOUNDS] The unbounded walk streamed the whole pos array and ran
+        // cells.size() iterations - 262144 at our context - on every call. The server
+        // issues three of these per speculative decode step (one on the target, two
+        // mirrored onto the draft context), so it was ~786k branchy iterations per step
+        // regardless of depth. Two cheap facts make almost all of it unnecessary:
+        //   - nothing outside [used_min, used_max_p1) can match, and
+        //   - if p0 is past this sequence's highest position there is nothing to remove,
+        //     which is the common case right after a fully accepted draft.
+        if (cells.seq_pos_max(seq_id) < p0) {
+            return true;
+        }
+
+        const uint32_t i_beg = cells.used_min();
+        const uint32_t i_end = cells.used_max_p1();
+
+        for (uint32_t i = i_beg; i < i_end; ++i) {
             if (!cells.pos_in(i, p0, p1)) {
                 continue;
             }
@@ -1368,13 +1383,11 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
             }
         }
 
-        // Count used cells in stream 0 (primary stream)
-        uint32_t n_used = 0;
-        for (uint32_t i = 0; i < v_cells[0].size(); ++i) {
-            if (!v_cells[0].is_empty(i)) {
-                n_used++;
-            }
-        }
+        // Count used cells in stream 0 (primary stream). llama_kv_cells already maintains
+        // this incrementally, so the old open-coded loop was an O(kv_size) walk - 262144
+        // iterations at our context, run once per apply_ubatch and therefore twice per
+        // ubatch, since prepare() calls apply_ubatch speculatively before the real one.
+        const uint32_t n_used = v_cells[0].get_used();
         if (triattention_should_prune(triattention_st, n_used)) {
             triattention_try_prune();
         }
@@ -1382,6 +1395,20 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
 }
 
 bool llama_kv_cache::get_can_shift() const {
+    // A turbo K cache is stored WHT-rotated. RoPE is a per-channel-pair rotation and is
+    // only meaningful in the original channel basis, but the 128-wide WHT mixes every
+    // channel in the group, so build_rope_shift would rotate the wrong quantity and then
+    // requantize through the CPU path. The Hadamard applied around it there is the
+    // upstream QuaRot matrix, which does not undo the turbo WHT. Refuse the shift rather
+    // than silently corrupting the cache; callers fall back to reprocessing the prompt.
+    for (const auto & layer : layers) {
+        if (layer.k && (layer.k->type == GGML_TYPE_TURBO2_0 ||
+                        layer.k->type == GGML_TYPE_TURBO3_0 ||
+                        layer.k->type == GGML_TYPE_TURBO4_0)) {
+            return false;
+        }
+    }
+
     // Step35 uses per-layer RoPE dims; K-shift assumes a single global n_rot.
     if (model.arch == LLM_ARCH_STEP35) {
         return false;

@@ -2888,7 +2888,12 @@ ggml_tensor * llm_graph_context::build_attn(
         const int64_t padded_v_head = v->ne[0];
         if (padded_v_head != orig_v_head) {
             // Reshape to 4D, extract original head_dim, reshape back to 2D
-            const int64_t n_head_v = hparams.n_head_kv(il);
+            // Query heads, not KV heads. The comment three lines up is right: after
+            // build_attn_mha, cur is (n_embd_head_v * n_head_q, n_tokens). Using n_head_kv
+            // here makes ggml_reshape_3d's nelements assert fire on any GQA model whose
+            // n_embd_head_v is not already a multiple of 128, which is why head_dim 256
+            // never tripped it.
+            const int64_t n_head_v = hparams.n_head(il);
             const int64_t n_tokens_cur = cur->ne[1];
             cur = ggml_reshape_3d(ctx0, cur, padded_v_head, n_head_v, n_tokens_cur);
             // ggml_view_3d to extract first orig_v_head elements per head
@@ -3010,7 +3015,12 @@ ggml_tensor * llm_graph_context::build_attn(
         const int64_t padded_v_head = v->ne[0];     // padded V head_dim in cache
         if (padded_v_head != orig_v_head) {
             // cur is 2D: (padded_v_head * n_head, n_tokens) after build_attn_mha
-            const int64_t n_head_v = hparams.n_head_kv(il);
+            // Query heads, not KV heads. The comment three lines up is right: after
+            // build_attn_mha, cur is (n_embd_head_v * n_head_q, n_tokens). Using n_head_kv
+            // here makes ggml_reshape_3d's nelements assert fire on any GQA model whose
+            // n_embd_head_v is not already a multiple of 128, which is why head_dim 256
+            // never tripped it.
+            const int64_t n_head_v = hparams.n_head(il);
             const int64_t n_tokens_cur = cur->ne[1];
             cur = ggml_reshape_3d(ctx0, cur, padded_v_head, n_head_v, n_tokens_cur);
             cur = ggml_view_3d(ctx0, cur, orig_v_head, n_head_v, n_tokens_cur,
@@ -3200,7 +3210,12 @@ ggml_tensor * llm_graph_context::build_attn(
         const int64_t orig_v_head = hparams.n_embd_head_v(il);
         const int64_t padded_v_head = v->ne[0];
         if (padded_v_head != orig_v_head) {
-            const int64_t n_head_v = hparams.n_head_kv(il);
+            // Query heads, not KV heads. The comment three lines up is right: after
+            // build_attn_mha, cur is (n_embd_head_v * n_head_q, n_tokens). Using n_head_kv
+            // here makes ggml_reshape_3d's nelements assert fire on any GQA model whose
+            // n_embd_head_v is not already a multiple of 128, which is why head_dim 256
+            // never tripped it.
+            const int64_t n_head_v = hparams.n_head(il);
             const int64_t n_tokens_cur = cur->ne[1];
             cur = ggml_reshape_3d(ctx0, cur, padded_v_head, n_head_v, n_tokens_cur);
             cur = ggml_view_3d(ctx0, cur, orig_v_head, n_head_v, n_tokens_cur,

@@ -66,6 +66,13 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
         return  model.hparams.is_swa(il);
     };
 
+    // [TAG_ISWA_EMPTY_BASE] An all-SWA draft model (DFlash2) inherits the target's n_ctx,
+    // so this non-SWA pool is built with 262144 cells while holding no tensors, and every
+    // seq_rm on the draft context walks all of them once per slot per speculative step.
+    // Sizing it down is NOT as simple as it looks: the cache still tracks cell positions
+    // for the sequence even with no tensors, so a small pool makes find_slot fail once the
+    // sequence outgrows it ("failed to find a memory slot for batch of size 2" on ctx_dft).
+    // A real fix has to skip the empty cache entirely rather than shrink it.
     const uint32_t size_base = kv_size;
 
     // note: the SWA cache is always padded to 256 for performance
