@@ -242,6 +242,7 @@ static __global__ void k_set_rows_turbo3(
         block_turbo3_0 * __restrict__ dst,
         const int64_t ne00,
         const int64_t ne01,
+        const int64_t ne02,
         const int64_t ne10,
         const int64_t ne11,
         const int64_t ne12,
@@ -269,11 +270,23 @@ static __global__ void k_set_rows_turbo3(
     int64_t       tmp   = g / n_groups_per_row;
     const int64_t i01   = tmp % ne01;
     tmp                 = tmp / ne01;
-    const int64_t i02   = tmp % ne12;
-    const int64_t i03   = tmp / ne12;
+    // Decode src0's own dim-2 extent, and map to src1 the way the generic quantized
+    // path does (k_set_rows_quant): src1's dim 1 is indexed by src0's dim 2 and src1's
+    // dim 2 by src0's dim 3, each modulo the src1 extent so a broadcast repeats.
+    // This used to decode with ne12 and then set i12 = i02 / i11 = i01 % ne11, which is
+    // shifted by one dimension and never broadcasts. It only agreed with the reference
+    // when ne02 == 1, because then s03 == s02 and the wrong index reads the right address.
+    // 32-bit div/mod: these extents are all far below 2^32 and 64-bit integer division
+    // costs roughly an order of magnitude more instructions on the GPU. Measured: doing
+    // this in int64 cost 5.5% of pp512. The generic quantized path avoids the same trap
+    // by passing precomputed fastdiv structs.
+    const uint32_t tmp32  = (uint32_t) tmp;
+    const uint32_t ne02_u = (uint32_t) ne02;
+    const int64_t i02   = (int64_t) (tmp32 % ne02_u);
+    const int64_t i03   = (int64_t) (tmp32 / ne02_u);
 
-    const int64_t i12 = i02;
-    const int64_t i11 = i01 % ne11;
+    const int64_t i12 = (int64_t) ((uint32_t) i03 % (uint32_t) ne12);
+    const int64_t i11 = (int64_t) ((uint32_t) i02 % (uint32_t) ne11);
     const int64_t i10 = i01;
 
     const int64_t dst_row = *(src1 + i10*s10 + i11*s11 + i12*s12);
@@ -576,13 +589,13 @@ static void set_rows_cuda_turbo3(
         if (group_size == 128) {
             k_set_rows_turbo3<idx_t, 128><<<(int)ne_total, 128, 0, stream>>>(
                 src0_d, src1_d, (block_turbo3_0 *)dst->data,
-                ne00, ne01, ne10, ne11, ne12, ne13,
+                ne00, ne01, ne02, ne10, ne11, ne12, ne13,
                 s01, s02, s03, s10, s11, s12,
                 nb1, nb2, nb3);
         } else {
             k_set_rows_turbo3<idx_t, 64><<<(int)ne_total, 64, 0, stream>>>(
                 src0_d, src1_d, (block_turbo3_0 *)dst->data,
-                ne00, ne01, ne10, ne11, ne12, ne13,
+                ne00, ne01, ne02, ne10, ne11, ne12, ne13,
                 s01, s02, s03, s10, s11, s12,
                 nb1, nb2, nb3);
         }
@@ -613,6 +626,7 @@ static __global__ void k_set_rows_turbo2(
         block_turbo2_0 * __restrict__ dst,
         const int64_t ne00,
         const int64_t ne01,
+        const int64_t ne02,
         const int64_t ne10,
         const int64_t ne11,
         const int64_t ne12,
@@ -638,11 +652,23 @@ static __global__ void k_set_rows_turbo2(
     int64_t       tmp   = g / n_groups_per_row;
     const int64_t i01   = tmp % ne01;
     tmp                 = tmp / ne01;
-    const int64_t i02   = tmp % ne12;
-    const int64_t i03   = tmp / ne12;
+    // Decode src0's own dim-2 extent, and map to src1 the way the generic quantized
+    // path does (k_set_rows_quant): src1's dim 1 is indexed by src0's dim 2 and src1's
+    // dim 2 by src0's dim 3, each modulo the src1 extent so a broadcast repeats.
+    // This used to decode with ne12 and then set i12 = i02 / i11 = i01 % ne11, which is
+    // shifted by one dimension and never broadcasts. It only agreed with the reference
+    // when ne02 == 1, because then s03 == s02 and the wrong index reads the right address.
+    // 32-bit div/mod: these extents are all far below 2^32 and 64-bit integer division
+    // costs roughly an order of magnitude more instructions on the GPU. Measured: doing
+    // this in int64 cost 5.5% of pp512. The generic quantized path avoids the same trap
+    // by passing precomputed fastdiv structs.
+    const uint32_t tmp32  = (uint32_t) tmp;
+    const uint32_t ne02_u = (uint32_t) ne02;
+    const int64_t i02   = (int64_t) (tmp32 % ne02_u);
+    const int64_t i03   = (int64_t) (tmp32 / ne02_u);
 
-    const int64_t i12 = i02;
-    const int64_t i11 = i01 % ne11;
+    const int64_t i12 = (int64_t) ((uint32_t) i03 % (uint32_t) ne12);
+    const int64_t i11 = (int64_t) ((uint32_t) i02 % (uint32_t) ne11);
     const int64_t i10 = i01;
 
     const int64_t dst_row = *(src1 + i10*s10 + i11*s11 + i12*s12);
@@ -920,13 +946,13 @@ static void set_rows_cuda_turbo2(
         if (group_size == 128) {
             k_set_rows_turbo2<idx_t, 128><<<(int)ne_total, 128, 0, stream>>>(
                 src0_d, src1_d, (block_turbo2_0 *)dst->data,
-                ne00, ne01, ne10, ne11, ne12, ne13,
+                ne00, ne01, ne02, ne10, ne11, ne12, ne13,
                 s01, s02, s03, s10, s11, s12,
                 nb1, nb2, nb3);
         } else {
             k_set_rows_turbo2<idx_t, 64><<<(int)ne_total, 64, 0, stream>>>(
                 src0_d, src1_d, (block_turbo2_0 *)dst->data,
-                ne00, ne01, ne10, ne11, ne12, ne13,
+                ne00, ne01, ne02, ne10, ne11, ne12, ne13,
                 s01, s02, s03, s10, s11, s12,
                 nb1, nb2, nb3);
         }
@@ -957,6 +983,7 @@ static __global__ void k_set_rows_turbo4(
         block_turbo4_0 * __restrict__ dst,
         const int64_t ne00,
         const int64_t ne01,
+        const int64_t ne02,
         const int64_t ne10,
         const int64_t ne11,
         const int64_t ne12,
@@ -981,11 +1008,23 @@ static __global__ void k_set_rows_turbo4(
     int64_t       tmp   = g / n_blocks_per_row;
     const int64_t i01   = tmp % ne01;
     tmp                 = tmp / ne01;
-    const int64_t i02   = tmp % ne12;
-    const int64_t i03   = tmp / ne12;
+    // Decode src0's own dim-2 extent, and map to src1 the way the generic quantized
+    // path does (k_set_rows_quant): src1's dim 1 is indexed by src0's dim 2 and src1's
+    // dim 2 by src0's dim 3, each modulo the src1 extent so a broadcast repeats.
+    // This used to decode with ne12 and then set i12 = i02 / i11 = i01 % ne11, which is
+    // shifted by one dimension and never broadcasts. It only agreed with the reference
+    // when ne02 == 1, because then s03 == s02 and the wrong index reads the right address.
+    // 32-bit div/mod: these extents are all far below 2^32 and 64-bit integer division
+    // costs roughly an order of magnitude more instructions on the GPU. Measured: doing
+    // this in int64 cost 5.5% of pp512. The generic quantized path avoids the same trap
+    // by passing precomputed fastdiv structs.
+    const uint32_t tmp32  = (uint32_t) tmp;
+    const uint32_t ne02_u = (uint32_t) ne02;
+    const int64_t i02   = (int64_t) (tmp32 % ne02_u);
+    const int64_t i03   = (int64_t) (tmp32 / ne02_u);
 
-    const int64_t i12 = i02;
-    const int64_t i11 = i01 % ne11;
+    const int64_t i12 = (int64_t) ((uint32_t) i03 % (uint32_t) ne12);
+    const int64_t i11 = (int64_t) ((uint32_t) i02 % (uint32_t) ne11);
     const int64_t i10 = i01;
 
     const int64_t dst_row = *(src1 + i10*s10 + i11*s11 + i12*s12);
@@ -1153,7 +1192,7 @@ static void set_rows_cuda_turbo4(
         const int64_t ne_total = n_blocks * ne01 * ne02 * ne03;
         k_set_rows_turbo4<idx_t><<<(int)ne_total, 128, 0, stream>>>(
             src0_d, src1_d, (block_turbo4_0 *)dst->data,
-            ne00, ne01, ne10, ne11, ne12, ne13,
+            ne00, ne01, ne02, ne10, ne11, ne12, ne13,
             s01, s02, s03, s10, s11, s12,
             nb1, nb2, nb3);
     }
