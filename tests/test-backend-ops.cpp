@@ -3377,6 +3377,39 @@ struct test_silu_back : public test_case {
     }
 };
 
+// TurboQuant WHT rotation (GGML_OP_TURBO_WHT).
+// [TAG_WHT_WARP_TO_BLOCK] The CUDA kernel runs butterfly stages h<32 under __syncwarp(),
+// because those pair lanes inside one warp, and stages h>=32 under __syncthreads(),
+// because they cross warps. A missing barrier at that boundary let warp 0 read
+// x[32..63] before warp 1 had written it, which silently perturbed the rotation and
+// made every turbo KV cache non-deterministic at temperature 0. Comparing against the
+// CPU reference here means a regression of that kind fails the suite instead of
+// surfacing as unstable draft acceptance.
+struct test_turbo_wht : public test_case {
+    const std::array<int64_t, 4> ne;
+    const int direction;
+    const int group_size;
+
+    std::string vars() override {
+        return VARS_TO_STR3(ne, direction, group_size);
+    }
+
+    test_turbo_wht(std::array<int64_t, 4> ne = {128, 5, 4, 3},
+            int direction = 0,
+            int group_size = 0)
+        : ne(ne), direction(direction), group_size(group_size) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_set_name(a, "a");
+
+        ggml_tensor * out = ggml_turbo_wht(ctx, a, direction, group_size, nullptr);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+
 // GGML_OP_NORM
 struct test_norm : public test_case {
     const ggml_type type;
@@ -9049,6 +9082,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_scale(GGML_TYPE_F32, {100, 10, 10, 10}, 2.0f, 1.0f));
     test_cases.emplace_back(new test_softcap(GGML_TYPE_F32, {10, 10, 10, 10}, 50.0f));
     test_cases.emplace_back(new test_silu_back());
+    for (int wht_dir : {0, 1}) {
+        for (int wht_gs : {64, 128}) {
+            for (int64_t wht_mult : {1, 2, 4}) {
+                test_cases.emplace_back(new test_turbo_wht({(int64_t) wht_gs * wht_mult, 5, 4, 3}, wht_dir, wht_gs));
+            }
+        }
+        test_cases.emplace_back(new test_turbo_wht({256, 7, 2, 2}, wht_dir, 0));
+        test_cases.emplace_back(new test_turbo_wht({128, 1, 1, 1}, wht_dir, 0));
+        test_cases.emplace_back(new test_turbo_wht({512, 3, 1, 1}, wht_dir, 0));
+    }
 
     for (float eps : { 0.0f, 1e-6f, 1e-4f, 1e-1f, 10.f }) {
         for (uint32_t n : { 64, 1025 }) {
