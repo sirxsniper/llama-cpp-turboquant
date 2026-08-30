@@ -10081,21 +10081,29 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     // TurboQuant KV cache FA correctness (fork): head_dim 128, multi-token KV.
     // Compares CUDA turbo kernels vs CPU reference to catch turbo4-specific bugs.
+    //
+    // [TAG_TURBO_FA_NB_SWEEP] nb is the query width and it selects the kernel, so it has
+    // to be swept rather than fixed. nb <= 2 takes the VEC path with six-way GQA packing,
+    // nb > 2 takes MMA. Every case here used to be nb=8, so the entire VEC path was never
+    // compared against the CPU reference, even though plain decode is nb=1 and that is
+    // what a server runs whenever no draft model is attached.
     for (int64_t kv : {128, 256, 512}) {
+      for (int64_t nb : {1, 2, 8}) {
         for (ggml_type tkv : {GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO4_0}) {
-            test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1}, kv, 8, true, false, 0, 0, GGML_PREC_F32, tkv, tkv));
+            test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, tkv, tkv));
         }
         // mixed: turbo4 K with q8 V and vice versa (Jarvis uses turbo4/turbo4 but also mixed)
-        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1}, kv, 8, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_Q8_0));
-        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1}, kv, 8, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_TURBO4_0));
+        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_Q8_0));
+        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_TURBO4_0));
 
         // Real deployed geometry: Qwen3.8-27B (qwen35) is head_dim=256, 24 heads / 4 kv-heads.
-        // D=256 turbo was previously untested — the 128-only cases above miss it entirely.
+        // D=256 turbo was previously untested, the 128-only cases above miss it entirely.
         for (ggml_type tkv : {GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO4_0}) {
-            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, 8, true, false, 0, 0, GGML_PREC_F32, tkv, tkv));
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, tkv, tkv));
         }
-        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, 8, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_Q8_0));
-        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, 8, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_TURBO4_0));
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_Q8_0));
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_TURBO4_0));
+      }
     }
 
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {   10, 5, 4, 3}));
