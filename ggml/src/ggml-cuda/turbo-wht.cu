@@ -81,6 +81,12 @@ static __global__ void k_turbo_wht_f32(const float * __restrict__ src,
     WHT_STAGE_WARP(4)
     WHT_STAGE_WARP(8)
     WHT_STAGE_WARP(16)
+    // [TAG_WHT_WARP_TO_BLOCK] Stages h<32 touch only x[32w .. 32w+31], so __syncwarp()
+    // orders them within each warp. Stage 32 is the FIRST cross-warp stage: warp 0 reads
+    // and writes x[32..63], which warp 1 wrote in stage 16. WHT_STAGE_BLOCK barriers only
+    // AFTER its own access, so without this barrier nothing orders warp 1's stage-16
+    // writes against warp 0's stage-32 reads. That race perturbs the rotation at random.
+    __syncthreads();
     WHT_STAGE_BLOCK(32)
     if (group_size == 128) { WHT_STAGE_BLOCK(64) }
 #undef WHT_STAGE_WARP
