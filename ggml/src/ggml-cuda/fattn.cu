@@ -32,6 +32,21 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_con
         return;
     }
 
+    // [TAG_FA_NCOLS_128] One more tier above 64, D=256 only. Each output tile rereads the
+    // whole KV region, so doubling the tile width halves the passes. Gated on Q being wide
+    // enough to actually fill it, otherwise the wider tile just wastes columns the way
+    // Q=5 does against ncols1=8. FA_NCOLS128=0 disables it for A/B.
+    if constexpr (DKQ == 256 && DV == 256 && ncols2 <= 8) {
+        static const bool ncols128_on = [] {
+            const char * e = getenv("FA_NCOLS128");
+            return !(e && e[0] == '0');
+        }();
+        if (ncols128_on && Q->ne[1] >= 128/ncols2 && turing_mma_available(cc)) {
+            ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 128/ncols2, ncols2>(ctx, dst);
+            return;
+        }
+    }
+
     ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 64/ncols2, ncols2>(ctx, dst);
 }
 

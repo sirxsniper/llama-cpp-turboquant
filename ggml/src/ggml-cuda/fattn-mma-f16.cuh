@@ -73,6 +73,17 @@ static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_co
     // and 724.70 -> 743.12 at d245760 on a 5090. 128 exceeds the shared-memory budget
     // and aborts with a CUDA error, so 64 is the ceiling here.
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 64, 128, 2,  32, 128, 128, 128, 2, true);
+    // [TAG_FA_NCOLS_128] Deep prefill is bound by how many times the KV region is
+    // streamed, not by arithmetic. Every output tile walks all iter_k KV tiles, and the
+    // number of output tiles is ceil(Q/ncols1) * ceil(gqa/ncols2) * n_kv_heads, so ncols
+    // is the only lever once ncols2 is pinned at 2 by the gqa-6 divisor rule. At d131072
+    // with ncols=64 that is 192 output tiles * 4112 KV tiles * 32 KiB = 414 GB per 512
+    // token ubatch, which against the measured 278 ms depth delta is 1.49 TB/s, i.e. the
+    // memory system already saturated. Halving the passes is the only thing left.
+    //
+    // occupancy drops 2 -> 1 because nbytes_shared_Q doubles to 128*(128+4)*4 = 67584 B,
+    // so shared memory per SM is unchanged; nthreads doubles to keep np == 1.
+    GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 128, 256, 1,  32, 128, 128, 128, 2, true);
 
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(320, 256, 32, 128, 2,  32, 128, 128, 128, 1, false);
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(320, 256, 64, 256, 1,  32, 128, 128, 128, 1, false);
@@ -2191,6 +2202,13 @@ DECL_FATTN_MMA_F16_CASE_ALL_NCOLS2( 96,  96,  64)
 DECL_FATTN_MMA_F16_CASE_ALL_NCOLS2(112, 112,  64)
 DECL_FATTN_MMA_F16_CASE_ALL_NCOLS2(128, 128,  64)
 DECL_FATTN_MMA_F16_CASE_ALL_NCOLS2(256, 256,  64)
+
+// [TAG_FA_NCOLS_128] D=256 only, and only the ncols2 values the gqa divisor rule can
+// actually select. See the hand-written instance files of the same tag.
+extern DECL_FATTN_MMA_F16_CASE(256, 256, 128,  1);
+extern DECL_FATTN_MMA_F16_CASE(256, 256,  64,  2);
+extern DECL_FATTN_MMA_F16_CASE(256, 256,  32,  4);
+extern DECL_FATTN_MMA_F16_CASE(256, 256,  16,  8);
 
 extern DECL_FATTN_MMA_F16_CASE(512, 512,  4,  2);
 extern DECL_FATTN_MMA_F16_CASE(512, 512,  8,  2);
