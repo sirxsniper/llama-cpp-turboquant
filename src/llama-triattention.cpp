@@ -896,7 +896,14 @@ static void triattention_init_gpu(triattention_state * state, ggml_type k_type) 
     gcfg.n_sampled    = cal->n_sampled;
     gcfg.n_offsets    = state->n_offsets;
     gcfg.k_type       = k_type;
-    gcfg.need_wht_inv = (k_type == GGML_TYPE_TURBO2_0 || k_type == GGML_TYPE_TURBO3_0);
+    // [TAG_TRIATT_TURBO4_WHT] turbo4 must be here too. The old exclusion was justified by
+// "turbo4 dequant already applies R^T internally", which stopped being true: with the
+// default TURBO4_USE_4BIT, dequantize_row_turbo4_0 returns CENTROIDS_4BIT[idx]*norm,
+// structurally identical to turbo3, i.e. still WHT-rotated. Scoring it without the
+// inverse feeds an inverse-RoPE and per-frequency magnitude scorer channels that a
+// 128-point Hadamard has mixed, so the eviction decisions were noise.
+    gcfg.need_wht_inv = (k_type == GGML_TYPE_TURBO2_0 || k_type == GGML_TYPE_TURBO3_0 ||
+                         k_type == GGML_TYPE_TURBO4_0);
     gcfg.disable_trig = cfg.disable_trig;
 
     std::vector<triattention_gpu_head_calib> gcalibs(cal->n_sampled);
@@ -1258,7 +1265,9 @@ int32_t triattention_prune_impl(
 
             const ggml_tensor * k_tensor = k_tensors[ikv];
             const ggml_type k_type_l = k_tensor->type;
-            const bool need_wht_inv = (k_type_l == GGML_TYPE_TURBO2_0 || k_type_l == GGML_TYPE_TURBO3_0);
+            // [TAG_TRIATT_TURBO4_WHT] see above
+            const bool need_wht_inv = (k_type_l == GGML_TYPE_TURBO2_0 || k_type_l == GGML_TYPE_TURBO3_0 ||
+                                       k_type_l == GGML_TYPE_TURBO4_0);
 
             // 3a. Dequantize K for this KV head for all decode cells
             triattention_dequant_kv_head(

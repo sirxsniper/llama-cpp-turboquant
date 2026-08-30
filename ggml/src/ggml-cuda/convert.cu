@@ -276,11 +276,17 @@ static __global__ void dequantize_block_turbo4_0_nc(
 
     const int64_t blocks_per_row = ne00 / QK_TURBO4;
 
-    const int64_t i01   = blockIdx.y;
-    const int64_t i0203 = blockIdx.z;
-    if (i01 >= ne01 || i0203 >= ne0203) {
-        return;
-    }
+    // [TAG_TURBO4_NC_GRID_STRIDE] The launcher clamps grid.y/grid.z to the hardware's
+    // 65535 limit, which is only safe if the kernel grid-strides over them - as the
+    // generic dequantize_block above does. This specialization dropped the loops and kept
+    // the clamp, so every slice at or past 65535 was never written and the F16 scratch
+    // kept whatever the allocator last left there.
+    //
+    // Reachable: launch_fattn takes the nc path when the KV view is not contiguously
+    // allocated, i.e. n_seq > 1 && n_kv < kv_size, where ne0203 = n_kv*n_seq crosses
+    // 65535 around 65K depth. Single-sequence is contiguous and so was never affected.
+    for (int64_t i01 = blockIdx.y; i01 < ne01; i01 += gridDim.y) {
+    for (int64_t i0203 = blockIdx.z; i0203 < ne0203; i0203 += gridDim.z) {
     // s01/s02/s03 are strides in BLOCKS, not elements (dequantize_block_cont_cuda passes
     // k/qk), and the destination is indexed by the flattened i0203 - both exactly as the
     // generic dequantize_block kernel above does it.
@@ -339,6 +345,8 @@ static __global__ void dequantize_block_turbo4_0_nc(
     // store is 8-byte (half) / 16-byte (float) aligned. Rows are block-aligned (asserted
     // by the launcher) so a full per_lane group is always in bounds here.
     ggml_cuda_memcpy_1<sizeof(dst_t)*per_lane>(&yrow[j0], v);
+    }
+    }
 }
 
 template<typename dst_t>
