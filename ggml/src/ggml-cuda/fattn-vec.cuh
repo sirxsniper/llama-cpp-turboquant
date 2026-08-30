@@ -132,6 +132,11 @@ static __global__ void flash_attn_ext_vec(
     // Each step up in packing needs a proportionally smaller column to stay in registers:
     // VKQ is [ncols][(D/2)/nthreads_V], so nthreads_V is the only lever on the dominant term.
     // 8 -> 16 is what made three- and four-way viable; six-way needs 32 for the same reason.
+    // NOTE: do NOT extend this ladder to unquantized (f16/bf16/f32) V. It was tried and it
+    // produces NaN: 64 FLASH_ATTN_EXT cases failed, all unquantized K/V at gqa_ratio 4
+    // (ncols2 == 4), which is the branch raising nthreads_V from 128/cpy_nb to 16. The
+    // unquantized V path depends on nthreads_V matching cpy_nb for its load width, so the
+    // two are not independently tunable the way they are for turbo.
     constexpr int nthreads_V  = type_V_is_turbo ? (ncols2 >= 6 ? 32 : (ncols2 >= 3 ? 16 : 8))
                                                 : (V_is_unquantized ? 128 / cpy_nb : nthreads_V_q);
 
@@ -222,12 +227,22 @@ static __global__ void flash_attn_ext_vec(
 
     constexpr int ne_KQ      = ncols*D;
     constexpr int ne_combine = nwarps*V_cols_per_iter*D;
+    // The KQ tile is written as KQ[j*nthreads + tid], so it needs ncols*nthreads slots.
+    // Neither of the two bounds above covers that: ne_KQ assumes nthreads == D and
+    // ne_combine shrinks as nthreads_V grows. With the fork's GQA packing (ncols2 up to 6)
+    // and the turbo-only nthreads_V == 32, D == 64 gives ne_KQ 384 and ne_combine 256
+    // while the indexing reaches 767 - a 768-byte shared overrun.
+    constexpr int ne_kqtile  = ncols*nthreads;
+    constexpr int ne_shared  = ne_KQ > ne_combine
+                             ? (ne_KQ > ne_kqtile ? ne_KQ : ne_kqtile)
+                             : (ne_combine > ne_kqtile ? ne_combine : ne_kqtile);
+    static_assert(ne_shared >= ncols*nthreads, "KQ tile write is out of bounds");
 #ifdef V_DOT2_F32_F16_AVAILABLE
     half2            VKQ[ncols][(D/2)/nthreads_V] = {{{0.0f, 0.0f}}};
-    __shared__ half   KQ[ne_KQ > ne_combine ? ne_KQ : ne_combine];
+    __shared__ half   KQ[ne_shared];
 #else
     float2           VKQ[ncols][(D/2)/nthreads_V] = {{{0.0f, 0.0f}}};
-    __shared__ float  KQ[ne_KQ > ne_combine ? ne_KQ : ne_combine];
+    __shared__ float  KQ[ne_shared];
 #endif // V_DOT2_F32_F16_AVAILABLE
 
     // Sparse V: skip V dequant for positions with negligible attention weights.
@@ -340,10 +355,12 @@ static __global__ void flash_attn_ext_vec(
                 __align__(16) float2 tmp[cpy_ne_KQ] = {{0.0f, 0.0f}};
                 if (FA_VEC_OK(j)) {
                     if constexpr (cpy_ne_KQ >= 2) {
+                        // cpy_ne_KQ*4 bytes is HALF of cpy_ne_KQ float2s, so both copies are
+                        // always needed. Guarding the second one on cpy_ne_KQ >= 4 left
+                        // tmp[1] at its zero initialiser whenever cpy_ne_KQ == 2, silently
+                        // zeroing half of Q.
                         ggml_cuda_memcpy_1<cpy_ne_KQ*4>(tmp,                 &Q_j[i]);
-                        if constexpr (cpy_ne_KQ >= 4) {
-                            ggml_cuda_memcpy_1<cpy_ne_KQ*4>(tmp + cpy_ne_KQ/2, &Q_j[i + cpy_ne_KQ/2]);
-                        }
+                        ggml_cuda_memcpy_1<cpy_ne_KQ*4>(tmp + cpy_ne_KQ/2, &Q_j[i + cpy_ne_KQ/2]);
                     } else {
                         tmp[0] = Q_j[i];
                     }

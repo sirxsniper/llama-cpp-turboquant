@@ -590,8 +590,19 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_turbo4_0_int(
     // QK_TURBO4 for every configuration this kernel is instantiated with.
     static_assert(QK_TURBO4 % (groups_per_thread*4) == 0, "turbo4 KQ run straddles a block");
 
-    uint8_t qs_run[qs_bytes];
-    ggml_cuda_memcpy_1<qs_bytes, 2>(qs_run, K_turbo[ib_first].qs + (j_first >> 1));
+    // [TAG_TURBO4_K_LOAD_ALIGN] alignment 2 emits qs_bytes/2 separate 16-bit loads. The
+    // address is provably 4-byte aligned: j_first is a multiple of 16 (groups_per_thread*4
+    // divides QK_TURBO4, asserted above) so j_first>>1 is a multiple of 8; qs sits at offset
+    // 4 in block_turbo4_0; and the block stride is 68 = 17*4, so every row and head stride
+    // is a multiple of 4 too. It is NOT 8-byte aligned - 68 mod 8 = 4 flips the parity
+    // between consecutive blocks - which is presumably why 2 was chosen conservatively.
+    // Give the destination 4-byte alignment as well so the copy stays in registers.
+    __align__(4) uint8_t qs_run[qs_bytes];
+    if constexpr (qs_bytes % 4 == 0) {
+        ggml_cuda_memcpy_1<qs_bytes, 4>(qs_run, K_turbo[ib_first].qs + (j_first >> 1));
+    } else {
+        ggml_cuda_memcpy_1<qs_bytes, 2>(qs_run, K_turbo[ib_first].qs + (j_first >> 1));
+    }
 
     // Block norm is uniform across the run, so it is loaded once rather than per group.
     const float norm_scaled = __half2float(K_turbo[ib_first].norm) * TURBO_INT8_4BIT_SCALE_REVERSE;
