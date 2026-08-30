@@ -3033,7 +3033,17 @@ private:
                             slot.spec_ckpt.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                         }
 
-                        slot.spec_prompt = slot.prompt.tokens.get_text_tokens();
+                        // [TAG_SPEC_PROMPT_LAZY] get_text_tokens() reserves and refills a fresh
+                        // vector of the WHOLE prompt every speculative step: at 254K that is a
+                        // ~1 MB allocation plus 254k branchy push_backs, and the old buffer is
+                        // freed - on Windows a 1 MB block round-trips through VirtualAlloc, so
+                        // it re-faults every step. Only the n-gram drafters ever read it; DFlash2
+                        // and MTP never touch dparams.prompt, so skip the copy entirely for them.
+                        if (common_speculative_wants_prompt(spec.get())) {
+                            slot.spec_prompt = slot.prompt.tokens.get_text_tokens();
+                        } else if (!slot.spec_prompt.empty()) {
+                            slot.spec_prompt.clear();
+                        }
 
                         common_speculative_get_draft_params(spec.get(), slot.id) = {
                             /* .drafting = */ true,
@@ -3966,7 +3976,20 @@ private:
 
             // verify and try to accept the draft
             {
-                common_sampler_ptr smpl_save(common_sampler_clone(slot.smpl.get()));
+                // [TAG_SPEC_SMPL_CLONE] Only the use_ckpt_tgt branch below consumes this clone, and
+                // cloning is not cheap: common_sampler_clone copies gsmpl->cur, which is
+                // n_vocab * sizeof(llama_token_data) = 248320 * 12 = 2.98 MB, plus a deep copy of the
+                // grammar stacks and the rest of the chain. That ran on EVERY speculative step.
+                //
+                // Hoist the same predicate the consumer uses. With qwen35 (which is in
+                // llm_arch_supports_rs_rollback) the type is RS and n_rollback <= n_draft <= n_max ==
+                // llama_n_rs_seq, so use_ckpt_tgt is always false here and the clone was pure waste.
+                const bool may_ckpt_tgt =
+                    ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
+                    (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS &&
+                     (uint32_t) n_draft + 1 > llama_n_rs_seq(ctx_tgt));
+                
+                common_sampler_ptr smpl_save(may_ckpt_tgt ? common_sampler_clone(slot.smpl.get()) : nullptr);
 
                 GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
                 // Two independent additions land on the same dispatch and both must survive:
@@ -4033,6 +4056,9 @@ private:
                         slot.mem.seq_rm(slot.id, ckpt.pos_max + 1, -1);
 
                         slot.prompt.tokens.keep_first(ckpt.n_tokens);
+                        // may_ckpt_tgt upper-bounds n_rollback by n_draft+1, so it can never
+                        // be false while use_ckpt_tgt is true. Assert rather than deref null.
+                        GGML_ASSERT(smpl_save && "sampler clone predicate diverged from its use");
                         common_sampler_copy(smpl_save.get(), slot.smpl.get());
 
                         return;

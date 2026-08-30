@@ -95,6 +95,11 @@ bool common_speculative_process(common_speculative * spec, const llama_batch & b
 // sliding-window drafter skip prompt ubatches whose KV would be evicted unused.
 void common_speculative_set_prefill_after(common_speculative * spec, int32_t n_after);
 
+// true if any registered implementation actually reads dparams.prompt. Only the n-gram
+// drafters do; the model-based ones (dflash, mtp, eagle3, simple) never look at it, so the
+// server can skip materialising the whole prompt vector every step.
+bool common_speculative_wants_prompt(const common_speculative * spec);
+
 // generate drafts for the sequences specified with `common_speculative_get_draft_params`
 void common_speculative_draft(common_speculative * spec);
 

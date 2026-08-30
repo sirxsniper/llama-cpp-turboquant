@@ -1144,7 +1144,12 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 const int v = atoi(e);
                 return (int32_t) (v > 0 ? v : 0);
             }();
-            if (tail > 0 && n_prefill_after > tail) {
+            // >= not >: is_masked_swa masks when p1 - p0 >= n_swa, so a query at P sees
+            // keys at P-(n_swa-1)..P. With n_ubatch == n_swa the second-to-last ubatch has
+            // n_prefill_after == tail exactly, and every one of its rows is already outside
+            // the window by the time any draft reads it - so it was being processed for
+            // nothing, doubling the drafter's prefill work at -ub 2048.
+            if (tail > 0 && n_prefill_after >= tail) {
                 // Skipping is only safe if it cannot leave a HOLE in the draft KV.
                 //
                 // On a cold prompt the draft cache is empty, so skipping the early ubatches
@@ -1687,39 +1692,24 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         // if kv is shared with target (e.g Gemma4), then we can skip this catch-up decode
         if (!is_mem_shared) {
-            common_batch_clear(batch);
-
-            for (int k = 0; k < n_tokens; ++k) {
-                common_batch_add(batch, batch_in.token[k], batch_in.pos[k], { batch_in.seq_id[k][0] }, 0);
-            }
-
-            // shift the tgt embeddings to the right by one position
-            // assumes that the tokens in the batch are sequential for each sequence
-            // i.e. we cannot have seq_id like this: [0, 0, 0, 1, 1, 0, 1, 1]
-            //                                                       ^--- this is a problem
-            // TODO:this is generally true, but would be nice to assert it
-            {
-                const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);
-                std::memcpy(batch.embd + (size_t) 1 * n_embd, h_tgt, row_bytes * (n_tokens-1));
-            }
-
-            // fill the pending embeddings from a previous run
-            auto set_h = [&](int idx, const float * h_row) {
-                std::memcpy(batch.embd + (size_t) idx * n_embd, h_row, row_bytes);
-            };
-
-            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
-                if (i_batch_beg[seq_id] < 0) {
-                    continue;
-                }
-
-                set_h(i_batch_beg[seq_id], pending_h[seq_id].data());
-            }
-
+            // [TAG_MTP_CHUNK_DECODE] This batch is built from the TARGET's ubatch, which can
+            // be n_batch(ctx_tgt) wide, but it is decoded on the DRAFT context whose n_batch
+            // SPEC_DFT_UBATCH deliberately clamps. Sizing the allocation from the target was
+            // only half the fix: llama_decode then asserts n_tokens_all <= cparams.n_batch,
+            // so the abort merely moved from common_batch_add to llama_context::decode, and
+            // the only way to run was to widen the draft context. That is expensive: its
+            // compute buffer reserves a KQ mask of n_kv * n_ubatch f16, which at n_kv 262144
+            // is 128 MiB at ubatch 256 but 1024 MiB at 2048.
+            //
+            // Chunk the decode instead. Positions are strictly increasing and contiguous per
+            // sequence, so each chunk's min pos still exceeds the draft KV's pos_max, and
+            // the h-shift is expressed in GLOBAL token index so splitting it is transparent.
             auto * mem_dft = llama_get_memory(ctx_dft);
+            const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);
+            const int32_t n_b_max = std::max<int32_t>(1, (int32_t) llama_n_batch(ctx_dft));
 
             bool ok = true;
-            for (int head = 0; head < n_mtp_layers; ++head) {
+            for (int head = 0; head < n_mtp_layers && ok; ++head) {
                 if (chain_heads) {
                     // ref: https://github.com/ggml-org/llama.cpp/pull/24340/changes#r3413498544
                     for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
@@ -1731,15 +1721,44 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     llama_set_nextn_layer_offset(ctx_dft, head);
                 }
 
-                const int32_t rc = llama_decode(ctx_dft, batch);
-                if (rc != 0) {
-                    SPC_ERR("llama_decode(ctx_dft) head=%d failed rc=%d (pos=%d)\n",
-                            head, (int) rc, (int) batch_in.pos[0]);
-                    ok = false;
-                    break;
+                for (int32_t off = 0; off < n_tokens && ok; off += n_b_max) {
+                    const int32_t n_chunk = std::min<int32_t>(n_b_max, n_tokens - off);
+
+                    common_batch_clear(batch);
+                    for (int32_t l = 0; l < n_chunk; ++l) {
+                        const int k = off + l;
+                        common_batch_add(batch, batch_in.token[k], batch_in.pos[k], { batch_in.seq_id[k][0] }, 0);
+                    }
+
+                    // tgt embeddings shifted right by one, in global index space
+                    for (int32_t l = 0; l < n_chunk; ++l) {
+                        const int k = off + l;
+                        if (k >= 1) {
+                            std::memcpy(batch.embd + (size_t) l*n_embd, h_tgt + (size_t) (k-1)*n_embd, row_bytes);
+                        } else {
+                            // row 0 has no predecessor; overwritten below when a sequence starts here
+                            std::memset(batch.embd, 0, row_bytes);
+                        }
+                    }
+
+                    // fill the pending embeddings from a previous run
+                    for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                        const int idx = i_batch_beg[seq_id];
+                        if (idx < 0 || idx < off || idx >= off + n_chunk) {
+                            continue;
+                        }
+                        std::memcpy(batch.embd + (size_t) (idx - off)*n_embd, pending_h[seq_id].data(), row_bytes);
+                    }
+
+                    const int32_t rc = llama_decode(ctx_dft, batch);
+                    if (rc != 0) {
+                        SPC_ERR("llama_decode(ctx_dft) head=%d failed rc=%d (pos=%d off=%d n=%d)\n",
+                                head, (int) rc, (int) batch_in.pos[0], (int) off, (int) n_chunk);
+                        ok = false;
+                        break;
+                    }
                 }
             }
-
             if (chain_heads) {
                 llama_set_nextn_layer_offset(ctx_dft, 0); // restore default for non-draft decodes
             }
@@ -3058,6 +3077,25 @@ bool common_speculative_process(common_speculative * spec, const llama_batch & b
     return result;
 }
 
+bool common_speculative_wants_prompt(const common_speculative * spec) {
+    if (!spec) {
+        return false;
+    }
+    for (const auto & impl : spec->impls) {
+        switch (impl->type) {
+            case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE:
+            case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K:
+            case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V:
+            case COMMON_SPECULATIVE_TYPE_NGRAM_MOD:
+            case COMMON_SPECULATIVE_TYPE_NGRAM_CACHE:
+                return true;
+            default:
+                break;
+        }
+    }
+    return false;
+}
+
 void common_speculative_draft(common_speculative * spec) {
     if (spec == nullptr) {
         return;
@@ -3109,6 +3147,16 @@ void common_speculative_draft(common_speculative * spec) {
                     if (!result.empty() && (int) result.size() > dp.n_max) {
                         SPC_DBG("truncating draft to %d tokens\n", dp.n_max);
                         result.resize(dp.n_max);
+
+                        // [TAG_SPEC_DISTS_TRUNC] dists is filled in lockstep with the draft, so it
+                        // must be truncated with it. The server gates the residual rejection sampler
+                        // on dists.size() == draft.size() and silently falls back to plain exact-match
+                        // verification when they disagree, which is a different and strictly worse
+                        // acceptance rule at temperature > 0. Fires whenever get_n_draft_max() drops
+                        // below n_max: the last few tokens of any context-full or capped generation.
+                        if (dp.dists && dp.dists->size() > result.size()) {
+                            dp.dists->resize(result.size());
+                        }
                     }
                 }
 
