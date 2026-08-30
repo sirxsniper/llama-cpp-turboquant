@@ -428,8 +428,14 @@ size_t quantize_turbo2_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT d
 /* ---------- TURBO4_0: 3-bit PolarQuant + 1-bit QJL ---------- */
 
 void quantize_row_turbo4_0_ref(const float * GGML_RESTRICT x, block_turbo4_0 * GGML_RESTRICT y, int64_t k) {
+#if !TURBO4_USE_4BIT
+    // Only the legacy 3-bit+QJL layout still needs the Gram-Schmidt matrix and the QJL
+    // table. Both initialisers are non-thread-safe lazy singletons writing shared globals,
+    // and ggml calls from_float from every worker thread, so keeping them off the default
+    // path removes that race as well as the basis mismatch fixed below.
     turbo_init_rotation();
     turbo_init_qjl();
+#endif
 
     assert(k % QK_TURBO4 == 0);
     const int nb = k / QK_TURBO4;
@@ -453,8 +459,21 @@ void quantize_row_turbo4_0_ref(const float * GGML_RESTRICT x, block_turbo4_0 * G
         }
 
         /* Step 2: Rotate */
+        //
+        // This MUST be the signed Walsh-Hadamard transform, not the Gram-Schmidt matrix.
+        // Every other turbo4 producer and consumer works in the WHT basis: the CUDA writer
+        // (ggml-cuda/set-rows.cu k_set_rows_turbo4), the graph-side Q rotation
+        // (ggml-cuda/turbo-wht.cu, GGML_OP_TURBO_WHT) and the CPU op (ggml-cpu/ops.cpp).
+        // turbo2 and turbo3 already call turbo_cpu_fwht here; turbo4 was left on the old
+        // random rotation, so anything this function wrote landed in a different basis and
+        // <WHT(Q), GramSchmidt(K)> is noise rather than an approximation of <Q,K>.
         float rotated[TURBO_D];
+#if TURBO4_USE_4BIT
+        memcpy(rotated, normalized, d * sizeof(float));
+        turbo_cpu_fwht(rotated, d);
+#else
         matvec(turbo_rotation, normalized, rotated, d);
+#endif
 
 #if TURBO4_USE_4BIT
         /* Step 3: 4-bit quantization (16 centroids) */

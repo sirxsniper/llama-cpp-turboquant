@@ -2463,6 +2463,20 @@ struct test_set_rows : public test_case {
             err_estimate /= 0.25f*float(ne[0] * r * ne[2]*nr23[0] * ne[3]*nr23[1]);
             return err_estimate;
         }
+        // [TAG_TURBO_SET_ROWS_TOL] Same argument as above, one centroid off, but the turbo
+        // types reach it by a different route. They apply a 128-point signed Walsh-Hadamard
+        // transform before binning, and the CPU reference sums that butterfly sequentially
+        // while CUDA does it as a tree. The last-bit difference flips which centroid a value
+        // near a decision boundary lands on.
+        //
+        // Measured on SET_ROWS(f32 -> turbo4, ne=[256,11,1,2], nr23=[2,3]): 7.28e-7, then
+        // 1.03e-6, then two passes, purely on random-data luck. 1e-7 is not attainable here
+        // for any correct implementation. 5e-6 still catches what matters - a wrong rotation
+        // basis and a broken broadcast mapping both measured 0.38 to 1.27.
+        if (type_dst == GGML_TYPE_TURBO2_0 || type_dst == GGML_TYPE_TURBO3_0 ||
+            type_dst == GGML_TYPE_TURBO4_0) {
+            return 5e-6;
+        }
         return 1e-7;
     }
 
@@ -8499,6 +8513,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, GGML_TYPE_F32, GGML_TYPE_I64, { 1, 8, 1, 3 }, { 1, 1 }, 2, false));
     test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, GGML_TYPE_F32, GGML_TYPE_I32, { 1, 8, 1, 3 }, { 1, 1 }, 2, false));
     test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, GGML_TYPE_Q8_0, GGML_TYPE_I32, { 256, 5, 1, 3 }, { 1, 1, }, 1, false));
+
+    // [TAG_TURBO_SET_ROWS_PARITY] SET_ROWS is the only op that exercises the turbo
+    // WRITER. Every other turbo test populates K/V on the host with ggml_quantize_chunk,
+    // so both backends receive identical bytes and both dequantize them identically -
+    // structurally blind to a writer that encodes in the wrong basis. That is exactly how
+    // the CPU turbo4 quantizer shipped rotating with a random Gram-Schmidt matrix while
+    // CUDA, the graph-side Q rotation and the CPU op all used the signed WHT.
+    for (ggml_type type : {GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO4_0}) {
+        test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, type, GGML_TYPE_I64, {  128, 5, 1, 3 }, { 1, 1, }, 1, false));
+        test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, type, GGML_TYPE_I64, { 1024, 5, 1, 3 }, { 1, 1, }, 1, false));
+        test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, type, GGML_TYPE_I64, {  256, 11, 1, 2 }, { 2, 3, }, 7, false));
+    }
     for (ggml_type src_type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
         for (ggml_type type : all_types) {
             for (int b : {1, 7}) {
