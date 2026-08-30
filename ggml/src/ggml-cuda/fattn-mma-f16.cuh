@@ -84,6 +84,14 @@ static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_co
     // occupancy drops 2 -> 1 because nbytes_shared_Q doubles to 128*(128+4)*4 = 67584 B,
     // so shared memory per SM is unchanged; nthreads doubles to keep np == 1.
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 128, 256, 1,  32, 128, 128, 128, 2, true);
+    // ncols 256 was tried and is WORSE, do not re-add it. Same mechanism says it should
+    // halve the passes again, and it does, but measured at d131072 against this same
+    // ncols=128 row: pp512 1579.57 -> 1112.08 and pp2048 1581.52 -> 1117.06, i.e. 8.6-8.8%
+    // BELOW even the ncols<=64 baseline. It needs nthreads 512 (np wants nwarps >= 16),
+    // nbatch_combine 64, and Q staged in two shared passes because a whole 256-column
+    // tile is 135168 B against the ~99 KB limit. The extra barriers, the register
+    // pressure at 16 warps, and one block per SM cost more than the halved passes save.
+    // p2048 regresses as much as p512, so it is not a small-prompt parallelism artefact.
 
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(320, 256, 32, 128, 2,  32, 128, 128, 128, 1, false);
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(320, 256, 64, 256, 1,  32, 128, 128, 128, 1, false);
@@ -2065,6 +2073,14 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
         const char * e = getenv("TURBO_MMA_NATIVE");
         return !(e && e[0] == '0');
     }();
+    // RE-MEASURED after the ncols=128 tier landed (which halves the passes): raising
+    // TURBO_MMA_NATIVE_MAXQ to 4096 still LOSES badly at prefill, pp2048 @ d131072
+    // 1597.40 -> 1022.87, -36%. So the F16-conversion path wins at wide Q even though it
+    // streams 3.8x more bytes. The reason is instruction width, not pass count: qs sits at
+    // offset 4 in a 68-byte block and 68 = 4 mod 8, so no qs address is ever provably
+    // 8-byte aligned and every load is ggml_cuda_memcpy_1<4,4>, plus a separate 2-byte norm
+    // load. That also makes cp_async illegal (it needs 16-byte alignment), which is why
+    // nstages is forced to 0 here. Fixing this needs a LAYOUT change, not scheduling.
     // Q-WIDTH GATE (this is the whole trick).
     //
     // The F16 conversion is paid ONCE per FA call and then amortised across every Q tile

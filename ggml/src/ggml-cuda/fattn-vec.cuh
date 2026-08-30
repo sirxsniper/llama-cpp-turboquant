@@ -132,6 +132,12 @@ static __global__ void flash_attn_ext_vec(
     // Each step up in packing needs a proportionally smaller column to stay in registers:
     // VKQ is [ncols][(D/2)/nthreads_V], so nthreads_V is the only lever on the dominant term.
     // 8 -> 16 is what made three- and four-way viable; six-way needs 32 for the same reason.
+    // MEASURED: asymmetric K=turbo4 / V=turbo3 is a LOSS despite reading 13.2% fewer KV
+    // bytes: 101.07 -> 88.08 t/s at d131072, ms/step 37.66 -> 41.96, acceptance unchanged.
+    // turbo3/turbo2 never received turbo4's int8-LUT/gather4 dequant, so they still do a
+    // per-element divergent __constant__ lookup. Modernise those before revisiting mixed
+    // precision; the byte saving is real but the dequant cost currently swamps it.
+
     // NOTE: do NOT extend this ladder to unquantized (f16/bf16/f32) V. It was tried and it
     // produces NaN: 64 FLASH_ATTN_EXT cases failed, all unquantized K/V at gqa_ratio 4
     // (ncols2 == 4), which is the branch raising nthreads_V from 128/cpy_nb to 16. The

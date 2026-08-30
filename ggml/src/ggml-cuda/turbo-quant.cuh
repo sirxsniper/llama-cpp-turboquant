@@ -292,7 +292,25 @@ static bool turbo_innerq_is_active(void) {
     return innerq_enabled == 2;
 }
 
-// ---- 4-bit centroids (Lloyd-Max for N(0, 1/128)) ----
+// ---- 4-bit centroids ----
+//
+// [TAG_TURBO4_CODEBOOK] These are NOT Lloyd-Max, despite what this comment used to say.
+// Verified numerically: every entry is the conditional mean of one of 16 EQUIPROBABLE
+// bins of N(0, 1/128), matching to 4 decimals. Against a true Gaussian source that is
+// 2.13x worse in MSE (0.020273 vs 0.009501 sigma^2), and the outermost level sits at
+// 1.9677 sigma, inside turbo3's 2.1568 - which looks impossible for 16 levels vs 8.
+//
+// The proper Lloyd-Max table WAS TRIED AND IS WORSE IN PRACTICE. Measured end to end:
+//   depth      0   acceptance 41.7% -> 33.0%,  TG 96.04 -> 84.26 t/s
+//   depth 131072   acceptance 71.6% -> 67.4%,  TG 101.05 -> 99.15 t/s
+// So the theory is right and its premise is wrong: the post-WHT values are not actually
+// N(0, 1/128). A 128-point Hadamard on a real attention K vector Gaussianizes only
+// approximately, and the residual distribution is evidently lighter-tailed than normal -
+// which is exactly the case an equiprobable-bin codebook fits better than a Gaussian
+// Lloyd-Max one. Do not 'fix' this table without measuring acceptance.
+//
+// If you want to revisit it, fit the codebook to a HISTOGRAM of real post-WHT values
+// rather than to an assumed normal.
 
 static __constant__ float TURBO_CENTROIDS_4BIT[16] = {
     -0.173926f, -0.117195f, -0.089527f, -0.068756f,
