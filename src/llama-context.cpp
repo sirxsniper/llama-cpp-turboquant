@@ -2223,7 +2223,6 @@ void llama_context::extract_layer_inputs(const llm_graph_result * res, size_t to
 
 void llama_context::output_reorder() {
     const uint64_t n_vocab     = model.vocab.n_tokens();
-    const uint64_t n_embd      = model.hparams.n_embd;
     const uint64_t n_embd_out  = model.hparams.n_embd_out();
 
     for (size_t s = 0; s < output_swaps.size(); ++s) {
@@ -2242,19 +2241,25 @@ void llama_context::output_reorder() {
             }
         }
 
-        if (embd_nextn.size > 0) {
+        // [TAG_REORDER_INDEX_SPACE] output_swaps are indices into out_ids[0..n_outputs),
+        // i.e. OUTPUT space. Only buffers that are themselves output-indexed may be
+        // permuted with them. Two of these are token-indexed and must not be touched:
+        //
+        //   - embd_nextn when NOT masked: get_embeddings_nextn_ith returns
+        //     embd_nextn.data + i*n_embd directly for that case ("indexed by raw token
+        //     position"), and only the masked branch goes through output_resolve_row.
+        //   - embd_layer_inp always: extract_layer_inputs writes it at
+        //     token_offset * row_floats, and get_embeddings_layer_inp hands the raw
+        //     pointer back with no index resolution, so the DFlash2 drafter reads it in
+        //     token order.
+        //
+        // Whenever n_outputs != n_tokens - every prefill ubatch, and any generation batch
+        // where only some tokens carry logits - the two index spaces are unrelated, so
+        // this quietly scrambled the hidden states the drafter is seeded with. It fails
+        // silently as reduced acceptance rather than as an error.
+        if (embd_nextn.size > 0 && cparams.embeddings_nextn_masked) {
             for (uint64_t k = 0; k < n_embd_out; k++) {
                 std::swap(embd_nextn.data[i0*n_embd_out + k], embd_nextn.data[i1*n_embd_out + k]);
-            }
-        }
-
-        if (embd_layer_inp.size() > 0) {
-            for (int lid = 0; lid < (int) embd_layer_inp.size(); ++lid) {
-                if (embd_layer_inp[lid].size > 0) {
-                    for (uint64_t k = 0; k < n_embd; ++k) {
-                        std::swap(embd_layer_inp[lid].data[i0*n_embd + k], embd_layer_inp[lid].data[i1*n_embd + k]);
-                    }
-                }
             }
         }
 
