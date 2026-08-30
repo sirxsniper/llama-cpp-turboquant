@@ -2703,6 +2703,21 @@ common_speculative_init_result::common_speculative_init_result(
     cparams.n_rs_seq  = 0;
     cparams.ctx_other = ctx_tgt;
 
+    // [TAG_SPEC_DFT_UBATCH] The draft context inherits the target's n_batch/n_ubatch, so its
+    // compute buffer reserves logits for a full ubatch: 1024 x 248320 vocab x 4 B is ~970 MiB
+    // on this model, for a drafter that only ever needs logits for its 8-token draft block.
+    // The drafter DOES encode the prompt in n_ubatch chunks during prefill, so shrinking this
+    // trades prefill throughput for VRAM. SPEC_DFT_UBATCH sets it; unset keeps the old
+    // behaviour exactly.
+    {
+        const char * e_du = getenv("SPEC_DFT_UBATCH");
+        const int v_du = e_du ? atoi(e_du) : 0;
+        if (v_du > 0) {
+            if ((uint32_t) v_du < cparams.n_ubatch) { cparams.n_ubatch = (uint32_t) v_du; }
+            if ((uint32_t) v_du < cparams.n_batch ) { cparams.n_batch  = (uint32_t) v_du; }
+        }
+    }
+
     std::string model_path;
     if (has_draft) {
         model_path = params.speculative.draft.mparams.path;
