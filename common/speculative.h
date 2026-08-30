@@ -108,10 +108,20 @@ void common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id
 // print statistics about the speculative decoding
 
 // [TAG_SPEC_PHASE_PROBE] Wall-clock accounting of one speculative decode step.
-// Measured: the speculative overhead per step is 12.7 ms at ~0 context but 38.9 ms at
-// 131K, while plain decode only moves 18.1 -> 21.3 ms. Something in the speculative
-// path scales with context and this says which phase it is.
 // Enable with SPEC_PHASE_PROBE=1; it prints a breakdown every 128 steps.
+//
+// History, so nobody re-opens this: the probe originally recorded 12.7 ms of speculative
+// overhead at ~0 context against 38.9 ms at 131K, while plain decode only moved 18.1 ->
+// 21.3 ms, and asked which phase scaled with context. That question is ANSWERED and the
+// cause is FIXED. A verification batch is Q = n_draft+1 tokens wide, which is too wide
+// for the FA-vec kernel (one pass, six query heads packed) and fell through to MMA, whose
+// ncols2 ladder took the largest power of two DIVIDING gqa_ratio - 2 for gqa_ratio 6 -
+// giving ntiles_z_gqa = 3 and three full passes over K and V per layer per step. Three
+// passes over a cache whose size is linear in context is exactly a term that vanishes at
+// empty context and dominates at 131K. Picking the packing by Q width instead (the
+// FA_NCOLS2_MAXQ gate in ggml-cuda/fattn.cu) took step time at d131072 from 60.46 ms to
+// 43.02 ms. The probe stays because it is still the right instrument, but the numbers
+// above are historical, not an open problem.
 enum common_spec_phase {
     COMMON_SPEC_PHASE_TGT_DECODE = 0, // llama_decode(ctx_tgt) + its synchronize
     COMMON_SPEC_PHASE_PROCESS,        // common_speculative_process: layer extract + drafter encode/inject

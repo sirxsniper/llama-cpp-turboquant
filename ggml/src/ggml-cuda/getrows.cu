@@ -560,8 +560,12 @@ void ggml_cuda_op_get_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     {
         static std::set<int> seen;
         const ggml_tensor * s0 = dst->src[0];
-        const char * e = getenv("TURBO_PATH_PROBE");
-        if (!(e && e[0] == '0') && seen.insert((int) s0->type).second) {
+        // Opt-IN: this ran a getenv plus a std::set lookup on EVERY get_rows.
+        static const bool probe_on = [] {
+            const char * e = getenv("TURBO_PATH_PROBE");
+            return e && e[0] == '1';
+        }();
+        if (probe_on && seen.insert((int) s0->type).second) {
             fprintf(stderr, "turbo-probe: get_rows src0=%s ne=[%d,%d] dst=%s\n",
                     ggml_type_name(s0->type), (int) s0->ne[0], (int) s0->ne[1],
                     ggml_type_name(dst->type));

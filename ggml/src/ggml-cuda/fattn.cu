@@ -686,8 +686,12 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
                     const bool turbo_K = K->type == GGML_TYPE_TURBO2_0 ||
                                          K->type == GGML_TYPE_TURBO3_0 ||
                                          K->type == GGML_TYPE_TURBO4_0;
-                    const char * force_mma = getenv("TURBO_FA_MMA");
-                    const bool want_mma = force_mma && force_mma[0] == '1';
+                    // Cached: this sits inside the per-FA-op kernel selection, so an
+                    // uncached getenv here is a locked CRT lookup on every attention op.
+                    static const bool want_mma = [] {
+                        const char * e = getenv("TURBO_FA_MMA");
+                        return e && e[0] == '1';
+                    }();
 
                     if (turbo_K && want_mma && K->ne[1] >= 4096) {
                         // fall through to MMA (previous behaviour)
@@ -817,9 +821,12 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     // 0.5K to 80K on Qwen3.8-Flash-Next) while q8_0 stays flat, pointing at the MMA path's
     // full-cache F16 materialisation (fattn-common.cuh: to_fp16 over ggml_nelements(K) on
     // EVERY call). This says which path each type actually takes. TURBO_PATH_PROBE=0 silences.
+    // Selected ONCE. This used to run here for the probe and again in the switch below,
+    // so every attention op paid two full passes of a function that queries device info
+    // and walks four tensors by four dimensions.
+    const best_fattn_kernel kprobe = ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst);
     {
         static std::set<int> seen;
-        const best_fattn_kernel kprobe = ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst);
         const ggml_tensor * Kp = dst->src[1];
         const ggml_tensor * Qp = dst->src[0];
         // Key on the ACTUAL Q width, not a narrow/wide bit. The old key collapsed every
@@ -828,8 +835,13 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         // clears the turbo_ok Q <= 32 gate in fattn-mma-f16.cuh.
         const int qw  = (int) Qp->ne[1];
         const int key = ((int) kprobe << 20) | ((int) Kp->type << 12) | (qw < 4095 ? qw : 4095);
-        const char * e = getenv("TURBO_PATH_PROBE");
-        if (!(e && e[0] == '0') && seen.insert(key).second) {
+        // Opt-IN (was opt-out, so release builds paid the getenv, the std::set lookup and
+        // a second full ggml_cuda_get_best_fattn_kernel on every attention op).
+        static const bool probe_on = [] {
+            const char * e = getenv("TURBO_PATH_PROBE");
+            return e && e[0] == '1';
+        }();
+        if (probe_on && seen.insert(key).second) {
             const char * kn = kprobe == BEST_FATTN_KERNEL_VEC     ? "VEC (reads KV natively)"        :
                               kprobe == BEST_FATTN_KERNEL_MMA_F16 ? "MMA_F16 (full-cache F16 copy)" :
                               kprobe == BEST_FATTN_KERNEL_TILE    ? "TILE (full-cache F16 copy)"    : "NONE";
@@ -853,7 +865,7 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             fflush(stderr);
         }
     }
-    switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
+    switch (kprobe) {
         case BEST_FATTN_KERNEL_NONE:
             GGML_ABORT("fatal error");
         case BEST_FATTN_KERNEL_TILE:

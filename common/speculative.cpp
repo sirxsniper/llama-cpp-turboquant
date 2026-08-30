@@ -491,7 +491,19 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
         n_embd_enc = (int32_t) target_layer_ids_n * n_embd_tgt;
         n_layer_tgt = llama_model_n_layer(model_tgt);
 
-        const int32_t n_b = (int32_t) llama_n_batch(ctx_dft);
+        // [TAG_SPEC_BATCH_FROM_TGT] This batch receives tokens copied out of the TARGET's
+        // batch in process(), so it must be sized by what the target can hand us, not by
+        // the draft context's own n_batch. SPEC_DFT_UBATCH deliberately clamps the draft
+        // context's n_batch/n_ubatch (to shrink its logits buffer, which reserves
+        // n_ubatch x n_vocab floats), and that clamp was silently shrinking this
+        // allocation too: with SPEC_DFT_UBATCH=256 and a 1024-token prefill ubatch,
+        // common_batch_add walked off the end and tripped
+        //   GGML_ASSERT(batch.seq_id[batch.n_tokens] && "llama_batch size exceeded")
+        // on the first prompt longer than 256 tokens. Short prompts fit, which is why
+        // this only showed up once a real prompt was used.
+        const uint32_t n_b_dft = llama_n_batch(ctx_dft);
+        const uint32_t n_b_tgt = ctx_tgt ? llama_n_batch(ctx_tgt) : 0u;
+        const int32_t  n_b     = (int32_t) std::max(n_b_dft, n_b_tgt);
         batch = llama_batch_init(/*n_tokens=*/ n_b, /*embd=*/ n_embd_dec, /*n_seq_max=*/ 1);
         // llama_batch_init allocates only one of token/embd; eagle3 decoder needs both.
         // TODO: fix, how to call without malloc
@@ -1532,7 +1544,19 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 ctx_dft ? "yes" : "no",
                 common_speculative_get_devices_str(this->params.devices).c_str());
 
-        const int32_t n_b = (int32_t) llama_n_batch(ctx_dft);
+        // [TAG_SPEC_BATCH_FROM_TGT] This batch receives tokens copied out of the TARGET's
+        // batch in process(), so it must be sized by what the target can hand us, not by
+        // the draft context's own n_batch. SPEC_DFT_UBATCH deliberately clamps the draft
+        // context's n_batch/n_ubatch (to shrink its logits buffer, which reserves
+        // n_ubatch x n_vocab floats), and that clamp was silently shrinking this
+        // allocation too: with SPEC_DFT_UBATCH=256 and a 1024-token prefill ubatch,
+        // common_batch_add walked off the end and tripped
+        //   GGML_ASSERT(batch.seq_id[batch.n_tokens] && "llama_batch size exceeded")
+        // on the first prompt longer than 256 tokens. Short prompts fit, which is why
+        // this only showed up once a real prompt was used.
+        const uint32_t n_b_dft = llama_n_batch(ctx_dft);
+        const uint32_t n_b_tgt = ctx_tgt ? llama_n_batch(ctx_tgt) : 0u;
+        const int32_t  n_b     = (int32_t) std::max(n_b_dft, n_b_tgt);
         batch = llama_batch_init(/*n_tokens=*/ n_b, /*embd=*/ n_embd, /*n_seq_max=*/ 1);
         // llama_batch_init allocates only one of token/embd; MTP needs both.
         // TODO: fix, how to call without malloc
