@@ -1413,6 +1413,29 @@ void llama_grammar_apply_impl(const struct llama_grammar & grammar, llama_token_
     for (const auto & reject : rejects) {
         cur_p->data[reject.index].logit = -INFINITY;
     }
+
+    // [TAG_GRAMMAR_CLEARS_SORTED] Setting logits to -INFINITY invalidates any descending-order
+    // guarantee, so the flag MUST be cleared, exactly as llama_sampler_penalties_apply and
+    // llama_sampler_dry_apply already do. This function never did, which was harmless only
+    // while the grammar was always applied to the raw array straight out of set_logits, where
+    // sorted is already false.
+    //
+    // Once a top_k pre-trim runs BEFORE the grammar the flag arrives true, and two consumers
+    // trust it:
+    //   llama_sampler_top_k_impl  skips its re-sort, so -INFINITY entries survive the cut
+    //                             instead of sinking below it;
+    //   llama_sampler_dist_apply  takes max_l = data[0].logit without scanning. When the
+    //                             model's argmax is grammar-invalid that is -INFINITY, so
+    //                             expf(logit - max_l) is NaN for every candidate, sum_cum is
+    //                             NaN, the selection test never fires, and it falls through to
+    //                             `cur_p->selected = cur_p->size - 1` - an arbitrary token,
+    //                             returned on the grammar_first path with no re-validation.
+    //
+    // Observed as: llama-server task cancelled with
+    //   "Unexpected empty grammar stack after accepting piece:  user (1156)"
+    // while streaming a tool call, because that arbitrary token was then accepted into the
+    // grammar. Intermittent, since it needs the argmax to be grammar-invalid at that position.
+    cur_p->sorted = false;
 }
 
 void llama_grammar_accept_impl(struct llama_grammar & grammar, llama_token token) {
