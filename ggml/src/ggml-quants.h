@@ -116,6 +116,12 @@ GGML_API void quantize_row_turbo2_0_ref(const float * GGML_RESTRICT x, block_tur
 GGML_API void dequantize_row_turbo2_0(const block_turbo2_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
 GGML_API size_t quantize_turbo2_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix);
 
+// turbo4p_0 is the same quantizer as turbo4_0 in a split-plane block, so k must be a
+// multiple of QK_TURBO4P (1024), not of the 128-element WHT group. See [TAG_TURBO4P].
+GGML_API void quantize_row_turbo4p_0_ref(const float * GGML_RESTRICT x, block_turbo4p_0 * GGML_RESTRICT y, int64_t k);
+GGML_API void dequantize_row_turbo4p_0(const block_turbo4p_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+GGML_API size_t quantize_turbo4p_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix);
+
 GGML_API void iq2xs_init_impl(enum ggml_type type);
 GGML_API void iq2xs_free_impl(enum ggml_type type);
 GGML_API void iq3xs_init_impl(int grid_size);

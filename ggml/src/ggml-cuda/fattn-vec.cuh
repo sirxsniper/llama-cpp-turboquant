@@ -91,14 +91,27 @@ static __global__ void flash_attn_ext_vec(
     // turbo K uses float-Q path (vec_dot_fattn_vec_KQ_turbo*_0 ignores Q_q8) but should
     // get q8's nthreads_KQ_q (=32 for D=128) for parallelism. Tested int8/__dp4a path
     // proved slower at depth (constant-memory serialization on divergent lookups).
-    constexpr bool type_K_is_turbo = (type_K == GGML_TYPE_TURBO3_0 || type_K == GGML_TYPE_TURBO2_0 || type_K == GGML_TYPE_TURBO4_0);
+    constexpr bool type_K_is_turbo = (type_K == GGML_TYPE_TURBO3_0 || type_K == GGML_TYPE_TURBO2_0 ||
+                                      type_K == GGML_TYPE_TURBO4_0 || type_K == GGML_TYPE_TURBO4P_0);
     // turbo4 now takes the int8 __dp4a KQ path, so it needs the int8-quantized Q that
     // Q_q8_1 (= !K_is_unquantized) produces - the same Q q8_0 gets. turbo2/turbo3 keep
-    // the float path and stay classed as unquantized.
-    constexpr bool type_K_is_turbo_int = (type_K == GGML_TYPE_TURBO4_0);
+    // the float path and stay classed as unquantized. turbo4p is turbo4 repacked, so it
+    // takes the same path and needs the same Q.
+    constexpr bool type_K_is_turbo_int = (type_K == GGML_TYPE_TURBO4_0 || type_K == GGML_TYPE_TURBO4P_0);
     constexpr bool K_is_unquantized = (type_K == GGML_TYPE_F16 || type_K == GGML_TYPE_BF16 ||
                                        (type_K_is_turbo && !type_K_is_turbo_int));
-    constexpr bool V_is_unquantized = (type_V == GGML_TYPE_F16 || type_V == GGML_TYPE_BF16 || type_V == GGML_TYPE_TURBO3_0 || type_V == GGML_TYPE_TURBO2_0 || type_V == GGML_TYPE_TURBO4_0);
+    constexpr bool V_is_unquantized = (type_V == GGML_TYPE_F16 || type_V == GGML_TYPE_BF16 || type_V == GGML_TYPE_TURBO3_0 || type_V == GGML_TYPE_TURBO2_0 || type_V == GGML_TYPE_TURBO4_0 || type_V == GGML_TYPE_TURBO4P_0);
+    // [TAG_TURBO4P_HEAD] turbo4p is the only KV layout whose blocks are split planes, so it
+    // is the only one that cannot be reached with nb12/nb22 and needs the block base plus an
+    // in-block element offset instead.
+    constexpr bool type_K_is_split_plane = (type_K == GGML_TYPE_TURBO4P_0);
+    constexpr bool type_V_is_split_plane = (type_V == GGML_TYPE_TURBO4P_0);
+    // A head must not straddle a block, or reaching it would need two pointers rather than
+    // one base plus an offset; and it must be a whole number of WHT groups, or two heads
+    // would share a norm and the rotation would no longer be per head. fattn.cu refuses the
+    // type when the cache geometry does not satisfy this.
+    static_assert(!type_K_is_split_plane || (QK_TURBO4P % D == 0 && D % QK_TURBO4P_GROUP == 0), "bad turbo4p K head geometry");
+    static_assert(!type_V_is_split_plane || (QK_TURBO4P % D == 0 && D % QK_TURBO4P_GROUP == 0), "bad turbo4p V head geometry");
     // PERF (turbo K alignment fix attempt): turbo K uses 16 threads/K (not 32) so
     // cpy_ne=4 fits and byte_base=tid*4 is uniformly 4-byte aligned → single LDG.E.32
     // qs load instead of <2,2> short load. Two 16-thread groups per warp process 2 K
@@ -109,7 +122,8 @@ static __global__ void flash_attn_ext_vec(
     // iteration. f16/bf16 use nthreads_V=128/cpy_nb=8 → V_cols_per_iter=4, processing
     // 4 V positions per warp iter. Route turbo through the same V dispatch as f16/bf16
     // (with V_rows_per_thread=2*cpy_ne and ne=8 dequant support added in fattn-common.cuh).
-    constexpr bool type_V_is_turbo = (type_V == GGML_TYPE_TURBO3_0 || type_V == GGML_TYPE_TURBO2_0 || type_V == GGML_TYPE_TURBO4_0);
+    constexpr bool type_V_is_turbo = (type_V == GGML_TYPE_TURBO3_0 || type_V == GGML_TYPE_TURBO2_0 ||
+                                      type_V == GGML_TYPE_TURBO4_0 || type_V == GGML_TYPE_TURBO4P_0);
     // PERF (turbo V correctness + speed): use 16 threads/V (not 8) so each lane holds
     // ONE centroid (matches turbo4's 16-entry table). Eliminates the broken half-pair
     // shfl pattern (~50% wrong-half lookups) AND the half2-packing overhead — single
@@ -132,6 +146,17 @@ static __global__ void flash_attn_ext_vec(
     // Each step up in packing needs a proportionally smaller column to stay in registers:
     // VKQ is [ncols][(D/2)/nthreads_V], so nthreads_V is the only lever on the dominant term.
     // 8 -> 16 is what made three- and four-way viable; six-way needs 32 for the same reason.
+    // FOLLOW-UP: the V dequant was NOT the cause. Replacing turbo3's 8 dependent
+    // __shfl_sync broadcasts with a single-PRMT int8 gather (turbo3's 8 centroids are
+    // exactly the 8-byte pool __byte_perm indexes, so it needs no blend, unlike turbo4)
+    // left the ratio unchanged: 88.08/101.07 = 0.871 before, 85.99/97.96 = 0.878 after.
+    // Reverted, since it is a numerics change for no measured gain.
+    //
+    // The real cause is the block layout. turbo3 is 50 B per 128 (2 norm + 32 qs + 16
+    // signs): 50 = 2 mod 4, so it is worse aligned than turbo4's 68, and it needs THREE
+    // loads per block (qs, signs, norm) against turbo4's two. The 13.2% byte saving does
+    // not pay for that. Asymmetric K/V needs a layout fix, not a dequant fix.
+
     // MEASURED: asymmetric K=turbo4 / V=turbo3 is a LOSS despite reading 13.2% fewer KV
     // bytes: 101.07 -> 88.08 t/s at d131072, ms/step 37.66 -> 41.96, acceptance unchanged.
     // turbo3/turbo2 never received turbo4's int8-LUT/gather4 dequant, so they still do a
@@ -168,9 +193,15 @@ static __global__ void flash_attn_ext_vec(
     // at 8 it was two calls, two loads and two norms for the same elements. The V loop owns
     // most of this kernel's load instructions, which an ablation showed to be the binding
     // constraint rather than the dequant arithmetic. Other types keep 2*cpy_ne.
-    constexpr bool type_V_is_turbo4 = (type_V == GGML_TYPE_TURBO4_0);
+    constexpr bool type_V_is_turbo4 = (type_V == GGML_TYPE_TURBO4_0 || type_V == GGML_TYPE_TURBO4P_0);
     // Measured: 16 rows/thread halves the V load instructions but costs occupancy through
     // the larger per-call register footprint, and lost 2% at d131072 against 8. Kept at 8.
+    //
+    // That 2% was measured on turbo4, where the 16-wide path still needs two 4-byte loads
+    // because a 68-byte block cannot promise 8-byte alignment. turbo4p can do the same 16
+    // elements in ONE 8-byte load (see dequantize_V_turbo4p_0's ne == 16 branch), so the
+    // trade is not the same one and is worth re-measuring for turbo4p specifically. Left at
+    // 8 here because it has not been measured, not because 8 is known to win.
     constexpr int V_rows_per_thread = (V_is_unquantized ? 2*cpy_ne : 4);
     (void)type_V_is_turbo;
     constexpr int V_cols_per_iter   = WARP_SIZE / nthreads_V;
@@ -207,8 +238,29 @@ static __global__ void flash_attn_ext_vec(
     const int zt_gqa   = z_rem - z_KV*ntiles_z_gqa;
     const int head0    = z_KV*gqa_ratio + zt_gqa*ncols2; // first Q head served by this block
     Q += nb03*sequence + nb02* head0             + nb01*ic0;
-    K += nb13*sequence + nb12* z_KV;
-    V += nb23*sequence + nb22* z_KV;
+    K += nb13*sequence;
+    V += nb23*sequence;
+
+    // [TAG_TURBO4P_HEAD] Every layout except turbo4p steps to its head with nb12/nb22.
+    // turbo4p's split-plane block makes that stride a lie - it would land 4*z_KV bytes past
+    // the head's qs at D=256 - so it steps in blocks instead and carries the leftover as an
+    // element offset the dot and the dequant apply themselves.
+    int K_row_elem0 = 0;
+    int V_row_elem0 = 0;
+    if constexpr (type_K_is_split_plane) {
+        const turbo4p_head_addr a = turbo4p_head_offset(z_KV, D);
+        K += a.byte_bias;
+        K_row_elem0 = a.row_elem0;
+    } else {
+        K += nb12*z_KV;
+    }
+    if constexpr (type_V_is_split_plane) {
+        const turbo4p_head_addr a = turbo4p_head_offset(z_KV, D);
+        V += a.byte_bias;
+        V_row_elem0 = a.row_elem0;
+    } else {
+        V += nb22*z_KV;
+    }
 
     // A column is live only if BOTH its token and its head exist. The token part is
     // monotonic in jc so callers may break on it; the head part cycles and must not break.
@@ -431,7 +483,7 @@ static __global__ void flash_attn_ext_vec(
 
 #pragma unroll
             for (int j = 0; j < ncols; ++j) {
-                float sum = vec_dot_KQ(K + i_KQ*nb11, Q_reg[j], Q_i32[j], Q_ds[j]);
+                float sum = vec_dot_KQ(K + i_KQ*nb11, K_row_elem0, Q_reg[j], Q_i32[j], Q_ds[j]);
                 sum = warp_reduce_sum<nthreads_KQ>(sum);
 
                 if (use_logit_softcap) {
@@ -518,14 +570,14 @@ static __global__ void flash_attn_ext_vec(
                 if constexpr (type_V == GGML_TYPE_BF16) {
                     float2 tmp_f[V_rows_per_thread/2];
                     dequantize_V(V + k*nb21, tmp_f,
-                        2*i_VKQ_0 + (nthreads_V == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_V)*V_rows_per_thread);
+                        V_row_elem0 + 2*i_VKQ_0 + (nthreads_V == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_V)*V_rows_per_thread);
 #pragma unroll
                     for (int i_VKQ_1 = 0; i_VKQ_1 < V_rows_per_thread/2; ++i_VKQ_1) {
                         tmp[i_VKQ_1] = __float22half2_rn(tmp_f[i_VKQ_1]);
                     }
                 } else {
                     dequantize_V(V + k*nb21, tmp,
-                        2*i_VKQ_0 + (nthreads_V == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_V)*V_rows_per_thread);
+                        V_row_elem0 + 2*i_VKQ_0 + (nthreads_V == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_V)*V_rows_per_thread);
                 }
 #pragma unroll
                 for (int i_VKQ_1 = 0; i_VKQ_1 < V_rows_per_thread/2; ++i_VKQ_1) {
@@ -556,7 +608,7 @@ static __global__ void flash_attn_ext_vec(
             for (int i_VKQ_0 = 0; i_VKQ_0 < D/2; i_VKQ_0 += nthreads_V*V_rows_per_thread/2) {
                 float2 tmp[V_rows_per_thread/2];
                 dequantize_V(V + k*nb21, tmp,
-                    2*i_VKQ_0 + (nthreads_V == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_V)*V_rows_per_thread);
+                    V_row_elem0 + 2*i_VKQ_0 + (nthreads_V == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_V)*V_rows_per_thread);
 #pragma unroll
                 for (int i_VKQ_1 = 0; i_VKQ_1 < V_rows_per_thread/2; ++i_VKQ_1) {
 #pragma unroll
@@ -983,3 +1035,27 @@ extern DECL_FATTN_VEC_CASE(256, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO2_0);
 extern DECL_FATTN_VEC_CASE( 64, GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO4_0);
 extern DECL_FATTN_VEC_CASE(128, GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO4_0);
 extern DECL_FATTN_VEC_CASE(256, GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO4_0);
+
+// [TAG_TURBO4P] turbo4p, the split-plane repack of turbo4.
+//
+// No D=64 anywhere below: a turbo4p head must be a whole number of 128-element WHT groups
+// (two heads sharing a norm would mean one rotation across two heads) and must not straddle
+// a 1024-element block. 64 fails the first, so the kernel static_asserts on it rather than
+// silently producing a head with the wrong scale.
+extern DECL_FATTN_VEC_CASE(128, GGML_TYPE_TURBO4P_0, GGML_TYPE_TURBO4P_0);
+extern DECL_FATTN_VEC_CASE(256, GGML_TYPE_TURBO4P_0, GGML_TYPE_TURBO4P_0);
+
+// Mixed turbo4p/q8_0 KV cache types
+extern DECL_FATTN_VEC_CASE(128, GGML_TYPE_TURBO4P_0, GGML_TYPE_Q8_0);
+extern DECL_FATTN_VEC_CASE(256, GGML_TYPE_TURBO4P_0, GGML_TYPE_Q8_0);
+
+extern DECL_FATTN_VEC_CASE(128, GGML_TYPE_Q8_0, GGML_TYPE_TURBO4P_0);
+extern DECL_FATTN_VEC_CASE(256, GGML_TYPE_Q8_0, GGML_TYPE_TURBO4P_0);
+
+// Mixed turbo4p/turbo4 KV cache types. Worth having because the two layouts differ only in
+// packing, so an asymmetric cache costs no accuracy and lets K and V be repacked separately.
+extern DECL_FATTN_VEC_CASE(128, GGML_TYPE_TURBO4P_0, GGML_TYPE_TURBO4_0);
+extern DECL_FATTN_VEC_CASE(256, GGML_TYPE_TURBO4P_0, GGML_TYPE_TURBO4_0);
+
+extern DECL_FATTN_VEC_CASE(128, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4P_0);
+extern DECL_FATTN_VEC_CASE(256, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4P_0);

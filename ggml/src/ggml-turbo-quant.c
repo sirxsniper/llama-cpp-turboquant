@@ -3,8 +3,9 @@
  * TurboQuant: KV cache compression via PolarQuant + QJL
  * Based on: arXiv 2504.19874 (ICLR 2026)
  *
- * Implements GGML_TYPE_TURBO2_0 (2-bit), GGML_TYPE_TURBO3_0 (3-bit) and
- * GGML_TYPE_TURBO4_0 (4-bit) for use as --cache-type-k turboN in llama-server.
+ * Implements GGML_TYPE_TURBO2_0 (2-bit), GGML_TYPE_TURBO3_0 (3-bit),
+ * GGML_TYPE_TURBO4_0 (4-bit) and GGML_TYPE_TURBO4P_0 (4-bit, split-plane layout)
+ * for use as --cache-type-k turboN in llama-server.
  */
 
 #include "ggml-quants.h"
@@ -40,6 +41,19 @@ static const float CENTROIDS_2BIT[4] = { -0.133462f, -0.039994f, 0.039994f, 0.13
 static const float CENTROIDS_3BIT[8] = {
     -0.190685f, -0.117832f, -0.065717f, -0.021460f,
      0.021460f,  0.065717f,  0.117832f,  0.190685f
+};
+
+/* 4-bit: shared by turbo4_0 and turbo4p_0. Hoisted to file scope so the two layouts
+ * cannot drift apart - they are the same quantizer and must produce the same indices.
+ * These are equiprobable-bin conditional means, NOT Lloyd-Max: see [TAG_TURBO4_CODEBOOK]
+ * in ggml-cuda/turbo-quant.cuh for the measurement showing the Lloyd-Max table is worse
+ * end to end. Changing a value here silently changes acceptance, so do not touch it
+ * without re-measuring, and keep it identical to TURBO_CENTROIDS_4BIT on the GPU side. */
+static const float CENTROIDS_4BIT[16] = {
+    -0.173926f, -0.117195f, -0.089527f, -0.068756f,
+    -0.051262f, -0.035597f, -0.020989f, -0.006938f,
+     0.006938f,  0.020989f,  0.035597f,  0.051262f,
+     0.068756f,  0.089527f,  0.117195f,  0.173926f
 };
 
 /* ---------- rotation matrix (lazy init) ---------- */
@@ -476,13 +490,7 @@ void quantize_row_turbo4_0_ref(const float * GGML_RESTRICT x, block_turbo4_0 * G
 #endif
 
 #if TURBO4_USE_4BIT
-        /* Step 3: 4-bit quantization (16 centroids) */
-        static const float CENTROIDS_4BIT[16] = {
-            -0.173926f, -0.117195f, -0.089527f, -0.068756f,
-            -0.051262f, -0.035597f, -0.020989f, -0.006938f,
-             0.006938f,  0.020989f,  0.035597f,  0.051262f,
-             0.068756f,  0.089527f,  0.117195f,  0.173926f
-        };
+        /* Step 3: 4-bit quantization (16 centroids, file-scope CENTROIDS_4BIT) */
         uint8_t indices[TURBO_D];
         for (int i = 0; i < d; i++) {
             indices[i] = (uint8_t)nearest_centroid_4bit(rotated[i]);
@@ -568,12 +576,6 @@ void dequantize_row_turbo4_0(const block_turbo4_0 * GGML_RESTRICT x, float * GGM
      * rotation must NOT be applied here — doing so (a) mismatches the CUDA K-dot / V-dequant
      * which return centroid*norm, and (b) called turbo_init_rotation() which races under
      * multi-threaded CPU flash-attention (-> corrupted rotation matrix -> NaN). */
-    static const float CENTROIDS_4BIT[16] = {
-        -0.173926f, -0.117195f, -0.089527f, -0.068756f,
-        -0.051262f, -0.035597f, -0.020989f, -0.006938f,
-         0.006938f,  0.020989f,  0.035597f,  0.051262f,
-         0.068756f,  0.089527f,  0.117195f,  0.173926f
-    };
     for (int block = 0; block < nb; block++) {
         float norm = GGML_FP16_TO_FP32(x[block].norm);
         float * dst = y + block * d;
@@ -639,6 +641,133 @@ size_t quantize_turbo4_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT d
         quantize_row_turbo4_0_ref(
             src + row * n_per_row,
             (block_turbo4_0 *)((char *)dst + row * row_size),
+            n_per_row
+        );
+    }
+    return nrows * row_size;
+}
+
+/* ---------- TURBO4P_0: turbo4_0 quantization, split-plane layout [TAG_TURBO4P] ---------- */
+/*
+ * This is NOT a new quantizer. Every arithmetic step below is the TURBO4_USE_4BIT branch
+ * of quantize_row_turbo4_0_ref applied to a 128-element group, in the same order, with the
+ * same file-scope CENTROIDS_4BIT, the same nearest_centroid_4bit midpoint chain and the
+ * same norm correction. Only the destination layout changes, so a turbo4p block holds
+ * exactly the eight nibble planes and eight norms that eight consecutive turbo4 blocks
+ * would have held. If you change the quantizer, change both or they will disagree.
+ *
+ * ASSUMPTIONS, stated because the GPU writer must agree byte for byte:
+ *
+ *  - Group g covers global elements [128*g, 128*g + 128) of the block, in source order.
+ *    No permutation, no interleave across groups.
+ *  - Element e of group g is global element i = 128*g + e, and its nibble lives in
+ *    qs[i/2], low nibble when i is even and high nibble when i is odd. Because 128*g is
+ *    even, i/2 == 64*g + e/2 and i%2 == e%2, so within a group the packing is bit for bit
+ *    the turbo4_0 packing shifted by 64*g bytes.
+ *  - norm[g] is the CORRECTED norm grp_norm/recon_norm, not the raw L2 norm, matching
+ *    turbo4_0 and k_set_rows_turbo4. Storing the raw norm here would bias every
+ *    reconstruction low by the codebook's shrinkage factor.
+ *  - The WHT group is fixed at 128 by the block layout, so turbo4p ignores the
+ *    turbo3_cpu_wht_group_size global that turbo2/turbo3 read.
+ *
+ * Float summation order is the one thing that is deliberately NOT matched to CUDA: the
+ * GPU reduces the two sums as a shuffle tree across 128 lanes and this walks them
+ * sequentially. That is already true of the turbo4_0 pair and can flip a value that lands
+ * within one ULP of a midpoint. The layout, indices and mapping are exact.
+ */
+
+void quantize_row_turbo4p_0_ref(const float * GGML_RESTRICT x, block_turbo4p_0 * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_TURBO4P == 0);
+
+    const int nb = k / QK_TURBO4P;
+    const int d  = QK_TURBO4P_GROUP;
+
+    for (int block = 0; block < nb; block++) {
+        block_turbo4p_0 * blk = &y[block];
+
+        /* Nibbles are OR'd in below, so the plane has to start clean. */
+        memset(blk->qs, 0, QK_TURBO4P / 2);
+
+        for (int g = 0; g < QK_TURBO4P_NGRP; g++) {
+            const float * src = x + (size_t)block * QK_TURBO4P + (size_t)g * d;
+
+            /* Step 1: Extract norm */
+            float norm_sq = 0.0f;
+            for (int i = 0; i < d; i++) norm_sq += src[i] * src[i];
+            float norm = sqrtf(norm_sq);
+
+            /* Normalize */
+            float normalized[QK_TURBO4P_GROUP];
+            if (norm > 1e-10f) {
+                const float inv = 1.0f / norm;
+                for (int i = 0; i < d; i++) normalized[i] = src[i] * inv;
+            } else {
+                memset(normalized, 0, d * sizeof(float));
+            }
+
+            /* Step 2: Rotate. Signed WHT, the same basis the graph-side Q rotation
+             * (GGML_OP_TURBO_WHT) uses, never the Gram-Schmidt matrix. */
+            float rotated[QK_TURBO4P_GROUP];
+            memcpy(rotated, normalized, d * sizeof(float));
+            turbo_cpu_fwht(rotated, d);
+
+            /* Step 3: 4-bit quantization (16 centroids) */
+            uint8_t indices[QK_TURBO4P_GROUP];
+            for (int i = 0; i < d; i++) {
+                indices[i] = (uint8_t)nearest_centroid_4bit(rotated[i]);
+            }
+
+            /* Norm correction: the codebook shrinks the unit vector, so rescale by the
+             * reconstruction's own length instead of the source's. */
+            float recon_norm_sq = 0.0f;
+            for (int i = 0; i < d; i++) {
+                recon_norm_sq += CENTROIDS_4BIT[indices[i]] * CENTROIDS_4BIT[indices[i]];
+            }
+            float recon_norm = sqrtf(recon_norm_sq);
+            float corrected_norm = (recon_norm > 1e-10f) ? norm / recon_norm : norm;
+            blk->norm[g] = GGML_FP32_TO_FP16(corrected_norm);
+
+            /* Pack: index by the GLOBAL element so the nibble rule reads exactly as the
+             * contract states it, rather than relying on 128*g being even. */
+            for (int i = 0; i < d; i++) {
+                const int gi = g * d + i;
+                blk->qs[gi / 2] |= (uint8_t)((indices[i] & 0xF) << ((gi % 2) * 4));
+            }
+        }
+    }
+}
+
+void dequantize_row_turbo4p_0(const block_turbo4p_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_TURBO4P == 0);
+
+    const int nb = k / QK_TURBO4P;
+
+    /* Like turbo4_0 and turbo3, this returns WHT-ROTATED values. K is stored rotated and
+     * the matching rotation is applied to Q in the graph (build_attn), so applying the
+     * inverse here would both disagree with the CUDA K-dot / V-dequant, which return
+     * centroid*norm, and drag in the racy lazy rotation-matrix init. */
+    for (int block = 0; block < nb; block++) {
+        const block_turbo4p_0 * blk = &x[block];
+        float * dst = y + (size_t)block * QK_TURBO4P;
+
+        for (int i = 0; i < QK_TURBO4P; i++) {
+            const float   norm = GGML_FP16_TO_FP32(blk->norm[i / QK_TURBO4P_GROUP]);
+            const uint8_t idx  = (blk->qs[i / 2] >> ((i % 2) * 4)) & 0xF;
+            dst[i] = CENTROIDS_4BIT[idx] * norm;
+        }
+    }
+}
+
+size_t quantize_turbo4p_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
+                          int64_t nrows, int64_t n_per_row, const float * imatrix) {
+    GGML_UNUSED(imatrix);
+    assert(n_per_row % QK_TURBO4P == 0);
+
+    size_t row_size = (n_per_row / QK_TURBO4P) * sizeof(block_turbo4p_0);
+    for (int64_t row = 0; row < nrows; row++) {
+        quantize_row_turbo4p_0_ref(
+            src + row * n_per_row,
+            (block_turbo4p_0 *)((char *)dst + row * row_size),
             n_per_row
         );
     }

@@ -435,7 +435,8 @@ extern "C" {
         // NOTE: TURBO3_0 moved 42 -> 45; upstream claimed 42 for Q2_0 (b9913).
         // turbo4/turbo2 ids are deliberately left untouched to keep existing KV state files valid.
         GGML_TYPE_TURBO3_0 = 45, // TurboQuant 3-bit KV cache: 2-bit PolarQuant + 1-bit QJL
-        GGML_TYPE_COUNT   = 46,
+        GGML_TYPE_TURBO4P_0 = 46, // TurboQuant 4-bit, split-plane layout (see block_turbo4p_0)
+        GGML_TYPE_COUNT   = 47,
     };
 
     // precision

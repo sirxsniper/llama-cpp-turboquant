@@ -251,6 +251,103 @@ static void get_rows_cuda_turbo4(
         src0_d, src1_d, dst_d, ne00, ne11, ne12_fdv,
         s1, s2, s3, nb01, nb02, nb03, s10, s11, s12);
 }
+
+// ---- turbo4p get_rows: same centroid broadcast, split-plane shape ----
+//
+// turbo4p_0 quantizes identically to turbo4_0, so the reason the kernel above exists is
+// unchanged - a data-dependent index into __constant__ TURBO_CENTROIDS_4BIT replays up to
+// 16 times per warp, and holding one centroid per lane in a register fixes it.
+//
+// Two differences, both inside turbo4p_dequant_lane (turbo-quant.cuh):
+//   - a lane covers 16/sizeof(dst_t) elements and stores them with ONE 16-byte instruction.
+//     k_get_rows_turbo4 above writes its four elements one scalar store at a time.
+//   - the qs read is 4 bytes for an f16 destination, up from turbo4_0's two byte loads,
+//     because a turbo4p block base is 16-byte aligned and jb/2 is a multiple of 4.
+//
+// [TAG_TURBO4_NC_GRID_STRIDE] grid.y and grid.z are clamped to UINT16_MAX by the launcher,
+// so both are grid-strided here. That clamp with no stride is what silently dropped whole
+// slices in the turbo4_0 dequant path, and there is no reason to leave the same trap armed.
+template <typename dst_t>
+static __global__ void k_get_rows_turbo4p(
+        const void * __restrict__ src0, const int32_t * __restrict__ src1, dst_t * __restrict__ dst,
+        const int64_t ne00, const int64_t nz, const uint3 ne12_fdv,
+        const size_t s1, const size_t s2, const size_t s3,
+        const size_t nb01, const size_t nb02, const size_t nb03,
+        const size_t s10, const size_t s11, const size_t s12) {
+
+    constexpr int per_lane = turbo4p_lane_shape<dst_t>::elems;
+    constexpr int per_warp = turbo4p_lane_shape<dst_t>::per_warp;
+
+    const int64_t warps_per_row = ne00 / per_warp;
+
+    const int i10 = blockIdx.x;
+
+    const int     warps_per_block = blockDim.x / WARP_SIZE;
+    const int     warp_in_block   = threadIdx.x / WARP_SIZE;
+    const int     lane            = threadIdx.x % WARP_SIZE;
+
+    const float raw_centroid = (lane < 16) ? TURBO_CENTROIDS_4BIT[lane] : 0.0f;
+
+    for (int64_t z = blockIdx.z; z < nz; z += gridDim.z) {
+        const uint2 dm  = fast_div_modulo((uint32_t) z, ne12_fdv);
+        const int   i11 = dm.x;
+        const int   i12 = dm.y;
+
+        const int i01 = src1[i10*s10 + i11*s11 + i12*s12];
+
+        const char * __restrict__ xrow = (const char *) src0 + i01*nb01 + i11*nb02 + i12*nb03;
+        dst_t * __restrict__      yrow = dst + i10*s1 + i11*s2 + i12*s3;
+
+        // Warp-uniform loop bound, so a whole warp always runs the same iterations and the
+        // full-mask __shfl_sync inside turbo4p_dequant_lane stays legal.
+        for (int64_t iw = (int64_t) blockIdx.y * warps_per_block + warp_in_block;
+             iw < warps_per_row;
+             iw += (int64_t) gridDim.y * warps_per_block) {
+
+            const int64_t j  = iw * per_warp + lane * per_lane;
+            const int64_t ib = j / QK_TURBO4P;
+            const int     jb = (int) (j % QK_TURBO4P);
+
+            turbo4p_dequant_lane<dst_t>((const block_turbo4p_0 *) xrow + ib, jb,
+                                        raw_centroid, yrow + j);
+        }
+    }
+}
+
+template<typename dst_t>
+static void get_rows_cuda_turbo4p(
+        const void * src0_d, const int32_t * src1_d, dst_t * dst_d,
+        const int64_t ne00, const size_t nb01, const size_t nb02, const size_t nb03,
+        const int64_t ne10, const int64_t ne11, const int64_t ne12,
+        const size_t nb10, const size_t nb11, const size_t nb12,
+        const size_t nb1, const size_t nb2, const size_t nb3,
+        cudaStream_t stream) {
+    GGML_ASSERT(ne00 % QK_TURBO4P == 0 && "turbo4p get_rows needs block-aligned rows");
+
+    constexpr int warps_per_block = 4;
+    constexpr int per_warp        = turbo4p_lane_shape<dst_t>::per_warp;
+    const int64_t warps_per_row   = ne00 / per_warp;
+
+    const dim3 block_dims(warps_per_block*WARP_SIZE, 1, 1);
+    const dim3 block_nums((unsigned) ne10,
+                          (unsigned) MIN((warps_per_row + warps_per_block - 1) / warps_per_block, (int64_t) UINT16_MAX),
+                          (unsigned) MIN(ne11*ne12, (int64_t) UINT16_MAX));
+
+    const size_t s1 = nb1 / sizeof(dst_t);
+    const size_t s2 = nb2 / sizeof(dst_t);
+    const size_t s3 = nb3 / sizeof(dst_t);
+    const size_t s10 = nb10 / sizeof(int32_t);
+    const size_t s11 = nb11 / sizeof(int32_t);
+    const size_t s12 = nb12 / sizeof(int32_t);
+
+    GGML_ASSERT(ne12 > 0);
+    const uint3 ne12_fdv = init_fastdiv_values(ne12);
+
+    k_get_rows_turbo4p<dst_t><<<block_nums, block_dims, 0, stream>>>(
+        src0_d, src1_d, dst_d, ne00, ne11*ne12, ne12_fdv,
+        s1, s2, s3, nb01, nb02, nb03, s10, s11, s12);
+}
+
 template<int qk, int qr, dequantize_kernel_t dq, typename dst_t>
 static void get_rows_cuda_q(
         const void * src0_d, const int32_t * src1_d, dst_t * dst_d,
@@ -450,6 +547,10 @@ static void ggml_cuda_get_rows_switch_src0_type(
         // what the turbo packing gives (element j lives in byte j/2, nibble j%2).
         case GGML_TYPE_TURBO4_0:
             get_rows_cuda_turbo4(src0_d, src1_d, dst_d,
+                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+            break;
+        case GGML_TYPE_TURBO4P_0:
+            get_rows_cuda_turbo4p(src0_d, src1_d, dst_d,
                 ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
             break;
         case GGML_TYPE_TURBO3_0:

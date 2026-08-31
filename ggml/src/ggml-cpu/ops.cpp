@@ -5053,11 +5053,14 @@ void ggml_compute_forward_get_rows(
         // every tensor there lives on the GPU.
         //
         // get_rows_q is type-generic - it dequantizes through
-        // ggml_get_type_traits(type)->to_float - and all three turbo types define that
-        // (ggml.c: dequantize_row_turbo{2,3,4}_0), so they need no special handling.
+        // ggml_get_type_traits(type)->to_float - and all four turbo types define that
+        // (ggml.c: dequantize_row_turbo{2,3,4}_0 and dequantize_row_turbo4p_0), so they
+        // need no special handling. turbo4p only additionally requires ne00 % 1024 == 0,
+        // which its block layout already demands of every tensor that uses it.
         case GGML_TYPE_TURBO2_0:
         case GGML_TYPE_TURBO3_0:
         case GGML_TYPE_TURBO4_0:
+        case GGML_TYPE_TURBO4P_0:
             {
                 ggml_compute_forward_get_rows_q(params, dst);
             } break;
@@ -5133,8 +5136,12 @@ static void ggml_compute_forward_set_rows_impl(
 
     ggml_from_float_t const from_float = ggml_get_type_traits_cpu(dst->type)->from_float;
 
-    // For turbo types: communicate WHT group size to the quantize function via global
-    if (dst->type == GGML_TYPE_TURBO3_0 || dst->type == GGML_TYPE_TURBO4_0 || dst->type == GGML_TYPE_TURBO2_0) {
+    // For turbo types: communicate WHT group size to the quantize function via global.
+    // turbo4p is listed for parity with turbo4, but its quantizer ignores the global the
+    // same way turbo4's does: both have the group size pinned by their block layout, and
+    // only turbo2/turbo3 actually read it back.
+    if (dst->type == GGML_TYPE_TURBO3_0 || dst->type == GGML_TYPE_TURBO4_0 ||
+        dst->type == GGML_TYPE_TURBO2_0 || dst->type == GGML_TYPE_TURBO4P_0) {
         int gs = 0;
         memcpy(&gs, dst->op_params, sizeof(int));
         turbo3_cpu_wht_group_size = (gs == 64 || gs == 128) ? gs : 0;

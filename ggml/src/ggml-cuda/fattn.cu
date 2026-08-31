@@ -382,6 +382,13 @@ static void ggml_cuda_flash_attn_ext_mma_f16(ggml_backend_cuda_context & ctx, gg
     FATTN_VEC_CASE(128, type_K, type_V)       \
     FATTN_VEC_CASE(256, type_K, type_V)       \
 
+// [TAG_TURBO4P] turbo4p is instantiated for D 128 and 256 only, so it needs a macro that
+// does not reach for a D=64 instance that deliberately does not exist. A turbo4p head must
+// be a whole number of 128-element WHT groups, and at D=64 two heads would share a norm.
+#define FATTN_VEC_CASES_TURBO4P_D(type_K, type_V) \
+    FATTN_VEC_CASE(128, type_K, type_V)           \
+    FATTN_VEC_CASE(256, type_K, type_V)           \
+
 static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_tensor * Q = dst->src[0];
     ggml_tensor * K = dst->src[1];
@@ -483,6 +490,18 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO2_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO4_0)
 
+    // [TAG_TURBO4P] turbo4p, the split-plane repack of turbo4 (always enabled)
+    FATTN_VEC_CASES_TURBO4P_D(GGML_TYPE_TURBO4P_0, GGML_TYPE_TURBO4P_0)
+
+    // Mixed turbo4p/q8_0 KV cache types
+    FATTN_VEC_CASES_TURBO4P_D(GGML_TYPE_TURBO4P_0, GGML_TYPE_Q8_0)
+    FATTN_VEC_CASES_TURBO4P_D(GGML_TYPE_Q8_0,      GGML_TYPE_TURBO4P_0)
+
+    // Mixed turbo4p/turbo4 KV cache types. The two layouts hold identical values, so an
+    // asymmetric cache costs no accuracy and lets K and V be repacked independently.
+    FATTN_VEC_CASES_TURBO4P_D(GGML_TYPE_TURBO4P_0, GGML_TYPE_TURBO4_0)
+    FATTN_VEC_CASES_TURBO4P_D(GGML_TYPE_TURBO4_0,  GGML_TYPE_TURBO4P_0)
+
     GGML_ABORT("fatal error");
 }
 
@@ -511,6 +530,7 @@ static bool ggml_cuda_fattn_kv_type_supported(ggml_type type) {
         case GGML_TYPE_TURBO2_0:
         case GGML_TYPE_TURBO3_0:
         case GGML_TYPE_TURBO4_0:
+        case GGML_TYPE_TURBO4P_0:
             return true;
         default:
             return false;
@@ -621,7 +641,8 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     if (K->type != V->type) {
         // Allow mixed turbo KV types (any combination of turbo2, turbo3, q8_0)
         auto is_turbo = [](ggml_type t) {
-            return t == GGML_TYPE_TURBO2_0 || t == GGML_TYPE_TURBO3_0 || t == GGML_TYPE_TURBO4_0 || t == GGML_TYPE_Q8_0;
+            return t == GGML_TYPE_TURBO2_0 || t == GGML_TYPE_TURBO3_0 || t == GGML_TYPE_TURBO4_0 ||
+                   t == GGML_TYPE_TURBO4P_0 || t == GGML_TYPE_Q8_0;
         };
         if (!is_turbo(K->type) || !is_turbo(V->type)) {
             return BEST_FATTN_KERNEL_NONE;
@@ -637,6 +658,43 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     if (K->type == GGML_TYPE_TURBO2_0 || K->type == GGML_TYPE_TURBO3_0 || K->type == GGML_TYPE_TURBO4_0) {
         if (K->ne[0] % 64 != 0) {
             return BEST_FATTN_KERNEL_NONE;
+        }
+    }
+
+    // [TAG_TURBO4P] turbo4p carries a stricter geometry than "D is a multiple of 64",
+    // because one block holds 1024 elements rather than 128 and therefore spans heads:
+    //   - the head must be a whole number of 128-element WHT groups, or two heads would
+    //     share a norm and one rotation would cover both;
+    //   - the head must fit inside one block, or reaching it would need two pointers
+    //     rather than a block base plus an element offset;
+    //   - n_embd_k_gqa (= ne[0]*ne[2] for the FA view) must be a whole number of blocks,
+    //     or a KV position would start mid-block and the position stride would stop being
+    //     a whole number of blocks.
+    // Qwen3.8-27B is 4 kv heads x 256 = 1024 exactly, i.e. one block per position.
+    {
+        auto turbo4p_geometry_ok = [](const ggml_tensor * t) {
+            return t->ne[0] % QK_TURBO4P_GROUP == 0 &&
+                   QK_TURBO4P % t->ne[0] == 0 &&
+                   (t->ne[0] * t->ne[2]) % QK_TURBO4P == 0;
+        };
+        if (K->type == GGML_TYPE_TURBO4P_0 && !turbo4p_geometry_ok(K)) {
+            return BEST_FATTN_KERNEL_NONE;
+        }
+        if (V->type == GGML_TYPE_TURBO4P_0 && !turbo4p_geometry_ok(V)) {
+            return BEST_FATTN_KERNEL_NONE;
+        }
+        // Only the pairs that have a VEC instance. The mixed-type check above admits any
+        // two turbo types, but turbo4p is instantiated against itself, q8_0 and turbo4 only
+        // - turbo2 and turbo3 still do a per-element divergent constant-memory lookup, so
+        // pairing them with turbo4p would be a measured LOSS anyway (K=turbo4 / V=turbo3 at
+        // d131072: 101.07 -> 88.08 t/s). Refusing here beats aborting in the dispatch.
+        if (K->type == GGML_TYPE_TURBO4P_0 || V->type == GGML_TYPE_TURBO4P_0) {
+            auto turbo4p_pairable = [](ggml_type t) {
+                return t == GGML_TYPE_TURBO4P_0 || t == GGML_TYPE_Q8_0 || t == GGML_TYPE_TURBO4_0;
+            };
+            if (!turbo4p_pairable(K->type) || !turbo4p_pairable(V->type)) {
+                return BEST_FATTN_KERNEL_NONE;
+            }
         }
     }
 
@@ -700,7 +758,8 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
                     // TURBO_FA_MMA=1 restores the old depth-based MMA routing for A/B.
                     const bool turbo_K = K->type == GGML_TYPE_TURBO2_0 ||
                                          K->type == GGML_TYPE_TURBO3_0 ||
-                                         K->type == GGML_TYPE_TURBO4_0;
+                                         K->type == GGML_TYPE_TURBO4_0 ||
+                                         K->type == GGML_TYPE_TURBO4P_0;
                     // Cached: this sits inside the per-FA-op kernel selection, so an
                     // uncached getenv here is a locked CRT lookup on every attention op.
                     static const bool want_mma = [] {
@@ -871,7 +930,8 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             const bool native = !(nenv && nenv[0] == '0') &&
                                 Qp->ne[0] == 256 && Vp && Vp->ne[0] == 256 &&
                                 Qp->ne[1] <= maxq &&
-                                Kp->type == GGML_TYPE_TURBO4_0 && Vp->type == GGML_TYPE_TURBO4_0;
+                                Kp->type == Vp->type &&
+                                (Kp->type == GGML_TYPE_TURBO4_0 || Kp->type == GGML_TYPE_TURBO4P_0);
             fprintf(stderr, "turbo-probe: FA kernel = %s | K=%s Q->ne[1]=%d n_kv=%d kq_stride_ok=%d gqa=%d native=%d\n",
                     kn, ggml_type_name(Kp->type), (int) Qp->ne[1], (int) Kp->ne[1],
                     (int) (Kp->ne[1] % FATTN_KQ_STRIDE == 0),

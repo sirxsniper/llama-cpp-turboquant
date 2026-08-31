@@ -314,6 +314,9 @@ const std::vector<ggml_type> kv_cache_types = {
     GGML_TYPE_TURBO2_0,
     GGML_TYPE_TURBO3_0,
     GGML_TYPE_TURBO4_0,
+    // turbo4p is turbo4 in a split-plane block. It needs n_embd_k_gqa % 1024 == 0, so it
+    // is offered here but will be rejected downstream on models that do not satisfy that.
+    GGML_TYPE_TURBO4P_0,
 };
 
 static ggml_type kv_cache_type_from_str(const std::string & s) {

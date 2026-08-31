@@ -788,6 +788,18 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .to_float                 = (ggml_to_float_t) dequantize_row_turbo2_0,
         .from_float_ref           = (ggml_from_float_t) quantize_row_turbo2_0_ref,
     },
+    // Same quantizer as turbo4, split-plane block [TAG_TURBO4P]. The block is eight WHT
+    // groups wide rather than one, so blck_size is 1024 and any tensor using it must have
+    // ne0 a multiple of 1024 - that is what buys the 16-byte alignment on every qs base.
+    // The name is what -ctk / -ctv parse, so it has to stay "turbo4p".
+    [GGML_TYPE_TURBO4P_0] = {
+        .type_name                = "turbo4p",
+        .blck_size                = QK_TURBO4P,
+        .type_size                = sizeof(block_turbo4p_0),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_turbo4p_0,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_turbo4p_0_ref,
+    },
     [GGML_TYPE_Q2_K] = {
         .type_name                = "q2_K",
         .blck_size                = QK_K,
@@ -8067,6 +8079,7 @@ size_t ggml_quantize_chunk(
         case GGML_TYPE_TURBO3_0: result = quantize_turbo3_0(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_TURBO4_0: result = quantize_turbo4_0(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_TURBO2_0: result = quantize_turbo2_0(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+        case GGML_TYPE_TURBO4P_0: result = quantize_turbo4p_0(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_F16:
             {
                 size_t elemsize = sizeof(ggml_fp16_t);

@@ -606,13 +606,17 @@ static void triattention_dequant_kv_head(
                 break;
             }
             default:
+                // turbo4p_0 lands here by design: its block spans a whole 1024-element row,
+                // so a per-head slice of padded_hd elements starts mid-block and cannot be
+                // dequantized standalone. Use turbo4 if TriAttention is wanted.
                 fprintf(stderr, "[TriAttention] ERROR: unsupported K cache type %d\n", k_type);
                 memset(out + (size_t)ci * padded_hd, 0, padded_hd * sizeof(float));
                 continue;
         }
 
-        // Apply inverse WHT rotation for turbo2/turbo3
-        // turbo4 dequant already applies R^T internally
+        // Apply the inverse WHT for every turbo type. The old comment here claimed
+        // turbo4 dequant applies R^T internally; it does not, and scoring turbo4 in the
+        // rotated basis made the eviction decisions noise. See TAG_TRIATT_TURBO4_WHT.
         if (need_wht_inv) {
             float * final_dst = out + (size_t)ci * padded_hd;
             // Process in 128-element blocks (WHT block size)
@@ -903,7 +907,8 @@ static void triattention_init_gpu(triattention_state * state, ggml_type k_type) 
 // inverse feeds an inverse-RoPE and per-frequency magnitude scorer channels that a
 // 128-point Hadamard has mixed, so the eviction decisions were noise.
     gcfg.need_wht_inv = (k_type == GGML_TYPE_TURBO2_0 || k_type == GGML_TYPE_TURBO3_0 ||
-                         k_type == GGML_TYPE_TURBO4_0);
+                         k_type == GGML_TYPE_TURBO4_0 ||
+                         k_type == GGML_TYPE_TURBO4P_0);
     gcfg.disable_trig = cfg.disable_trig;
 
     std::vector<triattention_gpu_head_calib> gcalibs(cal->n_sampled);
@@ -1267,7 +1272,8 @@ int32_t triattention_prune_impl(
             const ggml_type k_type_l = k_tensor->type;
             // [TAG_TRIATT_TURBO4_WHT] see above
             const bool need_wht_inv = (k_type_l == GGML_TYPE_TURBO2_0 || k_type_l == GGML_TYPE_TURBO3_0 ||
-                                       k_type_l == GGML_TYPE_TURBO4_0);
+                                       k_type_l == GGML_TYPE_TURBO4_0 ||
+                                       k_type_l == GGML_TYPE_TURBO4P_0);
 
             // 3a. Dequantize K for this KV head for all decode cells
             triattention_dequant_kv_head(

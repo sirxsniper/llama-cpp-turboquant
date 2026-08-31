@@ -2474,7 +2474,7 @@ struct test_set_rows : public test_case {
         // for any correct implementation. 5e-6 still catches what matters - a wrong rotation
         // basis and a broken broadcast mapping both measured 0.38 to 1.27.
         if (type_dst == GGML_TYPE_TURBO2_0 || type_dst == GGML_TYPE_TURBO3_0 ||
-            type_dst == GGML_TYPE_TURBO4_0) {
+            type_dst == GGML_TYPE_TURBO4_0 || type_dst == GGML_TYPE_TURBO4P_0) {
             return 5e-6;
         }
         return 1e-7;
@@ -8520,6 +8520,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // structurally blind to a writer that encodes in the wrong basis. That is exactly how
     // the CPU turbo4 quantizer shipped rotating with a random Gram-Schmidt matrix while
     // CUDA, the graph-side Q rotation and the CPU op all used the signed WHT.
+    // turbo4p is separate below: its block is 1024 elements, so ne0 must be a multiple of
+    // 1024 rather than 128 and it cannot share this loop.
+    for (int64_t ne0 : {1024, 2048}) {
+        test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, GGML_TYPE_TURBO4P_0, GGML_TYPE_I64, { ne0,  5, 1, 3 }, { 1, 1, }, 1, false));
+        test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, GGML_TYPE_TURBO4P_0, GGML_TYPE_I64, { ne0, 11, 1, 2 }, { 2, 3, }, 7, false));
+    }
+
     for (ggml_type type : {GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO4_0}) {
         test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, type, GGML_TYPE_I64, {  128, 5, 1, 3 }, { 1, 1, }, 1, false));
         test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, type, GGML_TYPE_I64, { 1024, 5, 1, 3 }, { 1, 1, }, 1, false));
@@ -10129,6 +10136,32 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_Q8_0));
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_TURBO4_0));
+
+        // [TAG_TURBO4P] Same deployed geometry: head_dim 256 x 4 kv heads = 1024 elements
+        // per position, i.e. exactly one turbo4p block, which is what the format targets.
+        //
+        // [TAG_TURBO4P_FA_UNTESTED] THESE THREE DO NOT RUN TODAY. They report
+        // "not supported" and are skipped, so do not read them as FA coverage.
+        //
+        // The cause is in this harness, not in the kernel. test_flash_attn_ext::build_graph
+        // pads the head size up to the block size:
+        //     hsk_padded = GGML_PAD(hsk, ggml_blck_size(type_K))
+        // That is the same "the block fits inside a head" assumption turbo4p inverts
+        // everywhere else. turbo4p's block is 1024, so GGML_PAD(256, 1024) is 1024, the case
+        // is built asking for a 1024-wide head, and no FA kernel supports a head that wide.
+        //
+        // In the real model the head really is 256 wide. It is a view into a 1024-element
+        // row (n_embd_k_gqa = 4 kv heads x 256), and the native tile loader addresses the
+        // head inside the block through elem0. Expressing that here needs the harness to
+        // allocate a wider backing tensor and view a slice of it, which the fixture cannot
+        // currently do, so fixing this means changing build_graph rather than these lines.
+        //
+        // Until then turbo4p FA is covered end to end (validate.ps1 plus the needle matrix),
+        // NOT by test-backend-ops. Leaving the cases in so they start passing for free once
+        // build_graph learns the geometry.
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_TURBO4P_0, GGML_TYPE_TURBO4P_0));
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_TURBO4P_0, GGML_TYPE_Q8_0));
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_TURBO4P_0));
       }
     }
 

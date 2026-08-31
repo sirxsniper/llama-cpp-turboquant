@@ -12,11 +12,13 @@
 #include "ggml-turbo-innerq.h"
 #include <cstdlib>
 #include <cmath>
+#include <type_traits>
 
 // ---- Quantization ratios for dequantize_block template ----
 #define QR_TURBO3 1  // Each dequantize call produces 2 consecutive elements (like q8_0)
 #define QR_TURBO2 1  // Each dequantize call produces 2 consecutive elements (like q8_0)
 #define QR_TURBO4 1  // Each dequantize call produces 2 consecutive elements (like q8_0)
+#define QR_TURBO4P 1 // Each dequantize call produces 2 consecutive elements (like q8_0)
 
 // ---- 2-bit centroids (Lloyd-Max for N(0, 1/128)) ----
 
@@ -408,6 +410,90 @@ static __device__ __forceinline__ float turbo4_dequant_element(
         const block_turbo4_0 * __restrict__ x, int j, float norm) {
     uint8_t idx = (x->qs[j / 2] >> ((j % 2) * 4)) & 0xF;
     return TURBO_CENTROIDS_4BIT[idx] * norm;
+}
+
+// ---- turbo4p: same quantization as turbo4_0, split-plane layout ----
+//
+// The nibble order is IDENTICAL to turbo4_0 - element j of the 1024-element block lives in
+// nibble (j%2) of qs[j/2], low nibble for even j - so the only thing a reader has to change
+// is where the norm comes from. Eight independent 128-element WHT groups share one block,
+// group g owning elements [128*g, 128*g+128) and its own norm at norm[g]. Splitting a
+// dequant into "which norm" and "which centroid" keeps the norm lookup hoistable: it is
+// uniform for a whole group, while the centroid index is per element.
+
+static __device__ __forceinline__ float turbo4p_group_norm(
+        const block_turbo4p_0 * __restrict__ x, int j) {
+    return __half2float(x->norm[j / QK_TURBO4P_GROUP]);
+}
+
+static __device__ __forceinline__ float turbo4p_dequant_element(
+        const block_turbo4p_0 * __restrict__ x, int j, float norm) {
+    uint8_t idx = (x->qs[j / 2] >> ((j % 2) * 4)) & 0xF;
+    return TURBO_CENTROIDS_4BIT[idx] * norm;
+}
+
+// ---- turbo4p bulk dequant, one lane's worth ----
+//
+// Shared by convert.cu (both the contiguous and the strided kernel) and getrows.cu so the
+// three of them cannot drift apart on nibble order or on the norm-to-group mapping.
+//
+// turbo4p_lane_shape<dst_t>::elems is 16/sizeof(dst_t), so every lane stores EXACTLY 16
+// bytes and a
+// warp stores 512 contiguous bytes in ONE instruction - the widest perfectly coalesced
+// store a warp can issue. It deliberately does not go higher even though the layout would
+// permit a 16-byte qs LOAD (32 elements per lane, block offset 16*k from a 16-byte aligned
+// block base): a lane can move at most 16 bytes per store, so 32 elements per lane means
+// four stores at a 64-byte lane stride, and each of those touches 32 half-filled sectors
+// instead of a contiguous run. The destination is 4x the traffic of the qs source here, so
+// the store shape decides the shape of everything else.
+//
+// Alignment of the qs load, argued from the block geometry alone: sizeof(block_turbo4p_0)
+// is 528 = 16*33 and qs sits at offset 0, so with CUDA's 128-byte buffer alignment and view
+// offsets that are whole numbers of blocks, every block base is 16-byte aligned. jb is a
+// multiple of elems, so the byte offset jb/2 is a multiple of elems/2 - 4 bytes for a
+// 16-bit dst_t, 2 bytes for a 32-bit one. That is the
+// width used, and no wider.
+//
+// raw_centroid is lane L's copy of TURBO_CENTROIDS_4BIT[L] for L < 16. Unlike turbo4_0 the
+// centroid is NOT pre-scaled by the norm, because a warp here can span two WHT groups with
+// two different norms. Scaling after the broadcast costs one multiply per element and is
+// what lets the lane cover 8 elements instead of 4.
+
+// Plain constexpr members rather than a constexpr function, so the launchers can use the
+// same numbers on the host without dragging in relaxed-constexpr device call rules.
+template <typename dst_t>
+struct turbo4p_lane_shape {
+    static constexpr int elems    = 16 / (int) sizeof(dst_t);  // 8 for f16/bf16, 4 for f32
+    static constexpr int qs_bytes = elems / 2;                 // 4 for f16/bf16, 2 for f32
+    static constexpr int per_warp = WARP_SIZE * elems;         // 256 for f16/bf16, 128 for f32
+};
+
+template <typename dst_t>
+static __device__ __forceinline__ void turbo4p_dequant_lane(
+        const block_turbo4p_0 * __restrict__ x, const int jb,
+        const float raw_centroid, dst_t * __restrict__ yout) {
+
+    constexpr int per_lane = turbo4p_lane_shape<dst_t>::elems;
+    constexpr int qs_bytes = turbo4p_lane_shape<dst_t>::qs_bytes;
+    using qs_word_t = typename std::conditional<qs_bytes == 4, uint32_t, uint16_t>::type;
+
+    // Uniform across the whole group, so the compiler hoists it out of the unrolled loop.
+    const float norm = __half2float(x->norm[jb / QK_TURBO4P_GROUP]);
+
+    // jb is even, so element jb+e is nibble e counting from bit 0 of this word: byte jb/2
+    // holds elements jb+0 (low nibble) and jb+1 (high nibble), byte jb/2+1 holds jb+2 and
+    // jb+3, and so on. Same nibble order as turbo4_0.
+    qs_word_t qsw;
+    ggml_cuda_memcpy_1<qs_bytes>(&qsw, x->qs + jb/2);
+
+    alignas(16) dst_t v[per_lane];
+#pragma unroll
+    for (int e = 0; e < per_lane; ++e) {
+        const unsigned idx = (unsigned) (qsw >> (4*e)) & 0xFu;
+        v[e] = (dst_t) (norm * __shfl_sync(0xFFFFFFFFu, raw_centroid, idx, WARP_SIZE));
+    }
+
+    ggml_cuda_memcpy_1<sizeof(dst_t)*per_lane>(yout, v);
 }
 
 // ---- Nearest 3-bit centroid index ----

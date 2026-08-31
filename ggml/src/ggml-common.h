@@ -347,6 +347,41 @@ static_assert(sizeof(block_turbo4_0) == 2*sizeof(ggml_half) + QK_TURBO4*3/8 + QK
 
 static_assert(QK_TURBO4 == 128, "turbo4 kernels assume QK_TURBO4 == 128");
 
+// ---- TurboQuant 4-bit, SPLIT-PLANE layout [TAG_TURBO4P] ----
+//
+// Identical quantization to turbo4_0 - same 128-element signed WHT group, same 16
+// centroids, same nibble packing, same per-group L2 norm. ONLY the memory layout differs:
+// eight consecutive groups share one block, with all the quantized nibbles first and the
+// eight norms collected at the end.
+//
+// Why: turbo4_0 interleaves a 2-byte norm with every 64 bytes of qs, giving a 68-byte
+// block. 68 = 4 (mod 8), so no qs address is ever provably 8-byte aligned and every load
+// in the FA path is forced to ggml_cuda_memcpy_1<N,4> - 4 bytes per instruction - while
+// cp_async, which needs 16-byte alignment, is illegal outright. That is why nstages is
+// pinned to 0 on the turbo MMA path, and it is why native turbo reads at wide Q measured
+// 1597 -> 1023 t/s against the F16-conversion path despite streaming 3.8x fewer bytes.
+//
+// 528 = 16 * 33, so every block base is 16-byte aligned; qs sits at offset 0, and each
+// 128-element group starts at byte 64*g, so every (position, head) qs base is 16-byte
+// aligned too. The norms form one contiguous 16-byte run.
+//
+// Bonus: the 2-byte pad turbo4_0 needs for its own alignment disappears, so this is
+// 4.125 bpw against 4.25 - 2.94% fewer KV bytes for free.
+//
+// Constraint: n_embd_k_gqa must be a multiple of 1024. Qwen3.8-27B is 4 kv heads x 256 =
+// 1024 exactly, i.e. one block per position per tensor.
+#define QK_TURBO4P      1024
+#define QK_TURBO4P_GROUP 128   // WHT group size, unchanged from turbo4_0
+#define QK_TURBO4P_NGRP    8   // = QK_TURBO4P / QK_TURBO4P_GROUP
+
+typedef struct {
+    uint8_t   qs[QK_TURBO4P / 2];      // 512 bytes: 4-bit indices, element i in nibble i%2 of qs[i/2]
+    ggml_half norm[QK_TURBO4P_NGRP];   //  16 bytes: L2 norm of each 128-element WHT group
+} block_turbo4p_0;                     // 528 bytes total
+static_assert(sizeof(block_turbo4p_0) == 528, "wrong turbo4p_0 block size");
+static_assert(QK_TURBO4P % QK_TURBO4P_GROUP == 0, "turbo4p group must divide the block");
+static_assert(QK_TURBO4P_GROUP == QK_TURBO4, "turbo4p reuses the turbo4 WHT group and centroids");
+
 // TurboQuant 2-bit: 2-bit PolarQuant indices only (no QJL)
 // Per block: norm(fp16) + 2-bit indices (8 bytes) = 10 bytes per 32 values
 // = 2.5 bits/value → 6.4× compression vs fp16

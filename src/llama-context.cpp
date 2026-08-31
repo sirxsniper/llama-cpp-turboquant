@@ -3616,7 +3616,8 @@ llama_context * llama_init_from_model(
 
     // TurboQuant: a turbo K cache also requires flash attention even when V is not quantized
     // (e.g. -ctk turbo4 -ctv f16), which the quantized-V check above does not cover.
-    if ((params.type_k == GGML_TYPE_TURBO2_0 || params.type_k == GGML_TYPE_TURBO3_0 || params.type_k == GGML_TYPE_TURBO4_0) &&
+    if ((params.type_k == GGML_TYPE_TURBO2_0 || params.type_k == GGML_TYPE_TURBO3_0 ||
+         params.type_k == GGML_TYPE_TURBO4_0 || params.type_k == GGML_TYPE_TURBO4P_0) &&
         params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_ENABLED) {
         if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO) {
             LLAMA_LOG_INFO("%s: enabling flash_attn since it is required for turbo K cache\n", __func__);
@@ -3632,14 +3633,26 @@ llama_context * llama_init_from_model(
         const uint32_t blck_size = ggml_blck_size(params.type_k);
         const bool k_is_turbo = (params.type_k == GGML_TYPE_TURBO2_0 ||
                                  params.type_k == GGML_TYPE_TURBO3_0 ||
-                                 params.type_k == GGML_TYPE_TURBO4_0);
+                                 params.type_k == GGML_TYPE_TURBO4_0 ||
+                                 params.type_k == GGML_TYPE_TURBO4P_0);
         for (uint32_t il = 0; il < model->hparams.n_layer(); ++il) {
             uint32_t head_k = model->hparams.n_embd_head_k(il);
             // Turbo types zero-pad heads to next multiple of 128 in llama-kv-cache.cpp
             if (k_is_turbo && head_k % 128 != 0) {
                 head_k = ((head_k + 127) / 128) * 128;
             }
-            if (head_k % blck_size != 0) {
+            // [TAG_TURBO4P] turbo4p inverts the usual relationship: its block is 1024 elements
+            // and therefore SPANS heads rather than dividing one. The requirement becomes that a
+            // head fits wholly inside a block and the full row is a whole number of blocks, which
+            // is what the FA path relies on to reach a head by block base plus an element offset.
+            if (params.type_k == GGML_TYPE_TURBO4P_0) {
+                const uint32_t row = model->hparams.n_embd_k_gqa(il);
+                if (blck_size % head_k != 0 || row % blck_size != 0) {
+                    LLAMA_LOG_ERROR("%s: turbo4p needs head (%u) to divide block (%u) and row (%u) to be a multiple of it\n",
+                        __func__, head_k, blck_size, row);
+                    return nullptr;
+                }
+            } else if (head_k % blck_size != 0) {
                 LLAMA_LOG_ERROR("%s: K cache type %s with block size %u does not divide n_embd_head_k=%u\n",
                     __func__, ggml_type_name(params.type_k), blck_size, model->hparams.n_embd_head_k(il));
                 return nullptr;
@@ -3651,7 +3664,8 @@ llama_context * llama_init_from_model(
         const uint32_t blck_size = ggml_blck_size(params.type_v);
         const bool v_is_turbo = (params.type_v == GGML_TYPE_TURBO2_0 ||
                                  params.type_v == GGML_TYPE_TURBO3_0 ||
-                                 params.type_v == GGML_TYPE_TURBO4_0);
+                                 params.type_v == GGML_TYPE_TURBO4_0 ||
+                                 params.type_v == GGML_TYPE_TURBO4P_0);
         const bool is_mla = model->hparams.is_mla();
         for (uint32_t il = 0; il < model->hparams.n_layer(); ++il) {
             uint32_t head_v = model->hparams.n_embd_head_v(il);
@@ -3659,7 +3673,18 @@ llama_context * llama_init_from_model(
             if (v_is_turbo && !is_mla && head_v % 128 != 0) {
                 head_v = ((head_v + 127) / 128) * 128;
             }
-            if (head_v % blck_size != 0) {
+            // [TAG_TURBO4P] turbo4p inverts the usual relationship: its block is 1024 elements
+            // and therefore SPANS heads rather than dividing one. The requirement becomes that a
+            // head fits wholly inside a block and the full row is a whole number of blocks, which
+            // is what the FA path relies on to reach a head by block base plus an element offset.
+            if (params.type_v == GGML_TYPE_TURBO4P_0) {
+                const uint32_t row = model->hparams.n_embd_v_gqa(il);
+                if (blck_size % head_v != 0 || row % blck_size != 0) {
+                    LLAMA_LOG_ERROR("%s: turbo4p needs head (%u) to divide block (%u) and row (%u) to be a multiple of it\n",
+                        __func__, head_v, blck_size, row);
+                    return nullptr;
+                }
+            } else if (head_v % blck_size != 0) {
                 LLAMA_LOG_ERROR("%s: V cache type %s with block size %u does not divide n_embd_head_v=%u\n",
                     __func__, ggml_type_name(params.type_v), blck_size, model->hparams.n_embd_head_v(il));
                 return nullptr;

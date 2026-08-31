@@ -461,6 +461,18 @@ static __device__ __forceinline__ void dequantize_turbo4_0(const void * vx, cons
     v.y = turbo4_dequant_element(&x[ib], iqs + 1, norm);
 }
 
+// Turbo4p: same 4-bit PolarQuant as turbo4_0, eight 128-element WHT groups per 1024-element
+// block, all nibbles first and the eight norms at the end.
+// iqs is the element index within the block (even), produces elements iqs and iqs+1.
+// Both land in the SAME WHT group: a group boundary is a multiple of 128, which is even, so
+// an even iqs and iqs+1 can never straddle one and a single norm lookup covers both.
+static __device__ __forceinline__ void dequantize_turbo4p_0(const void * vx, const int64_t ib, const int iqs, float2 & v){
+    const block_turbo4p_0 * x = (const block_turbo4p_0 *) vx;
+    const float norm = turbo4p_group_norm(&x[ib], iqs);
+    v.x = turbo4p_dequant_element(&x[ib], iqs + 0, norm);
+    v.y = turbo4p_dequant_element(&x[ib], iqs + 1, norm);
+}
+
 // Turbo3: 3-bit PolarQuant (2-bit qs + 1-bit sign), block size 32
 // iqs is the element index within the block (even), produces elements iqs and iqs+1
 static __device__ __forceinline__ void dequantize_turbo3_0(const void * vx, const int64_t ib, const int iqs, float2 & v){
