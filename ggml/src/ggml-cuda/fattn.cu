@@ -870,7 +870,32 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
 
     switch (kernel) {
         case BEST_FATTN_KERNEL_TILE:
+            need_f16_K = true;
+            need_f16_V = true;
+            break;
         case BEST_FATTN_KERNEL_MMA_F16:
+            // [TAG_TURBO_NATIVE_PREDICATE] DELIBERATE OVER-RESERVATION. Do not "fix" this.
+            //
+            // When the MMA kernel reads a turbo cache natively it passes need_f16_K/V = false to
+            // launch_fattn, so the scratch reserved here is never written: ggml_nelements(K) +
+            // ggml_nelements(V) halves, about 890 MiB of compute buffer at 256K, provably dead.
+            // Reclaiming it with
+            //     need_f16_K = !ggml_cuda_fattn_turbo_reads_native(dst, true);
+            // works and frees exactly that much (CUDA0 compute buffer 1834 -> 945 MiB), but it
+            // COSTS THROUGHPUT ON EVERY KV TYPE. Bisected against clean HEAD in one session,
+            // pp2048 / tg64 @ d131072, r=3:
+            //
+            //                              turbo4p pp    turbo4p tg    q8_0 pp     q8_0 tg
+            //   HEAD                        1419.46        44.46       1406.85      41.46
+            //   these changes + reclaim     1378.51        42.71       1350.85      39.78   -4%
+            //   these changes, no reclaim   1450.04        44.77       1423.59      41.69   +2%
+            //
+            // Shrinking the buffer moves every allocation that follows it, and q8_0 - which never
+            // enters the turbo predicate at all - loses the same 4%, so the cost is allocation
+            // placement rather than anything in the FA path. 890 MiB is not worth 4% here.
+            //
+            // Revisit only WITH a measurement: the memory is real and would buy roughly one more
+            // slot at 256K, so if VRAM ever becomes the binding constraint the trade may flip.
             need_f16_K = true;
             need_f16_V = true;
             break;
@@ -926,7 +951,9 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             const char * nenv = getenv("TURBO_MMA_NATIVE");
             const char * nmq  = getenv("TURBO_MMA_NATIVE_MAXQ");
             const int maxq_env = nmq ? atoi(nmq) : 0;
-            const int maxq = (maxq_env >= 1 && maxq_env <= 4096) ? maxq_env : 32;
+            // must match ggml_cuda_fattn_turbo_reads_native: turbo4p defaults to 4096, not 32.
+            const bool p_is_t4p = Kp && Kp->type == GGML_TYPE_TURBO4P_0;
+            const int maxq = (maxq_env >= 1 && maxq_env <= 4096) ? maxq_env : (p_is_t4p ? 4096 : 32);
             const bool native = !(nenv && nenv[0] == '0') &&
                                 Qp->ne[0] == 256 && Vp && Vp->ne[0] == 256 &&
                                 Qp->ne[1] <= maxq &&

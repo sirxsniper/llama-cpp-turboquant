@@ -654,6 +654,85 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_turbo4_0_int(
 // [h*D, h*D + D) of the n_embd_k_gqa elements at a position - so the step splits into a
 // whole number of blocks to skip plus an offset inside the block the head lands in.
 //
+// [TAG_TURBO_NATIVE_PREDICATE] Single source of truth for "will the MMA path read the turbo
+// KV natively, and therefore need NO F16 materialisation scratch".
+//
+// This MUST be shared. ggml_cuda_flash_attn_ext_get_alloc_size() sizes the scratch buffer from
+// the kernel enum alone and so reserved ggml_nelements(K) + ggml_nelements(V) halves for every
+// MMA node, about 1 GiB at 256K, while the launch path passed need_f16_K/V = false whenever
+// turbo_ok. That memory could never be written. Two copies of the predicate is exactly how that
+// drifted, so both callers now use this one.
+//
+// SAFETY DIRECTION: over-reserving wastes memory, under-reserving is the dangerous one. The
+// sizing caller passes worst_case_q = true, which scales Q->ne[1] by the stream count to bound
+// every ubatch the launch can present. With that, a true at sizing implies a true at launch for
+// any -ub and any stream count. Do NOT drop that argument.
+static inline bool ggml_cuda_fattn_turbo_reads_native(const ggml_tensor * dst, bool worst_case_q = false) {
+    if (!dst) {
+        return false;
+    }
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
+    if (!Q || !K || !V) {
+        return false;
+    }
+
+    static const bool env_on = [] {
+        const char * e = getenv("TURBO_MMA_NATIVE");
+        return !(e && e[0] == '0');
+    }();
+    if (!env_on) {
+        return false;
+    }
+
+    if (K->type != V->type) {
+        return false;
+    }
+    const bool is_t4  = K->type == GGML_TYPE_TURBO4_0;
+    const bool is_t4p = K->type == GGML_TYPE_TURBO4P_0;
+    if (!is_t4 && !is_t4p) {
+        return false;
+    }
+
+    const int64_t DKQ = K->ne[0];
+    const int64_t DV  = V->ne[0];
+    if (DKQ == 576 || DKQ != 256 || DV != 256) {   // 576 is the MLA V-is-a-K-view case
+        return false;
+    }
+
+    static const int max_q_env = [] {
+        const char * e = getenv("TURBO_MMA_NATIVE_MAXQ");
+        const int v = e ? atoi(e) : 0;
+        return (v >= 1 && v <= 4096) ? v : 0;
+    }();
+    // [TAG_TURBO4P_WIDE_Q] turbo4p reads natively at any Q width, turbo4 only at narrow Q.
+    const int max_q = max_q_env ? max_q_env : (is_t4p ? 4096 : 32);
+
+    // worst_case_q is set by the SIZING caller. The reserve graph is NOT worst case in Q width
+    // for a multi-stream cache: sched_reserve builds ubatch_reserve(n_tokens/n_seqs, n_seqs), and
+    // build_attn_mha then splits Q by n_stream, so reserve sees Q->ne[1] = n_ubatch/n_stream while
+    // a single-sequence ubatch at launch reaches the full n_ubatch with ns == 1. Multiplying back
+    // by K->ne[3] recovers the true bound, so sizing can never claim native for a width the launch
+    // might exceed. Without this the argument only held because turbo4p's max_q is 4096 and the
+    // deployed -ub is 1280; -ub above 4096 would have broken it.
+    const int64_t nsK = K->ne[3] > 0 ? K->ne[3] : 1;
+    const int64_t q_width = worst_case_q ? Q->ne[1]*nsK : Q->ne[1];
+    if (q_width > max_q) {
+        return false;
+    }
+
+    if (is_t4p) {
+        if (DKQ % QK_TURBO4P_GROUP != 0 || QK_TURBO4P % DKQ != 0) {
+            return false;
+        }
+        if ((K->ne[0]*K->ne[2]) % QK_TURBO4P != 0 || (V->ne[0]*V->ne[2]) % QK_TURBO4P != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
 // n_embd_k_gqa must be a multiple of QK_TURBO4P and D must divide it, or a head would
 // straddle a block boundary and this would need a second pointer. fattn.cu gates on that.
 struct turbo4p_head_addr {
@@ -2171,6 +2250,40 @@ void launch_fattn(
             nb13 = nb13*bs*sizeof(half)/ts;
         } else {
             GGML_ASSERT(K->nb[0] == ts);
+            if ((size_t) K->ne[0] < bs) {
+            // [TAG_TURBO4P_NC_PER_STREAM] When the block is WIDER than one head, ggml's
+            // stride model cannot describe this tensor and the generic strided dequant
+            // below is unusable. turbo4p is the first such type: its block is 1024
+            // elements while a head is 256, so ggml computes the head stride as
+            // row_size(turbo4p, 256) = 132 bytes, a fractional block that points at
+            // nothing. The real head h has its qs at 128*h and its norms at 512 + 4*h,
+            // two separate places that no single stride can reach, and s02 = nb12/ts
+            // truncates to 0 on top of that.
+            //
+            // The CONTIGUOUS path above has no such problem: it dequantizes the run
+            // linearly, never consulting the head stride, and its rescale turns that same
+            // 132 into 132*1024*2/528 = 512 bytes = 256 halves, which is exactly right.
+            // So the fix is not a new kernel, it is to keep using that path.
+            //
+            // The only reason we are here at all is that the tensor is not contiguously
+            // ALLOCATED, and with a per-stream KV cache (n_stream = n_seq_max when the
+            // cache is not unified) that is purely the gap BETWEEN streams. Each stream's
+            // own region is still ne1 consecutive rows of ne0*ne2 elements. So dequantize
+            // one stream at a time through the contiguous path and set the stream stride
+            // to the packed result. Without this, -np 2 or more without --kv-unified
+            // aborted on the first prefill batch that spanned two slots.
+            const int64_t per_stream = K->ne[0]*K->ne[1]*K->ne[2];
+                // rows must be packed consecutively inside a stream for this to hold
+                GGML_ASSERT((size_t) nb11 == (size_t) (K->ne[0]*K->ne[2])*ts/bs);
+                to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(K->type);
+                for (int64_t s = 0; s < K->ne[3]; ++s) {
+                    to_fp16(K_data + s*nb13, K_f16 + s*per_stream, per_stream, main_stream);
+                }
+
+                nb11 = nb11*bs*sizeof(half)/ts;
+                nb12 = nb12*bs*sizeof(half)/ts;
+                nb13 = per_stream*sizeof(half);
+            } else {
             to_fp16_nc_cuda_t to_fp16 = ggml_get_to_fp16_nc_cuda(K->type);
             const int64_t s01 = nb11 / ts;
             const int64_t s02 = nb12 / ts;
@@ -2180,6 +2293,7 @@ void launch_fattn(
             nb11 = K->ne[0] * sizeof(half);
             nb12 = K->ne[1] * nb11;
             nb13 = K->ne[2] * nb12;
+            }
         }
         K_data = (char *) K_f16;
     }
@@ -2206,6 +2320,40 @@ void launch_fattn(
                 nb23 = nb23*bs*sizeof(half)/ts;
             } else {
                 GGML_ASSERT(V->nb[0] == ts);
+            if ((size_t) V->ne[0] < bs) {
+            // [TAG_TURBO4P_NC_PER_STREAM] When the block is WIDER than one head, ggml's
+            // stride model cannot describe this tensor and the generic strided dequant
+            // below is unusable. turbo4p is the first such type: its block is 1024
+            // elements while a head is 256, so ggml computes the head stride as
+            // row_size(turbo4p, 256) = 132 bytes, a fractional block that points at
+            // nothing. The real head h has its qs at 128*h and its norms at 512 + 4*h,
+            // two separate places that no single stride can reach, and s02 = nb12/ts
+            // truncates to 0 on top of that.
+            //
+            // The CONTIGUOUS path above has no such problem: it dequantizes the run
+            // linearly, never consulting the head stride, and its rescale turns that same
+            // 132 into 132*1024*2/528 = 512 bytes = 256 halves, which is exactly right.
+            // So the fix is not a new kernel, it is to keep using that path.
+            //
+            // The only reason we are here at all is that the tensor is not contiguously
+            // ALLOCATED, and with a per-stream KV cache (n_stream = n_seq_max when the
+            // cache is not unified) that is purely the gap BETWEEN streams. Each stream's
+            // own region is still ne1 consecutive rows of ne0*ne2 elements. So dequantize
+            // one stream at a time through the contiguous path and set the stream stride
+            // to the packed result. Without this, -np 2 or more without --kv-unified
+            // aborted on the first prefill batch that spanned two slots.
+            const int64_t per_stream = V->ne[0]*V->ne[1]*V->ne[2];
+                // rows must be packed consecutively inside a stream for this to hold
+                GGML_ASSERT((size_t) nb21 == (size_t) (V->ne[0]*V->ne[2])*ts/bs);
+                to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(V->type);
+                for (int64_t s = 0; s < V->ne[3]; ++s) {
+                    to_fp16(V_data + s*nb23, V_f16 + s*per_stream, per_stream, main_stream);
+                }
+
+                nb21 = nb21*bs*sizeof(half)/ts;
+                nb22 = nb22*bs*sizeof(half)/ts;
+                nb23 = per_stream*sizeof(half);
+            } else {
                 to_fp16_nc_cuda_t to_fp16 = ggml_get_to_fp16_nc_cuda(V->type);
                 const int64_t s01 = nb21 / ts;
                 const int64_t s02 = nb22 / ts;
@@ -2215,6 +2363,7 @@ void launch_fattn(
                 nb21 = V->ne[0] * sizeof(half);
                 nb22 = V->ne[1] * nb21;
                 nb23 = V->ne[2] * nb22;
+                }
             }
             V_data = (char *) V_f16;
         }

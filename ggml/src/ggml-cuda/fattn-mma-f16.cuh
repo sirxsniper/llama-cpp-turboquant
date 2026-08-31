@@ -2253,10 +2253,6 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
     // tg 68.61 -> 76.00 (+10.8%) in one run and 72.28 -> 82.86 (+14.6%) in another, with
     // prefill unchanged (pp 1803.5 -> 1804.8) thanks to the Q-width gate below.
     // TURBO_MMA_NATIVE=0 restores the F16-conversion path.
-    static const bool turbo_mma_env = [] {
-        const char * e = getenv("TURBO_MMA_NATIVE");
-        return !(e && e[0] == '0');
-    }();
     // RE-MEASURED after the ncols=128 tier landed (which halves the passes): raising
     // TURBO_MMA_NATIVE_MAXQ to 4096 still LOSES badly at prefill, pp2048 @ d131072
     // 1597.40 -> 1022.87, -36%. So the F16-conversion path wins at wide Q even though it
@@ -2284,31 +2280,37 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
     // Narrow Q cannot amortise the conversion, so it should read natively; wide Q amortises
     // it easily and should not. 32 sits between a speculative batch (n_draft+1, 8 here) and
     // any real prefill ubatch. TURBO_MMA_NATIVE_MAXQ overrides it for measurement.
-    static const int turbo_native_max_q = [] {
-        const char * e = getenv("TURBO_MMA_NATIVE_MAXQ");
-        const int v = e ? atoi(e) : 0;
-        return (v >= 1 && v <= 4096) ? v : 32;
-    }();
+
+    // [TAG_TURBO4P_WIDE_Q] The A/B the comment above asked for has now been run, and turbo4p
+    // INVERTS turbo4's result. turbo4 reading natively at wide Q lost 36% (pp2048 @ d131072
+    // 1597.40 -> 1022.87) because its 68-byte block forces 4-byte loads. turbo4p's 528-byte
+    // block is 16-byte aligned, so the same read is one LDG.E.128 per 32 elements, and
+    // skipping the F16 materialisation now WINS. Measured on Qwen3.8-27B-UD-Q5_K_XL, r=3:
+    //
+    //                        max_q 32            max_q 4096
+    //   pp2048 @ d131072     1509.88 +- 2.04     1524.45 +- 2.57   (+0.96%)
+    //   pp2048 @ d253952      994.56 +- 1.01     1028.96 +- 0.82   (+3.46%)
+    //   tg64   @ d253952       41.57 +- 0.43       41.57 +- 0.30   (unchanged)
+    //
+    // The gain grows with depth because the conversion it avoids scales with the cache,
+    // while decode is untouched since narrow Q already read natively. turbo4 KEEPS 32.
     const ggml_tensor * Q_src = dst->src[0];
 
-    const bool turbo_shape_ok = turbo_mma_env && !V_is_K_view &&
-                                DKQ == 256 && DV == 256 &&
-                                K_src && V_src && Q_src &&
-                                Q_src->ne[1] <= turbo_native_max_q;
+    // [TAG_TURBO_NATIVE_PREDICATE] One predicate, shared with
+    // ggml_cuda_flash_attn_ext_get_alloc_size() in fattn.cu. It decides BOTH whether this
+    // kernel reads the turbo cache natively AND whether the F16 scratch is reserved at all.
+    // They were two separate copies and drifted, leaving ~1 GiB of scratch reserved at 256K
+    // that could never be written. Do not re-inline this test here.
+    const bool turbo_native = ggml_cuda_fattn_turbo_reads_native(dst);
 
-    // [TAG_TURBO4P] turbo4p additionally needs each head to be a whole number of WHT groups
-    // sitting inside one 1024-element block, so the tile loader can reach it with a block
-    // base plus an element offset. K->ne[0]*K->ne[2] is n_embd_k_gqa for the FA view.
-    const bool turbo4p_geometry_ok = turbo_shape_ok &&
-                                     DKQ % QK_TURBO4P_GROUP == 0 && QK_TURBO4P % DKQ == 0 &&
-                                     (K_src->ne[0]*K_src->ne[2]) % QK_TURBO4P == 0 &&
-                                     (V_src->ne[0]*V_src->ne[2]) % QK_TURBO4P == 0;
-
-    const int turbo_mode =
-        turbo_shape_ok && K_src->type == GGML_TYPE_TURBO4_0  && V_src->type == GGML_TYPE_TURBO4_0  ? FATTN_MMA_TURBO4  :
-        turbo4p_geometry_ok && K_src->type == GGML_TYPE_TURBO4P_0 && V_src->type == GGML_TYPE_TURBO4P_0 ? FATTN_MMA_TURBO4P :
-        FATTN_MMA_TURBO_NONE;
+    const int turbo_mode = !turbo_native ? FATTN_MMA_TURBO_NONE :
+        (K_src->type == GGML_TYPE_TURBO4_0 ? FATTN_MMA_TURBO4 : FATTN_MMA_TURBO4P);
     const bool turbo_ok = turbo_mode != FATTN_MMA_TURBO_NONE;
+
+    // The predicate works from tensor shapes, this kernel from template parameters. If those
+    // two ever disagree the scratch reservation would be sized for the wrong path, so fail
+    // loudly here rather than overrun a buffer at launch.
+    GGML_ASSERT(!turbo_ok || (DKQ == 256 && DV == 256 && !V_is_K_view));
 
     // Both turbo kernels force single-stage loading, so they must be sized as such.
     //

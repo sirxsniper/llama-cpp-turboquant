@@ -3629,26 +3629,6 @@ llama_context * llama_init_from_model(
         }
     }
 
-    // [TAG_TURBO4P_NEEDS_UNIFIED] turbo4p cannot be materialised as F16 through ggml's
-    // generic strides. A D=256 head lives at 128*h bytes with its norms at 512 + 4*h, but
-    // ggml_row_size(turbo4p, 256) is 132, so nb12 claims 132*h. The FA kernels sidestep that
-    // by addressing a head as block base plus row_elem0. launch_fattn's F16 materialisation
-    // path consumes the raw strides instead and cannot, and its non-contiguous branch lands
-    // in dequantize_row_turbo4p_0_nc_cuda, whose ne00 % 1024 precondition the per-head FA
-    // view (ne0 = head dim) can never satisfy.
-    //
-    // That branch is reached exactly when the K/V view is not contiguously allocated, which
-    // happens when the cache is split across streams (n_stream = n_seq_max when the cache is
-    // not unified) and a prefill ubatch spans more than one of them. Refuse it here with a
-    // readable message rather than aborting inside the dequant kernel on the first
-    // multi-sequence prefill.
-    if ((params.type_k == GGML_TYPE_TURBO4P_0 || params.type_v == GGML_TYPE_TURBO4P_0) &&
-        !params.kv_unified && params.n_seq_max > 1) {
-        LLAMA_LOG_ERROR("%s: turbo4p KV cache requires a unified cache when n_seq_max (%u) > 1, "
-                        "pass --kv-unified or use -np 1\n", __func__, params.n_seq_max);
-        return nullptr;
-    }
-
     if (params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED && ggml_is_quantized(params.type_k)) {
         const uint32_t blck_size = ggml_blck_size(params.type_k);
         const bool k_is_turbo = (params.type_k == GGML_TYPE_TURBO2_0 ||
