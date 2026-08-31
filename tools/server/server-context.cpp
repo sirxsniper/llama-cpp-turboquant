@@ -748,6 +748,57 @@ static int process_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch
     const auto & chunk = input_tokens.find_chunk(idx);
     int32_t res = 0;
 
+    // [TAG_SPEC_MEDIA_POS] see common/speculative.cpp. The drafter is text-only and now SKIPS
+    // media batches, so its cache stops at med_pos_0 - 1 while the target moves on to
+    // med_pos_0 + med_n_pos. Slide the drafter's sequence forward by exactly the positions the
+    // media chunk consumes, so the first post-media injection is consecutive.
+    //
+    // pos_next() here is still the position BEFORE this chunk: push_back_placeholder() runs after
+    // process_mtmd_chunk returns. n_pos is what the sequence actually advances by, max(nx, ny)
+    // under M-RoPE. It is NOT n_tokens: a 20x13 image is 260 rows but only 20 positions.
+    //
+    // Geometrically the drafter then sees the pre-image text glued straight onto the post-image
+    // text, so distances across the seam are those of the same conversation with the image
+    // removed. That is the right view for a model that cannot read the image, and it keeps the
+    // entire pre-image context, unlike dropping the draft cache.
+    const llama_pos med_pos_0 = slot.prompt.tokens.pos_next();
+    const llama_pos med_n_pos = mtmd_input_chunk_get_n_pos(chunk.get());
+
+    auto repair_draft_after_media = [&]() {
+        if (slot.ctx_dft == nullptr) {
+            return;
+        }
+
+        // llama_get_memory(slot.ctx_dft), NOT slot.mem: common_memory::seq_add applies to BOTH
+        // contexts, and llama_kv_cache::seq_add asserts n_pos_per_embd() == 1, which the M-RoPE
+        // TARGET does not satisfy. Shifting through slot.mem would abort.
+        auto * mem_dft = llama_get_memory(slot.ctx_dft);
+
+        const llama_pos pos_dft = llama_memory_seq_pos_max(mem_dft, slot.id);
+        if (pos_dft < 0) {
+            // Empty draft cache, e.g. [TAG_SPEC_PREFILL_TAIL] already wiped it. An empty sequence
+            // has no consecutiveness constraint, so there is nothing to repair.
+            return;
+        }
+
+        // Derived from the observed pos_max rather than assumed, so a drafter that is behind for
+        // any other reason still lands exactly on the position before the next text token.
+        const llama_pos delta = (med_pos_0 + med_n_pos - 1) - pos_dft;
+        if (delta == 0) {
+            return;
+        }
+
+        if (delta > 0 && llama_memory_can_shift(mem_dft)) {
+            llama_memory_seq_add(mem_dft, slot.id, -1, -1, delta);
+        } else {
+            // The draft K cache cannot be re-RoPEd (a turbo K cache via --spec-draft-type-k), or
+            // the drafter is somehow ahead. Drop its sequence: it is all-SWA, it re-primes from
+            // the following text, and an empty sequence imposes no constraint. Same remedy
+            // [TAG_SPEC_PREFILL_TAIL] already uses.
+            llama_memory_seq_rm(mem_dft, slot.id, -1, -1);
+        }
+    };
+
     auto try_decode = [&]() -> int32_t {
         if (mbatch) {
             float * embd = mtmd_batch_get_output_embd(mbatch.get(), chunk.get());
@@ -778,6 +829,8 @@ static int process_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch
                     SLT_ERR(slot, "failed to decode mtmd chunk, idx = %zu, res = %d\n", idx, res);
                     return -1;
                 }
+                repair_draft_after_media();
+
                 n_tokens_out = mtmd_input_chunk_get_n_tokens(chunk.get());
                 return 0; // success
             }
@@ -3048,7 +3101,14 @@ private:
                         common_speculative_get_draft_params(spec.get(), slot.id) = {
                             /* .drafting = */ true,
                             /* .n_max    = */ n_draft_max,
-                            /* .n_past   = */ slot.prompt.n_tokens(),
+                            // [TAG_SPEC_MEDIA_POS] pos_next(), NOT n_tokens(). Every drafter uses
+                            // n_past as a POSITION, but n_tokens() is tokens.size(), which counts a
+                            // media chunk as its full row count. For a 20x13 image that is 260
+                            // against a true advance of 20, so draft() would be asked to draft 240
+                            // positions past where the drafter's cache actually ends. pos_next()
+                            // applies the n_pos - n_tokens discount per media chunk.
+                            // No-op for text: with no media chunks pos_next() == tokens.size().
+                            /* .n_past   = */ slot.prompt.tokens.pos_next(),
                             /* .id_last  = */ slot.sampled,
                             /* .prompt   = */ &slot.spec_prompt,
                             /* .result   = */ &slot.spec_draft,

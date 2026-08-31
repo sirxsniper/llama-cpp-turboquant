@@ -1131,9 +1131,37 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         // skipping the embedding batches leaves a hole in the draft's cache and
         // the next injection fails to initialize.
         // TODO: revisit after https://github.com/ggml-org/llama.cpp/pull/24669 is merged
-        const bool has_tokens     = batch_in.token != nullptr;
-        const bool has_embeddings = batch_in.embd  != nullptr;
-        if (has_tokens == has_embeddings) {
+        // [TAG_SPEC_MEDIA_POS] Only plain token batches may be injected. This deliberately
+        // rejects media batches, matching the eagle3 and mtp impls, and REPLACES a guard that
+        // admitted them.
+        //
+        // An embedding batch from the target is always multimodal, and for an M-RoPE target its
+        // pos[] is four concatenated planes. Plane 0, the only one read below, is the temporal
+        // index, which mtmd sets to the CONSTANT pos_0 for every image row. Injecting those rows
+        // writes n_tokens draft KV cells all at pos_0 while the target's sequence advances by
+        // mtmd_input_chunk_get_n_pos() = max(nx, ny). Measured on a 20x13 image: the callback
+        // delivered 260 rows with pos0 = posN = 59, the drafter's pos_max stopped at 59 while the
+        // next text batch arrived at 79, and llama_batch_allocr::init rejected it with
+        //   "the last position stored ... is X = 59 ... starting position of Y = 79"
+        // so llama_decode returned -1 and the request died with HTTP 500.
+        //
+        // Only the DRAFTER fails, which is why vision works fine without one: the qwen35 target
+        // is IMROPE so n_pos_per_embd() == 4 and it takes the LENIENT position check, while a
+        // DFlash drafter is NEOX with n_pos_per_embd() == 1 and takes the STRICT branch that
+        // demands Y == X + 1. The message quoted above exists only in that strict branch, which
+        // is independent proof the failing context was ctx_dft.
+        //
+        // The alternative considered was remapping the rows onto the real span
+        // (pos_0 + r*n_pos/n_rows) so the drafter still sees image-derived features. It is
+        // workable but needs a per-seq side channel, a running row counter across sub-batches,
+        // and clamps at both chunk boundaries. Skipping is simpler and measured well: acceptance
+        // 51.7% on the image turn and 160.2 t/s on the text turn straight after it.
+        //
+        // Injecting cannot be made to work here: 260 rows do not fit in 20 positions, and
+        // llama_batch_allocr::init requires the distinct positions to be dense. What this leaves
+        // behind is a POSITION hole, not a content hole, and it is repaired once per media chunk
+        // by the caller - see [TAG_SPEC_MEDIA_POS] in server-context.cpp process_mtmd_chunk().
+        if (batch_in.token == nullptr || batch_in.embd != nullptr) {
             return true;
         }
 
