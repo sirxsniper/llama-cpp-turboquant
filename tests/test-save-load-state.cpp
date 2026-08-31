@@ -434,6 +434,16 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    // Test 6: seq copy (host, scatter)
+    if (!test_seq_cp_scatter(model, params, tokens, 6, false)) {
+        return false;
+    }
+
+    // Test 7: seq copy (device, scatter)
+    if (!test_seq_cp_scatter(model, params, tokens, 7, true)) {
+        return false;
+    }
+
     LOG("\nAll tests passed.\n");
 
     return 0;
