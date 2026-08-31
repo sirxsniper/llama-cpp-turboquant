@@ -1852,6 +1852,20 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
     if (it_best != states.end()) {
         SRV_TRC(" - found better prompt with f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
 
+        // [TAG_PROMPT_CACHE_POISON] Restoring CONSUMES this entry: data.main is cleared the
+        // moment it is restored. A failure AFTER that point must therefore not leave the entry
+        // in `states`. It previously did, stranding an entry with an empty data.main and an
+        // intact prompt.tokens. That entry still wins the f_keep/f_sim selection next time, and
+        // the `n != size` guard passes trivially because a zero-length blob makes both sides 0,
+        // so the no-op restore reads as SUCCESS and the slot is handed an N-token prompt whose
+        // target KV was never restored. With --cache-idle-slots that aborts at
+        // GGML_ABORT("pos_min == -1, but n_past > 0"); without it the prefix-reuse path can
+        // treat the previous conversation's cells as this prompt's prefix.
+        //
+        // Erase on EVERY exit path. A half-consumed entry has no value: its target blob is
+        // already gone and can never be restored again.
+        bool restored = true;
+
         {
             auto & data = it_best->data.main;
 
@@ -1860,14 +1874,14 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
             if (n != size) {
                 SRV_ERR("failed to restore state with size %zu\n", size);
 
-                return false;
+                restored = false;
+            } else {
+                data.clear();
+                data.shrink_to_fit();
             }
-
-            data.clear();
-            data.shrink_to_fit();
         }
 
-        {
+        if (restored) {
             auto & data = it_best->data.drft;
 
             if (!data.empty()) {
@@ -1878,12 +1892,18 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
                 if (n != size) {
                     SRV_WRN("failed to restore state with size %zu\n", size);
 
-                    return false;
+                    restored = false;
+                } else {
+                    data.clear();
+                    data.shrink_to_fit();
                 }
-
-                data.clear();
-                data.shrink_to_fit();
             }
+        }
+
+        if (!restored) {
+            states.erase(it_best);
+
+            return false;
         }
 
         prompt = std::move(it_best->prompt);
