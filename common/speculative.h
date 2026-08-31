@@ -95,6 +95,13 @@ bool common_speculative_process(common_speculative * spec, const llama_batch & b
 // sliding-window drafter skip prompt ubatches whose KV would be evicted unused.
 void common_speculative_set_prefill_after(common_speculative * spec, int32_t n_after);
 
+// [TAG_SPEC_PREFILL_TAIL_PER_SEQ] Per-sequence form of the above, which is what the skip
+// decision must use. The scalar is a MAX over slots, so on its own it lets a prefilling slot
+// speak for a generating one that merely shares the batch, and the skip wipes that slot's
+// drafter KV. Call clear() then set() for each slot still processing a prompt.
+void common_speculative_clear_prefill_after_seq(common_speculative * spec);
+void common_speculative_set_prefill_after_seq(common_speculative * spec, llama_seq_id seq_id, int32_t n_after);
+
 // true if any registered implementation actually reads dparams.prompt. Only the n-gram
 // drafters do; the model-based ones (dflash, mtp, eagle3, simple) never look at it, so the
 // server can skip materialising the whole prompt vector every step.

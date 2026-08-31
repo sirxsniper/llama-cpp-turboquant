@@ -179,6 +179,29 @@ struct common_speculative_impl {
     // so an implementation may use this to skip work on early prefill ubatches.
     int32_t n_prefill_after = 0;
 
+    // [TAG_SPEC_PREFILL_TAIL_PER_SEQ] The scalar above is the MAX over every slot still
+    // processing a prompt, which is the right input for the is_prefill heuristic but the WRONG
+    // one for the skip decision. The skip wipes the drafter KV of every sequence in the batch,
+    // and with -np >= 2 and continuous batching a GENERATING slot is routinely co-batched with a
+    // prefilling one. It would then have its drafter cache cleared on every batch for the whole
+    // of the other slot's prefill - no crash and no wrong output, but acceptance collapses to
+    // ~0 and speculation becomes pure overhead. Indexed by llama_seq_id, which the server sets
+    // to the slot id. -1 means "not prefilling", i.e. never skip this sequence.
+    // MEASURED A/B, Qwen3.8-27B-UD-Q5_K_XL, -np 2 --kv-unified, one slot generating 700 tokens
+    // while the other prefills 60000, acceptance of the GENERATING slot:
+    //   scalar (pre-fix)   40.2% solo -> 32.5% co-batched   80.7% retained
+    //   per-seq (this)     40.2% solo -> 40.0% co-batched   99.5% retained
+    // The loss is a 19% relative dent, not the total collapse the mechanism suggests, because
+    // the drafter re-warms between wipes. Still worth having, and it grows with prompt length.
+    std::vector<int32_t> n_prefill_after_seq;
+
+    int32_t prefill_after_for(llama_seq_id s) const {
+        if (s < 0 || (size_t) s >= n_prefill_after_seq.size()) {
+            return 0;
+        }
+        return n_prefill_after_seq[s];
+    }
+
     virtual void draft(common_speculative_draft_params_vec & dparams) = 0;
 
     virtual void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) = 0;
@@ -1149,7 +1172,34 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             // n_prefill_after == tail exactly, and every one of its rows is already outside
             // the window by the time any draft reads it - so it was being processed for
             // nothing, doubling the drafter's prefill work at -ub 2048.
-            if (tail > 0 && n_prefill_after >= tail) {
+            // [TAG_SPEC_PREFILL_TAIL_PER_SEQ] Every sequence in this batch must want the skip.
+            // The wipe below is unconditional over the batch, so skipping on behalf of a
+            // sequence that is generating (or is near the end of its own prompt) destroys its
+            // drafter cache. Ask each sequence about ITSELF and bail out on the first one that
+            // still needs this ubatch. Conservative by construction: a mixed batch is processed
+            // normally, which is exactly what it needs.
+            bool all_want_skip = tail > 0;
+            int  n_seqs_seen   = 0;
+            if (all_want_skip) {
+                llama_seq_id prev_s = -1;
+                for (int32_t i = 0; i < batch_in.n_tokens; ++i) {
+                    if (batch_in.n_seq_id == nullptr || batch_in.n_seq_id[i] <= 0) {
+                        continue;
+                    }
+                    const llama_seq_id s = batch_in.seq_id[i][0];
+                    if (s == prev_s) {
+                        continue;
+                    }
+                    prev_s = s;
+                    ++n_seqs_seen;
+                    if (prefill_after_for(s) < tail) {
+                        all_want_skip = false;
+                        break;
+                    }
+                }
+            }
+
+            if (all_want_skip && n_seqs_seen > 0) {
                 // Skipping is only safe if it cannot leave a HOLE in the draft KV.
                 //
                 // On a cold prompt the draft cache is empty, so skipping the early ubatches
@@ -3004,6 +3054,32 @@ void common_speculative_set_prefill_after(common_speculative * spec, int32_t n_a
 
     for (auto & impl : spec->impls) {
         impl->n_prefill_after = n_after;
+    }
+}
+
+// [TAG_SPEC_PREFILL_TAIL_PER_SEQ] Clear every sequence back to "not prefilling" before the
+// server republishes this batch's values. Without the reset a slot that finished its prompt
+// would keep a stale positive count and keep being skipped while it generates.
+void common_speculative_clear_prefill_after_seq(common_speculative * spec) {
+    if (spec == nullptr) {
+        return;
+    }
+
+    for (auto & impl : spec->impls) {
+        std::fill(impl->n_prefill_after_seq.begin(), impl->n_prefill_after_seq.end(), 0);
+    }
+}
+
+void common_speculative_set_prefill_after_seq(common_speculative * spec, llama_seq_id seq_id, int32_t n_after) {
+    if (spec == nullptr || seq_id < 0) {
+        return;
+    }
+
+    for (auto & impl : spec->impls) {
+        if ((size_t) seq_id >= impl->n_prefill_after_seq.size()) {
+            impl->n_prefill_after_seq.resize(seq_id + 1, 0);
+        }
+        impl->n_prefill_after_seq[seq_id] = n_after;
     }
 }
 

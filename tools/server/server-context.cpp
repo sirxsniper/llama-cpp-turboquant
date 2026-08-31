@@ -3799,12 +3799,22 @@ private:
             // Reported as the max over the slots still processing their prompt; 0 once
             // every slot is generating, so generation is never skipped.
             {
+                // [TAG_SPEC_PREFILL_TAIL_PER_SEQ] Publish BOTH: the max, which the is_prefill
+                // heuristic wants, and the per-slot value, which the skip decision needs. The
+                // skip wipes the drafter KV of every sequence in the batch, so letting the max
+                // speak for all of them meant a generating slot co-batched with a prefilling one
+                // lost its drafter cache on every batch, collapsing its acceptance to ~0.
+                // The sequence id IS the slot id, see common_batch_add(..., { t.id_slot }, ...).
+                common_speculative_clear_prefill_after_seq(spec.get());
+
                 int32_t n_after = 0;
                 for (const auto & slot : slots) {
                     if (slot.state == SLOT_STATE_PROCESSING_PROMPT && slot.task) {
                         const int32_t total = (int32_t) slot.task->n_tokens();
                         const int32_t done  = (int32_t) slot.prompt.n_tokens();
-                        n_after = std::max(n_after, total - done);
+                        const int32_t rem   = total - done;
+                        n_after = std::max(n_after, rem);
+                        common_speculative_set_prefill_after_seq(spec.get(), slot.id, rem);
                     }
                 }
                 common_speculative_set_prefill_after(spec.get(), n_after);
@@ -3987,7 +3997,13 @@ private:
                 const bool may_ckpt_tgt =
                     ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
                     (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS &&
-                     (uint32_t) n_draft + 1 > llama_n_rs_seq(ctx_tgt));
+                     // [TAG_SPEC_CKPT_OFF_BY_ONE] n_draft, NOT n_draft + 1. The consumer below
+                     // tests n_rollback > n_rs_seq, and n_rollback = n_draft + 1 - accepted.size()
+                     // with accepted.size() >= 1, so n_rollback <= n_draft. Hoisting n_draft + 1
+                     // was one too many and made this true on every full-width step at the shipped
+                     // default (n_rs_seq == n_max == 7 gives 8 > 7), which is precisely the case the
+                     // comment above says should never clone.
+                     (uint32_t) n_draft > llama_n_rs_seq(ctx_tgt));
                 
                 common_sampler_ptr smpl_save(may_ckpt_tgt ? common_sampler_clone(slot.smpl.get()) : nullptr);
 
