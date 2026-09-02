@@ -502,6 +502,11 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
     FATTN_VEC_CASES_TURBO4P_D(GGML_TYPE_TURBO4P_0, GGML_TYPE_TURBO4_0)
     FATTN_VEC_CASES_TURBO4P_D(GGML_TYPE_TURBO4_0,  GGML_TYPE_TURBO4P_0)
 
+    // [TAG_TURBO5P] turbo5p: same D set as turbo4p (whole WHT groups per head)
+    FATTN_VEC_CASES_TURBO4P_D(GGML_TYPE_TURBO5P_0, GGML_TYPE_TURBO5P_0)
+    FATTN_VEC_CASES_TURBO4P_D(GGML_TYPE_TURBO5P_0, GGML_TYPE_Q8_0)
+    FATTN_VEC_CASES_TURBO4P_D(GGML_TYPE_Q8_0,      GGML_TYPE_TURBO5P_0)
+
     GGML_ABORT("fatal error");
 }
 
@@ -531,6 +536,7 @@ static bool ggml_cuda_fattn_kv_type_supported(ggml_type type) {
         case GGML_TYPE_TURBO3_0:
         case GGML_TYPE_TURBO4_0:
         case GGML_TYPE_TURBO4P_0:
+        case GGML_TYPE_TURBO5P_0:
             return true;
         default:
             return false;
@@ -642,7 +648,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         // Allow mixed turbo KV types (any combination of turbo2, turbo3, q8_0)
         auto is_turbo = [](ggml_type t) {
             return t == GGML_TYPE_TURBO2_0 || t == GGML_TYPE_TURBO3_0 || t == GGML_TYPE_TURBO4_0 ||
-                   t == GGML_TYPE_TURBO4P_0 || t == GGML_TYPE_Q8_0;
+                   t == GGML_TYPE_TURBO4P_0 || t == GGML_TYPE_TURBO5P_0 || t == GGML_TYPE_Q8_0;
         };
         if (!is_turbo(K->type) || !is_turbo(V->type)) {
             return BEST_FATTN_KERNEL_NONE;
@@ -677,10 +683,10 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
                    QK_TURBO4P % t->ne[0] == 0 &&
                    (t->ne[0] * t->ne[2]) % QK_TURBO4P == 0;
         };
-        if (K->type == GGML_TYPE_TURBO4P_0 && !turbo4p_geometry_ok(K)) {
+        if ((K->type == GGML_TYPE_TURBO4P_0 || K->type == GGML_TYPE_TURBO5P_0) && !turbo4p_geometry_ok(K)) {
             return BEST_FATTN_KERNEL_NONE;
         }
-        if (V->type == GGML_TYPE_TURBO4P_0 && !turbo4p_geometry_ok(V)) {
+        if ((V->type == GGML_TYPE_TURBO4P_0 || V->type == GGML_TYPE_TURBO5P_0) && !turbo4p_geometry_ok(V)) {
             return BEST_FATTN_KERNEL_NONE;
         }
         // Only the pairs that have a VEC instance. The mixed-type check above admits any
@@ -688,9 +694,9 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         // - turbo2 and turbo3 still do a per-element divergent constant-memory lookup, so
         // pairing them with turbo4p would be a measured LOSS anyway (K=turbo4 / V=turbo3 at
         // d131072: 101.07 -> 88.08 t/s). Refusing here beats aborting in the dispatch.
-        if (K->type == GGML_TYPE_TURBO4P_0 || V->type == GGML_TYPE_TURBO4P_0) {
+        if (K->type == GGML_TYPE_TURBO4P_0 || V->type == GGML_TYPE_TURBO4P_0 || K->type == GGML_TYPE_TURBO5P_0 || V->type == GGML_TYPE_TURBO5P_0) {
             auto turbo4p_pairable = [](ggml_type t) {
-                return t == GGML_TYPE_TURBO4P_0 || t == GGML_TYPE_Q8_0 || t == GGML_TYPE_TURBO4_0;
+                return t == GGML_TYPE_TURBO4P_0 || t == GGML_TYPE_TURBO5P_0 || t == GGML_TYPE_Q8_0 || t == GGML_TYPE_TURBO4_0;
             };
             if (!turbo4p_pairable(K->type) || !turbo4p_pairable(V->type)) {
                 return BEST_FATTN_KERNEL_NONE;

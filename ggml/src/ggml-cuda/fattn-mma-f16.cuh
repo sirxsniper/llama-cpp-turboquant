@@ -496,6 +496,7 @@ enum fattn_mma_turbo_kv {
     FATTN_MMA_TURBO_NONE = 0,
     FATTN_MMA_TURBO4     = 1,
     FATTN_MMA_TURBO4P    = 2,
+    FATTN_MMA_TURBO5P    = 3,   // [TAG_TURBO5P]
 };
 
 // Load a tile of turbo4 K/V straight into the f16 shared tile, dequantizing on the way.
@@ -714,6 +715,113 @@ static __device__ __forceinline__ void flash_attn_ext_turbo4p_load_tile(
     ggml_cuda_unroll<6>{}(load);
 }
 
+// ---- [TAG_TURBO5P] turbo5p tile loader: turbo4p's, plus the high-bit plane ----
+template<int stride_tile, int nwarps, int nbatch_fa, bool oob_check>
+static __device__ __forceinline__ void flash_attn_ext_turbo5p_load_tile(
+        const char * const __restrict__ KV,      // block base of the tile's first KV position
+        half2 * const __restrict__ tile_KV,
+        const int D2,                             // half2 per row to produce, must be a multiple of 16
+        const int stride_KV_bytes,                // KV position stride in bytes
+        const int elem0,                          // first element inside the block
+        const int i_sup) {
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+
+    // 32 elements = 16 half2 = 64 bytes written per chunk, out of ONE 16-byte qs load and
+    // ONE norm. turbo4 needs four qs loads and four norms for the same 32 elements.
+    constexpr int h2_per_chunk   = 16;
+    constexpr int elem_per_chunk = 2*h2_per_chunk;
+    const int chunks_per_row = D2 / h2_per_chunk;
+
+    auto load = [&] __device__ (const int n) {
+        const int stride_k = warp_size >> n;
+        const int k0_start = stride_k == warp_size ? 0 : chunks_per_row - chunks_per_row % (2*stride_k);
+        const int k0_stop  =                             chunks_per_row - chunks_per_row % (1*stride_k);
+        const int stride_i = warp_size / stride_k;
+
+        if (k0_start == k0_stop) {
+            return;
+        }
+
+#pragma unroll
+        for (int i0 = 0; i0 < nbatch_fa; i0 += nwarps*stride_i) {
+            const int i = i0 + threadIdx.y*stride_i + (stride_k == warp_size ? 0 : threadIdx.x / stride_k);
+
+            if (i0 + nwarps*stride_i > nbatch_fa && i >= nbatch_fa) {
+                break;
+            }
+
+#pragma unroll
+            for (int k0 = k0_start; k0 < k0_stop; k0 += stride_k) {
+                const int k = k0 + (stride_k == warp_size ? threadIdx.x : threadIdx.x % stride_k);
+
+                __align__(16) half2 out[h2_per_chunk];
+
+                if (oob_check && i >= i_sup) {
+#pragma unroll
+                    for (int e = 0; e < h2_per_chunk; ++e) {
+                        out[e] = make_half2(0.0f, 0.0f);
+                    }
+                } else {
+                    const int e0 = elem0 + k*elem_per_chunk;
+                    const block_turbo5p_0 * __restrict__ blk =
+                        (const block_turbo5p_0 *) (KV + (size_t) i * stride_KV_bytes) + (e0 / QK_TURBO5P);
+                    const int j0 = e0 % QK_TURBO5P;
+
+                    // Default alignment argument on purpose: the explicit form is for
+                    // pointers that are NOT properly aligned and caps the instruction at
+                    // ggml_cuda_get_max_cpy_bytes(), which would split the one wide load
+                    // just proven legal into several narrow ones.
+                    __align__(16) uint32_t qs[4];
+                    ggml_cuda_memcpy_1<16>(qs, blk->qs + (j0 >> 1));
+                    // [TAG_TURBO5P] 32 high bits at qh[j0/8]; j0 is a multiple of 32, one aligned 4-byte load.
+                    uint32_t qh;
+                    ggml_cuda_memcpy_1<4>(&qh, blk->qh + (j0 >> 3));
+
+                    // The register LUT rather than TURBO_CENTROIDS_4BIT[idx]: a
+                    // data-dependent index into constant memory broadcasts only when every
+                    // lane wants the same entry, so 16 distinct centroids can replay 16
+                    // times, and at 32 elements per chunk that cost would swamp the wide
+                    // load this whole layout exists to enable. Each int8 entry is within
+                    // 0.5% of its float value, far inside the error of binning to one of 16
+                    // centroids in the first place - the same trade dequantize_V_turbo4_0
+                    // already makes.
+                    // [TAG_TURBO4P_CENT] MEASURED, do not switch this to the float centroid
+                    // table that flash_attn_ext_turbo4_load_tile uses. At 254k depth:
+                    //   turbo4        (float, 68 B block, 4-byte loads)  49.04 ms/step
+                    //   turbo5p float (528 B block, 16-byte loads)       46.70 ms/step  -4.8%
+                    //   turbo5p int8  (528 B block, 16-byte loads)       35.30 ms/step -28.0%
+                    // So the layout alignment on its own is worth under 5% and the int8 gather
+                    // carries the rest. Note the same gather measured 5-37% SLOWER in turbo4's
+                    // own loader: it only pays here because 32 elements per chunk behind one
+                    // 16-byte load changes the ALU-to-load ratio. The two are synergistic and
+                    // neither wins alone.
+                    turbo5_int8_lut lut;
+                    lut.init();
+                    const float nscale = __half2float(blk->norm[j0 / QK_TURBO5P_GROUP]) * TURBO_INT8_5BIT_SCALE_REVERSE;
+
+#pragma unroll
+                    for (int w = 0; w < 4; ++w) {
+                        const int g0 = (int) lut.gather4( qs[w]        & 0xFFFFu, (qh >> (8*w    )) & 0xFu);   // elements 8w+0..3
+                        const int g1 = (int) lut.gather4((qs[w] >> 16) & 0xFFFFu, (qh >> (8*w + 4)) & 0xFu);   // elements 8w+4..7
+
+                        out[4*w + 0] = make_half2((float) (int8_t) (g0      ) * nscale, (float) (int8_t) (g0 >>  8) * nscale);
+                        out[4*w + 1] = make_half2((float) (int8_t) (g0 >> 16) * nscale, (float) (int8_t) (g0 >> 24) * nscale);
+                        out[4*w + 2] = make_half2((float) (int8_t) (g1      ) * nscale, (float) (int8_t) (g1 >>  8) * nscale);
+                        out[4*w + 3] = make_half2((float) (int8_t) (g1 >> 16) * nscale, (float) (int8_t) (g1 >> 24) * nscale);
+                    }
+                }
+
+                // 64 bytes out, in the 16-byte units the helper can emit.
+#pragma unroll
+                for (int c = 0; c < h2_per_chunk/4; ++c) {
+                    ggml_cuda_memcpy_1<16>(tile_KV + i*stride_tile + k*h2_per_chunk + 4*c, out + 4*c);
+                }
+            }
+        }
+    };
+    ggml_cuda_unroll<6>{}(load);
+}
+
 template<int ncols1, int nwarps, int nbatch_fa, bool use_cp_async, bool oob_check>
 static __device__ __forceinline__ void flash_attn_ext_f16_load_mask(
         const half * const __restrict__ mask_h, half * const __restrict__ tile_mask,
@@ -897,6 +1005,13 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                 // a whole number of 528-byte blocks, and 528 is divisible by sizeof(half2).
                 static_assert(nbatch_K2 % 16 == 0, "turbo4p tile loader needs 32-element chunks");
                 flash_attn_ext_turbo4p_load_tile<stride_tile_K, nwarps, nbatch_fa, oob_check>
+                    ((const char *) (K_h2 + int64_t(k_VKQ_0)*stride_K), tile_K, k0_diff,
+                     stride_K*(int)sizeof(half2), turbo_e0 + k0_start*2, k_VKQ_sup);
+            } else if constexpr (turbo_KV == FATTN_MMA_TURBO5P) {
+                // [TAG_TURBO5P] identical addressing to turbo4p: a position is a whole number of
+                // 656-byte blocks, and 656 is divisible by sizeof(half2).
+                static_assert(nbatch_K2 % 16 == 0, "turbo5p tile loader needs 32-element chunks");
+                flash_attn_ext_turbo5p_load_tile<stride_tile_K, nwarps, nbatch_fa, oob_check>
                     ((const char *) (K_h2 + int64_t(k_VKQ_0)*stride_K), tile_K, k0_diff,
                      stride_K*(int)sizeof(half2), turbo_e0 + k0_start*2, k_VKQ_sup);
             } else {
@@ -1260,6 +1375,11 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                 } else if constexpr (turbo_KV == FATTN_MMA_TURBO4P) {
                     static_assert(nbatch_V2 % 16 == 0, "turbo4p tile loader needs 32-element chunks");
                     flash_attn_ext_turbo4p_load_tile<stride_tile_V, nwarps, nbatch_fa, oob_check>
+                        ((const char *) (V_h2 + int64_t(k_VKQ_0)*stride_V), tile_V, i0_diff/2,
+                         stride_V*(int)sizeof(half2), turbo_e0 + i0_start, k_VKQ_sup);
+                } else if constexpr (turbo_KV == FATTN_MMA_TURBO5P) {
+                    static_assert(nbatch_V2 % 16 == 0, "turbo5p tile loader needs 32-element chunks");
+                    flash_attn_ext_turbo5p_load_tile<stride_tile_V, nwarps, nbatch_fa, oob_check>
                         ((const char *) (V_h2 + int64_t(k_VKQ_0)*stride_V), tile_V, i0_diff/2,
                          stride_V*(int)sizeof(half2), turbo_e0 + i0_start, k_VKQ_sup);
                 } else {
@@ -2126,8 +2246,8 @@ static __global__ void flash_attn_ext_f16(
         int64_t head_bias_K = (int64_t) nb12*z_KV;
         int64_t head_bias_V = (int64_t) nb22*z_KV;
         int     turbo_e0    = 0;
-        if constexpr (turbo_KV == FATTN_MMA_TURBO4P) {
-            const turbo4p_head_addr a = turbo4p_head_offset(z_KV, DKQ);
+        if constexpr (turbo_KV == FATTN_MMA_TURBO4P || turbo_KV == FATTN_MMA_TURBO5P) {
+            const turbo4p_head_addr a = (turbo_KV == FATTN_MMA_TURBO5P) ? turbo5p_head_offset(z_KV, DKQ) : turbo4p_head_offset(z_KV, DKQ);
             head_bias_K = a.byte_bias;
             head_bias_V = a.byte_bias;
             turbo_e0    = a.row_elem0;
@@ -2183,8 +2303,8 @@ static __global__ void flash_attn_ext_f16(
     int64_t head_bias_K = (int64_t) nb12*z_KV;
     int64_t head_bias_V = (int64_t) nb22*z_KV;
     int     turbo_e0    = 0;
-    if constexpr (turbo_KV == FATTN_MMA_TURBO4P) {
-        const turbo4p_head_addr a = turbo4p_head_offset(z_KV, DKQ);
+    if constexpr (turbo_KV == FATTN_MMA_TURBO4P || turbo_KV == FATTN_MMA_TURBO5P) {
+        const turbo4p_head_addr a = (turbo_KV == FATTN_MMA_TURBO5P) ? turbo5p_head_offset(z_KV, DKQ) : turbo4p_head_offset(z_KV, DKQ);
         head_bias_K = a.byte_bias;
         head_bias_V = a.byte_bias;
         turbo_e0    = a.row_elem0;
@@ -2304,7 +2424,7 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
     const bool turbo_native = ggml_cuda_fattn_turbo_reads_native(dst);
 
     const int turbo_mode = !turbo_native ? FATTN_MMA_TURBO_NONE :
-        (K_src->type == GGML_TYPE_TURBO4_0 ? FATTN_MMA_TURBO4 : FATTN_MMA_TURBO4P);
+        (K_src->type == GGML_TYPE_TURBO4_0 ? FATTN_MMA_TURBO4 : K_src->type == GGML_TYPE_TURBO5P_0 ? FATTN_MMA_TURBO5P : FATTN_MMA_TURBO4P);
     const bool turbo_ok = turbo_mode != FATTN_MMA_TURBO_NONE;
 
     // The predicate works from tensor shapes, this kernel from template parameters. If those
@@ -2354,6 +2474,7 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
             fattn_kernel =
                 turbo_mode == FATTN_MMA_TURBO4  ? flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, FATTN_MMA_TURBO4>  :
                 turbo_mode == FATTN_MMA_TURBO4P ? flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, FATTN_MMA_TURBO4P> :
+                turbo_mode == FATTN_MMA_TURBO5P ? flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, FATTN_MMA_TURBO5P> :
                                                   flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, FATTN_MMA_TURBO_NONE>;
         } else {
             fattn_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, FATTN_MMA_TURBO_NONE>;
@@ -2362,7 +2483,7 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
 #if !defined(GGML_USE_MUSA)
         // Keyed on turbo_mode as well: each variant is a different kernel and each needs
         // its own shared-memory limit raised.
-        static bool shared_memory_limit_raised[GGML_CUDA_MAX_DEVICES][3] = {{false}};
+        static bool shared_memory_limit_raised[GGML_CUDA_MAX_DEVICES][4] = {{false}};   // [TAG_TURBO5P] one slot per turbo mode
         if (!shared_memory_limit_raised[id][turbo_mode]) {
             CUDA_CHECK(cudaFuncSetAttribute(reinterpret_cast<fattn_kernel_ptr_t>(fattn_kernel), cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes_shared_total));
             shared_memory_limit_raised[id][turbo_mode] = true;
@@ -2374,6 +2495,7 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
             fattn_kernel =
                 turbo_mode == FATTN_MMA_TURBO4  ? flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, FATTN_MMA_TURBO4>  :
                 turbo_mode == FATTN_MMA_TURBO4P ? flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, FATTN_MMA_TURBO4P> :
+                turbo_mode == FATTN_MMA_TURBO5P ? flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, FATTN_MMA_TURBO5P> :
                                                   flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, FATTN_MMA_TURBO_NONE>;
         } else {
             fattn_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, FATTN_MMA_TURBO_NONE>;

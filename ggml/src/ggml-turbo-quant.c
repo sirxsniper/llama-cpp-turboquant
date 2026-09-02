@@ -50,10 +50,24 @@ static const float CENTROIDS_3BIT[8] = {
  * end to end. Changing a value here silently changes acceptance, so do not touch it
  * without re-measuring, and keep it identical to TURBO_CENTROIDS_4BIT on the GPU side. */
 static const float CENTROIDS_4BIT[16] = {
-    -0.173926f, -0.117195f, -0.089527f, -0.068756f,
-    -0.051262f, -0.035597f, -0.020989f, -0.006938f,
-     0.006938f,  0.020989f,  0.035597f,  0.051262f,
-     0.068756f,  0.089527f,  0.117195f,  0.173926f
+    -0.241530f, -0.182875f, -0.143021f, -0.111033f,
+    -0.083297f, -0.058053f, -0.034304f, -0.011349f,
+     0.011349f,  0.034304f,  0.058053f,  0.083297f,
+     0.111033f,  0.143021f,  0.182875f,  0.241530f
+};
+/* [TAG_TURBO5P] 32 Lloyd-Max centroids fitted to the measured post-WHT histogram of real
+ * Qwen3.8-27B K/V (2.1e9 samples). 3.60x less MSE than the 16-level table; outermost
+ * level 3.08 sigma, clip bin 0.18%. Absolute scale is divided out by the norm correction,
+ * so only the SHAPE matters, but it must match the units of the rotated values. */
+static const float CENTROIDS_5BIT[32] = {
+    -0.271948f, -0.222223f, -0.189260f, -0.163683f,
+    -0.142366f, -0.123814f, -0.107237f, -0.092232f,
+    -0.078519f, -0.065814f, -0.053979f, -0.042868f,
+    -0.032338f, -0.022390f, -0.013026f, -0.004245f,
+     0.004245f,  0.013026f,  0.022390f,  0.032338f,
+     0.042868f,  0.053979f,  0.065814f,  0.078519f,
+     0.092232f,  0.107237f,  0.123814f,  0.142366f,
+     0.163683f,  0.189260f,  0.222223f,  0.271948f
 };
 
 /* ---------- rotation matrix (lazy init) ---------- */
@@ -194,23 +208,34 @@ static int nearest_centroid_3bit(float val) {
 }
 
 static int nearest_centroid_4bit(float val) {
-    /* 16 centroids, optimal for N(0, 1/sqrt(128)), find nearest via midpoints */
-    if (val < -0.145560f) return 0;
-    if (val < -0.103361f) return 1;
-    if (val < -0.079142f) return 2;
-    if (val < -0.060009f) return 3;
-    if (val < -0.043430f) return 4;
-    if (val < -0.028293f) return 5;
-    if (val < -0.013963f) return 6;
+    /* [TAG_TURBO4_CODEBOOK] 16 Lloyd-Max centroids for N(0, 1/128) - the post-WHT
+     * component distribution, verified against a 2.1e9-sample histogram of real
+     * Qwen3.8-27B K/V (std 0.088388 = 1/sqrt(128) exactly, kurtosis 2.954). */
+    if (val < -0.212203f) return 0;
+    if (val < -0.162948f) return 1;
+    if (val < -0.127027f) return 2;
+    if (val < -0.097165f) return 3;
+    if (val < -0.070675f) return 4;
+    if (val < -0.046178f) return 5;
+    if (val < -0.022826f) return 6;
     if (val <  0.000000f) return 7;
-    if (val <  0.013963f) return 8;
-    if (val <  0.028293f) return 9;
-    if (val <  0.043430f) return 10;
-    if (val <  0.060009f) return 11;
-    if (val <  0.079142f) return 12;
-    if (val <  0.103361f) return 13;
-    if (val <  0.145560f) return 14;
+    if (val <  0.022826f) return 8;
+    if (val <  0.046178f) return 9;
+    if (val <  0.070675f) return 10;
+    if (val <  0.097165f) return 11;
+    if (val <  0.127027f) return 12;
+    if (val <  0.162948f) return 13;
+    if (val <  0.212203f) return 14;
     return 15;
+}
+/* [TAG_TURBO5P] nearest of 32 by midpoint count; the table is sorted so the count of
+ * midpoints val is >= to IS the index. Kept as a loop: 31 compares, no branch chain. */
+static int nearest_centroid_5bit(float val) {
+    int idx = 0;
+    for (int i = 0; i < 31; i++) {
+        idx += (val >= 0.5f * (CENTROIDS_5BIT[i] + CENTROIDS_5BIT[i + 1]));
+    }
+    return idx;
 }
 
 /* ---------- WHT sign arrays (must match CUDA/Metal, seed=42) ---------- */
@@ -770,6 +795,83 @@ size_t quantize_turbo4p_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT 
             (block_turbo4p_0 *)((char *)dst + row * row_size),
             n_per_row
         );
+    }
+    return nrows * row_size;
+}
+
+/* ---- turbo5p_0 [TAG_TURBO5P] ---- */
+
+void quantize_row_turbo5p_0_ref(const float * GGML_RESTRICT x, block_turbo5p_0 * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_TURBO5P == 0);
+    const int nb = k / QK_TURBO5P;
+    const int d  = QK_TURBO5P_GROUP;
+
+    for (int block = 0; block < nb; block++) {
+        block_turbo5p_0 * blk = &y[block];
+        memset(blk->qs, 0, QK_TURBO5P / 2);
+        memset(blk->qh, 0, QK_TURBO5P / 8);
+
+        for (int g = 0; g < QK_TURBO5P_NGRP; g++) {
+            const float * src = x + (size_t)block * QK_TURBO5P + (size_t)g * d;
+
+            float norm_sq = 0.0f;
+            for (int i = 0; i < d; i++) norm_sq += src[i] * src[i];
+            const float norm = sqrtf(norm_sq);
+
+            float rotated[QK_TURBO5P_GROUP];
+            if (norm > 1e-10f) {
+                const float inv = 1.0f / norm;
+                for (int i = 0; i < d; i++) rotated[i] = src[i] * inv;
+            } else {
+                memset(rotated, 0, d * sizeof(float));
+            }
+            turbo_cpu_fwht(rotated, d);
+
+            uint8_t indices[QK_TURBO5P_GROUP];
+            float recon_norm_sq = 0.0f;
+            for (int i = 0; i < d; i++) {
+                const int idx = nearest_centroid_5bit(rotated[i]);
+                indices[i] = (uint8_t) idx;
+                recon_norm_sq += CENTROIDS_5BIT[idx] * CENTROIDS_5BIT[idx];
+            }
+            const float recon_norm = sqrtf(recon_norm_sq);
+            blk->norm[g] = GGML_FP32_TO_FP16((recon_norm > 1e-10f) ? norm / recon_norm : norm);
+
+            /* low nibble -> qs (turbo4p layout), high bit -> qh */
+            for (int i = 0; i < d; i++) {
+                const int gi = g * d + i;
+                blk->qs[gi / 2] |= (uint8_t)((indices[i] & 0xF) << ((gi % 2) * 4));
+                blk->qh[gi / 8] |= (uint8_t)(((indices[i] >> 4) & 1) << (gi % 8));
+            }
+        }
+    }
+}
+
+void dequantize_row_turbo5p_0(const block_turbo5p_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_TURBO5P == 0);
+    const int nb = k / QK_TURBO5P;
+    /* Returns WHT-rotated values, exactly like turbo4p: Q is rotated in the graph and the
+     * attention output gets the single inverse WHT. */
+    for (int block = 0; block < nb; block++) {
+        const block_turbo5p_0 * blk = &x[block];
+        float * dst = y + (size_t)block * QK_TURBO5P;
+        for (int i = 0; i < QK_TURBO5P; i++) {
+            const float   norm = GGML_FP16_TO_FP32(blk->norm[i / QK_TURBO5P_GROUP]);
+            const int     lo   = (blk->qs[i / 2] >> ((i % 2) * 4)) & 0xF;
+            const int     hi   = (blk->qh[i / 8] >> (i % 8)) & 1;
+            dst[i] = CENTROIDS_5BIT[lo | (hi << 4)] * norm;
+        }
+    }
+}
+
+size_t quantize_turbo5p_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
+                          int64_t nrows, int64_t n_per_row, const float * imatrix) {
+    GGML_UNUSED(imatrix);
+    assert(n_per_row % QK_TURBO5P == 0);
+    size_t row_size = (n_per_row / QK_TURBO5P) * sizeof(block_turbo5p_0);
+    for (int64_t row = 0; row < nrows; row++) {
+        quantize_row_turbo5p_0_ref(src + row * n_per_row,
+            (block_turbo5p_0 *)((char *)dst + row * row_size), n_per_row);
     }
     return nrows * row_size;
 }

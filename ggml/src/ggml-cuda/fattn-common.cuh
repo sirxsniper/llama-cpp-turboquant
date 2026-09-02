@@ -548,6 +548,33 @@ struct turbo4_int8_lut {
 
         return lo ^ ((lo ^ hi) & m);
     }
+};
+// [TAG_TURBO5P] 32-entry sibling of turbo4_int8_lut: the same PRMT gather one level deeper.
+// Two 16-entry halves are gathered exactly as above (four permutes, one bit-3 blend each),
+// then a second per-byte blend on index bit 4 - which arrives separately, from the qh plane,
+// as four bits in `hi4` (bit e = element e). ~3 dependent levels, against ~2 for 4-bit.
+struct turbo5_int8_lut {
+    uint32_t w0, w1, w2, w3, w4, w5, w6, w7;
+    __device__ __forceinline__ void init() {
+        w0 = TURBO_C5_LUT_W0; w1 = TURBO_C5_LUT_W1; w2 = TURBO_C5_LUT_W2; w3 = TURBO_C5_LUT_W3;
+        w4 = TURBO_C5_LUT_W4; w5 = TURBO_C5_LUT_W5; w6 = TURBO_C5_LUT_W6; w7 = TURBO_C5_LUT_W7;
+    }
+    __device__ __forceinline__ uint32_t gather4(uint32_t nib, uint32_t hi4) const {
+        const uint32_t sel = nib & 0x7777u;
+        const uint32_t l0 = __byte_perm(w0, w1, sel);   // 0..7
+        const uint32_t l1 = __byte_perm(w2, w3, sel);   // 8..15
+        const uint32_t h0 = __byte_perm(w4, w5, sel);   // 16..23
+        const uint32_t h1 = __byte_perm(w6, w7, sel);   // 24..31
+        uint32_t bytes = nib;
+        bytes = (bytes | (bytes << 8)) & 0x00FF00FFu;
+        bytes = (bytes | (bytes << 4)) & 0x0F0F0F0Fu;
+        const uint32_t m3 = ((bytes & 0x08080808u) >> 3) * 0xFFu;
+        const uint32_t lo16 = l0 ^ ((l0 ^ l1) & m3);
+        const uint32_t hi16 = h0 ^ ((h0 ^ h1) & m3);
+        // spread the four hi bits to one per byte, then to a full-byte mask
+        const uint32_t m4 = (((hi4 & 0xFu) * 0x00204081u) & 0x01010101u) * 0xFFu;
+        return lo16 ^ ((lo16 ^ hi16) & m4);
+    }
 };
 // [TAG_TURBO4_WIDE_KQ] Element-group mapping shared by the turbo4 int8 KQ dot and the
 // Q quantization that feeds it. Both MUST use this function or the dot silently pairs K
@@ -690,7 +717,7 @@ static inline bool ggml_cuda_fattn_turbo_reads_native(const ggml_tensor * dst, b
         return false;
     }
     const bool is_t4  = K->type == GGML_TYPE_TURBO4_0;
-    const bool is_t4p = K->type == GGML_TYPE_TURBO4P_0;
+    const bool is_t4p = K->type == GGML_TYPE_TURBO4P_0 || K->type == GGML_TYPE_TURBO5P_0;   // [TAG_TURBO5P] same 16-byte-aligned split-plane geometry
     if (!is_t4 && !is_t4p) {
         return false;
     }
@@ -745,6 +772,14 @@ static __device__ __forceinline__ turbo4p_head_addr turbo4p_head_offset(const in
     turbo4p_head_addr a;
     a.byte_bias = (e / QK_TURBO4P) * (int64_t) sizeof(block_turbo4p_0);
     a.row_elem0 = (int) (e % QK_TURBO4P);
+    return a;
+}
+// [TAG_TURBO5P] same geometry, 656-byte block.
+static __device__ __forceinline__ turbo4p_head_addr turbo5p_head_offset(const int head, const int D) {
+    const int64_t e = (int64_t) head * D;
+    turbo4p_head_addr a;
+    a.byte_bias = (e / QK_TURBO5P) * (int64_t) sizeof(block_turbo5p_0);
+    a.row_elem0 = (int) (e % QK_TURBO5P);
     return a;
 }
 
@@ -824,6 +859,88 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_turbo4p_0_int(
         qs_pair |= (uint16_t) ((uint16_t) qs_run[2*slot + 1] << 8);
 
         const int v_packed = (int) lut.gather4((uint32_t) qs_pair);
+
+        const int   sumi = ggml_cuda_dp4a(v_packed, Q_q8[slot], 0);
+        sum += float(sumi) * norm_scaled * Q_ds[slot].x;
+    }
+
+    return sum;
+}
+
+
+// ---- [TAG_TURBO5P] turbo5p KQ dot: turbo4p's, plus the high-bit plane ----
+template <int D, int nthreads>
+static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_turbo5p_0_int(
+    const char * __restrict__ K_c, const int row_elem0, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
+    // K_c is the BLOCK base for this KV position, not the head's row - see
+    // [TAG_TURBO4P_ROW_ELEM0]. row_elem0 is where this head starts inside that block.
+    const block_turbo5p_0 * __restrict__ K_turbo = (const block_turbo5p_0 * __restrict__) K_c;
+    GGML_UNUSED(Q_v);
+
+    constexpr int groups_per_thread = (D/int(sizeof(int))) / nthreads;
+    constexpr int qs_bytes          = groups_per_thread * 2;   // 4 nibbles per group
+
+    // A thread's run must stay inside ONE 128-element WHT group or its single norm load is
+    // wrong for part of the run. groups_per_thread*4 divides QK_TURBO5P_GROUP for every
+    // configuration this kernel is instantiated with.
+    static_assert(QK_TURBO5P_GROUP % (groups_per_thread*4) == 0, "turbo5p KQ run straddles a WHT group");
+
+    turbo5_int8_lut lut;
+    lut.init();
+
+    const int lane = (nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads);
+    const float2 * Q_ds = (const float2 *) Q_ds_v;
+
+    float sum = 0.0f;
+
+    // Same contiguous-run mapping as turbo4 [TAG_TURBO4_WIDE_KQ]: one wide load per thread
+    // for its whole share of the row, and the Q gather in fattn-vec.cuh uses the identical
+    // mapping or every group past the first pairs with the wrong q8_1 scale.
+    const int elem_head = turbo4_kq_group<D, nthreads>(0, lane) * 4;
+    const int elem      = row_elem0 + elem_head;
+    const int ib        = elem / QK_TURBO5P;
+    const int j_first   = elem % QK_TURBO5P;
+
+    // [TAG_TURBO4P_K_LOAD_ALIGN] The qs byte address is block_base + j_first/2, and:
+    //   - block_turbo5p_0 is 528 = 16*33 bytes with qs at offset 0, and the cache tensor
+    //     base is 128-byte aligned (ggml_backend_cuda_buffer_type_get_alignment), so every
+    //     block base is 16-byte aligned;
+    //   - row_elem0 is a whole number of heads, hence a multiple of D >= 128, so
+    //     row_elem0/2 is a multiple of 64;
+    //   - elem_head is lane*groups_per_thread*4, so j_first/2 is a multiple of qs_bytes.
+    // The address is therefore a multiple of min(qs_bytes, 16). At D=256 with nthreads=16
+    // that is 8 bytes: ONE LDG.E.64 for the whole run, where turbo4_0 needed two 32-bit
+    // loads because its 68-byte block flips qs parity between consecutive blocks.
+    //
+    // The copy goes through the DEFAULT alignment argument, not an explicit one: the
+    // explicit form exists for pointers that are NOT properly aligned and it caps the
+    // instruction at ggml_cuda_get_max_cpy_bytes(), so passing it here would ask for
+    // several narrow loads instead of the one wide load just proven legal.
+    constexpr int qs_cpy = qs_bytes < 16 ? qs_bytes : 16;
+    __align__(qs_cpy) uint8_t qs_run[qs_bytes];
+#pragma unroll
+    for (int b = 0; b < qs_bytes; b += qs_cpy) {
+        ggml_cuda_memcpy_1<qs_cpy>(qs_run + b, K_turbo[ib].qs + (j_first >> 1) + b);
+    }
+
+    // One norm for the whole run, from the norm plane at the end of the block.
+    const float norm_scaled = __half2float(K_turbo[ib].norm[j_first / QK_TURBO5P_GROUP]) * TURBO_INT8_5BIT_SCALE_REVERSE;
+    // [TAG_TURBO5P] groups_per_thread*4 high bits start at bit j_first of qh. j_first is a
+    // multiple of that count, so they sit at qh[j_first/8] with no byte straddle; 16 elements
+    // per thread at D=256/nthreads=16 is exactly one 16-bit load.
+    constexpr int qh_bits  = groups_per_thread * 4;
+    static_assert(qh_bits == 8 || qh_bits == 16 || qh_bits == 32, "turbo5p qh run must be 1, 2 or 4 bytes");
+    using qh_word_t = typename std::conditional<qh_bits == 32, uint32_t, typename std::conditional<qh_bits == 16, uint16_t, uint8_t>::type>::type;
+    qh_word_t qhw;
+    ggml_cuda_memcpy_1<sizeof(qh_word_t)>(&qhw, K_turbo[ib].qh + (j_first >> 3));
+
+#pragma unroll
+    for (int slot = 0; slot < groups_per_thread; ++slot) {
+        uint16_t qs_pair;
+        qs_pair  = (uint16_t) qs_run[2*slot];
+        qs_pair |= (uint16_t) ((uint16_t) qs_run[2*slot + 1] << 8);
+
+        const int v_packed = (int) lut.gather4((uint32_t) qs_pair, ((uint32_t) qhw >> (4*slot)) & 0xFu);
 
         const int   sumi = ggml_cuda_dp4a(v_packed, Q_q8[slot], 0);
         sum += float(sumi) * norm_scaled * Q_ds[slot].x;
@@ -1806,6 +1923,167 @@ static __device__ __forceinline__ void dequantize_V_turbo4p_0(const void * __res
         }
     }
 }
+
+
+// ---- [TAG_TURBO5P] turbo5p V dequant: turbo4p's, plus the high-bit plane ----
+template <typename T, int ne>
+static __device__ __forceinline__ void dequantize_V_turbo5p_0(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
+    const block_turbo5p_0 * x = (const block_turbo5p_0 *) vx;
+
+    const int64_t ib   = i0 / QK_TURBO5P;
+    const int     j0   = i0 % QK_TURBO5P;
+    const float   norm = __half2float(x[ib].norm[j0 / QK_TURBO5P_GROUP]);
+
+    static_assert(ne == 2 || ne == 4 || ne == 8 || ne == 16, "bad ne");
+    // A run of ne elements must not cross a WHT group or its single norm is wrong for the
+    // tail. ne <= 16 divides 128, and j0 is a multiple of ne, so it cannot.
+    static_assert(QK_TURBO5P_GROUP % ne == 0, "turbo5p V run straddles a WHT group");
+
+    if constexpr (ne == 16) {
+        // 16 elements is 8 contiguous qs bytes. j0 is a multiple of 16 here, so j0/2 is a
+        // multiple of 8, and qs sits at offset 0 of a 528 = 16*33 byte block whose base is
+        // 16-byte aligned - so this is a single LDG.E.64 where turbo4_0 needed two 32-bit
+        // loads. See [TAG_TURBO4P_K_LOAD_ALIGN] for the full alignment chain.
+        uint32_t qs_lo, qs_hi;
+        {
+            __align__(8) uint32_t tmp2[2];
+            ggml_cuda_memcpy_1<8>(tmp2, x[ib].qs + j0 / 2);
+            qs_lo = tmp2[0];
+            qs_hi = tmp2[1];
+        }
+
+        // [TAG_TURBO5P] 16 high bits at qh[j0/8]; j0 is a multiple of 16 so one aligned load.
+        uint16_t qhw;
+        ggml_cuda_memcpy_1<2>(&qhw, x[ib].qh + (j0 >> 3));
+        turbo5_int8_lut lut;
+        lut.init();
+        const float nscale = norm * TURBO_INT8_5BIT_SCALE_REVERSE;
+
+        const int g[4] = {
+            (int) lut.gather4( qs_lo        & 0xFFFFu, ((uint32_t) qhw >>  0) & 0xFu),
+            (int) lut.gather4((qs_lo >> 16) & 0xFFFFu, ((uint32_t) qhw >>  4) & 0xFu),
+            (int) lut.gather4( qs_hi        & 0xFFFFu, ((uint32_t) qhw >>  8) & 0xFu),
+            (int) lut.gather4((qs_hi >> 16) & 0xFFFFu, ((uint32_t) qhw >> 12) & 0xFu),
+        };
+
+        float s[16];
+#pragma unroll
+        for (int q = 0; q < 4; ++q) {
+            s[4*q + 0] = (float) (int8_t) (g[q]      ) * nscale;
+            s[4*q + 1] = (float) (int8_t) (g[q] >>  8) * nscale;
+            s[4*q + 2] = (float) (int8_t) (g[q] >> 16) * nscale;
+            s[4*q + 3] = (float) (int8_t) (g[q] >> 24) * nscale;
+        }
+
+#ifdef FP16_AVAILABLE
+        if constexpr (std::is_same_v<T, half>) {
+#pragma unroll
+            for (int q = 0; q < 8; ++q) {
+                ((half2 *) dst)[q] = make_half2(__float2half(s[2*q+0]), __float2half(s[2*q+1]));
+            }
+        } else
+#endif // FP16_AVAILABLE
+        if constexpr (std::is_same_v<T, float>) {
+#pragma unroll
+            for (int q = 0; q < 8; ++q) {
+                ((float2 *) dst)[q] = make_float2(s[2*q+0], s[2*q+1]);
+            }
+        } else {
+            static_assert(std::is_same_v<T, void>, "unsupported type");
+        }
+        return;
+    }
+
+    if constexpr (ne == 8) {
+        // 8 elements is 4 qs bytes. j0 is a multiple of 8 but not necessarily of 16, so
+        // only 4-byte alignment is provable here - which is exactly the load width anyway,
+        // so this path gains nothing from the repack and loses nothing either.
+        uint32_t qs_word;
+        ggml_cuda_memcpy_1<4, 4>(&qs_word, x[ib].qs + j0 / 2);
+
+        turbo5_int8_lut lut;
+        lut.init();
+        const float nscale = norm * TURBO_INT8_5BIT_SCALE_REVERSE;
+
+        // [TAG_TURBO5P] j0 is a multiple of 8, so these 8 high bits are exactly qh[j0/8].
+        const uint32_t qh8 = (uint32_t) x[ib].qh[j0 >> 3];
+        const int g0 = (int) lut.gather4( qs_word        & 0xFFFFu,  qh8       & 0xFu);  // elements 0..3
+        const int g1 = (int) lut.gather4((qs_word >> 16) & 0xFFFFu, (qh8 >> 4) & 0xFu);  // elements 4..7
+
+        float s[8];
+        s[0] = (float) (int8_t) (g0      ) * nscale;
+        s[1] = (float) (int8_t) (g0 >>  8) * nscale;
+        s[2] = (float) (int8_t) (g0 >> 16) * nscale;
+        s[3] = (float) (int8_t) (g0 >> 24) * nscale;
+        s[4] = (float) (int8_t) (g1      ) * nscale;
+        s[5] = (float) (int8_t) (g1 >>  8) * nscale;
+        s[6] = (float) (int8_t) (g1 >> 16) * nscale;
+        s[7] = (float) (int8_t) (g1 >> 24) * nscale;
+
+#ifdef FP16_AVAILABLE
+        if constexpr (std::is_same_v<T, half>) {
+#pragma unroll
+            for (int p = 0; p < 4; ++p) {
+                ((half2 *) dst)[p] = make_half2(__float2half(s[2*p+0]), __float2half(s[2*p+1]));
+            }
+        } else
+#endif // FP16_AVAILABLE
+        if constexpr (std::is_same_v<T, float>) {
+#pragma unroll
+            for (int p = 0; p < 4; ++p) {
+                ((float2 *) dst)[p] = make_float2(s[2*p+0], s[2*p+1]);
+            }
+        } else {
+            static_assert(std::is_same_v<T, void>, "unsupported type");
+        }
+        return;
+    }
+
+    if constexpr (ne == 4 || ne == 2) {
+        // Narrow paths: 2 or 1 qs bytes. Still the register LUT rather than a
+        // TURBO_CENTROIDS_4BIT[idx] read - a data-dependent index into constant memory
+        // broadcasts only when every lane picks the same entry, so 16 distinct centroids
+        // can replay 16 times, and that cost is paid per V element per KV cell.
+        uint16_t qs_pair = 0;
+        if constexpr (ne == 4) {
+            ggml_cuda_memcpy_1<2, 2>(&qs_pair, x[ib].qs + j0 / 2);
+        } else {
+            qs_pair = x[ib].qs[j0 / 2];
+        }
+
+        turbo5_int8_lut lut;
+        lut.init();
+        const float nscale = norm * TURBO_INT8_5BIT_SCALE_REVERSE;
+
+        // [TAG_TURBO5P] ne high bits start at bit j0%8 of qh[j0/8]; j0 is a multiple of ne so
+        // they never straddle the byte. For ne == 2 the upper two gathered lanes are unused.
+        const uint32_t qh4 = ((uint32_t) x[ib].qh[j0 >> 3] >> (j0 & 7)) & 0xFu;
+        const int g0 = (int) lut.gather4((uint32_t) qs_pair, qh4);
+
+        float s[4];
+        s[0] = (float) (int8_t) (g0      ) * nscale;
+        s[1] = (float) (int8_t) (g0 >>  8) * nscale;
+        s[2] = (float) (int8_t) (g0 >> 16) * nscale;
+        s[3] = (float) (int8_t) (g0 >> 24) * nscale;
+
+#ifdef FP16_AVAILABLE
+        if constexpr (std::is_same_v<T, half>) {
+#pragma unroll
+            for (int p = 0; p < ne/2; ++p) {
+                ((half2 *) dst)[p] = make_half2(__float2half(s[2*p+0]), __float2half(s[2*p+1]));
+            }
+        } else
+#endif // FP16_AVAILABLE
+        if constexpr (std::is_same_v<T, float>) {
+#pragma unroll
+            for (int p = 0; p < ne/2; ++p) {
+                ((float2 *) dst)[p] = make_float2(s[2*p+0], s[2*p+1]);
+            }
+        } else {
+            static_assert(std::is_same_v<T, void>, "unsupported type");
+        }
+    }
+}
 
 template <ggml_type type_K, int D, int nthreads>
 constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
@@ -1841,6 +2119,8 @@ constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
     } else if constexpr (type_K == GGML_TYPE_TURBO4P_0) {
         // Same int8 __dp4a path for the same reason; turbo4p only repacks the bytes.
         return vec_dot_fattn_vec_KQ_turbo4p_0_int<D, nthreads>;
+    } else if constexpr (type_K == GGML_TYPE_TURBO5P_0) {
+        return vec_dot_fattn_vec_KQ_turbo5p_0_int<D, nthreads>;
     } else {
         static_assert(type_K == -1, "bad type");
         return nullptr;
@@ -1871,6 +2151,8 @@ constexpr __device__ dequantize_V_t get_dequantize_V() {
         return dequantize_V_turbo4_0<T, ne>;
     } else if constexpr (type_V == GGML_TYPE_TURBO4P_0) {
         return dequantize_V_turbo4p_0<T, ne>;
+    } else if constexpr (type_V == GGML_TYPE_TURBO5P_0) {
+        return dequantize_V_turbo5p_0<T, ne>;
     } else {
         static_assert(type_V == -1, "bad type");
         return nullptr;

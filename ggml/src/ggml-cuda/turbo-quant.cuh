@@ -140,6 +140,63 @@ static __device__ __forceinline__ void turbo_rotate_forward_64(float * x) {
     for (int i = 0; i < 64; i++) x[i] *= TURBO_WHT_SIGNS2_64[i];
 }
 
+// ---- [TAG_TURBO4_HIST] post-WHT histogram, DEBUG ONLY ----
+// Set TURBO_WHT_HIST=<path> to accumulate a histogram of the post-WHT values that the
+// 4-bit quantiser actually sees, then fit a codebook to THAT rather than to an assumed
+// normal - which is exactly what the [TAG_TURBO4_CODEBOOK] note asks for. Off unless the
+// env var is set: one predicated atomicAdd per element, and the branch is uniform.
+#define TURBO_HIST_BINS 4096
+#define TURBO_HIST_LO   (-0.6f)
+#define TURBO_HIST_HI   ( 0.6f)
+static __device__ unsigned long long d_wht_hist[TURBO_HIST_BINS];
+static __device__ int d_wht_hist_on;
+
+static __device__ __forceinline__ void turbo_wht_hist_add(float v) {
+#ifndef TURBO_WHT_HIST_BUILD
+    // Compiled out by default: the runtime flag alone still costs a __device__
+    // global load per element on every KV write, which measured ~9% of pp and tg
+    // at d131072. Build with -DTURBO_WHT_HIST_BUILD to re-enable the histogram.
+    (void) v; return;
+#else
+    if (!d_wht_hist_on) return;
+    const float t = (v - TURBO_HIST_LO) / (TURBO_HIST_HI - TURBO_HIST_LO);
+    int b = (int) (t * TURBO_HIST_BINS);
+    b = b < 0 ? 0 : (b >= TURBO_HIST_BINS ? TURBO_HIST_BINS - 1 : b);
+    atomicAdd(&d_wht_hist[b], 1ULL);
+#endif
+}
+
+static bool turbo_wht_hist_enabled = false;
+static bool turbo_wht_hist_init_done = false;
+static void turbo_wht_hist_init(void) {
+    if (turbo_wht_hist_init_done) return;
+    turbo_wht_hist_init_done = true;
+    const char * e = getenv("TURBO_WHT_HIST");
+    if (!e || !*e) return;
+    turbo_wht_hist_enabled = true;
+    unsigned long long z[TURBO_HIST_BINS] = {0};
+    int one = 1;
+    cudaMemcpyToSymbol(d_wht_hist, z, sizeof(z));
+    cudaMemcpyToSymbol(d_wht_hist_on, &one, sizeof(int));
+    GGML_LOG_INFO("%s: post-WHT histogram enabled -> %s\n", __func__, e);
+}
+
+// Dump and reset. Called opportunistically from the set-rows launcher.
+static void turbo_wht_hist_dump(void) {
+    if (!turbo_wht_hist_enabled) return;
+    static int calls = 0;
+    if (++calls % 512 != 0) return;                 // amortise the copy
+    const char * e = getenv("TURBO_WHT_HIST");
+    unsigned long long h[TURBO_HIST_BINS];
+    cudaMemcpyFromSymbol(h, d_wht_hist, sizeof(h));
+    unsigned long long tot = 0;
+    for (int i = 0; i < TURBO_HIST_BINS; i++) tot += h[i];
+    if (tot < 2000000ULL) return;                   // wait for a decent sample
+    FILE * f = fopen(e, "wb");
+    if (f) { fwrite(h, sizeof(unsigned long long), TURBO_HIST_BINS, f); fclose(f);
+             GGML_LOG_INFO("turbo_wht_hist: wrote %llu samples to %s\n", tot, e); }
+}
+
 // ---- InnerQ per-channel equalization ----
 // Equalizes K channel variances before WHT rotation to reduce quantization error.
 // Enabled via TURBO_INNERQ=N env var (N = calibration token count).
@@ -296,29 +353,38 @@ static bool turbo_innerq_is_active(void) {
 
 // ---- 4-bit centroids ----
 //
-// [TAG_TURBO4_CODEBOOK] These are NOT Lloyd-Max, despite what this comment used to say.
-// Verified numerically: every entry is the conditional mean of one of 16 EQUIPROBABLE
-// bins of N(0, 1/128), matching to 4 decimals. Against a true Gaussian source that is
-// 2.13x worse in MSE (0.020273 vs 0.009501 sigma^2), and the outermost level sits at
-// 1.9677 sigma, inside turbo3's 2.1568 - which looks impossible for 16 levels vs 8.
+// [TAG_TURBO4_CODEBOOK] Lloyd-Max for N(0, 1/128), the post-WHT component distribution.
 //
-// The proper Lloyd-Max table WAS TRIED AND IS WORSE IN PRACTICE. Measured end to end:
-//   depth      0   acceptance 41.7% -> 33.0%,  TG 96.04 -> 84.26 t/s
-//   depth 131072   acceptance 71.6% -> 67.4%,  TG 101.05 -> 99.15 t/s
-// So the theory is right and its premise is wrong: the post-WHT values are not actually
-// N(0, 1/128). A 128-point Hadamard on a real attention K vector Gaussianizes only
-// approximately, and the residual distribution is evidently lighter-tailed than normal -
-// which is exactly the case an equiprobable-bin codebook fits better than a Gaussian
-// Lloyd-Max one. Do not 'fix' this table without measuring acceptance.
+// This REPLACES an equiprobable-bin codebook whose entries were the conditional means of
+// 16 equal-probability bins. That table clipped 4.85% of all values at its outermost
+// level of 1.968 sigma, against 0.59% here at 2.733 sigma, and measured 2.09x worse MSE
+// on real data.
 //
-// If you want to revisit it, fit the codebook to a HISTOGRAM of real post-WHT values
-// rather than to an assumed normal.
+// The previous comment argued the post-WHT values are 'evidently lighter-tailed than
+// normal' and recorded that Lloyd-Max measured WORSE end to end (acceptance 41.7 -> 33.0
+// at depth 0). It asked for the codebook to be fitted to a HISTOGRAM of real post-WHT
+// values instead of an assumed normal. That was done - see [TAG_TURBO4_HIST], which
+// accumulates exactly that histogram when TURBO_WHT_HIST is set.
+//
+// MEASURED on 2.107e9 real post-WHT samples from Qwen3.8-27B K and V:
+//   std       0.088388  = 1/sqrt(128) to six figures, exactly as theory predicts
+//   kurtosis  2.954     vs 3.0 for a normal - lighter tailed, but only by 1.5%
+//   MSE   equiprobable 1.522e-04 | Lloyd-Max 7.292e-05 | fitted-to-histogram 7.309e-05
+// The empirical fit and Lloyd-Max agree to within 0.2%, so the distribution IS normal
+// for codebook purposes and the earlier premise does not hold.
+//
+// Why the earlier Lloyd-Max attempt regressed is not proven, but note that FIVE tables
+// are derived from these centroids: TURBO_C4_I8_LIST, the four packed LUT words, the
+// static_asserts guarding them, TURBO_INT8_4BIT_SCALE_REVERSE and TURBO_MID_4BIT.
+// Changing only the float array leaves the __dp4a K-dot path scoring against the OLD
+// centroids while dequant uses the new ones - which would wreck draft acceptance and
+// drag TG down with it, exactly the signature recorded above. Change all five together.
 
 static __constant__ float TURBO_CENTROIDS_4BIT[16] = {
-    -0.173926f, -0.117195f, -0.089527f, -0.068756f,
-    -0.051262f, -0.035597f, -0.020989f, -0.006938f,
-     0.006938f,  0.020989f,  0.035597f,  0.051262f,
-     0.068756f,  0.089527f,  0.117195f,  0.173926f
+    -0.241530f, -0.182875f, -0.143021f, -0.111033f,
+    -0.083297f, -0.058053f, -0.034304f, -0.011349f,
+     0.011349f,  0.034304f,  0.058053f,  0.083297f,
+     0.111033f,  0.143021f,  0.182875f,  0.241530f
 };
 
 // PERF (int8 / __dp4a path): pre-quantized 4-bit centroids as int8 in [-127, 127].
@@ -326,12 +392,12 @@ static __constant__ float TURBO_CENTROIDS_4BIT[16] = {
 // use the Blackwell __dp4a hardware instruction (same path q8 uses) instead of
 // per-element float multiplies. Final scale factor TURBO_INT8_4BIT_SCALE recovers
 // real value: float_K = int8_K * (norm * TURBO_INT8_4BIT_SCALE).
-//   max_abs_centroid = 0.173926
-//   int8 centroids   = round(centroid / 0.173926 * 127)
+//   max_abs_centroid = 0.241530
+//   int8 centroids   = round(centroid / 0.241530 * 127)
 // Single source of truth for the int8 centroids. The __constant__ array below and the
 // pre-packed LUT words are both derived from this, so they cannot drift apart.
-#define TURBO_C4_I8_LIST -127, -86, -65, -50, -37, -26, -15,  -5, \
-                            5,  15,  26,  37,  50,  65,  86, 127
+#define TURBO_C4_I8_LIST -127, -96, -75, -58, -44, -31, -18,  -6, \
+                            6,  18,  31,  44,  58,  75,  96, 127
 
 static __constant__ int8_t TURBO_CENTROIDS_4BIT_INT8[16] = { TURBO_C4_I8_LIST };
 
@@ -355,21 +421,77 @@ static constexpr uint32_t TURBO_C4_LUT_W2 = turbo4_i8_pack( 8,  9, 10, 11);
 static constexpr uint32_t TURBO_C4_LUT_W3 = turbo4_i8_pack(12, 13, 14, 15);
 
 // Guards against a silent change to the centroid list reordering the packed bytes.
-static_assert(TURBO_C4_LUT_W0 == 0xCEBFAA81u, "turbo4 LUT w0 changed");
-static_assert(TURBO_C4_LUT_W1 == 0xFBF1E6DBu, "turbo4 LUT w1 changed");
-static_assert(TURBO_C4_LUT_W2 == 0x251A0F05u, "turbo4 LUT w2 changed");
-static_assert(TURBO_C4_LUT_W3 == 0x7F564132u, "turbo4 LUT w3 changed");
-// SCALE_REVERSE = 0.173926 / 127.0 — used to recover float dot product from int sum
-#define TURBO_INT8_4BIT_SCALE_REVERSE (0.173926f / 127.0f)
+static_assert(TURBO_C4_LUT_W0 == 0xC6B5A081u, "turbo4 LUT w0 changed");
+static_assert(TURBO_C4_LUT_W1 == 0xFAEEE1D4u, "turbo4 LUT w1 changed");
+static_assert(TURBO_C4_LUT_W2 == 0x2C1F1206u, "turbo4 LUT w2 changed");
+static_assert(TURBO_C4_LUT_W3 == 0x7F604B3Au, "turbo4 LUT w3 changed");
+// SCALE_REVERSE = 0.241530 / 127.0 — used to recover float dot product from int sum
+#define TURBO_INT8_4BIT_SCALE_REVERSE (0.241530f / 127.0f)
+// ---- [TAG_TURBO5P] int8 mirror of the 32-entry codebook, same derivation as 4-bit ----
+//   max_abs_centroid = 0.271948
+//   int8 centroids   = round(centroid / 0.271948 * 127)
+#define TURBO_C5_I8_LIST -127, -104,  -88,  -76,  -66,  -58,  -50,  -43, \
+                          -37,  -31,  -25,  -20,  -15,  -10,   -6,   -2, \
+                            2,    6,   10,   15,   20,   25,   31,   37, \
+                           43,   50,   58,   66,   76,   88,  104,  127
+static __constant__ int8_t TURBO_CENTROIDS_5BIT_INT8[32] = { TURBO_C5_I8_LIST };
+static constexpr int8_t TURBO_CENTROIDS_5BIT_I8_CE[32] = { TURBO_C5_I8_LIST };
+static constexpr uint32_t turbo5_i8_pack(int b0, int b1, int b2, int b3) {
+    return  (uint32_t) (uint8_t) TURBO_CENTROIDS_5BIT_I8_CE[b0]        |
+           ((uint32_t) (uint8_t) TURBO_CENTROIDS_5BIT_I8_CE[b1] <<  8) |
+           ((uint32_t) (uint8_t) TURBO_CENTROIDS_5BIT_I8_CE[b2] << 16) |
+           ((uint32_t) (uint8_t) TURBO_CENTROIDS_5BIT_I8_CE[b3] << 24);
+}
+static constexpr uint32_t TURBO_C5_LUT_W0 = turbo5_i8_pack( 0,  1,  2,  3);
+static constexpr uint32_t TURBO_C5_LUT_W1 = turbo5_i8_pack( 4,  5,  6,  7);
+static constexpr uint32_t TURBO_C5_LUT_W2 = turbo5_i8_pack( 8,  9, 10, 11);
+static constexpr uint32_t TURBO_C5_LUT_W3 = turbo5_i8_pack(12, 13, 14, 15);
+static constexpr uint32_t TURBO_C5_LUT_W4 = turbo5_i8_pack(16, 17, 18, 19);
+static constexpr uint32_t TURBO_C5_LUT_W5 = turbo5_i8_pack(20, 21, 22, 23);
+static constexpr uint32_t TURBO_C5_LUT_W6 = turbo5_i8_pack(24, 25, 26, 27);
+static constexpr uint32_t TURBO_C5_LUT_W7 = turbo5_i8_pack(28, 29, 30, 31);
+static_assert(TURBO_C5_LUT_W0 == 0xB4A89881u, "turbo5 LUT w0 changed");
+static_assert(TURBO_C5_LUT_W1 == 0xD5CEC6BEu, "turbo5 LUT w1 changed");
+static_assert(TURBO_C5_LUT_W2 == 0xECE7E1DBu, "turbo5 LUT w2 changed");
+static_assert(TURBO_C5_LUT_W3 == 0xFEFAF6F1u, "turbo5 LUT w3 changed");
+static_assert(TURBO_C5_LUT_W4 == 0x0F0A0602u, "turbo5 LUT w4 changed");
+static_assert(TURBO_C5_LUT_W5 == 0x251F1914u, "turbo5 LUT w5 changed");
+static_assert(TURBO_C5_LUT_W6 == 0x423A322Bu, "turbo5 LUT w6 changed");
+static_assert(TURBO_C5_LUT_W7 == 0x7F68584Cu, "turbo5 LUT w7 changed");
+#define TURBO_INT8_5BIT_SCALE_REVERSE (0.271948f / 127.0f)
 
 // ---- Midpoints for nearest 4-bit centroid lookup ----
 
 static __constant__ float TURBO_MID_4BIT[15] = {
-    -0.145561f, -0.103361f, -0.079142f, -0.060009f,
-    -0.043430f, -0.028293f, -0.013964f,  0.000000f,
-     0.013964f,  0.028293f,  0.043430f,  0.060009f,
-     0.079142f,  0.103361f,  0.145561f
+    -0.212203f, -0.162948f, -0.127027f, -0.097165f,
+    -0.070675f, -0.046178f, -0.022826f,  0.000000f,
+     0.022826f,  0.046178f,  0.070675f,  0.097165f,
+     0.127027f,  0.162948f,  0.212203f
 };
+// ---- [TAG_TURBO5P] 5-bit codebook: 32 Lloyd-Max centroids fitted to the measured post-WHT
+// histogram (see [TAG_TURBO4_CODEBOOK]). 3.60x less MSE than the 16-level table. Absolute
+// scale is divided out by the norm correction; the SHAPE is what matters.
+static __constant__ float TURBO_CENTROIDS_5BIT[32] = {
+    -0.271948f, -0.222223f, -0.189260f, -0.163683f, -0.142366f, -0.123814f, -0.107237f, -0.092232f,
+    -0.078519f, -0.065814f, -0.053979f, -0.042868f, -0.032338f, -0.022390f, -0.013026f, -0.004245f,
+     0.004245f,  0.013026f,  0.022390f,  0.032338f,  0.042868f,  0.053979f,  0.065814f,  0.078519f,
+     0.092232f,  0.107237f,  0.123814f,  0.142366f,  0.163683f,  0.189260f,  0.222223f,  0.271948f
+};
+static __constant__ float TURBO_MID_5BIT[31] = {
+    -0.247085f, -0.205741f, -0.176471f, -0.153025f, -0.133090f, -0.115525f, -0.099734f, -0.085376f,
+    -0.072167f, -0.059897f, -0.048423f, -0.037603f, -0.027364f, -0.017708f, -0.008635f,  0.000000f,
+     0.008635f,  0.017708f,  0.027364f,  0.037603f,  0.048423f,  0.059897f,  0.072167f,  0.085376f,
+     0.099734f,  0.115525f,  0.133090f,  0.153025f,  0.176471f,  0.205741f,  0.247085f
+};
+// Same branchless midpoint count as the 4-bit version: 31 independent compare+adds.
+static __device__ __forceinline__ uint8_t turbo_nearest_centroid_5bit(float val) {
+    int idx = 0;
+#pragma unroll
+    for (int i = 0; i < 31; ++i) {
+        idx += (val >= TURBO_MID_5BIT[i]);
+    }
+    return (uint8_t) idx;
+}
 
 // ---- Nearest 4-bit centroid index ----
 
@@ -490,6 +612,90 @@ static __device__ __forceinline__ void turbo4p_dequant_lane(
 #pragma unroll
     for (int e = 0; e < per_lane; ++e) {
         const unsigned idx = (unsigned) (qsw >> (4*e)) & 0xFu;
+        v[e] = (dst_t) (norm * __shfl_sync(0xFFFFFFFFu, raw_centroid, idx, WARP_SIZE));
+    }
+
+    ggml_cuda_memcpy_1<sizeof(dst_t)*per_lane>(yout, v);
+}
+
+
+// ---- [TAG_TURBO5P] turbo5p dequant helpers: turbo4p's, plus the high-bit plane ----
+// raw_centroid for the lane helper is TURBO_CENTROIDS_5BIT[lane] for ALL 32 lanes - a 5-bit
+// index addresses the full warp, so the __shfl_sync gather needs no lane<16 guard.
+static __device__ __forceinline__ float turbo5p_group_norm(
+        const block_turbo5p_0 * __restrict__ x, int j) {
+    return __half2float(x->norm[j / QK_TURBO5P_GROUP]);
+}
+
+static __device__ __forceinline__ float turbo5p_dequant_element(
+        const block_turbo5p_0 * __restrict__ x, int j, float norm) {
+    const unsigned lo  = (x->qs[j / 2] >> ((j % 2) * 4)) & 0xFu;
+    const unsigned hi  = (x->qh[j / 8] >> (j % 8)) & 1u;
+    const uint8_t  idx = (uint8_t) (lo | (hi << 4));
+    return TURBO_CENTROIDS_5BIT[idx] * norm;
+}
+
+// ---- turbo5p bulk dequant, one lane's worth ----
+//
+// Shared by convert.cu (both the contiguous and the strided kernel) and getrows.cu so the
+// three of them cannot drift apart on nibble order or on the norm-to-group mapping.
+//
+// turbo5p_lane_shape<dst_t>::elems is 16/sizeof(dst_t), so every lane stores EXACTLY 16
+// bytes and a
+// warp stores 512 contiguous bytes in ONE instruction - the widest perfectly coalesced
+// store a warp can issue. It deliberately does not go higher even though the layout would
+// permit a 16-byte qs LOAD (32 elements per lane, block offset 16*k from a 16-byte aligned
+// block base): a lane can move at most 16 bytes per store, so 32 elements per lane means
+// four stores at a 64-byte lane stride, and each of those touches 32 half-filled sectors
+// instead of a contiguous run. The destination is 4x the traffic of the qs source here, so
+// the store shape decides the shape of everything else.
+//
+// Alignment of the qs load, argued from the block geometry alone: sizeof(block_turbo5p_0)
+// is 528 = 16*33 and qs sits at offset 0, so with CUDA's 128-byte buffer alignment and view
+// offsets that are whole numbers of blocks, every block base is 16-byte aligned. jb is a
+// multiple of elems, so the byte offset jb/2 is a multiple of elems/2 - 4 bytes for a
+// 16-bit dst_t, 2 bytes for a 32-bit one. That is the
+// width used, and no wider.
+//
+// raw_centroid is lane L's copy of TURBO_CENTROIDS_5BIT[L] for L < 16. Unlike turbo4_0 the
+// centroid is NOT pre-scaled by the norm, because a warp here can span two WHT groups with
+// two different norms. Scaling after the broadcast costs one multiply per element and is
+// what lets the lane cover 8 elements instead of 4.
+
+// Plain constexpr members rather than a constexpr function, so the launchers can use the
+// same numbers on the host without dragging in relaxed-constexpr device call rules.
+template <typename dst_t>
+struct turbo5p_lane_shape {
+    static constexpr int elems    = 16 / (int) sizeof(dst_t);  // 8 for f16/bf16, 4 for f32
+    static constexpr int qs_bytes = elems / 2;                 // 4 for f16/bf16, 2 for f32
+    static constexpr int per_warp = WARP_SIZE * elems;         // 256 for f16/bf16, 128 for f32
+};
+
+template <typename dst_t>
+static __device__ __forceinline__ void turbo5p_dequant_lane(
+        const block_turbo5p_0 * __restrict__ x, const int jb,
+        const float raw_centroid, dst_t * __restrict__ yout) {
+
+    constexpr int per_lane = turbo5p_lane_shape<dst_t>::elems;
+    constexpr int qs_bytes = turbo5p_lane_shape<dst_t>::qs_bytes;
+    using qs_word_t = typename std::conditional<qs_bytes == 4, uint32_t, uint16_t>::type;
+
+    // Uniform across the whole group, so the compiler hoists it out of the unrolled loop.
+    const float norm = __half2float(x->norm[jb / QK_TURBO5P_GROUP]);
+
+    // jb is even, so element jb+e is nibble e counting from bit 0 of this word: byte jb/2
+    // holds elements jb+0 (low nibble) and jb+1 (high nibble), byte jb/2+1 holds jb+2 and
+    // jb+3, and so on. Same nibble order as turbo4_0.
+    qs_word_t qsw;
+    ggml_cuda_memcpy_1<qs_bytes>(&qsw, x->qs + jb/2);
+    // [TAG_TURBO5P] per_lane high bits start at bit jb of the qh plane; jb is a multiple of
+    // per_lane (4 or 8) so they never straddle a byte: bits (jb%8)..(jb%8)+per_lane-1 of qh[jb/8].
+    const unsigned qhw = ((unsigned) x->qh[jb / 8]) >> (jb % 8);
+
+    alignas(16) dst_t v[per_lane];
+#pragma unroll
+    for (int e = 0; e < per_lane; ++e) {
+        const unsigned idx = ((unsigned) (qsw >> (4*e)) & 0xFu) | (((qhw >> e) & 1u) << 4);
         v[e] = (dst_t) (norm * __shfl_sync(0xFFFFFFFFu, raw_centroid, idx, WARP_SIZE));
     }
 

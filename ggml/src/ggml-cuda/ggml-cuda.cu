@@ -2070,7 +2070,7 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         const ggml_tensor * b = dst->src[1];
         auto is_turbo = [](const ggml_tensor * t) {
             return t && (t->type == GGML_TYPE_TURBO2_0 || t->type == GGML_TYPE_TURBO3_0 ||
-                         t->type == GGML_TYPE_TURBO4_0 || t->type == GGML_TYPE_TURBO4P_0);
+                         t->type == GGML_TYPE_TURBO4_0 || t->type == GGML_TYPE_TURBO4P_0 || t->type == GGML_TYPE_TURBO5P_0);
         };
         const char * e = getenv("TURBO_OP_PROBE");
         if (e && e[0] == '1' && (is_turbo(a) || is_turbo(b))) {
@@ -5110,7 +5110,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 }
                 // [TAG_TURBO4P] turbo4p packs 8 WHT groups into one 1024-element block, so
                 // the row must be a whole number of blocks, not merely group-aligned.
-                if (op->type == GGML_TYPE_TURBO4P_0 && op->src[0]->ne[0] % 1024 != 0) {
+                if ((op->type == GGML_TYPE_TURBO4P_0 || op->type == GGML_TYPE_TURBO5P_0) && op->src[0]->ne[0] % 1024 != 0) {
                     return false;
                 }
                 return (
@@ -5119,7 +5119,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                                op->type == GGML_TYPE_Q4_0 || op->type == GGML_TYPE_Q4_1 || op->type == GGML_TYPE_Q5_0 ||
                                op->type == GGML_TYPE_Q5_1 || op->type == GGML_TYPE_Q8_0 || op->type == GGML_TYPE_IQ4_NL ||
                                op->type == GGML_TYPE_TURBO3_0 || op->type == GGML_TYPE_TURBO2_0 ||
-                               op->type == GGML_TYPE_TURBO4_0 || op->type == GGML_TYPE_TURBO4P_0) &&
+                               op->type == GGML_TYPE_TURBO4_0 || op->type == GGML_TYPE_TURBO4P_0 || op->type == GGML_TYPE_TURBO5P_0) &&
                                op->src[0]->type == GGML_TYPE_F32
                            ) || (
                                op->type == GGML_TYPE_F16 && op->src[0]->type == GGML_TYPE_F16

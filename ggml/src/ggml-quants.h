@@ -121,6 +121,10 @@ GGML_API size_t quantize_turbo2_0(const float * GGML_RESTRICT src, void * GGML_R
 GGML_API void quantize_row_turbo4p_0_ref(const float * GGML_RESTRICT x, block_turbo4p_0 * GGML_RESTRICT y, int64_t k);
 GGML_API void dequantize_row_turbo4p_0(const block_turbo4p_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
 GGML_API size_t quantize_turbo4p_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix);
+// turbo5p_0: turbo4p low plane + 1-bit high plane, 32 centroids. k must be a multiple of 1024.
+GGML_API void quantize_row_turbo5p_0_ref(const float * GGML_RESTRICT x, block_turbo5p_0 * GGML_RESTRICT y, int64_t k);
+GGML_API void dequantize_row_turbo5p_0(const block_turbo5p_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+GGML_API size_t quantize_turbo5p_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix);
 
 GGML_API void iq2xs_init_impl(enum ggml_type type);
 GGML_API void iq2xs_free_impl(enum ggml_type type);

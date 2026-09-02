@@ -512,6 +512,9 @@ static ggml_type ggml_type_from_name(const std::string & s) {
     if (s == "turbo4p") {
         return GGML_TYPE_TURBO4P_0;
     }
+    if (s == "turbo5p") {
+        return GGML_TYPE_TURBO5P_0;
+    }
 
     return GGML_TYPE_COUNT;
 }

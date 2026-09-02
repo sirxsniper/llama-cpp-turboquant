@@ -472,6 +472,14 @@ static __device__ __forceinline__ void dequantize_turbo4p_0(const void * vx, con
     v.x = turbo4p_dequant_element(&x[ib], iqs + 0, norm);
     v.y = turbo4p_dequant_element(&x[ib], iqs + 1, norm);
 }
+// [TAG_TURBO5P] turbo5p: turbo4p's pair dequant over the 5-bit element helper. Same
+// same-group guarantee: iqs is even, group boundaries are multiples of 128.
+static __device__ __forceinline__ void dequantize_turbo5p_0(const void * vx, const int64_t ib, const int iqs, float2 & v){
+    const block_turbo5p_0 * x = (const block_turbo5p_0 *) vx;
+    const float norm = turbo5p_group_norm(&x[ib], iqs);
+    v.x = turbo5p_dequant_element(&x[ib], iqs + 0, norm);
+    v.y = turbo5p_dequant_element(&x[ib], iqs + 1, norm);
+}
 
 // Turbo3: 3-bit PolarQuant (2-bit qs + 1-bit sign), block size 32
 // iqs is the element index within the block (even), produces elements iqs and iqs+1

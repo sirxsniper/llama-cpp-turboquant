@@ -674,7 +674,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
     // and answered correctly while longer generations silently derailed. Measured on
     // Qwen3.8-Flash-Next with -ctk turbo4: '17 * 23' -> '2 x 1 = 2', banana -> 'Blue',
     // while q8_0 answered every probe correctly.
-    if (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0 || k->type == GGML_TYPE_TURBO4P_0) {
+    if (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0 || k->type == GGML_TYPE_TURBO4P_0 || k->type == GGML_TYPE_TURBO5P_0) {
         if (q->ne[0] % 128 != 0) {
             const int64_t pad = ((q->ne[0] + 127) / 128) * 128 - q->ne[0];
             q = ggml_pad(ctx0, q, pad, 0, 0, 0);
@@ -689,7 +689,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
 
     // If V was padded to a 128 multiple for the turbo cache, trim the output back to the
     // real head dim (build_attn does the same after its own build_attn_mha).
-    if (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0 || k->type == GGML_TYPE_TURBO4P_0) {
+    if (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0 || k->type == GGML_TYPE_TURBO4P_0 || k->type == GGML_TYPE_TURBO5P_0) {
         const int64_t orig_v_head   = hparams.n_embd_head_v(il);
         const int64_t padded_v_head = v->ne[0];
         if (padded_v_head != orig_v_head) {

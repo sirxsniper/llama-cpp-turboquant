@@ -134,6 +134,9 @@ if (CUDAToolkit_FOUND)
             template-instances/fattn-vec-instance-turbo4p_0-turbo4p_0.cu
             template-instances/fattn-vec-instance-turbo4p_0-q8_0.cu
             template-instances/fattn-vec-instance-q8_0-turbo4p_0.cu
+            template-instances/fattn-vec-instance-turbo5p_0-turbo5p_0.cu
+            template-instances/fattn-vec-instance-turbo5p_0-q8_0.cu
+            template-instances/fattn-vec-instance-q8_0-turbo5p_0.cu
             template-instances/fattn-vec-instance-turbo4p_0-turbo4_0.cu
             template-instances/fattn-vec-instance-turbo4_0-turbo4p_0.cu
             template-instances/fattn-vec-instance-turbo4_0-q8_0.cu

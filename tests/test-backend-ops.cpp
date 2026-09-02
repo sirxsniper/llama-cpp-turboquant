@@ -2474,7 +2474,7 @@ struct test_set_rows : public test_case {
         // for any correct implementation. 5e-6 still catches what matters - a wrong rotation
         // basis and a broken broadcast mapping both measured 0.38 to 1.27.
         if (type_dst == GGML_TYPE_TURBO2_0 || type_dst == GGML_TYPE_TURBO3_0 ||
-            type_dst == GGML_TYPE_TURBO4_0 || type_dst == GGML_TYPE_TURBO4P_0) {
+            type_dst == GGML_TYPE_TURBO4_0 || type_dst == GGML_TYPE_TURBO4P_0 || type_dst == GGML_TYPE_TURBO5P_0) {
             return 5e-6;
         }
         return 1e-7;
@@ -8486,6 +8486,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (ggml_type type : {GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO4_0}) {
         test_cases.emplace_back(new test_get_rows(type, 256, 5, 4, 1, 1, false));
     }
+    // [TAG_TURBO5P] Split-plane types need ne0 to be a whole number of 1024-element blocks,
+    // so they cannot share the 256-wide loop above. GET_ROWS covers getrows.cu and CPY covers
+    // convert.cu in BOTH directions (f32 -> block is the writer, block -> f32 the dequant).
+    // turbo4p had no GET_ROWS/CPY coverage before this; it is added alongside turbo5p.
+    for (ggml_type type : {GGML_TYPE_TURBO4P_0, GGML_TYPE_TURBO5P_0}) {
+        test_cases.emplace_back(new test_get_rows(type, 1024, 5, 4, 1, 1, false));
+        test_cases.emplace_back(new test_get_rows(type, 2048, 7, 3, 2, 1, false));
+        test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, type, {1024, 4, 4, 4}));
+        test_cases.emplace_back(new test_cpy(type, GGML_TYPE_F32, {1024, 4, 4, 4}));
+        test_cases.emplace_back(new test_cpy(type, GGML_TYPE_F16, {2048, 3, 2, 1}));
+    }
     for (ggml_type type : all_types) {
         for (int b : {1, 7}) {
             for (bool v : {false, true}) {
@@ -8525,6 +8536,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int64_t ne0 : {1024, 2048}) {
         test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, GGML_TYPE_TURBO4P_0, GGML_TYPE_I64, { ne0,  5, 1, 3 }, { 1, 1, }, 1, false));
         test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, GGML_TYPE_TURBO4P_0, GGML_TYPE_I64, { ne0, 11, 1, 2 }, { 2, 3, }, 7, false));
+        test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, GGML_TYPE_TURBO5P_0, GGML_TYPE_I64, { ne0,  5, 1, 3 }, { 1, 1, }, 1, false));
+        test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, GGML_TYPE_TURBO5P_0, GGML_TYPE_I64, { ne0, 11, 1, 2 }, { 2, 3, }, 7, false));
     }
 
     for (ggml_type type : {GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO4_0}) {
@@ -10162,6 +10175,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_TURBO4P_0, GGML_TYPE_TURBO4P_0));
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_TURBO4P_0, GGML_TYPE_Q8_0));
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_TURBO4P_0));
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_TURBO5P_0, GGML_TYPE_TURBO5P_0));
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_TURBO5P_0, GGML_TYPE_Q8_0));
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_TURBO5P_0));
       }
     }
 

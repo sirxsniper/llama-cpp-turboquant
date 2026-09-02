@@ -579,6 +579,120 @@ static void dequantize_row_turbo4p_0_nc_cuda(const void * vx, dst_t * y,
         (vx, y, ne00, ne01, ne0203, ne02_fdv, s01, s02, s03);
 }
 
+
+// ---- [TAG_TURBO5P] turbo5p conversions: turbo4p's kernels over the 5-bit lane helper ----
+template <typename dst_t>
+static __global__ void dequantize_block_turbo5p_0_coop(
+        const void * __restrict__ vx, dst_t * __restrict__ y, const int64_t k) {
+
+    constexpr int per_lane = turbo5p_lane_shape<dst_t>::elems;
+    constexpr int per_warp = turbo5p_lane_shape<dst_t>::per_warp;
+
+    const block_turbo5p_0 * __restrict__ x = (const block_turbo5p_0 *) vx;
+
+    // Warp-uniform, so the whole warp leaves together and the __shfl_sync below keeps a
+    // full mask.
+    const int64_t iw = (int64_t) blockIdx.x * (blockDim.x / WARP_SIZE) + (threadIdx.x / WARP_SIZE);
+    const int64_t e0 = iw * per_warp;
+    if (e0 >= k) {
+        return;
+    }
+    const int lane = threadIdx.x % WARP_SIZE;
+
+    // The launcher asserts k % QK_TURBO5P == 0 and per_warp divides QK_TURBO5P, so every
+    // lane of a warp that got here is fully in bounds - no partial-store tail path.
+    const int64_t j  = e0 + lane * per_lane;
+    const int64_t ib = j / QK_TURBO5P;
+    const int     jb = (int) (j % QK_TURBO5P);
+
+    const float raw_centroid = TURBO_CENTROIDS_5BIT[lane];
+
+    turbo5p_dequant_lane<dst_t>(&x[ib], jb, raw_centroid, &y[j]);
+}
+
+template<typename dst_t>
+static void dequantize_row_turbo5p_0_cuda(const void * __restrict__ vx, dst_t * __restrict__ y,
+                                          const int64_t k, cudaStream_t stream) {
+    GGML_ASSERT(k % QK_TURBO5P == 0 && "turbo5p dequant needs block-aligned lengths");
+    constexpr int per_warp        = turbo5p_lane_shape<dst_t>::per_warp;
+    constexpr int warps_per_block = 4;
+    const int64_t nwarps = k / per_warp;
+    const int64_t grid   = (nwarps + warps_per_block - 1) / warps_per_block;
+    dequantize_block_turbo5p_0_coop<dst_t>
+        <<<grid, warps_per_block*WARP_SIZE, 0, stream>>>(vx, y, k);
+}
+
+// ---- turbo5p -> dst, NON-CONTIGUOUS (strided) source ----
+//
+// Same conversion as the contiguous kernel above, over the strided layout that
+// ggml_get_to_fp16_nc_cuda hands out: a row of ne00 elements with row/slice strides
+// s01/s02/s03 in BLOCKS, destination packed [ne00, ne01, ne02*ne03].
+//
+// [TAG_TURBO4_NC_GRID_STRIDE] The launcher clamps grid.y and grid.z to the hardware's 65535
+// limit, so the kernel MUST grid-stride over both. The turbo4_0 version of this kernel once
+// dropped the loops and kept the clamp, and every slice at or past 65535 was silently never
+// written - reachable at roughly 65K depth whenever the KV view is not contiguously
+// allocated (n_seq > 1 && n_kv < kv_size, where ne0203 = n_kv*n_seq).
+template <typename dst_t>
+static __global__ void dequantize_block_turbo5p_0_nc(
+        const void * __restrict__ vx, dst_t * __restrict__ y,
+        const int64_t ne00, const int64_t ne01, const int64_t ne0203,
+        const uint3 ne02_fdv, const int64_t s01, const int64_t s02, const int64_t s03) {
+
+    constexpr int per_lane = turbo5p_lane_shape<dst_t>::elems;
+    constexpr int per_warp = turbo5p_lane_shape<dst_t>::per_warp;
+
+    const int64_t warps_per_row = ne00 / per_warp;
+
+    // Everything up to here is independent of i01/i0203, so it is hoisted above the
+    // grid-stride loops. Warp-uniform exit, as in the contiguous kernel.
+    const int     warps_per_block = blockDim.x / WARP_SIZE;
+    const int64_t iw = (int64_t) blockIdx.x * warps_per_block + (threadIdx.x / WARP_SIZE);
+    if (iw >= warps_per_row) {
+        return;
+    }
+    const int lane = threadIdx.x % WARP_SIZE;
+
+    const int64_t j         = iw * per_warp + lane * per_lane;  // element offset within the row
+    const int64_t ib_in_row = j / QK_TURBO5P;
+    const int     jb        = (int) (j % QK_TURBO5P);
+
+    const float raw_centroid = TURBO_CENTROIDS_5BIT[lane];
+
+    for (int64_t i01 = blockIdx.y; i01 < ne01; i01 += gridDim.y) {
+        for (int64_t i0203 = blockIdx.z; i0203 < ne0203; i0203 += gridDim.z) {
+            const uint2   dm  = fast_div_modulo((uint32_t) i0203, ne02_fdv);
+            const int64_t i02 = dm.y;
+            const int64_t i03 = dm.x;
+
+            const int64_t ibx0 = i03*s03 + i02*s02 + i01*s01;
+            const block_turbo5p_0 * __restrict__ x =
+                (const block_turbo5p_0 *) vx + ibx0 + ib_in_row;
+
+            dst_t * __restrict__ yrow = y + (i0203*ne01 + i01)*ne00 + j;
+
+            turbo5p_dequant_lane<dst_t>(x, jb, raw_centroid, yrow);
+        }
+    }
+}
+
+template<typename dst_t>
+static void dequantize_row_turbo5p_0_nc_cuda(const void * vx, dst_t * y,
+        const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t ne03,
+        const int64_t s01, const int64_t s02, const int64_t s03, cudaStream_t stream) {
+    GGML_ASSERT(ne00 % QK_TURBO5P == 0 && "turbo5p nc dequant needs block-aligned rows");
+    const int64_t ne0203 = ne02*ne03;
+    const uint3 ne02_fdv = init_fastdiv_values(ne02);
+    constexpr int per_warp        = turbo5p_lane_shape<dst_t>::per_warp;
+    constexpr int warps_per_block = 4;
+    const int64_t warps_per_row = ne00 / per_warp;
+    const dim3 num_blocks((unsigned) ((warps_per_row + warps_per_block - 1) / warps_per_block),
+                          (unsigned) std::min(ne01,   (int64_t) 65535),
+                          (unsigned) std::min(ne0203, (int64_t) 65535));
+    dequantize_block_turbo5p_0_nc<dst_t><<<num_blocks, warps_per_block*WARP_SIZE, 0, stream>>>
+        (vx, y, ne00, ne01, ne0203, ne02_fdv, s01, s02, s03);
+}
+
 static void dequantize_block_q8_0_f16_cuda(const void * __restrict__ vx, half * __restrict__ y, const int64_t k, cudaStream_t stream) {
     const int num_blocks = (k + CUDA_Q8_0_NE_ALIGN - 1) / CUDA_Q8_0_NE_ALIGN;
     if (k % CUDA_Q8_0_NE_ALIGN == 0) {
@@ -891,6 +1005,8 @@ to_fp16_cuda_t ggml_get_to_fp16_cuda(ggml_type type) {
             return dequantize_row_turbo4_0_cuda;
         case GGML_TYPE_TURBO4P_0:
             return dequantize_row_turbo4p_0_cuda;
+        case GGML_TYPE_TURBO5P_0:
+            return dequantize_row_turbo5p_0_cuda;
         case GGML_TYPE_F32:
             return convert_unary_cont_cuda<float>;
         case GGML_TYPE_BF16:
@@ -956,6 +1072,8 @@ to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type) {
             return dequantize_row_turbo4_0_cuda;
         case GGML_TYPE_TURBO4P_0:
             return dequantize_row_turbo4p_0_cuda;
+        case GGML_TYPE_TURBO5P_0:
+            return dequantize_row_turbo5p_0_cuda;
         case GGML_TYPE_F16:
             return convert_unary_cont_cuda<half>;
         case GGML_TYPE_BF16:
@@ -991,6 +1109,8 @@ to_fp16_nc_cuda_t ggml_get_to_fp16_nc_cuda(ggml_type type) {
             return dequantize_row_turbo4_0_nc_cuda;
         case GGML_TYPE_TURBO4P_0:
             return dequantize_row_turbo4p_0_nc_cuda;
+        case GGML_TYPE_TURBO5P_0:
+            return dequantize_row_turbo5p_0_nc_cuda;
         case GGML_TYPE_BF16:
             return convert_unary_cuda<nv_bfloat16>;
         default:
@@ -1049,6 +1169,8 @@ to_fp32_nc_cuda_t ggml_get_to_fp32_nc_cuda(ggml_type type) {
             return dequantize_row_turbo4_0_nc_cuda;
         case GGML_TYPE_TURBO4P_0:
             return dequantize_row_turbo4p_0_nc_cuda;
+        case GGML_TYPE_TURBO5P_0:
+            return dequantize_row_turbo5p_0_nc_cuda;
         case GGML_TYPE_BF16:
             return convert_unary_cuda<nv_bfloat16, float>;
         default:

@@ -69,7 +69,7 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
         const char * idx_inherit = getenv("TURBO_IDX_INHERIT");
         const bool  inherit_idx  = idx_inherit && idx_inherit[0] == '1';
         const bool  k_is_turbo   = (type_k == GGML_TYPE_TURBO2_0 || type_k == GGML_TYPE_TURBO3_0 ||
-                                    type_k == GGML_TYPE_TURBO4_0 || type_k == GGML_TYPE_TURBO4P_0);
+                                    type_k == GGML_TYPE_TURBO4_0 || type_k == GGML_TYPE_TURBO4P_0 || type_k == GGML_TYPE_TURBO5P_0);
         // q8_0, not F16: half the memory (1.5 GiB vs 3.0 at 262144) and measured just as
         // fast on this path, which buys back a whole expert layer on the GPU.
         // TURBO_IDX_TYPE=f16 forces F16 if a future arch needs the precision.

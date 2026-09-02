@@ -381,6 +381,31 @@ typedef struct {
 static_assert(sizeof(block_turbo4p_0) == 528, "wrong turbo4p_0 block size");
 static_assert(QK_TURBO4P % QK_TURBO4P_GROUP == 0, "turbo4p group must divide the block");
 static_assert(QK_TURBO4P_GROUP == QK_TURBO4, "turbo4p reuses the turbo4 WHT group and centroids");
+// ---- TurboQuant 5-bit, SPLIT-PLANE layout [TAG_TURBO5P] ----
+//
+// turbo4p plus one high-bit plane. Same 128-element signed WHT group, same per-group L2
+// norm and norm correction, but 32 Lloyd-Max centroids fitted to the measured post-WHT
+// histogram (see [TAG_TURBO4_CODEBOOK]), which is 3.6x less MSE than 16 levels.
+//
+// Layout: qs is byte-identical to block_turbo4p_0 and holds the LOW 4 bits of each index;
+// qh holds the HIGH bit, element i at bit (i % 8) of qh[i / 8]. Index = nib | (bit << 4).
+// This keeps 5-bit extraction to one AND and one shift instead of the cross-byte shifting
+// a bit-packed layout needs - which is what makes turbo3 slower than turbo4p despite
+// reading fewer bytes.
+//
+// 656 = 16 * 41, so every block base is 16-byte aligned; qs at offset 0, qh at 512,
+// norms at 640. 5.125 bpw against turbo4p's 4.125 and q8_0's 8.5.
+#define QK_TURBO5P       1024
+#define QK_TURBO5P_GROUP 128
+#define QK_TURBO5P_NGRP    8
+
+typedef struct {
+    uint8_t   qs[QK_TURBO5P / 2];      // 512 bytes: low 4 bits, element i in nibble i%2 of qs[i/2]
+    uint8_t   qh[QK_TURBO5P / 8];      // 128 bytes: high bit,   element i at bit i%8 of qh[i/8]
+    ggml_half norm[QK_TURBO5P_NGRP];   //  16 bytes: L2 norm of each 128-element WHT group
+} block_turbo5p_0;                     // 656 bytes total
+static_assert(sizeof(block_turbo5p_0) == 656, "wrong turbo5p_0 block size");
+static_assert(QK_TURBO5P == QK_TURBO4P && QK_TURBO5P_GROUP == QK_TURBO4P_GROUP, "turbo5p shares the turbo4p block geometry");
 
 // TurboQuant 2-bit: 2-bit PolarQuant indices only (no QJL)
 // Per block: norm(fp16) + 2-bit indices (8 bytes) = 10 bytes per 32 values

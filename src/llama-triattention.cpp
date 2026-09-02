@@ -908,7 +908,8 @@ static void triattention_init_gpu(triattention_state * state, ggml_type k_type) 
 // 128-point Hadamard has mixed, so the eviction decisions were noise.
     gcfg.need_wht_inv = (k_type == GGML_TYPE_TURBO2_0 || k_type == GGML_TYPE_TURBO3_0 ||
                          k_type == GGML_TYPE_TURBO4_0 ||
-                         k_type == GGML_TYPE_TURBO4P_0);
+                         k_type == GGML_TYPE_TURBO4P_0 ||
+                         k_type == GGML_TYPE_TURBO5P_0);
     gcfg.disable_trig = cfg.disable_trig;
 
     std::vector<triattention_gpu_head_calib> gcalibs(cal->n_sampled);
@@ -1273,7 +1274,8 @@ int32_t triattention_prune_impl(
             // [TAG_TRIATT_TURBO4_WHT] see above
             const bool need_wht_inv = (k_type_l == GGML_TYPE_TURBO2_0 || k_type_l == GGML_TYPE_TURBO3_0 ||
                                        k_type_l == GGML_TYPE_TURBO4_0 ||
-                                       k_type_l == GGML_TYPE_TURBO4P_0);
+                                       k_type_l == GGML_TYPE_TURBO4P_0 ||
+                                       k_type_l == GGML_TYPE_TURBO5P_0);
 
             // 3a. Dequantize K for this KV head for all decode cells
             triattention_dequant_kv_head(

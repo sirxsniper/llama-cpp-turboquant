@@ -75,7 +75,7 @@ static void ggml_gen_hadamard(ggml_tensor * tensor) {
 // they were drifting.
 static inline bool llama_type_is_turbo(ggml_type t) {
     return t == GGML_TYPE_TURBO2_0 || t == GGML_TYPE_TURBO3_0 ||
-           t == GGML_TYPE_TURBO4_0 || t == GGML_TYPE_TURBO4P_0;
+           t == GGML_TYPE_TURBO4_0 || t == GGML_TYPE_TURBO4P_0 || t == GGML_TYPE_TURBO5P_0;
 }
 
 llama_kv_cache::llama_kv_cache(
@@ -352,14 +352,14 @@ llama_kv_cache::llama_kv_cache(
         // QK_TURBO4P lives in ggml-common.h, which this layer does not include. Keep the
         // value local and named rather than pulling that header in for one constant.
         const uint32_t turbo4p_blk = 1024;
-        if (layer_type_k == GGML_TYPE_TURBO4P_0 && n_embd_k_gqa_eff % turbo4p_blk != 0) {
+        if ((layer_type_k == GGML_TYPE_TURBO4P_0 || layer_type_k == GGML_TYPE_TURBO5P_0) && n_embd_k_gqa_eff % turbo4p_blk != 0) {
             throw std::runtime_error(format(
-                "turbo4p K needs n_embd_k_gqa to be a multiple of %d, got %u on layer %d. Use turbo4 instead.",
+                "split-plane K (turbo4p/turbo5p) needs n_embd_k_gqa to be a multiple of %d, got %u on layer %d. Use turbo4 instead.",
                 (int) turbo4p_blk, n_embd_k_gqa_eff, il));
         }
-        if (layer_type_v == GGML_TYPE_TURBO4P_0 && n_embd_v_gqa_eff % turbo4p_blk != 0) {
+        if ((layer_type_v == GGML_TYPE_TURBO4P_0 || layer_type_v == GGML_TYPE_TURBO5P_0) && n_embd_v_gqa_eff % turbo4p_blk != 0) {
             throw std::runtime_error(format(
-                "turbo4p V needs n_embd_v_gqa to be a multiple of %d, got %u on layer %d. Use turbo4 instead.",
+                "split-plane V (turbo4p/turbo5p) needs n_embd_v_gqa to be a multiple of %d, got %u on layer %d. Use turbo4 instead.",
                 (int) turbo4p_blk, n_embd_v_gqa_eff, il));
         }
 

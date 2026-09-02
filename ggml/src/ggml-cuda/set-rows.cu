@@ -1116,6 +1116,7 @@ static __global__ void k_set_rows_turbo4(
 
     // ---- Step 5: Quantize element j to 4-bit centroid ----
     const float rv = x[j];
+    turbo_wht_hist_add(rv);   // [TAG_TURBO4_HIST] no-op unless TURBO_WHT_HIST is set
     const uint8_t idx = turbo_nearest_centroid_4bit(rv);
 
     // ---- Step 6: Pack qs (nibble packed, warp-cooperative) ----
@@ -1186,7 +1187,9 @@ static void set_rows_cuda_turbo4(
     const int64_t s12 = nb12/sizeof(idx_t);
 
     // InnerQ: check/finalize calibration before kernel launch
+    turbo_wht_hist_init();
     turbo_innerq_check_finalize(QK_TURBO4, ne00);
+    turbo_wht_hist_dump();
 
     if (n_blocks > 0) {
         const int64_t ne_total = n_blocks * ne01 * ne02 * ne03;
@@ -1360,6 +1363,7 @@ static __global__ void k_set_rows_turbo4p(
 
     // ---- Step 5: Quantize element j to 4-bit centroid ----
     const float rv = x[j];
+    turbo_wht_hist_add(rv);   // [TAG_TURBO4_HIST] no-op unless TURBO_WHT_HIST is set
     const uint8_t idx = turbo_nearest_centroid_4bit(rv);
 
     // ---- Step 6: Pack qs (nibble packed, warp-cooperative) ----
@@ -1434,12 +1438,253 @@ static void set_rows_cuda_turbo4p(
 
     // InnerQ: check/finalize calibration before kernel launch. The group is still 128 wide
     // and still one head, so the calibration is the same as turbo4's.
+    turbo_wht_hist_init();
     turbo_innerq_check_finalize(QK_TURBO4P_GROUP, ne00);
+    turbo_wht_hist_dump();
 
     if (n_groups > 0) {
         const int64_t ne_total = n_groups * ne01 * ne02 * ne03;
         k_set_rows_turbo4p<idx_t><<<(int)ne_total, QK_TURBO4P_GROUP, 0, stream>>>(
             src0_d, src1_d, (block_turbo4p_0 *)dst->data,
+            ne00, ne01, ne02, ne10, ne11, ne12, ne13,
+            s01, s02, s03, s10, s11, s12,
+            nb1, nb2, nb3);
+    }
+}
+
+
+// ---- [TAG_TURBO5P] turbo5p writer: turbo4p's kernel plus the high-bit plane ----
+template <typename idx_t>
+__launch_bounds__(128)
+static __global__ void k_set_rows_turbo5p(
+        const float * __restrict__ src0,
+        const idx_t * __restrict__ src1,
+        block_turbo5p_0 * __restrict__ dst,
+        const int64_t ne00,
+        const int64_t ne01,
+        const int64_t ne02,
+        const int64_t ne10,
+        const int64_t ne11,
+        const int64_t ne12,
+        const int64_t ne13,
+        const int64_t s01,
+        const int64_t s02,
+        const int64_t s03,
+        const int64_t s10,
+        const int64_t s11,
+        const int64_t s12,
+        const int64_t s1,
+        const int64_t s2,
+        const int64_t s3) {
+
+    // blockIdx.x = flat group index; threadIdx.x = element within the group (0..127)
+    const int j = threadIdx.x;
+
+    // Decode blockIdx.x → (i_grp, i01, i02, i03)
+    const int64_t n_groups_per_row = ne00 / QK_TURBO5P_GROUP;
+    const int64_t g = blockIdx.x;
+    const int64_t i_grp = g % n_groups_per_row;
+    int64_t       tmp   = g / n_groups_per_row;
+    const int64_t i01   = tmp % ne01;
+    tmp                 = tmp / ne01;
+    // Decode src0's own dim-2 extent, and map to src1 the way the generic quantized
+    // path does (k_set_rows_quant): src1's dim 1 is indexed by src0's dim 2 and src1's
+    // dim 2 by src0's dim 3, each modulo the src1 extent so a broadcast repeats.
+    // Decoding with ne12 instead and setting i12 = i02 / i11 = i01 % ne11 is shifted by one
+    // dimension and never broadcasts. It only agrees with the reference when ne02 == 1,
+    // because then s03 == s02 and the wrong index reads the right address.
+    // 32-bit div/mod: these extents are all far below 2^32 and 64-bit integer division
+    // costs roughly an order of magnitude more instructions on the GPU. Measured on the
+    // turbo4 kernel: doing this in int64 cost 5.5% of pp512.
+    const uint32_t tmp32  = (uint32_t) tmp;
+    const uint32_t ne02_u = (uint32_t) ne02;
+    const int64_t i02   = (int64_t) (tmp32 % ne02_u);
+    const int64_t i03   = (int64_t) (tmp32 / ne02_u);
+
+    const int64_t i12 = (int64_t) ((uint32_t) i03 % (uint32_t) ne12);
+    const int64_t i11 = (int64_t) ((uint32_t) i02 % (uint32_t) ne11);
+    const int64_t i10 = i01;
+
+    const int64_t dst_row = *(src1 + i10*s10 + i11*s11 + i12*s12);
+    const float * src_row = src0 + i01*s01 + i02*s02 + i03*s03;
+    block_turbo5p_0 * dst_row_ptr = (block_turbo5p_0 *)((char *)dst + dst_row*s1 + i02*s2 + i03*s3);
+
+    // Split the row-local group index into (block, group within block).
+    const int       gsub    = (int) (i_grp % QK_TURBO5P_NGRP);
+    block_turbo5p_0 * blk   = dst_row_ptr + (i_grp / QK_TURBO5P_NGRP);
+    uint8_t * __restrict__ qs_grp = blk->qs + gsub * (QK_TURBO5P_GROUP / 2);
+    uint8_t * __restrict__ qh_grp = blk->qh + gsub * (QK_TURBO5P_GROUP / 8);
+
+    // ---- Step 1: Load element j (coalesced) ----
+    __shared__ float x[QK_TURBO5P_GROUP];
+    x[j] = src_row[i_grp * QK_TURBO5P_GROUP + j];
+    __syncthreads();
+
+    // ---- InnerQ: calibrate on original (unscaled) values ----
+    if (d_innerq_calibrating) {
+        atomicAdd(&d_innerq_sq_accum[j], x[j] * x[j]);
+        if (j == 0) atomicAdd(&d_innerq_count, 1);
+    }
+
+    // ---- InnerQ: apply channel scale (only when active) ----
+    if (d_innerq_active) {
+        x[j] *= d_innerq_scale[j];
+    }
+    __syncthreads();
+
+    // ---- Step 2: Parallel L2 norm ----
+    constexpr int n_warps = QK_TURBO5P_GROUP / WARP_SIZE;  // = 4
+    __shared__ float warp_accum[n_warps];
+    float v = x[j];
+    float v2 = v * v;
+    for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1)
+        v2 += __shfl_xor_sync(0xffffffff, v2, offset);
+    if (j % WARP_SIZE == 0)
+        warp_accum[j / WARP_SIZE] = v2;
+    __syncthreads();
+
+    __shared__ float s_norm_sq;
+    if (j == 0) {
+        float total = 0.0f;
+        for (int w = 0; w < n_warps; w++) total += warp_accum[w];
+        s_norm_sq = total;
+    }
+    __syncthreads();
+    const float grp_norm  = sqrtf(s_norm_sq);
+    const float inv_norm  = (grp_norm > 1e-10f) ? 1.0f / grp_norm : 0.0f;
+
+    // ---- Step 3: Normalize ----
+    x[j] *= inv_norm;
+    __syncthreads();
+
+    // ---- Step 4: Forward WHT (signs1 → butterfly → signs2, normalized) ----
+    x[j] *= TURBO_WHT_SIGNS1[j];
+    __syncthreads();
+
+    // For h < 32 the partner j^h is always in the same warp, so those stages run in
+    // registers via __shfl_xor_sync with no idle threads and no barrier. Only h = 32 and
+    // h = 64 cross a warp and need shared memory. The lane holding the LOW element
+    // ((j & h) == 0) wants a+b; the lane holding the high element wants a-b, which for
+    // that lane is (partner - self).
+    {
+        float v = x[j];
+#pragma unroll
+        for (int h = 1; h < 32; h <<= 1) {
+            const float partner = __shfl_xor_sync(0xffffffffu, v, h);
+            v = (j & h) ? (partner - v) : (v + partner);
+        }
+        x[j] = v;
+    }
+    // MANDATORY barrier between the warp-scope and block-scope halves of the butterfly.
+    // Dropping it made turbo4 non-deterministic: stage 32 reads x[j+32], written by another
+    // warp above (fixed in 9fab66162, regression test 38186ce59).
+    __syncthreads();
+
+#define WHT_STAGE_SHARED_T5P(h) \
+    if (j % (2*(h)) < (h)) { float a = x[j], b = x[j+(h)]; x[j] = a+b; x[j+(h)] = a-b; } \
+    __syncthreads();
+
+    WHT_STAGE_SHARED_T5P(32)
+    WHT_STAGE_SHARED_T5P(64)
+#undef WHT_STAGE_SHARED_T5P
+
+    constexpr float inv_sqrt_128 = 0.08838834764831845f;
+    x[j] = x[j] * inv_sqrt_128 * TURBO_WHT_SIGNS2[j];
+    __syncthreads();
+
+    // ---- Step 5: Quantize element j to 4-bit centroid ----
+    const float rv = x[j];
+    // [TAG_TURBO5P] histogram hook intentionally omitted: it samples the 4-bit writer.
+    const uint8_t idx = turbo_nearest_centroid_5bit(rv);
+
+    // ---- Step 6: Pack qs (nibble packed, warp-cooperative) ----
+    // Threads (j, j+1) share byte j/2 of this group's 64-byte qs run: the EVEN thread
+    // supplies the low nibble and the odd one the high nibble. j and j^1 differ only in
+    // bit 0, so the partner is always in the same warp.
+    const int lane = j % WARP_SIZE;
+    const uint8_t my_nibble = idx & 0xF;
+    uint8_t partner_nibble = __shfl_sync(0xffffffff, my_nibble, lane ^ 1);
+    if (j % 2 == 0) {
+        qs_grp[j / 2] = (uint8_t) (my_nibble | (partner_nibble << 4));
+    }
+    // [TAG_TURBO5P] High bit: one ballot gives all 32 lanes' bits; the lane at the start of
+    // each 8-element run stores its byte. Bit b of that byte is element (j&~7)+b, matching
+    // the CPU reference's qh[gi/8] |= hi << (gi%8).
+    const unsigned my_hi   = ((unsigned) idx >> 4) & 1u;
+    const unsigned hi_mask = __ballot_sync(0xffffffff, my_hi);
+    if ((lane & 7) == 0) {
+        qh_grp[j / 8] = (uint8_t) ((hi_mask >> (lane & ~7u)) & 0xFFu);
+    }
+
+    // ---- Step 7: Reconstruction norm (parallel) ----
+    const float c = TURBO_CENTROIDS_5BIT[idx];
+    float rc = c * c;
+    for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1)
+        rc += __shfl_xor_sync(0xffffffff, rc, offset);
+    if (j % WARP_SIZE == 0)
+        warp_accum[j / WARP_SIZE] = rc;
+    __syncthreads();
+
+    __shared__ float s_recon_sq;
+    if (j == 0) {
+        float total = 0.0f;
+        for (int w = 0; w < n_warps; w++) total += warp_accum[w];
+        s_recon_sq = total;
+    }
+    __syncthreads();
+    const float recon_norm     = sqrtf(s_recon_sq);
+    const float corrected_norm = (recon_norm > 1e-10f) ? grp_norm / recon_norm : grp_norm;
+
+    // ---- Step 8: Write this group's corrected norm ----
+    // norm[] holds the CORRECTED norm, not the raw L2 norm, matching both turbo4_0 writers.
+    // Each of the eight groups computes its own and writes its own slot, so the eight
+    // 2-byte stores into one block come from eight different CUDA blocks. There is nothing
+    // to coalesce there and no wider store is possible.
+    if (j == 0) {
+        blk->norm[gsub] = __float2half(corrected_norm);
+    }
+
+    GGML_UNUSED(ne10);
+    GGML_UNUSED(ne13);
+}
+
+template<typename idx_t>
+static void set_rows_cuda_turbo5p(
+        ggml_backend_cuda_context & ctx,
+        const ggml_tensor * src0,
+        const ggml_tensor * src1,
+        ggml_tensor * dst) {
+
+    const float * src0_d = (const float *)src0->data;
+    const idx_t * src1_d = (const idx_t *)src1->data;
+
+    GGML_TENSOR_BINARY_OP_LOCALS
+    // Whole blocks only: a partial block would leave some of the eight norm slots unwritten
+    // and there is no tail kernel. n_embd_k_gqa must be a multiple of 1024 to use this type.
+    GGML_ASSERT(ne00 % QK_TURBO5P == 0);
+
+    cudaStream_t stream = ctx.stream();
+
+    // One CUDA block per WHT group, not per turbo5p block.
+    const int64_t n_groups = ne00 / QK_TURBO5P_GROUP;
+
+    const int64_t s01 = nb01/sizeof(float);
+    const int64_t s02 = nb02/sizeof(float);
+    const int64_t s03 = nb03/sizeof(float);
+    const int64_t s10 = nb10/sizeof(idx_t);
+    const int64_t s11 = nb11/sizeof(idx_t);
+    const int64_t s12 = nb12/sizeof(idx_t);
+
+    // InnerQ: check/finalize calibration before kernel launch. The group is still 128 wide
+    // and still one head, so the calibration is the same as turbo4's.
+    turbo_wht_hist_init();
+    turbo_innerq_check_finalize(QK_TURBO5P_GROUP, ne00);
+    turbo_wht_hist_dump();
+
+    if (n_groups > 0) {
+        const int64_t ne_total = n_groups * ne01 * ne02 * ne03;
+        k_set_rows_turbo5p<idx_t><<<(int)ne_total, QK_TURBO5P_GROUP, 0, stream>>>(
+            src0_d, src1_d, (block_turbo5p_0 *)dst->data,
             ne00, ne01, ne02, ne10, ne11, ne12, ne13,
             s01, s02, s03, s10, s11, s12,
             nb1, nb2, nb3);
@@ -1554,6 +1799,8 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
         set_rows_cuda_turbo4<idx_t>(ctx, src0, src1, dst);
     } else if (dst->type == GGML_TYPE_TURBO4P_0) {
         set_rows_cuda_turbo4p<idx_t>(ctx, src0, src1, dst);
+    } else if (dst->type == GGML_TYPE_TURBO5P_0) {
+        set_rows_cuda_turbo5p<idx_t>(ctx, src0, src1, dst);
     } else {
         GGML_ABORT("unsupported type %s", ggml_type_name(dst->type));
     }
