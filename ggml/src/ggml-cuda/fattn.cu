@@ -902,8 +902,18 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
             //
             // Revisit only WITH a measurement: the memory is real and would buy roughly one more
             // slot at 256K, so if VRAM ever becomes the binding constraint the trade may flip.
-            need_f16_K = true;
-            need_f16_V = true;
+            //
+            // [TAG_TURBO_FA_RECLAIM] Default is now the reclaim path: a natively-read turbo cache reserves
+            // no F16 scratch (about 1 GiB at 256K on Qwen3.8-27B). TURBO_FA_RECLAIM=0 restores the
+            // over-reservation if the placement cost above ever shows up again.
+            {
+                static const bool reclaim = [] {
+                    const char * e = getenv("TURBO_FA_RECLAIM");
+                    return !(e && e[0] == '0');
+                }();
+                need_f16_K = reclaim ? !ggml_cuda_fattn_turbo_reads_native(dst, true) : true;
+                need_f16_V = need_f16_K;
+            }
             break;
         case BEST_FATTN_KERNEL_VEC:
             need_f16_K = K->type == GGML_TYPE_F32;
