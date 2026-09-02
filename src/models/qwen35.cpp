@@ -155,6 +155,15 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
     ggml_tensor * inp_pos     = build_inp_pos();
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
+    // [TAG_LAST_LAYER_CROP] Crop to the output rows unless h_nextn is needed for EVERY
+    // token. Testing embeddings_nextn_masked alone got this backwards: it defaults to
+    // false, so with no drafter attached the crop was skipped and the last block's
+    // attention, norms and FFN ran on the whole ubatch instead of the few output rows.
+    // mimo2.cpp and nemotron-h-moe.cpp already use this form.
+    const bool crop_last_layer = inp_out_ids &&
+        (!cparams.embeddings_nextn || cparams.embeddings_nextn_masked);
+    // Exactly one crop per graph: either here in the last layer, or at the tail after h_nextn.
+
     // MTP/NextN layers are loaded as extra decoder blocks but not executed in the main pass.
     for (int il = 0; il < n_layer; ++il) {
         res->t_layer_inp[il] = inpL;
@@ -175,13 +184,6 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
             cur = build_layer_attn(inp->get_attn(), cur, inp_pos, sections, il);
         }
 
-        // [TAG_LAST_LAYER_CROP] Crop to the output rows unless h_nextn is needed for EVERY
-        // token. Testing embeddings_nextn_masked alone got this backwards: it defaults to
-        // false, so with no drafter attached the crop was skipped and the last block's
-        // attention, norms and FFN ran on the whole ubatch instead of the few output rows.
-        // mimo2.cpp and nemotron-h-moe.cpp already use this form.
-        const bool crop_last_layer = inp_out_ids &&
-            (!cparams.embeddings_nextn || cparams.embeddings_nextn_masked);
         if (il == n_layer - 1 && crop_last_layer) {
             cur   = ggml_get_rows(ctx0, cur,   inp_out_ids);
             inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
@@ -219,7 +221,12 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
     cb(cur, "h_nextn", -1);
     res->t_h_nextn = cur;
 
-    if (!cparams.embeddings_nextn_masked && inp_out_ids) {
+    // [TAG_LAST_LAYER_CROP] The last layer already selected the output rows in the common case.
+    // Cropping again here indexes a tensor that only has n_outputs rows with batch-relative
+    // out_ids: row out_ids[0] of a 1-row tensor is out of bounds for every prompt longer than
+    // one token, so the LM head read a stale or zero row for the first token after a prefill.
+    // Crop here only when h_nextn had to stay full-width (emitted for every token, unmasked).
+    if (!crop_last_layer && inp_out_ids) {
         cur = ggml_get_rows(ctx0, cur, inp_out_ids);
     }
 
