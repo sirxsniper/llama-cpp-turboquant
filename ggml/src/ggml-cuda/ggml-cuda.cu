@@ -2617,8 +2617,29 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
     return use_cuda_graph;
 }
 
+// [TAG_CUDA_GRAPH_STRUCT_KEY] Key the per-context CUDA graphs by the graph STRUCTURE (op, type, shape
+// of every node), not by the address of the first node. llama rebuilds the ggml graph whenever its
+// reuse check fails, and the DFlash drafter fails it on every decode (two batch shapes per step, one
+// of variable length), so with a pointer key every draft decode started a fresh warmup and never
+// captured: ~150 raw launches per draft decode at ~7 us each on WDDM. With a structural key a rebuilt
+// graph of the same shape lands on the same object; the node-property comparison in
+// ggml_cuda_graph_update_required still decides whether it can be replayed, so a shape whose
+// allocation moved simply re-warms as before. Distinct shapes get distinct objects, and the 10 s
+// eviction sweep bounds the map.
 static const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
-    return cgraph->nodes[0];
+    uint64_t h = 1469598103934665603ull;   // FNV-1a
+    auto mix = [&h](uint64_t v) { h ^= v; h *= 1099511628211ull; };
+    mix((uint64_t) cgraph->n_nodes);
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        const ggml_tensor * t = cgraph->nodes[i];
+        mix((uint64_t) t->op); mix((uint64_t) t->type);
+        mix((uint64_t) t->ne[0]); mix((uint64_t) t->ne[1]); mix((uint64_t) t->ne[2]); mix((uint64_t) t->ne[3]);
+        for (int j = 0; j < GGML_MAX_SRC; j++) {
+            if (t->src[j]) { mix((uint64_t) t->src[j]->type); mix((uint64_t) t->src[j]->ne[0]); mix((uint64_t) t->src[j]->ne[1]); }
+        }
+    }
+    if (h == 0) { h = 1; }
+    return reinterpret_cast<const void *>((uintptr_t) h);
 }
 
 static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph) {
