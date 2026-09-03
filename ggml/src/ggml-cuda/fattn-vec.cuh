@@ -27,6 +27,8 @@ static __global__ void flash_attn_ext_vec(
         const char * V_ptr,
         const char * mask_ptr,
         const char * sinks_ptr,
+        const int32_t * __restrict__ kv_pos, // [TAG_FA_POS_MASK]
+        const int32_t * __restrict__ q_pos,
         const int  * KV_max_ptr,
         float      * dst_ptr,
         float2     * dst_meta_ptr,
@@ -56,7 +58,7 @@ static __global__ void flash_attn_ext_vec(
 
     // Skip unused kernel variants for faster compilation:
     if (use_logit_softcap && !(D == 128 || D == 256)) {
-        GGML_UNUSED_VARS(Q, K, V, mask, sinks, KV_max, dst, dst_meta, scale,
+        GGML_UNUSED_VARS(Q, K, V, mask, sinks, kv_pos, q_pos, KV_max, dst, dst_meta, scale,
             max_bias, m0, m1, n_head_log2, logit_softcap,
             ne00, ne01, ne02, ne03,
                   nb01, nb02, nb03,
@@ -493,6 +495,12 @@ static __global__ void flash_attn_ext_vec(
                 if (mask && FA_VEC_OK(j)) {
                     sum += slope_c[FA_VEC_HD(j)]*__half2float(maskh[FA_VEC_TOK(j)*ne11 + i_KQ]);
                 }
+                else if (kv_pos && FA_VEC_OK(j)) {   // [TAG_FA_POS_MASK]
+                    const int kp = kv_pos[k_VKQ_0 + i_KQ];
+                    if (kp < 0 || kp > q_pos[ic0 + FA_VEC_TOK(j)]) {
+                        sum = -INFINITY;
+                    }
+                }
 
                 KQ_max_new[j] = fmaxf(KQ_max_new[j], sum + FATTN_KQ_MAX_OFFSET);
 
@@ -786,7 +794,7 @@ static __global__ void flash_attn_ext_vec(
         dst_meta[((sequence*int(ne01.z) + ic0 + FA_VEC_TOK(tid))*ne02 + head0 + FA_VEC_HD(tid))*gridDim.y + blockIdx.y] = make_float2(KQ_max[tid], KQ_sum[tid]);
     }
 #else
-    GGML_UNUSED_VARS(Q_ptr, K_ptr, V_ptr, mask_ptr, sinks_ptr, KV_max_ptr, dst_ptr, dst_meta_ptr, scale,
+    GGML_UNUSED_VARS(Q_ptr, K_ptr, V_ptr, mask_ptr, sinks_ptr, kv_pos, q_pos, KV_max_ptr, dst_ptr, dst_meta_ptr, scale,
         max_bias, m0, m1, n_head_log2, logit_softcap,
         ne00, ne01, ne02, ne03,
               nb01, nb02, nb03,

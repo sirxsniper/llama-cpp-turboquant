@@ -8611,6 +8611,9 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
         }
 
         const ggml_fp16_t * mp = mask ? (ggml_fp16_t *)((char *) mask->data + iq1*mask->nb[1] + (iq2%mask->ne[2])*mask->nb[2] + (iq3%mask->ne[3])*mask->nb[3]) : NULL;
+        // [TAG_FA_POS_MASK] positional mask: -INF where the cell is not visible from this query
+        const int32_t * kvp  = dst->src[5] ? (const int32_t *) dst->src[5]->data : NULL;
+        const int32_t   qpos = (kvp && dst->src[6]) ? ((const int32_t *) dst->src[6]->data)[iq1] : 0;
 
         // k indices
         const int ik3 = iq3 / rk3;
@@ -8628,7 +8631,7 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
         // ref: https://arxiv.org/pdf/2112.05682.pdf
 
         for (int64_t ic = ic_start; ic < ic_end; ++ic) {
-            const float mv = mp ? slope*GGML_CPU_FP16_TO_FP32(mp[ic]) : 0.0f;
+            const float mv = mp ? slope*GGML_CPU_FP16_TO_FP32(mp[ic]) : (kvp ? ((kvp[ic] < 0 || kvp[ic] > qpos) ? -INFINITY : 0.0f) : 0.0f);
             if (mv == -INFINITY) {
                 continue;
             }
@@ -9220,6 +9223,7 @@ static void ggml_compute_forward_flash_attn_ext_f16(
 #endif
         use_tiled &= (DV % f32_epr == 0);
 #endif
+        use_tiled = use_tiled && dst->src[5] == NULL;   // [TAG_FA_POS_MASK] the tiled path reads the explicit mask only
         int current_chunk = ith;
 
         while (current_chunk < nchunk) {

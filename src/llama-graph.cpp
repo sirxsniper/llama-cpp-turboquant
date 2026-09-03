@@ -476,6 +476,10 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
     if (self_kq_mask && self_kq_mask->buffer) {
         mctx->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
     }
+    if (self_kv_pos && self_kv_pos->buffer) {   // [TAG_FA_POS_MASK]
+        mctx->set_input_kv_pos(self_kv_pos, ubatch);
+        ggml_backend_tensor_set(self_q_pos, ubatch->pos, 0, ubatch->n_tokens*ggml_element_size(self_q_pos));
+    }
 
     if (self_k_rot && self_k_rot->buffer) {
         mctx->set_input_k_rot(self_k_rot);
@@ -496,7 +500,13 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
     res &= self_k_idxs->ne[0] == params.ubatch.n_tokens;
   //res &= self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
 
-    res &= can_reuse_kq_mask(self_kq_mask, mctx, params.ubatch, params.cparams);
+    if (self_kq_mask) {
+        res &= can_reuse_kq_mask(self_kq_mask, mctx, params.ubatch, params.cparams);
+    }
+    if (self_kv_pos) {   // [TAG_FA_POS_MASK]
+        res &= self_kv_pos->ne[0] == mctx->get_n_kv();
+        res &= self_q_pos->ne[0]  == params.ubatch.n_tokens;
+    }
 
     return res;
 }
@@ -1087,7 +1097,13 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
     mctx->get_attn()->set_input_k_idxs(inp_attn->self_k_idxs, ubatch);
     mctx->get_attn()->set_input_v_idxs(inp_attn->self_v_idxs, ubatch);
 
-    mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
+    if (inp_attn->self_kq_mask) {
+        mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
+    }
+    if (inp_attn->self_kv_pos) {   // [TAG_FA_POS_MASK]
+        mctx->get_attn()->set_input_kv_pos(inp_attn->self_kv_pos, ubatch);
+        ggml_backend_tensor_set(inp_attn->self_q_pos, ubatch->pos, 0, ubatch->n_tokens*ggml_element_size(inp_attn->self_q_pos));
+    }
 
     if (inp_attn->self_k_rot) {
         mctx->get_attn()->set_input_k_rot(inp_attn->self_k_rot);
@@ -1120,7 +1136,13 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
     res &= inp_attn->self_k_idxs->ne[0] == params.ubatch.n_tokens;
   //res &= inp_attn->self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
 
-    res &= can_reuse_kq_mask(inp_attn->self_kq_mask, mctx->get_attn(), params.ubatch, params.cparams);
+    if (inp_attn->self_kq_mask) {
+        res &= can_reuse_kq_mask(inp_attn->self_kq_mask, mctx->get_attn(), params.ubatch, params.cparams);
+    }
+    if (inp_attn->self_kv_pos) {   // [TAG_FA_POS_MASK]
+        res &= inp_attn->self_kv_pos->ne[0] == mctx->get_attn()->get_n_kv();
+        res &= inp_attn->self_q_pos->ne[0]  == params.ubatch.n_tokens;
+    }
 
     res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
 
@@ -2547,7 +2569,9 @@ ggml_tensor * llm_graph_context::build_attn_mha(
          ggml_tensor * sinks,
          ggml_tensor * v_mla,
                float   kq_scale,
-                 int   il) const {
+                 int   il,
+                 ggml_tensor * kv_pos,
+                 ggml_tensor * q_pos) const {
     const bool v_trans = v->nb[1] > v->nb[2];
 
     // split the batch into streams if needed
@@ -2587,6 +2611,7 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, cur, il});
 
         ggml_flash_attn_ext_add_sinks(cur, sinks);
+        ggml_flash_attn_ext_set_pos  (cur, kv_pos, q_pos);   // [TAG_FA_POS_MASK] no-op when kv_pos is null
         ggml_flash_attn_ext_set_prec (cur, GGML_PREC_F32);
 
         // TurboQuant: inverse WHT on FA output when V values are WHT-rotated.
@@ -2797,8 +2822,26 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
         inp->self_k_idxs = mctx_cur->build_input_k_idxs(ctx0, ubatch);
         inp->self_v_idxs = mctx_cur->build_input_v_idxs(ctx0, ubatch);
 
-        inp->self_kq_mask = build_attn_inp_kq_mask(ctx0, mctx_cur, ubatch, cparams);
-        inp->self_kq_mask_cnv = inp->self_kq_mask;
+        // [TAG_FA_POS_MASK] Plain causal attention over one stream needs no [n_kv, n_tokens] mask: the kernel
+        // derives it from one position per cell and per query. At 262144 cells x 1280 tokens the F16 mask
+        // was 671 MiB of compute buffer (plus its host copy, refilled and uploaded on every ubatch).
+        // LLAMA_KQ_MASK_POS=0 restores the explicit mask.
+        static const bool pos_mask_env = [] {
+            const char * e = getenv("LLAMA_KQ_MASK_POS");
+            return !(e && e[0] == '0');
+        }();
+        const bool use_pos_mask = pos_mask_env && cparams.flash_attn && cparams.causal_attn &&
+            hparams.f_max_alibi_bias == 0.0f && (cparams.kv_unified || ubatch.n_seqs_unq == 1);
+        if (use_pos_mask) {
+            const auto n_kv = mctx_cur->get_n_kv();
+            inp->self_kv_pos = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_kv);
+            ggml_set_input(inp->self_kv_pos);
+            inp->self_q_pos = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, ubatch.n_tokens);
+            ggml_set_input(inp->self_q_pos);
+        } else {
+            inp->self_kq_mask = build_attn_inp_kq_mask(ctx0, mctx_cur, ubatch, cparams);
+            inp->self_kq_mask_cnv = inp->self_kq_mask;
+        }
     }
 
     inp->self_k_rot = mctx_cur->build_input_k_rot(ctx0);
@@ -2877,7 +2920,7 @@ ggml_tensor * llm_graph_context::build_attn(
         q = ggml_turbo_wht(ctx0, q, 0, 0, innerq_scale);  // 0 = forward, 0 = auto group size from q->ne[0]
     }
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
+    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il, inp->get_kv_pos(), inp->get_q_pos());   // [TAG_FA_POS_MASK]
     cb(cur, "kqv_out", il);
 
     // TurboQuant: if V was padded, the output has padded dimensions.

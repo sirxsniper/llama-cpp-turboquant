@@ -2041,6 +2041,22 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
     }
 }
 
+// [TAG_FA_POS_MASK] one position per cell of the current n_kv window: the cell's position when it belongs to
+// the batch's sequence, -1 when it is empty or belongs to another sequence. With causal attention the kernel
+// derives the mask from this and the query positions instead of reading an [n_kv, n_tokens] F16 mask.
+void llama_kv_cache::set_input_kv_pos(ggml_tensor * dst, const llama_ubatch * ubatch) const {
+    GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
+    GGML_ASSERT(dst->type == GGML_TYPE_I32);
+    int32_t * data = (int32_t *) dst->data;
+    const int64_t n_kv = dst->ne[0];
+    const llama_seq_id seq_id = ubatch->seq_id[0][0];
+    const auto & cells = v_cells.at(seq_to_stream[seq_id]);
+    const int64_t n_cells = cells.size();
+    for (int64_t j = 0; j < n_kv; ++j) {
+        data[j] = (j < n_cells && !cells.is_empty(j) && cells.seq_has(j, seq_id)) ? cells.pos_get(j) : -1;
+    }
+}
+
 void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
     const uint32_t n_tokens = ubatch->n_tokens;
 
@@ -3207,6 +3223,10 @@ void llama_kv_cache_context::set_input_v_idxs(ggml_tensor * dst, const llama_uba
 
 void llama_kv_cache_context::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
     kv->set_input_kq_mask(dst, ubatch, causal_attn);
+}
+
+void llama_kv_cache_context::set_input_kv_pos(ggml_tensor * dst, const llama_ubatch * ubatch) const {
+    kv->set_input_kv_pos(dst, ubatch);
 }
 
 void llama_kv_cache_context::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {

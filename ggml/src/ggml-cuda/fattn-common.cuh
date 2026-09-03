@@ -25,6 +25,8 @@ typedef void (* fattn_kernel_t)(
         const char * __restrict__ V,
         const char * __restrict__ mask,
         const char * __restrict__ sinks,
+        const int32_t * __restrict__ kv_pos, // [TAG_FA_POS_MASK] positional mask, or nullptr
+        const int32_t * __restrict__ q_pos,
         const int  * __restrict__ KV_max,
         float      * __restrict__ dst,
         float2     * __restrict__ dst_meta,
@@ -2159,6 +2161,48 @@ constexpr __device__ dequantize_V_t get_dequantize_V() {
     }
 }
 
+// [TAG_FA_POS_MASK] same job as flash_attn_mask_to_KV_max below, from cell positions: a KV tile is skippable for
+// this query tile when every cell in it is either empty (pos < 0) or later than the latest query position.
+template <int ncols1>
+static __global__ void flash_attn_pos_to_KV_max(
+        const int32_t * __restrict__ kv_pos, const int32_t * __restrict__ q_pos, int * KV_max_ptr, const int ne30, const uint3 ne01) {
+    int * GGML_CUDA_RESTRICT KV_max = KV_max_ptr;
+    const int tid = threadIdx.x;
+    const int jt  = blockIdx.x;
+    __shared__ int buf_iw[WARP_SIZE];
+    if (tid < WARP_SIZE) {
+        buf_iw[tid] = 1;
+    }
+    int q_max = -1;
+#pragma unroll
+    for (int j = 0; j < ncols1; ++j) {
+        q_max = max(q_max, q_pos[fastmodulo(jt*ncols1 + j, ne01)]);
+    }
+    ggml_cuda_pdl_sync();
+    __syncthreads();
+    int KV_max_sj = (ne30 - 1) * FATTN_KQ_STRIDE;
+    for (; KV_max_sj >= 0; KV_max_sj -= FATTN_KQ_STRIDE) {
+        // each thread checks two cells, like the half2 mask scan
+        const int c0 = kv_pos[KV_max_sj + 2*tid + 0];
+        const int c1 = kv_pos[KV_max_sj + 2*tid + 1];
+        int all_inf = int(c0 < 0 || c0 > q_max) && int(c1 < 0 || c1 > q_max);
+        all_inf = warp_reduce_all(all_inf);
+        if (tid % WARP_SIZE == 0) {
+            buf_iw[tid / WARP_SIZE] = all_inf;
+        }
+        __syncthreads();
+        all_inf = buf_iw[tid % WARP_SIZE];
+        __syncthreads();
+        all_inf = warp_reduce_all(all_inf);
+        if (!all_inf) {
+            break;
+        }
+    }
+    if (threadIdx.x == 0) {
+        KV_max[blockIdx.y*gridDim.x + jt] = KV_max_sj + FATTN_KQ_STRIDE;
+    }
+}
+
 template <int ncols1>
 __launch_bounds__(FATTN_KQ_STRIDE/2, 1)
 static __global__ void flash_attn_mask_to_KV_max(
@@ -2482,6 +2526,8 @@ void launch_fattn(
 
     const ggml_tensor * mask  = dst->src[3];
     const ggml_tensor * sinks = dst->src[4];
+    const ggml_tensor * kv_pos_t = dst->src[5];   // [TAG_FA_POS_MASK]
+    const ggml_tensor * q_pos_t  = dst->src[6];
 
     ggml_tensor * KQV = dst;
 
@@ -2675,6 +2721,17 @@ void launch_fattn(
             (const half2 *) mask->data, KV_max.ptr, iter_k, s31, s33);
         CUDA_CHECK(cudaGetLastError());
     }
+    const uint3 ne01_pos = init_fastdiv_values(Q->ne[1]);   // [TAG_FA_POS_MASK]
+    if (kv_pos_t && K->ne[1] % FATTN_KQ_STRIDE == 0 && Q->ne[1] >= 1024) {   // [TAG_FA_POS_MASK]
+        const dim3 blocks_num_KV_max(ntiles_x, 1, 1);
+        const dim3 block_dim_KV_max(FATTN_KQ_STRIDE/2, 1, 1);
+        const int iter_k = K->ne[1] / FATTN_KQ_STRIDE;
+        KV_max.alloc(ntiles_x);
+        ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num_KV_max, block_dim_KV_max, 0, main_stream);
+        ggml_cuda_kernel_launch(flash_attn_pos_to_KV_max<ncols1>, launch_params,
+            (const int32_t *) kv_pos_t->data, (const int32_t *) q_pos_t->data, KV_max.ptr, iter_k, ne01_pos);
+        CUDA_CHECK(cudaGetLastError());
+    }
 
     const dim3 block_dim(warp_size, nwarps, 1);
     int max_blocks_per_sm = 1; // Max. number of active blocks limited by occupancy.
@@ -2782,6 +2839,8 @@ void launch_fattn(
         V_data,
         mask ? ((const char *) mask->data) : nullptr,
         sinks ? ((const char *) sinks->data) : nullptr,
+        kv_pos_t ? (const int32_t *) kv_pos_t->data : nullptr,
+        q_pos_t  ? (const int32_t *) q_pos_t->data  : nullptr,
         KV_max.ptr,
         !stream_k && parallel_blocks > 1 ? dst_tmp.ptr : (float *) KQV->data, dst_tmp_meta.ptr,
         scale, max_bias, m0, m1, n_head_log2, logit_softcap,

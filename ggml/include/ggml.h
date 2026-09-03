@@ -2458,6 +2458,14 @@ extern "C" {
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);
 
+    // [TAG_FA_POS_MASK] optional positional mask instead of an explicit one: kv_pos [n_kv] (I32, -1 = not
+    // visible) and q_pos [n_q] (I32). Equivalent to a mask of -INF where kv_pos < 0 or kv_pos > q_pos and
+    // 0 elsewhere (plain causal attention over a single sequence). Requires no mask (src[3] == NULL).
+    GGML_API void ggml_flash_attn_ext_set_pos(
+            struct ggml_tensor * a,
+            struct ggml_tensor * kv_pos,
+            struct ggml_tensor * q_pos);
+
     // TODO: needs to be adapted to ggml_flash_attn_ext
     GGML_API struct ggml_tensor * ggml_flash_attn_back(
            struct ggml_context * ctx,

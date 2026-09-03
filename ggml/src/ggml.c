@@ -5560,6 +5560,26 @@ void ggml_flash_attn_ext_add_sinks(
     a->src[4] = sinks;
 }
 
+// [TAG_FA_POS_MASK]
+void ggml_flash_attn_ext_set_pos(
+        struct ggml_tensor * a,
+        struct ggml_tensor * kv_pos,
+        struct ggml_tensor * q_pos) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    if (!kv_pos) {
+        a->src[5] = NULL;
+        a->src[6] = NULL;
+        return;
+    }
+    GGML_ASSERT(a->src[3] == NULL && "positional mask replaces the explicit mask");
+    GGML_ASSERT(q_pos != NULL);
+    GGML_ASSERT(kv_pos->type == GGML_TYPE_I32 && q_pos->type == GGML_TYPE_I32);
+    GGML_ASSERT(kv_pos->ne[0] == a->src[1]->ne[1]);   // one entry per KV cell
+    GGML_ASSERT(q_pos->ne[0]  == a->src[0]->ne[1]);   // one entry per query token
+    a->src[5] = kv_pos;
+    a->src[6] = q_pos;
+}
+
 // ggml_flash_attn_back
 
 struct ggml_tensor * ggml_flash_attn_back(

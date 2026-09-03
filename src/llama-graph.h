@@ -337,12 +337,17 @@ public:
     ggml_tensor * get_v_idxs() const { return self_v_idxs; }
 
     ggml_tensor * get_kq_mask() const { return self_kq_mask_cnv; }
+    ggml_tensor * get_kv_pos() const { return self_kv_pos; }
+    ggml_tensor * get_q_pos()  const { return self_q_pos; }
 
     ggml_tensor * self_k_idxs = nullptr; // I64 [n_batch]
     ggml_tensor * self_v_idxs = nullptr; // I64 [n_batch] or [n_batch*n_embd_v_gqa]
 
     ggml_tensor * self_kq_mask     = nullptr; // F32/F16 [n_kv, n_batch/n_stream, 1, n_stream]
     ggml_tensor * self_kq_mask_cnv = nullptr; //         [n_kv, n_batch/n_stream, 1, n_stream]
+    // [TAG_FA_POS_MASK] positional mask: set instead of self_kq_mask when the cache is plain causal, single stream
+    ggml_tensor * self_kv_pos = nullptr; // I32 [n_kv]
+    ggml_tensor * self_q_pos  = nullptr; // I32 [n_batch]
 
     // note: assumes v_rot^2 == I
     ggml_tensor * self_k_rot = nullptr;
@@ -1172,7 +1177,9 @@ struct llm_graph_context {
             ggml_tensor * sinks,   // [n_head_q]
             ggml_tensor * v_mla,   // [n_embd_head_v_mla, n_embd_head_v, n_head_v]
                   float   kq_scale,
-                    int   il) const;
+                    int   il,
+                    ggml_tensor * kv_pos = nullptr,   // [TAG_FA_POS_MASK] positional mask (with q_pos) when kq_mask is null
+                    ggml_tensor * q_pos  = nullptr) const;
 
     llm_graph_input_attn_no_cache * build_attn_inp_no_cache() const;
 
