@@ -16,6 +16,7 @@
 #include "speculative.h"
 #include "mtmd.h"
 #include "mtmd-helper.h"
+#include "../../src/llama-ext.h" // [TAG_SPEC_PREFILL_TAIL_EXTRACT] llama_set_layer_inp_extract
 
 #include <algorithm>
 #include <cstdlib>
@@ -260,6 +261,9 @@ struct server_slot {
 
     // [TAG_CKPT_BYTE_BUDGET] log the byte-budget cap once per slot, not once per checkpoint
     bool logged_ckpt_budget = false;
+
+    // [TAG_CKPT_BUFFER_REUSE] the buffer of the last evicted checkpoint, handed to the next one
+    std::vector<uint8_t> ckpt_spare;
     bool spec_is_replay = false;
     std::mt19937 spec_synth_rng;
 
@@ -2463,15 +2467,27 @@ private:
 
         while (slot.prompt.checkpoints.size() >= n_ckpt_max) {
             // make room for the new checkpoint, if needed
-            const auto & cur = slot.prompt.checkpoints.front();
+            auto & old = slot.prompt.checkpoints.front();
 
             SLT_WRN(slot, "erasing old context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
-                    cur.pos_min, cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
+                    old.pos_min, old.pos_max, old.n_tokens, (float) old.size() / 1024 / 1024);
+
+            // [TAG_CKPT_BUFFER_REUSE] Keep the evicted entry's buffer for the checkpoint about to be
+            // created. update_tgt() then resizes to the same size, a no-op, instead of value-initialising
+            // and page-faulting a fresh 149.6 MiB allocation on every checkpoint.
+            if (slot.ckpt_spare.empty()) {
+                slot.ckpt_spare = std::move(old.data_tgt);
+            }
 
             slot.prompt.checkpoints.erase(slot.prompt.checkpoints.begin());
         }
 
         auto & cur = slot.prompt.checkpoints.emplace_back();
+
+        if (!slot.ckpt_spare.empty()) {
+            cur.data_tgt    = std::move(slot.ckpt_spare);
+            slot.ckpt_spare = std::vector<uint8_t>();
+        }
 
         cur.id_task = id_task;
 
@@ -3675,6 +3691,22 @@ private:
                     const auto & spans = slot.task->params.message_spans;
                     const auto last_user_pos = spans.last_user_message_pos();
 
+                    // [TAG_CKPT_TURN_MERGE] see the two break sites below. LLAMA_SERVER_TURN_SPLIT=1 restores the
+                    // upstream batching: a separate batch for the newline before the user message and another
+                    // for the last 4 tokens, each with its own decode and its own 149.6 MiB checkpoint.
+                    static const bool turn_split_forced = [] {
+                        const char * e = getenv("LLAMA_SERVER_TURN_SPLIT");
+                        return e != nullptr && atoi(e) != 0;
+                    }();
+                    // a user-start break is skipped while this batch holds at most this many of the slot's tokens
+                    constexpr int64_t ckpt_merge_max = 8;
+                    // the tail split (last 4 tokens as their own batch and checkpoint) only pays for itself when
+                    // the batch already carries at least this many tokens that a regenerate would re-prefill
+                    constexpr int64_t ckpt_tail_min = 512;
+
+                    bool user_start_merged         = false;
+                    bool user_start_merged_is_last = false;
+
                     // add prompt tokens for processing in the current batch
                     while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch) {
                         // get next token to process
@@ -3707,7 +3739,19 @@ private:
                             const auto & checkpoints = slot.prompt.checkpoints;
 
                             if (pos == last_user_pos || checkpoints.empty() || pos > checkpoints.back().n_tokens + params_base.checkpoint_min_step) {
-                                break;
+                                // [TAG_CKPT_TURN_MERGE] The break exists so that the next batch starts exactly at the
+                                // user message and gets its checkpoint. On every follow-up turn the only tokens before
+                                // it are the newline after the previous reply, so the break produced a 1-token batch:
+                                // one extra decode plus one extra checkpoint, one token away from the next one. When
+                                // this batch holds only a few tokens so far, keep filling and let the checkpoint at
+                                // this batch's start stand for the user message. An edit of that message then
+                                // re-prefills those few tokens more, nothing else changes.
+                                const int64_t n_in_batch = (int64_t) (batch.size() - n_tokens_prev);
+                                if (turn_split_forced || user_start_merged || n_in_batch > ckpt_merge_max) {
+                                    break;
+                                }
+                                user_start_merged         = true;
+                                user_start_merged_is_last = pos == last_user_pos;
                             }
                         }
 
@@ -3727,7 +3771,8 @@ private:
                                     break;
                                 }
                             }
-                            if (should_break) {
+                            // [TAG_CKPT_TURN_MERGE] the tail split only pays for itself past ckpt_tail_min tokens
+                            if (should_break && (turn_split_forced || (int64_t) (batch.size() - n_tokens_prev) >= ckpt_tail_min)) {
                                 break;
                             }
                         }
@@ -3740,8 +3785,8 @@ private:
 
                     const bool near_prompt_end = slot.task->n_tokens() < slot.prompt.n_tokens() + n_ubatch;
 
-                    const bool is_user_start = spans.is_user_start(n_tokens_start);
-                    const bool is_last_user_message = n_tokens_start == last_user_pos;
+                    const bool is_user_start = spans.is_user_start(n_tokens_start) || user_start_merged;
+                    const bool is_last_user_message = n_tokens_start == last_user_pos || user_start_merged_is_last;
 
                     // entire prompt has been processed
                     if (slot.prompt.n_tokens() == slot.task->n_tokens()) {
@@ -3830,6 +3875,41 @@ private:
             has_output |= batch.tokens[i].output;
         }
 
+        // [TAG_SPEC_PREFILL_TAIL_EXTRACT] Publish how many prompt tokens follow this batch BEFORE the
+        // target decode (this used to happen after it, right before the drafter ran). With that known,
+        // ask the drafter whether it will skip this batch, and if so let the target skip extracting the
+        // five per-layer inputs the drafter would never read: 5 x n_ubatch x n_embd x 4 B, 131 MB per
+        // 1280-token ubatch, copied GPU to host on the compute stream, 13 GB over a 131k prompt.
+        // SPEC_PREFILL_EXTRACT_ALL=1 restores the unconditional extraction.
+        bool skip_extract = false;
+        if (spec) {
+            // [TAG_SPEC_PREFILL_TAIL_PER_SEQ] Publish BOTH: the max, which the is_prefill
+            // heuristic wants, and the per-slot value, which the skip decision needs. The
+            // skip wipes the drafter KV of every sequence in the batch, so letting the max
+            // speak for all of them meant a generating slot co-batched with a prefilling one
+            // lost its drafter cache on every batch, collapsing its acceptance to ~0.
+            // The sequence id IS the slot id, see common_batch_add(..., { t.id_slot }, ...).
+            common_speculative_clear_prefill_after_seq(spec.get());
+
+            int32_t n_after = 0;
+            for (const auto & slot : slots) {
+                if (slot.state == SLOT_STATE_PROCESSING_PROMPT && slot.task) {
+                    const int32_t total = (int32_t) slot.task->n_tokens();
+                    const int32_t done  = (int32_t) slot.prompt.n_tokens();
+                    const int32_t rem   = total - done;
+                    n_after = std::max(n_after, rem);
+                    common_speculative_set_prefill_after_seq(spec.get(), slot.id, rem);
+                }
+            }
+            common_speculative_set_prefill_after(spec.get(), n_after);
+
+            static const bool extract_all = [] {
+                const char * e = getenv("SPEC_PREFILL_EXTRACT_ALL");
+                return e != nullptr && atoi(e) != 0;
+            }();
+            skip_extract = !extract_all && common_speculative_prefill_will_skip(spec.get(), batch_view);
+        }
+
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
@@ -3838,7 +3918,13 @@ private:
                               ? std::chrono::steady_clock::now()
                               : std::chrono::steady_clock::time_point{};
         queue_tasks.yield_to_queue([&]() {
+            if (skip_extract) {
+                llama_set_layer_inp_extract(ctx_tgt, false);
+            }
             ret = llama_decode(ctx_tgt, batch_view);
+            if (skip_extract) {
+                llama_set_layer_inp_extract(ctx_tgt, true);
+            }
             if (ret == 0 && has_output) {
                 llama_synchronize(ctx_tgt);
             }
@@ -3922,19 +4008,8 @@ private:
                 // speak for all of them meant a generating slot co-batched with a prefilling one
                 // lost its drafter cache on every batch, collapsing its acceptance to ~0.
                 // The sequence id IS the slot id, see common_batch_add(..., { t.id_slot }, ...).
-                common_speculative_clear_prefill_after_seq(spec.get());
-
-                int32_t n_after = 0;
-                for (const auto & slot : slots) {
-                    if (slot.state == SLOT_STATE_PROCESSING_PROMPT && slot.task) {
-                        const int32_t total = (int32_t) slot.task->n_tokens();
-                        const int32_t done  = (int32_t) slot.prompt.n_tokens();
-                        const int32_t rem   = total - done;
-                        n_after = std::max(n_after, rem);
-                        common_speculative_set_prefill_after_seq(spec.get(), slot.id, rem);
-                    }
-                }
-                common_speculative_set_prefill_after(spec.get(), n_after);
+                // [TAG_SPEC_PREFILL_TAIL_EXTRACT] the values for this batch were published before the
+                // target decode above, nothing between there and here changes them
             }
 
             bool ok = true;
@@ -4531,7 +4606,11 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             inputs.push_back(process_mtmd_prompt(ctx_server.mctx, prompt.get<std::string>(), files, ctx_server.init_opt));
         } else {
             // Everything else, including multimodal completions.
+            // [TAG_TURN_TIMING] the whole conversation is tokenized on every turn; make its cost visible
+            const int64_t t_tok0 = ggml_time_us();
             inputs = tokenize_input_prompts(ctx_server.vocab, ctx_server.mctx, prompt, true, true, ctx_server.init_opt);
+            SRV_INF("tokenized prompt: %.1f ms, %zu tokens\n", (ggml_time_us() - t_tok0) / 1000.0,
+                    inputs.empty() ? (size_t) 0 : inputs[0].size());
         }
 
         // tasks.reserve(inputs.size()); // TODO: this is inaccurate due to child tasks

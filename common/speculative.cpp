@@ -169,6 +169,15 @@ struct common_speculative_impl {
 
     virtual bool process(const llama_batch & batch) = 0;
 
+    // [TAG_SPEC_PREFILL_TAIL_EXTRACT] true when this implementation will not read the target's
+    // per-layer inputs (llama_get_embeddings_layer_inp) for this batch, so the target may skip
+    // extracting them. Only implementations that read them need to override: dflash answers with
+    // its sliding-window skip decision, eagle3 always reads them. The rest never touch them.
+    virtual bool prefill_skips_layer_inputs(const llama_batch & batch) const {
+        (void) batch;
+        return true;
+    }
+
     // [TAG_SPEC_PREFILL_TAIL]
     // How many prompt tokens still follow the ubatch currently being processed.
     // Set by the server before each common_speculative_process() call during prompt
@@ -459,6 +468,12 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
 //      in verify mode, have process() only stash features and let draft() seed run
 //      encoder+decoder on n_accepted+1 rows).
 struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
+    // [TAG_SPEC_PREFILL_TAIL_EXTRACT] eagle3 reads the target's layer inputs on every batch
+    bool prefill_skips_layer_inputs(const llama_batch & batch) const override {
+        (void) batch;
+        return false;
+    }
+
     common_params_speculative_draft params;
     llama_batch batch;
 
@@ -954,7 +969,59 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
 };
 
 // DFlash: block-diffusion drafting with a draft-side KV cache injection
+// [TAG_SPEC_PREFILL_TAIL] Default 2048 = one DFlash2 sliding window. SPEC_PREFILL_TAIL=0 disables
+// the skip and restores the old behaviour; a larger value is more conservative (keeps more of
+// the prompt warm in the draft KV).
+static int32_t spec_prefill_tail() {
+    static const int32_t tail = [] {
+        const char * e = getenv("SPEC_PREFILL_TAIL");
+        if (e == nullptr) {
+            return (int32_t) 2048;
+        }
+        const int v = atoi(e);
+        return (int32_t) (v > 0 ? v : 0);
+    }();
+    return tail;
+}
+
 struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+    // [TAG_SPEC_PREFILL_TAIL_EXTRACT] The per-sequence skip decision, shared by process() and by the
+    // server, which asks BEFORE the target decode so that llama can skip extracting the five layer
+    // inputs this batch would never read: 5 x n_ubatch x n_embd x 4 B, 131 MB per 1280-token ubatch,
+    // copied GPU to host on the compute stream, 13 GB over a 131k prompt. Media batches never skip.
+    bool prefill_batch_wants_skip(const llama_batch & batch_in) const {
+        const int32_t tail = spec_prefill_tail();
+        if (tail <= 0 || batch_in.token == nullptr || batch_in.embd != nullptr) {
+            return false;
+        }
+
+        // Every sequence in the batch must want the skip. The wipe in process() is unconditional
+        // over the batch, so skipping on behalf of a sequence that is generating (or is near the
+        // end of its own prompt) would destroy its drafter cache. Conservative by construction.
+        llama_seq_id prev_s = -1;
+        int n_seqs_seen = 0;
+        for (int32_t i = 0; i < batch_in.n_tokens; ++i) {
+            if (batch_in.n_seq_id == nullptr || batch_in.n_seq_id[i] <= 0) {
+                continue;
+            }
+            const llama_seq_id s = batch_in.seq_id[i][0];
+            if (s == prev_s) {
+                continue;
+            }
+            prev_s = s;
+            ++n_seqs_seen;
+            if (prefill_after_for(s) < tail) {
+                return false;
+            }
+        }
+
+        return n_seqs_seen > 0;
+    }
+
+    bool prefill_skips_layer_inputs(const llama_batch & batch) const override {
+        return prefill_batch_wants_skip(batch);
+    }
+
     common_params_speculative_draft params;
 
     llama_batch batch;        // noise tokens
@@ -1184,48 +1251,17 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         // the other) - a drafter reading a holed KV would collapse toward zero, so
         // this also confirms the skip is functionally sound.
         {
-            // Default 2048 = one DFlash2 sliding window. SPEC_PREFILL_TAIL=0 disables
-            // the skip and restores the old behaviour; a larger value is more
-            // conservative (keeps more of the prompt warm in the draft KV).
-            static const int32_t tail = [] {
-                const char * e = getenv("SPEC_PREFILL_TAIL");
-                if (e == nullptr) {
-                    return (int32_t) 2048;
-                }
-                const int v = atoi(e);
-                return (int32_t) (v > 0 ? v : 0);
-            }();
+            const int32_t tail = spec_prefill_tail();
+            (void) tail;
             // >= not >: is_masked_swa masks when p1 - p0 >= n_swa, so a query at P sees
             // keys at P-(n_swa-1)..P. With n_ubatch == n_swa the second-to-last ubatch has
             // n_prefill_after == tail exactly, and every one of its rows is already outside
             // the window by the time any draft reads it - so it was being processed for
             // nothing, doubling the drafter's prefill work at -ub 2048.
-            // [TAG_SPEC_PREFILL_TAIL_PER_SEQ] Every sequence in this batch must want the skip.
-            // The wipe below is unconditional over the batch, so skipping on behalf of a
-            // sequence that is generating (or is near the end of its own prompt) destroys its
-            // drafter cache. Ask each sequence about ITSELF and bail out on the first one that
-            // still needs this ubatch. Conservative by construction: a mixed batch is processed
-            // normally, which is exactly what it needs.
-            bool all_want_skip = tail > 0;
-            int  n_seqs_seen   = 0;
-            if (all_want_skip) {
-                llama_seq_id prev_s = -1;
-                for (int32_t i = 0; i < batch_in.n_tokens; ++i) {
-                    if (batch_in.n_seq_id == nullptr || batch_in.n_seq_id[i] <= 0) {
-                        continue;
-                    }
-                    const llama_seq_id s = batch_in.seq_id[i][0];
-                    if (s == prev_s) {
-                        continue;
-                    }
-                    prev_s = s;
-                    ++n_seqs_seen;
-                    if (prefill_after_for(s) < tail) {
-                        all_want_skip = false;
-                        break;
-                    }
-                }
-            }
+            // [TAG_SPEC_PREFILL_TAIL_PER_SEQ] Every sequence in this batch must want the skip, see
+            // prefill_batch_wants_skip(). The server asks the same question before the target decode.
+            const bool all_want_skip = prefill_batch_wants_skip(batch_in);
+            const int  n_seqs_seen   = all_want_skip ? 1 : 0;
 
             if (all_want_skip && n_seqs_seen > 0) {
                 // Skipping is only safe if it cannot leave a HOLE in the draft KV.
@@ -3109,6 +3145,20 @@ void common_speculative_set_prefill_after_seq(common_speculative * spec, llama_s
         }
         impl->n_prefill_after_seq[seq_id] = n_after;
     }
+}
+
+bool common_speculative_prefill_will_skip(const common_speculative * spec, const llama_batch & batch) {
+    if (spec == nullptr || spec->impls.empty()) {
+        return false;
+    }
+
+    for (const auto & impl : spec->impls) {
+        if (!impl->prefill_skips_layer_inputs(batch)) {
+            return false;
+        }
+    }
+
+    return true;
 }
 
 // [TAG_SPEC_PHASE_PROBE] see speculative.h

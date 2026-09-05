@@ -709,7 +709,25 @@ void llama_context::synchronize() {
         return;
     }
 
+    // [TAG_SYNC_EARLY_OUT] Every public getter (llama_get_sampled_*_ith, llama_get_logits_ith, ...)
+    // synchronizes first, and the server reads eight verify positions through four getters each,
+    // so one decode step paid about fifty cudaStreamSynchronize calls on an already idle stream.
+    // Nothing can be in flight unless graph_compute() ran since the last synchronize, so return
+    // early in that case. The n_copies > 1 (pipeline parallel) path keeps the unconditional call,
+    // because ggml_backend_sched_synchronize also resets its copy index there.
+    // LLAMA_SYNC_ALWAYS=1 restores the unconditional synchronize.
+    static const bool sync_always = [] {
+        const char * e = getenv("LLAMA_SYNC_ALWAYS");
+        return e != nullptr && atoi(e) != 0;
+    }();
+
+    if (!sched_pending && !sync_always && n_queued_tokens == 0 && ggml_backend_sched_get_n_copies(sched.get()) == 1) {
+        return;
+    }
+
     ggml_backend_sched_synchronize(sched.get());
+
+    sched_pending = false;
 
     // FIXME: if multiple single tokens are evaluated without a synchronization,
     // the stats will be added to the prompt evaluation stats
@@ -1166,6 +1184,10 @@ void llama_context::set_embeddings_nextn(bool value, bool masked) {
 
     cparams.embeddings_nextn        = value;
     cparams.embeddings_nextn_masked = masked;
+}
+
+void llama_context::set_layer_inp_extract(bool enable) {
+    layer_inp_extract = enable;
 }
 
 void llama_context::set_embeddings_layer_inp(uint32_t lid, bool enable) {
@@ -2194,6 +2216,11 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
 }
 
 void llama_context::extract_layer_inputs(const llm_graph_result * res, size_t token_offset, size_t n_tokens) {
+    // [TAG_SPEC_PREFILL_TAIL_EXTRACT] the caller knows nobody will read these for this batch
+    if (!layer_inp_extract) {
+        return;
+    }
+
     for (uint32_t il = 0; il < cparams.embeddings_layer_inp.size(); ++il) {
         if (!cparams.embeddings_layer_inp[il]) {
             continue;
@@ -2509,6 +2536,9 @@ ggml_status llama_context::graph_compute(
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
     }
+
+    // [TAG_SYNC_EARLY_OUT] work is in flight until the next synchronize()
+    sched_pending = true;
 
     // fprintf(stderr, "splits: %d\n", ggml_backend_sched_get_n_splits(sched));
 
@@ -3846,6 +3876,10 @@ void llama_set_embeddings_nextn(llama_context * ctx, bool value, bool masked) {
 
 void llama_set_embeddings_layer_inp(llama_context * ctx, uint32_t lid, bool value) {
     ctx->set_embeddings_layer_inp(lid, value);
+}
+
+void llama_set_layer_inp_extract(llama_context * ctx, bool enable) {
+    ctx->set_layer_inp_extract(enable);
 }
 
 void llama_set_nextn_layer_offset(llama_context * ctx, int32_t offset) {

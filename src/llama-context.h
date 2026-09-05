@@ -57,6 +57,8 @@ struct llama_context {
 
     void synchronize();
 
+    void set_layer_inp_extract(bool enable);
+
     const llama_model   & get_model()   const;
     const llama_cparams & get_cparams() const;
 
@@ -374,6 +376,12 @@ private:
     std::map<llama_seq_id, llama_memory_buffers> mem_storage;
 
     bool has_evaluated_once = false;
+
+    // [TAG_SYNC_EARLY_OUT] set by graph_compute() when work is queued on the backends, cleared by synchronize()
+    bool sched_pending = false;
+
+    // [TAG_SPEC_PREFILL_TAIL_EXTRACT] when false, decode() does not copy the per-layer inputs to the host
+    bool layer_inp_extract = true;
 
     // env: LLAMA_GRAPH_REUSE_DISABLE
     bool graph_reuse_disable = false;

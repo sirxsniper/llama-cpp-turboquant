@@ -102,6 +102,12 @@ void common_speculative_set_prefill_after(common_speculative * spec, int32_t n_a
 void common_speculative_clear_prefill_after_seq(common_speculative * spec);
 void common_speculative_set_prefill_after_seq(common_speculative * spec, llama_seq_id seq_id, int32_t n_after);
 
+// [TAG_SPEC_PREFILL_TAIL_EXTRACT] true if no registered implementation will read the target's
+// per-layer inputs (llama_get_embeddings_layer_inp) for this batch, so the caller may disable
+// their extraction for the target decode of this batch. Ask AFTER publishing the per-sequence
+// prefill_after values above.
+bool common_speculative_prefill_will_skip(const common_speculative * spec, const llama_batch & batch);
+
 // true if any registered implementation actually reads dparams.prompt. Only the n-gram
 // drafters do; the model-based ones (dflash, mtp, eagle3, simple) never look at it, so the
 // server can skip materialising the whole prompt vector every step.

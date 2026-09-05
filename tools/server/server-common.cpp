@@ -1334,7 +1334,10 @@ json oaicompat_chat_params_parse(
     inputs.force_pure_content = opt.force_pure_content;
 
     // Apply chat template to the list of messages
+    // [TAG_TURN_TIMING] the whole conversation is rendered on every turn; make its cost visible
+    const int64_t t_tmpl0 = ggml_time_us();
     auto chat_params = common_chat_templates_apply(opt.tmpls.get(), inputs);
+    SRV_INF("chat template applied: %.1f ms, %zu bytes\n", (ggml_time_us() - t_tmpl0) / 1000.0, chat_params.prompt.size());
 
     llama_params["chat_format"] = static_cast<int>(chat_params.format);
     llama_params["prompt"]      = chat_params.prompt;

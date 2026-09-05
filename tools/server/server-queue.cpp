@@ -174,6 +174,7 @@ void server_queue::worker_loop() {
         }
 
         // process tasks while the yield is active
+        bool parked = false; // [TAG_YIELD_PARK]
         while (true) {
             bool terminated = false;
             try {
@@ -192,17 +193,44 @@ void server_queue::worker_loop() {
             if (!queue_tasks.empty()) {
                 continue; // a new task arrived in the meantime
             }
+            // LLAMA_SERVER_YIELD_PARK=0 restores the upstream handshake for A/B purposes
+            static const bool park = [] {
+                const char * e = getenv("LLAMA_SERVER_YIELD_PARK");
+                return e == nullptr || atoi(e) != 0;
+            }();
+            if (!park) {
+                condition_tasks.wait(lock, [&]{
+                    return worker.stop || !running || !worker.yielding || !queue_tasks.empty();
+                });
+                continue;
+            }
+            // [TAG_YIELD_PARK] Nothing to do right now: hand `busy` back before parking, so that
+            // yield_to_queue() returns as soon as its work is done instead of waiting for this thread
+            // to wake up, notice the yield is over and clear the flag. That wait was two thread
+            // switches on the inference thread at the end of every yield, three yields per decode
+            // step. A task that arrives while the yield is still active takes `busy` again below.
+            worker.busy = false;
+            parked      = true;
+            condition_tasks.notify_all();
             condition_tasks.wait(lock, [&]{
                 return worker.stop || !running || !worker.yielding || !queue_tasks.empty();
             });
+            if (worker.stop || !running || !worker.yielding) {
+                break;
+            }
+            worker.busy = true;
+            parked      = false;
         }
 
-        // signal to yield_to_queue() that no more tasks will be processed
-        {
-            std::unique_lock<std::mutex> lock(mutex_tasks);
-            worker.busy = false;
+        // signal to yield_to_queue() that no more tasks will be processed. When this thread parked,
+        // `busy` is already clear and the next yield may already have set it again: leave it alone.
+        if (!parked) {
+            {
+                std::unique_lock<std::mutex> lock(mutex_tasks);
+                worker.busy = false;
+            }
+            condition_tasks.notify_all();
         }
-        condition_tasks.notify_all();
     }
 }
 

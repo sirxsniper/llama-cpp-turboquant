@@ -110,6 +110,11 @@ LLAMA_API float * llama_get_embeddings_nextn_ith(struct llama_context * ctx, int
 // Set whether the context outputs the input embeddings of a specific layer
 LLAMA_API void llama_set_embeddings_layer_inp(struct llama_context * ctx, uint32_t lid, bool value);
 
+// [TAG_SPEC_PREFILL_TAIL_EXTRACT] Enable or disable the per-decode copy of the enabled layer inputs
+// to the host. The layers stay enabled (the graph does not change), only the GPU-to-host copy is
+// skipped while this is false. Default true.
+LLAMA_API void llama_set_layer_inp_extract(struct llama_context * ctx, bool enable);
+
 // mirrors:
 // LLAMA_API float * llama_get_embeddings(struct llama_context * ctx);
 LLAMA_API float * llama_get_embeddings_layer_inp(struct llama_context * ctx, uint32_t lid);
