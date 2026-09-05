@@ -422,6 +422,16 @@ void server_response::remove_waiting_task_ids(const std::unordered_set<int> & id
         RES_DBG("remove task %d from waiting list. current waiting = %d (before remove)\n", id_task, (int) waiting_task_ids.size());
         waiting_task_ids.erase(id_task);
     }
+
+    // Drop any results already queued for these tasks, exactly as the single-id overload
+    // above does. Without this, a result pushed between the reader's last next() and this
+    // call is stranded in queue_results forever: nothing else erases by task id, so the
+    // vector only ever grows across the life of the server.
+    queue_results.erase(
+        std::remove_if(queue_results.begin(), queue_results.end(), [&id_tasks](const server_task_result_ptr & res) {
+            return id_tasks.count(res->id) > 0;
+        }),
+        queue_results.end());
 }
 
 server_task_result_ptr server_response::recv(const std::unordered_set<int> & id_tasks) {

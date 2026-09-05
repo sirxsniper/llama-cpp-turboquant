@@ -10,6 +10,9 @@
 #include "speculative.h"
 #include "server-common.h"
 
+#include <algorithm>
+#include <cstdlib>
+#include <iterator>
 #include <sstream>
 
 //
@@ -1735,7 +1738,7 @@ size_t server_prompt_cache::n_tokens() const {
     return res;
 }
 
-server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & prompt, size_t state_size_tgt, size_t state_size_dft) {
+server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & prompt, size_t state_size_tgt, size_t state_size_dft, const server_tokens * tokens_next) {
     // first check if the current state is contained fully in the cache
     for (auto it = states.begin(); it != states.end(); ++it) {
         const int cur_lcp_len = it->prompt.tokens.get_common_prefix(prompt.tokens);
@@ -1746,10 +1749,25 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         }
     }
 
+    // [TAG_PROMPT_CACHE_CKPT_KEEP] How many of the slot's checkpoints (newest first) travel
+    // with a cached entry. Default: all of them, the upstream behaviour. On a hybrid model
+    // each one is the entire recurrent state, 149.6 MiB for Qwen3.8-27B, so a full ring of
+    // 13 adds 1.9 GiB to every cached conversation. They are only used if the conversation
+    // is restored and then EDITED further back than the newest kept checkpoint; a plain
+    // continuation never touches them. LLAMA_PROMPT_CACHE_CKPT_KEEP=N keeps the newest N.
+    static const size_t n_ckpt_keep = [] {
+        const char * e = getenv("LLAMA_PROMPT_CACHE_CKPT_KEEP");
+        return e ? (size_t) strtoull(e, nullptr, 10) : (size_t) -1;
+    }();
+
+    const size_t n_ckpt = std::min<size_t>(prompt.checkpoints.size(), n_ckpt_keep);
+
+    const auto it_ckpt0 = std::next(prompt.checkpoints.begin(), prompt.checkpoints.size() - n_ckpt);
+
     // calculate checkpoints size to see if it will fit with the prompt
     size_t checkpoints_size = 0;
-    for (const auto & ckpt : prompt.checkpoints) {
-        checkpoints_size += ckpt.size();
+    for (auto it = it_ckpt0; it != prompt.checkpoints.end(); ++it) {
+        checkpoints_size += it->size();
     }
 
     const size_t state_size_new = state_size_tgt + state_size_dft + checkpoints_size;
@@ -1774,13 +1792,44 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         }
     }
 
+    // [TAG_PROMPT_CACHE_KEEP_NEXT] The caller saves the outgoing prompt and then immediately
+    // asks load() for the incoming one. Oldest-first eviction removed exactly the entry that
+    // load was about to restore whenever the two states did not fit together, so BOTH
+    // conversations re-prefilled from scratch on every switch: 15 times 237k tokens in one
+    // session, 20 minutes, with the cache full the whole time. Find that entry first, keep it.
+    const auto it_keep = tokens_next ? find(prompt, *tokens_next) : states.end();
+
     if (limit_size > 0) {
         // make room before allocating the new vectors to avoid breaching the limit
-        while (!states.empty() && size() + state_size_new > limit_size) {
-            SRV_WRN(" - making room for prompt cache entry, removing oldest entry (size = %.3f MiB)\n",
-                    states.front().size() / (1024.0 * 1024.0));
+        for (auto it = states.begin(); it != states.end() && size() + state_size_new > limit_size;) {
+            if (it == it_keep) {
+                ++it;
+                continue;
+            }
 
-            states.pop_front();
+            SRV_WRN(" - making room for prompt cache entry, removing oldest entry (size = %.3f MiB)\n",
+                    it->size() / (1024.0 * 1024.0));
+
+            it = states.erase(it);
+        }
+
+        if (size() + state_size_new > limit_size) {
+            // Only the kept entry is left and the outgoing state does not fit beside it, so one
+            // of the two conversations has to re-prefill. Prefill time scales with the token
+            // count: keep the longer one.
+            if (prompt.tokens.size() > it_keep->prompt.tokens.size()) {
+                SRV_WRN(" - evicting the %zu-token entry the next prompt restores (%.3f MiB) to cache the outgoing %zu-token prompt (%.3f MiB, limit %.3f MiB)\n",
+                        it_keep->prompt.tokens.size(), it_keep->size() / (1024.0 * 1024.0),
+                        prompt.tokens.size(), state_size_new / (1024.0 * 1024.0), limit_size / (1024.0 * 1024.0));
+
+                states.erase(it_keep);
+            } else {
+                SRV_WRN(" - not caching the outgoing %zu-token prompt (%.3f MiB): it does not fit beside the %zu-token entry the next prompt restores (%.3f MiB, limit %.3f MiB)\n",
+                        prompt.tokens.size(), state_size_new / (1024.0 * 1024.0),
+                        it_keep->prompt.tokens.size(), it_keep->size() / (1024.0 * 1024.0), limit_size / (1024.0 * 1024.0));
+
+                return nullptr;
+            }
         }
     }
 
@@ -1806,7 +1855,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
     states.push_back({
         /*.prompt =*/ {
             /*.tokens      =*/ prompt.tokens.clone(),
-            /*.checkpoints =*/ prompt.checkpoints,
+            /*.checkpoints =*/ std::list<common_prompt_checkpoint>(it_ckpt0, prompt.checkpoints.end()),
         },
         /*.data   =*/ {
             /*.main =*/ std::move(state_data_tgt),
@@ -1817,7 +1866,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
     return &states.back();
 }
 
-bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
+std::list<server_prompt_cache_state>::iterator server_prompt_cache::find(const server_prompt & prompt, const server_tokens & tokens_new) {
     const int lcp_best = prompt.tokens.get_common_prefix(tokens_new);
 
     float f_keep_best = prompt.tokens.size() > 0 ? float(lcp_best) / prompt.tokens.size() : -1.0f; // empty slot: any cache entry wins
@@ -1849,8 +1898,17 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
         }
     }
 
+    return it_best;
+}
+
+bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
+    const auto it_best = find(prompt, tokens_new);
+
     if (it_best != states.end()) {
-        SRV_TRC(" - found better prompt with f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
+        const int lcp = it_best->prompt.tokens.get_common_prefix(tokens_new);
+
+        SRV_TRC(" - found better prompt with f_keep = %.3f, f_sim = %.3f\n",
+                float(lcp) / it_best->prompt.tokens.size(), float(lcp) / tokens_new.size());
 
         // [TAG_PROMPT_CACHE_POISON] Restoring CONSUMES this entry: data.main is cleared the
         // moment it is restored. A failure AFTER that point must therefore not leave the entry

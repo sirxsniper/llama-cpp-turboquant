@@ -627,7 +627,13 @@ struct server_prompt_cache {
 
     size_t n_tokens() const;
 
-    server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft);
+    // tokens_next: the prompt that load() will be asked for right after this save. The entry
+    // that load would restore is protected from the eviction that makes room for this state.
+    // [TAG_PROMPT_CACHE_KEEP_NEXT]
+    server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft, const server_tokens * tokens_next = nullptr);
+
+    // the entry load() would restore for tokens_new while the slot holds prompt, or states.end()
+    std::list<server_prompt_cache_state>::iterator find(const server_prompt & prompt, const server_tokens & tokens_new);
 
     bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
 

@@ -2288,9 +2288,22 @@ void common_prompt_checkpoint::clear() {
     pos_min = 0;
     pos_max = 0;
 
-    data_tgt.clear();
-    data_dft.clear();
-    data_spec.clear();
+    // Release the CAPACITY, not just the size.
+    //
+    // On a hybrid (recurrent + attention) model one checkpoint holds the entire recurrent
+    // state, which is flat in context: 149.63 MiB for Qwen3.8-27B at any prompt length.
+    // std::vector::clear() keeps that allocation, so the buffer stayed resident for the
+    // life of the process even though this function is the caller's way of handing it back
+    // on slot reset. It is also invisible to every accounting path, because size() reports
+    // data_tgt.size() and that is 0 once cleared.
+    //
+    // Safe to free here: this is the once-per-request reset path (server_slot::reset()).
+    // The per-speculative-step paths are clear_tgt() and clear_dft(), which keep their
+    // capacity on purpose and are deliberately left alone. The only cost is one allocation
+    // per request, since the following resize() value-initializes the buffer either way.
+    std::vector<uint8_t>().swap(data_tgt);
+    std::vector<uint8_t>().swap(data_dft);
+    std::vector<uint8_t>().swap(data_spec);
 }
 
 void common_prompt_checkpoint::update_pos(

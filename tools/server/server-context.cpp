@@ -18,6 +18,7 @@
 #include "mtmd-helper.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstddef>
 #include <cinttypes>
 #include <exception>
@@ -256,6 +257,9 @@ struct server_slot {
     llama_tokens spec_prompt;
     std::vector<int32_t> spec_i_batch;
     common_prompt_checkpoint spec_ckpt;
+
+    // [TAG_CKPT_BYTE_BUDGET] log the byte-budget cap once per slot, not once per checkpoint
+    bool logged_ckpt_budget = false;
     bool spec_is_replay = false;
     std::mt19937 spec_synth_rng;
 
@@ -297,7 +301,7 @@ struct server_slot {
 
     server_prompt prompt;
 
-    bool prompt_save(server_prompt_cache & prompt_cache) const {
+    bool prompt_save(server_prompt_cache & prompt_cache, const server_tokens * tokens_next = nullptr) const {
         if (prompt.tokens.size() == 0) {
             return false;
         }
@@ -310,7 +314,7 @@ struct server_slot {
         SRV_TRC(" - saving prompt with length %d, total state size = %.3f MiB (draft: %.3f MiB)\n",
                 (int) prompt.tokens.size(), cur_size / (1024.0 * 1024.0), cur_size_dft / (1024.0 * 1024.0));
 
-        auto * cur = prompt_cache.alloc(prompt, cur_size_tgt, cur_size_dft);
+        auto * cur = prompt_cache.alloc(prompt, cur_size_tgt, cur_size_dft, tokens_next);
         if (cur == nullptr) {
             return false;
         }
@@ -1701,7 +1705,7 @@ private:
 
                 const int64_t t_start = ggml_time_us();
 
-                ret->prompt_save(*prompt_cache);
+                ret->prompt_save(*prompt_cache, &task.tokens);
 
                 if (!ret->prompt_load(*prompt_cache, task.tokens)) {
                     ret->prompt_clear();
@@ -2404,7 +2408,60 @@ private:
             ++it;
         }
 
-        while (slot.prompt.checkpoints.size() >= (size_t) params_base.n_ctx_checkpoints) {
+        // [TAG_CKPT_BYTE_BUDGET]
+        // Bound the ring by BYTES as well as by count.
+        //
+        // A checkpoint is a snapshot of the sequence's recurrent state, taken with
+        // LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY. On an attention-only model that flag skips
+        // almost everything and an entry costs a few MiB, which is what makes a default of
+        // 32 entries reasonable. On a hybrid model it is the opposite: llama_memory_hybrid
+        // skips the attention KV and writes the WHOLE recurrent state, which is flat in
+        // context and does not shrink with prompt length. For Qwen3.8-27B that is 149.6 MiB
+        // per entry no matter how short the prompt, so the same 32-entry default silently
+        // reserves 4.7 GiB of host RAM per slot. Measured on a 5090 box: the ring plus the
+        // host prompt cache accounted for the whole of an apparent "memory leak".
+        //
+        // A count is therefore the wrong unit for this bound: it means a hundred times more
+        // memory on one model than another. Convert it to a byte budget using the size of
+        // an entry we have actually created, so the cap self-tunes per model. This can only
+        // ever LOWER the effective count, never raise it above --ctx-checkpoints.
+        //
+        // Set LLAMA_CTX_CHECKPOINT_BUDGET_MIB=0 to restore the pure count-based behaviour,
+        // or to any other number of MiB to choose a different budget.
+        size_t n_ckpt_max = (size_t) params_base.n_ctx_checkpoints;
+
+        if (!slot.prompt.checkpoints.empty()) {
+            static const size_t budget_bytes = [] {
+                const char * e = getenv("LLAMA_CTX_CHECKPOINT_BUDGET_MIB");
+                // Default 2048 MiB. On this model that is 13 checkpoints instead of 32,
+                // which is still twice the depth reached in real coding sessions.
+                const size_t mib = e ? (size_t) strtoull(e, nullptr, 10) : 2048;
+                return mib * 1024 * 1024;
+            }();
+
+            const size_t one = slot.prompt.checkpoints.back().size();
+
+            if (budget_bytes > 0 && one > 0) {
+                // At least one, otherwise a model with a single oversized entry could never
+                // checkpoint at all and would re-prefill from scratch every time.
+                const size_t by_bytes = std::max<size_t>(1, budget_bytes / one);
+
+                if (by_bytes < n_ckpt_max) {
+                    if (!slot.logged_ckpt_budget) {
+                        slot.logged_ckpt_budget = true;
+
+                        SLT_WRN(slot, "context checkpoints capped at %d by the byte budget instead of %d by count "
+                                "(%.1f MiB each, budget %zu MiB) - set LLAMA_CTX_CHECKPOINT_BUDGET_MIB to change\n",
+                                (int) by_bytes, params_base.n_ctx_checkpoints,
+                                (float) one / 1024 / 1024, budget_bytes / 1024 / 1024);
+                    }
+
+                    n_ckpt_max = by_bytes;
+                }
+            }
+        }
+
+        while (slot.prompt.checkpoints.size() >= n_ckpt_max) {
             // make room for the new checkpoint, if needed
             const auto & cur = slot.prompt.checkpoints.front();
 
