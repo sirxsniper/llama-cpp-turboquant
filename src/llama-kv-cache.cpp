@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <limits>
 #include <map>
@@ -2124,8 +2125,24 @@ void llama_kv_cache::set_input_kv_pos(ggml_tensor * dst, const llama_ubatch * ub
     const llama_seq_id seq_id = ubatch->seq_id[0][0];
     const auto & cells = v_cells.at(seq_to_stream[seq_id]);
     const int64_t n_cells = cells.size();
+    // [TAG_MASK_PROBE] same probe as the explicit mask: this walk runs once per single-sequence ubatch
+    static const bool pos_probe = [] {
+        const char * e = getenv("TURBO_MASK_PROBE");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    const int64_t t_start = pos_probe ? ggml_time_us() : 0;
     for (int64_t j = 0; j < n_kv; ++j) {
         data[j] = (j < n_cells && !cells.is_empty(j) && cells.seq_has(j, seq_id)) ? cells.pos_get(j) : -1;
+    }
+    if (pos_probe) {
+        static int64_t acc_us = 0, acc_cells = 0, calls = 0, max_kv = 0;
+        acc_us    += ggml_time_us() - t_start;
+        acc_cells += n_kv;
+        max_kv     = std::max<int64_t>(max_kv, n_kv);
+        if (++calls % 512 == 0) {
+            fprintf(stderr, "turbo-probe: kv-pos fill %lld calls  avg %.3f ms/call  %.2f ns/cell  max n_kv %lld\n",
+                    (long long) calls, acc_us / 1000.0 / calls, acc_cells ? 1000.0 * acc_us / acc_cells : 0.0, (long long) max_kv);
+        }
     }
 }
 
@@ -2142,7 +2159,15 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
     // n_tps == n_tokens_per_stream
     const int64_t n_tps = n_tokens/n_stream;
 
-    //const int64_t t_start = ggml_time_us();
+    // [TAG_MASK_PROBE] TURBO_MASK_PROBE=1 times the host mask fill, which runs on the inference thread
+    // before every graph compute. With --kv-unified and several agents the explicit mask walks all n_kv
+    // cells once per sequence and uploads [n_kv x n_tokens] F16 - an estimate of 2-4 ms/step at 4x64K
+    // that no probe had ever measured (it sits inside tgt_decode, not in the host phases).
+    static const bool mask_probe = [] {
+        const char * e = getenv("TURBO_MASK_PROBE");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    const int64_t t_start = mask_probe ? ggml_time_us() : 0;
 
     const args_set_input_kq_mask args = {
         /*.hparams          =*/ hparams,
@@ -2162,9 +2187,19 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
         set_input_kq_mask_impl<float>(args, (float *) dst->data, causal_attn);
     }
 
-    //const int64_t t_end = ggml_time_us();
-
-    //LLAMA_LOG_ERROR("%s: kq mask time: %0.3f ms\n", __func__, (t_end - t_start)/1000.0);
+    if (mask_probe) {
+        // one thread fills masks (the inference thread), so plain statics are enough
+        static int64_t acc_us = 0, acc_cells = 0, calls = 0, max_kv = 0, max_seqs = 0;
+        acc_us    += ggml_time_us() - t_start;
+        acc_cells += n_kv * (int64_t) ubatch->n_seqs_unq;
+        max_kv     = std::max<int64_t>(max_kv, n_kv);
+        max_seqs   = std::max<int64_t>(max_seqs, ubatch->n_seqs_unq);
+        if (++calls % 512 == 0) {
+            fprintf(stderr, "turbo-probe: kq-mask fill %lld calls  avg %.3f ms/call  %.2f ns/cell-walk  max n_kv %lld  max seqs %lld\n",
+                    (long long) calls, acc_us / 1000.0 / calls, acc_cells ? 1000.0 * acc_us / acc_cells : 0.0,
+                    (long long) max_kv, (long long) max_seqs);
+        }
+    }
 }
 
 void llama_kv_cache::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {

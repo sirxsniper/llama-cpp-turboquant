@@ -1309,12 +1309,69 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         const int32_t n_ubatch = (int32_t) llama_n_ubatch(ctx_dft);
 
+        // [TAG_SPEC_TAIL_PER_ROW] The skip above fires only when EVERY sequence in the batch is still far
+        // from its prompt end. With several agents that almost never holds: a generating slot's verify
+        // tokens share the server batch with another agent's prompt chunk, its prefill_after is 0, and
+        // the whole chunk - up to n_batch rows - was copied out of the target's layer inputs and injected
+        // in n_ubatch pieces, each followed by a synchronize. That is the ~13%-of-prefill drafter cost
+        // the tail skip exists to remove, returning in exactly the multi-agent overlap.
+        // Decide per sequence instead: sequences that want the skip have their drafter KV wiped once
+        // (the state the solo skip leaves) and their rows dropped; every other row is injected exactly
+        // as before. The target is untouched, so greedy output cannot change.
+        // TURBO_SPEC_TAIL_PER_ROW=0 restores the whole-batch veto.
+        static const bool tail_per_row = [] {
+            const char * e = getenv("TURBO_SPEC_TAIL_PER_ROW");
+            return e == nullptr || atoi(e) != 0;
+        }();
+        std::vector<int32_t> keep_rows;   // batch indices to inject; empty = every row
+        {
+            const int32_t tail = spec_prefill_tail();
+            if (tail_per_row && tail > 0 && batch_in.token != nullptr && batch_in.embd == nullptr &&
+                batch_in.n_seq_id != nullptr) {
+                std::vector<int8_t> skip_seq(n_seq, -1);   // -1 not in batch, 0 inject, 1 skip
+                bool any_skip = false;
+                bool any_keep = false;
+                for (int32_t i = 0; i < n_tokens; ++i) {
+                    if (batch_in.n_seq_id[i] <= 0) {
+                        continue;
+                    }
+                    const llama_seq_id s = batch_in.seq_id[i][0];
+                    if (s < 0 || s >= (llama_seq_id) n_seq || skip_seq[s] >= 0) {
+                        continue;
+                    }
+                    skip_seq[s] = prefill_after_for(s) >= tail ? 1 : 0;
+                    any_skip    = any_skip || skip_seq[s] == 1;
+                    any_keep    = any_keep || skip_seq[s] == 0;
+                }
+                if (any_skip && any_keep) {
+                    auto * mem_dft = llama_get_memory(ctx_dft);
+                    for (llama_seq_id s = 0; s < (llama_seq_id) n_seq; ++s) {
+                        if (skip_seq[s] == 1 && llama_memory_seq_pos_max(mem_dft, s) >= 0) {
+                            llama_memory_seq_rm(mem_dft, s, -1, -1);
+                        }
+                    }
+                    keep_rows.reserve(n_tokens);
+                    for (int32_t i = 0; i < n_tokens; ++i) {
+                        if (batch_in.n_seq_id[i] > 0) {
+                            const llama_seq_id s = batch_in.seq_id[i][0];
+                            if (s >= 0 && s < (llama_seq_id) n_seq && skip_seq[s] == 1) {
+                                continue;
+                            }
+                        }
+                        keep_rows.push_back(i);
+                    }
+                }
+            }
+        }
+        const int32_t n_rows = keep_rows.empty() ? n_tokens : (int32_t) keep_rows.size();
+        const auto row_at = [&keep_rows](int32_t r) -> int32_t { return keep_rows.empty() ? r : keep_rows[r]; };
+
         // Flatten token-wise encoder work into shared chunks while preserving each row's position and sequence.
         // Upstream 662a0b012 folded the DFlash encoder (fc + norm) into the decoder's embd branch, so the
         // target features go straight into the inject batch and one llama_decode does both jobs. That
         // removes a llama_encode, a device-to-host round trip of its output and a graph build per chunk.
-        for (int32_t offset = 0; offset < n_tokens; offset += n_ubatch) {
-            const int32_t n_chunk = std::min(n_ubatch, n_tokens - offset);
+        for (int32_t offset = 0; offset < n_rows; offset += n_ubatch) {
+            const int32_t n_chunk = std::min(n_ubatch, n_rows - offset);
 
             batch_inject.n_tokens = n_chunk;
             for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
@@ -1324,13 +1381,13 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 }
                 for (int32_t i = 0; i < n_chunk; ++i) {
                     float       * dst = batch_inject.embd + (size_t) i * n_embd_enc + k * (size_t) n_embd_tgt;
-                    const float * src = layer + (size_t) (offset + i) * n_embd_tgt;
+                    const float * src = layer + (size_t) row_at(offset + i) * n_embd_tgt;
                     std::memcpy(dst, src, (size_t) n_embd_tgt * sizeof(float));
                 }
             }
 
             for (int32_t i = 0; i < n_chunk; ++i) {
-                const int32_t j = offset + i;
+                const int32_t j = row_at(offset + i);
                 GGML_ASSERT(batch_in.n_seq_id[j] == 1);
                 const llama_seq_id seq_id = batch_in.seq_id[j][0];
                 GGML_ASSERT(seq_id >= 0 && seq_id < (llama_seq_id) n_seq);
@@ -1372,8 +1429,30 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 return (e && e[0]) ? atoi(e) : -1;   // -1 = auto
             }();
             const bool is_prefill = n_prefill_after > 0 || n_tokens > 8;
+            // [TAG_SPEC_DFT_SYNC_LIVE] "a single sequence" means one sequence IN THIS BATCH, not a
+            // context built for one. n_seq is n_seq_max (= --parallel), so under -np 4 auto mode
+            // synced on every step even with one agent generating - the measured -2.3% was never
+            // delivered to the deployed config. Count the sequences actually present (a verify
+            // batch is at most n_parallel * (1 + n_draft) tokens, so this is a few iterations).
+            // Several live sequences keep the conservative sync, exactly as before.
+            int n_live_seq = 0;
+            {
+                llama_seq_id first = -1;
+                for (int32_t i = 0; i < batch_in.n_tokens && n_live_seq < 2; ++i) {
+                    if (batch_in.n_seq_id == nullptr || batch_in.n_seq_id[i] <= 0) {
+                        continue;
+                    }
+                    const llama_seq_id s = batch_in.seq_id[i][0];
+                    if (n_live_seq == 0) {
+                        first      = s;
+                        n_live_seq = 1;
+                    } else if (s != first) {
+                        n_live_seq = 2;
+                    }
+                }
+            }
             const bool sync_needed = dft_sync_mode == 1 || is_prefill ||
-                                     (dft_sync_mode != 0 && n_seq > 1);
+                                     (dft_sync_mode != 0 && n_live_seq > 1);
             if (sync_needed) {
                 llama_synchronize(ctx_dft);
             }
