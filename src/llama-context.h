@@ -16,6 +16,7 @@
 
 struct llama_model;
 class llama_batch_allocr;
+struct llama_ubatch;
 
 class llama_io_read_i;
 class llama_io_write_i;
@@ -233,8 +234,13 @@ private:
     int64_t output_resolve_row(int32_t i) const;
 
     // async-copy enabled layer-input tensors (per cparams.output_layer_inp)
-    // from backend into host-side embd_layer_inp buffers
-    void extract_layer_inputs(const llm_graph_result * res, size_t token_offset, size_t n_tokens);
+    // from backend into host-side embd_layer_inp buffers, each row at its batch index
+    void extract_layer_inputs(const llm_graph_result * res, size_t token_offset, const llama_ubatch & ubatch);
+
+    // [TAG_LAYER_INP_SCATTER] async-copy a token-indexed [row_floats, n_tokens] tensor so that ubatch
+    // row r lands at host row ubatch.data->idx_batch[r] (runs of consecutive indices are one copy)
+    void tensor_get_rows_batch_order(ggml_backend_t backend, ggml_tensor * t, float * dst, size_t dst_floats,
+            size_t row_floats, size_t token_offset, const llama_ubatch & ubatch);
 
     //
     // graph

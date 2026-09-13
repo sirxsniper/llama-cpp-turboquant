@@ -62,6 +62,12 @@ struct llama_ubatch {
         std::vector<int8_t>         output;
 
         std::vector<llama_seq_id> seq_id_data;
+
+        // [TAG_LAYER_INP_SCATTER] batch index of each ubatch row. split_equal does not keep batch
+        // order ([A0..Am, B0..Bm] out of [A...][B...]), and token-indexed host buffers (per-layer
+        // inputs, unmasked nextn embeddings) are read back by batch index, so they must be written
+        // at these indices rather than at the ubatch's running offset.
+        std::vector<int32_t>      idx_batch;
     };
 
     // the llama_ubatch pointers above point to this data if set. otherwise - point to external non-owning data

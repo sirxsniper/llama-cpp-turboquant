@@ -650,6 +650,89 @@ static void test_mrope(testing & t) {
     });
 }
 
+// [TAG_LAYER_INP_SCATTER] split_equal does not keep batch order for multi-sequence batches, and
+// token-indexed host buffers (per-layer inputs read by the DFlash2 / EAGLE3 drafters, unmasked nextn
+// embeddings) are read back by BATCH index. llama_context::tensor_get_rows_batch_order therefore writes
+// ubatch row r at idx_batch[r], in runs of consecutive indices. These tests pin the two facts that
+// write depends on: idx_batch really is the batch index of each row, and across all ubatches of one
+// batch the indices are a permutation, so the runs never overlap and every row lands exactly once.
+static void test_layer_inp_scatter(testing & t) {
+    llama_vocab vocab;
+
+    // the run loop of tensor_get_rows_batch_order, writing into a host buffer from a fake tensor whose
+    // row r holds `src[r]` (one float per row is enough to track placement)
+    auto scatter = [](std::vector<float> & dst, const std::vector<float> & src, const std::vector<int32_t> & idx) {
+        const size_t n = idx.size();
+        for (size_t r0 = 0; r0 < n; ) {
+            size_t len = 1;
+            while (r0 + len < n && idx[r0 + len] == idx[r0] + (int32_t) len) {
+                ++len;
+            }
+            for (size_t k = 0; k < len; ++k) {
+                dst[(size_t) idx[r0] + k] = src[r0 + k];
+            }
+            r0 += len;
+        }
+    };
+
+    auto check_layout = [&](testing & t, std::initializer_list<int> n_tokens, uint32_t n_ubatch, uint32_t keep_tail,
+                            bool expect_reorder) {
+        batch_builder bb(1);
+        llama_seq_id s = 0;
+        for (int n : n_tokens) {
+            for (int i = 0; i < n; ++i) {
+                bb.add(i, {s}, i == n - 1);
+            }
+            ++s;
+        }
+        const int32_t n_batch = (int32_t) bb.seq.size();
+
+        llama_batch_allocr ba(1);
+        t.assert_true(ba.init(bb.make(), vocab, nullptr, bb.n_embd, 4, false));
+
+        std::vector<float> dst(n_batch, -1.0f);
+        std::vector<int>   hits(n_batch, 0);
+        bool   reordered  = false;
+        size_t token_offs = 0;
+
+        for (llama_ubatch ub = ba.split_equal(n_ubatch, false, keep_tail); ub.n_tokens > 0;
+             ub = ba.split_equal(n_ubatch, false, keep_tail)) {
+            t.assert_true("ubatch owns its data", ub.data != nullptr);
+            const auto & idx = ub.data->idx_batch;
+            t.assert_equal("one batch index per row", (size_t) ub.n_tokens, idx.size());
+
+            std::vector<float> rows(ub.n_tokens);
+            for (uint32_t r = 0; r < ub.n_tokens; ++r) {
+                // batch_builder stores embd = 100 * batch index, so the row tells us where it came from
+                t.assert_equal("idx_batch is the row's batch index", 100.0f * idx[r], ub.embd[r]);
+                t.assert_true(idx[r] >= 0 && idx[r] < n_batch);
+                hits[idx[r]]++;
+                rows[r] = (float) idx[r];
+                reordered = reordered || ((size_t) idx[r] != token_offs + r);
+            }
+            scatter(dst, rows, idx);
+            token_offs += ub.n_tokens;
+        }
+
+        t.assert_equal("whole batch consumed", (size_t) n_batch, token_offs);
+        for (int32_t i = 0; i < n_batch; ++i) {
+            t.assert_equal("every batch index lands exactly once", 1, hits[i]);
+            t.assert_equal("scattered buffer is in batch order", (float) i, dst[i]);
+        }
+        t.assert_equal("layout reorders as expected (the old block copy was wrong here)", expect_reorder, reordered);
+    };
+
+    // the deployed shape: -ub 512, keep tail n_rs_seq + 1 = 4, two slots prefilling in one 1024 view
+    t.test("two_slots_700_324", [&](testing & t) { check_layout(t, {700, 324}, 512, 4, true);  });
+    t.test("two_slots_300_150", [&](testing & t) { check_layout(t, {300, 150}, 512, 4, true);  });
+    // generating slots (4-token verify blocks) co-batched with two prefilling slots
+    t.test("four_slots_mixed",  [&](testing & t) { check_layout(t, {4, 4, 700, 316}, 512, 4, true); });
+    // one sequence: the identity case must stay the single block copy
+    t.test("one_slot_identity", [&](testing & t) { check_layout(t, {1024}, 512, 4, false); });
+    // equal-length verify blocks keep batch order
+    t.test("verify_blocks_identity", [&](testing & t) { check_layout(t, {4, 4, 4, 4}, 512, 4, false); });
+}
+
 int main(int argc, char ** argv) {
     testing t;
 
@@ -669,6 +752,7 @@ int main(int argc, char ** argv) {
     t.test("split",     test_split);
     t.test("keep_tail", test_keep_tail);
     t.test("mrope",     test_mrope);
+    t.test("layer_inp_scatter", test_layer_inp_scatter);
 
     return t.summary();
 }

@@ -2025,7 +2025,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
             }
         }
 
-        extract_layer_inputs(res, n_tokens_prev, ubatch.n_tokens);
+        extract_layer_inputs(res, n_tokens_prev, ubatch);
 
         // extract nextn embeddings before
         // only meaningful in LLAMA_POOLING_TYPE_NONE (per-token); other pooling modes are ignored.
@@ -2039,10 +2039,19 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 GGML_ASSERT(backend_h != nullptr);
 
                 const uint32_t n_embd  = hparams.n_embd_out();
-                float * embd_nextn_out = embd_nextn.data + offset*n_embd;
 
-                GGML_ASSERT((offset + n_rows)*n_embd <= (int64_t) embd_nextn.size);
-                ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn_out, 0, n_rows*n_embd*sizeof(float));
+                if (masked) {
+                    // output-indexed: rows follow out_ids and are permuted later by output_reorder()
+                    float * embd_nextn_out = embd_nextn.data + offset*n_embd;
+
+                    GGML_ASSERT((offset + n_rows)*n_embd <= (int64_t) embd_nextn.size);
+                    ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn_out, 0, n_rows*n_embd*sizeof(float));
+                } else {
+                    // [TAG_LAYER_INP_SCATTER] token-indexed ("indexed by raw token position", see
+                    // get_embeddings_nextn_ith), so it takes the same batch-order write as the layer inputs
+                    tensor_get_rows_batch_order(backend_h, t_h_nextn, embd_nextn.data, embd_nextn.size,
+                            n_embd, (size_t) n_tokens_prev, ubatch);
+                }
             }
         }
 
@@ -2285,7 +2294,58 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     return n_outputs_max;
 }
 
-void llama_context::extract_layer_inputs(const llm_graph_result * res, size_t token_offset, size_t n_tokens) {
+// [TAG_LAYER_INP_SCATTER] Token-indexed host buffers must be written at each row's BATCH index.
+// On a hybrid model the memory splits with split_equal, which builds a multi-sequence ubatch as
+// [A0..Am, B0..Bm] out of a batch laid out [A...][B...], so ubatch row order is not batch order.
+// Copying the tensor as one block to token_offset * row_floats stored slot B's hidden states at
+// slot A's batch positions, and the DFlash2 / EAGLE3 drafters - which read these buffers by batch
+// index - seeded one slot's drafter KV with another slot's features whenever two slots prefilled in
+// the same batch. Output stayed exact, because the target verifies every draft, so it showed only
+// as acceptance quietly collapsing on those slots in multi-agent use.
+// Rows are copied in runs of consecutive batch indices, so the identity case (one sequence, or a
+// split that kept batch order) is still exactly one copy. LLAMA_LAYER_INP_SCATTER=0 restores the
+// old block copy for A/B.
+void llama_context::tensor_get_rows_batch_order(ggml_backend_t backend, ggml_tensor * t,
+        float * dst, size_t dst_floats, size_t row_floats, size_t token_offset, const llama_ubatch & ubatch) {
+    static const bool scatter = [] {
+        const char * e = getenv("LLAMA_LAYER_INP_SCATTER");
+        return e == nullptr || atoi(e) != 0;
+    }();
+
+    const size_t n_tokens = ubatch.n_tokens;
+
+    const std::vector<int32_t> * ids = nullptr;
+    if (scatter && ubatch.data && ubatch.data->idx_batch.size() == n_tokens) {
+        for (size_t r = 0; r < n_tokens; ++r) {
+            if ((size_t) ubatch.data->idx_batch[r] != token_offset + r) {
+                ids = &ubatch.data->idx_batch;
+                break;
+            }
+        }
+    }
+
+    if (ids == nullptr) {
+        GGML_ASSERT((token_offset + n_tokens) * row_floats <= dst_floats);
+        ggml_backend_tensor_get_async(backend, t, dst + token_offset * row_floats, 0, n_tokens * row_floats * sizeof(float));
+        return;
+    }
+
+    const auto & idx = *ids;
+    for (size_t r0 = 0; r0 < n_tokens; ) {
+        size_t len = 1;
+        while (r0 + len < n_tokens && idx[r0 + len] == idx[r0] + (int32_t) len) {
+            ++len;
+        }
+        GGML_ASSERT(idx[r0] >= 0 && ((size_t) idx[r0] + len) * row_floats <= dst_floats);
+        ggml_backend_tensor_get_async(backend, t, dst + (size_t) idx[r0] * row_floats,
+                r0 * row_floats * sizeof(float), len * row_floats * sizeof(float));
+        r0 += len;
+    }
+}
+
+void llama_context::extract_layer_inputs(const llm_graph_result * res, size_t token_offset, const llama_ubatch & ubatch) {
+    const size_t n_tokens = ubatch.n_tokens;
+
     // [TAG_SPEC_PREFILL_TAIL_EXTRACT] the caller knows nobody will read these for this batch
     if (!layer_inp_extract) {
         return;
@@ -2309,12 +2369,11 @@ void llama_context::extract_layer_inputs(const llm_graph_result * res, size_t to
         GGML_ASSERT(nfloats % n_tokens == 0);
 
         const size_t row_floats = nfloats / n_tokens;
-        const size_t dst_offset = token_offset * row_floats;
-        GGML_ASSERT(dst_offset + nfloats <= embd_layer_inp[il].size);
 
         ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched.get(), t);
         GGML_ASSERT(backend != nullptr);
-        ggml_backend_tensor_get_async(backend, t, embd_layer_inp[il].data + dst_offset, 0, nbytes);
+        tensor_get_rows_batch_order(backend, t, embd_layer_inp[il].data, embd_layer_inp[il].size,
+                row_floats, token_offset, ubatch);
     }
 }
 
@@ -2345,10 +2404,10 @@ void llama_context::output_reorder() {
         //   - embd_nextn when NOT masked: get_embeddings_nextn_ith returns
         //     embd_nextn.data + i*n_embd directly for that case ("indexed by raw token
         //     position"), and only the masked branch goes through output_resolve_row.
-        //   - embd_layer_inp always: extract_layer_inputs writes it at
-        //     token_offset * row_floats, and get_embeddings_layer_inp hands the raw
+        //   - embd_layer_inp always: extract_layer_inputs writes each row at its batch
+        //     index ([TAG_LAYER_INP_SCATTER]), and get_embeddings_layer_inp hands the raw
         //     pointer back with no index resolution, so the DFlash2 drafter reads it in
-        //     token order.
+        //     batch order.
         //
         // Whenever n_outputs != n_tokens - every prefill ubatch, and any generation batch
         // where only some tokens carry logits - the two index spaces are unrelated, so
