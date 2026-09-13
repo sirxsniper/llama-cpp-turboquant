@@ -375,6 +375,18 @@ struct server_slot {
 
     server_slot_stats stats;
 
+    // [TAG_JARVIS_SLOTS] per-slot monitoring totals. reset() zeroes `stats` in the same main-loop step
+    // that releases a request, so /slots could never show how a request ended and a poller lost the
+    // tail of every request. release() folds each finished request in first, and these never reset.
+    uint64_t mon_n_gen_total           = 0;
+    uint64_t mon_n_prompt_total        = 0;
+    int64_t  mon_t_gen_total_us        = 0;
+    uint64_t mon_n_gen_steps_total     = 0;   // n_gen - 1 per request: the tokens t_gen_us() actually timed
+    // the finished request's own numbers, which `stats` no longer holds after reset()
+    uint64_t mon_last_n_gen            = 0;
+    uint64_t mon_last_n_prompt         = 0;
+    uint64_t mon_last_n_prompt_cached  = 0;
+
     // accepted tokens per draft position
     // not in server_slot_stats to avoid copying to every task result
     std::vector<uint64_t> n_accepted_per_pos;
@@ -581,6 +593,19 @@ struct server_slot {
                 prompt_clear();
             }
 
+            // [TAG_JARVIS_SLOTS] fold this request into the monitoring totals before reset() clears
+            // it. A child inherits its parent's prompt stats (copy_state_to), so it adds no prompt.
+            {
+                const bool child = task->is_child();
+                mon_n_gen_total          += stats.n_gen;
+                mon_t_gen_total_us       += stats.t_gen_us();
+                mon_n_gen_steps_total    += stats.n_gen_steps();
+                mon_n_prompt_total       += child ? 0 : stats.n_prompt_processed;
+                mon_last_n_gen            = stats.n_gen;
+                mon_last_n_prompt         = child ? 0 : stats.n_prompt_processed;
+                mon_last_n_prompt_cached  = stats.n_prompt_cached;
+            }
+
             callback_on_reset(*this);
 
             reset();
@@ -738,6 +763,25 @@ struct server_slot {
             if (!only_metrics) {
                 res["prompt"] = ptask->tokens.detokenize(ctx_tgt, true);
                 res["generated"] = generated_text.empty() ? debug_generated_text : generated_text;
+            }
+        }
+
+        // [TAG_JARVIS_SLOTS] running totals: every finished request plus the live one. They only go
+        // up, including across a release, because release() folds `stats` in and clears `task` in
+        // the same step - so a client can diff two polls exactly.
+        {
+            const bool live = (bool) task;
+            const bool child = live && task->is_child();
+            res["n_decoded_total"]          = mon_n_gen_total + (live ? stats.n_gen : 0);
+            res["n_prompt_processed_total"] = mon_n_prompt_total + (live && !child ? stats.n_prompt_processed : 0);
+            res["t_gen_total_ms"]           = (double) (mon_t_gen_total_us + (live ? stats.t_gen_us() : 0)) / 1000.0;
+            // the first token of each request is free (prompt logits) and untimed, so a rate is
+            // n_gen_steps_total / t_gen_total_ms - the same convention as timings.predicted_per_second
+            res["n_gen_steps_total"]        = mon_n_gen_steps_total + (live ? stats.n_gen_steps() : 0);
+            if (!live && task_prev) {
+                res["last_n_decoded"]          = mon_last_n_gen;
+                res["last_n_prompt_processed"] = mon_last_n_prompt;
+                res["last_n_prompt_cache"]     = mon_last_n_prompt_cached;
             }
         }
 
@@ -4079,7 +4123,22 @@ private:
                     const int32_t done  = (int32_t) slot.prompt.n_tokens();
                     const int32_t rem   = total - done;
                     n_after = std::max(n_after, rem);
-                    common_speculative_set_prefill_after_seq(spec.get(), slot.id, rem);
+                    // [TAG_SHARE_PREFIX_DFT_TAIL] While a slot is paused on a shared boundary
+                    // ([TAG_SHARED_PREFIX_FANOUT]) the drafter state that gets published is the one AT
+                    // that boundary, so its warm tail has to end there. Measured to the full prompt end
+                    // instead, a leader whose own tail runs 2048+ tokens past the boundary skipped (and
+                    // wiped) the drafter for every batch up to it, and each follower restored an EMPTY
+                    // drafter window and drafted blind until it had generated its way back. The scalar
+                    // max above still measures to the full end, which is what the is_prefill heuristic
+                    // wants. TURBO_SHARE_PREFIX_DFT_TAIL=0 restores the old distance.
+                    static const bool dft_tail_to_boundary = [] {
+                        const char * e = getenv("TURBO_SHARE_PREFIX_DFT_TAIL");
+                        return e == nullptr || atoi(e) != 0;
+                    }();
+                    const int32_t skip_end = (dft_tail_to_boundary && slot.share_prefix_stop > 0)
+                                               ? std::min<int32_t>(total, (int32_t) slot.share_prefix_stop)
+                                               : total;
+                    common_speculative_set_prefill_after_seq(spec.get(), slot.id, std::max<int32_t>(0, skip_end - done));
                 }
             }
             common_speculative_set_prefill_after(spec.get(), n_after);
