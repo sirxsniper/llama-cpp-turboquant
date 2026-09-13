@@ -148,17 +148,78 @@ struct common_sampler {
 
         const int n_vocab = llama_vocab_n_tokens(vocab);
 
-        if (sampled_probs) {
+        // [TAG_BS_CANDIDATE_GUARD] The three backend-sampled arrays are fetched independently and
+        // are not guaranteed to correspond for a given row - get_sampled_candidates_ith falls back
+        // to token_ids_full_vocab when this row has no candidate data, while the probs array stays
+        // top-k sized. Taking the probs count as the bound for all three then reads token ids out
+        // of an array that holds something else, and the whole candidate set comes back as float
+        // bit patterns (0x3F800000 = 1.0f, 0xFF800000 = -inf). That surfaces much later as
+        // "invalid vector subscript" from the vocab lookup and kills the request with an HTTP 500.
+        //
+        // Agree on the shortest count, verify every id is a real token, and fall back to plain
+        // full-vocab logits if anything is off. Correctness first; the fallback costs one position.
+        const bool bs_ok = [&]() -> bool {
+            if (!sampled_probs || !sampled_ids || !sampled_logits) {
+                return false;
+            }
+
+            const uint32_t n_p = llama_get_sampled_probs_count_ith(ctx, idx);
+            const uint32_t n_c = llama_get_sampled_candidates_count_ith(ctx, idx);
+            const uint32_t n_l = llama_get_sampled_logits_count_ith(ctx, idx);
+
+            if (n_p == 0 || n_c < n_p || n_l < n_p) {
+                return false;
+            }
+
+            for (uint32_t i = 0; i < n_p; ++i) {
+                if (sampled_ids[i] < 0 || sampled_ids[i] >= n_vocab) {
+                    return false;
+                }
+            }
+
+            return true;
+        }();
+
+        if (sampled_probs && !bs_ok) {
+            static bool warned = false;
+            if (!warned) {
+                warned = true;
+                LOG_WRN("[TAG_BS_CANDIDATE_GUARD] backend-sampled candidates are inconsistent for "
+                        "output %d (probs=%u candidates=%u logits=%u) - falling back to full-vocab "
+                        "logits. This is logged once.\n", idx,
+                        (unsigned) llama_get_sampled_probs_count_ith(ctx, idx),
+                        (unsigned) llama_get_sampled_candidates_count_ith(ctx, idx),
+                        (unsigned) llama_get_sampled_logits_count_ith(ctx, idx));
+            }
+        }
+
+        if (bs_ok) {
             const uint32_t sampled_probs_count = llama_get_sampled_probs_count_ith(ctx, idx);
             cur.resize(sampled_probs_count);
             for (uint32_t i = 0; i < sampled_probs_count; ++i) {
                 cur[i] = llama_token_data{sampled_ids[i], sampled_logits[i], sampled_probs[i]};
             }
-        } else if (sampled_logits) {
+        } else if (sampled_logits && !sampled_probs) {
             const uint32_t sampled_logits_count = llama_get_sampled_logits_count_ith(ctx, idx);
-            cur.resize(sampled_logits_count);
-            for (uint32_t i = 0; i < sampled_logits_count; i++) {
-                cur[i] = llama_token_data{sampled_ids[i], sampled_logits[i], 0.0f};
+            const uint32_t n_c                  = llama_get_sampled_candidates_count_ith(ctx, idx);
+
+            bool ids_ok = sampled_ids != nullptr && n_c >= sampled_logits_count;
+            for (uint32_t i = 0; ids_ok && i < sampled_logits_count; ++i) {
+                ids_ok = sampled_ids[i] >= 0 && sampled_ids[i] < n_vocab;
+            }
+
+            if (ids_ok) {
+                cur.resize(sampled_logits_count);
+                for (uint32_t i = 0; i < sampled_logits_count; i++) {
+                    cur[i] = llama_token_data{sampled_ids[i], sampled_logits[i], 0.0f};
+                }
+            } else {
+                const auto * logits = llama_get_logits_ith(ctx, idx);
+                GGML_ASSERT(logits != nullptr);
+                cur.resize(n_vocab);
+                for (llama_token token_id = 0; token_id < n_vocab; token_id++) {
+                    cur[token_id] = llama_token_data{token_id, logits[token_id], 0.0f};
+                }
             }
         } else {
             const auto * logits = llama_get_logits_ith(ctx, idx);
@@ -532,7 +593,11 @@ void common_sampler_reset(struct common_sampler * gsmpl) {
 }
 
 struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
-    return new common_sampler {
+    // [TAG_SAMPLER_CLONE_CURP] cur_p.data is a raw pointer into `cur`. The clone gets its own copy
+    // of `cur` below, so copying cur_p verbatim would leave the clone pointing into the ORIGINAL
+    // sampler's vector - dangling the moment that vector is reallocated or the original is freed.
+    // common_sampler_copy already re-points for exactly this reason (see below); clone never did.
+    common_sampler * res = new common_sampler {
         /* .params  = */ gsmpl->params,
         /* .grmr    = */ llama_sampler_clone(gsmpl->grmr),
         /* .rbudget = */ llama_sampler_clone(gsmpl->rbudget),
@@ -544,6 +609,10 @@ struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
         /* .speculative_seed = */ gsmpl->speculative_seed,
         /* .speculative_rng  = */ gsmpl->speculative_rng,
     };
+
+    res->cur_p.data = gsmpl->cur_p.data ? res->cur.data() : nullptr; // re-point to the clone's buffer
+
+    return res;
 }
 
 void common_sampler_copy(const common_sampler * src, common_sampler * dst) {
@@ -872,10 +941,31 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(
         }
 
         llama_token id = fallback;
+        size_t       id_idx = SIZE_MAX;   // [TAG_SAMPLER_CLONE_CURP] which branch produced `id`
         if (residual_sum > 0.0f) {
             std::discrete_distribution<size_t> sample(residual.begin(), residual.end());
-            id = p->data[sample(gsmpl->speculative_rng)].id;
+            id_idx = sample(gsmpl->speculative_rng);
+            id = p->data[id_idx].id;
         }
+
+        // [TAG_SAMPLER_CLONE_CURP] An out-of-range id here is a candidate-buffer problem, not a
+        // model output: llama_token_data is {int32 id; float logit; float p;}, so reading the wrong
+        // field yields float bit patterns (0x3F800000 = 1.0f, 0xFF800000 = -inf). Say which branch
+        // and what the candidate array looked like, rather than letting it surface 12 frames later
+        // as "invalid vector subscript" from the vocab lookup.
+        {
+            const int n_vocab_dbg = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx)));
+            if (id < 0 || id >= n_vocab_dbg) {
+                LOG_ERR("[TAG_SAMPLER_CLONE_CURP] residual sampling produced id %d (0x%08X), outside "
+                        "[0, %d): branch=%s, p->size=%zu, p->sorted=%d, residual_sum=%g, idx=%zu, "
+                        "fallback=%d, draft_pos=%zu/%zu\n",
+                        (int) id, (unsigned) id, n_vocab_dbg,
+                        id_idx == SIZE_MAX ? "fallback" : "residual",
+                        (size_t) p->size, (int) p->sorted, residual_sum,
+                        id_idx, (int) fallback, i, draft.size());
+            }
+        }
+
         common_sampler_accept(gsmpl, id, true);
         result.push_back(id);
         break;

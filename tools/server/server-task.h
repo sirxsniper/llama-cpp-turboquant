@@ -598,6 +598,12 @@ struct server_prompt_cache_state {
     server_prompt prompt;
     server_prompt_data data;
 
+    // [TAG_PROMPT_CACHE_SHARED_ENTRY] This entry sits exactly on a prefix boundary that several
+    // slots branch from. A longer entry does NOT supersede it: the 48 recurrent layers cannot be
+    // rewound to the branch point, so only a state captured ON the boundary is usable there.
+    // Exempt from both containment rules in alloc(); still subject to the size limit and LRU.
+    bool shared = false;
+
     size_t size() const {
         size_t res = data.size();
 
@@ -630,7 +636,7 @@ struct server_prompt_cache {
     // tokens_next: the prompt that load() will be asked for right after this save. The entry
     // that load would restore is protected from the eviction that makes room for this state.
     // [TAG_PROMPT_CACHE_KEEP_NEXT]
-    server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft, const server_tokens * tokens_next = nullptr);
+    server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft, const server_tokens * tokens_next = nullptr, bool shared = false);
 
     // the entry load() would restore for tokens_new while the slot holds prompt, or states.end()
     std::list<server_prompt_cache_state>::iterator find(const server_prompt & prompt, const server_tokens & tokens_new);

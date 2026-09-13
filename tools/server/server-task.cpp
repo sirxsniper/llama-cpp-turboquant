@@ -181,10 +181,24 @@ common_chat_msg task_result_state::update_chat_msg(
     auto msg_prv_copy = chat_msg;
     const auto cp_t1 = cp_probe ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     //SRV_DBG("Parsing chat message: %s\n", generated_text.c_str());
-    auto new_msg = common_chat_parse(
-        generated_text,
-        is_partial,
-        chat_parser_params);
+    // [TAG_CHAT_PARSE_WHERE] Name this call if it throws. common_chat_parse reaches
+    // common_peg_arena::parse -> parsers_.at(id) on a std::vector, which is the MSVC source of
+    // "invalid vector subscript"; get_rule() throws a different message, so an out-of-range
+    // parser id is the only way to land on that text. Re-thrown unchanged.
+    common_chat_msg new_msg;
+    try {
+        new_msg = common_chat_parse(
+            generated_text,
+            is_partial,
+            chat_parser_params);
+    } catch (const std::exception & e) {
+        LOG_ERR("chat parse threw: %s | text=%zu bytes, is_partial=%d, prev tool_calls=%zu, "
+                "prev reasoning=%zu bytes, prev content=%zu bytes\n",
+                e.what(), generated_text.size(), (int) is_partial,
+                msg_prv_copy.tool_calls.size(), msg_prv_copy.reasoning_content.size(),
+                msg_prv_copy.content.size());
+        throw;
+    }
     const auto cp_t2 = cp_probe ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     if (!new_msg.empty()) {
         new_msg.set_tool_call_ids(generated_tool_call_ids, gen_tool_call_id);
@@ -1738,14 +1752,21 @@ size_t server_prompt_cache::n_tokens() const {
     return res;
 }
 
-server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & prompt, size_t state_size_tgt, size_t state_size_dft, const server_tokens * tokens_next) {
+server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & prompt, size_t state_size_tgt, size_t state_size_dft, const server_tokens * tokens_next, bool shared) {
     // first check if the current state is contained fully in the cache
-    for (auto it = states.begin(); it != states.end(); ++it) {
-        const int cur_lcp_len = it->prompt.tokens.get_common_prefix(prompt.tokens);
+    //
+    // [TAG_PROMPT_CACHE_SHARED_ENTRY] A `shared` entry is exempt. It sits on a prefix boundary that
+    // other slots branch from, and being contained in a longer entry does NOT make it redundant
+    // here: rewinding that longer state back to the boundary would require rolling back 48 Gated
+    // DeltaNet layers, which is impossible, so the server would re-prefill the whole prompt instead.
+    if (!shared) {
+        for (auto it = states.begin(); it != states.end(); ++it) {
+            const int cur_lcp_len = it->prompt.tokens.get_common_prefix(prompt.tokens);
 
-        if (cur_lcp_len == (int) prompt.tokens.size()) {
-            SRV_TRC("%s", " - prompt is already in the cache, skipping\n");
-            return nullptr;
+            if (cur_lcp_len == (int) prompt.tokens.size()) {
+                SRV_TRC("%s", " - prompt is already in the cache, skipping\n");
+                return nullptr;
+            }
         }
     }
 
@@ -1781,6 +1802,14 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
 
     // remove any cached prompts that are fully contained in the current prompt
     for (auto it = states.begin(); it != states.end();) {
+        // [TAG_PROMPT_CACHE_SHARED_ENTRY] never sweep away a boundary entry - the leader's own full
+        // prompt contains it by construction, so this rule would delete it the moment the leader
+        // finishes, which is precisely when the followers still need it
+        if (it->shared) {
+            ++it;
+            continue;
+        }
+
         const int len = it->prompt.tokens.get_common_prefix(prompt.tokens);
 
         if (len == (int) it->prompt.tokens.size()) {

@@ -312,7 +312,8 @@ struct server_slot {
 
     server_prompt prompt;
 
-    bool prompt_save(server_prompt_cache & prompt_cache, const server_tokens * tokens_next = nullptr) const {
+    bool prompt_save(server_prompt_cache & prompt_cache, const server_tokens * tokens_next = nullptr,
+                     bool shared = false) const {
         if (prompt.tokens.size() == 0) {
             return false;
         }
@@ -325,7 +326,10 @@ struct server_slot {
         SRV_TRC(" - saving prompt with length %d, total state size = %.3f MiB (draft: %.3f MiB)\n",
                 (int) prompt.tokens.size(), cur_size / (1024.0 * 1024.0), cur_size_dft / (1024.0 * 1024.0));
 
-        auto * cur = prompt_cache.alloc(prompt, cur_size_tgt, cur_size_dft, tokens_next);
+        auto * cur = prompt_cache.alloc(prompt, cur_size_tgt, cur_size_dft, tokens_next, shared);
+    if (cur != nullptr) {
+        cur->shared = shared;
+    }
         if (cur == nullptr) {
             return false;
         }
@@ -1737,7 +1741,8 @@ private:
             slot.share_prefix_stop      = 0;
             slot.share_prefix_published = true;
 
-            if (slot.prompt_save(*prompt_cache)) {
+            // shared = true: this is a boundary entry, exempt from containment
+            if (slot.prompt_save(*prompt_cache, nullptr, /*shared =*/ true)) {
                 prompt_cache->update();
                 SLT_INF(slot, "share_prefix: published %d tokens at the shared boundary\n", n_shared);
             } else {
@@ -3013,25 +3018,42 @@ private:
         return true;
     }
 
-    void iterate(std::vector<server_slot> & slots, std::function<void(server_slot &)> callback) {
+    // [TAG_ITERATE_WHERE] The catch-all below reports only the exception message, which is
+    // identical for every std::vector::at() in the process. That is not enough to localise a
+    // 1-in-50 mid-generation failure across eight call sites, so each site names itself and the
+    // slot's state is printed alongside. Diagnostics only.
+    static void iterate_report(const server_slot & slot, const char * where, const std::exception & e,
+                               std::string & msg) {
+        msg = std::string("got exception in ") + where + ": " + e.what();
+        SLT_ERR(slot, "%s | state=%d n_prompt=%d n_gen=%d n_ctx=%d id_task=%d\n",
+                msg.c_str(), (int) slot.state, (int) slot.prompt.n_tokens(),
+                (int) slot.stats.n_gen, (int) slot.n_ctx,
+                slot.task ? slot.task->id : -1);
+    }
+
+    void iterate(const char * where, std::vector<server_slot> & slots,
+                 std::function<void(server_slot &)> callback) {
         for (auto & slot : slots) {
             try {
                 callback(slot);
             } catch (const std::exception & e) {
-                SLT_ERR(slot, "got exception: %s\n", e.what());
-                send_error(slot, std::string("got exception: ") + e.what(), ERROR_TYPE_SERVER);
+                std::string msg;
+                iterate_report(slot, where, e, msg);
+                send_error(slot, msg, ERROR_TYPE_SERVER);
                 slot.release();
             }
         }
     }
 
-    void iterate(std::vector<server_slot *> & slots, std::function<void(server_slot &)> callback) {
+    void iterate(const char * where, std::vector<server_slot *> & slots,
+                 std::function<void(server_slot &)> callback) {
         for (auto & slot : slots) {
             try {
                 callback(*slot);
             } catch (const std::exception & e) {
-                SLT_ERR(*slot, "got exception: %s\n", e.what());
-                send_error(*slot, std::string("got exception: ") + e.what(), ERROR_TYPE_SERVER);
+                std::string msg;
+                iterate_report(*slot, where, e, msg);
+                send_error(*slot, msg, ERROR_TYPE_SERVER);
                 slot->release();
             }
         }
@@ -3199,7 +3221,7 @@ private:
     void pre_decode() {
         // apply context-shift if needed
         // TODO: simplify and improve
-        iterate(slots, [&](server_slot & slot) {
+        iterate("slots_3219", slots, [&](server_slot & slot) {
             if (slot.state == SLOT_STATE_GENERATING && slot.prompt.n_tokens() + 1 >= slot.n_ctx) {
                 if (!params_base.ctx_shift) {
                     // this check is redundant (for good)
@@ -3271,7 +3293,7 @@ private:
         std::vector<server_slot *> drafting;
 
         // determine which slots are generating and drafting
-        iterate(slots, [&](server_slot & slot) {
+        iterate("slots_3291", slots, [&](server_slot & slot) {
             if (slot.state != SLOT_STATE_GENERATING) {
                 return;
             }
@@ -3358,7 +3380,7 @@ private:
         }
 
         // make checkpoints if needed
-        iterate(drafting, [&](server_slot & slot) {
+        iterate("drafting_3378", drafting, [&](server_slot & slot) {
             auto & draft = slot.spec_draft;
             auto & ckpt  = slot.spec_ckpt;
 
@@ -3421,7 +3443,7 @@ private:
         });
 
         // update the batch with the sampled/drafted tokens
-        iterate(generating, [&](server_slot & slot) {
+        iterate("generating_3441", generating, [&](server_slot & slot) {
             slot.handle_last_sampled_token(batch);
         });
 
@@ -3436,7 +3458,7 @@ private:
         if (params_base.cont_batching || batch.size() == 0) {
             bool add_ok = true; // false means the batch is full, skip remaining slots
 
-            iterate(slots, [&](server_slot & slot) {
+            iterate("slots_3456", slots, [&](server_slot & slot) {
                 if (!add_ok || batch.size() >= n_batch) {
                     return; // batch is full, skip remaining slots
                 }
@@ -4218,7 +4240,7 @@ private:
 
         // TODO @ngxson : it's tricky to make sub-batch compatible with common_sampler_sample_and_accept_n,
         // so for now we will throw an error in this case: https://github.com/ggml-org/llama.cpp/issues/24840
-        iterate(slots, [&](server_slot & slot) {
+        iterate("slots_4238", slots, [&](server_slot & slot) {
             for (auto & i : slot.spec_i_batch) {
                 if (!is_inside_view(i)) {
                     throw std::runtime_error(string_format("speculative batch index %d is not inside the current sub-batch [%d, %d)", i, off, off + n_batch_tokens));
@@ -4231,7 +4253,7 @@ private:
                 slot.task->params.sampling.preserved_tokens.find(token) != slot.task->params.sampling.preserved_tokens.end();
         };
 
-        iterate(slots, [&](server_slot & slot) {
+        iterate("slots_4251", slots, [&](server_slot & slot) {
             // optionally send prompt processing progress
             if (slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_DONE_PROMPT) {
                 if (slot.task->params.stream && slot.task->params.return_progress) {
@@ -4324,7 +4346,7 @@ private:
         });
 
         // speculative decoding - main model sample and accept
-        iterate(slots, [&](server_slot & slot) {
+        iterate("slots_4344", slots, [&](server_slot & slot) {
             if (slot.state != SLOT_STATE_GENERATING || !slot.can_speculate() ||
                     slot.spec_draft.empty() || slot.spec_i_batch.empty()) {
                 return;
@@ -4335,7 +4357,13 @@ private:
 
             GGML_ASSERT(n_draft > 0);
 
+// [TAG_PHASE_PROBE] name the phase that throws, so the next occurrence localises itself
+#define TURBO_PHASE_BEGIN try {
+#define TURBO_PHASE_END(name) } catch (const std::exception & e_) { \
+    throw std::runtime_error(std::string(name) + ": " + e_.what()); }
+
             // verify and try to accept the draft
+            TURBO_PHASE_BEGIN
             {
                 // [TAG_SPEC_SMPL_CLONE] Only the use_ckpt_tgt branch below consumes this clone, and
                 // cloning is not cheap: common_sampler_clone copies gsmpl->cur, which is
@@ -4441,10 +4469,13 @@ private:
                 slot.spec_draft = std::move(accepted);
                 slot.spec_dists.clear();
             }
+            TURBO_PHASE_END("accept")
 
             const auto ids = std::move(slot.spec_draft);
 
             size_t n_accepted = ids.size() - 1;
+
+            TURBO_PHASE_BEGIN
             if (slot.spec_is_replay && n_accepted > 0) {
                 n_accepted--;
             }
@@ -4472,11 +4503,40 @@ private:
             SLT_DBG(slot, "add accepted tokens: sampled=%d, ids.size=%zu, n_draft=%zu\n", slot.sampled, ids.size(), n_draft);
 
             slot.mem.seq_rm(slot.id, slot.prompt.tokens.pos_next(), -1);
+            TURBO_PHASE_END("bookkeep")
+
+            TURBO_PHASE_BEGIN
+            // [TAG_BAD_TOKEN_GUARD] The vocab indexes std::vectors by token id with .at()
+            // (llama-vocab.cpp:3150, :3698), so an id outside [0, n_vocab) throws
+            // "invalid vector subscript" and the whole request dies with an HTTP 500. That is
+            // what has been happening on roughly 1 in 40 long reasoning generations, in stock
+            // llama.cpp as well as here. Report the actual value and stop cleanly instead.
+            const int n_vocab_tgt =
+                llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(slot.ctx_tgt)));
 
             for (size_t i = 0; i < ids.size(); ++i) {
                 completion_token_output result;
 
-                result.tok          = ids[i];
+                result.tok = ids[i];
+
+                if (result.tok < 0 || result.tok >= n_vocab_tgt) {
+                    SLT_ERR(slot, "[TAG_BAD_TOKEN_GUARD] speculative accept produced token id %d, "
+                            "outside [0, %d) - position %zu of %zu accepted, n_draft = %zu, "
+                            "replay = %d. Dropping it and ending this generation cleanly rather "
+                            "than throwing.\n",
+                            (int) result.tok, n_vocab_tgt, i, ids.size(), n_draft,
+                            (int) slot.spec_is_replay);
+
+                    slot.stop           = STOP_TYPE_EOS;
+                    slot.has_next_token = false;
+
+                    slot.print_timings();
+                    send_final_response(slot);
+                    slot.release();
+
+                    return;
+                }
+
                 result.text_to_send = common_token_to_piece(slot.ctx_tgt, result.tok, accept_special_token(slot, result.tok));
                 result.prob         = 1.0f; // set later
 
@@ -4494,6 +4554,10 @@ private:
             }
 
             slot.print_timings_tg();
+            TURBO_PHASE_END("emit")
+
+#undef TURBO_PHASE_BEGIN
+#undef TURBO_PHASE_END
 
             SLT_DBG(slot, "accepted %d/%d draft tokens, new n_tokens = %d\n", (int) n_accepted, (int) n_draft, slot.prompt.n_tokens());
         });
