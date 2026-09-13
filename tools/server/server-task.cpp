@@ -1922,6 +1922,27 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
         //
         // Erase on EVERY exit path. A half-consumed entry has no value: its target blob is
         // already gone and can never be restored again.
+        // [TAG_PROMPT_CACHE_SHARE] A SUCCESSFUL restore no longer consumes the entry.
+        //
+        // Clearing the blob and erasing the entry is correct only when at most one slot ever wants
+        // a given prefix. With --parallel > 1 it is backwards: four clients sharing a system
+        // prompt means the first slot restores the state and destroys it, and the other three each
+        // re-prefill the whole prefix. Measured here with four identical 18K prompts on 4 slots,
+        // 54,103 tokens of prompt processing where 18,033 would do - 35.7 s instead of 7.3 s, with
+        // every decoding slot starved to 9 t/s while it ran.
+        //
+        // llama_state_seq_set_data_ext takes a const buffer, so the blob is reusable as-is.
+        // Keeping it costs cache RAM, which update() already bounds by --cache-ram; the entry is
+        // spliced to the back so that budget counts it as recently used rather than evicting the
+        // one state every slot is asking for.
+        //
+        // A FAILED restore still erases - that is the [TAG_PROMPT_CACHE_POISON] case above, and a
+        // half-consumed entry has no value. TURBO_PROMPT_CACHE_SHARE=0 restores the old behaviour.
+        static const bool share = [] {
+            const char * s = getenv("TURBO_PROMPT_CACHE_SHARE");
+            return !(s && s[0] == '0' && s[1] == '\0');
+        }();
+
         bool restored = true;
 
         {
@@ -1933,7 +1954,7 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
                 SRV_ERR("failed to restore state with size %zu\n", size);
 
                 restored = false;
-            } else {
+            } else if (!share) {
                 data.clear();
                 data.shrink_to_fit();
             }
@@ -1951,7 +1972,7 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
                     SRV_WRN("failed to restore state with size %zu\n", size);
 
                     restored = false;
-                } else {
+                } else if (!share) {
                     data.clear();
                     data.shrink_to_fit();
                 }
@@ -1962,6 +1983,14 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
             states.erase(it_best);
 
             return false;
+        }
+
+        if (share) {
+            prompt = it_best->prompt.clone();
+
+            states.splice(states.end(), states, it_best);
+
+            return true;
         }
 
         prompt = std::move(it_best->prompt);

@@ -1,4 +1,8 @@
 #include "llama-kv-cache.h"
+
+#include <cstdlib>
+
+#include <set>
 #include "llama-triattention.h"
 
 #include "llama-impl.h"
@@ -181,6 +185,54 @@ llama_kv_cache::llama_kv_cache(
 
     const bool is_mla = hparams.is_mla();
 
+    // [TAG_KV_CPU_LAYERS] Adaptive KV placement: park the KV of N attention layers in host RAM.
+    //
+    // Each attention layer's KV at ctx 262144 / turbo5p is 328 MiB (262144 x 1024 x 5.125/8 x 2),
+    // so every layer moved off the GPU frees exactly that much VRAM. Nothing about the cached data
+    // changes - same type, same precision, same context - so output is identical; only where the
+    // bytes live changes.
+    //
+    // The cost is an extra PCIe read per offloaded layer per token, proportional to the context
+    // ACTUALLY used: ~0.37 ms at 16K, ~1.5 ms at 64K, ~6 ms at 262K on PCIe 5 x16. Cheap for short
+    // conversations, expensive for deep ones - measure at your real depth before committing.
+    //
+    // Layers are taken from the MIDDLE of the attention stack, leaving the first and last in VRAM.
+    const uint32_t kv_cpu_layers = [] {
+        const char * e = getenv("TURBO_KV_CPU_LAYERS");
+        const int    n = e ? atoi(e) : 0;
+        return (uint32_t) (n > 0 ? n : 0);
+    }();
+
+    // Build the offload set up front: we need to know how many layers this cache actually holds
+    // before we can pick the middle ones, and the filter decides that.
+    std::vector<uint32_t> kv_layers;
+    if (kv_cpu_layers > 0) {
+        for (uint32_t il = 0; il < n_layer; il++) {
+            if (!filter || filter(il)) {
+                kv_layers.push_back(il);
+            }
+        }
+    }
+    std::set<uint32_t> kv_on_cpu;
+    if (kv_cpu_layers > 0 && !kv_layers.empty()) {
+        const uint32_t n_cache  = (uint32_t) kv_layers.size();
+        const uint32_t n_to_cpu = std::min(kv_cpu_layers, n_cache > 2 ? n_cache - 2 : 0u);
+        if (n_to_cpu < kv_cpu_layers) {
+            LLAMA_LOG_WARN("%s: TURBO_KV_CPU_LAYERS=%u capped to %u "
+                           "(this cache holds %u layers; first and last stay on the GPU)\n",
+                           __func__, kv_cpu_layers, n_to_cpu, n_cache);
+        }
+        // centre the selection so the first and last attention layers stay resident
+        const uint32_t first = (n_cache - n_to_cpu) / 2;
+        for (uint32_t i = 0; i < n_to_cpu; ++i) {
+            kv_on_cpu.insert(kv_layers[first + i]);
+        }
+        if (n_to_cpu > 0) {
+            LLAMA_LOG_INFO("%s: KV for %u of %u attention layers placed in HOST RAM "
+                           "(TURBO_KV_CPU_LAYERS)\n", __func__, n_to_cpu, n_cache);
+        }
+    }
+
     for (uint32_t il = 0; il < n_layer; il++) {
         if (!hparams.has_kv(il)) {
             LLAMA_LOG_DEBUG("%s: layer %3d: does not have KV cache\n", __func__, il);
@@ -232,11 +284,17 @@ llama_kv_cache::llama_kv_cache(
 
         ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type();
 
-        if (offload) {
+        // [TAG_KV_CPU_LAYERS] a layer in the offload set keeps the CPU buffer type, which leaves
+        // its K and V in host RAM. Everything else about the layer is unchanged.
+        const bool kv_to_cpu = kv_on_cpu.count(il) > 0;
+
+        if (offload && !kv_to_cpu) {
             auto * dev = model.dev_layer(il);
             buft = ggml_backend_dev_buffer_type(dev);
 
             dev_name = ggml_backend_dev_name(dev);
+        } else if (kv_to_cpu) {
+            dev_name = "CPU (TURBO_KV_CPU_LAYERS)";
         }
 
         LLAMA_LOG_DEBUG("%s: layer %3d: dev = %s\n", __func__, il, dev_name);

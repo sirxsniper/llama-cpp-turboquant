@@ -303,6 +303,13 @@ struct server_slot {
     // state
     slot_state state = SLOT_STATE_IDLE;
 
+    // [TAG_SHARED_PREFIX_FANOUT] When other tasks are waiting on the prefix this slot is currently
+    // processing, stop filling at share_prefix_stop so one batch ends exactly on the boundary. The
+    // state saved at that instant IS the shared prefix, which is the only form a follower can use:
+    // the Gated DeltaNet layers cannot rewind a recurrent state to an earlier position.
+    int32_t share_prefix_stop      = 0;
+    bool    share_prefix_published = false;
+
     server_prompt prompt;
 
     bool prompt_save(server_prompt_cache & prompt_cache, const server_tokens * tokens_next = nullptr) const {
@@ -377,6 +384,10 @@ struct server_slot {
 
     void reset() {
         SLT_DBG(*this, "%s", "\n");
+
+        // [TAG_SHARED_PREFIX_FANOUT]
+        share_prefix_stop      = 0;
+        share_prefix_published = false;
 
         spec_is_replay = false;
 
@@ -1620,6 +1631,127 @@ private:
         return nullptr;
     }
 
+    // [TAG_SHARED_PREFIX_FANOUT] Should this task wait for a slot that is already processing the
+    // same prefix?
+    //
+    // Several agent harnesses share an identical system prompt + skills + tool block - here ~16,000
+    // tokens - and they arrive together. get_available_slot below can only reuse a prefix from a
+    // slot that already holds tokens and is idle, so at t=0 every one of them starts from zero and
+    // the same 16,000 tokens are processed once per slot. Deferring the followers lets the leader
+    // finish, publish its state to the prompt cache, and have them restore it instead.
+    //
+    // Only waits on a leader that is STILL mid-prompt. Once the leader's prompt is complete the
+    // state is in the cache and there is nothing left to wait for, so this goes false and the task
+    // proceeds - which is also why deferral here cannot starve a task.
+    bool share_prefix_should_defer(const server_task & task) {
+        static const bool enabled = [] {
+            const char * s = getenv("TURBO_SHARE_PREFIX");
+            return !(s && s[0] == '0' && s[1] == '\0');
+        }();
+        static const int share_min = [] {
+            const char * s = getenv("TURBO_SHARE_PREFIX_MIN");
+            const int    v = s ? atoi(s) : 0;
+            return v > 0 ? v : 2048;
+        }();
+
+        if (!enabled || !prompt_cache || slots.size() < 2) {
+            return false;
+        }
+
+        if (task.type != SERVER_TASK_TYPE_COMPLETION || task.id_slot != -1) {
+            return false;
+        }
+
+        for (auto & slot : slots) {
+            // STARTED as well as PROCESSING_PROMPT: every task in one arrival burst is launched
+            // before update_slots runs even once, so the leader is still in STARTED ("after
+            // assigning a task and about to process prompt") when its followers show up. Matching
+            // only PROCESSING_PROMPT meant this never fired for simultaneous requests, which is
+            // precisely the case it exists for.
+            const bool leader_busy_on_prompt =
+                slot.state == SLOT_STATE_STARTED || slot.state == SLOT_STATE_PROCESSING_PROMPT;
+
+            if (!leader_busy_on_prompt || !slot.task) {
+                continue;
+            }
+
+            // Already handed its prefix over. Without this a released follower simply re-defers on
+            // whichever slot is now mid-prompt and never gets anywhere.
+            if (slot.share_prefix_published) {
+                continue;
+            }
+
+            const int lcp = (int) slot.task->tokens.get_common_prefix(task.tokens);
+            if (lcp < share_min) {
+                continue;
+            }
+
+            // Past the branch point already, so pausing there is no longer possible and waiting
+            // would buy nothing.
+            if ((int) slot.prompt.n_tokens() >= lcp) {
+                continue;
+            }
+
+            // Pause the leader ON the boundary. If several followers share different amounts, the
+            // shortest wins - that prefix is common to all of them.
+            const int stop = std::min(lcp, (int) slot.task->n_tokens());
+            if (slot.share_prefix_stop == 0 || stop < slot.share_prefix_stop) {
+                slot.share_prefix_stop = stop;
+            }
+
+            SRV_INF("share_prefix: task %d shares %d tokens with slot %d - waiting for it to publish "
+                    "that prefix instead of processing it again\n", task.id, lcp, slot.id);
+            return true;
+        }
+
+        return false;
+    }
+
+    // [TAG_SHARED_PREFIX_FANOUT] The leader finished its prompt: publish the state so the tasks
+    // deferred above can restore it, then release them. Called once, from the point where prompt
+    // processing completes.
+    // [TAG_SHARED_PREFIX_FANOUT] Run after each decode: any slot that has just landed on its
+    // shared boundary publishes the state there and wakes the tasks waiting for it.
+    //
+    // The boundary matters. Saving once the leader's whole prompt is done produces a state at the
+    // END of that prompt, and a follower would have to rewind it to the branch point - impossible
+    // for the 48 recurrent layers, so the server falls back to a full re-prefill and the whole
+    // exercise is wasted. Saved ON the boundary, the cached prompt IS the shared prefix, the
+    // follower's f_keep is 1.0, and it processes only its own tail.
+    void share_prefix_publish_ready() {
+        if (!prompt_cache || slots.size() < 2) {
+            return;
+        }
+
+        for (auto & slot : slots) {
+            if (slot.share_prefix_stop == 0) {
+                continue;
+            }
+
+            if ((int) slot.prompt.n_tokens() < slot.share_prefix_stop) {
+                continue; // not on the boundary yet
+            }
+
+            const int n_shared = slot.share_prefix_stop;
+
+            slot.share_prefix_stop      = 0;
+            slot.share_prefix_published = true;
+
+            if (slot.prompt_save(*prompt_cache)) {
+                prompt_cache->update();
+                SLT_INF(slot, "share_prefix: published %d tokens at the shared boundary\n", n_shared);
+            } else {
+                SLT_WRN(slot, "share_prefix: could not publish %d tokens - followers will re-process\n",
+                        n_shared);
+            }
+
+            // wake everything parked on this prefix
+            for (size_t i = 0; i < slots.size(); ++i) {
+                queue_tasks.pop_deferred_task(-1);
+            }
+        }
+    }
+
     server_slot * get_available_slot(const server_task & task) {
         server_slot * ret = nullptr;
 
@@ -2540,6 +2672,13 @@ private:
                         }
                     }
 
+                    // [TAG_SHARED_PREFIX_FANOUT] wait for a slot that is already processing this
+                    // same prefix rather than processing all of it again on another slot
+                    if (share_prefix_should_defer(task)) {
+                        queue_tasks.defer(std::move(task));
+                        break;
+                    }
+
                     const int id_task = task.id;
 
                     server_slot * slot = get_available_slot(task);
@@ -3051,6 +3190,10 @@ private:
                 break; // stop any further processing
             }
         }
+
+        // [TAG_SHARED_PREFIX_FANOUT] the state is only valid once the batch has actually been
+        // decoded, so the boundary publish happens here rather than while the batch is built
+        share_prefix_publish_ready();
     }
 
     void pre_decode() {
@@ -3719,7 +3862,12 @@ private:
                     bool user_start_merged_is_last = false;
 
                     // add prompt tokens for processing in the current batch
-                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch) {
+                    // [TAG_SHARED_PREFIX_FANOUT] stop exactly on the boundary so the state saved
+                    // after this batch is the shared prefix and nothing more
+                    const int share_stop = slot.share_prefix_stop;
+
+                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch
+                           && (share_stop == 0 || (int) slot.prompt.n_tokens() < share_stop)) {
                         // get next token to process
                         llama_token cur_tok = input_tokens[slot.prompt.n_tokens()];
                         if (cur_tok == LLAMA_TOKEN_NULL) {
