@@ -550,7 +550,7 @@ struct turbo4_int8_lut {
 
         return lo ^ ((lo ^ hi) & m);
     }
-};
+};
 // [TAG_TURBO5P] 32-entry sibling of turbo4_int8_lut: the same PRMT gather one level deeper.
 // Two 16-entry halves are gathered exactly as above (four permutes, one bit-3 blend each),
 // then a second per-byte blend on index bit 4 - which arrives separately, from the qh plane,
@@ -877,7 +877,7 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_turbo4p_0_int(
 
     return sum;
 }
-
+
 
 // ---- [TAG_TURBO5P] turbo5p KQ dot: turbo4p's, plus the high-bit plane ----
 template <int D, int nthreads>
@@ -2014,7 +2014,7 @@ static __device__ __forceinline__ void dequantize_V_turbo4p_0(const void * __res
         }
     }
 }
-
+
 
 // ---- [TAG_TURBO5P] turbo5p V dequant: turbo4p's, plus the high-bit plane ----
 template <typename T, int ne>
@@ -2450,27 +2450,34 @@ static __global__ void flash_attn_pos_to_KV_max(
             break;
         }
     }
-    if (threadIdx.x == 0) {
-        // [TAG_FA_KVMIN] see the mask-based scan above; same idea from cell positions.
-        const int KV_max_out = KV_max_sj + FATTN_KQ_STRIDE;
-        int KV_min_sj = 0;
-        for (; KV_min_sj < KV_max_out; KV_min_sj += FATTN_KQ_STRIDE) {
-            const int c0 = kv_pos[KV_min_sj + 2*tid + 0];
-            const int c1 = kv_pos[KV_min_sj + 2*tid + 1];
-            int all_empty = (c0 < 0) && (c1 < 0);
-            all_empty = warp_reduce_all(all_empty);
-            if (tid % WARP_SIZE == 0) {
-                buf_iw[tid / WARP_SIZE] = all_empty;
-            }
-            __syncthreads();
-            all_empty = buf_iw[tid % WARP_SIZE];
-            __syncthreads();
-            all_empty = warp_reduce_all(all_empty);
-            if (!all_empty) {
-                break;
-            }
+    // [TAG_FA_KVMIN] see the mask-based scan below; same idea from cell positions.
+    // [TAG_FA_KVMIN_POS_THREADS] Structured exactly like the KV_max walk above and like the mask-based
+    // kernel: the walk runs on every thread (each tests two cells of the tile, warp_reduce_all combines
+    // them) and only thread 0 writes the result. It used to sit inside `threadIdx.x == 0` with its
+    // collectives. That looked like it could test only cells 0-1 of a tile, but test_flash_attn_ext_pos
+    // (sequence starting mid-tile at cell 3000, kv 4096/8192, nb 1..512, f16 and q8_0) passes on BOTH
+    // layouts, so the old form was not producing wrong output; this is an alignment with the proven
+    // kernel, not a correctness fix. [TAG_FA_KVMAX_POS] made this walk run for every query count.
+    const int KV_max_out = KV_max_sj + FATTN_KQ_STRIDE;
+    int KV_min_sj = 0;
+    for (; KV_min_sj < KV_max_out; KV_min_sj += FATTN_KQ_STRIDE) {
+        const int c0 = kv_pos[KV_min_sj + 2*tid + 0];
+        const int c1 = kv_pos[KV_min_sj + 2*tid + 1];
+        int all_empty = int(c0 < 0) && int(c1 < 0);
+        all_empty = warp_reduce_all(all_empty);
+        if (tid % WARP_SIZE == 0) {
+            buf_iw[tid / WARP_SIZE] = all_empty;
         }
+        __syncthreads();
+        all_empty = buf_iw[tid % WARP_SIZE];
+        __syncthreads();
+        all_empty = warp_reduce_all(all_empty);
+        if (!all_empty) {
+            break;
+        }
+    }
 
+    if (threadIdx.x == 0) {
         KV_max[2*(blockIdx.y*gridDim.x + jt) + 0] = KV_max_out;
         KV_max[2*(blockIdx.y*gridDim.x + jt) + 1] = KV_min_sj;
     }
@@ -3049,7 +3056,15 @@ void launch_fattn(
         CUDA_CHECK(cudaGetLastError());
     }
     const uint3 ne01_pos = init_fastdiv_values(Q->ne[1]);   // [TAG_FA_POS_MASK]
-    if (kv_pos_t && K->ne[1] % FATTN_KQ_STRIDE == 0 && Q->ne[1] >= 1024) {   // [TAG_FA_POS_MASK]
+    // [TAG_FA_KVMAX_POS] The positional path needs the same KV-length disjunct as the explicit-mask
+    // path above. With --kv-unified, n_kv is the high-water mark of the WHOLE shared pool, and every
+    // single-sequence ubatch takes this path (ubatch.n_seqs_unq == 1: each prompt chunk, and every
+    // verify step while only one agent is generating). Gated only on Q->ne[1] >= 1024, decode never
+    // got bounds here, so a lone agent at 16K beside another agent's resident 130K walked all ~146K
+    // cells - loading and multiplying cells whose positions mask them to exactly zero. The bounds
+    // come from positions, so they are exact per query tile and skipping the rest is arithmetically
+    // identical. FA_KVMAX_MIN_KV=0 restores the previous gate on both paths.
+    if (kv_pos_t && K->ne[1] % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || kvmax_worth_it)) {   // [TAG_FA_POS_MASK]
         const dim3 blocks_num_KV_max(ntiles_x, 1, 1);
         const dim3 block_dim_KV_max(FATTN_KQ_STRIDE/2, 1, 1);
         const int iter_k = K->ne[1] / FATTN_KQ_STRIDE;

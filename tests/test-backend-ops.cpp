@@ -7273,6 +7273,89 @@ struct test_flash_attn_ext : public test_case {
     }
 };
 
+// [TAG_FA_POS_MASK] GGML_OP_FLASH_ATTN_EXT with the positional mask (ggml_flash_attn_ext_set_pos) instead of an
+// explicit one. No test covered this path before [TAG_FA_KVMAX_POS] made its per-tile KV bounds run for every
+// query count at kv >= 4096. (The turbo KV types report "not supported" here because the CPU reference does not
+// build this geometry for them; f16 and q8_0 exercise the same CUDA bound computation.)
+// The layout reproduces a --kv-unified pool: the sequence starts `off` cells in (cells before it are -1, i.e.
+// empty or another sequence's), `off` is NOT a multiple of the 256-cell stride so a tile opens with empty cells,
+// every 7th cell inside the sequence is a hole, and the queries are the sequence's last nb positions, so early
+// queries must also mask later cells. Compared against the CPU reference like every other case.
+struct test_flash_attn_ext_pos : public test_case {
+    const int64_t hs;
+    const int64_t nh;
+    const int64_t nr2;   // grouped-query repeat
+    const int64_t kv;
+    const int64_t nb;
+    const int64_t off;   // first cell of the sequence
+    const ggml_type type_KV;
+
+    std::string vars() override {
+        return VARS_TO_STR7(hs, nh, nr2, kv, nb, off, type_KV);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    test_flash_attn_ext_pos(int64_t hs, int64_t nh, int64_t nr2, int64_t kv, int64_t nb, int64_t off, ggml_type type_KV)
+        : hs(hs), nh(nh), nr2(nr2), kv(kv), nb(nb), off(off), type_KV(type_KV) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t hs_padded = GGML_PAD(hs, ggml_blck_size(type_KV));
+
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hs_padded, nb, nh*nr2, 1);
+        ggml_set_name(q, "q");
+
+        // K and V as views of a larger buffer, like a KV cache
+        ggml_tensor * k0 = ggml_new_tensor_4d(ctx, type_KV, hs_padded, 2*kv, nh, 1);
+        ggml_tensor * k  = ggml_view_4d(ctx, k0, hs_padded, kv, nh, 1, k0->nb[1], k0->nb[2], k0->nb[3], 0);
+        ggml_set_name(k, "k");
+        ggml_tensor * v0 = ggml_new_tensor_4d(ctx, type_KV, hs_padded, 2*kv, nh, 1);
+        ggml_tensor * v  = ggml_view_4d(ctx, v0, hs_padded, kv, nh, 1, v0->nb[1], v0->nb[2], v0->nb[3], 0);
+        ggml_set_name(v, "v");
+
+        ggml_tensor * kv_pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, kv);
+        ggml_set_name(kv_pos, "kv_pos");
+        ggml_tensor * q_pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, nb);
+        ggml_set_name(q_pos, "q_pos");
+
+        ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, nullptr, 1.0f/sqrtf(hs), 0.0f, 0.0f);
+        ggml_flash_attn_ext_set_pos(out, kv_pos, q_pos);
+        ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        // positions of the sequence's cells, with holes; the last position is the newest token
+        std::vector<int32_t> pos(kv, -1);
+        int32_t p = 0;
+        for (int64_t j = off; j < kv; ++j) {
+            if ((j - off) % 7 == 6) {
+                continue;   // hole: empty cell inside the sequence's range
+            }
+            pos[j] = p++;
+        }
+        const int32_t p_last = p - 1;
+        std::vector<int32_t> qp(nb);
+        for (int64_t i = 0; i < nb; ++i) {
+            qp[i] = std::max<int32_t>(0, p_last - (int32_t) (nb - 1 - i));
+        }
+
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "kv_pos") == 0) {
+                ggml_backend_tensor_set(t, pos.data(), 0, ggml_nbytes(t));
+            } else if (strcmp(t->name, "q_pos") == 0) {
+                ggml_backend_tensor_set(t, qp.data(), 0, ggml_nbytes(t));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_OP_CROSS_ENTROPY_LOSS
 struct test_cross_entropy_loss : public test_case {
     const ggml_type type;
@@ -10124,6 +10207,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {4, 1}, 512, 75, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, false));
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 1024, 75, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, false));
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 512, 75, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, false));
+
+    // [TAG_FA_POS_MASK] positional-mask FA in the deployed geometry (head 256, 4 KV heads x 6 query repeats),
+    // sequence starting mid-tile inside a unified pool (see test_flash_attn_ext_pos). kv >= 4096 is where the
+    // per-tile KV bounds from positions are computed for every query count ([TAG_FA_KVMAX_POS]).
+    for (int64_t kv : { 4096, 8192 }) {
+        for (int64_t nb : { 1, 4, 16, 512 }) {
+            for (ggml_type tkv : { GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_TURBO5P_0 }) {
+                test_cases.emplace_back(new test_flash_attn_ext_pos(256, 4, 6, kv, nb, 3000, tkv));
+            }
+        }
+    }
 
     // TurboQuant KV cache FA correctness (fork): head_dim 128, multi-token KV.
     // Compares CUDA turbo kernels vs CPU reference to catch turbo4-specific bugs.
