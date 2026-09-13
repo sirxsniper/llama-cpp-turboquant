@@ -550,7 +550,7 @@ struct turbo4_int8_lut {
 
         return lo ^ ((lo ^ hi) & m);
     }
-};
+};
 // [TAG_TURBO5P] 32-entry sibling of turbo4_int8_lut: the same PRMT gather one level deeper.
 // Two 16-entry halves are gathered exactly as above (four permutes, one bit-3 blend each),
 // then a second per-byte blend on index bit 4 - which arrives separately, from the qh plane,
@@ -877,7 +877,7 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_turbo4p_0_int(
 
     return sum;
 }
-
+
 
 // ---- [TAG_TURBO5P] turbo5p KQ dot: turbo4p's, plus the high-bit plane ----
 template <int D, int nthreads>
@@ -2014,7 +2014,7 @@ static __device__ __forceinline__ void dequantize_V_turbo4p_0(const void * __res
         }
     }
 }
-
+
 
 // ---- [TAG_TURBO5P] turbo5p V dequant: turbo4p's, plus the high-bit plane ----
 template <typename T, int ne>
