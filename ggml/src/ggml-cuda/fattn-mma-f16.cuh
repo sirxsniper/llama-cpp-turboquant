@@ -2429,7 +2429,18 @@ static __global__ void flash_attn_ext_f16(
         const float slope = ncols2 == 1 ? get_alibi_slope(max_bias, zt_Q, n_head_log2, m0, m1) : 1.0f;
 
         if (KV_max) {
-            kb0_stop = min(kb0_stop, KV_max[sequence*iter_j + jt] / nbatch_fa);
+            // [TAG_FA_KVMIN] the array holds {max, min} pairs
+            const int kvb = 2*(sequence*iter_j + jt);
+            kb0_stop = min(kb0_stop, KV_max[kvb + 0] / nbatch_fa);
+        
+            // Skip the fully-masked leading tiles. The tile loop runs its LAST iteration
+            // unconditionally on the invariant "kb0_start is always < kb0_stop", so never
+            // raise kb0_start past kb0_stop - 1: a block lying entirely below KV_min still
+            // processes one zero-contribution tile instead of thousands.
+            const int kb0_min = KV_max[kvb + 1] / nbatch_fa;
+            if (kb0_min > kb0_start && kb0_start < kb0_stop) {
+                kb0_start = min(kb0_min, kb0_stop - 1);
+            }
         }
         constexpr bool is_fixup = false; // All but (potentially) the last iterations write their data to dst rather than the fixup buffer.
         if (kb0_start == 0) {
@@ -2486,7 +2497,18 @@ static __global__ void flash_attn_ext_f16(
     const float slope = ncols2 == 1 ? get_alibi_slope(max_bias, zt_Q, n_head_log2, m0, m1) : 1.0f;
 
     if (KV_max) {
-        kb0_stop = min(kb0_stop, KV_max[sequence*iter_j + jt] / nbatch_fa);
+        // [TAG_FA_KVMIN] the array holds {max, min} pairs
+        const int kvb = 2*(sequence*iter_j + jt);
+        kb0_stop = min(kb0_stop, KV_max[kvb + 0] / nbatch_fa);
+    
+        // Skip the fully-masked leading tiles. The tile loop runs its LAST iteration
+        // unconditionally on the invariant "kb0_start is always < kb0_stop", so never
+        // raise kb0_start past kb0_stop - 1: a block lying entirely below KV_min still
+        // processes one zero-contribution tile instead of thousands.
+        const int kb0_min = KV_max[kvb + 1] / nbatch_fa;
+        if (kb0_min > kb0_start && kb0_start < kb0_stop) {
+            kb0_start = min(kb0_min, kb0_stop - 1);
+        }
     }
 
     constexpr bool is_fixup = true; // Last index writes its data to fixup buffer to avoid data races with other blocks.

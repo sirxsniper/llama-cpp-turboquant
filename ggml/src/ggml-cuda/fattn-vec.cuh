@@ -466,11 +466,14 @@ static __global__ void flash_attn_ext_vec(
 #endif // V_DOT2_F32_F16_AVAILABLE
     }
 
-    const int k_VKQ_max = KV_max ? KV_max[sequence*gridDim.x + blockIdx.x] : ne11;
-    K     += blockIdx.y*nthreads * nb11;
-    V     += blockIdx.y*nthreads * nb21;
-    maskh += blockIdx.y*nthreads;
-    for (int k_VKQ_0 = blockIdx.y*nthreads; k_VKQ_0 < k_VKQ_max; k_VKQ_0 += gridDim.y*nthreads,
+    // [TAG_FA_KVMIN] the array holds {max, min} pairs; start at the first tile that is not
+    // entirely masked rather than at cell 0. Tiles below it contribute exp(-inf) = 0.
+    const int k_VKQ_max = KV_max ? KV_max[2*(sequence*gridDim.x + blockIdx.x) + 0] : ne11;
+    const int k_VKQ_min = KV_max ? KV_max[2*(sequence*gridDim.x + blockIdx.x) + 1] : 0;
+    K     += (k_VKQ_min + blockIdx.y*nthreads) * nb11;
+    V     += (k_VKQ_min + blockIdx.y*nthreads) * nb21;
+    maskh += k_VKQ_min + blockIdx.y*nthreads;
+    for (int k_VKQ_0 = k_VKQ_min + blockIdx.y*nthreads; k_VKQ_0 < k_VKQ_max; k_VKQ_0 += gridDim.y*nthreads,
              // Increment pointers after each loop:
              K += gridDim.y*nthreads*nb11, V += gridDim.y*nthreads*nb21, maskh += gridDim.y*nthreads) {
 

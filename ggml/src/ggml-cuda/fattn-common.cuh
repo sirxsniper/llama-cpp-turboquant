@@ -2451,7 +2451,28 @@ static __global__ void flash_attn_pos_to_KV_max(
         }
     }
     if (threadIdx.x == 0) {
-        KV_max[blockIdx.y*gridDim.x + jt] = KV_max_sj + FATTN_KQ_STRIDE;
+        // [TAG_FA_KVMIN] see the mask-based scan above; same idea from cell positions.
+        const int KV_max_out = KV_max_sj + FATTN_KQ_STRIDE;
+        int KV_min_sj = 0;
+        for (; KV_min_sj < KV_max_out; KV_min_sj += FATTN_KQ_STRIDE) {
+            const int c0 = kv_pos[KV_min_sj + 2*tid + 0];
+            const int c1 = kv_pos[KV_min_sj + 2*tid + 1];
+            int all_empty = (c0 < 0) && (c1 < 0);
+            all_empty = warp_reduce_all(all_empty);
+            if (tid % WARP_SIZE == 0) {
+                buf_iw[tid / WARP_SIZE] = all_empty;
+            }
+            __syncthreads();
+            all_empty = buf_iw[tid % WARP_SIZE];
+            __syncthreads();
+            all_empty = warp_reduce_all(all_empty);
+            if (!all_empty) {
+                break;
+            }
+        }
+
+        KV_max[2*(blockIdx.y*gridDim.x + jt) + 0] = KV_max_out;
+        KV_max[2*(blockIdx.y*gridDim.x + jt) + 1] = KV_min_sj;
     }
 }
 
@@ -2505,11 +2526,40 @@ static __global__ void flash_attn_mask_to_KV_max(
     // In either case, walk back the decrementation by FATTN_KQ_STRIDE.
     KV_max_sj += FATTN_KQ_STRIDE;
 
+    // [TAG_FA_KVMIN] Same walk from the other end: the first tile that is NOT entirely masked.
+    // With --kv-unified a slot's cells can start deep inside the shared pool, and every tile before
+    // them is fully masked - read today for nothing. Bounded by KV_max_sj so a fully masked row
+    // reports an empty range rather than scanning the whole pool twice.
+    int KV_min_sj = 0;
+    for (; KV_min_sj < KV_max_sj; KV_min_sj += FATTN_KQ_STRIDE) {
+        int all_inf = 1;
+
+#pragma unroll
+        for (int j = 0; j < ncols1; ++j) {
+            const float2 tmp = __half22float2(mask[j*s31 + KV_min_sj/2 + tid]);
+            all_inf = all_inf && int(isinf(tmp.x)) && int(isinf(tmp.y));
+        }
+
+        all_inf = warp_reduce_all(all_inf);
+        if (tid % WARP_SIZE == 0) {
+            buf_iw[tid / WARP_SIZE] = all_inf;
+        }
+        __syncthreads();
+        all_inf = buf_iw[tid % WARP_SIZE];
+        __syncthreads();
+        all_inf = warp_reduce_all(all_inf);
+
+        if (!all_inf) {
+            break;
+        }
+    }
+
     if (threadIdx.x != 0) {
         return;
     }
 
-    KV_max[sequence*ne31 + jt] = KV_max_sj;
+    KV_max[2*(sequence*ne31 + jt) + 0] = KV_max_sj;
+    KV_max[2*(sequence*ne31 + jt) + 1] = KV_min_sj;
 }
 
 template<int D, int ncols1, int ncols2> // D == head size
@@ -2992,7 +3042,7 @@ void launch_fattn(
         const int ne_KV_max = blocks_num_KV_max.x*blocks_num_KV_max.y;
         const int iter_k = K->ne[1] / FATTN_KQ_STRIDE;
 
-        KV_max.alloc(ne_KV_max);
+        KV_max.alloc(2*ne_KV_max);   // [TAG_FA_KVMIN] {max, min} per entry
         ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num_KV_max, block_dim_KV_max, 0, main_stream);
         ggml_cuda_kernel_launch(flash_attn_mask_to_KV_max<ncols1>, launch_params,
             (const half2 *) mask->data, KV_max.ptr, iter_k, s31, s33);
@@ -3003,7 +3053,7 @@ void launch_fattn(
         const dim3 blocks_num_KV_max(ntiles_x, 1, 1);
         const dim3 block_dim_KV_max(FATTN_KQ_STRIDE/2, 1, 1);
         const int iter_k = K->ne[1] / FATTN_KQ_STRIDE;
-        KV_max.alloc(ntiles_x);
+        KV_max.alloc(2*ntiles_x);    // [TAG_FA_KVMIN] {max, min} per entry
         ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num_KV_max, block_dim_KV_max, 0, main_stream);
         ggml_cuda_kernel_launch(flash_attn_pos_to_KV_max<ncols1>, launch_params,
             (const int32_t *) kv_pos_t->data, (const int32_t *) q_pos_t->data, KV_max.ptr, iter_k, ne01_pos);
