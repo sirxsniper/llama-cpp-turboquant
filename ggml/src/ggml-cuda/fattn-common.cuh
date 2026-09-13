@@ -2957,7 +2957,32 @@ void launch_fattn(
     // Optional optimization where the mask is scanned to determine whether part of the calculation can be skipped.
     // Only worth the overhead if there is at lease one FATTN_KQ_STRIDE x FATTN_KQ_STRIDE square to be skipped or
     //     multiple sequences of possibly different lengths.
-    if (mask && K->ne[1] % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1)) {
+    //
+    // [TAG_FA_KVMAX_UNIFIED] The two original disjuncts cover prefill (Q->ne[1] >= 1024) and
+    // sequences held in separate batch slots (Q->ne[3] > 1). With --kv-unified every slot shares a
+    // SINGLE stream, so ne[3] == 1, and a decode batch carries n_parallel * (1 + n_draft) query
+    // rows - 16 here, far below 1024. So KV_max was never computed at decode on a unified cache and
+    // every slot scanned the whole high-water mark of the shared pool rather than its own range.
+    //
+    // Measured, 4 connections at 24K each, the only change being whether the pool is shared:
+    //     --kv-unified   4 conn 48.7 62.2 64.2 66.9 -> SUM 242.1
+    //     without        4 conn 74.5 75.6 79.7 79.7 -> SUM 309.6   (+27.9%, identical VRAM)
+    // Single-connection was unchanged either way, which is exactly what a missing lower/upper bound
+    // predicts: with one slot the high-water mark already IS its own depth.
+    //
+    // So add a third disjunct on KV length. The scan is one block per query tile walking backwards
+    // and stopping at the first tile that is not entirely masked - negligible beside a flash
+    // attention pass over that same range. Short contexts keep the previous behaviour, where there
+    // was nothing to skip and the scan would be pure overhead.
+    // FA_KVMAX_MIN_KV overrides the threshold; 0 restores the original gate exactly.
+    static const int kvmax_min_kv = [] {
+        const char * e = getenv("FA_KVMAX_MIN_KV");
+        const int    v = e ? atoi(e) : -1;
+        return v >= 0 ? v : 4096;
+    }();
+    const bool kvmax_worth_it = kvmax_min_kv > 0 && K->ne[1] >= kvmax_min_kv;
+
+    if (mask && K->ne[1] % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1 || kvmax_worth_it)) {
         const int64_t s31 = mask->nb[1] / sizeof(half2);
         const int64_t s33 = mask->nb[3] / sizeof(half2);
 

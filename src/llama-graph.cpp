@@ -2905,8 +2905,26 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
         // are visible, and there is no positional equivalent. Without this, build_attn_qsa dereferences a
         // null mask and the server dies during graph construction, before it ever reaches the GPU.
         const bool has_sparse_attn_indexer = hparams.indexer_n_head > 0;
+        // [TAG_FA_POS_MASK_SEQ] The position vector set_input_kv_pos builds describes exactly ONE
+        // sequence - it takes seq_id from ubatch->seq_id[0][0] and marks every cell belonging to
+        // any other sequence as -1, i.e. invisible. That is correct only when the ubatch holds a
+        // single sequence.
+        //
+        // This used to read `(cparams.kv_unified || ubatch.n_seqs_unq == 1)`, where the kv_unified
+        // disjunct short-circuited the sequence count. But --kv-unified is exactly the case where
+        // slots share one stream, and a hybrid model batches several slots into one ubatch
+        // (llama-memory-hybrid.cpp init_batch -> split_equal). So every slot after the first read
+        // the FIRST slot's position vector: its own cells invisible, the first slot's cells
+        // visible. Measured with 4 concurrent connections each holding a unique passphrase, three
+        // of the four returned connection 1's passphrase on the second round. A silent
+        // cross-session context leak.
+        //
+        // Require a single sequence, unconditionally. Multi-sequence batches fall back to the
+        // explicit per-sequence KQ mask, which is correct by construction. Restoring the
+        // optimisation for multi-sequence batches needs an [n_kv, n_seqs] vector and matching
+        // kernel support - a bigger change than belongs in a correctness fix.
         const bool use_pos_mask = pos_mask_env && cparams.flash_attn && cparams.causal_attn &&
-            hparams.f_max_alibi_bias == 0.0f && (cparams.kv_unified || ubatch.n_seqs_unq == 1) &&
+            hparams.f_max_alibi_bias == 0.0f && ubatch.n_seqs_unq == 1 &&
             !has_sparse_attn_indexer;
         if (use_pos_mask) {
             const auto n_kv = mctx_cur->get_n_kv();
