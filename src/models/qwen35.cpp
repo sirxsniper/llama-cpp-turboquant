@@ -264,6 +264,18 @@ ggml_tensor * llama_model_qwen35::graph::build_norm_gated(
         ggml_tensor * gate,
         int           layer) {
     ggml_tensor * normalized = build_norm(input, weights, nullptr, LLM_NORM_RMS, layer);
+
+    // [TAG_GATED_NORM_GLU] silu(gate) * normalized is one split-GLU node (one launch) instead of a
+    // unary silu plus a mul; the backend uses the same silu function, so the values are identical.
+    // TURBO_GATED_NORM_GLU=0 restores the two-node form.
+    static const bool glu = [] {
+        const char * e = getenv("TURBO_GATED_NORM_GLU");
+        return !(e && e[0] == '0');
+    }();
+    if (glu && ggml_are_same_shape(gate, normalized)) {
+        return ggml_swiglu_split(ctx0, gate, normalized);
+    }
+
     ggml_tensor * gated_silu = ggml_silu(ctx0, gate);
 
     return ggml_mul(ctx0, normalized, gated_silu);

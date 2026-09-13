@@ -352,6 +352,15 @@ extern "C" {
     // Returns the old callback for chaining
     GGML_API ggml_abort_callback_t ggml_set_abort_callback(ggml_abort_callback_t callback);
 
+    struct ggml_tensor;
+
+    // MoE expert-routing observation callback: invoked by the CPU mul_mat_id
+    // with the op's expert-id tensor (I32 [n_expert_used, n_tokens]). Used by
+    // the llama MoE expert cache to drive LRU placement decisions.
+    typedef void (*ggml_moe_obs_cb_t)(const char * tensor_name, const struct ggml_tensor * ids, void * ud);
+    GGML_API void            ggml_set_moe_obs_callback(ggml_moe_obs_cb_t cb, void * ud);
+    GGML_API ggml_moe_obs_cb_t ggml_get_moe_obs_callback(void ** ud);
+
     GGML_NORETURN GGML_ATTRIBUTE_FORMAT(3, 4)
     GGML_API void ggml_abort(const char * file, int line, const char * fmt, ...);
 
@@ -437,7 +446,10 @@ extern "C" {
         GGML_TYPE_TURBO3_0 = 45, // TurboQuant 3-bit KV cache: 2-bit PolarQuant + 1-bit QJL
         GGML_TYPE_TURBO4P_0 = 46, // TurboQuant 4-bit, split-plane layout (see block_turbo4p_0)
         GGML_TYPE_TURBO5P_0 = 47, // TurboQuant 5-bit, split-plane: turbo4p low plane + 1-bit high plane
-        GGML_TYPE_COUNT   = 48,
+        // [TAG_TURBO5P512] turbo5p with a 512-element block, for models whose KV row is 512
+        // (n_head_kv 2 x head 256). Same maths, four WHT groups instead of eight.
+        GGML_TYPE_TURBO5P512_0 = 48,
+        GGML_TYPE_COUNT   = 49,
     };
 
     // precision
@@ -2416,6 +2428,16 @@ extern "C" {
     // top k elements per row
     // note: the resulting top k indices are in no particular order
     GGML_API struct ggml_tensor * ggml_top_k(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            int                   k);
+
+    // [TAG_TOPK_UNORDERED] same result set as ggml_top_k, but the caller states it will never read
+    // the ORDER of the indices - only which ones were selected. That lets a backend skip the rank
+    // sort of the k survivors entirely, which is what makes large k affordable: the sparse-attention
+    // indexers ask for k in the thousands purely to build an unmask set. A backend that ignores this
+    // hint and returns sorted indices is still correct.
+    GGML_API struct ggml_tensor * ggml_top_k_unordered(
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
             int                   k);

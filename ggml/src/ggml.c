@@ -249,6 +249,21 @@ GGML_API ggml_abort_callback_t ggml_set_abort_callback(ggml_abort_callback_t cal
     return ret_val;
 }
 
+static ggml_moe_obs_cb_t g_moe_obs_cb = NULL;
+static void *             g_moe_obs_ud = NULL;
+
+void ggml_set_moe_obs_callback(ggml_moe_obs_cb_t cb, void * ud) {
+    g_moe_obs_cb = cb;
+    g_moe_obs_ud = ud;
+}
+
+ggml_moe_obs_cb_t ggml_get_moe_obs_callback(void ** ud) {
+    if (ud) {
+        *ud = g_moe_obs_ud;
+    }
+    return g_moe_obs_cb;
+}
+
 void ggml_abort(const char * file, int line, const char * fmt, ...) {
     fflush(stdout);
 
@@ -808,6 +823,17 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .is_quantized             = true,
         .to_float                 = (ggml_to_float_t) dequantize_row_turbo5p_0,
         .from_float_ref           = (ggml_from_float_t) quantize_row_turbo5p_0_ref,
+    },
+    // [TAG_TURBO5P512] not named on the command line: -ctk/-ctv still say "turbo5p" and
+    // llama_kv_cache substitutes this when the model's KV row is 512 rather than 1024, so one
+    // profile string works on both geometries. The name is still needed for logs and asserts.
+    [GGML_TYPE_TURBO5P512_0] = {
+        .type_name                = "turbo5p512",
+        .blck_size                = QK_TURBO5P512,
+        .type_size                = sizeof(block_turbo5p512_0),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_turbo5p512_0,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_turbo5p512_0_ref,
     },
     [GGML_TYPE_Q2_K] = {
         .type_name                = "q2_K",
@@ -5453,6 +5479,23 @@ struct ggml_tensor * ggml_top_k(
     result->op     = GGML_OP_TOP_K;
     result->src[0] = a;
 
+    ggml_set_op_params_i32(result, 0, 0);   // [TAG_TOPK_UNORDERED] 0 = caller may read the order
+
+    return result;
+}
+
+// ggml_top_k_unordered
+
+struct ggml_tensor * ggml_top_k_unordered(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        int                   k) {
+    struct ggml_tensor * result = ggml_top_k(ctx, a, k);
+
+    // [TAG_TOPK_UNORDERED] the selected SET is all that matters here, so a backend is free to emit
+    // the indices in whatever order compaction produced them.
+    ggml_set_op_params_i32(result, 0, 1);
+
     return result;
 }
 
@@ -8110,6 +8153,7 @@ size_t ggml_quantize_chunk(
         case GGML_TYPE_TURBO2_0: result = quantize_turbo2_0(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_TURBO4P_0: result = quantize_turbo4p_0(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_TURBO5P_0: result = quantize_turbo5p_0(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+        case GGML_TYPE_TURBO5P512_0: result = quantize_turbo5p512_0(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_F16:
             {
                 size_t elemsize = sizeof(ggml_fp16_t);

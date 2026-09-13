@@ -1,5 +1,7 @@
 #include "llama-context.h"
 
+#include "llama-moecache.h"
+
 #include "ggml.h"
 #include "llama-arch.h"
 #include "llama-graph.h"
@@ -92,6 +94,8 @@ llama_context::llama_context(
     // TODO warning when creating llama_context with awkward ctx size that is not a power of 2,
     //     may need to be backend-dependent
     LLAMA_LOG_INFO("%s: constructing llama_context\n", __func__);
+
+    llama_moe_cache_init(model, params.n_moe_cache_slots, params.n_moe_cache_inserts);
 
     t_start_us = model.t_start_us;
     t_load_us  = model.t_load_us;
@@ -1346,6 +1350,59 @@ bool llama_context::set_adapter_cvec(
     return res;
 }
 
+
+// [TAG_NAN_SCAN] TURBO_NAN_SCAN=1 reports the FIRST tensor in a graph whose output contains NaN or
+// Inf, with its op and name. Written to chase a qwen4exp MTP block that emits NaN logits: acceptance
+// alone could not say which stage went bad, and every input ablation produced identical results
+// because NaN swamps everything downstream. Debug only, off unless the env is set; it reads every
+// tensor back from the backend, so it is very slow.
+static bool turbo_nan_scan_cb(struct ggml_tensor * t, bool ask, void * /*user_data*/) {
+    if (ask) {
+        return true;   // yes, we want to inspect this one
+    }
+    if (t->type != GGML_TYPE_F32 && t->type != GGML_TYPE_F16) {
+        return true;
+    }
+    static bool reported = false;
+    if (reported) {
+        return true;
+    }
+    const int64_t n = ggml_nelements(t);
+    if (n <= 0 || n > (int64_t) 8*1024*1024) {
+        return true;
+    }
+    std::vector<float> buf;
+    if (t->type == GGML_TYPE_F32) {
+        buf.resize(n);
+        ggml_backend_tensor_get(t, buf.data(), 0, n*sizeof(float));
+    } else {
+        std::vector<ggml_fp16_t> h(n);
+        ggml_backend_tensor_get(t, h.data(), 0, n*sizeof(ggml_fp16_t));
+        buf.resize(n);
+        for (int64_t i = 0; i < n; ++i) { buf[i] = ggml_fp16_to_fp32(h[i]); }
+    }
+    int64_t n_nan = 0, n_inf = 0;
+    for (int64_t i = 0; i < n; ++i) {
+        const float v = buf[i];
+        if (v != v)                       { ++n_nan; }
+        else if (v > 3.0e38f || v < -3.0e38f) { ++n_inf; }
+    }
+    // -INF in a causal mask is CORRECT, not a defect: skip masks, and only a real NaN counts.
+    // (An earlier version of this scanner flagged attn_inp_kq_mask with 509/512 -INF and that was
+    // simply a 2-token causal mask against a padded n_kv of 256.)
+    const char * tname = ggml_get_name(t);
+    const bool is_mask = tname && (strstr(tname, "mask") != nullptr);
+    if (n_nan && !is_mask) {
+        reported = true;
+        fprintf(stderr, "[NAN] first bad tensor: op=%s name='%s' ne=[%lld,%lld,%lld,%lld] nan=%lld inf=%lld of %lld\n",
+                ggml_op_name(t->op), ggml_get_name(t),
+                (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3],
+                (long long) n_nan, (long long) n_inf, (long long) n);
+        fflush(stderr);
+    }
+    return true;
+}
+
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
@@ -1375,7 +1432,15 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         res->reset();
 
         ggml_backend_sched_reset(sched.get());
-        ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+        static const bool nan_scan = [] {
+            const char * e = getenv("TURBO_NAN_SCAN");
+            return e && e[0] == '1';
+        }();
+        if (nan_scan) {
+            ggml_backend_sched_set_eval_callback(sched.get(), turbo_nan_scan_cb, nullptr);
+        } else {
+            ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+        }
 
         //const auto t_start_us = ggml_time_us();
 
@@ -2047,6 +2112,9 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     // wait for the computation to finish (automatically done when obtaining the model output)
     //synchronize();
+
+    // apply throttled MoE expert-cache updates between graph executions
+    llama_moe_cache_step();
 
     return 0;
 }
@@ -3657,6 +3725,8 @@ llama_context_params llama_context_default_params() {
         /*.yarn_beta_slow              =*/ -1.0f,
         /*.yarn_orig_ctx               =*/ 0,
         /*.defrag_thold                =*/ -1.0f,
+        /*.n_moe_cache_slots           =*/ 0,
+        /*.n_moe_cache_inserts         =*/ 2,
         /*.cb_eval                     =*/ nullptr,
         /*.cb_eval_user_data           =*/ nullptr,
         /*.type_k                      =*/ GGML_TYPE_F16,
@@ -3727,10 +3797,47 @@ llama_context * llama_init_from_model(
         }
     }
 
+    // [TAG_TURBO5P512] turbo5p packs 1024 elements per block, which requires the KV row
+    // (n_embd_head_k x n_head_kv) to be a whole number of blocks. Qwen3.8-27B is 4 x 256 = 1024
+    // exactly; Qwen3.8-Flash-Next is 2 x 256 = 512 and used to be rejected outright. Rather than
+    // make the user pick a different -ctk per model, swap in the 512-element sibling here, before
+    // any of the checks below run: same WHT group, same centroids, four groups per block instead
+    // of eight, 5.25 bpw instead of 5.125 (the extra 0.125 is norm-array padding that keeps every
+    // block base 16-byte aligned).
+    {
+        const uint32_t blk_1024 = (uint32_t) ggml_blck_size(GGML_TYPE_TURBO5P_0);
+        const uint32_t blk_512  = (uint32_t) ggml_blck_size(GGML_TYPE_TURBO5P512_0);
+        bool needs_512 = false, can_512 = true;
+        for (uint32_t il = 0; il < model->hparams.n_layer_all; ++il) {
+            const uint32_t rk = model->hparams.n_embd_k_gqa(il);
+            const uint32_t rv = model->hparams.n_embd_v_gqa(il);
+            for (uint32_t row : { rk, rv }) {
+                if (row == 0) {
+                    continue;   // recurrent layers hold no KV cache
+                }
+                if (row % blk_1024 != 0) { needs_512 = true; }
+                if (row % blk_512  != 0) { can_512   = false; }
+            }
+        }
+        if (needs_512 && can_512) {
+            if (params.type_k == GGML_TYPE_TURBO5P_0) {
+                params.type_k = GGML_TYPE_TURBO5P512_0;
+            }
+            if (params.type_v == GGML_TYPE_TURBO5P_0) {
+                params.type_v = GGML_TYPE_TURBO5P512_0;
+            }
+            if (params.type_k == GGML_TYPE_TURBO5P512_0 || params.type_v == GGML_TYPE_TURBO5P512_0) {
+                LLAMA_LOG_INFO("%s: KV row is not a multiple of %u; using turbo5p512 "
+                               "(512-element block) instead of turbo5p\n", __func__, blk_1024);
+            }
+        }
+    }
+
     // TurboQuant: a turbo K cache also requires flash attention even when V is not quantized
     // (e.g. -ctk turbo4 -ctv f16), which the quantized-V check above does not cover.
     if ((params.type_k == GGML_TYPE_TURBO2_0 || params.type_k == GGML_TYPE_TURBO3_0 ||
-         params.type_k == GGML_TYPE_TURBO4_0 || params.type_k == GGML_TYPE_TURBO4P_0 || params.type_k == GGML_TYPE_TURBO5P_0) &&
+         params.type_k == GGML_TYPE_TURBO4_0 || params.type_k == GGML_TYPE_TURBO4P_0 ||
+         params.type_k == GGML_TYPE_TURBO5P_0 || params.type_k == GGML_TYPE_TURBO5P512_0) &&
         params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_ENABLED) {
         if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO) {
             LLAMA_LOG_INFO("%s: enabling flash_attn since it is required for turbo K cache\n", __func__);
@@ -3747,8 +3854,13 @@ llama_context * llama_init_from_model(
         const bool k_is_turbo = (params.type_k == GGML_TYPE_TURBO2_0 ||
                                  params.type_k == GGML_TYPE_TURBO3_0 ||
                                  params.type_k == GGML_TYPE_TURBO4_0 ||
-                                 params.type_k == GGML_TYPE_TURBO4P_0 || params.type_k == GGML_TYPE_TURBO5P_0);
-        for (uint32_t il = 0; il < model->hparams.n_layer(); ++il) {
+                                 params.type_k == GGML_TYPE_TURBO4P_0 || params.type_k == GGML_TYPE_TURBO5P_0 ||
+                                 params.type_k == GGML_TYPE_TURBO5P512_0);
+        // [TAG_MTP_KV_VALIDATE] n_layer_all, not n_layer(): the KV cache allocates every layer
+        // (llama-kv-cache.cpp:118) including the nextn/MTP block, so validating only the trunk
+        // left the MTP layer's K/V type unchecked. A turbo type whose block does not divide that
+        // layer's row then produces garbage instead of a clean startup error.
+        for (uint32_t il = 0; il < model->hparams.n_layer_all; ++il) {
             uint32_t head_k = model->hparams.n_embd_head_k(il);
             // Turbo types zero-pad heads to next multiple of 128 in llama-kv-cache.cpp
             if (k_is_turbo && head_k % 128 != 0) {
@@ -3758,7 +3870,8 @@ llama_context * llama_init_from_model(
             // and therefore SPANS heads rather than dividing one. The requirement becomes that a
             // head fits wholly inside a block and the full row is a whole number of blocks, which
             // is what the FA path relies on to reach a head by block base plus an element offset.
-            if (params.type_k == GGML_TYPE_TURBO4P_0 || params.type_k == GGML_TYPE_TURBO5P_0) {   // [TAG_TURBO5P] same 1024-element block
+            if (params.type_k == GGML_TYPE_TURBO4P_0 || params.type_k == GGML_TYPE_TURBO5P_0 ||
+                params.type_k == GGML_TYPE_TURBO5P512_0) {   // [TAG_TURBO5P512] blck_size is read from the type
                 const uint32_t row = model->hparams.n_embd_k_gqa(il);
                 if (blck_size % head_k != 0 || row % blck_size != 0) {
                     LLAMA_LOG_ERROR("%s: turbo4p needs head (%u) to divide block (%u) and row (%u) to be a multiple of it\n",
@@ -3778,9 +3891,10 @@ llama_context * llama_init_from_model(
         const bool v_is_turbo = (params.type_v == GGML_TYPE_TURBO2_0 ||
                                  params.type_v == GGML_TYPE_TURBO3_0 ||
                                  params.type_v == GGML_TYPE_TURBO4_0 ||
-                                 params.type_v == GGML_TYPE_TURBO4P_0 || params.type_v == GGML_TYPE_TURBO5P_0);
+                                 params.type_v == GGML_TYPE_TURBO4P_0 || params.type_v == GGML_TYPE_TURBO5P_0 ||
+                                 params.type_v == GGML_TYPE_TURBO5P512_0);
         const bool is_mla = model->hparams.is_mla();
-        for (uint32_t il = 0; il < model->hparams.n_layer(); ++il) {
+        for (uint32_t il = 0; il < model->hparams.n_layer_all; ++il) {   // [TAG_MTP_KV_VALIDATE]
             uint32_t head_v = model->hparams.n_embd_head_v(il);
             // Turbo types zero-pad; MLA has no separate V cache (V = view of K)
             if (v_is_turbo && !is_mla && head_v % 128 != 0) {
@@ -3790,7 +3904,8 @@ llama_context * llama_init_from_model(
             // and therefore SPANS heads rather than dividing one. The requirement becomes that a
             // head fits wholly inside a block and the full row is a whole number of blocks, which
             // is what the FA path relies on to reach a head by block base plus an element offset.
-            if (params.type_v == GGML_TYPE_TURBO4P_0 || params.type_v == GGML_TYPE_TURBO5P_0) {   // [TAG_TURBO5P] same 1024-element block
+            if (params.type_v == GGML_TYPE_TURBO4P_0 || params.type_v == GGML_TYPE_TURBO5P_0 ||
+                params.type_v == GGML_TYPE_TURBO5P512_0) {   // [TAG_TURBO5P512] blck_size is read from the type
                 const uint32_t row = model->hparams.n_embd_v_gqa(il);
                 if (blck_size % head_v != 0 || row % blck_size != 0) {
                     LLAMA_LOG_ERROR("%s: turbo4p needs head (%u) to divide block (%u) and row (%u) to be a multiple of it\n",

@@ -227,6 +227,11 @@ struct llama_layer_nextn {
     struct ggml_tensor * shared_head_head_s    = nullptr;
     struct ggml_tensor * shared_head_head_in_s = nullptr;
     struct ggml_tensor * shared_head_norm      = nullptr;
+    // [TAG_QWEN4EXP_MTP] qwen4exp only: the MTP block's own wide->narrow hyper-connection
+    // collapse. Null for every other architecture.
+    struct ggml_tensor * hc_head_norm          = nullptr;
+    struct ggml_tensor * hc_head_down          = nullptr;
+    struct ggml_tensor * hc_head_up            = nullptr;
 };
 
 struct llama_layer_switch_lora {

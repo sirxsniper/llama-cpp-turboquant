@@ -1,5 +1,7 @@
 #include "speculative.h"
 
+#include <cstdlib>
+
 #include "common.h"
 #include "ggml.h"
 #include "ggml-cpp.h"
@@ -1881,10 +1883,30 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         return true;
     }
 
+    // [TAG_MTP_DISTS] one RNG per sequence for sampling the draft from the drafter's own
+    // distribution. Seeded deterministically so a run is reproducible; the draft is a PROPOSAL,
+    // so this choice cannot affect the output distribution, only which tokens get proposed.
+    std::vector<std::mt19937> mtp_dist_rng;
+
     void draft(common_speculative_draft_params_vec & dparams) override {
         auto & ctx_dft = params.ctx_dft;
 
         common_batch_clear(batch);
+
+        // [TAG_MTP_DISTS] q is recorded in lockstep with the draft; the server requires
+        // dists.size() == draft.size() or it silently uses the weaker exact-match accept rule.
+        if (mtp_dist_rng.size() != n_seq) {
+            mtp_dist_rng.clear();
+            for (uint32_t s = 0; s < n_seq; ++s) {
+                mtp_dist_rng.emplace_back(0x9E3779B9u + s);
+            }
+        }
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+            auto & dp = dparams[seq_id];
+            if (dp.drafting && dp.dists) {
+                dp.dists->clear();
+            }
+        }
 
         // keep track of which sequences are still drafting
         int n_drafting = 0;
@@ -1961,21 +1983,80 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                             common_token_to_piece(ctx_dft, cur_p->data[k].id).c_str());
                 }
 
-                // add drafted token for each sequence
-                const llama_token id = cur_p->data[0].id;
+                auto & dp = dparams.at(seq_id);
+                auto & result = *dp.result;
 
-                // only collect very high-confidence draft tokens
-                if (cur_p->data[0].p < params.p_min) {
-                    drafting[seq_id] = false;
-                    n_drafting--;
+                // [TAG_MTP_DISTS] At temp > 0 the target can use rejection sampling - accept with
+                // probability p/q - but ONLY if we hand it q, the distribution this draft token was
+                // actually sampled from (server-context.cpp:4232 checks dists.size() ==
+                // draft.size()). Without it the target silently falls back to exact-match
+                // (sampling.cpp:803), which accepts with probability sum p*q instead of
+                // sum min(p,q) - far worse on a flat prose distribution.
+                //
+                // Both halves are required together: recording q while proposing its ARGMAX would
+                // make the p/q ratio wrong and silently bias the output. So this branch samples.
+                static const bool mtp_dists_on = [] {
+                    const char * e = getenv("TURBO_MTP_DISTS");
+                    return !(e && e[0] == '0');
+                }();
 
-                    continue;
+                llama_token id;
+                float       id_p;
+
+                if (mtp_dists_on && dp.dists && dp.temperature > 0.0f && cur_p->size > 0) {
+                    common_speculative_token_dist dist;
+                    const size_t n_cand = cur_p->size;
+
+                    dist.ids.resize(n_cand);
+                    dist.probs.resize(n_cand);
+
+                    float sum = 0.0f;
+                    for (size_t k = 0; k < n_cand; ++k) {
+                        dist.ids[k]   = cur_p->data[k].id;
+                        dist.probs[k] = cur_p->data[k].p;
+                        sum          += cur_p->data[k].p;
+                    }
+                    if (sum > 0.0f) {
+                        for (float & pr : dist.probs) {
+                            pr /= sum;
+                        }
+                    }
+
+                    std::discrete_distribution<size_t> pick(dist.probs.begin(), dist.probs.end());
+                    const size_t sel = pick(mtp_dist_rng[seq_id]);
+
+                    id   = dist.ids[sel];
+                    id_p = dist.probs[sel];
+
+                    // [TAG_MTP_DISTS] p_min keeps its ORIGINAL meaning - "is the drafter confident"
+                    // - which is a property of the distribution, not of which token we drew from it.
+                    // Gating on the sampled token instead would silently disable drafting: the
+                    // shipped Flash-Next profile uses mtp_p_min 0.5, and on prose most sampled
+                    // tokens sit below that, so MTP would stop after the first draft every time.
+                    if (cur_p->data[0].p < params.p_min) {
+                        drafting[seq_id] = false;
+                        n_drafting--;
+
+                        continue;
+                    }
+
+                    dp.dists->push_back(std::move(dist));
+                } else {
+                    // temp 0, or no dists requested: exact-match is optimal at temp 0 and the
+                    // argmax is the right proposal for it.
+                    id   = cur_p->data[0].id;
+                    id_p = cur_p->data[0].p;
+
+                    // only collect very high-confidence draft tokens
+                    if (id_p < params.p_min) {
+                        drafting[seq_id] = false;
+                        n_drafting--;
+
+                        continue;
+                    }
                 }
 
                 common_sampler_accept(smpl, id, true);
-
-                auto & dp = dparams.at(seq_id);
-                auto & result = *dp.result;
 
                 result.push_back(id);
 

@@ -257,6 +257,36 @@ void ggml_cuda_op_expm1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 void ggml_cuda_op_softplus(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_op_unary<op_softplus>(ctx, dst);
 }
+
+// [TAG_GDN_PREP_FUSION] One launch for the add, softplus and mul that prepare a gated-delta-net
+// decay gate: dst[i] = softplus(x[i] + dt[i % ne0]) * a[i % ne0]. Each intermediate is a rounded
+// float exactly as in the three separate kernels, so the result is bit-identical.
+static __global__ void gdn_gate_prep_kernel(const float * __restrict__ x, const float * __restrict__ dt,
+                                            const float * __restrict__ a, float * __restrict__ dst,
+                                            const int64_t k, const int ne0) {
+    ggml_cuda_pdl_lc();
+    const int64_t i = (int64_t) blockDim.x * blockIdx.x + threadIdx.x;
+    if (i >= k) {
+        return;
+    }
+    ggml_cuda_pdl_sync();
+    const int   j = (int) (i % ne0);
+    const float s = x[i] + dt[j];
+    const float p = op_softplus(s);
+    dst[i] = p * a[j];
+}
+
+void ggml_cuda_op_gdn_gate_prep(ggml_backend_cuda_context & ctx, const ggml_tensor * add, ggml_tensor * mul) {
+    const ggml_tensor * x  = add->src[0];
+    const ggml_tensor * dt = add->src[1];
+    const ggml_tensor * a  = mul->src[1];
+    const int64_t k = ggml_nelements(mul);
+    const int64_t num_blocks = (k + CUDA_NEG_BLOCK_SIZE - 1) / CUDA_NEG_BLOCK_SIZE;
+    GGML_ASSERT(num_blocks <= INT_MAX);
+    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params((dim3) num_blocks, CUDA_NEG_BLOCK_SIZE, 0, ctx.stream());
+    ggml_cuda_kernel_launch(gdn_gate_prep_kernel, launch_params,
+        (const float *) x->data, (const float *) dt->data, (const float *) a->data, (float *) mul->data, k, (int) x->ne[0]);
+}
 /* gated ops */
 
 template <float (*op)(float), typename T>

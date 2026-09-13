@@ -93,6 +93,10 @@ void ggml_cuda_op_unary_mul(ggml_backend_cuda_context & ctx, ggml_tensor * unary
 
 void ggml_cuda_op_relu_sqr(ggml_backend_cuda_context & ctx, ggml_tensor * relu_node, ggml_tensor * sqr_node);
 
+// [TAG_GDN_PREP_FUSION] dst = softplus(x + dt[j]) * a[j] with j = i % ne0; `add` is the ADD node
+// (src0 = x, src1 = dt) and `mul` the MUL node (src1 = a) whose output receives the result.
+void ggml_cuda_op_gdn_gate_prep(ggml_backend_cuda_context & ctx, const ggml_tensor * add, ggml_tensor * mul);
+
 __device__ __forceinline__ float ggml_cuda_op_silu_single(float x) {
     return x / (1.0f + expf(-x));
 }

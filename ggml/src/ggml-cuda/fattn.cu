@@ -508,6 +508,10 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
     FATTN_VEC_CASES_TURBO4P_D(GGML_TYPE_TURBO5P_0, GGML_TYPE_TURBO5P_0)
     FATTN_VEC_CASES_TURBO4P_D(GGML_TYPE_TURBO5P_0, GGML_TYPE_Q8_0)
     FATTN_VEC_CASES_TURBO4P_D(GGML_TYPE_Q8_0,      GGML_TYPE_TURBO5P_0)
+    // [TAG_TURBO5P512]
+    FATTN_VEC_CASES_TURBO4P_D(GGML_TYPE_TURBO5P512_0, GGML_TYPE_TURBO5P512_0)
+    FATTN_VEC_CASES_TURBO4P_D(GGML_TYPE_TURBO5P512_0, GGML_TYPE_Q8_0)
+    FATTN_VEC_CASES_TURBO4P_D(GGML_TYPE_Q8_0,         GGML_TYPE_TURBO5P512_0)
 
     GGML_ABORT("fatal error");
 }
@@ -539,6 +543,7 @@ static bool ggml_cuda_fattn_kv_type_supported(ggml_type type) {
         case GGML_TYPE_TURBO4_0:
         case GGML_TYPE_TURBO4P_0:
         case GGML_TYPE_TURBO5P_0:
+        case GGML_TYPE_TURBO5P512_0:
             return true;
         default:
             return false;
@@ -651,7 +656,8 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         // Allow mixed turbo KV types (any combination of turbo2, turbo3, q8_0)
         auto is_turbo = [](ggml_type t) {
             return t == GGML_TYPE_TURBO2_0 || t == GGML_TYPE_TURBO3_0 || t == GGML_TYPE_TURBO4_0 ||
-                   t == GGML_TYPE_TURBO4P_0 || t == GGML_TYPE_TURBO5P_0 || t == GGML_TYPE_Q8_0;
+                   t == GGML_TYPE_TURBO4P_0 || t == GGML_TYPE_TURBO5P_0 ||
+                   t == GGML_TYPE_TURBO5P512_0 || t == GGML_TYPE_Q8_0;
         };
         if (!is_turbo(K->type) || !is_turbo(V->type)) {
             return BEST_FATTN_KERNEL_NONE;
@@ -681,15 +687,25 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     //     a whole number of blocks.
     // Qwen3.8-27B is 4 kv heads x 256 = 1024 exactly, i.e. one block per position.
     {
-        auto turbo4p_geometry_ok = [](const ggml_tensor * t) {
+        // [TAG_TURBO5P512] the same three conditions against whichever block length the type
+        // actually uses: the head must be whole WHT groups, a block must not split a head, and the
+        // full row (head_dim x n_head_kv) must be an exact number of blocks. turbo5p512 exists
+        // precisely because a 512-element row fails the third test against a 1024-element block.
+        auto turbo_blk_geometry_ok = [](const ggml_tensor * t, const int64_t QK) {
             return t->ne[0] % QK_TURBO4P_GROUP == 0 &&
-                   QK_TURBO4P % t->ne[0] == 0 &&
-                   (t->ne[0] * t->ne[2]) % QK_TURBO4P == 0;
+                   QK % t->ne[0] == 0 &&
+                   (t->ne[0] * t->ne[2]) % QK == 0;
         };
-        if ((K->type == GGML_TYPE_TURBO4P_0 || K->type == GGML_TYPE_TURBO5P_0) && !turbo4p_geometry_ok(K)) {
+        auto turbo_blk_len = [](ggml_type ty) -> int64_t {
+            return ty == GGML_TYPE_TURBO5P512_0 ? QK_TURBO5P512 : QK_TURBO4P;
+        };
+        auto is_split_plane = [](ggml_type ty) {
+            return ty == GGML_TYPE_TURBO4P_0 || ty == GGML_TYPE_TURBO5P_0 || ty == GGML_TYPE_TURBO5P512_0;
+        };
+        if (is_split_plane(K->type) && !turbo_blk_geometry_ok(K, turbo_blk_len(K->type))) {
             return BEST_FATTN_KERNEL_NONE;
         }
-        if ((V->type == GGML_TYPE_TURBO4P_0 || V->type == GGML_TYPE_TURBO5P_0) && !turbo4p_geometry_ok(V)) {
+        if (is_split_plane(V->type) && !turbo_blk_geometry_ok(V, turbo_blk_len(V->type))) {
             return BEST_FATTN_KERNEL_NONE;
         }
         // Only the pairs that have a VEC instance. The mixed-type check above admits any
@@ -697,9 +713,18 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         // - turbo2 and turbo3 still do a per-element divergent constant-memory lookup, so
         // pairing them with turbo4p would be a measured LOSS anyway (K=turbo4 / V=turbo3 at
         // d131072: 101.07 -> 88.08 t/s). Refusing here beats aborting in the dispatch.
-        if (K->type == GGML_TYPE_TURBO4P_0 || V->type == GGML_TYPE_TURBO4P_0 || K->type == GGML_TYPE_TURBO5P_0 || V->type == GGML_TYPE_TURBO5P_0) {
+        if (is_split_plane(K->type) || is_split_plane(V->type)) {
+            // [TAG_TURBO5P512] turbo5p512 is instantiated against itself and q8_0 only, and it
+            // must NOT pair with turbo5p: the two carry different block lengths, and a single
+            // kernel reads one geometry for both planes.
+            const bool k512 = K->type == GGML_TYPE_TURBO5P512_0;
+            const bool v512 = V->type == GGML_TYPE_TURBO5P512_0;
+            if (k512 != v512 && (is_split_plane(K->type) && is_split_plane(V->type))) {
+                return BEST_FATTN_KERNEL_NONE;
+            }
             auto turbo4p_pairable = [](ggml_type t) {
-                return t == GGML_TYPE_TURBO4P_0 || t == GGML_TYPE_TURBO5P_0 || t == GGML_TYPE_Q8_0 || t == GGML_TYPE_TURBO4_0;
+                return t == GGML_TYPE_TURBO4P_0 || t == GGML_TYPE_TURBO5P_0 ||
+                       t == GGML_TYPE_TURBO5P512_0 || t == GGML_TYPE_Q8_0 || t == GGML_TYPE_TURBO4_0;
             };
             if (!turbo4p_pairable(K->type) || !turbo4p_pairable(V->type)) {
                 return BEST_FATTN_KERNEL_NONE;

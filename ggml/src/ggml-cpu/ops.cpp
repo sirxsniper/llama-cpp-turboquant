@@ -5062,6 +5062,7 @@ void ggml_compute_forward_get_rows(
         case GGML_TYPE_TURBO4_0:
         case GGML_TYPE_TURBO4P_0:
         case GGML_TYPE_TURBO5P_0:
+        case GGML_TYPE_TURBO5P512_0:
             {
                 ggml_compute_forward_get_rows_q(params, dst);
             } break;
@@ -5143,7 +5144,7 @@ static void ggml_compute_forward_set_rows_impl(
     // only turbo2/turbo3 actually read it back.
     if (dst->type == GGML_TYPE_TURBO3_0 || dst->type == GGML_TYPE_TURBO4_0 ||
         dst->type == GGML_TYPE_TURBO2_0 || dst->type == GGML_TYPE_TURBO4P_0 ||
-        dst->type == GGML_TYPE_TURBO5P_0) {
+        dst->type == GGML_TYPE_TURBO5P_0 || dst->type == GGML_TYPE_TURBO5P512_0) {
         int gs = 0;
         memcpy(&gs, dst->op_params, sizeof(int));
         turbo3_cpu_wht_group_size = (gs == 64 || gs == 128) ? gs : 0;

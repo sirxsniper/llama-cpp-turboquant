@@ -686,6 +686,11 @@ enum llm_tensor {
     LLM_TENSOR_NEXTN_HNORM,
     LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD,
     LLM_TENSOR_NEXTN_SHARED_HEAD_NORM,
+    // [TAG_QWEN4EXP_MTP] qwen4exp's MTP block collapses its own wide hyper-connection stream,
+    // so it carries a second set of hc_head weights under blk.%d.nextn.
+    LLM_TENSOR_NEXTN_HC_HEAD_NORM,
+    LLM_TENSOR_NEXTN_HC_HEAD_DOWN,
+    LLM_TENSOR_NEXTN_HC_HEAD_UP,
     LLM_TENSOR_MASKED_EMBD_CENTROIDS,
     LLM_TENSOR_MASKED_EMBD_ORDERING,
     LLM_TENSOR_FC,

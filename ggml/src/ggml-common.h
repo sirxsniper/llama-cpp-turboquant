@@ -407,6 +407,34 @@ typedef struct {
 static_assert(sizeof(block_turbo5p_0) == 656, "wrong turbo5p_0 block size");
 static_assert(QK_TURBO5P == QK_TURBO4P && QK_TURBO5P_GROUP == QK_TURBO4P_GROUP, "turbo5p shares the turbo4p block geometry");
 
+// ---- TurboQuant 5-bit split-plane, 512-ELEMENT block [TAG_TURBO5P512] ----
+//
+// Bit-for-bit the same maths as turbo5p - same 128-element WHT group, same 32 Lloyd-Max
+// centroids, same low-nibble/high-bit split - with four groups per block instead of eight.
+// It exists because ggml needs ne[0] % blck_size == 0 and Qwen3.8-Flash-Next has a 512-element
+// KV row (n_head_kv 2 x head 256), which 1024 does not divide. Only {256, 512} are legal here:
+// the block must divide the row AND be a multiple of the 256-wide head so a head never
+// straddles a block. 512 wins over 256 because the alignment padding below is a smaller share
+// of a bigger block (5.25 vs 5.50 bpw).
+//
+// norm[] is deliberately 8 halves with only 4 used. Without that pad the block is
+// 256 + 64 + 8 = 328 = 8*41, so consecutive block bases alternate 16- and 8-byte alignment and
+// the wide qs load degrades - the same failure the 656 = 16*41 note above was written for.
+// 336 = 16*21 keeps every block base 16-byte aligned for 0.125 bpw.
+#define QK_TURBO5P512       512
+#define QK_TURBO5P512_GROUP 128
+#define QK_TURBO5P512_NGRP    4
+
+typedef struct {
+    uint8_t   qs[QK_TURBO5P512 / 2];   // 256 bytes: low 4 bits, element i in nibble i%2 of qs[i/2]
+    uint8_t   qh[QK_TURBO5P512 / 8];   //  64 bytes: high bit,   element i at bit i%8 of qh[i/8]
+    ggml_half norm[8];                 //  16 bytes: 4 group norms + 4 of padding, see above
+} block_turbo5p512_0;                  // 336 bytes total
+static_assert(sizeof(block_turbo5p512_0) == 336, "wrong turbo5p512_0 block size");
+static_assert(sizeof(block_turbo5p512_0) % 16 == 0, "turbo5p512 block base must stay 16-byte aligned");
+static_assert(QK_TURBO5P512_GROUP == QK_TURBO5P_GROUP, "turbo5p512 must reuse the turbo5p WHT group");
+static_assert(QK_TURBO5P512 == QK_TURBO5P512_GROUP * QK_TURBO5P512_NGRP, "turbo5p512 group count");
+
 // TurboQuant 2-bit: 2-bit PolarQuant indices only (no QJL)
 // Per block: norm(fp16) + 2-bit indices (8 bytes) = 10 bytes per 32 values
 // = 2.5 bits/value → 6.4× compression vs fp16

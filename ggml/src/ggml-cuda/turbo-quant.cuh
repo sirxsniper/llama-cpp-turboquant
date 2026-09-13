@@ -702,6 +702,40 @@ static __device__ __forceinline__ void turbo5p_dequant_lane(
     ggml_cuda_memcpy_1<sizeof(dst_t)*per_lane>(yout, v);
 }
 
+// [TAG_TURBO5P512] identical to turbo5p_dequant_lane; only the block struct and the
+// block length differ, and both are addressed per WHT group so the body is unchanged.
+template <typename dst_t> using turbo5p512_lane_shape = turbo5p_lane_shape<dst_t>;
+template <typename dst_t>
+static __device__ __forceinline__ void turbo5p512_dequant_lane(
+        const block_turbo5p512_0 * __restrict__ x, const int jb,
+        const float raw_centroid, dst_t * __restrict__ yout) {
+
+    constexpr int per_lane = turbo5p512_lane_shape<dst_t>::elems;
+    constexpr int qs_bytes = turbo5p512_lane_shape<dst_t>::qs_bytes;
+    using qs_word_t = typename std::conditional<qs_bytes == 4, uint32_t, uint16_t>::type;
+
+    // Uniform across the whole group, so the compiler hoists it out of the unrolled loop.
+    const float norm = __half2float(x->norm[jb / QK_TURBO5P512_GROUP]);
+
+    // jb is even, so element jb+e is nibble e counting from bit 0 of this word: byte jb/2
+    // holds elements jb+0 (low nibble) and jb+1 (high nibble), byte jb/2+1 holds jb+2 and
+    // jb+3, and so on. Same nibble order as turbo4_0.
+    qs_word_t qsw;
+    ggml_cuda_memcpy_1<qs_bytes>(&qsw, x->qs + jb/2);
+    // [TAG_TURBO5P512] per_lane high bits start at bit jb of the qh plane; jb is a multiple of
+    // per_lane (4 or 8) so they never straddle a byte: bits (jb%8)..(jb%8)+per_lane-1 of qh[jb/8].
+    const unsigned qhw = ((unsigned) x->qh[jb / 8]) >> (jb % 8);
+
+    alignas(16) dst_t v[per_lane];
+#pragma unroll
+    for (int e = 0; e < per_lane; ++e) {
+        const unsigned idx = ((unsigned) (qsw >> (4*e)) & 0xFu) | (((qhw >> e) & 1u) << 4);
+        v[e] = (dst_t) (norm * __shfl_sync(0xFFFFFFFFu, raw_centroid, idx, WARP_SIZE));
+    }
+
+    ggml_cuda_memcpy_1<sizeof(dst_t)*per_lane>(yout, v);
+}
+
 // ---- Nearest 3-bit centroid index ----
 
 static __device__ __forceinline__ uint8_t turbo_nearest_centroid_3bit(float val) {

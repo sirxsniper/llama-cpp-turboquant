@@ -1,5 +1,7 @@
 #include "llama-memory-hybrid-idx.h"
 
+#include <cstring>
+
 #include "llama-impl.h"
 #include "llama-batch.h"
 #include "llama-io.h"
@@ -69,12 +71,38 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
         const char * idx_inherit = getenv("TURBO_IDX_INHERIT");
         const bool  inherit_idx  = idx_inherit && idx_inherit[0] == '1';
         const bool  k_is_turbo   = (type_k == GGML_TYPE_TURBO2_0 || type_k == GGML_TYPE_TURBO3_0 ||
-                                    type_k == GGML_TYPE_TURBO4_0 || type_k == GGML_TYPE_TURBO4P_0 || type_k == GGML_TYPE_TURBO5P_0);
+                                    type_k == GGML_TYPE_TURBO4_0 || type_k == GGML_TYPE_TURBO4P_0 ||
+                                    type_k == GGML_TYPE_TURBO5P_0 || type_k == GGML_TYPE_TURBO5P512_0);
         // q8_0, not F16: half the memory (1.5 GiB vs 3.0 at 262144) and measured just as
         // fast on this path, which buys back a whole expert layer on the GPU.
         // TURBO_IDX_TYPE=f16 forces F16 if a future arch needs the precision.
+        // [TAG_IDX_TYPE_ANY] TURBO_IDX_TYPE takes any ggml type NAME now (q8_0, f16, q4_0,
+        // q5_1, turbo5p512, ...), not just "f" for F16. The indexer is the O(n_kv)/token read on
+        // this arch - it scores EVERY key to pick a top-2048 set, while the attention cache is then
+        // read for only those ~2051 positions - so the indexer type governs far more traffic than
+        // the KV type does, and it is worth being able to sweep it. Ranking a top-k set is also far
+        // less precision-sensitive than attention itself, so a 4-bit indexer may well be enough.
         const char * idx_ty = getenv("TURBO_IDX_TYPE");
-        const ggml_type idx_fallback = (idx_ty && idx_ty[0] == 'f') ? GGML_TYPE_F16 : GGML_TYPE_Q8_0;
+        ggml_type idx_fallback = GGML_TYPE_Q8_0;
+        if (idx_ty && idx_ty[0]) {
+            if (idx_ty[0] == 'f' && idx_ty[1] == 0) {
+                idx_fallback = GGML_TYPE_F16;          // back-compat with the old "f" spelling
+            } else {
+                bool found = false;
+                for (int ty = 0; ty < GGML_TYPE_COUNT; ++ty) {
+                    const char * nm = ggml_type_name((ggml_type) ty);
+                    if (nm && strcmp(nm, idx_ty) == 0) {
+                        idx_fallback = (ggml_type) ty;
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) {
+                    LLAMA_LOG_WARN("%s: TURBO_IDX_TYPE=%s is not a ggml type name; keeping q8_0\n",
+                                   __func__, idx_ty);
+                }
+            }
+        }
         const ggml_type idx_type_k = (k_is_turbo && !inherit_idx) ? idx_fallback : type_k;
         const ggml_type idx_type_v = (k_is_turbo && !inherit_idx) ? idx_fallback : type_v;
         LLAMA_LOG_INFO("%s: indexer cache type = %s/%s%s\n", __func__,

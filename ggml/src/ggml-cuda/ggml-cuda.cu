@@ -373,6 +373,27 @@ static ggml_cuda_device_info ggml_cuda_init() {
             CUDA_CHECK(cudaSetDeviceFlags(cudaDeviceScheduleSpin));
         }
 
+        // [TAG_CUDA_SCHED] TURBO_CUDA_SCHED=spin|yield|blocking pins the host wait policy used by every
+        // synchronize on this device (the driver's "auto" picks per process, which is one candidate
+        // for the decode step costing 25.3 ms in one server launch and 28.0 ms in the next).
+        {
+            static const int sched_flag = [] {
+                const char * e = getenv("TURBO_CUDA_SCHED");
+                if (e == nullptr) {
+                    return -1;
+                }
+                if (strcmp(e, "spin") == 0)     { return (int) cudaDeviceScheduleSpin; }
+                if (strcmp(e, "yield") == 0)    { return (int) cudaDeviceScheduleYield; }
+                if (strcmp(e, "blocking") == 0) { return (int) cudaDeviceScheduleBlockingSync; }
+                return -1;
+            }();
+            if (sched_flag >= 0) {
+                CUDA_CHECK(cudaSetDevice(physical_id));
+                CUDA_CHECK(cudaSetDeviceFlags((unsigned) sched_flag));
+                GGML_LOG_INFO("%s: device %d host wait policy set from TURBO_CUDA_SCHED (%s)\n", __func__, id, getenv("TURBO_CUDA_SCHED"));
+            }
+        }
+
 #endif  // defined(GGML_USE_HIP)
     }
 
@@ -1861,7 +1882,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         ggml_cuda_mul_mat_f(ctx, src0, src1, nullptr, dst);
         return;
     }
-    if (ggml_cuda_should_use_mmvq(src0->type, cc, ne11)) {
+    if (ggml_cuda_should_use_mmvq(src0->type, cc, ne11, /*ne01 =*/ src0->ne[1])) {
         ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst);
         return;
     }
@@ -2070,7 +2091,8 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         const ggml_tensor * b = dst->src[1];
         auto is_turbo = [](const ggml_tensor * t) {
             return t && (t->type == GGML_TYPE_TURBO2_0 || t->type == GGML_TYPE_TURBO3_0 ||
-                         t->type == GGML_TYPE_TURBO4_0 || t->type == GGML_TYPE_TURBO4P_0 || t->type == GGML_TYPE_TURBO5P_0);
+                         t->type == GGML_TYPE_TURBO4_0 || t->type == GGML_TYPE_TURBO4P_0 || t->type == GGML_TYPE_TURBO5P_0 ||
+                         t->type == GGML_TYPE_TURBO5P512_0);
         };
         const char * e = getenv("TURBO_OP_PROBE");
         if (e && e[0] == '1' && (is_turbo(a) || is_turbo(b))) {
@@ -2632,6 +2654,11 @@ static const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
     mix((uint64_t) cgraph->n_nodes);
     for (int i = 0; i < cgraph->n_nodes; i++) {
         const ggml_tensor * t = cgraph->nodes[i];
+        // [TAG_CUDA_GRAPH_KEY_IDENTITY] the name distinguishes one layer's split from the next.
+        // Without it every structurally identical per-layer split shares one graph object, their
+        // node_props overwrite each other and CUDA graph warmup can never complete. Names survive a
+        // graph rebuild, so this does not reintroduce the churn a pointer-based key caused.
+        for (const char * c = t->name; *c; ++c) { mix((uint64_t) (unsigned char) *c); }
         mix((uint64_t) t->op); mix((uint64_t) t->type);
         mix((uint64_t) t->ne[0]); mix((uint64_t) t->ne[1]); mix((uint64_t) t->ne[2]); mix((uint64_t) t->ne[3]);
         for (int j = 0; j < GGML_MAX_SRC; j++) {
@@ -3340,6 +3367,154 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
 }
 
 // try and fuse nodes and return the number of nodes to skip
+// [TAG_CPY_CHAIN_FUSION] Finds n >= 2 consecutive CPY nodes (only view/no-op nodes between them) that
+// copy the same shape with the same strides and whose src/dst pointers advance by constant byte
+// deltas. The chain is safe to run as one launch when no copy reads what any copy writes and no two
+// destinations overlap; the element order inside each copy is unchanged, so the result is the same
+// bytes. TURBO_CPY_CHAIN=0 disables it. Returns the number of graph nodes to skip after node i.
+static int ggml_cuda_try_cpy_chain_fusion(const ggml_cgraph * cgraph, int i, int & n_out, int64_t & dsrc_out, int64_t & ddst_out) {
+    static const bool on = [] {
+        const char * e = getenv("TURBO_CPY_CHAIN");
+        return !(e && e[0] == '0');
+    }();
+    if (!on) {
+        return 0;
+    }
+    const ggml_tensor * first = cgraph->nodes[i];
+    if (first->op != GGML_OP_CPY || (first->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return 0;
+    }
+    const ggml_tensor * s0 = first->src[0];
+    const ggml_tensor * s1 = first->src[1];
+    if (!s0 || !s1 || s0->type != GGML_TYPE_F32 || s1->type != GGML_TYPE_F32 || first->type != GGML_TYPE_F32 ||
+        s0->ne[3] != 1 || s1->ne[3] != 1 || first->data != s1->data || ggml_is_empty(s0)) {
+        return 0;
+    }
+    const auto same_layout = [](const ggml_tensor * a, const ggml_tensor * b) {
+        return a->type == b->type && std::equal(a->ne, a->ne + GGML_MAX_DIMS, b->ne) &&
+               std::equal(a->nb, a->nb + GGML_MAX_DIMS, b->nb);
+    };
+    int     n    = 1;
+    int     last = i;
+    int64_t dsrc = 0;
+    int64_t ddst = 0;
+    const ggml_tensor * prev = first;
+    for (int j = i + 1; j < cgraph->n_nodes; ++j) {
+        const ggml_tensor * t = cgraph->nodes[j];
+        if (ggml_cuda_is_view_or_noop(t)) {
+            continue;
+        }
+        if (t->op != GGML_OP_CPY || (t->flags & GGML_TENSOR_FLAG_OUTPUT) || !t->src[0] || !t->src[1] ||
+            t->data != t->src[1]->data || t->type != GGML_TYPE_F32 ||
+            !same_layout(t->src[0], s0) || !same_layout(t->src[1], s1)) {
+            break;
+        }
+        const int64_t d0 = (const char *) t->src[0]->data - (const char *) prev->src[0]->data;
+        const int64_t d1 = (const char *) t->src[1]->data - (const char *) prev->src[1]->data;
+        if (n == 1) {
+            dsrc = d0;
+            ddst = d1;
+        } else if (d0 != dsrc || d1 != ddst) {
+            break;
+        }
+        ++n;
+        last = j;
+        prev = t;
+    }
+    if (n < 2) {
+        return 0;
+    }
+    // byte spans touched by the whole chain (nbytes covers the strided extent of one copy)
+    const int64_t ext0 = (int64_t) ggml_nbytes(s0);
+    const int64_t ext1 = (int64_t) ggml_nbytes(s1);
+    const int64_t s0_lo = (int64_t) s0->data + (dsrc < 0 ? dsrc * (n - 1) : 0);
+    const int64_t s0_hi = (int64_t) s0->data + (dsrc > 0 ? dsrc * (n - 1) : 0) + ext0;
+    const int64_t s1_lo = (int64_t) s1->data + (ddst < 0 ? ddst * (n - 1) : 0);
+    const int64_t s1_hi = (int64_t) s1->data + (ddst > 0 ? ddst * (n - 1) : 0) + ext1;
+    const bool reads_own_writes = s0_lo < s1_hi && s1_lo < s0_hi;
+    const bool dst_overlap      = ddst == 0 || (ddst > 0 ? ddst : -ddst) < ext1;
+    if (reads_own_writes || dst_overlap) {
+        return 0;
+    }
+    n_out    = n;
+    dsrc_out = dsrc;
+    ddst_out = ddst;
+    return last - i;
+}
+
+// [TAG_GDN_PREP_FUSION] add(x, dt) -> softplus -> mul(., a) with dt and a plain F32 vectors along dim 0:
+// Qwen3.8's GDN decay gate does this three times per recurrent layer per step. Bit-exact single
+// launch; TURBO_GDN_PREP=0 disables it.
+static bool ggml_cuda_try_gdn_prep_fusion(const ggml_cgraph * cgraph, int i) {
+    static const bool on = [] {
+        const char * e = getenv("TURBO_GDN_PREP");
+        return !(e && e[0] == '0');
+    }();
+    if (!on || i + 2 >= cgraph->n_nodes) {
+        return false;
+    }
+    const ggml_tensor * add = cgraph->nodes[i];
+    const ggml_tensor * sp  = cgraph->nodes[i + 1];
+    const ggml_tensor * mul = cgraph->nodes[i + 2];
+    if (add->op != GGML_OP_ADD || sp->op != GGML_OP_UNARY || ggml_get_unary_op(sp) != GGML_UNARY_OP_SOFTPLUS || mul->op != GGML_OP_MUL) {
+        return false;
+    }
+    if (!ggml_can_fuse(cgraph, i, { GGML_OP_ADD, GGML_OP_UNARY, GGML_OP_MUL }) ||
+        !ggml_check_edges(cgraph, i, { { 1, 0, 0 }, { 2, 0, 1 } })) {
+        return false;
+    }
+    const ggml_tensor * x  = add->src[0];
+    const ggml_tensor * dt = add->src[1];
+    const ggml_tensor * a  = mul->src[1];
+    const auto vec_like = [&](const ggml_tensor * v) {
+        return v && v->type == GGML_TYPE_F32 && ggml_is_contiguous(v) && v->ne[0] == x->ne[0] &&
+               v->ne[1] == 1 && v->ne[2] == 1 && v->ne[3] == 1;
+    };
+    if (!x || x->type != GGML_TYPE_F32 || !ggml_is_contiguous(x) || !vec_like(dt) || !vec_like(a)) {
+        return false;
+    }
+    if (add->type != GGML_TYPE_F32 || sp->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32 ||
+        !ggml_is_contiguous(mul) || !ggml_are_same_shape(x, mul) || !ggml_are_same_shape(x, add) || !ggml_are_same_shape(x, sp)) {
+        return false;
+    }
+    return true;
+}
+
+// [TAG_RESID_NORM_FUSION] add(x, y) -> rms_norm -> mul(., w) where the add is a plain same-shape F32 sum
+// (a residual connection). The add's result keeps being written, so its other consumers are fine.
+// Bit-exact single launch; TURBO_RESID_NORM=0 disables it.
+static bool ggml_cuda_try_resid_norm_fusion(const ggml_cgraph * cgraph, int i) {
+    static const bool on = [] {
+        const char * e = getenv("TURBO_RESID_NORM");
+        return !(e && e[0] == '0');
+    }();
+    if (!on || i + 2 >= cgraph->n_nodes) {
+        return false;
+    }
+    const ggml_tensor * add  = cgraph->nodes[i];
+    const ggml_tensor * norm = cgraph->nodes[i + 1];
+    const ggml_tensor * mul  = cgraph->nodes[i + 2];
+    if (add->op != GGML_OP_ADD || norm->op != GGML_OP_RMS_NORM || mul->op != GGML_OP_MUL || norm->src[0] != add) {
+        return false;
+    }
+    const ggml_tensor * x = add->src[0];
+    const ggml_tensor * y = add->src[1];
+    if (!x || !y || add->type != GGML_TYPE_F32 || x->type != GGML_TYPE_F32 || y->type != GGML_TYPE_F32 ||
+        !ggml_is_contiguous(add) || !ggml_is_contiguous(x) || !ggml_is_contiguous(y) ||
+        !ggml_are_same_shape(add, x) || !ggml_are_same_shape(add, y) || ggml_is_empty(add)) {
+        return false;
+    }
+    // the norm -> mul pair must be fusable on its own (single use of the norm output, F32 everywhere)
+    if (!ggml_cuda_can_fuse(cgraph, i + 1, { GGML_OP_RMS_NORM, GGML_OP_MUL }, {})) {
+        return false;
+    }
+    const ggml_tensor * w = mul->src[0] == norm ? mul->src[1] : mul->src[0];
+    if (w->type != GGML_TYPE_F32 || w->nb[0] != ggml_type_size(GGML_TYPE_F32) || !ggml_is_contiguous(mul)) {
+        return false;
+    }
+    return true;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
@@ -3348,6 +3523,29 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     ggml_tensor * node = cgraph->nodes[i];
+
+    // [TAG_GDN_PREP_FUSION] add -> softplus -> mul -> one launch
+    if (node->op == GGML_OP_ADD && ggml_cuda_try_gdn_prep_fusion(cgraph, i)) {
+        ggml_cuda_op_gdn_gate_prep(*cuda_ctx, node, cgraph->nodes[i + 2]);
+        return 2;
+    }
+
+    // [TAG_RESID_NORM_FUSION] add -> rms_norm -> mul -> one launch (the add result is still written)
+    if (node->op == GGML_OP_ADD && ggml_cuda_try_resid_norm_fusion(cgraph, i)) {
+        ggml_cuda_op_rms_norm_resid_fused(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
+        return 2;
+    }
+
+    // [TAG_CPY_CHAIN_FUSION] cpy, cpy, cpy ... with constant pointer deltas -> one launch
+    if (node->op == GGML_OP_CPY) {
+        int     n_chain = 0;
+        int64_t dsrc = 0, ddst = 0;
+        const int nodes_to_skip = ggml_cuda_try_cpy_chain_fusion(cgraph, i, n_chain, dsrc, ddst);
+        if (nodes_to_skip > 0) {
+            ggml_cuda_cpy_chain(*cuda_ctx, node->src[0], node->src[1], n_chain, dsrc, ddst);
+            return nodes_to_skip;
+        }
+    }
 
     // gated_delta_net -> cpy: scatter recurrent-state snapshots into the cache
     if (node->op == GGML_OP_GATED_DELTA_NET) {
@@ -4310,10 +4508,48 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, co
 }
 #endif // USE_CUDA_GRAPH
 
+// [TAG_GRAPH_DUMP] TURBO_GRAPH_DUMP=1 prints every node of the first four distinct graph sizes this
+// backend computes, once each, to stderr: op, name, type, shape, strides, contiguity and sources.
+// Diagnostic only; a single static bool when the env is unset.
+static void ggml_cuda_graph_dump_once(const ggml_cgraph * cgraph) {
+    static const bool on = [] {
+        const char * e = getenv("TURBO_GRAPH_DUMP");
+        return e && e[0] == '1';
+    }();
+    if (!on) {
+        return;
+    }
+    static std::mutex mtx;
+    static std::set<int> seen;
+    std::lock_guard<std::mutex> lock(mtx);
+    if (seen.size() >= 4 || !seen.insert(cgraph->n_nodes).second) {
+        return;
+    }
+    fprintf(stderr, "turbo-dump: graph n_nodes=%d\n", cgraph->n_nodes);
+    auto desc = [](const ggml_tensor * t) {
+        char buf[256];
+        snprintf(buf, sizeof(buf), "%s %s [%lld,%lld,%lld,%lld] nb[%zu,%zu,%zu,%zu] c%d",
+                 t->name, ggml_type_name(t->type),
+                 (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3],
+                 t->nb[0], t->nb[1], t->nb[2], t->nb[3], ggml_is_contiguous(t) ? 1 : 0);
+        return std::string(buf);
+    };
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const ggml_tensor * n = cgraph->nodes[i];
+        std::string line = "turbo-dump: #" + std::to_string(i) + " " + ggml_op_desc(n) + " " + desc(n);
+        for (int j = 0; j < GGML_MAX_SRC && n->src[j]; ++j) {
+            line += " | src" + std::to_string(j) + "=" + desc(n->src[j]);
+        }
+        fprintf(stderr, "%s\n", line.c_str());
+    }
+    fflush(stderr);
+}
+
 static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
     ggml_cuda_set_device(cuda_ctx->device);
+    ggml_cuda_graph_dump_once(cgraph);
 
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;
@@ -5131,7 +5367,11 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 }
                 // [TAG_TURBO4P] turbo4p packs 8 WHT groups into one 1024-element block, so
                 // the row must be a whole number of blocks, not merely group-aligned.
+                // [TAG_TURBO5P512] each split-plane type against its own block length.
                 if ((op->type == GGML_TYPE_TURBO4P_0 || op->type == GGML_TYPE_TURBO5P_0) && op->src[0]->ne[0] % 1024 != 0) {
+                    return false;
+                }
+                if (op->type == GGML_TYPE_TURBO5P512_0 && op->src[0]->ne[0] % 512 != 0) {
                     return false;
                 }
                 return (
@@ -5140,7 +5380,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                                op->type == GGML_TYPE_Q4_0 || op->type == GGML_TYPE_Q4_1 || op->type == GGML_TYPE_Q5_0 ||
                                op->type == GGML_TYPE_Q5_1 || op->type == GGML_TYPE_Q8_0 || op->type == GGML_TYPE_IQ4_NL ||
                                op->type == GGML_TYPE_TURBO3_0 || op->type == GGML_TYPE_TURBO2_0 ||
-                               op->type == GGML_TYPE_TURBO4_0 || op->type == GGML_TYPE_TURBO4P_0 || op->type == GGML_TYPE_TURBO5P_0) &&
+                               op->type == GGML_TYPE_TURBO4_0 || op->type == GGML_TYPE_TURBO4P_0 ||
+                               op->type == GGML_TYPE_TURBO5P_0 || op->type == GGML_TYPE_TURBO5P512_0) &&
                                op->src[0]->type == GGML_TYPE_F32
                            ) || (
                                op->type == GGML_TYPE_F16 && op->src[0]->type == GGML_TYPE_F16

@@ -864,6 +864,84 @@ void dequantize_row_turbo5p_0(const block_turbo5p_0 * GGML_RESTRICT x, float * G
     }
 }
 
+/* [TAG_TURBO5P512] Identical to the turbo5p routines above with QK_TURBO5P -> QK_TURBO5P512.
+ * Kept as its own function rather than a shared macro so the two block layouts stay independently
+ * greppable; the only structural difference is that norm[] has four unused trailing halves, which
+ * exist purely to keep sizeof() a multiple of 16. */
+void quantize_row_turbo5p512_0_ref(const float * GGML_RESTRICT x, block_turbo5p512_0 * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_TURBO5P512 == 0);
+    const int nb = k / QK_TURBO5P512;
+    const int d  = QK_TURBO5P512_GROUP;
+
+    for (int block = 0; block < nb; block++) {
+        block_turbo5p512_0 * blk = &y[block];
+        memset(blk->qs, 0, QK_TURBO5P512 / 2);
+        memset(blk->qh, 0, QK_TURBO5P512 / 8);
+        memset(blk->norm, 0, sizeof(blk->norm));   /* zero the padding too, so blocks hash stably */
+
+        for (int g = 0; g < QK_TURBO5P512_NGRP; g++) {
+            const float * src = x + (size_t)block * QK_TURBO5P512 + (size_t)g * d;
+
+            float norm_sq = 0.0f;
+            for (int i = 0; i < d; i++) norm_sq += src[i] * src[i];
+            const float norm = sqrtf(norm_sq);
+
+            float rotated[QK_TURBO5P512_GROUP];
+            if (norm > 1e-10f) {
+                const float inv = 1.0f / norm;
+                for (int i = 0; i < d; i++) rotated[i] = src[i] * inv;
+            } else {
+                memset(rotated, 0, d * sizeof(float));
+            }
+            turbo_cpu_fwht(rotated, d);
+
+            uint8_t indices[QK_TURBO5P512_GROUP];
+            float recon_norm_sq = 0.0f;
+            for (int i = 0; i < d; i++) {
+                const int idx = nearest_centroid_5bit(rotated[i]);
+                indices[i] = (uint8_t) idx;
+                recon_norm_sq += CENTROIDS_5BIT[idx] * CENTROIDS_5BIT[idx];
+            }
+            const float recon_norm = sqrtf(recon_norm_sq);
+            blk->norm[g] = GGML_FP32_TO_FP16((recon_norm > 1e-10f) ? norm / recon_norm : norm);
+
+            for (int i = 0; i < d; i++) {
+                const int gi = g * d + i;
+                blk->qs[gi / 2] |= (uint8_t)((indices[i] & 0xF) << ((gi % 2) * 4));
+                blk->qh[gi / 8] |= (uint8_t)(((indices[i] >> 4) & 1) << (gi % 8));
+            }
+        }
+    }
+}
+
+void dequantize_row_turbo5p512_0(const block_turbo5p512_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_TURBO5P512 == 0);
+    const int nb = k / QK_TURBO5P512;
+    /* Returns WHT-rotated values, exactly like turbo4p/turbo5p. */
+    for (int block = 0; block < nb; block++) {
+        const block_turbo5p512_0 * blk = &x[block];
+        float * dst = y + (size_t)block * QK_TURBO5P512;
+        for (int i = 0; i < QK_TURBO5P512; i++) {
+            const float   norm = GGML_FP16_TO_FP32(blk->norm[i / QK_TURBO5P512_GROUP]);
+            const int     lo   = (blk->qs[i / 2] >> ((i % 2) * 4)) & 0xF;
+            const int     hi   = (blk->qh[i / 8] >> (i % 8)) & 1;
+            dst[i] = CENTROIDS_5BIT[lo | (hi << 4)] * norm;
+        }
+    }
+}
+
+size_t quantize_turbo5p512_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
+                             int64_t nrows, int64_t n_per_row, const float * imatrix) {
+    GGML_UNUSED(imatrix);
+    assert(n_per_row % QK_TURBO5P512 == 0);
+    size_t row_size = (n_per_row / QK_TURBO5P512) * sizeof(block_turbo5p512_0);
+    for (int64_t row = 0; row < nrows; row++) {
+        quantize_row_turbo5p512_0_ref(src + row * n_per_row,
+                                      (block_turbo5p512_0 *) ((char *) dst + row * row_size), n_per_row);
+    }
+    return row_size * nrows;
+}
+
 size_t quantize_turbo5p_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
                           int64_t nrows, int64_t n_per_row, const float * imatrix) {
     GGML_UNUSED(imatrix);

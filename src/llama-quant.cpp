@@ -286,9 +286,24 @@ static void llama_tensor_dequantize_impl(
 // do we allow this tensor to be quantized?
 //
 
-static bool tensor_allows_quantization(const llama_model_quantize_params * params, llm_arch arch, const ggml_tensor * tensor) {
-    // trivial checks first -- no string ops needed
-    if (params->only_copy)       return false;
+static bool tensor_allows_quantization(const llama_model_quantize_params * params, llm_arch arch, const ggml_tensor * tensor,
+                                       const std::vector<std::pair<std::regex, ggml_type>> * tt_patterns = nullptr) {
+    // [TAG_COPY_TENSOR_TYPE] COPY means "change nothing", but an EXPLICIT --tensor-type for this
+    // tensor is a direct instruction that should win. Without this, COPY + --tensor-type is a
+    // silent no-op: target_type is set to the current type and the override is never read.
+    // This is what makes a surgical retype possible - one tensor family changed, everything
+    // else copied verbatim rather than requantised from already-quantised data.
+    if (params->only_copy) {
+        if (tt_patterns && ggml_n_dims(tensor) >= 2) {
+            const std::string nm = ggml_get_name(tensor);
+            for (const auto & pat : *tt_patterns) {
+                if (std::regex_search(nm, pat.first)) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
 
     // quantize only 2D and 3D tensors (experts)
     if (ggml_n_dims(tensor) < 2) return false;
@@ -683,7 +698,10 @@ static ggml_type llama_tensor_get_type_impl(quantize_state_impl & qs, ggml_type 
 
 // outer wrapper: determine the ggml_type that this tensor should be quantized to
 static ggml_type llama_tensor_get_type(quantize_state_impl & qs, const llama_model_quantize_params * params, const ggml_tensor * tensor, ggml_type default_type, const tensor_metadata & tm) {
-    if (!tensor_allows_quantization(params, qs.model.arch, tensor)) {
+    // [TAG_COPY_TENSOR_TYPE] pass the compiled override patterns here too, otherwise under
+    // only_copy this gate returns false and the function bails to tensor->type before the
+    // override is ever read - which silently defeats a surgical --tensor-type retype.
+    if (!tensor_allows_quantization(params, qs.model.arch, tensor, &qs.tensor_type_patterns)) {
         return tensor->type;
     }
     if (params->token_embedding_type < GGML_TYPE_COUNT && tm.category == tensor_category::TOKEN_EMBD) {
@@ -707,10 +725,14 @@ static ggml_type llama_tensor_get_type(quantize_state_impl & qs, const llama_mod
         return params->output_tensor_type;
     }
 
-    ggml_type new_type = default_type;
+    // [TAG_COPY_TENSOR_TYPE] Under COPY, default_type is F32 (LLAMA_FTYPE_ALL_F32). Seed from the
+    // tensor's CURRENT type instead, so an unmatched tensor ends up with new_type == cur_type and is
+    // copied verbatim, while a tensor named by --tensor-type can still be retyped below. Seeding
+    // from F32 here is what made a surgical retype inflate the whole model to 17 BPW.
+    ggml_type new_type = params->only_copy ? tensor->type : default_type;
 
     // get more optimal quantization type based on the tensor shape, layer, etc.
-    if (ggml_is_quantized(default_type)) {
+    if (ggml_is_quantized(new_type)) {
         // if the user provided tensor types - use those
         bool manual = false;
         if (!qs.tensor_type_patterns.empty()) {
@@ -729,7 +751,9 @@ static ggml_type llama_tensor_get_type(quantize_state_impl & qs, const llama_mod
         }
 
         // if not manual - use the standard logic for choosing the quantization type based on the selected mixture
-        if (!manual && !params->pure) {
+        // [TAG_COPY_TENSOR_TYPE] never re-derive a mixture under COPY: an unnamed tensor must keep
+        // exactly the type it already has.
+        if (!manual && !params->pure && !params->only_copy) {
             new_type = llama_tensor_get_type_impl(qs, new_type, tensor, params->ftype, tm.category);
         }
 
@@ -1074,7 +1098,8 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
         }
         gguf_add_tensor(ctx_outs[i_split].get(), tensor);
 
-        metadata[i].allows_quantization = tensor_allows_quantization(params, model->arch, tensor);
+        metadata[i].allows_quantization = tensor_allows_quantization(params, model->arch, tensor,
+                                                                    &qs.tensor_type_patterns);
 
         if (metadata[i].allows_quantization) {
             metadata[i].target_type = llama_tensor_get_type(qs, params, tensor, default_type, metadata[i]);

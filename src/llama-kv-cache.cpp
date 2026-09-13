@@ -75,7 +75,8 @@ static void ggml_gen_hadamard(ggml_tensor * tensor) {
 // they were drifting.
 static inline bool llama_type_is_turbo(ggml_type t) {
     return t == GGML_TYPE_TURBO2_0 || t == GGML_TYPE_TURBO3_0 ||
-           t == GGML_TYPE_TURBO4_0 || t == GGML_TYPE_TURBO4P_0 || t == GGML_TYPE_TURBO5P_0;
+           t == GGML_TYPE_TURBO4_0 || t == GGML_TYPE_TURBO4P_0 || t == GGML_TYPE_TURBO5P_0 ||
+           t == GGML_TYPE_TURBO5P512_0;
 }
 
 llama_kv_cache::llama_kv_cache(
@@ -351,7 +352,20 @@ llama_kv_cache::llama_kv_cache(
         // Fail loudly rather than silently truncating or over-reading a partial block.
         // QK_TURBO4P lives in ggml-common.h, which this layer does not include. Keep the
         // value local and named rather than pulling that header in for one constant.
+        // [TAG_TURBO5P512] turbo5p512 carries a 512-element block for exactly the rows this
+        // guard used to reject; llama_context has already substituted it where appropriate.
         const uint32_t turbo4p_blk = 1024;
+        const uint32_t t5p512_blk  = 512;
+        if (layer_type_k == GGML_TYPE_TURBO5P512_0 && n_embd_k_gqa_eff % t5p512_blk != 0) {
+            throw std::runtime_error(format(
+                "turbo5p512 K needs n_embd_k_gqa to be a multiple of %d, got %u on layer %d.",
+                (int) t5p512_blk, n_embd_k_gqa_eff, il));
+        }
+        if (layer_type_v == GGML_TYPE_TURBO5P512_0 && n_embd_v_gqa_eff % t5p512_blk != 0) {
+            throw std::runtime_error(format(
+                "turbo5p512 V needs n_embd_v_gqa to be a multiple of %d, got %u on layer %d.",
+                (int) t5p512_blk, n_embd_v_gqa_eff, il));
+        }
         if ((layer_type_k == GGML_TYPE_TURBO4P_0 || layer_type_k == GGML_TYPE_TURBO5P_0) && n_embd_k_gqa_eff % turbo4p_blk != 0) {
             throw std::runtime_error(format(
                 "split-plane K (turbo4p/turbo5p) needs n_embd_k_gqa to be a multiple of %d, got %u on layer %d. Use turbo4 instead.",

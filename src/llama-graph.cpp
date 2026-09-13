@@ -1,4 +1,7 @@
 #include "llama-graph.h"
+#include <typeinfo>
+
+#include "llama-moecache.h"
 
 #include "llama-impl.h"
 #include "llama-model.h"
@@ -1441,7 +1444,7 @@ bool llm_graph_result::can_reuse(const llm_graph_params & params) {
         const bool cur = input->can_reuse(params);
 
         if (debug > 1) {
-            LLAMA_LOG_DEBUG("%s: can_reuse = %d\n", "placeholder", cur);
+            LLAMA_LOG_DEBUG("%s: can_reuse = %d\n", typeid(*input).name(), cur);
         }
 
         res = res && cur;
@@ -2124,7 +2127,27 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     //call early so that topk-moe can be used
     ggml_build_forward_expand(gf, weights);
 
+    // MoE expert cache (see llama-moecache.h): during single-token decode on a
+    // layer whose experts live in host memory, run a parallel mul_mat_id chain
+    // over a device-resident cache of hot experts. Cached ids are skipped by
+    // the CPU chain (src[3] table) and served by the cache chain; uncached ids
+    // map to the cache's zero slot. The two outputs sum to the exact result.
+    const llama_moe_cache_layer * mcache = nullptr;
+    ggml_tensor * mc_slot_ids = nullptr;
+    if (n_tokens == 1 && !gate_up_exps && gate_exps && down_exps &&
+        !up_exps_b && !gate_exps_b && !down_exps_b &&
+        !up_exps_s && !gate_exps_s && !down_exps_s &&
+        type_op == LLM_FFN_SILU && !weight_before_ffn && loras->empty()) {
+        mcache = llama_moe_cache_lookup(up_exps);
+    }
+    if (mcache) {
+        mc_slot_ids = ggml_get_rows(ctx0, mcache->dev_table, selected_experts); // [1, n_expert_used, 1]
+        mc_slot_ids = ggml_reshape_2d(ctx0, mc_slot_ids, n_expert_used, 1);
+        cb(mc_slot_ids, "ffn_moe_cache_slots", il);
+    }
+
     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
+    ggml_tensor * mc_inp = cur;
 
     if (weight_before_ffn) {
         // repeat cur to [n_embd, n_expert_used, n_tokens]
@@ -2160,6 +2183,11 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         up = build_lora_mm_id(up_exps, cur, selected_experts, up_exps_s); // [n_ff, n_expert_used, n_tokens]
         cb(up, "ffn_moe_up", il);
 
+        if (mcache) {
+            up->src[3] = mcache->host_table;
+            up->op_params[0] = mcache->n_slots;
+        }
+
         if (up_exps_s) {
             cb(up, "ffn_moe_up_scaled", il);
         }
@@ -2172,6 +2200,11 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         if (gate_exps) {
             cur = build_lora_mm_id(gate_exps, cur, selected_experts, gate_exps_s); // [n_ff, n_expert_used, n_tokens]
             cb(cur, "ffn_moe_gate", il);
+
+            if (mcache) {
+                cur->src[3] = mcache->host_table;
+                cur->op_params[0] = mcache->n_slots;
+            }
         } else {
             cur = up;
         }
@@ -2276,6 +2309,43 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     experts = build_lora_mm_id(down_exps, cur, selected_experts, down_exps_s); // [n_embd, n_expert_used, n_tokens]
     cb(experts, "ffn_moe_down", il);
+
+    if (mcache) {
+        experts->src[3] = mcache->host_table;
+        experts->op_params[0] = mcache->n_slots;
+
+        // device-side chain over the cached experts, mirroring the LLM_FFN_SILU
+        // activation above (the only type_op the cache path is enabled for)
+        ggml_tensor * up_g   = ggml_mul_mat_id(ctx0, mcache->up_c,   mc_inp, mc_slot_ids);
+        ggml_tensor * gate_g = ggml_mul_mat_id(ctx0, mcache->gate_c, mc_inp, mc_slot_ids);
+        cb(up_g,   "ffn_moe_cache_up",   il);
+        cb(gate_g, "ffn_moe_cache_gate", il);
+
+        ggml_tensor * act_g = nullptr;
+        {
+            const float limit = il >= 0 ? hparams.swiglu_clamp_exp[il] : 0.0f;
+            constexpr float eps = 1e-6f;
+            if (limit > eps) {
+                up_g = ggml_clamp(ctx0, up_g, -limit, limit);
+                if (arch == LLM_ARCH_DEEPSEEK4 || (arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0)) {
+                    gate_g = ggml_clamp(ctx0, gate_g, -INFINITY, limit);
+                    act_g  = ggml_swiglu_split(ctx0, gate_g, up_g);
+                } else {
+                    ggml_tensor * ga = ggml_silu(ctx0, gate_g);
+                    ga    = ggml_clamp(ctx0, ga, -INFINITY, limit);
+                    act_g = ggml_mul(ctx0, ga, up_g);
+                }
+            } else {
+                act_g = ggml_swiglu_split(ctx0, gate_g, up_g);
+            }
+        }
+
+        ggml_tensor * down_g = ggml_mul_mat_id(ctx0, mcache->down_c, act_g, mc_slot_ids);
+        cb(down_g, "ffn_moe_cache_down", il);
+
+        experts = ggml_add(ctx0, experts, down_g);
+        cb(experts, "ffn_moe_cache_merged", il);
+    }
 
     if (down_exps_s) {
         cb(experts, "ffn_moe_down_scaled", il);
@@ -2617,8 +2687,8 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         // TurboQuant: inverse WHT on FA output when V values are WHT-rotated.
         // For MLA, V is a view of K with different ne[0] (e.g. V=512, K=576).
         // Group size must come from K (which determines the WHT rotation), not V.
-        if (v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO4_0 || v->type == GGML_TYPE_TURBO2_0 || v->type == GGML_TYPE_TURBO4P_0 || v->type == GGML_TYPE_TURBO5P_0) {
-            const bool k_is_turbo = (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0 || k->type == GGML_TYPE_TURBO4P_0 || k->type == GGML_TYPE_TURBO5P_0);
+        if (v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO4_0 || v->type == GGML_TYPE_TURBO2_0 || v->type == GGML_TYPE_TURBO4P_0 || v->type == GGML_TYPE_TURBO5P_0 || v->type == GGML_TYPE_TURBO5P512_0) {
+            const bool k_is_turbo = (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0 || k->type == GGML_TYPE_TURBO4P_0 || k->type == GGML_TYPE_TURBO5P_0 || k->type == GGML_TYPE_TURBO5P512_0);
             const ggml_tensor * group_src = k_is_turbo ? k : v;
             const int turbo_group = (group_src->ne[0] % 128 == 0) ? 128 : 64;
             if (cur->ne[0] % turbo_group == 0) {
@@ -2695,8 +2765,8 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         cb(kqv, "kqv", il);
 
         // TurboQuant: inverse WHT on attention output (non-FA path)
-        if (v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO4_0 || v->type == GGML_TYPE_TURBO2_0 || v->type == GGML_TYPE_TURBO4P_0 || v->type == GGML_TYPE_TURBO5P_0) {
-            const bool k_is_turbo = (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0 || k->type == GGML_TYPE_TURBO4P_0 || k->type == GGML_TYPE_TURBO5P_0);
+        if (v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO4_0 || v->type == GGML_TYPE_TURBO2_0 || v->type == GGML_TYPE_TURBO4P_0 || v->type == GGML_TYPE_TURBO5P_0 || v->type == GGML_TYPE_TURBO5P512_0) {
+            const bool k_is_turbo = (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0 || k->type == GGML_TYPE_TURBO4P_0 || k->type == GGML_TYPE_TURBO5P_0 || k->type == GGML_TYPE_TURBO5P512_0);
             const ggml_tensor * group_src = k_is_turbo ? k : v;
             const int turbo_group = (group_src->ne[0] % 128 == 0) ? 128 : 64;
             if (kqv->ne[0] % turbo_group == 0) {
@@ -2830,8 +2900,14 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
             const char * e = getenv("LLAMA_KQ_MASK_POS");
             return !(e && e[0] == '0');
         }();
+        // [TAG_FA_POS_MASK] A model with a sparse-attention indexer (qwen4exp, DeepSeek V3.2+) must keep
+        // the explicit mask: its top-k block selection reads self_kq_mask directly to decide which blocks
+        // are visible, and there is no positional equivalent. Without this, build_attn_qsa dereferences a
+        // null mask and the server dies during graph construction, before it ever reaches the GPU.
+        const bool has_sparse_attn_indexer = hparams.indexer_n_head > 0;
         const bool use_pos_mask = pos_mask_env && cparams.flash_attn && cparams.causal_attn &&
-            hparams.f_max_alibi_bias == 0.0f && (cparams.kv_unified || ubatch.n_seqs_unq == 1);
+            hparams.f_max_alibi_bias == 0.0f && (cparams.kv_unified || ubatch.n_seqs_unq == 1) &&
+            !has_sparse_attn_indexer;
         if (use_pos_mask) {
             const auto n_kv = mctx_cur->get_n_kv();
             inp->self_kv_pos = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_kv);
@@ -2909,7 +2985,7 @@ ggml_tensor * llm_graph_context::build_attn(
     // TurboQuant pre-rotate-queries: O(d log d) WHT rotation via custom op
     // Q shape: (n_embd_head, n_head, n_tokens)
     // For zero-padded models (head_dim not 128-aligned), pad Q to match padded K dim first.
-    if (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0 || k->type == GGML_TYPE_TURBO4P_0 || k->type == GGML_TYPE_TURBO5P_0) {
+    if (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0 || k->type == GGML_TYPE_TURBO4P_0 || k->type == GGML_TYPE_TURBO5P_0 || k->type == GGML_TYPE_TURBO5P512_0) {
         // Pad Q per-head to next multiple of 128 if needed
         if (q->ne[0] % 128 != 0) {
             const int64_t pad = ((q->ne[0] + 127) / 128) * 128 - q->ne[0];
@@ -2925,7 +3001,7 @@ ggml_tensor * llm_graph_context::build_attn(
 
     // TurboQuant: if V was padded, the output has padded dimensions.
     // Extract original V head_dim after inverse WHT (applied inside build_attn_mha).
-    if (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0 || k->type == GGML_TYPE_TURBO4P_0 || k->type == GGML_TYPE_TURBO5P_0) {
+    if (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0 || k->type == GGML_TYPE_TURBO4P_0 || k->type == GGML_TYPE_TURBO5P_0 || k->type == GGML_TYPE_TURBO5P512_0) {
         const int64_t orig_v_head = hparams.n_embd_head_v(il);
         // cur is 2D: (n_embd_head * n_head, n_tokens) after build_attn_mha
         const int64_t padded_v_head = v->ne[0];
@@ -3037,7 +3113,7 @@ ggml_tensor * llm_graph_context::build_attn(
 
     // TurboQuant: pre-rotate Q for K-only (MLA) attention
     // For zero-padded models, pad Q to match padded K dim first.
-    if (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0 || k->type == GGML_TYPE_TURBO4P_0 || k->type == GGML_TYPE_TURBO5P_0) {
+    if (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0 || k->type == GGML_TYPE_TURBO4P_0 || k->type == GGML_TYPE_TURBO5P_0 || k->type == GGML_TYPE_TURBO5P512_0) {
         // Pad Q per-head to next multiple of 128 if needed
         if (q->ne[0] % 128 != 0) {
             const int64_t pad = ((q->ne[0] + 127) / 128) * 128 - q->ne[0];
@@ -3053,7 +3129,7 @@ ggml_tensor * llm_graph_context::build_attn(
 
     // TurboQuant: if V was padded (MLA: V is view of K, may have padded dim),
     // extract original V head_dim after inverse WHT.
-    if (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0 || k->type == GGML_TYPE_TURBO4P_0 || k->type == GGML_TYPE_TURBO5P_0) {
+    if (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0 || k->type == GGML_TYPE_TURBO4P_0 || k->type == GGML_TYPE_TURBO5P_0 || k->type == GGML_TYPE_TURBO5P512_0) {
         const int64_t orig_v_head = v_cur->ne[0];  // original V head_dim from model
         const int64_t padded_v_head = v->ne[0];     // padded V head_dim in cache
         if (padded_v_head != orig_v_head) {
@@ -3235,7 +3311,7 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
     // TurboQuant: pre-rotate Q for ISWA attention (pad to 128-aligned if needed)
-    if (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0 || k->type == GGML_TYPE_TURBO4P_0 || k->type == GGML_TYPE_TURBO5P_0) {
+    if (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0 || k->type == GGML_TYPE_TURBO4P_0 || k->type == GGML_TYPE_TURBO5P_0 || k->type == GGML_TYPE_TURBO5P512_0) {
         if (q->ne[0] % 128 != 0) {
             const int64_t pad = ((q->ne[0] + 127) / 128) * 128 - q->ne[0];
             q = ggml_pad(ctx0, q, pad, 0, 0, 0);
@@ -3249,7 +3325,7 @@ ggml_tensor * llm_graph_context::build_attn(
     cb(cur, "kqv_out", il);
 
     // TurboQuant: if V was padded, extract original V head_dim after inverse WHT
-    if (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0 || k->type == GGML_TYPE_TURBO4P_0 || k->type == GGML_TYPE_TURBO5P_0) {
+    if (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0 || k->type == GGML_TYPE_TURBO4P_0 || k->type == GGML_TYPE_TURBO5P_0 || k->type == GGML_TYPE_TURBO5P512_0) {
         const int64_t orig_v_head = hparams.n_embd_head_v(il);
         const int64_t padded_v_head = v->ne[0];
         if (padded_v_head != orig_v_head) {

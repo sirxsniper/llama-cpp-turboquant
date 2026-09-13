@@ -9,6 +9,9 @@
 #include <map>
 
 class llama_memory_hybrid_idx_context;
+// [TAG_QSA_INPUT_SHARE] defined in models/qwen4exp.cpp; only ever held here as a pointer, so an
+// incomplete type is sufficient and the definition stays local to the one arch that uses it.
+class llm_graph_input_qsa;
 
 //
 // base classes
@@ -2286,7 +2289,12 @@ struct llama_model_qwen4exp : public llama_model_base {
 
     struct graph : public llm_build_delta_net_base {
         graph(const llama_model & model, const llm_graph_params & params);
-    private:
+    protected:
+        // [TAG_QWEN4EXP_MTP] builds nothing; graph_mtp reuses the helpers below for its
+        // own single block. Members are protected rather than private for that reason.
+        graph(const llm_graph_params & params, const llama_model & model) :
+            llm_build_delta_net_base(params), model(model) {}
+
         // HC replaces every layer norm: residual is [n_embd, hc, n_tokens]
         ggml_tensor * build_hc_mix(
                     ggml_tensor * x,
@@ -2348,6 +2356,33 @@ struct llama_model_qwen4exp : public llama_model_base {
         // build_rs writes the state tensor in place, so one gather per cache tensor is reused
         std::map<ggml_tensor *, ggml_tensor *> rs_rows;
 
+        // [TAG_QSA_INPUT_SHARE] set_input_qsa reads only the ubatch, the cache cells, the compress
+        // ratio and blk_bias - never the layer - so all 12 QSA layers were uploading byte-identical
+        // index/position/bias tensors and repeating an O(n_kv) host sweep 12 times per step. Build
+        // one input per distinct shape and let the layers share it.
+        //
+        // The key carries every value set_input_qsa depends on rather than just the ratio: an arch
+        // with per-layer compress ratios then gets separate (correct) inputs instead of one wrong
+        // shared one.
+        struct qsa_input_key {
+            int64_t r;
+            int64_t n_kv;
+            int64_t n_blocks;
+            int64_t n_tps;
+            int64_t n_stream;
+            bool    blk_bias;
+
+            bool operator<(const qsa_input_key & o) const {
+                if (r        != o.r)        return r        < o.r;
+                if (n_kv     != o.n_kv)     return n_kv     < o.n_kv;
+                if (n_blocks != o.n_blocks) return n_blocks < o.n_blocks;
+                if (n_tps    != o.n_tps)    return n_tps    < o.n_tps;
+                if (n_stream != o.n_stream) return n_stream < o.n_stream;
+                return (int) blk_bias < (int) o.blk_bias;
+            }
+        };
+        std::map<qsa_input_key, llm_graph_input_qsa *> qsa_inputs;
+
         // one conv history per cache tensor: delta-net and PLE each have their own
         ggml_tensor * build_conv_state_at(
              llm_graph_input_rs * inp,
@@ -2372,6 +2407,11 @@ struct llama_model_qwen4exp : public llama_model_base {
                             int   il);
 
         const llama_model & model;
+    };
+
+    // [TAG_QWEN4EXP_MTP] one nextn block, run as the draft context of an MTP decode step
+    struct graph_mtp : public graph {
+        graph_mtp(const llama_model & model, const llm_graph_params & params);
     };
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;

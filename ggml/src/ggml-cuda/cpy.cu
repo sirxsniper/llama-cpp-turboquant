@@ -615,3 +615,20 @@ void ggml_cuda_dup(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     ggml_cuda_cpy(ctx, src0, dst);
 }
+
+// [TAG_CPY_CHAIN_FUSION] The generic scalar copy kernel already indexes four dimensions with
+// signed 64-bit strides, so a chain of n copies is the same kernel with ne3 = n, nb03 = dsrc and
+// nb13 = ddst. Element order inside each copy is unchanged, so the bytes written are identical to
+// n separate launches.
+void ggml_cuda_cpy_chain(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
+                         int n, int64_t dsrc, int64_t ddst) {
+    GGML_ASSERT(src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32);
+    GGML_ASSERT(src0->ne[3] == 1 && src1->ne[3] == 1);
+    GGML_ASSERT(n >= 1);
+    const int64_t ne1 = ggml_nelements(src0);
+    GGML_ASSERT(ne1 == ggml_nelements(src1));
+    ggml_cpy_scalar_cuda<float, float>(
+        (const char *) src0->data, (char *) src1->data, ne1 * n,
+        src0->ne[0], src0->ne[1], src0->ne[2], src0->nb[0], src0->nb[1], src0->nb[2], dsrc,
+        src1->ne[0], src1->ne[1], src1->ne[2], src1->nb[0], src1->nb[1], src1->nb[2], ddst, ctx.stream());
+}

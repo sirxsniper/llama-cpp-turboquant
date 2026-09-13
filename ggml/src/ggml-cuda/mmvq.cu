@@ -326,9 +326,26 @@ static int64_t ggml_cuda_mmvq_max_k() {
     return v;
 }
 
-bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
+// [TAG_MMVQ_SMALL_ROWS] kill switch: TURBO_MMVQ_SMALL_ROWS=0 restores the ne11-only routing.
+static bool ggml_cuda_mmvq_small_rows_enabled() {
+    static const bool on = [] {
+        const char * e = getenv("TURBO_MMVQ_SMALL_ROWS");
+        return !(e && e[0] == '0');
+    }();
+    return on;
+}
+
+bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11, int64_t ne01) {
     if (!ggml_is_quantized(type)) {
         return false;
+    }
+    // [TAG_MMVQ_SMALL_ROWS] A weight with fewer rows than one MMQ tile (128) still gets the full
+    // stream-k treatment in MMQ: its single tile is spread over every SM and the fixup kernel then
+    // walks all of those blocks serially (18 us for a 48-row projection; Qwen3.8's GDN alpha and
+    // beta projections do this 92 times per decode step). The mat-vec kernel handles that shape in
+    // one short launch, so it takes it regardless of the per-type ne11 thresholds below.
+    if (ne01 < 128 && ne11 <= MMVQ_MAX_BATCH_SIZE && GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_mmvq_small_rows_enabled()) {
+        return true;
     }
     // k-quants cost more to decode and mvq redoes that per column, so MMQ wins sooner.
     // Only list quant-types MMQ supports, others would fall back to cuBLAS.
