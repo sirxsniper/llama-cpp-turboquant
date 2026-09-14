@@ -1511,6 +1511,61 @@ static void test_backend_set_sampler(const test_params & params) {
     printf("backend set sampler test PASSED\n");
 }
 
+// [TAG_BS_LAZY_GRAMMAR] declared in src/llama-ext.h
+LLAMA_API void llama_sampler_chain_backend_detach(struct llama_sampler * smpl);
+
+// [TAG_BS_LAZY_GRAMMAR] The server offloads a slot's OWN sampler chain, and when a lazy grammar triggers mid-request it
+// drops that chain from the context and keeps sampling on the CPU with the same chain. test_backend_set_sampler switches
+// to a separate chain, so it never saw that an offloaded chain's CPU apply() still skipped its backend samplers after
+// the context dropped it and selected nothing (the server aborted on its first tool call). Greedy makes the expected
+// token exact: the argmax of the raw logits. Greedy alone is enough to hit the skip, and unlike top_k it offloads on
+// every backend (HIP has no full-vocabulary TOP_K), so this test needs no skip-list entry.
+static void test_backend_detach_same_chain(const test_params & params) {
+    const int seq_id = 0;
+
+    struct llama_sampler_chain_params chain_params = llama_sampler_chain_default_params();
+    llama_sampler_ptr chain(llama_sampler_chain_init(chain_params));
+    llama_sampler_chain_add(chain.get(), llama_sampler_init_greedy());
+    std::vector<llama_sampler_seq_config> configs = {{ seq_id, chain.get() }};
+
+    test_context test_ctx(params, configs);
+
+    if (!test_ctx.decode({{seq_id, "Hello"}})) {
+        GGML_ASSERT(false && "Failed to decode token");
+    }
+
+    const llama_token backend_token = llama_get_sampled_token_ith(test_ctx.ctx.get(), test_ctx.idx_for_seq(seq_id));
+    GGML_ASSERT(backend_token != LLAMA_TOKEN_NULL);
+    llama_sampler_accept(chain.get(), backend_token);
+
+    // what the server does when the grammar triggers
+    llama_set_sampler(test_ctx.ctx.get(), seq_id, nullptr);
+    llama_sampler_chain_backend_detach(chain.get());
+
+    std::map<llama_seq_id, llama_token> tokens = { { seq_id, backend_token } };
+    if (!test_ctx.decode_tokens(tokens)) {
+        GGML_ASSERT(false && "Failed to decode token");
+    }
+
+    const int32_t idx = test_ctx.idx_for_seq(seq_id);
+    GGML_ASSERT(llama_get_sampled_token_ith(test_ctx.ctx.get(), idx) == LLAMA_TOKEN_NULL);
+
+    const float * logits = llama_get_logits_ith(test_ctx.ctx.get(), idx);
+    GGML_ASSERT(logits != nullptr);
+    llama_token argmax = 0;
+    for (llama_token t = 1; t < test_ctx.n_vocab; ++t) {
+        if (logits[t] > logits[argmax]) {
+            argmax = t;
+        }
+    }
+
+    const llama_token cpu_token = llama_sampler_sample(chain.get(), test_ctx.ctx.get(), idx);
+    printf("detached chain sampled token = %d, raw-logit argmax = %d\n", cpu_token, argmax);
+    GGML_ASSERT(cpu_token == argmax);
+
+    printf("backend detach same chain test PASSED\n");
+}
+
 static void test_backend_cpu_mixed_batch(const test_params & params) {
     // Sequence 0 uses backend sampling
     struct llama_sampler_chain_params chain_params_0 = llama_sampler_chain_default_params();
@@ -1781,6 +1836,65 @@ static void test_backend_multi_output_dist_transaction(const test_params & param
     printf("backend multi-output dist transaction test PASSED\n");
 }
 
+// [TAG_BS_LAZY_GRAMMAR] A multi-output dist keeps a transaction: the backend draws one uniform per output row from a copy
+// of the RNG, and each CPU accept advances the real RNG once. The server detaches a slot's chain mid-request right after
+// an accept that committed fewer draws than the verify pass generated. If the dist stayed transactional, every later CPU
+// token drew twice (apply, then accept) and a seeded request diverged from pure CPU sampling after the tool-call
+// trigger. After detach the chain must spend exactly one draw per token, like a chain that was never offloaded: compare
+// it sample by sample with a never-offloaded chain that has consumed the same number of draws. temp 10 makes the
+// distribution so flat that a one-draw shift picks a different token.
+static void test_backend_multi_output_dist_detach(const test_params & params) {
+    const llama_seq_id seq_id = 0;
+    const uint32_t seed = 131;
+    const llama_vocab * vocab = llama_model_get_vocab(params.model.get());
+
+    llama_sampler_ptr chain(llama_sampler_chain_init(llama_sampler_chain_default_params()));
+    llama_sampler_chain_add(chain.get(), llama_sampler_init_temp(10.0f));
+    llama_sampler_chain_add(chain.get(), llama_sampler_init_dist(seed));
+    std::vector<llama_sampler_seq_config> configs = {{ seq_id, chain.get() }};
+    test_context test_ctx(params, configs, 1, 3, 2, 3);
+
+    int32_t pos = 0;
+    auto decode = [&]() {
+        llama_batch batch = llama_batch_init(3, 0, 1);
+        for (int32_t i = 0; i < 3; ++i) {
+            common_batch_add(batch, llama_vocab_bos(vocab), pos++, { seq_id }, true);
+        }
+        GGML_ASSERT(llama_decode(test_ctx.ctx.get(), batch) == 0);
+        llama_batch_free(batch);
+    };
+
+    // one verify-like pass: three backend draws generated, one committed by the accept inside llama_sampler_sample
+    decode();
+    const llama_token backend_token = llama_sampler_sample(chain.get(), test_ctx.ctx.get(), 0);
+    GGML_ASSERT(backend_token != LLAMA_TOKEN_NULL);
+    GGML_ASSERT(llama_get_sampled_token_ith(test_ctx.ctx.get(), 0) == backend_token);
+
+    // what the server does when the grammar triggers
+    llama_set_sampler(test_ctx.ctx.get(), seq_id, nullptr);
+    llama_sampler_chain_backend_detach(chain.get());
+
+    decode();
+    GGML_ASSERT(llama_get_sampled_token_ith(test_ctx.ctx.get(), 0) == LLAMA_TOKEN_NULL);
+
+    // reference: never offloaded, with one draw consumed to match the committed token
+    llama_sampler_ptr ref(llama_sampler_chain_init(llama_sampler_chain_default_params()));
+    llama_sampler_chain_add(ref.get(), llama_sampler_init_temp(10.0f));
+    llama_sampler_chain_add(ref.get(), llama_sampler_init_dist(seed));
+    llama_sampler_sample(ref.get(), test_ctx.ctx.get(), 0);
+
+    int n_same = 0;
+    for (int k = 0; k < 4; ++k) {
+        const llama_token a = llama_sampler_sample(chain.get(), test_ctx.ctx.get(), 0);
+        const llama_token b = llama_sampler_sample(ref.get(),   test_ctx.ctx.get(), 0);
+        printf("draw %d after detach: detached chain %d, never-offloaded chain %d\n", k, a, b);
+        n_same += a == b;
+    }
+    GGML_ASSERT(n_same == 4 && "a detached dist must spend one draw per token, like a never-offloaded one");
+
+    printf("backend multi-output dist detach test PASSED\n");
+}
+
 static void test_backend_multi_output_sampling_chain(const test_params & params) {
     const llama_seq_id seq_id = 0;
     const uint32_t seed = 88;
@@ -2010,9 +2124,11 @@ static const backend_test_case BACKEND_TESTS[] = {
     { "dist",            test_backend_dist_sampling,           true  },
     { "dist_and_cpu",    test_backend_dist_sampling_and_cpu,   true  },
     { "set_sampler",     test_backend_set_sampler,             true  },
+    { "detach_same_chain", test_backend_detach_same_chain,     true  },
     { "multi_output_limit",    test_backend_multi_output_limit,      true },
     { "multi_sequence_multi_output_dist", test_backend_multi_sequence_multi_output_dist, true },
     { "multi_output_dist_transaction", test_backend_multi_output_dist_transaction, true },
+    { "multi_output_dist_detach", test_backend_multi_output_dist_detach, true },
     { "multi_output_sampling_chain", test_backend_multi_output_sampling_chain, true },
     { "multi_output_cpu",      test_backend_multi_output_cpu_suffix, true },
     { "mixed",           test_backend_mixed_sampling,          true  },

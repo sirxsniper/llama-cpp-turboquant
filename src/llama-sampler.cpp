@@ -1,4 +1,5 @@
 #include "llama-sampler.h"
+#include "llama-ext.h"   // [TAG_BS_LAZY_GRAMMAR] prior declarations for the LLAMA_API helpers defined here (GCC/Clang -Wmissing-declarations)
 
 #include "llama-impl.h"
 #include "llama-vocab.h"
@@ -892,6 +893,25 @@ uint32_t llama_sampler_backend_n_nodes(const llama_sampler * sampler) {
     return chain->n_nodes;
 }
 
+static void llama_sampler_dist_backend_detach(struct llama_sampler * smpl); // [TAG_BS_LAZY_GRAMMAR] defined after dist
+
+// [TAG_BS_LAZY_GRAMMAR] see llama-ext.h
+LLAMA_API void llama_sampler_chain_backend_detach(struct llama_sampler * smpl) {
+    if (smpl == nullptr || smpl->iface != &llama_sampler_chain_i || smpl->ctx == nullptr) {
+        return;
+    }
+
+    auto * chain = (llama_sampler_chain *) smpl->ctx;
+
+    chain->is_init = false;
+    chain->n_nodes = 0;
+    for (auto & entry : chain->samplers) {
+        entry.is_backend = false;
+        llama_sampler_chain_backend_detach(entry.ptr);   // a nested chain
+        llama_sampler_dist_backend_detach(entry.ptr);    // end a multi-output dist transaction (found in re-review)
+    }
+}
+
 llama_token llama_sampler_sample(struct llama_sampler * smpl, struct llama_context * ctx, int32_t idx) {
     const llama_token   sampled_token  = llama_get_sampled_token_ith     (ctx, idx);
     const float *       sampled_probs  = llama_get_sampled_probs_ith     (ctx, idx);
@@ -1412,6 +1432,22 @@ struct llama_sampler * llama_sampler_init_dist(uint32_t seed) {
             /* .inp_uniforms              = */ {},
         }
     );
+}
+
+// [TAG_BS_LAZY_GRAMMAR] End the multi-output draw transaction of a dist whose chain the context no longer holds. Every
+// committed token has already advanced rng once (in accept), which is exactly one draw per token, as pure CPU sampling
+// spends. From here on apply draws from rng itself, so accept must not also draw for the backend draws that were
+// generated but never committed, or each later token would spend two and a seeded request would drift.
+static void llama_sampler_dist_backend_detach(struct llama_sampler * smpl) {
+    if (smpl == nullptr || smpl->iface != &llama_sampler_dist_i || smpl->ctx == nullptr) {
+        return;
+    }
+
+    auto * ctx = (llama_sampler_dist *) smpl->ctx;
+
+    ctx->backend_transactional     = false;
+    ctx->n_backend_draws_generated = 0;
+    ctx->n_backend_draws_committed = 0;
 }
 
 void llama_sampler_backend_begin(llama_sampler * sampler) {
@@ -2762,6 +2798,15 @@ static struct llama_sampler_i llama_sampler_grammar_i = {
     /* .backend_reset     = */ nullptr,
     /* .copy_state        = */ nullptr,
 };
+
+// [TAG_BS_LAZY_GRAMMAR] see llama-ext.h
+LLAMA_API bool llama_sampler_grammar_awaiting_trigger(const struct llama_sampler * smpl) {
+    if (smpl == nullptr || smpl->iface != &llama_sampler_grammar_i || smpl->ctx == nullptr) {
+        return false;
+    }
+    const auto * ctx = (const llama_sampler_grammar *) smpl->ctx;
+    return ctx->grammar != nullptr && ctx->grammar->lazy && ctx->grammar->awaiting_trigger;
+}
 
 static struct llama_sampler * llama_sampler_init_grammar_impl(
         const struct llama_vocab * vocab,

@@ -12,6 +12,7 @@
 #include <cctype>
 #include <climits>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <random>
 #include <unordered_map>
@@ -256,6 +257,41 @@ std::string common_params_sampling::print() const {
     return std::string(result);
 }
 
+// [TAG_BS_LAZY_GRAMMAR] declared in src/llama-ext.h (the fork's staging API, not in llama.h)
+LLAMA_API bool llama_sampler_grammar_awaiting_trigger(const struct llama_sampler * smpl);
+LLAMA_API void llama_sampler_chain_backend_detach(struct llama_sampler * smpl);
+
+void common_sampler_backend_detach(struct common_sampler * gsmpl, struct llama_context * ctx, llama_seq_id seq_id) {
+    llama_set_sampler(ctx, seq_id, nullptr);
+    if (gsmpl != nullptr) {
+        llama_sampler_chain_backend_detach(gsmpl->chain);
+    }
+}
+
+static bool bs_lazy_grammar_enabled() {
+    static const bool on = [] {
+        const char * e = std::getenv("TURBO_BS_LAZY_GRAMMAR");
+        return e == nullptr || std::atoi(e) != 0;
+    }();
+    return on;
+}
+
+bool common_sampler_backend_ok(const struct common_sampler * gsmpl) {
+    if (gsmpl == nullptr || (!gsmpl->grmr && !gsmpl->rbudget)) {
+        return true;
+    }
+    if (!bs_lazy_grammar_enabled()) {
+        return false;
+    }
+    if (gsmpl->grmr && !llama_sampler_grammar_awaiting_trigger(gsmpl->grmr)) {
+        return false;   // non-lazy, llguidance, or already triggered: the grammar constrains sampling now
+    }
+    if (gsmpl->rbudget && common_reasoning_budget_get_state(gsmpl->rbudget) == REASONING_BUDGET_FORCING) {
+        return false;   // the budget is overwriting logits with its forced end sequence
+    }
+    return true;
+}
+
 struct common_sampler * common_sampler_init(
         const struct llama_model * model,
         struct common_params_sampling & params) {
@@ -484,16 +520,28 @@ struct common_sampler * common_sampler_init(
         llama_sampler_chain_add(chain, smpl);
     }
 
-    if (grmr && params.backend_sampling) {
+    // [TAG_BS_LAZY_GRAMMAR] A lazy grammar that has not triggered, and a reasoning budget that is not forcing, change
+    // nothing about the distribution (both apply() calls are no-ops), so they no longer cost the request its backend
+    // sampler. Tool-bearing agent requests always carry both. The server re-checks common_sampler_backend_ok() after
+    // every accepted token and drops to CPU sampling for the slot the moment either one becomes active.
+    const bool bs_until_active = bs_lazy_grammar_enabled() &&
+        (!grmr    || (params.grammar_lazy && llama_sampler_grammar_awaiting_trigger(grmr))) &&
+        (!rbudget || common_reasoning_budget_get_state(rbudget) != REASONING_BUDGET_FORCING);
+
+    if (grmr && params.backend_sampling && !bs_until_active) {
         LOG_WRN("%s: backend sampling is not compatible with grammar, disabling\n", __func__);
 
         params.backend_sampling = false;
     }
 
-    if (rbudget && params.backend_sampling) {
+    if (rbudget && params.backend_sampling && !bs_until_active) {
         LOG_WRN("%s: backend sampling is not compatible with reasoning budget, disabling\n", __func__);
 
         params.backend_sampling = false;
+    }
+
+    if ((grmr || rbudget) && params.backend_sampling) {
+        LOG_DBG("%s: backend sampling kept until the lazy grammar triggers or the reasoning budget forces\n", __func__);
     }
 
     // Pre-trim for the grammar-rejection resample path. Sized well above params.top_k so the
@@ -713,8 +761,9 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
         if (id != LLAMA_TOKEN_NULL) {
             LOG_DBG("%s: Backend sampler selected token: '%d'. Will not run any CPU samplers\n", __func__, id);
 
-            GGML_ASSERT(!gsmpl->grmr    && "using grammar in combination with backend sampling is not supported");
-            GGML_ASSERT(!gsmpl->rbudget && "using reasoning budget in combination with backend sampling is not supported");
+            // [TAG_BS_LAZY_GRAMMAR] a backend-sampled token is only exact while common_sampler_backend_ok() holds; the
+            // accept loops stop at the token that ends it and the server detaches the backend sampler right after
+            GGML_ASSERT(common_sampler_backend_ok(gsmpl) && "backend-sampled token with an active grammar or a forcing reasoning budget");
 
             for (size_t i = 0; i < cur_p.size; ++i) {
                 if (cur_p.data[i].id == id) {
@@ -856,6 +905,18 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     return id;
 }
 
+// [TAG_BS_LAZY_GRAMMAR] true when the backend sampler touched this output row. A fully offloaded chain leaves a sampled
+// token. A chain that is only partly offloadable (typical_p, xtc, top_n_sigma or adaptive-p after top_k, or penalties
+// with several outputs per sequence) samples no token but still leaves filtered logits or probs for the CPU to finish.
+// Either way the row was prepared on the GPU without any constraint that became active on an earlier row of the pass.
+// Keying the stop on the sampled token alone missed the partial case: the rows after a grammar trigger were then
+// sampled from GPU-filtered candidates (inexact, and all -inf when no survivor was grammar-valid). Found in review.
+static bool bs_row_on_backend(struct llama_context * ctx, int idx) {
+    return llama_get_sampled_token_ith (ctx, idx) != LLAMA_TOKEN_NULL ||
+           llama_get_sampled_logits_ith(ctx, idx) != nullptr ||
+           llama_get_sampled_probs_ith (ctx, idx) != nullptr;
+}
+
 std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, bool grammar_first) {
     GGML_ASSERT(idxs.size() == draft.size() + 1 && "idxs.size() must be draft.size() + 1");
 
@@ -871,6 +932,13 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
         result.push_back(id);
 
         if (draft[i] != id) {
+            break;
+        }
+
+        // [TAG_BS_LAZY_GRAMMAR] every row of this step went through the backend sampler in one pass. If this accepted
+        // token triggered the lazy grammar (or started reasoning-budget forcing), the next rows were prepared without
+        // that constraint: stop here, exactly like a rejection at the next position.
+        if (bs_row_on_backend(ctx, idxs[i + 1]) && !common_sampler_backend_ok(gsmpl)) {
             break;
         }
     }
@@ -930,6 +998,11 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(
         if (q_draft > 0.0f && uniform(gsmpl->speculative_rng) * q_draft <= p_draft) {
             common_sampler_accept(gsmpl, draft[i], true);
             result.push_back(draft[i]);
+            // [TAG_BS_LAZY_GRAMMAR] same stop as the greedy overload: the rows after this token went through the
+            // backend sampler without the constraint this token just activated
+            if (bs_row_on_backend(ctx, idxs[i + 1]) && !common_sampler_backend_ok(gsmpl)) {
+                break;
+            }
             continue;
         }
 

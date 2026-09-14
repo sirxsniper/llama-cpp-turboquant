@@ -394,6 +394,9 @@ struct server_slot {
     std::function<void(int /* id_slot */)>   callback_on_release;
     std::function<void(const server_slot &)> callback_on_reset; // called before reset()
 
+    // [TAG_BS_LAZY_GRAMMAR] the target context currently holds this slot's backend sampler
+    bool bs_attached = false;
+
     // this is for printing timings with slot progress, not part of metrics
     int64_t t_print_last = 0;
     int32_t n_gen_last = 0;
@@ -435,6 +438,7 @@ struct server_slot {
         n_predict_max = -1;
 
         llama_set_sampler(ctx_tgt, id, nullptr);
+        bs_attached = false;   // [TAG_BS_LAZY_GRAMMAR]
 
         // clear alora start
         alora_invocation_start = -1;
@@ -2051,12 +2055,20 @@ private:
             // TODO: getting pre sampling logits is not yet supported with backend sampling
             use_backend_sampling &= !need_pre_sample_logits;
 
+            // [TAG_BS_LAZY_GRAMMAR] n_cmpl > 1: every child takes its first token from the parent's prompt row
+            // (copy_state_to shares i_batch), and a backend-sampled token in that row was drawn by the PARENT's chain,
+            // so all completions started with the same token instead of independent draws. Tool requests used to be
+            // immune because any grammar turned backend sampling off. Sample parents and children on the CPU, where
+            // each draws from the shared raw logits with its own chain (found in review).
+            use_backend_sampling &= !(task.is_parent() || task.is_child());
+
             // TODO: tmp until backend sampling is fully implemented
             if (use_backend_sampling) {
                 llama_set_sampler(ctx_tgt, slot.id, common_sampler_get(slot.smpl.get()));
             } else {
                 llama_set_sampler(ctx_tgt, slot.id, nullptr);
             }
+            slot.bs_attached = use_backend_sampling;   // [TAG_BS_LAZY_GRAMMAR]
 
             SLT_TRC(slot, "sampler chain: %s\n", common_sampler_print(slot.smpl.get()).c_str());
             SLT_TRC(slot, "sampler params: \n%s\n", task.params.sampling.print().c_str());
@@ -2821,6 +2833,16 @@ private:
                         }
                         // act on the live slot mid generation, never defer
                         common_sampler_reasoning_budget_force(slot->smpl.get());
+                        // [TAG_BS_LAZY_GRAMMAR] This is the one place the reasoning budget enters FORCING outside
+                        // common_sampler_accept, where the detach check normally runs. The web UI arms
+                        // reasoning_control on every request, so its slots now keep the backend sampler; left attached,
+                        // the next decode would backend-sample rows the forced end sequence must overwrite, and
+                        // common_sampler_sample's exactness assert would abort the whole server (found in review).
+                        // CONTROL is declined while a decode is in flight, so there are no pending backend rows here.
+                        if (slot->bs_attached && !common_sampler_backend_ok(slot->smpl.get())) {
+                            common_sampler_backend_detach(slot->smpl.get(), slot->ctx_tgt, slot->id);
+                            slot->bs_attached = false;
+                        }
                         res->success = true;
                     } else {
                         res->success = false;
@@ -4370,6 +4392,13 @@ private:
 
             common_sampler_accept(slot.smpl.get(), id, true);
 
+            // [TAG_BS_LAZY_GRAMMAR] the lazy grammar just triggered (or the reasoning budget started forcing):
+            // this slot samples on the CPU, grammar applied, from the next decode on
+            if (slot.bs_attached && !common_sampler_backend_ok(slot.smpl.get())) {
+                common_sampler_backend_detach(slot.smpl.get(), slot.ctx_tgt, slot.id);
+                slot.bs_attached = false;
+            }
+
             // here we have synchronized the llama_context (due to the sampling above), so we can do time measurement
             const int64_t t_now = ggml_time_us();
 
@@ -4476,6 +4505,13 @@ private:
                     common_speculative_probe_step();
                 }
                 slot.spec_i_batch.clear();
+
+                // [TAG_BS_LAZY_GRAMMAR] accept stopped at the token that activated the grammar or the budget's forcing;
+                // switch this slot to CPU sampling before its next verify decode is built
+                if (slot.bs_attached && !common_sampler_backend_ok(slot.smpl.get())) {
+                    common_sampler_backend_detach(slot.smpl.get(), slot.ctx_tgt, slot.id);
+                    slot.bs_attached = false;
+                }
 
                 GGML_ASSERT(accepted.size() >= 1);
 

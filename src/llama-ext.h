@@ -130,6 +130,21 @@ LLAMA_API const int32_t * llama_model_target_layer_ids  (const struct llama_mode
 // returns the number of extracted layers from target model
 LLAMA_API uint32_t        llama_model_target_layer_ids_n(const struct llama_model * model);
 
+// [TAG_BS_LAZY_GRAMMAR] true while `smpl` is a lazy grammar sampler that has not yet seen its trigger. Until then its
+// apply() is a no-op (llama_grammar_apply_impl returns immediately), so sampling that ignores it is exact.
+// false for any other sampler, for non-lazy grammars, for llguidance grammars, and after the trigger.
+LLAMA_API bool llama_sampler_grammar_awaiting_trigger(const struct llama_sampler * smpl);
+
+// [TAG_BS_LAZY_GRAMMAR] Undo the offload state that llama_set_sampler() put on a sampler chain, for a chain the context
+// no longer holds. A chain's CPU apply() skips its leading samplers whenever the chain was backend-initialized, because
+// in that mode the backend already ran them. Dropping the chain with llama_set_sampler(ctx, seq, nullptr) left that
+// state set, so every later CPU sample skipped top-k, top-p, temperature and dist and never selected a token. After this
+// call the chain samples on the CPU exactly as a chain that was never offloaded, down to one RNG draw per token (a
+// multi-output dist ends its backend draw transaction, so a seeded request stays reproducible against pure CPU sampling
+// after the switch). Call it only after the context dropped
+// the chain, and do not offload the same chain again. No-op for anything that is not a sampler chain.
+LLAMA_API void llama_sampler_chain_backend_detach(struct llama_sampler * smpl);
+
 // retrieves the whole token embedding matrix in F32 format (n_embd * n_vocab)
 // returns total number of elements or 0 on error
 // if out is nullptr, returns the number of tokens without writing to out

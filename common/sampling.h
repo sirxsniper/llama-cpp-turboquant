@@ -111,6 +111,16 @@ uint32_t common_sampler_get_seed(const struct common_sampler * gsmpl);
 // force the reasoning budget sampler (if any) to begin forcing its end sequence now.
 bool common_sampler_reasoning_budget_force(struct common_sampler * gsmpl);
 
+// [TAG_BS_LAZY_GRAMMAR] true while backend (GPU) sampling is exact for this sampler: no grammar, or a lazy grammar
+// still waiting for its trigger; and no reasoning budget, or one that is not forcing tokens. Re-check after every
+// accepted token - the server detaches the backend sampler for the slot as soon as this turns false.
+bool common_sampler_backend_ok(const struct common_sampler * gsmpl);
+
+// [TAG_BS_LAZY_GRAMMAR] move a slot from backend to CPU sampling mid-request. Drops the sampler from the context AND
+// clears the chain's offload state, without which the CPU chain keeps skipping the samplers the backend used to run
+// and selects nothing. Do not offload the same sampler again afterwards.
+void common_sampler_backend_detach(struct common_sampler * gsmpl, struct llama_context * ctx, llama_seq_id seq_id);
+
 // helpers
 
 // access the internal list of current candidate tokens
