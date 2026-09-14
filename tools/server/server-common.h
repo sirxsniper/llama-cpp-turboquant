@@ -366,6 +366,10 @@ struct server_slot_stats {
     int64_t t_prompt_last = 0;
     int64_t t_gen_last    = 0;
 
+    // [TAG_POOL_PREEMPT] time the request spent parked, excluded from the prompt and generation durations
+    int64_t t_paused_prompt_us = 0;
+    int64_t t_paused_gen_us    = 0;
+
     // can only move one direction: start -> prompt -> gen
     void update_prompt_start() {
         GGML_ASSERT(t_start == 0);
@@ -391,14 +395,14 @@ struct server_slot_stats {
         if (t_prompt_last == 0) {
             return 0.0; // the prompt is not processed yet
         }
-        return (t_prompt_last - t_start) / 1000.0;
+        return (t_prompt_last - t_start - t_paused_prompt_us) / 1000.0;
     }
     int64_t t_gen_us() const {
         if (t_gen_last == 0) {
             return 0; // the generation is not started yet
         }
         // clamp to 1 us, the first token can land in the same us as t_prompt_last
-        return std::max<int64_t>(1, t_gen_last - t_prompt_last);
+        return std::max<int64_t>(1, t_gen_last - t_prompt_last - t_paused_gen_us);
     }
     double t_gen_ms() const {
         return t_gen_us() / 1000.0;

@@ -10,6 +10,7 @@
 #include "llama-io.h"
 #include "llama-kv-cache.h"
 #include "llama-memory.h"
+#include "llama-memory-hybrid.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-ext.h"
@@ -4623,4 +4624,20 @@ llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * c
 
 llama_context * llama_get_ctx_other(struct llama_context * ctx) {
     return ctx->get_cparams().ctx_other;
+}
+
+// [TAG_POOL_PREEMPT] see llama-ext.h
+int32_t llama_memory_attn_n_free_ext(llama_context * ctx, llama_seq_id seq_id) {
+    llama_memory_i * mem = ctx ? ctx->get_memory() : nullptr;
+    llama_kv_cache * kv  = dynamic_cast<llama_kv_cache *>(mem);
+    if (kv == nullptr) {
+        if (auto * hyb = dynamic_cast<llama_memory_hybrid *>(mem)) {
+            kv = hyb->get_mem_attn();
+        }
+    }
+    if (kv == nullptr || seq_id < 0) {
+        return -1;
+    }
+    const llama_kv_cells & cells = kv->get_cells(seq_id);
+    return (int32_t) (cells.size() - cells.get_used());
 }

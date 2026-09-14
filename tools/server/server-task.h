@@ -629,6 +629,10 @@ struct server_prompt_cache {
     // in tokens, 0 = no limit
     size_t limit_tokens = 0;
 
+    // [TAG_POOL_PREEMPT] bytes held by parked slots. Counted against limit_size so parked requests and cached prompts
+    // together stay inside --cache-ram. Parking itself never refuses live work because of the limit.
+    size_t reserved = 0;
+
     size_t size() const;
 
     size_t n_tokens() const;

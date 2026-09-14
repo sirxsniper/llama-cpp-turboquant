@@ -145,6 +145,11 @@ LLAMA_API bool llama_sampler_grammar_awaiting_trigger(const struct llama_sampler
 // the chain, and do not offload the same chain again. No-op for anything that is not a sampler chain.
 LLAMA_API void llama_sampler_chain_backend_detach(struct llama_sampler * smpl);
 
+// [TAG_POOL_PREEMPT] Empty attention KV cells in the stream that seq_id writes to (the whole pool with --kv-unified).
+// Exact for llama_kv_cache and for the attention half of llama_memory_hybrid on models without SWA, because prepare()
+// places every ubatch row in any empty cell of the stream. -1 for any other memory type.
+LLAMA_API int32_t llama_memory_attn_n_free_ext(struct llama_context * ctx, llama_seq_id seq_id);
+
 // retrieves the whole token embedding matrix in F32 format (n_embd * n_vocab)
 // returns total number of elements or 0 on error
 // if out is nullptr, returns the number of tokens without writing to out

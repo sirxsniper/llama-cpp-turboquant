@@ -27,6 +27,8 @@
 #include <filesystem>
 #include <random>
 #include <utility>
+#include <thread>
+#include <chrono>
 #include <fstream>
 
 // fix problem with std::min and std::max
@@ -122,6 +124,7 @@ struct server_batch {
         bool is_prompt; // for stats tracking
     };
     std::vector<token> tokens;
+    int32_t n_gen_rows = 0; // [TAG_POOL_PREEMPT] leading sampled + draft rows of generating slots
     int32_t n_tokens_alloc = 0;
     int32_t n_embd = 0;
 
@@ -178,6 +181,7 @@ struct server_batch {
 
     void clear() {
         tokens.clear();
+        n_gen_rows = 0;
         embd.clear();
         common_batch_clear(batch);
         slot_batched      = nullptr;
@@ -334,9 +338,12 @@ struct server_slot {
             return false;
         }
 
-        llama_state_seq_get_data_ext(ctx_tgt, cur->data.main.data(), cur_size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
-        if (ctx_dft) {
-            llama_state_seq_get_data_ext(ctx_dft, cur->data.drft.data(), cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        // [TAG_POOL_PREEMPT] a short read would leave an entry whose blob does not describe its tokens
+        if (llama_state_seq_get_data_ext(ctx_tgt, cur->data.main.data(), cur_size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE) != cur_size_tgt ||
+            (ctx_dft && llama_state_seq_get_data_ext(ctx_dft, cur->data.drft.data(), cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE) != cur_size_dft)) {
+            SLT_WRN(*this, "%s", "prompt save read fewer bytes than the state size, entry dropped\n");
+            prompt_cache.states.pop_back();   // alloc() pushed this entry last
+            return false;
         }
 
         return true;
@@ -397,12 +404,30 @@ struct server_slot {
     // [TAG_BS_LAZY_GRAMMAR] the target context currently holds this slot's backend sampler
     bool bs_attached = false;
 
+    // [TAG_POOL_PREEMPT] While parked, the target memory holds nothing for seq `id`. The complete per-sequence state
+    // (attention KV plus the recurrent row, flags 0) lives in this host blob, the drafter keeps its own cells in its own
+    // context, and every other field (task, sampler, grammar, sampled token, draft, stats, generated text, stream) is
+    // untouched until resume.
+    bool                 parked          = false;
+    std::vector<uint8_t> park_tgt;
+    int32_t              park_cells      = 0;      // attention cells the park freed, needed again to resume
+    size_t               park_n_tokens   = 0;      // prompt.tokens.size() at park, verified on resume
+    slot_state           park_state      = SLOT_STATE_IDLE;
+    int64_t              t_park_us       = 0;
+    int64_t              t_run_us        = 0;      // launch or last resume, for victim ordering
+    int32_t              n_park_fail     = 0;
+    uint64_t             n_parks_total   = 0;      // never reset, /slots
+    uint64_t             ckpt_build_iter = 0;      // pool iteration that created the newest context checkpoint
+    std::function<void(server_slot &)> callback_on_park_drop;
+
     // this is for printing timings with slot progress, not part of metrics
     int64_t t_print_last = 0;
     int32_t n_gen_last = 0;
 
     void reset() {
         SLT_DBG(*this, "%s", "\n");
+
+        GGML_ASSERT(!parked); // [TAG_POOL_PREEMPT] release() drops a park before it resets
 
         // [TAG_SHARED_PREFIX_FANOUT]
         share_prefix_stop      = 0;
@@ -610,6 +635,11 @@ struct server_slot {
                 mon_last_n_prompt_cached  = stats.n_prompt_cached;
             }
 
+            // [TAG_POOL_PREEMPT] a parked request holds no cells: its blob goes to the prompt cache so a follow-up can restore it
+            if (parked) {
+                callback_on_park_drop(*this);
+            }
+
             callback_on_reset(*this);
 
             reset();
@@ -746,6 +776,11 @@ struct server_slot {
             {"speculative",   can_speculate()},
             {"is_processing", is_processing()},
         };
+
+        // [TAG_POOL_PREEMPT]
+        res["parked"]        = parked;
+        res["n_parks_total"] = n_parks_total;
+        res["park_cells"]    = parked ? park_cells : 0;
 
         const auto & ptask = task ? task : task_prev;
 
@@ -1449,6 +1484,8 @@ private:
                 }
             };
 
+            slot.callback_on_park_drop = [this](server_slot & s) { pool_drop_park(s, /*to_cache =*/ true); }; // [TAG_POOL_PREEMPT]
+
             slot.reset();
         }
 
@@ -1500,6 +1537,8 @@ private:
             SRV_TRC("%s", "prompt cache is disabled - use `--cache-ram N` to enable it\n");
         }
         SRV_TRC("%s", "for more info see https://github.com/ggml-org/llama.cpp/pull/16391\n");
+
+        pool_init(); // [TAG_POOL_PREEMPT]
 
         if (params_base.n_ctx_checkpoints > 0) {
             SRV_TRC("context checkpoints enabled, max = %d, min spacing = %d\n",
@@ -1723,7 +1762,7 @@ private:
             const bool leader_busy_on_prompt =
                 slot.state == SLOT_STATE_STARTED || slot.state == SLOT_STATE_PROCESSING_PROMPT;
 
-            if (!leader_busy_on_prompt || !slot.task) {
+            if (!leader_busy_on_prompt || !slot.task || slot.parked) { // [TAG_POOL_PREEMPT] a parked leader cannot publish
                 continue;
             }
 
@@ -1776,7 +1815,7 @@ private:
         }
 
         for (auto & slot : slots) {
-            if (slot.share_prefix_stop == 0) {
+            if (slot.share_prefix_stop == 0 || slot.parked) {
                 continue;
             }
 
@@ -1895,6 +1934,11 @@ private:
         }
 
         if (ret) {
+            // [TAG_POOL_PREEMPT] a requested slot that is busy is deferred by the caller, never save or load over its live memory
+            if (ret->is_processing()) {
+                return ret;
+            }
+
             update_cache = update_cache && prompt_cache;
 
             // cache prompts only for completion tasks
@@ -1902,6 +1946,59 @@ private:
 
             if (update_cache) {
                 SRV_TRC("%s", "updating prompt cache\n");
+
+                // [TAG_POOL_PREEMPT] A cached state that does not fit the unified pool fails to restore after this slot's
+                // own cells are already gone, so the whole prompt is processed again, and a long prompt holds the batch
+                // until it is done. Measured with 4 x 68K follow-ups: one agent processed 68,037 tokens again for 76 s
+                // while two others waited 75 s behind it. Room held by idle slots is taken first (saved, nothing is
+                // lost). Room held by busy slots is waited for: the task is deferred, retried whenever a slot releases,
+                // and after TURBO_POOL_LOAD_WAIT_MS (default 60000) it falls back to processing the prompt.
+                if (pool_preempt && params_base.kv_unified) {
+                    const auto it = prompt_cache->find(ret->prompt, task.tokens);
+                    if (it != prompt_cache->states.end()) {
+                        static const int64_t wait_max_us = [] {
+                            const char * e = getenv("TURBO_POOL_LOAD_WAIT_MS");
+                            return (e ? (int64_t) atoll(e) : (int64_t) 60000) * 1000;
+                        }();
+                        const int64_t need = (int64_t) it->prompt.tokens.size();
+                        const auto    room = [&]() {
+                            return (int64_t) llama_memory_attn_n_free_ext(ctx_tgt, 0) + (int64_t) ret->prompt.tokens.size();
+                        };
+                        int64_t idle = 0;
+                        for (const auto & o : slots) {
+                            if (&o != ret && !o.is_processing()) {
+                                idle += (int64_t) o.prompt.tokens.size();
+                            }
+                        }
+                        if (room() + idle < need) {
+                            if (pool_load_wait_t0.size() > 256) {
+                                pool_load_wait_t0.clear();   // tasks cancelled while deferred
+                            }
+                            const int64_t now = ggml_time_us();
+                            const auto    w   = pool_load_wait_t0.emplace(task.id, now).first;
+                            if (now - w->second < wait_max_us) {
+                                SLT_WRN(*ret, "__TEST_TAG_POOL_LOAD_WAIT__ task %d: cached prompt of %" PRId64 " cells, %" PRId64 " free with this slot, %" PRId64 " in idle slots, waited %.1f s\n",
+                                        task.id, need, room(), idle, (now - w->second) / 1e6);
+                                return nullptr;
+                            }
+                            SLT_WRN(*ret, "__TEST_TAG_POOL_LOAD_GIVEUP__ task %d waited %.1f s, processing the prompt instead\n",
+                                    task.id, (now - w->second) / 1e6);
+                        }
+                        for (auto & o : slots) {
+                            if (room() >= need) {
+                                break;
+                            }
+                            if (&o == ret || o.is_processing() || o.prompt.tokens.empty()) {
+                                continue;
+                            }
+                            SLT_INF(o, "__TEST_TAG_POOL_LOAD_ROOM__ saving and clearing %zu tokens for a cached prompt of %" PRId64 " cells\n",
+                                    o.prompt.tokens.size(), need);
+                            o.prompt_save(*prompt_cache, &task.tokens);
+                            o.prompt_clear();
+                        }
+                    }
+                    pool_load_wait_t0.erase(task.id);
+                }
 
                 const int64_t t_start = ggml_time_us();
 
@@ -1921,11 +2018,9 @@ private:
     }
 
     // return true if at least one slot has been cleared
-    // TODO: improve logic
-    //       - smarter decision which slot to clear (LRU or longest prompt?)
-    //       - move slot to level 2 cache instead of removing?
-    //       - instead of purging, try to store and resume later?
-    bool try_clear_idle_slots() {
+    // [TAG_POOL_PREEMPT] with the pool policy on, an idle slot is saved to the prompt cache before it is purged, and a
+    // slot that still has rows in the undecoded part of the batch (at or after `off`) is never purged.
+    bool try_clear_idle_slots(int32_t off = -1) {
         bool res = false;
 
         if (!params_base.kv_unified) {
@@ -1933,23 +2028,535 @@ private:
         }
 
         for (auto & slot : slots) {
-            if (slot.is_processing()) {
+            if (slot.is_processing() || slot.prompt.n_tokens() == 0) {
                 continue;
             }
 
-            if (slot.prompt.n_tokens() > 0) {
-                SRV_WRN("purging slot %d with %zu tokens\n", slot.id, slot.prompt.tokens.size());
-
-                slot.prompt_clear();
-
-                res = true;
-
-                // clear slots one by one
-                break;
+            if (pool_preempt) {
+                if (off >= 0 && batch_has_rows(slot.id, off)) {
+                    continue;
+                }
+                if (prompt_cache && slot.prompt_save(*prompt_cache)) {
+                    prompt_cache->update();
+                    SLT_INF(slot, "__TEST_TAG_POOL_IDLE_SAVED__ %zu tokens\n", slot.prompt.tokens.size());
+                } else {
+                    SLT_WRN(slot, "__TEST_TAG_POOL_IDLE_UNSAVED__ %zu tokens (already cached, over the cache limit, or no cache)\n",
+                            slot.prompt.tokens.size());
+                }
             }
+
+            SRV_WRN("purging slot %d with %zu tokens\n", slot.id, slot.prompt.tokens.size());
+
+            slot.prompt_clear();
+
+            res = true;
+
+            // clear slots one by one
+            break;
         }
 
         return res;
+    }
+
+    //
+    // [TAG_POOL_PREEMPT] unified KV pool exhaustion
+    //
+    // --kv-unified gives every slot the whole 262,144-cell pool, so four agents can outgrow it together while each is
+    // far below its own n_ctx. The upstream reaction to llama_decode returning 1 was to halve n_batch down to 1 and
+    // then fail EVERY processing slot. Halving also cut speculative verify groups in two, and post_decode then threw for
+    // each slot whose verify rows fell outside the view. Reproduced: 4 x 62K prompts + 6,000 tokens each, 2 of 4 agents
+    // got HTTP 500 with DFlash2, all 4 without speculation.
+    //
+    // Invariants this relies on. A llama_decode view that returns 1 applies nothing to memory. Generating slots put
+    // their sampled + draft rows first, [0, n_gen_rows), so a view that starts at 0 and is at least n_gen_rows long
+    // keeps every verify group whole. At the top of an iteration a slot that is not parked has
+    // prompt.tokens.pos_next() == seq_pos_max + 1, no i_batch and no verify rows, which is the state a park copies.
+    //
+    bool     pool_preempt          = false;
+    bool     pool_exhausted        = false;
+    bool     pool_handled_iter     = false;
+    int32_t  pool_park_margin      = 8192;
+    int64_t  pool_min_run_us       = 20000000;
+    std::map<int, int64_t> pool_load_wait_t0;   // task id -> first time its cached prompt did not fit the pool
+    int64_t  pool_dbg_hold_us      = 0;
+    uint64_t pool_iter             = 0;
+    int      pool_n_parked         = 0;
+    int      pool_no_progress      = 0;
+    int      pool_want_room        = -1;       // slot whose next image does not fit, set by the prompt pass
+    struct pool_dbg_trigger { bool gen; int64_t at; bool nopark; bool done; };
+    std::vector<pool_dbg_trigger> pool_dbg;    // TURBO_POOL_DEBUG_FAIL
+    int      pool_dbg_firing       = -1;
+    int32_t  pool_dbg_firing_off   = -1;
+    int64_t  pool_dbg_prompt_views = 0;
+
+    void pool_init() {
+        auto env_i64 = [](const char * n, int64_t d) {
+            const char * e = getenv(n);
+            return e ? (int64_t) atoll(e) : d;
+        };
+        const int32_t n_gen_max = params_base.n_parallel * (1 + (spec ? common_speculative_n_max(spec.get()) : 0));
+        const int32_t n_free    = llama_memory_attn_n_free_ext(ctx_tgt, 0);
+        pool_preempt = params_base.kv_unified && params_base.n_parallel > 1
+                    && env_i64("TURBO_POOL_PREEMPT", 1) != 0
+                    && n_free >= 0 && n_gen_max <= llama_n_batch(ctx_tgt);
+        pool_park_margin = (int32_t) env_i64("TURBO_POOL_PARK_MARGIN", 8192);
+        pool_min_run_us  = 1000 * env_i64("TURBO_POOL_MIN_RUN_MS", 20000);
+        pool_dbg_hold_us = 1000 * env_i64("TURBO_POOL_DEBUG_HOLD_MS", 0);
+        if (pool_preempt) {
+            pool_dbg_parse(getenv("TURBO_POOL_DEBUG_FAIL"));
+        }
+        SRV_WRN("[TAG_POOL_PREEMPT] %s: park margin %d cells, min run %lld ms, n_free %d, gen rows max %d, debug triggers %zu\n",
+                pool_preempt ? "on" : "off", pool_park_margin, (long long) (pool_min_run_us / 1000), n_free, n_gen_max,
+                pool_dbg.size());
+    }
+
+    void pool_dbg_parse(const char * s) {
+        pool_dbg.clear();
+        if (s == nullptr) {
+            return;
+        }
+        std::stringstream ss(s);
+        std::string item;
+        while (std::getline(ss, item, ',')) {
+            pool_dbg_trigger t = { true, 0, false, false };
+            if (item.rfind("gen@", 0) == 0) {
+                t.gen = true;
+                item  = item.substr(4);
+            } else if (item.rfind("prompt@", 0) == 0) {
+                t.gen = false;
+                item  = item.substr(7);
+            } else {
+                SRV_WRN("[TAG_POOL_PREEMPT] ignoring debug trigger '%s'\n", item.c_str());
+                continue;
+            }
+            const size_t c = item.find(':');
+            if (c != std::string::npos) {
+                t.nopark = item.substr(c + 1) == "nopark";
+                item     = item.substr(0, c);
+            }
+            t.at = atoll(item.c_str());
+            pool_dbg.push_back(t);
+        }
+    }
+
+    // test hook, runs inside the decode yield: pretend the view at `off` found no room, once per trigger, in order
+    bool pool_dbg_fire(int32_t off) {
+        if (pool_dbg.empty()) {
+            return false;
+        }
+        if (pool_dbg_firing >= 0) {
+            return pool_dbg_firing_off == off;
+        }
+        for (size_t i = 0; i < pool_dbg.size(); ++i) {
+            auto & t = pool_dbg[i];
+            if (t.done) {
+                continue;
+            }
+            bool hit = false;
+            if (t.gen) {
+                if (off == 0 && batch.n_gen_rows > 0) {
+                    for (const auto & s : slots) {
+                        if (s.state == SLOT_STATE_GENERATING && !s.parked && (int64_t) s.stats.n_gen >= t.at) {
+                            hit = true;
+                            break;
+                        }
+                    }
+                }
+            } else {
+                hit = off >= batch.n_gen_rows && pool_dbg_prompt_views >= t.at;
+            }
+            if (hit) {
+                t.done              = true;
+                pool_dbg_firing     = (int) i;
+                pool_dbg_firing_off = off;
+                return true;
+            }
+            break;
+        }
+        return false;
+    }
+
+    // ends a firing trigger, returns true when it asked for the undo only
+    bool pool_dbg_consume() {
+        if (pool_dbg_firing < 0) {
+            return false;
+        }
+        const bool nopark = pool_dbg[pool_dbg_firing].nopark;
+        pool_dbg_firing     = -1;
+        pool_dbg_firing_off = -1;
+        return nopark;
+    }
+
+    bool batch_has_rows(int id_slot, int32_t off) const {
+        for (int32_t i = std::max(0, off); i < batch.size(); ++i) {
+            if (batch.tokens[i].id_slot == id_slot) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Host-side undo of the rows at [off, size) that were never decoded. Each slot's rows are the last tokens it pushed
+    // this iteration, one contiguous run, so dropping that many tokens restores the state before the batch was built.
+    // Memory needs no undo: the failed view applied nothing. Drafts are kept and re-verified next iteration.
+    void pool_abandon_tail(int32_t off) {
+        std::vector<int32_t> k_rows(slots.size(), 0);
+        for (int32_t i = off; i < batch.size(); ++i) {
+            k_rows[batch.tokens[i].id_slot]++;
+        }
+        for (auto & slot : slots) {
+            const int32_t k = k_rows[slot.id];
+            if (k == 0 && slot.i_batch < off) {
+                continue;
+            }
+            if (k > 0) {
+                GGML_ASSERT((size_t) k <= slot.prompt.tokens.size());
+                slot.prompt.tokens.keep_first(slot.prompt.tokens.size() - k);
+            }
+            if (!slot.spec_i_batch.empty()) {
+                GGML_ASSERT(off == 0);
+                slot.spec_i_batch.clear();
+            }
+            if (slot.i_batch >= off) {
+                slot.i_batch = -1;
+            }
+            if (slot.state == SLOT_STATE_DONE_PROMPT) {
+                slot.state = SLOT_STATE_PROCESSING_PROMPT;
+            }
+            if (slot.ckpt_build_iter == pool_iter && slot.state == SLOT_STATE_PROCESSING_PROMPT &&
+                !slot.prompt.checkpoints.empty() &&
+                slot.prompt.checkpoints.back().n_tokens == (int64_t) slot.prompt.n_tokens()) {
+                if (slot.ckpt_spare.empty()) {
+                    slot.ckpt_spare = std::move(slot.prompt.checkpoints.back().data_tgt);
+                }
+                slot.prompt.checkpoints.pop_back();   // taken for rows that were never decoded
+            }
+        }
+    }
+
+    // slots that can be parked, best victim first: running longer than the minimum, not a shared-prefix leader, most cells
+    std::vector<server_slot *> pool_victims(int64_t now, const server_slot * exclude) {
+        std::vector<server_slot *> v;
+        for (auto & s : slots) {
+            if (&s == exclude || !s.is_processing() || s.parked || !s.task) {
+                continue;
+            }
+            if (s.state != SLOT_STATE_GENERATING && s.state != SLOT_STATE_PROCESSING_PROMPT) {
+                continue;
+            }
+            if (s.task->type != SERVER_TASK_TYPE_COMPLETION && s.task->type != SERVER_TASK_TYPE_INFILL) {
+                continue;
+            }
+            if (s.task->is_parent() || s.task->is_child() || s.prompt.n_tokens() == 0) {
+                continue;
+            }
+            v.push_back(&s);
+        }
+        std::stable_sort(v.begin(), v.end(), [&](const server_slot * a, const server_slot * b) {
+            const bool ra = now - a->t_run_us >= pool_min_run_us;
+            const bool rb = now - b->t_run_us >= pool_min_run_us;
+            if (ra != rb) {
+                return ra;
+            }
+            const bool la = a->share_prefix_stop != 0;
+            const bool lb = b->share_prefix_stop != 0;
+            if (la != lb) {
+                return lb;
+            }
+            return a->prompt.tokens.size() > b->prompt.tokens.size();
+        });
+        return v;
+    }
+
+    // Last resort: ONE request fails, saved to the prompt cache first, with the wording pi treats as a context overflow
+    // (it compacts instead of dropping the turn). An n_cmpl family fails together so no child waits forever.
+    void pool_fail_one(const char * why) {
+        server_slot * v = nullptr;
+        for (auto * s : pool_victims(ggml_time_us(), nullptr)) {
+            if (v == nullptr || s->prompt.tokens.size() > v->prompt.tokens.size()) {
+                v = s;
+            }
+        }
+        std::vector<server_slot *> group;
+        if (v != nullptr) {
+            group.push_back(v);
+        } else {
+            for (auto & s : slots) {
+                if (s.is_processing() && !s.parked && s.task && s.task->n_tokens() > 0 &&
+                    (v == nullptr || s.prompt.tokens.size() > v->prompt.tokens.size())) {
+                    v = &s;
+                }
+            }
+            if (v == nullptr) {
+                return;
+            }
+            const int id_family = v->task->is_child() ? v->task->id_parent : v->task->id;
+            for (auto & s : slots) {
+                if (s.task && !s.parked && (s.task->id == id_family || s.task->id_parent == id_family)) {
+                    group.push_back(&s);
+                }
+            }
+        }
+        for (auto * s : group) {
+            if (prompt_cache && s->state != SLOT_STATE_WAIT_OTHER && s->prompt_save(*prompt_cache)) {
+                prompt_cache->update();
+            }
+            SLT_ERR(*s, "__TEST_TAG_POOL_FAIL_ONE__ %s\n", why);
+            send_error(*s, string_format("request (%d tokens) exceeds the available context size (%d tokens) while other requests share the KV pool (%s)",
+                                         (int) s->prompt.tokens.size(), s->n_ctx, why), ERROR_TYPE_EXCEED_CONTEXT_SIZE);
+            s->release();
+            s->prompt_clear();
+        }
+    }
+
+    // the batch tail at `off` did not fit: undo it, then free cells without losing any work
+    void pool_handle_exhausted(int32_t off, const server_slot * exclude) {
+        const bool    dbg_nopark = pool_dbg_consume();
+        const int32_t n_free0    = llama_memory_attn_n_free_ext(ctx_tgt, 0);
+
+        pool_abandon_tail(off);
+        pool_handled_iter = true;
+
+        SRV_WRN("__TEST_TAG_POOL_FULL__ off = %d, n_gen_rows = %d, batch = %d, n_free = %d, parked = %d\n",
+                off, batch.n_gen_rows, batch.size(), n_free0, pool_n_parked);
+
+        if (dbg_nopark) {
+            return;
+        }
+        if (try_clear_idle_slots()) {
+            return;
+        }
+        if (++pool_no_progress > (int) slots.size() + 2) {
+            pool_no_progress = 0;
+            pool_fail_one("no slot could make progress");
+            return;
+        }
+        for (server_slot * v : pool_victims(ggml_time_us(), exclude)) {
+            if (pool_park(*v, "pool full")) {
+                return;
+            }
+        }
+        pool_fail_one("no slot could be parked");
+    }
+
+    bool pool_park(server_slot & s, const char * why) {
+        const llama_memory_t mt = llama_get_memory(ctx_tgt);
+        const llama_pos pos_max = llama_memory_seq_pos_max(mt, s.id);
+        if (s.parked || s.i_batch != -1 || !s.spec_i_batch.empty() || pos_max + 1 != s.prompt.tokens.pos_next()) {
+            SLT_WRN(s, "[TAG_POOL_PREEMPT] not parking (%s): i_batch = %d, verify rows = %zu, pos_max = %d, pos_next = %d\n",
+                    why, s.i_batch, s.spec_i_batch.size(), (int) pos_max, (int) s.prompt.tokens.pos_next());
+            return false;
+        }
+
+        // Only the target's cells are the contended pool. The drafter holds a fixed window per sequence in its own
+        // context (12.9 MiB at 20K and at 66K tokens), so it stays where it is. Sending it through a blob as well kept
+        // greedy tokens identical but changed the drafts a few steps after the resume, and a seeded request diverged
+        // from the same request without a park (token 40 of 3000, reproducible). Without speculation the target round
+        // trip alone was identical.
+        const int64_t t0    = ggml_time_us();
+        const size_t  n_tgt = llama_state_seq_get_size_ext(ctx_tgt, s.id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        if (n_tgt == 0) {
+            return false;
+        }
+
+        // live work outranks cached prompts: evict the oldest unshared entries until the park fits the RAM budget
+        if (prompt_cache && prompt_cache->limit_size > 0) {
+            for (auto it = prompt_cache->states.begin(); it != prompt_cache->states.end() &&
+                 prompt_cache->size() + prompt_cache->reserved + n_tgt > prompt_cache->limit_size;) {
+                if (it->shared) {
+                    ++it;
+                    continue;
+                }
+                it = prompt_cache->states.erase(it);
+            }
+        }
+
+        std::vector<uint8_t> bt;
+        for (;;) {
+            try {
+                bt.resize(n_tgt);
+                break;
+            } catch (const std::bad_alloc &) {
+                bt = std::vector<uint8_t>();
+                if (!prompt_cache || prompt_cache->states.empty()) {
+                    SLT_ERR(s, "[TAG_POOL_PREEMPT] not parking (%s): cannot allocate %.1f MiB of host memory\n",
+                            why, n_tgt / 1048576.0);
+                    return false;
+                }
+                prompt_cache->states.pop_front();
+            }
+        }
+
+        size_t got_tgt = 0;
+        queue_tasks.yield_to_queue([&]() {
+            got_tgt = llama_state_seq_get_data_ext(ctx_tgt, bt.data(), n_tgt, s.id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        });
+        if (got_tgt != n_tgt) {
+            SLT_ERR(s, "[TAG_POOL_PREEMPT] not parking (%s): state read %zu of %zu bytes\n", why, got_tgt, n_tgt);
+            return false;
+        }
+        const int32_t free0 = llama_memory_attn_n_free_ext(ctx_tgt, s.id);
+        llama_memory_seq_rm(mt, s.id, -1, -1);   // target only
+        const int32_t free1 = llama_memory_attn_n_free_ext(ctx_tgt, s.id);
+
+        s.park_tgt      = std::move(bt);
+        s.park_cells    = free1 - free0;
+        s.park_n_tokens = s.prompt.tokens.size();
+        s.park_state    = s.state;
+        s.parked        = true;
+        s.t_park_us     = ggml_time_us();
+        s.n_park_fail   = 0;
+        s.n_parks_total++;
+        pool_n_parked++;
+
+        if (prompt_cache) {
+            prompt_cache->reserved += s.park_tgt.size();
+            prompt_cache->update();
+        }
+
+        // followers waiting on this slot's prefix must not wait for the whole park
+        if (s.share_prefix_stop != 0) {
+            s.share_prefix_stop      = 0;
+            s.share_prefix_published = true;
+            for (size_t i = 0; i < slots.size(); ++i) {
+                queue_tasks.pop_deferred_task(-1);
+            }
+        }
+
+        SLT_WRN(s, "__TEST_TAG_POOL_PARK__ %s: state = %d, n_tokens = %zu, cells = %d, tgt = %.1f MiB, n_free %d -> %d, took %.1f ms\n",
+                why, (int) s.park_state, s.park_n_tokens, s.park_cells, s.park_tgt.size() / 1048576.0,
+                free0, free1, (ggml_time_us() - t0) / 1000.0);
+        return true;
+    }
+
+    bool pool_restore(server_slot & s) {
+        const int64_t t0 = ggml_time_us();
+        const llama_memory_t mt = llama_get_memory(ctx_tgt);
+        size_t put_tgt = 0;
+        queue_tasks.yield_to_queue([&]() {
+            put_tgt = llama_state_seq_set_data_ext(ctx_tgt, s.park_tgt.data(), s.park_tgt.size(), s.id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        });
+        if (put_tgt != s.park_tgt.size()) {
+            llama_memory_seq_rm(mt, s.id, -1, -1);   // the blob is a const source: intact, the slot stays parked
+            s.n_park_fail++;
+            SLT_WRN(s, "[TAG_POOL_PREEMPT] resume failed (%zu of %zu bytes), try %d\n", put_tgt, s.park_tgt.size(), s.n_park_fail);
+            return false;
+        }
+        if (llama_memory_seq_pos_max(mt, s.id) + 1 != s.prompt.tokens.pos_next() ||
+            s.prompt.tokens.size() != s.park_n_tokens) {
+            llama_memory_seq_rm(mt, s.id, -1, -1);
+            s.n_park_fail++;
+            SLT_ERR(s, "[TAG_POOL_PREEMPT] resumed state does not match its tokens, try %d\n", s.n_park_fail);
+            return false;
+        }
+
+        const int64_t now   = ggml_time_us();
+        const int64_t pause = now - s.t_park_us;
+        // excluded from the durations, and shifted so /slots running totals never step backwards at the resume
+        if (s.park_state == SLOT_STATE_GENERATING) {
+            s.stats.t_paused_gen_us += pause;
+            if (s.stats.t_gen_last != 0) {
+                s.stats.t_gen_last += pause;
+            }
+        } else if (s.park_state == SLOT_STATE_PROCESSING_PROMPT) {
+            s.stats.t_paused_prompt_us += pause;
+            if (s.stats.t_prompt_last != 0) {
+                s.stats.t_prompt_last += pause;
+            }
+        }
+
+        if (prompt_cache) {
+            prompt_cache->reserved -= std::min(prompt_cache->reserved, s.park_tgt.size());
+        }
+        s.park_tgt = std::vector<uint8_t>();
+        s.parked   = false;
+        s.t_run_us = now;
+        pool_n_parked--;
+
+        SLT_WRN(s, "__TEST_TAG_POOL_RESUME__ after %.1f s, n_tokens = %d, took %.1f ms\n",
+                pause / 1e6, s.prompt.n_tokens(), (now - t0) / 1000.0);
+        return true;
+    }
+
+    // a parked request is released (cancel, disconnect, abort): keep its work in the prompt cache for a follow-up
+    void pool_drop_park(server_slot & s, bool to_cache) {
+        if (!s.parked) {
+            return;
+        }
+        if (prompt_cache) {
+            prompt_cache->reserved -= std::min(prompt_cache->reserved, s.park_tgt.size());
+            if (to_cache && !s.prompt.tokens.empty()) {
+                // the drafter's cells never left its context, so its part of the entry is read now
+                const size_t n_dft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, s.id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
+                if (auto * cur = prompt_cache->alloc(s.prompt, 0, n_dft)) {
+                    cur->data.main = std::move(s.park_tgt);
+                    if (n_dft > 0 && llama_state_seq_get_data_ext(ctx_dft, cur->data.drft.data(), n_dft, s.id, LLAMA_STATE_SEQ_FLAGS_NONE) != n_dft) {
+                        cur->data.drft = std::vector<uint8_t>();   // restored later with an empty drafter window: acceptance only
+                    }
+                }
+            }
+            prompt_cache->update();
+        }
+        if (ctx_dft) {
+            llama_memory_seq_rm(llama_get_memory(ctx_dft), s.id, -1, -1);
+        }
+        SLT_WRN(s, "__TEST_TAG_POOL_PARK_DROP__ to_cache = %d, n_tokens = %zu\n", (int) to_cache, s.prompt.tokens.size());
+        s.park_tgt = std::vector<uint8_t>();
+        s.parked   = false;
+        pool_n_parked--;
+        s.prompt.clear();
+    }
+
+    void pool_restore_failed(server_slot & s) {
+        SLT_ERR(s, "[TAG_POOL_PREEMPT] parked state could not be restored after %d tries\n", s.n_park_fail);
+        pool_drop_park(s, false);
+        send_error(s, "parked state could not be restored", ERROR_TYPE_SERVER);
+        s.release();
+    }
+
+    // resume parked slots, oldest park first, never past the head
+    void pool_unpark() {
+        const int64_t now = ggml_time_us();
+        std::vector<server_slot *> q;
+        int n_active = 0;
+        for (auto & s : slots) {
+            if (s.parked) {
+                q.push_back(&s);
+            } else if (s.is_processing()) {
+                n_active++;
+            }
+        }
+        std::sort(q.begin(), q.end(), [](const server_slot * a, const server_slot * b) { return a->t_park_us < b->t_park_us; });
+
+        for (server_slot * s : q) {
+            if (now - s->t_park_us < pool_dbg_hold_us) {
+                break;
+            }
+            const int64_t need     = (int64_t) s->park_cells + (n_active > 0 ? pool_park_margin : 0);
+            int64_t       free_now = llama_memory_attn_n_free_ext(ctx_tgt, 0);
+            if (free_now < need) {
+                int64_t idle = 0;
+                for (auto & o : slots) {
+                    if (!o.is_processing()) {
+                        idle += (int64_t) o.prompt.tokens.size();
+                    }
+                }
+                if (free_now + idle >= need) {
+                    while (llama_memory_attn_n_free_ext(ctx_tgt, 0) < need && try_clear_idle_slots()) {}
+                    free_now = llama_memory_attn_n_free_ext(ctx_tgt, 0);
+                }
+            }
+            if (free_now < need) {
+                break;
+            }
+            if (!pool_restore(*s)) {
+                if (s->n_park_fail >= 3) {
+                    pool_restore_failed(*s);
+                }
+                break;
+            }
+            n_active++;
+        }
     }
 
     std::vector<common_adapter_lora_info> construct_lora_list(const std::map<int, float> & config) const {
@@ -2087,6 +2694,8 @@ private:
         slot.n_predict_max = task.params.n_predict != -1 ? task.params.n_predict : params_base.n_predict;
 
         slot.task = std::make_unique<const server_task>(std::move(task));
+
+        slot.t_run_us = ggml_time_us(); // [TAG_POOL_PREEMPT]
 
         slot.state = slot.task->is_child()
             ? SLOT_STATE_WAIT_OTHER // wait for the parent to process prompt
@@ -2699,6 +3308,7 @@ private:
         // TODO: here we incorrectly deterimne that the saved checkpoint data covers the [pos_min, pos_max] range
         //       this is not true for SWA models: https://github.com/ggml-org/llama.cpp/pull/24411#issuecomment-4677983225
         cur.update_pos(slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
+        slot.ckpt_build_iter = pool_iter; // [TAG_POOL_PREEMPT] dropped again if its rows are never decoded
 
         cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
         cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
@@ -3259,7 +3869,26 @@ private:
 
                     // on successful decode, restore the original batch size
                     n_batch = llama_n_batch(ctx_tgt);
+
+                    if (pool_preempt) {
+                        pool_no_progress = 0;
+                        if (off >= batch.n_gen_rows) {
+                            pool_dbg_prompt_views++;
+                        }
+                    }
                 } else {
+                    // [TAG_POOL_PREEMPT] the pool cannot take even the smallest valid view: undo the tail, make room, rebuild
+                    if (pool_exhausted) {
+                        pool_exhausted = false;
+                        try {
+                            pool_handle_exhausted(off, nullptr);
+                        } catch (const std::exception & e) {
+                            SRV_ERR("pool_handle_exhausted() failed: %s\n", e.what());
+                            abort_all_slots("pool preemption failed: " + std::string(e.what()));
+                        }
+                        break;
+                    }
+
                     // try again with the updated n_batch
                     continue;
                 }
@@ -3279,6 +3908,23 @@ private:
             }
         }
 
+        // [TAG_POOL_PREEMPT] an image that does not fit was held back by the prompt pass: make room for it now
+        if (pool_want_room >= 0) {
+            const int id_wait = pool_want_room;
+            pool_want_room = -1;
+            if (!pool_handled_iter && id_wait < (int) slots.size()) {
+                try {
+                    pool_handle_exhausted(batch.size(), &slots[id_wait]);
+                } catch (const std::exception & e) {
+                    SRV_ERR("pool_handle_exhausted() failed: %s\n", e.what());
+                    abort_all_slots("pool preemption failed: " + std::string(e.what()));
+                }
+            }
+        }
+        if (pool_preempt && batch.size() == 0 && pool_n_parked > 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1)); // parked slots waiting, nothing to decode: do not spin a core
+        }
+
         // [TAG_SHARED_PREFIX_FANOUT] the state is only valid once the batch has actually been
         // decoded, so the boundary publish happens here rather than while the batch is built
         share_prefix_publish_ready();
@@ -3288,7 +3934,7 @@ private:
         // apply context-shift if needed
         // TODO: simplify and improve
         iterate("slots_3219", slots, [&](server_slot & slot) {
-            if (slot.state == SLOT_STATE_GENERATING && slot.prompt.n_tokens() + 1 >= slot.n_ctx) {
+            if (slot.state == SLOT_STATE_GENERATING && !slot.parked && slot.prompt.n_tokens() + 1 >= slot.n_ctx) {
                 if (!params_base.ctx_shift) {
                     // this check is redundant (for good)
                     // we should never get here, because generation should already stopped in process_token()
@@ -3349,6 +3995,13 @@ private:
             }
         });
 
+        // [TAG_POOL_PREEMPT] bring parked slots back before the batch is built
+        pool_iter++;
+        pool_handled_iter = false;
+        if (pool_preempt && pool_n_parked > 0) {
+            pool_unpark();
+        }
+
         // start populating the batch for this iteration
         batch.clear();
 
@@ -3360,7 +4013,7 @@ private:
 
         // determine which slots are generating and drafting
         iterate("slots_3291", slots, [&](server_slot & slot) {
-            if (slot.state != SLOT_STATE_GENERATING) {
+            if (slot.state != SLOT_STATE_GENERATING || slot.parked) {
                 return;
             }
 
@@ -3512,6 +4165,7 @@ private:
         iterate("generating_3441", generating, [&](server_slot & slot) {
             slot.handle_last_sampled_token(batch);
         });
+        batch.n_gen_rows = batch.size(); // [TAG_POOL_PREEMPT] sampled + draft rows lead the batch
 
         // process in chunks of params.n_batch
         int32_t n_batch  = llama_n_batch(ctx_tgt);
@@ -3529,7 +4183,7 @@ private:
                     return; // batch is full, skip remaining slots
                 }
 
-                if (!slot.is_processing()) {
+                if (!slot.is_processing() || slot.parked) {
                     return;
                 }
 
@@ -3897,6 +4551,18 @@ private:
                             break;
                         }
 
+                        // [TAG_POOL_PREEMPT] an image decodes in its own llama_decode calls, and a full pool used to fail the request.
+                        // Hold it back instead (no rows added this iteration) and let update_slots make room.
+                        if (pool_preempt) {
+                            const auto & chunk_pool = input_tokens.find_chunk(cur_token_idx);
+                            const int64_t n_rows_pool = (int64_t) mtmd_input_chunk_get_n_tokens(chunk_pool.get());
+                            if ((int64_t) llama_memory_attn_n_free_ext(ctx_tgt, slot.id) < n_rows_pool) {
+                                SLT_WRN(slot, "__TEST_TAG_POOL_MEDIA_WAIT__ image needs %lld cells\n", (long long) n_rows_pool);
+                                pool_want_room = slot.id;
+                                return;
+                            }
+                        }
+
                         // process the mtmd chunk
                         // note: it submits its own decode, potentially be async
                         //       so the timing is queued and flushed on the next sync
@@ -4140,7 +4806,7 @@ private:
 
             int32_t n_after = 0;
             for (const auto & slot : slots) {
-                if (slot.state == SLOT_STATE_PROCESSING_PROMPT && slot.task) {
+                if (slot.state == SLOT_STATE_PROCESSING_PROMPT && slot.task && !slot.parked) {
                     const int32_t total = (int32_t) slot.task->n_tokens();
                     const int32_t done  = (int32_t) slot.prompt.n_tokens();
                     const int32_t rem   = total - done;
@@ -4183,7 +4849,7 @@ private:
             if (skip_extract) {
                 llama_set_layer_inp_extract(ctx_tgt, false);
             }
-            ret = llama_decode(ctx_tgt, batch_view);
+            ret = pool_dbg_fire(off) ? 1 : llama_decode(ctx_tgt, batch_view); // [TAG_POOL_PREEMPT] hook inert unless TURBO_POOL_DEBUG_FAIL
             if (skip_extract) {
                 llama_set_layer_inp_extract(ctx_tgt, true);
             }
@@ -4199,6 +4865,24 @@ private:
         }
 
         if (ret != 0) {
+            // [TAG_POOL_PREEMPT] never halve through a verify group and never fail every slot
+            if (pool_preempt && ret == 1) {
+                GGML_ASSERT(off == 0 || off >= batch.n_gen_rows);
+                if (pool_dbg_firing < 0 && try_clear_idle_slots(off)) {
+                    SRV_WRN("[TAG_POOL_PREEMPT] KV pool full at off = %d, cleared an idle slot, retrying\n", off);
+                    return false;
+                }
+                const int32_t floor  = off < batch.n_gen_rows ? batch.n_gen_rows - off : 1;
+                const int32_t n_free = llama_memory_attn_n_free_ext(ctx_tgt, 0);
+                if (n_free < floor || batch_view.n_tokens <= floor) {
+                    pool_exhausted = true;
+                    return false;
+                }
+                n_batch = std::max(floor, std::min(batch_view.n_tokens / 2, n_free));
+                SRV_WRN("[TAG_POOL_PREEMPT] KV pool full at off = %d, n_free = %d, retry with n_batch = %d\n", off, n_free, n_batch);
+                return false;
+            }
+
             {
                 std::string err;
 
@@ -4289,7 +4973,8 @@ private:
 
         // handle `n_cmpl > 1` tasks - when the main prompt is processed, activate all child tasks too
         for (auto & slot : slots) {
-            if (slot.state == SLOT_STATE_DONE_PROMPT && slot.task->is_parent()) {
+            if (slot.state == SLOT_STATE_DONE_PROMPT && slot.task->is_parent()
+                    && slot.i_batch >= off && slot.i_batch < off + batch_view.n_tokens) { // [TAG_POOL_PREEMPT] only once the parent's last row is decoded
                 std::vector<server_slot *> children;
                 for (auto & other : slots) {
                     if (other.state == SLOT_STATE_WAIT_OTHER && slot.task->id == other.task->id_parent) {
@@ -4335,6 +5020,10 @@ private:
         };
 
         iterate("slots_4251", slots, [&](server_slot & slot) {
+            if (slot.parked) {
+                return; // [TAG_POOL_PREEMPT]
+            }
+
             // optionally send prompt processing progress
             if (slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_DONE_PROMPT) {
                 if (slot.task->params.stream && slot.task->params.return_progress) {

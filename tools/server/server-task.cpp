@@ -1794,7 +1794,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
     const size_t state_size_new = state_size_tgt + state_size_dft + checkpoints_size;
 
     // skip over-limit entries to avoid disturbing the cache
-    if (limit_size > 0 && state_size_new > limit_size) {
+    if (limit_size > 0 && reserved + state_size_new > limit_size) { // [TAG_POOL_PREEMPT] reserved
         SRV_WRN(" - prompt state size %.3f MiB exceeds cache size limit %.3f MiB, skipping\n",
                 state_size_new / (1024.0 * 1024.0), limit_size / (1024.0 * 1024.0));
         return nullptr;
@@ -1830,7 +1830,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
 
     if (limit_size > 0) {
         // make room before allocating the new vectors to avoid breaching the limit
-        for (auto it = states.begin(); it != states.end() && size() + state_size_new > limit_size;) {
+        for (auto it = states.begin(); it != states.end() && size() + reserved + state_size_new > limit_size;) {
             if (it == it_keep) {
                 ++it;
                 continue;
@@ -1842,7 +1842,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
             it = states.erase(it);
         }
 
-        if (size() + state_size_new > limit_size) {
+        if (size() + reserved + state_size_new > limit_size) {
             // Only the kept entry is left and the outgoing state does not fit beside it, so one
             // of the two conversations has to re-prefill. Prefill time scales with the token
             // count: keep the longer one.
@@ -1872,7 +1872,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
     } catch (const std::bad_alloc & e) {
         SRV_ERR("failed to allocate memory for prompt cache state: %s\n", e.what());
 
-        limit_size = std::max<size_t>(1, 0.4*size());
+        limit_size = std::max<size_t>(1, 0.4*(size() + reserved)); // [TAG_POOL_PREEMPT] parked blobs count too
 
         SRV_WRN(" - cache size limit reduced to %.3f MiB\n", limit_size / (1024.0 * 1024.0));
 
@@ -2032,7 +2032,7 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
 
 void server_prompt_cache::update() {
     if (limit_size > 0) {
-        while (!states.empty() && size() > limit_size) {
+        while (!states.empty() && size() + reserved > limit_size) {
             SRV_WRN(" - cache size limit reached, removing oldest entry (size = %.3f MiB)\n", states.front().size() / (1024.0 * 1024.0));
 
             states.pop_front();
