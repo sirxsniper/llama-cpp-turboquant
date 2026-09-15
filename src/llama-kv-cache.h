@@ -5,6 +5,7 @@
 #include "llama-kv-cells.h"
 #include "llama-memory.h"
 
+#include <memory>
 #include <unordered_map>
 #include <vector>
 
@@ -14,6 +15,11 @@ struct llama_model;
 struct llama_context;
 struct triattention_state;
 struct triattention_config;
+
+// [TAG_TURBOT] llama-kv-tier.h, ggml-turbot.h
+class  llama_kv_tier;
+struct llama_turbot_plan;
+struct ggml_turbot_op_params;
 
 //
 // llama_kv_cache
@@ -268,6 +274,38 @@ public:
     // note: used by n-gram input embeddings
     void get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const;
 
+    //
+    // [TAG_TURBOT] tiered KV cache (docs/turbot/SPEC.md sections 9-10). Everything below except is_turbot() requires
+    // is_turbot(); no other cache type reaches any of it.
+    //
+
+    bool is_turbot() const { return turbot_tier != nullptr; }
+
+    const llama_kv_tier     * get_turbot_tier() const { return turbot_tier.get(); }
+    const llama_turbot_plan * get_turbot_plan() const { return turbot_plan.get(); }
+
+    uint32_t get_turbot_n_granules() const;
+
+    // young pool of layer il: I8 [pool_row_bytes, max(POOL, 64)]
+    ggml_tensor * get_turbot_pool(int32_t il) const;
+
+    // op params of layer il for side GGML_TURBOT_SIDE_K, _V or _BOTH
+    void get_turbot_op_params(int32_t il, int side, ggml_turbot_op_params & params) const;
+
+    // the writer op that replaces cpy_k / cpy_v: base code always, refinement for rows with a young pool row
+    //   young: I32 [n_tokens] pool row or -1, fill: I32 [4, n_fill] or nullptr
+    ggml_tensor * turbot_cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, ggml_tensor * young, ggml_tensor * fill, int32_t il) const;
+    ggml_tensor * turbot_cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, ggml_tensor * young, ggml_tensor * fill, int32_t il) const;
+
+    // ubatch lifecycle (SPEC 9.6): begin from llama_kv_cache_context::apply(), commit after a successful compute,
+    // abort after a failed one (before the failure seq_rm)
+    void turbot_begin_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch);
+    void turbot_commit_ubatch();
+    void turbot_abort_ubatch();
+
+    // granule table, young rows and fill list of the current ubatch (host buffers)
+    void set_input_turbot(ggml_tensor * gtab, ggml_tensor * young, ggml_tensor * fill) const;
+
 private:
     const llama_model & model;
     const llama_hparams & hparams;
@@ -282,6 +320,9 @@ private:
 
         std::vector<ggml_tensor *> k_stream;
         std::vector<ggml_tensor *> v_stream;
+
+        // [TAG_TURBOT] young pool of the layer, nullptr for every other cache type
+        ggml_tensor * pool = nullptr;
     };
 
     bool v_trans = true;  // the value tensor is transposed
@@ -348,6 +389,15 @@ private:
     // TriAttention eviction state (nullptr if not enabled)
     triattention_state * triattention_st = nullptr;
 
+    // [TAG_TURBOT] plan and tier state of a turbot cache, both nullptr for every other cache type
+    std::unique_ptr<llama_turbot_plan> turbot_plan;
+    std::unique_ptr<llama_kv_tier>     turbot_tier;
+
+    // [TAG_TURBOT] seq_rm with the tier hooks (SPEC 9.7); p0/p1 already normalised
+    bool seq_rm_turbot(llama_seq_id seq_id, llama_pos p0, llama_pos p1);
+
+    ggml_tensor * turbot_cpy(ggml_context * ctx, ggml_tensor * cur, ggml_tensor * idxs, ggml_tensor * young, ggml_tensor * fill, int32_t il, int side) const;
+
     size_t total_size() const;
 
     size_t size_k_bytes() const;
@@ -380,6 +430,10 @@ private:
     // sinfo_in, when set, replaces the find_slot call: the cells are given by the caller
     bool state_read_meta(llama_io_read_i & io, uint32_t strm, uint32_t cell_count,       slot_info & sinfo, llama_seq_id dest_seq_id = -1, const slot_info * sinfo_in = nullptr);
     bool state_read_data(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, const slot_info & sinfo);
+
+    // [TAG_TURBOT] the v2 section that follows the data section of a turbot cache (SPEC 9.10)
+    void state_write_turbot(llama_io_write_i & io, const cell_ranges_t & cr, uint32_t cell_count, llama_seq_id seq_id) const;
+    bool state_read_turbot (llama_io_read_i  & io, uint32_t strm, uint32_t cell_count, const slot_info & sinfo, llama_seq_id seq_id);
 };
 
 class llama_kv_cache_context : public llama_memory_context_i {
@@ -475,6 +529,19 @@ public:
 
     // see llama_kv_cache::get_prev_tokens()
     void get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const;
+
+    // [TAG_TURBOT] see llama_kv_cache
+    bool    is_turbot() const;
+    int64_t get_turbot_n_granules() const;
+    int64_t get_turbot_n_fill() const;   // fill entries of the current ubatch, 0 outside a batch processing context
+
+    ggml_tensor * get_turbot_pool(int32_t il) const;
+    void          get_turbot_op_params(int32_t il, int side, ggml_turbot_op_params & params) const;
+
+    ggml_tensor * turbot_cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, ggml_tensor * young, ggml_tensor * fill, int32_t il) const;
+    ggml_tensor * turbot_cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, ggml_tensor * young, ggml_tensor * fill, int32_t il) const;
+
+    void set_input_turbot(ggml_tensor * gtab, ggml_tensor * young, ggml_tensor * fill) const;
 
 private:
     llama_memory_status status;

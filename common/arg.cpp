@@ -323,6 +323,11 @@ const std::vector<ggml_type> kv_cache_types = {
 };
 
 static ggml_type kv_cache_type_from_str(const std::string & s) {
+    // [TAG_TURBOT] "turbot" selects the tiered cache; the per-layer types turbot_s8..s24 come from the plan, so they are
+    // not offered by name. GGML_TYPE_TURBOT_S8 is the "turbot requested" sentinel.
+    if (s == "turbot") {
+        return GGML_TYPE_TURBOT_S8;
+    }
     for (const auto & type : kv_cache_types) {
         if (ggml_type_name(type) == s) {
             return type;
@@ -334,8 +339,9 @@ static ggml_type kv_cache_type_from_str(const std::string & s) {
 static std::string get_all_kv_cache_types() {
     std::ostringstream msg;
     for (const auto & type : kv_cache_types) {
-        msg << ggml_type_name(type) << (&type == &kv_cache_types.back() ? "" : ", ");
+        msg << ggml_type_name(type) << ", ";
     }
+    msg << "turbot (-ctk and -ctv together, needs --kv-tier-plan)";   // [TAG_TURBOT]
     return msg.str();
 }
 
@@ -2474,6 +2480,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.cache_type_v = kv_cache_type_from_str(value);
         }
     ).set_env("LLAMA_ARG_CACHE_TYPE_V"));
+    add_opt(common_arg(
+        {"--kv-tier-plan"}, "FNAME",
+        "turbot tiered KV cache plan: per-head old widths (L lines), optional young widths (Y), young pool (POOL) and\n"
+        "per-sequence young cap (CAP). Required with -ctk turbot -ctv turbot unless env LLAMA_TURBOT_PLAN is set",
+        [](common_params & params, const std::string & value) {
+            params.kv_tier_plan = value;   // [TAG_TURBOT]
+        }
+    ).set_env("LLAMA_ARG_KV_TIER_PLAN"));
     add_opt(common_arg(
         {"--hellaswag"},
         "compute HellaSwag score over random tasks from datafile supplied with -f",

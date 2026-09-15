@@ -10,6 +10,10 @@
 // FIXME: required here for quantization functions
 #include "ggml-quants.h"
 
+// [TAG_TURBOT] type family, op params and layout of the tiered KV cache. Included before the do_not_use__ fp16
+// macros below, which would otherwise rename the header's ggml_fp16_to_fp32 / ggml_fp32_to_fp16 calls.
+#include "ggml-turbot.h"
+
 #ifdef GGML_USE_CPU_HBM
 #include <hbwmalloc.h>
 #endif
@@ -835,6 +839,37 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .to_float                 = (ggml_to_float_t) dequantize_row_turbo5p512_0,
         .from_float_ref           = (ggml_from_float_t) quantize_row_turbo5p512_0_ref,
     },
+    // [TAG_TURBOT] tiered KV cache base rows, S = sum of the 4 per-head old widths (ggml-turbot.h). A row decodes only
+    // with the per-head widths from the op params, so to_float and from_float_ref stay NULL: the writer is
+    // GGML_OP_TURBOT_SET_ROWS and the readers decode through ggml-turbot.h. Not named on the command line: -ctk/-ctv
+    // say "turbot", which maps to the GGML_TYPE_TURBOT_S8 sentinel.
+#define GGML_TURBOT_TYPE_TRAITS(S)                                    \
+    [GGML_TYPE_TURBOT_S ## S] = {                                     \
+        .type_name                = "turbot_s" #S,                    \
+        .blck_size                = GGML_TURBOT_ROW_ELEMS,            \
+        .type_size                = 32*(S) + 16,                      \
+        .is_quantized             = true,                             \
+        .to_float                 = NULL,                             \
+        .from_float_ref           = NULL,                             \
+    },
+    GGML_TURBOT_TYPE_TRAITS(8)
+    GGML_TURBOT_TYPE_TRAITS(9)
+    GGML_TURBOT_TYPE_TRAITS(10)
+    GGML_TURBOT_TYPE_TRAITS(11)
+    GGML_TURBOT_TYPE_TRAITS(12)
+    GGML_TURBOT_TYPE_TRAITS(13)
+    GGML_TURBOT_TYPE_TRAITS(14)
+    GGML_TURBOT_TYPE_TRAITS(15)
+    GGML_TURBOT_TYPE_TRAITS(16)
+    GGML_TURBOT_TYPE_TRAITS(17)
+    GGML_TURBOT_TYPE_TRAITS(18)
+    GGML_TURBOT_TYPE_TRAITS(19)
+    GGML_TURBOT_TYPE_TRAITS(20)
+    GGML_TURBOT_TYPE_TRAITS(21)
+    GGML_TURBOT_TYPE_TRAITS(22)
+    GGML_TURBOT_TYPE_TRAITS(23)
+    GGML_TURBOT_TYPE_TRAITS(24)
+#undef GGML_TURBOT_TYPE_TRAITS
     [GGML_TYPE_Q2_K] = {
         .type_name                = "q2_K",
         .blck_size                = QK_K,
@@ -1170,10 +1205,12 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OPT_STEP_SGD",
 
     "GLU",
+
+    "TURBOT_SET_ROWS",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");  // +1 GGML_OP_TURBO_WHT (TurboQuant fork), +1 GGML_OP_LIGHTNING_INDEXER
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");  // +1 GGML_OP_TURBO_WHT (TurboQuant fork), +1 GGML_OP_LIGHTNING_INDEXER, +1 GGML_OP_TURBOT_SET_ROWS [TAG_TURBOT]
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1287,10 +1324,12 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sgd(x)",
 
     "glu(x)",
+
+    "turbot_set_rows(x)",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");  // +1 GGML_OP_TURBO_WHT (TurboQuant fork), +1 GGML_OP_LIGHTNING_INDEXER
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");  // +1 GGML_OP_TURBO_WHT (TurboQuant fork), +1 GGML_OP_LIGHTNING_INDEXER, +1 GGML_OP_TURBOT_SET_ROWS [TAG_TURBOT]
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -4037,6 +4076,59 @@ struct ggml_tensor * ggml_set_rows(
     return result;
 }
 
+// ggml_turbot_set_rows [TAG_TURBOT]
+
+struct ggml_tensor * ggml_turbot_set_rows(
+        struct ggml_context                * ctx,
+        struct ggml_tensor                 * a,
+        struct ggml_tensor                 * b,
+        struct ggml_tensor                 * c,
+        struct ggml_tensor                 * pool,
+        struct ggml_tensor                 * young,
+        struct ggml_tensor                 * fill,
+        const struct ggml_turbot_op_params * params) {
+    GGML_ASSERT(params != NULL);
+    GGML_ASSERT(ggml_turbot_is_type(a->type));
+    GGML_ASSERT(a->ne[0] == GGML_TURBOT_ROW_ELEMS && a->ne[2] == 1 && a->ne[3] == 1);
+    GGML_ASSERT(ggml_is_contiguous_rows(a));
+    GGML_ASSERT(b->type == GGML_TYPE_F32);
+    GGML_ASSERT(b->ne[0] == GGML_TURBOT_ROW_ELEMS);
+    GGML_ASSERT(b->ne[2] == 1 && b->ne[3] == 1);
+    GGML_ASSERT(ggml_is_contiguous_rows(b));
+    GGML_ASSERT(c->type == GGML_TYPE_I64 || c->type == GGML_TYPE_I32);
+    GGML_ASSERT(c->ne[0] == b->ne[1] && c->ne[1] == 1 && c->ne[2] == 1 && c->ne[3] == 1);
+    GGML_ASSERT(pool != NULL && pool->type == GGML_TYPE_I8 && ggml_is_contiguous_rows(pool)); // POOL 0 still has 64 rows
+    GGML_ASSERT(young != NULL && young->type == GGML_TYPE_I32);
+    GGML_ASSERT(young->ne[0] == b->ne[1] && young->ne[1] == 1 && young->ne[2] == 1 && young->ne[3] == 1);
+    GGML_ASSERT(fill == NULL || (fill->type == GGML_TYPE_I32 && fill->ne[0] == 4 && fill->ne[2] == 1 && fill->ne[3] == 1));
+
+    struct ggml_tensor * result = ggml_view_tensor(ctx, a);
+
+    // bytes 0..15 of op_params are zero, the turbot params go at byte 16
+    memset(result->op_params, 0, GGML_TURBOT_OP_PARAMS_OFFSET);
+    ggml_turbot_op_params_set(result, params);
+
+    struct ggml_turbot_op_params p;
+    struct ggml_turbot_layer     l;
+    GGML_ASSERT(ggml_turbot_op_params_get(result, &p) && "turbot: invalid op params");
+    GGML_ASSERT((p.side == GGML_TURBOT_SIDE_K || p.side == GGML_TURBOT_SIDE_V) && "turbot: the writer takes side K or V");
+    GGML_ASSERT(ggml_turbot_layer_from_op_params(&p, &l) && "turbot: illegal per-head widths");
+
+    const struct ggml_turbot_side * sd = p.side == GGML_TURBOT_SIDE_K ? &l.k : &l.v;
+    GGML_ASSERT(ggml_turbot_type_of_s(sd->s) == a->type);
+    GGML_ASSERT(pool->ne[0] == (int64_t) l.pool_row_bytes);
+
+    result->op     = GGML_OP_TURBOT_SET_ROWS;
+    result->src[0] = b;
+    result->src[1] = c;
+    result->src[2] = a;     // same order as ggml_set_rows
+    result->src[3] = pool;
+    result->src[4] = young;
+    result->src[5] = fill;
+
+    return result;
+}
+
 // ggml_diag
 
 struct ggml_tensor * ggml_diag(
@@ -5621,6 +5713,41 @@ void ggml_flash_attn_ext_set_pos(
     GGML_ASSERT(q_pos->ne[0]  == a->src[0]->ne[1]);   // one entry per query token
     a->src[5] = kv_pos;
     a->src[6] = q_pos;
+}
+
+// [TAG_TURBOT]
+void ggml_flash_attn_ext_set_turbot(
+        struct ggml_tensor                 * a,
+        struct ggml_tensor                 * pool,
+        struct ggml_tensor                 * gtab,
+        const struct ggml_turbot_op_params * params) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    GGML_ASSERT(a->src[7] == NULL && a->src[8] == NULL);
+    GGML_ASSERT(params != NULL);
+
+    const struct ggml_tensor * k = a->src[1];
+    const struct ggml_tensor * v = a->src[2];
+
+    GGML_ASSERT(ggml_turbot_is_type(k->type) && ggml_turbot_is_type(v->type));
+    GGML_ASSERT(k->ne[0] == GGML_TURBOT_HEAD_DIM && v->ne[0] == GGML_TURBOT_HEAD_DIM);
+    GGML_ASSERT(k->ne[2] == GGML_TURBOT_N_HEAD   && v->ne[2] == GGML_TURBOT_N_HEAD);
+    GGML_ASSERT(k->ne[3] == 1);
+    GGML_ASSERT(pool != NULL && pool->type == GGML_TYPE_I8 && ggml_is_contiguous_rows(pool));
+    GGML_ASSERT(gtab != NULL && gtab->type == GGML_TYPE_I32 && ggml_n_dims(gtab) == 1 && ggml_is_contiguous(gtab));
+    GGML_ASSERT(gtab->ne[0]*GGML_TURBOT_GRANULE >= k->ne[1]);
+
+    // writes op_params bytes 16..39 only: scale, max_bias, softcap and prec (bytes 0..15) are untouched
+    ggml_turbot_op_params_set(a, params);
+
+    struct ggml_turbot_op_params p;
+    struct ggml_turbot_layer     l;
+    GGML_ASSERT(ggml_turbot_op_params_get(a, &p) && p.side == GGML_TURBOT_SIDE_BOTH && "turbot: invalid op params");
+    GGML_ASSERT(ggml_turbot_layer_from_op_params(&p, &l) && "turbot: illegal per-head widths");
+    GGML_ASSERT(ggml_turbot_s_of_type(k->type) == l.k.s && ggml_turbot_s_of_type(v->type) == l.v.s);
+    GGML_ASSERT(pool->ne[0] == (int64_t) l.pool_row_bytes);
+
+    a->src[7] = pool;
+    a->src[8] = gtab;
 }
 
 // ggml_flash_attn_back

@@ -28,6 +28,7 @@ add_library(llama
             llama-kv-cache-dsa-iswa.cpp
             llama-kv-cache-msa.cpp
             llama-kv-cache-dsv4.cpp
+            llama-kv-tier.cpp
             llama-memory.cpp
             llama-triattention.cpp
             llama-memory-hybrid.cpp

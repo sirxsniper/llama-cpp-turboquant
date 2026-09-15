@@ -290,6 +290,12 @@ if (NOT LLAMA_SANITIZE_ADDRESS AND NOT GGML_SCHED_NO_REALLOC)
 endif()
 llama_build_and_test(test-backend-ops.cpp)
 
+# [TAG_TURBOT] turbot tiered KV format unit tests, CPU only (docs/turbot/TESTING.md). The plan parser and llama_kv_tier
+# scenarios (TURBOT_TEST_TIER) call src/llama-kv-tier.h, which exports them with LLAMA_API, so they link in shared
+# builds too; llama_kv_cells and llama_ubatch are header-only.
+llama_build_and_test(test-turbot.cpp)
+target_compile_definitions(test-turbot PRIVATE TURBOT_TEST_TIER)
+
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model")
 llama_build_and_test(test-autorelease.cpp       LABEL "model")
 llama_build_and_test(test-backend-sampler.cpp   LABEL "model")
@@ -314,6 +320,10 @@ if (NOT GGML_BACKEND_DL)
     llama_build_and_test(test-quantize-perf.cpp)
     llama_build_and_test(test-rope.cpp)
     llama_build_and_test(test-col2im-1d.cpp)
+
+    # [TAG_TURBOT] CPU vs CUDA bytes of the turbot kernels. Built, not registered with ctest: it needs the GPU, and GPU
+    # jobs run one at a time (docs/turbot/TESTING.md).
+    llama_build(test-turbot-backend.cpp)
 endif()
 
 # libmtmd

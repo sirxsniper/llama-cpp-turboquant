@@ -15,6 +15,7 @@
 struct ggml_cgraph;
 struct ggml_context;
 struct ggml_tensor;
+struct ggml_turbot_op_params;   // [TAG_TURBOT] ggml-turbot.h
 
 struct llama_cparams;
 struct llama_layer;
@@ -352,6 +353,11 @@ public:
     // note: assumes v_rot^2 == I
     ggml_tensor * self_k_rot = nullptr;
     ggml_tensor * self_v_rot = nullptr;
+
+    // [TAG_TURBOT] tiered KV cache inputs, created only when the cache is turbot (docs/turbot/SPEC.md 10.1)
+    ggml_tensor * self_turbot_gtab  = nullptr; // I32 [n_granules]  slot or -1
+    ggml_tensor * self_turbot_young = nullptr; // I32 [n_tokens]    pool row or -1
+    ggml_tensor * self_turbot_fill  = nullptr; // I32 [4, n_fill], only when n_fill > 0
 
     // note: these have to be copies because in order to be able to reuse a graph, its inputs
     //       need to carry these parameters with them. otherwise, they can point to freed
@@ -1179,7 +1185,10 @@ struct llm_graph_context {
                   float   kq_scale,
                     int   il,
                     ggml_tensor * kv_pos = nullptr,   // [TAG_FA_POS_MASK] positional mask (with q_pos) when kq_mask is null
-                    ggml_tensor * q_pos  = nullptr) const;
+                    ggml_tensor * q_pos  = nullptr,
+                    ggml_tensor * turbot_pool = nullptr,                       // [TAG_TURBOT] young pool of the layer
+                    ggml_tensor * turbot_gtab = nullptr,                       // [TAG_TURBOT] granule table
+                    const ggml_turbot_op_params * turbot_params = nullptr) const;   // [TAG_TURBOT] K and V are turbot when set
 
     llm_graph_input_attn_no_cache * build_attn_inp_no_cache() const;
 

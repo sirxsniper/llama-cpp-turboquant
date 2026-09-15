@@ -49,6 +49,7 @@ public:
 
         for (uint32_t s = 0; s < LLAMA_MAX_SEQ; ++s) {
             seq_pos[s].clear();
+            seq_n[s] = 0;   // [TAG_TURBOT]
         }
     }
 
@@ -309,6 +310,22 @@ public:
         return seq[i].test(seq_id);
     }
 
+    // [TAG_TURBOT] number of (cell, seq_id) pairs, i.e. the cells sequence seq_id occupies
+    // maintained in seq_pos_inc/seq_pos_dec, the only two places where (cell, seq) membership changes
+    uint32_t seq_n_cells(llama_seq_id seq_id) const {
+        assert(seq_id >= 0);
+        assert(seq_id < LLAMA_MAX_SEQ);
+
+        return seq_n[seq_id];
+    }
+
+    // [TAG_TURBOT] the sequences occupying cell i
+    const std::bitset<LLAMA_MAX_SEQ> & seq_bits(uint32_t i) const {
+        assert(i < pos.size());
+
+        return seq[i];
+    }
+
     // gather the token ids of the cells in `seqs` with position in [p0, p1)
     // the callback receives (seq_id, pos, token) for every such (cell, seq) pair
     // note: used by n-gram input embeddings to recover the tokens preceding a ubatch
@@ -526,6 +543,9 @@ private:
     //
     std::map<llama_pos, int> seq_pos[LLAMA_MAX_SEQ];
 
+    // [TAG_TURBOT] seq_n[s]: number of cells occupied by sequence s (seq_n_cells)
+    uint32_t seq_n[LLAMA_MAX_SEQ] = {};
+
     // helper functions for updating `seq_pos`, once cell at a time:
 
     void seq_pos_dec(llama_seq_id s, llama_pos p) {
@@ -535,10 +555,15 @@ private:
         if (--it->second == 0) {
             seq_pos[s].erase(it);
         }
+
+        assert(seq_n[s] > 0);
+        seq_n[s]--;   // [TAG_TURBOT]
     }
 
     void seq_pos_inc(llama_seq_id s, llama_pos p) {
         seq_pos[s][p]++;
+
+        seq_n[s]++;   // [TAG_TURBOT]
     }
 
     // remove cell i

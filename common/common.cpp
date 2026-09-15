@@ -10,6 +10,8 @@
 #include "speculative.h"
 #include "unicode.h"
 
+#include "../src/llama-ext.h" // [TAG_TURBOT] llama_turbot_set_plan_path
+
 #include <algorithm>
 #include <cinttypes>
 #include <climits>
@@ -1289,6 +1291,12 @@ struct common_init_result::impl {
 
 common_init_result::common_init_result(common_params & params, bool model_only) :
     pimpl(new impl{}) {
+    // [TAG_TURBOT] before anything that creates a context: the fit probes below construct turbot caches too, and
+    // without the plan their refusal would read as a memory failure
+    if (!params.kv_tier_plan.empty()) {
+        llama_turbot_set_plan_path(params.kv_tier_plan.c_str());
+    }
+
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
 

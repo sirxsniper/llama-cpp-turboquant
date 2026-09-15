@@ -4,6 +4,7 @@
 #include "repack.h"
 #include "traits.h"
 #include "ggml-impl.h"
+#include "ggml-turbot.h" // [TAG_TURBOT]
 #include "amx/amx.h"
 
 #include <cctype>
@@ -421,12 +422,86 @@ static ggml_backend_buffer_t ggml_backend_cpu_device_buffer_from_host_ptr(ggml_b
     GGML_UNUSED(max_tensor_size);
 }
 
+// [TAG_TURBOT] the CPU reference ops read and write tensor data directly: every allocated source must be host memory
+static bool ggml_backend_cpu_turbot_host_ok(const struct ggml_tensor * t) {
+    return t == nullptr || t->buffer == nullptr || ggml_backend_buffer_is_host(t->buffer);
+}
+
+// [TAG_TURBOT] docs/turbot/SPEC.md 5.4: GGML_OP_TURBOT_SET_ROWS, and GGML_OP_FLASH_ATTN_EXT with a turbot K or V
+static bool ggml_backend_cpu_turbot_supports_op(const struct ggml_tensor * op) {
+    ggml_turbot_op_params p;
+    ggml_turbot_layer     l;
+    if (!ggml_turbot_op_params_get(op, &p) || !ggml_turbot_layer_from_op_params(&p, &l)) {
+        return false;   // also a FLASH_ATTN_EXT with turbot K/V that ggml_flash_attn_ext_set_turbot never marked
+    }
+    for (int i = 0; i < GGML_MAX_SRC; i++) {
+        if (!ggml_backend_cpu_turbot_host_ok(op->src[i])) {
+            return false;
+        }
+    }
+
+    if (op->op == GGML_OP_TURBOT_SET_ROWS) {
+        const ggml_tensor * b     = op->src[0];
+        const ggml_tensor * c     = op->src[1];
+        const ggml_tensor * a     = op->src[2];
+        const ggml_tensor * pool  = op->src[3];
+        const ggml_tensor * young = op->src[4];
+        const ggml_tensor * fill  = op->src[5];
+        if (p.side != GGML_TURBOT_SIDE_K && p.side != GGML_TURBOT_SIDE_V) {
+            return false;
+        }
+        if (!a || !b || !c || !pool || !young) {
+            return false;
+        }
+        const ggml_turbot_side & sd = p.side == GGML_TURBOT_SIDE_K ? l.k : l.v;
+        return
+            ggml_turbot_is_type(a->type) && a->type == ggml_turbot_type_of_s(sd.s) &&
+            a->ne[0] == GGML_TURBOT_ROW_ELEMS && a->ne[2] == 1 && a->ne[3] == 1 && ggml_is_contiguous_rows(a) &&
+            b->type == GGML_TYPE_F32 && b->ne[0] == GGML_TURBOT_ROW_ELEMS && b->ne[2] == 1 && b->ne[3] == 1 &&
+            ggml_is_contiguous_rows(b) &&
+            (c->type == GGML_TYPE_I64 || c->type == GGML_TYPE_I32) && c->ne[0] == b->ne[1] &&
+            c->ne[1] == 1 && c->ne[2] == 1 && c->ne[3] == 1 &&
+            pool->type == GGML_TYPE_I8 && pool->ne[0] == (int64_t) l.pool_row_bytes && ggml_is_contiguous_rows(pool) &&
+            young->type == GGML_TYPE_I32 && young->ne[0] == b->ne[1] &&
+            young->ne[1] == 1 && young->ne[2] == 1 && young->ne[3] == 1 &&
+            (fill == nullptr || (fill->type == GGML_TYPE_I32 && fill->ne[0] == 4 && fill->ne[2] == 1 && fill->ne[3] == 1));
+    }
+
+    GGML_ASSERT(op->op == GGML_OP_FLASH_ATTN_EXT);
+    const ggml_tensor * q    = op->src[0];
+    const ggml_tensor * k    = op->src[1];
+    const ggml_tensor * v    = op->src[2];
+    const ggml_tensor * mask = op->src[3];
+    const ggml_tensor * pool = op->src[7];
+    const ggml_tensor * gtab = op->src[8];
+    if (p.side != GGML_TURBOT_SIDE_BOTH || !pool || !gtab) {
+        return false;
+    }
+    return
+        ggml_turbot_is_type(k->type) && k->type == ggml_turbot_type_of_s(l.k.s) &&
+        ggml_turbot_is_type(v->type) && v->type == ggml_turbot_type_of_s(l.v.s) &&
+        k->ne[0] == GGML_TURBOT_HEAD_DIM && v->ne[0] == GGML_TURBOT_HEAD_DIM &&
+        k->ne[2] == GGML_TURBOT_N_HEAD   && v->ne[2] == GGML_TURBOT_N_HEAD &&
+        k->ne[3] == 1 && v->ne[3] == 1 && k->ne[1] == v->ne[1] &&
+        k->nb[1] == (size_t) l.k.base_row_bytes && v->nb[1] == (size_t) l.v.base_row_bytes &&
+        pool->type == GGML_TYPE_I8 && pool->ne[0] == (int64_t) l.pool_row_bytes && ggml_is_contiguous_rows(pool) &&
+        gtab->type == GGML_TYPE_I32 && ggml_is_contiguous(gtab) && gtab->ne[0]*GGML_TURBOT_GRANULE >= k->ne[1] &&
+        q->type == GGML_TYPE_F32 && q->ne[3] == 1 &&
+        (mask == nullptr || mask->ne[2] == 1);
+}
+
 static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
     const struct ggml_tensor * src0 = op->src[0];
     const struct ggml_tensor * src1 = op->src[1];
 
     if (op->op == GGML_OP_NONE || op->op == GGML_OP_RESHAPE || op->op == GGML_OP_VIEW || op->op == GGML_OP_PERMUTE || op->op == GGML_OP_TRANSPOSE) {
         return true;
+    }
+
+    // [TAG_TURBOT] decided before the extra buffer types, which know neither the op nor the type family
+    if (op->op == GGML_OP_TURBOT_SET_ROWS ||
+        (op->op == GGML_OP_FLASH_ATTN_EXT && (ggml_turbot_is_type(op->src[1]->type) || ggml_turbot_is_type(op->src[2]->type)))) {
+        return ggml_backend_cpu_turbot_supports_op(op);
     }
 
     // check extra buffer types

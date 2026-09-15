@@ -5650,6 +5650,24 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
                 VALIDATE_ROW_DATA_D_F16_IMPL(block_iq4_nl, data, nb);
             } break;
 
+        // [TAG_TURBOT] a turbot row decodes only with the per-head widths of its plan, so its bytes are not validated
+        case GGML_TYPE_TURBOT_S8:
+        case GGML_TYPE_TURBOT_S9:
+        case GGML_TYPE_TURBOT_S10:
+        case GGML_TYPE_TURBOT_S11:
+        case GGML_TYPE_TURBOT_S12:
+        case GGML_TYPE_TURBOT_S13:
+        case GGML_TYPE_TURBOT_S14:
+        case GGML_TYPE_TURBOT_S15:
+        case GGML_TYPE_TURBOT_S16:
+        case GGML_TYPE_TURBOT_S17:
+        case GGML_TYPE_TURBOT_S18:
+        case GGML_TYPE_TURBOT_S19:
+        case GGML_TYPE_TURBOT_S20:
+        case GGML_TYPE_TURBOT_S21:
+        case GGML_TYPE_TURBOT_S22:
+        case GGML_TYPE_TURBOT_S23:
+        case GGML_TYPE_TURBOT_S24:
         case GGML_TYPE_I8:
         case GGML_TYPE_I16:
         case GGML_TYPE_I32:

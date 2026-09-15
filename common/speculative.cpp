@@ -15,6 +15,7 @@
 #include "../src/llama-ext.h" // staging API: llama_set_embeddings_nextn / llama_get_embeddings_nextn_ith (used by MTP)
 
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <chrono>
 #include <cinttypes>
@@ -2928,6 +2929,25 @@ common_params common_base_params_to_speculative(const common_params & params) {
 
     result.cache_type_k  = params_spec.cache_type_k;
     result.cache_type_v  = params_spec.cache_type_v;
+
+    // [TAG_TURBOT] the draft cache never uses turbot: its plan names the target's attention layers, and DFlash2
+    // acceptance was measured with a turbo5p drafter. [TAG_SPEC_KV_INHERIT] copies -ctk turbot into the draft params;
+    // this swap removes it again. Every draft context (fit probe, server drafter, speculative-simple) comes through here.
+    if (result.cache_type_k == GGML_TYPE_TURBOT_S8 || result.cache_type_v == GGML_TYPE_TURBOT_S8) {
+        const bool asked = (params_spec.cache_type_k_set && params_spec.cache_type_k == GGML_TYPE_TURBOT_S8) ||
+                           (params_spec.cache_type_v_set && params_spec.cache_type_v == GGML_TYPE_TURBOT_S8);
+        if (result.cache_type_k == GGML_TYPE_TURBOT_S8) {
+            result.cache_type_k = GGML_TYPE_TURBO5P_0;
+        }
+        if (result.cache_type_v == GGML_TYPE_TURBOT_S8) {
+            result.cache_type_v = GGML_TYPE_TURBO5P_0;
+        }
+        static std::atomic<bool> warned{false};
+        if (asked && !warned.exchange(true)) {
+            LOG_WRN("%s: the draft KV cache does not support turbot, using turbo5p for it\n", __func__);
+        }
+    }
+
     result.n_outputs_max = params.n_parallel;
     result.n_outputs_max_per_seq = 1;
 

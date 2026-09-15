@@ -7,10 +7,12 @@
 #include "ggml.h"
 #include "unary-ops.h"
 #include "vec.h"
+#include "ggml-turbot.h" // [TAG_TURBOT]
 
 #include <algorithm>
 #include <cfloat>
 #include <cmath>
+#include <vector>
 
 extern "C" { GGML_API int turbo3_cpu_wht_group_size; }
 
@@ -5222,6 +5224,93 @@ void ggml_compute_forward_set_rows(
     }
 }
 
+// ggml_compute_forward_turbot_set_rows
+
+// [TAG_TURBOT] CPU reference writer of the turbot KV format (docs/turbot/SPEC.md 6.1), the host oracle for the CUDA
+// writer: the ggml-turbot.h coder, one row at a time. Every CPU thread enters every op (n_tasks only sizes the work
+// buffer), so thread 0 does all the work and the others return.
+void ggml_compute_forward_turbot_set_rows(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    if (params->ith != 0) {
+        return;
+    }
+
+    const ggml_tensor * src   = dst->src[0];   // F32 rows [1024, n_rows]
+    const ggml_tensor * idx   = dst->src[1];   // I64 or I32 destination cells [n_rows]
+    const ggml_tensor * base  = dst->src[2];   // turbot base cache [1024, kv_size]
+    const ggml_tensor * pool  = dst->src[3];   // I8 young pool [pool_row_bytes, n_pool_rows]
+    const ggml_tensor * young = dst->src[4];   // I32 young pool row of each row, or -1
+    const ggml_tensor * fill  = dst->src[5];   // I32 [4, n_fill] of (granule, slot, mask_lo, mask_hi), or NULL
+
+    ggml_turbot_op_params p;
+    ggml_turbot_layer     l;
+    GGML_ASSERT(ggml_turbot_op_params_get(dst, &p));
+    GGML_ASSERT(p.side == GGML_TURBOT_SIDE_K || p.side == GGML_TURBOT_SIDE_V);
+    GGML_ASSERT(ggml_turbot_layer_from_op_params(&p, &l));
+
+    const ggml_turbot_side * sd   = p.side == GGML_TURBOT_SIDE_K ? &l.k : &l.v;
+    const size_t             part = p.side == GGML_TURBOT_SIDE_K ? 0 : (size_t) l.pool_v_off;   // side part of a pool row
+
+    GGML_ASSERT(base->type == ggml_turbot_type_of_s(sd->s));
+    GGML_ASSERT(base->nb[1] == (size_t) sd->base_row_bytes);
+    GGML_ASSERT(src->type == GGML_TYPE_F32 && src->ne[0] == GGML_TURBOT_ROW_ELEMS && src->nb[0] == sizeof(float));
+    GGML_ASSERT(idx->type == GGML_TYPE_I64 || idx->type == GGML_TYPE_I32);
+    GGML_ASSERT(pool->type == GGML_TYPE_I8 && pool->ne[0] == (int64_t) l.pool_row_bytes);
+    GGML_ASSERT(young->type == GGML_TYPE_I32);
+
+    const int64_t n_rows  = src->ne[1];
+    const int64_t n_cells = base->ne[1];
+    const int64_t n_pool  = pool->ne[1];
+
+    GGML_ASSERT(idx->ne[0] == n_rows && young->ne[0] == n_rows);
+
+    const auto base_row = [&](int64_t cell) -> uint8_t * {
+        return (uint8_t *) base->data + (size_t) cell*base->nb[1];
+    };
+    const auto pool_row = [&](int64_t row) -> uint8_t * {
+        return (uint8_t *) pool->data + (size_t) row*pool->nb[1];
+    };
+
+    // center fill first (SPEC 4.4): live old-only cells of a granule that just gained a young slot
+    if (fill != nullptr) {
+        GGML_ASSERT(fill->type == GGML_TYPE_I32 && fill->ne[0] == 4);
+        for (int64_t f = 0; f < fill->ne[1]; ++f) {
+            int32_t e[4];
+            for (int j = 0; j < 4; ++j) {
+                e[j] = *(const int32_t *) ((const char *) fill->data + f*fill->nb[1] + j*fill->nb[0]);
+            }
+            const int64_t  granule = e[0];
+            const int64_t  slot    = e[1];
+            const uint64_t mask    = (uint64_t) (uint32_t) e[2] | ((uint64_t) (uint32_t) e[3] << 32);   // bit c = cell c of the granule
+
+            GGML_ASSERT(granule >= 0 && slot >= 0);
+            GGML_ASSERT(slot*GGML_TURBOT_GRANULE + (GGML_TURBOT_GRANULE - 1) < n_pool);
+
+            for (int64_t c = 0; c < GGML_TURBOT_GRANULE; ++c) {
+                if (((mask >> c) & 1) == 0) {
+                    continue;
+                }
+                const int64_t cell = granule*GGML_TURBOT_GRANULE + c;
+                GGML_ASSERT(cell < n_cells);
+                ggml_turbot_fill_side(base_row(cell), sd, pool_row(slot*GGML_TURBOT_GRANULE + c) + part);
+            }
+        }
+    }
+
+    for (int64_t i = 0; i < n_rows; ++i) {
+        const char *  pi   = (const char *) idx->data + i*idx->nb[0];
+        const int64_t cell = idx->type == GGML_TYPE_I64 ? *(const int64_t *) pi : (int64_t) *(const int32_t *) pi;
+        const int32_t yrow = *(const int32_t *) ((const char *) young->data + i*young->nb[0]);
+
+        GGML_ASSERT(cell >= 0 && cell < n_cells);
+        GGML_ASSERT(yrow < n_pool);
+
+        const float * x = (const float *) ((const char *) src->data + i*src->nb[1]);
+        ggml_turbot_encode_side(x, sd, base_row(cell), yrow >= 0 ? pool_row(yrow) + part : nullptr);
+    }
+}
+
 // ggml_compute_forward_get_rows_back
 
 static void ggml_compute_forward_get_rows_back_f32_f16(
@@ -9242,9 +9331,99 @@ static void ggml_compute_forward_flash_attn_ext_f16(
     }
 }
 
+// [TAG_TURBOT] CPU reference of flash attention over a turbot cache (docs/turbot/SPEC.md 6.2), the oracle for the
+// CUDA reader. Cells [0, n_kv) of K and V are decoded to F32 in the rotated domain (young read where the cell's
+// granule owns a pool slot, old read otherwise), then the scalar reference kernel runs on F32 stand-ins of the K/V
+// views, so mask, positional mask, sinks, softcap, ALiBi and GQA broadcast keep their exact semantics.
+//
+// Every CPU thread enters every op, and the f16 driver synchronises its threads with ggml_barrier, so it cannot run
+// on one thread alone. Thread 0 therefore calls the barrier-free one_chunk kernel over all query rows (scratch: one
+// task's DK + 2*DV floats at wdata offset 0, covered by the FLASH_ATTN_EXT work size) and the other threads return;
+// the per-node barrier of the graph loop waits for thread 0.
+static void ggml_compute_forward_flash_attn_ext_turbot(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    if (params->ith != 0) {
+        return;
+    }
+
+    const ggml_tensor * q    = dst->src[0];
+    const ggml_tensor * k    = dst->src[1];
+    const ggml_tensor * v    = dst->src[2];
+    const ggml_tensor * pool = dst->src[7];
+    const ggml_tensor * gtab = dst->src[8];
+
+    GGML_ASSERT(pool != nullptr && gtab != nullptr && "turbot K/V need ggml_flash_attn_ext_set_turbot");
+
+    ggml_turbot_op_params p;
+    ggml_turbot_layer     l;
+    GGML_ASSERT(ggml_turbot_op_params_get(dst, &p) && p.side == GGML_TURBOT_SIDE_BOTH);
+    GGML_ASSERT(ggml_turbot_layer_from_op_params(&p, &l));
+
+    GGML_ASSERT(k->type == ggml_turbot_type_of_s(l.k.s) && v->type == ggml_turbot_type_of_s(l.v.s));
+    GGML_ASSERT(k->ne[0] == GGML_TURBOT_HEAD_DIM && v->ne[0] == GGML_TURBOT_HEAD_DIM);
+    GGML_ASSERT(k->ne[2] == GGML_TURBOT_N_HEAD   && v->ne[2] == GGML_TURBOT_N_HEAD);
+    GGML_ASSERT(k->ne[3] == 1 && v->ne[3] == 1 && k->ne[1] == v->ne[1]);
+    GGML_ASSERT(k->nb[1] == (size_t) l.k.base_row_bytes && v->nb[1] == (size_t) l.v.base_row_bytes);
+    GGML_ASSERT(pool->type == GGML_TYPE_I8 && pool->ne[0] == (int64_t) l.pool_row_bytes);
+    GGML_ASSERT(gtab->type == GGML_TYPE_I32 && ggml_is_contiguous(gtab));
+    GGML_ASSERT(gtab->ne[0]*GGML_TURBOT_GRANULE >= k->ne[1]);
+
+    const int64_t   n_kv   = k->ne[1];
+    const int64_t   n_pool = pool->ne[1];
+    const int32_t * slots  = (const int32_t *) gtab->data;
+
+    std::vector<float> k_f32((size_t) (GGML_TURBOT_ROW_ELEMS*n_kv));
+    std::vector<float> v_f32((size_t) (GGML_TURBOT_ROW_ELEMS*n_kv));
+
+    for (int64_t i = 0; i < n_kv; ++i) {
+        const int32_t   slot = slots[i >> GGML_TURBOT_LOG2_GRANULE];
+        const uint8_t * yrow = nullptr;   // the cell's pool row, [K part][V part], when its granule is young
+        if (slot >= 0) {
+            const int64_t row = ggml_turbot_pool_row(slot, (uint32_t) i);
+            GGML_ASSERT(row < n_pool);
+            yrow = (const uint8_t *) pool->data + (size_t) row*pool->nb[1];
+        }
+        ggml_turbot_decode_side((const uint8_t *) k->data + (size_t) i*k->nb[1], yrow,
+                &l.k, k_f32.data() + GGML_TURBOT_ROW_ELEMS*i);
+        ggml_turbot_decode_side((const uint8_t *) v->data + (size_t) i*v->nb[1], yrow ? yrow + l.pool_v_off : nullptr,
+                &l.v, v_f32.data() + GGML_TURBOT_ROW_ELEMS*i);
+    }
+
+    // F32 stand-ins with the views' shape [256, n_kv, 4, 1]: cell i, head h, element e at 4*(1024*i + 256*h + e)
+    const auto as_f32 = [n_kv](ggml_tensor & t, float * data) {
+        t.type      = GGML_TYPE_F32;
+        t.data      = data;
+        t.nb[0]     = sizeof(float);
+        t.nb[1]     = sizeof(float)*GGML_TURBOT_ROW_ELEMS;
+        t.nb[2]     = sizeof(float)*GGML_TURBOT_HEAD_DIM;
+        t.nb[3]     = sizeof(float)*GGML_TURBOT_ROW_ELEMS*(size_t) n_kv;
+        t.view_src  = nullptr;
+        t.view_offs = 0;
+    };
+    ggml_tensor kf = *k;
+    ggml_tensor vf = *v;
+    as_f32(kf, k_f32.data());
+    as_f32(vf, v_f32.data());
+
+    ggml_tensor d = *dst;
+    d.src[1] = &kf;
+    d.src[2] = &vf;
+    d.src[7] = nullptr;
+    d.src[8] = nullptr;
+
+    const int64_t nr = q->ne[1]*q->ne[2]*q->ne[3];
+    ggml_compute_forward_flash_attn_ext_f16_one_chunk(params, &d, 0, (int) nr, 0, n_kv, nullptr, 0);
+}
+
 void ggml_compute_forward_flash_attn_ext(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
+    // [TAG_TURBOT] turbot K/V decode through ggml-turbot.h; every other type keeps the paths below
+    if (ggml_turbot_is_type(dst->src[1]->type) || ggml_turbot_is_type(dst->src[2]->type)) {
+        ggml_compute_forward_flash_attn_ext_turbot(params, dst);
+        return;
+    }
     switch (dst->op_params[3]) {
         case GGML_PREC_DEFAULT:
         case GGML_PREC_F32:

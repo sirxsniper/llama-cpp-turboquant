@@ -499,6 +499,9 @@ enum fattn_mma_turbo_kv {
     FATTN_MMA_TURBO5P    = 3,   // [TAG_TURBO5P]
     FATTN_MMA_TURBO5P512 = 4,   // [TAG_TURBO5P512] 512-element block, KV rows of 512
 };
+// [TAG_TURBOT] Number of fattn_mma_turbo_kv values. Sizes every array indexed by turbo_mode, so a new mode can never
+// index past the end again (the shared_memory_limit_raised arrays were [4] and [3] with modes up to 4).
+constexpr int FATTN_MMA_TURBO_MODE_COUNT = 5;
 
 // Load a tile of turbo4 K/V straight into the f16 shared tile, dequantizing on the way.
 //
@@ -2671,7 +2674,7 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
 #if !defined(GGML_USE_MUSA)
         // Keyed on turbo_mode as well: each variant is a different kernel and each needs
         // its own shared-memory limit raised.
-        static bool shared_memory_limit_raised[GGML_CUDA_MAX_DEVICES][4] = {{false}};   // [TAG_TURBO5P] one slot per turbo mode
+        static bool shared_memory_limit_raised[GGML_CUDA_MAX_DEVICES][FATTN_MMA_TURBO_MODE_COUNT] = {{false}};   // [TAG_TURBO5P] one slot per turbo mode
         if (!shared_memory_limit_raised[id][turbo_mode]) {
             CUDA_CHECK(cudaFuncSetAttribute(reinterpret_cast<fattn_kernel_ptr_t>(fattn_kernel), cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes_shared_total));
             shared_memory_limit_raised[id][turbo_mode] = true;
@@ -2690,7 +2693,7 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
         }
 
 #if !defined(GGML_USE_MUSA)
-        static bool shared_memory_limit_raised[GGML_CUDA_MAX_DEVICES][3] = {{false}};
+        static bool shared_memory_limit_raised[GGML_CUDA_MAX_DEVICES][FATTN_MMA_TURBO_MODE_COUNT] = {{false}};   // [TAG_TURBOT] was [3], indexed up to 4
         if (!shared_memory_limit_raised[id][turbo_mode]) {
             CUDA_CHECK(cudaFuncSetAttribute(reinterpret_cast<fattn_kernel_ptr_t>(fattn_kernel), cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes_shared_total));
             shared_memory_limit_raised[id][turbo_mode] = true;

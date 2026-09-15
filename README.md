@@ -54,6 +54,7 @@ at those depths.</sub>
 | [Build](#build) | Windows and Linux, from source |
 | [Configuration](#configuration) | launch recipes, flag reference, tuning knobs |
 | [How it works](#how-it-works) | the turbo formats and the attention path |
+| [turbot](#turbot-tiered-kv-cache) | a tiered KV cache: better quality than turbo5p in the same VRAM |
 | [Engineering log](#engineering-log) | every change, with before and after |
 | [Measured and ruled out](#measured-and-ruled-out) | the negative results, with numbers |
 | [Current focus](#current-focus) | where the remaining headroom is |
@@ -571,6 +572,7 @@ Environment variables, for A/B testing rather than daily use.
 | **`turbo4_0`** | **4.25** | 16 Lloyd-Max centroids, nibble packed, WHT pre-rotation |
 | `turbo3_0` | ~3.0 | sub-byte, Hadamard pre-rotation |
 | `turbo2_0` | ~2.0 | WHT-space centroids |
+| `turbot` | 4.3 old, 7 young | tiered: per-head 2-6 bit base codes for every cell, 7-bit refinement for each sequence's newest 16K tokens |
 
 Kernels cover Turing (SM75), Ampere (SM80/86), Ada (SM89) and Blackwell (SM120/121). `turbo4` is the one that matters here.
 
@@ -609,9 +611,69 @@ Choosing by exact divisor instead (6 % 2 == 0, so 2) fixed it.
 
 </details>
 
+### turbot tiered KV cache
+
+`turbot` keeps every cell as a compact per-head base code (2-6 bits in the WHT domain, widths chosen per layer, head and side by a plan file) and adds a 7-bit nested refinement for the newest 16,384 tokens of each sequence. Aging is metadata only: a granule of 64 cells drops its refinement slot when it leaves the young band, with no re-encode. The CUDA read runs natively in its own MMA instances; the writer is a single `TURBOT_SET_ROWS` op per layer side.
+
+```
+-ctk turbot -ctv turbot --kv-tier-plan docs/turbot/plans/turbot-default.plan
+```
+
+`LLAMA_TURBOT_PLAN` can carry the plan instead of the flag (llama-bench and llama-perplexity use it). `LLAMA_TURBOT=0` falls back to turbo5p. It needs flash attention, CUDA and a unified KV pool; the DFlash2 drafter cache stays turbo5p.
+
+<sub>Qwen3.8-27B-UD-Q5_K_XL, RTX 5090, 262,144 cells, same build for both caches.</sub>
+
+| | turbo5p | **turbot** | f16 floor |
+|:--|--:|--:|--:|
+| KV cache at 262,144 cells | 5,248.00 MiB | **5,246.00 MiB** | |
+| Code KLD / same-top (16 x 32K) | 0.001631 / 99.120% | **0.001137 / 99.267%** | 0.001041 / 99.306% |
+| Prose KLD / same-top (16 x 32K) | 0.002550 / 97.862% | **0.001848 / 98.174%** | 0.001699 / 98.230% |
+| tg64, depth 0 / 131K / 245K | 57.77 / 47.17 / 40.37 t/s | **61.39 / 50.07 / 43.78 t/s** | |
+| pp512, depth 0 / 131K / 245K | 3463 / 1605 / 1091 t/s | 3437 / 1502 / 1003 t/s | |
+| DFlash2 server ms/step, 131K / 200K | 26.20 / 28.20 | 27.04 / 28.72 | |
+| DFlash2 acceptance, matched prompts, 131K | 0.783 | **0.788** | |
+
+Short-context and multi-slot acceptance also match turbo5p within 0.02 (single prose 0.451 vs 0.440, code 0.764 vs 0.771, four agents 0.629 vs 0.638).
+
+<details>
+<summary><b>What made the read fast enough</b></summary>
+
+<br>
+
+The first working build decoded at 37.1 t/s at 131K, 21% below turbo5p. Four changes closed it:
+
+- **Slowest-block layout.** stream_k blocks run in parallel and the op waits for the slowest one. With one KV head per block, a 6-bit head or a block full of young cells gated the whole op. Decode layouts now use striped blocks, so every block holds the same mix.
+- **Compile-time widths.** The loaders are templated on the base width and refinement width, so plane layout, shifts and gather paths are constants. Mean -17% per op. Configs with 16 columns or fewer keep the runtime loaders to avoid a stack spill.
+- **Q=1 routing.** Single-query decode runs the `<4,8>` instance instead of `<1,8>` (-46% per op), with a row-wrapping KV-bounds scan so the mask is never read past its last row.
+- **KV_min classification.** A block that owns a whole output tile was treated as a fixup block once KV_min moved its start, leaving tiles unnormalised at ubatch 1280 with the positional mask.
+
+</details>
+
+<details>
+<summary><b>Limits</b></summary>
+
+<br>
+
+- Prefill is 4-8% slower than turbo5p at 131K and 245K.
+- A cached long prompt (over 16K tokens) can decode slightly differently from the same prompt sent cold: tail cells that aged out come back with fill codes when the generated tokens are trimmed.
+- Two-token verify batches still run the `<2,8>` instance.
+
+Contract and tests: [docs/turbot/SPEC.md](docs/turbot/SPEC.md), [docs/turbot/TESTING.md](docs/turbot/TESTING.md). Plan tools: `tools/turbot/`.
+
+</details>
+
 ---
 
 ## Engineering log
+
+<details open>
+<summary><b>September 2026 — turbot tiered KV cache</b> &nbsp;·&nbsp; <code>code KLD -30%, prose -28% vs turbo5p in the same VRAM</code></summary>
+
+<br>
+
+A two-tier KV cache sized to turbo5p's footprint: per-head base codes for every cell and a 7-bit refinement for each sequence's newest 16K tokens. Quality lands between turbo5p and q8_0 on code and at the f16 floor on prose. llama-bench decode is faster than turbo5p at every depth (50.07 vs 47.17 t/s at 131K, 43.78 vs 40.37 at 245K); the DFlash2 server step is within 3% of turbo5p. 195/195 turbot FA cases and 28/28 writer cases pass against the CPU reference, compute-sanitizer reports 0 errors, and every existing kernel keeps identical codegen.
+
+</details>
 
 <details open>
 <summary><b>August 2026 — FA GQA packing chosen by Q width</b> &nbsp;·&nbsp; <code>-29% step time at 131K</code></summary>
@@ -806,6 +868,7 @@ Long-context throughput on a single RTX 5090: holding a full 262,144-token conte
 - **Decode is at the practical ceiling.** After the V gather fix the KV read costs 6.00 ms at `d131072`, against `q8_0`'s 6.01 ms at twice the VRAM and `f16`'s 5.63 ms at 3.8×. The remaining 6% would have to come from the K dot, which already uses `__dp4a` with a byte-permute LUT.
 - **Prefill attention has headroom, but not from tuning.** The MMA config is swept out — `ncols2` and `nbatch_fa` won, `nthreads`, `occupancy` and `ncols1` all lose. Attention is 77% of prefill at depth at ~101 TFLOPS. Further gain needs kernel work.
 - **Wide-Q native turbo reads.** Prefill still uses F16 conversion, because it amortises across many Q tiles. Measured: an `f16` cache prefills only ~3% faster, so the conversion is close to free and this is not a promising lever.
+- **turbot prefill.** The tiered cache still prefills 4-8% slower than turbo5p at depth, and two-token verify batches run the slower `<2,8>` instance.
 
 ---
 

@@ -18,6 +18,9 @@
 #include "llama-triattention.h"
 #include "llama.h"
 
+#include "ggml-turbot.h"
+
+#include <atomic>
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
@@ -1404,6 +1407,31 @@ static bool turbo_nan_scan_cb(struct ggml_tensor * t, bool ask, void * /*user_da
     return true;
 }
 
+// [TAG_TURBOT] the attention cache of this memory when it is a turbot cache, nullptr otherwise
+static llama_kv_cache * llama_turbot_kv_of(llama_memory_i * mem) {
+    llama_kv_cache * kv = dynamic_cast<llama_kv_cache *>(mem);
+    if (kv == nullptr) {
+        if (auto * hyb = dynamic_cast<llama_memory_hybrid *>(mem)) {
+            kv = hyb->get_mem_attn();
+        }
+    }
+    return kv != nullptr && kv->is_turbot() ? kv : nullptr;
+}
+
+// [TAG_TURBOT] LLAMA_TURBOT_FAIL_UBATCH=<n>: the n-th ubatch (1-based, process-wide) of a turbot context is reported as
+// failed after it computed, so the failure path (abort, seq_rm rollback) can be tested without a real fault
+static bool llama_turbot_fail_ubatch_hit() {
+    static const int64_t n_fail = [] {
+        const char * e = getenv("LLAMA_TURBOT_FAIL_UBATCH");
+        return e ? (int64_t) atoll(e) : (int64_t) 0;
+    }();
+    if (n_fail <= 0) {
+        return false;
+    }
+    static std::atomic<int64_t> n_seen{0};
+    return ++n_seen == n_fail;
+}
+
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
@@ -1907,7 +1935,21 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
         const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
 
+        // [TAG_TURBOT] the tier of a turbot attention cache: demotion only after a successful ubatch (SPEC 9.6)
+        llama_kv_cache * turbot_kv = llama_turbot_kv_of(memory.get());
+
+        if (turbot_kv && res && llama_turbot_fail_ubatch_hit()) {
+            LLAMA_LOG_WARN("%s: LLAMA_TURBOT_FAIL_UBATCH: reporting this ubatch as failed\n", __func__);
+            res    = nullptr;
+            status = GGML_STATUS_FAILED;
+        }
+
         if (!res) {
+            // [TAG_TURBOT] before the seq_rm below: the fills of this ubatch are queued again, nothing is demoted
+            if (turbot_kv) {
+                turbot_kv->turbot_abort_ubatch();
+            }
+
             // the last ubatch failed or was aborted -> remove all positions of that ubatch from the memory module
             llama_pos pos_min[LLAMA_MAX_SEQ];
             for (int s = 0; s < LLAMA_MAX_SEQ; ++s) {
@@ -1936,6 +1978,11 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 case GGML_STATUS_FAILED:       return -3;
                 case GGML_STATUS_SUCCESS:      GGML_ABORT("should not happen");
             }
+        }
+
+        // [TAG_TURBOT] the ubatch computed: recompute the young quotas and free the granules nobody wants young
+        if (turbot_kv) {
+            turbot_kv->turbot_commit_ubatch();
         }
 
         // plot the computation graph in dot format (for debugging purposes)
@@ -3841,6 +3888,30 @@ llama_context * llama_init_from_model(
         }
     }
 
+    // [TAG_TURBOT] tiered KV cache selection (docs/turbot/SPEC.md 9.2). GGML_TYPE_TURBOT_S8 is the "turbot requested"
+    // sentinel; the cache constructor validates the geometry and the plan.
+    if (ggml_turbot_is_type(params.type_k) || ggml_turbot_is_type(params.type_v)) {
+        const char * LLAMA_TURBOT = getenv("LLAMA_TURBOT");
+        if (LLAMA_TURBOT && strcmp(LLAMA_TURBOT, "0") == 0) {
+            LLAMA_LOG_WARN("%s: LLAMA_TURBOT=0: turbot disabled, using turbo5p\n", __func__);
+            params.type_k = GGML_TYPE_TURBO5P_0;
+            params.type_v = GGML_TYPE_TURBO5P_0;
+        } else {
+            if (!ggml_turbot_is_type(params.type_k) || !ggml_turbot_is_type(params.type_v)) {
+                LLAMA_LOG_ERROR("%s: turbot needs -ctk turbot and -ctv turbot together\n", __func__);
+                return nullptr;
+            }
+            if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO) {
+                LLAMA_LOG_INFO("%s: enabling flash_attn since it is required for the turbot KV cache\n", __func__);
+                params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+            }
+            if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_DISABLED) {
+                LLAMA_LOG_ERROR("%s: turbot KV cache requires flash_attn to be enabled\n", __func__);
+                return nullptr;
+            }
+        }
+    }
+
     if ((model->hparams.is_mla() || model->arch == LLM_ARCH_DEEPSEEK4) && params.type_k != params.type_v) {
         LLAMA_LOG_ERROR("%s: model does not support different K (%s) and V (%s) cache types\n", __func__, ggml_type_name(params.type_k), ggml_type_name(params.type_v));
         return nullptr;
@@ -3909,7 +3980,8 @@ llama_context * llama_init_from_model(
         }
     }
 
-    if (params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED && ggml_is_quantized(params.type_k)) {
+    // [TAG_TURBOT] turbot validates its own geometry in the cache constructor
+    if (params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED && ggml_is_quantized(params.type_k) && !ggml_turbot_is_type(params.type_k)) {
         const uint32_t blck_size = ggml_blck_size(params.type_k);
         const bool k_is_turbo = (params.type_k == GGML_TYPE_TURBO2_0 ||
                                  params.type_k == GGML_TYPE_TURBO3_0 ||
@@ -3946,7 +4018,8 @@ llama_context * llama_init_from_model(
         }
     }
 
-    if (params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED && ggml_is_quantized(params.type_v)) {
+    // [TAG_TURBOT] turbot validates its own geometry in the cache constructor
+    if (params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED && ggml_is_quantized(params.type_v) && !ggml_turbot_is_type(params.type_v)) {
         const uint32_t blck_size = ggml_blck_size(params.type_v);
         const bool v_is_turbo = (params.type_v == GGML_TYPE_TURBO2_0 ||
                                  params.type_v == GGML_TYPE_TURBO3_0 ||

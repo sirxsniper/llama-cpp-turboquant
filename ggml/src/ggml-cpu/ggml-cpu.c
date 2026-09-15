@@ -14,6 +14,7 @@
 #include "vec.h"
 #include "ops.h"
 #include "ggml.h"
+#include "ggml-turbot.h" // [TAG_TURBOT]
 #include "common.h"
 
 #if defined(_MSC_VER) || defined(__MINGW32__)
@@ -2212,6 +2213,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_turbo_wht(params, tensor);
             } break;
+        case GGML_OP_TURBOT_SET_ROWS:
+            {
+                ggml_compute_forward_turbot_set_rows(params, tensor);
+            } break;
         case GGML_OP_MAP_CUSTOM1:
             {
                 ggml_compute_forward_map_custom1(params, tensor);
@@ -2478,6 +2483,10 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
                 //n_tasks = n_threads;
                 n_tasks = 1;
             } break;
+        case GGML_OP_TURBOT_SET_ROWS:
+            {
+                n_tasks = 1; // [TAG_TURBOT] CPU reference writer, thread 0 only
+            } break;
         case GGML_OP_SCALE:
         case GGML_OP_SET:
         case GGML_OP_RESHAPE:
@@ -2532,13 +2541,17 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_TIMESTEP_EMBEDDING:
         case GGML_OP_ARGSORT:
         case GGML_OP_TOP_K:
-        case GGML_OP_FLASH_ATTN_EXT:
         case GGML_OP_FLASH_ATTN_BACK:
         case GGML_OP_SSM_CONV:
         case GGML_OP_SSM_SCAN:
         case GGML_OP_LIGHTNING_INDEXER:
             {
                 n_tasks = n_threads;
+            } break;
+        case GGML_OP_FLASH_ATTN_EXT:
+            {
+                // [TAG_TURBOT] the turbot CPU reference runs on thread 0 only (ops.cpp): one task of scratch
+                n_tasks = ggml_turbot_is_type(node->src[1]->type) ? 1 : n_threads;
             } break;
         case GGML_OP_RWKV_WKV6:
         case GGML_OP_GATED_LINEAR_ATTN:
@@ -3133,6 +3146,10 @@ struct ggml_cplan ggml_graph_plan(
                 case GGML_OP_TURBO_WHT:
                     {
                         cur = 0;  // no extra workspace needed
+                    } break;
+                case GGML_OP_TURBOT_SET_ROWS:
+                    {
+                        cur = 0;  // [TAG_TURBOT] the CPU reference coder works on the stack
                     } break;
                 case GGML_OP_COUNT:
                     {

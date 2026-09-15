@@ -4,8 +4,22 @@
 #include "fattn-tile.cuh"
 #include "fattn-vec.cuh"
 #include "fattn.cuh"
+#include "fattn-turbot-decl.cuh"   // [TAG_TURBOT] host declarations only, never turbot-tables.cuh
+#include "ggml-turbot.h"
 
 #include <set>
+
+// [TAG_TURBOT] every D=256 case call passes through here so a turbot K/V reaches its own kernel instances
+template <int DKQ, int DV, int ncols1, int ncols2>
+static void ggml_cuda_fattn_mma_case_dispatch(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    if constexpr (DKQ == 256 && DV == 256 && ncols2 <= 8) {
+        if (ggml_turbot_is_type(dst->src[1]->type)) {
+            ggml_cuda_flash_attn_ext_turbot_case<DKQ, DV, ncols1, ncols2>(ctx, dst);
+            return;
+        }
+    }
+    ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, ncols1, ncols2>(ctx, dst);
+}
 
 template <int DKQ, int DV, int ncols2>
 static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -14,21 +28,31 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_con
 
     if constexpr (ncols2 <= 8) {
         if (turing_mma_available(cc) && Q->ne[1] <= 8/ncols2) {
-            ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 8/ncols2, ncols2>(ctx, dst);
+            // [TAG_TURBOT_Q1_ROUTE] turbot only: a single query runs on the <4,8> instance, not <1,8>. At the deployed
+            // shape <4,8> computes 4x the queries at nb 4 and is still faster than <1,8> at nb 1 (B0, 131K 261 vs 483
+            // us/op), so the extra columns cost less than the <1,8> kernel shape. The kernel zero-fills the missing Q
+            // columns and skips their output; launch_fattn_turbot scans only the real mask row for the KV bounds.
+            if constexpr (DKQ == 256 && DV == 256 && ncols2 == 8) {
+                if (Q->ne[1] == 1 && ggml_turbot_is_type(dst->src[1]->type)) {
+                    ggml_cuda_fattn_mma_case_dispatch<DKQ, DV, 4, ncols2>(ctx, dst);
+                    return;
+                }
+            }
+            ggml_cuda_fattn_mma_case_dispatch<DKQ, DV, 8/ncols2, ncols2>(ctx, dst);
             return;
         }
     }
 
     if constexpr (ncols2 <= 16) {
         if (Q->ne[1] <= 16/ncols2) {
-            ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 16/ncols2, ncols2>(ctx, dst);
+            ggml_cuda_fattn_mma_case_dispatch<DKQ, DV, 16/ncols2, ncols2>(ctx, dst);
             return;
         }
     }
 
     if (Q->ne[1] <= 32/ncols2 || (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) == GGML_CUDA_CC_TURING) ||
             (GGML_CUDA_CC_IS_AMD(cc) && DKQ > 256)) {
-        ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 32/ncols2, ncols2>(ctx, dst);
+        ggml_cuda_fattn_mma_case_dispatch<DKQ, DV, 32/ncols2, ncols2>(ctx, dst);
         return;
     }
 
@@ -42,12 +66,12 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_con
             return !(e && e[0] == '0');
         }();
         if (ncols128_on && Q->ne[1] >= 128/ncols2 && turing_mma_available(cc)) {
-            ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 128/ncols2, ncols2>(ctx, dst);
+            ggml_cuda_fattn_mma_case_dispatch<DKQ, DV, 128/ncols2, ncols2>(ctx, dst);
             return;
         }
     }
 
-    ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 64/ncols2, ncols2>(ctx, dst);
+    ggml_cuda_fattn_mma_case_dispatch<DKQ, DV, 64/ncols2, ncols2>(ctx, dst);
 }
 
 template <int DKQ, int DV>
@@ -651,6 +675,17 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
             return BEST_FATTN_KERNEL_NONE;
     }
 
+    // [TAG_TURBOT] turbot K/V is read natively by its own MMA instances at every Q width, Q = 1 included. There is no
+    // VEC or TILE instance and no F16 conversion (a turbot row cannot decode without the plan), so anything the MMA
+    // turbot kernel cannot take is refused here, before any of the turbo routing below can see the type.
+    if (ggml_turbot_is_type(K->type) || ggml_turbot_is_type(V->type)) {
+        const bool ok = ggml_turbot_is_type(K->type) && ggml_turbot_is_type(V->type) &&
+                        Q->ne[0] == 256 && K->ne[0] == 256 && V->ne[0] == 256 && K->ne[2] == 4 && V->ne[2] == 4 &&
+                        dst->src[7] != nullptr && dst->src[8] != nullptr &&
+                        (!mask || mask->ne[2] == 1) && Q->ne[3] == 1 && turing_mma_available(cc);
+        return ok ? BEST_FATTN_KERNEL_MMA_F16 : BEST_FATTN_KERNEL_NONE;
+    }
+
 #ifndef GGML_CUDA_FA_ALL_QUANTS
     if (K->type != V->type) {
         // Allow mixed turbo KV types (any combination of turbo2, turbo3, q8_0)
@@ -902,6 +937,14 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
     bool need_f16_K = false;
     bool need_f16_V = false;
 
+    // [TAG_TURBOT] A turbot cache is always read natively by its own MMA instances and has no F16 conversion at all,
+    // so no F16 scratch is ever reserved for it (SPEC decision 10), whatever the kernel choice above says.
+    if (ggml_turbot_is_type(K->type)) {
+        const ggml_cuda_flash_attn_ext_f16_extra_data turbot_extra =
+            ggml_cuda_flash_attn_ext_get_f16_extra_data(dst, need_f16_K, need_f16_V);
+        return turbot_extra.end - (uintptr_t) dst->data;
+    }
+
     switch (kernel) {
         case BEST_FATTN_KERNEL_TILE:
             need_f16_K = true;
@@ -1031,6 +1074,27 @@ bool ggml_cuda_flash_attn_ext_supported(int device, const ggml_tensor * dst) {
     if (dst->src[5] != nullptr) {
         if (dst->src[3] != nullptr || dst->src[6] == nullptr || dst->src[5]->type != GGML_TYPE_I32 || dst->src[6]->type != GGML_TYPE_I32 ||
             dst->src[0]->ne[3] != 1 || !ggml_is_contiguous(dst->src[5]) || !ggml_is_contiguous(dst->src[6])) {
+            return false;
+        }
+    }
+    // [TAG_TURBOT] a turbot K/V needs its young pool, its granule table and valid layout params (SPEC 5.2, 7.6); the
+    // routing rule itself lives in ggml_cuda_get_best_fattn_kernel
+    if (ggml_turbot_is_type(dst->src[1]->type) || ggml_turbot_is_type(dst->src[2]->type)) {
+        const ggml_tensor * pool = dst->src[7];
+        const ggml_tensor * gtab = dst->src[8];
+        if (pool == nullptr || gtab == nullptr || pool->type != GGML_TYPE_I8 || gtab->type != GGML_TYPE_I32 ||
+                !ggml_is_contiguous(gtab) || gtab->ne[0]*GGML_TURBOT_GRANULE < dst->src[1]->ne[1]) {
+            return false;
+        }
+        ggml_turbot_op_params tp;
+        ggml_turbot_layer     tl;
+        if (!ggml_turbot_op_params_get(dst, &tp) || tp.side != GGML_TURBOT_SIDE_BOTH || !ggml_turbot_layer_from_op_params(&tp, &tl)) {
+            return false;
+        }
+        if (!ggml_turbot_is_type(dst->src[1]->type) || !ggml_turbot_is_type(dst->src[2]->type) ||
+                ggml_turbot_s_of_type(dst->src[1]->type) != tl.k.s || ggml_turbot_s_of_type(dst->src[2]->type) != tl.v.s ||
+                pool->ne[0] != (int64_t) tl.pool_row_bytes || pool->nb[0] != 1 ||
+                dst->src[1]->nb[1] != (size_t) tl.k.base_row_bytes || dst->src[2]->nb[1] != (size_t) tl.v.base_row_bytes) {
             return false;
         }
     }

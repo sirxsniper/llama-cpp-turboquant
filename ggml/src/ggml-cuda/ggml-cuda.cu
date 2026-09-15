@@ -64,6 +64,7 @@
 #include "ggml-cuda/dsv4-hc.cuh"
 #include "ggml-cuda/set.cuh"
 #include "ggml-cuda/set-rows.cuh"
+#include "ggml-cuda/turbot-set-rows.cuh"   // [TAG_TURBOT]
 #include "ggml-cuda/turbo-wht.cuh"
 #include "ggml-cuda/pad_reflect_1d.cuh"
 #include "ggml-cuda/solve_tri.cuh"
@@ -2127,6 +2128,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_SET_ROWS:
             ggml_cuda_op_set_rows(ctx, dst);
+            break;
+        case GGML_OP_TURBOT_SET_ROWS:   // [TAG_TURBOT]
+            ggml_cuda_op_turbot_set_rows(ctx, dst);
             break;
         case GGML_OP_TURBO_WHT:
             ggml_cuda_turbo_wht(ctx, dst);
@@ -5389,6 +5393,12 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                        ) &&
                        (op->src[1]->type == GGML_TYPE_I64 || op->src[1]->type == GGML_TYPE_I32);
             } break;
+        case GGML_OP_TURBOT_SET_ROWS:
+            // [TAG_TURBOT] SPEC 5.4: the op checks, plus the base cache (src[2]) and the young pool (src[3]) written in
+            // place in CUDA buffers. A tensor without a buffer yet is placed on this device by the scheduler.
+            return ggml_cuda_turbot_set_rows_supported(op) &&
+                   (op->src[2]->buffer == nullptr || ggml_backend_buft_is_cuda(op->src[2]->buffer->buft)) &&
+                   (op->src[3]->buffer == nullptr || ggml_backend_buft_is_cuda(op->src[3]->buffer->buft));
         case GGML_OP_SET:
             {
                 const ggml_type t = op->type;

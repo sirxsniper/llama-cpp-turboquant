@@ -449,7 +449,28 @@ extern "C" {
         // [TAG_TURBO5P512] turbo5p with a 512-element block, for models whose KV row is 512
         // (n_head_kv 2 x head 256). Same maths, four WHT groups instead of eight.
         GGML_TYPE_TURBO5P512_0 = 48,
-        GGML_TYPE_COUNT   = 49,
+        // [TAG_TURBOT] tiered KV cache base rows (docs/turbot/SPEC.md, ggml/include/ggml-turbot.h). One type per
+        // S = sum of the 4 per-head old widths of a layer-side: blck_size 1024, type_size 32*S + 16. A row decodes
+        // only with the per-head widths carried in the op params, so the family has no to_float. TURBOT_S8 doubles
+        // as the "turbot requested" sentinel in llama_context_params.type_k/type_v.
+        GGML_TYPE_TURBOT_S8  = 49,
+        GGML_TYPE_TURBOT_S9  = 50,
+        GGML_TYPE_TURBOT_S10 = 51,
+        GGML_TYPE_TURBOT_S11 = 52,
+        GGML_TYPE_TURBOT_S12 = 53,
+        GGML_TYPE_TURBOT_S13 = 54,
+        GGML_TYPE_TURBOT_S14 = 55,
+        GGML_TYPE_TURBOT_S15 = 56,
+        GGML_TYPE_TURBOT_S16 = 57,
+        GGML_TYPE_TURBOT_S17 = 58,
+        GGML_TYPE_TURBOT_S18 = 59,
+        GGML_TYPE_TURBOT_S19 = 60,
+        GGML_TYPE_TURBOT_S20 = 61,
+        GGML_TYPE_TURBOT_S21 = 62,
+        GGML_TYPE_TURBOT_S22 = 63,
+        GGML_TYPE_TURBOT_S23 = 64,
+        GGML_TYPE_TURBOT_S24 = 65,
+        GGML_TYPE_COUNT   = 66,
     };
 
     // precision
@@ -609,6 +630,8 @@ extern "C" {
         GGML_OP_OPT_STEP_SGD,
 
         GGML_OP_GLU,
+
+        GGML_OP_TURBOT_SET_ROWS, // [TAG_TURBOT] appended last so that no existing op value moves
 
         GGML_OP_COUNT,
     };
@@ -1716,6 +1739,31 @@ extern "C" {
             struct ggml_tensor  * b,  // source
             struct ggml_tensor  * c); // row indices
 
+    // [TAG_TURBOT] tiered KV cache (docs/turbot/SPEC.md 5.2). Layout, op params and the reference coder live in
+    // ggml/include/ggml-turbot.h.
+    struct ggml_turbot_op_params;
+
+    // Write K or V rows into a turbot base cache and, for rows with a young pool row, into the young pool.
+    //   a      : base cache, turbot type, [1024, kv_size, 1, 1] (contiguous rows)
+    //   b      : F32 [1024, n_rows, 1, 1], ggml_is_contiguous_rows
+    //   c      : I64 or I32 [n_rows], destination cell of each row
+    //   pool   : GGML_TYPE_I8 [pool_row_bytes, n_pool_rows, 1, 1] (the layer's young pool, never NULL)
+    //   young  : I32 [n_rows], young pool row of each row, or -1
+    //   fill   : I32 [4, n_fill] of (granule, slot, mask_lo, mask_hi), or NULL
+    //   params : side GGML_TURBOT_SIDE_K or _V; ggml_turbot_type_of_s(side.s) must equal a->type
+    // Fill entries are applied before the rows.
+    //
+    // return view(a)
+    GGML_API struct ggml_tensor * ggml_turbot_set_rows(
+            struct ggml_context                * ctx,
+            struct ggml_tensor                 * a,
+            struct ggml_tensor                 * b,
+            struct ggml_tensor                 * c,
+            struct ggml_tensor                 * pool,
+            struct ggml_tensor                 * young,
+            struct ggml_tensor                 * fill,
+            const struct ggml_turbot_op_params * params);
+
     GGML_API struct ggml_tensor * ggml_diag(
         struct ggml_context     * ctx,
         struct ggml_tensor      * a);
@@ -2487,6 +2535,16 @@ extern "C" {
             struct ggml_tensor * a,
             struct ggml_tensor * kv_pos,
             struct ggml_tensor * q_pos);
+
+    // [TAG_TURBOT] Mark a GGML_OP_FLASH_ATTN_EXT whose K and V are turbot views. Sets src[7] = pool, src[8] = gtab and
+    // the turbot op params (side GGML_TURBOT_SIDE_BOTH) at op_params byte 16; bytes 0..15 (scale, max_bias, softcap,
+    // prec) are untouched. gtab: I32 [n_granules], contiguous, n_granules*64 >= K->ne[1], entry g = young slot of
+    // granule g or -1. pool: the layer's young pool, GGML_TYPE_I8 [pool_row_bytes, n_pool_rows].
+    GGML_API void ggml_flash_attn_ext_set_turbot(
+            struct ggml_tensor                 * a,
+            struct ggml_tensor                 * pool,
+            struct ggml_tensor                 * gtab,
+            const struct ggml_turbot_op_params * params);
 
     // TODO: needs to be adapted to ggml_flash_attn_ext
     GGML_API struct ggml_tensor * ggml_flash_attn_back(

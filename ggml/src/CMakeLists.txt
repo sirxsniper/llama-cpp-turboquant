@@ -196,6 +196,8 @@ add_library(ggml-base
             ../include/ggml-cpp.h
             ../include/ggml-opt.h
             ../include/ggml-turbo-innerq.h
+            ../include/ggml-turbot.h
+            ../include/ggml-turbot-tables.h
             ../include/gguf.h
             ggml.c
             ggml.cpp

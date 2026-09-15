@@ -19,6 +19,7 @@
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cpp.h"
+#include "ggml-turbot.h"
 
 #include <algorithm>
 #include <atomic>
@@ -1443,6 +1444,12 @@ struct test_case {
                     ud->ok = false;
                     return true;
                 }
+            }
+
+            // [TAG_TURBOT] a turbot cache row has no to_float (its layout needs the plan). The writer's result is a view
+            // of the cache; the turbot FA that reads it back is the node compared instead.
+            if (ggml_turbot_is_type(t1->type)) {
+                return true;
             }
 
             std::vector<float> f1 = tensor_to_float(t1);
@@ -7356,6 +7363,621 @@ struct test_flash_attn_ext_pos : public test_case {
     }
 };
 
+// [TAG_TURBOT] Tiered KV cache cases (docs/turbot/SPEC.md 11.2). The cache bytes are encoded on the host with
+// ggml-turbot.h, so the FA cases need no writer. The writer cases read their rows back through the turbot FA: a turbot
+// row has no to_float (its layout needs the plan), and the harness compares F32 outputs.
+// Layout of every case: base caches [1024, kv_size] (kv_size a multiple of 64, one granule more than the FA view
+// needs), K/V FA views [256, n_kv, 4, 1] built like llama_kv_cache::get_k, a young pool I8 [pool_row_bytes, rows] and a
+// granule table I32 [kv_size / 64]. Young slots are handed out in reverse granule order so pool order never matches cell
+// order, and pool rows no granule owns hold noise.
+enum turbot_test_widths {
+    TURBOT_TW_L23,       // default plan layer 23: K 5 4 4 6, V 5 4 4 5, young 7
+    TURBOT_TW_MIXED,     // K 2 6 3 5 (young 8 7 7 7), V 4 2 6 3 (young 7 7 8 5): K != V, every plane shape, r = 1..6
+    TURBOT_TW_UNIFORM5,  // 5 bits everywhere, young 7
+    TURBOT_TW_UNIFORM6,  // 6 bits everywhere (every head on the float old path), young 7
+};
+
+enum turbot_test_mix {
+    TURBOT_MIX_OLD,      // gtab all -1
+    TURBOT_MIX_YOUNG,    // every granule young
+    TURBOT_MIX_ALT,      // odd granules young
+    TURBOT_MIX_TAIL,     // only the granule of the last cell young (the last partial tile)
+    TURBOT_MIX_BAND16K,  // granules overlapping the newest 16,384 cells young
+    TURBOT_MIX_BAND64K,  // granules overlapping the newest 65,024 cells young
+};
+
+static const char * turbot_test_widths_name(turbot_test_widths w) {
+    switch (w) {
+        case TURBOT_TW_L23:      return "l23";
+        case TURBOT_TW_MIXED:    return "mixed";
+        case TURBOT_TW_UNIFORM5: return "uniform5";
+        case TURBOT_TW_UNIFORM6: return "uniform6";
+    }
+    return "?";
+}
+
+static const char * turbot_test_mix_name(turbot_test_mix m) {
+    switch (m) {
+        case TURBOT_MIX_OLD:     return "old";
+        case TURBOT_MIX_YOUNG:   return "young";
+        case TURBOT_MIX_ALT:     return "alt";
+        case TURBOT_MIX_TAIL:    return "tail";
+        case TURBOT_MIX_BAND16K: return "band16k";
+        case TURBOT_MIX_BAND64K: return "band64k";
+    }
+    return "?";
+}
+
+static ggml_turbot_layer turbot_test_layer(turbot_test_widths w) {
+    static const uint8_t l23_bk[4] = { 5, 4, 4, 6 }, l23_bv[4] = { 5, 4, 4, 5 };
+    static const uint8_t mix_bk[4] = { 2, 6, 3, 5 }, mix_yk[4] = { 8, 7, 7, 7 };
+    static const uint8_t mix_bv[4] = { 4, 2, 6, 3 }, mix_yv[4] = { 7, 7, 8, 5 };
+    static const uint8_t u5[4]     = { 5, 5, 5, 5 }, y7[4]     = { 7, 7, 7, 7 };
+    static const uint8_t u6[4]     = { 6, 6, 6, 6 };
+    ggml_turbot_layer l{};
+    bool ok = false;
+    switch (w) {
+        case TURBOT_TW_L23:      ok = ggml_turbot_layer_init(&l, l23_bk, l23_bv, y7, y7);         break;
+        case TURBOT_TW_MIXED:    ok = ggml_turbot_layer_init(&l, mix_bk, mix_bv, mix_yk, mix_yv); break;
+        case TURBOT_TW_UNIFORM5: ok = ggml_turbot_layer_init(&l, u5, u5, y7, y7);                 break;
+        case TURBOT_TW_UNIFORM6: ok = ggml_turbot_layer_init(&l, u6, u6, y7, y7);                 break;
+    }
+    GGML_ASSERT(ok);
+    return l;
+}
+
+static uint64_t turbot_test_splitmix(uint64_t & s) {
+    uint64_t z = (s += 0x9e3779b97f4a7c15ull);
+    z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ull;
+    z = (z ^ (z >> 27)) * 0x94d049bb133111ebull;
+    return z ^ (z >> 31);
+}
+
+// one pseudo-random K or V row: uniform [-1, 1] times a per-row scale 2^-2 .. 2^2, one outlier channel per head, and an
+// exact zero row every 97 cells (the zero-gain path)
+static void turbot_test_row(uint64_t seed, int64_t cell, float * x) {
+    if (cell % 97 == 5) {
+        memset(x, 0, 1024 * sizeof(float));
+        return;
+    }
+    uint64_t s = seed * 0x100000001b3ull + (uint64_t) cell;
+    const float scale = 0.25f * (float) (1 << (turbot_test_splitmix(s) % 5));
+    for (int i = 0; i < 1024; ++i) {
+        x[i] = scale * ((float) (turbot_test_splitmix(s) >> 40) / (float) (1 << 24) * 2.0f - 1.0f);
+    }
+    for (int h = 0; h < 4; ++h) {
+        x[256 * h + (int) (turbot_test_splitmix(s) % 256)] *= 8.0f;
+    }
+}
+
+struct turbot_test_cache {
+    ggml_turbot_layer    layer{};
+    int64_t              kv_size     = 0;   // cells of the base tensors
+    int64_t              n_pool_rows = 0;
+    std::vector<int32_t> gtab;              // [kv_size / 64] slot or -1
+    std::vector<uint8_t> base_k;
+    std::vector<uint8_t> base_v;
+    std::vector<uint8_t> pool;
+};
+
+// slot of every granule for a young pattern over the first n_kv cells
+static void turbot_test_plan_granules(turbot_test_cache & c, int64_t n_kv, turbot_test_mix mix) {
+    const int64_t n_gran = c.kv_size / 64;
+    const int64_t g_last = (n_kv - 1) / 64;
+    std::vector<int64_t> young;
+    for (int64_t g = 0; g < n_gran; ++g) {
+        bool y = false;
+        switch (mix) {
+            case TURBOT_MIX_OLD:     y = false;                                          break;
+            case TURBOT_MIX_YOUNG:   y = true;                                           break;
+            case TURBOT_MIX_ALT:     y = g % 2 == 1;                                     break;
+            case TURBOT_MIX_TAIL:    y = g == g_last;                                    break;
+            case TURBOT_MIX_BAND16K: y = g <= g_last && (g + 1) * 64 > n_kv - 16384;     break;
+            case TURBOT_MIX_BAND64K: y = g <= g_last && (g + 1) * 64 > n_kv - 65024;     break;
+        }
+        if (y) {
+            young.push_back(g);
+        }
+    }
+    c.gtab.assign(n_gran, -1);
+    for (size_t k = 0; k < young.size(); ++k) {
+        c.gtab[young[k]] = (int32_t) (young.size() - 1 - k);
+    }
+    c.n_pool_rows = std::max<int64_t>(GGML_TURBOT_POOL_MIN_ROWS, 64 * (int64_t) young.size());
+}
+
+// Encode every cell of both caches and the young parts of every young granule. n_templ > 0 encodes that many distinct
+// cells and tiles them (perf cases, where only the byte volume and the tier mix matter).
+static void turbot_test_encode(turbot_test_cache & c, uint64_t seed, int64_t n_templ) {
+    const ggml_turbot_layer & l = c.layer;
+    const size_t rk  = l.k.base_row_bytes;
+    const size_t rv  = l.v.base_row_bytes;
+    const size_t prb = l.pool_row_bytes;
+    c.base_k.assign((size_t) c.kv_size * rk, 0);
+    c.base_v.assign((size_t) c.kv_size * rv, 0);
+    c.pool.resize((size_t) c.n_pool_rows * prb);
+    uint64_t ns = seed ^ 0x5bd1e995ull;
+    for (size_t i = 0; i < c.pool.size(); i += 8) {
+        const uint64_t r = turbot_test_splitmix(ns);
+        memcpy(c.pool.data() + i, &r, std::min<size_t>(8, c.pool.size() - i));
+    }
+    n_templ = n_templ > 0 ? std::min(n_templ, c.kv_size) : 0;
+    std::vector<uint8_t> tyoung((size_t) n_templ * prb);
+    {
+        std::vector<float> x(1024);
+        for (int64_t t = 0; t < n_templ; ++t) {
+            turbot_test_row(seed, 2 * t, x.data());
+            ggml_turbot_encode_side(x.data(), &l.k, c.base_k.data() + (size_t) t * rk, tyoung.data() + (size_t) t * prb);
+            turbot_test_row(seed, 2 * t + 1, x.data());
+            ggml_turbot_encode_side(x.data(), &l.v, c.base_v.data() + (size_t) t * rv, tyoung.data() + (size_t) t * prb + l.pool_v_off);
+        }
+    }
+    auto work = [&](int64_t c0, int64_t c1) {
+        std::vector<float> x(1024);
+        for (int64_t cell = c0; cell < c1; ++cell) {
+            const int32_t slot  = c.gtab[cell / 64];
+            uint8_t *     young = slot >= 0 ? c.pool.data() + (size_t) ggml_turbot_pool_row(slot, (uint32_t) cell) * prb : nullptr;
+            if (n_templ > 0) {
+                const int64_t t = cell % n_templ;
+                if (cell >= n_templ) {
+                    memcpy(c.base_k.data() + (size_t) cell * rk, c.base_k.data() + (size_t) t * rk, rk);
+                    memcpy(c.base_v.data() + (size_t) cell * rv, c.base_v.data() + (size_t) t * rv, rv);
+                }
+                if (young) {
+                    memcpy(young, tyoung.data() + (size_t) t * prb, prb);
+                }
+            } else {
+                turbot_test_row(seed, 2 * cell, x.data());
+                ggml_turbot_encode_side(x.data(), &l.k, c.base_k.data() + (size_t) cell * rk, young);
+                turbot_test_row(seed, 2 * cell + 1, x.data());
+                ggml_turbot_encode_side(x.data(), &l.v, c.base_v.data() + (size_t) cell * rv, young ? young + l.pool_v_off : nullptr);
+            }
+        }
+    };
+    const int64_t n_threads = std::max<int64_t>(1, std::min<int64_t>((int64_t) N_THREADS, c.kv_size / 64));
+    std::vector<std::future<void>> tasks;
+    for (int64_t i = 0; i < n_threads; ++i) {
+        tasks.push_back(std::async(std::launch::async, work, i * c.kv_size / n_threads, (i + 1) * c.kv_size / n_threads));
+    }
+    for (auto & t : tasks) {
+        t.get();
+    }
+}
+
+// the llama_kv_cache::get_k view: [256, 4 heads, n_kv] with the fractional-block head stride, then the FA permute
+static ggml_tensor * turbot_test_fa_view(ggml_context * ctx, ggml_tensor * cache, int64_t n_kv) {
+    ggml_tensor * t = ggml_view_4d(ctx, cache, 256, 4, n_kv, 1,
+            ggml_row_size(cache->type, 256),
+            ggml_row_size(cache->type, 1024),
+            ggml_row_size(cache->type, 1024*cache->ne[1]), 0);
+    return ggml_permute(ctx, t, 0, 2, 1, 3);
+}
+
+// test_flash_attn_ext_pos layout: the sequence starts at an odd cell (never a granule or tile start), every 7th cell is
+// a hole, the queries are the last nb positions
+static void turbot_test_positions(int64_t kv, int64_t nb, std::vector<int32_t> & pos, std::vector<int32_t> & qp) {
+    const int64_t off = (kv * 3 / 8) | 1;
+    pos.assign(kv, -1);
+    int32_t p = 0;
+    for (int64_t j = off; j < kv; ++j) {
+        if ((j - off) % 7 == 6) {
+            continue;
+        }
+        pos[j] = p++;
+    }
+    const int32_t p_last = p - 1;
+    qp.resize(nb);
+    for (int64_t i = 0; i < nb; ++i) {
+        qp[i] = std::max<int32_t>(0, p_last - (int32_t) (nb - 1 - i));
+    }
+}
+
+static void turbot_test_set(ggml_tensor * t, const void * data, size_t n) {
+    GGML_ASSERT(n == ggml_nbytes(t));
+    ggml_backend_tensor_set(t, data, 0, n);
+}
+
+// GGML_OP_FLASH_ATTN_EXT over turbot K/V (SPEC 7, 11.2). perf = true names the case turbot_perf for gate B0.
+struct test_flash_attn_ext_turbot : public test_case {
+    const turbot_test_widths widths;
+    const int64_t            kv;
+    const int64_t            nb;
+    const turbot_test_mix    mix_id;
+    const int                mask_mode;      // 0 no mask, 1 explicit F16 mask, 2 positional (kv_pos / q_pos)
+    const bool               sinks;
+    const float              logit_softcap;
+    const bool               perf;
+    const std::string        wname;
+    const std::string        mix;
+    turbot_test_cache        cache;
+
+    std::string vars() override {
+        return std::string(perf ? "turbot_perf=" : "turbot=") + wname + "," + VARS_TO_STR6(kv, nb, mix, mask_mode, sinks, logit_softcap);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return 2 * 24 * nb * (256 + 256) * kv;
+    }
+
+    test_flash_attn_ext_turbot(turbot_test_widths widths, int64_t kv, int64_t nb, turbot_test_mix mix_id, int mask_mode,
+                               bool sinks, float logit_softcap, bool perf)
+        : widths(widths), kv(kv), nb(nb), mix_id(mix_id), mask_mode(mask_mode), sinks(sinks), logit_softcap(logit_softcap),
+          perf(perf), wname(turbot_test_widths_name(widths)), mix(turbot_test_mix_name(mix_id)) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        cache.layer   = turbot_test_layer(widths);
+        cache.kv_size = GGML_PAD(kv, 64) + 64;
+        turbot_test_plan_granules(cache, kv, mix_id);
+        const ggml_turbot_layer & l = cache.layer;
+
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 256, nb, 24, 1);
+        ggml_set_name(q, "q");
+        ggml_tensor * kc = ggml_new_tensor_2d(ctx, ggml_turbot_type_of_s(l.k.s), 1024, cache.kv_size);
+        ggml_set_name(kc, "turbot_k");
+        ggml_tensor * vc = ggml_new_tensor_2d(ctx, ggml_turbot_type_of_s(l.v.s), 1024, cache.kv_size);
+        ggml_set_name(vc, "turbot_v");
+        ggml_tensor * pool = ggml_new_tensor_2d(ctx, GGML_TYPE_I8, l.pool_row_bytes, cache.n_pool_rows);
+        ggml_set_name(pool, "turbot_pool");
+        ggml_tensor * gtab = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, (int64_t) cache.gtab.size());
+        ggml_set_name(gtab, "turbot_gtab");
+
+        ggml_tensor * m = nullptr;
+        if (mask_mode == 1) {
+            m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, nb, 1, 1);
+            ggml_set_name(m, "m");
+        }
+        ggml_tensor * s = nullptr;
+        if (sinks) {
+            s = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 24);
+            ggml_set_name(s, "s");
+        }
+
+        ggml_tensor * out = ggml_flash_attn_ext(ctx, q, turbot_test_fa_view(ctx, kc, kv), turbot_test_fa_view(ctx, vc, kv), m,
+                                                1.0f/16.0f, 0.0f, logit_softcap);
+        ggml_flash_attn_ext_add_sinks(out, s);
+        if (mask_mode == 2) {
+            ggml_tensor * kv_pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, kv);
+            ggml_set_name(kv_pos, "kv_pos");
+            ggml_tensor * q_pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, nb);
+            ggml_set_name(q_pos, "q_pos");
+            ggml_flash_attn_ext_set_pos(out, kv_pos, q_pos);
+        }
+        ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32);
+        ggml_turbot_op_params p;
+        ggml_turbot_op_params_make(&p, &l, GGML_TURBOT_SIDE_BOTH);
+        ggml_flash_attn_ext_set_turbot(out, pool, gtab, &p);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        const uint64_t seed = (uint64_t) kv * 1000003u + (uint64_t) nb * 7919u + (uint64_t) mix_id * 131u + (uint64_t) widths;
+        turbot_test_encode(cache, seed, perf ? 512 : 0);
+        std::vector<int32_t> pos, qp;
+        turbot_test_positions(kv, nb, pos, qp);
+
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->view_src != nullptr || t->op != GGML_OP_NONE) {
+                continue;
+            }
+            if (strcmp(t->name, "turbot_k") == 0) {
+                turbot_test_set(t, cache.base_k.data(), cache.base_k.size());
+            } else if (strcmp(t->name, "turbot_v") == 0) {
+                turbot_test_set(t, cache.base_v.data(), cache.base_v.size());
+            } else if (strcmp(t->name, "turbot_pool") == 0) {
+                turbot_test_set(t, cache.pool.data(), cache.pool.size());
+            } else if (strcmp(t->name, "turbot_gtab") == 0) {
+                turbot_test_set(t, cache.gtab.data(), cache.gtab.size() * sizeof(int32_t));
+            } else if (strcmp(t->name, "kv_pos") == 0) {
+                turbot_test_set(t, pos.data(), pos.size() * sizeof(int32_t));
+            } else if (strcmp(t->name, "q_pos") == 0) {
+                turbot_test_set(t, qp.data(), qp.size() * sizeof(int32_t));
+            } else if (strcmp(t->name, "m") == 0) {
+                init_tensor_kq_mask(t);
+            } else if (strcmp(t->name, "s") == 0) {
+                init_tensor_uniform(t, -10.0f, 10.0f);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
+// gate B0 reference: turbo5p FA at the same shape, with the cache geometry the server uses (a head view into the
+// 1024-value row). test_flash_attn_ext pads the head to the 1024 block and cannot build it ([TAG_TURBO4P_FA_UNTESTED]).
+struct test_flash_attn_ext_turbo5p_ref : public test_case {
+    const int64_t kv;
+    const int64_t nb;
+
+    std::string vars() override {
+        return std::string("turbot_ref=turbo5p,") + VARS_TO_STR2(kv, nb);
+    }
+
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return 2 * 24 * nb * (256 + 256) * kv;
+    }
+
+    test_flash_attn_ext_turbo5p_ref(int64_t kv, int64_t nb) : kv(kv), nb(nb) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t kv_size = GGML_PAD(kv, 64) + 64;
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 256, nb, 24, 1);
+        ggml_set_name(q, "q");
+        ggml_tensor * kc = ggml_new_tensor_2d(ctx, GGML_TYPE_TURBO5P_0, 1024, kv_size);
+        ggml_set_name(kc, "t5_k");
+        ggml_tensor * vc = ggml_new_tensor_2d(ctx, GGML_TYPE_TURBO5P_0, 1024, kv_size);
+        ggml_set_name(vc, "t5_v");
+        ggml_tensor * m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, nb, 1, 1);
+        ggml_set_name(m, "m");
+        ggml_tensor * out = ggml_flash_attn_ext(ctx, q, turbot_test_fa_view(ctx, kc, kv), turbot_test_fa_view(ctx, vc, kv), m,
+                                                1.0f/16.0f, 0.0f, 0.0f);
+        ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        const int64_t n_templ = 512;
+        std::vector<float> src(1024 * n_templ);
+        std::vector<uint8_t> tq(ggml_row_size(GGML_TYPE_TURBO5P_0, 1024 * n_templ));
+        const size_t row = ggml_row_size(GGML_TYPE_TURBO5P_0, 1024);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->view_src != nullptr || t->op != GGML_OP_NONE) {
+                continue;
+            }
+            if (strcmp(t->name, "t5_k") == 0 || strcmp(t->name, "t5_v") == 0) {
+                const uint64_t seed = strcmp(t->name, "t5_k") == 0 ? 11 : 12;
+                for (int64_t i = 0; i < n_templ; ++i) {
+                    turbot_test_row(seed, i, src.data() + 1024 * i);
+                }
+                ggml_quantize_chunk(GGML_TYPE_TURBO5P_0, src.data(), tq.data(), 0, n_templ, 1024, nullptr);
+                std::vector<uint8_t> data(ggml_nbytes(t));
+                for (int64_t c = 0; c < t->ne[1]; ++c) {
+                    memcpy(data.data() + (size_t) c * row, tq.data() + (size_t) (c % n_templ) * row, row);
+                }
+                turbot_test_set(t, data.data(), data.size());
+            } else if (strcmp(t->name, "m") == 0) {
+                init_tensor_kq_mask(t);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
+// GGML_OP_TURBOT_SET_ROWS (SPEC 5.2, 6.1, 8): K and V writers into host-encoded caches, fill entries, then a turbot FA
+// whose mask shows only the written cells and the filled granules, so every written byte reaches the compared output.
+// perf = true times the K writer alone (turbot_perf=writer_*).
+struct test_turbot_set_rows : public test_case {
+    const turbot_test_widths widths;
+    const int64_t            rows;
+    const ggml_type          type_idx;
+    const int                young_mode;     // 0 no young rows, 1 every row young, 2 mixed (plus young granules without rows)
+    const bool               fill;
+    const bool               perf;
+    const std::string        wname;
+    const std::string        young;
+    int64_t                  nb = 1;
+    turbot_test_cache        cache;
+    std::vector<int64_t>     cells;
+    std::vector<int32_t>     young_rows;
+    std::vector<int32_t>     fill_entries;
+    std::vector<int64_t>     fill_granules;
+    std::vector<uint8_t>     visible;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "TURBOT_SET_ROWS";
+    }
+
+    std::string vars() override {
+        return std::string(perf ? "turbot_perf=writer_" : "turbot=") + wname + "," + VARS_TO_STR5(rows, type_idx, young, fill, nb);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    test_turbot_set_rows(turbot_test_widths widths, int64_t rows, ggml_type type_idx, int young_mode, bool fill, bool perf)
+        : widths(widths), rows(rows), type_idx(type_idx), young_mode(young_mode), fill(fill), perf(perf),
+          wname(turbot_test_widths_name(widths)), young(young_mode == 0 ? "none" : young_mode == 1 ? "all" : "mixed") {}
+
+    void plan() {
+        cache.layer   = turbot_test_layer(widths);
+        cache.kv_size = perf ? 16384 : GGML_PAD(rows + rows / 2 + 128, 64);
+        nb            = perf || rows <= 4 ? 1 : 4;
+        const int64_t n_gran = cache.kv_size / 64;
+
+        std::mt19937 gen((uint32_t) (rows * 7919 + young_mode * 31 + (fill ? 1 : 0) + widths * 131));
+        std::vector<int64_t> perm(cache.kv_size);
+        for (int64_t i = 0; i < cache.kv_size; ++i) {
+            perm[i] = i;
+        }
+        std::shuffle(perm.begin(), perm.end(), gen);
+        cells.assign(perm.begin(), perm.begin() + rows);
+
+        std::vector<uint64_t> written(n_gran, 0);
+        for (int64_t c : cells) {
+            written[c / 64] |= 1ull << (c & 63);
+        }
+        std::vector<int64_t> young_gran;
+        for (int64_t g = 0; g < n_gran; ++g) {
+            const bool has = written[g] != 0;
+            const bool y = young_mode == 1 ? has : young_mode == 2 ? ((has && g % 3 != 0) || (!has && g % 5 == 2)) : false;
+            if (y) {
+                young_gran.push_back(g);
+            }
+        }
+        fill_granules.clear();
+        if (fill) {
+            // a granule without rows and a granule with rows gain a slot while they hold old cells (SPEC 4.4, 9.6)
+            int64_t g_empty = -1, g_rows = -1;
+            for (int64_t g = n_gran - 1; g >= 0 && (g_empty < 0 || g_rows < 0); --g) {
+                if (std::find(young_gran.begin(), young_gran.end(), g) != young_gran.end()) {
+                    continue;
+                }
+                if (written[g] == 0 && g_empty < 0) {
+                    g_empty = g;
+                }
+                if (written[g] != 0 && written[g] != ~0ull && g_rows < 0) {
+                    g_rows = g;
+                }
+            }
+            for (int64_t g : { g_empty, g_rows }) {
+                if (g >= 0) {
+                    fill_granules.push_back(g);
+                }
+            }
+        }
+        std::vector<int64_t> owned = young_gran;
+        owned.insert(owned.end(), fill_granules.begin(), fill_granules.end());
+        cache.gtab.assign(n_gran, -1);
+        for (size_t k = 0; k < owned.size(); ++k) {
+            cache.gtab[owned[k]] = (int32_t) (owned.size() - 1 - k);
+        }
+        cache.n_pool_rows = std::max<int64_t>(GGML_TURBOT_POOL_MIN_ROWS, 64 * (int64_t) owned.size());
+
+        young_rows.resize(rows);
+        for (int64_t i = 0; i < rows; ++i) {
+            const int32_t slot = cache.gtab[cells[i] / 64];
+            young_rows[i] = slot >= 0 ? ggml_turbot_pool_row(slot, (uint32_t) cells[i]) : -1;
+        }
+        fill_entries.clear();
+        visible.assign(cache.kv_size, 0);
+        for (int64_t c : cells) {
+            visible[c] = 1;
+        }
+        for (int64_t g : fill_granules) {
+            const uint64_t mask = ~written[g];
+            fill_entries.push_back((int32_t) g);
+            fill_entries.push_back(cache.gtab[g]);
+            fill_entries.push_back((int32_t) (uint32_t) (mask & 0xffffffffu));
+            fill_entries.push_back((int32_t) (uint32_t) (mask >> 32));
+            for (int c = 0; c < 64; ++c) {
+                visible[g * 64 + c] = 1;
+            }
+        }
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        plan();
+        const ggml_turbot_layer & l = cache.layer;
+        const int64_t n_fill = (int64_t) fill_entries.size() / 4;
+
+        ggml_tensor * kc = ggml_new_tensor_2d(ctx, ggml_turbot_type_of_s(l.k.s), 1024, cache.kv_size);
+        ggml_set_name(kc, "turbot_k");
+        ggml_tensor * vc = ggml_new_tensor_2d(ctx, ggml_turbot_type_of_s(l.v.s), 1024, cache.kv_size);
+        ggml_set_name(vc, "turbot_v");
+        ggml_tensor * pool = ggml_new_tensor_2d(ctx, GGML_TYPE_I8, l.pool_row_bytes, cache.n_pool_rows);
+        ggml_set_name(pool, "turbot_pool");
+        ggml_tensor * rk = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1024, rows);
+        ggml_set_name(rk, "rows_k");
+        ggml_tensor * rv = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1024, rows);
+        ggml_set_name(rv, "rows_v");
+        ggml_tensor * idx = ggml_new_tensor_1d(ctx, type_idx, rows);
+        ggml_set_name(idx, "idx");
+        ggml_tensor * yr = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, rows);
+        ggml_set_name(yr, "young");
+        ggml_tensor * fl = nullptr;
+        if (n_fill > 0) {
+            fl = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 4, n_fill);
+            ggml_set_name(fl, "fill");
+        }
+
+        ggml_turbot_op_params pk, pv, pb;
+        ggml_turbot_op_params_make(&pk, &l, GGML_TURBOT_SIDE_K);
+        ggml_turbot_op_params_make(&pv, &l, GGML_TURBOT_SIDE_V);
+        ggml_turbot_op_params_make(&pb, &l, GGML_TURBOT_SIDE_BOTH);
+        ggml_tensor * wk = ggml_turbot_set_rows(ctx, kc, rk, idx, pool, yr, fl, &pk);
+        if (perf) {
+            ggml_set_name(wk, "out");
+            return wk;
+        }
+        ggml_tensor * wv = ggml_turbot_set_rows(ctx, vc, rv, idx, pool, yr, fl, &pv);
+
+        ggml_tensor * gtab = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, (int64_t) cache.gtab.size());
+        ggml_set_name(gtab, "turbot_gtab");
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 256, nb, 24, 1);
+        ggml_set_name(q, "q");
+        ggml_tensor * m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, cache.kv_size, nb, 1, 1);
+        ggml_set_name(m, "m");
+
+        // the FA views hang off the writers' results, so both writers run before the FA
+        ggml_tensor * out = ggml_flash_attn_ext(ctx, q, turbot_test_fa_view(ctx, wk, cache.kv_size), turbot_test_fa_view(ctx, wv, cache.kv_size),
+                                                m, 1.0f/16.0f, 0.0f, 0.0f);
+        ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32);
+        ggml_flash_attn_ext_set_turbot(out, pool, gtab, &pb);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        const uint64_t seed = 0x7475726274ull + (uint64_t) rows * 131u + (uint64_t) young_mode * 7u + (fill ? 1u : 0u) + (uint64_t) widths * 17u;
+        // the filled granules start with noise in their pool rows: hide their slots while the host encodes
+        const std::vector<int32_t> gtab = cache.gtab;
+        for (int64_t g : fill_granules) {
+            cache.gtab[g] = -1;
+        }
+        turbot_test_encode(cache, seed, perf ? 512 : 0);
+        cache.gtab = gtab;
+
+        std::vector<float> xk(1024 * rows), xv(1024 * rows);
+        for (int64_t i = 0; i < rows; ++i) {
+            turbot_test_row(seed ^ 0xabcdefull, 2 * i, xk.data() + 1024 * i);
+            turbot_test_row(seed ^ 0xabcdefull, 2 * i + 1, xv.data() + 1024 * i);
+        }
+        std::vector<ggml_fp16_t> mask((size_t) (cache.kv_size * nb));
+        const ggml_fp16_t f16_zero = ggml_fp32_to_fp16(0.0f), f16_ninf = ggml_fp32_to_fp16(-INFINITY);
+        for (int64_t i = 0; i < nb; ++i) {
+            for (int64_t c = 0; c < cache.kv_size; ++c) {
+                mask[(size_t) (i * cache.kv_size + c)] = visible[c] ? f16_zero : f16_ninf;
+            }
+        }
+
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->view_src != nullptr || t->op != GGML_OP_NONE) {
+                continue;
+            }
+            if (strcmp(t->name, "turbot_k") == 0) {
+                turbot_test_set(t, cache.base_k.data(), cache.base_k.size());
+            } else if (strcmp(t->name, "turbot_v") == 0) {
+                turbot_test_set(t, cache.base_v.data(), cache.base_v.size());
+            } else if (strcmp(t->name, "turbot_pool") == 0) {
+                turbot_test_set(t, cache.pool.data(), cache.pool.size());
+            } else if (strcmp(t->name, "turbot_gtab") == 0) {
+                turbot_test_set(t, cache.gtab.data(), cache.gtab.size() * sizeof(int32_t));
+            } else if (strcmp(t->name, "rows_k") == 0) {
+                turbot_test_set(t, xk.data(), xk.size() * sizeof(float));
+            } else if (strcmp(t->name, "rows_v") == 0) {
+                turbot_test_set(t, xv.data(), xv.size() * sizeof(float));
+            } else if (strcmp(t->name, "idx") == 0) {
+                if (t->type == GGML_TYPE_I32) {
+                    std::vector<int32_t> c32(cells.begin(), cells.end());
+                    turbot_test_set(t, c32.data(), c32.size() * sizeof(int32_t));
+                } else {
+                    turbot_test_set(t, cells.data(), cells.size() * sizeof(int64_t));
+                }
+            } else if (strcmp(t->name, "young") == 0) {
+                turbot_test_set(t, young_rows.data(), young_rows.size() * sizeof(int32_t));
+            } else if (strcmp(t->name, "fill") == 0) {
+                turbot_test_set(t, fill_entries.data(), fill_entries.size() * sizeof(int32_t));
+            } else if (strcmp(t->name, "m") == 0) {
+                turbot_test_set(t, mask.data(), mask.size() * sizeof(ggml_fp16_t));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_OP_CROSS_ENTROPY_LOSS
 struct test_cross_entropy_loss : public test_case {
     const ggml_type type;
@@ -10218,6 +10840,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+    // [TAG_TURBOT_KVMIN_FIXUP] prefill-sized query counts with KV_min > 0: more output tiles than stream_k blocks, the
+    // shape where a raised kb0_start misclassified whole tiles as fixup tiles in the turbot kernel. kv 8192 keeps the
+    // sequence (8192 - 3000 cells) longer than nb.
+    for (int64_t nb : { 1024, 1280 }) {
+        for (ggml_type tkv : { GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_TURBO5P_0 }) {
+            test_cases.emplace_back(new test_flash_attn_ext_pos(256, 4, 6, 8192, nb, 3000, tkv));
+        }
+    }
 
     // TurboQuant KV cache FA correctness (fork): head_dim 128, multi-token KV.
     // Compares CUDA turbo kernels vs CPU reference to catch turbo4-specific bugs.
@@ -10273,6 +10903,54 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_TURBO5P_0, GGML_TYPE_Q8_0));
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_TURBO5P_0));
       }
+    }
+
+    // [TAG_TURBOT] tiered KV cache (docs/turbot/SPEC.md 11.2): FA over host-encoded caches at every query count the model
+    // uses (1, draft verify 2-16, prefill 512 / 1280 with FA_NCOLS128 on), kv tails that end mid tile (100, 1000: the
+    // is_fixup block), granule patterns old / young / alternating / last-partial-tile, the positional mask starting at an
+    // odd cell with holes, K widths != V widths with b = 2 and b = 6 heads and a y = 8 head. Run in both
+    // GGML_CUDA_TURBOT_OLD_I8 builds; the nb 512 / 1280 cases must pass before any perf run (SPEC 7.4 LUT placement).
+    for (int64_t kv : { 96, 100, 1000, 1024, 4096, 16384 }) {
+        for (int64_t nb : { 1, 2, 4, 8, 16, 512, 1280 }) {
+            if (kv == 16384 && nb != 1 && nb != 4 && nb != 512) {
+                continue;
+            }
+            if (nb == 1280 && kv != 1000 && kv != 4096) {
+                continue;
+            }
+            const turbot_test_widths w = (kv == 100 || kv == 1000 || kv == 4096) ? TURBOT_TW_MIXED : TURBOT_TW_L23;
+            for (turbot_test_mix mix : { TURBOT_MIX_OLD, TURBOT_MIX_YOUNG, TURBOT_MIX_ALT, TURBOT_MIX_TAIL }) {
+                test_cases.emplace_back(new test_flash_attn_ext_turbot(w, kv, nb, mix, 1, false, 0.0f, false));
+            }
+            test_cases.emplace_back(new test_flash_attn_ext_turbot(w, kv, nb, TURBOT_MIX_ALT, 2, false, 0.0f, false));
+        }
+    }
+    test_cases.emplace_back(new test_flash_attn_ext_turbot(TURBOT_TW_MIXED,    1000,  4, TURBOT_MIX_ALT,   1, true,  0.0f,  false));
+    test_cases.emplace_back(new test_flash_attn_ext_turbot(TURBOT_TW_L23,      1024,  8, TURBOT_MIX_TAIL,  1, false, 30.0f, false));
+    test_cases.emplace_back(new test_flash_attn_ext_turbot(TURBOT_TW_UNIFORM5, 1024,  4, TURBOT_MIX_YOUNG, 0, false, 0.0f,  false));
+    test_cases.emplace_back(new test_flash_attn_ext_turbot(TURBOT_TW_UNIFORM5,  100,  1, TURBOT_MIX_OLD,   2, false, 0.0f,  false));
+    // [TAG_TURBOT_Q1_ROUTE] Q = 1 runs on the <4,8> instance and Q = 2 on <2,8>, with the explicit-mask KV_max scan
+    // active (kv >= 4096, a multiple of 1024): the turbot row-wrapping bounds scan, with and without sinks and softcap.
+    for (int64_t kv : { 4096, 8192 }) {
+        for (int64_t nb : { 1, 2 }) {
+            const turbot_test_widths w = kv == 4096 ? TURBOT_TW_MIXED : TURBOT_TW_L23;
+            for (bool sinks : { false, true }) {
+                for (float softcap : { 0.0f, 30.0f }) {
+                    test_cases.emplace_back(new test_flash_attn_ext_turbot(w, kv, nb, TURBOT_MIX_ALT, 1, sinks, softcap, false));
+                }
+            }
+        }
+    }
+
+    // [TAG_TURBOT] writer read back through the turbot FA: rows 1 / 4 / 16 / 1280, I64 and I32 cells, young rows none /
+    // all / mixed, fill entries present / absent, K widths != V widths with b = 2 and b = 6 heads
+    for (int64_t rows : { 1, 4, 16, 1280 }) {
+        for (int young_mode : { 0, 1, 2 }) {
+            for (bool fill : { false, true }) {
+                test_cases.emplace_back(new test_turbot_set_rows(TURBOT_TW_MIXED, rows, GGML_TYPE_I64, young_mode, fill, false));
+            }
+        }
+        test_cases.emplace_back(new test_turbot_set_rows(TURBOT_TW_L23, rows, GGML_TYPE_I32, 2, true, false));
     }
 
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {   10, 5, 4, 3}));
@@ -10533,6 +11211,49 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             }
         }
     }
+
+    // [TAG_TURBOT] gate B0 (docs/turbot/SPEC.md 7.8): turbot FA against turbo5p at the deployed geometry, kv 32768 /
+    // 131072 / 245760, nb 1 / 4 / 512, tier mixes old / band16k / band64k (young only at 32768). The layer is default-plan
+    // layer 23 (608 B per side row, above the plan mean of 565). tools/turbot/b0_gate.py reads the log:
+    //   test-backend-ops perf -b CUDA0 -o FLASH_ATTN_EXT -p "turbot_perf=|turbot_ref="
+    // plus the writer at 2048 rows against turbo5p set_rows (SPEC 8.2 alternatives): -o TURBOT_SET_ROWS,SET_ROWS
+    for (int64_t kv : { 32768, 131072, 245760 }) {
+        for (int64_t nb : { 1, 4, 512 }) {
+            for (turbot_test_mix mix : { TURBOT_MIX_OLD, TURBOT_MIX_BAND16K, TURBOT_MIX_BAND64K, TURBOT_MIX_YOUNG }) {
+                if (mix == TURBOT_MIX_YOUNG && kv != 32768) {
+                    continue;
+                }
+                test_cases.emplace_back(new test_flash_attn_ext_turbot(TURBOT_TW_L23, kv, nb, mix, 1, false, 0.0f, true));
+            }
+            test_cases.emplace_back(new test_flash_attn_ext_turbo5p_ref(kv, nb));
+        }
+    }
+    // [TAG_TURBOT_B0_DIAG] slowest-block diagnostics (item 0 of the read speed plan): the op waits for its slowest
+    // stream_k block. TAIL (one young granule) vs ALT (half the granules young, spread over every block) vs band16k
+    // separates a slowest-block cost from a per-cell cost; UNIFORM5 (int8 old path on every head) and UNIFORM6 (float
+    // old path on every head) separate the b = 6 head from the rest of L23.
+    for (int64_t nb : { 1, 4, 512 }) {
+        for (turbot_test_mix mix : { TURBOT_MIX_TAIL, TURBOT_MIX_ALT }) {
+            test_cases.emplace_back(new test_flash_attn_ext_turbot(TURBOT_TW_L23, 131072, nb, mix, 1, false, 0.0f, true));
+        }
+    }
+    for (int64_t kv : { 131072, 245760 }) {
+        for (int64_t nb : { 4, 512 }) {
+            for (turbot_test_mix mix : { TURBOT_MIX_OLD, TURBOT_MIX_BAND16K }) {
+                test_cases.emplace_back(new test_flash_attn_ext_turbot(TURBOT_TW_UNIFORM5, kv, nb, mix, 1, false, 0.0f, true));
+            }
+        }
+    }
+    for (turbot_test_mix mix : { TURBOT_MIX_OLD, TURBOT_MIX_BAND16K }) {
+        test_cases.emplace_back(new test_flash_attn_ext_turbot(TURBOT_TW_UNIFORM6, 131072, 4, mix, 1, false, 0.0f, true));
+    }
+    // [TAG_TURBOT_CT_SPILL] nb 2 = a Q = 2 DFlash2 verification batch, which runs the ncols 16 instance <2,8>.
+    for (turbot_test_mix mix : { TURBOT_MIX_OLD, TURBOT_MIX_BAND16K }) {
+        test_cases.emplace_back(new test_flash_attn_ext_turbot(TURBOT_TW_L23, 131072, 2, mix, 1, false, 0.0f, true));
+    }
+    test_cases.emplace_back(new test_flash_attn_ext_turbo5p_ref(131072, 2));
+    test_cases.emplace_back(new test_turbot_set_rows(TURBOT_TW_L23, 2048, GGML_TYPE_I64, 1, false, true));
+    test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, GGML_TYPE_TURBO5P_0, GGML_TYPE_I64, { 1024, 16384, 1, 1 }, { 1, 1 }, 2048, false));
 
     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
     // note: same bytes either way, so a backend that indexes them differently shows it here
