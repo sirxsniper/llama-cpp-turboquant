@@ -24,6 +24,16 @@
 #pragma warning(disable: 4244 4267) // possible loss of data
 #endif
 
+#ifdef _WIN32   // [TAG_PPL_KLD_FAST] memory-mapped base log-probs
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+
 struct results_perplexity {
     std::vector<llama_token> tokens;
     double                   ppl_value;
@@ -252,7 +262,7 @@ static std::pair<double, float> log_softmax(int n_vocab, const float * logits, c
 }
 
 static void process_logits(int n_vocab, const float * logits, const int * tokens, int n_token,
-        std::vector<std::thread> & workers, const std::vector<uint16_t> & base_log_probs, kl_divergence_result & kld,
+        std::vector<std::thread> & workers, const uint16_t * base_log_probs, kl_divergence_result & kld,
         float * kld_values, float * p_diff_values) {
     std::mutex mutex;
     const int nv = 2*((n_vocab + 1)/2) + 4;
@@ -279,7 +289,7 @@ static void process_logits(int n_vocab, const float * logits, const int * tokens
                 break;
             }
             lock.unlock();
-            std::pair<double, float> v = log_softmax(n_vocab, logits + size_t(i)*n_vocab, base_log_probs.data() + size_t(i)*nv, tokens[i+1], local_kld);
+            std::pair<double, float> v = log_softmax(n_vocab, logits + size_t(i)*n_vocab, base_log_probs + size_t(i)*nv, tokens[i+1], local_kld);
             kld_values[i]    = (float)v.first;
             p_diff_values[i] = v.second;
         }
@@ -1739,6 +1749,58 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {
         return;
     }
 
+    // [TAG_PPL_KLD_FAST] --chunks limits KL mode to the first N chunks of the base file (rows are stored in chunk order,
+    // and every chunk starts from a cleared cache, so the per-chunk values match a full run)
+    const int n_chunk_file = n_chunk;
+    if (params.n_chunks > 0 && params.n_chunks < n_chunk) {
+        LOG_INF("%s: limiting to the first %d of %d chunks (--chunks)\n", __func__, params.n_chunks, n_chunk);
+        n_chunk = params.n_chunks;
+    }
+    const uint64_t kld_rows     = uint64_t(n_ctx - 1 - n_ctx/2);
+    const uint64_t kld_row_size = uint64_t(2*((n_vocab + 1)/2) + 4) * sizeof(uint16_t);
+    const uint64_t chunk_bytes  = kld_rows * kld_row_size;
+    const uint64_t probs_offset = 20 + uint64_t(n_ctx) * uint64_t(n_chunk_file) * sizeof(llama_token);   // "_logits_" + 3 x int32
+    const bool     kld_sync     = getenv("LLAMA_PPL_KLD_SYNC") != nullptr;
+    const uint8_t * map_view    = nullptr;
+#ifdef _WIN32
+    HANDLE map_file = INVALID_HANDLE_VALUE;
+    HANDLE map_obj  = NULL;
+    if (!kld_sync) {
+        const std::string & lf = params.logits_file;
+        const int wlen = MultiByteToWideChar(CP_UTF8, 0, lf.c_str(), -1, NULL, 0);
+        if (wlen > 0) {
+            std::wstring wpath(size_t(wlen), L'\0');
+            MultiByteToWideChar(CP_UTF8, 0, lf.c_str(), -1, &wpath[0], wlen);
+            map_file = CreateFileW(wpath.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+        }
+        LARGE_INTEGER fsize = {};
+        if (map_file != INVALID_HANDLE_VALUE && GetFileSizeEx(map_file, &fsize) &&
+                uint64_t(fsize.QuadPart) >= probs_offset + chunk_bytes * uint64_t(n_chunk_file)) {
+            map_obj = CreateFileMappingW(map_file, NULL, PAGE_READONLY, 0, 0, NULL);
+            if (map_obj != NULL) {
+                map_view = (const uint8_t *) MapViewOfFile(map_obj, FILE_MAP_READ, 0, 0, 0);
+            }
+        }
+        if (map_view == nullptr) {
+            if (map_obj != NULL) { CloseHandle(map_obj); map_obj = NULL; }
+            if (map_file != INVALID_HANDLE_VALUE) { CloseHandle(map_file); map_file = INVALID_HANDLE_VALUE; }
+            LOG_WRN("%s: could not memory-map %s, using stream reads\n", __func__, lf.c_str());
+        } else {
+            LOG_INF("%s: base log-probs memory-mapped (%.1f GiB per chunk)\n", __func__, chunk_bytes / (1024.0*1024.0*1024.0));
+        }
+    }
+    struct map_guard {
+        HANDLE          f;
+        HANDLE          m;
+        const uint8_t * v;
+        ~map_guard() {
+            if (v != nullptr) { UnmapViewOfFile(v); }
+            if (m != NULL) { CloseHandle(m); }
+            if (f != INVALID_HANDLE_VALUE) { CloseHandle(f); }
+        }
+    } map_hold { map_file, map_obj, map_view };
+#endif
+
     const int n_batch = params.n_batch;
     const int num_batches = (static_cast<int>(n_ctx) + n_batch - 1) / n_batch;
     // Calculate n_seq based on the logits file's n_ctx, but cap it at what the context supports
@@ -1755,12 +1817,12 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {
 
     llama_batch batch = llama_batch_init(std::min(n_batch, static_cast<int>(n_ctx)*n_seq), 0, 1);
 
-    std::vector<uint16_t> log_probs_uint16(size_t(n_ctx - 1 - n_ctx/2) * nv);
+    std::vector<uint16_t> log_probs_uint16(map_view != nullptr ? 0 : size_t(n_ctx - 1 - n_ctx/2) * nv);   // [TAG_PPL_KLD_FAST] unused when mapped
     std::vector<float>    kld_values(size_t(n_ctx - 1 - n_ctx/2)*n_chunk);
     std::vector<float> p_diff_values(size_t(n_ctx - 1 - n_ctx/2)*n_chunk);
     std::vector<float> logits;
     if (num_batches > 1) {
-        logits.reserve(size_t(n_ctx) * n_vocab);
+        logits.reserve(size_t(n_ctx - n_ctx/2) * n_vocab);   // [TAG_PPL_KLD_FAST] only positions >= n_ctx/2 are ever inserted
     }
 
     LOG_INF("%s: computing over %d chunks, n_ctx=%u, batch_size=%d, n_seq=%d\n", __func__, n_chunk, n_ctx, n_batch, n_seq);
@@ -1790,6 +1852,106 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {
     auto p_diff_ptr = p_diff_values.data();
 
     const int first = n_ctx/2;
+
+    // [TAG_PPL_KLD_FAST] pipeline state. The joiner is declared after everything the threads use, so it runs first on
+    // any return path and no joinable std::thread is ever destroyed.
+    const bool pipeline = !kld_sync && map_view != nullptr && n_seq == 1 && num_batches > 1;
+    std::thread scorer;
+    std::thread prefetcher;
+    int pending_chunk = -1;
+    struct thread_joiner {
+        std::thread & a;
+        std::thread & b;
+        ~thread_joiner() {
+            if (a.joinable()) { a.join(); }
+            if (b.joinable()) { b.join(); }
+        }
+    } joiner { scorer, prefetcher };
+
+    auto base_rows = [&](int chunk) -> const uint16_t * {
+        return (const uint16_t *) (map_view + probs_offset + uint64_t(chunk) * chunk_bytes);
+    };
+    auto prefetch = [&](int chunk) {
+        if (map_view == nullptr || chunk >= n_chunk) {
+            return;
+        }
+        if (prefetcher.joinable()) {
+            prefetcher.join();
+        }
+        prefetcher = std::thread([base = base_rows(chunk), bytes = chunk_bytes]() {
+#ifdef _WIN32
+            WIN32_MEMORY_RANGE_ENTRY range;
+            range.VirtualAddress = (PVOID) base;
+            range.NumberOfBytes  = (SIZE_T) bytes;
+            if (!PrefetchVirtualMemory(GetCurrentProcess(), 1, &range, 0)) {
+                volatile uint8_t sink = 0;
+                const uint8_t * p = (const uint8_t *) base;
+                for (uint64_t o = 0; o < bytes; o += 4096) {
+                    sink ^= p[o];
+                }
+            }
+#else
+            (void) base; (void) bytes;
+#endif
+        });
+    };
+    auto print_row = [&](int chunk_no) {
+        LOG("%4d", chunk_no);
+
+        auto log_ppl = mean_and_uncertainty(kld.sum_nll, kld.sum_nll2, kld.count);
+        const double ppl_val = exp(log_ppl.first);
+        const double ppl_unc = ppl_val * log_ppl.second;
+        LOG("    %9.4lf ± %9.4lf", ppl_val, ppl_unc);
+
+        auto log_ppl_base = mean_and_uncertainty(kld.sum_nll_base, kld.sum_nll_base2, kld.count);
+        const double log_ppl_cov = covariance(kld.sum_nll, kld.sum_nll_base, kld.sum_nll_nll_base, kld.count);
+        const double log_ppl_ratio_val = log_ppl.first - log_ppl_base.first;
+        const double log_ppl_ratio_unc = sqrt(log_ppl.second*log_ppl.second + log_ppl_base.second*log_ppl_base.second - 2.0*log_ppl_cov);
+        LOG("    %10.5lf ± %10.5lf", log_ppl_ratio_val, log_ppl_ratio_unc);
+
+        auto kl_div = mean_and_uncertainty(kld.sum_kld, kld.sum_kld2, kld.count);
+        LOG("    %10.5lf ± %10.5lf", kl_div.first, kl_div.second);
+
+        auto p_diff_mse   = mean_and_uncertainty(kld.sum_p_diff2, kld.sum_p_diff4, kld.count);
+        const double p_diff_rms_val = sqrt(p_diff_mse.first);
+        const double p_diff_rms_unc = 0.5/p_diff_rms_val * p_diff_mse.second;
+        LOG("    %6.3lf ± %6.3lf %%", 100.0*p_diff_rms_val, 100.0*p_diff_rms_unc);
+
+        double p_top_val = 1.*kld.n_same_top/kld.count;
+        double p_top_unc = sqrt(p_top_val*(1 - p_top_val)/(kld.count - 1));
+        LOG("    %6.3lf ± %6.3lf %%", 100.0*p_top_val, 100.0*p_top_unc);
+
+        LOG("\n");
+    };
+    auto finish_pending = [&]() {
+        if (scorer.joinable()) {
+            scorer.join();
+            print_row(pending_chunk + 1);
+            logits.clear();
+            pending_chunk = -1;
+        }
+    };
+    auto launch_scorer = [&](int chunk, int chunk_start) {
+        if (prefetcher.joinable()) {
+            prefetcher.join();   // this chunk's rows are paged in before 32 threads read them
+        }
+        const float    * all_logits = logits.data();
+        const int      * toks       = tokens.data() + chunk_start + first;
+        const uint16_t * base       = base_rows(chunk);
+        float * kp = kld_ptr;
+        float * pp = p_diff_ptr;
+        kld_ptr    += n_ctx - 1 - first;
+        p_diff_ptr += n_ctx - 1 - first;
+        pending_chunk = chunk;
+        scorer = std::thread([&, all_logits, toks, base, kp, pp]() {
+            process_logits(n_vocab, all_logits, toks, n_ctx - 1 - first, workers, base, kld, kp, pp);
+        });
+        prefetch(chunk + 1);     // the next chunk's rows page in during its GPU phase
+    };
+    if (pipeline) {
+        LOG_INF("%s: pipelined scoring (LLAMA_PPL_KLD_SYNC=1 disables)\n", __func__);
+        prefetch(0);
+    }
 
     for (int i = 0; i < n_chunk; i += n_seq) {
         const int start =     i * n_ctx;
@@ -1838,6 +2000,9 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {
             }
 
             if (num_batches > 1 && n_outputs > 0) {
+                if (pipeline) {
+                    finish_pending();   // [TAG_PPL_KLD_FAST] the previous chunk's scorer reads `logits`
+                }
                 const auto * batch_logits = llama_get_logits(ctx);
                 logits.insert(logits.end(), batch_logits, batch_logits + size_t(n_outputs) * n_vocab);
             }
@@ -1858,9 +2023,16 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {
             LOG("chunk             PPL               ln(PPL(Q)/PPL(base))          KL Divergence              Δp RMS            Same top p\n");
         }
 
+        if (pipeline) {   // [TAG_PPL_KLD_FAST] scored on the scorer thread, printed when it is joined
+            launch_scorer(i, start);
+            continue;
+        }
+
         // Read log probs for each sequence in the batch
         for (int seq = 0; seq < n_seq_batch; seq++) {
-            if (in.read((char *)log_probs_uint16.data(), log_probs_uint16.size()*sizeof(uint16_t)).fail()) {
+            if (map_view != nullptr) {
+                // mapped: rows are read in place by process_logits
+            } else if (in.read((char *)log_probs_uint16.data(), log_probs_uint16.size()*sizeof(uint16_t)).fail()) {
                 LOG_ERR("%s: failed reading log-probs for chunk %d\n", __func__, i + seq);
                 llama_batch_free(batch);
                 return;
@@ -1869,7 +2041,7 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {
             const float * all_logits = num_batches > 1 ? logits.data() : llama_get_logits_ith(ctx, seq*n_ctx + first);
 
             process_logits(n_vocab, all_logits, tokens.data() + start + seq*n_ctx + first, n_ctx - 1 - first,
-                    workers, log_probs_uint16, kld, kld_ptr, p_diff_ptr);
+                    workers, map_view != nullptr ? base_rows(i + seq) : log_probs_uint16.data(), kld, kld_ptr, p_diff_ptr);
             p_diff_ptr += n_ctx - 1 - first;
             kld_ptr    += n_ctx - 1 - first;
 
@@ -1902,6 +2074,10 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {
         }
 
         logits.clear();
+    }
+
+    if (pipeline) {
+        finish_pending();   // [TAG_PPL_KLD_FAST] last chunk
     }
 
     llama_batch_free(batch);
