@@ -9,6 +9,18 @@
 #define GGML_FA_TILE_Q  64
 #define GGML_FA_TILE_KV 64
 
+// [TAG_CPU_FA_DV_PAD] row stride of the V32/VKQ32 tiles in the tiled flash attention (ops.cpp): DV rounded up to
+// the SIMD width, so the V GEMM (simd-gemm.h) runs whole vectors for any head size. Shared by the kernel and the
+// scratch sizing in ggml_graph_plan (ggml-cpu.c), which must agree. Same platform condition as simd-gemm.h; SVE and
+// RVV keep DV (their tiled dispatch still requires DV % epr == 0, or their GEMM handles the tail itself).
+static inline int64_t ggml_fa_tiled_dv_pad(int64_t DV) {
+#if defined(GGML_SIMD) && !defined(__ARM_FEATURE_SVE) && !defined(__riscv_v_intrinsic)
+    return GGML_PAD(DV, GGML_F32_EPR);
+#else
+    return DV;
+#endif
+}
+
 #ifdef __cplusplus
 
 #include <utility>

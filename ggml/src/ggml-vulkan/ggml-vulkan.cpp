@@ -14867,9 +14867,29 @@ static ggml_backend_t ggml_backend_vk_device_init(ggml_backend_dev_t dev, const 
     return ggml_backend_vk_init(ctx->device);
 }
 
+// [TAG_VK_NO_TURBO] The fork's KV types (turbo4/2/3, turbo4p, turbo5p, turbo5p512 and the turbot family,
+// ids GGML_TYPE_TURBO4_0..GGML_TYPE_TURBOT_S24) have no Vulkan kernels. Several generic cases below
+// (ROPE, RMS_NORM, same-type CPY, VIEW/RESHAPE, REPEAT by type size) would otherwise claim them, so
+// nothing that reads or writes a turbo/turbot tensor may ever be scheduled on Vulkan.
+static_assert(GGML_TYPE_TURBO4_0 == 43 && GGML_TYPE_TURBOT_S24 == 65 && GGML_TYPE_COUNT == 66,
+              "ggml_type changed: check that every fork KV type is still covered by ggml_vk_is_fork_turbo_type");
+static bool ggml_vk_is_fork_turbo_type(ggml_type t) {
+    return (int) t >= (int) GGML_TYPE_TURBO4_0 && (int) t <= (int) GGML_TYPE_TURBOT_S24;
+}
+
 static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     ggml_backend_vk_device_context * ctx = (ggml_backend_vk_device_context *)dev->context;
     const vk_device& device = ggml_vk_get_device(ctx->device);
+
+    // [TAG_VK_NO_TURBO] see above
+    if (ggml_vk_is_fork_turbo_type(op->type)) {
+        return false;
+    }
+    for (int i = 0; i < GGML_MAX_SRC; i++) {
+        if (op->src[i] && ggml_vk_is_fork_turbo_type(op->src[i]->type)) {
+            return false;
+        }
+    }
 
     const bool uses_bda = (op->op == GGML_OP_IM2COL || op->op == GGML_OP_IM2COL_3D) &&
                           device->shader_int64 && device->buffer_device_address;
@@ -15013,6 +15033,11 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
             }
         case GGML_OP_FLASH_ATTN_EXT:
             {
+                // [TAG_FA_POS_MASK] src[5]/src[6] (positional mask) and [TAG_TURBOT] src[7]/src[8] (pool, granule
+                // table) are fork inputs the Vulkan shaders do not read: accepting them would silently drop the mask.
+                if (op->src[5] || op->src[6] || op->src[7] || op->src[8]) {
+                    return false;
+                }
                 bool coopmat2 = device->coopmat2;
                 uint32_t HSK = op->src[1]->ne[0];
                 uint32_t HSV = op->src[2]->ne[0];

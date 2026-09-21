@@ -245,6 +245,17 @@ struct clip_ctx {
 // clip_graph
 //
 
+// [TAG_CLIP_CPU_KV_F32] On the CPU backend the F16 cast of K/V costs two extra ops per layer, and the tiled
+// CPU flash attention converts every K/V tile back to F32 anyway, so the cast only loses precision and time.
+// MTMD_CPU_KV_F32=0 restores the upstream cast (A/B on one binary).
+static bool clip_cpu_kv_f32_enabled() {
+    static const bool enabled = [] {
+        const char * e = std::getenv("MTMD_CPU_KV_F32");
+        return !(e != nullptr && std::atoi(e) == 0);
+    }();
+    return enabled;
+}
+
 clip_graph::clip_graph(clip_ctx * ctx, const clip_image_f32 & img) :
         model(ctx->model),
         hparams(model.hparams),
@@ -262,7 +273,8 @@ clip_graph::clip_graph(clip_ctx * ctx, const clip_image_f32 & img) :
         n_mmproj_embd(clip_n_mmproj_embd(ctx)),
         eps(hparams.eps),
         kq_scale(d_head > 0 ? 1.0f / sqrtf((float)d_head) : 0.0f),
-        flash_attn_type(ctx->flash_attn_type) {
+        flash_attn_type(ctx->flash_attn_type),
+        kv_f32_cpu(ctx->backend == ctx->backend_cpu && clip_cpu_kv_f32_enabled()) {
     struct ggml_init_params params = {
         /*.mem_size   =*/ ctx->buf_compute_meta.size(),
         /*.mem_buffer =*/ ctx->buf_compute_meta.data(),
@@ -290,7 +302,8 @@ clip_graph::clip_graph(const clip_graph & parent) :
         n_mmproj_embd(parent.n_mmproj_embd),
         eps(parent.eps),
         kq_scale(parent.kq_scale),
-        flash_attn_type(parent.flash_attn_type) {
+        flash_attn_type(parent.flash_attn_type),
+        kv_f32_cpu(parent.kv_f32_cpu) {
     // reuse from parent
     ctx0 = parent.ctx0;
     gf   = parent.gf;
@@ -773,8 +786,16 @@ ggml_tensor * clip_graph::build_attn(
     if (flash_attn_type == CLIP_FLASH_ATTN_TYPE_ENABLED) {
         ggml_tensor * v = ggml_permute(ctx0, v_cur, 0, 2, 1, 3);
 
-        k = ggml_cast(ctx0, k, GGML_TYPE_F16);
-        v = ggml_cast(ctx0, v, GGML_TYPE_F16);
+        // [TAG_CLIP_CPU_KV_F32] K/V stay F32 on the CPU backend when their rows are contiguous, which is all the CPU
+        // flash attention needs (it asserts nb[0] == type size); otherwise the cast keeps making them contiguous.
+        // The mask must stay F16 (ggml_flash_attn_ext asserts it).
+        const bool keep_kv_f32 = kv_f32_cpu &&
+            k->type == GGML_TYPE_F32 && k->nb[0] == sizeof(float) &&
+            v->type == GGML_TYPE_F32 && v->nb[0] == sizeof(float);
+        if (!keep_kv_f32) {
+            k = ggml_cast(ctx0, k, GGML_TYPE_F16);
+            v = ggml_cast(ctx0, v, GGML_TYPE_F16);
+        }
         if (kq_mask) {
             kq_mask = ggml_cast(ctx0, kq_mask, GGML_TYPE_F16);
         }

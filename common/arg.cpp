@@ -2655,11 +2655,29 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         // note: "-mmdev" must sort after "--rpc" in the preset map, else RPC devices are not registered yet
         {"-mmdev", "--mmproj-device"}, "DEVICE",
         "device to use for multimodal projector (none = don't offload, default: follows --device)\n"
+        "also accepts a device type keyword: cpu|gpu|igpu (cpu = same as none, gpu = first discrete GPU,\n"
+        "igpu = first integrated GPU, e.g. an AMD iGPU through Vulkan)\n"
         "use --list-devices to see a list of available devices",
         [](common_params & params, const std::string & value) {
-            if (value == "none") {
+            if (value == "none" || value == "cpu") {
                 params.mmproj_use_gpu = false;
                 params.mmproj_device  = nullptr;
+                return;
+            }
+            // [TAG_MMDEV_TYPE] select the vision device by type instead of a backend index
+            // (Vulkan0/Vulkan1 depend on driver enumeration order). CUDA registers first, so
+            // "gpu" resolves to CUDA0; Vulkan reports an iGPU as GGML_BACKEND_DEVICE_TYPE_IGPU.
+            if (value == "gpu" || value == "igpu") {
+                ggml_backend_load_all();
+                const bool want_igpu = value == "igpu";
+                auto * dev = ggml_backend_dev_by_type(want_igpu ? GGML_BACKEND_DEVICE_TYPE_IGPU : GGML_BACKEND_DEVICE_TYPE_GPU);
+                if (!dev) {
+                    throw std::invalid_argument(want_igpu
+                        ? "--mmproj-device igpu: no integrated GPU device found (Vulkan not built, or GGML_DISABLE_VULKAN set)"
+                        : "--mmproj-device gpu: no discrete GPU device found (GPU backend not built or no GPU visible)");
+                }
+                params.mmproj_use_gpu = true;
+                params.mmproj_device  = dev;
                 return;
             }
             auto devices = parse_device_list(value);
@@ -2671,6 +2689,17 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.mmproj_device  = devices.front();
         }
     ).set_examples(mmproj_examples).set_env("MTMD_BACKEND_DEVICE")); // no LLAMA_ARG_ prefix for backward compatibility reason
+    add_opt(common_arg(
+        // [TAG_MMPROJ_THREADS] CPU threads for the vision encoder only, so it can be tuned without touching -t
+        {"--mmproj-threads"}, "N",
+        string_format("number of CPU threads for the multimodal projector (default: %d, 0 = same as --threads)", params.mmproj_n_threads),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("--mmproj-threads must be >= 0");
+            }
+            params.mmproj_n_threads = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_MMPROJ_THREADS"));
     add_opt(common_arg(
         {"--image", "--audio", "--video"}, "FILE",
         "path to an image, audio, or video file. use with multimodal models, use comma-separated values for multiple files\n",

@@ -9050,6 +9050,12 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
     static constexpr int Q_TILE_SZ  = ggml_fa_tile_config::Q;
     static constexpr int KV_TILE_SZ = ggml_fa_tile_config::KV;
 
+    // [TAG_CPU_FA_DV_PAD] V32 and VKQ32 rows use the stride DVp = DV rounded up to the SIMD width, so the V GEMM
+    // runs whole vectors for any head size (e.g. DV = 72 on AVX-512). The pad columns of V32 are zeroed once
+    // below and never written, so the pad columns of VKQ32 stay 0; only DV values are scaled and copied out.
+    // DVp == DV when DV is already a multiple of the SIMD width, so those sizes keep their exact arithmetic.
+    const int64_t DVp = ggml_fa_tiled_dv_pad(DV);
+
     int ir = ir0;
     while (ir < ir1) {
         // q indices for the start of this tile
@@ -9079,19 +9085,20 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
         // Q_q:    Q_TILE_SZ * DK (converted Q tile — F32 for GEMM, KV type for scalar)
         // KQ:     Q_TILE_SZ * KV_TILE_SZ (attention scores in float)
         // mask:   Q_TILE_SZ * KV_TILE_SZ (mask in float)
-        // VKQ32:  Q_TILE_SZ * DV (FP32 output accumulator)
-        // V32:    KV_TILE_SZ * DV (F32 buffer for V tile)
+        // VKQ32:  Q_TILE_SZ * DVp (FP32 output accumulator, [TAG_CPU_FA_DV_PAD] row stride DVp)
+        // V32:    KV_TILE_SZ * DVp (F32 buffer for V tile, row stride DVp)
         // K_f32:  KV_TILE_SZ * DK (F32 buffer for K tile — GEMM path)
-        float * base  = (float *) params->wdata + ith*(Q_TILE_SZ*DK + 2*Q_TILE_SZ*KV_TILE_SZ + Q_TILE_SZ*DV + KV_TILE_SZ*DV + KV_TILE_SZ*DK + CACHE_LINE_SIZE_F32);
+        // (sized by ggml_graph_plan in ggml-cpu.c with the same ggml_fa_tiled_dv_pad)
+        float * base  = (float *) params->wdata + ith*(Q_TILE_SZ*DK + 2*Q_TILE_SZ*KV_TILE_SZ + Q_TILE_SZ*DVp + KV_TILE_SZ*DVp + KV_TILE_SZ*DK + CACHE_LINE_SIZE_F32);
 
         void  * Q_q    = base;
         float * KQ     = (float *)((char *)base + Q_TILE_SZ * DK * sizeof(float));
         float * mask32 = KQ + Q_TILE_SZ * KV_TILE_SZ;
         float * VKQ32  = mask32 + Q_TILE_SZ * KV_TILE_SZ;
-        float * V32    = VKQ32 + Q_TILE_SZ * DV;
-        float * K_f32  = V32 + KV_TILE_SZ * DV;
+        float * V32    = VKQ32 + Q_TILE_SZ * DVp;
+        float * K_f32  = V32 + KV_TILE_SZ * DVp;
 
-        memset(VKQ32, 0, Q_TILE_SZ * DV * sizeof(float));
+        memset(VKQ32, 0, Q_TILE_SZ * DVp * sizeof(float));
         memset(mask32, 0, Q_TILE_SZ * KV_TILE_SZ * sizeof(float));
 
         // k indices
@@ -9114,7 +9121,7 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
         }
 
         memset(K_f32, 0, DK * KV_TILE_SZ * sizeof(float));
-        memset(V32,   0, KV_TILE_SZ * DV * sizeof(float));
+        memset(V32,   0, KV_TILE_SZ * DVp * sizeof(float));
 
         for (int64_t ic = 0; ic < nek1; ic += KV_TILE_SZ) {
             const int kv_tile = (int)std::min((int64_t)KV_TILE_SZ, nek1 - ic);
@@ -9197,7 +9204,7 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
 
                 if (Mnew > Mold) {
                     const float ms = expf(Mold - Mnew);
-                    ggml_vec_scale_f32(DV, VKQ32 + tq * DV, ms);
+                    ggml_vec_scale_f32(DV, VKQ32 + tq * DVp, ms);
                     S[tq] *= ms;
                 }
                 M[tq] = Mnew;
@@ -9207,13 +9214,13 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
             }
 
             // V accumulation: VKQ32 += softmax(KQ) * V
-            // Pack V tile to contiguous F32, zero-padded
+            // Pack V tile to contiguous F32, zero-padded (row stride DVp, columns [DV, DVp) stay 0)
             for (int tk = 0; tk < kv_tile; tk++) {
                 const char * v_data = (const char *)v->data + (ic + tk)*nbv1 + iv2*nbv2 + iv3*nbv3;
                 if (kv_type == GGML_TYPE_F16) {
-                    ggml_cpu_fp16_to_fp32((const ggml_fp16_t *)v_data, V32 + tk * DV, DV);
+                    ggml_cpu_fp16_to_fp32((const ggml_fp16_t *)v_data, V32 + tk * DVp, DV);
                 } else {
-                    memcpy(V32 + tk * DV, v_data, DV * sizeof(float));
+                    memcpy(V32 + tk * DVp, v_data, DV * sizeof(float));
                 }
             }
             for (int tq = 0; tq < Q_TILE_SZ; tq++) {
@@ -9221,7 +9228,7 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
                     memset(KQ + tq * KV_TILE_SZ, 0, KV_TILE_SZ * sizeof(float));
                 }
             }
-            simd_gemm(VKQ32, KQ, V32, Q_TILE_SZ, KV_TILE_SZ, DV);
+            simd_gemm(VKQ32, KQ, V32, Q_TILE_SZ, KV_TILE_SZ, DVp);
         }
 
         // sinks (apply only to valid rows in the tile)
@@ -9234,7 +9241,7 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
 
                 if (s > M[tq]) {
                     ms = expf(M[tq] - s);
-                    ggml_vec_scale_f32(DV, VKQ32 + tq * DV, ms);
+                    ggml_vec_scale_f32(DV, VKQ32 + tq * DVp, ms);
                 } else {
                     vs = expf(s - M[tq]);
                 }
@@ -9246,15 +9253,15 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
         for (int tq = 0; tq < tile_rows; tq++) {
             // V /= S
             const float S_inv = S[tq] == 0.0f ? 0.0f : 1.0f / S[tq];
-            ggml_vec_scale_f32(DV, VKQ32 + tq * DV, S_inv);
+            ggml_vec_scale_f32(DV, VKQ32 + tq * DVp, S_inv);
 
             // dst indices
             const int i1 = iq1 + tq;
             const int i2 = iq2;
             const int i3 = iq3;
 
-            // permute(0, 2, 1, 3)
-            memcpy((char *) dst->data + (i3*ne2*ne1 + i2 + i1*ne1)*nb1, VKQ32 + tq * DV, nb1);
+            // permute(0, 2, 1, 3); [TAG_CPU_FA_DV_PAD] copies the DV values only (nb1 == DV*sizeof(float))
+            memcpy((char *) dst->data + (i3*ne2*ne1 + i2 + i1*ne1)*nb1, VKQ32 + tq * DVp, DV*sizeof(float));
         }
 
         ir += tile_rows;
@@ -9450,7 +9457,16 @@ static void ggml_compute_forward_flash_attn_ext_f16(
 #else
         const int64_t f32_epr = GGML_F32_EPR;
 #endif
-        use_tiled &= (DV % f32_epr == 0);
+        // [TAG_CPU_FA_DV_PAD] where ggml_fa_tiled_dv_pad pads DV (x86/NEON/...), the tiled path handles any DV, e.g.
+        // the head size 72 of vision encoders on AVX-512, which used to fall back to one_chunk with an FP16 V
+        // accumulator. GGML_CPU_FA_DV_PAD=0 restores the upstream DV % epr gate (A/B on one binary).
+        static const bool dv_pad_on = [] {
+            const char * e = getenv("GGML_CPU_FA_DV_PAD");
+            return !(e != nullptr && atoi(e) == 0);
+        }();
+        if (!(dv_pad_on && ggml_fa_tiled_dv_pad(DV) != DV)) {
+            use_tiled &= (DV % f32_epr == 0);
+        }
 #endif
         use_tiled = use_tiled && dst->src[5] == NULL;   // [TAG_FA_POS_MASK] the tiled path reads the explicit mask only
         int current_chunk = ith;

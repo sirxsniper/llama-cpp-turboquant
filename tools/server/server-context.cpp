@@ -1209,7 +1209,8 @@ private:
             mparams.use_gpu          = params_base.mmproj_use_gpu;
             mparams.device           = params_base.mmproj_device;
             mparams.print_timings    = false;
-            mparams.n_threads        = params_base.cpuparams.n_threads;
+            // [TAG_MMPROJ_THREADS] --mmproj-threads N > 0 overrides -t for the vision encoder only
+            mparams.n_threads        = params_base.mmproj_n_threads > 0 ? params_base.mmproj_n_threads : params_base.cpuparams.n_threads;
             mparams.flash_attn_type  = params_base.flash_attn_type;
             mparams.warmup           = params_base.warmup;
             mparams.image_min_tokens = params_base.image_min_tokens;
@@ -3231,23 +3232,56 @@ private:
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
         const int id_task = slot.task->id;
 
+        // [TAG_SYNC_CKPT_EVICT] Upstream 5d806aa25 (#28302) applies the min-step spacing eviction only once
+        // the list is full, counted against --ctx-checkpoints, and supersedes a checkpoint at the same
+        // n_tokens instead of appending a duplicate. Here "full" is the effective cap after the byte budget
+        // below ([TAG_CKPT_BYTE_BUDGET], 13 entries instead of 32 on Qwen3.8-27B), otherwise the budget's
+        // FIFO eviction would always run first and the spacing rule would never fire. When the budget does
+        // not bind, the cap is --ctx-checkpoints and this is upstream's rule exactly. The supersede runs
+        // first so that a duplicate never costs an unrelated old checkpoint, and it donates its buffer to
+        // [TAG_CKPT_BUFFER_REUSE]. LLAMA_CTX_CHECKPOINT_MIN_STEP_ALWAYS=1 restores the pre-sync fork
+        // behaviour for A/B: spacing eviction on every call, before the budget, and no supersede.
+        static const bool min_step_always = [] {
+            const char * e = getenv("LLAMA_CTX_CHECKPOINT_MIN_STEP_ALWAYS");
+            return e != nullptr && atoi(e) != 0;
+        }();
+
+        // replace an existing checkpoint at the same n_tokens instead of appending a duplicate
+        if (!min_step_always) {
+            const int64_t n_tokens_new = slot.prompt.n_tokens() - n_tokens_cur;
+            for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end(); ) {
+                if (it->n_tokens == n_tokens_new) {
+                    SLT_TRC(slot, "superseding context checkpoint at n_tokens = %" PRId64 "\n", it->n_tokens);
+                    if (slot.ckpt_spare.empty()) {
+                        slot.ckpt_spare = std::move(it->data_tgt);
+                    }
+                    it = slot.prompt.checkpoints.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
+
         // evict checkpoints within min-step of a previous checkpoint, unless they were
         // created by the current task
-        // only when the list is full, otherwise short prompts keep just the oldest checkpoint
-        int64_t last = -1;
-        for (auto it = slot.prompt.checkpoints.begin();
-                slot.prompt.checkpoints.size() + 1 >= (size_t) params_base.n_ctx_checkpoints &&
-                it != slot.prompt.checkpoints.end(); ) {
-            if (it->id_task != id_task && last >= 0 && it->n_tokens <= last + params_base.checkpoint_min_step) {
-                SLT_TRC(slot, "erasing context checkpoint too close to an earlier one (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
-                        it->pos_min, it->pos_max, it->n_tokens, (float) it->size() / 1024 / 1024);
+        const auto evict_min_step = [&]() {
+            int64_t last = -1;
+            for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end(); ) {
+                if (it->id_task != id_task && last >= 0 && it->n_tokens <= last + params_base.checkpoint_min_step) {
+                    SLT_TRC(slot, "erasing context checkpoint too close to an earlier one (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
+                            it->pos_min, it->pos_max, it->n_tokens, (float) it->size() / 1024 / 1024);
 
-                it = slot.prompt.checkpoints.erase(it);
-                continue;
+                    it = slot.prompt.checkpoints.erase(it);
+                    continue;
+                }
+
+                last = it->n_tokens;
+                ++it;
             }
+        };
 
-            last = it->n_tokens;
-            ++it;
+        if (min_step_always) {
+            evict_min_step();
         }
 
         // [TAG_CKPT_BYTE_BUDGET]
@@ -3303,6 +3337,11 @@ private:
             }
         }
 
+        // [TAG_SYNC_CKPT_EVICT] only when the list is full, otherwise short prompts keep just the oldest checkpoint
+        if (!min_step_always && slot.prompt.checkpoints.size() + 1 >= n_ckpt_max) {
+            evict_min_step();
+        }
+
         while (slot.prompt.checkpoints.size() >= n_ckpt_max) {
             // make room for the new checkpoint, if needed
             auto & old = slot.prompt.checkpoints.front();
@@ -3318,19 +3357,6 @@ private:
             }
 
             slot.prompt.checkpoints.erase(slot.prompt.checkpoints.begin());
-        }
-
-        // replace an existing checkpoint at the same n_tokens instead of appending a duplicate
-        {
-            const int64_t n_tokens_new = slot.prompt.n_tokens() - n_tokens_cur;
-            for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end(); ) {
-                if (it->n_tokens == n_tokens_new) {
-                    SLT_TRC(slot, "superseding context checkpoint at n_tokens = %" PRId64 "\n", it->n_tokens);
-                    it = slot.prompt.checkpoints.erase(it);
-                } else {
-                    ++it;
-                }
-            }
         }
 
         auto & cur = slot.prompt.checkpoints.emplace_back();
@@ -4610,7 +4636,21 @@ private:
                         size_t n_tokens_out = 0;
                         int32_t res = 0;
                         queue_tasks.yield_to_queue([&]() {
-                            res = process_mtmd_chunk(slot, slot.mbatch, cur_token_idx, n_tokens_out);
+                            // [TAG_MTMD_ENCODE_CATCH] mtmd_batch_encode already turns a std::exception from
+                            // the encoder (a Vulkan DeviceLost on the iGPU is a vk::SystemError) into an error
+                            // code. This also stops anything else thrown here (a non-std exception, the image
+                            // decode helper) from escaping update_slots and killing the server with every
+                            // slot. Fail only this request: res != 0 below sends the error and releases the
+                            // slot, which also drops the partially encoded slot.mbatch.
+                            try {
+                                res = process_mtmd_chunk(slot, slot.mbatch, cur_token_idx, n_tokens_out);
+                            } catch (const std::exception & e) {
+                                SLT_ERR(slot, "exception while processing mtmd chunk: %s\n", e.what());
+                                res = -1;
+                            } catch (...) {
+                                SLT_ERR(slot, "%s", "unknown exception while processing mtmd chunk\n");
+                                res = -1;
+                            }
                         });
 
                         if (res != 0) {

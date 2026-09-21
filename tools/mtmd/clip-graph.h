@@ -44,6 +44,9 @@ struct clip_graph {
     const float eps;
     float kq_scale; // TODO: maybe move this to hparams
     const clip_flash_attn_type flash_attn_type;
+    // [TAG_CLIP_CPU_KV_F32] the encoder runs on the CPU backend: build_attn keeps K/V in F32 for flash
+    // attention instead of casting them to F16 (env MTMD_CPU_KV_F32=0 restores the cast)
+    const bool kv_f32_cpu;
 
     // TODO [QWEN_VIDEO]: improve this in the future
     int n_batch = 1;
