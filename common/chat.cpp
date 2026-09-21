@@ -1491,6 +1491,8 @@ common_chat_msg common_chat_peg_parse(const common_peg_arena &          src_pars
             }
             return msg;
         }
+        // [TAG_SYNC_CHAT_PARSE_NOTHROW] fork deviation, upstream throws here. Qwen3.5/3.8 templates route
+        // through common/parsers/qwen3-coder.cpp, whose arena is parsed by this function.
         // Fallback: when the model emits malformed tool-call XML (e.g. duplicate
         // </parameter> tags from Qwen / Hermes-style outputs), don't throw.
         // Return the raw text as plain assistant content so the client still

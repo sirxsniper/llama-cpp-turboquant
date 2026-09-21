@@ -20,9 +20,11 @@
 #include <chrono>
 #include <cinttypes>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <iomanip>
 #include <map>
+#include <mutex>
 #include <random>
 
 #define SPC_DBG(fmt, ...) LOG_DBG("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
@@ -987,6 +989,63 @@ static int32_t spec_prefill_tail() {
     return tail;
 }
 
+// [TAG_SPEC_DFT_DUMP] SPEC_DFT_DUMP=<path> writes every DFlash2 selector lattice row that draft() reads
+// from llama_get_embeddings_nextn, so an old and a new build can be compared offline (sync plan B4: the
+// upstream in-graph selector must reproduce the layout draft() reads; a mismatch would otherwise only
+// show up as lower acceptance). Unset (the default) costs one cached-pointer test per draft() call.
+//
+// Text, '\n' endings, the file is truncated when the process opens it. One header line, then one line
+// per drafted block position:
+//   # spec_dft_dump v1 top_k=<K> n_embd=<N>
+//   <call> <seq_id> <pos0> <id_last> <i> <K candidate ids> <K*K scores>
+//   <call>    draft() invocation counter in this process, 1-based
+//   <pos0>    position of id_last, the block anchor; the line is block position <i> = 1..n_block-1
+//             (row 0 of a block is the anchor and holds no candidates, so it is not written)
+//   ids       the lattice's f32 values printed as they are; a non-integer means a broken layout
+//   scores    predecessor-major: K groups of K successor scores, group p conditioned on candidate p
+//             at position i-1 (at i=1 all groups are conditioned on the anchor and are identical)
+// Floats use %.9g, which round-trips an f32 exactly. Match old and new runs on
+// (seq_id, pos0, id_last, i), not on <call>: once two builds accept different tokens the steps diverge.
+static FILE * spec_dft_dump_file() {
+    static FILE * const f = [] () -> FILE * {
+        const char * path = getenv("SPEC_DFT_DUMP");
+        if (path == nullptr || path[0] == '\0') {
+            return nullptr;
+        }
+        FILE * fp = fopen(path, "wb");
+        if (fp == nullptr) {
+            LOG_WRN("spec_dft_dump: cannot open SPEC_DFT_DUMP='%s' for writing, dump disabled\n", path);
+        } else {
+            LOG_INF("spec_dft_dump: writing the DFlash2 selector lattice to '%s'\n", path);
+        }
+        return fp;
+    }();
+    return f;
+}
+
+static void spec_dft_dump_rows(FILE * f, const float * lattice, int32_t n_embd, int32_t top_k, uint64_t n_call,
+        llama_seq_id seq_id, llama_pos pos0, llama_token id_last, int32_t beg, int32_t n_block_tokens) {
+    static std::mutex mtx;
+    static bool header_done = false;
+
+    std::lock_guard<std::mutex> lock(mtx);
+    if (!header_done) {
+        fprintf(f, "# spec_dft_dump v1 top_k=%d n_embd=%d\n", (int) top_k, (int) n_embd);
+        header_done = true;
+    }
+
+    const int32_t n_used = top_k + top_k * top_k;
+    for (int32_t i = 1; i < n_block_tokens; ++i) {
+        const float * row = lattice + (size_t) (beg + i) * n_embd;
+        fprintf(f, "%" PRIu64 " %d %d %d %d", n_call, (int) seq_id, (int) pos0, (int) id_last, (int) i);
+        for (int32_t k = 0; k < n_used; ++k) {
+            fprintf(f, " %.9g", (double) row[k]);
+        }
+        fputc('\n', f);
+    }
+    fflush(f);
+}
+
 struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     // [TAG_SPEC_PREFILL_TAIL_EXTRACT] The per-sequence skip decision, shared by process() and by the
     // server, which asks BEFORE the target decode so that llama can skip extracting the five layer
@@ -1047,6 +1106,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     int32_t selector_top_k = 0;
     std::vector<std::mt19937> selector_rng;
     std::vector<bool> selector_reset;
+
+    uint64_t n_dump_call = 0; // [TAG_SPEC_DFT_DUMP] draft() calls written so far
 
     // draft-dspark: the draft carries a Markov head and uses an anchor-first block layout
     const bool is_dspark;
@@ -1590,6 +1651,12 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             return;
         }
 
+        // [TAG_SPEC_DFT_DUMP] nullptr unless SPEC_DFT_DUMP is set
+        FILE * dump = is_dflash2 ? spec_dft_dump_file() : nullptr;
+        if (dump) {
+            ++n_dump_call;
+        }
+
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             if (i_block_beg[seq_id] < 0) {
                 continue;
@@ -1611,6 +1678,11 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 GGML_ASSERT(dp.temperature <= 0.0f || dp.dists);
                 const float * lattice = llama_get_embeddings_nextn(ctx_dft);
                 GGML_ASSERT(lattice && "DFlash2 selector produced no lattice");
+
+                if (dump) {
+                    spec_dft_dump_rows(dump, lattice, n_embd_dec, selector_top_k, n_dump_call,
+                            seq_id, dp.pos0, dp.id_last, beg, n_block_tokens);
+                }
 
                 if (selector_reset[seq_id]) {
                     uint32_t seed = dp.seed;
