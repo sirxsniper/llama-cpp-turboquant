@@ -229,7 +229,8 @@ install the OpenSSL Windows binaries from
   unloads), a reboot is the cheapest first move. This was needed once
   during this round of work.
 
-* `--no-mmap` (or `-mmp 0` for `llama-bench`) is recommended once the
+* `--load-mode none` (`-lm none` for `llama-bench`; replaces the removed
+  `--no-mmap` / `-mmp 0`) is recommended once the
   model fits in VRAM. Saves a small TG hit from page-fault stalls when
   the OS lazily pages in mmapped weights.
 

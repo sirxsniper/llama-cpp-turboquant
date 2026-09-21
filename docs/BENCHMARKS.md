@@ -62,7 +62,7 @@ Full build recipe in [`docs/BUILD-WINDOWS.md`](BUILD-WINDOWS.md).
 --flash-attn on
 -ngl 99
 -mg 0 -dev CUDA0 -ts 1
---no-mmap
+--load-mode none
 --batch-size 2048 --ubatch-size 1024
 --threads 16 --threads-batch 16
 --ctx-size 262144
@@ -111,7 +111,7 @@ llama-batched-bench.exe ^
   -m Qwen3.6-27B-UD-Q6_K_XL.gguf ^
   -c 262144 -b 2048 -ub 1024 ^
   -fa on -ctk turbo4 -ctv turbo4 ^
-  -ngl 99 -mg 0 -dev CUDA0 -ts 1 --no-mmap ^
+  -ngl 99 -mg 0 -dev CUDA0 -ts 1 --load-mode none ^
   -npp 4000,8000,16000,32000,64000,128000,256000 ^
   -ntg 128 -npl 1 -t 16 -tb 16
 ```
@@ -172,7 +172,7 @@ and extract there if you don't have it.)
 
 * **Single-GPU isolation.** All runs use `-dev CUDA0 -ts 1` so the work stays on one
   device. Reported numbers are not multi-GPU-split.
-* **No mmap.** `--no-mmap` is required for accurate TG numbers; mmap-on can cause
+* **No mmap.** `--load-mode none` (formerly `--no-mmap`) is required for accurate TG numbers; mmap-on can cause
   occasional page-fault stalls during generation that show up as a roughly 1-3 t/s drop.
 * **Power state.** Both the Windows power plan (High Performance) and the NVIDIA
   Control Panel "Power management mode" (Prefer maximum performance) must be set

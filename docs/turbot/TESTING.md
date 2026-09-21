@@ -212,7 +212,7 @@ Model `D:\Projects\LocalAI\models\Qwen3.8-27B-UD-Q5_K_XL.gguf`. The reference is
 ```powershell
 $env:LLAMA_TURBOT_PLAN = "WT\docs\turbot\plans\turbot-default.plan"
 $ppl  = "BIN\llama-perplexity.exe"
-$args = "-m D:\Projects\LocalAI\models\Qwen3.8-27B-UD-Q5_K_XL.gguf -c 32768 --chunks 16 -ngl 999 -fa on --no-mmap -b 2048 --threads 16 -ctk turbot -ctv turbot"
+$args = "-m D:\Projects\LocalAI\models\Qwen3.8-27B-UD-Q5_K_XL.gguf -c 32768 --chunks 16 -ngl 999 -fa on --load-mode none -b 2048 --threads 16 -ctk turbot -ctv turbot"
 & $ppl $args.Split(" ") -ub 512  -f E:\kv-bar-s0\code_corpus.txt  --kl-divergence-base E:\kv-bar-s0\base_code.dat  --kl-divergence *> E:\kv-s3\code_turbot.log
 & $ppl $args.Split(" ") -ub 512  -f E:\kv-bar-s0\prose_corpus.txt --kl-divergence-base E:\kv-bar-s0\base_prose.dat --kl-divergence *> E:\kv-s3\prose_turbot.log
 & $ppl $args.Split(" ") -ub 1280 -f E:\kv-bar-s0\code_corpus.txt  --kl-divergence-base E:\kv-bar-s0\base_code.dat  --kl-divergence *> E:\kv-s3\code_turbot_ub1280.log

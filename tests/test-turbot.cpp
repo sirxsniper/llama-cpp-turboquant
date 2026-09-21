@@ -920,7 +920,7 @@ static void test_params_layout() {
         for (int side : { GGML_TURBOT_SIDE_K, GGML_TURBOT_SIDE_V, GGML_TURBOT_SIDE_BOTH }) {
             ggml_tensor t;
             std::memset(&t, 0, sizeof(t));
-            std::memset(t.op_params, 0x77, GGML_TURBOT_OP_PARAMS_OFFSET);   // FA bytes 0..15 must survive
+            std::memset(t.op_params, 0x77, GGML_TURBOT_OP_PARAMS_OFFSET);   // FA bytes 0..23 must survive
             ggml_turbot_op_params p;
             ggml_turbot_op_params_make(&p, &l, side);
             ggml_turbot_op_params_set(&t, &p);

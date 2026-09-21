@@ -112,50 +112,25 @@ if (CUDAToolkit_FOUND)
     file(GLOB   SRCS "template-instances/mmf*.cu")
     list(APPEND GGML_SOURCES_CUDA ${SRCS})
 
-    if (GGML_CUDA_FA_ALL_QUANTS)
-        file(GLOB   SRCS "template-instances/fattn-vec*.cu")
-        list(APPEND GGML_SOURCES_CUDA ${SRCS})
-        add_compile_definitions(GGML_CUDA_FA_ALL_QUANTS)
-    else()
-        list(APPEND GGML_SOURCES_CUDA
-            template-instances/fattn-vec-instance-f16-f16.cu
-            template-instances/fattn-vec-instance-q4_0-q4_0.cu
-            template-instances/fattn-vec-instance-q8_0-q8_0.cu
-            template-instances/fattn-vec-instance-bf16-bf16.cu
-            template-instances/fattn-vec-instance-turbo3_0-turbo3_0.cu
-            template-instances/fattn-vec-instance-turbo3_0-q8_0.cu
-            template-instances/fattn-vec-instance-q8_0-turbo3_0.cu
-            template-instances/fattn-vec-instance-turbo2_0-turbo2_0.cu
-            template-instances/fattn-vec-instance-turbo2_0-q8_0.cu
-            template-instances/fattn-vec-instance-q8_0-turbo2_0.cu
-            template-instances/fattn-vec-instance-turbo3_0-turbo2_0.cu
-            template-instances/fattn-vec-instance-turbo2_0-turbo3_0.cu
-            template-instances/fattn-vec-instance-turbo4_0-turbo4_0.cu
-            template-instances/fattn-vec-instance-turbo4p_0-turbo4p_0.cu
-            template-instances/fattn-vec-instance-turbo4p_0-q8_0.cu
-            template-instances/fattn-vec-instance-q8_0-turbo4p_0.cu
-            template-instances/fattn-vec-instance-turbo5p_0-turbo5p_0.cu
-            template-instances/fattn-vec-instance-turbo5p_0-q8_0.cu
-            template-instances/fattn-vec-instance-q8_0-turbo5p_0.cu
-            template-instances/fattn-vec-instance-turbo5p512_0-turbo5p512_0.cu
-            template-instances/fattn-vec-instance-turbo5p512_0-q8_0.cu
-            template-instances/fattn-vec-instance-q8_0-turbo5p512_0.cu
-            template-instances/fattn-vec-instance-turbo4p_0-turbo4_0.cu
-            template-instances/fattn-vec-instance-turbo4_0-turbo4p_0.cu
-            template-instances/fattn-vec-instance-turbo4_0-q8_0.cu
-            template-instances/fattn-vec-instance-q8_0-turbo4_0.cu
-            template-instances/fattn-vec-instance-turbo4_0-turbo3_0.cu
-            template-instances/fattn-vec-instance-turbo3_0-turbo4_0.cu
-            template-instances/fattn-vec-instance-turbo4_0-turbo2_0.cu
-            template-instances/fattn-vec-instance-turbo2_0-turbo4_0.cu)
-    endif()
+    ggml_cuda_fattn_vec_instances(${CMAKE_CURRENT_SOURCE_DIR} SRCS)
+    list(APPEND GGML_SOURCES_CUDA ${SRCS})
+
+    # [TAG_SYNC_FA_TURBO_INSTANCES] The turbo VEC instances (turbo2/3/4/4p/5p/5p512, their
+    # mixed pairs and the q8_0 pairs) are outside GGML_CUDA_FA_QUANTS and are always compiled:
+    # fattn.cu dispatches them through ungated FATTN_VEC_CASES_TURBO entries, and a missing one
+    # would be a link error rather than an f16 fallback. The 20 turbot MMA instances
+    # (fattn-mma-turbot-instance-*.cu) are already picked up by the fattn-mma* glob above.
+    file(GLOB   SRCS "template-instances/fattn-vec-instance-*turbo*.cu")
+    list(APPEND GGML_SOURCES_CUDA ${SRCS})
+    list(LENGTH SRCS GGML_CUDA_FA_TURBO_VEC_COUNT)
+    file(GLOB   SRCS "template-instances/fattn-mma-turbot-instance-*.cu")
+    list(LENGTH SRCS GGML_CUDA_FA_TURBOT_MMA_COUNT)
+    message(STATUS "FlashAttention turbo VEC instances: ${GGML_CUDA_FA_TURBO_VEC_COUNT}, turbot MMA instances: ${GGML_CUDA_FA_TURBOT_MMA_COUNT}")
 
     ggml_add_backend_library(ggml-cuda
                              ${GGML_HEADERS_CUDA}
                              ${GGML_SOURCES_CUDA}
                             )
-
-    add_compile_definitions(GGML_CUDA_PEER_MAX_BATCH_SIZE=${GGML_CUDA_PEER_MAX_BATCH_SIZE})
 
     if (GGML_CUDA_GRAPHS)
         add_compile_definitions(GGML_CUDA_USE_GRAPHS)

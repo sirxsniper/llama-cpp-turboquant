@@ -77,6 +77,7 @@ extern "C" {
         LLAMA_VOCAB_TYPE_UGM    = 4, // T5 tokenizer based on Unigram
         LLAMA_VOCAB_TYPE_RWKV   = 5, // RWKV tokenizer based on greedy tokenization
         LLAMA_VOCAB_TYPE_PLAMO2 = 6, // PLaMo-2 tokenizer based on Aho-Corasick with dynamic programming
+        LLAMA_VOCAB_TYPE_TEST   = 7, // Dummy tokenizer for testing: rolling hash of fixed-size chunks -> tokens, tokens -> hex
     };
 
     enum llama_rope_type {
@@ -214,10 +215,10 @@ extern "C" {
     LLAMA_API const char * llama_load_mode_name(enum llama_load_mode load_mode);
     LLAMA_API enum llama_load_mode llama_load_mode_from_str(const char * str);
 
-    enum llama_tensor_read_lazy {
-        LLAMA_TENSOR_READ_LAZY_OFF  = 0, // always read the whole tensor up front
-        LLAMA_TENSOR_READ_LAZY_AUTO = 1, // lazy only for marked tensors larger than 4 GiB (requires mmap)
-        LLAMA_TENSOR_READ_LAZY_ON   = 2, // read the rows of tensors marked by the arch on demand (requires mmap)
+    enum llama_lazy_mode {
+        LLAMA_LAZY_MODE_OFF  = 0, // always read the whole tensor up front
+        LLAMA_LAZY_MODE_AUTO = 1, // lazy only for marked tensors larger than 4 GiB (requires mmap)
+        LLAMA_LAZY_MODE_ON   = 2, // read the rows of tensors marked by the arch on demand (requires mmap)
     };
 
     enum llama_context_type {
@@ -321,7 +322,7 @@ extern "C" {
         enum llama_split_mode split_mode; // how to split the model across multiple GPUs
         enum llama_load_mode  load_mode;  // how to load the model
 
-        enum llama_tensor_read_lazy tensor_read_lazy; // on-demand reading of tensors marked by the arch
+        enum llama_lazy_mode lazy_mode; // on-demand reading of tensors marked by the arch
 
         // the GPU that is used for the entire model when split_mode is LLAMA_SPLIT_MODE_NONE
         int32_t main_gpu;
@@ -449,6 +450,7 @@ extern "C" {
         const struct llama_model_kv_override * kv_overrides;        // pointer to kv overrides
         const struct llama_model_tensor_override * tt_overrides;    // pointer to tensor overrides
         const int32_t * prune_layers;                               // pointer to layer indices to prune
+        size_t max_buf_size;                                        // max bytes of tensor rows kept in memory at once, 0 = default (8 GiB)
     } llama_model_quantize_params;
 
     typedef struct llama_logit_bias {
@@ -521,6 +523,8 @@ extern "C" {
               struct llama_model_params   params);
 
     // Load a model from an open FILE pointer
+    // The GGUF is read from the current position, so it can be embedded in a larger file
+    // mmap needs the GGUF data section at a file offset to be aligned to the CPU tensor alignment (32 bytes)
     LLAMA_API struct llama_model * llama_model_load_from_file_ptr(
                                    FILE * file,
               struct llama_model_params   params);
@@ -683,6 +687,11 @@ extern "C" {
     LLAMA_API struct llama_adapter_lora * llama_adapter_lora_init(
             struct llama_model * model,
             const char * path_lora);
+
+    // Load a LoRA adapter from an open FILE pointer, reading from its current position
+    LLAMA_API struct llama_adapter_lora * llama_adapter_lora_init_from_file_ptr(
+            struct llama_model * model,
+            FILE * file);
 
     // Functions to access the adapter's GGUF metadata scalar values
     // - The functions return the length of the string on success, or -1 on failure
@@ -1390,7 +1399,7 @@ extern "C" {
     LLAMA_API struct llama_sampler * llama_sampler_chain_get(      struct llama_sampler * chain, int32_t i);
 
     // the total number of samplers in the chain
-    LLAMA_API int                    llama_sampler_chain_n  (const struct llama_sampler * chain);
+    LLAMA_API int32_t                llama_sampler_chain_n  (const struct llama_sampler * chain);
 
     // after removing a sampler, the chain will no longer own it, and it will not be freed when the chain is freed
     LLAMA_API struct llama_sampler * llama_sampler_chain_remove(   struct llama_sampler * chain, int32_t i);

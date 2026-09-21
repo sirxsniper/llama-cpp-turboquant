@@ -667,8 +667,10 @@ static __device__ __forceinline__ void flash_attn_ext_turbot_iter(
             flash_attn_ext_f16_gen_mask<ncols1, nwarps, nbatch_fa, oob_check>
                 (kv_pos + k_VKQ_0, q_pos, tile_mask, k_VKQ_sup, jt*ncols1, ne01);
         } else if (ncols2 > 1 || mask_h) {
-            flash_attn_ext_f16_load_mask<ncols1, nwarps, nbatch_fa, use_cp_async, oob_check>
-                (mask_h + k_VKQ_0, tile_mask, stride_mask, k_VKQ_sup, jt*ncols1, ne01);
+            // [TAG_SYNC_LOAD_MASK] upstream load_mask takes the tile start and a sparse index list; turbot never
+            // uses sparse FA, so use_sparse = false and no indices (same addresses as the old mask_h + k_VKQ_0).
+            flash_attn_ext_f16_load_mask<ncols1, nwarps, nbatch_fa, use_cp_async, oob_check, false>
+                (mask_h, tile_mask, stride_mask, k_VKQ_0, k_VKQ_sup, jt*ncols1, ne01, nullptr);
         }
     }
 

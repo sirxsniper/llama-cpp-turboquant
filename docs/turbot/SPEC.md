@@ -468,7 +468,7 @@ GGML_API void ggml_flash_attn_ext_set_turbot(
 - `fill == NULL` or (`fill->type == I32`, `fill->ne[0] == 4`);
 - the params pass `ggml_turbot_op_params_get`, and the side's S matches `a->type`.
 
-Result: `ggml_view_tensor(ctx, a)`, op, sources as in the table. Bytes 0..15 of op_params are zero; turbot params go at byte 16.
+Result: `ggml_view_tensor(ctx, a)`, op, sources as in the table. Bytes 0..23 of op_params are zero; turbot params go at byte 24.
 
 **`ggml_flash_attn_ext_set_turbot` asserts:**
 - `a->op == FLASH_ATTN_EXT`;
@@ -479,21 +479,23 @@ Result: `ggml_view_tensor(ctx, a)`, op, sources as in the table. Bytes 0..15 of 
 - pool I8; gtab I32, 1-D, contiguous, `gtab->ne[0]*64 >= src[1]->ne[1]`;
 - `src[7] == src[8] == NULL` before the call.
 
-Bytes 0..15 (scale, max_bias, softcap, prec) are untouched.
+Bytes 0..19 (scale, max_bias, softcap, prec, n_kv_max) are untouched.
 
-### 5.3 Op params (`struct ggml_turbot_op_params`, 24 bytes at op_params byte 16)
+### 5.3 Op params (`struct ggml_turbot_op_params`, 24 bytes at op_params byte 24)
 
 | Byte | Field |
 |---|---|
-| 16-19 | magic `0x54425254` |
-| 20 | version 1 |
-| 21 | side (0 K, 1 V, 2 both) |
-| 22 | log2_granule = 6 |
-| 23 | flags = 0 |
-| 24-27 | bk[4] |
-| 28-31 | bv[4] |
-| 32-35 | yk[4] |
-| 36-39 | yv[4] |
+| 24-27 | magic `0x54425254` |
+| 28 | version 1 |
+| 29 | side (0 K, 1 V, 2 both) |
+| 30 | log2_granule = 6 |
+| 31 | flags = 0 |
+| 32-35 | bk[4] |
+| 36-39 | bv[4] |
+| 40-43 | yk[4] |
+| 44-47 | yv[4] |
+
+The offset was 16 before the upstream sync; upstream `ggml_flash_attn_ext_set_n_kv_max` now owns int32 slot 4 (bytes 16-19) of every FLASH_ATTN_EXT.
 
 Use `ggml_turbot_op_params_make/set/get` and `ggml_turbot_layer_from_op_params`. Never write the bytes by hand.
 

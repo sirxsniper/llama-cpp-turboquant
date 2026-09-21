@@ -226,12 +226,12 @@ build-tq-merged\bin\llama-server.exe --version
 
 REM bench TG at empty cache (5 reps, no-mmap):
 build-tq-merged\bin\llama-bench.exe -m model.gguf -fa 1 -ctk turbo4 -ctv turbo4 ^
-   -ngl 99 -mg 0 -dev CUDA0 -ts 1 -mmp 0 -p 0 -n 128 -r 5
+   -ngl 99 -mg 0 -dev CUDA0 -ts 1 -lm none -p 0 -n 128 -r 5
 
 REM bench at 8k/32k/64k/128k context fills (separate PP and TG):
 build-tq-merged\bin\llama-batched-bench.exe -m model.gguf -c 131072 ^
    -b 2048 -ub 1024 -fa on -ctk turbo4 -ctv turbo4 ^
-   -ngl 99 -mg 0 -dev CUDA0 -ts 1 --no-mmap ^
+   -ngl 99 -mg 0 -dev CUDA0 -ts 1 --load-mode none ^
    -npp 8000,32000,64000,128000 -ntg 128 -npl 1
 ```
 

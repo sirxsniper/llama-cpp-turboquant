@@ -1970,6 +1970,7 @@ ggml_tensor * llama_kv_cache::build_input_k_idxs(ggml_context * ctx, const llama
     ggml_tensor * k_idxs = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, n_tokens);
 
     ggml_set_input(k_idxs);
+    ggml_set_name(k_idxs, "attn_inp_k_idxs");
 
     return k_idxs;
 }
@@ -1986,6 +1987,7 @@ ggml_tensor * llama_kv_cache::build_input_v_idxs(ggml_context * ctx, const llama
     }
 
     ggml_set_input(v_idxs);
+    ggml_set_name(v_idxs, "attn_inp_v_idxs");
 
     return v_idxs;
 }
@@ -2239,7 +2241,9 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
 
                 // apply SWA if any
                 if (swa) {
-                    if (llama_hparams::is_masked_swa(n_swa, swa_type, p0, p1)) {
+                    // see llama_non_causal_type
+                    const bool in_span = !causal && args.hparams.non_causal_type == LLAMA_NON_CAUSAL_TYPE_SWA_FULL && p0 >= seq_pos_min[seq_id];
+                    if (!in_span && llama_hparams::is_masked_swa(n_swa, swa_type, p0, p1)) {
                         goto skip;
                     }
                 }
@@ -2342,6 +2346,12 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
     // n_tps == n_tokens_per_stream
     const int64_t n_tps = n_tokens/n_stream;
 
+    // see llama_non_causal_type
+    // only the SWA cache (or the SWA layers of a single cache) become non-causal
+    if (!causal_attn && hparams.non_causal_type == LLAMA_NON_CAUSAL_TYPE_SWA_ONLY) {
+        causal_attn = swa_type == LLAMA_SWA_TYPE_NONE;
+    }
+
     // [TAG_MASK_PROBE] TURBO_MASK_PROBE=1 times the host mask fill, which runs on the inference thread
     // before every graph compute. With --kv-unified and several agents the explicit mask walks all n_kv
     // cells once per sequence and uploads [n_kv x n_tokens] F16 - an estimate of 2-4 ms/step at 4x64K
@@ -2443,34 +2453,23 @@ void llama_kv_cache::get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, st
         return;
     }
 
-    // note: apply_ubatch() has already stored the current ubatch
-    //       the window below thus covers tokens of this very ubatch as well, which is what we want
-    llama_pos p_min = std::numeric_limits<llama_pos>::max();
-    llama_pos p_max = std::numeric_limits<llama_pos>::min();
+    // note: apply_ubatch() has already stored the current ubatch, so the cells cover the tokens
+    //       of this very ubatch as well, which is what we want
+    // the nearest cell at or before a position also resolves M-RoPE gaps, where multiple tokens
+    // share the same temporal pos
 
-    std::bitset<LLAMA_MAX_SEQ> seqs;
+    // an embd (multimodal) ubatch can repeat one position for a whole image, so positions
+    // do not encode the token order; resolve its predecessors by ubatch order instead
+    std::vector<uint32_t> ord; // index among the ubatch tokens of the same seq
+    std::unordered_map<llama_seq_id, std::vector<uint32_t>> seq_idx;
 
-    for (uint32_t i = 0; i < n_tokens; ++i) {
-        p_min = std::min(p_min, ubatch.pos[i]);
-        p_max = std::max(p_max, ubatch.pos[i]);
-    }
-
-    for (uint32_t s = 0; s < ubatch.n_seqs_unq; ++s) {
-        seqs.set(ubatch.seq_id_unq[s]);
-    }
-
-    // (seq_id, pos) -> token, for every cell that could be a predecessor of a ubatch token
-    std::unordered_map<uint64_t, llama_token> hist;
-
-    const auto key = [](llama_seq_id seq_id, llama_pos pos) {
-        return ((uint64_t) seq_id << 32) | (uint32_t) pos;
-    };
-
-    for (uint32_t s = 0; s < n_stream; ++s) {
-        v_cells[s].for_each_token_in(seqs, p_min - (llama_pos) n, p_max,
-            [&](llama_seq_id seq_id, llama_pos pos, llama_token tok) {
-                hist[key(seq_id, pos)] = tok;
-            });
+    if (!ubatch.token) {
+        ord.resize(n_tokens);
+        for (uint32_t i = 0; i < n_tokens; ++i) {
+            auto & v = seq_idx[ubatch.seq_id[i][0]];
+            ord[i] = v.size();
+            v.push_back(i);
+        }
     }
 
     for (uint32_t i = 0; i < n_tokens; ++i) {
@@ -2479,15 +2478,23 @@ void llama_kv_cache::get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, st
         const llama_seq_id seq_id = ubatch.seq_id[i][0];
 
         for (uint32_t j = 0; j < n; ++j) {
-            const llama_pos p = ubatch.pos[i] - (llama_pos) (n - j);
+            const llama_pos d = (llama_pos) (n - j);
+
+            llama_pos p;
+            if (!ubatch.token) {
+                const auto & v = seq_idx[seq_id];
+                const int64_t k = (int64_t) ord[i] - d;
+                // k >= 0: an earlier token of this very ubatch; k < 0: before the chunk
+                p = k >= 0 ? ubatch.pos[v[k]] : ubatch.pos[v[0]] + (llama_pos) k;
+            } else {
+                p = ubatch.pos[i] - d;
+            }
+
             if (p < 0) {
                 continue;
             }
 
-            const auto it = hist.find(key(seq_id, p));
-            if (it != hist.end()) {
-                res[i*n + j] = it->second;
-            }
+            res[i*n + j] = v_cells[seq_to_stream[seq_id]].seq_pos_tok_le(seq_id, p);
         }
     }
 }
@@ -2961,6 +2968,12 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
 
         ubatch.seq_id_unq[0] = dest_seq_id;
 
+        // the ext as it was saved, to put back after apply_ubatch()
+        std::vector<llama_kv_cell_ext> exts;
+        if (has_cell_ext()) {
+            exts.resize(cell_count);
+        }
+
         for (uint32_t i = 0; i < cell_count; ++i) {
             llama_pos pos;
             uint32_t n_seq_id;
@@ -2984,6 +2997,8 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
 
                 // apply_ubatch() below restores ext.tok from the ubatch tokens
                 ubatch.token[i] = ext.tok;
+
+                exts[i] = ext;
             }
 
             // read the sequence id, but directly discard it - we will use dest_seq_id instead
@@ -3034,6 +3049,14 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
         //       only ext.tok and the M-RoPE 2D position round-trip through it
         //       see: https://github.com/ggml-org/llama.cpp/pull/16825#issuecomment-3460868350
         apply_ubatch(sinfo, ubatch);
+
+        // apply_ubatch() takes the 2D position from the ubatch, and that ubatch is built with this
+        // cache's own n_pos_per_embd. a cache that does not use M-RoPE itself but mirrors one that
+        // does (the qwen4exp QSA indexer) would drop x and y. put the saved ext back instead, which
+        // is what the whole-context path below already does.
+        for (uint32_t i = 0; i < (uint32_t) exts.size(); ++i) {
+            cells.ext_set(sinfo.idxs[0][i], exts[i]);
+        }
 
         LLAMA_LOG_DEBUG("%s: cell_count = %d, dest_seq_id = %d\n", __func__, cell_count, dest_seq_id);
 

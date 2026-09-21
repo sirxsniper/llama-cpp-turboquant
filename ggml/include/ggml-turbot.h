@@ -62,7 +62,9 @@ extern "C" {
 #define GGML_TURBOT_INV_SQRT_128     0.08838834764831845f
 
 #define GGML_TURBOT_MAGIC            0x54425254u   // "TRBT" little endian
-#define GGML_TURBOT_OP_PARAMS_OFFSET 16            // bytes 0..15 of FLASH_ATTN_EXT hold scale, max_bias, softcap, prec
+// [TAG_SYNC_TURBOT_OP_OFFSET] was 16. Upstream ggml_flash_attn_ext_set_n_kv_max writes int32 slot 4 (bytes 16..19),
+// which held the turbot magic, so the params moved to byte 24. Runtime only (GGUF and state files carry no op params).
+#define GGML_TURBOT_OP_PARAMS_OFFSET 24            // bytes 0..19 of FLASH_ATTN_EXT: scale, max_bias, softcap, prec, n_kv_max
 #define GGML_TURBOT_OP_PARAMS_VERSION 1
 #define GGML_TURBOT_SIDE_K           0
 #define GGML_TURBOT_SIDE_V           1
@@ -250,8 +252,8 @@ static inline bool ggml_turbot_layer_init(struct ggml_turbot_layer * l,
 }
 
 //
-// op params: 24 bytes at op_params byte GGML_TURBOT_OP_PARAMS_OFFSET (16) of GGML_OP_TURBOT_SET_ROWS and of a
-// GGML_OP_FLASH_ATTN_EXT that ggml_flash_attn_ext_set_turbot() marked. Bytes 40..63 stay zero.
+// op params: 24 bytes at op_params byte GGML_TURBOT_OP_PARAMS_OFFSET (24) of GGML_OP_TURBOT_SET_ROWS and of a
+// GGML_OP_FLASH_ATTN_EXT that ggml_flash_attn_ext_set_turbot() marked. Bytes 48..63 stay zero; bytes 20..23 are unused.
 //
 
 struct ggml_turbot_op_params {
