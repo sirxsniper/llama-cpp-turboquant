@@ -1162,6 +1162,46 @@ static std::vector<ggml_backend_dev_t> parse_device_list(const std::string & val
     return devices;
 }
 
+// [TAG_MMDEV_FALLBACK] -mmdev gpu|igpu: the first device of that type, or nullptr when there is none.
+//
+// "igpu" never resolves to a discrete card. ggml-vulkan reports GGML_BACKEND_DEVICE_TYPE_IGPU only for a
+// VkPhysicalDevice whose deviceType is INTEGRATED_GPU (ggml_backend_vk_device_get_type). A discrete card such as
+// the RTX 5090 reports DISCRETE_GPU there, so its Vulkan device is TYPE_GPU, the same as CUDA0. CUDA reports IGPU
+// only when cudaDeviceProp::integrated is set (unified-memory parts, never a PCIe card). As a second guard, an
+// IGPU device with exactly the name of a TYPE_GPU device (one card seen through two backends, e.g. CUDA0 and
+// Vulkan0) is skipped. The name is compared rather than the PCI id because ggml_backend_dev_get_props also
+// queries memory, which on CUDA creates a context while the arguments are still being parsed.
+static ggml_backend_dev_t mmdev_find_by_type(enum ggml_backend_dev_type type) {
+    ggml_backend_load_all();
+
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        if (ggml_backend_dev_type(dev) != type) {
+            continue;
+        }
+
+        if (type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+            const char *      desc  = ggml_backend_dev_description(dev);
+            const std::string name  = desc ? desc : "";
+            bool              alias = false;
+            for (size_t j = 0; j < ggml_backend_dev_count() && !alias && !name.empty(); ++j) {
+                ggml_backend_dev_t other = ggml_backend_dev_get(j);
+                const char * other_desc = ggml_backend_dev_description(other);
+                alias = ggml_backend_dev_type(other) == GGML_BACKEND_DEVICE_TYPE_GPU && other_desc && name == other_desc;
+            }
+            if (alias) {
+                LOG_WRN("--mmproj-device igpu: skipping %s (%s), a discrete GPU device has the same name\n",
+                        ggml_backend_dev_name(dev), name.c_str());
+                continue;
+            }
+        }
+
+        return dev;
+    }
+
+    return nullptr;
+}
+
 void common_print_available_devices() {
     constexpr size_t MiB = 1024 * 1024;
     std::vector<ggml_backend_dev_t> devices;
@@ -2660,7 +2700,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"-mmdev", "--mmproj-device"}, "DEVICE",
         "device to use for multimodal projector (none = don't offload, default: follows --device)\n"
         "also accepts a device type keyword: cpu|gpu|igpu (cpu = same as none, gpu = first discrete GPU,\n"
-        "igpu = first integrated GPU, e.g. an AMD iGPU through Vulkan)\n"
+        "igpu = first integrated GPU, e.g. an AMD iGPU through Vulkan; never the discrete GPU).\n"
+        "gpu or igpu with no such device warns and runs the projector on the CPU; an unknown device name is an error\n"
         "use --list-devices to see a list of available devices",
         [](common_params & params, const std::string & value) {
             if (value == "none" || value == "cpu") {
@@ -2672,13 +2713,20 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             // (Vulkan0/Vulkan1 depend on driver enumeration order). CUDA registers first, so
             // "gpu" resolves to CUDA0; Vulkan reports an iGPU as GGML_BACKEND_DEVICE_TYPE_IGPU.
             if (value == "gpu" || value == "igpu") {
-                ggml_backend_load_all();
                 const bool want_igpu = value == "igpu";
-                auto * dev = ggml_backend_dev_by_type(want_igpu ? GGML_BACKEND_DEVICE_TYPE_IGPU : GGML_BACKEND_DEVICE_TYPE_GPU);
+                auto * dev = mmdev_find_by_type(want_igpu ? GGML_BACKEND_DEVICE_TYPE_IGPU : GGML_BACKEND_DEVICE_TYPE_GPU);
                 if (!dev) {
-                    throw std::invalid_argument(want_igpu
-                        ? "--mmproj-device igpu: no integrated GPU device found (Vulkan not built, or GGML_DISABLE_VULKAN set)"
-                        : "--mmproj-device gpu: no discrete GPU device found (GPU backend not built or no GPU visible)");
+                    // [TAG_MMDEV_FALLBACK] A type keyword with no matching device must not stop the program from
+                    // starting: the same command line then works on a build without Vulkan, with GGML_DISABLE_VULKAN
+                    // set, or on a machine without an iGPU. The projector runs on the CPU, exactly as with -mmdev cpu.
+                    // A device NAME that does not exist is still rejected below, as upstream does.
+                    LOG_WRN("--mmproj-device %s: %s, the multimodal projector runs on the CPU instead\n", value.c_str(),
+                        want_igpu
+                            ? "no integrated GPU device found (Vulkan not built, GGML_DISABLE_VULKAN set, or no iGPU)"
+                            : "no discrete GPU device found (GPU backend not built or no GPU visible)");
+                    params.mmproj_use_gpu = false;
+                    params.mmproj_device  = nullptr;
+                    return;
                 }
                 params.mmproj_use_gpu = true;
                 params.mmproj_device  = dev;

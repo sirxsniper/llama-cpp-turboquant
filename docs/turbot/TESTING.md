@@ -467,7 +467,7 @@ srvcmd emits both for the new build (`--vision cpu|gpu|igpu`).
 | 8.5.1 | `BIN\llama-server.exe --list-devices`, with `GGML_DISABLE_VULKAN=1` and then with the iGPU loader filter | first: CUDA0 only; second: CUDA0 and one Vulkan device, the AMD iGPU |
 | 8.5.2 | production preset (`qwen38-prod`, 4 slots, turbot) with `--vision cpu`, `gpu`, `igpu`, same image prompts as the vision checks of section 5 | the log puts the vision encoder on the chosen device and the model and drafter on CUDA0 only; answers match the cpu arm in content; 5090 VRAM with `cpu` or `igpu` equals the server without vision; the encode time per image is recorded |
 | 8.5.3 | a corrupt image in one request while other slots generate | that request fails, the server keeps serving the others ([TAG_MTMD_ENCODE_CATCH]) |
-| 8.5.4 | `-mmdev igpu` with `GGML_DISABLE_VULKAN=1` | argument error naming the reason (`no integrated GPU device found`) |
+| 8.5.4 | `-mmdev igpu` with `GGML_DISABLE_VULKAN=1` | the server starts and logs one warning naming the reason (`no integrated GPU device found`, [TAG_MMDEV_FALLBACK]); the vision encoder runs on the CPU and the image checks of 8.5.2 pass as in the cpu arm |
 | 8.5.5 | iGPU ops, with the loader filter set: `BIN\test-backend-ops.exe test -b Vulkan0 -o <op>`, one op at a time, for MUL_MAT, FLASH_ATTN_EXT, ROPE, IM2COL, UPSCALE, NORM, ADD, MUL, UNARY, CPY, CONT, SOFT_MAX | 0 FAIL; F16 flash attention at head size 72 supported; turbo FA cases report `not supported` ([TAG_VK_NO_TURBO]) |
 | 8.5.6 | `--mmproj-threads 8` against `0` (= `-t`) with `-mmdev cpu` | encode time recorded; answers unchanged |
 

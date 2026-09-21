@@ -638,9 +638,17 @@ The flag wins over the variable. If the plan does not fit the model (its `L` lin
 | `-mmdev` | The vision encoder runs on |
 |:--|:--|
 | `cpu` (same as `none`) | the CPU, with `--mmproj-threads` threads |
-| `gpu` | the first discrete GPU, which is CUDA0 because CUDA registers first |
-| `igpu` | the first integrated GPU, for example an AMD iGPU through Vulkan. This needs a build with `-DGGML_VULKAN=ON` (Vulkan SDK). Without an iGPU the option is rejected when the arguments are parsed, and the message says why. |
-| a device name | that device, as before |
+| `gpu` | the first discrete GPU, which is CUDA0 because CUDA registers first. With no GPU device, the CPU (see below). |
+| `igpu` | the first integrated GPU, for example an AMD iGPU through Vulkan. This needs a build with `-DGGML_VULKAN=ON` (Vulkan SDK). It is never the discrete GPU (see below). With no iGPU, the CPU. |
+| a device name | that device, as before. A name that does not exist, such as `Vulkan7`, is still an error. |
+
+When `gpu` or `igpu` finds no device of that type, the server still starts (`[TAG_MMDEV_FALLBACK]`). This happens on a build without Vulkan, with `GGML_DISABLE_VULKAN` set, or on a machine without an iGPU. The vision encoder then runs on the CPU, exactly as with `-mmdev cpu`, and one warning says why:
+
+```
+--mmproj-device igpu: no integrated GPU device found (Vulkan not built, GGML_DISABLE_VULKAN set, or no iGPU), the multimodal projector runs on the CPU instead
+```
+
+`igpu` cannot pick the RTX 5090 through Vulkan. The Vulkan backend reports a device as an integrated GPU only when the driver gives its type as `INTEGRATED_GPU`. The NVIDIA driver gives a discrete card the type `DISCRETE_GPU`, so `Vulkan0` counts as a discrete GPU, like `CUDA0`. As a second guard, `igpu` skips an integrated-GPU device that has exactly the name of a discrete-GPU device, and logs that it did.
 
 `--mmproj-threads N` (server only, env `LLAMA_ARG_MMPROJ_THREADS`) sets the number of CPU threads for the vision encoder. `0`, the default, uses `-t`.
 
@@ -655,7 +663,7 @@ Set the Vulkan environment to match:
 | Vision on | Environment |
 |:--|:--|
 | `cpu` or `gpu` | `GGML_DISABLE_VULKAN=1`. The process then has only CUDA0 and the CPU. |
-| `igpu` | `VK_LOADER_DRIVERS_SELECT=*amd-vulkan64*`, with `GGML_DISABLE_VULKAN` unset. The Vulkan loader loads only the AMD driver, so the 5090 never becomes a Vulkan device. |
+| `igpu` | `VK_LOADER_DRIVERS_SELECT=*amd-vulkan64*`, with `GGML_DISABLE_VULKAN` unset. The Vulkan loader loads only the AMD driver, so the 5090 never becomes a Vulkan device. `igpu` would not pick the 5090 without this, but the setting keeps the NVIDIA Vulkan driver out of the process. If `GGML_DISABLE_VULKAN` is left set, `igpu` falls back to the CPU with the warning above. |
 
 Do not use `GGML_VK_VISIBLE_DEVICES` for this. It takes a raw device index, and that index depends on the order in which the drivers enumerate.
 
