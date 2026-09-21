@@ -150,17 +150,42 @@ bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(const int cc, const ggml_
 
     const int64_t n_gather = (ncols1 == 1 ? Q->ne[1] : ncols1) * (int64_t) n_kv_max;
 
-    return GGML_CUDA_CC_IS_NVIDIA(cc) && turing_mma_available(cc) &&
+    // [TAG_SYNC_SPARSE_TURBOT] a turbot K/V has its own kernel with no sparse gather, and the sparse branch in
+    // ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1 calls the f16 case directly (past the turbot dispatch). The
+    // turbot graph passes n_kv_max = 0, so this only guards an API caller that sets n_kv_max on a turbot FA.
+    return GGML_CUDA_CC_IS_NVIDIA(cc) && turing_mma_available(cc) && !ggml_turbot_is_type(K->type) &&
         mask != nullptr && n_kv_max > 0 && max_bias == 0.0f && logit_softcap == 0.0f &&
         mask->ne[0] == K->ne[1] && mask->ne[1] >= Q->ne[1] && mask->ne[2] == 1 &&
         K->ne[1] >= std::max<int64_t>(4096, 2*n_gather);
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 }
 
+// [TAG_TURBOT_Q2_ROUTE] kill switch for the Q <= 2 turbot route below: TURBOT_Q2_ROUTE=0 sends Q = 2 back to the <2,8>
+// instance (Q = 1 then takes [TAG_TURBOT_Q1_ROUTE] as before) for the A/B on one binary. Default on.
+static bool turbot_q2_route_on() {
+    static const bool on = [] {
+        const char * e = getenv("TURBOT_Q2_ROUTE");
+        return !(e && e[0] == '0');
+    }();
+    return on;
+}
+
 template <int DKQ, int DV, int ncols2>
 static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     const ggml_tensor * Q = dst->src[0];
+
+    // [TAG_TURBOT_Q2_ROUTE] turbot only: Q <= 2 runs on the <4,8> instance, as Q = 1 already does ([TAG_TURBOT_Q1_ROUTE]).
+    // Q = 2 is one slot verifying a 1-token draft, or two slots decoding one token each (unified KV: one FA call with
+    // ne[1] = 2); it used to fall through to <2,8>. Nothing else changes: the kernel zero-fills the missing Q columns and
+    // skips their output (and the fixup kernels skip rows >= ne01), and launch_fattn_turbot takes its row-wrapping
+    // "turbot<ncols1> wrap" KV bounds scan for Q % ncols1 != 0 (the positional scan wraps with fastmodulo).
+    if constexpr (DKQ == 256 && DV == 256 && ncols2 == 8) {
+        if (turing_mma_available(cc) && Q->ne[1] <= 2 && ggml_turbot_is_type(dst->src[1]->type) && turbot_q2_route_on()) {
+            ggml_cuda_fattn_mma_case_dispatch<DKQ, DV, 4, ncols2>(ctx, dst);
+            return;
+        }
+    }
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
     if constexpr (ggml_cuda_flash_attn_ext_mma_f16_may_use_sparse(DKQ, DV, 1, ncols2)) {
@@ -177,6 +202,7 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_con
             // shape <4,8> computes 4x the queries at nb 4 and is still faster than <1,8> at nb 1 (B0, 131K 261 vs 483
             // us/op), so the extra columns cost less than the <1,8> kernel shape. The kernel zero-fills the missing Q
             // columns and skips their output; launch_fattn_turbot scans only the real mask row for the KV bounds.
+            // With [TAG_TURBOT_Q2_ROUTE] on (default) Q = 1 already left above; this is the TURBOT_Q2_ROUTE=0 path.
             if constexpr (DKQ == 256 && DV == 256 && ncols2 == 8) {
                 if (Q->ne[1] == 1 && ggml_turbot_is_type(dst->src[1]->type)) {
                     ggml_cuda_fattn_mma_case_dispatch<DKQ, DV, 4, ncols2>(ctx, dst);

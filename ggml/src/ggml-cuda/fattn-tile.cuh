@@ -973,7 +973,10 @@ static __global__ void flash_attn_tile(
     __syncthreads();
 
     // Main loop over KV cache:
-    const int k_VKQ_max = KV_max ? KV_max[sequence*gridDim.x + blockIdx.x] : ne11;
+    // [TAG_FA_KVMIN] launch_fattn writes {max, min} pairs (flash_attn_mask_to_KV_max / flash_attn_pos_to_KV_max, one pair
+    // per (sequence, query tile), gridDim.x == ntiles_x here). Only the max is used; reading it unpaired took the wrong
+    // tile's bound (the hsk=40 failures with Q->ne[3] > 1).
+    const int k_VKQ_max = KV_max ? KV_max[2*(sequence*gridDim.x + blockIdx.x) + 0] : ne11;
     if (ncols2 == 1) {
         // Branch with out-of-bounds checks.
         int k_VKQ_0 = blockIdx.y*nbatch_fa;

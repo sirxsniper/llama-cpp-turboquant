@@ -118,6 +118,8 @@ BIN\test-backend-ops.exe test -b CUDA0 -o TURBOT_SET_ROWS -p "^turbot=" > E:\kv-
 | extras | sinks; softcap 30 |
 | widths | mixed (K != V, b 2 and 6, y 8) and default layer 23 |
 
+nb 1 and nb 2 run on the <4,8> instance (SPEC 7.6, Q ≤ 2 route). Run the FA command a second time with `$env:TURBOT_Q2_ROUTE = "0"`, which puts nb 2 back on <2,8>, and then remove the variable. Both runs must pass. With `LLAMA_TURBOT_FA_DEBUG=1` the nb 2 shapes print `ncols1=4 ncols2=8` and, with an explicit mask at kv >= 4096, `kv_scan=turbot<ncols1> wrap`.
+
 **Writer coverage:**
 
 | Parameter | Values |
@@ -181,6 +183,14 @@ Writer speed (SPEC 8.2 alternatives, reported only):
 ```powershell
 BIN\test-backend-ops.exe perf -b CUDA0 -o TURBOT_SET_ROWS,SET_ROWS -p "turbot_perf=writer_|type_dst=turbo5p"
 ```
+
+Q ≤ 2 route (SPEC 7.6), an A/B on one binary. Route off (nb 2 on <2,8>), then the default (nb 2 on <4,8>):
+```powershell
+$p = "(turbot_perf=l23|turbot_ref=turbo5p),kv=(131072|245760),nb=2"
+$env:TURBOT_Q2_ROUTE = "0"; BIN\test-backend-ops.exe perf -b CUDA0 -o FLASH_ATTN_EXT -p $p > E:\kv-turbot\q2_off.log
+Remove-Item Env:TURBOT_Q2_ROUTE; BIN\test-backend-ops.exe perf -b CUDA0 -o FLASH_ATTN_EXT -p $p > E:\kv-turbot\q2_on.log
+```
+Keep the route only if every nb 2 turbot cell is at most as slow with it on. Confirm end to end with `llama-bench -ctk turbot -ctv turbot -p 2 -n 0 -d 131072,245760 -r 5` under both settings.
 
 ---
 
@@ -332,4 +342,9 @@ SPEC 4.4 expectation for the fill table (sphere Monte Carlo): worst MSE(fill, ol
 | 6 llama-bench tg64 / pp512 | 0: 61.39 / 3437, 131K: 50.07 / 1502, 245K: 43.78 / 1003 (turbo5p 57.77 / 3463, 47.17 / 1605, 40.37 / 1091) |
 | 6 DFlash2 server ms/step | 512: 23.07, 32K: 24.46, 131K: 27.04, 200K: 28.72 (turbo5p 22.52 / 23.55 / 26.20 / 28.20) |
 | 6 VRAM | 5,246.00 MiB at 262,144 cells (turbo5p 5,248.00) |
+
+Known limits, 2026-09-15 build:
+- Prefill is 4-8% slower than turbo5p at 131K-245K.
+- A cached long prompt can decode slightly differently from the same prompt sent cold.
+- Two-token verify batches ran the <2,8> instance. On the upstream-sync branch they run <4,8> (SPEC 7.6, `TURBOT_Q2_ROUTE=0` to compare). That route is not measured yet; see the Q ≤ 2 route A/B in section 3.
 

@@ -2549,6 +2549,15 @@ static __global__ void flash_attn_ext_f16(
 
         const float slope = ncols2 == 1 ? get_alibi_slope(max_bias, zt_Q, n_head_log2, m0, m1) : 1.0f;
 
+        // [TAG_FA_KVMIN_FIXUP] Whether this CUDA block owns the start of the output tile is block geometry and must be
+        // decided BEFORE the [TAG_FA_KVMIN] skip below raises kb0_start (same fix as [TAG_TURBOT_KVMIN_FIXUP] in
+        // fattn-turbot.cuh). Otherwise a block that owns a whole tile whose leading KV tiles are fully masked takes the
+        // needs_fixup variant: the tile is written without the rowsum normalisation, no fixup kernel ever finishes it
+        // (the general fixup skips blocks starting on a tile boundary), and its meta overwrites the slot of the block's
+        // real leading partial tile. The skipped KV tiles contribute nothing for any query in the tile, so starting the
+        // accumulators at kb0_min and normalising here is exact. Affects f16, q8_0 and turbo4/4p/5p alike.
+        const bool block_owns_tile_start = kb0_start == 0;
+
         if (use_sparse) {
             kb0_stop = min(kb0_stop, (KV_max[(sequence % ne33)*iter_j + jt] + nbatch_fa - 1) / nbatch_fa);
         } else if (KV_max) {
@@ -2566,7 +2575,7 @@ static __global__ void flash_attn_ext_f16(
             }
         }
         constexpr bool is_fixup = false; // All but (potentially) the last iterations write their data to dst rather than the fixup buffer.
-        if (kb0_start == 0) {
+        if (block_owns_tile_start) {
             constexpr bool needs_fixup = false; // CUDA block is working on an entire tile.
             flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, turbo_KV, use_sparse, needs_fixup, is_fixup>
                 (Q_f2, K_h2, V_h2, mask_h, indices, kv_pos, q_pos, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
@@ -2620,6 +2629,9 @@ static __global__ void flash_attn_ext_f16(
 
     const float slope = ncols2 == 1 ? get_alibi_slope(max_bias, zt_Q, n_head_log2, m0, m1) : 1.0f;
 
+    // [TAG_FA_KVMIN_FIXUP] second KV_max site: nothing to capture here. The final block always takes the is_fixup variant
+    // (its partial result goes to the fixup buffer whether or not it starts the tile), so raising kb0_start below can
+    // only narrow the range it reads, never change how its result is combined. Same as the turbot kernel's final block.
     if (use_sparse) {
         kb0_stop = min(kb0_stop, (KV_max[(sequence % ne33)*iter_j + jt] + nbatch_fa - 1) / nbatch_fa);
     } else if (KV_max) {

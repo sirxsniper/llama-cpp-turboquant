@@ -3724,6 +3724,77 @@ struct test_norm_scale : public test_case {
     }
 };
 
+// ---- [TAG_RMSNORM_SCALE_FUSION] begin: GDN q/k l2 norm test (gdn-fusion; keep this block separate) ----
+// GGML_OP_RMS_NORM + GGML_OP_SCALE as upstream 5fdfa6282 builds it (build_gdn_l2_norm, src/models/models.h):
+// scale(rms_norm(x, eps/n), 1/sqrt(n)) = x * rsqrt(sum x^2 + eps). CUDA fuses each pair into one launch.
+// strided: q and k are views into one silu'd [q | k | v] row per token, as in qwen35 build_layer_attn_linear.
+// bias != 0, a second reader of the norm output (extra_use) must fall back to the plain ops; inplace uses
+// ggml_scale_bias_inplace, so the scale output is the norm's own buffer.
+struct test_gdn_l2_norm : public test_case {
+    const std::array<int64_t, 4> ne; // head_dim, n_heads, n_tokens, n_seqs
+    const float eps;
+    const bool  strided;
+    const float bias;
+    const bool  extra_use;
+    const bool  inplace;
+
+    std::string vars() override {
+        return VARS_TO_STR6(ne, eps, strided, bias, extra_use, inplace);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "GDN_L2_NORM";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    test_gdn_l2_norm(std::array<int64_t, 4> ne = { 128, 16, 1, 1 }, float eps = 1e-6f, bool strided = true,
+                     float bias = 0.0f, bool extra_use = false, bool inplace = false)
+        : ne(ne), eps(eps), strided(strided), bias(bias), extra_use(extra_use), inplace(inplace) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t d  = ne[0];
+        const int64_t h  = ne[1];
+        const int64_t nt = ne[2];
+        const int64_t ns = ne[3];
+
+        ggml_tensor * q;
+        ggml_tensor * k;
+        if (strided) {
+            const int64_t qkv_dim = 4 * d * h; // q, k, then v with twice the heads
+            ggml_tensor * qkv = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, qkv_dim, nt, ns);
+            ggml_set_name(qkv, "qkv");
+            qkv = ggml_silu(ctx, qkv); // a computed parent, as in the model
+            ggml_set_name(qkv, "qkv_silu");
+            const size_t nb1 = ggml_row_size(GGML_TYPE_F32, qkv_dim);
+            q = ggml_view_4d(ctx, qkv, d, h, nt, ns, ggml_row_size(GGML_TYPE_F32, d), nb1, nb1 * nt, 0);
+            k = ggml_view_4d(ctx, qkv, d, h, nt, ns, ggml_row_size(GGML_TYPE_F32, d), nb1, nb1 * nt,
+                             ggml_row_size(GGML_TYPE_F32, d * h));
+        } else {
+            q = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+            k = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        }
+        ggml_set_name(q, "q");
+        ggml_set_name(k, "k");
+
+        const float n = (float) d;
+        ggml_tensor * qn = ggml_rms_norm(ctx, q, eps / n);
+        ggml_tensor * kn = ggml_rms_norm(ctx, k, eps / n);
+        ggml_tensor * qs = inplace ? ggml_scale_bias_inplace(ctx, qn, 1.0f / sqrtf(n), bias) : ggml_scale_bias(ctx, qn, 1.0f / sqrtf(n), bias);
+        ggml_tensor * ks = inplace ? ggml_scale_bias_inplace(ctx, kn, 1.0f / sqrtf(n), bias) : ggml_scale_bias(ctx, kn, 1.0f / sqrtf(n), bias);
+
+        ggml_tensor * out = ggml_add(ctx, qs, ks);
+        if (extra_use) {
+            out = ggml_add(ctx, out, qn); // a second reader of the q norm: that pair must not fuse
+        }
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+// ---- [TAG_RMSNORM_SCALE_FUSION] end ----
+
 // GGML_OP_RMS_NORM
 struct test_rms_norm : public test_case {
     const ggml_type type;
@@ -10575,6 +10646,23 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // in-place tests
     test_cases.emplace_back(new test_rms_norm(GGML_TYPE_F32, {64, 5, 4, 3}, false, 1e-6f, true));
 
+    // ---- [TAG_RMSNORM_SCALE_FUSION] begin: GDN q/k l2 norm (rms_norm -> scale) cases (gdn-fusion) ----
+    // Qwen3.8-27B GDN q/k: 16 heads of 128 per token; 1 token (decode), 4 (DFlash2 verify), 512 (prefill ubatch)
+    // and 2 sequences. The 1100-wide rows take the 1024-thread kernel. Last three: no fusion (bias, second
+    // reader) and the in-place scale.
+    for (bool strided : { true, false }) {
+        for (int64_t n_tokens : { 1, 4, 512 }) {
+            test_cases.emplace_back(new test_gdn_l2_norm({ 128, 16, n_tokens, 1 }, 1e-6f, strided));
+        }
+        test_cases.emplace_back(new test_gdn_l2_norm({ 128, 16, 3, 2 }, 1e-6f, strided));
+        test_cases.emplace_back(new test_gdn_l2_norm({ 128, 16, 4, 1 }, 0.0f, strided));
+        test_cases.emplace_back(new test_gdn_l2_norm({ 1100, 3, 2, 2 }, 1e-6f, strided));
+        test_cases.emplace_back(new test_gdn_l2_norm({ 128, 16, 4, 1 }, 1e-6f, strided, 0.25f));
+        test_cases.emplace_back(new test_gdn_l2_norm({ 128, 16, 4, 1 }, 1e-6f, strided, 0.0f, true));
+        test_cases.emplace_back(new test_gdn_l2_norm({ 128, 16, 4, 1 }, 1e-6f, strided, 0.0f, false, true));
+    }
+    // ---- [TAG_RMSNORM_SCALE_FUSION] end ----
+
     for (ggml_type set_rows_type : { GGML_TYPE_F32, GGML_TYPE_F16 }) {
         test_cases.emplace_back(new test_rms_norm_mul_rope({ 256, 1, 1, 1 }, 1e-6f, false, true, false, GGML_ROPE_TYPE_NORMAL, false, false, set_rows_type));
         test_cases.emplace_back(new test_rms_norm_mul_rope({ 128, 4, 3, 1 }, 1e-6f, false, true, false, GGML_ROPE_TYPE_NORMAL, false, false, set_rows_type));
@@ -11744,6 +11832,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_flash_attn_ext_pos(256, 4, 6, 8192, nb, 3000, tkv));
         }
     }
+    // [TAG_FA_KVMIN_FIXUP] the same misclassification in the f16 / turbo MMA kernel (fattn-mma-f16.cuh), in the layout of
+    // the turbot case that caught it (test_flash_attn_ext_turbot kv 4096, nb 1280, positional mask): the sequence starts
+    // at cell (4096*3/8)|1 = 1537, mid-tile, leaving 2194 positions. The f16 route (ncols2 2, ncols1 64: 3 x 4 head
+    // groups) makes 240 output tiles at nb 1280 and 384 at nb 2048; 384 stays above the stream_k block count on the 5090
+    // (170 SMs x occupancy) up to occupancy 2, so blocks own whole tiles whose leading KV tiles the KV_min skip drops.
+    // turbo5p reports "not supported" in this fixture (its 1024-element block pads hs 256 to 1024); f16 and q8_0 run
+    // the same kernel code with the turbo loader switched off.
+    for (int64_t nb : { 1280, 2048 }) {
+        for (ggml_type tkv : { GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_TURBO5P_0 }) {
+            test_cases.emplace_back(new test_flash_attn_ext_pos(256, 4, 6, 4096, nb, (4096*3/8) | 1, tkv));
+        }
+    }
 
     // TurboQuant KV cache FA correctness (fork): head_dim 128, multi-token KV.
     // Compares CUDA turbo kernels vs CPU reference to catch turbo4-specific bugs.
@@ -11825,8 +11925,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext_turbot(TURBOT_TW_L23,      1024,  8, TURBOT_MIX_TAIL,  1, false, 30.0f, false));
     test_cases.emplace_back(new test_flash_attn_ext_turbot(TURBOT_TW_UNIFORM5, 1024,  4, TURBOT_MIX_YOUNG, 0, false, 0.0f,  false));
     test_cases.emplace_back(new test_flash_attn_ext_turbot(TURBOT_TW_UNIFORM5,  100,  1, TURBOT_MIX_OLD,   2, false, 0.0f,  false));
-    // [TAG_TURBOT_Q1_ROUTE] Q = 1 runs on the <4,8> instance and Q = 2 on <2,8>, with the explicit-mask KV_max scan
-    // active (kv >= 4096, a multiple of 1024): the turbot row-wrapping bounds scan, with and without sinks and softcap.
+    // [TAG_TURBOT_Q1_ROUTE] Q = 1 and Q = 2 run on the <4,8> instance ([TAG_TURBOT_Q2_ROUTE]; TURBOT_Q2_ROUTE=0 puts
+    // Q = 2 back on <2,8>, so run these under both settings), with the explicit-mask KV_max scan active (kv >= 4096, a
+    // multiple of 1024): the turbot row-wrapping bounds scan, with and without sinks and softcap.
     for (int64_t kv : { 4096, 8192 }) {
         for (int64_t nb : { 1, 2 }) {
             const turbot_test_widths w = kv == 4096 ? TURBOT_TW_MIXED : TURBOT_TW_L23;
@@ -12192,11 +12293,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     for (turbot_test_mix mix : { TURBOT_MIX_OLD, TURBOT_MIX_BAND16K }) {
         test_cases.emplace_back(new test_flash_attn_ext_turbot(TURBOT_TW_UNIFORM6, 131072, 4, mix, 1, false, 0.0f, true));
     }
-    // [TAG_TURBOT_CT_SPILL] nb 2 = a Q = 2 DFlash2 verification batch, which runs the ncols 16 instance <2,8>.
-    for (turbot_test_mix mix : { TURBOT_MIX_OLD, TURBOT_MIX_BAND16K }) {
-        test_cases.emplace_back(new test_flash_attn_ext_turbot(TURBOT_TW_L23, 131072, 2, mix, 1, false, 0.0f, true));
+    // [TAG_TURBOT_CT_SPILL] nb 2 = a Q = 2 DFlash2 verification batch (or two slots decoding one token each).
+    // [TAG_TURBOT_Q2_ROUTE] it runs the ncols 32 instance <4,8>; TURBOT_Q2_ROUTE=0 restores the ncols 16 instance <2,8>
+    // for the A/B on one binary. kv 245760 added for that A/B; the kv 131072 cases keep their names and order.
+    for (int64_t kv : { 131072, 245760 }) {
+        for (turbot_test_mix mix : { TURBOT_MIX_OLD, TURBOT_MIX_BAND16K }) {
+            test_cases.emplace_back(new test_flash_attn_ext_turbot(TURBOT_TW_L23, kv, 2, mix, 1, false, 0.0f, true));
+        }
+        test_cases.emplace_back(new test_flash_attn_ext_turbo5p_ref(kv, 2));
     }
-    test_cases.emplace_back(new test_flash_attn_ext_turbo5p_ref(131072, 2));
     test_cases.emplace_back(new test_turbot_set_rows(TURBOT_TW_L23, 2048, GGML_TYPE_I64, 1, false, true));
     test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, GGML_TYPE_TURBO5P_0, GGML_TYPE_I64, { 1024, 16384, 1, 1 }, { 1, 1 }, 2048, false));
 

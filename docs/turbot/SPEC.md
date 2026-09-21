@@ -767,6 +767,11 @@ static void ggml_cuda_fattn_mma_case_dispatch(ggml_backend_cuda_context & ctx, g
 | 128 | (128,1) (64,2) (32,4) (16,8) |
 
 - At Q = 1, <1,8> / <8,1> use nbatch 64. At Q≈4, <4,8> uses 32. Prefill uses <16..128, *> at 32. All of them satisfy 64 % nbatch_fa == 0.
+- **Q ≤ 2 route** (`[TAG_TURBOT_Q1_ROUTE]`, `[TAG_TURBOT_Q2_ROUTE]`, added after this spec; fattn.cu `ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1`). With ncols2 = 8, Q = 1 and Q = 2 both run on <4,8> instead of <1,8> and <2,8>.
+  - Q = 2 is one slot verifying a 1-token draft, or two slots decoding one token each (one FA call with ne[1] = 2 on the unified cache).
+  - Nothing else changes for the narrower Q. The kernel zero-fills the missing Q columns and skips their output, and the fixup kernels skip rows past ne01.
+  - `launch_fattn_turbot` bounds KV with the row-wrapping mask scan (`flash_attn_turbot_mask_to_KV_max`: `turbot<1>` for Q = 1, `turbot<ncols1> wrap` for Q % ncols1 != 0), so the mask is never read past its last row. The positional scan wraps with fastmodulo.
+  - `TURBOT_Q2_ROUTE=0` puts Q = 2 back on <2,8> for the A/B on one binary; Q = 1 stays on <4,8> either way. `LLAMA_TURBOT_FA_DEBUG=1` prints the instance (`ncols1=4 ncols2=8`) and `kv_scan` per shape.
 
 **`ggml_cuda_flash_attn_ext_get_alloc_size`.** Before the kernel switch: `if (ggml_turbot_is_type(K->type)) { need_f16_K = need_f16_V = false; }` and skip the switch. No F16 scratch is reserved (decision 10).
 
@@ -1472,6 +1477,10 @@ Gates in order, each with a command and pass criterion:
 
   Fixing either would change existing codegen, so both are out of scope. The second is why turbot requires one head-state helper at both sites (7.2).
 - **Speed:** turbot reads 0.90× turbo5p's bytes at 262K with one sequence, 1.00× with four at quota, and 1.42× below 65K context (7.8). The target is parity at long context, decided by gate B0 before C and D are integrated.
+- **Known limits** (as of the upstream sync):
+  - Prefill is 4-8% slower than turbo5p at 131K-245K.
+  - A cached long prompt can decode slightly differently from the same prompt sent cold.
+  - Two-token verify batches no longer run the <2,8> instance: they take <4,8>, as Q = 1 does (7.6, `[TAG_TURBOT_Q2_ROUTE]`). That route is on by default and `TURBOT_Q2_ROUTE=0` restores <2,8>. It stays on only if the nb 2 A/B at kv 131072 / 245760 (TESTING.md 3) shows it neutral or faster.
 - **Deviation from 7.2, work-balanced stream_k blocks (`[TAG_TURBOT_FA_BALANCE]`, read-speed plan item 2).** 7.2 says `launch_fattn_turbot` keeps the stream_k block layout and reuses the fixup kernels unchanged. That no longer holds for layouts that already need a fixup (`ntiles_dst % nblocks != 0`, which covers every decode and prefill shape at depth).
   - **Reason:** every stream_k block launches at once, so the op waits for its slowest block. At 131K nb 4 there are 340 blocks, 85 per output tile, and each lies inside one KV head. The young band is the newest cells of every head, so a uniform slice puts the all-young tail blocks last, and those gate the op: a young tile costs 1.22× an old one at ncols 32 and about 1.10× at ncols ≥ 64 (B0, after item 4). Balancing the work across blocks is expected to move G1 from 1.35 toward about 1.14.
   - **What changed:**
