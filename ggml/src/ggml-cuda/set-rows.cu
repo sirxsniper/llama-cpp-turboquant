@@ -1451,7 +1451,7 @@ static void set_rows_cuda_turbo4p(
             nb1, nb2, nb3);
     }
 }
-
+
 
 // ---- [TAG_TURBO5P] turbo5p writer: turbo4p's kernel plus the high-bit plane ----
 template <typename idx_t>
