@@ -2607,11 +2607,17 @@ static __global__ void flash_attn_ext_f16(
     const int zt_Q = z_KV*gqa_ratio + zt_gqa*ncols2; // Global Q head start index.
 
     // [TAG_TURBO4P_HEAD] see the same block in the loop above.
+    // [TAG_TURBO5P512_MMA] must list the same split-plane modes as that block. turbo5p512 was missing here, so the
+    // final (is_fixup) block of a turbo5p512 kernel stepped to its head with the fractional nb12 and read from the
+    // wrong place.
     int64_t head_bias_K = (int64_t) nb12*z_KV;
     int64_t head_bias_V = (int64_t) nb22*z_KV;
     int     turbo_e0    = 0;
-    if constexpr (turbo_KV == FATTN_MMA_TURBO4P || turbo_KV == FATTN_MMA_TURBO5P) {
-        const turbo4p_head_addr a = (turbo_KV == FATTN_MMA_TURBO5P) ? turbo5p_head_offset(z_KV, DKQ) : turbo4p_head_offset(z_KV, DKQ);
+    if constexpr (turbo_KV == FATTN_MMA_TURBO4P || turbo_KV == FATTN_MMA_TURBO5P ||
+                  turbo_KV == FATTN_MMA_TURBO5P512) {
+        const turbo4p_head_addr a = (turbo_KV == FATTN_MMA_TURBO5P512) ? turbo5p512_head_offset(z_KV, DKQ)
+                                  : (turbo_KV == FATTN_MMA_TURBO5P)    ? turbo5p_head_offset(z_KV, DKQ)
+                                                                       : turbo4p_head_offset(z_KV, DKQ);
         head_bias_K = a.byte_bias;
         head_bias_V = a.byte_bias;
         turbo_e0    = a.row_elem0;
@@ -2669,6 +2675,38 @@ static __global__ void flash_attn_ext_f16(
 }
 
 bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(const int cc, const ggml_tensor * dst, const int ncols1);
+
+// [TAG_TURBO5P512_MMA] The one place a turbo_mode becomes a kernel. This used to be two copies (with and without
+// logit softcap) of a ternary chain whose last arm was the f16 kernel, and neither copy had a FATTN_MMA_TURBO5P512
+// arm. A turbo5p512 cache that ggml_cuda_fattn_turbo_reads_native accepted therefore ran the f16 kernel on raw
+// turbo5p512 bytes while launch_fattn skipped the F16 conversion (turbo_ok), which is garbage output, and with shared
+// memory sized for the unswizzled turbo tiles while that f16 kernel swizzles its own. A switch has no fallback arm:
+// a mode added to fattn_mma_turbo_kv without a case here aborts at its first launch instead of reading raw bytes.
+// Each case names the same kernel the old chain did, so turbo4/4p/5p and f16 compile to the same instances as before.
+template <int DKQ, int DV, int ncols1, int ncols2, bool use_logit_softcap, bool V_is_K_view, bool use_sparse>
+static fattn_kernel_t ggml_cuda_fattn_mma_f16_select_kernel(const int turbo_mode) {
+    if constexpr (DKQ == 256 && DV == 256 && !V_is_K_view && !use_sparse) {
+        switch (turbo_mode) {
+            case FATTN_MMA_TURBO_NONE:
+                return flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, FATTN_MMA_TURBO_NONE, use_sparse>;
+            case FATTN_MMA_TURBO4:
+                return flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, FATTN_MMA_TURBO4,     use_sparse>;
+            case FATTN_MMA_TURBO4P:
+                return flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, FATTN_MMA_TURBO4P,    use_sparse>;
+            case FATTN_MMA_TURBO5P:
+                return flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, FATTN_MMA_TURBO5P,    use_sparse>;
+            case FATTN_MMA_TURBO5P512:
+                return flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, FATTN_MMA_TURBO5P512, use_sparse>;
+            default:
+                break;
+        }
+        GGML_ABORT("flash_attn_ext MMA: no kernel for turbo mode %d", turbo_mode);
+    } else {
+        // Only the D=256 cases read a turbo cache natively; the caller asserts that before getting here.
+        GGML_ASSERT(turbo_mode == FATTN_MMA_TURBO_NONE);
+        return flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, FATTN_MMA_TURBO_NONE, use_sparse>;
+    }
+}
 
 template <int DKQ, int DV, int ncols1, int ncols2>
 void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -2810,15 +2848,7 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
         // ([TAG_FA_POS_MASK], dst->src[5]): gen_mask reads kv_pos linearly, not through the index lists,
         // and the positional KV bounds scan in launch_fattn would reuse the buffer holding those lists.
         constexpr bool use_sparse_kernel = false;
-        if constexpr (DKQ == 256 && DV == 256 && !V_is_K_view) {
-            fattn_kernel =
-                turbo_mode == FATTN_MMA_TURBO4  ? flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, FATTN_MMA_TURBO4,     use_sparse_kernel> :
-                turbo_mode == FATTN_MMA_TURBO4P ? flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, FATTN_MMA_TURBO4P,    use_sparse_kernel> :
-                turbo_mode == FATTN_MMA_TURBO5P ? flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, FATTN_MMA_TURBO5P,    use_sparse_kernel> :
-                                                  flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, FATTN_MMA_TURBO_NONE, use_sparse_kernel>;
-        } else {
-            fattn_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, FATTN_MMA_TURBO_NONE, use_sparse_kernel>;
-        }
+        fattn_kernel = ggml_cuda_fattn_mma_f16_select_kernel<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, use_sparse_kernel>(turbo_mode);   // [TAG_TURBO5P512_MMA]
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
         if constexpr (ggml_cuda_flash_attn_ext_mma_f16_may_use_sparse(DKQ, DV, ncols1, ncols2)) {
             if (!turbo_ok && !dst->src[5] && ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(cc, dst, ncols1)) {
@@ -2840,15 +2870,7 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
     } else {
         constexpr bool use_logit_softcap = true;
         constexpr bool use_sparse_kernel = false;
-        if constexpr (DKQ == 256 && DV == 256 && !V_is_K_view) {
-            fattn_kernel =
-                turbo_mode == FATTN_MMA_TURBO4  ? flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, FATTN_MMA_TURBO4,     use_sparse_kernel> :
-                turbo_mode == FATTN_MMA_TURBO4P ? flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, FATTN_MMA_TURBO4P,    use_sparse_kernel> :
-                turbo_mode == FATTN_MMA_TURBO5P ? flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, FATTN_MMA_TURBO5P,    use_sparse_kernel> :
-                                                  flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, FATTN_MMA_TURBO_NONE, use_sparse_kernel>;
-        } else {
-            fattn_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, FATTN_MMA_TURBO_NONE, use_sparse_kernel>;
-        }
+        fattn_kernel = ggml_cuda_fattn_mma_f16_select_kernel<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, use_sparse_kernel>(turbo_mode);   // [TAG_TURBO5P512_MMA]
 
 #if !defined(GGML_USE_MUSA)
         static bool shared_memory_limit_raised[GGML_CUDA_MAX_DEVICES][FATTN_MMA_TURBO_MODE_COUNT] = {{false}};   // [TAG_TURBOT] was [3], indexed up to 4

@@ -1243,18 +1243,10 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             // Mirrors [TAG_TURBO_MMA_NATIVE] in fattn-mma-f16.cuh. If this reports
             // native=0 on an MMA_F16 call with a turbo4 cache, that call is paying a
             // full-cache F16 materialisation (to_fp16 over ggml_nelements(K)).
-            const ggml_tensor * Vp = dst->src[2];
-            const char * nenv = getenv("TURBO_MMA_NATIVE");
-            const char * nmq  = getenv("TURBO_MMA_NATIVE_MAXQ");
-            const int maxq_env = nmq ? atoi(nmq) : 0;
-            // must match ggml_cuda_fattn_turbo_reads_native: turbo4p defaults to 4096, not 32.
-            const bool p_is_t4p = Kp && Kp->type == GGML_TYPE_TURBO4P_0;
-            const int maxq = (maxq_env >= 1 && maxq_env <= 4096) ? maxq_env : (p_is_t4p ? 4096 : 32);
-            const bool native = !(nenv && nenv[0] == '0') &&
-                                Qp->ne[0] == 256 && Vp && Vp->ne[0] == 256 &&
-                                Qp->ne[1] <= maxq &&
-                                Kp->type == Vp->type &&
-                                (Kp->type == GGML_TYPE_TURBO4_0 || Kp->type == GGML_TYPE_TURBO4P_0);
+            // [TAG_TURBO5P512_MMA] asks the launch predicate itself. The hand copy that was here
+            // knew only turbo4 and turbo4p, so it reported native=0 for every turbo5p and
+            // turbo5p512 call.
+            const bool native = ggml_cuda_fattn_turbo_reads_native(dst);
             fprintf(stderr, "turbo-probe: FA kernel = %s | K=%s Q->ne[1]=%d n_kv=%d kq_stride_ok=%d gqa=%d native=%d\n",
                     kn, ggml_type_name(Kp->type), (int) Qp->ne[1], (int) Kp->ne[1],
                     (int) (Kp->ne[1] % FATTN_KQ_STRIDE == 0),

@@ -753,10 +753,17 @@ static inline bool ggml_cuda_fattn_turbo_reads_native(const ggml_tensor * dst, b
     }
 
     if (is_t4p) {
-        if (DKQ % QK_TURBO4P_GROUP != 0 || QK_TURBO4P % DKQ != 0) {
+        // [TAG_TURBO5P512_MMA] against the type's own block length, the same three conditions fattn.cu routes on
+        // (whole WHT groups per head, no head split across blocks, a whole number of blocks per KV position).
+        // This tested every split-plane type against QK_TURBO4P, so a turbo5p512 cache with a 512-element row (the
+        // row llama_context swaps turbo5p512 in for) was never read natively, and a turbo5p512 row that is a multiple
+        // of 1024 was, while the kernel switch had no turbo5p512 arm.
+        // K->type == V->type is checked above, so one block length serves both.
+        const int64_t qk = K->type == GGML_TYPE_TURBO5P512_0 ? (int64_t) QK_TURBO5P512 : (int64_t) QK_TURBO4P;
+        if (DKQ % QK_TURBO4P_GROUP != 0 || qk % DKQ != 0) {
             return false;
         }
-        if ((K->ne[0]*K->ne[2]) % QK_TURBO4P != 0 || (V->ne[0]*V->ne[2]) % QK_TURBO4P != 0) {
+        if ((K->ne[0]*K->ne[2]) % qk != 0 || (V->ne[0]*V->ne[2]) % qk != 0) {
             return false;
         }
     }

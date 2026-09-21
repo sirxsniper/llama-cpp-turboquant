@@ -8100,6 +8100,128 @@ struct test_flash_attn_ext_pos : public test_case {
     }
 };
 
+// ==== [TAG_TURBO5P512_MMA] split-plane turbo K/V at the real head geometry (begin) ====================================
+// test_flash_attn_ext and test_flash_attn_ext_pos pad the head to the type's block (GGML_PAD(hs, blck)), so their
+// split-plane cases ask for a 512- or 1024-wide head that no FA kernel takes and report "not supported"
+// ([TAG_TURBO4P_FA_UNTESTED]). This fixture builds the cache the way llama_kv_cache does - one row of hs x nh elements
+// per KV position, [hs*nh, kv_size] - and reads it through the get_k head view [hs, n_kv, nh, 1], whose nb[2] =
+// row_size(type, hs) is a fraction of a block. That is the layout the server hands the D = 256 turbo kernels.
+//   - hs 256 x 2 KV heads = 512 is one turbo5p512 block (Spark2.5-1.7B, Ornith-35B-A3B).
+//   - hs 256 x 4 KV heads = 1024 is two turbo5p512 blocks, the row that used to reach the f16 MMA kernel with raw
+//     turbo5p512 bytes.
+// The CPU reference decodes whole rows ([TAG_TURBO5P512_MMA] in ggml-cpu/ops.cpp). Before that it aborted on this view.
+struct test_flash_attn_ext_split_plane : public test_case {
+    const ggml_type type_KV;
+    const int64_t   hs;            // head size of K and V
+    const int64_t   nh;            // KV heads; one cache row is hs*nh elements
+    const int64_t   nr2;           // query heads per KV head
+    const int64_t   kv;            // KV cells in the FA view
+    const int64_t   nb;            // queries
+    const int       mask_mode;     // 1 explicit F16 mask, 2 positional mask (kv_pos / q_pos)
+    const float     logit_softcap;
+
+    // [TAG_TURBO5P512_MMA] -p filters on vars(), not on the struct name, so the "split_plane=" prefix is what makes
+    // `test-backend-ops -o FLASH_ATTN_EXT -p split_plane` select exactly these cases (turbot uses "turbot=" the same way)
+    std::string vars() override {
+        return std::string("split_plane=") + ggml_type_name(type_KV) + "," +
+               VARS_TO_STR7(hs, nh, nr2, kv, nb, mask_mode, logit_softcap);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return 2 * nh*nr2 * nb * (hs + hs) * kv;
+    }
+
+    test_flash_attn_ext_split_plane(ggml_type type_KV, int64_t hs, int64_t nh, int64_t nr2, int64_t kv, int64_t nb,
+                                    int mask_mode, float logit_softcap = 0.0f)
+        : type_KV(type_KV), hs(hs), nh(nh), nr2(nr2), kv(kv), nb(nb), mask_mode(mask_mode), logit_softcap(logit_softcap) {}
+
+    // the llama_kv_cache::get_k view: [hs, nh, n_kv] with the fractional-block head stride, then the FA permute
+    static ggml_tensor * head_view(ggml_context * ctx, ggml_tensor * cache, int64_t d_head, int64_t n_head, int64_t n_kv) {
+        ggml_tensor * t = ggml_view_4d(ctx, cache, d_head, n_head, n_kv, 1,
+                ggml_row_size(cache->type, d_head),
+                ggml_row_size(cache->type, d_head*n_head),
+                ggml_row_size(cache->type, d_head*n_head*cache->ne[1]), 0);
+        return ggml_permute(ctx, t, 0, 2, 1, 3);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        GGML_ASSERT((hs*nh) % ggml_blck_size(type_KV) == 0 && "one cache row must be whole blocks");
+        const int64_t kv_size = GGML_PAD(kv, 256) + 256;   // the view covers part of a larger cache, like a KV cache
+
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hs, nb, nh*nr2, 1);
+        ggml_set_name(q, "q");
+        ggml_tensor * kc = ggml_new_tensor_2d(ctx, type_KV, hs*nh, kv_size);
+        ggml_set_name(kc, "kc");
+        ggml_tensor * vc = ggml_new_tensor_2d(ctx, type_KV, hs*nh, kv_size);
+        ggml_set_name(vc, "vc");
+        ggml_tensor * k = head_view(ctx, kc, hs, nh, kv);
+        ggml_set_name(k, "k");
+        ggml_tensor * v = head_view(ctx, vc, hs, nh, kv);
+        ggml_set_name(v, "v");
+
+        ggml_tensor * m = nullptr;
+        if (mask_mode == 1) {
+            m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, nb, 1, 1);
+            ggml_set_name(m, "m");
+        }
+
+        ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, m, 1.0f/sqrtf((float) hs), 0.0f, logit_softcap);
+        if (mask_mode == 2) {
+            ggml_tensor * kv_pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, kv);
+            ggml_set_name(kv_pos, "kv_pos");
+            ggml_tensor * q_pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, nb);
+            ggml_set_name(q_pos, "q_pos");
+            ggml_flash_attn_ext_set_pos(out, kv_pos, q_pos);
+        }
+        ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        // positional mask: the test_flash_attn_ext_pos layout. The sequence starts at an odd cell mid-tile, every 7th
+        // cell after it is a hole, and the queries are its last nb positions.
+        std::vector<int32_t> pos(kv, -1);
+        std::vector<int32_t> qp(nb, 0);
+        if (mask_mode == 2) {
+            const int64_t off = (kv * 3 / 8) | 1;
+            int32_t p = 0;
+            for (int64_t j = off; j < kv; ++j) {
+                if ((j - off) % 7 == 6) {
+                    continue;
+                }
+                pos[j] = p++;
+            }
+            const int32_t p_last = p - 1;
+            for (int64_t i = 0; i < nb; ++i) {
+                qp[i] = std::max<int32_t>(0, p_last - (int32_t) (nb - 1 - i));
+            }
+        }
+
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->view_src != nullptr || t->op != GGML_OP_NONE) {
+                continue;   // the K/V head views: their bytes are the caches'
+            }
+            if (strcmp(t->name, "kv_pos") == 0) {
+                ggml_backend_tensor_set(t, pos.data(), 0, ggml_nbytes(t));
+            } else if (strcmp(t->name, "q_pos") == 0) {
+                ggml_backend_tensor_set(t, qp.data(), 0, ggml_nbytes(t));
+            } else if (strcmp(t->name, "m") == 0) {
+                init_tensor_kq_mask(t);
+            } else {
+                init_tensor_uniform(t);   // q, and the caches quantized block by block
+            }
+        }
+    }
+};
+// ==== [TAG_TURBO5P512_MMA] split-plane turbo K/V at the real head geometry (end) ======================================
+
 // [TAG_TURBOT] Tiered KV cache cases (docs/turbot/SPEC.md 11.2). The cache bytes are encoded on the host with
 // ggml-turbot.h, so the FA cases need no writer. The writer cases read their rows back through the turbot FA: a turbot
 // row has no to_float (its layout needs the plan), and the harness compares F32 outputs.
@@ -11903,6 +12025,40 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_TURBO5P_0));
       }
     }
+
+    // ==== [TAG_TURBO5P512_MMA] split-plane turbo K/V through the real head view (begin) ================================
+    // test_flash_attn_ext_split_plane: args are type, head size, KV heads, query heads per KV head, kv, nb, mask mode
+    // (1 explicit, 2 positional), logit softcap. On sm_120: nb 1 runs the VEC kernel, and nb >= 4 runs the native MMA
+    // kernel for that type.
+    //
+    // turbo5p512, hs 256 x 2 KV heads = one 512-element block per KV position, GQA 4 (the Spark2.5-1.7B shape).
+    // Before the fix the native predicate tested this row against 1024, so the turbo5p512 MMA kernel never ran here.
+    for (int64_t nb : { 1, 4, 16, 64, 512 }) {
+        test_cases.emplace_back(new test_flash_attn_ext_split_plane(GGML_TYPE_TURBO5P512_0, 256, 2, 4, 4096, nb, 1));
+    }
+    // positional mask: the --kv-unified pool layout (sequence starts mid-tile, holes, queries at its end)
+    for (int64_t nb : { 1, 16, 512 }) {
+        test_cases.emplace_back(new test_flash_attn_ext_split_plane(GGML_TYPE_TURBO5P512_0, 256, 2, 4, 4096, nb, 2));
+    }
+    // GQA 8 (ncols2 8), the logit-softcap kernel variant, and a KV length off the 256 stride. The last one means no
+    // GQA packing, no VEC, and the oob_check tail tile.
+    test_cases.emplace_back(new test_flash_attn_ext_split_plane(GGML_TYPE_TURBO5P512_0, 256, 2, 8, 4096, 16, 1));
+    test_cases.emplace_back(new test_flash_attn_ext_split_plane(GGML_TYPE_TURBO5P512_0, 256, 2, 4, 4096, 16, 1, 30.0f));
+    for (int64_t nb : { 1, 16 }) {
+        test_cases.emplace_back(new test_flash_attn_ext_split_plane(GGML_TYPE_TURBO5P512_0, 256, 2, 4, 1000, nb, 1));
+    }
+    // turbo5p512 on a 1024-element row (4 KV heads, two blocks per position). Before the fix this ran the f16 MMA
+    // kernel on raw turbo5p512 bytes. llama_context puts turbo5p512 on every layer as soon as one layer's row is not a
+    // multiple of 1024, so a 1024-row layer can hold it.
+    for (int64_t nb : { 1, 4, 64 }) {
+        test_cases.emplace_back(new test_flash_attn_ext_split_plane(GGML_TYPE_TURBO5P512_0, 256, 4, 6, 4096, nb, 1));
+    }
+    // Control: turbo5p, the production kernel, at the Qwen3.8-27B geometry through the same fixture and CPU reference.
+    // If these pass and a turbo5p512 case fails, the fault is in the turbo5p512 path, not in the harness.
+    for (int64_t nb : { 1, 4, 64 }) {
+        test_cases.emplace_back(new test_flash_attn_ext_split_plane(GGML_TYPE_TURBO5P_0, 256, 4, 6, 4096, nb, 1));
+    }
+    // ==== [TAG_TURBO5P512_MMA] (end) ====================================================================================
 
     // [TAG_TURBOT] tiered KV cache (docs/turbot/SPEC.md 11.2): FA over host-encoded caches at every query count the model
     // uses (1, draft verify 2-16, prefill 512 / 1280 with FA_NCOLS128 on), kv tails that end mid tile (100, 1000: the

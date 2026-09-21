@@ -9571,12 +9571,108 @@ static void ggml_compute_forward_flash_attn_ext_turbot(
     ggml_compute_forward_flash_attn_ext_f16_one_chunk(params, &d, 0, (int) nr, 0, n_kv, nullptr, 0);
 }
 
+// [TAG_TURBO5P512_MMA] A split-plane turbo K or V (turbo4p, turbo5p, turbo5p512) read through a head view: the head is
+// narrower than the type's block, e.g. a 2 x 256 KV row in one 512-element turbo5p512 block or Qwen3.8's 4 x 256 row
+// in one 1024-element turbo5p block. ggml's stride model cannot describe such a view (nb[2] = row_size(type, D) is a
+// fraction of a block), the per-row vec_dot asserts n % block == 0, and with NDEBUG the per-row to_float of V decodes
+// nothing. So the FA below used to abort on K and read stale scratch for V.
+static bool ggml_fa_split_plane_head_view(const ggml_tensor * t) {
+    const bool split_plane = t->type == GGML_TYPE_TURBO4P_0 || t->type == GGML_TYPE_TURBO5P_0 ||
+                             t->type == GGML_TYPE_TURBO5P512_0;
+    return split_plane && t->ne[0] % ggml_blck_size(t->type) != 0;
+}
+
+// Decodes every KV position's whole row (all heads, contiguous in the element domain) to F32 and turns `tf` into an F32
+// stand-in of the view `t`: same ne, head h at element h*head_step of its position's row. head_step comes from nb[2]
+// (row_size(type, D) scaled back to elements), so a view built like llama_kv_cache::get_k keeps its exact meaning.
+static void ggml_fa_split_plane_to_f32(const ggml_tensor * t, std::vector<float> & buf, ggml_tensor & tf) {
+    const int64_t blck = ggml_blck_size(t->type);
+    const size_t  ts   = ggml_type_size(t->type);
+
+    GGML_ASSERT(t->nb[0] == ts && "split-plane FA view: elements must be packed");
+    GGML_ASSERT(t->nb[1] % ts == 0 && t->nb[3] % ts == 0 && (t->nb[2]*blck) % ts == 0 &&
+                "split-plane FA view: KV positions and streams must start on a block boundary");
+
+    const int64_t row_elems = (int64_t) (t->nb[1]/ts)*blck;     // one KV position, every head of the row
+    const int64_t head_step = (int64_t) ((t->nb[2]*blck)/ts);   // elements from one head to the next
+    GGML_ASSERT(head_step*(t->ne[2] - 1) + t->ne[0] <= row_elems && "split-plane FA view: heads overrun the row");
+
+    const ggml_to_float_t to_float = ggml_get_type_traits(t->type)->to_float;
+    GGML_ASSERT(to_float != nullptr);
+
+    const int64_t n_kv = t->ne[1];
+    const int64_t n_s  = t->ne[3];
+    buf.resize((size_t) (row_elems*n_kv*n_s));
+    for (int64_t s = 0; s < n_s; ++s) {
+        for (int64_t i = 0; i < n_kv; ++i) {
+            to_float((const char *) t->data + s*t->nb[3] + i*t->nb[1], buf.data() + (s*n_kv + i)*row_elems, row_elems);
+        }
+    }
+
+    tf.type      = GGML_TYPE_F32;
+    tf.data      = buf.data();
+    tf.nb[0]     = sizeof(float);
+    tf.nb[1]     = sizeof(float)*(size_t) row_elems;
+    tf.nb[2]     = sizeof(float)*(size_t) head_step;
+    tf.nb[3]     = sizeof(float)*(size_t) (row_elems*n_kv);
+    tf.view_src  = nullptr;
+    tf.view_offs = 0;
+}
+
+// Same shape as the turbot reference above: decode, then the scalar reference kernel over F32 stand-ins of the views on
+// thread 0 (one_chunk is barrier-free; the other threads return and the graph loop's per-node barrier waits). Slow, but
+// it is the reference for test-backend-ops and a correct fallback for a split-plane KV cache kept on the CPU. Mask,
+// positional mask, sinks, softcap, ALiBi and GQA broadcast keep their exact semantics. The other of K/V, when it is not
+// a split-plane head view, is passed through unchanged.
+static void ggml_compute_forward_flash_attn_ext_split_plane(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    if (params->ith != 0) {
+        return;
+    }
+
+    static bool warned = false;
+    if (!warned) {
+        warned = true;
+        GGML_LOG_WARN("%s: %s K / %s V is read through a head view narrower than its block; "
+                      "the CPU runs the single-threaded reference flash attention for it (slow)\n",
+                      __func__, ggml_type_name(dst->src[1]->type), ggml_type_name(dst->src[2]->type));
+    }
+
+    const ggml_tensor * q = dst->src[0];
+    const ggml_tensor * k = dst->src[1];
+    const ggml_tensor * v = dst->src[2];
+
+    std::vector<float> k_f32;
+    std::vector<float> v_f32;
+    ggml_tensor kf = *k;
+    ggml_tensor vf = *v;
+    if (ggml_fa_split_plane_head_view(k)) {
+        ggml_fa_split_plane_to_f32(k, k_f32, kf);
+    }
+    if (ggml_fa_split_plane_head_view(v)) {
+        ggml_fa_split_plane_to_f32(v, v_f32, vf);
+    }
+
+    ggml_tensor d = *dst;
+    d.src[1] = &kf;
+    d.src[2] = &vf;
+
+    const int64_t nr = q->ne[1]*q->ne[2]*q->ne[3];
+    ggml_compute_forward_flash_attn_ext_f16_one_chunk(params, &d, 0, (int) nr, 0, k->ne[1], nullptr, 0);
+}
+
 void ggml_compute_forward_flash_attn_ext(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
     // [TAG_TURBOT] turbot K/V decode through ggml-turbot.h; every other type keeps the paths below
     if (ggml_turbot_is_type(dst->src[1]->type) || ggml_turbot_is_type(dst->src[2]->type)) {
         ggml_compute_forward_flash_attn_ext_turbot(params, dst);
+        return;
+    }
+    // [TAG_TURBO5P512_MMA] split-plane K/V head views: decode to F32 first (see above); every other type unchanged
+    if (ggml_fa_split_plane_head_view(dst->src[1]) || ggml_fa_split_plane_head_view(dst->src[2])) {
+        ggml_compute_forward_flash_attn_ext_split_plane(params, dst);
         return;
     }
     switch (dst->op_params[3]) {
