@@ -19,12 +19,17 @@
 #include "../../src/llama-ext.h" // [TAG_SPEC_PREFILL_TAIL_EXTRACT] llama_set_layer_inp_extract
 
 #include <algorithm>
+#include <atomic>
+#include <condition_variable>
 #include <cstdlib>
 #include <cstddef>
+#include <cstring>
 #include <cinttypes>
+#include <deque>
 #include <exception>
 #include <memory>
 #include <filesystem>
+#include <mutex>
 #include <random>
 #include <utility>
 #include <thread>
@@ -242,6 +247,242 @@ struct server_batch {
     }
 };
 
+//
+// [TAG_MTMD_ASYNC_ENCODE] media encoding off the server loop
+//
+// Gate 8 (production --no-mmproj-offload): a 4000-token image took 346 s to encode on the CPU, and three text
+// streams on the other slots stalled for 342 s of it. The encode ran inside yield_to_queue(), which only lets
+// the queue answer /metrics and /slots in the meantime: every other task is declined until the yield ends, and
+// no slot can decode, because the thread that builds and decodes the batch is the one running the encode.
+//
+// Here one encoder thread owns every mtmd encode call. A clip context is not thread-safe, so it runs one job at
+// a time, first in first out. A slot whose prompt reaches a media chunk that is not encoded yet stays in
+// SLOT_STATE_PROCESSING_PROMPT and adds no rows to the batch, so the loop keeps serving the other slots. When
+// the job is done, the main thread decodes the embeddings into the llama context through the same
+// process_mtmd_chunk_decode() as the synchronous path (llama_decode never leaves the main thread), so the
+// slot's own token and position sequence, its checkpoints and the drafter repair are unchanged.
+//
+// A job owns deep copies of its chunks and never touches the slot or the task, so a request that is cancelled
+// while its media encodes cannot leave the encoder with a dangling pointer. A cancelled job is skipped if it
+// has not started, otherwise it runs to the end (a clip encode cannot be interrupted) and its result is dropped.
+//
+// Used when the projector runs on the CPU while the text model runs on a GPU, or on a GPU the text model does not
+// use (an AMD iGPU through Vulkan, -mmdev igpu). On a CUDA device the encode is fast and a second thread driving CUDA is avoided, so it stays
+// synchronous. MTMD_ASYNC_ENCODE=0 keeps the synchronous encode everywhere, MTMD_ASYNC_ENCODE=1 also allows a
+// non-CUDA device the text model uses. Only llama-server is affected, the mtmd library and tools are not.
+//
+struct server_media_job {
+    enum job_state : int {
+        JOB_QUEUED    = 0,
+        JOB_RUNNING   = 1,
+        JOB_DONE      = 2, // the embeddings are ready
+        JOB_FAILED    = 3,
+        JOB_CANCELLED = 4, // dropped before it started
+    };
+
+    int id_slot = -1;
+    int id_task = -1;
+
+    // start index of each chunk in the task's tokens, and the job's own copy of that chunk (ascending)
+    std::vector<size_t>                idxs;
+    std::vector<mtmd::input_chunk_ptr> chunks;
+    mtmd::batch_ptr                    mbatch;       // its entries point into `chunks`
+    size_t                             n_tokens = 0; // embedding rows over all chunks
+
+    std::atomic<int>     state       { JOB_QUEUED };
+    std::atomic<bool>    cancelled   { false };
+    std::atomic<int64_t> t_submit_us { 0 };
+    std::atomic<int64_t> t_start_us  { 0 };
+    std::atomic<int64_t> t_end_us    { 0 };
+
+    bool finished() const {
+        return state.load(std::memory_order_acquire) >= JOB_DONE;
+    }
+
+    bool holds(size_t idx) const {
+        return std::find(idxs.begin(), idxs.end(), idx) != idxs.end();
+    }
+
+    // the embeddings of the chunk that starts at `idx`; nullptr unless the job is done and holds that chunk
+    float * get_embd(size_t idx) {
+        if (state.load(std::memory_order_acquire) != JOB_DONE) {
+            return nullptr;
+        }
+        for (size_t i = 0; i < idxs.size(); ++i) {
+            if (idxs[i] == idx) {
+                return mtmd_batch_get_output_embd(mbatch.get(), chunks[i].get());
+            }
+        }
+        return nullptr;
+    }
+
+    const char * state_str() const {
+        switch (state.load(std::memory_order_acquire)) {
+            case JOB_QUEUED:    return "queued";
+            case JOB_RUNNING:   return "encoding";
+            case JOB_DONE:      return "done";
+            case JOB_FAILED:    return "failed";
+            case JOB_CANCELLED: return "cancelled";
+        }
+        return "unknown";
+    }
+};
+
+// [TAG_MTMD_ASYNC_ENCODE] the encoder thread, see server_media_job
+struct server_media_encoder {
+    ~server_media_encoder() {
+        stop();
+    }
+
+    bool is_running() const {
+        return thread.joinable();
+    }
+
+    // throws std::system_error if the thread cannot be created
+    void start() {
+        if (thread.joinable()) {
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            req_stop = false;
+            busy     = false;
+        }
+        thread = std::thread([this]() { loop(); });
+    }
+
+    // drops the jobs that have not started and waits for the running one, which cannot be interrupted
+    void stop() {
+        if (!thread.joinable()) {
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            req_stop = true;
+            for (auto & job : queue) {
+                job->state.store(server_media_job::JOB_CANCELLED, std::memory_order_release);
+            }
+            queue.clear();
+        }
+        cv_work.notify_all();
+        cv_done.notify_all();
+        thread.join();
+    }
+
+    void submit(std::shared_ptr<server_media_job> job) {
+        job->t_submit_us.store(ggml_time_us());
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            queue.push_back(std::move(job));
+        }
+        cv_work.notify_one();
+    }
+
+    // returns as soon as one of the jobs is finished, or after the timeout
+    void wait_any(const std::vector<const server_media_job *> & jobs, std::chrono::milliseconds timeout) {
+        std::unique_lock<std::mutex> lock(mutex);
+        cv_done.wait_for(lock, timeout, [&]() {
+            if (req_stop) {
+                return true;
+            }
+            for (const auto * job : jobs) {
+                if (job->finished()) {
+                    return true;
+                }
+            }
+            return false;
+        });
+    }
+
+    // returns as soon as no job is queued or running, or after the timeout
+    void wait_idle(std::chrono::milliseconds timeout) {
+        std::unique_lock<std::mutex> lock(mutex);
+        cv_done.wait_for(lock, timeout, [&]() {
+            return req_stop || (queue.empty() && !busy);
+        });
+    }
+
+    // jobs queued or running, including a cancelled job that is still running
+    int n_jobs() {
+        std::lock_guard<std::mutex> lock(mutex);
+        return (int) queue.size() + (busy ? 1 : 0);
+    }
+
+private:
+    std::thread             thread;
+    std::mutex              mutex;
+    std::condition_variable cv_work; // the encoder thread waits here for a job
+    std::condition_variable cv_done; // the server loop waits here for a finished job
+    std::deque<std::shared_ptr<server_media_job>> queue;
+    bool req_stop = false;
+    bool busy     = false;
+
+    void loop() {
+        while (true) {
+            std::shared_ptr<server_media_job> job;
+            {
+                std::unique_lock<std::mutex> lock(mutex);
+                cv_work.wait(lock, [&]() { return req_stop || !queue.empty(); });
+                if (req_stop) {
+                    return;
+                }
+                job = std::move(queue.front());
+                queue.pop_front();
+                if (job->cancelled.load()) {
+                    job->state.store(server_media_job::JOB_CANCELLED, std::memory_order_release);
+                    // wait_idle() may be waiting for the queue to drain: tell it now, not at its timeout
+                    lock.unlock();
+                    cv_done.notify_all();
+                    continue;
+                }
+                busy = true;
+                job->state.store(server_media_job::JOB_RUNNING, std::memory_order_release);
+            }
+
+            job->t_start_us.store(ggml_time_us());
+
+            // [TAG_MTMD_ENCODE_CATCH] mtmd_batch_encode already turns a std::exception from the encoder (a Vulkan
+            // DeviceLost on the iGPU is a vk::SystemError) into an error code. Nothing else may escape this thread
+            // either, that would terminate the process: it fails only this job, and so only its request.
+            int32_t res = 1;
+            try {
+                res = mtmd_batch_encode(job->mbatch.get());
+            } catch (const std::exception & e) {
+                SRV_ERR("[TAG_MTMD_ASYNC_ENCODE] exception while encoding media for slot %d, task %d: %s\n",
+                        job->id_slot, job->id_task, e.what());
+                res = 1;
+            } catch (...) {
+                SRV_ERR("[TAG_MTMD_ASYNC_ENCODE] unknown exception while encoding media for slot %d, task %d\n",
+                        job->id_slot, job->id_task);
+                res = 1;
+            }
+
+            const int64_t t_end = ggml_time_us();
+            job->t_end_us.store(t_end);
+
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                busy = false;
+                job->state.store(res == 0 ? server_media_job::JOB_DONE : server_media_job::JOB_FAILED,
+                                 std::memory_order_release);
+            }
+            cv_done.notify_all();
+
+            const int64_t t_start  = job->t_start_us.load();
+            const int64_t t_submit = job->t_submit_us.load();
+            if (res == 0) {
+                SRV_INF("[TAG_MTMD_ASYNC_ENCODE] slot %d, task %d: encoded %zu media chunk(s), %zu tokens, in %.2f s (queued %.2f s)%s\n",
+                        job->id_slot, job->id_task, job->idxs.size(), job->n_tokens,
+                        (t_end - t_start) / 1e6, (t_start - t_submit) / 1e6,
+                        job->cancelled.load() ? ", request gone, result dropped" : "");
+            } else {
+                SRV_ERR("[TAG_MTMD_ASYNC_ENCODE] slot %d, task %d: failed to encode %zu media chunk(s) after %.2f s\n",
+                        job->id_slot, job->id_task, job->idxs.size(), (t_end - t_start) / 1e6);
+            }
+        }
+    }
+};
+
 struct server_slot {
     int id;
 
@@ -253,6 +494,27 @@ struct server_slot {
     // multimodal
     mtmd_context * mctx = nullptr;
     mtmd::batch_ptr mbatch = nullptr;
+
+    // [TAG_MTMD_ASYNC_ENCODE] the encode job of the next media chunk(s) of this prompt: queued, running, or done
+    // and not decoded yet. The encoder thread holds its own reference while the job is queued or running.
+    std::shared_ptr<server_media_job> media_job;
+
+    // [TAG_MTMD_ASYNC_ENCODE] the prompt stands at a media chunk whose encode has not finished
+    bool media_blocked() const {
+        if (!media_job || media_job->finished() || state != SLOT_STATE_PROCESSING_PROMPT || !task || parked) {
+            return false;
+        }
+        const size_t idx = prompt.tokens.size();
+        return idx < task->tokens.size() && task->tokens[idx] == LLAMA_TOKEN_NULL;
+    }
+
+    // [TAG_MTMD_ASYNC_ENCODE] a job still in the encoder is skipped or its result dropped there
+    void media_job_drop() {
+        if (media_job) {
+            media_job->cancelled.store(true);
+            media_job.reset();
+        }
+    }
 
     // speculative decoding
     common_speculative * spec;
@@ -470,6 +732,7 @@ struct server_slot {
 
         // clear multimodal state
         mbatch.reset();
+        media_job_drop(); // [TAG_MTMD_ASYNC_ENCODE] cancel, disconnect, error: the encode of this request is not needed
     }
 
     void init_sampler() const {
@@ -782,6 +1045,22 @@ struct server_slot {
         res["n_parks_total"] = n_parks_total;
         res["park_cells"]    = parked ? park_cells : 0;
 
+        // [TAG_MTMD_ASYNC_ENCODE] waiting_media: the prompt is held at a media chunk until its encode finishes
+        res["waiting_media"] = media_blocked();
+        if (media_job) {
+            const int64_t t_now    = ggml_time_us();
+            const int64_t t_submit = media_job->t_submit_us.load();
+            const int64_t t_start  = media_job->t_start_us.load();
+            const int64_t t_end    = media_job->t_end_us.load();
+            res["media_encode"] = {
+                {"state",       media_job->state_str()},
+                {"n_chunks",    media_job->idxs.size()},
+                {"n_tokens",    media_job->n_tokens},
+                {"t_queued_ms", t_submit > 0 ? ((t_start > 0 ? t_start : t_now) - t_submit) / 1000.0 : 0.0},
+                {"t_encode_ms", t_start  > 0 ? ((t_end   > 0 ? t_end   : t_now) - t_start ) / 1000.0 : 0.0},
+            };
+        }
+
         const auto & ptask = task ? task : task_prev;
 
         if (ptask) {
@@ -842,17 +1121,17 @@ struct server_slot {
     }
 };
 
-// returns 0 on success
+// [TAG_MTMD_ASYNC_ENCODE] The decode half of process_mtmd_chunk(), moved out unchanged so that the synchronous
+// path and the async path (embeddings from a server_media_job) run the very same code: put the embeddings `embd`
+// of the media chunk that starts at `idx` into the llama context at the slot's next position, hand the same
+// batches to the drafter, and repair the drafter's positions after the chunk. Main thread only.
+// returns 0 on success, -1 on error
 // caller need to update prompt.tokens after a successful call to keep track of the processing progress
-// note: this is not a member of server_slot because we want to run it inside yield_to_queue
-//       slot is passed as const to avoid accidental modification of the slot state
-//       some pointers are allowed to be used, they are not used by to_json()
-static int process_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch, size_t idx, size_t & n_tokens_out) {
+static int process_mtmd_chunk_decode(const server_slot & slot, size_t idx, float * embd, size_t & n_tokens_out) {
     GGML_ASSERT(slot.mctx);
-    const auto & mctx = slot.mctx;
-    const auto & input_tokens = slot.task->tokens;
-    const auto & chunk = input_tokens.find_chunk(idx);
-    int32_t res = 0;
+    GGML_ASSERT(embd != nullptr);
+    const auto & mctx  = slot.mctx;
+    const auto & chunk = slot.task->tokens.find_chunk(idx);
 
     // [TAG_SPEC_MEDIA_POS] see common/speculative.cpp. The drafter is text-only and now SKIPS
     // media batches, so its cache stops at med_pos_0 - 1 while the target moves on to
@@ -905,40 +1184,56 @@ static int process_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch
         }
     };
 
+    void * cb_data = slot.spec;
+    static auto cb = [](llama_batch batch, void * user_data) {
+        common_speculative * spec = static_cast<common_speculative *>(user_data);
+        if (!common_speculative_process(spec, batch)) {
+            return 1;
+        }
+        return 0;
+    };
+
+    llama_pos new_n_past; // unused for now
+    const int32_t res = mtmd_helper_decode_image_chunk(
+        mctx,
+        slot.ctx_tgt,
+        chunk.get(),
+        embd,
+        slot.prompt.tokens.pos_next(),
+        slot.id,
+        llama_n_batch(slot.ctx_tgt),
+        &new_n_past,
+        cb,
+        cb_data
+    );
+    if (res != 0) {
+        SLT_ERR(slot, "failed to decode mtmd chunk, idx = %zu, res = %d\n", idx, res);
+        return -1;
+    }
+    repair_draft_after_media();
+
+    n_tokens_out = mtmd_input_chunk_get_n_tokens(chunk.get());
+    return 0; // success
+}
+
+// returns 0 on success
+// caller need to update prompt.tokens after a successful call to keep track of the processing progress
+// note: this is not a member of server_slot because we want to run it inside yield_to_queue
+//       slot is passed as const to avoid accidental modification of the slot state
+//       some pointers are allowed to be used, they are not used by to_json()
+static int process_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch, size_t idx, size_t & n_tokens_out) {
+    GGML_ASSERT(slot.mctx);
+    const auto & mctx = slot.mctx;
+    const auto & input_tokens = slot.task->tokens;
+    const auto & chunk = input_tokens.find_chunk(idx);
+    int32_t res = 0;
+
     auto try_decode = [&]() -> int32_t {
         if (mbatch) {
             float * embd = mtmd_batch_get_output_embd(mbatch.get(), chunk.get());
             if (embd) {
-                void * cb_data = slot.spec;
-                static auto cb = [](llama_batch batch, void * user_data) {
-                    common_speculative * spec = static_cast<common_speculative *>(user_data);
-                    if (!common_speculative_process(spec, batch)) {
-                        return 1;
-                    }
-                    return 0;
-                };
-
-                llama_pos new_n_past; // unused for now
-                res = mtmd_helper_decode_image_chunk(
-                    mctx,
-                    slot.ctx_tgt,
-                    chunk.get(),
-                    embd,
-                    slot.prompt.tokens.pos_next(),
-                    slot.id,
-                    llama_n_batch(slot.ctx_tgt),
-                    &new_n_past,
-                    cb,
-                    cb_data
-                );
-                if (res != 0) {
-                    SLT_ERR(slot, "failed to decode mtmd chunk, idx = %zu, res = %d\n", idx, res);
-                    return -1;
-                }
-                repair_draft_after_media();
-
-                n_tokens_out = mtmd_input_chunk_get_n_tokens(chunk.get());
-                return 0; // success
+                // [TAG_MTMD_ASYNC_ENCODE] the decode itself lives in process_mtmd_chunk_decode()
+                return process_mtmd_chunk_decode(slot, idx, embd, n_tokens_out);
             }
         }
         return 1; // (non-error) need to create & encode batch
@@ -1096,7 +1391,19 @@ private:
 
     int64_t t_last_load_progress_ms = 0;
 
+    // [TAG_MTMD_ASYNC_ENCODE] true when media is encoded on media_encoder's thread, decided by media_async_init()
+    bool                 media_async = false;
+    server_media_encoder media_encoder;
+
     void destroy() {
+        // [TAG_MTMD_ASYNC_ENCODE] the encoder thread uses mctx: drop the jobs and stop it before mctx is freed.
+        // A job that is already running is waited for, a clip encode cannot be interrupted.
+        for (auto & slot : slots) {
+            slot.media_job_drop();
+        }
+        media_encoder.stop();
+        media_async = false;
+
         spec.reset();
         spec_init.reset();
 
@@ -1327,6 +1634,8 @@ private:
                 return false;
             }
             SRV_INF("loaded multimodal model, '%s'\n", mmproj_path.c_str());
+
+            media_async_init(mparams); // [TAG_MTMD_ASYNC_ENCODE]
 
             init_opt.video_params.fps_target = params_base.video_fps;
             init_opt.video_params.timestamp_interval_ms = params_base.video_timestamp_interval_ms;
@@ -1885,7 +2194,9 @@ private:
             float f_sim_best = 0;
 
             for (server_slot & slot : slots) {
-                if (task.id_slot != -1 && slot.id != task.id_slot) {
+                // [TAG_FKEEP_NAN] compare with the slot get_slot_by_id returned, not the raw id: it wraps an
+                // out-of-range id_slot (N+k -> k), and the raw compare then skipped every slot
+                if (task.id_slot != -1 && &slot != ret) {
                     continue;
                 }
 
@@ -1904,8 +2215,9 @@ private:
                 }
 
                 // fraction of the Longest Common Prefix length with respect to the input prompt length
+                // [TAG_FKEEP_NAN] an empty prompt reaches here (it is rejected later, in pre_decode): 0, not 0/0
                 const size_t lcp_len = tokens.get_common_prefix(task.tokens);
-                const float f_sim_cur = float(lcp_len) / task.tokens.size();
+                const float f_sim_cur = task.tokens.empty() ? 0.0f : float(lcp_len) / task.tokens.size();
 
                 SLT_TRC(slot, " - checking sim = %.3f (%zu/%zu) > %.3f\n", f_sim_cur, lcp_len, task.tokens.size(), slot_prompt_similarity);
 
@@ -1918,7 +2230,13 @@ private:
             }
 
             if (ret != nullptr) {
-                const float f_keep = (f_sim_best*task.tokens.size()) / ret->prompt.tokens.size();
+                // [TAG_FKEEP_NAN] With id_slot set, ret is the requested slot even when the loop above skipped it for
+                // being empty (never used, or cleared by --cache-idle-slots). Its size is 0, so f_keep was 0/0 = NaN,
+                // "f_keep < 0.5f" was false, update_cache stayed false and the prompt cache was never searched: the
+                // whole prompt was processed again. An empty slot keeps nothing, so f_keep = 0 and the cache is
+                // searched and loaded exactly as on the id_slot = -1 path, where LRU picks an empty slot.
+                const size_t n_cur  = ret->prompt.tokens.size();
+                const float  f_keep = n_cur > 0 ? (f_sim_best*task.tokens.size()) / n_cur : 0.0f;
 
                 if (task.id_slot == -1) {
                     SLT_INF(*ret, "selected slot by LCP similarity, f_sim_best = %.3f (> %.3f thold), f_keep = %.3f\n",
@@ -1930,6 +2248,12 @@ private:
                     update_cache = true;
                 }
             }
+        }
+
+        // [TAG_FKEEP_NAN] The same for --slot-prompt-similarity 0, where the block above does not run: a requested
+        // slot that holds nothing has nothing to lose, so look for the prompt in the cache.
+        if (ret != nullptr && task.id_slot != -1 && ret->prompt.tokens.empty()) {
+            update_cache = true;
         }
 
         // find the slot that has been least recently used
@@ -2579,6 +2903,213 @@ private:
                 break;
             }
             n_active++;
+        }
+    }
+
+    //
+    // [TAG_MTMD_ASYNC_ENCODE] asynchronous media encoding, see server_media_encoder
+    //
+
+    // Decides whether media is encoded on its own thread. Called once mctx is loaded, again after a sleep.
+    void media_async_init(const mtmd_context_params & mparams) {
+        media_async = false;
+        if (mctx == nullptr) {
+            return;
+        }
+
+        // MTMD_ASYNC_ENCODE: 0 = always synchronous, 1 = asynchronous on any device but CUDA, unset or auto = automatic
+        int mode = -1;
+        if (const char * e = getenv("MTMD_ASYNC_ENCODE")) {
+            if (strcmp(e, "0") == 0) {
+                mode = 0;
+            } else if (strcmp(e, "1") == 0) {
+                mode = 1;
+            } else if (e[0] != '\0' && strcmp(e, "auto") != 0) {
+                SRV_WRN("[TAG_MTMD_ASYNC_ENCODE] ignoring MTMD_ASYNC_ENCODE=%s, expected 0, 1 or auto\n", e);
+            }
+        }
+
+        // the device clip_ctx::clip_ctx() (tools/mtmd/clip.cpp) runs the projector on, for these params
+        ggml_backend_dev_t dev = nullptr;
+        if (mparams.use_gpu) {
+            dev = mparams.device;
+            if (dev == nullptr) {
+                dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+            }
+            if (dev == nullptr) {
+                dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_IGPU);
+            }
+        }
+        const bool        on_cpu   = dev == nullptr || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU;
+        const std::string dev_name = on_cpu ? std::string("CPU") : std::string(ggml_backend_dev_name(dev));
+
+        bool is_cuda = false; // CUDA, or the same backend built for HIP (ROCm) or MUSA
+        bool shared  = false; // the text model or the drafter runs on this device too
+        if (on_cpu) {
+            // [TAG_MTMD_ASYNC_ENCODE_CPU_TEXT] A text model on the CPU (a CPU-only build, --device none, -ngl 0) shares
+            // the cores with a CPU projector: two ggml thread pools of -t / --mmproj-threads threads each would spin
+            // against each other in their barriers, so it stays synchronous unless MTMD_ASYNC_ENCODE=1.
+            shared = model_tgt == nullptr || llama_model_n_devices(model_tgt) == 0 || params_base.n_gpu_layers == 0;
+        } else {
+            ggml_backend_reg_t reg      = ggml_backend_dev_backend_reg(dev);
+            const char *       reg_name = reg ? ggml_backend_reg_name(reg) : "";
+            is_cuda = strcmp(reg_name, "CUDA") == 0 || strcmp(reg_name, "ROCm") == 0 || strcmp(reg_name, "MUSA") == 0;
+
+            const llama_model * models[] = { model_tgt, model_dft };
+            for (const llama_model * m : models) {
+                if (m == nullptr) {
+                    continue;
+                }
+                for (int32_t i = 0; i < llama_model_n_devices(m); ++i) {
+                    shared = shared || llama_model_get_device(m, i) == dev;
+                }
+            }
+        }
+
+        const char * why_sync = nullptr;
+        if (mode == 0) {
+            why_sync = "MTMD_ASYNC_ENCODE=0";
+        } else if (is_cuda) {
+            why_sync = "it is fast on a CUDA device, and a second thread driving CUDA is avoided";
+        } else if (shared && mode != 1) {
+            why_sync = "the text model uses the same device, MTMD_ASYNC_ENCODE=1 overrides";
+        }
+
+        if (why_sync == nullptr) {
+            try {
+                media_encoder.start();
+                media_async = true;
+            } catch (const std::exception & e) {
+                SRV_WRN("[TAG_MTMD_ASYNC_ENCODE] cannot start the encoder thread (%s), media is encoded synchronously\n", e.what());
+                return;
+            }
+            SRV_INF("[TAG_MTMD_ASYNC_ENCODE] media is encoded on its own thread (projector on %s): the other slots keep "
+                    "generating while an image or audio is encoded. MTMD_ASYNC_ENCODE=0 encodes synchronously\n", dev_name.c_str());
+        } else {
+            SRV_INF("[TAG_MTMD_ASYNC_ENCODE] media is encoded synchronously (projector on %s): %s\n", dev_name.c_str(), why_sync);
+        }
+    }
+
+    // Queues the encode of the media chunk that starts at `idx`, batched with the media chunks after it by the same
+    // rule as process_mtmd_chunk(), so the encoder computes exactly what the synchronous path computes. The job
+    // gets its own copies of those chunks. Returns false if the job cannot be built.
+    bool media_async_submit(server_slot & slot, size_t idx) {
+        const auto & input_tokens = slot.task->tokens;
+
+        // pick the chunks on the originals first, so that only the chunks that go into the batch are copied
+        std::vector<std::pair<size_t, const mtmd_input_chunk *>> picked;
+        {
+            mtmd::batch_ptr probe(mtmd_batch_init(mctx));
+            const mtmd_input_chunk * first = input_tokens.find_chunk(idx).get();
+            if (mtmd_batch_add_chunk(probe.get(), first) != 0) {
+                SLT_ERR(slot, "[TAG_MTMD_ASYNC_ENCODE] cannot encode the media chunk at idx = %zu\n", idx);
+                return false;
+            }
+            picked.emplace_back(idx, first);
+
+            size_t idx_cur = idx;
+            while (true) {
+                const auto [next_chunk, next_idx] = input_tokens.find_next_media_chunk(idx_cur);
+                if (next_chunk == nullptr || mtmd_batch_add_chunk(probe.get(), next_chunk->get()) != 0) {
+                    break; // no more media, the batch is full, or the chunk cannot be batched with the others
+                }
+                picked.emplace_back(next_idx, next_chunk->get());
+                idx_cur = next_idx;
+            }
+        }
+
+        auto job = std::make_shared<server_media_job>();
+        job->id_slot = slot.id;
+        job->id_task = slot.task->id;
+        job->mbatch.reset(mtmd_batch_init(mctx));
+
+        for (const auto & [at, src] : picked) {
+            mtmd::input_chunk_ptr cpy(mtmd_input_chunk_copy(src));
+            if (!cpy || mtmd_batch_add_chunk(job->mbatch.get(), cpy.get()) != 0) {
+                SLT_ERR(slot, "[TAG_MTMD_ASYNC_ENCODE] cannot put a copy of the media chunk at idx = %zu into an encode job\n", at);
+                return false;
+            }
+            job->n_tokens += mtmd_input_chunk_get_n_tokens(cpy.get());
+            job->idxs.push_back(at);
+            job->chunks.push_back(std::move(cpy));
+        }
+
+        SLT_INF(slot, "[TAG_MTMD_ASYNC_ENCODE] queued the encode of %zu media chunk(s), %zu tokens, from idx = %zu%s, %d job(s) ahead\n",
+                job->idxs.size(), job->n_tokens, idx, idx > slot.prompt.tokens.size() ? " (ahead of the prompt)" : "",
+                media_encoder.n_jobs());
+
+        slot.media_job = job;
+        media_encoder.submit(std::move(job));
+        return true;
+    }
+
+    // Where the slot stands with its media, called while its prompt is processed. Returns
+    //    2: the prompt is at a media chunk whose encode was queued by this call: add nothing for this slot
+    //    1: the prompt is at a media chunk that is still being encoded: add nothing for this slot in this iteration
+    //    0: go on: the next token is text, or the embeddings of the media chunk at the prompt are ready
+    //   -1: the encode failed or could not be queued: fail the request
+    // While the next token is text, the next media chunk of the prompt is queued already, so that its encode overlaps
+    // with the text before it instead of starting only when the prompt gets there.
+    int media_async_step(server_slot & slot) {
+        const auto & input_tokens = slot.task->tokens;
+        const size_t idx          = slot.prompt.tokens.size();
+
+        // a job of another task, or one the prompt is past the last chunk of (all of it decoded), is not needed
+        if (slot.media_job && (slot.media_job->id_task != slot.task->id || slot.media_job->idxs.back() < idx)) {
+            slot.media_job_drop();
+        }
+
+        if (idx >= input_tokens.size()) {
+            return 0;
+        }
+
+        const bool at_media = input_tokens[idx] == LLAMA_TOKEN_NULL;
+
+        if (at_media && slot.media_job && !slot.media_job->holds(idx)) {
+            // the job holds later chunks only - not expected, chunks are queued in prompt order
+            slot.media_job_drop();
+        }
+
+        bool queued_now = false;
+        if (!slot.media_job) {
+            size_t idx_media = idx;
+            if (!at_media) {
+                const auto next = input_tokens.find_next_media_chunk(idx);
+                if (next.first == nullptr) {
+                    return 0; // no media left in this prompt
+                }
+                idx_media = next.second;
+            }
+            // [TAG_MTMD_ENCODE_CATCH] find_chunk() throws on an index that is not a chunk start, and the copies can
+            // run out of memory. The synchronous path runs this inside the yield's try/catch and fails only the
+            // request; here an exception would leave pre_decode() and abort every slot.
+            bool ok = false;
+            try {
+                ok = media_async_submit(slot, idx_media);
+            } catch (const std::exception & e) {
+                SLT_ERR(slot, "[TAG_MTMD_ASYNC_ENCODE] exception while queueing the media chunk at idx = %zu: %s\n", idx_media, e.what());
+                ok = false;
+            }
+            if (!ok) {
+                slot.media_job_drop();
+                return -1;
+            }
+            queued_now = true;
+        }
+
+        if (!at_media) {
+            return 0;
+        }
+
+        switch (slot.media_job->state.load(std::memory_order_acquire)) {
+            case server_media_job::JOB_DONE:
+                return 0;
+            case server_media_job::JOB_FAILED:
+            case server_media_job::JOB_CANCELLED:
+                slot.media_job_drop();
+                return -1;
+            default:
+                return queued_now ? 2 : 1; // queued or encoding
         }
     }
 
@@ -3532,10 +4063,14 @@ private:
             case SERVER_TASK_TYPE_METRICS:
                 {
                     int n_processing_slots = 0;
+                    int n_media_waiting    = 0; // [TAG_MTMD_ASYNC_ENCODE]
 
                     for (server_slot & slot : slots) {
                         if (slot.is_processing()) {
                             n_processing_slots++;
+                        }
+                        if (slot.media_blocked()) {
+                            n_media_waiting++;
                         }
                     }
                     SRV_DBG("n_processing_slots = %d\n", n_processing_slots);
@@ -3544,6 +4079,8 @@ private:
                     res->id                  = task.id;
                     res->n_processing_slots  = n_processing_slots;
                     res->n_tasks_deferred    = queue_tasks.queue_tasks_deferred_size();
+                    res->n_media_waiting     = n_media_waiting;
+                    res->n_media_jobs        = media_async ? media_encoder.n_jobs() : 0;
                     res->metrics             = metrics;
 
                     if (task.metrics_reset_bucket) {
@@ -3864,6 +4401,21 @@ private:
             }
 
             if (all_idle) {
+                // [TAG_MTMD_ASYNC_ENCODE] The encode of a request that is gone (cancelled, disconnected) may still be
+                // running, a clip encode cannot be interrupted. Keep the loop turning until it ends, as a waiting slot
+                // would: otherwise the idle timer could put the server to sleep, and destroy() would have to wait for
+                // the encode while holding the task queue. The wait returns when the encoder is idle, or after 5 ms.
+                if (media_async && media_encoder.n_jobs() > 0) {
+                    metrics_flush_idle();
+
+                    server_task task(SERVER_TASK_TYPE_NEXT_RESPONSE);
+                    task.id = queue_tasks.get_new_id();
+                    queue_tasks.post(std::move(task));
+
+                    media_encoder.wait_idle(std::chrono::milliseconds(5));
+                    return;
+                }
+
                 SRV_TRC("%s", "all slots are idle\n");
 
                 metrics_flush_idle();
@@ -3987,6 +4539,23 @@ private:
         }
         if (pool_preempt && batch.size() == 0 && pool_n_parked > 0) {
             std::this_thread::sleep_for(std::chrono::milliseconds(1)); // parked slots waiting, nothing to decode: do not spin a core
+        }
+
+        // [TAG_MTMD_ASYNC_ENCODE] Nothing was decoded because the only work left is slots waiting for their media
+        // encode. update_slots() posted NEXT_RESPONSE above, so the loop comes straight back here: instead of
+        // spinning a core for minutes, wait until one of those encodes finishes (the encoder thread notifies), or
+        // 5 ms at most so that new tasks are still picked up promptly. The loop keeps turning, so the idle timer
+        // cannot put the server to sleep (and free mctx) under a running encode.
+        if (media_async && batch.size() == 0) {
+            std::vector<const server_media_job *> waiting;
+            for (const auto & slot : slots) {
+                if (slot.media_blocked()) {
+                    waiting.push_back(slot.media_job.get());
+                }
+            }
+            if (!waiting.empty()) {
+                media_encoder.wait_any(waiting, std::chrono::milliseconds(5));
+            }
         }
 
         // [TAG_SHARED_PREFIX_FANOUT] the state is only valid once the batch has actually been
@@ -4563,6 +5132,31 @@ private:
                         }
                     }
 
+                    // [TAG_MTMD_ASYNC_ENCODE] The prompt is at a media chunk that is still being encoded on the
+                    // encoder thread: add nothing for this slot, the other slots are batched as usual. Checked
+                    // before anything below touches the batch, and before print_timings_pp(), which would log on
+                    // every iteration of the wait. This also queues the encode of the next media chunk while the
+                    // prompt is still on text, so that the encode overlaps with that text.
+                    if (media_async) {
+                        const int r = media_async_step(slot);
+                        if (r < 0) {
+                            SLT_ERR(slot, "%s", "failed to process mtmd chunk, the encode failed\n");
+                            send_error(slot, "failed to process mtmd chunk", ERROR_TYPE_SERVER);
+                            slot.release();
+                            return;
+                        }
+                        if (r > 0) {
+                            // The wait starts here (r == 2, the job was just queued): drop what lies past the
+                            // prompt from memory now, as the synchronous path does before its encode (the seq_rm
+                            // below), so that a waiting slot holds exactly its prompt's cells - the pool, a park
+                            // and a restore see the same state. Only once, it is a scan over the whole KV cache.
+                            if (r == 2) {
+                                slot.mem.seq_rm(slot.id, slot.prompt.tokens.pos_next(), -1);
+                            }
+                            return;
+                        }
+                    }
+
                     // note: the prompt timing is advanced in post_decode(), so it does not cover
                     //       the tokens added to the batch below
                     slot.print_timings_pp();
@@ -4615,6 +5209,25 @@ private:
                             break;
                         }
 
+                        // [TAG_MTMD_ASYNC_ENCODE] the embeddings come from the slot's encode job. A second media chunk
+                        // right after the first may still be encoding, then the slot waits from here: the chunks
+                        // decoded so far stay decoded, and the text after them is added once the rest is decoded,
+                        // so has_mtmd (no checkpoint in that batch) comes out as in the synchronous path.
+                        float * embd_async = nullptr;
+                        if (media_async) {
+                            const int r = media_async_step(slot);
+                            if (r > 0) {
+                                return;
+                            }
+                            embd_async = (r == 0 && slot.media_job) ? slot.media_job->get_embd(cur_token_idx) : nullptr;
+                            if (embd_async == nullptr) {
+                                SLT_ERR(slot, "failed to process mtmd chunk, no embeddings for idx = %zu\n", (size_t) cur_token_idx);
+                                send_error(slot, "failed to process mtmd chunk", ERROR_TYPE_SERVER);
+                                slot.release();
+                                return;
+                            }
+                        }
+
                         // [TAG_POOL_PREEMPT] an image decodes in its own llama_decode calls, and a full pool used to fail the request.
                         // Hold it back instead (no rows added this iteration) and let update_slots make room.
                         if (pool_preempt) {
@@ -4643,7 +5256,10 @@ private:
                             // slot. Fail only this request: res != 0 below sends the error and releases the
                             // slot, which also drops the partially encoded slot.mbatch.
                             try {
-                                res = process_mtmd_chunk(slot, slot.mbatch, cur_token_idx, n_tokens_out);
+                                // [TAG_MTMD_ASYNC_ENCODE] async: only the decode is left, the encode ran on the encoder thread
+                                res = embd_async != nullptr
+                                    ? process_mtmd_chunk_decode(slot, cur_token_idx, embd_async, n_tokens_out)
+                                    : process_mtmd_chunk(slot, slot.mbatch, cur_token_idx, n_tokens_out);
                             } catch (const std::exception & e) {
                                 SLT_ERR(slot, "exception while processing mtmd chunk: %s\n", e.what());
                                 res = -1;
@@ -4660,6 +5276,11 @@ private:
                             return; // the slot is done, skip it entirely
                         }
 
+                        // [TAG_MTMD_ASYNC_ENCODE] free the job (chunk copies, embeddings) once its last chunk is decoded
+                        if (embd_async != nullptr && slot.media_job && slot.media_job->idxs.back() == (size_t) cur_token_idx) {
+                            slot.media_job.reset();
+                        }
+
                         metrics_queue_prompt(n_tokens_out);
                         slot.stats.n_prompt_processed += n_tokens_out;
                         slot.stats.update_prompt_last();
@@ -4672,6 +5293,13 @@ private:
                         }
 
                         has_mtmd = true;
+                    }
+
+                    // [TAG_MTMD_ASYNC_ENCODE] media was just decoded and the prompt goes on with text: queue the
+                    // next media chunk now, so that its encode overlaps with this text. The result only matters for
+                    // a failure to queue, which is reported when the prompt reaches that chunk.
+                    if (media_async && has_mtmd && !slot.media_job) {
+                        (void) media_async_step(slot);
                     }
 
                     const auto & spans = slot.task->params.message_spans;
@@ -5103,7 +5731,9 @@ private:
             }
 
             // optionally send prompt processing progress
-            if (slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_DONE_PROMPT) {
+            // [TAG_MTMD_ASYNC_ENCODE] not while the prompt waits for its media encode: nothing changed, and the other
+            // slots' decodes would send the same progress event every step for the whole encode
+            if ((slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_DONE_PROMPT) && !slot.media_blocked()) {
                 if (slot.task->params.stream && slot.task->params.return_progress) {
                     send_partial_response(slot, {}, true);
                 }

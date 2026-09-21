@@ -470,6 +470,8 @@ srvcmd emits both for the new build (`--vision cpu|gpu|igpu`).
 | 8.5.4 | `-mmdev igpu` with `GGML_DISABLE_VULKAN=1` | the server starts and logs one warning naming the reason (`no integrated GPU device found`, [TAG_MMDEV_FALLBACK]); the vision encoder runs on the CPU and the image checks of 8.5.2 pass as in the cpu arm |
 | 8.5.5 | iGPU ops, with the loader filter set: `BIN\test-backend-ops.exe test -b Vulkan0 -o <op>`, one op at a time, for MUL_MAT, FLASH_ATTN_EXT, ROPE, IM2COL, UPSCALE, NORM, ADD, MUL, UNARY, CPY, CONT, SOFT_MAX | 0 FAIL; F16 flash attention at head size 72 supported; turbo FA cases report `not supported` ([TAG_VK_NO_TURBO]) |
 | 8.5.6 | `--mmproj-threads 8` against `0` (= `-t`) with `-mmdev cpu` | encode time recorded; answers unchanged |
+| 8.5.7 | production preset with `--vision cpu`: one 4000-token image request while 3 slots stream text, then the same with `MTMD_ASYNC_ENCODE=0` ([TAG_MTMD_ASYNC_ENCODE]) | the log says `media is encoded on its own thread`; the 3 streams keep producing tokens during the encode (record their t/s and the longest gap between two tokens), while with `=0` they stall for the whole encode; `/slots` shows `waiting_media: true` for the image slot during the encode; the image answer matches the `=0` arm in content |
+| 8.5.8 | cancel the image request of 8.5.7 during its encode, then send a text request and a second image request; stop the server during a third encode | the slot is free at once and the text request is served during the encode; the log shows `request gone, result dropped`; the second image is encoded after the first encode ends; the stop waits for the running encode and exits with no crash |
 
 ### 8.6 Switch A/Bs (one binary, default against the switch)
 

@@ -671,7 +671,8 @@ Other changes in the same area:
 - The Vulkan backend refuses every fork turbo type and the fork's extra flash-attention inputs (`[TAG_VK_NO_TURBO]`), so a turbo cache never runs on Vulkan.
 - A failed image encode fails only that request and frees its slot; the server keeps running (`[TAG_MTMD_ENCODE_CATCH]`).
 - The CPU flash attention now takes its tiled path for head sizes 72 (the Qwen3.8 vision encoder) and 40 on AVX-512 (`[TAG_CPU_FA_DV_PAD]`). On the CPU, the encoder's K and V stay F32 into flash attention (`[TAG_CLIP_CPU_KV_F32]`).
-- Image encoding still runs on the inference thread, so every slot waits while an image is encoded, whichever device encodes it.
+- Images and audio are encoded on a thread of their own when the vision encoder runs on the CPU and the text model on a GPU, or on a GPU the text model does not use, such as the iGPU (`[TAG_MTMD_ASYNC_ENCODE]`). The request waits at its image until the encode is done, and the other slots keep generating in the meantime. The embeddings then go into the context on the inference thread through the same code as before, so the request's positions, checkpoints and DFlash2 drafter repair are unchanged. On a CUDA device the encode stays on the inference thread, and every slot waits for it as before.
+- While a request waits for its encode, `/slots` shows `waiting_media: true` and a `media_encode` object (state, chunks, tokens, time queued and encoding). `/metrics` adds `requests_waiting_media` and `media_encode_jobs`. A request that is cancelled during its encode frees its slot at once. The encode itself cannot be interrupted, so it runs to the end and its result is dropped.
 
 None of the vision changes is measured yet.
 
@@ -693,6 +694,7 @@ Every switch defaults to the new behaviour. None of the new behaviours is measur
 | `TURBO_RMSNORM_SCALE_FUSION` | on | `0` makes CUDA run the GDN q/k norm (RMS_NORM, then SCALE) as two kernels instead of one fused kernel. `GGML_CUDA_DISABLE_FUSION` turns it off too. |
 | `GGML_CPU_FA_DV_PAD` | on | `0` restores upstream's rule that the CPU tiled flash attention needs a V head size that is a multiple of the SIMD width. Head sizes 72 and 40 on AVX-512 then take the per-row path again. |
 | `MTMD_CPU_KV_F32` | on | `0` makes the vision encoder cast K and V to F16 before CPU flash attention, as upstream does. |
+| `MTMD_ASYNC_ENCODE` | auto | `0` encodes images and audio on the inference thread everywhere, as upstream does, so every slot waits for the encode. `1` also uses the encoder thread when the text model runs on the same device (a CPU-only run, `-ngl 0`, or a shared Vulkan device). A CUDA projector always encodes on the inference thread. |
 | `LLAMA_CTX_CHECKPOINT_MIN_STEP_ALWAYS` | off | `1` restores the pre-sync checkpoint eviction order: spacing eviction on every checkpoint, before the byte budget, and no replacement of a checkpoint at the same position. |
 | `SPEC_DFT_DUMP` | unset | `<file>` writes the DFlash2 selector lattice (top-k ids and scores for each drafted position) after every drafter decode, so two builds can be compared offline. |
 | `TURBO_MMA_NATIVE` | `1` | Existing switch. `0` now also sends turbo5p512 back to the F16 conversion path. |

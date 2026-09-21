@@ -1627,6 +1627,15 @@ std::string server_task_result_metrics::to_metrics() {
             "Number of requests deferred",
             (double) n_tasks_deferred
         }, {
+            // [TAG_MTMD_ASYNC_ENCODE]
+            "requests_waiting_media",
+            "Number of requests whose prompt waits for its image or audio encode (async media encode)",
+            (double) n_media_waiting
+        }, {
+            "media_encode_jobs",
+            "Number of media encode jobs queued or running on the encoder thread",
+            (double) n_media_jobs
+        }, {
             "n_busy_slots_per_decode",
             "Average number of busy slots per llama_decode() call",
             (double) metrics.n_busy_slots / std::max((double) metrics.n_decode, 1.0)

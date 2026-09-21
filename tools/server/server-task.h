@@ -494,6 +494,8 @@ struct server_task_result_metrics : server_task_result {
     // these are immediate stats, not accumulated (server_metrics is cumulative)
     int n_processing_slots = 0;
     int n_tasks_deferred = 0;
+    int n_media_waiting = 0; // [TAG_MTMD_ASYNC_ENCODE] requests whose prompt waits for its media encode
+    int n_media_jobs    = 0; // [TAG_MTMD_ASYNC_ENCODE] encode jobs queued or running on the encoder thread
 
     server_metrics metrics;
 
