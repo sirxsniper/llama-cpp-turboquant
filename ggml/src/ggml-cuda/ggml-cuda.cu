@@ -3674,6 +3674,41 @@ static bool ggml_cuda_try_resid_norm_fusion(const ggml_cgraph * cgraph, int i) {
     return true;
 }
 
+// [TAG_RMSNORM_SCALE_FUSION] rms_norm(x, eps) -> scale(., s) with no bias. Upstream 5fdfa6282 builds the GDN q/k
+// l2 norm this way (build_gdn_l2_norm in src/models/models.h: rms_norm(x, eps/n) * 1/sqrt(n)), twice per recurrent
+// layer per step on Qwen3.8. The graph keeps both ops, so other backends run them plain; CUDA runs one launch that
+// never writes the norm's output. Bit-exact; TURBO_RMSNORM_SCALE_FUSION=0 disables it.
+static bool ggml_cuda_try_rms_norm_scale_fusion(const ggml_cgraph * cgraph, int i) {
+    static const bool on = [] {
+        const char * e = getenv("TURBO_RMSNORM_SCALE_FUSION");
+        return !(e && e[0] == '0');
+    }();
+    if (!on || i + 1 >= cgraph->n_nodes) {
+        return false;
+    }
+    const ggml_tensor * norm  = cgraph->nodes[i];
+    const ggml_tensor * scale = cgraph->nodes[i + 1];
+    if (norm->op != GGML_OP_RMS_NORM || scale->op != GGML_OP_SCALE || scale->src[0] != norm) {
+        return false;
+    }
+    // the norm output has the scale as its only reader, is not a graph output or a view, same shape
+    if (!ggml_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_SCALE })) {
+        return false;
+    }
+    const ggml_tensor * x = norm->src[0];
+    if (!x || x->type != GGML_TYPE_F32 || norm->type != GGML_TYPE_F32 || scale->type != GGML_TYPE_F32 ||
+        x->nb[0] != ggml_type_size(GGML_TYPE_F32) || !ggml_is_contiguous(norm) || !ggml_is_contiguous(scale) ||
+        ggml_is_empty(norm)) {
+        return false;
+    }
+    if (ggml_get_op_params_f32(scale, 1) != 0.0f) { // scale bias
+        return false;
+    }
+    // the fused kernel reads x after other rows may have been written: the output must not alias it
+    const int out_node = i + 1;
+    return ggml_cuda_check_fusion_memory_ranges(cgraph, i, 2, &out_node, 1);
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
@@ -3693,6 +3728,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     if (node->op == GGML_OP_ADD && ggml_cuda_try_resid_norm_fusion(cgraph, i)) {
         ggml_cuda_op_rms_norm_resid_fused(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
         return 2;
+    }
+
+    // [TAG_RMSNORM_SCALE_FUSION] rms_norm -> scale (GDN q/k l2 norm) -> one launch
+    if (node->op == GGML_OP_RMS_NORM && ggml_cuda_try_rms_norm_scale_fusion(cgraph, i)) {
+        ggml_cuda_op_rms_norm_scale_fused(*cuda_ctx, node, cgraph->nodes[i + 1]);
+        return 1;
     }
 
     // [TAG_CPY_CHAIN_FUSION] cpy, cpy, cpy ... with constant pointer deltas -> one launch

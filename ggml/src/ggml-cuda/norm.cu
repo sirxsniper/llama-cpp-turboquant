@@ -353,6 +353,47 @@ static __global__ void rms_norm_pre_add_mul_f32(const float * x, const float * y
     }
 }
 
+// [TAG_RMSNORM_SCALE_FUSION] dst = out_scale * rms_norm(x) + out_bias in one launch. This is upstream's GDN q/k
+// l2 norm (5fdfa6282, build_gdn_l2_norm: rms_norm(x, eps/n) * 1/sqrt(n) = x * rsqrt(sum x^2 + eps)).
+// Mirrors rms_norm_f32<block_size, false> (same reduction, same block size) and then applies scale_f32's
+// expression to the rounded F32 norm value, so the result is bit-identical to the two separate kernels.
+template <int block_size>
+static __global__ void rms_norm_scale_f32(const float * x, float * dst, const int ncols, const int64_t stride_row,
+                                          const int64_t stride_channel, const int64_t stride_sample, const float eps,
+                                          const float out_scale, const float out_bias) {
+    ggml_cuda_pdl_lc();
+    const int nrows     = gridDim.x;
+    const int nchannels = gridDim.y;
+
+    const int row       = blockIdx.x;
+    const int channel   = blockIdx.y;
+    const int sample    = blockIdx.z;
+    const int tid       = threadIdx.x;
+
+    x   += sample*stride_sample + channel*stride_channel + row*stride_row;
+    dst += ((sample*nchannels + channel)*nrows + row)*ncols;
+
+    float tmp = 0.0f; // partial sum for thread in warp
+
+    ggml_cuda_pdl_sync();
+    for (int col = tid; col < ncols; col += block_size) {
+        const float xi = x[col];
+        tmp += xi * xi;
+    }
+
+    // sum up partial sums
+    extern __shared__ float s_sum[];
+    tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
+
+    const float mean = tmp / ncols;
+    const float scale = rsqrtf(mean + eps);
+
+    for (int col = tid; col < ncols; col += block_size) {
+        const float y = scale * x[col];     // the RMS_NORM output value
+        dst[col]      = out_scale * y + out_bias; // the SCALE kernel's expression
+    }
+}
+
 static void rms_norm_f32_cuda(
         const float * x, float * dst, const int ncols, const int nrows, const int nchannels, const int nsamples,
         const int64_t stride_row, const int64_t stride_channel, const int64_t stride_sample, const float eps, cudaStream_t stream) {
@@ -667,6 +708,53 @@ void ggml_cuda_op_rms_norm_resid_fused(ggml_backend_cuda_context & ctx, ggml_ten
         ggml_cuda_kernel_launch(rms_norm_pre_add_mul_f32<1024>, launch_params,
             x_d, y_d, s_d, dst_d, (int) ne00, s01, s02, s03, eps,
             mul_d, mul_s01, mul_s02, mul_s03, mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed);
+    }
+}
+
+// [TAG_RMSNORM_SCALE_FUSION] rms_norm -> scale: the norm's output is not written (its only reader is the scale).
+// The launch shape matches rms_norm_f32_cuda so the reduction order, and with it every value, is unchanged.
+void ggml_cuda_op_rms_norm_scale_fused(ggml_backend_cuda_context & ctx, ggml_tensor * norm, ggml_tensor * scale_tensor) {
+    const ggml_tensor * src0 = norm->src[0];
+
+    GGML_ASSERT(scale_tensor->src[0] == norm);
+    GGML_ASSERT(src0->type == GGML_TYPE_F32 && norm->type == GGML_TYPE_F32 && scale_tensor->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_are_same_shape(src0, scale_tensor) && ggml_is_contiguous(scale_tensor));
+
+    float eps;
+    memcpy(&eps, norm->op_params, sizeof(float));
+    GGML_ASSERT(eps >= 0.0f);
+
+    float out_scale;
+    float out_bias;
+    memcpy(&out_scale, (const float *) scale_tensor->op_params + 0, sizeof(float));
+    memcpy(&out_bias,  (const float *) scale_tensor->op_params + 1, sizeof(float));
+
+    const int64_t ne00 = src0->ne[0];
+    const int64_t ne01 = src0->ne[1];
+    const int64_t ne02 = src0->ne[2];
+    const int64_t ne03 = src0->ne[3];
+
+    const size_t ts0 = ggml_type_size(src0->type);
+    GGML_ASSERT(src0->nb[0] == ts0);
+    const int64_t s01 = src0->nb[1] / ts0;
+    const int64_t s02 = src0->nb[2] / ts0;
+    const int64_t s03 = src0->nb[3] / ts0;
+
+    const float * src0_d = (const float *) src0->data;
+    float *       dst_d  = (float *) scale_tensor->data;
+    cudaStream_t  stream = ctx.stream();
+
+    const dim3 blocks_num((unsigned) ne01, (unsigned) ne02, (unsigned) ne03);
+    if (ne00 < 1024) {
+        const dim3 block_dims(256, 1, 1);
+        const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float): 0, stream};
+        ggml_cuda_kernel_launch(rms_norm_scale_f32<256>, launch_params,
+            src0_d, dst_d, (int) ne00, s01, s02, s03, eps, out_scale, out_bias);
+    } else {
+        const dim3 block_dims(1024, 1, 1);
+        const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float): 0, stream};
+        ggml_cuda_kernel_launch(rms_norm_scale_f32<1024>, launch_params,
+            src0_d, dst_d, (int) ne00, s01, s02, s03, eps, out_scale, out_bias);
     }
 }
 
