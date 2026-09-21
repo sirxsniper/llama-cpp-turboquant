@@ -256,6 +256,28 @@ k_top_k_select(const float * __restrict__ x, int * __restrict__ dst, const int n
     }
 }
 
+// [TAG_SYNC_TOPK] the fork's launcher must stay outside upstream's HIP-only radix block below.
+static void top_k_select_cuda(const float * x, int * dst, const int64_t ncols, const int64_t nrows, const int64_t k, const bool ordered, cudaStream_t stream) {
+    // float4 row reads need 16-byte aligned rows: base pointer and row pitch both multiples of 16
+    const bool vec4 = (ncols % 4 == 0) && (((uintptr_t) x) % 16 == 0);
+    // [TAG_TOPK_UNORDERED] k_max is only the size of the rank-sort staging arrays, so the unordered
+    // instantiations ask for 1 element rather than TOPK_SELECT_MAX_K and keep their shared memory
+    // to the histograms alone - that is what lets k run into the thousands.
+    if (ordered) {
+        if (vec4) {
+            k_top_k_select<TOPK_SELECT_MAX_K, true,  true><<<(unsigned) nrows, TOPK_SELECT_THREADS, 0, stream>>>(x, dst, (int) ncols, (int) k);
+        } else {
+            k_top_k_select<TOPK_SELECT_MAX_K, false, true><<<(unsigned) nrows, TOPK_SELECT_THREADS, 0, stream>>>(x, dst, (int) ncols, (int) k);
+        }
+    } else {
+        if (vec4) {
+            k_top_k_select<1, true,  false><<<(unsigned) nrows, TOPK_SELECT_THREADS, 0, stream>>>(x, dst, (int) ncols, (int) k);
+        } else {
+            k_top_k_select<1, false, false><<<(unsigned) nrows, TOPK_SELECT_THREADS, 0, stream>>>(x, dst, (int) ncols, (int) k);
+        }
+    }
+}
+
 #if !defined(GGML_CUDA_USE_CUB) && defined(GGML_USE_HIP)
 
 static __device__ __forceinline__ uint32_t top_k_float_to_ordered(float value) {
@@ -381,27 +403,6 @@ static __global__ void top_k_radix_gather(
             if (pos < state->rank) {
                 row_dst[k - state->rank + pos] = col;
             }
-        }
-    }
-}
-
-static void top_k_select_cuda(const float * x, int * dst, const int64_t ncols, const int64_t nrows, const int64_t k, const bool ordered, cudaStream_t stream) {
-    // float4 row reads need 16-byte aligned rows: base pointer and row pitch both multiples of 16
-    const bool vec4 = (ncols % 4 == 0) && (((uintptr_t) x) % 16 == 0);
-    // [TAG_TOPK_UNORDERED] k_max is only the size of the rank-sort staging arrays, so the unordered
-    // instantiations ask for 1 element rather than TOPK_SELECT_MAX_K and keep their shared memory
-    // to the histograms alone - that is what lets k run into the thousands.
-    if (ordered) {
-        if (vec4) {
-            k_top_k_select<TOPK_SELECT_MAX_K, true,  true><<<(unsigned) nrows, TOPK_SELECT_THREADS, 0, stream>>>(x, dst, (int) ncols, (int) k);
-        } else {
-            k_top_k_select<TOPK_SELECT_MAX_K, false, true><<<(unsigned) nrows, TOPK_SELECT_THREADS, 0, stream>>>(x, dst, (int) ncols, (int) k);
-        }
-    } else {
-        if (vec4) {
-            k_top_k_select<1, true,  false><<<(unsigned) nrows, TOPK_SELECT_THREADS, 0, stream>>>(x, dst, (int) ncols, (int) k);
-        } else {
-            k_top_k_select<1, false, false><<<(unsigned) nrows, TOPK_SELECT_THREADS, 0, stream>>>(x, dst, (int) ncols, (int) k);
         }
     }
 }
