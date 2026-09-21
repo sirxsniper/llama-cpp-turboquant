@@ -951,10 +951,26 @@ An empty value counts as unset. The value `default` in 1 or 2 selects the built-
 - The existing quantized-K/V head-divisibility loops (`[TAG_MTP_KV_VALIDATE]`) skip turbot. Turbot validates its own geometry in the cache constructor (9.3).
 - The `[TAG_TURBO5P512]` substitution never touches turbot.
 - REVISED 2026-09-21 [TAG_KV_RESOLVE]: right after the `LLAMA_TURBOT=0` swap, `llama_kv_resolve` (src/llama-kv-cache-resolve.h) runs the 9.3 refusals and the plan match (`llama_turbot_plan_matches`) without building a cache. When turbot would be refused it falls back turbot → turbo5p (turbo5p512 for 512-element rows) → turbo4 → q8_0 → f16, with one `LLAMA_LOG_WARN` per downgrade that names every reason, so none of the refusals above or in 9.3 fails context creation. Should the cache constructor still refuse turbot, the `llama_context` constructor resolves again without it and rebuilds the memory. The other KV types go through the same resolver (head size, row and flash-attention rules). Env `LLAMA_KV_RESOLVE=0` turns it off and restores the refusals.
+  - The refusal checks are shared between the resolver and the cache constructor: `llama_turbot_cache_refusal`, `llama_turbot_env_refusal`, `llama_turbot_layer_refusal` and `llama_turbot_layer_device_refusal` (src/llama-kv-cache-resolve.h), with the constructor's messages unchanged.
+  - The attention layers the plan must name are derived with the same filter as `llama_model::create_memory` (`llama_kv_resolve_attn_layer`, a copy). A disagreement between the two is caught by the constructor retry above.
+  - Plan check: `llama_turbot_plan_get_source` → `llama_turbot_plan_read` → `llama_turbot_plan_matches`, for every origin (9.1). A plan file that does not fit also falls back.
+  - What a turbot request becomes (tests/test-kv-resolve.cpp, synthetic hparams):
+
+    | Cause | Result |
+    |---|---|
+    | n_stream > 1, SWA, MLA or shared cells, a TURBO_* env switch, a layer off CUDA, a plan that does not fit | turbo5p (turbo5p512 when a row is 512 elements) if the model takes it, else further down the chain |
+    | head geometry other than 4 × 256 | turbo5p if heads are 128/256 and rows a multiple of 512, else turbo4 for 128/256 heads, else q8_0, else f16 |
+    | only one of -ctk/-ctv is turbot | the turbot side → turbo5p, then the pair rules apply (`-ctk turbot -ctv turbo5p` → turbo5p/turbo5p; a split-plane K against f16 V → q8_0/f16) |
+    | FA explicitly off | K q8_0, V f16 |
+    | an arch whose attention has no turbo query rotation (DeepSeek 3.2/V4, GLM DSA, Hy V4, dots3-note, MiniMax-M3, Qwen4exp QSA) | q8_0 (f16 where the head is not a whole q8_0 block) |
+
+  - Qwen3.8-27B with the built-in or the default plan file keeps turbot with no new log line. Not yet built or run.
 
 ### 9.3 Refusals (thrown as `std::runtime_error` from the `llama_kv_cache` constructor unless noted)
 
 Each message starts with `"turbot: "`.
+
+REVISED 2026-09-21 [TAG_KV_RESOLVE]: with the resolver on (the default), every condition below is checked before the cache is built and leads to a fallback with a warning (9.2), not to a failed context. The constructor still throws when it is reached directly, or with `LLAMA_KV_RESOLVE=0`.
 
 | Condition | Message gist |
 |---|---|
@@ -969,7 +985,7 @@ Each message starts with `"turbot: "`.
 | SWA model (`swa_type != NONE` or n_swa > 0) | unsupported |
 | shared cells (`mem_other != nullptr`) or MLA | unsupported |
 | TriAttention enabled on this cache | unsupported |
-| plan missing or invalid | 9.1 messages |
+| plan unreadable, invalid, or not naming exactly the attention layers (a missing plan is no longer possible: the built-in plan is used, 9.1) | 9.1 messages |
 
 - `get_can_shift()` returns false when any layer is turbot.
 - `seq_add` and `seq_div` on a turbot cache: `GGML_ABORT("turbot: seq_add/seq_div are not supported (no K shift)")`.
@@ -1461,9 +1477,11 @@ Gates in order, each with a command and pass criterion:
 | `llama_turbot_set_plan_path` | `LLAMA_API void (const char * path)` in `src/llama-ext.h` | D | D (common) |
 | `llama_kv_cells::seq_n_cells`, `llama_kv_cells::seq_bits` | `uint32_t (llama_seq_id) const`, `const std::bitset<LLAMA_MAX_SEQ> & (uint32_t) const` | D | D E |
 | `llama_turbot_plan`, `llama_turbot_plan_parse_text`, `llama_turbot_plan_parse_file`, `llama_kv_tier` | section 9.5 | D | E |
+| `llama_turbot_default_plan_text`, `llama_turbot_default_plan_hash`, `llama_turbot_plan_get_source`, `llama_turbot_plan_read`, `llama_turbot_plan_matches` | `src/llama-kv-tier.h`, 9.1 ([TAG_TURBOT_EMBED_PLAN]) | D | D (resolver, cache constructor) E |
+| `llama_kv_resolve`, `llama_kv_resolve_type_name`, `llama_turbot_cache_refusal`, `llama_turbot_env_refusal`, `llama_turbot_layer_refusal`, `llama_turbot_layer_device_refusal` | `src/llama-kv-cache-resolve.h`, 9.2 ([TAG_KV_RESOLVE]) | D | D E (test-kv-resolve) |
 | `common_params::kv_tier_plan` | `std::string` | D | D |
-| env | `LLAMA_TURBOT`, `LLAMA_TURBOT_PLAN`, `LLAMA_TURBOT_DEBUG`, `LLAMA_TURBOT_FAIL_UBATCH`, `LLAMA_TURBOT_ATTN_ROT`, `LLAMA_ARG_KV_TIER_PLAN`, `LLAMA_KV_RESOLVE` ([TAG_KV_RESOLVE]) | D | E |
-| CLI | `-ctk turbot`, `-ctv turbot`, `--kv-tier-plan <file>` | D | E |
+| env | `LLAMA_TURBOT`, `LLAMA_TURBOT_PLAN` (a path, or `default`), `LLAMA_TURBOT_DEBUG`, `LLAMA_TURBOT_FAIL_UBATCH`, `LLAMA_TURBOT_ATTN_ROT`, `LLAMA_ARG_KV_TIER_PLAN`, `LLAMA_KV_RESOLVE` ([TAG_KV_RESOLVE]), `TURBOT_Q2_ROUTE` (7.6) | D | E |
+| CLI | `-ctk turbot`, `-ctv turbot`, `--kv-tier-plan <file>` or `--kv-tier-plan default` | D | E |
 | plan file | `docs/turbot/plans/turbot-default.plan` | E | D (docs), E |
 
 ### 12.3 Integration order
@@ -1489,6 +1507,13 @@ Gates in order, each with a command and pass criterion:
   2. The last-iteration `[TAG_TURBO4P_HEAD]` block in `flash_attn_ext_f16` omits `TURBO5P512`.
 
   Fixing either would change existing codegen, so both are out of scope. The second is why turbot requires one head-state helper at both sites (7.2).
+
+  REVISED 2026-09-21 [TAG_TURBO5P512_MMA]: both are fixed on the `upstream-sync` branch.
+  - `ggml_cuda_fattn_mma_f16_select_kernel` is an exhaustive switch over the turbo modes, so turbo5p512 gets its own D = 256 MMA kernels (with and without softcap). An unknown mode aborts instead of running the f16 kernel.
+  - The last-iteration block includes turbo5p512.
+  - The native-read predicate checks turbo5p512 against its 512-element block, so 512-element rows read natively too.
+  - turbot, turbo4, turbo4p and turbo5p keep their kernels. `TURBO_MMA_NATIVE=0` restores the F16 conversion path.
+  - Test: `test-backend-ops -o FLASH_ATTN_EXT -p split_plane`. Not yet built or run.
 - **Speed:** turbot reads 0.90× turbo5p's bytes at 262K with one sequence, 1.00× with four at quota, and 1.42× below 65K context (7.8). The target is parity at long context, decided by gate B0 before C and D are integrated.
 - **Known limits** (as of the upstream sync):
   - Prefill is 4-8% slower than turbo5p at 131K-245K.
@@ -1521,6 +1546,12 @@ Gates in order, each with a command and pass criterion:
 - **Truncated state blob:** evictions made by `restore_cells` before the byte read fails are not undone (9.10).
 - **Upstream Hadamard:** off by default for turbot, an opt-in arm (10.3).
 - **Study codebook deviation:** 4.6. The generator is authoritative.
+- **Other models, 2026-09-21 (`upstream-sync` branch).** turbot stays a Qwen3.8-27B-shaped cache: 4 KV heads × 256, no SWA, one stream, and a plan that names exactly the attention layers. Every other model is served by the resolver fallback (9.2), not by turbot.
+  - The README section "Using the fork with any model" is the user-facing summary. It covers the resolve rules, the built-in plan, the vision device (`-mmdev cpu|gpu|igpu` with the `--device CUDA0 --spec-draft-device CUDA0` pinning rule), `--load-mode none`, the new switches and the architectures that came with the sync.
+  - TESTING.md section 8 lists the checks. None of them has run yet.
+  - Two turbot-relevant switches came with the sync, both default on:
+    - `TURBOT_Q2_ROUTE` (7.6).
+    - `TURBO_RMSNORM_SCALE_FUSION`, the CUDA GDN q/k norm fusion. It is on the Qwen3.8 decode path and meant to be bit-exact; that is not yet checked.
 
 ---
 

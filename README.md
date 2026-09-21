@@ -8,7 +8,7 @@
 [![CUDA](https://img.shields.io/badge/CUDA-13.1-76b900?style=for-the-badge&logo=nvidia&logoColor=white)](https://developer.nvidia.com/cuda-downloads)
 [![Arch](https://img.shields.io/badge/SM-75%20→%20121-8957e5?style=for-the-badge)](#build)
 [![KV](https://img.shields.io/badge/KV%20cache-4.25%20bpw-e3b341?style=for-the-badge)](#the-turbo-formats)
-[![Base](https://img.shields.io/badge/llama.cpp-b10655-6e7681?style=for-the-badge)](https://github.com/ggml-org/llama.cpp)
+[![Base](https://img.shields.io/badge/llama.cpp-b11093-6e7681?style=for-the-badge)](https://github.com/ggml-org/llama.cpp)
 
 <br>
 
@@ -53,6 +53,7 @@ at those depths.</sub>
 | [Benchmarks](#benchmarks) | full results, with methodology |
 | [Build](#build) | Windows and Linux, from source |
 | [Configuration](#configuration) | launch recipes, flag reference, tuning knobs |
+| [Any model](#using-the-fork-with-any-model) | KV type resolved per model, built-in turbot plan, vision device, new switches and architectures |
 | [How it works](#how-it-works) | the turbo formats and the attention path |
 | [turbot](#turbot-tiered-kv-cache) | a tiered KV cache: better quality than turbo5p in the same VRAM |
 | [Engineering log](#engineering-log) | every change, with before and after |
@@ -563,6 +564,152 @@ Environment variables, for A/B testing rather than daily use.
 
 ---
 
+## Using the fork with any model
+
+Qwen3.8-27B is the model this fork is tuned for: hybrid Gated DeltaNet, 16 attention layers, 4 KV heads × 256. Other software also uses the fork as a general llama.cpp, so any model that fits the card has to load and run. A fork feature that cannot serve a model falls back to something that works and says so in one log line. It never stops the server from starting, and it never runs a path that would compute wrong output.
+
+> **Status, 2026-09-21.** Everything in this section is on the `upstream-sync` branch (upstream `fb34fc262`, `b11093`) and has **not been built or run yet**. None of it is measured. The benchmark numbers above come from the pre-sync `b10655` builds. The checks still to run are in [docs/turbot/TESTING.md section 8](docs/turbot/TESTING.md#8-upstream-sync-branch-and-other-models).
+
+### KV cache type, resolved per model
+
+Ask for a cache type with `-ctk`/`-ctv` as before. `llama_init_from_model` now checks the request against the model before the cache is built (`[TAG_KV_RESOLVE]`, `src/llama-context.cpp`). When the model cannot take a type, it steps down this chain:
+
+```
+turbot -> turbo5p (turbo5p512 for 512-element rows) -> turbo4 -> q8_0 -> f16
+```
+
+Each downgrade logs one warning that gives the reason for every type it passed over, for example:
+
+```
+llama_init_from_model: KV cache type for K and V: turbot -> turbo5p (turbot: SWA caches are unsupported)
+```
+
+The `llama_kv_cache: size = ...` line shows the types actually used. A request the model supports is left as it is, with no new log line. Qwen3.8-27B with turbot or turbo5p is unchanged.
+
+| Type | Kept when |
+|:--|:--|
+| `turbot` | All of these hold: <br>• `-ctk turbot -ctv turbot` are given together. <br>• There is one KV stream (`--kv-unified` or `-np 1`). <br>• Flash attention is not off. <br>• There is no SWA, no MLA and no shared cells. <br>• Every attention layer has 4 KV heads × 256 for K and V, with its KV on CUDA. <br>• `TURBO_KV_CPU_LAYERS`, `TURBO_LAYER_ADAPTIVE` and `TURBO_INNERQ` are unset. <br>• The plan's `L` lines are exactly the model's attention layers. |
+| `turbo5p`, `turbo5p512` | Flash attention is not off, and K and V heads are the same size, 128 or 256. Every KV row (KV heads × head size) must be a multiple of 512. When a row is not a multiple of 1024, turbo5p runs as turbo5p512. That swap logs an INFO line and does not count as a downgrade. |
+| `turbo4p` | The same as turbo5p, but rows must be a multiple of 1024. |
+| `turbo4`, `turbo3`, `turbo2` | Flash attention is not off. Asked for by name, any head the zero-padding path has a CUDA kernel for is kept: K = V of 128, 256 or 512 after padding to 128, or MLA with K 576 and V 512. As a fallback step, only unpadded heads of 128 or 256 are taken. |
+| `q8_0` and the other block types | The head size is a multiple of the block (32 for q8_0). A quantized V also needs flash attention. |
+| `f16` | Always. |
+
+Other rules:
+- **Archs that get no turbo type.** Their attention input has no turbo query rotation: DeepSeek 3.2 and V4, GLM DSA, Hy V4, dots3-note, the MiniMax-M3 sparse layers and the Qwen4exp QSA layers. MLA models get no split-plane type (turbo4p, turbo5p, turbo5p512).
+- **Mixed K/V pairs** are resolved side by side. If the resulting pair has no flash-attention kernel, both sides take the lower turbo type, or a lone turbo side becomes q8_0.
+- **Flash attention off (`-fa off`):** K can stay q8_0; a quantized V becomes f16.
+- **Recurrent-only models** have no KV cache. The requested types are ignored, with one INFO line.
+- **Safety net:** if the cache constructor still refuses turbot, the context rebuilds its memory once without turbot.
+- **`LLAMA_KV_RESOLVE=0`** turns the resolver off. The old checks then apply: a type the model cannot take fails context creation with the reason.
+
+What `-ctk turbot -ctv turbot` resolves to on a few shapes. These come from `tests/test-kv-resolve.cpp`, which uses synthetic hyperparameters and has not been run yet:
+
+| Model | KV shape | Result |
+|:--|:--|:--|
+| Qwen3.8-27B | 16 attention layers, 4 × 256; the plan fits | turbot |
+| Qwen3.8-27B with `-np 4` and no `--kv-unified` | 4 KV streams | turbo5p |
+| Spark-X2.5-4B | iSWA, 4 × 256 | turbo5p |
+| Spark-X2.5-1.7B | iSWA, 2 × 256 (512-element rows) | turbo5p512 |
+| Granite 4.2 8B | 8 × 128 | turbo5p |
+| MiniCPM5-2B | 2 × 128 (256-element rows) | turbo4 |
+| Muse Glimmer 30B | SWA, 2 × 128 | turbo4 |
+| any model with head size 64 | 8 × 64 | q8_0 |
+| any model with head size 80 | 8 × 80 | f16 |
+| MLA (DeepSeek-V2 style) | K 576, V 512 | q8_0 |
+| recurrent-only (Mamba) | no KV cache | f16, with no warning |
+
+### turbot plan, built in
+
+The default plan, `docs/turbot/plans/turbot-default.plan`, is calibrated on Qwen3.8-27B and compiled into libllama (`[TAG_TURBOT_EMBED_PLAN]`). `-ctk turbot -ctv turbot` therefore needs no plan file.
+
+| You give | Plan used |
+|:--|:--|
+| nothing | the built-in plan, with one INFO line |
+| `--kv-tier-plan default` or `LLAMA_TURBOT_PLAN=default` | the built-in plan |
+| `--kv-tier-plan <file>` or `LLAMA_TURBOT_PLAN=<file>` | that file (write `./default` for a file named `default`) |
+
+The flag wins over the variable. If the plan does not fit the model (its `L` lines are not the model's attention layers) or cannot be read, the resolver moves to turbo5p (or to the next type the model takes) and logs why. Fine-tunes that keep Qwen3.8-27B's attention layers (4 × 256 at layers 3, 7, ..., 63) match the built-in plan, so they run turbot with widths calibrated on the base model. Their quality is not yet measured.
+
+### Vision: pick the device
+
+`-mmdev` (`--mmproj-device`, env `MTMD_BACKEND_DEVICE`) now also accepts a device type (`[TAG_MMDEV_TYPE]`):
+
+| `-mmdev` | The vision encoder runs on |
+|:--|:--|
+| `cpu` (same as `none`) | the CPU, with `--mmproj-threads` threads |
+| `gpu` | the first discrete GPU, which is CUDA0 because CUDA registers first |
+| `igpu` | the first integrated GPU, for example an AMD iGPU through Vulkan. This needs a build with `-DGGML_VULKAN=ON` (Vulkan SDK). Without an iGPU the option is rejected when the arguments are parsed, and the message says why. |
+| a device name | that device, as before |
+
+`--mmproj-threads N` (server only, env `LLAMA_ARG_MMPROJ_THREADS`) sets the number of CPU threads for the vision encoder. `0`, the default, uses `-t`.
+
+**Device pinning rule.** Since the upstream sync, the vision encoder and the draft model follow `--device` unless they are set on their own. A build with both CUDA and Vulkan sees the RTX 5090 twice, as `CUDA0` and `Vulkan0`, and the iGPU as `Vulkan1`. In such a build, always pin all three:
+
+```
+--device CUDA0 --spec-draft-device CUDA0 -mmdev cpu|gpu|igpu
+```
+
+Set the Vulkan environment to match:
+
+| Vision on | Environment |
+|:--|:--|
+| `cpu` or `gpu` | `GGML_DISABLE_VULKAN=1`. The process then has only CUDA0 and the CPU. |
+| `igpu` | `VK_LOADER_DRIVERS_SELECT=*amd-vulkan64*`, with `GGML_DISABLE_VULKAN` unset. The Vulkan loader loads only the AMD driver, so the 5090 never becomes a Vulkan device. |
+
+Do not use `GGML_VK_VISIBLE_DEVICES` for this. It takes a raw device index, and that index depends on the order in which the drivers enumerate.
+
+Other changes in the same area:
+- The Vulkan backend refuses every fork turbo type and the fork's extra flash-attention inputs (`[TAG_VK_NO_TURBO]`), so a turbo cache never runs on Vulkan.
+- A failed image encode fails only that request and frees its slot; the server keeps running (`[TAG_MTMD_ENCODE_CATCH]`).
+- The CPU flash attention now takes its tiled path for head sizes 72 (the Qwen3.8 vision encoder) and 40 on AVX-512 (`[TAG_CPU_FA_DV_PAD]`). On the CPU, the encoder's K and V stay F32 into flash attention (`[TAG_CLIP_CPU_KV_F32]`).
+- Image encoding still runs on the inference thread, so every slot waits while an image is encoded, whichever device encodes it.
+
+None of the vision changes is measured yet.
+
+### Loading: `--load-mode none` replaces `--no-mmap`
+
+Upstream removed `--mmap`, `--no-mmap`, `--mlock` and `--direct-io` / `--no-direct-io` (#28334), and llama-bench lost `-mmp`. Use `-lm` / `--load-mode` instead: `auto`, `none`, `mmap`, `mlock`, `mmap+mlock` or `dio`. llama-bench takes the same `-lm`.
+- `--no-mmap` becomes `--load-mode none`.
+- A command line that still passes one of the removed flags is rejected at startup.
+- Builds on the pre-sync base `b10655` already accept `--load-mode`, so one command line works for both.
+
+### New switches on the sync branch
+
+Every switch defaults to the new behaviour. None of the new behaviours is measured yet.
+
+| Variable | Default | Effect when set |
+|:--|:--|:--|
+| `LLAMA_KV_RESOLVE` | on | `0` turns the KV type resolver off, so the old refusals apply. |
+| `TURBOT_Q2_ROUTE` | on | `0` sends two-token turbot batches (a one-token draft verify, or two slots decoding) back to the `<2,8>` instance. Q = 1 stays on `<4,8>`. |
+| `TURBO_RMSNORM_SCALE_FUSION` | on | `0` makes CUDA run the GDN q/k norm (RMS_NORM, then SCALE) as two kernels instead of one fused kernel. `GGML_CUDA_DISABLE_FUSION` turns it off too. |
+| `GGML_CPU_FA_DV_PAD` | on | `0` restores upstream's rule that the CPU tiled flash attention needs a V head size that is a multiple of the SIMD width. Head sizes 72 and 40 on AVX-512 then take the per-row path again. |
+| `MTMD_CPU_KV_F32` | on | `0` makes the vision encoder cast K and V to F16 before CPU flash attention, as upstream does. |
+| `LLAMA_CTX_CHECKPOINT_MIN_STEP_ALWAYS` | off | `1` restores the pre-sync checkpoint eviction order: spacing eviction on every checkpoint, before the byte budget, and no replacement of a checkpoint at the same position. |
+| `SPEC_DFT_DUMP` | unset | `<file>` writes the DFlash2 selector lattice (top-k ids and scores for each drafted position) after every drafter decode, so two builds can be compared offline. |
+| `TURBO_MMA_NATIVE` | `1` | Existing switch. `0` now also sends turbo5p512 back to the F16 conversion path. |
+
+`TURBO_MMA_NATIVE` matters here because turbo5p512 now has its own MMA kernel at head size 256 (`[TAG_TURBO5P512_MMA]`). Before, a turbo5p512 cache whose rows were a multiple of 1024 reached the f16 kernel with raw turbo5p512 bytes and produced garbage. Caches with 512-element rows took the slower F16 conversion. The new kernel is not yet run.
+
+### Architectures new with the sync
+
+| Arch | Model | KV on this fork |
+|:--|:--|:--|
+| `spark2_5` | Spark-X2.5 4B and 1.7B (#27868) | iSWA. turbot falls back to turbo5p (4B, 4 × 256) or turbo5p512 (1.7B, 2 × 256). |
+| `maple` | Maple 20B-A1B ternary MoE (#27000) | Upstream supports it on the CPU only. |
+| `hy_v4` | Tencent Hy 4 preview (#28127) | No turbo type, because its attention has no turbo query rotation. It falls back to q8_0, or to f16 where q8_0 does not fit. |
+| `hrm_text` | HrmTextForCausalLM, DFM Mimir 1B (#27625) | Resolved by the rules above. |
+| `deepseek4v` (mtmd projector) | DeepSeek-V4-Flash-Vision-Exp (#28133) | The DeepSeek V4 text model takes no turbo type. |
+| `nemotron_h` (NemotronHPuzzle) | Nemotron-3-Puzzle-75B-A9B (#25444) | Needs the cherry-picked #28717 below for the CUDA SSM scan. |
+
+Upstream PRs cherry-picked on top of the sync, before they were merged upstream:
+- **#29242:** the Muse Glimmer parser fix for a reply that starts with a tool call (`common/parsers/muse-glimmer.cpp`, with `test-chat` cases).
+- **#28717:** the CUDA SSM scan for state size 96 (Nemotron 3 Puzzle), with `test-backend-ops` SSM_SCAN cases.
+
+Of these models only Spark-X2.5-4B has been downloaded for testing. None of them has been loaded on this fork yet, and none has been measured.
+
+---
+
 ## How it works
 
 ### The turbo formats
@@ -627,7 +774,7 @@ The default plan, `docs/turbot/plans/turbot-default.plan` (calibrated on Qwen3.8
 
 A plan is only used when its `L` lines are exactly the model's attention layers. When the plan does not fit (or the file cannot be read), turbot is not used for that model: the context falls back to turbo5p (or the next type the model supports) and the log says why. With `LLAMA_KV_RESOLVE=0`, context creation fails with the reason instead.
 
-`LLAMA_TURBOT_PLAN` can carry the plan instead of the flag (llama-bench and llama-perplexity use it). `LLAMA_TURBOT=0` falls back to turbo5p. It needs flash attention, CUDA and a unified KV pool; the DFlash2 drafter cache stays turbo5p.
+`LLAMA_TURBOT_PLAN` can carry the plan instead of the flag (llama-bench and llama-perplexity use it). `LLAMA_TURBOT=0` falls back to turbo5p. It needs flash attention, CUDA and a unified KV pool; the DFlash2 drafter cache stays turbo5p. When a model or setting does not meet a turbot precondition, the KV resolver picks the next type and logs why ([KV cache type, resolved per model](#kv-cache-type-resolved-per-model)).
 
 The built-in plan is compiled from `src/llama-turbot-default-plan.h`, a checked-in header generated by `python docs/turbot/gen_turbot_default_plan.py`. If you edit the plan file, re-run that script. CMake configure stops when the header and the plan differ, and `--check` reports the same thing.
 
@@ -666,7 +813,7 @@ The first working build decoded at 37.1 t/s at 131K, 21% below turbo5p. Four cha
 
 - Prefill is 4-8% slower than turbo5p at 131K and 245K.
 - A cached long prompt (over 16K tokens) can decode slightly differently from the same prompt sent cold: tail cells that aged out come back with fill codes when the generated tokens are trimmed.
-- Two-token verify batches still run the `<2,8>` instance.
+- Two-token verify batches ran the `<2,8>` instance in the build measured above. The `upstream-sync` branch runs them on `<4,8>`, and `TURBOT_Q2_ROUTE=0` restores `<2,8>`. The new route is not yet measured.
 
 Contract and tests: [docs/turbot/SPEC.md](docs/turbot/SPEC.md), [docs/turbot/TESTING.md](docs/turbot/TESTING.md). Plan tools: `tools/turbot/`.
 
@@ -878,7 +1025,8 @@ Long-context throughput on a single RTX 5090: holding a full 262,144-token conte
 - **Decode is at the practical ceiling.** After the V gather fix the KV read costs 6.00 ms at `d131072`, against `q8_0`'s 6.01 ms at twice the VRAM and `f16`'s 5.63 ms at 3.8×. The remaining 6% would have to come from the K dot, which already uses `__dp4a` with a byte-permute LUT.
 - **Prefill attention has headroom, but not from tuning.** The MMA config is swept out — `ncols2` and `nbatch_fa` won, `nthreads`, `occupancy` and `ncols1` all lose. Attention is 77% of prefill at depth at ~101 TFLOPS. Further gain needs kernel work.
 - **Wide-Q native turbo reads.** Prefill still uses F16 conversion, because it amortises across many Q tiles. Measured: an `f16` cache prefills only ~3% faster, so the conversion is close to free and this is not a promising lever.
-- **turbot prefill.** The tiered cache still prefills 4-8% slower than turbo5p at depth, and two-token verify batches run the slower `<2,8>` instance.
+- **turbot prefill.** The tiered cache still prefills 4-8% slower than turbo5p at depth. Two-token verify batches ran the slower `<2,8>` instance; the `<4,8>` route on the `upstream-sync` branch is not yet measured.
+- **Any model.** The `upstream-sync` branch resolves the KV type per model, builds the turbot plan in, and adds the vision device choice ([Using the fork with any model](#using-the-fork-with-any-model)). It is not built or measured yet.
 
 ---
 
@@ -886,13 +1034,13 @@ Long-context throughput on a single RTX 5090: holding a full 262,144-token conte
 
 This fork stands on work by several people. Attribution follows the commit history.
 
-**Upstream** — [llama.cpp](https://github.com/ggml-org/llama.cpp), Georgi Gerganov and contributors. The base this is forked from, currently `b10655`.
+**Upstream** — [llama.cpp](https://github.com/ggml-org/llama.cpp), Georgi Gerganov and contributors. The base this is forked from, currently `b11093` (`fb34fc262`, merged 2026-09-21; the benchmarks above were measured on `b10655`).
 
 **The TurboQuant formats** — original CUDA port by **Gabe Ortiz** (March 2026): `turbo2_0`/`turbo3_0`/`turbo4_0`, the Walsh-Hadamard rotation, InnerQ per-channel equalization, and the type-id allocation. Method paper: [arXiv 2504.19874](https://arxiv.org/abs/2504.19874) (ICLR 2026).
 
 **TriAttention** — KV-cache pruning by **atomicmilkshake** (April 2026), on the `feature/triattention` branch. Method paper: [arXiv 2604.04921](https://arxiv.org/abs/2604.04921).
 
-**The long-context performance work** — [@sirxsniper](https://github.com/sirxsniper). Everything documented above: native `turbo4` reads at depth, the MMA shared-tile loader, the K and V byte-permute centroid gathers, coalesced dequant stores, GQA packing by exact divisor, the `nbatch_fa` retune, the speculative prefill tail, memory-fit estimation for unmeasurable drafters, GDN decode-shape test coverage, the Windows CUDA build recipe, and upstream merge and conflict resolution across `b8650` to `b10655`.
+**The long-context performance work** — [@sirxsniper](https://github.com/sirxsniper). Everything documented above: native `turbo4` reads at depth, the MMA shared-tile loader, the K and V byte-permute centroid gathers, coalesced dequant stores, GQA packing by exact divisor, the `nbatch_fa` retune, the speculative prefill tail, memory-fit estimation for unmeasurable drafters, GDN decode-shape test coverage, the Windows CUDA build recipe, and upstream merge and conflict resolution across `b8650` to `b11093`.
 
 <sub><a href="CREDITS.md">CREDITS.md</a> holds the per-file inventory, with authorship derived from the commit history.</sub>
 

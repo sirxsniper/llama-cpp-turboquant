@@ -40,6 +40,7 @@ powershell -File C:\Users\xSniper\AppData\Local\Temp\claude\D--Projects\8efd145b
 | `python docs\turbot\gen_turbot_tables.py --check` | `ggml-turbot-tables.h matches` |
 | `python tools\turbot\check_tables_vs_study.py` | `RESULT: PASS`. Structural checks, then the shipped tables against `kv_nested_study.build_designs(..., ['a_lloyd'])`: exact for b = 4, 5; within 2e-7 for b = 2, 3; within 6e-5 for b = 6 |
 | `python tools\turbot\plan_vram.py docs\turbot\plans\turbot-default.plan --layers` | base `4520.00`, young pool `726.00`, total `5246.00` MiB, per-layer bytes equal SPEC appendix A, hash `0x56c3503c949a7749` |
+| `python docs\turbot\gen_turbot_default_plan.py --check` ([TAG_TURBOT_EMBED_PLAN]) | prints `llama-turbot-default-plan.h matches` and exits 0: `src\llama-turbot-default-plan.h` holds the current plan. After an edit to the plan, run it without `--check` to regenerate the header. CMake configure stops on the same difference |
 
 To make a plan from another allocation:
 ```powershell
@@ -72,6 +73,7 @@ Pass: exit 0 and the last line is `OK`. What it checks:
 | 5 fill | every (b, y): MSE(fill, old) / D_b <= 0.30 and MSE(fill, true) / D_b <= 1.30 (record the printed table in section 7) |
 | 6 params and layout | op params roundtrip, FA bytes 0..15 untouched, bad magic, version, side or granule refused. Default plan bytes per layer equal appendix A (18,080 base, 11,616 pool per cell, 5,500,829,696 B total). Illegal widths refused. Type family traits (`blck 1024`, `type_size 32S+16`, `row_size(256) = 8S+4`) |
 | 7a plan parser | the default plan parses with the expected hash. kvfq keys ignored. Y, POOL 0 and a trailing comment accepted. Refused: unknown tag, malformed line, duplicates, widths out of range, a missing L line, a layer the cache does not hold, POOL not a multiple of 64 or above kv_size, negative CAP |
+| 7a' built-in plan ([TAG_TURBOT_EMBED_PLAN]) | the built-in text is LF with hash `0x56c3503c949a7749`. `llama_turbot_plan_matches` is true for the Qwen3.8 layers (also at kv 4096). It is false for Spark's 9 layers (the reason names layer 39), a shifted list, 17 layers and an empty list. `default` resolves to the built-in plan and `./no-such-dir/default` to a file |
 | 7b tier | scenarios of SPEC 11.1 item 7 driving a real `llama_kv_cells`: single-sequence band 16,384; 4 sequences at quota 16,256 with 0 evictions after warm-up; eviction order (smallest margin, never the previous ubatch's granule); empty owned slot first; release then prefill or restore with 0 evictions; 10,000-step draft loop (counter == live rows, band intact); seq_cp adoption; restore into a larger counter; stale bits; trim then fill entry; failure then abort, re-queued fill and counter rollback; `abort_restore`; POOL 0; seq id 255; determinism |
 
 `--quick` cuts the nesting and Monte Carlo sizes for a smoke run.
@@ -144,7 +146,12 @@ BIN_F\test-turbot-backend.exe --old-read float # OLD_I8 0 build
 
 ### 2d. Existing types unchanged
 
-- `powershell -File D:\Projects\LocalAI\source-build\validate.ps1 -BuildDir WT\build-turbot -Tag turbot`: must print `GATE PASSED`. It runs the full `test-backend-ops` suite, including the f16, q8_0, turbo4p and turbo5p cases, plus the production end-to-end generation on turbo5p.
+- `powershell -File D:\Projects\LocalAI\source-build\validate.ps1 -BuildDir WT\build-turbot -Tag turbot`: must print `GATE PASSED` (exit 0; exit 2 means the preflight refused and nothing ran).
+  - **Preflight.** It refuses while any llama, ggml, test-backend, test-turbot or compute-sanitizer process is alive, or after an nvlddmkm event since boot. It never stops a process it did not start.
+  - **Part 1.** The full `test-backend-ops` suite, including the f16, q8_0, turbo4p and turbo5p cases. FAIL lines for cases in `-KnownFails` (default: the saved base-commit log with the 64 hsk=40 cases) are reported without failing the gate.
+  - **Part 2, end-to-end smoke test.** One server per KV arm. The arms are **turbo4, turbo5p and turbot** (`-SmokeKv`, default `turbo4,turbo5p,turbot`). Each runs on port 8091 with Qwen3.8-27B-UD-Q5_K_XL, `-c 32768 --kv-unified -fa on`, and is probed by `thresh.py` (20 exact prompt lengths, number-sequence continuation) and `difflen.py` (10 prefill lengths up to 28,000 tokens, needle recall).
+  - **turbot plan.** The turbot arm gets `--kv-tier-plan`: `-TurbotPlan`, else the first `turbot-default.plan` next to the build, else the deployed one.
+  - **Environment.** Every child runs with `GGML_DISABLE_VULKAN=1` and `--load-mode none`. Pass `-LoadModeFlag '--no-mmap'` only for a build older than `--load-mode`.
 - **Codegen identity** (SPEC 12.3 item 7). Every object of the existing FA template instances (`ggml-cuda\template-instances\fattn-*-instance-*.cu`, excluding `fattn-mma-turbot-*`) must be byte-identical, relocations masked, to a build of the base commit (`60e5e979e`). Its constant-memory map must also be unchanged. `fattn.cu` and `ggml-cuda.cu` may differ in host code only.
 
 ---
@@ -196,12 +203,19 @@ Keep the route only if every nb 2 turbot cell is at most as slow with it on. Con
 
 ## 4. Full-stack correctness (A-D integrated)
 
-Every server below runs `-ctk turbot -ctv turbot --kv-tier-plan WT\docs\turbot\plans\turbot-default.plan` on port 8091, one at a time. The scratchpad harnesses (`acceptab.py`, `overcommit_accept.py`, `pool_exact.py`, `crosstalk.py`) build their command from the Jarvis production profile. They take the cache type from that profile, so each needs a turbot arm with these arguments appended (the last `-ctk` wins). `LLAMA_TURBOT_PLAN` can carry the plan instead of the flag.
+Every server below runs `-ctk turbot -ctv turbot --kv-tier-plan WT\docs\turbot\plans\turbot-default.plan` on port 8091, one at a time. On the `upstream-sync` branch the plan flag is optional: without it the built-in plan is used, and it has the same hash.
+
+REVISED 2026-09-21 ([TAG_HARNESS_SRVCMD]): the scratchpad harnesses (`acceptab.py`, `overcommit_accept.py`, `pool_exact.py`, `crosstalk.py`, `niah.py` and others) no longer read Jarvis. They build their command with `<scratchpad>\srvcmd.py`.
+- The default preset, `qwen38-prod`, is the production command with turbot K and V.
+- The build is chosen with `BENCH_SERVER_EXE=old|new|<path>` or `--exe`. `new` is `WT\build-sync\bin`: it gets `--load-mode none`, `--device CUDA0` and `--spec-draft-device CUDA0`, and uses the built-in plan.
+- `BENCH_KV` or `--kv` sets another cache type, and `BENCH_TURBOT_PLAN` or `--plan` passes a plan file.
+- srvcmd refuses to start while any llama, ggml or test-backend process runs, and it refuses port 8080.
+- `<scratchpad>\README_harness.md` has the command for each harness on each build. `LLAMA_TURBOT_PLAN` can still carry the plan instead of the flag.
 
 | # | Test | Command / procedure | Pass |
 |---|---|---|---|
 | 4.1 | tier unit tests | section 1b item 7 on the integrated tree | `OK` |
-| 4.2 | refusals | start `llama-server` with `-ctk turbot` alone; `-ctk turbot -ctv turbot` without a plan; `-np 4` without `--kv-unified`; `-fa off`; `TURBO_KV_CPU_LAYERS=1`; `TURBO_LAYER_ADAPTIVE=1`; `TURBO_INNERQ=1` | each exits with a message starting `turbot:` (or the plan message of SPEC 9.1). No crash, no CUDA error |
+| 4.2 | refusals | start `llama-server` with `-ctk turbot` alone; `-np 4` without `--kv-unified`; `-fa off`; `TURBO_KV_CPU_LAYERS=1`; `TURBO_LAYER_ADAPTIVE=1`; `TURBO_INNERQ=1`; `--kv-tier-plan` with a plan missing one `L` line | REVISED 2026-09-21 ([TAG_KV_RESOLVE], `upstream-sync`): each one starts. It logs one `KV cache type for ...: turbot -> ... (reason)` warning, and the size line shows the fallback: turbo5p in most cases; q8_0 K with the default f16 V for `-ctk turbot` alone; K q8_0 and V f16 with `-fa off`. Greedy output is coherent. Run the same list again with `LLAMA_KV_RESOLVE=0`: each exits with a message starting `turbot:` (or the plan message of SPEC 9.1). Pre-sync builds: the `LLAMA_KV_RESOLVE=0` behaviour. No crash, no CUDA error |
 | 4.3 | kill switch | `LLAMA_TURBOT=0` with `-ctk turbot -ctv turbot` | warning `LLAMA_TURBOT=0: turbot disabled, using turbo5p`, size line equals turbo5p |
 | 4.4 | size line | server log | `turbot plan ...: 16 layers, old bits 4.289 (sum 549), young pool 65536 cells (1024 granules), cap 16384, hash 0x56c3503c949a7749` and `size = 5246.00 MiB ... young pool:  726.00 MiB`; no F16 scratch buffer |
 | 4.5 | crosstalk | `crosstalk.py` with the turbot arm, cold and warm | every slot returns its own passphrase |
@@ -212,6 +226,7 @@ Every server below runs `-ctk turbot -ctv turbot --kv-tier-plan WT\docs\turbot\p
 | 4.10 | trim | two requests on one slot, the second a prefix of the first plus new text (`cache_prompt`), under `LLAMA_TURBOT_DEBUG=2` | no invariant assertion; the DEBUG=1 line shows fills > 0; the answer holds the passphrase |
 | 4.11 | failure injection | `LLAMA_TURBOT_FAIL_UBATCH=<n>` for n in {1, 17, 500} with 4 slots and unique passphrases (crosstalk prompts), `LLAMA_TURBOT_DEBUG=2` | the failing request errors or retries per server policy; every other slot answers with its own passphrase; no assertion |
 | 4.12 | hybrid prepare order | DFlash2 speculative decode with `LLAMA_TURBOT_DEBUG=2` (the `prepare()` apply path) and a trim that forces a fill on a reused hybrid graph | no invariant assertion; the fill runs (DEBUG=1 fill count > 0) and the output is coherent |
+| 4.13 | built-in plan ([TAG_TURBOT_EMBED_PLAN], `upstream-sync`) | start with no `--kv-tier-plan` and no `LLAMA_TURBOT_PLAN`; then with `--kv-tier-plan default`; then with `LLAMA_TURBOT_PLAN=default` | the first logs `turbot: no --kv-tier-plan or LLAMA_TURBOT_PLAN given, using the built-in default plan (docs/turbot/plans/turbot-default.plan, calibrated on Qwen3.8-27B)`, the others `turbot: --kv-tier-plan default: ...` / `LLAMA_TURBOT_PLAN=default: ...`. All three show `turbot plan <built-in default>: 16 layers, ... hash 0x56c3503c949a7749` and `size = 5246.00 MiB`, as in 4.4 |
 
 ---
 
@@ -247,7 +262,7 @@ Further quality arms, each against the same bar:
 |---|---|---|
 | upstream Hadamard | `LLAMA_TURBOT_ATTN_ROT=1`, logs `*_turbot_rot.log` | reported; the default changes only if this arm is at least as good |
 | 131K depth | wikitext-2 prose at `-c 131072`, PPL | within noise of f16 5.5193 / q8_0 5.5191 / turbo5p 5.5217 (2026-09-03) |
-| needles | `niah.py` at 32K / 131K / 200K / 250K, 1 and 4 agents. `niah.py` hardcodes port 8080: run a copy with `U = "http://127.0.0.1:8091"` | retrieval equal to turbo5p |
+| needles | `niah.py` at 32K / 131K / 200K / 250K, 1 and 4 agents. `niah.py` now talks to port 8091. Pass `--start` (or a build option such as `--exe new`) so that it starts its own server through srvcmd. Without it, niah.py sends its requests to whatever already listens on 8091, which can be a running gate's server | retrieval equal to turbo5p |
 | DFlash2 acceptance | `acceptab.py` turbot arm against turbo5p (drafter cache must log turbo5p) | acceptance >= turbo5p − 0.02 |
 | vision | mmproj image prompts from the vision checks | answers equal to turbo5p in content |
 
@@ -347,4 +362,137 @@ Known limits, 2026-09-15 build:
 - Prefill is 4-8% slower than turbo5p at 131K-245K.
 - A cached long prompt can decode slightly differently from the same prompt sent cold.
 - Two-token verify batches ran the <2,8> instance. On the upstream-sync branch they run <4,8> (SPEC 7.6, `TURBOT_Q2_ROUTE=0` to compare). That route is not measured yet; see the Q ≤ 2 route A/B in section 3.
+
+---
+
+## 8. upstream-sync branch and other models
+
+Section 8 covers the branch `upstream-sync` in the worktree `D:\Projects\LocalAI\source-build\turboquant-sync` (called `WS`), built in `WS\build-sync` (its `bin` folder is `BIN` in this section). The branch adds:
+- upstream `fb34fc262` (`b11093`), merged;
+- the KV type resolver ([TAG_KV_RESOLVE]);
+- the built-in turbot plan ([TAG_TURBOT_EMBED_PLAN]);
+- the turbo5p512 D = 256 MMA kernel ([TAG_TURBO5P512_MMA]);
+- the vision device choice ([TAG_MMDEV_TYPE]);
+- the new switches of the README section "Using the fork with any model".
+
+**None of it has been built or run yet.** Every result in 8.7 is still to be filled in. The rules of section 0 apply to every step.
+
+### 8.1 Build
+
+- Use a fresh build directory. CUDA objects have no depfiles, so a reused directory can keep stale kernels.
+- Use the `build-turbot` options, with two changes:
+  - drop `GGML_CUDA_FA_ALL_QUANTS`, which was removed upstream;
+  - add `-DGGML_VULKAN=ON` only for the iGPU vision device. That needs the Vulkan SDK, and `GGML_BACKEND_DL` stays `OFF`.
+- Targets: `ggml llama llama-server llama-perplexity llama-bench llama-mtmd-cli test-backend-ops test-turbot test-turbot-backend test-kv-resolve test-chat test-llama-archs`.
+- A Vulkan build lists the 5090 twice (`CUDA0` and `Vulkan0`). Run every step below with `GGML_DISABLE_VULKAN=1` unless it is an iGPU step (8.5). validate.ps1 sets it for its own children.
+- Model loading is `--load-mode none` everywhere. The synced build rejects `--no-mmap`, and llama-bench no longer has `-mmp`.
+
+### 8.2 CPU gates
+
+| Command | Pass |
+|---|---|
+| `python docs\turbot\gen_turbot_default_plan.py --check` | `llama-turbot-default-plan.h matches` |
+| `BIN\test-turbot.exe` | `OK`, item 7a' included (1b) |
+| `BIN\test-kv-resolve.exe` | Exit 0, and the last line reads `<n> checks, 0 failed`. The test covers three things: the shared turbot refusal messages, the built-in plan against the Qwen3.8 and Spark layer lists, and the resolve table in the README section "KV cache type, resolved per model" (synthetic hparams). |
+| `BIN\test-chat.exe`, run from `WS` | Exit 0. This includes the Muse Glimmer case where the reply starts with a tool call (#29242). |
+
+### 8.3 CUDA correctness
+
+```powershell
+$cs = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.1\bin\compute-sanitizer.bat"
+& $cs --tool memcheck --error-exitcode 99 BIN\test-backend-ops.exe test -b CUDA0 -o FLASH_ATTN_EXT -p "^split_plane=turbo5p512,.*,kv=1000,"
+BIN\test-backend-ops.exe test -b CUDA0 -o FLASH_ATTN_EXT -p "^split_plane=" > E:\kv-turbot\sync\split_plane.txt
+BIN\test-backend-ops.exe test -b CUDA0 -o GDN_L2_NORM > E:\kv-turbot\sync\gdn_l2_norm.txt
+BIN\test-backend-ops.exe test -b CUDA0 -o SSM_SCAN,SSM_SCAN_ROLLBACK > E:\kv-turbot\sync\ssm_scan.txt
+```
+
+**Pass:**
+- Memcheck: `ERROR SUMMARY: 0 errors`.
+- Every case prints OK and the exit code is 0.
+- `split_plane` ([TAG_TURBO5P512_MMA]):
+  - The turbo5p512 cases cover 2 × 256 heads (512-element rows) and 4 × 256 heads (1024-element rows, the case that used to produce garbage). All must pass at nb 1 to 512, with positional masks, GQA 8, softcap and kv 1000.
+  - The turbo5p cases at the Qwen3.8 geometry are the control. If only the control fails, suspect the test or its 5e-4 NMSE bound, which is not yet measured, rather than the kernel.
+  - The nb 512 cases take seconds each on the CPU reference.
+- `GDN_L2_NORM`: the fused kernel ([TAG_RMSNORM_SCALE_FUSION]) must pass. Run it again with `$env:TURBO_RMSNORM_SCALE_FUSION = "0"`; both runs must pass.
+- `SSM_SCAN` includes the state size 96 cases of #28717 (Nemotron 3 Puzzle).
+- validate.ps1 (2d) on this build:
+  - Must print `GATE PASSED`.
+  - The 64 hsk=40 f16 cases in its known-fails baseline should now pass, because the fattn-tile KV_max pair index is fixed. Record whether they do.
+  - The KV_min fixup `test_flash_attn_ext_pos` cases (hs 256, kv 4096, nb 1280/2048, f16, q8_0, turbo5p) are part of the full suite.
+
+### 8.4 KV resolver on real models
+
+Start one server per row, one at a time, through srvcmd:
+```powershell
+python <scratchpad>\srvcmd.py serve --exe new --preset generic --model D:\Projects\LocalAI\models\<file> --kv turbot --ctx 32768 --parallel 1
+```
+Then send one short greedy prompt. Repeat each row with `--env LLAMA_KV_RESOLVE=0`.
+
+**Pass:**
+- The server starts.
+- The `llama_kv_cache: size` line shows the expected type.
+- A downgrade logs one `KV cache type for ...` warning that names the reason.
+- The greedy output is coherent, and there is no CUDA error.
+- With `LLAMA_KV_RESOLVE=0`, every row except the first two exits with the old `turbot:` refusal.
+
+| Model file | Arch, KV shape | Expected with `--kv turbot` (from the rules, not yet run) |
+|---|---|---|
+| Qwen3.8-27B-UD-Q5_K_XL | qwen35, 16 attention layers, 4 × 256 | turbot, no warning |
+| TURBO-Qwen3.8-27B-NEO-CODER-MAX-Q5_K_M | qwen35 fine-tune, same layers | turbot with the built-in plan. Its quality with this plan is not measured: run a KLD against turbo5p before using it. |
+| Spark-X2.5-4B-Q8_0 | spark2_5, iSWA, 4 × 256 | turbo5p (`SWA caches are unsupported`) |
+| Ornith-1.5-9B-Q8_0 | qwen35, 32 layers, 4 × 256 | turbo5p: the built-in plan names attention layers that this model does not have |
+| Ornith-1.5-35B-Q4_K_M | qwen35moe, 2 × 256 | turbo5p512 (512-element rows), now read natively by the MMA kernel. Compare with `TURBO_MMA_NATIVE=0` |
+| MiniCPM5-2B-Q8_0 | 2 × 128 (256-element rows) | turbo4 |
+| Muse-Glimmer-30B-KQuant-17GB-Q4_K_M | SWA, 2 × 128 | turbo4 |
+| NVIDIA-Nemotron-3.5-Lightning-30B-A3B-Q4_0 | nemotron_h MoE, 2 × 128 attention | turbo4 |
+
+Also run each row with `--kv auto` (no cache type) as a baseline: it must start with f16 and no resolver line. Then run `-np 4` without `--kv-unified` on Qwen3.8: it must log turbot → turbo5p (`single KV stream`).
+
+New architectures without a model on disk (maple, hy_v4, hrm_text):
+```powershell
+BIN\test-llama-archs.exe -a "spark2_5|maple|hy_v4|hrm_text"
+```
+This test builds a small random-weight model for each architecture and runs it on the backends, so it uses the GPU (rule 0.1). Pass: every listed architecture passes. The DeepSeek-V4 vision projector (`deepseek4v`) and Nemotron 3 Puzzle have no local check.
+
+### 8.5 Vision device
+
+Pinning rule (README, "Vision: pick the device"): `--device CUDA0 --spec-draft-device CUDA0 -mmdev cpu|gpu|igpu`.
+- `cpu` or `gpu`: set `GGML_DISABLE_VULKAN=1`.
+- `igpu`: set `VK_LOADER_DRIVERS_SELECT=*amd-vulkan64*`, with `GGML_DISABLE_VULKAN` unset.
+
+srvcmd emits both for the new build (`--vision cpu|gpu|igpu`).
+
+| # | Check | Pass |
+|---|---|---|
+| 8.5.1 | `BIN\llama-server.exe --list-devices`, with `GGML_DISABLE_VULKAN=1` and then with the iGPU loader filter | first: CUDA0 only; second: CUDA0 and one Vulkan device, the AMD iGPU |
+| 8.5.2 | production preset (`qwen38-prod`, 4 slots, turbot) with `--vision cpu`, `gpu`, `igpu`, same image prompts as the vision checks of section 5 | the log puts the vision encoder on the chosen device and the model and drafter on CUDA0 only; answers match the cpu arm in content; 5090 VRAM with `cpu` or `igpu` equals the server without vision; the encode time per image is recorded |
+| 8.5.3 | a corrupt image in one request while other slots generate | that request fails, the server keeps serving the others ([TAG_MTMD_ENCODE_CATCH]) |
+| 8.5.4 | `-mmdev igpu` with `GGML_DISABLE_VULKAN=1` | argument error naming the reason (`no integrated GPU device found`) |
+| 8.5.5 | iGPU ops, with the loader filter set: `BIN\test-backend-ops.exe test -b Vulkan0 -o <op>`, one op at a time, for MUL_MAT, FLASH_ATTN_EXT, ROPE, IM2COL, UPSCALE, NORM, ADD, MUL, UNARY, CPY, CONT, SOFT_MAX | 0 FAIL; F16 flash attention at head size 72 supported; turbo FA cases report `not supported` ([TAG_VK_NO_TURBO]) |
+| 8.5.6 | `--mmproj-threads 8` against `0` (= `-t`) with `-mmdev cpu` | encode time recorded; answers unchanged |
+
+### 8.6 Switch A/Bs (one binary, default against the switch)
+
+| Switch | A/B | Keep the default when |
+|---|---|---|
+| `TURBOT_Q2_ROUTE=0` | 2b second run and the section 3 nb 2 A/B | nb 2 is at most as slow with the route on |
+| `TURBO_RMSNORM_SCALE_FUSION=0` | `BIN\llama-bench.exe -m D:\Projects\LocalAI\models\Qwen3.8-27B-UD-Q5_K_XL.gguf -ngl 99 -fa 1 -ctk turbot -ctv turbot -lm none -p 512 -n 64 -d 0,131072 -r 3`, and a greedy server prompt | greedy text byte-identical (the fusion is meant to be bit-exact) and tg not slower |
+| `GGML_CPU_FA_DV_PAD=0` | `-mmdev cpu`, same images | answers equal in content; encode time lower with the default |
+| `MTMD_CPU_KV_F32=0` | `-mmdev cpu`, same images | answers equal in content; encode time not higher with the default |
+| `LLAMA_CTX_CHECKPOINT_MIN_STEP_ALWAYS=1` | `acceptab.py` multi-agent scenario with DFlash2 | same text and acceptance; with the default there are no extra full re-prefills (count them in the log; `superseding context checkpoint` lines are expected) |
+| `TURBO_MMA_NATIVE=0` | Ornith-1.5-35B turbo5p512, `server_depth_bench.py` | output coherent in both; prefill and decode recorded |
+| `LLAMA_KV_RESOLVE=0` | 4.2 and 8.4 | the pre-resolver refusals, word for word |
+| `SPEC_DFT_DUMP=<file>` | the same greedy DFlash2 prompt on two builds that carry [TAG_SPEC_DFT_DUMP] | matched on (seq_id, pos0, id_last, i), the lattices agree up to the first differing accepted token, and every id is an integer |
+
+### 8.7 Results (to fill)
+
+| Step | Result |
+|---|---|
+| 8.2 gen --check, test-turbot, test-kv-resolve, test-chat | not yet run |
+| 8.3 split_plane, GDN_L2_NORM, SSM_SCAN, memcheck, validate.ps1 (hsk=40 cases) | not yet run |
+| 8.4 real models, resolved types and warnings, `LLAMA_KV_RESOLVE=0` | not yet run |
+| 8.4 test-llama-archs for the new architectures | not yet run |
+| 8.5 vision device, VRAM, encode time per device | not yet measured |
+| 8.6 switch A/Bs | not yet measured |
+| NEO-CODER-MAX turbot KLD against turbo5p | not yet measured |
 
