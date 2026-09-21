@@ -9,6 +9,8 @@
 #include "llama-batch.h"
 #include "llama-io.h"
 #include "llama-kv-cache.h"
+#include "llama-kv-cache-resolve.h"   // [TAG_KV_RESOLVE]
+#include "llama-kv-tier.h"            // [TAG_KV_RESOLVE] turbot plan source and match check
 #include "llama-memory.h"
 #include "llama-memory-hybrid.h"
 #include "llama-mmap.h"
@@ -88,6 +90,600 @@ static const llm_fused_op_probe llm_fused_op_dsv4_hc_post_probe = {
     /*.name             =*/ "fused DeepSeek V4 HC post",
     /*.n_tokens_per_seq =*/ 1,
 };
+
+//
+// [TAG_KV_RESOLVE] KV cache type resolver (llama-kv-cache-resolve.h)
+//
+// The pure decision function first, then the glue that describes a llama_model and llama_context_params to it.
+// llama_init_from_model runs it before the checks that used to fail context creation; with it on, those checks can no
+// longer fire, and with env LLAMA_KV_RESOLVE=0 they behave exactly as before.
+//
+
+const char * llama_kv_resolve_type_name(ggml_type t) {
+    return ggml_turbot_is_type(t) ? "turbot" : ggml_type_name(t);
+}
+
+// the turbo family (turbot is separate: its own cache, plan and FA kernels)
+static bool llama_kv_resolve_is_turbo(ggml_type t) {
+    return t == GGML_TYPE_TURBO2_0  || t == GGML_TYPE_TURBO3_0 || t == GGML_TYPE_TURBO4_0 ||
+           t == GGML_TYPE_TURBO4P_0 || t == GGML_TYPE_TURBO5P_0 || t == GGML_TYPE_TURBO5P512_0;
+}
+
+// split-plane turbo types: one block spans heads (ggml-cuda/fattn.cu [TAG_TURBO4P])
+static bool llama_kv_resolve_is_split_plane(ggml_type t) {
+    return t == GGML_TYPE_TURBO4P_0 || t == GGML_TYPE_TURBO5P_0 || t == GGML_TYPE_TURBO5P512_0;
+}
+
+// how far down the turbo ladder a type sits (a mixed turbo pair without an FA kernel takes the lower one for both)
+static int llama_kv_resolve_turbo_rank(ggml_type t) {
+    switch (t) {
+        case GGML_TYPE_TURBO5P_0:
+        case GGML_TYPE_TURBO5P512_0: return 1;
+        case GGML_TYPE_TURBO4P_0:    return 2;
+        case GGML_TYPE_TURBO4_0:     return 3;
+        case GGML_TYPE_TURBO3_0:     return 4;
+        case GGML_TYPE_TURBO2_0:     return 5;
+        default:                     return 0;
+    }
+}
+
+// the fallback chain of a requested type, the requested type first
+static std::vector<ggml_type> llama_kv_resolve_chain(ggml_type t) {
+    if (ggml_turbot_is_type(t)) {
+        return { GGML_TYPE_TURBOT_S8, GGML_TYPE_TURBO5P_0, GGML_TYPE_TURBO4_0, GGML_TYPE_Q8_0, GGML_TYPE_F16 };
+    }
+    switch (t) {
+        case GGML_TYPE_TURBO5P_0:
+        case GGML_TYPE_TURBO5P512_0:
+        case GGML_TYPE_TURBO4P_0:
+            return { t, GGML_TYPE_TURBO4_0, GGML_TYPE_Q8_0, GGML_TYPE_F16 };
+        case GGML_TYPE_Q8_0:
+            return { t, GGML_TYPE_F16 };
+        default:
+            break;
+    }
+    if (ggml_is_quantized(t)) {
+        return { t, GGML_TYPE_Q8_0, GGML_TYPE_F16 };   // turbo2/3/4 and the other block types
+    }
+    return { t };   // f16, bf16, f32 fit every layer
+}
+
+// a K/V pair that has a CUDA FA vector-kernel instance (ggml-cuda/fattn.cu, ggml_cuda_get_fattn_vec_case: every turbo
+// type against itself and q8_0, the turbo2/3/4 cross pairs, turbo4p with turbo4). Any other pair with a turbo side is
+// converted to F16 on every FA call (slow) or refused by the dispatch. Pairs of upstream types are not checked here.
+static bool llama_kv_resolve_fa_native(ggml_type k, ggml_type v) {
+    if (!llama_kv_resolve_is_turbo(k) && !llama_kv_resolve_is_turbo(v)) {
+        return true;
+    }
+    if (k == v) {
+        return true;
+    }
+    switch (k) {
+        case GGML_TYPE_TURBO2_0:
+        case GGML_TYPE_TURBO3_0:
+            return v == GGML_TYPE_Q8_0 || v == GGML_TYPE_TURBO2_0 || v == GGML_TYPE_TURBO3_0 || v == GGML_TYPE_TURBO4_0;
+        case GGML_TYPE_TURBO4_0:
+            return v == GGML_TYPE_Q8_0 || v == GGML_TYPE_TURBO2_0 || v == GGML_TYPE_TURBO3_0 || v == GGML_TYPE_TURBO4P_0;
+        case GGML_TYPE_TURBO4P_0:
+            return v == GGML_TYPE_Q8_0 || v == GGML_TYPE_TURBO4_0;
+        case GGML_TYPE_TURBO5P_0:
+        case GGML_TYPE_TURBO5P512_0:
+            return v == GGML_TYPE_Q8_0;
+        case GGML_TYPE_Q8_0:
+            return llama_kv_resolve_is_turbo(v);
+        default:
+            return false;
+    }
+}
+
+// a pair the CUDA FA dispatch refuses outright (ggml_cuda_get_best_fattn_kernel returns NONE): a split-plane side
+// against a type it does not pair with, or turbo5p against turbo5p512
+static bool llama_kv_resolve_fa_refused(ggml_type k, ggml_type v) {
+    if (!llama_kv_resolve_is_split_plane(k) && !llama_kv_resolve_is_split_plane(v)) {
+        return false;
+    }
+    if (llama_kv_resolve_is_split_plane(k) && llama_kv_resolve_is_split_plane(v) &&
+        (k == GGML_TYPE_TURBO5P512_0) != (v == GGML_TYPE_TURBO5P512_0)) {
+        return true;
+    }
+    const auto pairable = [](ggml_type t) {
+        return llama_kv_resolve_is_split_plane(t) || t == GGML_TYPE_Q8_0 || t == GGML_TYPE_TURBO4_0;
+    };
+    return !pairable(k) || !pairable(v);
+}
+
+// "" when every KV row of the model can be held as the K (is_v false) or V side in type t (not turbot), else why.
+// asked: t is one of the requested types (-ctk/-ctv), not a step down the chain.
+static std::string llama_kv_resolve_side_refusal(const llama_kv_resolve_input & in, ggml_type t, bool is_v, bool asked) {
+    if (!ggml_is_quantized(t)) {
+        return "";
+    }
+
+    const bool fa_off = in.flash_attn == LLAMA_FLASH_ATTN_TYPE_DISABLED;
+
+    if (llama_kv_resolve_is_turbo(t)) {
+        if (fa_off) {
+            return "needs flash attention";
+        }
+        if (!in.turbo_graph) {
+            return "the attention graph of this model has no turbo query rotation";
+        }
+        const bool split_plane = llama_kv_resolve_is_split_plane(t);
+        if (split_plane && in.mla) {
+            return "not applicable to MLA attention";
+        }
+        for (const auto & L : in.layers) {
+            if (L.n_head_kv == 0 || split_plane) {
+                continue;
+            }
+            // [TAG_KV_RESOLVE] turbo2/3/4: the cache zero-pads each head to whole 128-element WHT groups
+            // (llama-kv-cache.cpp) and llama-graph.cpp pads Q to match; MLA keeps V inside the padded K. Asked for, every
+            // padded shape that has a CUDA FA kernel is kept as before the resolver: K = V in {128, 256, 512}, or MLA
+            // K 576 -> 640 with V 512 (GLM-4.7-Flash, fattn.cu case 640). As a step down the chain only the unpadded
+            // VEC shapes 128 and 256 are taken: a padded head (64 -> 128) costs what q8_0 costs, with less precision.
+            const uint32_t pk = (L.head_k + 127)/128*128;
+            const uint32_t pv = in.mla ? L.head_v : (L.head_v + 127)/128*128;
+            const bool padded = pk != L.head_k || pv != L.head_v;
+            const bool shape_ok = (pk == pv && (pk == 128 || pk == 256 || pk == 512)) || (in.mla && pk == 640 && pv == 512);
+            if (!shape_ok) {
+                return llama_kv_resolve_fmt("layer %d: K head %u, V head %u (zero-padded %u, %u): no turbo flash-attention kernel",
+                        L.il, L.head_k, L.head_v, pk, pv);
+            }
+            if (!asked && (padded || in.mla || pk == 512)) {
+                return llama_kv_resolve_fmt("layer %d: head size K %u, V %u: only 128 or 256 is taken as a fallback "
+                        "(ask for it with -ctk/-ctv to use the zero-padded or F16-converted path)", L.il, L.head_k, L.head_v);
+            }
+        }
+        if (!split_plane) {
+            return "";
+        }
+        // the FA vector kernels of the split-plane types exist for D = 128 and 256 with DV = D ([TAG_TURBO4P] and
+        // [TAG_TURBO5P] instantiate no D = 64); their block spans heads, so there is no zero-padding
+        for (const auto & L : in.layers) {
+            if (L.n_head_kv == 0) {
+                continue;
+            }
+            if (L.head_k != L.head_v) {
+                return llama_kv_resolve_fmt("layer %d: K head %u and V head %u differ", L.il, L.head_k, L.head_v);
+            }
+            if (L.head_k != 128 && L.head_k != 256) {
+                return llama_kv_resolve_fmt("layer %d: head size %u (the FA kernels take 128 or 256)", L.il, L.head_k);
+            }
+            const uint32_t row = L.head_k*L.n_head_kv;
+            if (t == GGML_TYPE_TURBO4P_0 && row % 1024 != 0) {
+                return llama_kv_resolve_fmt("layer %d: KV row %u (%u heads x %u) is not a multiple of 1024",
+                        L.il, row, L.n_head_kv, L.head_k);
+            }
+            if ((t == GGML_TYPE_TURBO5P_0 || t == GGML_TYPE_TURBO5P512_0) && row % 512 != 0) {
+                return llama_kv_resolve_fmt("layer %d: KV row %u (%u heads x %u) is not a multiple of 512",
+                        L.il, row, L.n_head_kv, L.head_k);
+            }
+        }
+        return "";
+    }
+
+    if (is_v && fa_off) {
+        return "a quantized V cache needs flash attention";
+    }
+
+    const uint32_t blck = (uint32_t) ggml_blck_size(t);
+    for (const auto & L : in.layers) {
+        if (L.n_head_kv == 0) {
+            continue;
+        }
+        const uint32_t head = is_v ? L.head_v : L.head_k;
+        if (head % blck != 0) {
+            return llama_kv_resolve_fmt("layer %d: %s head size %u is not a multiple of its %u-element block",
+                    L.il, is_v ? "V" : "K", head, blck);
+        }
+    }
+    return "";
+}
+
+// "" when a turbot cache can be built, else why: the constructor's refusals (shared helpers) and the plan check
+static std::string llama_kv_resolve_turbot_refusal(const llama_kv_resolve_input & in, bool k_turbot, bool v_turbot) {
+    if (!in.turbot_refused.empty()) {
+        return in.turbot_refused;
+    }
+
+    llama_turbot_cache_desc d;
+    d.k_turbot     = k_turbot;
+    d.v_turbot     = v_turbot;
+    d.n_stream     = in.n_stream;
+    d.v_trans      = in.flash_attn == LLAMA_FLASH_ATTN_TYPE_DISABLED;
+    d.shared_cells = in.shared_cells;
+    d.mla          = in.mla;
+    d.swa          = in.swa;
+    d.kv_size      = in.kv_size;
+
+    std::string why = llama_turbot_cache_refusal(d);
+    if (!why.empty()) {
+        return why;
+    }
+    if (!in.env_refusal.empty()) {
+        return in.env_refusal;
+    }
+    if (!in.turbo_graph) {
+        return "the attention graph of this model has no turbo query rotation";
+    }
+
+    std::vector<int32_t> attn_layers;
+    for (const auto & L : in.layers) {
+        if (!L.attn) {
+            continue;
+        }
+        why = llama_turbot_layer_refusal((uint32_t) L.il, L.head_k, L.head_v, L.n_head_kv);
+        if (why.empty()) {
+            why = L.dev_refusal;
+        }
+        if (!why.empty()) {
+            return why;
+        }
+        attn_layers.push_back(L.il);
+    }
+
+    if (!in.plan_check) {
+        return "no plan: pass --kv-tier-plan <file> or set LLAMA_TURBOT_PLAN";
+    }
+    if (!in.plan_check(attn_layers, in.kv_size, why)) {
+        return why.empty() ? "the plan does not fit this model" : why;
+    }
+    return "";
+}
+
+// the types passed over on the way down a chain, as "a, b: why; c: why" (a run of equal reasons is said once)
+struct llama_kv_resolve_notes {
+    std::vector<std::pair<std::string, std::string>> runs;   // (type names, why)
+
+    void add(ggml_type t, std::string why) {
+        // the plan parser and the turbot refusals carry their own "turbot: " prefix; the type name says it already
+        if (why.rfind("turbot: ", 0) == 0) {
+            why = why.substr(8);
+        }
+        if (!runs.empty() && runs.back().second == why) {
+            runs.back().first += std::string(", ") + llama_kv_resolve_type_name(t);
+        } else {
+            runs.emplace_back(llama_kv_resolve_type_name(t), why);
+        }
+    }
+
+    std::string str() const {
+        std::string s;
+        for (const auto & [names, why] : runs) {
+            s += (s.empty() ? "" : "; ") + names + ": " + why;
+        }
+        return s;
+    }
+};
+
+// the first type of chain that fits side K (sides & 1) and/or V (sides & 2); req_k/req_v: the requested pair, which
+// decides whether turbot has its partner and which chain entries were asked for (the rest are steps down). The last
+// chain entry is taken when nothing fits (f16 always does).
+static ggml_type llama_kv_resolve_walk(const llama_kv_resolve_input & in, const std::vector<ggml_type> & chain, int sides,
+        ggml_type req_k, ggml_type req_v, llama_kv_resolve_notes & notes) {
+    for (size_t i = 0; i < chain.size(); ++i) {
+        const ggml_type t = chain[i];
+        std::string why;
+        if (ggml_turbot_is_type(t)) {
+            why = llama_kv_resolve_turbot_refusal(in,
+                    (sides & 1) ? true : ggml_turbot_is_type(req_k),
+                    (sides & 2) ? true : ggml_turbot_is_type(req_v));
+        } else {
+            const bool asked = t == req_k || t == req_v;
+            if (sides & 1) {
+                why = llama_kv_resolve_side_refusal(in, t, false, asked);
+            }
+            if (why.empty() && (sides & 2)) {
+                why = llama_kv_resolve_side_refusal(in, t, true, asked);
+            }
+        }
+        if (why.empty() || i + 1 == chain.size()) {
+            return t;
+        }
+        notes.add(t, why);
+    }
+    return GGML_TYPE_F16;
+}
+
+llama_kv_resolve_result llama_kv_resolve(const llama_kv_resolve_input & in) {
+    llama_kv_resolve_result res;
+
+    // one sentinel for "turbot requested", whichever turbot type the caller passed
+    const auto norm = [](ggml_type t) { return ggml_turbot_is_type(t) ? GGML_TYPE_TURBOT_S8 : t; };
+    const ggml_type req_k = norm(in.type_k);
+    const ggml_type req_v = norm(in.type_v);
+
+    // recurrent-only: there is no KV cache to type. Quantized or turbot requests are set aside so that none of the
+    // KV checks after this can refuse the context over a cache that is never built.
+    if (in.no_kv) {
+        res.no_kv  = true;
+        res.type_k = ggml_is_quantized(req_k) ? GGML_TYPE_F16 : req_k;
+        res.type_v = ggml_is_quantized(req_v) ? GGML_TYPE_F16 : req_v;
+        return res;
+    }
+
+    const bool fa_off = in.flash_attn == LLAMA_FLASH_ATTN_TYPE_DISABLED;
+
+    ggml_type want_k = req_k;
+    ggml_type want_v = req_v;
+
+    // MLA keeps V inside K: one type for both, taken from K
+    if (in.same_type && want_v != want_k) {
+        llama_kv_resolve_step st;
+        st.side   = 'V';
+        st.from   = want_v;
+        st.to     = want_k;
+        st.reason = "this model keeps one type for K and V (V is read from the K cache)";
+        res.steps.push_back(st);
+        want_v = want_k;
+    }
+
+    ggml_type k = want_k;
+    ggml_type v = want_v;
+
+    const auto push_step = [&](char side, ggml_type from, ggml_type to, const llama_kv_resolve_notes & notes) {
+        if (from == to) {
+            return;
+        }
+        llama_kv_resolve_step st;
+        st.side   = side;
+        st.from   = from;
+        st.to     = to;
+        st.reason = notes.str();
+        res.steps.push_back(st);
+    };
+
+    if (want_k == want_v && !(fa_off && !in.same_type)) {
+        // a matched pair stays matched: every turbo type has an FA kernel against itself
+        llama_kv_resolve_notes notes;
+        k = v = llama_kv_resolve_walk(in, llama_kv_resolve_chain(want_k), 3, want_k, want_v, notes);
+        push_step('B', want_k, k, notes);
+    } else {
+        // a mixed pair, or flash attention off (no FA kernel to pair for; K may stay quantized, V may not)
+        llama_kv_resolve_notes notes_k;
+        llama_kv_resolve_notes notes_v;
+        k = llama_kv_resolve_walk(in, llama_kv_resolve_chain(want_k), 1, want_k, want_v, notes_k);
+        v = llama_kv_resolve_walk(in, llama_kv_resolve_chain(want_v), 2, want_k, want_v, notes_v);
+        push_step('K', want_k, k, notes_k);
+        push_step('V', want_v, v, notes_v);
+    }
+
+    // [TAG_TURBO5P512] turbo5p is only kept when every KV row is a multiple of 512; any row that is not a multiple of
+    // 1024 takes the 512-element sibling for the whole cache, as llama_init_from_model has always done (same maths,
+    // not a downgrade, so no step: the swap keeps its own INFO line there)
+    {
+        bool needs_512 = false;
+        for (const auto & L : in.layers) {
+            if (L.n_head_kv > 0 && ((L.head_k*L.n_head_kv) % 1024 != 0 || (L.head_v*L.n_head_kv) % 1024 != 0)) {
+                needs_512 = true;
+            }
+        }
+        if (needs_512) {
+            k = k == GGML_TYPE_TURBO5P_0 ? GGML_TYPE_TURBO5P512_0 : k;
+            v = v == GGML_TYPE_TURBO5P_0 ? GGML_TYPE_TURBO5P512_0 : v;
+        }
+    }
+
+    // a mixed turbo pair without an FA kernel: refused by the dispatch, or (when a downgrade made it) converted to F16
+    // on every call. Prefer a matched pair: both sides take the lower turbo type, or a lone turbo side leaves the
+    // turbo family for q8_0.
+    if (!fa_off && !llama_kv_resolve_fa_native(k, v) &&
+        (llama_kv_resolve_fa_refused(k, v) || k != want_k || v != want_v)) {
+        const std::string why = llama_kv_resolve_fmt("no flash-attention kernel for K %s with V %s",
+                llama_kv_resolve_type_name(k), llama_kv_resolve_type_name(v));
+        if (llama_kv_resolve_is_turbo(k) && llama_kv_resolve_is_turbo(v)) {
+            const ggml_type t = llama_kv_resolve_turbo_rank(v) > llama_kv_resolve_turbo_rank(k) ? v : k;
+            llama_kv_resolve_notes walk_notes;
+            const ggml_type u = llama_kv_resolve_walk(in, llama_kv_resolve_chain(t), 3, want_k, want_v, walk_notes);
+            // the side that already had t only passes over what the walk passed over; the other one also over its own
+            const auto side_notes = [&](ggml_type from) {
+                llama_kv_resolve_notes n;
+                if (from != t) {
+                    n.add(from, why);
+                }
+                n.runs.insert(n.runs.end(), walk_notes.runs.begin(), walk_notes.runs.end());
+                return n;
+            };
+            push_step('K', k, u, side_notes(k));
+            push_step('V', v, u, side_notes(v));
+            k = u;
+            v = u;
+        } else {
+            const bool      k_side = llama_kv_resolve_is_turbo(k);
+            const ggml_type from   = k_side ? k : v;
+            llama_kv_resolve_notes notes;
+            notes.add(from, why);
+            const ggml_type u = llama_kv_resolve_walk(in, llama_kv_resolve_chain(GGML_TYPE_Q8_0), k_side ? 1 : 2, want_k, want_v, notes);
+            push_step(k_side ? 'K' : 'V', from, u, notes);
+            if (k_side) {
+                k = u;
+            } else {
+                v = u;
+            }
+        }
+    }
+
+    res.type_k = k;
+    res.type_v = v;
+
+    return res;
+}
+
+// [TAG_KV_RESOLVE] env LLAMA_KV_RESOLVE=0 turns the resolver off (read on every context, like LLAMA_TURBOT)
+static bool llama_kv_resolve_enabled() {
+    const char * LLAMA_KV_RESOLVE = getenv("LLAMA_KV_RESOLVE");
+    return !(LLAMA_KV_RESOLVE && strcmp(LLAMA_KV_RESOLVE, "0") == 0);
+}
+
+// [TAG_KV_RESOLVE] the layers the attention KV cache of this context holds: the layer filter llama_model::create_memory
+// hands that cache (keep in step with it). A turbot plan must name exactly these layers. Should this ever disagree
+// with create_memory, the turbot cache constructor still refuses and the llama_context constructor falls back.
+static bool llama_kv_resolve_attn_layer(const llama_model & model, llama_context_type ctx_type, uint32_t il) {
+    const auto & hp = model.hparams;
+
+    if (!hp.has_kv(il)) {
+        return false;
+    }
+
+    const llm_arch arch = model.arch;
+    const bool     mtp  = ctx_type == LLAMA_CONTEXT_TYPE_MTP;
+
+    // dense MTP heads of hybrid models get a plain attention cache over the nextn layers
+    const bool mtp_on_hybrid = mtp &&
+        (arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE ||
+         arch == LLM_ARCH_BAILINGMOE3 || arch == LLM_ARCH_NEMOTRON_H_MOE);
+
+    if (llm_arch_is_hybrid(arch) && !mtp_on_hybrid) {
+        switch (arch) {
+            case LLM_ARCH_FALCON_H1:
+                return true;
+            case LLM_ARCH_NEMOTRON_H:
+            case LLM_ARCH_NEMOTRON_H_MOE:
+                return !hp.is_recr(il) && hp.n_ff(il) == 0;
+            case LLM_ARCH_QWEN3NEXT:
+            case LLM_ARCH_QWEN35:
+            case LLM_ARCH_QWEN35MOE:
+            case LLM_ARCH_QWEN4EXP:
+            case LLM_ARCH_MINIMAX_01:
+                return il < hp.n_layer() && !hp.is_recr(il);
+            default:
+                return !hp.is_recr(il);   // llama_memory_hybrid's default attention filter
+        }
+    }
+
+    if (mtp_on_hybrid) {
+        return il >= hp.n_layer();
+    }
+
+    if (hp.n_layer_nextn > 0 && hp.n_layer() > 0 && hp.router_layer < 0) {
+        return mtp ? il >= hp.n_layer() : il < hp.n_layer();
+    }
+
+    return true;
+}
+
+// [TAG_KV_RESOLVE] archs whose attention input has no turbo query rotation (llama-graph.cpp: build_attn for
+// llm_graph_input_attn_k_dsa / k_dsa_iswa / k_iswa): a turbo cache there would be read without the rotation
+static bool llama_kv_resolve_turbo_graph(const llama_model & model) {
+    switch (model.arch) {
+        case LLM_ARCH_DEEPSEEK32:
+        case LLM_ARCH_GLM_DSA:
+        case LLM_ARCH_HY_V4:
+        case LLM_ARCH_DOTS3NOTE:
+        case LLM_ARCH_DEEPSEEK4:
+        // [TAG_KV_RESOLVE] the MSA sparse layers call ggml_flash_attn_ext directly (models/minimax-m3.cpp): no forward
+        // WHT on Q, no inverse WHT on the output
+        case LLM_ARCH_MINIMAX_M3:
+            return false;
+        case LLM_ARCH_QWEN4EXP:
+            {
+                // [TAG_KV_RESOLVE] the QSA layers (compress ratio > 0 with the indexer cache, models/qwen4exp.cpp
+                // build_attn_qsa) call build_attn_mha without the forward WHT on Q; dense-only checkpoints are fine
+                const auto & hp = model.hparams;
+                if (hp.indexer_head_size == 0) {
+                    return true;
+                }
+                for (uint32_t il = 0; il < hp.n_layer_all && il < LLAMA_MAX_LAYERS; ++il) {
+                    if (hp.dsv4_compress_ratios[il] > 0) {
+                        return false;
+                    }
+                }
+                return true;
+            }
+        case LLM_ARCH_DFLASH:
+            return model.hparams.dsv4_hc_mult == 0;   // the DeepSeek V4 DSpark stages use k_iswa
+        default:
+            return true;
+    }
+}
+
+// [TAG_KV_RESOLVE] cells of the attention cache: llama_context's n_ctx_seq, computed the same way
+static uint32_t llama_kv_resolve_kv_size(const llama_model & model, const llama_context_params & params) {
+    const uint32_t n_ctx = GGML_PAD(params.n_ctx == 0 ? model.hparams.n_ctx_train : params.n_ctx, 256);
+    if (params.kv_unified) {
+        return n_ctx;
+    }
+    return GGML_PAD(n_ctx / std::max(1u, params.n_seq_max), 256);
+}
+
+// [TAG_KV_RESOLVE] resolve params.type_k/type_v for model and log one warning per downgrade. turbot_refused: the turbot
+// cache constructor refused anyway (the llama_context constructor's fallback), so turbot is out.
+static void llama_kv_resolve_params(const llama_model & model, llama_context_params & params, const char * func,
+        const std::string & turbot_refused = "") {
+    const auto & hp = model.hparams;
+
+    if (hp.vocab_only) {
+        return;   // no memory is built
+    }
+
+    llama_kv_resolve_input in;
+    in.type_k         = params.type_k;
+    in.type_v         = params.type_v;
+    in.no_kv          = llm_arch_is_recurrent(model.arch);
+    in.mla            = hp.is_mla();
+    in.same_type      = hp.is_mla() || model.arch == LLM_ARCH_DEEPSEEK4;
+    in.turbo_graph    = llama_kv_resolve_turbo_graph(model);
+    in.swa            = hp.swa_type != LLAMA_SWA_TYPE_NONE || hp.n_swa > 0;
+    in.shared_cells   = model.arch == LLM_ARCH_GEMMA4_ASSISTANT && params.ctx_other != nullptr;
+    in.flash_attn     = params.flash_attn_type;
+    in.n_stream       = params.kv_unified ? 1 : std::max(1u, params.n_seq_max);
+    in.kv_size        = llama_kv_resolve_kv_size(model, params);
+    in.turbot_refused = turbot_refused;
+
+    const bool want_turbot = ggml_turbot_is_type(params.type_k) || ggml_turbot_is_type(params.type_v);
+    if (want_turbot) {
+        in.env_refusal = llama_turbot_env_refusal();
+    }
+
+    for (uint32_t il = 0; il < hp.n_layer_all; ++il) {
+        const bool attn = llama_kv_resolve_attn_layer(model, params.ctx_type, il);
+        if (!attn && hp.n_head_kv(il) == 0) {
+            continue;
+        }
+        llama_kv_resolve_layer L;
+        L.il        = (int32_t) il;
+        L.head_k    = hp.n_embd_head_k(il);
+        L.head_v    = hp.n_embd_head_v(il);
+        L.n_head_kv = hp.n_head_kv(il);
+        L.attn      = attn;
+        if (want_turbot && attn) {
+            L.dev_refusal = llama_turbot_layer_device_refusal(il, params.offload_kqv ? model.dev_layer(il) : nullptr);
+        }
+        in.layers.push_back(std::move(L));
+    }
+
+    // the plan the turbot cache would load (--kv-tier-plan, LLAMA_TURBOT_PLAN, else the built-in one), checked without
+    // a log line against the attention layers
+    in.plan_check = [](const std::vector<int32_t> & attn_layers, uint32_t kv_size, std::string & why) {
+        const llama_turbot_plan_source src = llama_turbot_plan_get_source();
+        std::string text;
+        if (!llama_turbot_plan_read(src, text, why)) {
+            return false;
+        }
+        if (!llama_turbot_plan_matches(text, attn_layers, kv_size, why, src.name)) {
+            if (src.origin != LLAMA_TURBOT_PLAN_FILE) {
+                why += " (the built-in plan fits only models with its attention layers; --kv-tier-plan <file> selects another)";
+            }
+            return false;
+        }
+        return true;
+    };
+
+    const llama_kv_resolve_result res = llama_kv_resolve(in);
+
+    for (const auto & st : res.steps) {
+        LLAMA_LOG_WARN("%s: KV cache type for %s: %s -> %s (%s)\n", func,
+                st.side == 'K' ? "K" : st.side == 'V' ? "V" : "K and V",
+                llama_kv_resolve_type_name(st.from), llama_kv_resolve_type_name(st.to), st.reason.c_str());
+    }
+    if (res.no_kv && (res.type_k != params.type_k || res.type_v != params.type_v)) {
+        LLAMA_LOG_INFO("%s: this model keeps no KV cache: the requested KV cache types (%s, %s) are not used\n", func,
+                llama_kv_resolve_type_name(params.type_k), llama_kv_resolve_type_name(params.type_v));
+    }
+
+    params.type_k = res.type_k;
+    params.type_v = res.type_v;
+}
 
 llama_context::llama_context(
         const llama_model & model,
@@ -403,7 +999,20 @@ llama_context::llama_context(
             /*.mem_other =*/ llama_get_memory(cparams.ctx_other),
         };
 
-        memory.reset(model.create_memory(params_mem, cparams));
+        try {
+            memory.reset(model.create_memory(params_mem, cparams));
+        } catch (const std::exception & err) {
+            // [TAG_KV_RESOLVE] the resolver runs the turbot constructor's own checks, but the attention layer set it
+            // gives the plan check re-derives create_memory's layer filter. Should the constructor still refuse turbot,
+            // resolve again without it instead of failing the context. The half-built memory has been unwound.
+            if (!llama_kv_resolve_enabled() || !ggml_turbot_is_type(params.type_k) || strncmp(err.what(), "turbot", 6) != 0) {
+                throw;
+            }
+            llama_kv_resolve_params(model, params, __func__, err.what());
+            params_mem.type_k = params.type_k;
+            params_mem.type_v = params.type_v;
+            memory.reset(model.create_memory(params_mem, cparams));
+        }
     }
 
     // init backends
@@ -4001,19 +4610,30 @@ llama_context * llama_init_from_model(
             LLAMA_LOG_WARN("%s: LLAMA_TURBOT=0: turbot disabled, using turbo5p\n", __func__);
             params.type_k = GGML_TYPE_TURBO5P_0;
             params.type_v = GGML_TYPE_TURBO5P_0;
-        } else {
-            if (!ggml_turbot_is_type(params.type_k) || !ggml_turbot_is_type(params.type_v)) {
-                LLAMA_LOG_ERROR("%s: turbot needs -ctk turbot and -ctv turbot together\n", __func__);
-                return nullptr;
-            }
-            if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO) {
-                LLAMA_LOG_INFO("%s: enabling flash_attn since it is required for the turbot KV cache\n", __func__);
-                params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
-            }
-            if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_DISABLED) {
-                LLAMA_LOG_ERROR("%s: turbot KV cache requires flash_attn to be enabled\n", __func__);
-                return nullptr;
-            }
+        }
+    }
+
+    // [TAG_KV_RESOLVE] pick the best K/V cache types this model and these settings support, before any check below
+    // could refuse them: turbot only when the turbot cache and its plan would accept this model, else turbo5p
+    // (turbo5p512 for 512-element rows), turbo4, q8_0, f16, with one warning per downgrade. With it on, the refusals
+    // below can no longer fire; LLAMA_KV_RESOLVE=0 restores them.
+    if (llama_kv_resolve_enabled()) {
+        llama_kv_resolve_params(*model, params, __func__);
+    }
+
+    // [TAG_TURBOT] what survives the resolver (or everything, with LLAMA_KV_RESOLVE=0) meets the old turbot checks
+    if (ggml_turbot_is_type(params.type_k) || ggml_turbot_is_type(params.type_v)) {
+        if (!ggml_turbot_is_type(params.type_k) || !ggml_turbot_is_type(params.type_v)) {
+            LLAMA_LOG_ERROR("%s: turbot needs -ctk turbot and -ctv turbot together\n", __func__);
+            return nullptr;
+        }
+        if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO) {
+            LLAMA_LOG_INFO("%s: enabling flash_attn since it is required for the turbot KV cache\n", __func__);
+            params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+        }
+        if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_DISABLED) {
+            LLAMA_LOG_ERROR("%s: turbot KV cache requires flash_attn to be enabled\n", __func__);
+            return nullptr;
         }
     }
 

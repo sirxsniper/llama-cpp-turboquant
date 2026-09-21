@@ -315,6 +315,10 @@ llama_build(test-backend-ops.cpp)
 llama_build_and_test(test-turbot.cpp)
 target_compile_definitions(test-turbot PRIVATE TURBOT_TEST_TIER)
 
+# [TAG_KV_RESOLVE] KV cache type resolver decisions on synthetic hparams (Qwen3.8-27B, Spark2.5, MiniCPM5, MLA, ...),
+# CPU only. llama_kv_resolve and the turbot plan parser are exported with LLAMA_API, so it links in shared builds too.
+llama_build_and_test(test-kv-resolve.cpp)
+
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model")
 llama_build_and_test(test-autorelease.cpp       LABEL "model")
 llama_build_and_test(test-backend-sampler.cpp   LABEL "model")

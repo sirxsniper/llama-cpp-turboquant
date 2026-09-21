@@ -10,6 +10,7 @@
 #include "llama-model.h"
 #include "llama-context.h"
 #include "llama-kv-tier.h"
+#include "llama-kv-cache-resolve.h"   // [TAG_KV_RESOLVE] turbot refusals shared with the KV type resolver
 
 #include "ggml-turbot.h"
 
@@ -247,37 +248,26 @@ llama_kv_cache::llama_kv_cache(
         const auto refuse = [](const std::string & msg) {
             throw std::runtime_error("turbot: " + msg);
         };
-        const auto env_positive = [](const char * name) {
-            const char * e = getenv(name);
-            return e != nullptr && atoi(e) > 0;
-        };
 
-        if (!ggml_turbot_is_type(type_k) || !ggml_turbot_is_type(type_v)) {
-            refuse("needs -ctk turbot and -ctv turbot together");
+        // [TAG_KV_RESOLVE] the refusals live in llama-kv-cache-resolve.h, shared with the KV type resolver, which runs
+        // them before any cache is built and falls back to turbo5p instead. Here they still throw on direct misuse.
+        // TURBO_KV_CPU_LAYERS is refused through llama_turbot_env_refusal (kv_cpu_layers > 0 is the same test).
+        llama_turbot_cache_desc desc;
+        desc.k_turbot     = ggml_turbot_is_type(type_k);
+        desc.v_turbot     = ggml_turbot_is_type(type_v);
+        desc.n_stream     = n_stream;
+        desc.v_trans      = v_trans;
+        desc.shared_cells = other != nullptr;
+        desc.mla          = is_mla;
+        desc.swa          = swa_type != LLAMA_SWA_TYPE_NONE || n_swa > 0;
+        desc.kv_size      = kv_size;
+
+        std::string why = llama_turbot_cache_refusal(desc);
+        if (why.empty()) {
+            why = llama_turbot_env_refusal();
         }
-        if (n_stream > 1) {
-            refuse("needs a single KV stream: use --kv-unified or -np 1");
-        }
-        if (v_trans) {
-            refuse("needs flash attention");
-        }
-        if (other != nullptr || is_mla) {
-            refuse("shared cells and MLA caches are unsupported");
-        }
-        if (swa_type != LLAMA_SWA_TYPE_NONE || n_swa > 0) {
-            refuse("SWA caches are unsupported");
-        }
-        if (kv_size % GGML_TURBOT_GRANULE != 0) {
-            refuse(format("kv_size must be a multiple of %d, got %u", GGML_TURBOT_GRANULE, kv_size));
-        }
-        if (kv_cpu_layers > 0) {
-            refuse("TURBO_KV_CPU_LAYERS is incompatible: attention KV must be on CUDA");
-        }
-        if (env_positive("TURBO_LAYER_ADAPTIVE")) {
-            refuse("TURBO_LAYER_ADAPTIVE is incompatible: the plan sets the widths of every layer");
-        }
-        if (env_positive("TURBO_INNERQ")) {
-            refuse("TURBO_INNERQ is incompatible");
+        if (!why.empty()) {
+            refuse(why);
         }
 
         std::vector<int32_t> attn_layers;
@@ -285,35 +275,24 @@ llama_kv_cache::llama_kv_cache(
             if (!hparams.has_kv(il) || (filter && !filter(il))) {
                 continue;
             }
-            if (hparams.n_embd_head_k(il) != GGML_TURBOT_HEAD_DIM || hparams.n_embd_head_v(il) != GGML_TURBOT_HEAD_DIM ||
-                hparams.n_head_kv(il) != GGML_TURBOT_N_HEAD) {
-                refuse(format("unsupported head geometry on layer %u: head_k %u, head_v %u, n_head_kv %u (needs %d, %d, %d)",
-                        il, hparams.n_embd_head_k(il), hparams.n_embd_head_v(il), hparams.n_head_kv(il),
-                        GGML_TURBOT_HEAD_DIM, GGML_TURBOT_HEAD_DIM, GGML_TURBOT_N_HEAD));
+            why = llama_turbot_layer_refusal(il, hparams.n_embd_head_k(il), hparams.n_embd_head_v(il), hparams.n_head_kv(il));
+            if (why.empty()) {
+                why = llama_turbot_layer_device_refusal(il, offload ? model.dev_layer(il) : nullptr);
             }
-            ggml_backend_dev_t dev = offload ? model.dev_layer(il) : nullptr;
-            ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
-            if (reg == nullptr || strcmp(ggml_backend_reg_name(reg), "CUDA") != 0) {
-                refuse(format("attention KV must be on a CUDA device (layer %u: %s)", il,
-                        dev ? ggml_backend_dev_name(dev) : "KV offload is off"));
+            if (!why.empty()) {
+                refuse(why);
             }
             attn_layers.push_back((int32_t) il);
         }
 
-        // plan source precedence: llama_turbot_set_plan_path (--kv-tier-plan), then env LLAMA_TURBOT_PLAN
-        std::string plan_path = llama_turbot_get_plan_path();
-        if (plan_path.empty()) {
-            const char * LLAMA_TURBOT_PLAN = getenv("LLAMA_TURBOT_PLAN");
-            plan_path = LLAMA_TURBOT_PLAN ? LLAMA_TURBOT_PLAN : "";
-        }
-        if (plan_path.empty()) {
-            throw std::runtime_error("turbot KV cache needs a plan: pass --kv-tier-plan <file> or set LLAMA_TURBOT_PLAN");
-        }
-
+        // [TAG_TURBOT_EMBED_PLAN] plan source precedence (llama_turbot_plan_get_source): llama_turbot_set_plan_path
+        // (--kv-tier-plan), then env LLAMA_TURBOT_PLAN, then the built-in default plan; "default" in either place selects
+        // the built-in plan. A plan that does not name exactly attn_layers is refused here: code that wants to fall back
+        // instead checks llama_turbot_plan_matches before the cache is built.
         turbot_plan = std::make_unique<llama_turbot_plan>();
 
         std::string err;
-        if (!llama_turbot_plan_parse_file(plan_path, attn_layers, kv_size, *turbot_plan, err)) {
+        if (!llama_turbot_plan_load(attn_layers, kv_size, *turbot_plan, err)) {
             throw std::runtime_error(err);
         }
 
