@@ -255,7 +255,7 @@ Further quality arms, each against the same bar:
 
 ## 6. Speed and VRAM
 
-Rebuild `llama-bench` first (rule 0.4). llama-bench has no `--kv-tier-plan` flag: the plan comes from `LLAMA_TURBOT_PLAN`.
+Rebuild `llama-bench` first (rule 0.4). llama-bench has no `--kv-tier-plan` flag: the plan comes from `LLAMA_TURBOT_PLAN`, and without it from the built-in default plan ([TAG_TURBOT_EMBED_PLAN]).
 
 ```powershell
 $env:LLAMA_TURBOT_PLAN = "WT\docs\turbot\plans\turbot-default.plan"

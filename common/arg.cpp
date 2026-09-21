@@ -341,7 +341,7 @@ static std::string get_all_kv_cache_types() {
     for (const auto & type : kv_cache_types) {
         msg << ggml_type_name(type) << ", ";
     }
-    msg << "turbot (-ctk and -ctv together, needs --kv-tier-plan)";   // [TAG_TURBOT]
+    msg << "turbot (-ctk and -ctv together; default plan built in)";   // [TAG_TURBOT] [TAG_TURBOT_EMBED_PLAN]
     return msg.str();
 }
 
@@ -2486,9 +2486,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--kv-tier-plan"}, "FNAME",
         "turbot tiered KV cache plan: per-head old widths (L lines), optional young widths (Y), young pool (POOL) and\n"
-        "per-sequence young cap (CAP). Required with -ctk turbot -ctv turbot unless env LLAMA_TURBOT_PLAN is set",
+        "per-sequence young cap (CAP). 'default' selects the built-in plan (docs/turbot/plans/turbot-default.plan,\n"
+        "calibrated on Qwen3.8-27B); use './default' for a file named default. Without this flag and without env\n"
+        "LLAMA_TURBOT_PLAN, -ctk turbot -ctv turbot uses the built-in plan if it fits the model's attention layers",
         [](common_params & params, const std::string & value) {
-            params.kv_tier_plan = value;   // [TAG_TURBOT]
+            // [TAG_TURBOT] [TAG_TURBOT_EMBED_PLAN] "default" is passed through: libllama resolves it
+            // (llama_turbot_plan_get_source), so LLAMA_TURBOT_PLAN=default behaves the same
+            params.kv_tier_plan = value;
         }
     ).set_env("LLAMA_ARG_KV_TIER_PLAN"));
     add_opt(common_arg(

@@ -14,6 +14,7 @@
 #ifdef TURBOT_TEST_TIER
 #    include "llama.h"
 #    include "../src/llama-batch.h"
+#    include "../src/llama-ext.h"   // [TAG_TURBOT_EMBED_PLAN] llama_turbot_set_plan_path
 #    include "../src/llama-kv-cells.h"
 #    include "../src/llama-kv-tier.h"
 #endif
@@ -1136,6 +1137,70 @@ static void test_plan_parser() {
     }
 }
 
+// [TAG_TURBOT_EMBED_PLAN] the built-in plan (src/llama-turbot-default-plan.h), llama_turbot_plan_matches and the plan source
+static void test_default_plan() {
+    printf("[7a'] built-in default plan and plan source\n");
+    const auto     layers = qwen38_attn_layers();
+    const uint32_t kv     = 262144;
+
+    const std::string text = llama_turbot_default_plan_text();
+    TCHECK(!text.empty() && text.find('\r') == std::string::npos, "built-in plan text is empty or not LF");
+
+    std::string err;
+    {
+        llama_turbot_plan plan;
+        const bool ok = llama_turbot_plan_parse_text(text, layers, kv, plan, err);
+        TCHECK(ok, "built-in plan refused: %s", err.c_str());
+        TCHECK(plan.hash == DEFAULT_PLAN_HASH, "built-in plan hash 0x%016" PRIx64 ", expected 0x%016" PRIx64
+                " (docs/turbot/plans/turbot-default.plan changed: regenerate the header and update this test)", plan.hash, DEFAULT_PLAN_HASH);
+        TCHECK(llama_turbot_default_plan_hash() == DEFAULT_PLAN_HASH, "LLAMA_TURBOT_DEFAULT_PLAN_HASH 0x%016" PRIx64,
+                llama_turbot_default_plan_hash());
+    }
+
+    std::string why = "stale";
+    TCHECK(llama_turbot_plan_matches(text, layers, kv, why) && why.empty(), "Qwen3.8 layers do not match: %s", why.c_str());
+    TCHECK(llama_turbot_plan_matches(text, layers, 4096, why), "Qwen3.8 layers at kv_size 4096 (POOL clamp) do not match: %s", why.c_str());
+
+    // Spark-X2.5-4B shape: full-attention layers 3, 7, ..., 35. The first L line it does not hold is layer 39 (line 14).
+    std::vector<int32_t> spark;
+    for (int32_t il = 3; il <= 35; il += 4) {
+        spark.push_back(il);
+    }
+    TCHECK(!llama_turbot_plan_matches(text, spark, kv, why), "9 attention layers match");
+    TCHECK(why.find("layer 39 ") != std::string::npos && why.find(LLAMA_TURBOT_PLAN_BUILTIN_NAME) != std::string::npos,
+            "mismatch reason for 9 layers: %s", why.c_str());
+
+    std::vector<int32_t> shifted;
+    for (int32_t il = 0; il < 64; il += 4) {
+        shifted.push_back(il);
+    }
+    TCHECK(!llama_turbot_plan_matches(text, shifted, kv, why) && !why.empty(), "layers 0, 4, ..., 60 match");
+
+    std::vector<int32_t> extra = layers;
+    extra.push_back(64);
+    TCHECK(!llama_turbot_plan_matches(text, extra, kv, why) && why.find("missing L line for attention layer 64") != std::string::npos,
+            "17 attention layers: %s", why.c_str());
+
+    TCHECK(!llama_turbot_plan_matches(text, std::vector<int32_t>(), kv, why) && !why.empty(), "no attention layers match");
+    TCHECK(!llama_turbot_plan_matches("L 3 K 1 2 2 4 V 2 2 2 4\n", std::vector<int32_t>(1, 3), kv, why, "custom.plan") &&
+            why.find("custom.plan") != std::string::npos, "source name missing from the reason: %s", why.c_str());
+
+    // plan source: llama_turbot_set_plan_path wins over env LLAMA_TURBOT_PLAN; "default" is the built-in plan
+    llama_turbot_set_plan_path(LLAMA_TURBOT_PLAN_KEYWORD_DEFAULT);
+    llama_turbot_plan_source src = llama_turbot_plan_get_source();
+    TCHECK(src.origin == LLAMA_TURBOT_PLAN_BUILTIN_FORCED && src.name == LLAMA_TURBOT_PLAN_BUILTIN_NAME && src.path.empty(),
+            "'default' keyword: origin %d name '%s'", (int) src.origin, src.name.c_str());
+    std::string got;
+    TCHECK(llama_turbot_plan_read(src, got, err) && got == text, "reading the built-in plan: %s", err.c_str());
+
+    llama_turbot_set_plan_path("./no-such-dir/default");
+    src = llama_turbot_plan_get_source();
+    TCHECK(src.origin == LLAMA_TURBOT_PLAN_FILE && src.path == "./no-such-dir/default" && src.name == src.path, "a path ending in default is a file");
+    TCHECK(!llama_turbot_plan_read(src, got, err) && err.find("cannot open plan file") != std::string::npos, "missing plan file: %s", err.c_str());
+
+    llama_turbot_set_plan_path(nullptr);
+}
+
 // quota of SPEC 9.6
 static uint32_t tier_quota(uint32_t pool, uint32_t cap, const std::vector<uint32_t> & n, size_t s) {
     uint64_t sum = 0;
@@ -1644,6 +1709,7 @@ int main(int argc, char ** argv) {
     test_params_layout();
 #ifdef TURBOT_TEST_TIER
     test_plan_parser();
+    test_default_plan();
     test_tier();
 #else
     printf("[7] plan parser and llama_kv_tier: SKIPPED (internal llama symbols do not link in this build, see docs/turbot/TESTING.md)\n");

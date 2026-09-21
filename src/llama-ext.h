@@ -153,6 +153,7 @@ LLAMA_API void llama_sampler_chain_backend_detach(struct llama_sampler * smpl);
 LLAMA_API int32_t llama_memory_attn_n_free_ext(struct llama_context * ctx, llama_seq_id seq_id);
 
 // [TAG_TURBOT] Process-wide turbot plan path; takes precedence over env LLAMA_TURBOT_PLAN. nullptr or "" clears it.
+// [TAG_TURBOT_EMBED_PLAN] "default" selects the built-in plan; with neither set, the built-in plan is used when it fits.
 LLAMA_API void llama_turbot_set_plan_path(const char * path);
 
 // retrieves the whole token embedding matrix in F32 format (n_embd * n_vocab)

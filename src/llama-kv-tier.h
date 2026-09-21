@@ -45,6 +45,58 @@ LLAMA_API bool llama_turbot_plan_parse_file(const std::string & path, const std:
 // the path stored by llama_turbot_set_plan_path() (llama-ext.h), "" when none was set
 std::string llama_turbot_get_plan_path();
 
+//
+// [TAG_TURBOT_EMBED_PLAN] built-in default plan and plan source
+//
+// docs/turbot/plans/turbot-default.plan is compiled into libllama through the checked-in, generated
+// src/llama-turbot-default-plan.h (docs/turbot/gen_turbot_default_plan.py; src/CMakeLists.txt stops the configure when
+// the two drift apart). It was calibrated on Qwen3.8-27B: 16 attention layers il = 3, 7, ..., 63, 4 KV heads x 256.
+//
+
+// the keyword that selects the built-in plan in --kv-tier-plan / LLAMA_TURBOT_PLAN (use "./default" for a file of that name)
+#define LLAMA_TURBOT_PLAN_KEYWORD_DEFAULT "default"
+// the name of the built-in plan in log lines and errors, and its llama_turbot_plan::path
+#define LLAMA_TURBOT_PLAN_BUILTIN_NAME    "<built-in default>"
+
+// the built-in plan text: NUL-terminated, LF line endings, never nullptr
+LLAMA_API const char * llama_turbot_default_plan_text();
+// its plan hash when the cache has at least POOL cells (0x56c3503c949a7749); a smaller cache clamps POOL, which changes it
+LLAMA_API uint64_t     llama_turbot_default_plan_hash();
+
+// Pure (no log line, no global state): does the plan text parse and name exactly the attention layers attn_layers?
+// Every attention layer needs an L line and every L/Y line must be one of them. kv_size only clamps POOL, so it never
+// causes a mismatch. On false, why says what is wrong and names source, e.g. "turbot: plan <built-in default> line 14:
+// layer 39 is not an attention layer of this cache"; on true, why is cleared. It does NOT check head geometry, SWA,
+// streams, flash attention or devices: the cache constructor (llama-kv-cache.cpp) still refuses those.
+LLAMA_API bool llama_turbot_plan_matches(const std::string & text, const std::vector<int32_t> & attn_layers, uint32_t kv_size,
+                                         std::string & why, const std::string & source = LLAMA_TURBOT_PLAN_BUILTIN_NAME);
+
+enum llama_turbot_plan_origin {
+    LLAMA_TURBOT_PLAN_BUILTIN_AUTO,     // nothing set: the built-in plan, meant to be used only when it matches the model
+    LLAMA_TURBOT_PLAN_BUILTIN_FORCED,   // --kv-tier-plan default or LLAMA_TURBOT_PLAN=default
+    LLAMA_TURBOT_PLAN_FILE,             // a plan file
+};
+
+struct llama_turbot_plan_source {
+    llama_turbot_plan_origin origin = LLAMA_TURBOT_PLAN_BUILTIN_AUTO;
+    std::string              path;      // LLAMA_TURBOT_PLAN_FILE: the path as given, else ""
+    std::string              name;      // the path, or LLAMA_TURBOT_PLAN_BUILTIN_NAME
+    std::string              set_by;    // "--kv-tier-plan", "LLAMA_TURBOT_PLAN", or "" for BUILTIN_AUTO
+};
+
+// Where the plan of a turbot cache comes from, in this order: llama_turbot_set_plan_path() (--kv-tier-plan, or env
+// LLAMA_ARG_KV_TIER_PLAN, set by common), then env LLAMA_TURBOT_PLAN, then the built-in plan. An empty value counts as
+// unset; the value "default" in either place selects the built-in plan.
+LLAMA_API llama_turbot_plan_source llama_turbot_plan_get_source();
+
+// The plan text of src: the built-in text, or the file contents. false and err ("turbot: cannot open plan file ...")
+// when the file cannot be read.
+LLAMA_API bool llama_turbot_plan_read(const llama_turbot_plan_source & src, std::string & text, std::string & err);
+
+// The turbot cache constructor's plan loader: llama_turbot_plan_get_source + llama_turbot_plan_read + parse, with
+// plan.path = src.name. When the built-in plan does not fit, err also says how to pick another plan or KV type.
+bool llama_turbot_plan_load(const std::vector<int32_t> & attn_layers, uint32_t kv_size, llama_turbot_plan & plan, std::string & err);
+
 // f(s) for every sequence id in seqs, ascending. A cell carries a handful of sequences at most, so the walk stops at the
 // last set bit instead of visiting all LLAMA_MAX_SEQ ids.
 template<typename F>

@@ -67,6 +67,30 @@ set_source_files_properties(${LLAMA_CORE_SOURCES} ../include/llama.h unicode.h
 
 configure_file(llama-version.h.in ${CMAKE_CURRENT_BINARY_DIR}/llama-version.h @ONLY)
 
+# [TAG_TURBOT_EMBED_PLAN] The built-in turbot plan is compiled in from the checked-in llama-turbot-default-plan.h, which
+# docs/turbot/gen_turbot_default_plan.py generates from docs/turbot/plans/turbot-default.plan. The header is checked in,
+# not generated here, so build systems that compile src/ without this CMakeLists (vendored copies) still get the plan.
+# Drift guard: when the plan file is present, configure stops if the header's SHA-256 of the plan text (LF line
+# endings) differs from the file's; both files are configure dependencies, so an edit to either re-runs this check.
+set(LLAMA_TURBOT_DEFAULT_PLAN_SRC "${CMAKE_CURRENT_SOURCE_DIR}/../docs/turbot/plans/turbot-default.plan")
+set(LLAMA_TURBOT_DEFAULT_PLAN_HDR "${CMAKE_CURRENT_SOURCE_DIR}/llama-turbot-default-plan.h")
+if (EXISTS "${LLAMA_TURBOT_DEFAULT_PLAN_SRC}")
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${LLAMA_TURBOT_DEFAULT_PLAN_SRC}" "${LLAMA_TURBOT_DEFAULT_PLAN_HDR}")
+    file(READ "${LLAMA_TURBOT_DEFAULT_PLAN_SRC}" LLAMA_TURBOT_DEFAULT_PLAN_TEXT)
+    string(REPLACE "\r\n" "\n" LLAMA_TURBOT_DEFAULT_PLAN_TEXT "${LLAMA_TURBOT_DEFAULT_PLAN_TEXT}")
+    string(SHA256 LLAMA_TURBOT_DEFAULT_PLAN_SHA_SRC "${LLAMA_TURBOT_DEFAULT_PLAN_TEXT}")
+    file(STRINGS "${LLAMA_TURBOT_DEFAULT_PLAN_HDR}" LLAMA_TURBOT_DEFAULT_PLAN_SHA_HDR
+         REGEX "^#define LLAMA_TURBOT_DEFAULT_PLAN_SHA256 \"[0-9a-f]+\"")
+    string(REGEX REPLACE "^#define LLAMA_TURBOT_DEFAULT_PLAN_SHA256 \"([0-9a-f]+)\".*$" "\\1"
+           LLAMA_TURBOT_DEFAULT_PLAN_SHA_HDR "${LLAMA_TURBOT_DEFAULT_PLAN_SHA_HDR}")
+    if (NOT "${LLAMA_TURBOT_DEFAULT_PLAN_SHA_HDR}" STREQUAL "${LLAMA_TURBOT_DEFAULT_PLAN_SHA_SRC}")
+        message(FATAL_ERROR
+            "src/llama-turbot-default-plan.h is out of date: it does not match docs/turbot/plans/turbot-default.plan "
+            "(sha256 '${LLAMA_TURBOT_DEFAULT_PLAN_SHA_HDR}' in the header, '${LLAMA_TURBOT_DEFAULT_PLAN_SHA_SRC}' for the plan). "
+            "Regenerate it with: python docs/turbot/gen_turbot_default_plan.py")
+    endif()
+endif()
+
 target_include_directories(llama PRIVATE . ${CMAKE_CURRENT_BINARY_DIR})
 target_include_directories(llama PUBLIC ../include)
 target_compile_features   (llama PRIVATE cxx_std_17) # don't bump

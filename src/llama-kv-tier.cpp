@@ -3,6 +3,7 @@
 #include "llama-batch.h"
 #include "llama-ext.h"
 #include "llama-impl.h"
+#include "llama-turbot-default-plan.h"   // [TAG_TURBOT_EMBED_PLAN] generated, checked in
 
 #include <algorithm>
 #include <cerrno>
@@ -58,8 +59,10 @@ static int llama_turbot_popcount(uint64_t x) {
     return n;
 }
 
+// quiet: no warning lines ([TAG_TURBOT_EMBED_PLAN] llama_turbot_plan_matches is pure)
 static bool llama_turbot_plan_parse_impl(const std::string & text, const std::string & source,
-        const std::vector<int32_t> & attn_layers, uint32_t kv_size, llama_turbot_plan & plan, std::string & err) {
+        const std::vector<int32_t> & attn_layers, uint32_t kv_size, llama_turbot_plan & plan, std::string & err,
+        bool quiet = false) {
     const auto fail = [&](int line_no, const std::string & msg) {
         err = line_no > 0 ? format("turbot: plan %s line %d: %s", source.c_str(), line_no, msg.c_str())
                           : format("turbot: plan %s: %s", source.c_str(), msg.c_str());
@@ -192,8 +195,10 @@ static bool llama_turbot_plan_parse_impl(const std::string & text, const std::st
     // probes) run with every granule able to be young instead of being refused. The 262144-cell server is unaffected.
     if (pool > (int64_t) kv_size) {
         const int64_t clamped = ((int64_t) kv_size / GGML_TURBOT_GRANULE) * GGML_TURBOT_GRANULE;
-        LLAMA_LOG_WARN("%s: turbot plan %s%s: POOL %lld is larger than the cache (%u cells), using %lld\n", __func__, source.c_str(),
-                line_pool ? format(" line %d", line_pool).c_str() : "", (long long) pool, kv_size, (long long) clamped);
+        if (!quiet) {
+            LLAMA_LOG_WARN("%s: turbot plan %s%s: POOL %lld is larger than the cache (%u cells), using %lld\n", __func__, source.c_str(),
+                    line_pool ? format(" line %d", line_pool).c_str() : "", (long long) pool, kv_size, (long long) clamped);
+        }
         pool = clamped;
     }
 
@@ -253,7 +258,7 @@ static bool llama_turbot_plan_parse_impl(const std::string & text, const std::st
     }
     res.hash = ggml_turbot_plan_hash_finish(h, res.pool_cells, res.cap_cells);
 
-    if (line_bench) {
+    if (line_bench && !quiet) {
         LLAMA_LOG_WARN("%s: turbot plan %s line %d: the kvfq bench keys W, W2 and M are ignored\n", __func__, source.c_str(), line_bench);
     }
 
@@ -268,8 +273,7 @@ bool llama_turbot_plan_parse_text(const std::string & text, const std::vector<in
     return llama_turbot_plan_parse_impl(text, "<text>", attn_layers, kv_size, plan, err);
 }
 
-bool llama_turbot_plan_parse_file(const std::string & path, const std::vector<int32_t> & attn_layers, uint32_t kv_size,
-                                  llama_turbot_plan & plan, std::string & err) {
+static bool llama_turbot_plan_read_file(const std::string & path, std::string & text, std::string & err) {
     std::ifstream f(path, std::ios::binary);
     if (!f) {
         err = format("turbot: cannot open plan file %s", path.c_str());
@@ -278,12 +282,113 @@ bool llama_turbot_plan_parse_file(const std::string & path, const std::vector<in
 
     std::stringstream buf;
     buf << f.rdbuf();
+    text = buf.str();
 
-    if (!llama_turbot_plan_parse_impl(buf.str(), path, attn_layers, kv_size, plan, err)) {
+    return true;
+}
+
+bool llama_turbot_plan_parse_file(const std::string & path, const std::vector<int32_t> & attn_layers, uint32_t kv_size,
+                                  llama_turbot_plan & plan, std::string & err) {
+    std::string text;
+    if (!llama_turbot_plan_read_file(path, text, err)) {
+        return false;
+    }
+
+    if (!llama_turbot_plan_parse_impl(text, path, attn_layers, kv_size, plan, err)) {
         return false;
     }
 
     plan.path = path;
+
+    return true;
+}
+
+//
+// [TAG_TURBOT_EMBED_PLAN] built-in default plan (src/llama-turbot-default-plan.h) and plan source
+//
+
+const char * llama_turbot_default_plan_text() {
+    return LLAMA_TURBOT_DEFAULT_PLAN_TEXT;
+}
+
+uint64_t llama_turbot_default_plan_hash() {
+    return LLAMA_TURBOT_DEFAULT_PLAN_HASH;
+}
+
+bool llama_turbot_plan_matches(const std::string & text, const std::vector<int32_t> & attn_layers, uint32_t kv_size,
+                               std::string & why, const std::string & source) {
+    llama_turbot_plan plan;
+    return llama_turbot_plan_parse_impl(text, source, attn_layers, kv_size, plan, why, /*quiet =*/ true);
+}
+
+llama_turbot_plan_source llama_turbot_plan_get_source() {
+    std::string value  = llama_turbot_get_plan_path();
+    std::string set_by = "--kv-tier-plan";
+    if (value.empty()) {
+        const char * LLAMA_TURBOT_PLAN = getenv("LLAMA_TURBOT_PLAN");
+        value  = LLAMA_TURBOT_PLAN ? LLAMA_TURBOT_PLAN : "";
+        set_by = "LLAMA_TURBOT_PLAN";
+    }
+
+    llama_turbot_plan_source src;
+    if (value.empty()) {
+        src.origin = LLAMA_TURBOT_PLAN_BUILTIN_AUTO;
+        src.name   = LLAMA_TURBOT_PLAN_BUILTIN_NAME;
+    } else if (value == LLAMA_TURBOT_PLAN_KEYWORD_DEFAULT) {
+        src.origin = LLAMA_TURBOT_PLAN_BUILTIN_FORCED;
+        src.name   = LLAMA_TURBOT_PLAN_BUILTIN_NAME;
+        src.set_by = set_by;
+    } else {
+        src.origin = LLAMA_TURBOT_PLAN_FILE;
+        src.path   = value;
+        src.name   = value;
+        src.set_by = set_by;
+    }
+
+    return src;
+}
+
+bool llama_turbot_plan_read(const llama_turbot_plan_source & src, std::string & text, std::string & err) {
+    if (src.origin == LLAMA_TURBOT_PLAN_FILE) {
+        return llama_turbot_plan_read_file(src.path, text, err);
+    }
+
+    text = LLAMA_TURBOT_DEFAULT_PLAN_TEXT;
+    err.clear();
+
+    return true;
+}
+
+bool llama_turbot_plan_load(const std::vector<int32_t> & attn_layers, uint32_t kv_size, llama_turbot_plan & plan, std::string & err) {
+    const llama_turbot_plan_source src = llama_turbot_plan_get_source();
+
+    std::string text;
+    if (!llama_turbot_plan_read(src, text, err)) {
+        return false;
+    }
+
+    llama_turbot_plan res;
+    if (!llama_turbot_plan_parse_impl(text, src.name, attn_layers, kv_size, res, err)) {
+        if (src.origin != LLAMA_TURBOT_PLAN_FILE) {
+            err += format(" (the built-in plan was calibrated on %s and covers attention layers %s; for this model pass "
+                          "--kv-tier-plan <file> with a plan for its layers, or use -ctk turbo5p -ctv turbo5p)",
+                          LLAMA_TURBOT_DEFAULT_PLAN_MODEL, LLAMA_TURBOT_DEFAULT_PLAN_LAYERS);
+        }
+        return false;
+    }
+    res.path = src.name;
+
+    if (src.origin == LLAMA_TURBOT_PLAN_BUILTIN_AUTO) {
+        LLAMA_LOG_INFO("%s: turbot: no --kv-tier-plan or LLAMA_TURBOT_PLAN given, using the built-in default plan "
+                       "(%s, calibrated on %s)\n", __func__, LLAMA_TURBOT_DEFAULT_PLAN_FILE, LLAMA_TURBOT_DEFAULT_PLAN_MODEL);
+    } else if (src.origin == LLAMA_TURBOT_PLAN_BUILTIN_FORCED) {
+        LLAMA_LOG_INFO("%s: turbot: %s: using the built-in default plan (%s, calibrated on %s)\n", __func__,
+                       src.set_by == "LLAMA_TURBOT_PLAN" ? "LLAMA_TURBOT_PLAN=" LLAMA_TURBOT_PLAN_KEYWORD_DEFAULT
+                                                         : "--kv-tier-plan " LLAMA_TURBOT_PLAN_KEYWORD_DEFAULT,
+                       LLAMA_TURBOT_DEFAULT_PLAN_FILE, LLAMA_TURBOT_DEFAULT_PLAN_MODEL);
+    }
+
+    plan = std::move(res);
 
     return true;
 }

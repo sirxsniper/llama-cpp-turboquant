@@ -531,7 +531,8 @@ static ggml_type ggml_type_from_name(const std::string & s) {
         return GGML_TYPE_TURBO5P_0;
     }
     // [TAG_TURBOT] tiered cache: GGML_TYPE_TURBOT_S8 is the "turbot requested" sentinel (common/arg.cpp); the per-layer
-    // types and the young pool come from the plan in env LLAMA_TURBOT_PLAN, since llama-bench has no --kv-tier-plan
+    // types and the young pool come from the plan in env LLAMA_TURBOT_PLAN, since llama-bench has no --kv-tier-plan.
+    // [TAG_TURBOT_EMBED_PLAN] without the env variable, the built-in default plan is used.
     if (s == "turbot") {
         return GGML_TYPE_TURBOT_S8;
     }
