@@ -12,6 +12,16 @@
 #include <limits>
 #include <map>
 #include <stdexcept>
+#include <cstdlib>
+
+// [TAG_XSEQ_PLANES] LLAMA_XSEQ_FIX=0 restores the old behaviour (snapshot rows of moved extra cells stay behind)
+static bool llama_xseq_fix_enabled() {
+    static const bool enabled = [] {
+        const char * e = getenv("LLAMA_XSEQ_FIX");
+        return !(e && e[0] == '0' && e[1] == '\0');
+    }();
+    return enabled;
+}
 
 //
 // llama_memory_recurrent
@@ -703,6 +713,22 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
         }
     }
 
+    // [TAG_XSEQ_PLANES] the gather above can move a cell that is not part of this ubatch (an "extra") to another row.
+    //   The graph copies only its main row (group 0). Its rollback snapshots (groups 1..n_rs_seq) stay in the old
+    //   row, which this ubatch then overwrites with its own snapshots. That is harmless unless the moved sequence
+    //   still needs them: a sequence whose verify tokens went into an EARLIER ubatch of the same batch (split_equal
+    //   emits it alone when the draft sizes differ, or defers others for n_keep_tail) gets moved here, and its
+    //   rollback after the verify then reads another sequence's snapshot. Count such moves so the graph also moves
+    //   the snapshot groups of the extra cells.
+    rs_n_mv = 0;
+    if (n_rs_seq > 0 && llama_xseq_fix_enabled()) {
+        for (int i = min + (int) n_seqs; i <= max; ++i) {
+            if (!cells[i].seq_id.empty() && cells[i].src0 >= 0 && cells[i].src0 != i) {
+                rs_n_mv++;
+            }
+        }
+    }
+
     // allow getting the range of used cells, from head to head + n
     head = min;
     n    = max - min + 1;
@@ -1321,4 +1347,22 @@ int32_t llama_memory_recurrent_context::s_copy(int i) const {
         }
     }
     return (int32_t)(idx * mem->size) + src0;
+}
+
+uint32_t llama_memory_recurrent_context::get_n_mv() const {
+    return is_full ? 0 : mem->rs_n_mv;
+}
+
+uint32_t llama_memory_recurrent_context::get_n_rs_seq() const {
+    return mem->n_rs_seq;
+}
+
+int32_t llama_memory_recurrent_context::s_copy_plane(int i, uint32_t plane) const {
+    const uint32_t cell_idx = i + mem->head;
+    const int32_t  src0     = mem->cells[cell_idx].src0;
+
+    GGML_ASSERT(plane >= 1 && plane <= mem->n_rs_seq);
+    GGML_ASSERT(src0 >= 0 && (uint32_t) src0 < mem->size);
+
+    return (int32_t)(plane * mem->size) + src0;
 }

@@ -331,9 +331,31 @@ void llm_graph_input_cls::set_input(const llama_ubatch * ubatch) {
     }
 }
 
-void llm_graph_input_rs::set_input(const llama_ubatch * ubatch) {
-    GGML_UNUSED(ubatch);
+// [TAG_XSEQ_PLANES] the snapshot groups of the extra cells are moved only when find_slot moved one of them
+static bool rs_planes_needed(const llama_memory_recurrent_context * mctx, uint32_t n_seqs) {
+    return mctx->get_n_mv() > 0 && mctx->get_n_rs_seq() > 0 && mctx->get_n_rs() > n_seqs;
+}
 
+static void rs_set_input_planes(ggml_tensor * s_copy_planes, const llama_memory_recurrent_context * mctx, uint32_t n_seqs) {
+    if (s_copy_planes == nullptr) {
+        return;
+    }
+
+    GGML_ASSERT(ggml_backend_buffer_is_host(s_copy_planes->buffer));
+    int32_t * data = (int32_t *) s_copy_planes->data;
+
+    const uint32_t n_extra  = mctx->get_n_rs() - n_seqs;
+    const uint32_t n_planes = mctx->get_n_rs_seq();
+    GGML_ASSERT((int64_t) n_extra*n_planes == s_copy_planes->ne[0]);
+
+    for (uint32_t p = 1; p <= n_planes; ++p) {
+        for (uint32_t e = 0; e < n_extra; ++e) {
+            data[(p - 1)*n_extra + e] = mctx->s_copy_plane((int) (n_seqs + e), p);
+        }
+    }
+}
+
+void llm_graph_input_rs::set_input(const llama_ubatch * ubatch) {
     const int64_t n_rs = mctx->get_n_rs();
 
     if (s_copy) {
@@ -344,6 +366,10 @@ void llm_graph_input_rs::set_input(const llama_ubatch * ubatch) {
         for (uint32_t i = 0; i < n_rs; ++i) {
             data[i] = mctx->s_copy(i);
         }
+    }
+
+    if (s_copy_planes != nullptr) {
+        rs_set_input_planes(s_copy_planes, mctx, ubatch->n_seqs);
     }
 }
 
@@ -361,6 +387,7 @@ bool llm_graph_input_rs::can_reuse(const llm_graph_params & params) {
 
     res &= head == mctx->get_head();
     res &= rs_z == mctx->get_rs_z();
+    res &= (s_copy_planes != nullptr) == rs_planes_needed(mctx, params.ubatch.n_seqs);
 
     return res;
 }
@@ -1163,6 +1190,10 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
             data[i] = mctx->get_recr()->s_copy(i);
         }
     }
+
+    if (inp_rs->s_copy_planes != nullptr) {
+        rs_set_input_planes(inp_rs->s_copy_planes, mctx->get_recr(), ubatch->n_seqs);
+    }
 }
 
 bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
@@ -1194,6 +1225,7 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
 
     res &= inp_rs->head == mctx->get_recr()->get_head();
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
+    res &= (inp_rs->s_copy_planes != nullptr) == rs_planes_needed(mctx->get_recr(), params.ubatch.n_seqs);
 
     return res;
 }
@@ -1217,6 +1249,10 @@ void llm_graph_input_mem_hybrid_k::set_input(const llama_ubatch * ubatch) {
             data[i] = mctx->get_recr()->s_copy(i);
         }
     }
+
+    if (inp_rs->s_copy_planes != nullptr) {
+        rs_set_input_planes(inp_rs->s_copy_planes, mctx->get_recr(), ubatch->n_seqs);
+    }
 }
 
 bool llm_graph_input_mem_hybrid_k::can_reuse(const llm_graph_params & params) {
@@ -1237,6 +1273,7 @@ bool llm_graph_input_mem_hybrid_k::can_reuse(const llm_graph_params & params) {
 
     res &= inp_rs->head == mctx->get_recr()->get_head();
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
+    res &= (inp_rs->s_copy_planes != nullptr) == rs_planes_needed(mctx->get_recr(), params.ubatch.n_seqs);
 
     return res;
 }
@@ -1291,6 +1328,10 @@ void llm_graph_input_mem_hybrid_iswa::set_input(const llama_ubatch * ubatch) {
             data[i] = mctx->get_recr()->s_copy(i);
         }
     }
+
+    if (inp_rs->s_copy_planes != nullptr) {
+        rs_set_input_planes(inp_rs->s_copy_planes, mctx->get_recr(), ubatch->n_seqs);
+    }
 }
 
 bool llm_graph_input_mem_hybrid_iswa::can_reuse(const llm_graph_params & params) {
@@ -1325,6 +1366,7 @@ bool llm_graph_input_mem_hybrid_iswa::can_reuse(const llm_graph_params & params)
 
     res &= inp_rs->head == mctx->get_recr()->get_head();
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
+    res &= (inp_rs->s_copy_planes != nullptr) == rs_planes_needed(mctx->get_recr(), params.ubatch.n_seqs);
 
     return res;
 }
@@ -3895,6 +3937,13 @@ static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
     inp->s_copy_main  = ggml_view_1d(ctx0, inp->s_copy, n_seqs, 0);
     inp->s_copy_extra = ggml_view_1d(ctx0, inp->s_copy, n_rs - n_seqs, n_seqs * inp->s_copy->nb[0]);
 
+    // [TAG_XSEQ_PLANES]
+    if (rs_planes_needed(mctx_cur, (uint32_t) n_seqs)) {
+        inp->s_copy_planes = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, (n_rs - n_seqs)*mctx_cur->get_n_rs_seq());
+        ggml_set_input(inp->s_copy_planes);
+        ggml_set_name(inp->s_copy_planes, "rs_s_copy_planes");
+    }
+
     inp->head = mctx_cur->get_head();
     inp->rs_z = mctx_cur->get_rs_z();
 
@@ -3917,9 +3966,34 @@ ggml_tensor * llm_graph_context::build_rs(
         const llm_graph_get_rows_fn & get_state_rows) const {
     const auto * kv_state = inp->mctx;
 
-    return build_rs(s, inp->s_copy_main, inp->s_copy_extra, state_size, n_seqs,
+    ggml_tensor * output_states = build_rs(s, inp->s_copy_main, inp->s_copy_extra, state_size, n_seqs,
                     kv_state->get_n_rs(), kv_state->get_head(), kv_state->get_size(), kv_state->get_rs_z(),
                     get_state_rows);
+
+    // [TAG_XSEQ_PLANES] move the snapshot groups of the extra cells along with their main rows. Inserted after the
+    //   main gather (an in-ubatch rollback may read a group row that an extra moves into) and before this layer's
+    //   snapshot writes (which overwrite the rows the extras moved out of), same ordering as the main extra copy.
+    if (inp->s_copy_planes != nullptr) {
+        const int64_t  n_extra  = (int64_t) kv_state->get_n_rs() - n_seqs;
+        const int64_t  n_planes = inp->s_copy_planes->ne[0] / n_extra;
+        const uint32_t rs_head  = kv_state->get_head();
+        const uint32_t rs_size  = kv_state->get_size();
+
+        GGML_ASSERT(n_extra > 0 && n_planes*n_extra == inp->s_copy_planes->ne[0]);
+
+        ggml_tensor * states = ggml_reshape_2d(ctx0, s, state_size, s->ne[1]);
+
+        for (int64_t p = 1; p <= n_planes; ++p) {
+            ggml_tensor * ids = ggml_view_1d(ctx0, inp->s_copy_planes, n_extra, (p - 1)*n_extra*inp->s_copy_planes->nb[0]);
+            ggml_tensor * rows = ggml_get_rows(ctx0, states, ids);
+            ggml_build_forward_expand(gf,
+                ggml_cpy(ctx0,
+                    rows,
+                    ggml_view_2d(ctx0, s, state_size, n_extra, s->nb[1], ((size_t) p*rs_size + rs_head + n_seqs)*s->nb[1])));
+        }
+    }
+
+    return output_states;
 }
 
 ggml_tensor * llm_graph_context::build_rwkv_token_shift_load(

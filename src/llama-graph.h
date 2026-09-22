@@ -276,6 +276,10 @@ public:
     ggml_tensor * s_copy_main;   // I32 [n_seqs]
     ggml_tensor * s_copy_extra;  // I32 [n_rs - n_seqs]
 
+    // [TAG_XSEQ_PLANES] snapshot-group sources of the extra cells, I32 [(n_rs - n_seqs)*n_rs_seq]
+    //   only present when find_slot moved an extra cell (rare), otherwise nullptr
+    ggml_tensor * s_copy_planes = nullptr;
+
     const llama_memory_recurrent_context * mctx;
 
     // used in view offsets, need to match for valid graph reuse

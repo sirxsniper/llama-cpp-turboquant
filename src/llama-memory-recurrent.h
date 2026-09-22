@@ -84,6 +84,12 @@ public:
     // first zero-ed state
     int32_t rs_z = -1;
 
+    // [TAG_XSEQ_PLANES] number of non-empty extra cells of the current ubatch (inside [head, head + n) but not part
+    //   of the ubatch) whose data row was moved by find_slot. The graph moves only their main row, so their
+    //   rollback snapshot rows (groups 1..n_rs_seq) must be moved as well, otherwise a pending rollback of that
+    //   sequence reads the snapshot another sequence wrote into the new row. 0 when LLAMA_XSEQ_FIX=0.
+    uint32_t rs_n_mv = 0;
+
     // TODO: optimize for recurrent state needs
     struct mem_cell {
         llama_pos pos  = -1;
@@ -176,6 +182,13 @@ public:
     ggml_tensor * get_p_l(int32_t il) const;
 
     int32_t s_copy(int i) const;
+
+    // [TAG_XSEQ_PLANES] extra cells whose data row moved in the current ubatch (0 -> no snapshot move needed)
+    uint32_t get_n_mv() const;
+    uint32_t get_n_rs_seq() const;
+
+    // source row of snapshot group `plane` (1..n_rs_seq) for cell i (relative to head); does not consume rs_idx
+    int32_t s_copy_plane(int i, uint32_t plane) const;
 
 private:
     const llama_memory_status status;

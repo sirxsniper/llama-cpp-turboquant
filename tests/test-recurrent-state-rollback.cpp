@@ -482,6 +482,155 @@ static int test_rollback(const common_params & params, llama_model * model, uint
     return 0;
 }
 
+// [TAG_XSEQ_PLANES] A sequence verified in an earlier ubatch of a batch and then moved as an "extra" cell by a later
+// multi-seq ubatch of the same batch must keep its rollback snapshots.
+//   prefill [B x8][A x8][C x8]           -> one ubatch, recurrent rows [B, A, C]
+//   verify  [A x4][B x6][C x6]           -> split_equal (n_keep_tail 4) emits [A x4] alone (B, C would keep 2 < 4),
+//                                           then [B x6, C x6], whose gather moves A from row 1 to row 2
+//   seq_rm(A, 9, -1)                     -> rollback 3, pending on the snapshot group 3 of A's (new) row
+//   replay  [A x4]                       -> must match a context where A only ever decoded the accepted token
+// Before the fix the snapshot groups stayed in row 1 (then overwritten by C) and the replay read C's old snapshot.
+static bool test_displaced_extra_rollback(const common_params & params, llama_model * model, uint8_t fill) {
+    const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+
+    constexpr uint32_t     n_rs_seq = 3;
+    constexpr uint32_t     n_prompt = 8;
+    constexpr uint32_t     n_verify = n_rs_seq + 1; // sampled token + 3 drafts
+    constexpr uint32_t     n_other  = 6;            // 2 left after the first 4 -> A is emitted alone
+    constexpr llama_seq_id seq_a    = 0;
+    constexpr llama_seq_id seq_b    = 1;
+    constexpr llama_seq_id seq_c    = 2;
+
+    const auto make_ctx_xseq = [&]() {
+        auto cparams = common_context_params_to_llama(params);
+        cparams.n_seq_max  = 3;
+        cparams.n_rs_seq   = n_rs_seq;
+        cparams.n_ctx      = 256;
+        cparams.n_batch    = 256;
+        cparams.n_ubatch   = 64;
+        cparams.kv_unified = true;
+        return init_ctx(model, cparams, fill);
+    };
+
+    llama_context * ctx_roll = make_ctx_xseq();
+    llama_context * ctx_ref  = make_ctx_xseq();
+    if (ctx_roll == nullptr || ctx_ref == nullptr) {
+        fprintf(stderr, "%s : failed to init contexts\n", __func__);
+        llama_free(ctx_roll);
+        llama_free(ctx_ref);
+        return false;
+    }
+
+    const auto cleanup = [&]() {
+        llama_free(ctx_roll);
+        llama_free(ctx_ref);
+    };
+
+    if (llama_n_rs_seq(ctx_roll) < n_rs_seq) {
+        fprintf(stderr, "%s : skipping because n_rs_seq is too small\n", __func__);
+        cleanup();
+        return true;
+    }
+
+    const auto tok = [&](llama_seq_id seq, llama_pos pos) {
+        return (llama_token) ((7*(uint32_t) pos + 31*(uint32_t) seq + 1) % (uint32_t) n_vocab);
+    };
+    // rejected drafts: tokens that differ from the replay tokens
+    const auto tok_bad = [&](llama_seq_id seq, llama_pos pos) {
+        return (llama_token) ((13*(uint32_t) pos + 5*(uint32_t) seq + 3) % (uint32_t) n_vocab);
+    };
+
+    bool ok = true;
+
+    // prefill, B first so that A ends up between B and C
+    {
+        llama_batch batch = llama_batch_init(3*n_prompt, 0, 1);
+        for (llama_seq_id s : { seq_b, seq_a, seq_c }) {
+            for (llama_pos pos = 0; pos < (llama_pos) n_prompt; ++pos) {
+                common_batch_add(batch, tok(s, pos), pos, { s }, false);
+            }
+        }
+        ok = ok && llama_decode(ctx_roll, batch) == 0;
+        ok = ok && llama_decode(ctx_ref,  batch) == 0;
+        llama_batch_free(batch);
+    }
+
+    // verify step: ctx_roll decodes A's sampled token plus 3 drafts, ctx_ref only the sampled token
+    const llama_pos p_a = n_prompt;
+    for (int which = 0; which < 2 && ok; ++which) {
+        llama_context * ctx = which == 0 ? ctx_roll : ctx_ref;
+        const uint32_t n_a = which == 0 ? n_verify : 1;
+
+        llama_batch batch = llama_batch_init(n_verify + 2*n_other, 0, 1);
+        for (uint32_t i = 0; i < n_a; ++i) {
+            const llama_pos pos = p_a + (llama_pos) i;
+            common_batch_add(batch, i == 0 ? tok(seq_a, pos) : tok_bad(seq_a, pos), pos, { seq_a }, true);
+        }
+        for (llama_seq_id s : { seq_b, seq_c }) {
+            for (uint32_t i = 0; i < n_other; ++i) {
+                const llama_pos pos = n_prompt + (llama_pos) i;
+                common_batch_add(batch, tok(s, pos), pos, { s }, i + 1 == n_other);
+            }
+        }
+        ok = llama_decode(ctx, batch) == 0;
+        llama_batch_free(batch);
+    }
+
+    // reject all 3 drafts of A
+    ok = ok && llama_memory_seq_rm(llama_get_memory(ctx_roll), seq_a, p_a + 1, -1);
+
+    if (!ok) {
+        fprintf(stderr, "%s : prefill/verify/rollback failed\n", __func__);
+        cleanup();
+        return false;
+    }
+
+    // replay A from the accepted position in both contexts
+    constexpr uint32_t n_replay = 4;
+    {
+        llama_batch batch = llama_batch_init(n_replay, 0, 1);
+        for (uint32_t i = 0; i < n_replay; ++i) {
+            const llama_pos pos = p_a + 1 + (llama_pos) i;
+            common_batch_add(batch, tok(seq_a, pos), pos, { seq_a }, true);
+        }
+        ok = llama_decode(ctx_roll, batch) == 0;
+        ok = ok && llama_decode(ctx_ref, batch) == 0;
+        llama_batch_free(batch);
+    }
+    if (!ok) {
+        fprintf(stderr, "%s : replay decode failed\n", __func__);
+        cleanup();
+        return false;
+    }
+
+    // the verify step used different ubatch shapes in the two contexts (A x4 alone vs A x1 in a 3-seq ubatch), so
+    // allow rounding noise; a foreign recurrent state gives an nmse of order 1e-1
+    constexpr double nmse_eps = 1e-4;
+
+    double nmse_max = 0.0;
+    for (uint32_t i = 0; i < n_replay; ++i) {
+        const float * l_roll = llama_get_logits_ith(ctx_roll, i);
+        const float * l_ref  = llama_get_logits_ith(ctx_ref,  i);
+        if (l_roll == nullptr || l_ref == nullptr) {
+            fprintf(stderr, "%s : missing logits at replay index %u\n", __func__, i);
+            cleanup();
+            return false;
+        }
+        nmse_max = std::max(nmse_max, nmse(l_ref, l_roll, n_vocab));
+    }
+
+    if (!(nmse_max <= nmse_eps)) {
+        fprintf(stderr, "%s : rollback of a sequence moved as an extra cell read a foreign snapshot (nmse %g)\n",
+                __func__, nmse_max);
+        cleanup();
+        return false;
+    }
+
+    fprintf(stderr, "%s : moved extra cell kept its rollback snapshots (nmse %g)\n", __func__, nmse_max);
+    cleanup();
+    return true;
+}
+
 int main(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
 
@@ -512,6 +661,9 @@ int main(int argc, char ** argv) {
     for (uint8_t fill : { 0, 0x3e }) {
         fprintf(stderr, "%s : testing with cache fill 0x%02x\n", __func__, fill);
         if (test_rollback(params, model, fill) != 0) {
+            return 1;
+        }
+        if (!test_displaced_extra_rollback(params, model, fill)) {
             return 1;
         }
     }
