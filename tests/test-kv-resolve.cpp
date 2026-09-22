@@ -555,13 +555,20 @@ static void test_ornith_9b() {
     TCHECK(g_plan_chosen == 0, "Ornith-9B MTP: a plan was chosen (%s)", kind_name(g_plan_kind));
 }
 
-// [TAG_TURBOT_ANY_RESOLVE] Ornith-1.5-35B: 2 x 256 (512-element rows), automatic plan in the turbo5p512 budget
+// [TAG_TURBOT_ANY_RESOLVE] Ornith-1.5-35B: 2 x 256 (512-element rows). 256 x 2 left the validated list (G5 failed on
+// this model, 2026-09-22): turbo5p512 by default, the automatic plan in the turbo5p512 budget with AUTO_PLAN=all
 static void test_ornith_35b() {
     reset_env();
 
-    const auto r = resolve("Ornith-1.5-35B turbot (10 layers, 2 x 256)", ornith_35b(T_TURBOT, T_TURBOT));
-    TCHECK(is_pair(r, T_TURBOT, T_TURBOT) && r.steps.empty(), "Ornith-35B: %s/%s", tn(r.type_k), tn(r.type_v));
+    const auto r0 = resolve("Ornith-1.5-35B turbot (10 layers, 2 x 256)", ornith_35b(T_TURBOT, T_TURBOT));
+    TCHECK(is_pair(r0, T_5P512, T_5P512) && r0.steps.size() == 1, "Ornith-35B: %s/%s", tn(r0.type_k), tn(r0.type_v));
+    TCHECK(has_step(r0, 'B', T_TURBOT, T_5P, "not validated for an automatic plan"), "Ornith-35B: the step names the validated list");
+
+    set_env("LLAMA_TURBOT_AUTO_PLAN", "all");
+    const auto r = resolve("Ornith-1.5-35B turbot, AUTO_PLAN=all", ornith_35b(T_TURBOT, T_TURBOT));
+    TCHECK(is_pair(r, T_TURBOT, T_TURBOT) && r.steps.empty(), "Ornith-35B AUTO_PLAN=all: %s/%s", tn(r.type_k), tn(r.type_v));
     TCHECK(g_plan_chosen > 0 && g_plan_kind == LLAMA_TURBOT_PLAN_KIND_AUTO, "Ornith-35B plan: %s", kind_name(g_plan_kind));
+    reset_env();
 
     set_env("LLAMA_TURBOT_ANY", "0");
     llama_kv_resolve_input in = ornith_35b(T_TURBOT, T_TURBOT);
@@ -615,11 +622,18 @@ static void test_spark_4b() {
 static void test_spark_1_7b() {
     reset_env();
 
-    // turbot on the full-attention layers; the SWA layers take turbo5p, which runs as turbo5p512 on these rows
-    const auto r = resolve("Spark-X2.5-1.7B turbot (iSWA, 2 x 256)", spark_1_7b(T_TURBOT, T_TURBOT));
+    // 256 x 2 is not on the validated list: turbo5p512 by default, no iSWA split (the SWA layers take the same type)
+    const auto r0 = resolve("Spark-X2.5-1.7B turbot (iSWA, 2 x 256)", spark_1_7b(T_TURBOT, T_TURBOT));
+    TCHECK(is_pair(r0, T_5P512, T_5P512) && has_step(r0, 'B', T_TURBOT, T_5P, "not validated for an automatic plan"),
+           "Spark 1.7B: %s/%s SWA %s/%s", tn(r0.type_k), tn(r0.type_v), tn(r0.type_k_swa), tn(r0.type_v_swa));
+
+    // AUTO_PLAN=all: turbot on the full-attention layers; the SWA layers take turbo5p, which runs as turbo5p512 on these rows
+    set_env("LLAMA_TURBOT_AUTO_PLAN", "all");
+    const auto r = resolve("Spark-X2.5-1.7B turbot, AUTO_PLAN=all", spark_1_7b(T_TURBOT, T_TURBOT));
     TCHECK(is_pair(r, T_TURBOT, T_TURBOT, T_5P512, T_5P512), "Spark 1.7B: %s/%s SWA %s/%s",
            tn(r.type_k), tn(r.type_v), tn(r.type_k_swa), tn(r.type_v_swa));
     TCHECK(r.steps_swa.empty(), "Spark 1.7B: the 512 swap is not a downgrade");
+    reset_env();
 
     // turbo5p asked directly: the same swap, no warning
     const auto r2 = llama_kv_resolve(spark_1_7b(T_5P, T_5P));
@@ -634,6 +648,7 @@ static void test_spark_1_7b() {
     TCHECK(is_pair(r4, T_4, T_4), "Spark 1.7B turbo4p/turbo5p: %s/%s", tn(r4.type_k), tn(r4.type_v));
 
     // SWA_TYPE=turbo4p on 512-element rows: the SWA layers step down to turbo4 with a warning
+    set_env("LLAMA_TURBOT_AUTO_PLAN", "all");
     set_env("LLAMA_TURBOT_SWA_TYPE", "turbo4p");
     const auto r5 = resolve("Spark-X2.5-1.7B turbot, SWA_TYPE=turbo4p", spark_1_7b(T_TURBOT, T_TURBOT));
     TCHECK(is_pair(r5, T_TURBOT, T_TURBOT, T_4, T_4) && has_step(r5.steps_swa, 'B', T_4P, T_4, "1024"),

@@ -92,10 +92,11 @@ llama_turbot_switches llama_turbot_read_switches() {
 }
 
 bool llama_turbot_auto_geom_validated(int head_dim, int n_head_kv) {
-    // head dim x KV heads that an automatic plan was validated on (turbot_guard.py G5 runs)
+    // head dim x KV heads that an automatic plan was validated on (turbot_guard.py G5 runs). 256 x 2 failed G5 on
+    // Ornith-1.5-35B (2026-09-22, prose 32K x 8: turbot KLD 0.0884 against turbo5p512 0.0702, p99.9 worse), so those
+    // models keep turbo5p512 unless LLAMA_TURBOT_AUTO_PLAN=all.
     static constexpr int validated[][2] = {
         { 256, 4 },
-        { 256, 2 },
     };
     for (const auto & v : validated) {
         if (v[0] == head_dim && v[1] == n_head_kv) {

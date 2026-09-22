@@ -59,7 +59,7 @@ LLAMA_API bool llama_turbot_plan_parse_file(const std::string & path, const std:
 //      the same attention layers stop here, bit-identical to the plan before this change.
 //   4. the automatic plan (llama_turbot_plan_auto_text), only with shape.auto_ok (the main context, resolver on), the
 //      switch LLAMA_TURBOT_AUTO_PLAN on, and every layer geometry allowed: the validated list
-//      (llama_turbot_auto_geom_validated: 256x4, 256x2 as head dim x KV heads), every supported geometry with
+//      (llama_turbot_auto_geom_validated: 256x4 as head dim x KV heads), every supported geometry with
 //      LLAMA_TURBOT_AUTO_PLAN=all, and the one-run geometries (128x2, 256x1) with LLAMA_TURBOT_AUTO_BUDGET=turbo5p.
 //
 
@@ -159,8 +159,8 @@ struct llama_turbot_switches {
 
 LLAMA_API llama_turbot_switches llama_turbot_read_switches();
 
-// the geometries an automatic plan is validated on without LLAMA_TURBOT_AUTO_PLAN=all: 256x4 and 256x2 (head dim x KV
-// heads). A constexpr table.
+// the geometries an automatic plan is validated on without LLAMA_TURBOT_AUTO_PLAN=all: 256x4 (head dim x KV heads);
+// 256x2 failed G5 on Ornith-1.5-35B. A constexpr table.
 LLAMA_API bool llama_turbot_auto_geom_validated(int head_dim, int n_head_kv);
 
 // the fallback type whose bytes an automatic plan must fit, by row values: TURBO5P_0 if row % 1024 == 0, TURBO5P512_0 if

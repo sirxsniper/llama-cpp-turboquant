@@ -2096,7 +2096,7 @@ static void test_any_plan_parser() {
         TCHECK(s2.any && !s2.auto_plan && !s2.sidecar && !s2.iswa && !s2.multi_stream, "single switches off");
         reset_turbot_env();
 
-        TCHECK(llama_turbot_auto_geom_validated(256, 4) && llama_turbot_auto_geom_validated(256, 2) &&
+        TCHECK(llama_turbot_auto_geom_validated(256, 4) && !llama_turbot_auto_geom_validated(256, 2) &&
                !llama_turbot_auto_geom_validated(256, 1) && !llama_turbot_auto_geom_validated(128, 8) &&
                !llama_turbot_auto_geom_validated(128, 4) && !llama_turbot_auto_geom_validated(128, 2), "validated geometries");
         TCHECK(llama_turbot_budget_type(1024) == GGML_TYPE_TURBO5P_0 && llama_turbot_budget_type(2048) == GGML_TYPE_TURBO5P_0 &&
@@ -2247,8 +2247,13 @@ static void test_plan_choose() {
             "Ornith-9B: kind %d (%s)", (int) c.kind, why.c_str());
     TCHECK(!choose(ornith_draft) && why.find("main context") != std::string::npos && why.find(LLAMA_TURBOT_PLAN_BUILTIN_NAME) != std::string::npos,
             "Ornith-9B draft: '%s'", why.c_str());
+    // 256x2 left the validated list (G5 failed on Ornith-1.5-35B, 2026-09-22): no automatic plan unless AUTO_PLAN=all
+    TCHECK(!choose(shape_of(il_range(3, 39, 4), 256, 2, 262144, 1, 1, true)) && why.find("not validated") != std::string::npos,
+            "Ornith-35B (256x2, not validated): '%s'", why.c_str());
+    set_env("LLAMA_TURBOT_AUTO_PLAN", "all");
     TCHECK(choose(shape_of(il_range(3, 39, 4), 256, 2, 262144, 1, 1, true)) && c.kind == LLAMA_TURBOT_PLAN_KIND_AUTO && c.text == AUTO_ORNITH35,
-            "Ornith-35B (256x2, validated): kind %d (%s)", (int) c.kind, why.c_str());
+            "Ornith-35B (256x2, AUTO_PLAN=all): kind %d (%s)", (int) c.kind, why.c_str());
+    set_env("LLAMA_TURBOT_AUTO_PLAN", nullptr);
 
     set_env("LLAMA_TURBOT_AUTO_PLAN", "0");
     TCHECK(!choose(ornith) && why.find("LLAMA_TURBOT_AUTO_PLAN=0") != std::string::npos, "AUTO_PLAN=0: '%s'", why.c_str());

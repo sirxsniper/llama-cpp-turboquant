@@ -56,7 +56,7 @@ REPO = os.path.normpath(os.path.join(HERE, "..", ".."))
 # (head dim, KV heads) -> flags
 GEOM_FLAGS = {(256, 4): 0, (256, 2): 1, (256, 1): 2, (128, 8): 4, (128, 4): 5, (128, 2): 6}
 # validated for an automatic plan without LLAMA_TURBOT_AUTO_PLAN=all (llama_turbot_auto_geom_validated)
-AUTO_VALIDATED = {(256, 4), (256, 2)}
+AUTO_VALIDATED = {(256, 4)}   # (256, 2) failed G5 on Ornith-1.5-35B, 2026-09-22
 # fallback KV types: (bytes per block, values per block)
 BUDGET_TYPES = {"turbo5p": (656, 1024), "turbo5p512": (336, 512), "turbo4": (68, 128)}   # ggml type_size / blck_size
 
