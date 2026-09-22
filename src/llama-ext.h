@@ -156,6 +156,12 @@ LLAMA_API int32_t llama_memory_attn_n_free_ext(struct llama_context * ctx, llama
 // [TAG_TURBOT_EMBED_PLAN] "default" selects the built-in plan; with neither set, the built-in plan is used when it fits.
 LLAMA_API void llama_turbot_set_plan_path(const char * path);
 
+// [TAG_TURBOT_ANY_SIDECAR] Process-wide path of the model's sidecar plan (<model>.turbot.plan), set by common when the file
+// exists and neither --kv-tier-plan nor LLAMA_TURBOT_PLAN is given. It is used only when it carries a '# verified:' stamp
+// and a '# model:' fingerprint equal to the model's (tools/turbot/turbot_guard.py writes both), and loses to an explicit
+// plan. LLAMA_TURBOT_SIDECAR=0 (or LLAMA_TURBOT_ANY=0) ignores it. nullptr or "" clears it.
+LLAMA_API void llama_turbot_set_sidecar_path(const char * path);
+
 // retrieves the whole token embedding matrix in F32 format (n_embd * n_vocab)
 // returns total number of elements or 0 on error
 // if out is nullptr, returns the number of tokens without writing to out

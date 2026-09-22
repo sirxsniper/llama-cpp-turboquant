@@ -2527,11 +2527,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"--kv-tier-plan"}, "FNAME",
         "turbot tiered KV cache plan: per-head old widths (L lines), optional young widths (Y), young pool (POOL) and\n"
         "per-sequence young cap (CAP). 'default' selects the built-in plan (docs/turbot/plans/turbot-default.plan,\n"
-        "calibrated on Qwen3.8-27B); use './default' for a file named default. Without this flag and without env\n"
-        "LLAMA_TURBOT_PLAN, -ctk turbot -ctv turbot uses the built-in plan if it fits the model's attention layers",
+        "calibrated on Qwen3.8-27B); 'auto' an automatic, uncalibrated plan for the model's attention layers (old\n"
+        "widths 4/5, young 7, sized to the bytes of the fallback type); use './default' or './auto' for files of\n"
+        "those names. Without this flag and without env LLAMA_TURBOT_PLAN, -ctk turbot -ctv turbot uses, in order:\n"
+        "the sidecar <model>.turbot.plan when it is verified for this model (tools/turbot/turbot_guard.py), the\n"
+        "built-in plan if it fits the model's attention layers, else an automatic plan for validated head shapes",
         [](common_params & params, const std::string & value) {
             // [TAG_TURBOT] [TAG_TURBOT_EMBED_PLAN] "default" is passed through: libllama resolves it
             // (llama_turbot_plan_get_source), so LLAMA_TURBOT_PLAN=default behaves the same
+            // [TAG_TURBOT_ANY_PLAN] so is "auto" (llama_turbot_plan_choose)
             params.kv_tier_plan = value;
         }
     ).set_env("LLAMA_ARG_KV_TIER_PLAN"));

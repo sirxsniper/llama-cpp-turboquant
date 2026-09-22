@@ -20,6 +20,7 @@ struct triattention_config;
 class  llama_kv_tier;
 struct llama_turbot_plan;
 struct ggml_turbot_op_params;
+struct ggml_turbot_layer;
 
 //
 // llama_kv_cache
@@ -282,17 +283,22 @@ public:
     // is_turbot(); no other cache type reaches any of it.
     //
 
-    bool is_turbot() const { return turbot_tier != nullptr; }
+    bool is_turbot() const { return !turbot_tier.empty(); }
 
-    const llama_kv_tier     * get_turbot_tier() const { return turbot_tier.get(); }
+    // [TAG_TURBOT_ANY_STREAMS] one tier per KV stream
+    const llama_kv_tier     * get_turbot_tier(uint32_t strm = 0) const { return turbot_tier[strm].get(); }
     const llama_turbot_plan * get_turbot_plan() const { return turbot_plan.get(); }
 
-    uint32_t get_turbot_n_granules() const;
+    uint32_t get_turbot_n_granules() const;   // per stream: kv_size / 64
 
-    // young pool of layer il: I8 [pool_row_bytes, max(POOL, 64)]
+    // [TAG_TURBOT_ANY_STREAMS] fill entries of the streams of sinfo (their last begin_ubatch)
+    int64_t  get_turbot_n_fill(const slot_info & sinfo) const;
+
+    // young pool of layer il: I8 [pool_row_bytes, max(POOL, 64)]; stream s owns rows [s*POOL_s, (s+1)*POOL_s)
     ggml_tensor * get_turbot_pool(int32_t il) const;
 
-    // op params of layer il for side GGML_TURBOT_SIDE_K, _V or _BOTH
+    // op params of layer il for side GGML_TURBOT_SIDE_K, _V or _BOTH ([TAG_TURBOT_ANY_GEOM] a reused layer takes the
+    // plan entry of the layer that owns its KV)
     void get_turbot_op_params(int32_t il, int side, ggml_turbot_op_params & params) const;
 
     // the writer op that replaces cpy_k / cpy_v: base code always, refinement for rows with a young pool row
@@ -301,13 +307,15 @@ public:
     ggml_tensor * turbot_cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, ggml_tensor * young, ggml_tensor * fill, int32_t il) const;
 
     // ubatch lifecycle (SPEC 9.6): begin from llama_kv_cache_context::apply(), commit after a successful compute,
-    // abort after a failed one (before the failure seq_rm)
+    // abort after a failed one (before the failure seq_rm). [TAG_TURBOT_ANY_STREAMS] begin runs the tier of every stream
+    // of sinfo on its rows; commit and abort run on the streams of the last begin only.
     void turbot_begin_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch);
     void turbot_commit_ubatch();
     void turbot_abort_ubatch();
 
-    // granule table, young rows and fill list of the current ubatch (host buffers)
-    void set_input_turbot(ggml_tensor * gtab, ggml_tensor * young, ggml_tensor * fill) const;
+    // granule table, young rows and fill list of the current ubatch (host buffers). [TAG_TURBOT_ANY_STREAMS] gtab covers
+    // the view streams sinfo.s0..s1, stream-major; every value is global (llama-kv-tier.h, llama_turbot_streams_*)
+    void set_input_turbot(ggml_tensor * gtab, ggml_tensor * young, ggml_tensor * fill, const slot_info & sinfo) const;
 
 private:
     const llama_model & model;
@@ -326,6 +334,9 @@ private:
 
         // [TAG_TURBOT] young pool of the layer, nullptr for every other cache type
         ggml_tensor * pool = nullptr;
+
+        // [TAG_TURBOT_ANY_STREAMS] rows [s*POOL_s, (s+1)*POOL_s) of the pool, one view per stream; empty with one stream
+        std::vector<ggml_tensor *> pool_stream;
     };
 
     bool v_trans = true;  // the value tensor is transposed
@@ -392,12 +403,26 @@ private:
     // TriAttention eviction state (nullptr if not enabled)
     triattention_state * triattention_st = nullptr;
 
-    // [TAG_TURBOT] plan and tier state of a turbot cache, both nullptr for every other cache type
+    // [TAG_TURBOT] plan and tier state of a turbot cache, nullptr / empty for every other cache type
     std::unique_ptr<llama_turbot_plan> turbot_plan;
-    std::unique_ptr<llama_kv_tier>     turbot_tier;
+
+    // [TAG_TURBOT_ANY_STREAMS] one tier per stream (POOL_s = POOL / n_stream rows each, same CAP); one entry with one stream
+    std::vector<std::unique_ptr<llama_kv_tier>> turbot_tier;
+
+    // [TAG_TURBOT_ANY_STREAMS] pool rows per stream (POOL with one stream)
+    uint32_t turbot_pool_s = 0;
+
+    // [TAG_TURBOT_ANY_STREAMS] slot_info::strm of the last turbot_begin_ubatch: the streams commit and abort run on
+    std::vector<llama_seq_id> turbot_cur_strm;
 
     // [TAG_TURBOT] seq_rm with the tier hooks (SPEC 9.7); p0/p1 already normalised
     bool seq_rm_turbot(llama_seq_id seq_id, llama_pos p0, llama_pos p1);
+
+    // [TAG_TURBOT_ANY_STREAMS] seq_rm_turbot on one stream
+    void seq_rm_turbot_stream(uint32_t strm, llama_seq_id seq_id, llama_pos p0, llama_pos p1);
+
+    // [TAG_TURBOT_ANY_GEOM] the plan entry of layer il: the layer that owns its KV (map_layer_ids, reused layers)
+    const ggml_turbot_layer & turbot_layer_of(int32_t il) const;
 
     ggml_tensor * turbot_cpy(ggml_context * ctx, ggml_tensor * cur, ggml_tensor * idxs, ggml_tensor * young, ggml_tensor * fill, int32_t il, int side) const;
 
@@ -535,7 +560,8 @@ public:
 
     // [TAG_TURBOT] see llama_kv_cache
     bool    is_turbot() const;
-    int64_t get_turbot_n_granules() const;
+    int64_t get_turbot_n_stream() const;     // [TAG_TURBOT_ANY_STREAMS] KV streams of the current ubatch's view (s1 - s0 + 1)
+    int64_t get_turbot_n_granules() const;   // granule table entries: kv_size / 64 per stream, times get_turbot_n_stream()
     int64_t get_turbot_n_fill() const;   // fill entries of the current ubatch, 0 outside a batch processing context
 
     ggml_tensor * get_turbot_pool(int32_t il) const;

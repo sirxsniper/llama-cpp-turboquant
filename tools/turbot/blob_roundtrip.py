@@ -17,10 +17,19 @@
 #   refuse_t5_into_t  save a slot on a turbo5p server, restore it on a turbot server: the restore fails cleanly, the server
 #                     stays healthy and still answers, the log names the type mismatch
 #   refuse_t_into_t5  the reverse
+#   streams_equal     [TAG_TURBOT_ANY_STREAMS] the same greedy prompt on slot 0 of a --kv-unified server and on slot 2 of a
+#                     server with one KV stream per slot (-np N --no-kv-unified): tokens identical (below the per-stream
+#                     young quota every cell is young in both, and stream 2 exercises every per-stream offset)
 #
 # The server command comes from the Jarvis production profile through the scratchpad harness (acceptab.build_cmd_and_env,
 # port 8091) when --harness-dir holds it, otherwise from a minimal command (-np 4 --kv-unified -c 262144 -fa on). The cache
 # type and plan are forced here; the last -ctk/-ctv on the command line wins.
+#
+# [TAG_TURBOT_ANY_STREAMS] --np N sets the slot count, --non-unified runs every arm with one KV stream per slot
+# (--no-kv-unified; turbot keeps one tier per stream unless LLAMA_TURBOT_MULTI_STREAM=0):
+#   python tools/turbot/blob_roundtrip.py --exe <build>/bin/llama-server.exe --np 4 --non-unified
+# Every turbot server must log its "turbot plan" line: a server that fell back to another KV type fails the arm instead
+# of testing that type.
 import argparse
 import json
 import os
@@ -59,7 +68,8 @@ def http(path, body=None, timeout=3600):
             return e.code, {}
 
 
-def base_cmd(args):
+def base_cmd(args, unified=None):
+    """unified: None keeps the profile's KV layout (or --non-unified), True / False force --kv-unified / --no-kv-unified."""
     try:
         sys.path.insert(0, args.harness_dir)
         import acceptab as A  # noqa: E402
@@ -70,27 +80,46 @@ def base_cmd(args):
         cmd = [args.exe, "-m", args.model, "-ngl", "999", "-fa", "on", "-c", "262144", "-np", "4", "--kv-unified",
                "-b", "2048", "-ub", "512", "--host", "127.0.0.1"]
         env = dict(os.environ)
+    if unified is None and args.non_unified:
+        unified = False
+    drop2 = ["--port", "-ctk", "-ctv", "--cache-type-k", "--cache-type-v", "--kv-tier-plan", "--slot-save-path"]
+    drop1 = []
+    if args.np is not None:
+        drop2 += ["-np", "--parallel"]
+    if unified is not None:
+        drop1 += ["-kvu", "--kv-unified", "-no-kvu", "--no-kv-unified"]
     out, i = [], 0
-    while i < len(cmd):                       # drop any port / cache type / plan the profile sets
-        if cmd[i] in ("--port", "-ctk", "-ctv", "--cache-type-k", "--cache-type-v", "--kv-tier-plan", "--slot-save-path"):
+    while i < len(cmd):                       # drop any port / cache type / plan / layout the profile sets
+        if cmd[i] in drop2:
             i += 2
+            continue
+        if cmd[i] in drop1:
+            i += 1
             continue
         out.append(cmd[i])
         i += 1
+    if args.np is not None:
+        out += ["-np", str(args.np)]
+    if unified is not None:
+        out += ["--kv-unified" if unified else "--no-kv-unified"]
+        env = dict(env)
+        env.pop("LLAMA_ARG_KV_UNIFIED", None)
     return out + ["--port", str(PORT)], env
 
 
 class Server:
-    def __init__(self, args, kv, extra_env=None, tag="srv"):
+    def __init__(self, args, kv, extra_env=None, tag="srv", unified=None):
         self.args, self.kv, self.tag = args, kv, tag
         self.extra_env = extra_env or {}
+        self.unified = unified
+        self.streams_line = ""
         self.p = None
         self.log_path = os.path.join(args.work, "%s_%s.log" % (tag, kv))
 
     def __enter__(self):
         if busy():
             raise SystemExit("REFUSED: a llama/ggml process is already running: %s" % busy())
-        cmd, env = base_cmd(self.args)
+        cmd, env = base_cmd(self.args, self.unified)
         cmd += ["-ctk", self.kv, "-ctv", self.kv, "--slot-save-path", self.args.work + os.sep]
         if self.kv == "turbot":
             cmd += ["--kv-tier-plan", self.args.plan]
@@ -103,14 +132,32 @@ class Server:
         while time.time() - t0 < 900:
             if self.p.poll() is not None:
                 raise RuntimeError("server exited with %s, see %s" % (self.p.returncode, self.log_path))
+            ready = False
             try:
                 st, js = http("/health", timeout=3)
-                if st == 200:
-                    return self
+                ready = st == 200
             except Exception:
                 pass
+            if ready:
+                try:
+                    self.check_kv()
+                except RuntimeError:
+                    self.__exit__()
+                    raise
+                return self
             time.sleep(3)
         raise RuntimeError("server not ready after 900 s")
+
+    def check_kv(self):
+        """[TAG_TURBOT_ANY_STREAMS] a turbot server that silently runs another KV type would test that type"""
+        if self.kv != "turbot":
+            return
+        log = self.log_text()
+        if "turbot plan " not in log:
+            down = re.findall(r"KV cache type for [^\n]*", log)
+            raise RuntimeError("turbot server has no 'turbot plan' line (downgraded: %s), see %s" % (down[:2], self.log_path))
+        m = re.search(r"turbot plan .*young pool \d+ cells \(\d+ granules\)(, \d+ streams x \d+ cells)?", log)
+        self.streams_line = m.group(1) if m and m.group(1) else ""
 
     def __exit__(self, *exc):
         if self.p and self.p.poll() is None:
@@ -215,6 +262,19 @@ def arm_park_resume(args):
            "tokens %s, parks %d, resumes %d" % ("identical" if toks == ref else "DIFFER", parks, resumes))
 
 
+def arm_streams_equal(args):
+    n_tok = min(args.prompt_tokens, 12000)    # below the per-stream quota of POOL / n_stream - 128 cells
+    text = prompt(51, n_tok, "INDIGO-MARTEN-7710")
+    with Server(args, "turbot", tag="streams_unified", unified=True):
+        ref, _, _ = complete(text, 0, n_predict=128)
+    with Server(args, "turbot", tag="streams_split", unified=False) as srv:
+        toks, _, _ = complete(text, 2, n_predict=128)
+        streams = srv.streams_line
+    record("streams_equal", toks == ref and streams != "",
+           "%d prompt tokens, unified slot 0 vs per-stream slot 2: tokens %s, stream split logged: %s" % (
+               n_tok, "identical" if toks == ref else "DIFFER", streams.strip(", ") or "NO (not multi-stream)"))
+
+
 def arm_refuse(args, src_kv, dst_kv, name):
     fname = "blob_%s.bin" % src_kv
     with Server(args, src_kv, tag=name + "_src"):
@@ -246,6 +306,8 @@ def main():
     ap.add_argument("--prompt-tokens", type=int, default=20000)
     ap.add_argument("--work", default=None, help="directory for slot files and server logs (default: a temp dir on E: if present)")
     ap.add_argument("--only", default="", help="comma list of arms")
+    ap.add_argument("--np", type=int, default=None, help="slots (-np); default: the profile's (4)")
+    ap.add_argument("--non-unified", action="store_true", help="one KV stream per slot (--no-kv-unified) in every arm")
     args = ap.parse_args()
     if args.work is None:
         root = "E:/" if os.path.isdir("E:/") else None
@@ -262,6 +324,7 @@ def main():
         "park_resume": lambda: arm_park_resume(args),
         "refuse_t5_into_t": lambda: arm_refuse(args, "turbo5p", "turbot", "refuse_t5_into_t"),
         "refuse_t_into_t5": lambda: arm_refuse(args, "turbot", "turbo5p", "refuse_t_into_t5"),
+        "streams_equal": lambda: arm_streams_equal(args),
     }
     only = [a for a in args.only.split(",") if a]
     for name, fn in arms.items():

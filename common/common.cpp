@@ -10,7 +10,7 @@
 #include "speculative.h"
 #include "unicode.h"
 
-#include "../src/llama-ext.h" // [TAG_TURBOT] llama_turbot_set_plan_path
+#include "../src/llama-ext.h" // [TAG_TURBOT] llama_turbot_set_plan_path, [TAG_TURBOT_ANY_SIDECAR] llama_turbot_set_sidecar_path
 
 #include <algorithm>
 #include <cinttypes>
@@ -1295,6 +1295,31 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     // without the plan their refusal would read as a memory failure
     if (!params.kv_tier_plan.empty()) {
         llama_turbot_set_plan_path(params.kv_tier_plan.c_str());
+    }
+
+    // [TAG_TURBOT_ANY_SIDECAR] <model>.turbot.plan next to the model: libllama uses it only when it carries a '# verified:'
+    // stamp and a '# model:' fingerprint equal to this model's (tools/turbot/turbot_guard.py writes both), and says in one
+    // INFO line why when it does not. An explicit plan (--kv-tier-plan, LLAMA_TURBOT_PLAN) wins. LLAMA_TURBOT_SIDECAR=0 or
+    // LLAMA_TURBOT_ANY=0: not looked for. Set on every init, so a previous model's sidecar never carries over.
+    {
+        const auto env_is = [](const char * name, const char * value) {
+            const char * e = getenv(name);
+            return e != nullptr && strcmp(e, value) == 0;
+        };
+        const char * env_plan = getenv("LLAMA_TURBOT_PLAN");
+
+        std::string sidecar;
+        if (params.kv_tier_plan.empty() && (env_plan == nullptr || env_plan[0] == '\0') &&
+                !env_is("LLAMA_TURBOT_SIDECAR", "0") && !env_is("LLAMA_TURBOT_ANY", "0") && !params.model.path.empty()) {
+            const std::string path = params.model.path + ".turbot.plan";
+            std::error_code ec;
+            if (std::filesystem::is_regular_file(std::filesystem::path(path), ec)) {
+                sidecar = path;
+                COM_INF("%s: turbot: sidecar plan %s found (used only when its '# verified:' stamp and '# model:' fingerprint "
+                        "match this model)\n", __func__, path.c_str());
+            }
+        }
+        llama_turbot_set_sidecar_path(sidecar.empty() ? nullptr : sidecar.c_str());
     }
 
     auto mparams = common_model_params_to_llama(params);

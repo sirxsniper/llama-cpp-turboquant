@@ -146,7 +146,9 @@ llama_kv_cache::llama_kv_cache(
                 // upstream: 2 tensors per layer (K, V), plus one view per tensor per stream
                 // +3 for turbo rotation matrices (turbo_rotation + turbo_rotation_inv + turbo_innerq_scale_inv)
                 // [TAG_TURBOT] +1 young pool per layer for a turbot cache
-                /*.mem_size   =*/ size_t((2u*(1 + n_stream)*n_layer + 3 + (turbot_req ? n_layer : 0u))*ggml_tensor_overhead()),
+                // [TAG_TURBOT_ANY_STREAMS] + one pool view per stream per layer when there is more than one stream
+                /*.mem_size   =*/ size_t((2u*(1 + n_stream)*n_layer + 3 +
+                        (turbot_req ? n_layer*(n_stream > 1 ? 1 + n_stream : 1u) : 0u))*ggml_tensor_overhead()),
                 /*.mem_buffer =*/ NULL,
                 /*.no_alloc   =*/ true,
             };
@@ -243,7 +245,7 @@ llama_kv_cache::llama_kv_cache(
     }
 
     // [TAG_TURBOT] tiered KV cache: refusals, plan and tier state (docs/turbot/SPEC.md 9.3-9.5). Every later turbot
-    // branch in this file keys on turbot_plan / turbot_tier, which stay nullptr for every other cache type.
+    // branch in this file keys on turbot_plan (nullptr) / turbot_tier (empty, is_turbot()) for every other cache type.
     if (turbot_req) {
         const auto refuse = [](const std::string & msg) {
             throw std::runtime_error("turbot: " + msg);
@@ -270,7 +272,15 @@ llama_kv_cache::llama_kv_cache(
             refuse(why);
         }
 
-        std::vector<int32_t> attn_layers;
+        // [TAG_TURBOT_ANY_GEOM] the shape of this cache: head dim and KV heads of every attention layer it holds, the
+        // cells and the streams. llama_turbot_layer_refusal (llama-kv-cache-resolve.h) has checked K = V and a geometry
+        // turbot has a layout for (4 KV heads x 256 only with LLAMA_TURBOT_ANY=0).
+        llama_turbot_cache_shape shape;
+        shape.kv_size   = kv_size;
+        shape.n_stream  = n_stream;
+        shape.n_seq_max = n_seq_max;
+        shape.model     = &model;
+
         for (uint32_t il = 0; il < n_layer; il++) {
             if (!hparams.has_kv(il) || (filter && !filter(il))) {
                 continue;
@@ -282,21 +292,28 @@ llama_kv_cache::llama_kv_cache(
             if (!why.empty()) {
                 refuse(why);
             }
-            attn_layers.push_back((int32_t) il);
+            shape.layers.push_back({ (int32_t) il, (uint16_t) hparams.n_embd_head_k(il), (uint8_t) hparams.n_head_kv(il) });
         }
 
         // [TAG_TURBOT_EMBED_PLAN] plan source precedence (llama_turbot_plan_get_source): llama_turbot_set_plan_path
         // (--kv-tier-plan), then env LLAMA_TURBOT_PLAN, then the built-in default plan; "default" in either place selects
         // the built-in plan. A plan that does not name exactly attn_layers is refused here: code that wants to fall back
         // instead checks llama_turbot_plan_matches before the cache is built.
+        // [TAG_TURBOT_ANY_PLAN] llama_context chooses the plan (llama_turbot_plan_choose: file, sidecar, built-in,
+        // automatic) and hands it over in a llama_turbot_plan_scope; the loader parses that text against this shape.
         turbot_plan = std::make_unique<llama_turbot_plan>();
 
         std::string err;
-        if (!llama_turbot_plan_load(attn_layers, kv_size, *turbot_plan, err)) {
+        if (!llama_turbot_plan_load(shape, *turbot_plan, err)) {
             throw std::runtime_error(err);
         }
 
-        turbot_tier = std::make_unique<llama_kv_tier>(kv_size, turbot_plan->pool_cells, turbot_plan->cap_cells);
+        // [TAG_TURBOT_ANY_STREAMS] one tier per stream, each with POOL / n_stream young pool rows in whole granules and the
+        // plan's CAP. One stream: the one tier of before, with the whole pool.
+        turbot_pool_s = turbot_plan->pool_cells / n_stream / GGML_TURBOT_GRANULE * GGML_TURBOT_GRANULE;
+        for (uint32_t s = 0; s < n_stream; ++s) {
+            turbot_tier.push_back(std::make_unique<llama_kv_tier>(kv_size, turbot_pool_s, turbot_plan->cap_cells));
+        }
     }
 
     for (uint32_t il = 0; il < n_layer; il++) {
@@ -476,6 +493,13 @@ llama_kv_cache::llama_kv_cache(
             }
         }
 
+        // [TAG_TURBOT_ANY_GEOM] a turbot layer is a [1024, kv_size, n_stream] container whatever its runs: one 1024-element
+        // block of 32*S + 16 bytes holds the nr*256 values of a row (1024 = n_embd_k_gqa at 4 KV heads x 256)
+        if (turbot_plan) {
+            n_embd_k_gqa_eff = GGML_TURBOT_ROW_ELEMS;
+            n_embd_v_gqa_eff = GGML_TURBOT_ROW_ELEMS;
+        }
+
         // [TAG_TURBO4P] turbo4p_0 packs 8 WHT groups into one 1024-element block so that a
         // block base is 16-byte aligned. That only works if a whole row is an exact number
         // of blocks. Every other turbo type has a 128-element block and does not care.
@@ -534,6 +558,15 @@ llama_kv_cache::llama_kv_cache(
                     std::max<int64_t>(turbot_plan->pool_cells, GGML_TURBOT_POOL_MIN_ROWS));
             ggml_format_name(pool, "cache_%sturbot_young_l%d", name_tag, il);
             layers.back().pool = pool;
+
+            // [TAG_TURBOT_ANY_STREAMS] the slice of each stream, for the pool copy of a cross-stream seq_cp (update())
+            if (n_stream > 1 && turbot_pool_s > 0) {
+                for (uint32_t s = 0; s < n_stream; ++s) {
+                    ggml_tensor * ps = ggml_view_2d(ctx, pool, pool->ne[0], turbot_pool_s, pool->nb[1], (size_t) s*turbot_pool_s*pool->nb[1]);
+                    ggml_format_name(ps, "cache_%sturbot_young_l%d_s%u", name_tag, il, s);
+                    layers.back().pool_stream.push_back(ps);
+                }
+            }
         }
 
         // TurboQuant: create rotation matrix tensors (once, shared across layers)
@@ -624,19 +657,24 @@ llama_kv_cache::llama_kv_cache(
 
         size_t memory_size_pool = 0;
         int    sum_s            = 0;
+        int    sum_runs         = 0;   // [TAG_TURBOT_ANY_GEOM] 2*nr per layer: 8 per layer at 4 KV heads x 256, as before
         for (const auto & layer : layers) {
             memory_size_pool += ggml_nbytes(layer.pool);
         }
         for (const auto & [il, tl] : turbot_plan->layers) {
-            sum_s += tl.k.s + tl.v.s;
+            sum_s    += tl.k.s  + tl.v.s;
+            sum_runs += tl.k.nr + tl.v.nr;
         }
 
         const size_t memory_size_total = memory_size_k + memory_size_v + memory_size_pool;
 
-        LLAMA_LOG_INFO("%s: turbot plan %s: %d layers, old bits %.3f (sum %d), young pool %u cells (%u granules), cap %u, hash 0x%016llx\n",
+        // [TAG_TURBOT_ANY_STREAMS] with several streams the pool is split: POOL_s rows per stream
+        const std::string pool_streams = n_stream > 1 ? format(", %u streams x %u cells", n_stream, turbot_pool_s) : std::string();
+
+        LLAMA_LOG_INFO("%s: turbot plan %s: %d layers, old bits %.3f (sum %d), young pool %u cells (%u granules)%s, cap %u, hash 0x%016llx\n",
                 __func__, turbot_plan->path.c_str(), (int) turbot_plan->layers.size(),
-                (double) sum_s / (double) (turbot_plan->layers.size()*2*GGML_TURBOT_N_HEAD), sum_s,
-                turbot_plan->pool_cells, turbot_plan->pool_cells / GGML_TURBOT_GRANULE, turbot_plan->cap_cells,
+                (double) sum_s / (double) sum_runs, sum_s,
+                turbot_plan->pool_cells, turbot_plan->pool_cells / GGML_TURBOT_GRANULE, pool_streams.c_str(), turbot_plan->cap_cells,
                 (unsigned long long) turbot_plan->hash);
 
         LLAMA_LOG_INFO("%s: size = %7.2f MiB (%6u cells, %3d layers, %2u/%u seqs), K (turbot): %7.2f MiB, V (turbot): %7.2f MiB, young pool: %7.2f MiB\n", __func__,
@@ -645,11 +683,26 @@ llama_kv_cache::llama_kv_cache(
                 (float)memory_size_v    / (1024.0f * 1024.0f),
                 (float)memory_size_pool / (1024.0f * 1024.0f));
 
-        // turbot is meant to fit in the turbo5p budget of the same cache; a plan that does not is allowed, but said
-        const size_t memory_size_turbo5p = (size_t) kv_size*layers.size()*2*ggml_row_size(GGML_TYPE_TURBO5P_0, GGML_TURBOT_ROW_ELEMS);
-        if (memory_size_total > memory_size_turbo5p) {
-            LLAMA_LOG_WARN("%s: turbot: %.2f MiB exceeds the turbo5p size of this cache (%.2f MiB)\n", __func__,
-                    memory_size_total / (1024.0*1024.0), memory_size_turbo5p / (1024.0*1024.0));
+        // turbot is meant to fit in the budget of its fallback type for the same cache; a plan that does not is allowed,
+        // but said. [TAG_TURBOT_ANY_GEOM] the fallback is turbo5p for rows of 1024 values (the only reference before),
+        // turbo5p512 when every row is a multiple of 512, else turbo4 (llama_turbot_budget_type, one type per cache)
+        bool rows_1024 = true;
+        bool rows_512  = true;
+        for (const auto & layer : layers) {
+            const uint32_t row = (uint32_t) ggml_turbot_geom_row_elems(turbot_plan->layers.at((int32_t) layer.il).flags);
+            rows_1024 = rows_1024 && row % 1024 == 0;
+            rows_512  = rows_512  && row % 512  == 0;
+        }
+        const ggml_type ref_type = llama_turbot_budget_type(rows_1024 ? 1024 : rows_512 ? 512 : 256);
+
+        size_t memory_size_ref = 0;
+        for (const auto & layer : layers) {
+            const uint32_t row = (uint32_t) ggml_turbot_geom_row_elems(turbot_plan->layers.at((int32_t) layer.il).flags);
+            memory_size_ref += (size_t) kv_size*n_stream*2*ggml_row_size(ref_type, row);
+        }
+        if (memory_size_total > memory_size_ref) {
+            LLAMA_LOG_WARN("%s: turbot: %.2f MiB exceeds the %s size of this cache (%.2f MiB)\n", __func__,
+                    memory_size_total / (1024.0*1024.0), ggml_type_name(ref_type), memory_size_ref / (1024.0*1024.0));
         }
     } else {
         const size_t memory_size_k = size_k_bytes();
@@ -746,9 +799,9 @@ void llama_kv_cache::clear(bool data) {
         v_heads[s] = 0;
     }
 
-    // [TAG_TURBOT] every slot free; stamps, counters, cuts, ref_valid and pending zeroed
-    if (turbot_tier) {
-        turbot_tier->clear();
+    // [TAG_TURBOT] every slot free; stamps, counters, cuts, ref_valid and pending zeroed ([TAG_TURBOT_ANY_STREAMS] every stream)
+    for (auto & tier : turbot_tier) {
+        tier->clear();
     }
 
     // Reset TriAttention position tracking
@@ -793,7 +846,7 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     }
 
     // [TAG_TURBOT] the same removal with the tier hooks
-    if (turbot_tier) {
+    if (is_turbot()) {
         return seq_rm_turbot(seq_id, p0, p1);
     }
 
@@ -897,7 +950,7 @@ void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, ll
         }
 
         // [TAG_TURBOT] a copy into an empty sequence adopts the source's write-row counter (SPEC 9.7)
-        const bool turbot_dst_was_empty = turbot_tier && cells.seq_n_cells(seq_id_dst) == 0;
+        const bool turbot_dst_was_empty = is_turbot() && cells.seq_n_cells(seq_id_dst) == 0;
 
         for (uint32_t i = 0; i < cells.size(); ++i) {
             if (!cells.pos_in(i, p0, p1)) {
@@ -909,8 +962,8 @@ void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, ll
             }
         }
 
-        if (turbot_tier) {
-            turbot_tier->on_seq_cp(seq_id_src, seq_id_dst, turbot_dst_was_empty);
+        if (is_turbot()) {
+            turbot_tier[s0]->on_seq_cp(seq_id_src, seq_id_dst, turbot_dst_was_empty);
         }
 
         return;
@@ -960,6 +1013,13 @@ void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, ll
 
     v_heads[s1] = v_heads[s0];
 
+    // [TAG_TURBOT_ANY_STREAMS] the destination tier becomes the source's (granule table, stamps, refinement bits), with
+    // seq_id_src's counter and cut on seq_id_dst; update() copies the source stream's pool rows under it
+    if (is_turbot()) {
+        turbot_tier[s1]->copy_stream_from(*turbot_tier[s0], seq_id_src, seq_id_dst);
+        turbot_tier[s1]->drop_empty_cells(v_cells[s1]);
+    }
+
     //for (uint32_t s = 0; s < n_stream; ++s) {
     //    LLAMA_LOG_WARN("%s: seq %d: min = %d, max = %d\n", __func__, s, v_cells[s].seq_pos_min(s), v_cells[s].seq_pos_max(s));
     //}
@@ -980,8 +1040,8 @@ void llama_kv_cache::seq_keep(llama_seq_id seq_id) {
 
     for (uint32_t i = 0; i < cells.size(); ++i) {
         if (cells.seq_keep(i, seq_id)) {
-            if (turbot_tier) {   // [TAG_TURBOT]
-                turbot_tier->on_cell_emptied(i);
+            if (is_turbot()) {   // [TAG_TURBOT] [TAG_TURBOT_ANY_STREAMS] the tier of this stream
+                turbot_tier[seq_to_stream[seq_id]]->on_cell_emptied(i);
             }
             if (new_head == cells.size()) {
                 new_head = i;
@@ -1027,7 +1087,7 @@ void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, ll
     }
 
     // [TAG_TURBOT] a turbot K cache cannot be shifted (SPEC 9.3); the no-op calls above stay harmless
-    if (turbot_tier) {
+    if (is_turbot()) {
         GGML_ABORT("turbot: seq_add/seq_div are not supported (no K shift)");
     }
 
@@ -1082,7 +1142,7 @@ void llama_kv_cache::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, in
     }
 
     // [TAG_TURBOT] a turbot K cache cannot be shifted (SPEC 9.3); the no-op calls above stay harmless
-    if (turbot_tier) {
+    if (is_turbot()) {
         GGML_ABORT("turbot: seq_add/seq_div are not supported (no K shift)");
     }
 
@@ -1290,6 +1350,11 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
 
                 if (layer.v_stream[ssrc]) {
                     ggml_backend_tensor_copy(layer.v_stream[ssrc], layer.v_stream[sdst]);
+                }
+
+                // [TAG_TURBOT_ANY_STREAMS] the young pool rows of the source stream, under the tier seq_cp copied
+                if (!layer.pool_stream.empty()) {
+                    ggml_backend_tensor_copy(layer.pool_stream[ssrc], layer.pool_stream[sdst]);
                 }
             }
         }
@@ -1756,6 +1821,22 @@ ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_k
     const uint64_t kv_size      = get_size();
     const uint64_t n_embd_k_gqa = k->ne[0];
 
+    // [TAG_TURBOT_ANY_GEOM] a turbot layer is a [1024, kv_size, n_stream] container of one 32*S + 16 byte block per row:
+    // the view is [head dim, KV heads, n_kv, ns] with nb2 = the row bytes (nb1 is fractional and unused: the turbot FA
+    // reads the row through the plan's run layout). At 4 KV heads x 256 these are the strides of before.
+    if (ggml_turbot_is_type(k->type)) {
+        const uint32_t ns      = sinfo.s1 - sinfo.s0 + 1;
+        const size_t   row     = ggml_type_size(k->type);
+        const int64_t  head    = hparams.n_embd_head_k(il);
+
+        return ggml_view_4d(ctx, k,
+                head, hparams.n_head_kv(il), n_kv, ns,
+                ggml_row_size(k->type, head),
+                row,
+                row*kv_size,
+                row*kv_size*sinfo.s0);
+    }
+
     // For turbo-padded caches, n_embd_k_gqa may be larger than hparams value
     const bool k_is_turbo = llama_type_is_turbo(k->type);
     if (k_is_turbo) {
@@ -1786,6 +1867,22 @@ ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_k
 
     const uint64_t kv_size      = get_size();
     const uint64_t n_embd_v_gqa = v->ne[0];
+
+    // [TAG_TURBOT_ANY_GEOM] the container view of get_k (turbot needs flash attention: V is never transposed)
+    if (ggml_turbot_is_type(v->type)) {
+        GGML_ASSERT(!v_trans);
+
+        const uint32_t ns      = sinfo.s1 - sinfo.s0 + 1;
+        const size_t   row     = ggml_type_size(v->type);
+        const int64_t  head    = hparams.n_embd_head_v(il);
+
+        return ggml_view_4d(ctx, v,
+                head, hparams.n_head_kv(il), n_kv, ns,
+                ggml_row_size(v->type, head),
+                row,
+                row*kv_size,
+                row*kv_size*sinfo.s0);
+    }
 
     // [TAG_V_CACHE_VARIABLE] — for turbo-padded V, cache may be larger
     assert(n_embd_v_gqa >= hparams.n_embd_v_gqa(il));
@@ -2708,7 +2805,7 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
         state_write_data(io, cr);
 
         // [TAG_TURBOT] stamps, counters, young flags and the young pool bytes of the written cells (SPEC 9.10)
-        if (turbot_tier) {
+        if (is_turbot()) {
             state_write_turbot(io, cr, cell_count, seq_id);
         }
     }
@@ -2777,7 +2874,7 @@ const slot_info_vec_t *   sinfos_in) {
             res = res && state_read_data(io, strm, cell_count, sinfo);
 
             // [TAG_TURBOT] the v2 section follows the data of this stream (SPEC 9.10)
-            if (turbot_tier) {
+            if (is_turbot()) {
                 res = res && state_read_turbot(io, strm, cell_count, sinfo, seq_id);
             }
         } catch (...) {
@@ -3277,15 +3374,28 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
 //
 
 bool llama_kv_cache::seq_rm_turbot(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
-    GGML_ASSERT(n_stream == 1);
+    // [TAG_TURBOT_ANY_STREAMS] the stream of seq_id with its tier, or every stream for seq_id < 0 (one stream: stream 0)
+    if (seq_id >= 0) {
+        seq_rm_turbot_stream(seq_to_stream[seq_id], seq_id, p0, p1);
+    } else {
+        for (uint32_t s = 0; s < n_stream; ++s) {
+            seq_rm_turbot_stream(s, seq_id, p0, p1);
+        }
+    }
+
+    return true;
+}
+
+void llama_kv_cache::seq_rm_turbot_stream(uint32_t strm, llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    GGML_ASSERT(strm < n_stream && strm < turbot_tier.size());
 
     // a removal to the end of a sequence rolls its write-row counter back, so rejected draft rows leave no gap in stamp
     // space (SPEC 9.7). p1 is already normalised: max() here means the caller passed p1 < 0 or max() itself.
     const bool tail = p1 == std::numeric_limits<llama_pos>::max();
 
-    auto & tier  = *turbot_tier;
-    auto & cells = v_cells[0];
-    auto & head  = v_heads[0];
+    auto & tier  = *turbot_tier[strm];
+    auto & cells = v_cells[strm];
+    auto & head  = v_heads[strm];
 
     uint32_t new_head = cells.size();
 
@@ -3295,7 +3405,7 @@ bool llama_kv_cache::seq_rm_turbot(llama_seq_id seq_id, llama_pos p0, llama_pos 
 
     if (seq_id >= 0) {
         if (cells.seq_pos_max(seq_id) < p0) {
-            return true;
+            return;
         }
 
         uint64_t min_st  = std::numeric_limits<uint64_t>::max();
@@ -3355,14 +3465,25 @@ bool llama_kv_cache::seq_rm_turbot(llama_seq_id seq_id, llama_pos p0, llama_pos 
     if (new_head != cells.size() && new_head < head) {
         head = new_head;
     }
-
-    return true;
 }
 
 uint32_t llama_kv_cache::get_turbot_n_granules() const {
-    GGML_ASSERT(turbot_tier);
+    GGML_ASSERT(is_turbot());
 
-    return turbot_tier->n_granules();
+    return turbot_tier[0]->n_granules();
+}
+
+int64_t llama_kv_cache::get_turbot_n_fill(const slot_info & sinfo) const {
+    GGML_ASSERT(is_turbot());
+
+    return llama_turbot_streams_n_fill(turbot_tier, sinfo.strm);
+}
+
+const ggml_turbot_layer & llama_kv_cache::turbot_layer_of(int32_t il) const {
+    GGML_ASSERT(turbot_plan);
+
+    // [TAG_TURBOT_ANY_GEOM] a reused layer reads and writes the KV of the layer it maps to, with that layer's widths
+    return turbot_plan->layers.at((int32_t) layers[map_layer_ids.at(il)].il);
 }
 
 ggml_tensor * llama_kv_cache::get_turbot_pool(int32_t il) const {
@@ -3376,7 +3497,7 @@ ggml_tensor * llama_kv_cache::get_turbot_pool(int32_t il) const {
 void llama_kv_cache::get_turbot_op_params(int32_t il, int side, ggml_turbot_op_params & params) const {
     GGML_ASSERT(turbot_plan);
 
-    ggml_turbot_op_params_make(&params, &turbot_plan->layers.at(il), side);
+    ggml_turbot_op_params_make(&params, &turbot_layer_of(il), side);
 }
 
 ggml_tensor * llama_kv_cache::turbot_cpy(ggml_context * ctx, ggml_tensor * cur, ggml_tensor * idxs, ggml_tensor * young, ggml_tensor * fill, int32_t il, int side) const {
@@ -3386,22 +3507,33 @@ ggml_tensor * llama_kv_cache::turbot_cpy(ggml_context * ctx, ggml_tensor * cur, 
 
     const auto & layer = layers[ikv];
 
+    const ggml_turbot_layer & tl = turbot_layer_of(il);
+
     ggml_tensor * dst = side == GGML_TURBOT_SIDE_K ? layer.k : layer.v;
 
     const int64_t n_embd_head = cur->ne[0];
     const int64_t n_head      = cur->ne[1];
     const int64_t n_tokens    = cur->ne[2];
 
-    GGML_ASSERT(n_embd_head*n_head == GGML_TURBOT_ROW_ELEMS);
-    GGML_ASSERT(dst->ne[0] == GGML_TURBOT_ROW_ELEMS && dst->ne[2] == 1);
+    // [TAG_TURBOT_ANY_GEOM] a row holds nr*256 values (1024 at 4 KV heads x 256) inside the 1024-wide container
+    const int64_t row_elems = ggml_turbot_geom_row_elems(tl.flags);
 
-    // the heads of a row are laid out contiguously: merge dims 0 and 1 into one 1024-value row, as cpy_k does
+    GGML_ASSERT(n_embd_head*n_head == row_elems);
+    GGML_ASSERT(dst->ne[0] == GGML_TURBOT_ROW_ELEMS);
+
+    // the heads of a row are laid out contiguously: merge dims 0 and 1 into one row, as cpy_k does
     GGML_ASSERT(ggml_row_size(cur->type, n_embd_head) == cur->nb[1]);
 
-    cur = ggml_view_2d(ctx, cur, GGML_TURBOT_ROW_ELEMS, n_tokens, cur->nb[2], 0);
+    cur = ggml_view_2d(ctx, cur, row_elems, n_tokens, cur->nb[2], 0);
+
+    // [TAG_TURBOT_ANY_STREAMS] the idxs are global (stream*kv_size + cell), the young rows and fill entries too: flatten
+    // the streams as cpy_k does. One stream: dst as before.
+    if (dst->ne[2] > 1) {
+        dst = ggml_reshape_2d(ctx, dst, dst->ne[0], dst->ne[1]*dst->ne[2]);
+    }
 
     ggml_turbot_op_params params;
-    ggml_turbot_op_params_make(&params, &turbot_plan->layers.at(il), side);
+    ggml_turbot_op_params_make(&params, &tl, side);
 
     return ggml_turbot_set_rows(ctx, dst, cur, idxs, layer.pool, young, fill, &params);
 }
@@ -3417,28 +3549,80 @@ ggml_tensor * llama_kv_cache::turbot_cpy_v(ggml_context * ctx, ggml_tensor * v_c
 }
 
 void llama_kv_cache::turbot_begin_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch) {
-    GGML_ASSERT(turbot_tier);
-    GGML_ASSERT(sinfo.n_stream() == 1);
+    GGML_ASSERT(is_turbot());
 
-    turbot_tier->begin_ubatch(ubatch, sinfo.idxs[0], v_cells[sinfo.strm[0]]);
+    // [TAG_TURBOT_ANY_STREAMS] the tier of every stream of the ubatch on its rows; one stream: the tier on the whole
+    // ubatch against the cells of its stream, as before
+    llama_turbot_streams_begin(turbot_tier, ubatch, sinfo.strm, sinfo.idxs, v_cells);
+
+    turbot_cur_strm = sinfo.strm;
 }
 
 void llama_kv_cache::turbot_commit_ubatch() {
-    GGML_ASSERT(turbot_tier);
+    GGML_ASSERT(is_turbot());
 
-    turbot_tier->commit_ubatch(v_cells[0]);
+    if (n_stream == 1) {
+        turbot_tier[0]->commit_ubatch(v_cells[0]);
+        return;
+    }
+
+    // [TAG_TURBOT_ANY_STREAMS] only the streams of the last begin, each against its own cells
+    llama_turbot_streams_commit(turbot_tier, turbot_cur_strm, v_cells);
 }
 
 void llama_kv_cache::turbot_abort_ubatch() {
-    GGML_ASSERT(turbot_tier);
+    GGML_ASSERT(is_turbot());
 
-    turbot_tier->abort_ubatch();
+    if (n_stream == 1) {
+        turbot_tier[0]->abort_ubatch();
+        return;
+    }
+
+    // [TAG_TURBOT_ANY_STREAMS]
+    llama_turbot_streams_abort(turbot_tier, turbot_cur_strm);
 }
 
-void llama_kv_cache::set_input_turbot(ggml_tensor * gtab, ggml_tensor * young, ggml_tensor * fill) const {
-    GGML_ASSERT(turbot_tier);
+void llama_kv_cache::set_input_turbot(ggml_tensor * gtab, ggml_tensor * young, ggml_tensor * fill, const slot_info & sinfo) const {
+    GGML_ASSERT(is_turbot());
 
-    const auto & tier = *turbot_tier;
+    // [TAG_TURBOT_ANY_STREAMS] several streams: the composed, global inputs of llama-kv-tier.h
+    if (n_stream > 1) {
+        const int64_t n_view = (int64_t) (sinfo.s1 - sinfo.s0 + 1);
+        const int64_t n_fill = llama_turbot_streams_n_fill(turbot_tier, sinfo.strm);
+
+        if (gtab && gtab->buffer) {
+            GGML_ASSERT(ggml_backend_buffer_is_host(gtab->buffer));
+            GGML_ASSERT(gtab->type == GGML_TYPE_I32 && gtab->ne[0] == (int64_t) turbot_tier[0]->n_granules()*n_view);
+
+            llama_turbot_streams_gtab(turbot_tier, sinfo.s0, sinfo.s1, (int32_t *) gtab->data);
+        }
+
+        if (young && young->buffer) {
+            int64_t n_rows = 0;
+            for (const llama_seq_id s : sinfo.strm) {
+                n_rows += (int64_t) turbot_tier[s]->young_rows().size();
+            }
+
+            GGML_ASSERT(ggml_backend_buffer_is_host(young->buffer));
+            GGML_ASSERT(young->type == GGML_TYPE_I32 && young->ne[0] == n_rows);
+
+            llama_turbot_streams_young(turbot_tier, sinfo.strm, (int32_t *) young->data);
+
+            // a graph built without the fill tensor must never run a ubatch that has fill entries (SPEC 10.1)
+            GGML_ASSERT((fill != nullptr || n_fill == 0) && "turbot: graph reused across a fill");
+        }
+
+        if (fill && fill->buffer) {
+            GGML_ASSERT(ggml_backend_buffer_is_host(fill->buffer));
+            GGML_ASSERT(fill->type == GGML_TYPE_I32 && fill->ne[0] == 4 && fill->ne[1] == n_fill);
+
+            llama_turbot_streams_fill(turbot_tier, sinfo.strm, (int32_t *) fill->data);
+        }
+
+        return;
+    }
+
+    const auto & tier = *turbot_tier[0];
 
     // an input the graph does not read stays unallocated
     if (gtab && gtab->buffer) {
@@ -3471,8 +3655,10 @@ void llama_kv_cache::set_input_turbot(ggml_tensor * gtab, ggml_tensor * young, g
 }
 
 void llama_kv_cache::state_write_turbot(llama_io_write_i & io, const cell_ranges_t & cr, uint32_t cell_count, llama_seq_id seq_id) const {
-    const auto & tier  = *turbot_tier;
-    const auto & cells = v_cells[cr.strm];
+    // [TAG_TURBOT_ANY_STREAMS] the tier of this stream; its pool rows start at row cr.strm*POOL_s (0 with one stream)
+    const auto & tier    = *turbot_tier[cr.strm];
+    const auto & cells   = v_cells[cr.strm];
+    const size_t row_off = (size_t) cr.strm*turbot_pool_s;
 
     const uint32_t magic   = GGML_TURBOT_BLOB_MAGIC;
     const uint32_t version = GGML_TURBOT_BLOB_VERSION;
@@ -3559,7 +3745,7 @@ void llama_kv_cache::state_write_turbot(llama_io_write_i & io, const cell_ranges
                 ++n;
             }
 
-            io.write_tensor(layer.pool, (size_t) row0*row_bytes, n*row_bytes);
+            io.write_tensor(layer.pool, (row_off + (size_t) row0)*row_bytes, n*row_bytes);
 
             k += n;
         }
@@ -3567,8 +3753,10 @@ void llama_kv_cache::state_write_turbot(llama_io_write_i & io, const cell_ranges
 }
 
 bool llama_kv_cache::state_read_turbot(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, const slot_info & sinfo, llama_seq_id seq_id) {
-    auto & tier  = *turbot_tier;
-    auto & cells = v_cells[strm];
+    // [TAG_TURBOT_ANY_STREAMS] the tier of this stream; its pool rows start at row strm*POOL_s (0 with one stream)
+    auto &       tier    = *turbot_tier[strm];
+    auto &       cells   = v_cells[strm];
+    const size_t row_off = (size_t) strm*turbot_pool_s;
 
     // 1. read and validate everything up to the raw pool bytes. On any mismatch the tier is untouched and the caller's
     //    failure path clears or seq_rm's the restored cells.
@@ -3689,7 +3877,7 @@ bool llama_kv_cache::state_read_turbot(llama_io_read_i & io, uint32_t strm, uint
                     while (k + n < young_idx.size() && rows[young_idx[k + n]] == row0 + (int32_t) n) {
                         ++n;
                     }
-                    io.read_tensor(layer.pool, (size_t) row0*row_bytes, n*row_bytes);
+                    io.read_tensor(layer.pool, (row_off + (size_t) row0)*row_bytes, n*row_bytes);
                 } else {
                     while (k + n < young_idx.size() && rows[young_idx[k + n]] < 0 && n < (size_t) GGML_TURBOT_GRANULE) {
                         ++n;
@@ -3720,7 +3908,7 @@ void llama_kv_cache::init_triattention(const char * stats_path, const triattenti
         return;
     }
     // [TAG_TURBOT] TriAttention evicts cells and rewrites K through the CPU path; neither knows the tier (SPEC 9.3)
-    if (turbot_tier) {
+    if (is_turbot()) {
         LLAMA_LOG_ERROR("%s: turbot: TriAttention is unsupported on a turbot KV cache\n", __func__);
         return;
     }
@@ -3999,8 +4187,21 @@ bool llama_kv_cache_context::is_turbot() const {
     return kv->is_turbot();
 }
 
+int64_t llama_kv_cache_context::get_turbot_n_stream() const {
+    // [TAG_TURBOT_ANY_STREAMS] the streams of the K/V view of the current ubatch (get_k: s1 - s0 + 1); the full-cache
+    // context's dummy slot info spans every stream
+    if (sinfos.empty()) {
+        return kv->get_n_stream();
+    }
+
+    const auto & sinfo = sinfos[i_cur];
+
+    return (int64_t) (sinfo.s1 - sinfo.s0 + 1);
+}
+
 int64_t llama_kv_cache_context::get_turbot_n_granules() const {
-    return kv->get_turbot_n_granules();
+    // [TAG_TURBOT_ANY_STREAMS] the granule table is stream-major over the view streams (one stream: kv_size / 64)
+    return (int64_t) kv->get_turbot_n_granules()*get_turbot_n_stream();
 }
 
 int64_t llama_kv_cache_context::get_turbot_n_fill() const {
@@ -4010,7 +4211,8 @@ int64_t llama_kv_cache_context::get_turbot_n_fill() const {
         return 0;
     }
 
-    return (int64_t) kv->get_turbot_tier()->fill_entries().size()/4;
+    // [TAG_TURBOT_ANY_STREAMS] the tiers of the streams of the current ubatch
+    return kv->get_turbot_n_fill(sinfos[i_cur]);
 }
 
 ggml_tensor * llama_kv_cache_context::get_turbot_pool(int32_t il) const {
@@ -4030,5 +4232,5 @@ ggml_tensor * llama_kv_cache_context::turbot_cpy_v(ggml_context * ctx, ggml_tens
 }
 
 void llama_kv_cache_context::set_input_turbot(ggml_tensor * gtab, ggml_tensor * young, ggml_tensor * fill) const {
-    kv->set_input_turbot(gtab, young, fill);
+    kv->set_input_turbot(gtab, young, fill, sinfos[i_cur]);
 }

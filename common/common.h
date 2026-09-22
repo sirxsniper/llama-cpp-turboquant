@@ -615,7 +615,7 @@ struct common_params {
     ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
     ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
 
-    std::string kv_tier_plan = ""; // [TAG_TURBOT] turbot plan file (--kv-tier-plan), "" = env LLAMA_TURBOT_PLAN, else the built-in plan; "default" = built-in [TAG_TURBOT_EMBED_PLAN]
+    std::string kv_tier_plan = ""; // [TAG_TURBOT] turbot plan file (--kv-tier-plan), "" = env LLAMA_TURBOT_PLAN, else the built-in plan; "default" = built-in [TAG_TURBOT_EMBED_PLAN]; "auto" = automatic plan, "" also allows a verified <model>.turbot.plan sidecar [TAG_TURBOT_ANY_PLAN]
 
     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;
 

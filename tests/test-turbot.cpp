@@ -27,11 +27,16 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <limits>
 #include <map>
+#include <memory>
 #include <random>
 #include <set>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -1216,15 +1221,31 @@ static uint32_t tier_quota(uint32_t pool, uint32_t cap, const std::vector<uint32
     return (uint32_t) std::min<uint64_t>(cap, (uint64_t) n_eff * n[s] / sum);
 }
 
+// [TAG_TURBOT_ANY_STREAMS] one tier in the vector the stream helpers take
+static llama_kv_tier_ptrs one_tier(uint32_t kv, uint32_t pool, uint32_t cap) {
+    llama_kv_tier_ptrs t;
+    t.push_back(std::make_unique<llama_kv_tier>(kv, pool, cap));
+    return t;
+}
+
 // Drives a real llama_kv_cells and a llama_kv_tier the way llama_kv_cache and llama_context do (SPEC 9.6, 9.7).
+// [TAG_TURBOT_ANY_STREAMS] via_streams: the ubatch lifecycle and the graph inputs go through llama_turbot_streams_* with
+// one stream, as llama_kv_cache does; record keeps the inputs of every ubatch (hist).
 struct tier_sim {
-    const uint32_t kv_size;
-    llama_kv_cells cells;
-    llama_kv_tier  tier;
+    const uint32_t              kv_size;
+    std::vector<llama_kv_cells> cells_v;   // one stream
+    llama_kv_tier_ptrs          tiers;
+    llama_kv_cells &            cells;
+    llama_kv_tier  &            tier;
     std::set<uint32_t> empty;
     std::vector<std::map<llama_pos, uint32_t>> seq_cells;   // seq -> pos -> cell
 
-    tier_sim(uint32_t kv, uint32_t pool, uint32_t cap) : kv_size(kv), tier(kv, pool, cap), seq_cells(LLAMA_MAX_SEQ) {
+    bool via_streams = false;
+    bool record      = false;
+    std::vector<std::vector<int32_t>> hist;                 // young, fill, gtab of every ubatch (record)
+
+    tier_sim(uint32_t kv, uint32_t pool, uint32_t cap) : kv_size(kv), cells_v(1), tiers(one_tier(kv, pool, cap)),
+            cells(cells_v[0]), tier(*tiers[0]), seq_cells(LLAMA_MAX_SEQ) {
         cells.resize(kv);
         for (uint32_t i = 0; i < kv; ++i) {
             empty.insert(i);
@@ -1279,13 +1300,38 @@ struct tier_sim {
         ub.n_seq_id     = n_seq_id.data();
         ub.seq_id       = sidp.data();
         ub.seq_id_unq   = unq.data();
-        tier.begin_ubatch(ub, idx, cells);
-        last_young = tier.young_rows();
-        last_fill  = tier.fill_entries();
-        if (ok) {
-            tier.commit_ubatch(cells);
+        const std::vector<llama_seq_id> strm(1, 0);
+        if (via_streams) {
+            llama_turbot_streams_begin(tiers, ub, strm, std::vector<std::vector<uint32_t>>(1, idx), cells_v);
+            last_young.assign(n, -2);
+            llama_turbot_streams_young(tiers, strm, last_young.data());
+            last_fill.assign(4*(size_t) llama_turbot_streams_n_fill(tiers, strm), -2);
+            llama_turbot_streams_fill(tiers, strm, last_fill.data());
+            last_gtab.assign(tier.n_granules(), -2);
+            llama_turbot_streams_gtab(tiers, 0, 0, last_gtab.data());
         } else {
-            tier.abort_ubatch();
+            tier.begin_ubatch(ub, idx, cells);
+            last_young = tier.young_rows();
+            last_fill  = tier.fill_entries();
+            last_gtab  = tier.granule_slots();
+        }
+        if (record) {
+            hist.push_back(last_young);
+            hist.push_back(last_fill);
+            hist.push_back(last_gtab);
+        }
+        if (ok) {
+            if (via_streams) {
+                llama_turbot_streams_commit(tiers, strm, cells_v);
+            } else {
+                tier.commit_ubatch(cells);
+            }
+        } else {
+            if (via_streams) {
+                llama_turbot_streams_abort(tiers, strm);
+            } else {
+                tier.abort_ubatch();
+            }
             for (auto & pm : pos_min) {
                 seq_rm(pm.first, pm.second, -1);
             }
@@ -1294,6 +1340,7 @@ struct tier_sim {
 
     std::vector<int32_t> last_young;
     std::vector<int32_t> last_fill;
+    std::vector<int32_t> last_gtab;   // [TAG_TURBOT_ANY_STREAMS] the granule table after begin (the graph input)
 
     // contiguous rows for one sequence at the lowest empty cells
     void decode(llama_seq_id s, uint32_t n, bool ok = true) {
@@ -1689,6 +1736,1080 @@ static void test_tier() {
     }
 }
 
+// ---------------------------------------------------------------------------------------------------------------
+// 8. [TAG_TURBOT_ANY_*] turbot on other models: shapes, automatic plan, chooser, scope, per-stream tiers
+// ---------------------------------------------------------------------------------------------------------------
+
+static void set_env(const char * name, const char * value) {
+#ifdef _WIN32
+    _putenv_s(name, value ? value : "");
+#else
+    if (value) {
+        setenv(name, value, 1);
+    } else {
+        unsetenv(name);
+    }
+#endif
+}
+
+// every switch the plan code reads, back to unset (the defaults), and no plan path, sidecar or test fingerprint
+static void reset_turbot_env() {
+    static const char * names[] = {
+        "LLAMA_TURBOT_ANY", "LLAMA_TURBOT_AUTO_PLAN", "LLAMA_TURBOT_AUTO_BUDGET", "LLAMA_TURBOT_AUTO_PLAN_DUMP",
+        "LLAMA_TURBOT_SIDECAR", "LLAMA_TURBOT_ISWA", "LLAMA_TURBOT_SWA_TYPE", "LLAMA_TURBOT_MULTI_STREAM", "LLAMA_TURBOT_PLAN",
+    };
+    for (const char * n : names) {
+        set_env(n, nullptr);
+    }
+    llama_turbot_set_plan_path(nullptr);
+    llama_turbot_set_sidecar_path(nullptr);
+    llama_turbot_test_set_model_fingerprint(nullptr);
+}
+
+static std::vector<int32_t> il_range(int32_t first, int32_t last, int32_t step) {
+    std::vector<int32_t> v;
+    for (int32_t il = first; il <= last; il += step) {
+        v.push_back(il);
+    }
+    return v;
+}
+
+static llama_turbot_cache_shape shape_of(const std::vector<int32_t> & ils, int head_dim, int n_head_kv, uint32_t kv_size,
+        uint32_t n_stream = 1, uint32_t n_seq_max = 1, bool auto_ok = false) {
+    llama_turbot_cache_shape s;
+    for (const int32_t il : ils) {
+        s.layers.push_back({ il, (uint16_t) head_dim, (uint8_t) n_head_kv });
+    }
+    s.kv_size   = kv_size;
+    s.n_stream  = n_stream;
+    s.n_seq_max = n_seq_max;
+    s.auto_ok   = auto_ok;
+    return s;
+}
+
+static std::string replace_first(std::string s, const std::string & from, const std::string & to) {
+    const size_t p = s.find(from);
+    GGML_ASSERT(p != std::string::npos);
+    return s.replace(p, from.size(), to);
+}
+
+static std::string temp_path(const char * tag) {
+    std::random_device rd;
+    return (std::filesystem::temp_directory_path() / (std::string("test-turbot-") + tag + "-" + std::to_string(rd()) + ".plan")).string();
+}
+
+static void write_file(const std::string & path, const std::string & text) {
+    std::ofstream f(path, std::ios::binary);
+    f << text;
+}
+
+// the plan hash of parsed layers, folded again from ggml-turbot.h (flags_override >= 0: every layer's flags replaced)
+static uint64_t rehash(const llama_turbot_plan & p, int flags_override = -1) {
+    uint64_t h = GGML_TURBOT_FNV_OFFSET;
+    for (const auto & it : p.layers) {
+        ggml_turbot_layer l = it.second;
+        if (flags_override >= 0) {
+            l.flags = (uint8_t) flags_override;
+        }
+        h = ggml_turbot_plan_hash_layer(h, it.first, &l);
+    }
+    return ggml_turbot_plan_hash_finish(h, p.pool_cells, p.cap_cells);
+}
+
+// tools/turbot/turbot_plan.py auto (goldens: the same text and hash from the Python mirror)
+static const char * AUTO_QWEN_262K =
+    "# turbot auto plan v1\n"
+    "# shape: 16 attention layers: 16 x 4x256 (KV heads x head dim); kv_size 262144, n_stream 1, n_seq_max 1\n"
+    "# budget: the bytes of the fallback type turbo5p\n"
+    "# size: 5145.19 MiB (turbo5p 5248.00 MiB); old widths 4/5 mean 4.750, young 7, uncalibrated\n"
+    "L 3 K 5 5 5 4 V 5 5 5 4\n"
+    "L 7 K 5 5 5 4 V 5 5 5 4\n"
+    "L 11 K 5 5 5 4 V 5 5 5 4\n"
+    "L 15 K 5 5 5 4 V 5 5 5 4\n"
+    "L 19 K 5 5 5 4 V 5 5 5 4\n"
+    "L 23 K 5 5 5 4 V 5 5 5 4\n"
+    "L 27 K 5 5 5 4 V 5 5 5 4\n"
+    "L 31 K 5 5 5 4 V 5 5 5 4\n"
+    "L 35 K 5 5 5 4 V 5 5 5 4\n"
+    "L 39 K 5 5 5 4 V 5 5 5 4\n"
+    "L 43 K 5 5 5 4 V 5 5 5 4\n"
+    "L 47 K 5 5 5 4 V 5 5 5 4\n"
+    "L 51 K 5 5 5 4 V 5 5 5 4\n"
+    "L 55 K 5 5 5 4 V 5 5 5 4\n"
+    "L 59 K 5 5 5 4 V 5 5 5 4\n"
+    "L 63 K 5 5 5 4 V 5 5 5 4\n"
+    "POOL 16512\n"
+    "CAP 16384\n";
+static const uint64_t AUTO_QWEN_262K_HASH = 0xf4b8a2ce643381c5ull;
+
+// Ornith-1.5-9B: 8 attention layers 3, 7, ..., 31, 4 KV heads x 256
+static const char * AUTO_ORNITH9 =
+    "# turbot auto plan v1\n"
+    "# shape: 8 attention layers: 8 x 4x256 (KV heads x head dim); kv_size 262144, n_stream 1, n_seq_max 1\n"
+    "# budget: the bytes of the fallback type turbo5p\n"
+    "# size: 2572.59 MiB (turbo5p 2624.00 MiB); old widths 4/5 mean 4.750, young 7, uncalibrated\n"
+    "L 3 K 5 5 5 4 V 5 5 5 4\n"
+    "L 7 K 5 5 5 4 V 5 5 5 4\n"
+    "L 11 K 5 5 5 4 V 5 5 5 4\n"
+    "L 15 K 5 5 5 4 V 5 5 5 4\n"
+    "L 19 K 5 5 5 4 V 5 5 5 4\n"
+    "L 23 K 5 5 5 4 V 5 5 5 4\n"
+    "L 27 K 5 5 5 4 V 5 5 5 4\n"
+    "L 31 K 5 5 5 4 V 5 5 5 4\n"
+    "POOL 16512\n"
+    "CAP 16384\n";
+static const uint64_t AUTO_ORNITH9_HASH = 0x7de0f0bf9a53a865ull;
+
+// Ornith-1.5-35B: 10 attention layers 3, 7, ..., 39, 2 KV heads x 256 (512-value rows, turbo5p512 fallback). The budget is
+// ggml_row_size(turbo5p512, 512) = 336 B per row (the 16-byte aligned block), 1680 MiB at 262144 cells: K 5 5, V 5 4.
+static const char * AUTO_ORNITH35 =
+    "# turbot auto plan v1\n"
+    "# shape: 10 attention layers: 10 x 2x256 (KV heads x head dim); kv_size 262144, n_stream 1, n_seq_max 1\n"
+    "# budget: the bytes of the fallback type turbo5p512\n"
+    "# size: 1650.39 MiB (turbo5p512 1680.00 MiB); old widths 4/5 mean 4.750, young 7, uncalibrated\n"
+    "L 3 K 5 5 V 5 4\n"
+    "L 7 K 5 5 V 5 4\n"
+    "L 11 K 5 5 V 5 4\n"
+    "L 15 K 5 5 V 5 4\n"
+    "L 19 K 5 5 V 5 4\n"
+    "L 23 K 5 5 V 5 4\n"
+    "L 27 K 5 5 V 5 4\n"
+    "L 31 K 5 5 V 5 4\n"
+    "L 35 K 5 5 V 5 4\n"
+    "L 39 K 5 5 V 5 4\n"
+    "POOL 16512\n"
+    "CAP 16384\n";
+static const uint64_t AUTO_ORNITH35_HASH = 0x19f3b236d735818dull;
+
+// 6 attention layers of 2 KV heads x 128 (256-value rows) with LLAMA_TURBOT_AUTO_BUDGET=turbo5p
+static const char * AUTO_2X128_T5P =
+    "# turbot auto plan v1\n"
+    "# shape: 6 attention layers: 6 x 2x128 (KV heads x head dim); kv_size 262144, n_stream 1, n_seq_max 1\n"
+    "# budget: turbo5p rate, 656 B per 1024 values (LLAMA_TURBOT_AUTO_BUDGET=turbo5p); the fallback type is turbo4\n"
+    "# size: 453.16 MiB (turbo5p 492.00 MiB); old widths 4/5 mean 4.000, young 7, uncalibrated\n"
+    "L 4 K 4 V 4\n"
+    "L 12 K 4 V 4\n"
+    "L 20 K 4 V 4\n"
+    "L 28 K 4 V 4\n"
+    "L 36 K 4 V 4\n"
+    "L 44 K 4 V 4\n"
+    "POOL 16512\n"
+    "CAP 16384\n";
+static const uint64_t AUTO_2X128_T5P_HASH = 0xb856a10f462c3c1full;
+
+static const std::vector<int32_t> NEMO_IL = { 4, 12, 20, 28, 36, 44 };
+
+// (1) and (2): the built-in plan through both parsers, the old error strings, the other geometries
+static void test_any_plan_parser() {
+    printf("[8a] plan parser: shapes and geometries ([TAG_TURBOT_ANY_PLAN], [TAG_TURBOT_ANY_GEOM])\n");
+    reset_turbot_env();
+
+    const auto                     layers = qwen38_attn_layers();
+    const llama_turbot_cache_shape qwen   = shape_of(layers, 256, 4, 262144);
+
+    // the built-in plan: hash 0x56c3503c949a7749 and the same layers through the old and the shape parser
+    for (const std::string text : { std::string(DEFAULT_PLAN_TEXT), std::string(llama_turbot_default_plan_text()) }) {
+        llama_turbot_plan a, b;
+        std::string       ea, eb;
+        const bool oka = llama_turbot_plan_parse_text(text, layers, 262144, a, ea);
+        const bool okb = llama_turbot_plan_parse_shape(text, "<text>", qwen, b, eb);
+        TCHECK(oka && okb, "built-in plan refused: '%s' / '%s'", ea.c_str(), eb.c_str());
+        TCHECK(a.hash == DEFAULT_PLAN_HASH && b.hash == DEFAULT_PLAN_HASH && rehash(b) == DEFAULT_PLAN_HASH,
+                "built-in plan hash 0x%016" PRIx64 " / 0x%016" PRIx64 ", expected 0x%016" PRIx64, a.hash, b.hash, DEFAULT_PLAN_HASH);
+        TCHECK(a.layers.size() == 16 && b.layers.size() == 16 && a.pool_cells == b.pool_cells && a.cap_cells == b.cap_cells, "plan fields differ");
+        for (const auto & it : a.layers) {
+            const auto jt = b.layers.find(it.first);
+            TCHECK(jt != b.layers.end() && std::memcmp(&it.second, &jt->second, sizeof(ggml_turbot_layer)) == 0,
+                    "layer %d differs between the two parsers", it.first);
+            TCHECK(it.second.flags == 0 && it.second.k.nr == 4 && it.second.v.nr == 4, "layer %d: flags %d nr %d/%d", it.first,
+                    it.second.flags, it.second.k.nr, it.second.v.nr);
+        }
+    }
+
+    // the old error strings, byte for byte, through both parsers
+    {
+        const std::string base = DEFAULT_PLAN_TEXT;
+        std::string no_pool = base;
+        no_pool.erase(no_pool.find("POOL 65536\n"), std::strlen("POOL 65536\n"));
+        no_pool.erase(no_pool.find("CAP 16384\n"), std::strlen("CAP 16384\n"));
+        struct err_case {
+            const char * what;
+            std::string  text;
+            std::string  err;
+        };
+        const err_case cases[] = {
+            { "malformed L", replace_first(base, "L 3 K 2 2 2 4", "L 3 K 2 2 2"),
+              "turbot: plan <text> line 4: malformed L line, expected 'L <il> K <w0> <w1> <w2> <w3> V <w0> <w1> <w2> <w3>'" },
+            { "old width 1", replace_first(base, "L 3 K 2 2 2 4", "L 3 K 1 2 2 4"),
+              "turbot: plan <text> line 4: layer 3 head 0: old width must be in [2, 6] (K 1, V 2)" },
+            { "missing L", replace_first(base, "L 63 K 4 4 4 4 V 5 4 5 5\n", ""),
+              "turbot: plan <text>: missing L line for attention layer 63" },
+            { "foreign L", base + "L 64 K 4 4 4 4 V 4 4 4 4\n",
+              "turbot: plan <text> line 20: layer 64 is not an attention layer of this cache" },
+            { "young == old", base + "Y 23 K 5 7 7 7 V 7 7 7 7\n",
+              "turbot: plan <text> line 20: layer 23 head 0: young width must be in [b+1, 8] (K b 5 y 5, V b 5 y 7)" },
+            { "young 9", base + "Y 23 K 7 7 7 9 V 7 7 7 7\n",
+              "turbot: plan <text> line 20: layer 23 head 3: young width must be in [b+1, 8] (K 9, V 7)" },
+            { "unknown tag", base + "FOO 1\n", "turbot: plan <text> line 20: unknown tag 'FOO'" },
+            { "POOL 100", no_pool + "POOL 100\n", "turbot: plan <text> line 18: POOL 100 must be a non-negative multiple of 64" },
+        };
+        for (const auto & c : cases) {
+            llama_turbot_plan p;
+            std::string       e1, e2;
+            const bool ok1 = llama_turbot_plan_parse_text(c.text, layers, 262144, p, e1);
+            const bool ok2 = llama_turbot_plan_parse_shape(c.text, "<text>", qwen, p, e2);
+            TCHECK(!ok1 && e1 == c.err, "%s, old parser: '%s', expected '%s'", c.what, e1.c_str(), c.err.c_str());
+            TCHECK(!ok2 && e2 == c.err, "%s, shape parser: '%s', expected '%s'", c.what, e2.c_str(), c.err.c_str());
+        }
+    }
+
+    // other geometries: nr runs per side, 4+2*nr tokens per L / Y line
+    struct geo_case {
+        int          d, h, flags, nr;
+        const char * good;     // layers 3 and 7
+        const char * bad;      // a wrong token count on layer 3
+        const char * form;
+        const char * y_line;   // a legal Y line for layer 3 of good
+        const char * y_bad;    // a Y line with the wrong token count
+    };
+    const geo_case geos[] = {
+        { 256, 2, 1, 2, "L 3 K 5 4 V 4 6\nL 7 K 2 6 V 3 3\n", "L 3 K 5 4 4 V 4 6\nL 7 K 2 6 V 3 3\n",
+          "expected 'L <il> K <w0> <w1> V <w0> <w1>'", "Y 3 K 8 6 V 5 7\n", "Y 3 K 8 6 6 V 5 7\n" },
+        { 256, 1, 2, 1, "L 3 K 4 V 5\nL 7 K 6 V 2\n", "L 3 K 4 4 V 5\nL 7 K 6 V 2\n",
+          "expected 'L <il> K <w0> V <w0>'", "Y 3 K 8 V 6\n", "Y 3 K 8 V 6 6\n" },
+        { 128, 8, 4, 4, "L 3 K 5 4 4 3 V 4 4 4 5\nL 7 K 4 4 4 4 V 4 4 4 4\n", "L 3 K 5 4 V 4 4\nL 7 K 4 4 4 4 V 4 4 4 4\n",
+          "expected 'L <il> K <w0> <w1> <w2> <w3> V <w0> <w1> <w2> <w3>'", "Y 3 K 6 7 7 8 V 7 7 7 6\n", "Y 3 K 6 7 V 7 7\n" },
+        { 128, 4, 5, 2, "L 3 K 5 4 V 4 6\nL 7 K 2 6 V 3 3\n", "L 3 K 5 V 4 6\nL 7 K 2 6 V 3 3\n",
+          "expected 'L <il> K <w0> <w1> V <w0> <w1>'", "Y 3 K 8 6 V 5 7\n", "Y 3 K 8 V 5 7\n" },
+        { 128, 2, 6, 1, "L 3 K 4 V 5\nL 7 K 6 V 2\n", "L 3 K V 5\nL 7 K 6 V 2\n",
+          "expected 'L <il> K <w0> V <w0>'", "Y 3 K 8 V 6\n", "Y 3 K V 6\n" },
+    };
+    for (const auto & g : geos) {
+        const llama_turbot_cache_shape shape = shape_of({ 3, 7 }, g.d, g.h, 32768);
+        TCHECK(ggml_turbot_geom_flags(g.d, g.h) == g.flags && ggml_turbot_geom_nr((unsigned) g.flags) == g.nr,
+                "%dx%d: flags %d nr %d", g.d, g.h, ggml_turbot_geom_flags(g.d, g.h), ggml_turbot_geom_nr((unsigned) g.flags));
+
+        llama_turbot_plan p;
+        std::string       err;
+        const bool ok = llama_turbot_plan_parse_shape(g.good, "<geo>", shape, p, err);
+        TCHECK(ok, "%dx%d: plan refused: %s", g.d, g.h, err.c_str());
+        if (ok) {
+            const ggml_turbot_layer & l = p.layers.at(3);
+            TCHECK(l.flags == g.flags && l.k.nr == g.nr && l.v.nr == g.nr, "%dx%d: flags %d nr %d/%d", g.d, g.h, l.flags, l.k.nr, l.v.nr);
+            int s_k = 0;
+            for (int r = 0; r < GGML_TURBOT_MAX_RUNS; ++r) {
+                TCHECK(r < g.nr ? (l.k.b[r] >= 2 && l.k.y[r] == 7) : (l.k.b[r] == 0 && l.k.y[r] == 0 && l.v.b[r] == 0 && l.v.y[r] == 0),
+                        "%dx%d: run %d widths %d/%d", g.d, g.h, r, l.k.b[r], l.k.y[r]);
+                s_k += l.k.b[r];
+            }
+            TCHECK(l.k.s == s_k && l.k.base_row_bytes == 32*s_k + 16 && ggml_type_size(ggml_turbot_type_of_s(l.k.s)) == (size_t) (32*s_k + 16),
+                    "%dx%d: S %d, base row %d B", g.d, g.h, l.k.s, l.k.base_row_bytes);
+            TCHECK(ggml_turbot_is_type(ggml_turbot_type_of_s(l.k.s)) && ggml_turbot_s_of_type(ggml_turbot_type_of_s(l.k.s)) == l.k.s,
+                    "%dx%d: type of S %d", g.d, g.h, l.k.s);
+            TCHECK(p.pool_cells == 32768 && p.hash == rehash(p), "%dx%d: POOL %u, hash 0x%016" PRIx64 " vs 0x%016" PRIx64,
+                    g.d, g.h, p.pool_cells, p.hash, rehash(p));
+            // the geometry is part of the plan identity: the same widths at flags 0 hash differently
+            TCHECK(rehash(p, 0) != p.hash, "%dx%d: the hash ignores the geometry", g.d, g.h);
+
+            llama_turbot_plan py;
+            TCHECK(llama_turbot_plan_parse_shape(std::string(g.good) + g.y_line, "<geo>", shape, py, err), "%dx%d: Y line refused: %s",
+                    g.d, g.h, err.c_str());
+            TCHECK(py.layers.at(3).k.y[0] == 8 || py.layers.at(3).k.y[0] == 6, "%dx%d: Y line not applied", g.d, g.h);
+        }
+        TCHECK(!llama_turbot_plan_parse_shape(g.bad, "<geo>", shape, p, err) && err.find(g.form) != std::string::npos,
+                "%dx%d: wrong token count: '%s'", g.d, g.h, err.c_str());
+        TCHECK(!llama_turbot_plan_parse_shape(std::string(g.good) + g.y_bad, "<geo>", shape, p, err) && err.find("malformed Y line") != std::string::npos,
+                "%dx%d: Y line with the wrong token count: '%s'", g.d, g.h, err.c_str());
+        // the 12-token form is refused on a layer with fewer runs
+        if (g.nr != 4) {
+            TCHECK(!llama_turbot_plan_parse_shape("L 3 K 4 4 4 4 V 4 4 4 4\nL 7 K 4 4 4 4 V 4 4 4 4\n", "<geo>", shape, p, err),
+                    "%dx%d: 4 widths accepted on a layer with %d runs", g.d, g.h, g.nr);
+        }
+    }
+
+    // 128x8 and 256x4 have 4 runs each: the same text parses on both, with different hashes; head dim 128 says "run"
+    {
+        const char * text = "L 3 K 5 4 4 3 V 4 4 4 5\nL 7 K 4 4 4 4 V 4 4 4 4\n";
+        llama_turbot_plan a, b;
+        std::string       err;
+        TCHECK(llama_turbot_plan_parse_shape(text, "<t>", shape_of({ 3, 7 }, 256, 4, 32768), a, err) &&
+               llama_turbot_plan_parse_shape(text, "<t>", shape_of({ 3, 7 }, 128, 8, 32768), b, err), "4-run plan refused: %s", err.c_str());
+        TCHECK(a.hash != b.hash, "256x4 and 128x8 share a hash");
+        TCHECK(!llama_turbot_plan_parse_shape("L 3 K 1 4 4 4 V 4 4 4 4\nL 7 K 4 4 4 4 V 4 4 4 4\n", "<t>", shape_of({ 3, 7 }, 128, 8, 32768), b, err) &&
+               err.find("layer 3 run 0: old width") != std::string::npos, "head dim 128 width error: '%s'", err.c_str());
+    }
+
+    // no layout: refused before any line is read
+    {
+        llama_turbot_plan p;
+        std::string       err;
+        TCHECK(!llama_turbot_plan_parse_shape("L 3 K 4 V 4\n", "<t>", shape_of({ 3 }, 64, 8, 32768), p, err) &&
+               err.find("no layout for 8 KV heads x 64") != std::string::npos, "head dim 64: '%s'", err.c_str());
+        TCHECK(!llama_turbot_plan_parse_shape("L 3 K 4 V 4\n", "<t>", shape_of({ 3 }, 256, 3, 32768), p, err), "3 KV heads accepted");
+        TCHECK(!llama_turbot_plan_parse_shape("L 3 K 4 V 4\n", "<t>", shape_of({ 3 }, 128, 16, 32768), p, err), "16 KV heads x 128 accepted");
+    }
+
+    // LLAMA_TURBOT_ANY=0: only 4 KV heads x 256, as before
+    {
+        set_env("LLAMA_TURBOT_ANY", "0");
+        llama_turbot_plan p;
+        std::string       err;
+        TCHECK(!llama_turbot_plan_parse_shape("L 3 K 5 4 V 4 6\nL 7 K 2 6 V 3 3\n", "<t>", shape_of({ 3, 7 }, 256, 2, 32768), p, err),
+                "LLAMA_TURBOT_ANY=0: a 256x2 shape parsed");
+        TCHECK(llama_turbot_plan_parse_shape(DEFAULT_PLAN_TEXT, "<t>", qwen, p, err) && p.hash == DEFAULT_PLAN_HASH,
+                "LLAMA_TURBOT_ANY=0: the built-in plan: %s", err.c_str());
+        set_env("LLAMA_TURBOT_ANY", nullptr);
+    }
+
+    // [TAG_TURBOT_ANY_STREAMS] POOL is clamped to kv_size*n_stream
+    {
+        llama_turbot_plan p;
+        std::string       err;
+        TCHECK(llama_turbot_plan_parse_shape(DEFAULT_PLAN_TEXT, "<t>", shape_of(layers, 256, 4, 8192, 4, 4), p, err) && p.pool_cells == 32768,
+                "4 streams of 8192: POOL %u (%s)", p.pool_cells, err.c_str());
+        TCHECK(llama_turbot_plan_parse_shape(DEFAULT_PLAN_TEXT, "<t>", shape_of(layers, 256, 4, 8192), p, err) && p.pool_cells == 8192,
+                "1 stream of 8192: POOL %u (%s)", p.pool_cells, err.c_str());
+        TCHECK(llama_turbot_plan_parse_shape(DEFAULT_PLAN_TEXT, "<t>", shape_of(layers, 256, 4, 65536, 4, 4), p, err) &&
+               p.pool_cells == 65536 && p.hash == DEFAULT_PLAN_HASH, "4 streams of 65536 keep POOL 65536 and the hash");
+    }
+
+    // switches, validated geometries and budget types
+    {
+        const llama_turbot_switches sw = llama_turbot_read_switches();
+        TCHECK(sw.any && sw.auto_plan && !sw.auto_all && !sw.auto_budget_turbo5p && sw.sidecar && sw.iswa && sw.multi_stream && sw.swa_type.empty(),
+                "default switches");
+        set_env("LLAMA_TURBOT_AUTO_PLAN", "all");
+        set_env("LLAMA_TURBOT_AUTO_BUDGET", "turbo5p");
+        set_env("LLAMA_TURBOT_SWA_TYPE", "q8_0");
+        llama_turbot_switches s2 = llama_turbot_read_switches();
+        TCHECK(s2.auto_plan && s2.auto_all && s2.auto_budget_turbo5p && s2.swa_type == "q8_0", "switches read on every call");
+        set_env("LLAMA_TURBOT_ANY", "0");
+        s2 = llama_turbot_read_switches();
+        TCHECK(!s2.any && !s2.auto_plan && !s2.auto_all && !s2.auto_budget_turbo5p && !s2.sidecar && !s2.iswa && !s2.multi_stream &&
+               s2.swa_type.empty(), "LLAMA_TURBOT_ANY=0 turns every switch off");
+        reset_turbot_env();
+        set_env("LLAMA_TURBOT_AUTO_PLAN", "0");
+        set_env("LLAMA_TURBOT_SIDECAR", "0");
+        set_env("LLAMA_TURBOT_ISWA", "0");
+        set_env("LLAMA_TURBOT_MULTI_STREAM", "0");
+        s2 = llama_turbot_read_switches();
+        TCHECK(s2.any && !s2.auto_plan && !s2.sidecar && !s2.iswa && !s2.multi_stream, "single switches off");
+        reset_turbot_env();
+
+        TCHECK(llama_turbot_auto_geom_validated(256, 4) && llama_turbot_auto_geom_validated(256, 2) &&
+               !llama_turbot_auto_geom_validated(256, 1) && !llama_turbot_auto_geom_validated(128, 8) &&
+               !llama_turbot_auto_geom_validated(128, 4) && !llama_turbot_auto_geom_validated(128, 2), "validated geometries");
+        TCHECK(llama_turbot_budget_type(1024) == GGML_TYPE_TURBO5P_0 && llama_turbot_budget_type(2048) == GGML_TYPE_TURBO5P_0 &&
+               llama_turbot_budget_type(512) == GGML_TYPE_TURBO5P512_0 && llama_turbot_budget_type(256) == GGML_TYPE_TURBO4_0,
+               "budget types");
+    }
+}
+
+// (3) the automatic plan: golden texts and hashes (tools/turbot/turbot_plan.py auto prints the same)
+static void test_auto_plan() {
+    printf("[8b] automatic plan ([TAG_TURBOT_ANY_PLAN])\n");
+    reset_turbot_env();
+
+    const auto qwen_il = qwen38_attn_layers();
+
+    // text, hash, and fits the fallback bytes
+    const auto golden = [](const char * what, const llama_turbot_cache_shape & shape, const char * want, uint64_t want_hash) {
+        std::string text, why;
+        const bool ok = llama_turbot_plan_auto_text(shape, text, why);
+        TCHECK(ok, "%s: refused: %s", what, why.c_str());
+        TCHECK(!ok || text == want, "%s: text differs:\n%s\n--- expected ---\n%s", what, text.c_str(), want);
+        llama_turbot_plan p;
+        std::string       err;
+        TCHECK(llama_turbot_plan_parse_shape(text, LLAMA_TURBOT_PLAN_AUTO_NAME, shape, p, err), "%s: does not parse: %s", what, err.c_str());
+        TCHECK(p.hash == want_hash && rehash(p) == want_hash, "%s: hash 0x%016" PRIx64 ", turbot_plan.py 0x%016" PRIx64, what, p.hash, want_hash);
+        std::string again;
+        TCHECK(llama_turbot_plan_auto_text(shape, again, why) && again == text, "%s: not deterministic", what);
+    };
+
+    golden("16 x 4x256 at 262144, 1 sequence", shape_of(qwen_il, 256, 4, 262144), AUTO_QWEN_262K, AUTO_QWEN_262K_HASH);
+    golden("Ornith-9B 8 x 4x256 at 262144", shape_of(il_range(3, 31, 4), 256, 4, 262144), AUTO_ORNITH9, AUTO_ORNITH9_HASH);
+    golden("Ornith-35B 10 x 2x256 at 262144", shape_of(il_range(3, 39, 4), 256, 2, 262144), AUTO_ORNITH35, AUTO_ORNITH35_HASH);
+
+    // the key numbers of the sizing reference (scratchpad autoplan_models.py) and the budget
+    struct key_case {
+        const char *             what;
+        llama_turbot_cache_shape shape;
+        const char *             mean;
+        const char *             pool;
+        const char *             size;
+        uint64_t                 hash;
+    };
+    const key_case keys[] = {
+        { "16 x 4x256 at 262144, 4 sequences, unified", shape_of(qwen_il, 256, 4, 262144, 1, 4), "mean 4.250", "\nPOOL 66048\n",
+          "# size: 5221.75 MiB (turbo5p 5248.00 MiB)", 0xdf2f4307ffc5ac96ull },
+        { "16 x 4x256, 4 streams of 65536", shape_of(qwen_il, 256, 4, 65536, 4, 4), "mean 4.250", "\nPOOL 66048\n",
+          "# size: 5221.75 MiB (turbo5p 5248.00 MiB)", 0xdf2f4307ffc5ac96ull },
+        { "16 x 4x256 at 32768", shape_of(qwen_il, 256, 4, 32768), "mean 4.000", "\nPOOL 10432\n",
+          "# size: 655.34 MiB (turbo5p 656.00 MiB)", 0x30a288cee72141cdull },
+        { "Ornith-35B 10 x 2x256 at 262144, 4 sequences", shape_of(il_range(3, 39, 4), 256, 2, 262144, 1, 4), "mean 4.000", "\nPOOL 66048\n",
+          "# size: 1622.03 MiB (turbo5p512 1680.00 MiB)", 0xa8832f16bdad6104ull },
+    };
+    for (const auto & k : keys) {
+        std::string text, why;
+        TCHECK(llama_turbot_plan_auto_text(k.shape, text, why), "%s: refused: %s", k.what, why.c_str());
+        TCHECK(text.find(k.mean) != std::string::npos && text.find(k.pool) != std::string::npos && text.find(k.size) != std::string::npos,
+                "%s:\n%s", k.what, text.c_str());
+        llama_turbot_plan p;
+        std::string       err;
+        TCHECK(llama_turbot_plan_parse_shape(text, "<auto>", k.shape, p, err) && p.hash == k.hash,
+                "%s: hash 0x%016" PRIx64 ", expected 0x%016" PRIx64 " (%s)", k.what, p.hash, k.hash, err.c_str());
+        TCHECK(p.pool_cells % (GGML_TURBOT_GRANULE*k.shape.n_stream) == 0, "%s: POOL %u not whole granules per stream", k.what, p.pool_cells);
+    }
+
+    // every automatic plan fits the fallback's bytes: base rows of every cell plus the pool
+    for (const auto & shape : { shape_of(qwen_il, 256, 4, 262144), shape_of(il_range(3, 39, 4), 256, 2, 131072, 1, 2),
+                                shape_of(qwen_il, 256, 4, 16384), shape_of({ 3, 7, 11 }, 128, 8, 65536), shape_of({ 3, 7 }, 128, 4, 262144) }) {
+        std::string text, why;
+        if (!llama_turbot_plan_auto_text(shape, text, why)) {
+            TCHECK(false, "auto plan refused: %s", why.c_str());
+            continue;
+        }
+        llama_turbot_plan p;
+        std::string       err;
+        TCHECK(llama_turbot_plan_parse_shape(text, "<auto>", shape, p, err), "does not parse: %s", err.c_str());
+        uint64_t base = 0, young = 0, budget = 0;
+        for (const auto & it : p.layers) {
+            base  += (uint64_t) it.second.k.base_row_bytes + it.second.v.base_row_bytes;
+            young += it.second.pool_row_bytes;
+            const uint32_t row = (uint32_t) ggml_turbot_geom_row_elems(it.second.flags);
+            budget += 2*ggml_row_size(llama_turbot_budget_type(row), row);
+            TCHECK(it.second.k.b[0] >= 4 && it.second.k.b[0] <= 5 && it.second.k.y[0] == 7, "old width %d / young %d", it.second.k.b[0], it.second.k.y[0]);
+        }
+        const uint64_t cells = (uint64_t) shape.kv_size*shape.n_stream;
+        TCHECK(cells*base + (uint64_t) p.pool_cells*young <= cells*budget, "auto plan above the fallback: %" PRIu64 " > %" PRIu64,
+                cells*base + (uint64_t) p.pool_cells*young, cells*budget);
+        TCHECK(p.cap_cells == 16384 && p.pool_cells >= shape.n_seq_max*(1024 + 128), "CAP %u, POOL %u", p.cap_cells, p.pool_cells);
+    }
+
+    // 2 KV heads x 128 (rows of 256 values): 4-bit rows alone cost 144 B per 256 values, turbo4 136 B: refused.
+    // With LLAMA_TURBOT_AUTO_BUDGET=turbo5p (656 B per 1024 values) they fit at 4 bits.
+    {
+        std::string text, why;
+        const auto shape = shape_of(NEMO_IL, 128, 2, 262144);
+        TCHECK(!llama_turbot_plan_auto_text(shape, text, why) && why.find("turbo4") != std::string::npos, "2x128 at the turbo4 budget: %s", why.c_str());
+        TCHECK(!llama_turbot_plan_auto_text(shape_of(NEMO_IL, 256, 1, 262144), text, why), "1x256 at the turbo4 budget accepted");
+        set_env("LLAMA_TURBOT_AUTO_BUDGET", "turbo5p");
+        golden("6 x 2x128, LLAMA_TURBOT_AUTO_BUDGET=turbo5p", shape, AUTO_2X128_T5P, AUTO_2X128_T5P_HASH);
+        TCHECK(llama_turbot_plan_auto_text(shape_of(NEMO_IL, 256, 1, 262144), text, why) && text.find("mean 4.000") != std::string::npos &&
+               text.find("\nPOOL 16512\n") != std::string::npos, "1x256 with the turbo5p budget: %s", why.c_str());
+        set_env("LLAMA_TURBOT_AUTO_BUDGET", nullptr);
+    }
+
+    // a tiny cache: not even a floor pool fits
+    {
+        std::string text, why;
+        TCHECK(!llama_turbot_plan_auto_text(shape_of(qwen_il, 256, 4, 1024), text, why) && why.find("below 1152") != std::string::npos,
+                "kv_size 1024: '%s'", why.c_str());
+        TCHECK(!llama_turbot_plan_auto_text(shape_of({}, 256, 4, 32768), text, why), "no layers accepted");
+        TCHECK(!llama_turbot_plan_auto_text(shape_of({ 3 }, 96, 4, 32768), text, why), "head dim 96 accepted");
+    }
+}
+
+// (4) chooser precedence
+static void test_plan_choose() {
+    printf("[8c] plan chooser ([TAG_TURBOT_ANY_PLAN], [TAG_TURBOT_ANY_SIDECAR])\n");
+    reset_turbot_env();
+
+    static int                     fake_model_storage = 0;
+    const llama_model *            fake_model         = reinterpret_cast<const llama_model *>(&fake_model_storage);
+    const llama_turbot_cache_shape qwen               = shape_of(qwen38_attn_layers(), 256, 4, 262144, 1, 1, true);
+    const llama_turbot_cache_shape ornith             = shape_of(il_range(3, 31, 4), 256, 4, 262144, 1, 1, true);
+    llama_turbot_cache_shape       ornith_draft       = ornith;
+    ornith_draft.auto_ok = false;
+
+    llama_turbot_plan_choice c;
+    std::string              why;
+
+    const auto choose = [&](const llama_turbot_cache_shape & s) {
+        c = llama_turbot_plan_choice();
+        why = "stale";
+        const bool ok = llama_turbot_plan_choose(s, c, why);
+        TCHECK(!ok || why.empty(), "a successful choice left why '%s'", why.c_str());
+        return ok;
+    };
+
+    // nothing given: Qwen3.8-27B stops at the built-in plan, auto_ok or not
+    TCHECK(choose(qwen) && c.kind == LLAMA_TURBOT_PLAN_KIND_BUILTIN && c.name == LLAMA_TURBOT_PLAN_BUILTIN_NAME &&
+           c.text == llama_turbot_default_plan_text(), "Qwen shape: kind %d name '%s' (%s)", (int) c.kind, c.name.c_str(), why.c_str());
+    {
+        llama_turbot_cache_shape q = qwen;
+        q.auto_ok = false;
+        TCHECK(choose(q) && c.kind == LLAMA_TURBOT_PLAN_KIND_BUILTIN, "Qwen shape without auto_ok: kind %d", (int) c.kind);
+    }
+
+    // nothing given, another model: the automatic plan, only for the main context
+    TCHECK(choose(ornith) && c.kind == LLAMA_TURBOT_PLAN_KIND_AUTO && c.name == LLAMA_TURBOT_PLAN_AUTO_NAME && c.text == AUTO_ORNITH9,
+            "Ornith-9B: kind %d (%s)", (int) c.kind, why.c_str());
+    TCHECK(!choose(ornith_draft) && why.find("main context") != std::string::npos && why.find(LLAMA_TURBOT_PLAN_BUILTIN_NAME) != std::string::npos,
+            "Ornith-9B draft: '%s'", why.c_str());
+    TCHECK(choose(shape_of(il_range(3, 39, 4), 256, 2, 262144, 1, 1, true)) && c.kind == LLAMA_TURBOT_PLAN_KIND_AUTO && c.text == AUTO_ORNITH35,
+            "Ornith-35B (256x2, validated): kind %d (%s)", (int) c.kind, why.c_str());
+
+    set_env("LLAMA_TURBOT_AUTO_PLAN", "0");
+    TCHECK(!choose(ornith) && why.find("LLAMA_TURBOT_AUTO_PLAN=0") != std::string::npos, "AUTO_PLAN=0: '%s'", why.c_str());
+    TCHECK(choose(qwen) && c.kind == LLAMA_TURBOT_PLAN_KIND_BUILTIN, "AUTO_PLAN=0 still takes the built-in plan");
+    set_env("LLAMA_TURBOT_AUTO_PLAN", nullptr);
+
+    // validated list: 128x8 only with AUTO_PLAN=all; the one-run shapes only with AUTO_BUDGET=turbo5p
+    {
+        const auto d128 = shape_of({ 3, 7, 11, 15 }, 128, 8, 262144, 1, 1, true);
+        TCHECK(!choose(d128) && why.find("not validated") != std::string::npos, "128x8 without AUTO_PLAN=all: '%s'", why.c_str());
+        set_env("LLAMA_TURBOT_AUTO_PLAN", "all");
+        TCHECK(choose(d128) && c.kind == LLAMA_TURBOT_PLAN_KIND_AUTO, "128x8 with AUTO_PLAN=all: %s", why.c_str());
+        set_env("LLAMA_TURBOT_AUTO_PLAN", nullptr);
+
+        const auto nemo = shape_of(NEMO_IL, 128, 2, 262144, 1, 1, true);
+        TCHECK(!choose(nemo), "2x128 without the turbo5p budget chosen");
+        set_env("LLAMA_TURBOT_AUTO_PLAN", "all");
+        TCHECK(!choose(nemo) && why.find("turbo4") != std::string::npos, "2x128 with AUTO_PLAN=all at the turbo4 budget: '%s'", why.c_str());
+        set_env("LLAMA_TURBOT_AUTO_PLAN", nullptr);
+        set_env("LLAMA_TURBOT_AUTO_BUDGET", "turbo5p");
+        TCHECK(choose(nemo) && c.kind == LLAMA_TURBOT_PLAN_KIND_AUTO && c.text == AUTO_2X128_T5P, "2x128 with AUTO_BUDGET=turbo5p: %s", why.c_str());
+        set_env("LLAMA_TURBOT_AUTO_BUDGET", nullptr);
+    }
+
+    // a plan file: used alone; a mismatch fails and never becomes an automatic plan
+    {
+        const std::string path = temp_path("file");
+        write_file(path, DEFAULT_PLAN_TEXT);
+        llama_turbot_set_plan_path(path.c_str());
+        TCHECK(choose(qwen) && c.kind == LLAMA_TURBOT_PLAN_KIND_FILE && c.name == path && c.text == DEFAULT_PLAN_TEXT, "file on Qwen: kind %d", (int) c.kind);
+        TCHECK(!choose(ornith) && why.find(path) != std::string::npos && why.find("automatic") == std::string::npos,
+                "file mismatch on Ornith: '%s'", why.c_str());
+        llama_turbot_set_plan_path(nullptr);
+        set_env("LLAMA_TURBOT_PLAN", path.c_str());
+        TCHECK(!choose(ornith) && why.find(path) != std::string::npos, "LLAMA_TURBOT_PLAN file mismatch: '%s'", why.c_str());
+        set_env("LLAMA_TURBOT_PLAN", nullptr);
+        std::filesystem::remove(path);
+        llama_turbot_set_plan_path("./no-such-dir/x.plan");
+        TCHECK(!choose(ornith) && why.find("cannot open plan file") != std::string::npos, "missing file: '%s'", why.c_str());
+        llama_turbot_set_plan_path(nullptr);
+    }
+
+    // "default": the built-in plan alone
+    llama_turbot_set_plan_path(LLAMA_TURBOT_PLAN_KEYWORD_DEFAULT);
+    TCHECK(choose(qwen) && c.kind == LLAMA_TURBOT_PLAN_KIND_BUILTIN, "'default' on Qwen: kind %d", (int) c.kind);
+    TCHECK(!choose(ornith), "'default' on Ornith became another plan");
+    llama_turbot_set_plan_path(nullptr);
+
+    // "auto": the automatic plan, also on the Qwen shape and without auto_ok (it was asked for)
+    {
+        llama_turbot_set_plan_path(LLAMA_TURBOT_PLAN_KEYWORD_AUTO);
+        const llama_turbot_plan_source src = llama_turbot_plan_get_source();
+        TCHECK(src.origin == LLAMA_TURBOT_PLAN_AUTO_FORCED && src.name == LLAMA_TURBOT_PLAN_AUTO_NAME, "'auto' source: origin %d", (int) src.origin);
+        TCHECK(choose(qwen) && c.kind == LLAMA_TURBOT_PLAN_KIND_AUTO && c.text == AUTO_QWEN_262K, "'auto' on Qwen: kind %d (%s)", (int) c.kind, why.c_str());
+        TCHECK(choose(ornith_draft) && c.kind == LLAMA_TURBOT_PLAN_KIND_AUTO && c.text == AUTO_ORNITH9, "'auto' without auto_ok: kind %d", (int) c.kind);
+        std::string text, err;
+        TCHECK(!llama_turbot_plan_read(src, text, err) && !err.empty(), "reading 'auto' as text succeeded");
+        llama_turbot_set_plan_path(nullptr);
+        set_env("LLAMA_TURBOT_PLAN", "auto");
+        TCHECK(choose(ornith_draft) && c.kind == LLAMA_TURBOT_PLAN_KIND_AUTO, "LLAMA_TURBOT_PLAN=auto: kind %d", (int) c.kind);
+        set_env("LLAMA_TURBOT_PLAN", nullptr);
+        llama_turbot_set_plan_path("./auto");
+        TCHECK(llama_turbot_plan_get_source().origin == LLAMA_TURBOT_PLAN_FILE, "'./auto' is not a file");
+        llama_turbot_set_plan_path(nullptr);
+    }
+
+    // sidecar: used only with a '# verified:' stamp, a matching '# model:' fingerprint and a model
+    {
+        const std::string fp   = "arch=qwen35 basename=ornith-1.5 size=9B layers=3,7,11,15,19,23,27,31 geom=256x4";
+        const std::string path = temp_path("sidecar");
+        const std::string plan = std::string("# model: ") + fp + "\n# verified: 2026-09-22 b0 code dKLD -1e-4\n" + AUTO_ORNITH9;
+        write_file(path, plan);
+        llama_turbot_set_sidecar_path(path.c_str());
+        llama_turbot_test_set_model_fingerprint(fp.c_str());
+
+        llama_turbot_cache_shape with_model = ornith;
+        with_model.model = fake_model;
+        TCHECK(llama_turbot_fingerprint_text("qwen35", "ornith-1.5", "9B", with_model) == fp, "fingerprint text: %s",
+                llama_turbot_fingerprint_text("qwen35", "ornith-1.5", "9B", with_model).c_str());
+        TCHECK(llama_turbot_model_fingerprint(with_model) == fp && llama_turbot_model_fingerprint(ornith).empty(), "model fingerprint");
+        TCHECK(choose(with_model) && c.kind == LLAMA_TURBOT_PLAN_KIND_SIDECAR && c.name == path, "verified sidecar: kind %d (%s)", (int) c.kind, why.c_str());
+        TCHECK(choose(ornith) && c.kind == LLAMA_TURBOT_PLAN_KIND_AUTO, "sidecar without a model: kind %d", (int) c.kind);
+
+        set_env("LLAMA_TURBOT_SIDECAR", "0");
+        TCHECK(choose(with_model) && c.kind == LLAMA_TURBOT_PLAN_KIND_AUTO, "LLAMA_TURBOT_SIDECAR=0: kind %d", (int) c.kind);
+        set_env("LLAMA_TURBOT_SIDECAR", nullptr);
+
+        write_file(path, std::string("# model: ") + fp + "\n" + AUTO_ORNITH9);
+        TCHECK(choose(with_model) && c.kind == LLAMA_TURBOT_PLAN_KIND_AUTO, "sidecar without a stamp used");
+        write_file(path, std::string("# model: ") + fp + "\n# verified:\n" + AUTO_ORNITH9);
+        TCHECK(choose(with_model) && c.kind == LLAMA_TURBOT_PLAN_KIND_AUTO, "sidecar with an empty stamp used");
+        write_file(path, std::string("# verified: 2026-09-22 b0\n") + AUTO_ORNITH9);
+        TCHECK(choose(with_model) && c.kind == LLAMA_TURBOT_PLAN_KIND_AUTO, "sidecar without a fingerprint used");
+        write_file(path, std::string("# model: ") + fp + " \r\n# verified: 2026-09-22 b0\r\n" + AUTO_ORNITH9);
+        TCHECK(choose(with_model) && c.kind == LLAMA_TURBOT_PLAN_KIND_SIDECAR, "CRLF sidecar not used (%s)", why.c_str());
+        llama_turbot_test_set_model_fingerprint("arch=qwen35 basename=ornith-1.5 size=35B layers=3,7,11,15,19,23,27,31 geom=256x4");
+        TCHECK(choose(with_model) && c.kind == LLAMA_TURBOT_PLAN_KIND_AUTO, "sidecar of another model used");
+        llama_turbot_test_set_model_fingerprint(fp.c_str());
+        {
+            llama_turbot_cache_shape draft = with_model;
+            draft.auto_ok = false;
+            write_file(path, std::string("# model: ") + fp + "\n# verified: x\nL 3 K 4 4 4 4 V 4 4 4 4\n");
+            TCHECK(!choose(draft) && why.find("sidecar") != std::string::npos, "a sidecar that does not parse: '%s'", why.c_str());
+            write_file(path, plan);
+        }
+
+        // the pure check
+        std::string w;
+        TCHECK(llama_turbot_sidecar_accepts(plan, fp, w) && w.empty(), "sidecar_accepts: %s", w.c_str());
+        TCHECK(!llama_turbot_sidecar_accepts(AUTO_ORNITH9, fp, w) && w.find("verified") != std::string::npos, "no stamp: '%s'", w.c_str());
+        TCHECK(!llama_turbot_sidecar_accepts(plan, "arch=x", w) && w.find("not this model") != std::string::npos, "wrong model: '%s'", w.c_str());
+        TCHECK(!llama_turbot_sidecar_accepts(plan, "", w), "empty fingerprint accepted");
+
+        // an explicit plan wins over the sidecar
+        llama_turbot_set_plan_path(LLAMA_TURBOT_PLAN_KEYWORD_AUTO);
+        TCHECK(choose(with_model) && c.kind == LLAMA_TURBOT_PLAN_KIND_AUTO, "'auto' lost to the sidecar");
+        llama_turbot_set_plan_path(nullptr);
+
+        // a verified sidecar outranks the built-in plan (turbot_guard.py refuses to write one without --force)
+        const std::string qfp = "arch=qwen35 basename=Qwen3.8-27B size=27B layers=3,7,11,15,19,23,27,31,35,39,43,47,51,55,59,63 geom=256x4";
+        write_file(path, std::string("# model: ") + qfp + "\n# verified: x\n" + AUTO_QWEN_262K);
+        llama_turbot_test_set_model_fingerprint(qfp.c_str());
+        llama_turbot_cache_shape q = qwen;
+        q.model = fake_model;
+        TCHECK(choose(q) && c.kind == LLAMA_TURBOT_PLAN_KIND_SIDECAR, "Qwen sidecar: kind %d", (int) c.kind);
+
+        // LLAMA_TURBOT_ANY=0: the sidecar is ignored
+        set_env("LLAMA_TURBOT_ANY", "0");
+        TCHECK(choose(q) && c.kind == LLAMA_TURBOT_PLAN_KIND_BUILTIN, "LLAMA_TURBOT_ANY=0 used the sidecar");
+        set_env("LLAMA_TURBOT_ANY", nullptr);
+
+        std::filesystem::remove(path);
+        llama_turbot_set_sidecar_path(nullptr);
+        llama_turbot_test_set_model_fingerprint(nullptr);
+    }
+
+    // LLAMA_TURBOT_ANY=0: the results of the plan check before [TAG_TURBOT_ANY_PLAN]
+    {
+        set_env("LLAMA_TURBOT_ANY", "0");
+        TCHECK(choose(qwen) && c.kind == LLAMA_TURBOT_PLAN_KIND_BUILTIN, "ANY=0 Qwen");
+        std::string old_why;
+        const bool old_ok = llama_turbot_plan_matches(llama_turbot_default_plan_text(), il_range(3, 31, 4), 262144, old_why);
+        TCHECK(!old_ok && !choose(ornith) && why == old_why, "ANY=0 Ornith: '%s', before: '%s'", why.c_str(), old_why.c_str());
+        TCHECK(!choose(shape_of(il_range(3, 39, 4), 256, 2, 262144, 1, 1, true)), "ANY=0 took a 256x2 shape");
+        llama_turbot_set_plan_path(LLAMA_TURBOT_PLAN_KEYWORD_AUTO);
+        TCHECK(llama_turbot_plan_get_source().origin == LLAMA_TURBOT_PLAN_FILE, "ANY=0: 'auto' is not a file name again");
+        TCHECK(!choose(ornith) && why.find("cannot open plan file auto") != std::string::npos, "ANY=0 'auto': '%s'", why.c_str());
+        llama_turbot_set_plan_path(nullptr);
+        set_env("LLAMA_TURBOT_ANY", nullptr);
+    }
+
+    reset_turbot_env();
+}
+
+// (5) plan scope and the constructor path
+static void test_plan_scope() {
+    printf("[8d] plan scope and loader ([TAG_TURBOT_ANY_PLAN])\n");
+    reset_turbot_env();
+
+    TCHECK(llama_turbot_plan_scope_current() == nullptr, "a scope is live at start");
+
+    llama_turbot_plan_choice a;
+    a.kind = LLAMA_TURBOT_PLAN_KIND_FILE;
+    a.text = DEFAULT_PLAN_TEXT;
+    a.name = "a.plan";
+    llama_turbot_plan_choice b;
+    b.kind = LLAMA_TURBOT_PLAN_KIND_AUTO;
+    b.text = AUTO_ORNITH9;
+    b.name = LLAMA_TURBOT_PLAN_AUTO_NAME;
+
+    {
+        llama_turbot_plan_scope sa(a);
+        const llama_turbot_plan_choice * cur = llama_turbot_plan_scope_current();
+        TCHECK(cur != nullptr && cur != &a && cur->name == "a.plan" && cur->text == a.text, "outer scope");
+        {
+            llama_turbot_plan_scope sb(b);
+            TCHECK(llama_turbot_plan_scope_current() && llama_turbot_plan_scope_current()->name == LLAMA_TURBOT_PLAN_AUTO_NAME, "nested scope");
+            const llama_turbot_plan_choice * other = &a;
+            std::thread t([&]() { other = llama_turbot_plan_scope_current(); });
+            t.join();
+            TCHECK(other == nullptr, "a scope is visible on another thread");
+        }
+        TCHECK(llama_turbot_plan_scope_current() && llama_turbot_plan_scope_current()->name == "a.plan", "outer scope after the nested one");
+    }
+    TCHECK(llama_turbot_plan_scope_current() == nullptr, "scope not cleared");
+
+    const llama_turbot_cache_shape qwen   = shape_of(qwen38_attn_layers(), 256, 4, 262144);
+    const llama_turbot_cache_shape ornith = shape_of(il_range(3, 31, 4), 256, 4, 262144);
+    llama_turbot_plan              p;
+    std::string                    err;
+
+    // the constructor path parses the scope's text against its own shape, whatever the plan source says
+    {
+        llama_turbot_set_plan_path(LLAMA_TURBOT_PLAN_KEYWORD_DEFAULT);
+        llama_turbot_plan_scope sb(b);
+        TCHECK(llama_turbot_plan_load(ornith, p, err) && p.hash == AUTO_ORNITH9_HASH && p.path == LLAMA_TURBOT_PLAN_AUTO_NAME,
+                "scope text: hash 0x%016" PRIx64 " path '%s' (%s)", p.hash, p.path.c_str(), err.c_str());
+        TCHECK(!llama_turbot_plan_load(qwen, p, err) && !err.empty(), "a scope text that does not fit the shape was loaded");
+        llama_turbot_set_plan_path(nullptr);
+    }
+
+    // no scope: the old precedence, plus the "auto" keyword from the constructor's shape
+    TCHECK(llama_turbot_plan_load(qwen, p, err) && p.hash == DEFAULT_PLAN_HASH && p.path == LLAMA_TURBOT_PLAN_BUILTIN_NAME,
+            "no scope, Qwen: hash 0x%016" PRIx64 " (%s)", p.hash, err.c_str());
+    TCHECK(llama_turbot_plan_load(qwen38_attn_layers(), 262144, p, err) && p.hash == DEFAULT_PLAN_HASH, "old loader overload");
+    TCHECK(!llama_turbot_plan_load(ornith, p, err) && err.find("--kv-tier-plan auto") != std::string::npos,
+            "no scope, Ornith: '%s'", err.c_str());
+    llama_turbot_set_plan_path(LLAMA_TURBOT_PLAN_KEYWORD_AUTO);
+    TCHECK(llama_turbot_plan_load(ornith, p, err) && p.hash == AUTO_ORNITH9_HASH && p.path == LLAMA_TURBOT_PLAN_AUTO_NAME,
+            "no scope, 'auto': hash 0x%016" PRIx64 " (%s)", p.hash, err.c_str());
+    TCHECK(!llama_turbot_plan_load(shape_of(il_range(3, 31, 4), 256, 4, 1024), p, err) && err.find(LLAMA_TURBOT_PLAN_AUTO_NAME) != std::string::npos,
+            "no scope, 'auto' on a tiny cache: '%s'", err.c_str());
+    llama_turbot_set_plan_path(nullptr);
+
+    // LLAMA_TURBOT_AUTO_PLAN_DUMP writes the automatic plan text
+    {
+        const std::string dump = temp_path("dump");
+        set_env("LLAMA_TURBOT_AUTO_PLAN_DUMP", dump.c_str());
+        llama_turbot_plan_scope sb(b);
+        TCHECK(llama_turbot_plan_load(ornith, p, err), "load with dump: %s", err.c_str());
+        std::ifstream f(dump, std::ios::binary);
+        std::string got((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+        TCHECK(got == AUTO_ORNITH9, "dump holds '%s'", got.c_str());
+        f.close();
+        std::filesystem::remove(dump);
+        set_env("LLAMA_TURBOT_AUTO_PLAN_DUMP", nullptr);
+    }
+
+    reset_turbot_env();
+}
+
+// a cache with ns streams, sequence s in stream s, driven through llama_turbot_streams_* like llama_kv_cache
+struct streams_sim {
+    const uint32_t                     kv_size;
+    const uint32_t                     ns;
+    std::vector<llama_kv_cells>        cells;
+    llama_kv_tier_ptrs                 tiers;
+    std::vector<std::set<uint32_t>>    empty;
+    std::vector<llama_pos>             next;
+    std::vector<llama_seq_id>          strm;                // streams of the last ubatch
+    std::vector<int32_t>               young, fill, gtab;   // composed inputs of the last ubatch (gtab over its s0..s1)
+
+    streams_sim(uint32_t kv, uint32_t n_stream, uint32_t pool_s, uint32_t cap) : kv_size(kv), ns(n_stream), cells(n_stream),
+            empty(n_stream), next(n_stream, 0) {
+        for (uint32_t s = 0; s < ns; ++s) {
+            cells[s].resize(kv);
+            tiers.push_back(std::make_unique<llama_kv_tier>(kv, pool_s, cap));
+            for (uint32_t i = 0; i < kv; ++i) {
+                empty[s].insert(i);
+            }
+        }
+    }
+
+    std::vector<uint32_t> lowest_empty(uint32_t s, uint32_t n) const {
+        std::vector<uint32_t> out;
+        for (auto it = empty[s].begin(); it != empty[s].end() && out.size() < n; ++it) {
+            out.push_back(*it);
+        }
+        GGML_ASSERT(out.size() == n);
+        return out;
+    }
+
+    // split_equal: n rows of sequence s for every stream s in [s0, s1], stream-major
+    void ubatch(uint32_t s0, uint32_t s1, uint32_t n, bool ok = true) {
+        const uint32_t k_n = s1 - s0 + 1;
+        std::vector<llama_pos>      pos(n*k_n);
+        std::vector<int32_t>        n_seq_id(n*k_n, 1);
+        std::vector<llama_seq_id>   sid(n*k_n);
+        std::vector<llama_seq_id *> sidp(n*k_n);
+        std::vector<std::vector<uint32_t>> idxs;
+        strm.clear();
+        for (uint32_t k = 0; k < k_n; ++k) {
+            const uint32_t s   = s0 + k;
+            const auto     idx = lowest_empty(s, n);
+            for (uint32_t i = 0; i < n; ++i) {
+                const uint32_t row = k*n + i;
+                pos[row] = next[s]++;
+                sid[row] = (llama_seq_id) s;
+                cells[s].pos_set(idx[i], pos[row]);
+                cells[s].seq_add(idx[i], (llama_seq_id) s);
+                empty[s].erase(idx[i]);
+            }
+            strm.push_back((llama_seq_id) s);
+            idxs.push_back(idx);
+        }
+        for (uint32_t row = 0; row < n*k_n; ++row) {
+            sidp[row] = &sid[row];
+        }
+        llama_ubatch ub{};
+        ub.n_tokens     = n*k_n;
+        ub.n_seq_tokens = n;
+        ub.n_seqs       = k_n;
+        ub.n_seqs_unq   = k_n;
+        ub.n_pos        = 1;
+        ub.pos          = pos.data();
+        ub.n_seq_id     = n_seq_id.data();
+        ub.seq_id       = sidp.data();
+        ub.seq_id_unq   = strm.data();
+
+        llama_turbot_streams_begin(tiers, ub, strm, idxs, cells);
+        young.assign(n*k_n, -2);
+        llama_turbot_streams_young(tiers, strm, young.data());
+        fill.assign(4*(size_t) llama_turbot_streams_n_fill(tiers, strm), -2);
+        llama_turbot_streams_fill(tiers, strm, fill.data());
+        gtab.assign((size_t) k_n*tiers[0]->n_granules(), -2);
+        llama_turbot_streams_gtab(tiers, s0, s1, gtab.data());
+        if (ok) {
+            llama_turbot_streams_commit(tiers, strm, cells);
+        } else {
+            llama_turbot_streams_abort(tiers, strm);
+        }
+    }
+
+    // llama_kv_cache::seq_rm(s, p0, -1) with the turbot hooks
+    void seq_rm_tail(uint32_t s, llama_pos p0) {
+        uint64_t min_st  = UINT64_MAX;
+        bool     removed = false;
+        for (uint32_t c = 0; c < kv_size; ++c) {
+            if (cells[s].is_empty(c) || cells[s].pos_get(c) < p0) {
+                continue;
+            }
+            min_st  = std::min(min_st, tiers[s]->stamp(c));
+            removed = true;
+            if (cells[s].seq_rm(c, (llama_seq_id) s)) {
+                tiers[s]->on_cell_emptied(c);
+                empty[s].insert(c);
+            }
+        }
+        if (removed) {
+            tiers[s]->on_seq_tail_removed((llama_seq_id) s, min_st);
+        }
+        next[s] = p0;
+    }
+};
+
+// begin + commit of n rows of seq at the given cells of a single tier (no tier_sim bookkeeping)
+static void drive_rows(llama_kv_tier & t, llama_kv_cells & cells, llama_seq_id seq, const std::vector<uint32_t> & idx, llama_pos pos0) {
+    const uint32_t n = (uint32_t) idx.size();
+    std::vector<llama_pos>      pos(n);
+    std::vector<int32_t>        n_seq_id(n, 1);
+    std::vector<llama_seq_id>   sid(n, seq);
+    std::vector<llama_seq_id *> sidp(n);
+    for (uint32_t i = 0; i < n; ++i) {
+        pos[i]  = pos0 + (llama_pos) i;
+        sidp[i] = &sid[i];
+        cells.pos_set(idx[i], pos[i]);
+        cells.seq_add(idx[i], seq);
+    }
+    llama_ubatch ub{};
+    ub.n_tokens     = n;
+    ub.n_seq_tokens = n;
+    ub.n_seqs       = 1;
+    ub.n_seqs_unq   = 1;
+    ub.n_pos        = 1;
+    ub.pos          = pos.data();
+    ub.n_seq_id     = n_seq_id.data();
+    ub.seq_id       = sidp.data();
+    ub.seq_id_unq   = sid.data();
+    t.begin_ubatch(ub, idx, cells);
+    t.commit_ubatch(cells);
+}
+
+// (6) per-stream tiers
+static void test_streams() {
+    printf("[8e] per-stream tiers ([TAG_TURBOT_ANY_STREAMS])\n");
+
+    // one stream through the stream helpers: gtab, young and fill byte-equal to the single tier, ubatch by ubatch
+    {
+        auto script = [](tier_sim & sim) {
+            sim.prefill(0, 3000, 128);
+            sim.prefill(1, 2000, 100);
+            for (int t = 0; t < 300; ++t) {
+                sim.ubatch({ 0, 1 }, sim.lowest_empty(2));
+                if (t % 7 == 0) {
+                    sim.seq_rm(t % 2, sim.next_pos(t % 2) - 1, -1);
+                }
+            }
+            sim.seq_rm(1, -1, -1);
+            sim.prefill(2, 1500, 256);
+            sim.seq_cp(0, 3);
+            sim.decode(3, 5);
+            sim.seq_rm(3, 100, -1);
+            sim.decode(3, 1, /*ok =*/ false);
+            sim.decode(3, 3);
+            // trim, then a rewrite into an old granule: a fill entry (the "trim then rewrite" case of [7b])
+            sim.seq_rm(0, -1, -1);
+            sim.seq_rm(2, -1, -1);
+            sim.seq_rm(3, -1, -1);
+            sim.prefill(4, 300, 32);
+            sim.seq_rm(4, 100, -1);
+            sim.decode(4, 1);
+        };
+        tier_sim a(8192, 1024, 64), b(8192, 1024, 64);
+        a.record = b.record = true;
+        b.via_streams = true;
+        script(a);
+        script(b);
+        TCHECK(!a.hist.empty() && a.hist.size() == b.hist.size(), "one stream: %zu vs %zu recorded inputs", a.hist.size(), b.hist.size());
+        size_t diff = 0;
+        for (size_t i = 0; i < std::min(a.hist.size(), b.hist.size()); ++i) {
+            diff += a.hist[i] != b.hist[i];
+        }
+        TCHECK(diff == 0, "one stream: %zu of %zu inputs differ from the single tier", diff, a.hist.size());
+        bool saw_fill = false;
+        for (size_t i = 1; i < a.hist.size(); i += 3) {
+            saw_fill = saw_fill || !a.hist[i].empty();
+        }
+        TCHECK(saw_fill, "one stream: the script produced no fill entry");
+    }
+
+    // three streams: the composition equals three independent tiers plus the stream offsets
+    {
+        const uint32_t kv = 4096, n_str = 3, pool_s = 256, cap = 64;
+        const int32_t  n_gran = (int32_t) (kv/64), n_slot = (int32_t) (pool_s/64);
+
+        streams_sim S(kv, n_str, pool_s, cap);
+        std::vector<std::unique_ptr<tier_sim>> R;
+        for (uint32_t s = 0; s < n_str; ++s) {
+            R.push_back(std::make_unique<tier_sim>(kv, pool_s, cap));
+        }
+
+        int  n_steps     = 0;
+        int  bad         = 0;
+        bool fill_offset = false;
+        bool slot_offset = false;
+
+        const auto step = [&](uint32_t s0, uint32_t s1, uint32_t n) {
+            S.ubatch(s0, s1, n);
+            std::vector<int32_t> want_young, want_fill, want_gtab;
+            for (uint32_t s = s0; s <= s1; ++s) {
+                tier_sim & r = *R[s];
+                r.ubatch(std::vector<llama_seq_id>(n, (llama_seq_id) s), r.lowest_empty(n));
+                for (const int32_t y : r.last_young) {
+                    want_young.push_back(y >= 0 ? y + (int32_t) s*(int32_t) pool_s : -1);
+                }
+                for (size_t k = 0; k + 3 < r.last_fill.size(); k += 4) {
+                    want_fill.push_back(r.last_fill[k]     + (int32_t) s*n_gran);
+                    want_fill.push_back(r.last_fill[k + 1] + (int32_t) s*n_slot);
+                    want_fill.push_back(r.last_fill[k + 2]);
+                    want_fill.push_back(r.last_fill[k + 3]);
+                    fill_offset = fill_offset || s > 0;
+                }
+                for (const int32_t g : r.last_gtab) {
+                    want_gtab.push_back(g >= 0 ? g + (int32_t) s*n_slot : -1);
+                    slot_offset = slot_offset || (g >= 0 && s > 0);
+                }
+            }
+            ++n_steps;
+            if (S.young != want_young || S.fill != want_fill || S.gtab != want_gtab) {
+                if (bad++ < 5) {
+                    TCHECK(false, "streams step %d (%u..%u x %u): young %d fill %d gtab %d", n_steps, s0, s1, n,
+                            (int) (S.young != want_young), (int) (S.fill != want_fill), (int) (S.gtab != want_gtab));
+                }
+            }
+            for (uint32_t s = 0; s < n_str; ++s) {
+                if (S.tiers[s]->granule_slots() != R[s]->tier.granule_slots() || S.tiers[s]->row_counter((llama_seq_id) s) != R[s]->tier.row_counter((llama_seq_id) s)) {
+                    if (bad++ < 5) {
+                        TCHECK(false, "streams step %d: tier %u differs from its independent tier", n_steps, s);
+                    }
+                }
+            }
+        };
+
+        for (int t = 0; t < 10; ++t) {
+            step(0, 2, 32);
+        }
+        step(1, 2, 16);
+        S.seq_rm_tail(1, 100);
+        R[1]->seq_rm(1, 100, -1);
+        step(1, 1, 1);                 // a rewrite into an old granule of stream 1: a fill entry with offsets
+        for (int t = 0; t < 20; ++t) {
+            step(0, 2, 1);
+        }
+        step(2, 2, 40);
+        S.seq_rm_tail(2, 50);
+        R[2]->seq_rm(2, 50, -1);
+        step(1, 2, 3);
+        TCHECK(bad == 0, "streams: %d mismatches in %d steps", bad, n_steps);
+        TCHECK(fill_offset && slot_offset, "streams: the script never exercised a fill (%d) or a slot (%d) offset", (int) fill_offset, (int) slot_offset);
+        bool same = true;
+        for (uint32_t s = 0; s < n_str; ++s) {
+            for (uint32_t c = 0; c < kv; ++c) {
+                same = same && S.tiers[s]->stamp(c) == R[s]->tier.stamp(c) && S.tiers[s]->cell_young(c) == R[s]->tier.cell_young(c);
+            }
+        }
+        TCHECK(same, "streams: stamps or young cells differ from the independent tiers");
+    }
+
+    // commit and abort run on the streams of the ubatch only
+    {
+        streams_sim S(4096, 2, 512, 1000);
+        S.ubatch(0, 1, 100);
+        const std::vector<int32_t> g0 = S.tiers[0]->granule_slots();
+        const uint64_t             c0 = S.tiers[0]->row_counter(0);
+        int64_t cut0 = 0, cut_after = 0;
+        TCHECK(S.tiers[0]->seq_cut(0, cut0), "stream 0 has no cut after its commit");
+        S.ubatch(1, 1, 70, /*ok =*/ false);
+        TCHECK(S.tiers[0]->granule_slots() == g0 && S.tiers[0]->row_counter(0) == c0 && S.tiers[0]->seq_cut(0, cut_after) && cut_after == cut0,
+                "an aborted ubatch of stream 1 changed stream 0");
+        S.ubatch(1, 1, 30);
+        TCHECK(S.tiers[0]->granule_slots() == g0 && S.tiers[0]->seq_cut(0, cut_after) && cut_after == cut0,
+                "a committed ubatch of stream 1 changed stream 0");
+        TCHECK(S.tiers[1]->row_counter(1) == 200, "stream 1 counter %" PRIu64 ", expected 200", S.tiers[1]->row_counter(1));
+        TCHECK(llama_turbot_streams_n_fill(S.tiers, { 0 }) == (int64_t) (S.tiers[0]->fill_entries().size()/4), "n_fill of stream 0");
+    }
+
+    // copy_stream_from: the destination takes the source's table, stamps and bits, and seq_src's counter and cut on seq_dst
+    {
+        tier_sim a(4096, 512, 1000);
+        a.prefill(0, 700, 100);
+        a.prefill(2, 300, 100);                        // cells of another sequence the copy leaves behind
+        int64_t cut_a = 0;
+        TCHECK(a.tier.seq_cut(0, cut_a), "copy source: no cut");
+
+        // llama_kv_cache::seq_cp across streams: the destination cells are the source sequence's, as seq 1
+        llama_kv_cells dst;
+        dst.resize(4096);
+        for (const auto & pc : a.seq_cells[0]) {
+            dst.pos_set(pc.second, pc.first);
+            dst.seq_add(pc.second, 1);
+        }
+
+        // the destination tier runs the full invariant check in every begin (SPEC 9.8, aborts on a violation)
+        const char *      old_debug  = getenv("LLAMA_TURBOT_DEBUG");
+        const std::string keep_debug = old_debug ? old_debug : "";
+        const bool        had_debug  = old_debug != nullptr;
+        set_env("LLAMA_TURBOT_DEBUG", "2");
+        llama_kv_tier b(4096, 512, 1000);
+        set_env("LLAMA_TURBOT_DEBUG", had_debug ? keep_debug.c_str() : nullptr);
+        b.copy_stream_from(a.tier, 0, 1);
+        b.drop_empty_cells(dst);
+
+        int64_t cut_b = 0, dummy = 0;
+        TCHECK(b.row_counter(1) == a.tier.row_counter(0) && b.row_counter(0) == 0 && b.row_counter(2) == 0,
+                "copy: counters %" PRIu64 " / %" PRIu64 " / %" PRIu64, b.row_counter(1), b.row_counter(0), b.row_counter(2));
+        TCHECK(b.seq_cut(1, cut_b) && cut_b == cut_a && !b.seq_cut(0, dummy) && !b.seq_cut(2, dummy), "copy: cut %lld vs %lld",
+                (long long) cut_b, (long long) cut_a);
+        TCHECK(b.granule_slots() == a.tier.granule_slots(), "copy: granule table differs");
+        bool same = true, dropped = true;
+        for (uint32_t c = 0; c < 4096; ++c) {
+            same = same && b.stamp(c) == a.tier.stamp(c);
+            if (!dst.is_empty(c)) {
+                same = same && b.cell_young(c) == a.tier.cell_young(c);
+            } else {
+                dropped = dropped && !b.cell_young(c);
+            }
+        }
+        TCHECK(same, "copy: stamps or young bits of the copied cells differ");
+        TCHECK(dropped, "copy: a cell the destination does not hold is young");
+
+        // the destination keeps going: the next row of seq 1 continues its stamp sequence
+        const uint64_t ctr = b.row_counter(1);
+        uint32_t cell = 0;
+        while (!dst.is_empty(cell)) {
+            ++cell;
+        }
+        drive_rows(b, dst, 1, { cell }, 700);
+        TCHECK(b.stamp(cell) == ctr + 1 && b.cell_young(cell), "copy: next row stamp %" PRIu64 ", expected %" PRIu64, b.stamp(cell), ctr + 1);
+    }
+}
+
 #endif // TURBOT_TEST_TIER
 
 int main(int argc, char ** argv) {
@@ -1711,6 +2832,12 @@ int main(int argc, char ** argv) {
     test_plan_parser();
     test_default_plan();
     test_tier();
+    // [TAG_TURBOT_ANY_*]
+    test_any_plan_parser();
+    test_auto_plan();
+    test_plan_choose();
+    test_plan_scope();
+    test_streams();
 #else
     printf("[7] plan parser and llama_kv_tier: SKIPPED (internal llama symbols do not link in this build, see docs/turbot/TESTING.md)\n");
 #endif
