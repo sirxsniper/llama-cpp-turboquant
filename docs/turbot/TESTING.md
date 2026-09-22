@@ -661,18 +661,20 @@ Context checkpoints in slot files (`[TAG_SLOT_FILE_CKPT]`, `tools/server/server-
 - Multi-stream and iSWA stay on only if G7 passes.
 - A failure flips that switch's default in code (a one-line change). The env switches remain.
 
-### 9.9 Results (to fill)
+### 9.9 Results (2026-09-22)
+
+Builds: NEW = `build-sync-any` at `840a8e9e7` (Vulkan on), BASE = `turboquant-ref80\build-ref` at `80f44b5d8`, both fresh. Outputs under `E:\turbot-gates\any`. llama-perplexity and llama-server print the libllama info lines (`llama_kv_cache: size`, `turbot plan`) only from `-lv 4` on this build; `turbot_guard.py` and `blob_roundtrip.py` now pass it.
 
 | Gate | Result |
 |---|---|
-| G0 preflight, rebuilt tools | not yet run |
-| G1 test-turbot, test-turbot-geom, test-kv-resolve | not yet run |
-| G2 Qwen3.8-27B bit-identity (SASS, test-backend-ops, bytes, validate.ps1, server log, transcripts, KLD, tg64) | not yet run |
-| G3 new-kernel correctness, memcheck, synccheck | not yet run |
-| G4 kernel speed per geometry | not yet measured |
-| G5 quality per model (KLD CI, same-top, p99.9, 131K PPL) | not yet measured |
-| G6 speed and VRAM per model | not yet measured |
-| G7 server smoke per model, Qwen `-np 4` streams | not yet run |
-| G7 slot-file checkpoints (`save_restore` arm, kill switch, old file, corrupt file, budget) | not yet run |
-| G8 VALIDATED list and switch defaults | not yet decided |
+| G0 preflight, rebuilt tools | pass: every tool built with its DLLs, 0 nvlddmkm / Display 4101 events all run |
+| G1 test-turbot, test-turbot-geom, test-kv-resolve | pass: 15707 checks, 1773 checks with (g) and (h) run, 154 checks, 0 failed (after the 2 × 256 change: 15709, 1773, 157) |
+| G2 Qwen3.8-27B bit-identity | pass. SASS (sm_120a, gate scope): 44 IDENTICAL, 0 DIFF, 0 MISSING, 75 new-only kernels. FLASH_ATTN_EXT `^turbot=[a-z0-9]+,kv=` 195/195 and TURBOT_SET_ROWS 28/28, case names equal to BASE. test-turbot-backend: every BASE line identical in NEW (NEW adds the [1b] geometry section). Production server: `turbot plan <built-in default>`, hash `0x56c3503c949a7749`, `size = 5246.00 MiB ... young pool: 726.00 MiB`. Greedy prose 512, code 512, tool call and 4 concurrent unique-value prompts identical to BASE, including the DFlash2 acceptance (317/581, 376/405). Repeats: the single-stream transcripts stayed identical in two more runs of NEW (after the 2 × 256 change) and one more of BASE; one concurrent prompt changed wording between runs of BASE itself (batch timing), and the second BASE run equals both later NEW runs on all 4. KLD 16 × 32K: code 0.001139, prose 0.001856, PPL(Q) 1.536336 / 6.189125, exactly as before; turbo5p code 0.001595. validate.ps1 (after the 2 × 256 change): `GATE PASSED`, test-backend-ops 18228/18228 (16732 before plus the new turbot cases), 0 FAIL, the 64 old hsk=40 baseline cases still pass, smoke arms turbo4 / turbo5p / turbot 10/10 each. llama-bench turbot tg64 (`-r 2`, no draft model, BASE run first): d0 56.95 ± 0.54 BASE / 56.61 ± 0.84 NEW, d131072 47.22 ± 0.41 / 46.66 ± 0.46 (−0.6 % and −1.2 %, inside two standard deviations; the turbot kernels are the same SASS). d245760 not run |
+| G3 new-kernel correctness, memcheck, synccheck | pass: FLASH_ATTN_EXT `^turbot=[a-z0-9]+,d=` 1426/1426, TURBOT_SET_ROWS 70/70; memcheck and synccheck on the small FA (282 cases) and writer (50 cases) filters: 0 errors |
+| G4 kernel speed per geometry | not measured |
+| G5 quality per model (prose 32K × 8, turbot with no plan against the fallback) | Ornith-1.5-9B pass: KLD 0.005942 vs turbo5p 0.011281, CI [−0.0081, −0.0031], same-top +0.71 pp, p99.9 0.86 vs 1.94. Spark-X2.5-4B pass: 0.010718 vs 0.014022, CI [−0.0051, −0.0015], +0.76 pp, 0.50 vs 0.61. Ornith-1.5-35B **fail**: 0.088414 vs turbo5p512 0.070221, CI [−0.0099, +0.0457], same-top −0.29 pp (lower bound −1.23), p99.9 11.59 vs 10.43. On this model llama-perplexity is not repeatable: a second f16 run against a fresh f16 base gives KLD 0.028955 (same-top 95.16 %, p99.9 3.07), and turbo5p512 again gives 0.069681. Qwen3.8-27B repeats to six digits, so this is specific to the MoE model (not investigated); the 2 × 256 numbers carry that noise. Code corpus, 131K PPL and the 2 × 128 opt-in arms not run |
+| G6 speed and VRAM per model | VRAM at 262144 cells: Ornith-9B 2572.59 vs turbo5p 2624.00 MiB; Spark-4B 2894.17 + 34.59 (SWA) vs 2952.00 + 34.59 MiB; Ornith-35B 1650.39 vs turbo5p512 1680.00 MiB. Speed not measured |
+| G7 server smoke per model | 262K server with `-ctk turbot`, all six models (Ornith 9B/35B, Spark 4B, MiniCPM5, Muse, Nemotron): 3/3 facts and the tool call right, no CUDA error. MiniCPM5, Muse and Nemotron resolve to turbo4 with one warning. Qwen crosstalk (6 rounds, 24 requests, `LLAMA_TURBOT_DEBUG=2`): 0 failures, 0 invariant violations. eos_repro arm A, 2 waves: 160 graded, 0 early EOS, 4 diverged, all near-ties, 0 anomalous. Qwen `-np 4` streams and vision not run |
+| G7 slot-file checkpoints | `save_restore`: `prompt_n` 20015 → 4, `saved 2 context checkpoints`, `restored 2 of 2 ... draft state restored`; tokens identical **without** the draft model, but with DFlash2 the tokens differ from token 87 of 96 (deterministic; draft acceptance 67/84 after the restore against 65/86 in the reference run), so the arm fails on the production command. A file from the deployed build (no section) restores with 200, no warning, full prompt, identical tokens. `LLAMA_SLOT_FILE_CKPT=0`: file 711706994 B (the old `n_written`), full prompt, identical tokens and acceptance. Last byte flipped: restore 200, `checkpoint section ignored (the draft state fails its checksum)`, full prompt, identical tokens, `/health` 200. Budget arm not run |
+| G8 VALIDATED list and switch defaults | VALIDATED = {256 × 4}. 256 × 2 left the list (G5 failed on Ornith-1.5-35B): Ornith-35B and Spark-1.7B now take turbo5p512 with one warning; `LLAMA_TURBOT_AUTO_PLAN=all` still gives turbot. NR 1 stays opt-in (not measured). Multi-stream and iSWA: iSWA checked on Spark-4B only |
 
