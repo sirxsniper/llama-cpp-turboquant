@@ -6082,6 +6082,14 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
     GGML_UNUSED(reg);
 }
 
+// [TAG_TURBOT_ANY_RESOLVE] "ggml_backend_turbot_supports_geometry", bool (ggml_backend_dev_t, int head_dim, int n_head_kv):
+// the KV resolver (LLAMA_TURBOT_DEV_GEOM_PROC, src/llama-context.cpp) asks it per attention layer, so a layer this build
+// or this device cannot run as turbot steps down instead of reaching a refused flash attention. See fattn.cu.
+static bool ggml_backend_cuda_turbot_supports_geometry(ggml_backend_dev_t dev, int head_dim, int n_head_kv) {
+    const ggml_backend_cuda_device_context * dev_ctx = (const ggml_backend_cuda_device_context *) dev->context;
+    return ggml_cuda_turbot_geometry_supported(dev_ctx->device, head_dim, n_head_kv);
+}
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
@@ -6101,6 +6109,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_cuda_get_features;
+    }
+    if (strcmp(name, "ggml_backend_turbot_supports_geometry") == 0) {   // [TAG_TURBOT_ANY_RESOLVE]
+        return (void *)ggml_backend_cuda_turbot_supports_geometry;
     }
     return nullptr;
 }

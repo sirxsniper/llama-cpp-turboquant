@@ -3,7 +3,8 @@
 // [TAG_TURBOT] CUDA flash attention read path of the turbot tiered KV cache, docs/turbot/SPEC.md section 7.
 //
 // Everything turbot-specific on the device lives here and is compiled ONLY into the 20 hand-written
-// template-instances/fattn-mma-turbot-instance-ncols1_*-ncols2_*.cu TUs. No existing kernel, loader, template or
+// template-instances/fattn-mma-turbot-instance-ncols1_*-ncols2_*.cu TUs (and the 16 fattn-mma-turbot-d128-instance-*.cu
+// ones, [TAG_TURBOT_ANY_D128]). No existing kernel, loader, template or
 // instance TU changes or includes this file, so every existing KV type keeps identical codegen and constant memory.
 //
 // The kernel is a specialised copy of flash_attn_ext_f16 (fattn-mma-f16.cuh) for D = 256:
@@ -12,6 +13,11 @@
 //   - softmax, mask, sinks, softcap, combine and fixup code is the f16 kernel's, copied verbatim.
 // launch_fattn_turbot is launch_fattn without the F16 conversion, with the same KV_max scans and fixup launches, except
 // that fixup layouts are work-balanced by default ([TAG_TURBOT_FA_BALANCE], SPEC section 13).
+//
+// [TAG_TURBOT_ANY_D128] The same kernel also serves D = 128 (the 16 fattn-mma-turbot-d128-instance-*.cu TUs) and rows
+// of 1, 2 or 4 runs of 256 values (the op-params geometry flags, ggml_turbot_geom_*). A D = 256 head z is run z; a
+// D = 128 head z is run z >> 1 at element base 128*(z & 1), so the loaders only add that base (turbot_elem_base) and the
+// head state is the run's (turbot_head_state_of_d). Every D = 256 path is if-constexpr'd to the pre-change code.
 
 #include "common.cuh"
 #include "fattn-mma-f16.cuh"
@@ -103,6 +109,20 @@ static_assert((TURBOT_LUT_V_YOUNG + 256)*sizeof(float) <= TURBOT_NBYTES_SHARED_L
 static constexpr __host__ __device__ int ggml_cuda_fattn_turbot_lut_off(const int nbatch_fa, const int nbatch_K2, const int nbatch_V2, const int ncols1) {
     return GGML_PAD(nbatch_fa * (nbatch_K2 > nbatch_V2 ? nbatch_K2 + 4 : nbatch_V2 + 4) * (int) sizeof(half2) +
                     ncols1    * (nbatch_fa/2 + 4)                                          * (int) sizeof(half2), 16);
+}
+
+// [TAG_TURBOT_ANY_D128] KV rows per tile of the turbot kernel. A tile must lie inside one 64-cell granule (one gtab entry
+// per tile), and the D = 128 ncols 8 config asks for 128 rows, so D = 128 is capped at 64. For D = 256 this is exactly
+// ggml_cuda_fattn_mma_get_nbatch_fa (every D = 256 config is already <= 64). Device and host twins, as in fattn-mma-f16.cuh.
+static constexpr __device__ int turbot_nbatch_fa(const int DKQ, const int DV, const int ncols) {
+    return DKQ == 128 ? (ggml_cuda_fattn_mma_get_nbatch_fa(DKQ, DV, ncols) < GGML_TURBOT_GRANULE ?
+                         ggml_cuda_fattn_mma_get_nbatch_fa(DKQ, DV, ncols) : GGML_TURBOT_GRANULE)
+                      :  ggml_cuda_fattn_mma_get_nbatch_fa(DKQ, DV, ncols);
+}
+
+static __host__ int turbot_nbatch_fa(const int DKQ, const int DV, const int ncols, const int cc) {
+    const int n = ggml_cuda_fattn_mma_get_nbatch_fa(DKQ, DV, ncols, cc);
+    return DKQ == 128 ? std::min(n, GGML_TURBOT_GRANULE) : n;
 }
 
 // ------------------------------------------------------------------------------------------------------------------
@@ -224,6 +244,42 @@ static __device__ __forceinline__ turbot_head_state turbot_head_state_of(int z_K
     hs.k = turbot_side_state_of(z_KV,  d0        & 0xFFFFFFFFu, d1, 0);
     hs.v = turbot_side_state_of(z_KV, (d0 >> 32) & 0xFFFFFFFFu, d2, hs.pool_v_off);
     return hs;
+}
+
+// [TAG_TURBOT_ANY_D128] Head state and element base of KV head z_KV for head size DKQ, used at both [TAG_TURBOT_HEAD_STATE]
+// sites. D = 256: head z is run z at element 0, i.e. turbot_head_state_of unchanged and the constant 0. D = 128: head z
+// is run z >> 1 (its widths, offsets and gains) at element base 128*(z & 1) inside the run, so its two halves are the
+// run's WHT groups 0 and 1 and the loaders' gain index (e0 >> 7) picks the right group once eb is added.
+template <int DKQ>
+static __device__ __forceinline__ turbot_head_state turbot_head_state_of_d(int z_KV, int64_t desc0, int64_t desc1, int64_t desc2) {
+    if constexpr (DKQ == 256) {
+        return turbot_head_state_of(z_KV, desc0, desc1, desc2);
+    } else {
+        static_assert(DKQ == 128, "turbot: head size 128 or 256");
+        return turbot_head_state_of(z_KV >> 1, desc0, desc1, desc2);
+    }
+}
+
+template <int DKQ>
+static __device__ __forceinline__ int turbot_head_eb(const int z_KV) {
+    if constexpr (DKQ == 256) {
+        GGML_UNUSED(z_KV);
+        return 0;
+    } else {
+        return 128*(z_KV & 1);
+    }
+}
+
+// [TAG_TURBOT_ANY_D128] First element inside the run of a K or V loader call: e for D = 256 (the pre-change expression,
+// no eb term at all), e + eb for D = 128.
+template <int DKQ>
+static __device__ __forceinline__ int turbot_elem_base(const int e, const int eb) {
+    if constexpr (DKQ == 256) {
+        GGML_UNUSED(eb);
+        return e;
+    } else {
+        return e + eb;
+    }
 }
 
 // Code of chunk element e (0..31) from the plane words of one 32-element chunk; absent planes are loaded as 0.
@@ -624,14 +680,15 @@ static __device__ __forceinline__ void flash_attn_ext_turbot_iter(
         const int jt,
         const int kb0,
         const int k_VKQ_sup,
-        const turbot_head_state & hs) {
+        const turbot_head_state & hs,
+        const int eb) {                              // [TAG_TURBOT_ANY_D128] head element base in its run, 0 for D=256
 #if defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
     constexpr int  warp_size       = ggml_cuda_get_physical_warp_size();
     constexpr int  ncols           = ncols1 * ncols2;
     constexpr int  cols_per_warp   = T_B_KQ::I;
     constexpr int  cols_per_thread = get_cols_per_thread();
     constexpr int  np              = cols_per_warp > ncols ? nwarps : nwarps * cols_per_warp/ncols; // Number of parallel CUDA warps per Q column.
-    constexpr int  nbatch_fa       = ggml_cuda_fattn_mma_get_nbatch_fa(DKQ, DV, ncols);
+    constexpr int  nbatch_fa       = turbot_nbatch_fa(DKQ, DV, ncols);   // [TAG_TURBOT_ANY_D128] == the f16 value for D=256
     constexpr int  nbatch_K2       = ggml_cuda_fattn_mma_get_nbatch_K2(DKQ, DV, ncols);
     constexpr int  nbatch_V2       = ggml_cuda_fattn_mma_get_nbatch_V2(DKQ, DV, ncols);
     constexpr bool Q_in_reg        = ggml_cuda_fattn_mma_get_Q_in_reg (DKQ, DV, ncols);
@@ -681,12 +738,13 @@ static __device__ __forceinline__ void flash_attn_ext_turbot_iter(
         const int k0_diff = k0_stop - k0_start;
 
         // [TAG_TURBOT] K side: element offset inside the head is k0_start*2 (the rows are row bases, no head bias).
+        // [TAG_TURBOT_ANY_D128] inside the run: k0_start*2 + eb for D=128, k0_start*2 exactly for D=256.
         if (young) {
             flash_attn_ext_turbot_load_tile_young_dispatch<(ncols >= TURBOT_CT_WIDTH_MIN_NCOLS), stride_tile_K, nwarps, nbatch_fa, oob_check>
-                (hs.generic, K_base0, prow0, tile_K, k0_diff, nb11, nb_pool, k0_start*2, hs.k, lut + TURBOT_LUT_K_YOUNG, k_VKQ_sup);
+                (hs.generic, K_base0, prow0, tile_K, k0_diff, nb11, nb_pool, turbot_elem_base<DKQ>(k0_start*2, eb), hs.k, lut + TURBOT_LUT_K_YOUNG, k_VKQ_sup);
         } else {
             flash_attn_ext_turbot_load_tile_old_dispatch<(ncols >= TURBOT_CT_WIDTH_MIN_NCOLS), stride_tile_K, nwarps, nbatch_fa, oob_check>
-                (hs.generic, K_base0, tile_K, k0_diff, nb11, k0_start*2, hs.k, lut + TURBOT_LUT_K_OLD, k_VKQ_sup);
+                (hs.generic, K_base0, tile_K, k0_diff, nb11, turbot_elem_base<DKQ>(k0_start*2, eb), hs.k, lut + TURBOT_LUT_K_OLD, k_VKQ_sup);
         }
         __syncthreads();
 
@@ -984,12 +1042,13 @@ static __device__ __forceinline__ void flash_attn_ext_turbot_iter(
         const int i0_diff = i0_stop - i0_start;
 
         // [TAG_TURBOT] V side: V base row offsets, V refinement at pool_v_off (folded into hs.v.pool).
+        // [TAG_TURBOT_ANY_D128] first element i0_start + eb for D=128, i0_start exactly for D=256.
         if (young) {
             flash_attn_ext_turbot_load_tile_young_dispatch<(ncols >= TURBOT_CT_WIDTH_MIN_NCOLS), stride_tile_V, nwarps, nbatch_fa, oob_check>
-                (hs.generic, V_base0, prow0, tile_V, i0_diff/2, nb21, nb_pool, i0_start, hs.v, lut + TURBOT_LUT_V_YOUNG, k_VKQ_sup);
+                (hs.generic, V_base0, prow0, tile_V, i0_diff/2, nb21, nb_pool, turbot_elem_base<DKQ>(i0_start, eb), hs.v, lut + TURBOT_LUT_V_YOUNG, k_VKQ_sup);
         } else {
             flash_attn_ext_turbot_load_tile_old_dispatch<(ncols >= TURBOT_CT_WIDTH_MIN_NCOLS), stride_tile_V, nwarps, nbatch_fa, oob_check>
-                (hs.generic, V_base0, tile_V, i0_diff/2, nb21, i0_start, hs.v, lut + TURBOT_LUT_V_OLD, k_VKQ_sup);
+                (hs.generic, V_base0, tile_V, i0_diff/2, nb21, turbot_elem_base<DKQ>(i0_start, eb), hs.v, lut + TURBOT_LUT_V_OLD, k_VKQ_sup);
         }
         __syncthreads();
 
@@ -1041,7 +1100,7 @@ static __device__ __forceinline__ void flash_attn_ext_turbot_iter(
 #else
     GGML_UNUSED_VARS(Q_f2, K_row, V_row, pool, gtab, mask_h, kv_pos, q_pos, dstk, dstk_fixup,
         scale, slope, logit_softcap, ne01, ne02, nb11, nb21, nb_pool, stride_mask,
-        tile_Q, tile_K, tile_V, tile_mask, lut, Q_B, VKQ_C, KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup, hs);
+        tile_Q, tile_K, tile_V, tile_mask, lut, Q_B, VKQ_C, KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup, hs, eb);
     NO_DEVICE_CODE;
 #endif // defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
 }
@@ -1081,7 +1140,8 @@ static __device__ __forceinline__ void flash_attn_ext_turbot_process_tile(
         const int kb0_start,
         const int kb0_stop,
         const int kb0_stride,                        // [TAG_TURBOT_FA_STRIPE] 1, or the stripe of a striped block
-        const turbot_head_state & hs) {
+        const turbot_head_state & hs,
+        const int eb) {                              // [TAG_TURBOT_ANY_D128] head element base in its run, 0 for D=256
 #if defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
     //In this kernel Q, K, V are matrices while i, j, k are matrix indices.
 
@@ -1097,7 +1157,7 @@ static __device__ __forceinline__ void flash_attn_ext_turbot_process_tile(
     constexpr int  cols_per_warp   = T_B_KQ::I;
     constexpr int  cols_per_thread = get_cols_per_thread();
     constexpr int  np              = cols_per_warp > ncols ? nwarps : nwarps * cols_per_warp/ncols; // Number of parallel CUDA warps per Q column.
-    constexpr int  nbatch_fa       = ggml_cuda_fattn_mma_get_nbatch_fa     (DKQ, DV, ncols);
+    constexpr int  nbatch_fa       = turbot_nbatch_fa                      (DKQ, DV, ncols);   // [TAG_TURBOT_ANY_D128]
     constexpr int  nbatch_K2       = ggml_cuda_fattn_mma_get_nbatch_K2     (DKQ, DV, ncols);
     constexpr int  nbatch_V2       = ggml_cuda_fattn_mma_get_nbatch_V2     (DKQ, DV, ncols);
     constexpr int  nbatch_combine  = ggml_cuda_fattn_mma_get_nbatch_combine(DKQ, DV, ncols);
@@ -1259,7 +1319,7 @@ static __device__ __forceinline__ void flash_attn_ext_turbot_process_tile(
                  T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>
                 (Q_f2, K_row, V_row, pool, gtab, mask_h, kv_pos, q_pos, dstk, dstk_fixup, scale, slope, logit_softcap,
                  ne01, ne02, nb11, nb21, nb_pool, stride_mask, tile_Q, tile_K, tile_V, tile_mask, lut, Q_B, VKQ_C,
-                 KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup, hs);
+                 KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup, hs, eb);
         }
         constexpr bool last_iter = true;
         const     int  k_VKQ_sup = ne11 - kb0*nbatch_fa;
@@ -1268,7 +1328,7 @@ static __device__ __forceinline__ void flash_attn_ext_turbot_process_tile(
               T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>
             (Q_f2, K_row, V_row, pool, gtab, mask_h, kv_pos, q_pos, dstk, dstk_fixup, scale, slope, logit_softcap,
              ne01, ne02, nb11, nb21, nb_pool, stride_mask, tile_Q, tile_K, tile_V, tile_mask, lut, Q_B, VKQ_C,
-             KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup, hs);
+             KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup, hs, eb);
     } else {
         constexpr bool oob_check = false;
         for (; kb0 + kb0_stride < kb0_stop; kb0 += kb0_stride) {   // [TAG_TURBOT_FA_STRIPE] stride 1: kb0 < kb0_stop-1
@@ -1279,7 +1339,7 @@ static __device__ __forceinline__ void flash_attn_ext_turbot_process_tile(
                  T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>
                 (Q_f2, K_row, V_row, pool, gtab, mask_h, kv_pos, q_pos, dstk, dstk_fixup, scale, slope, logit_softcap,
                  ne01, ne02, nb11, nb21, nb_pool, stride_mask, tile_Q, tile_K, tile_V, tile_mask, lut, Q_B, VKQ_C,
-                 KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup, hs);
+                 KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup, hs, eb);
         }
         constexpr bool last_iter = true;
         constexpr int  k_VKQ_sup = nbatch_fa;
@@ -1288,7 +1348,7 @@ static __device__ __forceinline__ void flash_attn_ext_turbot_process_tile(
              T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>
             (Q_f2, K_row, V_row, pool, gtab, mask_h, kv_pos, q_pos, dstk, dstk_fixup, scale, slope, logit_softcap,
              ne01, ne02, nb11, nb21, nb_pool, stride_mask, tile_Q, tile_K, tile_V, tile_mask, lut, Q_B, VKQ_C,
-             KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup, hs);
+             KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup, hs, eb);
     }
 
     // Finally, sum up partial KQ rowsums.
@@ -1677,7 +1737,7 @@ static __device__ __forceinline__ void flash_attn_ext_turbot_process_tile(
     GGML_UNUSED_VARS(Q_f2, K_row, V_row, pool, gtab, mask_h, kv_pos, q_pos, sinks_f, dstk, dstk_fixup,
         scale, slope, logit_softcap, ne01, ne02, gqa_ratio, ne11,
         stride_Q1, stride_Q2, nb11, nb21, nb_pool, stride_mask,
-        jt, zt_gqa, kb0_start, kb0_stop, kb0_stride, hs);
+        jt, zt_gqa, kb0_start, kb0_stop, kb0_stride, hs, eb);
     NO_DEVICE_CODE;
 #endif // defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
 }
@@ -1733,7 +1793,8 @@ static __global__ void flash_attn_ext_turbot(
     const int32_t * GGML_CUDA_RESTRICT gtab     = gtab_ptr;
     const int     * GGML_CUDA_RESTRICT balance_bounds = balance_bounds_ptr;
 
-    static_assert(DKQ == 256 && DV == 256, "turbot kernels exist for D=256 only");
+    // [TAG_TURBOT_ANY_D128] D = 128 too (DKQ = DV)
+    static_assert((DKQ == 256 && DV == 256) || (DKQ == 128 && DV == 128), "turbot kernels exist for D=256 and D=128 only");
 
 #ifdef VOLTA_MMA_AVAILABLE
     if (ncols1*ncols2 < 32) {
@@ -1765,7 +1826,7 @@ static __global__ void flash_attn_ext_turbot(
 
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
     constexpr int ncols     = ncols1 * ncols2;
-    constexpr int nbatch_fa = ggml_cuda_fattn_mma_get_nbatch_fa(DKQ, DV, ncols);
+    constexpr int nbatch_fa = turbot_nbatch_fa(DKQ, DV, ncols);   // [TAG_TURBOT_ANY_D128]
     constexpr int nthreads  = ggml_cuda_fattn_mma_get_nthreads(DKQ, DV, ncols);
     constexpr int nwarps    = nthreads / warp_size;
 
@@ -1822,7 +1883,9 @@ static __global__ void flash_attn_ext_turbot(
 
         // [TAG_TURBOT_HEAD_STATE] site 1 of 2. Heads have different widths, so K and V are row bases (never nb12/nb22)
         // and every per-head offset comes from the head state.
-        const turbot_head_state hs = turbot_head_state_of(z_KV, turbot_desc0, turbot_desc1, turbot_desc2);
+        // [TAG_TURBOT_ANY_D128] turbot_head_state_of for D=256 (eb the constant 0); the run z >> 1 and 128*(z & 1) for D=128.
+        const turbot_head_state hs = turbot_head_state_of_d<DKQ>(z_KV, turbot_desc0, turbot_desc1, turbot_desc2);
+        const int               eb = turbot_head_eb<DKQ>(z_KV);
         const char * const K_row = K + nb13*sequence;
         const char * const V_row = V + nb23*sequence;
 
@@ -1873,13 +1936,13 @@ static __global__ void flash_attn_ext_turbot(
             flash_attn_ext_turbot_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, needs_fixup, is_fixup>
                 (Q_f2, K_row, V_row, pool, gtab, mask_h, kv_pos, q_pos, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
                  ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, (int64_t) nb11, (int64_t) nb21, nb_pool, stride_mask,
-                 jt, zt_gqa, kb0_start, kb0_stop, kb0_stride, hs);
+                 jt, zt_gqa, kb0_start, kb0_stop, kb0_stride, hs, eb);
         } else {
             constexpr bool needs_fixup = true; // CUDA block is missing the beginning of a tile.
             flash_attn_ext_turbot_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, needs_fixup, is_fixup>
                 (Q_f2, K_row, V_row, pool, gtab, mask_h, kv_pos, q_pos, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
                  ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, (int64_t) nb11, (int64_t) nb21, nb_pool, stride_mask,
-                 jt, zt_gqa, kb0_start, kb0_stop, kb0_stride, hs);
+                 jt, zt_gqa, kb0_start, kb0_stop, kb0_stride, hs, eb);
         }
 
         kbc += iter_k;
@@ -1902,7 +1965,8 @@ static __global__ void flash_attn_ext_turbot(
     const int zt_Q = z_KV*gqa_ratio + zt_gqa*ncols2; // Global Q head start index.
 
     // [TAG_TURBOT_HEAD_STATE] site 2 of 2, the final is_fixup block: identical to site 1 by construction.
-    const turbot_head_state hs = turbot_head_state_of(z_KV, turbot_desc0, turbot_desc1, turbot_desc2);
+    const turbot_head_state hs = turbot_head_state_of_d<DKQ>(z_KV, turbot_desc0, turbot_desc1, turbot_desc2);
+    const int               eb = turbot_head_eb<DKQ>(z_KV);   // [TAG_TURBOT_ANY_D128]
     const char * const K_row = K + nb13*sequence;
     const char * const V_row = V + nb23*sequence;
 
@@ -1944,7 +2008,7 @@ static __global__ void flash_attn_ext_turbot(
     flash_attn_ext_turbot_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, needs_fixup, is_fixup>
         (Q_f2, K_row, V_row, pool, gtab, mask_h, kv_pos, q_pos, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
          ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, (int64_t) nb11, (int64_t) nb21, nb_pool, stride_mask,
-         jt, zt_gqa, kb0_start, kb0_stop, kb0_stride, hs);
+         jt, zt_gqa, kb0_start, kb0_stop, kb0_stride, hs, eb);
 #else
     GGML_UNUSED_VARS(Q_ptr, K_ptr, V_ptr, mask_ptr, sinks_ptr, kv_pos, q_pos, KV_max_ptr, dst_ptr, dst_meta_ptr, scale,
         max_bias, m0, m1, n_head_log2, logit_softcap,
@@ -2151,7 +2215,11 @@ static __device__ __forceinline__ int64_t turbot_balance_cum(
     return w_old*kb + w_delta*prefix[kb];
 }
 
-template <int n_head>
+// [TAG_TURBOT_ANY_NHEAD] n_head KV heads, hpr heads per 256-value run (1 for D = 256, 2 for D = 128). The weights are
+// packed per RUN (16 bits each, at most GGML_TURBOT_MAX_RUNS runs), and KV head h reads the weight of run h / hpr.
+// <4, 1> is the Qwen3.8-27B instance and compiles today's body verbatim (the first if-constexpr branch); every other
+// instance takes the generic branch, which computes the same seams for n_head = 4, hpr = 1.
+template <int n_head, int hpr>
 __launch_bounds__(WARP_SIZE, 1)
 static __global__ void flash_attn_turbot_balance_bounds(
         const int * prefix_ptr,      // [iter_k + 1], flash_attn_turbot_young_prefix
@@ -2161,12 +2229,16 @@ static __global__ void flash_attn_turbot_balance_bounds(
         const int nit,               // ceil(log2(iter_k)): the kb search interval is <= 1 after nit halvings
         const int n_o,               // output tiles per head: iter_j * iter_z_gqa
         const int n_seq,
-        const int64_t w_old_pack,    // 16 bits per head
+        const int64_t w_old_pack,    // 16 bits per head (per run, [TAG_TURBOT_ANY_NHEAD])
         const int64_t w_young_pack) {
     const int * GGML_CUDA_RESTRICT prefix = prefix_ptr;
     int       * GGML_CUDA_RESTRICT seams  = seams_ptr;
 
-    static_assert(n_head == 4, "turbot balance packs 4 head weights");
+    static_assert((hpr == 1 || hpr == 2) && n_head % hpr == 0 && n_head/hpr >= 1 && n_head/hpr <= GGML_TURBOT_MAX_RUNS,
+                  "turbot balance packs one 16-bit weight per run, at most 4 runs");
+
+    if constexpr (n_head == 4 && hpr == 1) {
+    // ---- the pre-[TAG_TURBOT_ANY_NHEAD] body, unchanged (n_head == 4) ----
 
     const int tid = threadIdx.x;
 
@@ -2220,6 +2292,115 @@ static __global__ void flash_attn_turbot_balance_bounds(
         const int64_t seam = t <= 0 ? 0 : (i >= nblocks ? n_units : kbc);
         if (i <= nblocks) {
             seams[i] = int(seam);
+        }
+    }
+
+    } else {
+    // ---- [TAG_TURBOT_ANY_NHEAD] generic body: any n_head, head h weighted by run h / hpr ----
+
+    const int tid = threadIdx.x;
+
+    ggml_cuda_pdl_sync();
+
+    // Per-head totals, uniform across lanes.
+    const int64_t y_all = prefix[iter_k];
+    int64_t w_old   [n_head];
+    int64_t w_delta [n_head];
+    int64_t w_tile  [n_head];
+    int64_t head_end[n_head];
+    int64_t acc = 0;
+#pragma unroll
+    for (int h = 0; h < n_head; ++h) {
+        const int r = h / hpr;
+        w_old[h]    = int64_t(((uint64_t) w_old_pack   >> (16*r)) & 0xFFFFu);
+        w_delta[h]  = int64_t(((uint64_t) w_young_pack >> (16*r)) & 0xFFFFu) - w_old[h];
+        w_tile[h]   = w_old[h]*iter_k + w_delta[h]*y_all;   // >= iter_k: every unit weighs >= 1
+        acc        += w_tile[h]*n_o;
+        head_end[h] = acc;
+    }
+    const int64_t w_seq   = acc;
+    const int64_t w_total = w_seq*n_seq;
+    const int64_t n_units = int64_t(iter_k)*n_o*n_head*n_seq;
+
+    for (int i0 = 0; i0 <= nblocks; i0 += WARP_SIZE) {
+        const int     i   = i0 + tid;
+        const int64_t t   = int64_t(i)*w_total / nblocks;
+        // Clamp so every lane stays in range (i past nblocks, or t == 0); those lanes' results are replaced below.
+        const int64_t tc  = t <= 0 ? 1 : (t < w_total ? t : w_total);
+        const int64_t seq = (tc - 1) / w_seq;
+        const int64_t ts  = tc - seq*w_seq;                                                  // (0, w_seq]
+
+        // head of ts: the number of head ends strictly below it, then that head's totals (register selects, no
+        // dynamic indexing of the per-head arrays)
+        int h = 0;
+#pragma unroll
+        for (int hh = 0; hh < n_head - 1; ++hh) {
+            h += int(ts > head_end[hh]);
+        }
+        int64_t hb = 0;
+        int64_t wt = w_tile[0];
+        int64_t wo = w_old[0];
+        int64_t wd = w_delta[0];
+#pragma unroll
+        for (int hh = 1; hh < n_head; ++hh) {
+            if (h == hh) {
+                hb = head_end[hh - 1];
+                wt = w_tile[hh];
+                wo = w_old[hh];
+                wd = w_delta[hh];
+            }
+        }
+        const int64_t th  = ts - hb;                                                         // (0, wt*n_o]
+        const int64_t o   = (th - 1) / wt;                                                   // output tile in the head
+        const int64_t rem = th - o*wt;                                                       // (0, wt]
+
+        // smallest kb in (0, iter_k] with cum(kb) >= rem; invariant cum(lo) < rem <= cum(hi)
+        int lo = 0;
+        int hi = iter_k;
+        for (int it = 0; it < nit; ++it) {
+            const int  mid = (lo + hi) >> 1;
+            const bool ge  = turbot_balance_cum(prefix, mid, wo, wd) >= rem;
+            hi = ge ? mid : hi;
+            lo = ge ? lo  : mid;
+        }
+
+        const int64_t kbc  = ((seq*n_head + h)*n_o + o)*iter_k + hi;
+        const int64_t seam = t <= 0 ? 0 : (i >= nblocks ? n_units : kbc);
+        if (i <= nblocks) {
+            seams[i] = int(seam);
+        }
+    }
+
+    }
+}
+
+// [TAG_TURBOT_ANY_NHEAD] Launch the seam kernel for the layer's KV head count (K->ne[2]) and head size: D = 256 has one
+// head per run (4, 2 or 1 heads), D = 128 two (8, 4 or 2). Qwen3.8-27B (D = 256, 4 heads) launches <4, 1> as before.
+template <int D>
+static __host__ void ggml_cuda_fattn_turbot_launch_balance_bounds(
+        const int64_t n_head, const ggml_cuda_kernel_launch_params & launch_params,
+        const int * prefix, int * seams, const int nblocks, const int iter_k, const int nit, const int n_o, const int n_seq,
+        const int64_t w_old, const int64_t w_young) {
+    if constexpr (D == 256) {
+        switch (n_head) {
+            case 4: ggml_cuda_kernel_launch(flash_attn_turbot_balance_bounds<4, 1>, launch_params,
+                        prefix, seams, nblocks, iter_k, nit, n_o, n_seq, w_old, w_young); break;
+            case 2: ggml_cuda_kernel_launch(flash_attn_turbot_balance_bounds<2, 1>, launch_params,
+                        prefix, seams, nblocks, iter_k, nit, n_o, n_seq, w_old, w_young); break;
+            case 1: ggml_cuda_kernel_launch(flash_attn_turbot_balance_bounds<1, 1>, launch_params,
+                        prefix, seams, nblocks, iter_k, nit, n_o, n_seq, w_old, w_young); break;
+            default: GGML_ABORT("turbot balance: %d KV heads at D=256", (int) n_head);
+        }
+    } else {
+        static_assert(D == 128, "turbot: head size 128 or 256");
+        switch (n_head) {
+            case 8: ggml_cuda_kernel_launch(flash_attn_turbot_balance_bounds<8, 2>, launch_params,
+                        prefix, seams, nblocks, iter_k, nit, n_o, n_seq, w_old, w_young); break;
+            case 4: ggml_cuda_kernel_launch(flash_attn_turbot_balance_bounds<4, 2>, launch_params,
+                        prefix, seams, nblocks, iter_k, nit, n_o, n_seq, w_old, w_young); break;
+            case 2: ggml_cuda_kernel_launch(flash_attn_turbot_balance_bounds<2, 2>, launch_params,
+                        prefix, seams, nblocks, iter_k, nit, n_o, n_seq, w_old, w_young); break;
+            default: GGML_ABORT("turbot balance: %d KV heads at D=128", (int) n_head);
         }
     }
 }
@@ -2487,8 +2668,12 @@ static __host__ ggml_turbot_layer ggml_cuda_fattn_turbot_layer_of(const ggml_ten
 
     GGML_ASSERT(ggml_turbot_is_type(K->type) && ggml_turbot_is_type(V->type));
     GGML_ASSERT(ggml_turbot_s_of_type(K->type) == l.k.s && ggml_turbot_s_of_type(V->type) == l.v.s);
-    GGML_ASSERT(K->ne[0] == GGML_TURBOT_HEAD_DIM && V->ne[0] == GGML_TURBOT_HEAD_DIM);
-    GGML_ASSERT(K->ne[2] == GGML_TURBOT_N_HEAD   && V->ne[2] == GGML_TURBOT_N_HEAD);
+    // [TAG_TURBOT_ANY_NHEAD] the geometry the op params name: 256 x 4 for flags 0 (the old GGML_TURBOT_HEAD_DIM /
+    // GGML_TURBOT_N_HEAD asserts), and n_head == K->ne[2] == ggml_turbot_geom_n_head(flags) for every geometry
+    GGML_ASSERT(ggml_turbot_geom_valid(l.flags));
+    GGML_ASSERT(K->ne[0] == ggml_turbot_geom_head_dim(l.flags) && V->ne[0] == ggml_turbot_geom_head_dim(l.flags));
+    GGML_ASSERT(K->ne[2] == ggml_turbot_geom_n_head(l.flags)   && V->ne[2] == ggml_turbot_geom_n_head(l.flags));
+    GGML_ASSERT(l.k.nr == ggml_turbot_geom_nr(l.flags) && l.v.nr == ggml_turbot_geom_nr(l.flags));
     GGML_ASSERT(K->ne[3] == 1 && V->ne[3] == 1);
     GGML_ASSERT(K->nb[1] == (size_t) l.k.base_row_bytes && V->nb[1] == (size_t) l.v.base_row_bytes);
 
@@ -2500,10 +2685,14 @@ static __host__ ggml_turbot_layer ggml_cuda_fattn_turbot_layer_of(const ggml_ten
     return l;
 }
 
+// [TAG_TURBOT_ANY_NHEAD] Only the side's nr runs are packed; the fields of runs r >= nr stay 0 (b = y = 0, offset 0),
+// and no kernel ever reads them (a D = 256 head z < nr is run z, a D = 128 head z < 2*nr is run z >> 1). nr = 4 packs
+// the four runs exactly as before.
 static __host__ void ggml_cuda_fattn_turbot_pack_side(const ggml_turbot_side & sd, uint64_t & widths, uint64_t & offs) {
     widths = 0;
     offs   = 0;
-    for (int h = 0; h < GGML_TURBOT_N_HEAD; ++h) {
+    GGML_ASSERT(sd.nr >= 1 && sd.nr <= GGML_TURBOT_MAX_RUNS);
+    for (int h = 0; h < (int) sd.nr; ++h) {
         GGML_ASSERT(sd.base_off[h] % 32 == 0 && sd.base_off[h]/32 <= 0x1F);
         GGML_ASSERT(sd.young_off[h] % 32 == 0 && sd.young_off[h]/32 <= 0x1F);
         widths |= (uint64_t) (sd.b[h] & 0xF) << (4*h);
@@ -2605,7 +2794,7 @@ static __host__ void ggml_cuda_fattn_turbot_balance_weights(
     uint64_t wy = 0;
     if (cfg.mode == 2) {
         uint64_t s = cfg.seed ^ (shape_key * 0xD6E8FEB86659FD93ull);
-        for (int h = 0; h < GGML_TURBOT_N_HEAD; ++h) {
+        for (int h = 0; h < GGML_TURBOT_MAX_RUNS; ++h) {   // [TAG_TURBOT_ANY_NHEAD] per run (== 4 heads at D=256 x 4)
             const uint64_t r  = ggml_cuda_fattn_turbot_splitmix64(s);
             const uint64_t ho = 1 + (((r >>  0) & 0xFFFu) >> ((r >> 12) % 12));   // log-spread in [1, 4096]
             const uint64_t hy = 1 + (((r >> 16) & 0xFFFu) >> ((r >> 28) % 12));
@@ -2616,7 +2805,7 @@ static __host__ void ggml_cuda_fattn_turbot_balance_weights(
         const bool ct          = ncols >= TURBOT_CT_WIDTH_MIN_NCOLS && !ggml_cuda_fattn_turbot_generic_on();
         const int  b6_extra    = ct ? (ncols >= 64 ?  4 :  1) : (ncols >= 64 ?  8 : 24);
         const int  young_extra = ct ? (ncols >= 64 ? 10 : 22) : (ncols >= 64 ? 25 : 45);
-        for (int h = 0; h < GGML_TURBOT_N_HEAD; ++h) {
+        for (int h = 0; h < GGML_TURBOT_MAX_RUNS; ++h) {   // [TAG_TURBOT_ANY_NHEAD] runs r >= nr: b = 0, unused
             const int ho = 200 + (l.k.b[h] == 6 ? b6_extra : 0) + (l.v.b[h] == 6 ? b6_extra : 0);
             const int hy = ho + 2*young_extra;
             wo |= (uint64_t) ho << (16*h);
@@ -2909,9 +3098,10 @@ static void launch_fattn_turbot(
             ++log2_tpg;
         }
         GGML_ASSERT((nbatch_fa << log2_tpg) == GGML_TURBOT_GRANULE && log2_tpg <= 2);
-        GGML_ASSERT(K->ne[2] == GGML_TURBOT_N_HEAD);
+        // [TAG_TURBOT_ANY_NHEAD] any KV head count of the geometry (4 for Qwen3.8-27B, as the old assert required)
+        GGML_ASSERT(K->ne[2] == ggml_turbot_geom_n_head(layer.flags));
         GGML_ASSERT(((iter_k - 1) >> log2_tpg) < gtab_t->ne[0]);
-        GGML_ASSERT((int64_t) iter_k * n_o * GGML_TURBOT_N_HEAD * n_seq < INT_MAX);
+        GGML_ASSERT((int64_t) iter_k * n_o * K->ne[2] * n_seq < INT_MAX);
 
         int nit = 0;
         while ((1 << nit) < iter_k) {
@@ -2941,7 +3131,8 @@ static void launch_fattn_turbot(
         }
         CUDA_CHECK(cudaGetLastError());
         if (balance_cfg.diag != 1) {
-            ggml_cuda_kernel_launch(flash_attn_turbot_balance_bounds<GGML_TURBOT_N_HEAD>, launch_params_bal,
+            // [TAG_TURBOT_ANY_NHEAD] <4, 1> for Qwen3.8-27B (the old flash_attn_turbot_balance_bounds<4>)
+            ggml_cuda_fattn_turbot_launch_balance_bounds<DV>(K->ne[2], launch_params_bal,
                 (const int *) prefix, seams, nblocks, iter_k, nit, n_o, n_seq, balance_w_old, balance_w_young);
             CUDA_CHECK(cudaGetLastError());
         }
@@ -3057,7 +3248,8 @@ static void launch_fattn_turbot(
 
 template <int DKQ, int DV, int ncols1, int ncols2>
 void ggml_cuda_flash_attn_ext_turbot_case(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    static_assert(DKQ == 256 && DV == 256, "turbot kernels exist for D=256 only");
+    // [TAG_TURBOT_ANY_D128] D = 128 too (DKQ = DV)
+    static_assert((DKQ == 256 && DV == 256) || (DKQ == 128 && DV == 128), "turbot kernels exist for D=256 and D=128 only");
 
     const ggml_tensor * KQV = dst;
     const int id = ggml_cuda_get_device();
@@ -3067,10 +3259,11 @@ void ggml_cuda_flash_attn_ext_turbot_case(ggml_backend_cuda_context & ctx, ggml_
 
     // Validates the params and every tensor property the kernel relies on (the launcher packs the same layout).
     const ggml_turbot_layer layer = ggml_cuda_fattn_turbot_layer_of(dst);
-    GGML_UNUSED(layer);
+    // [TAG_TURBOT_ANY_D128] the instance's head size is the geometry's (routing only sends a matching D here)
+    GGML_ASSERT(ggml_turbot_geom_head_dim(layer.flags) == DKQ);
 
     const int  nthreads       = ggml_cuda_fattn_mma_get_nthreads      (DKQ, DV, ncols, cc);
-    const int  nbatch_fa      = ggml_cuda_fattn_mma_get_nbatch_fa     (DKQ, DV, ncols, cc);
+    const int  nbatch_fa      = turbot_nbatch_fa                      (DKQ, DV, ncols, cc);   // [TAG_TURBOT_ANY_D128]
     const int  nbatch_K2      = ggml_cuda_fattn_mma_get_nbatch_K2     (DKQ, DV, ncols, cc);
     const int  nbatch_V2      = ggml_cuda_fattn_mma_get_nbatch_V2     (DKQ, DV, ncols, cc);
     const int  nbatch_combine = ggml_cuda_fattn_mma_get_nbatch_combine(DKQ, DV, ncols, cc);

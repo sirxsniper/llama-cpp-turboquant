@@ -125,7 +125,19 @@ if (CUDAToolkit_FOUND)
     list(LENGTH SRCS GGML_CUDA_FA_TURBO_VEC_COUNT)
     file(GLOB   SRCS "template-instances/fattn-mma-turbot-instance-*.cu")
     list(LENGTH SRCS GGML_CUDA_FA_TURBOT_MMA_COUNT)
-    message(STATUS "FlashAttention turbo VEC instances: ${GGML_CUDA_FA_TURBO_VEC_COUNT}, turbot MMA instances: ${GGML_CUDA_FA_TURBOT_MMA_COUNT}")
+    # [TAG_TURBOT_ANY_D128] The 16 D=128 turbot MMA instances (fattn-mma-turbot-d128-instance-*.cu, also matched by the
+    # fattn-mma* glob above) serve head size 128 models. OFF drops them and defines GGML_CUDA_FA_TURBOT_D128=0, which
+    # compiles out the D=128 turbot dispatch in fattn.cu (no link error) and makes the routing refuse D=128 turbot.
+    option(GGML_CUDA_FA_TURBOT_D128 "ggml: compile the D=128 turbot FlashAttention instances" ON)
+    file(GLOB   SRCS "template-instances/fattn-mma-turbot-d128-instance-*.cu")
+    if (GGML_CUDA_FA_TURBOT_D128)
+        list(LENGTH SRCS GGML_CUDA_FA_TURBOT_D128_COUNT)
+    else()
+        list(FILTER GGML_SOURCES_CUDA EXCLUDE REGEX "fattn-mma-turbot-d128-instance-")
+        add_compile_definitions(GGML_CUDA_FA_TURBOT_D128=0)
+        set(GGML_CUDA_FA_TURBOT_D128_COUNT 0)
+    endif()
+    message(STATUS "FlashAttention turbo VEC instances: ${GGML_CUDA_FA_TURBO_VEC_COUNT}, turbot MMA instances: ${GGML_CUDA_FA_TURBOT_MMA_COUNT} (D=256) + ${GGML_CUDA_FA_TURBOT_D128_COUNT} (D=128)")
 
     ggml_add_backend_library(ggml-cuda
                              ${GGML_HEADERS_CUDA}

@@ -13,6 +13,11 @@
 // The per-head layout arrives as block-uniform scalar kernel arguments, never as __device__ globals (a host write to
 // a global races with kernels still queued for earlier layers): b[h] and y[h] as nibbles, base_off[h] and
 // young_off[h] as 16-bit fields, the two gain offsets, and the side's byte offset inside a pool row.
+//
+// [TAG_TURBOT_ANY_WRITER_NG] A row holds NG = 2*NR WHT groups (NR = 1, 2 or 4 runs of 256 values, the op-params geometry;
+// "head" h below is run h). Both kernels take LOG2_NG as a template parameter: NG = 8 (LOG2_NG 3) is the 4 x 256 row
+// and compiles to the pre-change kernels, the shifts being the same constants. A D = 128 row of 8 heads is also NG 8:
+// group ig is then head ig, the same bytes.
 
 #include "turbot-set-rows.cuh"
 #include "turbo-quant.cuh"      // TURBO_WHT_SIGNS1/2, read-only use
@@ -79,10 +84,10 @@ static __device__ __forceinline__ uint8_t turbot_p2_byte(unsigned lo, unsigned h
     }
 
 // ---- [TAG_TURBOT] row kernel: base code always, a_lloyd refinement for rows with a young pool row ----
-template <typename idx_t>
+template <typename idx_t, int LOG2_NG>   // [TAG_TURBOT_ANY_WRITER_NG] NG = 1 << LOG2_NG groups per row (3: 4 x 256)
 __launch_bounds__(128)
 static __global__ void k_turbot_set_rows(
-        const float   * __restrict__ src0,       // rows, F32 [1024, n_rows], contiguous inside a row
+        const float   * __restrict__ src0,       // rows, F32 [128*NG, n_rows], contiguous inside a row
         const idx_t   * __restrict__ src1,       // destination cell of each row
         const int32_t * __restrict__ young,      // young pool row of each row, or -1
         char          * __restrict__ dst,        // base cache data
@@ -105,9 +110,11 @@ static __global__ void k_turbot_set_rows(
     const int lane = j % WARP_SIZE;
 
     // blockIdx.x = 8*row + (2*h + g). Shifts only: no 64-bit or even 32-bit division on the GPU ([TAG_TURBO5P]).
+    // [TAG_TURBOT_ANY_WRITER_NG] NG*row + (2*h + g): >> LOG2_NG and & (NG - 1), i.e. >> 3 and & 7 for NG 8.
+    static_assert(LOG2_NG >= 1 && LOG2_NG <= 3, "turbot writer: 2, 4 or 8 groups per row");
     const uint32_t blk = (uint32_t) blockIdx.x;
-    const int64_t  i   = (int64_t) (blk >> 3);
-    const int      ig  = (int) (blk & 7u);
+    const int64_t  i   = (int64_t) (blk >> LOG2_NG);
+    const int      ig  = (int) (blk & ((1u << LOG2_NG) - 1u));
     const int      h   = ig >> 1;
     const int      g   = ig & 1;
 
@@ -299,6 +306,7 @@ static __global__ void k_turbot_set_rows(
 }
 
 // ---- [TAG_TURBOT] centre fill: refinement for a live cell that only holds an old code ----
+template <int LOG2_NG>   // [TAG_TURBOT_ANY_WRITER_NG] NG = 1 << LOG2_NG groups per row (3: 4 x 256)
 __launch_bounds__(128)
 static __global__ void k_turbot_fill(
         const int32_t * __restrict__ fill_ents,  // I32 [4, n_fill]: granule, slot, (int32) mask_lo, (int32) mask_hi
@@ -320,10 +328,12 @@ static __global__ void k_turbot_fill(
     const int lane = j % WARP_SIZE;
 
     // blockIdx.x = 512*entry + 8*c + (2*h + g), c = cell inside the granule
+    // [TAG_TURBOT_ANY_WRITER_NG] 64*NG*entry + NG*c + (2*h + g): >> (LOG2_NG + 6), >> LOG2_NG, & (NG - 1) (9, 3, 7 for NG 8)
+    static_assert(LOG2_NG >= 1 && LOG2_NG <= 3, "turbot writer: 2, 4 or 8 groups per row");
     const uint32_t blk = (uint32_t) blockIdx.x;
-    const int64_t  f   = (int64_t) (blk >> 9);
-    const int      c   = (int) ((blk >> 3) & 63u);
-    const int      ig  = (int) (blk & 7u);
+    const int64_t  f   = (int64_t) (blk >> (LOG2_NG + 6));
+    const int      c   = (int) ((blk >> LOG2_NG) & 63u);
+    const int      ig  = (int) (blk & ((1u << LOG2_NG) - 1u));
     const int      h   = ig >> 1;
     const int      g   = ig & 1;
 
@@ -447,9 +457,10 @@ struct turbot_writer_layout {
     uint64_t young_offs = 0;   // young_off[h] in bits 16h..16h+15
 };
 
+// [TAG_TURBOT_ANY_WRITER_NG] every run slot is packed; runs r >= nr are b = y = 0, offset 0, and no block reads them
 static turbot_writer_layout turbot_writer_layout_of(const ggml_turbot_side & sd) {
     turbot_writer_layout lo;
-    for (int h = 0; h < GGML_TURBOT_N_HEAD; ++h) {
+    for (int h = 0; h < GGML_TURBOT_MAX_RUNS; ++h) {
         lo.bw         |= (uint32_t) sd.b[h] << (4*h);
         lo.yw         |= (uint32_t) sd.y[h] << (4*h);
         lo.base_offs  |= (uint64_t) sd.base_off[h]  << (16*h);
@@ -458,8 +469,10 @@ static turbot_writer_layout turbot_writer_layout_of(const ggml_turbot_side & sd)
     return lo;
 }
 
-// Parses and validates the op without asserting. On success fills the layer, the written side and its pool part.
-static bool turbot_set_rows_layout(const ggml_tensor * op, ggml_turbot_layer & layer, const ggml_turbot_side *& sd, int64_t & part_off) {
+// Parses and validates the op without asserting. On success fills the layer, the written side, its pool part and the
+// number of WHT groups per row ([TAG_TURBOT_ANY_WRITER_NG]: NG = rows->ne[0] / 128, 2*NR of the op-params geometry).
+static bool turbot_set_rows_layout(const ggml_tensor * op, ggml_turbot_layer & layer, const ggml_turbot_side *& sd, int64_t & part_off,
+                                   int & ng) {
     if (op->op != GGML_OP_TURBOT_SET_ROWS) {
         return false;
     }
@@ -477,10 +490,13 @@ static bool turbot_set_rows_layout(const ggml_tensor * op, ggml_turbot_layer & l
     if (!ggml_turbot_is_type(base->type)) {
         return false;
     }
-    if (rows->type != GGML_TYPE_F32 || rows->ne[0] != GGML_TURBOT_ROW_ELEMS || rows->ne[2] != 1 || rows->ne[3] != 1 ||
-            !ggml_is_contiguous_rows(rows)) {
+    // [TAG_TURBOT_ANY_WRITER_NG] a row is NG = 2, 4 or 8 whole WHT groups (256, 512 or 1024 values); the geometry check
+    // against the op params follows below. 1024 values (NG 8) is the only row the old check accepted.
+    if (rows->type != GGML_TYPE_F32 || rows->ne[2] != 1 || rows->ne[3] != 1 || !ggml_is_contiguous_rows(rows) ||
+            (rows->ne[0] != 2*GGML_TURBOT_GROUP && rows->ne[0] != 4*GGML_TURBOT_GROUP && rows->ne[0] != 8*GGML_TURBOT_GROUP)) {
         return false;
     }
+    ng = (int) (rows->ne[0] / GGML_TURBOT_GROUP);
     if (cells->ne[0] != rows->ne[1] || (cells->type != GGML_TYPE_I64 && cells->type != GGML_TYPE_I32)) {
         return false;
     }
@@ -505,24 +521,34 @@ static bool turbot_set_rows_layout(const ggml_tensor * op, ggml_turbot_layer & l
         return false;
     }
 
-    // Geometry the kernels address directly: whole 1024-value cell rows in the base cache, one pool row per pool
-    // cell with the bytes of a row consecutive, and launch counts that fit the int grid size.
+    // [TAG_TURBOT_ANY_WRITER_NG] the row must be the geometry's (NG = 2*NR); GGML_TURBOT_ANY=0 accepts only the 4 x 256
+    // geometry, flags 0 and NG 8, i.e. exactly what the old check accepted.
+    if (!ggml_turbot_geom_valid(layer.flags) || ng != ggml_turbot_geom_n_groups(layer.flags) || 2*(int) sd->nr != ng) {
+        return false;
+    }
+    if (!ggml_cuda_turbot_any_on() && (layer.flags != 0 || ng != 8)) {
+        return false;
+    }
+
+    // Geometry the kernels address directly: whole 1024-value cell rows in the base cache (the container of every
+    // geometry, [TAG_TURBOT_ANY_WRITER_NG]), one pool row per pool cell with the bytes of a row consecutive, and launch
+    // counts that fit the int grid size.
     if (base->ne[0] != GGML_TURBOT_ROW_ELEMS || base->nb[1] != (size_t) sd->base_row_bytes) {
         return false;
     }
     if (pool->ne[0] != (int64_t) layer.pool_row_bytes || pool->nb[0] != 1) {
         return false;
     }
-    if (rows->ne[1] > INT_MAX / GGML_TURBOT_N_GAINS) {
+    if (rows->ne[1] > INT_MAX / ng) {
         return false;
     }
-    if (fill != nullptr && fill->ne[1] > INT_MAX / (GGML_TURBOT_GRANULE*GGML_TURBOT_N_GAINS)) {
+    if (fill != nullptr && fill->ne[1] > INT_MAX / (GGML_TURBOT_GRANULE*ng)) {
         return false;
     }
     return true;
 }
 
-template <typename idx_t>
+template <typename idx_t, int LOG2_NG>
 static void turbot_set_rows_cuda(
         ggml_backend_cuda_context  & ctx,
         ggml_tensor                * dst,
@@ -539,8 +565,8 @@ static void turbot_set_rows_cuda(
 
     cudaStream_t stream = ctx.stream();
 
-    // One CUDA block per (row, WHT group): 8 per row, 128 lanes each.
-    k_turbot_set_rows<idx_t><<<(int) (n_rows*GGML_TURBOT_N_GAINS), GGML_TURBOT_GROUP, 0, stream>>>(
+    // One CUDA block per (row, WHT group): NG per row (8 for the 4 x 256 row), 128 lanes each.
+    k_turbot_set_rows<idx_t, LOG2_NG><<<(int) (n_rows << LOG2_NG), GGML_TURBOT_GROUP, 0, stream>>>(
         (const float *) src0->data, (const idx_t *) src1->data, (const int32_t *) young->data,
         (char *) dst->data, (char *) pool->data,
         (int64_t) (src0->nb[1]/sizeof(float)), (int64_t) (src1->nb[0]/sizeof(idx_t)), (int64_t) (young->nb[0]/sizeof(int32_t)),
@@ -548,21 +574,52 @@ static void turbot_set_rows_cuda(
         lo.bw, lo.yw, lo.base_offs, lo.young_offs, (int) sd.base_gain_off, (int) sd.young_gain_off);
 }
 
+// [TAG_TURBOT_ANY_WRITER_NG] both kernels of one op for NG = 1 << LOG2_NG, in the pre-change order (fill, then rows)
+template <int LOG2_NG>
+static void turbot_set_rows_launch(
+        ggml_backend_cuda_context  & ctx,
+        ggml_tensor                * dst,
+        const ggml_turbot_side     & sd,
+        const turbot_writer_layout & lo,
+        const int64_t                part_off) {
+    const ggml_tensor * src1 = dst->src[1];
+    const ggml_tensor * pool = dst->src[3];
+    const ggml_tensor * fill = dst->src[5];
+
+    cudaStream_t stream = ctx.stream();
+
+    // Fill entries first (SPEC 5.2): a granule that just gained a slot gets refinements for its live old cells
+    // before this layer's FA reads it through the young path. Rows written by this ubatch are never in a mask.
+    if (fill != nullptr && fill->ne[1] > 0) {
+        const int64_t n_blocks = (fill->ne[1]*GGML_TURBOT_GRANULE) << LOG2_NG;
+        k_turbot_fill<LOG2_NG><<<(int) n_blocks, GGML_TURBOT_GROUP, 0, stream>>>(
+            (const int32_t *) fill->data, (char *) dst->data, (char *) pool->data,
+            (int64_t) (fill->nb[0]/sizeof(int32_t)), (int64_t) (fill->nb[1]/sizeof(int32_t)),
+            (int64_t) dst->nb[1], (int64_t) pool->nb[1], part_off,
+            lo.bw, lo.yw, lo.base_offs, lo.young_offs, (int) sd.base_gain_off, (int) sd.young_gain_off);
+    }
+
+    if (src1->type == GGML_TYPE_I64) {
+        turbot_set_rows_cuda<int64_t, LOG2_NG>(ctx, dst, sd, lo, part_off);
+    } else {
+        turbot_set_rows_cuda<int32_t, LOG2_NG>(ctx, dst, sd, lo, part_off);
+    }
+}
+
 void ggml_cuda_op_turbot_set_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_turbot_layer        layer;
     const ggml_turbot_side * sd       = nullptr;
     int64_t                  part_off = 0;
-    GGML_ASSERT(turbot_set_rows_layout(dst, layer, sd, part_off) && "turbot_set_rows: invalid op (see SPEC 5.2)");
+    int                      ng       = 0;
+    GGML_ASSERT(turbot_set_rows_layout(dst, layer, sd, part_off, ng) && "turbot_set_rows: invalid op (see SPEC 5.2)");
 
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
     const ggml_tensor * base = dst->src[2];
-    const ggml_tensor * pool = dst->src[3];
-    const ggml_tensor * fill = dst->src[5];
 
     // dst is ggml_view_tensor(base): same data, same row stride.
     GGML_ASSERT(dst->data == base->data && dst->nb[1] == base->nb[1]);
-    GGML_ASSERT(src0->ne[0] == GGML_TURBOT_ROW_ELEMS);
+    GGML_ASSERT(src0->ne[0] == (int64_t) ng*GGML_TURBOT_GROUP);   // [TAG_TURBOT_ANY_WRITER_NG] 1024 for NG 8
     GGML_ASSERT(src1->ne[0] == src0->ne[1]);
 
     const int64_t n_rows = src0->ne[1];
@@ -570,24 +627,14 @@ void ggml_cuda_op_turbot_set_rows(ggml_backend_cuda_context & ctx, ggml_tensor *
         return;
     }
 
-    const turbot_writer_layout lo     = turbot_writer_layout_of(*sd);
-    cudaStream_t               stream = ctx.stream();
+    const turbot_writer_layout lo = turbot_writer_layout_of(*sd);
 
-    // Fill entries first (SPEC 5.2): a granule that just gained a slot gets refinements for its live old cells
-    // before this layer's FA reads it through the young path. Rows written by this ubatch are never in a mask.
-    if (fill != nullptr && fill->ne[1] > 0) {
-        const int64_t n_blocks = fill->ne[1]*GGML_TURBOT_GRANULE*GGML_TURBOT_N_GAINS;
-        k_turbot_fill<<<(int) n_blocks, GGML_TURBOT_GROUP, 0, stream>>>(
-            (const int32_t *) fill->data, (char *) dst->data, (char *) pool->data,
-            (int64_t) (fill->nb[0]/sizeof(int32_t)), (int64_t) (fill->nb[1]/sizeof(int32_t)),
-            (int64_t) dst->nb[1], (int64_t) pool->nb[1], part_off,
-            lo.bw, lo.yw, lo.base_offs, lo.young_offs, (int) sd->base_gain_off, (int) sd->young_gain_off);
-    }
-
-    if (src1->type == GGML_TYPE_I64) {
-        turbot_set_rows_cuda<int64_t>(ctx, dst, *sd, lo, part_off);
-    } else {
-        turbot_set_rows_cuda<int32_t>(ctx, dst, *sd, lo, part_off);
+    // [TAG_TURBOT_ANY_WRITER_NG] NG 8 (the 4 x 256 row, and 8 x 128) launches the pre-change kernels
+    switch (ng) {
+        case 8: turbot_set_rows_launch<3>(ctx, dst, *sd, lo, part_off); break;
+        case 4: turbot_set_rows_launch<2>(ctx, dst, *sd, lo, part_off); break;
+        case 2: turbot_set_rows_launch<1>(ctx, dst, *sd, lo, part_off); break;
+        default: GGML_ABORT("turbot_set_rows: %d groups per row", ng);
     }
 }
 
@@ -598,5 +645,6 @@ bool ggml_cuda_turbot_set_rows_supported(const ggml_tensor * op) {
     ggml_turbot_layer        layer;
     const ggml_turbot_side * sd       = nullptr;
     int64_t                  part_off = 0;
-    return turbot_set_rows_layout(op, layer, sd, part_off);
+    int                      ng       = 0;
+    return turbot_set_rows_layout(op, layer, sd, part_off, ng);
 }

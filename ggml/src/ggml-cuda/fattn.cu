@@ -5,14 +5,17 @@
 #include "fattn-vec.cuh"
 #include "fattn.cuh"
 #include "fattn-turbot-decl.cuh"   // [TAG_TURBOT] host declarations only, never turbot-tables.cuh
+#include "turbot-set-rows.cuh"     // [TAG_TURBOT_ANY_ROUTE] ggml_cuda_turbot_any_on, host declarations only
 #include "ggml-turbot.h"
 
 #include <set>
 
 // [TAG_TURBOT] every D=256 case call passes through here so a turbot K/V reaches its own kernel instances
+// [TAG_TURBOT_ANY_D128] and every D=128 one (unless GGML_CUDA_FA_TURBOT_D128 is 0): the D=128 f16 ladder selects exactly
+// the 16 pairs of fattn-turbot-decl.cuh. A turbot K/V only gets here when ggml_cuda_get_best_fattn_kernel admitted it.
 template <int DKQ, int DV, int ncols1, int ncols2>
 static void ggml_cuda_fattn_mma_case_dispatch(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    if constexpr (DKQ == 256 && DV == 256 && ncols2 <= 8) {
+    if constexpr (((DKQ == 256 && DV == 256) || (GGML_CUDA_FA_TURBOT_D128 && DKQ == 128 && DV == 128)) && ncols2 <= 8) {
         if (ggml_turbot_is_type(dst->src[1]->type)) {
             ggml_cuda_flash_attn_ext_turbot_case<DKQ, DV, ncols1, ncols2>(ctx, dst);
             return;
@@ -889,10 +892,24 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     // VEC or TILE instance and no F16 conversion (a turbot row cannot decode without the plan), so anything the MMA
     // turbot kernel cannot take is refused here, before any of the turbo routing below can see the type.
     if (ggml_turbot_is_type(K->type) || ggml_turbot_is_type(V->type)) {
-        const bool ok = ggml_turbot_is_type(K->type) && ggml_turbot_is_type(V->type) &&
-                        Q->ne[0] == 256 && K->ne[0] == 256 && V->ne[0] == 256 && K->ne[2] == 4 && V->ne[2] == 4 &&
-                        dst->src[7] != nullptr && dst->src[8] != nullptr &&
-                        (!mask || mask->ne[2] == 1) && Q->ne[3] == 1 && turing_mma_available(cc);
+        bool ok = ggml_turbot_is_type(K->type) && ggml_turbot_is_type(V->type) &&
+                  Q->ne[0] == 256 && K->ne[0] == 256 && V->ne[0] == 256 && K->ne[2] == 4 && V->ne[2] == 4 &&
+                  dst->src[7] != nullptr && dst->src[8] != nullptr &&
+                  (!mask || mask->ne[2] == 1) && Q->ne[3] == 1 && turing_mma_available(cc);
+        // [TAG_TURBOT_ANY_ROUTE] Any other KV geometry the op params name (docs/turbot/SPEC.md, ggml_turbot_geom_*):
+        // D = 256 with 4, 2 or 1 KV heads, D = 128 with 8, 4 or 2 (one to four 256-value runs per row). Evaluated only
+        // when the Qwen predicate above failed, so the 4 x 256 route is untouched; GGML_TURBOT_ANY=0 turns it off.
+        if (!ok && ggml_cuda_turbot_any_on() && ggml_turbot_is_type(K->type) && ggml_turbot_is_type(V->type)) {
+            ggml_turbot_op_params tp;
+            if (ggml_turbot_op_params_get(dst, &tp) && ggml_turbot_geom_valid(tp.flags)) {
+                const int64_t hd = ggml_turbot_geom_head_dim(tp.flags);
+                const int64_t nh = ggml_turbot_geom_n_head(tp.flags);
+                const bool d_ok = hd == 256 || (hd == 128 && GGML_CUDA_FA_TURBOT_D128);
+                ok = d_ok && Q->ne[0] == hd && K->ne[0] == hd && V->ne[0] == hd && K->ne[2] == nh && V->ne[2] == nh &&
+                     dst->src[7] != nullptr && dst->src[8] != nullptr &&
+                     (!mask || mask->ne[2] == 1) && Q->ne[3] == 1 && turing_mma_available(cc);
+            }
+        }
         return ok ? BEST_FATTN_KERNEL_MMA_F16 : BEST_FATTN_KERNEL_NONE;
     }
 
@@ -1298,6 +1315,37 @@ bool ggml_cuda_flash_attn_ext_supported(int device, const ggml_tensor * dst) {
                 dst->src[1]->nb[1] != (size_t) tl.k.base_row_bytes || dst->src[2]->nb[1] != (size_t) tl.v.base_row_bytes) {
             return false;
         }
+        // [TAG_TURBOT_ANY_ROUTE] the K/V views must have the geometry the op params name (flags 0 is 4 x 256, the only
+        // one GGML_TURBOT_ANY=0 accepts). The nb[1] == base_row_bytes cell stride check above holds for every geometry.
+        if (!ggml_turbot_geom_valid(tp.flags) || (tp.flags != 0 && !ggml_cuda_turbot_any_on())) {
+            return false;
+        }
+        const int64_t geom_hd = ggml_turbot_geom_head_dim(tp.flags);
+        const int64_t geom_nh = ggml_turbot_geom_n_head(tp.flags);
+        if (dst->src[0]->ne[0] != geom_hd || dst->src[1]->ne[0] != geom_hd || dst->src[2]->ne[0] != geom_hd ||
+                dst->src[1]->ne[2] != geom_nh || dst->src[2]->ne[2] != geom_nh) {
+            return false;
+        }
     }
     return ggml_cuda_get_best_fattn_kernel(device, dst) != BEST_FATTN_KERNEL_NONE;
+}
+
+// [TAG_TURBOT_ANY_RESOLVE] The device answer of the KV resolver (turbot-set-rows.cuh): the shape-only part of the routing
+// above, i.e. what ggml_cuda_get_best_fattn_kernel and ggml_cuda_flash_attn_ext_supported accept for a turbot layer of
+// that geometry, and what ggml_cuda_turbot_set_rows_supported accepts for its rows. 4 x 256 (flags 0) needs Turing+ MMA
+// exactly as the Qwen predicate does; the other geometries also need GGML_TURBOT_ANY on and, at head dim 128, the D = 128
+// instances (GGML_CUDA_FA_TURBOT_D128).
+bool ggml_cuda_turbot_geometry_supported(const int device, const int head_dim, const int n_head_kv) {
+    const int flags = ggml_turbot_geom_flags(head_dim, n_head_kv);
+    if (flags < 0) {
+        return false;
+    }
+    if (flags != 0 && !ggml_cuda_turbot_any_on()) {
+        return false;
+    }
+    if (head_dim == 128 && !GGML_CUDA_FA_TURBOT_D128) {
+        return false;
+    }
+    const int cc = ggml_cuda_info().devices[device].cc;
+    return turing_mma_available(cc);
 }
