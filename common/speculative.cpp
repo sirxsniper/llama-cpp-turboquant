@@ -3165,16 +3165,27 @@ common_speculative_init_result::common_speculative_init_result(
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
 
-    // A draft model and MTP both want the single draft context this struct owns, and
-    // common_memory mirrors every sequence operation (seq_rm/seq_cp/seq_add) plus the
-    // speculative checkpoint to exactly one ctx_dft. Requesting both used to set
-    // ctx_type = MTP and then build the DRAFT MODEL's context with it, which fails
-    // later as an opaque "failed to create llama_context". Say so plainly instead.
+    // [TAG_SPEC_MTP_SIDECAR] draft-mtp + a draft model is upstream's way to run an MTP head
+    // shipped as its own mtp-*.gguf (the ggml-org Nemotron 3.5 repos): -hf <repo> --spec-type
+    // draft-mtp wires the sidecar in as the draft model, and -md mtp-*.gguf alone auto-detects
+    // draft-mtp (common_speculative_types_from_gguf). The draft context is then an MTP context
+    // on the sidecar's weights, which the has_draft branch below builds. What still cannot work
+    // is a SECOND drafter beside it: this struct owns one ctx_dft, and common_memory mirrors
+    // every sequence operation (seq_rm/seq_cp/seq_add) plus the speculative checkpoint to
+    // exactly that one. A draft file that is not an MTP head is refused after loading it.
     if (spec_mtp && has_draft) {
-        LOG_ERR("%s: draft-mtp cannot be combined with a draft model (--spec-draft-model). "
-                "Both need the single draft context. Pick one: draft-mtp uses the target's "
-                "own MTP head, a draft model uses its own weights.\n", __func__);
-        return;
+        const bool other_model_draft = std::any_of(
+            params.speculative.types.begin(), params.speculative.types.end(),
+            [](common_speculative_type t) {
+                return t == COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE || t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 ||
+                       t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
+            });
+        if (other_model_draft) {
+            LOG_ERR("%s: draft-mtp cannot be combined with another draft-model type in --spec-type. "
+                    "Both need the single draft context. Pick one: draft-mtp (the target's own MTP head, "
+                    "or an mtp-*.gguf head via --spec-draft-model) or the other drafter.\n", __func__);
+            return;
+        }
     }
 
     if (spec_mtp) {
@@ -3217,9 +3228,19 @@ common_speculative_init_result::common_speculative_init_result(
 
         pimpl->model.reset(model_dft);
 
+        // [TAG_SPEC_MTP_SIDECAR] with draft-mtp the draft file has to BE an MTP head (mtp-*.gguf);
+        // a DFlash / EAGLE3 / plain drafter would only fail inside llama_init_from_model with a
+        // generic "doesn't contain MTP layers" warning
+        if (spec_mtp && llama_model_n_layer_nextn(model_dft) == 0) {
+            LOG_ERR("%s: draft-mtp with --spec-draft-model needs an MTP head file (mtp-*.gguf), but '%s' "
+                    "has no MTP layers. Drop --spec-type draft-mtp to use it as its own drafter type, or "
+                    "drop --spec-draft-model to use the target's in-model MTP head.\n", __func__, model_path.c_str());
+            return;
+        }
+
         llama_context * ctx_dft = llama_init_from_model(model_dft, cparams);
         if (ctx_dft == nullptr) {
-            LOG_ERR("%s: failed to create MTP context\n", __func__);
+            LOG_ERR("%s: failed to create %s context\n", __func__, spec_mtp ? "MTP" : "draft");
             return;
         }
 
