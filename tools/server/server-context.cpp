@@ -105,6 +105,637 @@ static std::vector<llama_token> server_sample_and_accept_synth(
     return result;
 }
 
+//
+// [TAG_SLOT_FILE_CKPT] Context checkpoints in slot files (/slots/{id}?action=save|restore, --slot-save-path).
+//
+// A slot file is what llama_state_seq_save_file writes: magic, version, the packed prompt tokens and the full state of
+// the sequence. On a hybrid or recurrent model (Qwen3.8-27B: 48 Gated DeltaNet layers beside 16 attention layers) that
+// is not enough to reuse the prompt. The server always evaluates at least one prompt token ([TAG_PROMPT_LOGITS]), so a
+// request that re-sends the saved prompt needs the state at least one token back, and a recurrent state cannot be
+// rolled back. The live slot and the RAM prompt cache solve this with context checkpoints (snapshots of the part of
+// the state that cannot be rolled back, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY), but the file never carried them: the
+// first request after a restore found no checkpoint and re-processed the whole prompt.
+//
+// The save now appends a versioned section after the state blob:
+//
+//   header   80 bytes: magic "LSCK", version, the section size, the size of the state file in front of it, the count
+//            and a hash of the packed prompt tokens (together they bind the section to that one file), fingerprints
+//            of the target and draft models, the number of checkpoints, flags, the size and hash of the draft state
+//   entries  per checkpoint, oldest first as in the slot's ring: n_tokens, pos_min, pos_max, the sizes of its target,
+//            draft and speculative blobs and a hash over all of it (48 bytes), then the three blobs
+//   draft    the draft context's full sequence state (flags 0), which the RAM prompt cache keeps as well
+//
+// The restore reads the section and hands the checkpoints to the slot, so the next request that re-sends the prompt
+// resumes from the newest usable checkpoint and processes only the tokens after it, exactly as after a RAM prompt
+// cache hit. The draft sequence gets the saved draft state, or is emptied when none fits the loaded draft model.
+//
+// Compatibility: llama_state_seq_load_file stops at the end of the state blob, so older servers read new files and
+// ignore the section. A file without a section restores exactly as before; that covers files of older servers and
+// new files with no checkpoints and no draft context, to which nothing is appended (byte-identical to before). A
+// section that does not match its file, the loaded models or its hashes is ignored as a whole with a warning, it never
+// fails the restore. Nothing here touches a kernel or the numerics of a decode: the blobs are the same bytes the live
+// slot would hold, and they are loaded by the same checkpoint restore the server always runs.
+//
+// LLAMA_SLOT_FILE_CKPT=0 restores the old behaviour: nothing is appended and any section is ignored.
+// LLAMA_SLOT_FILE_CKPT_KEEP=N writes only the newest N checkpoints (default: all, like LLAMA_PROMPT_CACHE_CKPT_KEEP).
+// A restore keeps the newest of them within the live ring's own bounds: --ctx-checkpoints by count and the
+// [TAG_CKPT_BYTE_BUDGET] by bytes (LLAMA_CTX_CHECKPOINT_BUDGET_MIB, default 2048 MiB = 13 checkpoints on Qwen3.8-27B),
+// so a file written by a server with a larger budget never puts more checkpoint RAM into the slot than a live ring.
+//
+
+static bool slot_file_ckpt_enabled() {
+    static const bool on = [] {
+        const char * e = getenv("LLAMA_SLOT_FILE_CKPT");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    return on;
+}
+
+static size_t slot_file_ckpt_keep() {
+    static const size_t n = [] {
+        const char * e = getenv("LLAMA_SLOT_FILE_CKPT_KEEP");
+        return e ? (size_t) strtoull(e, nullptr, 10) : (size_t) -1;
+    }();
+    return n;
+}
+
+// the byte budget of the checkpoint ring: the same variable and default as [TAG_CKPT_BYTE_BUDGET] in
+// create_checkpoint(), 0 = no byte bound (count only)
+static size_t slot_file_ckpt_budget_bytes() {
+    static const size_t n = [] {
+        const char * e = getenv("LLAMA_CTX_CHECKPOINT_BUDGET_MIB");
+        const size_t mib = e ? (size_t) strtoull(e, nullptr, 10) : 2048;
+        return mib * 1024 * 1024;
+    }();
+    return n;
+}
+
+static constexpr uint32_t SLOT_FILE_CKPT_MAGIC      = 0x4b43534cu; // "LSCK" in the file
+static constexpr uint32_t SLOT_FILE_CKPT_VERSION    = 1;
+static constexpr uint32_t SLOT_FILE_CKPT_FLAG_DRAFT = 1u;          // the draft state follows the entries
+static constexpr uint64_t SLOT_FILE_CKPT_HDR_SIZE   = 80;
+static constexpr uint64_t SLOT_FILE_CKPT_ENT_SIZE   = 48;
+static constexpr uint64_t SLOT_FILE_CKPT_SEED       = 0x51c7f11ec4c0ffeeull;
+
+static inline uint64_t slot_file_ckpt_rotl(uint64_t x, int r) {
+    return (x << r) | (x >> (64 - r));
+}
+
+// 64-bit checksum: four independent multiply-rotate lanes (the xxh64 round), so it runs near memory speed on the
+// 149.6 MiB checkpoints of Qwen3.8-27B. It guards against a truncated or damaged file, it is not cryptographic.
+static uint64_t slot_file_ckpt_hash(const void * data, size_t n, uint64_t seed) {
+    static constexpr uint64_t P1 = 0x9e3779b185ebca87ull;
+    static constexpr uint64_t P2 = 0xc2b2ae3d27d4eb4full;
+    static constexpr uint64_t P3 = 0x165667b19e3779f9ull;
+    static constexpr uint64_t P4 = 0x85ebca77c2b2ae63ull;
+    static constexpr uint64_t P5 = 0x27d4eb2f165667c5ull;
+
+    const uint8_t * p = (const uint8_t *) data;
+
+    size_t   i = 0;
+    uint64_t h = 0;
+
+    if (n >= 32) {
+        uint64_t v1 = seed + P1 + P2;
+        uint64_t v2 = seed + P2;
+        uint64_t v3 = seed;
+        uint64_t v4 = seed - P1;
+
+        for (; i + 32 <= n; i += 32) {
+            uint64_t w[4];
+            memcpy(w, p + i, sizeof(w));
+            v1 = slot_file_ckpt_rotl(v1 + w[0]*P2, 31)*P1;
+            v2 = slot_file_ckpt_rotl(v2 + w[1]*P2, 31)*P1;
+            v3 = slot_file_ckpt_rotl(v3 + w[2]*P2, 31)*P1;
+            v4 = slot_file_ckpt_rotl(v4 + w[3]*P2, 31)*P1;
+        }
+
+        h = slot_file_ckpt_rotl(v1, 1) + slot_file_ckpt_rotl(v2, 7) + slot_file_ckpt_rotl(v3, 12) + slot_file_ckpt_rotl(v4, 18);
+    } else {
+        h = seed + P5;
+    }
+
+    h += (uint64_t) n;
+
+    for (; i + 8 <= n; i += 8) {
+        uint64_t w;
+        memcpy(&w, p + i, sizeof(w));
+        h ^= slot_file_ckpt_rotl(w*P2, 31)*P1;
+        h  = slot_file_ckpt_rotl(h, 27)*P1 + P4;
+    }
+
+    for (; i < n; ++i) {
+        h ^= (uint64_t) p[i]*P5;
+        h  = slot_file_ckpt_rotl(h, 11)*P1;
+    }
+
+    h ^= h >> 33;
+    h *= P2;
+    h ^= h >> 29;
+    h *= P3;
+    h ^= h >> 32;
+
+    return h;
+}
+
+// identifies the model behind a context: a section written with another model (even one with the same state layout,
+// e.g. another quant of the same architecture) is ignored. 0 = no context.
+static uint64_t slot_file_ckpt_model_fp(const llama_context * ctx) {
+    if (ctx == nullptr) {
+        return 0;
+    }
+
+    const llama_model * model = llama_get_model(ctx);
+    if (model == nullptr) {
+        return 0;
+    }
+
+    char desc[256] = {};
+    llama_model_desc(model, desc, sizeof(desc) - 1);
+
+    const uint64_t v[4] = {
+        llama_model_size(model),
+        llama_model_n_params(model),
+        (uint64_t) llama_model_n_embd(model),
+        (uint64_t) llama_model_n_layer(model),
+    };
+
+    const uint64_t h = slot_file_ckpt_hash(desc, strlen(desc), SLOT_FILE_CKPT_SEED);
+
+    return slot_file_ckpt_hash(v, sizeof(v), h) | 1u;
+}
+
+static uint64_t slot_file_ckpt_tokens_hash(const void * data, size_t n_bytes) {
+    return slot_file_ckpt_hash(data, n_bytes, SLOT_FILE_CKPT_SEED ^ 0x746f6b656e73ull);
+}
+
+static uint64_t slot_file_ckpt_entry_hash(const common_prompt_checkpoint & c) {
+    const int64_t n_tokens = c.n_tokens;
+    const int32_t pos[2]   = { c.pos_min, c.pos_max };
+
+    uint64_t h = slot_file_ckpt_hash(&n_tokens, sizeof(n_tokens), SLOT_FILE_CKPT_SEED);
+    h = slot_file_ckpt_hash(pos,                sizeof(pos),         h);
+    h = slot_file_ckpt_hash(c.data_tgt.data(),  c.data_tgt.size(),  h);
+    h = slot_file_ckpt_hash(c.data_dft.data(),  c.data_dft.size(),  h);
+    h = slot_file_ckpt_hash(c.data_spec.data(), c.data_spec.size(), h);
+
+    return h;
+}
+
+struct slot_file_ckpt_info {
+    uint64_t n_bytes       = 0;  // section bytes written / read
+    uint32_t n_ckpt        = 0;  // checkpoints written / kept
+    uint32_t n_ckpt_file   = 0;  // checkpoints in the file (restore)
+    uint64_t n_ckpt_bytes  = 0;
+    int64_t  n_tokens_last = -1; // n_tokens of the newest checkpoint written / kept
+    uint64_t n_dft_bytes   = 0;  // draft state written / read, 0 = none
+};
+
+// Appends the section to the file that llama_state_seq_save_file just wrote (main_size bytes). Returns the number of
+// bytes appended: 0 when there is nothing to carry (no checkpoints, no draft context) and on any error, in which case
+// the file is cut back to main_size - exactly the old format.
+static uint64_t slot_file_ckpt_write(
+        const std::string & filepath,
+        uint64_t main_size,
+        const std::vector<char> & packed,
+        size_t n_prompt,
+        const std::list<common_prompt_checkpoint> & checkpoints,
+        llama_context * ctx_tgt,
+        llama_context * ctx_dft,
+        llama_seq_id seq_id,
+        slot_file_ckpt_info & info,
+        std::string & err) {
+    namespace fs = std::filesystem;
+
+    const fs::path path = fs::u8path(filepath);
+
+    bool appending = false;
+
+    try {
+        // the checkpoints that describe a prefix of the saved prompt, oldest first, newest LLAMA_SLOT_FILE_CKPT_KEEP
+        std::vector<const common_prompt_checkpoint *> sel;
+        for (const auto & c : checkpoints) {
+            if (!c.data_tgt.empty() && c.n_tokens >= 0 && (size_t) c.n_tokens <= n_prompt && c.pos_min <= c.pos_max) {
+                sel.push_back(&c);
+            }
+        }
+
+        std::stable_sort(sel.begin(), sel.end(), [](const common_prompt_checkpoint * a, const common_prompt_checkpoint * b) {
+            return a->n_tokens < b->n_tokens;
+        });
+
+        const size_t n_keep = slot_file_ckpt_keep();
+        if (sel.size() > n_keep) {
+            sel.erase(sel.begin(), sel.begin() + (std::ptrdiff_t) (sel.size() - n_keep));
+        }
+
+        // the draft context's full sequence state, as server_slot::prompt_save() keeps it in the RAM prompt cache
+        std::vector<uint8_t> dft;
+        if (ctx_dft != nullptr) {
+            const size_t n = llama_state_seq_get_size_ext(ctx_dft, seq_id, 0);
+            dft.resize(n);
+            if (n == 0 || llama_state_seq_get_data_ext(ctx_dft, dft.data(), n, seq_id, 0) != n) {
+                SRV_WRN("[TAG_SLOT_FILE_CKPT] could not read the draft state of seq %d, the file will not carry it\n", seq_id);
+                std::vector<uint8_t>().swap(dft);
+            }
+        }
+
+        if (sel.empty() && dft.empty()) {
+            return 0;
+        }
+
+        uint64_t section_size = SLOT_FILE_CKPT_HDR_SIZE + dft.size();
+        for (const auto * c : sel) {
+            section_size += SLOT_FILE_CKPT_ENT_SIZE + c->data_tgt.size() + c->data_dft.size() + c->data_spec.size();
+        }
+
+        std::error_code ec;
+        const uintmax_t size_on_disk = fs::file_size(path, ec);
+        if (ec || size_on_disk != main_size) {
+            err = string_format("the state file is %llu bytes, expected %llu", (unsigned long long) (ec ? 0 : size_on_disk), (unsigned long long) main_size);
+            return 0;
+        }
+
+        const uint64_t tokens_hash = slot_file_ckpt_tokens_hash(packed.data(), packed.size());
+        const uint64_t dft_hash    = dft.empty() ? 0 : slot_file_ckpt_hash(dft.data(), dft.size(), SLOT_FILE_CKPT_SEED);
+
+        bool ok = true;
+        {
+            std::ofstream f(path, std::ios::binary | std::ios::app);
+            ok = f.is_open();
+            appending = ok;
+
+            auto put = [&](const void * p, uint64_t n) {
+                if (ok && n > 0) {
+                    f.write((const char *) p, (std::streamsize) n);
+                    ok = f.good();
+                }
+            };
+            auto put_u32 = [&](uint32_t v) { put(&v, sizeof(v)); };
+            auto put_u64 = [&](uint64_t v) { put(&v, sizeof(v)); };
+
+            // header, 80 bytes
+            put_u32(SLOT_FILE_CKPT_MAGIC);
+            put_u32(SLOT_FILE_CKPT_VERSION);
+            put_u64(section_size);
+            put_u64(main_size);
+            put_u64(packed.size() / sizeof(llama_token));
+            put_u64(tokens_hash);
+            put_u64(slot_file_ckpt_model_fp(ctx_tgt));
+            put_u64(slot_file_ckpt_model_fp(ctx_dft));
+            put_u32((uint32_t) sel.size());
+            put_u32(dft.empty() ? 0u : SLOT_FILE_CKPT_FLAG_DRAFT);
+            put_u64(dft.size());
+            put_u64(dft_hash);
+
+            // entries, 48 bytes each plus the blobs
+            for (const auto * c : sel) {
+                const int64_t n_tokens = c->n_tokens;
+                const int32_t pos_min  = c->pos_min;
+                const int32_t pos_max  = c->pos_max;
+
+                put(&n_tokens, sizeof(n_tokens));
+                put(&pos_min,  sizeof(pos_min));
+                put(&pos_max,  sizeof(pos_max));
+                put_u64(c->data_tgt.size());
+                put_u64(c->data_dft.size());
+                put_u64(c->data_spec.size());
+                put_u64(slot_file_ckpt_entry_hash(*c));
+
+                put(c->data_tgt.data(),  c->data_tgt.size());
+                put(c->data_dft.data(),  c->data_dft.size());
+                put(c->data_spec.data(), c->data_spec.size());
+
+                info.n_ckpt_bytes += c->size();
+            }
+
+            put(dft.data(), dft.size());
+
+            if (ok) {
+                f.flush();
+                ok = f.good();
+            }
+        }
+
+        if (ok) {
+            const uintmax_t size_new = fs::file_size(path, ec);
+            ok = !ec && size_new == main_size + section_size;
+        }
+
+        if (!ok) {
+            err = "writing the checkpoint section failed";
+        } else {
+            info.n_bytes       = section_size;
+            info.n_ckpt        = (uint32_t) sel.size();
+            info.n_tokens_last = sel.empty() ? -1 : sel.back()->n_tokens;
+            info.n_dft_bytes   = dft.size();
+
+            return section_size;
+        }
+    } catch (const std::exception & e) {
+        err = std::string("writing the checkpoint section failed: ") + e.what();
+    }
+
+    if (appending) {
+        std::error_code ec;
+        fs::resize_file(path, main_size, ec); // back to the plain state file
+        if (ec) {
+            err += ", and cutting the file back failed: " + ec.message();
+        }
+    }
+
+    info = slot_file_ckpt_info();
+
+    return 0;
+}
+
+struct slot_file_ckpt_section {
+    std::list<common_prompt_checkpoint> checkpoints; // oldest first, as in the slot's ring
+    std::vector<uint8_t> dft;                        // the draft state, empty when absent or not for this draft model
+    slot_file_ckpt_info info;
+};
+
+// Reads the section that follows the state blob (main_size bytes, as llama_state_seq_load_file reported). Returns
+// false when there is none (`why` empty: an old file, or nothing was carried) or when it cannot be used (`why` says
+// why) - the restore then goes on exactly as before. Keeps the newest n_keep_max checkpoints, fewer when the
+// [TAG_CKPT_BYTE_BUDGET] binds; only those are read. Every kept blob and the draft state must pass their hashes,
+// otherwise the whole section is ignored.
+static bool slot_file_ckpt_read(
+        const std::string & filepath,
+        uint64_t main_size,
+        uint64_t n_packed,
+        uint64_t tokens_hash,
+        size_t n_prompt,
+        const llama_context * ctx_tgt,
+        const llama_context * ctx_dft,
+        size_t n_keep_max,
+        slot_file_ckpt_section & out,
+        std::string & why) {
+    namespace fs = std::filesystem;
+
+    const fs::path path = fs::u8path(filepath);
+
+    std::error_code ec;
+    const uintmax_t file_size = fs::file_size(path, ec);
+    if (ec) {
+        why = "cannot read the file size: " + ec.message();
+        return false;
+    }
+
+    if (file_size <= main_size) {
+        return false; // nothing after the state blob
+    }
+
+    const uint64_t avail = file_size - main_size;
+    if (avail < SLOT_FILE_CKPT_HDR_SIZE) {
+        why = string_format("%llu unknown bytes after the state", (unsigned long long) avail);
+        return false;
+    }
+
+    std::ifstream f(path, std::ios::binary);
+    if (!f.is_open()) {
+        why = "cannot open the file";
+        return false;
+    }
+
+    f.seekg((std::streamoff) main_size, std::ios::beg);
+
+    bool ok = f.good();
+
+    auto get = [&](void * p, uint64_t n) {
+        if (ok && n > 0) {
+            f.read((char *) p, (std::streamsize) n);
+            ok = f.good() && (uint64_t) f.gcount() == n;
+        }
+        return ok;
+    };
+    auto get_u32 = [&](uint32_t & v) { return get(&v, sizeof(v)); };
+    auto get_u64 = [&](uint64_t & v) { return get(&v, sizeof(v)); };
+
+    uint32_t magic   = 0;
+    uint32_t version = 0;
+    get_u32(magic);
+    get_u32(version);
+
+    if (!ok || magic != SLOT_FILE_CKPT_MAGIC) {
+        why = string_format("%llu unknown bytes after the state", (unsigned long long) avail);
+        return false;
+    }
+
+    if (version != SLOT_FILE_CKPT_VERSION) {
+        why = string_format("section version %u, this server reads version %u", version, SLOT_FILE_CKPT_VERSION);
+        return false;
+    }
+
+    uint64_t section_size = 0;
+    uint64_t main_size_f  = 0;
+    uint64_t n_packed_f   = 0;
+    uint64_t tokens_hash_f = 0;
+    uint64_t fp_tgt       = 0;
+    uint64_t fp_dft       = 0;
+    uint32_t n_ckpt       = 0;
+    uint32_t flags        = 0;
+    uint64_t dft_size     = 0;
+    uint64_t dft_hash     = 0;
+
+    get_u64(section_size);
+    get_u64(main_size_f);
+    get_u64(n_packed_f);
+    get_u64(tokens_hash_f);
+    get_u64(fp_tgt);
+    get_u64(fp_dft);
+    get_u32(n_ckpt);
+    get_u32(flags);
+    get_u64(dft_size);
+    get_u64(dft_hash);
+
+    if (!ok) {
+        why = "truncated section header";
+        return false;
+    }
+
+    if (section_size != avail || main_size_f != main_size) {
+        why = string_format("the section describes %llu + %llu bytes, the file has %llu + %llu",
+                (unsigned long long) main_size_f, (unsigned long long) section_size,
+                (unsigned long long) main_size, (unsigned long long) avail);
+        return false;
+    }
+
+    if (n_packed_f != n_packed || tokens_hash_f != tokens_hash) {
+        why = "the section belongs to a different prompt";
+        return false;
+    }
+
+    if (fp_tgt != slot_file_ckpt_model_fp(ctx_tgt)) {
+        why = "the section was written with a different model";
+        return false;
+    }
+
+    const bool has_dft = (flags & SLOT_FILE_CKPT_FLAG_DRAFT) != 0;
+    if ((flags & ~SLOT_FILE_CKPT_FLAG_DRAFT) != 0 || (!has_dft && dft_size != 0) || dft_size > avail) {
+        why = string_format("invalid section flags 0x%x", flags);
+        return false;
+    }
+
+    // pass 1: the entry headers only, seeking over the blobs. The whole layout is checked before any blob is read,
+    // and the sizes decide how many of the newest entries the live ring's bounds let the slot keep.
+    struct entry {
+        int64_t  n_tokens;
+        int32_t  pos_min;
+        int32_t  pos_max;
+        uint64_t size_tgt;
+        uint64_t size_dft;
+        uint64_t size_spec;
+        uint64_t hash;
+        uint64_t off;       // of the blobs, from the start of the section
+    };
+
+    // every entry takes at least its header and one byte of target state, which bounds the list below by the file
+    if ((uint64_t) n_ckpt > avail / (SLOT_FILE_CKPT_ENT_SIZE + 1)) {
+        why = string_format("the section claims %u checkpoints in %llu bytes", n_ckpt, (unsigned long long) avail);
+        return false;
+    }
+
+    std::vector<entry> ents;
+    ents.reserve(n_ckpt);
+
+    uint64_t off           = SLOT_FILE_CKPT_HDR_SIZE;
+    int64_t  n_tokens_prev = -1;
+
+    for (uint32_t i = 0; i < n_ckpt; ++i) {
+        entry e = {};
+
+        get(&e.n_tokens, sizeof(e.n_tokens));
+        get(&e.pos_min,  sizeof(e.pos_min));
+        get(&e.pos_max,  sizeof(e.pos_max));
+        get_u64(e.size_tgt);
+        get_u64(e.size_dft);
+        get_u64(e.size_spec);
+        get_u64(e.hash);
+
+        if (!ok) {
+            why = string_format("truncated entry %u", i);
+            return false;
+        }
+
+        off += SLOT_FILE_CKPT_ENT_SIZE;
+
+        if (e.size_tgt == 0 || e.size_tgt > avail || e.size_dft > avail || e.size_spec > avail ||
+            off + e.size_tgt + e.size_dft + e.size_spec > avail) {
+            why = string_format("entry %u has blob sizes outside the section", i);
+            return false;
+        }
+
+        if (e.n_tokens < 0 || (uint64_t) e.n_tokens > n_prompt || e.n_tokens < n_tokens_prev || e.pos_min > e.pos_max) {
+            why = string_format("entry %u has an invalid position (n_tokens = %" PRId64 ", pos %d..%d, prompt %zu tokens)",
+                    i, e.n_tokens, e.pos_min, e.pos_max, n_prompt);
+            return false;
+        }
+
+        n_tokens_prev = e.n_tokens;
+
+        e.off = off;
+
+        const uint64_t size_all = e.size_tgt + e.size_dft + e.size_spec;
+
+        f.seekg((std::streamoff) size_all, std::ios::cur);
+        ok = f.good();
+        if (!ok) {
+            why = string_format("truncated checkpoint %u", i);
+            return false;
+        }
+
+        off += size_all;
+
+        ents.push_back(e);
+    }
+
+    if (off + dft_size != avail) {
+        why = string_format("the section entries add up to %llu bytes, the header says %llu",
+                (unsigned long long) (off + dft_size), (unsigned long long) avail);
+        return false;
+    }
+
+    // the newest entries within --ctx-checkpoints and the [TAG_CKPT_BYTE_BUDGET], with the rule of create_checkpoint():
+    // the budget divided by the size of the newest entry, at least one
+    size_t n_keep = std::min<size_t>(ents.size(), n_keep_max);
+    if (n_keep > 0) {
+        const entry & last = ents.back();
+
+        const uint64_t one    = last.size_tgt + last.size_dft + last.size_spec;
+        const size_t   budget = slot_file_ckpt_budget_bytes();
+
+        if (budget > 0 && one > 0) {
+            n_keep = std::min<size_t>(n_keep, std::max<uint64_t>(1, budget / one));
+        }
+    }
+
+    // pass 2: read and verify the kept entries, oldest first
+    for (size_t i = ents.size() - n_keep; i < ents.size(); ++i) {
+        const entry & e = ents[i];
+
+        f.clear();
+        f.seekg((std::streamoff) (main_size + e.off), std::ios::beg);
+        ok = f.good();
+
+        common_prompt_checkpoint c;
+        c.n_tokens = e.n_tokens;
+        c.id_task  = -1;
+        c.pos_min  = e.pos_min;
+        c.pos_max  = e.pos_max;
+
+        c.data_tgt.resize(e.size_tgt);
+        c.data_dft.resize(e.size_dft);
+        c.data_spec.resize(e.size_spec);
+
+        get(c.data_tgt.data(),  e.size_tgt);
+        get(c.data_dft.data(),  e.size_dft);
+        get(c.data_spec.data(), e.size_spec);
+
+        if (!ok) {
+            why = string_format("truncated checkpoint %zu", i);
+            return false;
+        }
+
+        if (slot_file_ckpt_entry_hash(c) != e.hash) {
+            why = string_format("checkpoint %zu (n_tokens = %" PRId64 ") fails its checksum", i, e.n_tokens);
+            return false;
+        }
+
+        out.info.n_ckpt_bytes += c.size();
+        out.info.n_tokens_last = e.n_tokens;
+        out.checkpoints.push_back(std::move(c));
+    }
+
+    // the draft state only for the draft model it was taken from
+    if (has_dft && ctx_dft != nullptr && fp_dft == slot_file_ckpt_model_fp(ctx_dft)) {
+        f.clear();
+        f.seekg((std::streamoff) (main_size + off), std::ios::beg);
+        ok = f.good();
+
+        out.dft.resize(dft_size);
+        get(out.dft.data(), dft_size);
+
+        if (!ok) {
+            why = "truncated draft state";
+            return false;
+        }
+
+        if (slot_file_ckpt_hash(out.dft.data(), out.dft.size(), SLOT_FILE_CKPT_SEED) != dft_hash) {
+            why = "the draft state fails its checksum";
+            return false;
+        }
+
+        out.info.n_dft_bytes = dft_size;
+    }
+
+    out.info.n_bytes     = avail;
+    out.info.n_ckpt      = (uint32_t) out.checkpoints.size();
+    out.info.n_ckpt_file = n_ckpt;
+
+    return true;
+}
+
 // state diagram: https://github.com/ggml-org/llama.cpp/pull/9283
 enum slot_state {
     SLOT_STATE_IDLE,
@@ -4147,6 +4778,27 @@ private:
                         break;
                     }
 
+                    // [TAG_SLOT_FILE_CKPT] append the slot's context checkpoints and the draft state after the
+                    // state blob, so that a restore can resume the prompt instead of re-processing all of it
+                    uint64_t n_section = 0;
+                    if (slot_file_ckpt_enabled()) {
+                        slot_file_ckpt_info info;
+                        std::string err;
+
+                        n_section = slot_file_ckpt_write(filepath, nwrite, packed, slot->prompt.tokens.size(),
+                                slot->prompt.checkpoints, ctx_tgt, ctx_dft, slot->id, info, err);
+
+                        if (n_section > 0) {
+                            SLT_INF(*slot, "[TAG_SLOT_FILE_CKPT] saved %u context checkpoints (%.1f MiB, newest at n_tokens = %" PRId64 ") "
+                                    "and %.1f MiB of draft state after the %zu-byte slot state\n",
+                                    info.n_ckpt, info.n_ckpt_bytes / (1024.0 * 1024.0), info.n_tokens_last,
+                                    info.n_dft_bytes / (1024.0 * 1024.0), nwrite);
+                        } else if (!err.empty()) {
+                            SLT_WRN(*slot, "[TAG_SLOT_FILE_CKPT] the slot file carries no checkpoints (%s); "
+                                    "it restores as before, a hybrid or recurrent model then re-processes the prompt\n", err.c_str());
+                        }
+                    }
+
                     const int64_t t_end = ggml_time_us();
                     const double t_save_ms = (t_end - t_start) / 1000.0;
 
@@ -4156,7 +4808,7 @@ private:
                     res->filename = filename;
                     res->is_save  = true;
                     res->n_tokens = slot->prompt.tokens.size();
-                    res->n_bytes  = nwrite;
+                    res->n_bytes  = nwrite + n_section; // [TAG_SLOT_FILE_CKPT] the whole file
                     res->t_ms     = t_save_ms;
                     queue_results.send(std::move(res));
                 } break;
@@ -4181,6 +4833,11 @@ private:
                     std::string filepath = task.slot_action.filepath;
 
                     size_t nread = 0;
+
+                    // [TAG_SLOT_FILE_CKPT] what binds a checkpoint section to the state blob in front of it
+                    uint64_t ckpt_n_packed    = 0;
+                    uint64_t ckpt_tokens_hash = 0;
+
                     try {
                         size_t n_packed = 0;
                         llama_tokens packed;
@@ -4193,6 +4850,11 @@ private:
                             throw std::runtime_error("No available space in KV cache or invalid slot save file");
                         }
                         packed.resize(n_packed);
+
+                        if (slot_file_ckpt_enabled()) {
+                            ckpt_n_packed    = n_packed;
+                            ckpt_tokens_hash = slot_file_ckpt_tokens_hash(packed.data(), packed.size() * sizeof(llama_token));
+                        }
 
                         server_tokens restored = server_tokens::deserialize(packed, mctx != nullptr);
 
@@ -4212,6 +4874,67 @@ private:
                         break;
                     }
 
+                    // [TAG_SLOT_FILE_CKPT] The state is restored. Hand the slot the checkpoints saved with it, so the
+                    // next request that re-sends the prompt restores the newest usable one and processes only the
+                    // tokens after it, as after a RAM prompt cache hit. Without a usable section the slot is exactly
+                    // what the old restore left: no checkpoints, the draft sequence untouched.
+                    uint64_t n_section = 0;
+                    if (slot_file_ckpt_enabled()) {
+                        slot_file_ckpt_section sec;
+                        std::string why;
+                        bool ok = false;
+
+                        // the checkpoint ring is bounded by --ctx-checkpoints and the byte budget, a restored one as well
+                        const size_t n_keep_max = (size_t) std::max(0, params_base.n_ctx_checkpoints);
+
+                        try {
+                            ok = slot_file_ckpt_read(filepath, nread, ckpt_n_packed, ckpt_tokens_hash,
+                                    slot->prompt.tokens.size(), ctx_tgt, ctx_dft, n_keep_max, sec, why);
+                        } catch (const std::exception & e) {
+                            ok  = false;
+                            why = std::string("reading the checkpoint section failed: ") + e.what();
+                        }
+
+                        if (ok) {
+                            // the draft sequence must describe the same prompt as the target, or be empty: after the
+                            // target restore above it still holds whatever this slot drafted last
+                            bool dft_ok = false;
+                            if (ctx_dft != nullptr) {
+                                if (!sec.dft.empty()) {
+                                    dft_ok = llama_state_seq_set_data_ext(ctx_dft, sec.dft.data(), sec.dft.size(), slot->id, 0) == sec.dft.size();
+                                    if (!dft_ok) {
+                                        SLT_WRN(*slot, "%s", "[TAG_SLOT_FILE_CKPT] the saved draft state does not load into this draft context, the draft sequence starts empty\n");
+                                    }
+                                }
+                                if (!dft_ok) {
+                                    llama_memory_t mem_dft = llama_get_memory(ctx_dft);
+                                    if (mem_dft != nullptr) {
+                                        llama_memory_seq_rm(mem_dft, slot->id, -1, -1);
+                                    }
+                                }
+                            }
+
+                            if (!dft_ok) {
+                                // draft-side checkpoint data is only valid next to the draft state it was taken with
+                                for (auto & c : sec.checkpoints) {
+                                    std::vector<uint8_t>().swap(c.data_dft);
+                                    std::vector<uint8_t>().swap(c.data_spec);
+                                }
+                            }
+
+                            slot->prompt.checkpoints = std::move(sec.checkpoints);
+
+                            n_section = sec.info.n_bytes;
+
+                            SLT_INF(*slot, "[TAG_SLOT_FILE_CKPT] restored %u of %u context checkpoints (%.1f MiB, newest at n_tokens = %" PRId64 " of %zu), draft state %s\n",
+                                    sec.info.n_ckpt, sec.info.n_ckpt_file, sec.info.n_ckpt_bytes / (1024.0 * 1024.0),
+                                    sec.info.n_tokens_last, slot->prompt.tokens.size(),
+                                    dft_ok ? "restored" : (ctx_dft != nullptr ? "cleared" : "not used"));
+                        } else if (!why.empty()) {
+                            SLT_WRN(*slot, "[TAG_SLOT_FILE_CKPT] checkpoint section ignored (%s); restored as before, a hybrid or recurrent model then re-processes the prompt\n", why.c_str());
+                        }
+                    }
+
                     const int64_t t_end = ggml_time_us();
                     const double t_restore_ms = (t_end - t_start) / 1000.0;
 
@@ -4221,7 +4944,7 @@ private:
                     res->filename = filename;
                     res->is_save  = false;
                     res->n_tokens = slot->prompt.tokens.size();
-                    res->n_bytes  = nread;
+                    res->n_bytes  = nread + n_section; // [TAG_SLOT_FILE_CKPT] with the section it used
                     res->t_ms     = t_restore_ms;
                     queue_results.send(std::move(res));
                 } break;

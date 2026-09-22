@@ -1185,6 +1185,33 @@ In *router mode* the query param `?model={model_id}` has to be set. This endpoin
 }
 ```
 
+#### Context checkpoints in slot files (hybrid, recurrent and SWA models)
+
+A slot file holds the prompt tokens and the full state of the slot's sequence. On a hybrid or recurrent model (for example Qwen3.8 with its Gated DeltaNet layers) that alone is not enough to reuse the prompt. The server always evaluates at least one prompt token, so a request that re-sends the saved prompt needs the state at least one token earlier. A recurrent state cannot be rolled back. The live slot and the RAM prompt cache (`--cache-ram`) handle this with context checkpoints (`--ctx-checkpoints`). Slot files did not carry them, so the first request after a restore processed the whole prompt again.
+
+The save now appends a versioned checkpoint section after the state:
+
+- the slot's context checkpoints, oldest first, each with its own checksum
+- the full state of the draft model's sequence when a draft model is loaded (`--model-draft`, MTP), which the RAM prompt cache keeps as well
+
+The section is bound to the file it follows (state size, prompt tokens) and to the loaded target and draft models. The restore gives the slot these checkpoints, so the next request that re-sends the prompt only processes the tokens after the newest usable checkpoint. That is typically the last few tokens, the same as after a RAM prompt cache hit. The draft sequence is restored as well. When no saved draft state fits the loaded draft model, the draft sequence starts empty instead of holding cells from another prompt.
+
+Compatibility:
+
+- Older servers read the new files and ignore the section, because the state loader stops at the end of the state.
+- Files without a section restore exactly as before. This covers files written by older servers. It also covers new files that had nothing to carry: when a slot has no checkpoints and no draft model is loaded, nothing is appended and the file is byte-identical to the old format.
+- If a section does not match its file, the loaded models or its checksums, the whole section is ignored and a warning is logged. The restore still succeeds, and the next request processes the prompt as before.
+- `n_written` and `n_read` count the whole file, including the section that was written or used.
+
+Environment variables:
+
+| Variable | Default | Effect |
+| -------- | ------- | ------ |
+| `LLAMA_SLOT_FILE_CKPT` | `1` | `0` restores the old behaviour: a save appends nothing, and a restore ignores any section. |
+| `LLAMA_SLOT_FILE_CKPT_KEEP` | all | A save writes only the newest N checkpoints. `0` keeps the draft state but writes no checkpoints. On Qwen3.8-27B each checkpoint is 149.6 MiB. |
+
+A restore keeps the newest saved checkpoints within the bounds of a live slot: at most `--ctx-checkpoints` of them, and no more than the checkpoint byte budget allows (`LLAMA_CTX_CHECKPOINT_BUDGET_MIB`, default 2048 MiB, which is 13 checkpoints on Qwen3.8-27B; `0` = count only). Only the kept checkpoints are read from the file.
+
 ### POST `/slots/{id_slot}?action=erase`: Erase the prompt cache of the specified slot.
 
 **Response format**
