@@ -686,7 +686,7 @@ Measured on 2026-09-22 (TESTING.md 9.9). KLD: llama-perplexity, prose corpus, 32
 |:--|:--|:--|:--|
 | Ornith-1.5-9B | turbot, automatic plan | 0.005942 / turbo5p 0.011281 (98.10 / 97.39 %, 0.86 / 1.94): passes | 2572.59 / 2624.00 MiB |
 | Spark-X2.5-4B | turbot on the 9 full-attention layers, turbo5p on the 27 SWA layers | 0.010718 / turbo5p 0.014022 (95.62 / 94.86 %, 0.50 / 0.61): passes | 2894.17 + 34.59 / 2952.00 + 34.59 MiB |
-| Ornith-1.5-35B | **turbo5p512** (was turbot, automatic plan) | 0.088414 / turbo5p512 0.070221 (91.12 / 91.41 %, 11.59 / 10.43): **fails**, turbot is worse | 1650.39 / 1680.00 MiB |
+| Ornith-1.5-35B | **turbo5p512** (was turbot, automatic plan) | 0.088414 / turbo5p512 0.070221 (91.12 / 91.41 %, 11.59 / 10.43): **fails** with the 32K automatic plan (4.0-bit old rows); the 262K plan (4.75 bits) is not measured yet | 1650.39 / 1680.00 MiB |
 | MiniCPM5-2B, Muse Glimmer 30B, Nemotron 3.5 30B | turbo4 (2 × 128), one warning. turbot only with `LLAMA_TURBOT_AUTO_BUDGET=turbo5p`: 4-bit old rows alone cost 144 B per 256 values, turbo4 136 B. | not measured | turbo4: 2856 / 884 + 25.9 / 408 MiB. Opt-in sizing (not measured): +316 / +98 / +45 MiB |
 | Granite 4.2 8B (8 × 128) | turbo5p. turbot only with `LLAMA_TURBOT_AUTO_PLAN=all` | no model on disk | — |
 | Qwen3.8-27B, `-np 4` without `--kv-unified` | turbot on 4 streams | not measured | — |
