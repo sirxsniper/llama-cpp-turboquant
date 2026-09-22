@@ -6090,6 +6090,7 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
 
     clip_encode_status st;
     std::string reason;
+    bool threw = false; // [TAG_MTMD_DEVICE_FALLBACK] only a backend that threw may be lost; see backend_abandoned below
     try {
         if (clip_encode_impl(ctx, params, &st)) {
             return true;
@@ -6103,11 +6104,13 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
             throw; // the graph builder rejected the input, not a device failure
         }
         reason = e.what();
+        threw  = true;
     } catch (...) {
         if (!st.graph_built) {
             throw;
         }
         reason = "unknown exception";
+        threw  = true;
     }
 
     const std::string dev_name = ggml_backend_name(ctx->backend);
@@ -6120,11 +6123,13 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
         return false;
     }
 
-    // free what the failed device holds; the backend itself is abandoned, not freed (see clip_ctx::backend_abandoned)
+    // free what the failed device holds. A backend that threw (Vulkan throws vk::DeviceLostError) may be lost, and
+    // its teardown would wait on it: it is abandoned, not freed (see clip_ctx::backend_abandoned). A backend that
+    // returned an error (Vulkan: only a failed buffer allocation, the device is fine) is freed as usual by ~clip_ctx.
     ctx->sched.reset();
     ctx->buf.reset();
     ctx->is_allocated      = false;
-    ctx->backend_abandoned = true;
+    ctx->backend_abandoned = threw;
     ctx->cpu_only          = true;
 
     return clip_encode_on_cpu_twin(ctx, twin, params);
