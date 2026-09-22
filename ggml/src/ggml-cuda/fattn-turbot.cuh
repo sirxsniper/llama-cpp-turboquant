@@ -1466,57 +1466,60 @@ static __device__ __forceinline__ void flash_attn_ext_turbot_process_tile(
     // [TAG_SYNC_TURBOT_BARRIER] upstream b74f590ea (#27870) ported: every warp reaches the SAME __syncthreads below. The
     // old form had the combining warps (threadIdx.y % np == 0) and the rest sync on two different barriers in two
     // branches, which is divergent-barrier undefined behaviour; the arithmetic and the writes are unchanged.
+    // [TAG_TURBOT_COMBINE_UNIFORM] No branch before that barrier either: every warp computes its group's combine from
+    // the combining warp's shared-memory slots (same addresses, the other warps' results are unused) and only the
+    // combining warps write after the barrier. Upstream's form (compute under one branch, write under a second one)
+    // made the register-saturated turbot instances spill more: stack <4,8> 48 -> 72 B, <8,4> 48 -> 72 B, <16,2>
+    // 56 -> 80 B (cuobjdump -res-usage), and the decode FA (<4,8>, Q 1-4) ran 2-2.5 % slower at 131K-245K and 7-8 %
+    // slower at 32K with old-tier cells (test-backend-ops perf turbot_perf nb 1/4). This form compiles to the
+    // pre-port stack sizes (48, 48, 56 B) and keeps a single, uniform barrier.
     if (np > 1) {
         constexpr int nmeta = np*cols_per_warp >= warp_size ? np*cols_per_warp/warp_size : 1;
+        const bool combiner = threadIdx.y % np == 0;
 
-        float KQ_cmn;
-        float KQ_cms[nmeta];
-        float KQ_crs;
-
-        const int jc_meta = threadIdx.y*cols_per_warp + (np*cols_per_warp < warp_size ? threadIdx.x % (np*cols_per_warp) : threadIdx.x);
+        const int jc_meta = (threadIdx.y - threadIdx.y % np)*cols_per_warp + (np*cols_per_warp < warp_size ? threadIdx.x % (np*cols_per_warp) : threadIdx.x);
         float2 * const meta_ptr = ((float2 *) tile_Q) + jc_meta*(tile_stride/2) + nbatch_combine/2;
 
-        if (threadIdx.y % np == 0) {
-            // Combine the meta data for parallel warps via shared memory.
-            float2 meta[nmeta];
+        // Combine the meta data for parallel warps via shared memory.
+        float2 meta[nmeta];
 #pragma unroll
-            for (int imeta = 0; imeta < nmeta; ++imeta) {
-                meta[imeta] = meta_ptr[imeta * warp_size * tile_stride/2];
-            }
+        for (int imeta = 0; imeta < nmeta; ++imeta) {
+            meta[imeta] = meta_ptr[imeta * warp_size * tile_stride/2];
+        }
 
-            KQ_cmn = meta[0].x; // KQ combine max new, max between all parallel warps.
+        float KQ_cmn = meta[0].x; // KQ combine max new, max between all parallel warps.
 #pragma unroll
-            for (int imeta = 1; imeta < nmeta; ++imeta) {
-                KQ_cmn = fmaxf(KQ_cmn, meta[imeta].x);
-            }
+        for (int imeta = 1; imeta < nmeta; ++imeta) {
+            KQ_cmn = fmaxf(KQ_cmn, meta[imeta].x);
+        }
 #pragma unroll
-            for (int offset = np*cols_per_warp/2; offset >= cols_per_warp; offset >>= 1) {
-                if (offset < warp_size) {
-                    KQ_cmn = fmaxf(KQ_cmn, __shfl_xor_sync(0xFFFFFFFF, KQ_cmn, offset, warp_size));
-                }
+        for (int offset = np*cols_per_warp/2; offset >= cols_per_warp; offset >>= 1) {
+            if (offset < warp_size) {
+                KQ_cmn = fmaxf(KQ_cmn, __shfl_xor_sync(0xFFFFFFFF, KQ_cmn, offset, warp_size));
             }
+        }
 
+        float KQ_cms[nmeta]; // KQ combine max scale per warp.
 #pragma unroll
-            for (int imeta = 0; imeta < nmeta; ++imeta) {
-                KQ_cms[imeta] = expf(meta[imeta].x - KQ_cmn);
-            }
+        for (int imeta = 0; imeta < nmeta; ++imeta) {
+            KQ_cms[imeta] = expf(meta[imeta].x - KQ_cmn);
+        }
 
-            KQ_crs = KQ_cms[0]*meta[0].y; // KQ combine rowsum, scaled sum of all parallel warps.
+        float KQ_crs = KQ_cms[0]*meta[0].y; // KQ combine rowsum, scaled sum of all parallel warps.
 #pragma unroll
-            for (int imeta = 1; imeta < nmeta; ++imeta) {
-                KQ_crs += KQ_cms[imeta]*meta[imeta].y;
-            }
+        for (int imeta = 1; imeta < nmeta; ++imeta) {
+            KQ_crs += KQ_cms[imeta]*meta[imeta].y;
+        }
 #pragma unroll
-            for (int offset = np*cols_per_warp/2; offset >= cols_per_warp; offset >>= 1) {
-                if (offset < warp_size) {
-                    KQ_crs += __shfl_xor_sync(0xFFFFFFFF, KQ_crs, offset, warp_size);
-                }
+        for (int offset = np*cols_per_warp/2; offset >= cols_per_warp; offset >>= 1) {
+            if (offset < warp_size) {
+                KQ_crs += __shfl_xor_sync(0xFFFFFFFF, KQ_crs, offset, warp_size);
             }
         }
 
         __syncthreads();
 
-        if (threadIdx.y % np == 0) {
+        if (combiner) {
             // Write back combined meta data:
 #pragma unroll
             for (int imeta = 0; imeta < nmeta; ++imeta) {
