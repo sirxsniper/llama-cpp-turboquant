@@ -543,7 +543,7 @@ llama-server -m Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf   -c 131072 -ng
 | `--spec-draft-n-max 7` | DFlash2 trains at `block_size` 8, so 7 is its natural ceiling. |
 | `-ngl 99` | All layers on the GPU. |
 
-> **Qwen3.8 and MTP.** Every Qwen3.8 GGUF ships an MTP head, and it is **silently ignored** unless you pass `--spec-type draft-mtp`. It cannot be combined with a draft model — `common_memory` owns a single draft context — and this fork now rejects that pairing with an explicit reason rather than an opaque failure. DFlash2 yields more per step (3.05 vs 2.55), so prefer it when the VRAM is there.
+> **Qwen3.8 and MTP.** Every Qwen3.8 GGUF ships an MTP head, and it is **silently ignored** unless you pass `--spec-type draft-mtp`. It cannot be combined with a separate drafter such as DFlash2 — `common_memory` owns a single draft context — and this fork rejects that pairing with an explicit reason. A draft model that is itself an MTP head (an `mtp-*.gguf` sidecar, as Nemotron 3.5 ships) is accepted. DFlash2 yields more per step (3.05 vs 2.55), so prefer it when the VRAM is there.
 
 ### Tuning knobs
 
@@ -568,7 +568,11 @@ Environment variables, for A/B testing rather than daily use.
 
 Qwen3.8-27B is the model this fork is tuned for: hybrid Gated DeltaNet, 16 attention layers, 4 KV heads × 256. Other software also uses the fork as a general llama.cpp, so any model that fits the card has to load and run. A fork feature that cannot serve a model falls back to something that works and says so in one log line. It never stops the server from starting, and it never runs a path that would compute wrong output.
 
-> **Status, 2026-09-21.** Everything in this section is on the `upstream-sync` branch (upstream `fb34fc262`, `b11093`) and has **not been built or run yet**. None of it is measured. The benchmark numbers above come from the pre-sync `b10655` builds. The checks still to run are in [docs/turbot/TESTING.md section 8](docs/turbot/TESTING.md#8-upstream-sync-branch-and-other-models).
+> **Status, 2026-09-22.** Built and measured on the `upstream-sync` branch (upstream `fb34fc262`, `b11093`), RTX 5090, old build = pre-sync `f52b7db3b` run back to back on the same day.
+> - Test suites: `validate.ps1` 16732/16732 (the 64 old hsk=40 failures are fixed), FLASH_ATTN_EXT 4309/4309, turbot 195/195, compute-sanitizer memcheck and synccheck 0 errors, CPU FLASH_ATTN_EXT 5698/5698.
+> - Qwen3.8-27B UD-Q5_K_XL, production server (262K, 4 slots, turbot, DFlash2 n_max 3): prose 106-107 t/s (old 103.5-105), code 147-151 t/s (old 142-143), 24.2 ms/step (old 25.0). KLD against the same reference: turbot code 0.001139 (old 0.001137), prose 0.001856 (old 0.001848); turbo5p code 0.001595, prose 0.002583. llama-bench tg64 new ≥ old at 0/131K/245K for turbo5p and turbot.
+> - **Fixed: wrong tokens under concurrency** (`[TAG_XSEQ_PLANES]`, `LLAMA_XSEQ_FIX=0` restores the old path). With `--spec-rs-seq` and several slots, a split batch could move one sequence's recurrent cell after it had written its rollback snapshots; a later draft rejection then restored another sequence's state. Measured: 14 anomalous greedy tokens in 640 concurrent requests before, 0 in 320 after. The bug was in the pre-sync builds too.
+> - Every new model listed below loads and was checked for facts, a tool call, vision where it has a projector, and speed.
 
 ### KV cache type, resolved per model
 
@@ -676,18 +680,27 @@ Other changes in the same area:
 - Images and audio are encoded on a thread of their own when the vision encoder runs on the CPU and the text model on a GPU, or on a GPU the text model does not use, such as the iGPU (`[TAG_MTMD_ASYNC_ENCODE]`). The request waits at its image until the encode is done, and the other slots keep generating in the meantime. The embeddings then go into the context on the inference thread through the same code as before, so the request's positions, checkpoints and DFlash2 drafter repair are unchanged. On a CUDA device the encode stays on the inference thread, and every slot waits for it as before.
 - While a request waits for its encode, `/slots` shows `waiting_media: true` and a `media_encode` object (state, chunks, tokens, time queued and encoding). `/metrics` adds `requests_waiting_media` and `media_encode_jobs`. A request that is cancelled during its encode frees its slot at once. The encode itself cannot be interrupted, so it runs to the end and its result is dropped.
 
-None of the vision changes is measured yet.
+Measured on Qwen3.8-27B with the F16 mmproj (encode time for a ~1000-token / ~4000-token image):
+
+| `-mmdev` | ~1000 tokens | ~4000 tokens |
+|:--|--:|--:|
+| `gpu` (CUDA0) | 0.13 s | 1.26 s |
+| `cpu`, this branch | 4.7 s | 36 s |
+| `cpu`, pre-sync build | 26.6 s | 352 s |
+| `igpu` (2-CU Radeon) | 44 s | moved to the CPU by the limit above (38 s total); with the limit off, the device is lost and the encode is retried on the CPU |
+
+With a 4-slot server and the encoder on the CPU, three text streams kept generating at about 64 t/s while a ~4000-token image was encoded (the longest gap was 1.5 s). The pre-sync build stalled them for 342 s.
 
 ### Loading: `--load-mode none` replaces `--no-mmap`
 
 Upstream removed `--mmap`, `--no-mmap`, `--mlock` and `--direct-io` / `--no-direct-io` (#28334), and llama-bench lost `-mmp`. Use `-lm` / `--load-mode` instead: `auto`, `none`, `mmap`, `mlock`, `mmap+mlock` or `dio`. llama-bench takes the same `-lm`.
 - `--no-mmap` becomes `--load-mode none`.
-- A command line that still passes one of the removed flags is rejected at startup.
+- This fork keeps the removed flags as deprecated aliases (`[TAG_SYNC_MMAP_COMPAT]`): `--no-mmap`, `--mmap`, `--mlock` and `--direct-io` still work and log one deprecation warning, so existing launchers keep starting.
 - Builds on the pre-sync base `b10655` already accept `--load-mode`, so one command line works for both.
 
 ### New switches on the sync branch
 
-Every switch defaults to the new behaviour. None of the new behaviours is measured yet.
+Every switch defaults to the new behaviour. The defaults are what the measurements in the status note above ran with; the fused GDN norm is bit-identical to the unfused one (same KLD to six digits).
 
 | Variable | Default | Effect when set |
 |:--|:--|:--|
@@ -698,10 +711,13 @@ Every switch defaults to the new behaviour. None of the new behaviours is measur
 | `MTMD_CPU_KV_F32` | on | `0` makes the vision encoder cast K and V to F16 before CPU flash attention, as upstream does. |
 | `MTMD_ASYNC_ENCODE` | auto | `0` encodes images and audio on the inference thread everywhere, as upstream does, so every slot waits for the encode. `1` also uses the encoder thread when the text model runs on the same device (a CPU-only run, `-ngl 0`, or a shared Vulkan device). A CUDA projector always encodes on the inference thread. |
 | `LLAMA_CTX_CHECKPOINT_MIN_STEP_ALWAYS` | off | `1` restores the pre-sync checkpoint eviction order: spacing eviction on every checkpoint, before the byte budget, and no replacement of a checkpoint at the same position. |
+| `LLAMA_XSEQ_FIX` | on | `0` restores the old recurrent-state path, where a sequence moved inside a split batch could later restore another sequence's rollback snapshot. Only for A/B testing. |
+| `MTMD_IGPU_MAX_TOKENS` | 1536 | Images above this many output tokens are encoded on the CPU when the projector is on an iGPU. `0` = no limit. |
+| `MTMD_DEVICE_FALLBACK` | on | `0` turns off the CPU fallback after a failed non-CUDA encode, and the iGPU limit. |
 | `SPEC_DFT_DUMP` | unset | `<file>` writes the DFlash2 selector lattice (top-k ids and scores for each drafted position) after every drafter decode, so two builds can be compared offline. |
 | `TURBO_MMA_NATIVE` | `1` | Existing switch. `0` now also sends turbo5p512 back to the F16 conversion path. |
 
-`TURBO_MMA_NATIVE` matters here because turbo5p512 now has its own MMA kernel at head size 256 (`[TAG_TURBO5P512_MMA]`). Before, a turbo5p512 cache whose rows were a multiple of 1024 reached the f16 kernel with raw turbo5p512 bytes and produced garbage. Caches with 512-element rows took the slower F16 conversion. The new kernel is not yet run.
+`TURBO_MMA_NATIVE` matters here because turbo5p512 now has its own MMA kernel at head size 256 (`[TAG_TURBO5P512_MMA]`). Before, a turbo5p512 cache whose rows were a multiple of 1024 reached the f16 kernel with raw turbo5p512 bytes and produced garbage. Caches with 512-element rows took the slower F16 conversion. The new kernel passes the `split_plane` FLASH_ATTN_EXT cases and compute-sanitizer memcheck (0 errors).
 
 ### Architectures new with the sync
 
@@ -718,7 +734,19 @@ Upstream PRs cherry-picked on top of the sync, before they were merged upstream:
 - **#29242:** the Muse Glimmer parser fix for a reply that starts with a tool call (`common/parsers/muse-glimmer.cpp`, with `test-chat` cases).
 - **#28717:** the CUDA SSM scan for state size 96 (Nemotron 3 Puzzle), with `test-backend-ops` SSM_SCAN cases.
 
-Of these models only Spark-X2.5-4B has been downloaded for testing. None of them has been loaded on this fork yet, and none has been measured.
+Models checked on this branch (single stream, 2K-token prompt; KV type as picked by the resolver from `-ctk turbot -ctv turbot`):
+
+| Model | KV picked | Decode t/s | With speculative decoding |
+|:--|:--|--:|:--|
+| Qwen3.8-27B UD-Q5_K_XL | turbot | 106-107 prose / 147-151 code (server) | DFlash2 (above); in-model MTP `--spec-type draft-mtp`: 100 / 135 |
+| Spark-X2.5-4B Q8_0 | turbo5p (SWA) | 119-121 | none shipped |
+| MiniCPM5-2B Q8_0 | turbo4 (2 × 128) | 170-204 | — |
+| Ornith-1.5-9B Q8_0 + mmproj | turbo5p (plan layers do not match) | 109-113 | MTP: 180 |
+| Ornith-1.5-35B-A3B Q4_K_M + mmproj | turbo5p (2 KV heads) | 165-174 | MTP: 255 |
+| Muse Glimmer 30B Q4_K_M + mmproj | turbo4 (SWA) | 55 | its DFlash drafter: 107-114 |
+| Nemotron 3.5 Lightning 30B-A3B Q4_0 | turbo4 (2 × 128) | 275 | MTP sidecar: 422-442 |
+
+All of them answered the fact checks correctly and returned a valid tool call; the vision models read the test image. Nemotron's MTP ships as a separate `mtp-*.gguf`: use `--spec-type draft-mtp --spec-draft-model mtp-<model>.gguf`. The fork had refused that pairing; it now only refuses draft-mtp together with a non-MTP drafter.
 
 ---
 
@@ -825,7 +853,7 @@ The first working build decoded at 37.1 t/s at 131K, 21% below turbo5p. Four cha
 
 - Prefill is 4-8% slower than turbo5p at 131K and 245K.
 - A cached long prompt (over 16K tokens) can decode slightly differently from the same prompt sent cold: tail cells that aged out come back with fill codes when the generated tokens are trimmed.
-- Two-token verify batches ran the `<2,8>` instance in the build measured above. The `upstream-sync` branch runs them on `<4,8>`, and `TURBOT_Q2_ROUTE=0` restores `<2,8>`. The new route is not yet measured.
+- Two-token verify batches ran the `<2,8>` instance in the build measured above. The `upstream-sync` branch runs them on `<4,8>` (`TURBOT_Q2_ROUTE=0` restores `<2,8>`): pp2 at 131K 75.97 → 78.70 t/s, at 245K 67.34 → 70.55.
 
 Contract and tests: [docs/turbot/SPEC.md](docs/turbot/SPEC.md), [docs/turbot/TESTING.md](docs/turbot/TESTING.md). Plan tools: `tools/turbot/`.
 
@@ -1037,8 +1065,8 @@ Long-context throughput on a single RTX 5090: holding a full 262,144-token conte
 - **Decode is at the practical ceiling.** After the V gather fix the KV read costs 6.00 ms at `d131072`, against `q8_0`'s 6.01 ms at twice the VRAM and `f16`'s 5.63 ms at 3.8×. The remaining 6% would have to come from the K dot, which already uses `__dp4a` with a byte-permute LUT.
 - **Prefill attention has headroom, but not from tuning.** The MMA config is swept out — `ncols2` and `nbatch_fa` won, `nthreads`, `occupancy` and `ncols1` all lose. Attention is 77% of prefill at depth at ~101 TFLOPS. Further gain needs kernel work.
 - **Wide-Q native turbo reads.** Prefill still uses F16 conversion, because it amortises across many Q tiles. Measured: an `f16` cache prefills only ~3% faster, so the conversion is close to free and this is not a promising lever.
-- **turbot prefill.** The tiered cache still prefills 4-8% slower than turbo5p at depth. Two-token verify batches ran the slower `<2,8>` instance; the `<4,8>` route on the `upstream-sync` branch is not yet measured.
-- **Any model.** The `upstream-sync` branch resolves the KV type per model, builds the turbot plan in, and adds the vision device choice ([Using the fork with any model](#using-the-fork-with-any-model)). It is not built or measured yet.
+- **turbot prefill.** The tiered cache still prefills 4-8% slower than turbo5p at depth. Two-token verify batches now run the `<4,8>` instance (+3.6% / +4.8% at 131K / 245K).
+- **turbot on other models.** The built-in plan is calibrated for Qwen3.8-27B's attention layers, so other models fall back to turbo5p / turbo4. A per-model plan needs a calibration run.
 
 ---
 
