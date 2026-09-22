@@ -12488,6 +12488,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
         test_cases.emplace_back(new test_flash_attn_ext_turbo5p_ref(kv, 2));
     }
+    // [TAG_FA_D256_NCOLS16] nb 16 = a 4-slot DFlash2 verify step (4 x 4 tokens): gqa 6 packs ncols2 2, so turbot and
+    // turbo5p both run the ncols 16 instance <8,2>. Its (256,256,16) config row (ce8caa6e6) is shared with turbo5p nb 2
+    // (<2,8>, also ncols 16); measured 2026-09-22, the pre-ce8caa6e6 row + tiles were 0.4-0.75 % faster here, 11 % slower
+    // for turbo5p nb 2 at kv 131072, so the upstream row stays. Compare with the nb 2 cases above.
+    for (int64_t kv : { 131072, 245760 }) {
+        for (turbot_test_mix mix : { TURBOT_MIX_OLD, TURBOT_MIX_BAND16K }) {
+            test_cases.emplace_back(new test_flash_attn_ext_turbot(TURBOT_TW_L23, kv, 16, mix, 1, false, 0.0f, true));
+        }
+        test_cases.emplace_back(new test_flash_attn_ext_turbo5p_ref(kv, 16));
+    }
     test_cases.emplace_back(new test_turbot_set_rows(TURBOT_TW_L23, 2048, GGML_TYPE_I64, 1, false, true));
     test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, GGML_TYPE_TURBO5P_0, GGML_TYPE_I64, { 1024, 16384, 1, 1 }, { 1, 1 }, 2048, false));
 
