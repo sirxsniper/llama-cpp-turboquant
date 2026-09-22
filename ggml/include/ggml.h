@@ -470,7 +470,17 @@ extern "C" {
         GGML_TYPE_TURBOT_S22 = 63,
         GGML_TYPE_TURBOT_S23 = 64,
         GGML_TYPE_TURBOT_S24 = 65,
-        GGML_TYPE_COUNT   = 66,
+        // [TAG_TURBOT_ANY_TYPES] base rows of turbot layers with fewer than 4 runs of 256 values (2 x 256, 1 x 256,
+        // 4 x 128, 2 x 128 KV heads; docs/turbot/SPEC.md 14): S = sum of the NR run widths, 2..7. Same traits as
+        // S8..S24 (blck_size 1024, type_size 32*S + 16). Appended after S24 so that no existing id moves: state files
+        // and the TURBOT_S8 sentinel stay valid.
+        GGML_TYPE_TURBOT_S2  = 66,
+        GGML_TYPE_TURBOT_S3  = 67,
+        GGML_TYPE_TURBOT_S4  = 68,
+        GGML_TYPE_TURBOT_S5  = 69,
+        GGML_TYPE_TURBOT_S6  = 70,
+        GGML_TYPE_TURBOT_S7  = 71,
+        GGML_TYPE_COUNT   = 72,
     };
 
     // [TAG_GGML_PREC]
@@ -1799,8 +1809,10 @@ extern "C" {
     struct ggml_turbot_op_params;
 
     // Write K or V rows into a turbot base cache and, for rows with a young pool row, into the young pool.
-    //   a      : base cache, turbot type, [1024, kv_size, 1, 1] (contiguous rows)
-    //   b      : F32 [1024, n_rows, 1, 1], ggml_is_contiguous_rows
+    //   a      : base cache, turbot type, [1024, kv_size, 1, 1] (contiguous rows; 1024 is the container width for
+    //            every geometry, a row is 32*S + 16 bytes)
+    //   b      : F32 [row_elems, n_rows, 1, 1], ggml_is_contiguous_rows; row_elems = ggml_turbot_geom_row_elems(
+    //            params->flags) = NR*256 (1024 at flags 0, the 4 x 256 geometry) [TAG_TURBOT_ANY_GEOM]
     //   c      : I64 or I32 [n_rows], destination cell of each row
     //   pool   : GGML_TYPE_I8 [pool_row_bytes, n_pool_rows, 1, 1] (the layer's young pool, never NULL)
     //   young  : I32 [n_rows], young pool row of each row, or -1
@@ -2602,6 +2614,8 @@ extern "C" {
     // the turbot op params (side GGML_TURBOT_SIDE_BOTH) at op_params byte 24; bytes 0..19 (scale, max_bias, softcap,
     // prec, n_kv_max) are untouched. gtab: I32 [n_granules], contiguous, n_granules*64 >= K->ne[1], entry g = young slot of
     // granule g or -1. pool: the layer's young pool, GGML_TYPE_I8 [pool_row_bytes, n_pool_rows].
+    // [TAG_TURBOT_ANY_GEOM] K and V views: ne[0] = ggml_turbot_geom_head_dim(params->flags), ne[2] =
+    // ggml_turbot_geom_n_head(params->flags) (256 and 4 at flags 0), ne[3] = 1.
     GGML_API void ggml_flash_attn_ext_set_turbot(
             struct ggml_tensor                 * a,
             struct ggml_tensor                 * pool,

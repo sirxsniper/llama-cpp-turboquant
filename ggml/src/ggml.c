@@ -840,7 +840,7 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .to_float                 = (ggml_to_float_t) dequantize_row_turbo5p512_0,
         .from_float_ref           = (ggml_from_float_t) quantize_row_turbo5p512_0_ref,
     },
-    // [TAG_TURBOT] tiered KV cache base rows, S = sum of the 4 per-head old widths (ggml-turbot.h). A row decodes only
+    // [TAG_TURBOT] tiered KV cache base rows, S = sum of the per-run old widths (ggml-turbot.h). A row decodes only
     // with the per-head widths from the op params, so to_float and from_float_ref stay NULL: the writer is
     // GGML_OP_TURBOT_SET_ROWS and the readers decode through ggml-turbot.h. Not named on the command line: -ctk/-ctv
     // say "turbot", which maps to the GGML_TYPE_TURBOT_S8 sentinel.
@@ -870,6 +870,13 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
     GGML_TURBOT_TYPE_TRAITS(22)
     GGML_TURBOT_TYPE_TRAITS(23)
     GGML_TURBOT_TYPE_TRAITS(24)
+    // [TAG_TURBOT_ANY_TYPES] S = 2..7: layers with 1 or 2 runs (2 x 256, 1 x 256, 4 x 128, 2 x 128 KV heads)
+    GGML_TURBOT_TYPE_TRAITS(2)
+    GGML_TURBOT_TYPE_TRAITS(3)
+    GGML_TURBOT_TYPE_TRAITS(4)
+    GGML_TURBOT_TYPE_TRAITS(5)
+    GGML_TURBOT_TYPE_TRAITS(6)
+    GGML_TURBOT_TYPE_TRAITS(7)
 #undef GGML_TURBOT_TYPE_TRAITS
     [GGML_TYPE_Q2_K] = {
         .type_name                = "q2_K",
@@ -4152,10 +4159,12 @@ struct ggml_tensor * ggml_turbot_set_rows(
         const struct ggml_turbot_op_params * params) {
     GGML_ASSERT(params != NULL);
     GGML_ASSERT(ggml_turbot_is_type(a->type));
-    GGML_ASSERT(a->ne[0] == GGML_TURBOT_ROW_ELEMS && a->ne[2] == 1 && a->ne[3] == 1);
+    GGML_ASSERT(a->ne[0] == GGML_TURBOT_ROW_ELEMS && a->ne[2] == 1 && a->ne[3] == 1);   // the container, every geometry
     GGML_ASSERT(ggml_is_contiguous_rows(a));
     GGML_ASSERT(b->type == GGML_TYPE_F32);
-    GGML_ASSERT(b->ne[0] == GGML_TURBOT_ROW_ELEMS);
+    // [TAG_TURBOT_ANY_GEOM] one F32 row = the geometry's NR*256 values (1024 at flags 0)
+    GGML_ASSERT(ggml_turbot_geom_valid(params->flags) && "turbot: invalid geometry flags");
+    GGML_ASSERT(b->ne[0] == ggml_turbot_geom_row_elems(params->flags));
     GGML_ASSERT(b->ne[2] == 1 && b->ne[3] == 1);
     GGML_ASSERT(ggml_is_contiguous_rows(b));
     GGML_ASSERT(c->type == GGML_TYPE_I64 || c->type == GGML_TYPE_I32);
@@ -5801,8 +5810,10 @@ void ggml_flash_attn_ext_set_turbot(
     const struct ggml_tensor * v = a->src[2];
 
     GGML_ASSERT(ggml_turbot_is_type(k->type) && ggml_turbot_is_type(v->type));
-    GGML_ASSERT(k->ne[0] == GGML_TURBOT_HEAD_DIM && v->ne[0] == GGML_TURBOT_HEAD_DIM);
-    GGML_ASSERT(k->ne[2] == GGML_TURBOT_N_HEAD   && v->ne[2] == GGML_TURBOT_N_HEAD);
+    // [TAG_TURBOT_ANY_GEOM] head dim and KV heads of the views follow the geometry (256 and 4 at flags 0)
+    GGML_ASSERT(ggml_turbot_geom_valid(params->flags) && "turbot: invalid geometry flags");
+    GGML_ASSERT(k->ne[0] == ggml_turbot_geom_head_dim(params->flags) && v->ne[0] == ggml_turbot_geom_head_dim(params->flags));
+    GGML_ASSERT(k->ne[2] == ggml_turbot_geom_n_head(params->flags)   && v->ne[2] == ggml_turbot_geom_n_head(params->flags));
     GGML_ASSERT(k->ne[3] == 1);
     GGML_ASSERT(pool != NULL && pool->type == GGML_TYPE_I8 && ggml_is_contiguous_rows(pool));
     GGML_ASSERT(gtab != NULL && gtab->type == GGML_TYPE_I32 && ggml_n_dims(gtab) == 1 && ggml_is_contiguous(gtab));

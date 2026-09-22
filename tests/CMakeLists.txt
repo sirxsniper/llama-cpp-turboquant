@@ -315,6 +315,14 @@ llama_build(test-backend-ops.cpp)
 llama_build_and_test(test-turbot.cpp)
 target_compile_definitions(test-turbot PRIVATE TURBOT_TEST_TIER)
 
+# [TAG_TURBOT_ANY_GEOM] turbot on other shapes (docs/turbot/SPEC.md 14): geometry flags, NR-run coder, S2..S7 types,
+# op params and hash, CPU only. Parts (g) CPU flash attention and (h) CPU writer call the CPU backend directly
+# (ggml-cpu.h), which links only without dynamic backend loading; they print SKIPPED otherwise.
+llama_build_and_test(test-turbot-geom.cpp)
+if (NOT GGML_BACKEND_DL AND GGML_CPU)
+    target_compile_definitions(test-turbot-geom PRIVATE TURBOT_GEOM_CPU_OPS)
+endif()
+
 # [TAG_KV_RESOLVE] KV cache type resolver decisions on synthetic hparams (Qwen3.8-27B, Spark2.5, MiniCPM5, MLA, ...),
 # CPU only. llama_kv_resolve and the turbot plan parser are exported with LLAMA_API, so it links in shared builds too.
 llama_build_and_test(test-kv-resolve.cpp)

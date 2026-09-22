@@ -498,3 +498,172 @@ srvcmd emits both for the new build (`--vision cpu|gpu|igpu`).
 | 8.6 switch A/Bs | not yet measured |
 | NEO-CODER-MAX turbot KLD against turbo5p | not yet measured |
 
+---
+
+## 9. Any-model gates (`[TAG_TURBOT_ANY_*]`, SPEC 14)
+
+Section 9 covers turbot on other shapes (SPEC section 14):
+- the geometry flags, the S2..S7 types, the NR-run coder and the CPU reference, with `test-turbot-geom` (WP1);
+- the CUDA reader and writer for the new geometries, with their `test-backend-ops` / `test-turbot-backend` cases, `b0_gate.py` and `sass_diff.py` (WP2);
+- the host cache and tier: NR-run plans, the automatic plan, the sidecar and per-stream tiers, with `test-turbot`, `turbot_plan.py`, `blob_roundtrip.py` and `turbot_guard.py` (WP3);
+- the resolver, the iSWA split and the graph, with `test-kv-resolve` (WP4).
+
+It runs on the `upstream-sync` worktree `WS` after the orchestrator's single integration build (the packages merge in the order WP1, WP2, WP3, WP4), in the build directory of section 8.1 (`BIN`).
+
+**None of it has run yet.** Run the gates in order. A failed gate stops the sequence until it is understood. G2 is a hard gate: nothing after it counts if Qwen3.8-27B changed. The rules of section 0 apply to every step.
+
+### 9.0 G0: preflight
+
+1. **One GPU process** (rule 0.1). Any llama, ggml or test-backend process means wait:
+   ```powershell
+   Get-Process | Where-Object { $_.ProcessName -match 'llama|ggml|test-backend' }
+   ```
+2. **Driver faults first** (rule 0.2). Look for `nvlddmkm` event 153 before anything else. If there is one, reboot before any GPU step:
+   ```powershell
+   Get-WinEvent -FilterHashtable @{LogName='System'; ProviderName='nvlddmkm'; Id=153; StartTime=(Get-Date).AddHours(-24)} -ErrorAction SilentlyContinue
+   ```
+3. `$env:GGML_DISABLE_VULKAN = "1"` for every step.
+4. **Rebuild every tool exe** with the new DLLs (rule 0.4): `test-backend-ops`, `llama-perplexity`, `llama-bench` and `llama-server`, plus `test-turbot`, `test-turbot-geom`, `test-kv-resolve` and `test-turbot-backend`.
+5. Servers on port **8091** only. Outputs go to `E:` (for example `E:\kv-turbot\any`).
+
+### 9.1 G1: CPU tests
+
+| Command | Pass |
+|---|---|
+| `BIN\test-turbot.exe` | `OK` |
+| `BIN\test-turbot-geom.exe` | `OK`. Parts (g) CPU flash attention and (h) CPU writer ran, not `SKIPPED`. |
+| `BIN\test-kv-resolve.exe` | exit 0, last line `<n> checks, 0 failed` |
+
+### 9.2 G2: Qwen3.8-27B bit-identity (hard gate)
+
+The baseline is a build of commit `80f44b5d8` (the committed tree under the WP changes: `0fc83cc8d` plus `[TAG_FA_SINK_CLAMP]` and the seeded turbot test inputs `[TAG_TURBOT_TEST_SEEDED]`), from a fresh build directory `BASE`. Every item must hold:
+
+| # | Check | Pass |
+|---|---|---|
+| 2.1 | `python tools\turbot\sass_diff.py BASE\bin\ggml-cuda.dll BIN\ggml-cuda.dll --arch sm_120a` (CPU only, cuobjdump) | exit 0: `IDENTICAL` for the 20 `flash_attn_ext_turbot<256,256,...>` kernels, `k_turbot_set_rows<int>` and `<int64_t>`, `k_turbot_fill` and `flash_attn_turbot_balance_bounds<4>`; `--scope turbot` for the full turbot list |
+| 2.2 | `BIN\test-backend-ops.exe test -b CUDA0 -o FLASH_ATTN_EXT -p "^turbot=[a-z0-9]+,kv="`, then `-o TURBOT_SET_ROWS -p "^turbot=[a-z0-9]+,rows="` | 195/195, with case names identical to the baseline's `-p "^turbot="` run; the Qwen writer cases pass. The plain `^turbot=` filter of sections 2b and 8 now also selects the new geometry cases, whose names carry `d=..,hkv=..,hq=..` after the widths. |
+| 2.3 | `BIN\test-turbot-backend.exe` on both builds | bytes identical |
+| 2.4 | `validate.ps1` (section 2d) | `GATE PASSED` |
+| 2.5 | production server: 262K, 4 slots, `--kv-unified`, turbot, DFlash2 n_max 3, port 8091 | the log shows `turbot plan <built-in default>`, hash `0x56c3503c949a7749`, and the same size lines as the baseline (`size = 5246.00 MiB ... young pool:  726.00 MiB`) |
+| 2.6 | greedy transcripts: code, prose, a tool call, and 4 concurrent unique-value prompts | identical to the baseline build |
+| 2.7 | KLD 16 × 32K (section 5 commands, `-ub 512`) | code **0.001139** and prose **0.001856**, exactly |
+| 2.8 | `llama-bench` tg64 at `-d 0,131072,245760` | within noise of the baseline |
+
+### 9.3 G3: new-kernel correctness
+
+- Every new `test-backend-ops` case passes against the CPU reference:
+  - FA at D 256 with GQA 4, GQA 1, 2 heads and 1 head;
+  - FA at D 128 with 8, 4 and 2 heads, including GQA 7 and 16;
+  - the NR 1 and NR 2 writers, and the NR 4 writer at D 128.
+  ```powershell
+  BIN\test-backend-ops.exe test -b CUDA0 -o FLASH_ATTN_EXT -p "^turbot=[a-z0-9]+,d=" > E:\kv-turbot\any\g3_fa.txt
+  BIN\test-backend-ops.exe test -b CUDA0 -o TURBOT_SET_ROWS -p "^turbot=[a-z0-9]+,d=" > E:\kv-turbot\any\g3_writer.txt
+  ```
+- `compute-sanitizer` memcheck and synccheck on the small cases (the command pattern of 8.3, with `--tool memcheck` and `--tool synccheck`), for example `-p "^turbot=[a-z0-9]+,d=.*,kv=(96|100),nb=(1|2|4),"` for FA and `-p "^turbot=[a-z0-9]+,d=.*,rows=(1|4|16),"` for the writer: `ERROR SUMMARY: 0 errors` for both.
+
+### 9.4 G4: kernel speed (B0 style)
+
+`turbot_perf` at nb 1 and nb 512, each geometry against its reference:
+
+| Geometry | Reference |
+|---|---|
+| D 128, 8 heads | turbo5p |
+| D 256, 4 heads, GQA 4 | turbo5p |
+| D 256, 2 heads | turbo5p512 (turbo5p cannot hold a 512-value row) |
+| D 128, 2 heads, GQA 8 and GQA 16 | turbo4 |
+
+```powershell
+BIN\test-backend-ops.exe perf -b CUDA0 -o FLASH_ATTN_EXT -p "turbot_perf=[a-z0-9]+,d=|turbot_ref=[a-z0-9]+,d=" > E:\kv-turbot\any\g4.log
+python tools\turbot\b0_gate.py E:\kv-turbot\any\g4.log
+```
+
+**Pass:** turbot is no slower than the reference at both nb (`b0_gate.py` prints `G4 <geometry>: VALIDATED`; `--g4-limit` changes the 1.00 bar). A geometry that fails leaves the VALIDATED list (SPEC 14.11).
+
+### 9.5 G5: per-model quality
+
+Run with `turbot_guard.py`, one model at a time. It refuses to start while a GPU process runs, writes under `E:\turbot-guard\<model>` and deletes the `.dat` logits at the end unless `--keep`:
+```powershell
+python tools\turbot\turbot_guard.py --selftest
+python tools\turbot\turbot_guard.py --exe-dir BIN --model D:\Projects\LocalAI\models\Ornith-1.5-9B-Q8_0.gguf
+python tools\turbot\turbot_guard.py --exe-dir BIN --model D:\Projects\LocalAI\models\MiniCPM5-2B-Q8_0.gguf --budget turbo5p --allow-larger
+```
+Without `--plan` it measures the automatic plan of the production shape (`--plan-ctx 262144 --plan-np 1`; add `--plan-unified` for a `--kv-unified` server). `--sidecar` also writes the stamped `<model>.turbot.plan` next to the model after a pass. The NR 1 opt-in arms need `--budget turbo5p --allow-larger`, because that plan is larger than turbo4.
+
+**Setup.** f16 base logits, 32K × 8 chunks, code and prose corpora, `-ub 512`.
+
+**Disk space.** Check `E:` first. The base files take about 65 GB per corpus for the ~248K vocabulary of the Ornith models (qwen35 family), and about 34 GB for 131K vocabularies. Delete them after each model.
+
+| Model | turbot arm | Against |
+|---|---|---|
+| Ornith-1.5-9B-Q8_0 | turbot (automatic plan) | turbo5p |
+| Spark-X2.5-4B-Q8_0 | turbot (automatic plan on the full-attention layers, SWA on turbo5p) | turbo5p |
+| Ornith-1.5-35B-Q4_K_M | turbot (automatic plan, NR 2) | turbo5p512 |
+| MiniCPM5-2B-Q8_0 | turbot with `LLAMA_TURBOT_AUTO_BUDGET=turbo5p` | turbo4 |
+| NVIDIA-Nemotron-3.5-Lightning-30B-A3B-Q4_0 | turbot with `LLAMA_TURBOT_AUTO_BUDGET=turbo5p` | turbo4 |
+| Muse-Glimmer-30B-KQuant-17GB-Q4_K_M | turbot with `LLAMA_TURBOT_AUTO_BUDGET=turbo5p` | turbo4 |
+
+turbo4 is the reference for the three 2 × 128 models because turbo5p cannot hold a 256-value row.
+
+**Pass, per corpus:**
+- the paired chunk-bootstrap 95% CI of mean KLD (turbot − fallback) lies entirely below 0;
+- the same-top lower bound is ≥ −0.05 points;
+- p99.9 KLD is no worse.
+
+If the CI crosses 0, go to 16 chunks.
+
+**Depth arm.** 131K single-chunk PPL for Ornith-1.5-9B, Ornith-1.5-35B and Spark-X2.5-4B (PPL rather than KLD, because of the RAM spike of rule 0.6). Pass: turbot no worse than the fallback within noise.
+
+Every arm must log its plan and hash lines. An arm whose cache silently resolved to another type fails.
+
+### 9.6 G6: per-model speed and VRAM
+
+For each model of G5, turbot against its fallback, three repetitions:
+```powershell
+BIN\llama-bench.exe -m D:\Projects\LocalAI\models\<file> -ngl 99 -fa 1 -lm none -ctk turbot -ctv turbot -p 2048 -n 64 -d 0,32768,131072 -r 3 -o csv > E:\kv-turbot\any\<model>_turbot.csv
+BIN\llama-bench.exe -m D:\Projects\LocalAI\models\<file> -ngl 99 -fa 1 -lm none -ctk <fallback> -ctv <fallback> -p 2048 -n 64 -d 0,32768,131072 -r 3 -o csv > E:\kv-turbot\any\<model>_fallback.csv
+```
+- `<fallback>` is `turbo5p` (the cache takes turbo5p512 by itself for 512-value rows) or `turbo4`.
+- The turbot arm of the NR 1 models runs with `$env:LLAMA_TURBOT_AUTO_BUDGET = "turbo5p"`.
+
+**Pass:**
+- tg64 and pp2048 of turbot ≥ the fallback at every depth;
+- for automatic plans, the `llama_kv_cache: size` line shows turbot ≤ the fallback;
+- for the NR 1 opt-in, record the extra MiB (sizing at 262K: +316 MiB MiniCPM5, +98 MiB Muse, +45 MiB Nemotron).
+
+### 9.7 G7: server smoke
+
+For each promoted model, on port 8091:
+- facts and a tool call;
+- vision with the Ornith and Muse mmproj files;
+- 4 concurrent unique-value prompts with no cross-slot leak;
+- `blob_roundtrip.py` slot save and restore.
+
+Qwen3.8-27B with `-np 4` and no `--kv-unified`:
+- the log shows turbot on 4 streams;
+- each prompt's greedy output equals its single-stream output;
+- `blob_roundtrip.py` passes, every arm with one KV stream per slot, including `streams_equal` (unified slot 0 against stream 2):
+  ```powershell
+  python tools\turbot\blob_roundtrip.py --exe BIN\llama-server.exe --np 4 --non-unified
+  ```
+
+### 9.8 G8: set the defaults from the data
+
+- The VALIDATED list becomes the geometries whose models passed G4-G7. Expected: {256 × 4, 256 × 2}.
+- NR 1 becomes a default only if turbot beats turbo4 on all three NR 1 models in G5 and loses no decode speed in G6. It costs about 11% more KV VRAM than turbo4 at 262K cells (4-bit base rows alone are 6% larger, the young pool adds the rest). Otherwise it stays opt-in.
+- Multi-stream and iSWA stay on only if G7 passes.
+- A failure flips that switch's default in code (a one-line change). The env switches remain.
+
+### 9.9 Results (to fill)
+
+| Gate | Result |
+|---|---|
+| G0 preflight, rebuilt tools | not yet run |
+| G1 test-turbot, test-turbot-geom, test-kv-resolve | not yet run |
+| G2 Qwen3.8-27B bit-identity (SASS, test-backend-ops, bytes, validate.ps1, server log, transcripts, KLD, tg64) | not yet run |
+| G3 new-kernel correctness, memcheck, synccheck | not yet run |
+| G4 kernel speed per geometry | not yet measured |
+| G5 quality per model (KLD CI, same-top, p99.9, 131K PPL) | not yet measured |
+| G6 speed and VRAM per model | not yet measured |
+| G7 server smoke per model, Qwen `-np 4` streams | not yet run |
+| G8 VALIDATED list and switch defaults | not yet decided |
+

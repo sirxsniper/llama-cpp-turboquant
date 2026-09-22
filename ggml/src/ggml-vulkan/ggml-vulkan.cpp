@@ -14868,13 +14868,14 @@ static ggml_backend_t ggml_backend_vk_device_init(ggml_backend_dev_t dev, const 
 }
 
 // [TAG_VK_NO_TURBO] The fork's KV types (turbo4/2/3, turbo4p, turbo5p, turbo5p512 and the turbot family,
-// ids GGML_TYPE_TURBO4_0..GGML_TYPE_TURBOT_S24) have no Vulkan kernels. Several generic cases below
+// ids GGML_TYPE_TURBO4_0..GGML_TYPE_TURBOT_S7, i.e. 43..71) have no Vulkan kernels. Several generic cases below
 // (ROPE, RMS_NORM, same-type CPY, VIEW/RESHAPE, REPEAT by type size) would otherwise claim them, so
 // nothing that reads or writes a turbo/turbot tensor may ever be scheduled on Vulkan.
-static_assert(GGML_TYPE_TURBO4_0 == 43 && GGML_TYPE_TURBOT_S24 == 65 && GGML_TYPE_COUNT == 66,
+// [TAG_TURBOT_ANY_TYPES] turbot_s2..s7 (66..71) were appended after turbot_s24, so the range still ends at the last id.
+static_assert(GGML_TYPE_TURBO4_0 == 43 && GGML_TYPE_TURBOT_S24 == 65 && GGML_TYPE_TURBOT_S7 == 71 && GGML_TYPE_COUNT == 72,
               "ggml_type changed: check that every fork KV type is still covered by ggml_vk_is_fork_turbo_type");
 static bool ggml_vk_is_fork_turbo_type(ggml_type t) {
-    return (int) t >= (int) GGML_TYPE_TURBO4_0 && (int) t <= (int) GGML_TYPE_TURBOT_S24;
+    return (int) t >= (int) GGML_TYPE_TURBO4_0 && (int) t <= (int) GGML_TYPE_TURBOT_S7;
 }
 
 static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {

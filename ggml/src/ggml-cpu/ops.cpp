@@ -5369,9 +5369,9 @@ void ggml_compute_forward_turbot_set_rows(
         return;
     }
 
-    const ggml_tensor * src   = dst->src[0];   // F32 rows [1024, n_rows]
+    const ggml_tensor * src   = dst->src[0];   // F32 rows [NR*256, n_rows] (1024 at flags 0)
     const ggml_tensor * idx   = dst->src[1];   // I64 or I32 destination cells [n_rows]
-    const ggml_tensor * base  = dst->src[2];   // turbot base cache [1024, kv_size]
+    const ggml_tensor * base  = dst->src[2];   // turbot base cache [1024 (container), kv_size]
     const ggml_tensor * pool  = dst->src[3];   // I8 young pool [pool_row_bytes, n_pool_rows]
     const ggml_tensor * young = dst->src[4];   // I32 young pool row of each row, or -1
     const ggml_tensor * fill  = dst->src[5];   // I32 [4, n_fill] of (granule, slot, mask_lo, mask_hi), or NULL
@@ -5387,7 +5387,9 @@ void ggml_compute_forward_turbot_set_rows(
 
     GGML_ASSERT(base->type == ggml_turbot_type_of_s(sd->s));
     GGML_ASSERT(base->nb[1] == (size_t) sd->base_row_bytes);
-    GGML_ASSERT(src->type == GGML_TYPE_F32 && src->ne[0] == GGML_TURBOT_ROW_ELEMS && src->nb[0] == sizeof(float));
+    // [TAG_TURBOT_ANY_GEOM] a row is the geometry's NR*256 values; encode_side and fill_side walk the side's nr runs
+    GGML_ASSERT(src->type == GGML_TYPE_F32 && src->ne[0] == ggml_turbot_geom_row_elems(l.flags) && src->nb[0] == sizeof(float));
+    GGML_ASSERT(src->ne[0] == (int64_t) sd->nr*GGML_TURBOT_RUN_ELEMS);
     GGML_ASSERT(idx->type == GGML_TYPE_I64 || idx->type == GGML_TYPE_I32);
     GGML_ASSERT(pool->type == GGML_TYPE_I8 && pool->ne[0] == (int64_t) l.pool_row_bytes);
     GGML_ASSERT(young->type == GGML_TYPE_I32);
@@ -9515,9 +9517,16 @@ static void ggml_compute_forward_flash_attn_ext_turbot(
     GGML_ASSERT(ggml_turbot_op_params_get(dst, &p) && p.side == GGML_TURBOT_SIDE_BOTH);
     GGML_ASSERT(ggml_turbot_layer_from_op_params(&p, &l));
 
+    // [TAG_TURBOT_ANY_GEOM] the geometry of the op params: head dim D, KV heads, NR*256 values per decoded row.
+    // Flags 0 gives D 256, 4 heads and 1024 values, the constants this function used before.
+    const int64_t hd        = ggml_turbot_geom_head_dim(l.flags);
+    const int64_t n_head    = ggml_turbot_geom_n_head(l.flags);
+    const size_t  row_elems = (size_t) ggml_turbot_geom_row_elems(l.flags);
+
     GGML_ASSERT(k->type == ggml_turbot_type_of_s(l.k.s) && v->type == ggml_turbot_type_of_s(l.v.s));
-    GGML_ASSERT(k->ne[0] == GGML_TURBOT_HEAD_DIM && v->ne[0] == GGML_TURBOT_HEAD_DIM);
-    GGML_ASSERT(k->ne[2] == GGML_TURBOT_N_HEAD   && v->ne[2] == GGML_TURBOT_N_HEAD);
+    GGML_ASSERT(k->ne[0] == hd     && v->ne[0] == hd);
+    GGML_ASSERT(k->ne[2] == n_head && v->ne[2] == n_head);
+    GGML_ASSERT(row_elems == (size_t) l.k.nr*GGML_TURBOT_RUN_ELEMS && row_elems == (size_t) l.v.nr*GGML_TURBOT_RUN_ELEMS);
     GGML_ASSERT(k->ne[3] == 1 && v->ne[3] == 1 && k->ne[1] == v->ne[1]);
     GGML_ASSERT(k->nb[1] == (size_t) l.k.base_row_bytes && v->nb[1] == (size_t) l.v.base_row_bytes);
     GGML_ASSERT(pool->type == GGML_TYPE_I8 && pool->ne[0] == (int64_t) l.pool_row_bytes);
@@ -9528,8 +9537,8 @@ static void ggml_compute_forward_flash_attn_ext_turbot(
     const int64_t   n_pool = pool->ne[1];
     const int32_t * slots  = (const int32_t *) gtab->data;
 
-    std::vector<float> k_f32((size_t) (GGML_TURBOT_ROW_ELEMS*n_kv));
-    std::vector<float> v_f32((size_t) (GGML_TURBOT_ROW_ELEMS*n_kv));
+    std::vector<float> k_f32(row_elems*(size_t) n_kv);
+    std::vector<float> v_f32(row_elems*(size_t) n_kv);
 
     for (int64_t i = 0; i < n_kv; ++i) {
         const int32_t   slot = slots[i >> GGML_TURBOT_LOG2_GRANULE];
@@ -9540,19 +9549,21 @@ static void ggml_compute_forward_flash_attn_ext_turbot(
             yrow = (const uint8_t *) pool->data + (size_t) row*pool->nb[1];
         }
         ggml_turbot_decode_side((const uint8_t *) k->data + (size_t) i*k->nb[1], yrow,
-                &l.k, k_f32.data() + GGML_TURBOT_ROW_ELEMS*i);
+                &l.k, k_f32.data() + row_elems*(size_t) i);
         ggml_turbot_decode_side((const uint8_t *) v->data + (size_t) i*v->nb[1], yrow ? yrow + l.pool_v_off : nullptr,
-                &l.v, v_f32.data() + GGML_TURBOT_ROW_ELEMS*i);
+                &l.v, v_f32.data() + row_elems*(size_t) i);
     }
 
-    // F32 stand-ins with the views' shape [256, n_kv, 4, 1]: cell i, head h, element e at 4*(1024*i + 256*h + e)
-    const auto as_f32 = [n_kv](ggml_tensor & t, float * data) {
+    // F32 stand-ins with the views' shape [D, n_kv, H, 1]: cell i, head z, element e at 4*(row_elems*i + D*z + e).
+    // D*z is the run mapping of SPEC 14.2 (D 256: run z; D 128: run z>>1 at element 128*(z&1)). At flags 0 these are
+    // the old strides 4*1024, 4*256 and 4*1024*n_kv.
+    const auto as_f32 = [n_kv, row_elems, hd](ggml_tensor & t, float * data) {
         t.type      = GGML_TYPE_F32;
         t.data      = data;
         t.nb[0]     = sizeof(float);
-        t.nb[1]     = sizeof(float)*GGML_TURBOT_ROW_ELEMS;
-        t.nb[2]     = sizeof(float)*GGML_TURBOT_HEAD_DIM;
-        t.nb[3]     = sizeof(float)*GGML_TURBOT_ROW_ELEMS*(size_t) n_kv;
+        t.nb[1]     = sizeof(float)*row_elems;
+        t.nb[2]     = sizeof(float)*(size_t) hd;
+        t.nb[3]     = sizeof(float)*row_elems*(size_t) n_kv;
         t.view_src  = nullptr;
         t.view_offs = 0;
     };

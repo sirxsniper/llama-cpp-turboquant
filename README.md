@@ -588,11 +588,13 @@ Each downgrade logs one warning that gives the reason for every type it passed o
 llama_init_from_model: KV cache type for K and V: turbot -> turbo5p (turbot: SWA caches are unsupported)
 ```
 
+(Since turbot takes iSWA models, this particular warning appears only with `LLAMA_TURBOT_ISWA=0` or on an all-SWA model.)
+
 The `llama_kv_cache: size = ...` line shows the types actually used. A request the model supports is left as it is, with no new log line. Qwen3.8-27B with turbot or turbo5p is unchanged.
 
 | Type | Kept when |
 |:--|:--|
-| `turbot` | All of these hold: <br>• `-ctk turbot -ctv turbot` are given together. <br>• There is one KV stream (`--kv-unified` or `-np 1`). <br>• Flash attention is not off. <br>• There is no SWA, no MLA and no shared cells. <br>• Every attention layer has 4 KV heads × 256 for K and V, with its KV on CUDA. <br>• `TURBO_KV_CPU_LAYERS`, `TURBO_LAYER_ADAPTIVE` and `TURBO_INNERQ` are unset. <br>• The plan's `L` lines are exactly the model's attention layers. |
+| `turbot` | All of these hold (`[TAG_TURBOT_ANY_*]`, see "turbot on other models" below): <br>• `-ctk turbot -ctv turbot` are given together. <br>• Flash attention is not off. <br>• There is no MLA and there are no shared cells. <br>• Every turbot layer has K and V heads of the same size, in one of the shapes 4 × 256, 2 × 256, 1 × 256, 8 × 128, 4 × 128 or 2 × 128 (KV heads × head size), with its KV on CUDA (Turing or newer). <br>• SWA only as one half of an iSWA model: turbot goes on the full-attention layers and the SWA layers resolve their own type (turbo5p where the row allows it). All-SWA models fall back. <br>• Several KV streams (`-np N` without `--kv-unified`) are allowed, with one tier per stream. <br>• The arch has the turbo query rotation, and the cache size is a multiple of 64 cells. <br>• `TURBO_KV_CPU_LAYERS`, `TURBO_LAYER_ADAPTIVE` and `TURBO_INNERQ` are unset. <br>• There is a plan for the model: a plan file, a verified sidecar, the built-in plan (its `L` lines are exactly the model's attention layers), or the automatic plan for a validated shape that fits the fallback type's bytes. <br>`LLAMA_TURBOT_ANY=0` restores the old rule: one stream, no SWA, 4 × 256 only, and a plan whose `L` lines match. |
 | `turbo5p`, `turbo5p512` | Flash attention is not off, and K and V heads are the same size, 128 or 256. Every KV row (KV heads × head size) must be a multiple of 512. When a row is not a multiple of 1024, turbo5p runs as turbo5p512. That swap logs an INFO line and does not count as a downgrade. |
 | `turbo4p` | The same as turbo5p, but rows must be a multiple of 1024. |
 | `turbo4`, `turbo3`, `turbo2` | Flash attention is not off. Asked for by name, any head the zero-padding path has a CUDA kernel for is kept: K = V of 128, 256 or 512 after padding to 128, or MLA with K 576 and V 512. As a fallback step, only unpadded heads of 128 or 256 are taken. |
@@ -607,17 +609,20 @@ Other rules:
 - **Safety net:** if the cache constructor still refuses turbot, the context rebuilds its memory once without turbot.
 - **`LLAMA_KV_RESOLVE=0`** turns the resolver off. The old checks then apply: a type the model cannot take fails context creation with the reason.
 
-What `-ctk turbot -ctv turbot` resolves to on a few shapes. These come from `tests/test-kv-resolve.cpp`, which uses synthetic hyperparameters and has not been run yet:
+What `-ctk turbot -ctv turbot` resolves to on a few shapes. These follow from the rules above and SPEC section 14 (`tests/test-kv-resolve.cpp` checks them on synthetic hyperparameters). None of it has been run yet:
 
 | Model | KV shape | Result |
 |:--|:--|:--|
-| Qwen3.8-27B | 16 attention layers, 4 × 256; the plan fits | turbot |
-| Qwen3.8-27B with `-np 4` and no `--kv-unified` | 4 KV streams | turbo5p |
-| Spark-X2.5-4B | iSWA, 4 × 256 | turbo5p |
-| Spark-X2.5-1.7B | iSWA, 2 × 256 (512-element rows) | turbo5p512 |
-| Granite 4.2 8B | 8 × 128 | turbo5p |
-| MiniCPM5-2B | 2 × 128 (256-element rows) | turbo4 |
-| Muse Glimmer 30B | SWA, 2 × 128 | turbo4 |
+| Qwen3.8-27B | 16 attention layers, 4 × 256; the built-in plan fits | turbot, built-in plan, unchanged |
+| Qwen3.8-27B with `-np 4` and no `--kv-unified` | 4 KV streams | turbot, one tier per stream (`LLAMA_TURBOT_MULTI_STREAM=0`: turbo5p) |
+| Ornith-1.5-9B | 8 attention layers, 4 × 256 | turbot, automatic plan |
+| Spark-X2.5-4B | iSWA, 4 × 256 | turbot on the 9 full-attention layers (automatic plan), turbo5p on the SWA layers |
+| Spark-X2.5-1.7B | iSWA, 2 × 256 (512-element rows) | turbot on the full-attention layers (automatic plan), turbo5p512 on the SWA layers |
+| Ornith-1.5-35B | 10 attention layers, 2 × 256 | turbot, automatic plan (2 runs of 256 values per row) |
+| Granite 4.2 8B | 8 × 128 | turbo5p; turbot with `LLAMA_TURBOT_AUTO_PLAN=all` (the shape has kernels but no model on disk to validate them) |
+| MiniCPM5-2B | 2 × 128 (256-element rows) | turbo4; turbot with `LLAMA_TURBOT_AUTO_BUDGET=turbo5p` |
+| Muse Glimmer 30B | iSWA, 2 × 128 | turbo4; with `LLAMA_TURBOT_AUTO_BUDGET=turbo5p`, turbot on the full-attention layers and turbo4 on the SWA layers |
+| Nemotron 3.5 Lightning 30B-A3B | 6 attention layers, 2 × 128 | turbo4; turbot with `LLAMA_TURBOT_AUTO_BUDGET=turbo5p` |
 | any model with head size 64 | 8 × 64 | q8_0 |
 | any model with head size 80 | 8 × 80 | f16 |
 | MLA (DeepSeek-V2 style) | K 576, V 512 | q8_0 |
@@ -629,11 +634,51 @@ The default plan, `docs/turbot/plans/turbot-default.plan`, is calibrated on Qwen
 
 | You give | Plan used |
 |:--|:--|
-| nothing | the built-in plan, with one INFO line |
+| nothing | Qwen3.8-27B-shaped models: the built-in plan, with one INFO line. Other models: a verified sidecar `<model>.turbot.plan` if there is one, otherwise the automatic plan (below). |
 | `--kv-tier-plan default` or `LLAMA_TURBOT_PLAN=default` | the built-in plan |
-| `--kv-tier-plan <file>` or `LLAMA_TURBOT_PLAN=<file>` | that file (write `./default` for a file named `default`) |
+| `--kv-tier-plan auto` or `LLAMA_TURBOT_PLAN=auto` | the automatic plan |
+| `--kv-tier-plan <file>` or `LLAMA_TURBOT_PLAN=<file>` | that file only (write `./default` or `./auto` for files with those names). A file that does not fit falls back down the type chain; it never becomes an automatic plan. |
 
 The flag wins over the variable. If the plan does not fit the model (its `L` lines are not the model's attention layers) or cannot be read, the resolver moves to turbo5p (or to the next type the model takes) and logs why. Fine-tunes that keep Qwen3.8-27B's attention layers (4 × 256 at layers 3, 7, ..., 63) match the built-in plan, so they run turbot with widths calibrated on the base model. Their quality is not yet measured.
+
+### turbot on other models
+
+> **Status, 2026-09-22: implemented, not built or measured.** Every number in this subsection is a sizing estimate from the GGUF headers, not a measurement. The gates in `docs/turbot/TESTING.md` section 9 decide the defaults. SPEC section 14 has the details.
+
+turbot used to take only Qwen3.8-27B's shape, 4 KV heads × 256. It now also takes 2 × 256, 1 × 256, 8 × 128, 4 × 128 and 2 × 128 (`[TAG_TURBOT_ANY_*]`). A row holds 1, 2 or 4 runs of 256 values, each with its own old and young width, so the format, the young tier and the plan work the same way at every shape. Qwen3.8-27B keeps the built-in plan and runs exactly the same kernels and numbers as before (the G2 gate checks this bit for bit).
+
+**Default policy.** `-ctk turbot -ctv turbot` keeps turbot for a model only when the model meets the rules in the table above and has a plan. Everything else steps down the usual chain (turbot → turbo5p / turbo5p512 → turbo4 → q8_0 → f16), with one warning per step. The plan comes from, in this order: `--kv-tier-plan` / `LLAMA_TURBOT_PLAN`; a sidecar `<model>.turbot.plan` with a `# verified:` stamp and a matching `# model:` fingerprint; the built-in plan when it names exactly the model's attention layers and shape; the automatic plan. The DFlash2 and MTP draft contexts never use turbot.
+
+**Automatic plan.** It gives every run an old width of 4 or 5 and every young run width 7. It uses the most width-5 runs that still fit in the bytes of the type the model would otherwise get (turbo5p, turbo5p512 or turbo4), so it never uses more VRAM than the fallback. It only runs for the main context, with the resolver on, and only for shapes on the VALIDATED list: 4 × 256 and 2 × 256 are expected there after the gates. `LLAMA_TURBOT_AUTO_PLAN_DUMP=<file>` writes the generated plan.
+
+| Model | turbot as expected by default | Sizing at 262K cells, one sequence (not measured) |
+|:--|:--|:--|
+| Ornith-1.5-9B | turbot, automatic plan | 2572.6 MiB against turbo5p's 2624 MiB (mean old width 4.75) |
+| Spark-X2.5-4B | turbot on the 9 full-attention layers, turbo5p on the 27 SWA layers | full-attention part 2894.2 MiB against turbo5p's 2952 MiB |
+| Ornith-1.5-35B | turbot, automatic plan, 2 × 256 | 1650.4 MiB against turbo5p512's 1680 MiB (mean old width 4.75) |
+| MiniCPM5-2B, Muse Glimmer 30B, Nemotron 3.5 30B | turbo4 (2 × 128). turbot only with `LLAMA_TURBOT_AUTO_BUDGET=turbo5p`: 4-bit old rows alone cost 144 B per 256 values, turbo4 136 B. | with the opt-in: +316 / +98 / +45 MiB of KV over turbo4 |
+| Granite 4.2 8B (8 × 128) | turbo5p. turbot only with `LLAMA_TURBOT_AUTO_PLAN=all` | — |
+| Qwen3.8-27B, `-np 4` without `--kv-unified` | turbot on 4 streams | — |
+
+Speed and quality for these models are **not measured**. TESTING.md section 9 (G4-G7) measures them, and a shape that fails leaves the VALIDATED list.
+
+**Switches.** Each one restores the behaviour before this change for its part:
+
+| Variable | Default | Effect when set |
+|:--|:--|:--|
+| `LLAMA_TURBOT_ANY` | on | `0` restores exactly the old turbot rules: 4 × 256 only, no automatic plan, no sidecar, no iSWA split, one stream. Every other switch below then reads as off. |
+| `GGML_TURBOT_ANY` | on | `0` makes the CUDA backend accept only the 4 × 256 kernels and writer, today's routing. |
+| `LLAMA_TURBOT_AUTO_PLAN` | `1` | `0`: no automatic plan; a model without a plan falls back to turbo5p. `all`: every supported shape, not just the validated ones. |
+| `LLAMA_TURBOT_AUTO_BUDGET` | unset | `turbo5p` budgets the automatic plan at turbo5p's rate even where the fallback is turbo4 (the 2 × 128 models). This uses more VRAM than the fallback. |
+| `LLAMA_TURBOT_AUTO_PLAN_DUMP` | unset | `<file>` writes the generated plan text. |
+| `LLAMA_TURBOT_SIDECAR` | on | `0` ignores `<model>.turbot.plan`. |
+| `LLAMA_TURBOT_ISWA` | on | `0`: SWA models refuse turbot and take turbo5p for all layers, as before. |
+| `LLAMA_TURBOT_SWA_TYPE` | unset | `<type>` sets the cache type of the SWA layers of an iSWA model, for A/B runs. Unset, they resolve turbo5p through their own chain. |
+| `LLAMA_TURBOT_MULTI_STREAM` | on | `0`: several KV streams refuse turbot and take turbo5p, as before. |
+
+`LLAMA_KV_RESOLVE=0` and `LLAMA_TURBOT=0` keep their meaning. With the resolver off, the cache uses the old plan precedence plus the explicit `auto` keyword only.
+
+The build option `-DGGML_CUDA_FA_TURBOT_D128=OFF` leaves out the 16 head-size-128 turbot kernels (shorter CUDA build). Head-size-128 models then step down to their fallback type: the CUDA backend tells the resolver which shapes it can run.
 
 ### Vision: pick the device
 
@@ -700,7 +745,7 @@ Upstream removed `--mmap`, `--no-mmap`, `--mlock` and `--direct-io` / `--no-dire
 
 ### New switches on the sync branch
 
-Every switch defaults to the new behaviour. The defaults are what the measurements in the status note above ran with; the fused GDN norm is bit-identical to the unfused one (same KLD to six digits).
+Every switch defaults to the new behaviour. The defaults are what the measurements in the status note above ran with; the fused GDN norm is bit-identical to the unfused one (same KLD to six digits). The switches of turbot on other shapes (`LLAMA_TURBOT_ANY` and the rest) are listed under "turbot on other models" above; they are not measured yet.
 
 | Variable | Default | Effect when set |
 |:--|:--|:--|
@@ -723,7 +768,7 @@ Every switch defaults to the new behaviour. The defaults are what the measuremen
 
 | Arch | Model | KV on this fork |
 |:--|:--|:--|
-| `spark2_5` | Spark-X2.5 4B and 1.7B (#27868) | iSWA. turbot falls back to turbo5p (4B, 4 × 256) or turbo5p512 (1.7B, 2 × 256). |
+| `spark2_5` | Spark-X2.5 4B and 1.7B (#27868) | iSWA. turbot goes on the full-attention layers and the SWA layers take turbo5p (4B, 4 × 256) or turbo5p512 (1.7B, 2 × 256); not yet measured. With `LLAMA_TURBOT_ISWA=0`, turbot falls back to turbo5p or turbo5p512 on every layer, as measured below. |
 | `maple` | Maple 20B-A1B ternary MoE (#27000) | Upstream supports it on the CPU only. |
 | `hy_v4` | Tencent Hy 4 preview (#28127) | No turbo type, because its attention has no turbo query rotation. It falls back to q8_0, or to f16 where q8_0 does not fit. |
 | `hrm_text` | HrmTextForCausalLM, DFM Mimir 1B (#27625) | Resolved by the rules above. |
@@ -746,7 +791,9 @@ Models checked on this branch (single stream, 2K-token prompt; KV type as picked
 | Muse Glimmer 30B Q4_K_M + mmproj | turbo4 (SWA) | 55 | its DFlash drafter: 107-114 |
 | Nemotron 3.5 Lightning 30B-A3B Q4_0 | turbo4 (2 × 128) | 275 | MTP sidecar: 422-442 |
 
-All of them answered the fact checks correctly and returned a valid tool call; the vision models read the test image. Nemotron's MTP ships as a separate `mtp-*.gguf`: use `--spec-type draft-mtp --spec-draft-model mtp-<model>.gguf`. The fork had refused that pairing; it now only refuses draft-mtp together with a non-MTP drafter.
+All of them answered the fact checks correctly and returned a valid tool call; the vision models read the test image.
+
+The "KV picked" column is what the measured build picked, before turbot took other shapes. With "turbot on other models" above, Ornith-1.5-9B, Spark-X2.5-4B (full-attention layers) and Ornith-1.5-35B are expected to pick turbot. Those runs are not measured yet (TESTING.md section 9). Nemotron's MTP ships as a separate `mtp-*.gguf`: use `--spec-type draft-mtp --spec-draft-model mtp-<model>.gguf`. The fork had refused that pairing; it now only refuses draft-mtp together with a non-MTP drafter.
 
 ---
 
@@ -811,10 +858,11 @@ The default plan, `docs/turbot/plans/turbot-default.plan` (calibrated on Qwen3.8
 - **No `--kv-tier-plan` and no `LLAMA_TURBOT_PLAN`:** the built-in plan.
 - **`--kv-tier-plan default`** (or `LLAMA_TURBOT_PLAN=default`): the built-in plan, chosen explicitly.
 - **`--kv-tier-plan <file>`:** that plan file. Use `./default` for a file named `default`.
+- **`--kv-tier-plan auto`** (or `LLAMA_TURBOT_PLAN=auto`): the automatic plan (`[TAG_TURBOT_ANY_*]`, see [turbot on other models](#turbot-on-other-models)). Without a flag, a model that the built-in plan does not fit uses a verified sidecar plan or the automatic plan.
 
 A plan is only used when its `L` lines are exactly the model's attention layers. When the plan does not fit (or the file cannot be read), turbot is not used for that model: the context falls back to turbo5p (or the next type the model supports) and the log says why. With `LLAMA_KV_RESOLVE=0`, context creation fails with the reason instead.
 
-`LLAMA_TURBOT_PLAN` can carry the plan instead of the flag (llama-bench and llama-perplexity use it). `LLAMA_TURBOT=0` falls back to turbo5p. It needs flash attention, CUDA and a unified KV pool; the DFlash2 drafter cache stays turbo5p. When a model or setting does not meet a turbot precondition, the KV resolver picks the next type and logs why ([KV cache type, resolved per model](#kv-cache-type-resolved-per-model)).
+`LLAMA_TURBOT_PLAN` can carry the plan instead of the flag (llama-bench and llama-perplexity use it). `LLAMA_TURBOT=0` falls back to turbo5p. It needs flash attention and CUDA; the DFlash2 drafter cache stays turbo5p. Several KV streams and iSWA models are allowed since turbot took other shapes (not yet measured); `LLAMA_TURBOT_ANY=0` brings back the old requirement of one unified KV pool and no SWA. When a model or setting does not meet a turbot precondition, the KV resolver picks the next type and logs why ([KV cache type, resolved per model](#kv-cache-type-resolved-per-model)).
 
 The built-in plan is compiled from `src/llama-turbot-default-plan.h`, a checked-in header generated by `python docs/turbot/gen_turbot_default_plan.py`. If you edit the plan file, re-run that script. CMake configure stops when the header and the plan differ, and `--check` reports the same thing.
 

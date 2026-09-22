@@ -5668,6 +5668,13 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
         case GGML_TYPE_TURBOT_S22:
         case GGML_TYPE_TURBOT_S23:
         case GGML_TYPE_TURBOT_S24:
+        // [TAG_TURBOT_ANY_TYPES] the S2..S7 rows of layers with 1 or 2 runs, same rule
+        case GGML_TYPE_TURBOT_S2:
+        case GGML_TYPE_TURBOT_S3:
+        case GGML_TYPE_TURBOT_S4:
+        case GGML_TYPE_TURBOT_S5:
+        case GGML_TYPE_TURBOT_S6:
+        case GGML_TYPE_TURBOT_S7:
         case GGML_TYPE_I8:
         case GGML_TYPE_I16:
         case GGML_TYPE_I32:

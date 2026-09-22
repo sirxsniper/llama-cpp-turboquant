@@ -191,6 +191,8 @@ Old tier ×1.000: the base codes are identical to kvfq. The kill check passes.
 - Group g of head h owns values [256h+128g, 256h+128g+128).
 - Element index inside a head: e ∈ [0, 256).
 
+> `[TAG_TURBOT_ANY_GEOM]` This is geometry flags 0. Other shapes (2 × 256, 1 × 256, 8 × 128, 4 × 128, 2 × 128 KV heads) use rows of NR = 1, 2 or 4 runs of 256 values, one width per run, in the same 1024-wide container tensor. Section 14.1-14.3 has the flags, the run mapping and the row sizes.
+
 ### 3.2 Base row (one cell, one layer-side), `struct ggml_turbot_side`
 
 | Bytes | Content |
@@ -411,6 +413,7 @@ type_traits (`ggml.c`) for S in 8..24:
 - `GGML_TYPE_TURBOT_S8` is also the "turbot requested" sentinel in `llama_context_params.type_k/type_v`. `common` maps `-ctk turbot` to it.
 - `ggml_type_name(GGML_TYPE_TURBOT_S8)` stays "turbot_s8"; logs print "turbot" explicitly.
 - If `ggml_validate_row_data` rejects unknown types in its switch, add the family as "no validation".
+- `[TAG_TURBOT_ANY_TYPES]` `GGML_TYPE_TURBOT_S2` … `GGML_TYPE_TURBOT_S7` (66..71) are appended for rows with 1 or 2 runs, and `GGML_TYPE_COUNT` is 72 (14.3).
 
 ### 5.2 Ops
 
@@ -460,7 +463,7 @@ GGML_API void ggml_flash_attn_ext_set_turbot(
 **`ggml_turbot_set_rows` asserts:**
 - `ggml_turbot_is_type(a->type)`;
 - `b->type == F32`;
-- `b->ne[0] == 1024`;
+- `b->ne[0] == 1024` (REVISED `[TAG_TURBOT_ANY_GEOM]`: `ggml_turbot_geom_row_elems(flags)`, which is 1024 at flags 0; `a->ne[0]` stays 1024, 14.5);
 - `b->ne[2] == b->ne[3] == 1`;
 - `c->ne[0] == b->ne[1]`, type I64 or I32;
 - `pool->type == I8` (never NULL: a POOL 0 plan still has 64 pool rows, 9.4);
@@ -475,6 +478,7 @@ Result: `ggml_view_tensor(ctx, a)`, op, sources as in the table. Bytes 0..23 of 
 - src[1] and src[2] are turbot types matching the params' K and V sums;
 - `src[1]->ne[0] == src[2]->ne[0] == 256`;
 - `src[1]->ne[2] == src[2]->ne[2] == 4`;
+- REVISED `[TAG_TURBOT_ANY_GEOM]`: the two lines above are the flags-0 case of `ne[0] == ggml_turbot_geom_head_dim(flags)` and `ne[2] == ggml_turbot_geom_n_head(flags)` (14.5);
 - `src[1]->ne[3] == 1`;
 - pool I8; gtab I32, 1-D, contiguous, `gtab->ne[0]*64 >= src[1]->ne[1]`;
 - `src[7] == src[8] == NULL` before the call.
@@ -489,7 +493,7 @@ Bytes 0..19 (scale, max_bias, softcap, prec, n_kv_max) are untouched.
 | 28 | version 1 |
 | 29 | side (0 K, 1 V, 2 both) |
 | 30 | log2_granule = 6 |
-| 31 | flags = 0 |
+| 31 | flags = geometry, 0 for 4 × 256 (`[TAG_TURBOT_ANY_GEOM]`, 14.1) |
 | 32-35 | bk[4] |
 | 36-39 | bv[4] |
 | 40-43 | yk[4] |
@@ -499,6 +503,8 @@ The offset was 16 before the upstream sync; upstream `ggml_flash_attn_ext_set_n_
 
 Use `ggml_turbot_op_params_make/set/get` and `ggml_turbot_layer_from_op_params`. Never write the bytes by hand.
 
+`[TAG_TURBOT_ANY_GEOM]` The version stays 1, because flags 0 reads exactly as before. `ggml_turbot_op_params_get` rejects a flags byte with a bit above 0x07 or an invalid geometry (3, 7). Width bytes of runs ≥ NR are 0, and `ggml_turbot_layer_from_op_params` rejects them otherwise (14.4).
+
 ### 5.4 supports_op rules
 
 **CPU (owner A)**
@@ -506,7 +512,7 @@ Use `ggml_turbot_op_params_make/set/get` and `ggml_turbot_layer_from_op_params`.
 - FLASH_ATTN_EXT with a turbot K or V:
   - both turbot, params valid with side BOTH;
   - src[7] and src[8] present;
-  - D = 256, 4 KV heads;
+  - D = 256, 4 KV heads. REVISED `[TAG_TURBOT_ANY_GEOM]`: D and the KV head count must match the op-params geometry (`ggml_turbot_geom_head_dim`, `ggml_turbot_geom_n_head`), which is D = 256 and 4 heads at flags 0. The CPU takes every geometry of 14.1, and a TURBOT_SET_ROWS source row must have `ggml_turbot_geom_row_elems(flags)` values;
   - `q->ne[3] == 1`;
   - mask ne[2] == 1 (or no mask).
 - FLASH_ATTN_EXT with a turbot type but no src[7]/src[8]: false.
@@ -971,6 +977,8 @@ An empty value counts as unset. The value `default` in 1 or 2 selects the built-
 Each message starts with `"turbot: "`.
 
 REVISED 2026-09-21 [TAG_KV_RESOLVE]: with the resolver on (the default), every condition below is checked before the cache is built and leads to a fallback with a warning (9.2), not to a failed context. The constructor still throws when it is reached directly, or with `LLAMA_KV_RESOLVE=0`.
+
+REVISED 2026-09-22 `[TAG_TURBOT_ANY_*]`: n_stream > 1, the head geometry and SWA are no longer refusals on their own. Section 14.8 lists what SUPPORTED means now, and 14.10 lists the switches that restore the rows of this table (`LLAMA_TURBOT_ANY=0` restores all of them).
 
 | Condition | Message gist |
 |---|---|
@@ -1463,6 +1471,8 @@ Gates in order, each with a command and pass criterion:
 | `GGML_TURBOT_*_LIST`, `GGML_TURBOT_*_TOTAL` | generated macros | Architect | A (via header) B C E |
 | `TURBOT_D_OLD_LEVELS`, `TURBOT_D_OLD_THR`, `TURBOT_D_YOUNG_LUT`, `TURBOT_D_YOUNG_THR`, `TURBOT_D_FILL_CODE`, `turbot_d_old_off`, `turbot_d_young_off`, `turbot_d_fill_off` | `turbot-tables.cuh` (turbot instance TUs and turbot-set-rows.cu only) | Architect | B C |
 | `GGML_TYPE_TURBOT_S8` … `GGML_TYPE_TURBOT_S24` | enum 49 … 65, `GGML_TYPE_COUNT = 66` | A | all |
+| `GGML_TYPE_TURBOT_S2` … `GGML_TYPE_TURBOT_S7` | enum 66 … 71, `GGML_TYPE_COUNT = 72` (`[TAG_TURBOT_ANY_TYPES]`, 14.3) | WP1 | all |
+| geometry symbols of 14.1 and 14.4 (`ggml_turbot_geom_*`, `ggml_turbot_side_init_nr`, `ggml_turbot_layer_init_geom`, `side.nr`, `layer.flags`) | `ggml-turbot.h` (`[TAG_TURBOT_ANY_GEOM]`) | WP1 | WP2 WP3 WP4 |
 | type names | `"turbot_s8"` … `"turbot_s24"` | A | E (logs) |
 | `GGML_OP_TURBOT_SET_ROWS` | enum, directly before `GGML_OP_COUNT` (= 103) | A | C D E |
 | `ggml_turbot_set_rows` | `struct ggml_tensor * (struct ggml_context *, struct ggml_tensor * a, struct ggml_tensor * b, struct ggml_tensor * c, struct ggml_tensor * pool, struct ggml_tensor * young, struct ggml_tensor * fill, const struct ggml_turbot_op_params *)` | A | D E |
@@ -1552,6 +1562,240 @@ Gates in order, each with a command and pass criterion:
   - Two turbot-relevant switches came with the sync, both default on:
     - `TURBOT_Q2_ROUTE` (7.6).
     - `TURBO_RMSNORM_SCALE_FUSION`, the CUDA GDN q/k norm fusion. It is on the Qwen3.8 decode path and meant to be bit-exact; that is not yet checked.
+  - REVISED 2026-09-22 `[TAG_TURBOT_ANY_*]`: turbot now also serves other shapes, iSWA models and several streams. Section 14 is the contract.
+
+---
+
+## 14. turbot on other shapes (`[TAG_TURBOT_ANY_*]`, 2026-09-22)
+
+This section extends turbot from the one Qwen3.8-27B shape (4 KV heads × 256) to every model whose attention layers fit one of six geometries. It is the contract of four work packages with disjoint files, merged in this order:
+
+| Package | Scope |
+|---|---|
+| WP1 | ggml core (types, ops, `ggml-turbot.h`), CPU reference, `tests/test-turbot-geom.cpp`, this section, TESTING.md 9, README |
+| WP2 | CUDA reader and writer for the new geometries, their routing and `GGML_TURBOT_ANY`; the new `test-backend-ops` and `test-turbot-backend` cases; `tools/turbot/b0_gate.py` (G4) and `tools/turbot/sass_diff.py` (G2) |
+| WP3 | host cache and tier: NR-run plan lines, plan precedence, automatic plan, sidecar, per-stream tiers and the `LLAMA_TURBOT_*` switches (`src/llama-kv-tier.*`, `src/llama-kv-cache.*`, `common`); `tests/test-turbot.cpp`; `tools/turbot/turbot_plan.py`, `plan_vram.py`, `blob_roundtrip.py` and `turbot_guard.py` (G5) |
+| WP4 | host resolver (`[TAG_KV_RESOLVE]`), iSWA split, graph and context (`src/llama-kv-cache-resolve.h`, `src/llama-context.cpp`, `src/llama-graph.*`, the iSWA caches, `src/llama-model.cpp`); `tests/test-kv-resolve.cpp` |
+
+Tags: `[TAG_TURBOT_ANY_GEOM]` (geometry), `[TAG_TURBOT_ANY_TYPES]` (S2..S7) and the other `[TAG_TURBOT_ANY_*]` tags of each package.
+
+**Status: implemented, not yet built or run.** The sizing numbers in 14.7 come from a CPU-only script over the GGUF headers (`scratchpad/autoplan_models.py`), not from a measurement. The gates in TESTING.md section 9 decide the defaults (14.11).
+
+**Hard requirement.** Qwen3.8-27B (hybrid GDN, 16 attention layers 3, 7, …, 63, 4 KV heads × 256, built-in plan hash `0x56c3503c949a7749`) keeps exactly today's turbot behaviour, kernels and numerics. Every code path at geometry flags 0 is either unchanged or constant-folds to today's code. Gate G2 checks this bit for bit.
+
+### 14.1 Geometry flags
+
+A layer's geometry travels as one byte, `flags`, in `struct ggml_turbot_layer` and at op-params byte 31 (5.3). Bits 0-1 hold log2(4/NR), where NR is the number of 256-value runs in a row. Bit 2 (`GGML_TURBOT_GEOM_D128`) says the head dim is 128.
+
+| Head dim × KV heads | flags | NR | Values per row | WHT groups per row | Model on disk |
+|---|---|---|---|---|---|
+| 256 × 4 | 0 | 4 | 1024 | 8 | Qwen3.8-27B (sections 1-13), Ornith-1.5-9B, Spark-X2.5-4B |
+| 256 × 2 | 1 | 2 | 512 | 4 | Ornith-1.5-35B |
+| 256 × 1 | 2 | 1 | 256 | 2 | none |
+| 128 × 8 | 4 | 4 | 1024 | 8 | none |
+| 128 × 4 | 5 | 2 | 512 | 4 | none |
+| 128 × 2 | 6 | 1 | 256 | 2 | MiniCPM5-2B, Muse Glimmer 30B, Nemotron 3.5 30B |
+
+- flags 3 and 7 (log2 field 3) are invalid, and so is any value with a bit above `GGML_TURBOT_GEOM_MASK` (0x07).
+- `ggml_turbot_geom_flags(head_dim, n_head_kv)` returns the flags of a shape, or −1 when turbot has no layout for it. That covers head dims other than 128 and 256, 128 × 1 (half a run), and rows above 1024 values (256 × 8, 128 × 16).
+- Accessors in `ggml-turbot.h`:
+  - `ggml_turbot_geometry_supported(head_dim, n_head_kv)`;
+  - `ggml_turbot_geom_valid(flags)`;
+  - `ggml_turbot_geom_nr(flags)` = 4 >> (flags & 3);
+  - `ggml_turbot_geom_head_dim(flags)` = 128 or 256;
+  - `ggml_turbot_geom_n_head(flags)` = NR·256 / head dim;
+  - `ggml_turbot_geom_row_elems(flags)` = NR·256;
+  - `ggml_turbot_geom_n_groups(flags)` = 2·NR (the writer's NG).
+- New constants: `GGML_TURBOT_RUN_ELEMS` 256, `GGML_TURBOT_MAX_RUNS` 4, `GGML_TURBOT_S_MIN_ANY` 2, `GGML_TURBOT_GEOM_LOG2_MASK` 0x03, `GGML_TURBOT_GEOM_D128` 0x04, `GGML_TURBOT_GEOM_MASK` 0x07.
+- `GGML_TURBOT_HEAD_DIM` (256), `GGML_TURBOT_N_HEAD` (4) and `GGML_TURBOT_ROW_ELEMS` (1024) keep their values and their meaning at flags 0. `GGML_TURBOT_ROW_ELEMS` is now documented as the container width (14.3).
+
+### 14.2 Run mapping
+
+A run is 256 values with one old width `b[r]` and one young width `y[r]`, and it is two WHT-128 groups. In every geometry:
+- run r holds values [256r, 256r + 256);
+- group g of run r holds values [256r + 128g, 256r + 128g + 128);
+- the old gain of (run r, group g) sits at byte `32·S + 2·(2r + g)` of the base row, and the young gain at byte `32·R + 2·(2r + g)` of the side's pool part.
+
+KV head z of a cell:
+- **Head dim 256:** head z is run z. At flags 0 this is 3.1 unchanged.
+- **Head dim 128:** head z is run z >> 1 at element base 128·(z & 1), which is group z & 1 of run z >> 1. The two heads of a run share its widths.
+
+In both cases head z covers values [D·z, D·z + D) of the decoded row. That is why the CPU reference's F32 stand-in uses a cell stride of NR·256 values and a head stride of D (14.5).
+
+### 14.3 Rows, container tensors and types
+
+- **Base row** of a layer-side: the NR runs (planes per 3.4), then 8 `ggml_fp16_t` gain slots, of which slots 2·NR … 7 stay zero. The size is 32·S + 16 bytes for any NR, with S = Σ b[r] over the NR runs.
+- **Young part:** the NR refinement runs, then 8 gain slots: 32·R + 16 bytes, R = Σ (y[r] − b[r]). Pool rows keep the 3.3 layout, `[K part][V part]`.
+- **Container tensor.** The base cache stays `[1024, kv_size]` of type `turbot_s<S>` for every geometry. 1024 is the block size of every turbot type, so one cell is one block of 32·S + 16 bytes whatever NR is. The K and V views are `[D, n_kv, H, 1]` with nb[1] = 32·S + 16, built as for Qwen3.8 (10.2).
+- **Types.** S ranges over 2..6 at NR 1, 4..12 at NR 2 and 8..24 at NR 4.
+  - S8..S24 keep ids 49..65.
+  - `GGML_TYPE_TURBOT_S2` … `GGML_TYPE_TURBOT_S7` are appended as ids 66..71, and `GGML_TYPE_COUNT` becomes 72. No existing id moves, so state files and the `GGML_TYPE_TURBOT_S8` sentinel stay valid.
+  - Traits as in 5.1: names `turbot_s2` … `turbot_s7`, blck_size 1024, type_size 80 / 112 / 144 / 176 / 208 / 240, quantized, no to_float.
+  - `ggml_validate_row_data` accepts them without validation. Vulkan refuses ids 43..71 (`[TAG_VK_NO_TURBO]`).
+  - `ggml_turbot_is_type` covers 49..65 and 66..71. `ggml_turbot_type_of_s` and `ggml_turbot_s_of_type` handle S 2..24 over both ranges. `GGML_TURBOT_S_MIN` stays 8, the first S of the 49..65 block; `GGML_TURBOT_S_MIN_ANY` is 2.
+- **Examples.**
+  - NR 1, b 3, y 7: S 3, base row 112 B, young part 144 B.
+  - NR 2, b {2, 6}, y {8, 7}: runs at bytes 0 and 64, base row 272 B; young runs at 0 and 192, young part 240 B.
+- **VRAM:** the 3.6 formula holds, with the sums taken over the NR runs of each layer-side.
+
+### 14.4 Header contract C1 (`ggml/include/ggml-turbot.h`, WP1)
+
+| Symbol | Contract |
+|---|---|
+| `struct ggml_turbot_side` | New LAST member `uint8_t nr`. Runs r ≥ nr have b = y = 0 and offsets 0. |
+| `struct ggml_turbot_layer` | New LAST member `uint8_t flags`. |
+| `ggml_turbot_side_init_nr(sd, b, y, nr)` | nr ∈ {1, 2, 4}. Reads b[0..nr) and y[0..nr) only. Returns false on an illegal nr or width. The old `ggml_turbot_side_init(sd, b, y)` is nr = 4. |
+| `ggml_turbot_layer_init_geom(l, bk, bv, yk, yv, flags)` | Returns false on invalid flags. Zeroes the whole struct first, so two equal layers compare equal with memcmp. The old `ggml_turbot_layer_init(...)` is flags = 0. |
+| `ggml_turbot_encode_side`, `ggml_turbot_decode_side`, `ggml_turbot_fill_side` | Loop over `sd->nr` runs instead of 4, gains at 2r + g. A row takes or gives NR·256 values. For nr = 4 the arithmetic and its order are unchanged. |
+| op params | Byte 31 `flags` is the geometry; the version stays 1. `ggml_turbot_op_params_make` copies `l->flags`. `ggml_turbot_op_params_get` rejects `flags & ~0x07` and an invalid geometry. `ggml_turbot_layer_from_op_params` passes the flags, and it also rejects a width in a run ≥ nr. |
+| `ggml_turbot_plan_hash_layer` | Folds `{'G','E','O','1', flags}` after the widths, only when flags ≠ 0. Qwen3.8-27B's hash `0x56c3503c949a7749` does not change. |
+
+Every existing inline function gives the same result for nr = 4 and flags = 0. `tests/test-turbot-geom.cpp` (c), (d) and (f) compare them with copies of the pre-change code.
+
+### 14.5 ggml ops
+
+- `ggml_turbot_set_rows`: `a->ne[0] == 1024` (the container), `b->ne[0] == ggml_turbot_geom_row_elems(params->flags)` and `a->type == ggml_turbot_type_of_s(side.s)`. The rest of 5.2 is unchanged.
+- `ggml_flash_attn_ext_set_turbot`: the K and V views have `ne[0] == ggml_turbot_geom_head_dim(flags)` and `ne[2] == ggml_turbot_geom_n_head(flags)`. `ne[3] == 1` stays; a cache with several streams passes one view per stream.
+- **CPU reference** (6.1, 6.2):
+  - The writer takes NR·256-value rows and runs the header coder over the side's nr runs.
+  - The FA decodes every cell to NR·256 floats and runs the unchanged scalar kernel on F32 stand-ins with cell stride NR·256 and head stride D, GQA broadcast included. At flags 0 this is the old code.
+  - The CPU supports every geometry. It is the test oracle, so it has no switch.
+- **CUDA** (WP2): readers and writers for the geometries of 14.1. `GGML_TURBOT_ANY=0` accepts only flags 0 and NG 8, which is today's kernel routing.
+  - FA: the Qwen predicate (D 256, 4 KV heads) is tested first and unchanged; any other geometry is admitted only when it fails. D 128 head z is run z>>1 at element 128·(z&1); a D 128 tile holds at most 64 cells (one granule). The 16 D 128 instances (`fattn-mma-turbot-d128-instance-*.cu`) are dropped by the CMake option `GGML_CUDA_FA_TURBOT_D128=OFF`, which also refuses D 128 turbot in the routing.
+  - Writer: NG = 2·NR WHT groups per row (`k_turbot_set_rows<idx, LOG2_NG>`); NG 8 compiles the old kernels.
+  - ggml-cuda exports `ggml_backend_turbot_supports_geometry`, which the resolver asks (14.8): a geometry of 14.1, Turing+ MMA, `GGML_TURBOT_ANY` on for anything but 4 × 256, and the D 128 instances for head dim 128.
+
+### 14.6 Plan text and precedence
+
+- An `L` or `Y` line for a layer with nr runs has exactly 4 + 2·nr tokens: `L <il> K <b0> … <b(nr−1)> V <b0> … <b(nr−1)>`. nr = 4 is the old 12-token form. A line with the wrong count is refused with its line number.
+  - NR 2: `L 3 K 5 4 V 5 4`
+  - NR 1: `L 0 K 5 V 4`
+- The plan gives the widths. The geometry comes from the model (`ggml_turbot_geom_flags` of each layer's head dim and KV heads), and the plan hash folds it (14.4).
+
+**Plan precedence.** The first match wins:
+1. `--kv-tier-plan` or `LLAMA_TURBOT_PLAN`:
+   - `<file>` uses only that file. A mismatch falls back down the type chain and never becomes an automatic plan.
+   - `default` uses the built-in plan.
+   - `auto` uses the automatic plan.
+2. A sidecar `<model>.turbot.plan`, used only when it has a `# verified:` stamp and a matching `# model:` fingerprint.
+3. The built-in plan, when it names exactly the model's attention layers and geometry. Qwen3.8-27B and fine-tunes with the same layers stop here, bit-identical to today.
+4. The automatic plan (14.7), only for the main context (ctx_type DEFAULT) with the resolver on. Every layer geometry must be in the VALIDATED list (14.11), or be allowed by `LLAMA_TURBOT_AUTO_PLAN=all` (any geometry) or `LLAMA_TURBOT_AUTO_BUDGET=turbo5p` (NR 1 layers), and the plan must fit the budget (14.7) with old widths 4 or 5.
+
+### 14.7 Automatic plan v1 (WP3)
+
+A deterministic integer model. It reads no calibration data.
+1. kvt = kv_size · n_stream.
+2. Budget B = kvt · Σ over layers of 2 · `ggml_row_size(budget_type, row_elems)`. `budget_type` is one type for the whole cache, the one the resolver falls back to (`llama_turbot_budget_type`):
+   - `TURBO5P_0` (656 B per 1024 values) when every layer's row_elems % 1024 == 0;
+   - else `TURBO5P512_0` (336 B per 512 values) when every row_elems % 512 == 0;
+   - else `TURBO4_0` (136 B per 256 values).
+
+   With `LLAMA_TURBOT_AUTO_BUDGET=turbo5p` every row is budgeted at turbo5p's rate, 656 B per 1024 values.
+3. POOL P = min(roundup64(n_seq_max · (16384 + 128)), rounddown64(kvt)), then rounded down to a multiple of 64 · n_stream.
+4. Old widths are 4 or 5 only. For m from 2·nr down to 0: K gets ceil(m/2) runs at width 5 and V gets floor(m/2), lowest run first, and the other runs get 4. Every layer uses the same pattern, within its own nr. Take the largest m with base + P · young ≤ B (bytes as in 3.6, with y = 7).
+5. If even m = 0 does not fit, shrink P. Refuse (fall back down the type chain) if P < n_seq_max · (1024 + 128).
+6. y = 7 everywhere, CAP 16384.
+7. Plan text, in this order: the line `# turbot auto plan v1`; comment lines with the shape, the budget type and `X MiB (<type> Y MiB)`; the L lines; POOL; CAP. `LLAMA_TURBOT_AUTO_PLAN_DUMP=<file>` writes it to a file.
+
+Sizing. The budget is the bytes of the type the model would otherwise fall back to. 262,144 cells and one sequence unless noted. Not measured.
+
+| Model | Attention layers, shape | Mean old width | Plan | Fallback |
+|---|---|---|---|---|
+| Ornith-1.5-9B | 8, 4 × 256 | 4.75 (POOL 16512) | 2572.6 MiB | turbo5p 2624 MiB |
+| Ornith-1.5-9B, 32K | 8, 4 × 256 | 4.0 | 327.7 MiB | turbo5p 328 MiB |
+| Spark-X2.5-4B, full-attention layers | 9, 4 × 256 | 4.75 | 2894.2 MiB | turbo5p 2952 MiB |
+| Ornith-1.5-35B | 10, 2 × 256 | 4.75 (4.0 at 4 sequences, 1622.0 MiB) | 1650.4 MiB | turbo5p512 1680 MiB |
+| MiniCPM5-2B, Muse Glimmer 30B, Nemotron 3.5 30B | 42 / 13 / 6, 2 × 128 | refused: 4-bit old rows alone cost 144 B per 256 values, turbo4 136 B | — | turbo4 |
+| the same, `LLAMA_TURBOT_AUTO_BUDGET=turbo5p` | 2 × 128 | 4 | +316 / +98 / +45 MiB of KV over turbo4 | turbo4 |
+
+### 14.8 Default policy
+
+`-ctk turbot -ctv turbot` keeps turbot for a model only when the model is SUPPORTED and has a PLAN (14.6). Everything else steps down the existing chain turbot → turbo5p / turbo5p512 → turbo4 → q8_0 → f16, with one WARN line per step (9.2).
+
+SUPPORTED means all of these hold:
+- flash attention is on;
+- no MLA and no shared cells;
+- no `TURBO_*` environment switch (9.3);
+- the arch has the turbo query rotation;
+- kv_size is a multiple of 64;
+- K and V are both turbot;
+- every turbot layer has head_k == head_v, a geometry in {256 × 4, 256 × 2, 256 × 1, 128 × 8, 128 × 4, 128 × 2}, and its KV on CUDA with Turing+ MMA. The resolver checks the CUDA device, `GGML_TURBOT_ANY=0` (other geometries step down), and the backend's answer through the optional proc `ggml_backend_turbot_supports_geometry` when the backend exports it. ggml-cuda exports it (WP2, 14.5): the geometry, Turing+ MMA, `GGML_TURBOT_ANY` and the D 128 instances, so a layer the build or device cannot run steps down here instead of reaching a refused FA. Under `LLAMA_TURBOT_ANY=0` the resolver does not ask it, as before;
+- SWA appears only as the SWA half of an iSWA split (14.9); all-SWA models are refused;
+- n_stream > 1 is allowed, with a tier per stream (14.9).
+
+Expected defaults on the models on disk, before the gates:
+- Ornith-1.5-9B: turbot.
+- Spark-X2.5-4B: turbot on the full-attention layers, turbo5p on the SWA layers.
+- Ornith-1.5-35B: turbot.
+- MiniCPM5, Muse Glimmer and Nemotron: turbo4 unless opted in.
+- The DFlash2 and MTP draft contexts never use turbot (unchanged, 9.1).
+
+### 14.9 iSWA split and streams
+
+- **iSWA.** An iSWA model has two caches. turbot goes on the full-attention child. The SWA child resolves its own type through its own chain and gets turbo5p (turbo5p512 for 512-value rows).
+  - `LLAMA_TURBOT_SWA_TYPE=<type>` sets the SWA child's type, for A/B runs.
+  - `LLAMA_TURBOT_ISWA=0` refuses turbot on SWA models, which then fall back to turbo5p / turbo5p as today.
+- **Streams.** Without `--kv-unified`, `-np N` (N > 1) gives the cache N streams. Each stream has its own tier state and POOL_s = POOL / n_stream young rows, rounded down to whole granules, with the same CAP. The automatic plan makes POOL a multiple of 64 · n_stream, so nothing is lost there; a plan file's POOL can lose up to one granule per stream to the rounding. The base cache is one `[1024, kv_size, n_stream]` container: the writer sees it flattened to `[1024, kv_size · n_stream]`, and the graph runs one turbot FA per stream (`ne[3] == 1`).
+  - `LLAMA_TURBOT_MULTI_STREAM=0` refuses n_stream > 1, which then falls back to turbo5p as today.
+
+### 14.10 Switches
+
+| Variable | Scope | Effect |
+|---|---|---|
+| `LLAMA_TURBOT_ANY=0` | master switch, host | Restores today's behaviour exactly: only the 4 × 256 geometry, no automatic plan, no sidecar, no iSWA split, no multi-stream. Every other switch below reads false when this is 0. |
+| `GGML_TURBOT_ANY=0` | ggml CUDA routing and writer supports | Only flags 0 (4 × 256) and NG 8 are accepted: today's kernel routing. The resolver reads it too, so other geometries step down before a graph is built. |
+| `LLAMA_TURBOT_AUTO_PLAN=0\|1\|all` | automatic plan | `0`: fall back to turbo5p when no plan matches (today). Unset or `1`: VALIDATED geometries only. `all`: every supported geometry. |
+| `LLAMA_TURBOT_AUTO_BUDGET=turbo5p` | automatic plan, opt-in | Budget at turbo5p's rate. Unset: the budget is the fallback type's bytes, never more VRAM than today. |
+| `LLAMA_TURBOT_AUTO_PLAN_DUMP=<file>` | diagnostic | Writes the generated plan text. |
+| `LLAMA_TURBOT_SIDECAR=0` | sidecar lookup | The sidecar is ignored. |
+| `LLAMA_TURBOT_ISWA=0` | iSWA split | SWA models refuse turbot and fall back to turbo5p / turbo5p (today). |
+| `LLAMA_TURBOT_SWA_TYPE=<type>` | A/B arm | Unset: the SWA child resolves turbo5p through its own chain. |
+| `LLAMA_TURBOT_MULTI_STREAM=0` | non-unified `-np N` | n_stream > 1 is refused and falls back to turbo5p (today). |
+| `LLAMA_KV_RESOLVE=0`, `LLAMA_TURBOT=0` | existing | Unchanged meaning. With the resolver off there is no plan scope, so the cache constructor uses the old precedence (9.1) plus only the explicit `auto` keyword. |
+
+### 14.11 VALIDATED list and the models on disk
+
+- **VALIDATED** is the set of geometries the automatic plan may use by default. It is expected to be {256 × 4, 256 × 2} after the gates.
+  - 128 × 8 and 128 × 4 have kernels but no model on disk to measure them, so they are opt-in with `LLAMA_TURBOT_AUTO_PLAN=all`.
+  - The NR = 1 shapes (2 × 128, 1 × 256) cannot fit the turbo4 budget and are opt-in with `LLAMA_TURBOT_AUTO_BUDGET=turbo5p`. NR = 1 becomes a default only if turbot beats turbo4 on all three NR = 1 models in G5 and loses no decode speed in G6; it costs about 11% more KV VRAM than turbo4 at 262K cells (+316 / +98 / +45 MiB, 14.7).
+- Multi-stream and iSWA stay on only if G7 passes.
+- A failed gate flips that switch's default in code (a one-line change); the env switches remain.
+
+| Model file | Arch | Attention layers | KV shape | GQA | Fallback | turbot path |
+|---|---|---|---|---|---|---|
+| Qwen3.8-27B (reference) | qwen35 hybrid | 3, 7, …, 63 (16) | 4 × 256 | 6 | turbo5p | built-in plan, unchanged |
+| Ornith-1.5-9B-Q8_0 | qwen35 hybrid, MTP layer 32 excluded | 3, 7, …, 31 (8) | 4 × 256 | 4 | turbo5p | automatic plan. Same kernel shape as Qwen; the ncols2 = 4 instances run for the first time. |
+| Spark-X2.5-4B-Q8_0 | spark2_5 iSWA, window 512 | full 3, 7, …, 35 (9), 27 SWA | 4 × 256 | 4 | turbo5p | iSWA split: turbot on the 9 full layers, turbo5p on the SWA layers; automatic plan |
+| Ornith-1.5-35B-Q4_K_M | qwen35moe hybrid, MTP layer 40 excluded | 3, …, 39 (10) | 2 × 256 (NR 2) | 8 | turbo5p512 | new head count, 512-value rows; automatic plan |
+| MiniCPM5-2B-Q8_0 | llama | 0..41 (42) | 2 × 128 (NR 1) | 8 | turbo4 (68 B per 128) | D = 128 kernels and S < 8 types; opt-in only (budget rule) |
+| Muse-Glimmer-30B-KQuant-17GB-Q4_K_M | muse-glimmer iSWA, window 2048 | 13 full of 52 | 2 × 128 (NR 1) | 16 | turbo4 | iSWA and NR 1; opt-in only |
+| NVIDIA-Nemotron-3.5-Lightning-30B-A3B-Q4_0 | nemotron_h_moe hybrid | 5, 12, 19, 26, 33, 42 (6) | 2 × 128 (NR 1) | 16 | turbo4 | NR 1; opt-in only |
+
+### 14.12 Not covered
+
+These stay on the fallback chain (9.2), with the reason in the WARN line:
+- head dims other than 128 and 256 (64, 80, 96, 192, 512, …), 128 × 1 (half a run), and rows above 1024 values (256 × 8, 128 × 16, …): turbot has no layout for them;
+- K and V head sizes that differ, MLA, shared cells, and archs without the turbo query rotation: refused as before;
+- all-SWA models: there is no full-attention child to hold turbot;
+- KV off CUDA, or a GPU without Turing+ MMA;
+- NR = 1 shapes at the default budget: they cannot fit turbo4's bytes (14.7), so they need the opt-in;
+- the DFlash2 and MTP draft contexts.
+
+K shift (`seq_add` / `seq_div`) stays unsupported on every geometry (9.3).
+
+### 14.13 Tests
+
+- `tests/test-turbot-geom.cpp` (CPU only; registered like test-turbot):
+  - (a) geometry flags of the six shapes, the accessors, the run mapping, and −1 for (64, 8), (128, 16), (256, 8), (512, 1) and others;
+  - (b) side and layer init for nr 1, 2 and 4: sums, offsets, row and young bytes, zero runs beyond nr, illegal input;
+  - (c) encode, decode and fill per nr at old widths 2..6 and young 7 and 8, against `ggml_turbot_quantize_group`. An NR-run row equals the first NR runs of a 4-run row. nr 4 (flags 0) is byte-identical to a copy of the pre-change loops;
+  - (d) hash: flags 0 equals a copy of the old fold (default plan `0x56c3503c949a7749`), and flags ≠ 0 differs;
+  - (e) the type family: ids, `ggml_type_size` = 32·S + 16, blck 1024, names, `is_type` false at 48 and 72;
+  - (f) op params: make / get / layer round trip carries flags; reserved bits, invalid geometries and widths beyond nr are rejected;
+  - (g) CPU FA reference at D 128 NR 4 (GQA 4 and 7), D 256 NR 2 (GQA 8) and the other geometries, equal to dense attention over the decoded K/V; CPU supports_op follows the op-params geometry;
+  - (h) the CPU writer op at every geometry, fill entries included, byte-identical to the header coder.
+  - (g) and (h) call the CPU backend directly, so they are compiled only without `GGML_BACKEND_DL` and print SKIPPED otherwise.
+- The GPU gates G0-G8 are in TESTING.md section 9.
 
 ---
 

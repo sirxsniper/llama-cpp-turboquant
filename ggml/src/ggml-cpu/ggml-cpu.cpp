@@ -427,7 +427,8 @@ static bool ggml_backend_cpu_turbot_host_ok(const struct ggml_tensor * t) {
     return t == nullptr || t->buffer == nullptr || ggml_backend_buffer_is_host(t->buffer);
 }
 
-// [TAG_TURBOT] docs/turbot/SPEC.md 5.4: GGML_OP_TURBOT_SET_ROWS, and GGML_OP_FLASH_ATTN_EXT with a turbot K or V
+// [TAG_TURBOT] docs/turbot/SPEC.md 5.4: GGML_OP_TURBOT_SET_ROWS, and GGML_OP_FLASH_ATTN_EXT with a turbot K or V.
+// [TAG_TURBOT_ANY_GEOM] any geometry of SPEC 14 (op params byte 31); invalid flags fail ggml_turbot_op_params_get.
 static bool ggml_backend_cpu_turbot_supports_op(const struct ggml_tensor * op) {
     ggml_turbot_op_params p;
     ggml_turbot_layer     l;
@@ -454,10 +455,12 @@ static bool ggml_backend_cpu_turbot_supports_op(const struct ggml_tensor * op) {
             return false;
         }
         const ggml_turbot_side & sd = p.side == GGML_TURBOT_SIDE_K ? l.k : l.v;
+        // [TAG_TURBOT_ANY_GEOM] a stays the 1024-wide container; b rows hold the geometry's NR*256 values. The CPU
+        // reference takes every geometry (it is the test oracle), so there is no switch here.
         return
             ggml_turbot_is_type(a->type) && a->type == ggml_turbot_type_of_s(sd.s) &&
             a->ne[0] == GGML_TURBOT_ROW_ELEMS && a->ne[2] == 1 && a->ne[3] == 1 && ggml_is_contiguous_rows(a) &&
-            b->type == GGML_TYPE_F32 && b->ne[0] == GGML_TURBOT_ROW_ELEMS && b->ne[2] == 1 && b->ne[3] == 1 &&
+            b->type == GGML_TYPE_F32 && b->ne[0] == ggml_turbot_geom_row_elems(l.flags) && b->ne[2] == 1 && b->ne[3] == 1 &&
             ggml_is_contiguous_rows(b) &&
             (c->type == GGML_TYPE_I64 || c->type == GGML_TYPE_I32) && c->ne[0] == b->ne[1] &&
             c->ne[1] == 1 && c->ne[2] == 1 && c->ne[3] == 1 &&
@@ -477,11 +480,15 @@ static bool ggml_backend_cpu_turbot_supports_op(const struct ggml_tensor * op) {
     if (p.side != GGML_TURBOT_SIDE_BOTH || !pool || !gtab) {
         return false;
     }
+    // [TAG_TURBOT_ANY_GEOM] head dim and KV heads come from the op-params geometry (256 and 4 at flags 0); every
+    // geometry is supported here
+    const int64_t hd = ggml_turbot_geom_head_dim(l.flags);
+    const int64_t nh = ggml_turbot_geom_n_head(l.flags);
     return
         ggml_turbot_is_type(k->type) && k->type == ggml_turbot_type_of_s(l.k.s) &&
         ggml_turbot_is_type(v->type) && v->type == ggml_turbot_type_of_s(l.v.s) &&
-        k->ne[0] == GGML_TURBOT_HEAD_DIM && v->ne[0] == GGML_TURBOT_HEAD_DIM &&
-        k->ne[2] == GGML_TURBOT_N_HEAD   && v->ne[2] == GGML_TURBOT_N_HEAD &&
+        k->ne[0] == hd && v->ne[0] == hd &&
+        k->ne[2] == nh && v->ne[2] == nh &&
         k->ne[3] == 1 && v->ne[3] == 1 && k->ne[1] == v->ne[1] &&
         k->nb[1] == (size_t) l.k.base_row_bytes && v->nb[1] == (size_t) l.v.base_row_bytes &&
         pool->type == GGML_TYPE_I8 && pool->ne[0] == (int64_t) l.pool_row_bytes && ggml_is_contiguous_rows(pool) &&
