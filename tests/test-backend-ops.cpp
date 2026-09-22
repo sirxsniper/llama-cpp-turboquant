@@ -8441,26 +8441,59 @@ static void turbot_test_set(ggml_tensor * t, const void * data, size_t n) {
 // column 0 (about 1 run in 200 per case). The CPU reference writes 0 for such a row, the CUDA kernels (the f16 MMA
 // kernel and turbot alike) 0/0 = NaN, so the case failed at random with "NaN at index (CPU=0)". No real graph has such
 // a row (a query always sees its own cell), so re-open the newest cell of any fully masked row.
-static void turbot_test_init_mask(ggml_tensor * t) {
-    init_tensor_kq_mask(t);
+//
+// [TAG_TURBOT_TEST_SEEDED] The mask, q and the sinks come from the case seed, like the caches, so every run of a case
+// sees the same inputs and computes the same NMSE. With std::random_device inputs the NMSE of the old-tier kv 4096 -
+// 16384, nb 1 / 2 cases is a random variable with a data-driven tail (median 3-10e-5, a few q inputs in 10^4 above the
+// 5e-4 limit), the same on the build before the upstream sync and after it: over 9650 runs each, 6 runs from 2 inputs
+// above 5e-4 after, 2 runs from 2 inputs before (max 7.06e-4); kv 4096 nb 1 mix=tail p99.9 3.96e-4 after, 3.97e-4
+// before. One input repeated 1500 times gives one output hash, so the tail is the inputs, not a race; the cases failed
+// at random without any kernel change. The mask keeps the init_tensor_kq_mask layout: uniform [-1, 1] and 20 % of the
+// area in 128 x 64 blocks of -INF or 0.
+static void turbot_test_init_mask(ggml_tensor * t, uint64_t seed) {
     GGML_ASSERT(t->type == GGML_TYPE_F16 && ggml_is_contiguous(t));
-    const int64_t ne0 = t->ne[0];
-    std::vector<ggml_fp16_t> m(ggml_nelements(t));
-    ggml_backend_tensor_get(t, m.data(), 0, ggml_nbytes(t));
-    bool changed = false;
-    for (int64_t r = 0; r < ggml_nrows(t); ++r) {
+    const int64_t ne0   = t->ne[0];
+    const int64_t nrows = ggml_nrows(t);
+    const int64_t n     = ggml_nelements(t);
+    uint64_t s = seed;
+    std::vector<float> f(n);
+    for (float & v : f) {
+        v = (float) (turbot_test_splitmix(s) >> 40) / (float) (1 << 24) * 2.0f - 1.0f;
+    }
+    const int n_inf_zero_blocks = 0.2*n/(128*64);
+    for (int b = 0; b < n_inf_zero_blocks; ++b) {
+        const int64_t p1  = (int64_t) (turbot_test_splitmix(s) % (uint64_t) nrows);
+        const int64_t p0  = (int64_t) (turbot_test_splitmix(s) % (uint64_t) ne0);
+        const bool    inf = turbot_test_splitmix(s) & 1;
+        for (int64_t i1 = p1; i1 < std::min(p1 + 64, nrows); ++i1) {
+            for (int64_t i0 = p0; i0 < std::min(p0 + 128, ne0); ++i0) {
+                f[i1*ne0 + i0] = inf ? -INFINITY : 0.0f;
+            }
+        }
+    }
+    for (int64_t r = 0; r < nrows; ++r) {
         bool all_inf = true;
         for (int64_t i = 0; i < ne0 && all_inf; ++i) {
-            all_inf = std::isinf(ggml_fp16_to_fp32(m[r*ne0 + i]));
+            all_inf = std::isinf(f[r*ne0 + i]);
         }
         if (all_inf) {
-            m[r*ne0 + ne0 - 1] = ggml_fp32_to_fp16(0.0f);
-            changed = true;
+            f[r*ne0 + ne0 - 1] = 0.0f;
         }
     }
-    if (changed) {
-        ggml_backend_tensor_set(t, m.data(), 0, ggml_nbytes(t));
+    std::vector<ggml_fp16_t> m(n);
+    ggml_fp32_to_fp16_row(f.data(), m.data(), n);
+    ggml_backend_tensor_set(t, m.data(), 0, ggml_nbytes(t));
+}
+
+// [TAG_TURBOT_TEST_SEEDED] uniform [lo, hi] F32 from the case seed
+static void turbot_test_init_uniform(ggml_tensor * t, uint64_t seed, float lo, float hi) {
+    GGML_ASSERT(t->type == GGML_TYPE_F32 && ggml_is_contiguous(t));
+    uint64_t s = seed;
+    std::vector<float> f(ggml_nelements(t));
+    for (float & v : f) {
+        v = lo + (hi - lo) * ((float) (turbot_test_splitmix(s) >> 40) / (float) (1 << 24));
     }
+    ggml_backend_tensor_set(t, f.data(), 0, ggml_nbytes(t));
 }
 
 // GGML_OP_FLASH_ATTN_EXT over turbot K/V (SPEC 7, 11.2). perf = true names the case turbot_perf for gate B0.
@@ -8565,9 +8598,11 @@ struct test_flash_attn_ext_turbot : public test_case {
             } else if (strcmp(t->name, "q_pos") == 0) {
                 turbot_test_set(t, qp.data(), qp.size() * sizeof(int32_t));
             } else if (strcmp(t->name, "m") == 0) {
-                turbot_test_init_mask(t);
+                turbot_test_init_mask(t, seed ^ 0x6d61736bull);
             } else if (strcmp(t->name, "s") == 0) {
-                init_tensor_uniform(t, -10.0f, 10.0f);
+                turbot_test_init_uniform(t, seed ^ 0x73696e6bull, -10.0f, 10.0f);
+            } else if (strcmp(t->name, "q") == 0) {
+                turbot_test_init_uniform(t, seed ^ 0x71756572ull, -1.0f, 1.0f);
             } else {
                 init_tensor_uniform(t);
             }
