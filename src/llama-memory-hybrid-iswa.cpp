@@ -29,7 +29,10 @@ llama_memory_hybrid_iswa::llama_memory_hybrid_iswa(
                      bool   unified,
                             /* layer filters */
     const layer_filter_cb & filter_attn,
-    const layer_filter_cb & filter_recr) :
+    const layer_filter_cb & filter_recr,
+                            /* [TAG_TURBOT_ANY_ISWA] SWA child of the attention cache */
+                ggml_type   type_k_swa,
+                ggml_type   type_v_swa) :
     hparams(model.hparams),
     mem_attn(new llama_kv_cache_iswa(
         model,
@@ -48,7 +51,9 @@ llama_memory_hybrid_iswa::llama_memory_hybrid_iswa(
             [&](int32_t il) { return !hparams.is_recr(il); }
             : filter_attn,
         nullptr,
-        nullptr
+        nullptr,
+        type_k_swa,
+        type_v_swa
     )),
     mem_recr(new llama_memory_recurrent(
         model,

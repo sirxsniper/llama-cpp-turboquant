@@ -25,6 +25,11 @@ struct llama_memory_params {
     llama_context_type ctx_type;
 
     llama_memory_t mem_other;
+
+    // [TAG_TURBOT_ANY_ISWA] K/V types of the SWA child of an iSWA cache (llama_kv_cache_iswa, llama_memory_hybrid_iswa).
+    // GGML_TYPE_COUNT: the same as type_k/type_v. Set by the resolver when turbot goes on the full-attention child only.
+    ggml_type type_k_swa = GGML_TYPE_COUNT;
+    ggml_type type_v_swa = GGML_TYPE_COUNT;
 };
 
 enum llama_memory_status {

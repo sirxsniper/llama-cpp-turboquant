@@ -536,6 +536,12 @@ public:
     ggml_tensor * self_k_rot_swa = nullptr;
     ggml_tensor * self_v_rot_swa = nullptr;
 
+    // [TAG_TURBOT_ANY_ISWA] tiered KV cache inputs of the base (full-attention) child, created only when it is turbot.
+    // The SWA child is never turbot.
+    ggml_tensor * self_turbot_gtab  = nullptr; // I32 [n_granules]  slot or -1
+    ggml_tensor * self_turbot_young = nullptr; // I32 [n_tokens]    pool row or -1
+    ggml_tensor * self_turbot_fill  = nullptr; // I32 [4, n_fill], only when n_fill > 0
+
     const llama_hparams hparams;
     const llama_cparams cparams;
 
@@ -1208,6 +1214,24 @@ struct llm_graph_context {
                     ggml_tensor * turbot_pool = nullptr,                       // [TAG_TURBOT] young pool of the layer
                     ggml_tensor * turbot_gtab = nullptr,                       // [TAG_TURBOT] granule table
                     const ggml_turbot_op_params * turbot_params = nullptr) const;   // [TAG_TURBOT] K and V are turbot when set
+
+    // [TAG_TURBOT_ANY_ISWA] the read side of a K/V cache attention, shared by the kv and the iSWA build_attn: the turbo /
+    // turbot rotation of Q for the type of k, then build_attn_mha. mctx_cur is the cache k and v are views of; when it is
+    // a turbot cache the FA also reads its young pool of layer il and the granule table turbot_gtab (must be set).
+    ggml_tensor * build_attn_mha_kv(
+            const llama_kv_cache_context * mctx_cur,
+            ggml_tensor * q,
+            ggml_tensor * k,
+            ggml_tensor * v,
+            ggml_tensor * kq_b,
+            ggml_tensor * kq_mask,
+            ggml_tensor * sinks,
+            ggml_tensor * v_mla,
+                  float   kq_scale,
+                    int   il,
+            ggml_tensor * kv_pos,
+            ggml_tensor * q_pos,
+            ggml_tensor * turbot_gtab) const;
 
     llm_graph_input_attn_no_cache * build_attn_inp_no_cache() const;
 

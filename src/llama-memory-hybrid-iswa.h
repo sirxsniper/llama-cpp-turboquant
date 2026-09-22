@@ -39,7 +39,10 @@ public:
                      bool   unified,
                             /* layer filters */
     const layer_filter_cb & filter_attn = nullptr,
-    const layer_filter_cb & filter_recr = nullptr);
+    const layer_filter_cb & filter_recr = nullptr,
+                            /* [TAG_TURBOT_ANY_ISWA] SWA child of the attention cache, GGML_TYPE_COUNT = type_k/type_v */
+                ggml_type   type_k_swa  = GGML_TYPE_COUNT,
+                ggml_type   type_v_swa  = GGML_TYPE_COUNT);
 
     ~llama_memory_hybrid_iswa() = default;
 

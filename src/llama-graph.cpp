@@ -501,8 +501,12 @@ void llm_graph_input_attn_no_cache::set_input(const llama_ubatch * ubatch) {
 
 // [TAG_TURBOT] the graph topology depends on the fill list: the fill tensor exists only when this ubatch has fill
 // entries, so a graph built for another fill count is never reused (SPEC 10.1). No-op for every other cache type.
-static bool can_reuse_turbot(const llm_graph_input_attn_kv * inp, const llama_kv_cache_context * mctx, const llama_ubatch & ubatch) {
-    if (inp->self_turbot_gtab == nullptr) {
+// [TAG_TURBOT_ANY_ISWA] takes the three inputs, so the kv, hybrid, iSWA and hybrid-iSWA inputs share it; mctx is the
+// cache they belong to (the base child of an iSWA cache). [TAG_TURBOT_ANY_STREAMS] the granule count covers the
+// streams of this ubatch, so a graph built for another stream count is not reused either.
+static bool can_reuse_turbot(const ggml_tensor * gtab, const ggml_tensor * young, const ggml_tensor * fill,
+        const llama_kv_cache_context * mctx, const llama_ubatch & ubatch) {
+    if (gtab == nullptr) {
         return !mctx->is_turbot();
     }
 
@@ -510,12 +514,16 @@ static bool can_reuse_turbot(const llm_graph_input_attn_kv * inp, const llama_kv
 
     bool res = mctx->is_turbot();
 
-    res = res && inp->self_turbot_gtab->ne[0]  == mctx->get_turbot_n_granules();
-    res = res && inp->self_turbot_young->ne[0] == (int64_t) ubatch.n_tokens;
-    res = res && (inp->self_turbot_fill != nullptr) == (n_fill > 0);
-    res = res && (inp->self_turbot_fill == nullptr || inp->self_turbot_fill->ne[1] == n_fill);
+    res = res && gtab->ne[0]  == mctx->get_turbot_n_granules();
+    res = res && young->ne[0] == (int64_t) ubatch.n_tokens;
+    res = res && (fill != nullptr) == (n_fill > 0);
+    res = res && (fill == nullptr || fill->ne[1] == n_fill);
 
     return res;
+}
+
+static bool can_reuse_turbot(const llm_graph_input_attn_kv * inp, const llama_kv_cache_context * mctx, const llama_ubatch & ubatch) {
+    return can_reuse_turbot(inp->self_turbot_gtab, inp->self_turbot_young, inp->self_turbot_fill, mctx, ubatch);
 }
 
 void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
@@ -687,6 +695,10 @@ void llm_graph_input_attn_kv_iswa::set_input(const llama_ubatch * ubatch) {
         }
     }
 
+    if (self_turbot_gtab) {   // [TAG_TURBOT_ANY_ISWA] a turbot base child (unallocated inputs are skipped)
+        mctx->get_base()->set_input_turbot(self_turbot_gtab, self_turbot_young, self_turbot_fill);
+    }
+
     // the kq mask guards on its own buffer: shared cells leave idxs unbacked while the mask stays live
     if (self_kq_mask && self_kq_mask->buffer) {
         mctx->get_base()->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
@@ -747,6 +759,9 @@ bool llm_graph_input_attn_kv_iswa::can_reuse(const llm_graph_params & params) {
     if (self_kq_mask_swa && self_kq_mask_swa->buffer) {
         res &= can_reuse_kq_mask(self_kq_mask_swa, mctx->get_swa(), params.ubatch, params.cparams);
     }
+
+    // [TAG_TURBOT_ANY_ISWA] the fill tensor of a turbot base child exists only when this ubatch has fill entries
+    res &= can_reuse_turbot(self_turbot_gtab, self_turbot_young, self_turbot_fill, mctx->get_base(), params.ubatch);
 
     return res;
 }
@@ -1287,6 +1302,10 @@ void llm_graph_input_mem_hybrid_iswa::set_input(const llama_ubatch * ubatch) {
         attn_ctx->get_base()->set_input_v_idxs(inp_attn->self_v_idxs, ubatch);
     }
 
+    if (inp_attn->self_turbot_gtab) {   // [TAG_TURBOT_ANY_ISWA] a turbot base child (unallocated inputs are skipped)
+        attn_ctx->get_base()->set_input_turbot(inp_attn->self_turbot_gtab, inp_attn->self_turbot_young, inp_attn->self_turbot_fill);
+    }
+
     if (inp_attn->self_kq_mask && inp_attn->self_kq_mask->buffer) {
         attn_ctx->get_base()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
     }
@@ -1358,6 +1377,10 @@ bool llm_graph_input_mem_hybrid_iswa::can_reuse(const llm_graph_params & params)
     }
 
     res &= can_reuse_kq_mask(inp_attn->self_kq_mask_swa, attn_ctx->get_swa(), params.ubatch, params.cparams);
+
+    // [TAG_TURBOT_ANY_ISWA] this check re-implements the attention input's, so the turbot conditions go here as well
+    res &= can_reuse_turbot(inp_attn->self_turbot_gtab, inp_attn->self_turbot_young, inp_attn->self_turbot_fill,
+            attn_ctx->get_base(), params.ubatch);
 
     res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
 
@@ -2816,21 +2839,54 @@ ggml_tensor * llm_graph_context::build_attn_mha(
             v = ggml_cast(ctx0, v, GGML_TYPE_F16);
         }
 
-        cur = ggml_flash_attn_ext(ctx0, q, k, v, kq_mask, kq_scale, hparams.f_max_alibi_bias,
-                                  hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
-        res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, cur, il});
+        // one FA node over q, k, v (and the mask and granule table that go with them)
+        const auto build_fa = [&](ggml_tensor * q_fa, ggml_tensor * k_fa, ggml_tensor * v_fa, ggml_tensor * mask_fa,
+                                  ggml_tensor * gtab_fa) {
+            ggml_tensor * fa = ggml_flash_attn_ext(ctx0, q_fa, k_fa, v_fa, mask_fa, kq_scale, hparams.f_max_alibi_bias,
+                                                   hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
+            res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, fa, il});
 
-        ggml_flash_attn_ext_add_sinks(cur, sinks);
-        // [TAG_SYNC_FA_SETTERS] order: n_kv_max (op_params slot 4), then pos, then turbot (writes from
-        // GGML_TURBOT_OP_PARAMS_OFFSET, past slot 4), then the accumulator precision (slot 3)
-        GGML_ASSERT(n_kv_max >= 0 && n_kv_max <= INT32_MAX);
-        ggml_flash_attn_ext_set_n_kv_max(cur, static_cast<int32_t>(n_kv_max));
-        ggml_flash_attn_ext_set_pos  (cur, kv_pos, q_pos);   // [TAG_FA_POS_MASK] no-op when kv_pos is null
-        if (turbot_params != nullptr) {
-            // [TAG_TURBOT] K and V are turbot views: src[7] = young pool, src[8] = granule table
-            ggml_flash_attn_ext_set_turbot(cur, turbot_pool, turbot_gtab, turbot_params);
+            ggml_flash_attn_ext_add_sinks(fa, sinks);
+            // [TAG_SYNC_FA_SETTERS] order: n_kv_max (op_params slot 4), then pos, then turbot (writes from
+            // GGML_TURBOT_OP_PARAMS_OFFSET, past slot 4), then the accumulator precision (slot 3)
+            GGML_ASSERT(n_kv_max >= 0 && n_kv_max <= INT32_MAX);
+            ggml_flash_attn_ext_set_n_kv_max(fa, static_cast<int32_t>(n_kv_max));
+            ggml_flash_attn_ext_set_pos  (fa, kv_pos, q_pos);   // [TAG_FA_POS_MASK] no-op when kv_pos is null
+            if (turbot_params != nullptr) {
+                // [TAG_TURBOT] K and V are turbot views: src[7] = young pool, src[8] = granule table
+                ggml_flash_attn_ext_set_turbot(fa, turbot_pool, gtab_fa, turbot_params);
+            }
+            ggml_prec_set_acc(fa, GGML_PREC_F32);
+
+            return fa;
+        };
+
+        if (turbot_params != nullptr && k->ne[3] > 1) {
+            // [TAG_TURBOT_ANY_STREAMS] a turbot FA takes one stream (ne[3] == 1): one FA per stream j over the views of
+            // q, k, v and the mask along dim 3, and the stream's slice of the granule table (stream-major, global
+            // slots into the one young pool of the layer). Same scale, softcap, sinks, pool and params; the outputs
+            // are concatenated along dim 3 in stream order, which is the layout the single FA would have written.
+            GGML_ASSERT(kv_pos == nullptr && "turbot: the positional mask covers a single sequence, not several streams");
+            GGML_ASSERT(turbot_gtab != nullptr && turbot_gtab->ne[0] % k->ne[3] == 0);
+
+            const int64_t n_strm   = k->ne[3];
+            const int64_t n_gran_s = turbot_gtab->ne[0] / n_strm;
+
+            const auto stream_view = [&](ggml_tensor * t, int64_t j) {
+                return ggml_view_4d(ctx0, t, t->ne[0], t->ne[1], t->ne[2], 1, t->nb[1], t->nb[2], t->nb[3], j*t->nb[3]);
+            };
+
+            cur = nullptr;
+            for (int64_t j = 0; j < n_strm; ++j) {
+                ggml_tensor * mask_j = kq_mask == nullptr || kq_mask->ne[3] == 1 ? kq_mask : stream_view(kq_mask, j);
+                ggml_tensor * gtab_j = ggml_view_1d(ctx0, turbot_gtab, n_gran_s, j*n_gran_s*ggml_element_size(turbot_gtab));
+
+                ggml_tensor * fa = build_fa(stream_view(q, j), stream_view(k, j), stream_view(v, j), mask_j, gtab_j);
+                cur = cur == nullptr ? fa : ggml_concat(ctx0, cur, fa, 3);
+            }
+        } else {
+            cur = build_fa(q, k, v, kq_mask, turbot_gtab);
         }
-        ggml_prec_set_acc(cur, GGML_PREC_F32);
 
         // TurboQuant: inverse WHT on FA output when V values are WHT-rotated.
         // For MLA, V is a view of K with different ne[0] (e.g. V=512, K=576).
@@ -3038,6 +3094,29 @@ ggml_tensor * llm_graph_context::build_attn(
     return cur;
 }
 
+// [TAG_TURBOT] granule table, young pool rows and fill list, filled from the tier after begin_ubatch (SPEC 10.1).
+// The fill tensor exists only when this ubatch has fill entries; can_reuse keys on that. No-op unless mctx_cur is a
+// turbot cache. [TAG_TURBOT_ANY_ISWA] shared by the kv input and the iSWA inputs (mctx_cur = the base child there).
+template <typename T>
+static void build_turbot_inputs(ggml_context * ctx0, const llama_kv_cache_context * mctx_cur, const llama_ubatch & ubatch, T * inp) {
+    if (mctx_cur->is_turbot()) {
+        inp->self_turbot_gtab = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, mctx_cur->get_turbot_n_granules());
+        ggml_set_input(inp->self_turbot_gtab);
+        ggml_set_name(inp->self_turbot_gtab, "attn_inp_turbot_gtab");
+
+        inp->self_turbot_young = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, ubatch.n_tokens);
+        ggml_set_input(inp->self_turbot_young);
+        ggml_set_name(inp->self_turbot_young, "attn_inp_turbot_young");
+
+        const int64_t n_fill = mctx_cur->get_turbot_n_fill();
+        if (n_fill > 0) {
+            inp->self_turbot_fill = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, 4, n_fill);
+            ggml_set_input(inp->self_turbot_fill);
+            ggml_set_name(inp->self_turbot_fill, "attn_inp_turbot_fill");
+        }
+    }
+}
+
 static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
            ggml_context * ctx0,
      const llama_ubatch & ubatch,
@@ -3102,24 +3181,7 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
     inp->self_k_rot = mctx_cur->build_input_k_rot(ctx0);
     inp->self_v_rot = mctx_cur->build_input_v_rot(ctx0);
 
-    // [TAG_TURBOT] granule table, young pool rows and fill list, filled from the tier after begin_ubatch (SPEC 10.1).
-    // The fill tensor exists only when this ubatch has fill entries; can_reuse keys on that.
-    if (mctx_cur->is_turbot()) {
-        inp->self_turbot_gtab = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, mctx_cur->get_turbot_n_granules());
-        ggml_set_input(inp->self_turbot_gtab);
-        ggml_set_name(inp->self_turbot_gtab, "attn_inp_turbot_gtab");
-
-        inp->self_turbot_young = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, ubatch.n_tokens);
-        ggml_set_input(inp->self_turbot_young);
-        ggml_set_name(inp->self_turbot_young, "attn_inp_turbot_young");
-
-        const int64_t n_fill = mctx_cur->get_turbot_n_fill();
-        if (n_fill > 0) {
-            inp->self_turbot_fill = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, 4, n_fill);
-            ggml_set_input(inp->self_turbot_fill);
-            ggml_set_name(inp->self_turbot_fill, "attn_inp_turbot_fill");
-        }
-    }
+    build_turbot_inputs(ctx0, mctx_cur, ubatch, inp.get());   // [TAG_TURBOT]
 
     return inp;
 }
@@ -3130,6 +3192,52 @@ llm_graph_input_attn_kv * llm_graph_context::build_attn_inp_kv() const {
     auto inp = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur);
 
     return (llm_graph_input_attn_kv *) res->add_input(std::move(inp));
+}
+
+ggml_tensor * llm_graph_context::build_attn_mha_kv(
+        const llama_kv_cache_context * mctx_cur,
+        ggml_tensor * q,
+        ggml_tensor * k,
+        ggml_tensor * v,
+        ggml_tensor * kq_b,
+        ggml_tensor * kq_mask,
+        ggml_tensor * sinks,
+        ggml_tensor * v_mla,
+              float   kq_scale,
+                int   il,
+        ggml_tensor * kv_pos,
+        ggml_tensor * q_pos,
+        ggml_tensor * turbot_gtab) const {
+    // TurboQuant pre-rotate-queries: O(d log d) WHT rotation via custom op
+    // Q shape: (n_embd_head, n_head, n_tokens)
+    // For zero-padded models (head_dim not 128-aligned), pad Q to match padded K dim first.
+    if (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0 || k->type == GGML_TYPE_TURBO4P_0 || k->type == GGML_TYPE_TURBO5P_0 || k->type == GGML_TYPE_TURBO5P512_0) {
+        // Pad Q per-head to next multiple of 128 if needed
+        if (q->ne[0] % 128 != 0) {
+            const int64_t pad = ((q->ne[0] + 127) / 128) * 128 - q->ne[0];
+            q = ggml_pad(ctx0, q, pad, 0, 0, 0);
+        }
+        if (!ggml_is_contiguous(q)) { q = ggml_cont(ctx0, q); }
+        ggml_tensor * innerq_scale = mctx_cur->get_turbo_innerq_scale_inv();
+        q = ggml_turbo_wht(ctx0, q, 0, 0, innerq_scale);  // 0 = forward, 0 = auto group size from q->ne[0]
+    } else if (ggml_turbot_is_type(k->type)) {
+        // [TAG_TURBOT] the same forward WHT-128 as turbo5p (no padding: turbot heads are 128 or 256); no InnerQ
+        if (!ggml_is_contiguous(q)) { q = ggml_cont(ctx0, q); }
+        q = ggml_turbo_wht(ctx0, q, 0, 0, nullptr);  // 0 = forward, 0 = auto group size from q->ne[0]
+    }
+
+    // [TAG_TURBOT] a turbot FA reads the young pool and the granule table next to K and V
+    ggml_turbot_op_params turbot_params;
+    const bool turbot = mctx_cur->is_turbot();
+    if (turbot) {
+        GGML_ASSERT(turbot_gtab != nullptr && "turbot: the attention input has no granule table");
+        mctx_cur->get_turbot_op_params(il, GGML_TURBOT_SIDE_BOTH, turbot_params);
+    }
+
+    return build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il, kv_pos, q_pos,
+            turbot ? mctx_cur->get_turbot_pool(il) : nullptr,
+            turbot ? turbot_gtab                   : nullptr,
+            turbot ? &turbot_params                : nullptr);
 }
 
 ggml_tensor * llm_graph_context::build_attn(
@@ -3187,35 +3295,10 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
-    // TurboQuant pre-rotate-queries: O(d log d) WHT rotation via custom op
-    // Q shape: (n_embd_head, n_head, n_tokens)
-    // For zero-padded models (head_dim not 128-aligned), pad Q to match padded K dim first.
-    if (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0 || k->type == GGML_TYPE_TURBO4P_0 || k->type == GGML_TYPE_TURBO5P_0 || k->type == GGML_TYPE_TURBO5P512_0) {
-        // Pad Q per-head to next multiple of 128 if needed
-        if (q->ne[0] % 128 != 0) {
-            const int64_t pad = ((q->ne[0] + 127) / 128) * 128 - q->ne[0];
-            q = ggml_pad(ctx0, q, pad, 0, 0, 0);
-        }
-        if (!ggml_is_contiguous(q)) { q = ggml_cont(ctx0, q); }
-        ggml_tensor * innerq_scale = mctx_cur->get_turbo_innerq_scale_inv();
-        q = ggml_turbo_wht(ctx0, q, 0, 0, innerq_scale);  // 0 = forward, 0 = auto group size from q->ne[0]
-    } else if (ggml_turbot_is_type(k->type)) {
-        // [TAG_TURBOT] the same forward WHT-128 as turbo5p (head dim 256, no padding); turbot refuses InnerQ
-        if (!ggml_is_contiguous(q)) { q = ggml_cont(ctx0, q); }
-        q = ggml_turbo_wht(ctx0, q, 0, 0, nullptr);  // 0 = forward, 0 = auto group size from q->ne[0]
-    }
-
-    // [TAG_TURBOT] a turbot FA reads the young pool and the granule table next to K and V
-    ggml_turbot_op_params turbot_params;
-    const bool turbot = mctx_cur->is_turbot();
-    if (turbot) {
-        mctx_cur->get_turbot_op_params(il, GGML_TURBOT_SIDE_BOTH, turbot_params);
-    }
-
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il, inp->get_kv_pos(), inp->get_q_pos(),   // [TAG_FA_POS_MASK]
-            turbot ? mctx_cur->get_turbot_pool(il) : nullptr,
-            turbot ? inp->self_turbot_gtab         : nullptr,
-            turbot ? &turbot_params                : nullptr);
+    // [TAG_TURBOT_ANY_ISWA] the Q rotation and the FA, shared with the iSWA build_attn (the same nodes as before)
+    ggml_tensor * cur = build_attn_mha_kv(mctx_cur, q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il,
+            inp->get_kv_pos(), inp->get_q_pos(),   // [TAG_FA_POS_MASK]
+            inp->self_turbot_gtab);
     cb(cur, "kqv_out", il);
 
     // TurboQuant: if V was padded, the output has padded dimensions.
@@ -3510,17 +3593,30 @@ ggml_tensor * llm_graph_context::build_attn(
 
     const auto * mctx_cur = is_swa ? mctx_iswa->get_swa() : mctx_iswa->get_base();
 
+    // [TAG_TURBOT_ANY_ISWA] turbot is only ever the base (full-attention) child; the SWA child keeps its own type
+    const bool turbot = mctx_cur->is_turbot();
+    GGML_ASSERT(!(turbot && is_swa) && "turbot: the SWA child of an iSWA cache cannot be turbot");
+
     // optionally store to KV cache
     if (k_cur) {
         const auto & k_idxs = is_swa ? inp->get_k_idxs_swa() : inp->get_k_idxs();
 
-        ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
+        if (turbot) {
+            // [TAG_TURBOT_ANY_ISWA] one writer op per layer-side, as in the kv build_attn (SPEC 10.2)
+            ggml_build_forward_expand(gf, mctx_cur->turbot_cpy_k(ctx0, k_cur, k_idxs, inp->self_turbot_young, inp->self_turbot_fill, il));
+        } else {
+            ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
+        }
     }
 
     if (v_cur) {
         const auto & v_idxs = is_swa ? inp->get_v_idxs_swa() : inp->get_v_idxs();
 
-        ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
+        if (turbot) {
+            ggml_build_forward_expand(gf, mctx_cur->turbot_cpy_v(ctx0, v_cur, v_idxs, inp->self_turbot_young, inp->self_turbot_fill, il));
+        } else {
+            ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
+        }
     }
 
     const auto & kq_mask = is_swa ? inp->get_kq_mask_swa() : inp->get_kq_mask();
@@ -3529,18 +3625,10 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
-    // TurboQuant: pre-rotate Q for ISWA attention (pad to 128-aligned if needed)
-    if (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0 || k->type == GGML_TYPE_TURBO4P_0 || k->type == GGML_TYPE_TURBO5P_0 || k->type == GGML_TYPE_TURBO5P512_0) {
-        if (q->ne[0] % 128 != 0) {
-            const int64_t pad = ((q->ne[0] + 127) / 128) * 128 - q->ne[0];
-            q = ggml_pad(ctx0, q, pad, 0, 0, 0);
-        }
-        if (!ggml_is_contiguous(q)) { q = ggml_cont(ctx0, q); }
-        ggml_tensor * innerq_scale = mctx_cur->get_turbo_innerq_scale_inv();
-        q = ggml_turbo_wht(ctx0, q, 0, 0, innerq_scale);
-    }
-
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il);
+    // TurboQuant: pre-rotate Q for ISWA attention (pad to 128-aligned if needed); [TAG_TURBOT_ANY_ISWA] the turbot
+    // rotation and the FA with the young pool and the granule table of a turbot base child, shared with the kv overload
+    ggml_tensor * cur = build_attn_mha_kv(mctx_cur, q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il,
+            nullptr, nullptr, is_swa ? nullptr : inp->self_turbot_gtab);
     cb(cur, "kqv_out", il);
 
     // TurboQuant: if V was padded, extract original V head_dim after inverse WHT
@@ -3826,6 +3914,8 @@ llm_graph_input_attn_kv_iswa * llm_graph_context::build_attn_inp_kv_iswa() const
     inp->self_k_rot_swa = mctx_cur->get_swa()->build_input_k_rot(ctx0);
     inp->self_v_rot_swa = mctx_cur->get_swa()->build_input_v_rot(ctx0);
 
+    build_turbot_inputs(ctx0, mctx_cur->get_base(), ubatch, inp.get());   // [TAG_TURBOT_ANY_ISWA]
+
     return (llm_graph_input_attn_kv_iswa *) res->add_input(std::move(inp));
 }
 
@@ -4084,6 +4174,8 @@ llm_graph_input_mem_hybrid_iswa * llm_graph_context::build_inp_mem_hybrid_iswa()
         inp_attn->self_kq_mask_swa = build_attn_inp_kq_mask(ctx0, attn_ctx->get_swa(), ubatch, cparams);
         inp_attn->self_kq_mask_swa_cnv = inp_attn->self_kq_mask_swa;
     }
+
+    build_turbot_inputs(ctx0, attn_ctx->get_base(), ubatch, inp_attn.get());   // [TAG_TURBOT_ANY_ISWA]
 
     auto inp = std::make_unique<llm_graph_input_mem_hybrid_iswa>(cparams, std::move(inp_attn), std::move(inp_rs), mctx_cur);
 

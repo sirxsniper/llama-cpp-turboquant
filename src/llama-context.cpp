@@ -9,10 +9,12 @@
 #include "llama-batch.h"
 #include "llama-io.h"
 #include "llama-kv-cache.h"
+#include "llama-kv-cache-iswa.h"      // [TAG_TURBOT_ANY_ISWA] llama_turbot_kv_of
 #include "llama-kv-cache-resolve.h"   // [TAG_KV_RESOLVE]
 #include "llama-kv-tier.h"            // [TAG_KV_RESOLVE] turbot plan source and match check
 #include "llama-memory.h"
 #include "llama-memory-hybrid.h"
+#include "llama-memory-hybrid-iswa.h" // [TAG_TURBOT_ANY_ISWA] llama_turbot_kv_of
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-ext.h"
@@ -280,11 +282,48 @@ static std::string llama_kv_resolve_side_refusal(const llama_kv_resolve_input & 
     return "";
 }
 
-// "" when a turbot cache can be built, else why: the constructor's refusals (shared helpers) and the plan check
+// [TAG_TURBOT_ANY_ISWA] turbot splits this cache: create_memory builds an iSWA cache for an SWA model and
+// LLAMA_TURBOT_ISWA is on (LLAMA_TURBOT_ANY=0 turns it off), so turbot goes on the full-attention child only
+static bool llama_kv_resolve_iswa_split(const llama_kv_resolve_input & in, const llama_turbot_switches & sw) {
+    return in.swa && in.iswa && sw.iswa;
+}
+
+// [TAG_TURBOT_ANY_RESOLVE] the layers of the turbot cache: the attention cache's, minus the SWA child's of a split
+static bool llama_kv_resolve_turbot_layer(const llama_kv_resolve_layer & L, bool split) {
+    return L.attn && !(split && L.swa);
+}
+
+llama_turbot_cache_shape llama_kv_resolve_turbot_shape_of(const llama_kv_resolve_input & in) {
+    const bool split = llama_kv_resolve_iswa_split(in, llama_turbot_read_switches());
+
+    llama_turbot_cache_shape shape;
+    for (const auto & L : in.layers) {
+        if (llama_kv_resolve_turbot_layer(L, split)) {
+            llama_turbot_layer_geom g;
+            g.il        = L.il;
+            g.head_dim  = (uint16_t) L.head_k;
+            g.n_head_kv = (uint8_t)  L.n_head_kv;
+            shape.layers.push_back(g);
+        }
+    }
+    shape.kv_size   = in.kv_size;
+    shape.n_stream  = in.n_stream;
+    shape.n_seq_max = in.n_seq_max;
+    shape.auto_ok   = in.ctx_default;
+    shape.model     = nullptr;
+    return shape;
+}
+
+// "" when a turbot cache can be built, else why: the constructor's refusals (shared helpers) and the plan check.
+// [TAG_TURBOT_ANY_RESOLVE] order: constructor refusal, cache checks (an iSWA split is no SWA refusal), env switches,
+// turbo query rotation, the turbot layers, their geometry and device, the plan.
 static std::string llama_kv_resolve_turbot_refusal(const llama_kv_resolve_input & in, bool k_turbot, bool v_turbot) {
     if (!in.turbot_refused.empty()) {
         return in.turbot_refused;
     }
+
+    const llama_turbot_switches sw = llama_turbot_read_switches();
+    const bool split = llama_kv_resolve_iswa_split(in, sw);
 
     llama_turbot_cache_desc d;
     d.k_turbot     = k_turbot;
@@ -293,7 +332,7 @@ static std::string llama_kv_resolve_turbot_refusal(const llama_kv_resolve_input 
     d.v_trans      = in.flash_attn == LLAMA_FLASH_ATTN_TYPE_DISABLED;
     d.shared_cells = in.shared_cells;
     d.mla          = in.mla;
-    d.swa          = in.swa;
+    d.swa          = in.swa && !split;   // [TAG_TURBOT_ANY_ISWA] the base child of a split is built with swa = false
     d.kv_size      = in.kv_size;
 
     std::string why = llama_turbot_cache_refusal(d);
@@ -307,11 +346,12 @@ static std::string llama_kv_resolve_turbot_refusal(const llama_kv_resolve_input 
         return "the attention graph of this model has no turbo query rotation";
     }
 
-    std::vector<int32_t> attn_layers;
+    bool any_layer = false;
     for (const auto & L : in.layers) {
-        if (!L.attn) {
+        if (!llama_kv_resolve_turbot_layer(L, split)) {
             continue;
         }
+        any_layer = true;
         why = llama_turbot_layer_refusal((uint32_t) L.il, L.head_k, L.head_v, L.n_head_kv);
         if (why.empty()) {
             why = L.dev_refusal;
@@ -319,16 +359,66 @@ static std::string llama_kv_resolve_turbot_refusal(const llama_kv_resolve_input 
         if (!why.empty()) {
             return why;
         }
-        attn_layers.push_back(L.il);
+    }
+    // [TAG_TURBOT_ANY_ISWA] an all-SWA split has no layer for turbot. LLAMA_TURBOT_ANY=0 leaves it to the plan check, as
+    // before (no split there: the SWA refusal above has already fired for an SWA model)
+    if (!any_layer && sw.any) {
+        return "no full-attention layers";
     }
 
     if (!in.plan_check) {
         return "no plan: pass --kv-tier-plan <file> or set LLAMA_TURBOT_PLAN";
     }
-    if (!in.plan_check(attn_layers, in.kv_size, why)) {
+    if (!in.plan_check(llama_kv_resolve_turbot_shape_of(in), why)) {
         return why.empty() ? "the plan does not fit this model" : why;
     }
     return "";
+}
+
+// [TAG_TURBOT_ANY_ISWA] the KV type asked for the SWA layers of a split: LLAMA_TURBOT_SWA_TYPE (the names -ctk takes,
+// turbot excepted), turbo5p when it is unset. An unknown name sets note and asks for turbo5p.
+static ggml_type llama_kv_resolve_swa_request(const std::string & name, std::string & note) {
+    note.clear();
+    if (name.empty()) {
+        return GGML_TYPE_TURBO5P_0;
+    }
+    static const ggml_type types[] = {
+        GGML_TYPE_F32,      GGML_TYPE_F16,      GGML_TYPE_BF16,      GGML_TYPE_Q8_0,
+        GGML_TYPE_Q4_0,     GGML_TYPE_Q4_1,     GGML_TYPE_IQ4_NL,    GGML_TYPE_Q5_0,
+        GGML_TYPE_Q5_1,     GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO3_0,  GGML_TYPE_TURBO4_0,
+        GGML_TYPE_TURBO4P_0, GGML_TYPE_TURBO5P_0, GGML_TYPE_TURBO5P512_0,
+    };
+    for (const ggml_type t : types) {
+        if (name == ggml_type_name(t)) {
+            return t;
+        }
+    }
+    note = "LLAMA_TURBOT_SWA_TYPE=" + name + " is not a KV cache type the SWA layers can take, using turbo5p";
+    return GGML_TYPE_TURBO5P_0;
+}
+
+// [TAG_TURBOT_ANY_ISWA] the SWA child of a split resolves its own type: the SWA layers only, through the chain of the
+// type asked for them (turbo5p -> turbo4 -> q8_0 -> f16 by default). Only type_k/type_v/steps/swa_note are meaningful.
+static llama_kv_resolve_result llama_kv_resolve_swa_child(const llama_kv_resolve_input & in, const llama_turbot_switches & sw) {
+    std::string note;
+    const ggml_type want = llama_kv_resolve_swa_request(sw.swa_type, note);
+
+    llama_kv_resolve_input in_swa = in;
+    in_swa.type_k = want;
+    in_swa.type_v = want;
+    in_swa.iswa   = false;             // no further split: the request is never turbot
+    in_swa.plan_check = nullptr;
+    in_swa.turbot_refused.clear();
+    in_swa.layers.clear();
+    for (const auto & L : in.layers) {
+        if (L.swa) {
+            in_swa.layers.push_back(L);
+        }
+    }
+
+    llama_kv_resolve_result r = llama_kv_resolve(in_swa);
+    r.swa_note = note;
+    return r;
 }
 
 // the types passed over on the way down a chain, as "a, b: why; c: why" (a run of equal reasons is said once)
@@ -506,6 +596,24 @@ llama_kv_resolve_result llama_kv_resolve(const llama_kv_resolve_input & in) {
     res.type_k = k;
     res.type_v = v;
 
+    // [TAG_TURBOT_ANY_ISWA] turbot kept on the full-attention child of an iSWA split: the SWA child gets its own type
+    if (ggml_turbot_is_type(k) && ggml_turbot_is_type(v)) {
+        const llama_turbot_switches sw = llama_turbot_read_switches();
+        const bool split = llama_kv_resolve_iswa_split(in, sw);
+
+        for (const auto & L : in.layers) {
+            res.n_turbot_layers += llama_kv_resolve_turbot_layer(L, split) ? 1 : 0;
+        }
+
+        if (split) {
+            const llama_kv_resolve_result rs = llama_kv_resolve_swa_child(in, sw);
+            res.type_k_swa = rs.type_k;
+            res.type_v_swa = rs.type_v;
+            res.steps_swa  = rs.steps;
+            res.swa_note   = rs.swa_note;
+        }
+    }
+
     return res;
 }
 
@@ -606,15 +714,96 @@ static uint32_t llama_kv_resolve_kv_size(const llama_model & model, const llama_
     return GGML_PAD(n_ctx / std::max(1u, params.n_seq_max), 256);
 }
 
-// [TAG_KV_RESOLVE] resolve params.type_k/type_v for model and log one warning per downgrade. turbot_refused: the turbot
-// cache constructor refused anyway (the llama_context constructor's fallback), so turbot is out.
-static void llama_kv_resolve_params(const llama_model & model, llama_context_params & params, const char * func,
-        const std::string & turbot_refused = "") {
+// [TAG_TURBOT_ANY_ISWA] create_memory builds an iSWA cache for this context (llama_kv_cache_iswa or
+// llama_memory_hybrid_iswa), whose base child could hold turbot. A copy of create_memory's branch (llama-model.cpp; keep
+// in step with it). The DeepSeek V4 and DSpark iSWA sites are left out: their archs get no turbo query rotation, and
+// their turbot refusal stays the SWA one. Should this disagree with create_memory, the turbot cache constructor still
+// refuses and the llama_context constructor falls back.
+static bool llama_kv_resolve_iswa_memory(const llama_model & model, llama_context_type ctx_type) {
     const auto & hp = model.hparams;
+    const llm_arch arch = model.arch;
 
-    if (hp.vocab_only) {
-        return;   // no memory is built
+    // an MTP context of a hybrid model gets a plain llama_kv_cache_iswa instead of llama_memory_hybrid_iswa: iSWA
+    // either way. Only the DeepSeek V4 MTP site differs, and that arch is left out below.
+    GGML_UNUSED(ctx_type);
+
+    switch (arch) {
+        case LLM_ARCH_BERT:
+        case LLM_ARCH_JINA_BERT_V2:
+        case LLM_ARCH_JINA_BERT_V3:
+        case LLM_ARCH_NOMIC_BERT:
+        case LLM_ARCH_NOMIC_BERT_MOE:
+        case LLM_ARCH_NEO_BERT:
+        case LLM_ARCH_EUROBERT:
+        case LLM_ARCH_WAVTOKENIZER_DEC:
+        case LLM_ARCH_MODERN_BERT:
+        case LLM_ARCH_GEMMA_EMBEDDING:
+        case LLM_ARCH_DREAM:
+        case LLM_ARCH_LLADA:
+        case LLM_ARCH_LLADA_MOE:
+        case LLM_ARCH_RND1:
+        case LLM_ARCH_MINIMAX_M3:
+        case LLM_ARCH_GLM_DSA:
+        case LLM_ARCH_DEEPSEEK32:
+        case LLM_ARCH_HY_V4:
+        case LLM_ARCH_DOTS3NOTE:
+        case LLM_ARCH_DEEPSEEK4:
+            return false;
+        case LLM_ARCH_DFLASH:
+            if (hp.dsv4_hc_mult > 0) {
+                return false;
+            }
+            break;
+        default:
+            break;
     }
+
+    if (llm_arch_is_recurrent(arch)) {
+        return false;
+    }
+
+    // hybrid (llama_memory_hybrid_iswa) or plain (llama_kv_cache_iswa, the MTP heads of hybrid models included): both
+    // are iSWA exactly when the model has a sliding-window type
+    return hp.swa_type != LLAMA_SWA_TYPE_NONE;
+}
+
+// [TAG_TURBOT_ANY_RESOLVE] the kernel side of a turbot layer on its CUDA device dev, "" when it can run there. Checked by
+// the resolver only (the cache constructor keeps llama_turbot_layer_device_refusal), and only with LLAMA_TURBOT_ANY on:
+//   - GGML_TURBOT_ANY=0 (the ggml CUDA switch) routes only the 4 x 256 geometry, so other geometries step down here
+//     instead of reaching an FA the backend refuses. Read exactly as ggml_cuda_turbot_any_on reads it (a value that
+//     starts with '0'), so the two never disagree;
+//   - a backend that exports LLAMA_TURBOT_DEV_GEOM_PROC, bool (ggml_backend_dev_t dev, int head_dim, int n_head_kv),
+//     answers for the device: ggml-cuda does (ggml_cuda_turbot_geometry_supported: the geometry, Turing+ MMA,
+//     GGML_TURBOT_ANY and the D = 128 instances). A backend without the export is not asked.
+#define LLAMA_TURBOT_DEV_GEOM_PROC "ggml_backend_turbot_supports_geometry"
+typedef bool (*llama_turbot_dev_geom_fn)(ggml_backend_dev_t dev, int head_dim, int n_head_kv);
+
+static std::string llama_kv_resolve_turbot_kernel_refusal(uint32_t il, ggml_backend_dev_t dev, uint32_t head, uint32_t n_head_kv) {
+    if (dev == nullptr || !llama_turbot_read_switches().any) {
+        return "";
+    }
+    const bool qwen_geom = head == GGML_TURBOT_HEAD_DIM && n_head_kv == GGML_TURBOT_N_HEAD;
+    if (!qwen_geom) {
+        const char * e = getenv("GGML_TURBOT_ANY");
+        if (e != nullptr && e[0] == '0') {
+            return llama_kv_resolve_fmt("GGML_TURBOT_ANY=0: the CUDA kernels take only 4 KV heads x 256 (layer %u: %u x %u)",
+                    il, n_head_kv, head);
+        }
+    }
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    const auto fn = reg ? (llama_turbot_dev_geom_fn) ggml_backend_reg_get_proc_address(reg, LLAMA_TURBOT_DEV_GEOM_PROC) : nullptr;
+    if (fn != nullptr && !fn(dev, (int) head, (int) n_head_kv)) {
+        return llama_kv_resolve_fmt("%s has no turbot kernel for %u KV heads x %u (layer %u; turbot needs Turing+ MMA, "
+                "and GGML_TURBOT_ANY on for other shapes than 4 x 256)", ggml_backend_dev_name(dev), n_head_kv, head, il);
+    }
+    return "";
+}
+
+// [TAG_KV_RESOLVE] the resolver input for model and params, without the plan check. turbot_refused: the turbot cache
+// constructor refused anyway (the llama_context constructor's fallback), so turbot is out.
+static llama_kv_resolve_input llama_kv_resolve_make_input(const llama_model & model, const llama_context_params & params,
+        const std::string & turbot_refused) {
+    const auto & hp = model.hparams;
 
     llama_kv_resolve_input in;
     in.type_k         = params.type_k;
@@ -625,10 +814,16 @@ static void llama_kv_resolve_params(const llama_model & model, llama_context_par
     in.turbo_graph    = llama_kv_resolve_turbo_graph(model);
     in.swa            = hp.swa_type != LLAMA_SWA_TYPE_NONE || hp.n_swa > 0;
     in.shared_cells   = model.arch == LLM_ARCH_GEMMA4_ASSISTANT && params.ctx_other != nullptr;
+    in.iswa           = llama_kv_resolve_iswa_memory(model, params.ctx_type);   // [TAG_TURBOT_ANY_ISWA]
     in.flash_attn     = params.flash_attn_type;
     in.n_stream       = params.kv_unified ? 1 : std::max(1u, params.n_seq_max);
+    in.n_seq_max      = std::max(1u, params.n_seq_max);                           // [TAG_TURBOT_ANY_RESOLVE]
     in.kv_size        = llama_kv_resolve_kv_size(model, params);
     in.turbot_refused = turbot_refused;
+
+    // [TAG_TURBOT_ANY_RESOLVE] only the main context may get an automatic plan: not an MTP context, not a draft model
+    // (common also swaps turbot out of every draft context, [TAG_TURBOT] in common/speculative.cpp)
+    in.ctx_default    = params.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && model.arch != LLM_ARCH_DFLASH;
 
     const bool want_turbot = ggml_turbot_is_type(params.type_k) || ggml_turbot_is_type(params.type_v);
     if (want_turbot) {
@@ -646,28 +841,109 @@ static void llama_kv_resolve_params(const llama_model & model, llama_context_par
         L.head_v    = hp.n_embd_head_v(il);
         L.n_head_kv = hp.n_head_kv(il);
         L.attn      = attn;
+        L.swa       = hp.is_swa(il);   // [TAG_TURBOT_ANY_ISWA]
         if (want_turbot && attn) {
-            L.dev_refusal = llama_turbot_layer_device_refusal(il, params.offload_kqv ? model.dev_layer(il) : nullptr);
+            ggml_backend_dev_t dev = params.offload_kqv ? model.dev_layer(il) : nullptr;
+            L.dev_refusal = llama_turbot_layer_device_refusal(il, dev);
+            if (L.dev_refusal.empty()) {
+                L.dev_refusal = llama_kv_resolve_turbot_kernel_refusal(il, dev, L.head_k, L.n_head_kv);   // [TAG_TURBOT_ANY_RESOLVE]
+            }
         }
         in.layers.push_back(std::move(L));
     }
 
-    // the plan the turbot cache would load (--kv-tier-plan, LLAMA_TURBOT_PLAN, else the built-in one), checked without
-    // a log line against the attention layers
-    in.plan_check = [](const std::vector<int32_t> & attn_layers, uint32_t kv_size, std::string & why) {
-        const llama_turbot_plan_source src = llama_turbot_plan_get_source();
-        std::string text;
-        if (!llama_turbot_plan_read(src, text, why)) {
-            return false;
-        }
-        if (!llama_turbot_plan_matches(text, attn_layers, kv_size, why, src.name)) {
-            if (src.origin != LLAMA_TURBOT_PLAN_FILE) {
-                why += " (the built-in plan fits only models with its attention layers; --kv-tier-plan <file> selects another)";
+    return in;
+}
+
+// [TAG_TURBOT_ANY_RESOLVE] the plan shape of the turbot cache this context would build (llama_turbot_plan_choose)
+static llama_turbot_cache_shape llama_kv_resolve_turbot_shape(const llama_model & model, const llama_context_params & params) {
+    llama_turbot_cache_shape shape = llama_kv_resolve_turbot_shape_of(llama_kv_resolve_make_input(model, params, ""));
+    shape.auto_ok = shape.auto_ok && llama_kv_resolve_enabled();
+    shape.model   = &model;
+    return shape;
+}
+
+// [TAG_TURBOT_ANY_ISWA] the K/V types of the SWA child of an iSWA split, recomputed the way llama_kv_resolve_params
+// decided them (no log line). GGML_TYPE_COUNT for both (= the same as type_k/type_v) when params are not turbot, the
+// memory is not an iSWA split, or the resolver is off.
+static std::pair<ggml_type, ggml_type> llama_kv_resolve_swa_types(const llama_model & model, const llama_context_params & params) {
+    const std::pair<ggml_type, ggml_type> same = { GGML_TYPE_COUNT, GGML_TYPE_COUNT };
+
+    if (model.hparams.vocab_only || !llama_kv_resolve_enabled() ||
+        !ggml_turbot_is_type(params.type_k) || !ggml_turbot_is_type(params.type_v)) {
+        return same;
+    }
+
+    const llama_turbot_switches sw = llama_turbot_read_switches();
+    const llama_kv_resolve_input in = llama_kv_resolve_make_input(model, params, "");
+    if (!llama_kv_resolve_iswa_split(in, sw)) {
+        return same;
+    }
+
+    const llama_kv_resolve_result rs = llama_kv_resolve_swa_child(in, sw);
+    return { rs.type_k, rs.type_v };
+}
+
+// [TAG_TURBOT_ANY_RESOLVE] the plan the turbot cache of this context loads: the choice of llama_turbot_plan_choose for
+// its shape, which the llama_context constructor holds in a llama_turbot_plan_scope around create_memory. false (no
+// scope: the cache constructor keeps its own plan precedence) when params are not turbot, the resolver is off,
+// LLAMA_TURBOT_ANY=0, or no plan fits (the resolver would have stepped down already).
+static bool llama_kv_resolve_plan_choice(const llama_model & model, const llama_context_params & params, llama_turbot_plan_choice & choice) {
+    if (model.hparams.vocab_only || !llama_kv_resolve_enabled() ||
+        !ggml_turbot_is_type(params.type_k) || !ggml_turbot_is_type(params.type_v) || !llama_turbot_read_switches().any) {
+        return false;
+    }
+    std::string why;
+    if (!llama_turbot_plan_choose(llama_kv_resolve_turbot_shape(model, params), choice, why)) {
+        LLAMA_LOG_WARN("%s: turbot: no plan for this cache (%s)\n", __func__, why.c_str());
+        return false;
+    }
+    return true;
+}
+
+// [TAG_KV_RESOLVE] resolve params.type_k/type_v for model and log one warning per downgrade. turbot_refused: the turbot
+// cache constructor refused anyway (the llama_context constructor's fallback), so turbot is out.
+static void llama_kv_resolve_params(const llama_model & model, llama_context_params & params, const char * func,
+        const std::string & turbot_refused = "") {
+    const auto & hp = model.hparams;
+
+    if (hp.vocab_only) {
+        return;   // no memory is built
+    }
+
+    llama_kv_resolve_input in = llama_kv_resolve_make_input(model, params, turbot_refused);
+
+    if (llama_turbot_read_switches().any) {
+        // [TAG_TURBOT_ANY_RESOLVE] the plan the turbot cache will load: --kv-tier-plan / LLAMA_TURBOT_PLAN (a file,
+        // "default" or "auto"), a verified sidecar next to the model, the built-in plan, else the automatic one
+        in.plan_check = [&model](const llama_turbot_cache_shape & shape, std::string & why) {
+            llama_turbot_cache_shape s = shape;
+            s.model = &model;
+            llama_turbot_plan_choice choice;
+            return llama_turbot_plan_choose(s, choice, why);
+        };
+    } else {
+        // LLAMA_TURBOT_ANY=0: the plan the turbot cache would load (--kv-tier-plan, LLAMA_TURBOT_PLAN, else the built-in
+        // one), checked without a log line against the attention layers, as before
+        in.plan_check = [](const llama_turbot_cache_shape & shape, std::string & why) {
+            std::vector<int32_t> attn_layers;
+            for (const auto & g : shape.layers) {
+                attn_layers.push_back(g.il);
             }
-            return false;
-        }
-        return true;
-    };
+            const llama_turbot_plan_source src = llama_turbot_plan_get_source();
+            std::string text;
+            if (!llama_turbot_plan_read(src, text, why)) {
+                return false;
+            }
+            if (!llama_turbot_plan_matches(text, attn_layers, shape.kv_size, why, src.name)) {
+                if (src.origin != LLAMA_TURBOT_PLAN_FILE) {
+                    why += " (the built-in plan fits only models with its attention layers; --kv-tier-plan <file> selects another)";
+                }
+                return false;
+            }
+            return true;
+        };
+    }
 
     const llama_kv_resolve_result res = llama_kv_resolve(in);
 
@@ -679,6 +955,27 @@ static void llama_kv_resolve_params(const llama_model & model, llama_context_par
     if (res.no_kv && (res.type_k != params.type_k || res.type_v != params.type_v)) {
         LLAMA_LOG_INFO("%s: this model keeps no KV cache: the requested KV cache types (%s, %s) are not used\n", func,
                 llama_kv_resolve_type_name(params.type_k), llama_kv_resolve_type_name(params.type_v));
+    }
+
+    // [TAG_TURBOT_ANY_ISWA] the SWA child of an iSWA split: its own type, its own steps down
+    if (res.type_k_swa != GGML_TYPE_COUNT || res.type_v_swa != GGML_TYPE_COUNT) {
+        if (!res.swa_note.empty()) {
+            LLAMA_LOG_WARN("%s: %s\n", func, res.swa_note.c_str());
+        }
+        for (const auto & st : res.steps_swa) {
+            LLAMA_LOG_WARN("%s: KV cache type of the SWA layers for %s: %s -> %s (%s)\n", func,
+                    st.side == 'K' ? "K" : st.side == 'V' ? "V" : "K and V",
+                    llama_kv_resolve_type_name(st.from), llama_kv_resolve_type_name(st.to), st.reason.c_str());
+        }
+        const ggml_type tk = res.type_k_swa != GGML_TYPE_COUNT ? res.type_k_swa : res.type_k;
+        const ggml_type tv = res.type_v_swa != GGML_TYPE_COUNT ? res.type_v_swa : res.type_v;
+        if (tk == tv) {
+            LLAMA_LOG_INFO("%s: turbot on %u full-attention layers; SWA layers: %s\n", func,
+                    res.n_turbot_layers, llama_kv_resolve_type_name(tk));
+        } else {
+            LLAMA_LOG_INFO("%s: turbot on %u full-attention layers; SWA layers: K %s, V %s\n", func,
+                    res.n_turbot_layers, llama_kv_resolve_type_name(tk), llama_kv_resolve_type_name(tv));
+        }
     }
 
     params.type_k = res.type_k;
@@ -991,16 +1288,34 @@ llama_context::llama_context(
 
     // init the memory module
     if (!hparams.vocab_only) {
+        // [TAG_TURBOT_ANY_ISWA] the SWA child of an iSWA split takes its own type (GGML_TYPE_COUNT: the same as K/V)
+        const auto swa_types = llama_kv_resolve_swa_types(model, params);
+
         llama_memory_params params_mem = {
-            /*.type_k    =*/ params.type_k,
-            /*.type_v    =*/ params.type_v,
-            /*.swa_full  =*/ params.swa_full,
-            /*.ctx_type  =*/ cparams.ctx_type,
-            /*.mem_other =*/ llama_get_memory(cparams.ctx_other),
+            /*.type_k     =*/ params.type_k,
+            /*.type_v     =*/ params.type_v,
+            /*.swa_full   =*/ params.swa_full,
+            /*.ctx_type   =*/ cparams.ctx_type,
+            /*.mem_other  =*/ llama_get_memory(cparams.ctx_other),
+            /*.type_k_swa =*/ swa_types.first,
+            /*.type_v_swa =*/ swa_types.second,
+        };
+
+        // [TAG_TURBOT_ANY_RESOLVE] a turbot cache loads the plan the resolver chose for it: the choice is held in a
+        // thread-local llama_turbot_plan_scope while create_memory runs (the loader logs it and writes an automatic plan
+        // to LLAMA_TURBOT_AUTO_PLAN_DUMP). Without a scope (resolver off, LLAMA_TURBOT_ANY=0, no turbot) the cache
+        // constructor keeps its own plan precedence.
+        const auto build_memory = [&]() {
+            llama_turbot_plan_choice choice;
+            std::unique_ptr<llama_turbot_plan_scope> plan_scope;
+            if (llama_kv_resolve_plan_choice(model, params, choice)) {
+                plan_scope = std::make_unique<llama_turbot_plan_scope>(choice);
+            }
+            memory.reset(model.create_memory(params_mem, cparams));
         };
 
         try {
-            memory.reset(model.create_memory(params_mem, cparams));
+            build_memory();
         } catch (const std::exception & err) {
             // [TAG_KV_RESOLVE] the resolver runs the turbot constructor's own checks, but the attention layer set it
             // gives the plan check re-derives create_memory's layer filter. Should the constructor still refuse turbot,
@@ -1009,9 +1324,12 @@ llama_context::llama_context(
                 throw;
             }
             llama_kv_resolve_params(model, params, __func__, err.what());
-            params_mem.type_k = params.type_k;
-            params_mem.type_v = params.type_v;
-            memory.reset(model.create_memory(params_mem, cparams));
+            const auto swa_types_retry = llama_kv_resolve_swa_types(model, params);
+            params_mem.type_k     = params.type_k;
+            params_mem.type_v     = params.type_v;
+            params_mem.type_k_swa = swa_types_retry.first;
+            params_mem.type_v_swa = swa_types_retry.second;
+            build_memory();
         }
     }
 
@@ -2088,6 +2406,11 @@ static llama_kv_cache * llama_turbot_kv_of(llama_memory_i * mem) {
     if (kv == nullptr) {
         if (auto * hyb = dynamic_cast<llama_memory_hybrid *>(mem)) {
             kv = hyb->get_mem_attn();
+        } else if (auto * iswa = dynamic_cast<llama_kv_cache_iswa *>(mem)) {
+            // [TAG_TURBOT_ANY_ISWA] turbot is only ever the base (full-attention) child of an iSWA cache
+            kv = iswa->get_base();
+        } else if (auto * hyb_iswa = dynamic_cast<llama_memory_hybrid_iswa *>(mem)) {
+            kv = hyb_iswa->get_mem_attn()->get_base();
         }
     }
     return kv != nullptr && kv->is_turbot() ? kv : nullptr;
@@ -3216,6 +3539,15 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
         const uint32_t selector_tokens = std::min<uint32_t>(
                 n_tokens, model.hparams.dflash_block_size * cparams.n_seq_max);
         res += 32*selector_tokens;
+    }
+
+    // [TAG_TURBOT_ANY_STREAMS] a turbot cache with several KV streams runs one flash attention per stream
+    // (llama-graph.cpp build_attn_mha): views of q, k, v, the mask and the granule table, the FA and a concat, for every
+    // stream of every turbot layer. One stream (Qwen3.8-27B with --kv-unified) adds nothing.
+    if (const llama_kv_cache * turbot_kv = llama_turbot_kv_of(memory.get())) {
+        if (turbot_kv->get_n_stream() > 1) {
+            res += 8u*model.hparams.n_layer_all*turbot_kv->get_n_stream();
+        }
     }
 
     uint32_t n_sampling_nodes = 0;

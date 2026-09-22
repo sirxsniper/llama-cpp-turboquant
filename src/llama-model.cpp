@@ -2608,7 +2608,9 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* offload           */ cparams.offload_kqv,
                             /* unified           */ cparams.kv_unified,
                             /* filter_attn       */ std::move(filter_attn),
-                            /* filter_recr       */ std::move(filter_recr));
+                            /* filter_recr       */ std::move(filter_recr),
+                            /* attn_type_k_swa   */ params.type_k_swa,    // [TAG_TURBOT_ANY_ISWA]
+                            /* attn_type_v_swa   */ params.type_v_swa);
                     } else if (needs_mem_idx) {
                         // sparse attention over a per-token indexer cache, in its own memory type
                         res = new llama_memory_hybrid_idx(
@@ -2712,7 +2714,9 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                     mem_other,
                                     filter,
                                     reuse,
-                                    share);
+                                    share,
+                                    params.type_k_swa,    // [TAG_TURBOT_ANY_ISWA]
+                                    params.type_v_swa);
                         } else {
                             res = new llama_kv_cache_iswa(
                                     *this,
@@ -2729,7 +2733,9 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                     nullptr,
                                     filter,
                                     reuse,
-                                    share);
+                                    share,
+                                    params.type_k_swa,    // [TAG_TURBOT_ANY_ISWA]
+                                    params.type_v_swa);
                         }
                     } else {
                         GGML_ASSERT(!hparams.is_swa_any());

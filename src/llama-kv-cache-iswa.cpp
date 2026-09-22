@@ -26,9 +26,11 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
            llama_memory_t   mem_other,
     const layer_filter_cb & filter,
     const  layer_reuse_cb & reuse,
-    const  layer_share_cb & share) :
+    const  layer_share_cb & share,
+                ggml_type   type_k_swa,
+                ggml_type   type_v_swa) :
     llama_kv_cache_iswa(model, model.hparams, type_k, type_v, v_trans, offload, swa_full, unified,
-            kv_size, n_seq_max, n_ubatch, n_pad, mem_other, filter, reuse, share) {
+            kv_size, n_seq_max, n_ubatch, n_pad, mem_other, filter, reuse, share, type_k_swa, type_v_swa) {
 }
 
 llama_kv_cache_iswa::llama_kv_cache_iswa(
@@ -47,7 +49,9 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
            llama_memory_t   mem_other,
     const layer_filter_cb & filter,
     const  layer_reuse_cb & reuse,
-    const  layer_share_cb & share) : unified(unified) {
+    const  layer_share_cb & share,
+                ggml_type   type_k_swa,
+                ggml_type   type_v_swa) : unified(unified) {
 
     // chain filters
     const layer_filter_cb filter_base = [&](int32_t il) {
@@ -106,8 +110,13 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
 
     LLAMA_LOG_INFO("%s: creating     SWA KV cache, size = %u cells\n", __func__, size_swa);
 
+    // [TAG_TURBOT_ANY_ISWA] with a turbot base child the SWA child takes the type the resolver picked for the SWA layers
+    // (turbo5p by default); GGML_TYPE_COUNT keeps the base child's type, as before
+    const ggml_type type_k_swa_eff = type_k_swa == GGML_TYPE_COUNT ? type_k : type_k_swa;
+    const ggml_type type_v_swa_eff = type_v_swa == GGML_TYPE_COUNT ? type_v : type_v_swa;
+
     kv_swa = std::make_unique<llama_kv_cache>(
-            model, hparams, type_k, type_v,
+            model, hparams, type_k_swa_eff, type_v_swa_eff,
             v_trans, offload, unified, size_swa, n_seq_max, n_pad,
             hparams.n_swa, hparams.swa_type, mem_other_swa, filter_swa, reuse, share);
 }
