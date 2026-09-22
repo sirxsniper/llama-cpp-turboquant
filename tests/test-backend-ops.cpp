@@ -8436,6 +8436,33 @@ static void turbot_test_set(ggml_tensor * t, const void * data, size_t n) {
     ggml_backend_tensor_set(t, data, 0, n);
 }
 
+// [TAG_TURBOT_TEST_MASK_ROWS] init_tensor_kq_mask sets random 128 x 64 blocks to -INF. A mask narrower than one block
+// (kv 96 and 100, where nb 512 gets one block) is fully masked on up to 64 query rows whenever that block starts at
+// column 0 (about 1 run in 200 per case). The CPU reference writes 0 for such a row, the CUDA kernels (the f16 MMA
+// kernel and turbot alike) 0/0 = NaN, so the case failed at random with "NaN at index (CPU=0)". No real graph has such
+// a row (a query always sees its own cell), so re-open the newest cell of any fully masked row.
+static void turbot_test_init_mask(ggml_tensor * t) {
+    init_tensor_kq_mask(t);
+    GGML_ASSERT(t->type == GGML_TYPE_F16 && ggml_is_contiguous(t));
+    const int64_t ne0 = t->ne[0];
+    std::vector<ggml_fp16_t> m(ggml_nelements(t));
+    ggml_backend_tensor_get(t, m.data(), 0, ggml_nbytes(t));
+    bool changed = false;
+    for (int64_t r = 0; r < ggml_nrows(t); ++r) {
+        bool all_inf = true;
+        for (int64_t i = 0; i < ne0 && all_inf; ++i) {
+            all_inf = std::isinf(ggml_fp16_to_fp32(m[r*ne0 + i]));
+        }
+        if (all_inf) {
+            m[r*ne0 + ne0 - 1] = ggml_fp32_to_fp16(0.0f);
+            changed = true;
+        }
+    }
+    if (changed) {
+        ggml_backend_tensor_set(t, m.data(), 0, ggml_nbytes(t));
+    }
+}
+
 // GGML_OP_FLASH_ATTN_EXT over turbot K/V (SPEC 7, 11.2). perf = true names the case turbot_perf for gate B0.
 struct test_flash_attn_ext_turbot : public test_case {
     const turbot_test_widths widths;
@@ -8538,7 +8565,7 @@ struct test_flash_attn_ext_turbot : public test_case {
             } else if (strcmp(t->name, "q_pos") == 0) {
                 turbot_test_set(t, qp.data(), qp.size() * sizeof(int32_t));
             } else if (strcmp(t->name, "m") == 0) {
-                init_tensor_kq_mask(t);
+                turbot_test_init_mask(t);
             } else if (strcmp(t->name, "s") == 0) {
                 init_tensor_uniform(t, -10.0f, 10.0f);
             } else {
