@@ -540,7 +540,7 @@ The baseline is a build of commit `80f44b5d8` (the committed tree under the WP c
 
 | # | Check | Pass |
 |---|---|---|
-| 2.1 | `python tools\turbot\sass_diff.py BASE\bin\ggml-cuda.dll BIN\ggml-cuda.dll --arch sm_120a` (CPU only, cuobjdump) | exit 0: `IDENTICAL` for the 20 `flash_attn_ext_turbot<256,256,...>` kernels, `k_turbot_set_rows<int>` and `<int64_t>`, `k_turbot_fill` and `flash_attn_turbot_balance_bounds<4>`; `--scope turbot` for the full turbot list |
+| 2.1 | `python tools\turbot\sass_diff.py BASE\bin\ggml-cuda.dll BIN\ggml-cuda.dll --arch sm_120a` (CPU only, cuobjdump) | exit 0: `IDENTICAL` for the 40 `flash_attn_ext_turbot<256,256,...>` kernels (20 instances, both softcap variants), `k_turbot_set_rows<int>` and `<int64_t>`, `k_turbot_fill` and `flash_attn_turbot_balance_bounds<4>`; `--scope turbot` for the full turbot list |
 | 2.2 | `BIN\test-backend-ops.exe test -b CUDA0 -o FLASH_ATTN_EXT -p "^turbot=[a-z0-9]+,kv="`, then `-o TURBOT_SET_ROWS -p "^turbot=[a-z0-9]+,rows="` | 195/195, with case names identical to the baseline's `-p "^turbot="` run; the Qwen writer cases pass. The plain `^turbot=` filter of sections 2b and 8 now also selects the new geometry cases, whose names carry `d=..,hkv=..,hq=..` after the widths. |
 | 2.3 | `BIN\test-turbot-backend.exe` on both builds | bytes identical |
 | 2.4 | `validate.ps1` (section 2d) | `GATE PASSED` |
@@ -646,6 +646,14 @@ Qwen3.8-27B with `-np 4` and no `--kv-unified`:
   python tools\turbot\blob_roundtrip.py --exe BIN\llama-server.exe --np 4 --non-unified
   ```
 
+Context checkpoints in slot files (`[TAG_SLOT_FILE_CKPT]`, `tools/server/server-context.cpp`), on Qwen3.8-27B:
+- `python tools\turbot\blob_roundtrip.py --exe BIN\llama-server.exe --only save_restore`: `PASS`, the detail line shows `prompt_n` about 4 after the restore (was the full prompt) and identical tokens. The server log shows `[TAG_SLOT_FILE_CKPT] saved K context checkpoints` and `restored K of K context checkpoints ... draft state restored`.
+- the same arm with `LLAMA_SLOT_FILE_CKPT=0` in the server environment: `prompt_n` is the full prompt again (the arm fails, as before this change), and the file size equals the old `n_written`.
+- a file saved with `LLAMA_SLOT_FILE_CKPT=0`, restored on a default server: no warning, full prompt.
+- the last byte of a saved file changed: the restore returns 200, the log says `checkpoint section ignored (... fails its checksum)`, the next request processes the full prompt, `/health` stays OK.
+- a file saved with `LLAMA_CTX_CHECKPOINT_BUDGET_MIB=0`, restored on a default server: the log says `restored 13 of N`.
+- a full run without `--only`: `RESULT: 6/6 arms passed` (the five arms of 4.9 plus `streams_equal`).
+
 ### 9.8 G8: set the defaults from the data
 
 - The VALIDATED list becomes the geometries whose models passed G4-G7. Expected: {256 × 4, 256 × 2}.
@@ -665,5 +673,6 @@ Qwen3.8-27B with `-np 4` and no `--kv-unified`:
 | G5 quality per model (KLD CI, same-top, p99.9, 131K PPL) | not yet measured |
 | G6 speed and VRAM per model | not yet measured |
 | G7 server smoke per model, Qwen `-np 4` streams | not yet run |
+| G7 slot-file checkpoints (`save_restore` arm, kill switch, old file, corrupt file, budget) | not yet run |
 | G8 VALIDATED list and switch defaults | not yet decided |
 

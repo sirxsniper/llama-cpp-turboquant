@@ -53,7 +53,7 @@ at those depths.</sub>
 | [Benchmarks](#benchmarks) | full results, with methodology |
 | [Build](#build) | Windows and Linux, from source |
 | [Configuration](#configuration) | launch recipes, flag reference, tuning knobs |
-| [Any model](#using-the-fork-with-any-model) | KV type resolved per model, built-in turbot plan, vision device, new switches and architectures |
+| [Any model](#using-the-fork-with-any-model) | KV type resolved per model, built-in turbot plan, turbot on other models, context checkpoints in slot files, vision device, new switches and architectures |
 | [How it works](#how-it-works) | the turbo formats and the attention path |
 | [turbot](#turbot-tiered-kv-cache) | a tiered KV cache: better quality than turbo5p in the same VRAM |
 | [Engineering log](#engineering-log) | every change, with before and after |
@@ -573,6 +573,12 @@ Qwen3.8-27B is the model this fork is tuned for: hybrid Gated DeltaNet, 16 atten
 > - Qwen3.8-27B UD-Q5_K_XL, production server (262K, 4 slots, turbot, DFlash2 n_max 3): prose 106-107 t/s (old 103.5-105), code 147-151 t/s (old 142-143), 24.2 ms/step (old 25.0). KLD against the same reference: turbot code 0.001139 (old 0.001137), prose 0.001856 (old 0.001848); turbo5p code 0.001595, prose 0.002583. llama-bench tg64 new ≥ old at 0/131K/245K for turbo5p and turbot.
 > - **Fixed: wrong tokens under concurrency** (`[TAG_XSEQ_PLANES]`, `LLAMA_XSEQ_FIX=0` restores the old path). With `--spec-rs-seq` and several slots, a split batch could move one sequence's recurrent cell after it had written its rollback snapshots; a later draft rejection then restored another sequence's state. Measured: 14 anomalous greedy tokens in 640 concurrent requests before, 0 in 320 after. The bug was in the pre-sync builds too.
 > - Every new model listed below loads and was checked for facts, a tool call, vision where it has a projector, and speed.
+>
+> **Newer, not built or measured yet (GPU results pending).** Two changes are committed on top of the measured build and have not been compiled or run yet:
+> - turbot on other KV shapes (`[TAG_TURBOT_ANY_*]`, commits `1bbcb0dc2`, `84f49d76e`, `4f5aa27d3`, `642d0dce7`): see "turbot on other models" below.
+> - Context checkpoints in slot files (`[TAG_SLOT_FILE_CKPT]`, commit `6e505dbcc`): see "Slot files keep their context checkpoints" below.
+>
+> Both are meant to leave Qwen3.8-27B exactly as measured above: same kernels, same numbers, same log lines. The gates in `docs/turbot/TESTING.md` section 9 check this, with G2 checking bit for bit. Until they pass, the numbers above are the ones to quote. `LLAMA_TURBOT_ANY=0` with `GGML_TURBOT_ANY=0`, and `LLAMA_SLOT_FILE_CKPT=0`, restore the measured behaviour.
 
 ### KV cache type, resolved per model
 
@@ -643,9 +649,32 @@ The flag wins over the variable. If the plan does not fit the model (its `L` lin
 
 ### turbot on other models
 
-> **Status, 2026-09-22: implemented, not built or measured.** Every number in this subsection is a sizing estimate from the GGUF headers, not a measurement. The gates in `docs/turbot/TESTING.md` section 9 decide the defaults. SPEC section 14 has the details.
+> **Status, 2026-09-22: committed (`1bbcb0dc2`, `84f49d76e`, `4f5aa27d3`, `642d0dce7`), not built or measured. GPU results are pending.** Every number in this subsection is a sizing estimate from the GGUF headers, not a measurement. The gates in `docs/turbot/TESTING.md` section 9 (G0-G8) decide the defaults. SPEC section 14 has the details.
 
-turbot used to take only Qwen3.8-27B's shape, 4 KV heads × 256. It now also takes 2 × 256, 1 × 256, 8 × 128, 4 × 128 and 2 × 128 (`[TAG_TURBOT_ANY_*]`). A row holds 1, 2 or 4 runs of 256 values, each with its own old and young width, so the format, the young tier and the plan work the same way at every shape. Qwen3.8-27B keeps the built-in plan and runs exactly the same kernels and numbers as before (the G2 gate checks this bit for bit).
+turbot used to take only Qwen3.8-27B's shape, 4 KV heads × 256. It now also takes 2 × 256, 1 × 256, 8 × 128, 4 × 128 and 2 × 128 (`[TAG_TURBOT_ANY_*]`). A row holds 1, 2 or 4 runs of 256 values, each with its own old and young width, so the format, the young tier and the plan work the same way at every shape. Qwen3.8-27B keeps the built-in plan and is meant to run exactly the same kernels and numbers as before. The G2 gate checks this bit for bit, and it has not run yet.
+
+What each shape gets with `-ctk turbot -ctv turbot`:
+
+| KV shape (heads × head size) | Runs per row | Default | Opt-in | Examples |
+|:--|:-:|:--|:--|:--|
+| 4 × 256 | 4 | turbot: the built-in plan when the attention layers are Qwen3.8-27B's, else the automatic plan | — | Qwen3.8-27B, Ornith-1.5-9B, Spark-X2.5-4B |
+| 2 × 256 | 2 | turbot, automatic plan | — | Ornith-1.5-35B, Spark-X2.5-1.7B |
+| 8 × 128 | 4 | turbo5p | `LLAMA_TURBOT_AUTO_PLAN=all` | Granite 4.2 8B |
+| 4 × 128 | 2 | turbo5p512 | `LLAMA_TURBOT_AUTO_PLAN=all` | — |
+| 2 × 128 | 1 | turbo4 | `LLAMA_TURBOT_AUTO_BUDGET=turbo5p` (uses more VRAM than turbo4) | MiniCPM5-2B, Muse Glimmer 30B, Nemotron 3.5 30B |
+| 1 × 256 | 1 | turbo4 | `LLAMA_TURBOT_AUTO_BUDGET=turbo5p` | — |
+
+The head-size-128 shapes run on 16 new CUDA flash-attention kernels. Every shape can also run as several KV streams (`-np N` without `--kv-unified`, one tier per stream) and on the full-attention layers of an iSWA model.
+
+**Not covered.** These still step down the chain, and the warning line says why:
+- head sizes other than 128 and 256, and rows above 1024 values (8 × 256, 16 × 128);
+- K and V heads of different sizes, MLA, shared cells, and archs without the turbo query rotation;
+- all-SWA models, and the SWA layers of an iSWA model (they take turbo5p, turbo5p512 or turbo4);
+- KV anywhere but a CUDA GPU of the Turing generation or newer: Vulkan, Metal, ROCm, or KV layers moved to the CPU with `TURBO_KV_CPU_LAYERS`;
+- the DFlash2 and MTP draft contexts;
+- context shift (`seq_add` / `seq_div`), which turbot has never supported.
+
+The automatic plan is uncalibrated: it uses the same 4/5-bit split on every layer. A calibrated plan for another model can go next to the model as a verified sidecar. `tools/turbot/turbot_guard.py --plan <file> --sidecar` measures the plan against the fallback type and stamps it only when it passes.
 
 **Default policy.** `-ctk turbot -ctv turbot` keeps turbot for a model only when the model meets the rules in the table above and has a plan. Everything else steps down the usual chain (turbot → turbo5p / turbo5p512 → turbo4 → q8_0 → f16), with one warning per step. The plan comes from, in this order: `--kv-tier-plan` / `LLAMA_TURBOT_PLAN`; a sidecar `<model>.turbot.plan` with a `# verified:` stamp and a matching `# model:` fingerprint; the built-in plan when it names exactly the model's attention layers and shape; the automatic plan. The DFlash2 and MTP draft contexts never use turbot.
 
@@ -679,6 +708,31 @@ Speed and quality for these models are **not measured**. TESTING.md section 9 (G
 `LLAMA_KV_RESOLVE=0` and `LLAMA_TURBOT=0` keep their meaning. With the resolver off, the cache uses the old plan precedence plus the explicit `auto` keyword only.
 
 The build option `-DGGML_CUDA_FA_TURBOT_D128=OFF` leaves out the 16 head-size-128 turbot kernels (shorter CUDA build). Head-size-128 models then step down to their fallback type: the CUDA backend tells the resolver which shapes it can run.
+
+### Slot files keep their context checkpoints
+
+> **Status, 2026-09-22: committed (`6e505dbcc`), not built or measured. GPU results are pending.**
+
+`/slots/{id}?action=save` and `?action=restore` (with `--slot-save-path`) now also carry the slot's context checkpoints (`[TAG_SLOT_FILE_CKPT]`, `tools/server/server-context.cpp`).
+
+This matters for hybrid models such as Qwen3.8-27B:
+- The server always evaluates at least one prompt token, so reusing a saved prompt needs the model state from at least one token earlier.
+- The Gated DeltaNet state cannot be rolled back. Only a context checkpoint gives that earlier state.
+- The live slot and the RAM prompt cache (`--cache-ram`) already kept checkpoints. A slot file did not, so the first request after a restore processed the whole prompt again.
+
+What changes:
+- **Save.** The file gets a versioned section after the state. It holds the checkpoints, each with its own checksum, and the draft model's sequence state when one is loaded (DFlash2, MTP).
+- **Restore.** The slot gets the checkpoints back, up to the same limits a live slot has (`--ctx-checkpoints`, and `LLAMA_CTX_CHECKPOINT_BUDGET_MIB`, whose default of 2048 MiB allows 13 checkpoints on Qwen3.8-27B). The next request that re-sends the prompt only processes the tokens after the newest checkpoint, the same as after a RAM prompt cache hit. That is expected to be about 4 tokens. The draft sequence is restored too. When the saved draft state does not fit the loaded draft model, the draft sequence starts empty.
+- **Safety.** The section is bound to its file (state size, prompt tokens) and to the loaded models. A section that does not match, or that fails a checksum, is ignored with one warning; the restore still succeeds and the prompt is processed in full, as before.
+- **Compatibility.** Older servers read the new files and ignore the section. Old files restore exactly as before. A slot with no checkpoints and no draft model writes a file byte-identical to the old format.
+- **Size.** Each checkpoint adds 149.6 MiB to the file on Qwen3.8-27B, about 1.9 GiB for 13. The save hashes it on the main loop, which is estimated (not measured) to pause the server for 1-3 s per save. `LLAMA_SLOT_FILE_CKPT_KEEP` limits this.
+
+| Variable | Default | Effect |
+|:--|:--|:--|
+| `LLAMA_SLOT_FILE_CKPT` | `1` | `0`: a save appends nothing and a restore ignores any section, as before. |
+| `LLAMA_SLOT_FILE_CKPT_KEEP` | all | A save writes only the newest N checkpoints. `0` keeps the draft state but writes no checkpoints. |
+
+No kernel, KV cache or turbot code changes: the restored checkpoints are the same bytes the live slot would hold, loaded by the existing checkpoint restore. `tools/server/README.md` has the file format. Pending on the GPU: the `save_restore` arm of `tools/turbot/blob_roundtrip.py`, where the expected result is about 4 prompt tokens after the restore with identical output tokens, plus the old-file, corruption and `LLAMA_SLOT_FILE_CKPT=0` checks.
 
 ### Vision: pick the device
 
@@ -745,7 +799,7 @@ Upstream removed `--mmap`, `--no-mmap`, `--mlock` and `--direct-io` / `--no-dire
 
 ### New switches on the sync branch
 
-Every switch defaults to the new behaviour. The defaults are what the measurements in the status note above ran with; the fused GDN norm is bit-identical to the unfused one (same KLD to six digits). The switches of turbot on other shapes (`LLAMA_TURBOT_ANY` and the rest) are listed under "turbot on other models" above; they are not measured yet.
+Every switch defaults to the new behaviour. The defaults are what the measurements in the status note above ran with; the fused GDN norm is bit-identical to the unfused one (same KLD to six digits). Two sets of switches are listed elsewhere and are not measured yet: turbot on other shapes (`LLAMA_TURBOT_ANY` and the rest) under "turbot on other models", and `LLAMA_SLOT_FILE_CKPT` / `LLAMA_SLOT_FILE_CKPT_KEEP` under "Slot files keep their context checkpoints".
 
 | Variable | Default | Effect when set |
 |:--|:--|:--|
@@ -1114,7 +1168,7 @@ Long-context throughput on a single RTX 5090: holding a full 262,144-token conte
 - **Prefill attention has headroom, but not from tuning.** The MMA config is swept out — `ncols2` and `nbatch_fa` won, `nthreads`, `occupancy` and `ncols1` all lose. Attention is 77% of prefill at depth at ~101 TFLOPS. Further gain needs kernel work.
 - **Wide-Q native turbo reads.** Prefill still uses F16 conversion, because it amortises across many Q tiles. Measured: an `f16` cache prefills only ~3% faster, so the conversion is close to free and this is not a promising lever.
 - **turbot prefill.** The tiered cache still prefills 4-8% slower than turbo5p at depth. Two-token verify batches now run the `<4,8>` instance (+3.6% / +4.8% at 131K / 245K).
-- **turbot on other models.** The built-in plan is calibrated for Qwen3.8-27B's attention layers, so other models fall back to turbo5p / turbo4. A per-model plan needs a calibration run.
+- **turbot on other models.** turbot now takes six KV shapes, with an automatic plan for models that do not match the built-in one (see [turbot on other models](#turbot-on-other-models)). This is not built or measured yet; the GPU gates are pending. The automatic plan is uncalibrated, so a calibrated per-model plan still needs a calibration run. It can then ship as a verified sidecar.
 
 ---
 
