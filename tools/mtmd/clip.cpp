@@ -178,7 +178,18 @@ struct clip_ctx {
     std::mt19937 rng{std::random_device{}()};
     uint32_t rng_seed = UINT32_MAX;
 
+    // [TAG_MTMD_DEVICE_FALLBACK] what a CPU copy of this context is built from: the mmproj path and the params
+    // given to clip_init. cpu_twin is that copy, loaded on first use from the file (the weights of this context
+    // may sit in a GPU buffer). cpu_only: the device failed an encode, every encode now runs on cpu_twin.
+    // backend_abandoned: backend is that failed device; it is never freed, because its teardown waits on it.
+    std::string fname;
+    clip_context_params init_params = {};
+    clip_ctx * cpu_twin = nullptr;
+    bool cpu_only = false;
+    bool backend_abandoned = false;
+
     clip_ctx(clip_context_params & ctx_params) {
+        init_params = ctx_params;
         flash_attn_type = ctx_params.flash_attn_type;
         no_alloc = ctx_params.no_alloc;
         backend_cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
@@ -229,7 +240,11 @@ struct clip_ctx {
     }
 
     ~clip_ctx() {
-        ggml_backend_free(backend);
+        delete cpu_twin;
+        // [TAG_MTMD_DEVICE_FALLBACK] a backend abandoned after a failed encode is not freed (see backend_abandoned)
+        if (!backend_abandoned) {
+            ggml_backend_free(backend);
+        }
         if (backend != backend_cpu) {
             ggml_backend_free(backend_cpu);
         }
@@ -3989,6 +4004,7 @@ struct clip_init_result clip_init(const char * fname, struct clip_context_params
 
         if (loader.has_vision) {
             ctx_vision = new clip_ctx(ctx_params);
+            ctx_vision->fname = fname; // [TAG_MTMD_DEVICE_FALLBACK]
             loader.load_hparams(ctx_vision->model, CLIP_MODALITY_VISION);
             loader.load_tensors(*ctx_vision);
             loader.init_ctx(*ctx_vision);
@@ -4003,6 +4019,7 @@ struct clip_init_result clip_init(const char * fname, struct clip_context_params
 
         if (loader.has_audio && !skip_audio) {
             ctx_audio = new clip_ctx(ctx_params);
+            ctx_audio->fname = fname; // [TAG_MTMD_DEVICE_FALLBACK]
             loader.load_hparams(ctx_audio->model, CLIP_MODALITY_AUDIO);
             loader.load_tensors(*ctx_audio);
             loader.init_ctx(*ctx_audio);
@@ -4434,7 +4451,15 @@ static std::vector<c2w_state_slot> list_gen_state_slots(const clip_hparams & hpa
     }
 }
 
-bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
+// [TAG_MTMD_DEVICE_FALLBACK] where clip_encode_impl stopped. A failure after the graph is built (allocation,
+// input upload, compute, output download) is a failure of the device; a rejected input or a graph builder that
+// throws is not, and never moves the context to the CPU.
+struct clip_encode_status {
+    bool graph_built   = false; // the graph builder returned; an exception after this comes from the backend
+    bool device_failed = false; // graph allocation or graph compute returned an error
+};
+
+static bool clip_encode_impl(struct clip_ctx * ctx, struct clip_encode_params * params, clip_encode_status * st) {
     const clip_image_f32_batch & imgs = *params->imgs;
     int n_batch_cur = imgs.entries.size();
 
@@ -4457,8 +4482,10 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
     // build the inference graph
     ggml_backend_sched_reset(ctx->sched.get());
     ggml_cgraph * gf = clip_get_graph_builder(ctx, imgs, params)->build();
+    st->graph_built = true;
     if (!ggml_backend_sched_alloc_graph(ctx->sched.get(), gf)) {
         LOG_ERR("%s: failed to allocate compute graph\n", __func__);
+        st->device_failed = true;
         return false;
     }
 
@@ -5773,6 +5800,7 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
     auto status = ggml_backend_sched_graph_compute(ctx->sched.get(), gf);
     if (status != GGML_STATUS_SUCCESS) {
         LOG_ERR("%s: ggml_backend_sched_graph_compute failed with error %d\n", __func__, status);
+        st->device_failed = true;
         return false;
     }
 
@@ -5930,6 +5958,176 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
     }
 
     return true;
+}
+
+// [TAG_MTMD_DEVICE_FALLBACK] An encoder that survives its device.
+//
+// Measured: with -mmdev igpu (Vulkan, 2-CU AMD iGPU) a ~4000-token Qwen3.8 image encode lost the Vulkan device after
+// ~11 s (Windows TDR, LiveKernelEvent 141). The request failed and the projector stayed unusable for the rest of the
+// process. Now, when an encode fails on a non-CPU device (graph allocation or compute returns an error, or the backend
+// throws, as ggml-vulkan does with vk::DeviceLostError), the context moves to the CPU for good: a CPU copy of the
+// context (cpu_twin) reads the weights again from the mmproj file, the device's weight and compute buffers are freed,
+// and the same encode runs once more on the CPU, so the request still succeeds. One warning says so. The fallback
+// lives here, below mtmd_encode, so the server's async encoder thread gets it too.
+//
+// Proactive guard: on an integrated GPU, an image of more than MTMD_IGPU_MAX_TOKENS output tokens (default 1536,
+// 0 = off) is encoded on the CPU copy directly, and smaller images stay on the iGPU. Measured: 1066 tokens took 44 s
+// on the iGPU and 4.7 s on the CPU. The CPU copy then stays loaded (one more copy of the weights in RAM).
+//
+// Not covered, unchanged: CUDA (and ROCm, MUSA), which abort on a device error instead of returning it; gen-audio
+// contexts; no_alloc contexts. MTMD_DEVICE_FALLBACK=0 turns both the fallback and the guard off.
+static bool clip_device_fallback_enabled() {
+    static const bool enabled = [] {
+        const char * e = std::getenv("MTMD_DEVICE_FALLBACK");
+        return !(e != nullptr && std::atoi(e) == 0);
+    }();
+    return enabled;
+}
+
+static int clip_igpu_max_tokens() {
+    static const int n = [] {
+        const char * e = std::getenv("MTMD_IGPU_MAX_TOKENS");
+        if (e == nullptr || *e == '\0') {
+            return 1536;
+        }
+        return std::max(0, std::atoi(e));
+    }();
+    return n;
+}
+
+static bool clip_device_fallback_eligible(const clip_ctx * ctx) {
+    if (!clip_device_fallback_enabled() || ctx->no_alloc || ctx->fname.empty()) {
+        return false;
+    }
+    if (ctx->model.modality != CLIP_MODALITY_VISION && ctx->model.modality != CLIP_MODALITY_AUDIO) {
+        return false;
+    }
+    if (ctx->cpu_only) {
+        return true;
+    }
+    if (ctx->backend == nullptr || ctx->backend == ctx->backend_cpu) {
+        return false;
+    }
+    ggml_backend_dev_t dev      = ggml_backend_get_device(ctx->backend);
+    ggml_backend_reg_t reg      = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+    const char *       reg_name = reg ? ggml_backend_reg_name(reg) : nullptr;
+    if (reg_name == nullptr) {
+        return false;
+    }
+    return strcmp(reg_name, "CUDA") != 0 && strcmp(reg_name, "ROCm") != 0 && strcmp(reg_name, "MUSA") != 0;
+}
+
+// the CPU copy of ctx, loaded from the mmproj file on first use; nullptr when it cannot be loaded
+static clip_ctx * clip_get_cpu_twin(clip_ctx * ctx) {
+    if (ctx->cpu_twin != nullptr) {
+        return ctx->cpu_twin;
+    }
+    clip_context_params p = ctx->init_params;
+    p.use_gpu                     = false;
+    p.device                      = nullptr;
+    p.warmup                      = false; // the first encode reserves the compute buffers for its own batch
+    p.no_alloc                    = false;
+    p.progress_callback           = nullptr;
+    p.progress_callback_user_data = nullptr;
+
+    LOG_INF("%s: loading a CPU copy of the %s encoder from %s\n", __func__,
+            ctx->model.modality == CLIP_MODALITY_AUDIO ? "audio" : "vision", ctx->fname.c_str());
+    clip_ctx * twin = nullptr;
+    try {
+        clip_model_loader loader(ctx->fname.c_str());
+        twin = new clip_ctx(p);
+        twin->fname = ctx->fname;
+        loader.load_hparams(twin->model, ctx->model.modality);
+        loader.load_tensors(*twin);
+        clip_model_loader::init_ctx(*twin);
+    } catch (const std::exception & e) {
+        LOG_ERR("%s: failed to load the CPU copy of the encoder from %s: %s\n", __func__, ctx->fname.c_str(), e.what());
+        delete twin;
+        return nullptr;
+    }
+    ctx->cpu_twin = twin;
+    return twin;
+}
+
+static bool clip_encode_on_cpu_twin(const clip_ctx * ctx, clip_ctx * twin, struct clip_encode_params * params) {
+    twin->debug_output_embeddings = ctx->debug_output_embeddings;
+    clip_encode_status st;
+    return clip_encode_impl(twin, params, &st);
+}
+
+bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
+    if (!clip_device_fallback_eligible(ctx)) {
+        clip_encode_status st;
+        return clip_encode_impl(ctx, params, &st);
+    }
+
+    // [TAG_MTMD_DEVICE_FALLBACK] the device failed an earlier encode
+    if (ctx->cpu_only) {
+        return clip_encode_on_cpu_twin(ctx, ctx->cpu_twin, params);
+    }
+
+    // [TAG_MTMD_DEVICE_FALLBACK] proactive guard: a large image on an iGPU is encoded on the CPU
+    const int igpu_max_tokens = clip_igpu_max_tokens();
+    const auto & entries = params->imgs->entries;
+    if (igpu_max_tokens > 0 && ctx->model.modality == CLIP_MODALITY_VISION && !entries.empty() &&
+        ggml_backend_dev_type(ggml_backend_get_device(ctx->backend)) == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+        int n_tokens = clip_n_output_tokens(ctx, &entries[0]);
+        if (ctx->support_batch) {
+            n_tokens = 0;
+            for (const auto & entry : entries) {
+                n_tokens += clip_n_output_tokens(ctx, &entry);
+            }
+        }
+        if (n_tokens > igpu_max_tokens) {
+            clip_ctx * twin = clip_get_cpu_twin(ctx);
+            if (twin != nullptr) {
+                LOG_INF("%s: image of %d tokens is above MTMD_IGPU_MAX_TOKENS=%d, encoding it on the CPU instead of %s\n",
+                        __func__, n_tokens, igpu_max_tokens, ggml_backend_name(ctx->backend));
+                return clip_encode_on_cpu_twin(ctx, twin, params);
+            }
+        }
+    }
+
+    clip_encode_status st;
+    std::string reason;
+    try {
+        if (clip_encode_impl(ctx, params, &st)) {
+            return true;
+        }
+        if (!st.device_failed) {
+            return false; // the input was rejected, the device is fine
+        }
+        reason = "graph allocation or compute returned an error";
+    } catch (const std::exception & e) {
+        if (!st.graph_built) {
+            throw; // the graph builder rejected the input, not a device failure
+        }
+        reason = e.what();
+    } catch (...) {
+        if (!st.graph_built) {
+            throw;
+        }
+        reason = "unknown exception";
+    }
+
+    const std::string dev_name = ggml_backend_name(ctx->backend);
+    LOG_WRN("%s: WARNING: the %s encoder failed on %s (%s); it runs on the CPU from now on, retrying this encode on the CPU\n",
+            __func__, ctx->model.modality == CLIP_MODALITY_AUDIO ? "audio" : "vision", dev_name.c_str(), reason.c_str());
+
+    clip_ctx * twin = clip_get_cpu_twin(ctx);
+    if (twin == nullptr) {
+        LOG_ERR("%s: no CPU copy of the encoder, this encode fails\n", __func__);
+        return false;
+    }
+
+    // free what the failed device holds; the backend itself is abandoned, not freed (see clip_ctx::backend_abandoned)
+    ctx->sched.reset();
+    ctx->buf.reset();
+    ctx->is_allocated      = false;
+    ctx->backend_abandoned = true;
+    ctx->cpu_only          = true;
+
+    return clip_encode_on_cpu_twin(ctx, twin, params);
 }
 
 int clip_n_mmproj_embd(const struct clip_ctx * ctx) {
