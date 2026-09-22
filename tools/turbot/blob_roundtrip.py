@@ -104,7 +104,7 @@ def base_cmd(args, unified=None):
         out += ["--kv-unified" if unified else "--no-kv-unified"]
         env = dict(env)
         env.pop("LLAMA_ARG_KV_UNIFIED", None)
-    return out + ["--port", str(PORT)], env
+    return out + ["-lv", "4", "--port", str(PORT)], env   # libllama info (check_kv's "turbot plan" line) shows from -lv 4
 
 
 class Server:

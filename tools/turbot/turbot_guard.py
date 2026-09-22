@@ -287,7 +287,7 @@ def matches_builtin(shape):
 def arm_argv(args, model, corpus_path, kv, dat, kl, plan=None):
     argv = ["-m", model, "-f", corpus_path, "-c", str(args.ctx), "--chunks", str(args.cur_chunks), "-ngl", "999",
             "-fa", "on", "-b", "2048", "-ub", str(args.ub), "--threads", str(args.threads), "-ctk", kv, "-ctv", kv,
-            "--kl-divergence-base", dat]
+            "--kl-divergence-base", dat, "-lv", "4"]   # libllama info (size, plan, fingerprint lines) shows from -lv 4
     if kl:
         argv.append("--kl-divergence")
     if plan:
