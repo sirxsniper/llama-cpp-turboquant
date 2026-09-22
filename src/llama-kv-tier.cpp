@@ -1024,10 +1024,19 @@ bool llama_turbot_plan_choose(const llama_turbot_cache_shape & shape, llama_turb
         }
     }
 
-    // 3. the built-in plan, when it names exactly these layers with their geometry
+    // 3. the built-in plan, when it names exactly these layers with their geometry. [TAG_TURBOT_BUILTIN_GEOM] It is written
+    // for 4 KV heads x 256 only; for any other shape say so instead of reporting its L lines as malformed.
     std::string why_builtin;
     text = LLAMA_TURBOT_DEFAULT_PLAN_TEXT;
-    if (llama_turbot_plan_parse_impl(text, LLAMA_TURBOT_PLAN_BUILTIN_NAME, shape, plan, why_builtin, /*quiet =*/ true)) {
+    bool builtin_geom = !shape.layers.empty();
+    for (const auto & g : shape.layers) {
+        builtin_geom = builtin_geom && g.head_dim == 256 && g.n_head_kv == 4;
+    }
+    if (!builtin_geom) {
+        why_builtin = format("the built-in plan is for 4 KV heads x 256 (Qwen3.8-27B); this cache has %u x %u",
+                shape.layers.empty() ? 0u : (unsigned) shape.layers[0].n_head_kv,
+                shape.layers.empty() ? 0u : (unsigned) shape.layers[0].head_dim);
+    } else if (llama_turbot_plan_parse_impl(text, LLAMA_TURBOT_PLAN_BUILTIN_NAME, shape, plan, why_builtin, /*quiet =*/ true)) {
         choice.kind = LLAMA_TURBOT_PLAN_KIND_BUILTIN;
         choice.text = text;
         choice.name = LLAMA_TURBOT_PLAN_BUILTIN_NAME;
