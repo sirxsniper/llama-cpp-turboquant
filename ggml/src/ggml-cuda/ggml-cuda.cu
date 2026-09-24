@@ -32,6 +32,7 @@
 #include "ggml-cuda/im2col.cuh"
 #include "ggml-cuda/mmf.cuh"
 #include "ggml-cuda/mmq.cuh"
+#include "ggml-cuda/mmsb.cuh"   // [TAG_MMSB] [TAG_SMALLB]
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
 #include "ggml-cuda/moe-weighted-reduction.cuh"
@@ -1888,6 +1889,13 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     }
     if (ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, ne11, /*mul_mat_id =*/ false)) {
         ggml_cuda_mul_mat_f(ctx, src0, src1, nullptr, dst);
+        return;
+    }
+    // [TAG_MMSB] [TAG_SMALLB] 2..16-column Q4_K/Q5_K/Q6_K/Q8_0 matmuls on the int8 tensor cores (mmsb.cu), ahead of
+    // MMVQ/MMQ. By default MMVQ keeps every width it takes today, so this only replaces MMQ at the multi-stream verify
+    // widths; MMQ itself is unchanged (prefill). GGML_CUDA_SMALLB=0 restores today's dispatch exactly.
+    if (ggml_cuda_should_use_mmsb(src0, src1, dst, cc)) {
+        ggml_cuda_mul_mat_sb(ctx, src0, src1, dst);
         return;
     }
     if (ggml_cuda_should_use_mmvq(src0->type, cc, ne11, /*ne01 =*/ src0->ne[1])) {

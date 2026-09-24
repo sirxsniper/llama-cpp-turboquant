@@ -12011,6 +12011,36 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // [TAG_MMSB] [TAG_SMALLB] the 2..16-column tensor-core matmul (ggml-cuda/mmsb.cu). n = 1..17 crosses every routing
+    // edge at the model's thin shapes (MMVQ below the per-type ceiling, MMSB up to 16, MMQ at 17; GGML_CUDA_SMALLB_MIN=2
+    // moves the lower edge to 2). m = 40 and 1023 leave a partial 16-row tile; k = 256 and 768 give fewer 128-value
+    // units than warps (empty K ranges); m = 48 is the ssm_alpha/ssm_beta shape. The large shapes cover every row-group
+    // count (RG 4: 10240/12288, RG 2: 5120 on a 170-SM card); m = 10200 is RG 4 with a half-empty last block and a
+    // partial tile. The last cases have a row stride larger than the row (k_v = 5376: nb01 != row size, b is a view too).
+    {
+        struct mmsb_mk { int64_t m; int64_t k; };
+        const mmsb_mk mmsb_small[] = {{48, 5120}, {1024, 5120}, {40, 768}, {1023, 256}};
+        const mmsb_mk mmsb_large[] = {{10240, 5120}, {12288, 5120}, {5120, 6144}, {5120, 17408}};
+        for (ggml_type ta : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0}) {
+            for (int n = 1; n <= 17; ++n) {
+                for (const mmsb_mk & mk : mmsb_small) {
+                    test_cases.emplace_back(new test_mul_mat(ta, GGML_TYPE_F32, mk.m, n, mk.k, {1, 1}, {1, 1}));
+                }
+            }
+            for (int n : {2, 4, 6, 9, 13, 16}) {
+                for (const mmsb_mk & mk : mmsb_large) {
+                    test_cases.emplace_back(new test_mul_mat(ta, GGML_TYPE_F32, mk.m, n, mk.k, {1, 1}, {1, 1}));
+                }
+            }
+            for (int n : {7, 16}) {
+                test_cases.emplace_back(new test_mul_mat(ta, GGML_TYPE_F32, 10200, n, 5120, {1, 1}, {1, 1}));
+            }
+            for (int n : {6, 12}) {
+                test_cases.emplace_back(new test_mul_mat(ta, GGML_TYPE_F32, 1024, n, 5120, {1, 1}, {1, 1}, {0, 1, 2, 3}, 5376));
+            }
+        }
+    }
+
 #if 0
     {
         // Test paths in OpenCL
@@ -13499,6 +13529,46 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    // [TAG_MMSB] [TAG_SMALLB] per-op A/B of the small-batch matmul (GGML_CUDA_SMALLB=0 against the default, and
+    // GGML_CUDA_SMALLB_MIN=2 for n = 2..5): the Qwen3.8-27B UD-Q5_K_XL weights at the verify widths of 1..4 streams
+    // (n = 4 per stream with DFlash2 n_max 3). Shapes under the 96 MB L2 of sm_120 rerun from L2 in the perf loop, so
+    // they rank kernels only; the two cases larger than L2 (245 MB, 292 MB) are the absolute GB/s numbers. Then the
+    // DFlash2 drafter (Q8_0) at 3 and 4 streams.
+    {
+        struct mmsb_perf_shape { ggml_type type; int64_t m; int64_t k; };
+        const mmsb_perf_shape target_shapes[] = {
+            {GGML_TYPE_Q5_K,  17408,  5120},   // ffn gate/up
+            {GGML_TYPE_Q6_K,   5120, 17408},   // ffn_down
+            {GGML_TYPE_Q5_K,  10240,  5120},   // attn_qkv
+            {GGML_TYPE_Q5_K,   6144,  5120},   // attn_gate
+            {GGML_TYPE_Q6_K,   5120,  6144},   // ssm_out / attn_output
+            {GGML_TYPE_Q6_K,  12288,  5120},   // attn_q
+            {GGML_TYPE_Q6_K,   1024,  5120},   // attn_k
+            {GGML_TYPE_Q8_0,   1024,  5120},   // attn_v
+            {GGML_TYPE_Q5_K,     48,  5120},   // ssm_alpha
+            {GGML_TYPE_Q4_K,     48,  5120},   // ssm_beta
+            {GGML_TYPE_Q6_K, 248320,  5120},   // LM head
+            {GGML_TYPE_Q5_K,  69632,  5120},   // larger than L2 (245 MB)
+            {GGML_TYPE_Q6_K,  20480, 17408},   // larger than L2 (292 MB)
+        };
+        for (int64_t n : {1, 2, 4, 5, 6, 8, 9, 12, 16}) {
+            for (const mmsb_perf_shape & s : target_shapes) {
+                test_cases.emplace_back(new test_mul_mat(s.type, GGML_TYPE_F32, s.m, n, s.k, {1, 1}, {1, 1}));
+            }
+        }
+        const mmsb_perf_shape drafter_shapes[] = {
+            {GGML_TYPE_Q8_0,  17408,  5120},
+            {GGML_TYPE_Q8_0,   5120, 17408},
+            {GGML_TYPE_Q8_0,   4096,  5120},
+            {GGML_TYPE_Q8_0, 248320,   256},
+        };
+        for (int64_t n : {12, 16}) {
+            for (const mmsb_perf_shape & s : drafter_shapes) {
+                test_cases.emplace_back(new test_mul_mat(s.type, GGML_TYPE_F32, s.m, n, s.k, {1, 1}, {1, 1}));
+            }
+        }
+    }
 
     // ---- Qwen3.8-27B (qwen35) PREFILL-scale coverage -----------------------
     // The perf list only exercised n<=5 (decode). Prefill is where the gap to
