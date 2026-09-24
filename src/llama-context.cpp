@@ -5829,6 +5829,10 @@ llama_batch_ext & llama_context::batch_compat_get() {
     }
     batch_compat->clear();
     batch_compat->mem = memory.get();
+    // llama_batch_ext::clear() keeps n_embd, and llama_batch_compat::init only sets it for embd batches: without this
+    // a token-only batch would inherit the previous call's row width, and encode/decode reject a width that is not
+    // their input width (e.g. a token encode after an embd decode where n_embd_inp_enc != n_embd_inp)
+    batch_compat->n_embd = 0;
 
     return *batch_compat;
 }
