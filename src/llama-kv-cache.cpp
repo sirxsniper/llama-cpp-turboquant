@@ -4213,34 +4213,59 @@ void llama_kv_cache_context::set_input_k_shift(ggml_tensor * dst) const {
 }
 
 void llama_kv_cache_context::set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const {
+    // [TAG_KV_NO_LAYERS] a graph without attention layers does not use (or allocate) the attention inputs
+    if (dst == nullptr || dst->buffer == nullptr) {
+        return;
+    }
     kv->set_input_k_idxs(dst, ubatch, sinfos[i_cur]);
 }
 
 void llama_kv_cache_context::set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const {
+    if (dst == nullptr || dst->buffer == nullptr) { // [TAG_KV_NO_LAYERS]
+        return;
+    }
     kv->set_input_v_idxs(dst, ubatch, sinfos[i_cur]);
 }
 
 void llama_kv_cache_context::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
+    if (dst == nullptr || dst->buffer == nullptr) { // [TAG_KV_NO_LAYERS]
+        return;
+    }
     kv->set_input_kq_mask(dst, ubatch, causal_attn);
 }
 
 void llama_kv_cache_context::set_input_kv_pos(ggml_tensor * dst, const llama_ubatch * ubatch) const {
+    if (dst == nullptr || dst->buffer == nullptr) { // [TAG_KV_NO_LAYERS]
+        return;
+    }
     kv->set_input_kv_pos(dst, ubatch);
 }
 
 void llama_kv_cache_context::set_input_q_pos(ggml_tensor * dst, const llama_ubatch * ubatch) const {
+    if (dst == nullptr || dst->buffer == nullptr) { // [TAG_KV_NO_LAYERS]
+        return;
+    }
     kv->set_input_q_pos(dst, ubatch);
 }
 
 void llama_kv_cache_context::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {
+    if (dst == nullptr || dst->buffer == nullptr) { // [TAG_KV_NO_LAYERS]
+        return;
+    }
     kv->set_input_pos_bucket(dst, ubatch);
 }
 
 void llama_kv_cache_context::set_input_k_rot(ggml_tensor * dst) const {
+    if (dst == nullptr || dst->buffer == nullptr) { // [TAG_KV_NO_LAYERS]
+        return;
+    }
     kv->set_input_k_rot(dst);
 }
 
 void llama_kv_cache_context::set_input_v_rot(ggml_tensor * dst) const {
+    if (dst == nullptr || dst->buffer == nullptr) { // [TAG_KV_NO_LAYERS]
+        return;
+    }
     kv->set_input_v_rot(dst);
 }
 

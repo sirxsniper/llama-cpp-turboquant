@@ -344,7 +344,8 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
                 // pending rollback is single-use
                 const bool pending = rs_idx[seq_id] != 0;
                 // [TAG_4C_GDN_REPLAY] only the last n_rb tokens have a ring entry and a valid conv group
-                const bool in_ring = !replay || rollback <= (llama_pos) cell.n_rb;
+                // [TAG_RS_SNAP_DEPTH] the snapshot layout has valid groups for the last n_rb tokens too
+                const bool in_ring = rollback <= (llama_pos) cell.n_rb;
                 if (!pending && in_ring && rollback >= 1 && rollback <= (llama_pos) n_rs_seq) {
                     set_rs_idx(seq_id, (uint32_t) rollback);
                     cell.pos = p0 - 1;
@@ -1514,11 +1515,9 @@ bool llama_memory_recurrent::state_read_data(llama_io_read_i & io, uint32_t cell
 
     // [TAG_4C_GDN_REPLAY] old-format data is a materialized state: the committed state with an empty ring. Only conv
     //   group 0 is restored, so no rollback before the next ubatch.
-    if (replay) {
-        for (uint32_t i = 0; i < cell_count; ++i) {
-            cells[head + i].n_ring = fmt_ring ? ring_live[i] : 0;
-            cells[head + i].n_rb   = 0;
-        }
+    for (uint32_t i = 0; i < cell_count; ++i) {
+        cells[head + i].n_ring = replay && fmt_ring ? ring_live[i] : 0;
+        cells[head + i].n_rb   = 0;
     }
 
     return true;
@@ -1631,6 +1630,11 @@ int32_t llama_memory_recurrent_context::s_copy(int i) const {
         cell.n_rpl  = cell.n_ring >= idx ? cell.n_ring - idx : 0;
         cell.n_ring = is_main ? mem->rs_n_w : cell.n_rpl;
         cell.n_rb   = is_main ? mem->rs_n_w : (idx > 0 ? 0 : std::min(cell.n_rb, cell.n_ring));
+    } else {
+        // [TAG_RS_SNAP_DEPTH] a main cell has groups for the last rs_n_w tokens, an extra that folds a rollback has none
+        auto & cell = mem->cells[cell_idx];
+        const bool is_main = (uint32_t) i < mem->rs_n_main;
+        cell.n_rb = is_main ? mem->rs_n_w : (idx > 0 ? 0 : cell.n_rb);
     }
 
     return (int32_t)(idx * mem->size) + src0;

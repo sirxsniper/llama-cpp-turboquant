@@ -130,7 +130,7 @@ bool llm_graph_input_embd_h::can_reuse(const llm_graph_params & params) {
 }
 
 void llm_graph_input_pos::set_input(const llama_ubatch * ubatch) {
-    if (ubatch->pos && pos) {
+    if (ubatch->pos && pos && pos->buffer) { // [TAG_KV_NO_LAYERS] no attention layer, no position input
         const int64_t n_tokens = ubatch->n_tokens;
 
         if (ubatch->token && n_pos_per_embd == 4) {
