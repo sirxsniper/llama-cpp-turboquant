@@ -471,8 +471,17 @@ void ggml_cuda_op_gated_delta_net_fused_cache(
 // The per-token state update is the scalar-gate path of gated_delta_net_cuda, same expressions in the same order, so a
 // token replayed from the ring gives the state bits it gave as a new token, and new tokens give the same outputs.
 // gated_delta_net_cuda itself is not changed: GDN_REPLAY=0 runs exactly the old kernel.
+// Registers: with a minimum of 2 blocks per SM nvcc gave this kernel up to 96 registers (the snapshot kernel gets 40),
+// so an SM held 5 blocks instead of 12 and one sequence's 48 heads x 32 column blocks took two waves on a 170-SM
+// RTX 5090. A minimum of 12 blocks of 128 threads caps it at 40, with no spills (cuobjdump -res-usage, sm_120a).
+// HIP and MUSA keep the old bound.
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+#define GDN_REPLAY_MIN_BLOCKS 2
+#else
+#define GDN_REPLAY_MIN_BLOCKS 12
+#endif
 template <int S_v>
-__global__ void __launch_bounds__((ggml_cuda_get_physical_warp_size() < S_v ? ggml_cuda_get_physical_warp_size() : S_v) * 4, 2)
+__global__ void __launch_bounds__((ggml_cuda_get_physical_warp_size() < S_v ? ggml_cuda_get_physical_warp_size() : S_v) * 4, GDN_REPLAY_MIN_BLOCKS)
 gated_delta_net_replay_cuda(const float *   q,
                             const float *   k,
                             const float *   v,
@@ -557,59 +566,88 @@ gated_delta_net_replay_cuda(const float *   q,
     const int m        = min(max(ring_n[sequence], 0), n_ring);
     const int t_commit = m + (int) n_tokens - n_w;
 
-    // k of head h is written by block (h, z = 0) for h < H_k; g and beta by lane 0 of warp 0 of block z = 0
-    const bool write_k  = h_idx < H_k && blockIdx.z == 0 && threadIdx.y == 0;
-    const bool write_gb = blockIdx.z == 0 && threadIdx.y == 0 && lane == 0;
-
     if (t_commit == 0) {
         store_state(s_commit);
     }
 
-    for (int t = 0; t < m + (int) n_tokens; t++) {
-        const bool rpl = t < m;
-        const int  tn  = t - m;
+    // Two loops (replayed ring tokens, then new tokens) and the ring written after them from the inputs. One merged
+    // loop that chose its pointers per token and wrote the ring inside it made nvcc rebuild every address with 64-bit
+    // multiplies in every iteration before the loads could issue, where gated_delta_net_cuda steps its pointers; prefill
+    // runs through this kernel in replay mode and a 16K prompt was 3.5-4.4% slower than with GDN_REPLAY=0. The new-token
+    // loop is now the body of gated_delta_net_cuda. Every expression is unchanged, so the bits are too.
 
-        const float * q_t = nullptr;
-        const float * k_t;
-        const float * v_t;
-        const float * g_t;
-        const float * beta_t;
-        if (rpl) {
-            const float * sl = rin + t * slot;
-            k_t    = sl + iq1 * S_v;
-            v_t    = sl + off_v + h_idx * S_v;
-            g_t    = sl + off_g + h_idx;
-            beta_t = sl + off_b + h_idx;
+    // replayed ring tokens: the state update only, the same expressions as for a new token
+    for (int t = 0; t < m; t++) {
+        const float * sl  = rin + t * slot;
+        const float * k_t = sl + iq1 * S_v;
+
+        const float beta_val = sl[off_b + h_idx];
+
+        float k_reg[rows_per_lane];
+        if constexpr (vec4) {
+            const float4 kv4 = *(const float4 *) (k_t + lane*4);
+            k_reg[0]=kv4.x; k_reg[1]=kv4.y; k_reg[2]=kv4.z; k_reg[3]=kv4.w;
         } else {
-            q_t    = q + iq3 * sq3 + tn * sq2 + iq1 * sq1;
-            k_t    = k + iq3 * sq3 + tn * sq2 + iq1 * sq1;
-            v_t    = v + sequence * sv3 + tn * sv2 + h_idx * sv1;
-            const int64_t gb_offset = sequence * sb3 + tn * sb2 + h_idx * sb1;
-            beta_t = beta + gb_offset;
-            g_t    = g    + gb_offset;
+#pragma unroll
+            for (int r = 0; r < rows_per_lane; r++) {
+                k_reg[r] = k_t[row_of(r)];
+            }
         }
 
-        const float beta_val = *beta_t;
+        const float g_val = expf(sl[off_g + h_idx]);
+
+        // kv[col] = (S^T @ k)[col] = sum_i S[i][col] * k[i]
+        float kv_shard = 0.0f;
+#pragma unroll
+        for (int r = 0; r < rows_per_lane; r++) {
+            kv_shard += s_shard[r] * k_reg[r];
+        }
+        float kv_col = warp_reduce_sum<warp_size>(kv_shard);
+
+        // delta[col] = (v[col] - g * kv[col]) * beta
+        float delta_col = (sl[off_v + h_idx * S_v + col] - g_val * kv_col) * beta_val;
+
+        // S[i][col] = g * S[i][col] + k[i] * delta[col]
+#pragma unroll
+        for (int r = 0; r < rows_per_lane; r++) {
+            s_shard[r]  = g_val * s_shard[r] + k_reg[r] * delta_col;
+        }
+
+        if (t + 1 == t_commit) {
+            store_state(s_commit);
+        }
+    }
+
+    // new tokens: the body of gated_delta_net_cuda (scalar gate)
+    const float * q_s  = q + iq3 * sq3 + iq1 * sq1;
+    const float * k_s  = k + iq3 * sq3 + iq1 * sq1;
+    const float * v_s  = v + sequence * sv3 + h_idx * sv1;
+    const int64_t gb_s = sequence * sb3 + h_idx * sb1;
+
+    for (int tn = 0; tn < (int) n_tokens; tn++) {
+        const float * q_t = q_s + tn * sq2;
+        const float * k_t = k_s + tn * sq2;
+        const float * v_t = v_s + tn * sv2;
+
+        const float beta_val = beta[gb_s + tn * sb2];
 
         float k_reg[rows_per_lane];
         float q_reg[rows_per_lane];
         if constexpr (vec4) {
             const float4 kv4 = *(const float4 *) (k_t + lane*4);
+            const float4 qv4 = *(const float4 *) (q_t + lane*4);
             k_reg[0]=kv4.x; k_reg[1]=kv4.y; k_reg[2]=kv4.z; k_reg[3]=kv4.w;
-            if (!rpl) {
-                const float4 qv4 = *(const float4 *) (q_t + lane*4);
-                q_reg[0]=qv4.x; q_reg[1]=qv4.y; q_reg[2]=qv4.z; q_reg[3]=qv4.w;
-            }
+            q_reg[0]=qv4.x; q_reg[1]=qv4.y; q_reg[2]=qv4.z; q_reg[3]=qv4.w;
         } else {
 #pragma unroll
             for (int r = 0; r < rows_per_lane; r++) {
                 const int i = row_of(r);
                 k_reg[r] = k_t[i];
-                q_reg[r] = rpl ? 0.0f : q_t[i];
+                q_reg[r] = q_t[i];
             }
         }
 
-        const float g_val = expf(*g_t);
+        const float g_val = expf(g[gb_s + tn * sb2]);
 
         // kv[col] = (S^T @ k)[col] = sum_i S[i][col] * k[i]
         float kv_shard = 0.0f;
@@ -622,78 +660,75 @@ gated_delta_net_replay_cuda(const float *   q,
         // delta[col] = (v[col] - g * kv[col]) * beta
         float delta_col = (v_t[col] - g_val * kv_col) * beta_val;
 
-        if (rpl) {
-            // S[i][col] = g * S[i][col] + k[i] * delta[col]
+        // fused: S[i][col] = g * S[i][col] + k[i] * delta[col]
+        // attn[col] = (S^T @ q)[col] = sum_i S[i][col] * q[i]
+        float attn_partial = 0.0f;
 #pragma unroll
-            for (int r = 0; r < rows_per_lane; r++) {
-                s_shard[r]  = g_val * s_shard[r] + k_reg[r] * delta_col;
-            }
-        } else {
-            // fused: S[i][col] = g * S[i][col] + k[i] * delta[col]
-            // attn[col] = (S^T @ q)[col] = sum_i S[i][col] * q[i]
-            float attn_partial = 0.0f;
-#pragma unroll
-            for (int r = 0; r < rows_per_lane; r++) {
-                s_shard[r]  = g_val * s_shard[r] + k_reg[r] * delta_col;
-                attn_partial += s_shard[r] * q_reg[r];
-            }
-
-            float attn_col = warp_reduce_sum<warp_size>(attn_partial);
-
-            if (lane == 0) {
-                attn_data[col] = attn_col * scale;
-            }
-            attn_data += S_v * H;
-
-            // the last n_w new tokens go to ring slots 0..n_w-1
-            const int js = tn - ((int) n_tokens - n_w);
-            if (js >= 0) {
-                float * so = rout + js * slot;
-                if (lane == 0) {
-                    so[off_v + h_idx * S_v + col] = v_t[col];
-                }
-                if (write_k) {
-#pragma unroll
-                    for (int r = 0; r < rows_per_lane; r++) {
-                        so[h_idx * S_v + row_of(r)] = k_reg[r];
-                    }
-                }
-                if (write_gb) {
-                    so[off_g + h_idx] = *g_t;
-                    so[off_b + h_idx] = beta_val;
-                }
-            }
+        for (int r = 0; r < rows_per_lane; r++) {
+            s_shard[r]  = g_val * s_shard[r] + k_reg[r] * delta_col;
+            attn_partial += s_shard[r] * q_reg[r];
         }
 
-        if (t + 1 == t_commit) {
+        float attn_col = warp_reduce_sum<warp_size>(attn_partial);
+
+        if (lane == 0) {
+            attn_data[col] = attn_col * scale;
+        }
+        attn_data += S_v * H;
+
+        if (m + tn + 1 == t_commit) {
             store_state(s_commit);
         }
     }
 
-    // unused slots and the pad are zeroed so that the ring is fully defined
-    for (int js = n_w; js < n_ring; js++) {
+    // the ring: the last n_w new tokens in slots 0..n_w-1 (k | v | g | beta copied from the inputs), zeros in the
+    // unused slots. k of head h is written by block (h, z = 0) for h < H_k (there iq1 == h), g and beta by lane 0 of
+    // warp 0 of block z = 0, v by lane 0 of every warp (its column).
+    const bool write_k  = h_idx < H_k && blockIdx.z == 0 && threadIdx.y == 0;
+    const bool write_gb = blockIdx.z == 0 && threadIdx.y == 0 && lane == 0;
+    for (int js = 0; js < n_ring; js++) {
         float * so = rout + js * slot;
-        if (lane == 0) {
-            so[off_v + h_idx * S_v + col] = 0.0f;
-        }
-        if (write_k) {
-#pragma unroll
-            for (int r = 0; r < rows_per_lane; r++) {
-                so[h_idx * S_v + row_of(r)] = 0.0f;
+        if (js < n_w) {
+            const int tn = (int) n_tokens - n_w + js;
+            if (lane == 0) {
+                so[off_v + h_idx * S_v + col] = v_s[tn * sv2 + col];
             }
-        }
-        if (write_gb) {
-            so[off_g + h_idx] = 0.0f;
-            so[off_b + h_idx] = 0.0f;
+            if (write_k) {
+#pragma unroll
+                for (int r = 0; r < rows_per_lane; r++) {
+                    so[h_idx * S_v + row_of(r)] = k_s[tn * sq2 + row_of(r)];
+                }
+            }
+            if (write_gb) {
+                so[off_g + h_idx] = g[gb_s + tn * sb2];
+                so[off_b + h_idx] = beta[gb_s + tn * sb2];
+            }
+        } else {
+            if (lane == 0) {
+                so[off_v + h_idx * S_v + col] = 0.0f;
+            }
+            if (write_k) {
+#pragma unroll
+                for (int r = 0; r < rows_per_lane; r++) {
+                    so[h_idx * S_v + row_of(r)] = 0.0f;
+                }
+            }
+            if (write_gb) {
+                so[off_g + h_idx] = 0.0f;
+                so[off_b + h_idx] = 0.0f;
+            }
         }
     }
     // the pad (k of heads >= H_k when the ring is sized for repeated k) is spread over all threads of the sequence
-    const int64_t n_pad = slot - n_used;
+    const int n_pad = (int) (slot - n_used);
     if (n_pad > 0) {
-        const int64_t tid    = (((int64_t) h_idx * gridDim.z + blockIdx.z) * blockDim.y + threadIdx.y) * blockDim.x + lane;
-        const int64_t stride = (int64_t) gridDim.x * gridDim.z * blockDim.y * blockDim.x;
-        for (int64_t p = tid; p < n_ring * n_pad; p += stride) {
-            rout[(p / n_pad) * slot + n_used + p % n_pad] = 0.0f;
+        const int tid    = (int) (((h_idx * gridDim.z + blockIdx.z) * blockDim.y + threadIdx.y) * blockDim.x + lane);
+        const int stride = (int) (gridDim.x * gridDim.z * blockDim.y * blockDim.x);
+        for (int js = 0; js < n_ring; js++) {
+            float * so = rout + js * slot + n_used;
+            for (int p = tid; p < n_pad; p += stride) {
+                so[p] = 0.0f;
+            }
         }
     }
 }
