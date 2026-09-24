@@ -74,6 +74,7 @@ Pass: exit 0 and the last line is `OK`. What it checks:
 | 6 params and layout | op params roundtrip, FA bytes 0..15 untouched, bad magic, version, side or granule refused. Default plan bytes per layer equal appendix A (18,080 base, 11,616 pool per cell, 5,500,829,696 B total). Illegal widths refused. Type family traits (`blck 1024`, `type_size 32S+16`, `row_size(256) = 8S+4`) |
 | 7a plan parser | the default plan parses with the expected hash. kvfq keys ignored. Y, POOL 0 and a trailing comment accepted. Refused: unknown tag, malformed line, duplicates, widths out of range, a missing L line, a layer the cache does not hold, POOL not a multiple of 64 or above kv_size, negative CAP |
 | 7a' built-in plan ([TAG_TURBOT_EMBED_PLAN]) | the built-in text is LF with hash `0x56c3503c949a7749`. `llama_turbot_plan_matches` is true for the Qwen3.8 layers (also at kv 4096). It is false for Spark's 9 layers (the reason names layer 39), a shifted list, 17 layers and an empty list. `default` resolves to the built-in plan and `./no-such-dir/default` to a file |
+| 7a'' POOL auto ([TAG_TURBOT_POOL_AUTO]) | `POOL auto` and `POOL auto 65536` at unified n_seq_max 1 / 2 / 3 / 4 resolve to 18624 / 35136 / 51648 / 65536 cells with hashes `0x6353ed30f20f3168`, `0xffe1c6ca4132aa83`, `0xd4262394cdf8ec43` and the built-in `0x56c3503c949a7749`; auto at 1 sequence equals `POOL 18624`; the max, CAP 32768 (35008), 4 streams (74496) and the cache clamp apply; 6 malformed or duplicate POOL lines are refused. Tier scenario: 1 / 2 / 3 sequences at CAP growing by 512-row ubatches at those pools evict nothing after warm-up and keep their bands; the 2048-row counts are printed as `info:` lines (record them) |
 | 7b tier | scenarios of SPEC 11.1 item 7 driving a real `llama_kv_cells`: single-sequence band 16,384; 4 sequences at quota 16,256 with 0 evictions after warm-up; eviction order (smallest margin, never the previous ubatch's granule); empty owned slot first; release then prefill or restore with 0 evictions; 10,000-step draft loop (counter == live rows, band intact); seq_cp adoption; restore into a larger counter; stale bits; trim then fill entry; failure then abort, re-queued fill and counter rollback; `abort_restore`; POOL 0; seq id 255; determinism |
 | 8f quota ([TAG_4C_QUOTA], SPEC 9.6 water-filling) | named mixes (1 x 200K + 3 x 2K gives 2,048 per short sequence; 3 x 200K + 1 x 16,000; 20K / 40K / 60K / 100K gives 16,256 each); equal lengths give the proportional values bit for bit at every slot count; 20,000 random mixes (2,000 with `--quick`): Y <= min(CAP, n), sum Y <= N_eff, a served sequence gets all it can use, the open ones share equally; tier runs under both `TURBOT_QUOTA` modes |
 
@@ -119,7 +120,7 @@ BIN\test-backend-ops.exe test -b CUDA0 -o TURBOT_SET_ROWS -p "^turbot=" > E:\kv-
 | granule patterns | old, young, alternating, tail |
 | mask | explicit, positional (odd start, holes), none |
 | extras | sinks; softcap 30 |
-| widths | mixed (K != V, b 2 and 6, y 8) and default layer 23 |
+| widths | mixed (K != V, b 2 and 6, y 8) and default layer 23; `y8` and `y6` ([TAG_TURBOT_YOUNG_CT_EXT], every compiled (b, y) of the EXT build: 36 cases, kv 1000 / 4096, nb 1 / 4 / 512, mixes young / alt / band16k) |
 
 nb 1 and nb 2 run on the <4,8> instance (SPEC 7.6, Q ≤ 2 route). Run the FA command a second time with `$env:TURBOT_Q2_ROUTE = "0"`, which puts nb 2 back on <2,8>, and then remove the variable. Both runs must pass. With `LLAMA_TURBOT_FA_DEBUG=1` the nb 2 shapes print `ncols1=4 ncols2=8` and, with an explicit mask at kv >= 4096, `kv_scan=turbot<ncols1> wrap`.
 
@@ -543,6 +544,7 @@ The baseline is a build of commit `80f44b5d8` (the committed tree under the WP c
 |---|---|---|
 | 2.1 | `python tools\turbot\sass_diff.py BASE\bin\ggml-cuda.dll BIN\ggml-cuda.dll --arch sm_120a` (CPU only, cuobjdump) | exit 0: `IDENTICAL` for the 40 `flash_attn_ext_turbot<256,256,...>` kernels (20 instances, both softcap variants), `k_turbot_set_rows<int>` and `<int64_t>`, `k_turbot_fill` and `flash_attn_turbot_balance_bounds<4>`; `--scope turbot` for the full turbot list |
 | 2.2 | `BIN\test-backend-ops.exe test -b CUDA0 -o FLASH_ATTN_EXT -p "^turbot=[a-z0-9]+,kv="`, then `-o TURBOT_SET_ROWS -p "^turbot=[a-z0-9]+,rows="` | 195/195, with case names identical to the baseline's `-p "^turbot="` run; the Qwen writer cases pass. The plain `^turbot=` filter of sections 2b and 8 now also selects the new geometry cases, whose names carry `d=..,hkv=..,hq=..` after the widths. |
+| 2.2' | the same filters on a build with `[TAG_TURBOT_YOUNG_CT_EXT]` (2026-09-24 and later) | 231/231 FA and 36/36 writer: the 195 / 28 baseline names unchanged plus the 36 `turbot=y8,` / `turbot=y6,` FA cases and 8 writer cases. Compare names only against the baseline subset |
 | 2.3 | `BIN\test-turbot-backend.exe` on both builds | bytes identical |
 | 2.4 | `validate.ps1` (section 2d) | `GATE PASSED` |
 | 2.5 | production server: 262K, 4 slots, `--kv-unified`, turbot, DFlash2 n_max 3, port 8091 | the log shows `turbot plan <built-in default>`, hash `0x56c3503c949a7749`, and the same size lines as the baseline (`size = 5246.00 MiB ... young pool:  726.00 MiB`) |
@@ -860,3 +862,62 @@ The Ornith-35B text differs from OLD because upstream's top-k MoE fusion (`1a679
 - **OLD's llama-perplexity exit crash on Ornith-35B** was not root-caused; NEW does not crash.
 - `hrm_text` on CUDA: nmse 1.0e-5 to 1.09e-5 against the 1e-4 limit; there is no OLD CUDA baseline.
 - Not run (no local workload): `--host a,b` multi-bind, `video_url` (ffmpeg is not in PATH), sleep/wake with `/v1/messages/count_tokens`, router mode, images in a Responses `function_call_output`. Latent with no local model: the fork's 16-column FA tier bypasses sparse attention (only DeepSeek V4), a DFlash draft with `token_embd` but no `output` now uses its own head, the Mistral 4 MoE down-projection runs on the CPU under CUDA/Vulkan.
+
+---
+
+## 12. tq8 additions (branch tq8, 2026-09-24)
+
+New pieces: `POOL auto` ([TAG_TURBOT_POOL_AUTO], SPEC 9.1), the young band log line ([TAG_TURBOT_BAND_INFO], SPEC 9.4), the
+build option `GGML_CUDA_TURBOT_YOUNG_CT_EXT` ([TAG_TURBOT_YOUNG_CT_EXT], SPEC 7.4) and the llama-perplexity measurement
+options ([TAG_PPL_TQ8]). Plan files of the campaign: `docs/turbot/plans/tq8/`. Rules of section 0 apply to every GPU step.
+
+### 12.1 CPU
+
+| Command | Pass |
+|---|---|
+| `BIN\test-turbot.exe` | `OK`, item [7a''] included (1b); record its `info:` lines (evictions at ub 2048) |
+| `BIN\test-turbot-geom.exe`, `BIN\test-kv-resolve.exe` | `OK` / `<n> checks, 0 failed` (unchanged behaviour) |
+| `python tools\turbot\plan_vram.py <plan> --kv 262144 [--np N]` on every `docs\turbot\plans\tq8\*.plan` | the MiB and hashes of the tq8 plan table; `tq8_c_default_auto.plan` gives 4726.31 / 4909.23 / 5092.15 / 5246.00 MiB at --np 1 / 2 / 3 / 4 |
+
+### 12.2 CUDA, default build (option OFF)
+
+- `sass_diff.py <build of b93f35be0's tree>\ggml-cuda.dll BIN\ggml-cuda.dll --arch sm_120a --scope turbot`: `IDENTICAL`.
+  The option is compile-time only; the balance-weight change (SPEC 7.4) is host code.
+- 2b filters: 231/231 FA and 36/36 writer cases (9.2 row 2.2').
+- 16 x 32K KLD with the built-in plan written as a file (`--kv-tier-plan docs\turbot\plans\tq8\tq8_c_default.plan`): code
+  0.001139 / prose 0.001856 and the other summary lines of 9.2 row 2.7, exactly. If they differ, the three memory commits
+  after the 09-24 baseline build (`b05ea359a`, `b2a167c7b`, `b93f35be0`) are the first suspects; record the new numbers.
+
+### 12.3 CUDA, option ON (`-DGGML_CUDA_TURBOT_YOUNG_CT_EXT=ON`, only when a plan with young widths other than 7 is a candidate)
+
+- 2b filters: every case OK, including the `y8` / `y6` cases, which now run the compiled loaders at nb 512 and on the Q <= 4
+  route.
+- `cuobjdump -res-usage BIN\ggml-cuda.dll`: no new stack frame or spill in the turbot instances with ncols >= 32.
+- Gate B0 perf cases (section 3) of the default widths: within noise of the OFF build.
+
+### 12.4 Log lines (server or perplexity, `-lv 4`)
+
+- `turbot plan <src> line N: POOL auto = P cells (n_seq_max S, n_stream N, CAP C)`: at a unified 262144-cell server,
+  -np 1 / 2 / 3 / 4 give P = 18624 / 35136 / 51648 / 65536 and `size =` 4726.31 / 4909.23 / 5092.15 / 5246.00 MiB. Check
+  that S equals -np (a server that reserves extra sequences would size a larger pool).
+- `turbot: young band per sequence: B1 with 1 active sequence, Bn with n active (CAP C, POOL P)`: default plan at -np 4
+  16384 and 16256; no WARN line.
+- POOL auto is bit-identical to the numeric POOL it resolves to, and to the built-in plan whenever the band is not short:
+  16 x 32K code and a 131K run at one sequence, and 32K code with 1 and 2 decoy sequences (below), must match the
+  `tq8_c_default.plan` run in every summary line and in the per-token dump.
+
+### 12.5 llama-perplexity options ([TAG_PPL_TQ8], env only; without them the output is byte-identical to before)
+
+| Env | Effect |
+|---|---|
+| `LLAMA_PPL_KLD_DUMP=<file>` | with `--kl-divergence`: per-token dump, little endian: `KLDTOK1\0`, int32 n_chunk, rows, first, stride, flags (bit0 sparse base, bit1 copy, bit2 decoys), float32 kld[n], p_diff[n], nll[n], nll_base[n], uint8 same_top[n]. Its mean equals `Mean KLD` to the printed digits |
+| `LLAMA_PPL_SPARSE_K=K` (16..1024) | with `--kl-divergence-base <file>` and without `--kl-divergence`: writes a sparse base (`_logitsS`: per scored token nll_base, tail mass, top-1 and the top-K base log-probs) as `<file>.part`, renamed when complete. Never reserves n_ctx x n_vocab floats |
+| `LLAMA_PPL_SCORE_FIRST=p`, `LLAMA_PPL_SCORE_STRIDE=s` | sparse writer: scored positions p, p+s, ... <= n_ctx-2 (default n_ctx/2 and 1) |
+| `LLAMA_PPL_COPY=1` | sparse writer: chunk c is corpus tokens [c*n_ctx/2, (c+1)*n_ctx/2) twice, so the scored half repeats text n_ctx/2 back |
+| `LLAMA_PPL_DECOYS=d` | both readers: n_parallel d+1, unified KV, n_ctx (d+1) x `-c`; d decoy sequences from the last chunks stay resident while each chunk is scored as sequence 0. Log: `decoys: d sequences x n tokens, cells used X` |
+
+A `--kl-divergence` run picks the sparse reader by the base file's magic. Sparse KLD (top-K plus one tail bucket) is not
+the full-vocabulary KLD: compare arms only on the same sparse base, never with 32K full-row numbers. Validation: one
+16K chunk, full-row and sparse base of the same f16 run, the same turbot arm read against both: mean difference < 2e-6.
+The full-row base stores uint16 log-probs, so its nll_base and top-1 differ slightly from the sparse base's floats.
+

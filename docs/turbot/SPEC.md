@@ -701,6 +701,8 @@ for each element: j = assembled code;  v = level_old(j) * gain;  store half
 - The b = 5 turbot run is P4 then P1, so one 32-element chunk is one 16-byte P4 load plus one 4-byte P1 load. That is exactly the (qs, qh) pair `turbo5_int8_lut::gather4` consumes in `flash_attn_ext_turbo5p_load_tile`; b = 4 is P4 only, the `turbo4_int8_lut` input.
 - B verifies in a comment tagged `[TAG_TURBOT_I8]` that entry k of each reused table is `ggml_turbot_old_level_i8(b, k)` for the turbot index order (ascending levels, j = count of thresholds ≤ u). E's backend test checks it numerically (11.3).
 - `GGML_CUDA_TURBOT_OLD_I8` (a `#define` at the top of `fattn-turbot.cuh`, 0 or 1, default 1) selects the OLD representation for b ≤ 5 at compile time, so gate B0 can build and measure both. The CPU reference always reads float; the 11.2 FA tolerance covers the int8 difference.
+- `GGML_CUDA_TURBOT_YOUNG_CT_EXT` ([TAG_TURBOT_YOUNG_CT_EXT], 2026-09-24; CMake option of the same name, default OFF) also compiles the young loaders for y = 8 (b 2..6) and y = 6 (b 2..5) next to the y = 7 ones, in `flash_attn_ext_turbot_load_tile_young_dispatch` after the y = 7 switch. Only the instances with ncols ≥ `TURBOT_CT_WIDTH_MIN_NCOLS` use compiled loaders; a head whose (b, y) has no compiled loader takes the runtime loader, which computes the same values more slowly (about +0.4-0.7% decode, -1.5% prefill for a y ≠ 7 plan without the option, an estimate). OFF leaves the turbot SASS identical to builds without the option (check with `tools/turbot/sass_diff.py --scope turbot`); ON must be checked with `cuobjdump -res-usage` for new stack frames. The option applies to the D = 128 instances too, which have no y 8 / y 6 test widths.
+- Stream-k balance weights (`ggml_cuda_fattn_turbot_balance_weights`, [TAG_TURBOT_YOUNG_CT_EXT]): the young extra weight is taken per side, the compiled-loader weight for y = 7 (plus 6 and 8 with the option) and for an unused run, else the runtime-loader weight. y = 7 plans (the built-in and every automatic plan) get exactly the old weights; plans with other young widths get different seams, so their outputs may differ in the last bits from builds before 2026-09-24. Weights change speed and seams, never the per-element values.
 - The young variants need two data-dependent float gathers (base level and scale) plus the int8 gather, against one float gather for the LUT. So the float LUT is expected to win, and it is the default.
 
 **Float LUT runs in shared memory.** These cover YOUNG always, OLD b = 6, and OLD b ≤ 5 when `GGML_CUDA_TURBOT_OLD_I8` is 0.
@@ -936,6 +938,11 @@ keeps the built-in plan's hash 0x56c3503c949a7749. One INFO line: `turbot plan <
 The 33-granule headroom assumes -ub <= 2048 (the ubatch whose rows are in flight). A larger -ub with a full
 band can find no free pool row: the tier then evicts young granules (or writes the row old-only), which
 costs quality, not correctness. Use a numeric POOL for such runs.
+Because the hash uses the resolved POOL, a `POOL auto` plan has a different hash at each -np below the cap: a state blob
+(`--slot-save-path` file) saved at -np 2 is refused at -np 1 or 3 with `state blob from another plan` (9.10), where a
+numeric POOL would load it. Within one server process the -np, and so the hash, never changes. The tier check is
+test-turbot item [7a'']: at 18624 / 35136 / 51648 cells, 1 / 2 / 3 sequences at CAP growing by 512-row ubatches evict
+nothing after warm-up (the 2048-row count is printed, not gated).
 
 POOL 0 is allowed as a diagnostic arm:
 - every row is written old-only (young rows −1, gtab all −1, no fill);
@@ -1022,6 +1029,7 @@ REVISED 2026-09-22 `[TAG_TURBOT_ANY_*]`: n_stream > 1, the head geometry and SWA
 - Logs:
   - `llama_kv_cache: turbot plan <path>: <n> layers, old bits <mean> (sum <S>), young pool <N_R> cells (<N_R/64> granules), cap <CAP>, hash 0x<16 hex>`
   - `llama_kv_cache: size = %7.2f MiB (%6u cells, %3d layers, %2u/%u seqs), K (turbot): %7.2f MiB, V (turbot): %7.2f MiB, young pool: %7.2f MiB` — K and V are base bytes only; the size is base + pool.
+  - `llama_kv_cache: turbot: young band per sequence: <B1> with 1 active sequence, <Bn> with <n> active (CAP <C>, POOL <P>)` ([TAG_TURBOT_BAND_INFO], log only): B1 and Bn from `llama_turbot_young_quota` for one sequence and for ceil(n_seq_max / n_stream) sequences with equal shares of the cache. Default plan at -np 4: 16384 and 16256. A WARN line follows when Bn < CAP / 2 (a small POOL at a high -np).
   - Default plan: `size = 5246.00 MiB ... young pool:  726.00 MiB`.
 
 ### 9.5 Tier state (`src/llama-kv-tier.h`, `src/llama-kv-tier.cpp`, owner D; E unit-tests the public interface)
@@ -1421,6 +1429,7 @@ No test or tool runs during implementation. These are written now and executed a
   - pos-mask sequence starting at a cell not a multiple of 64, with holes;
   - one sinks case, one softcap case;
   - both `GGML_CUDA_TURBOT_OLD_I8` builds.
+  - widths `y8` (K 2 3 4 5 / V 6 4 5 3, y = 8) and `y6` (K 2 3 4 5 / V 5 4 3 2, y = 6) ([TAG_TURBOT_YOUNG_CT_EXT]): kv 1000 / 4096, nb 1 / 4 / 512, mixes young / alt / band16k (36 FA cases), plus 8 writer cases. They cover every compiled (b, y) of the `GGML_CUDA_TURBOT_YOUNG_CT_EXT` build and run on the runtime young loader in the default build. The Qwen3.8 filter `^turbot=[a-z0-9]+,kv=` now selects 195 + 36 = 231 FA cases, the writer filter 28 + 8 = 36.
 - **Hybrid graph reuse** (llama-level test in `tests/test-turbot.cpp` or a small driver): a reused hybrid graph followed by a ubatch that needs a fill must rebuild and run the fill (10.1).
 - **Perf cases (gate B0, 7.8)**, not correctness: `turbot_perf` FA cases against turbo5p.
   - kv 32768 / 131072 / 245760; nb 1 / 4 / 512; mixes `old`, `band16k`, `band64k`, `young`.
@@ -1440,6 +1449,7 @@ No test or tool runs during implementation. These are written now and executed a
 |---|---|
 | `check_tables_vs_study.py` | runs `gen_turbot_tables.py --check`, then compares with `kv_nested_study.build_designs(..., ['a_lloyd'])`. Tolerances: exact for b = 4, 5; ≤ 2e-7 for b = 2, 3; ≤ 6e-5 for b = 6 (4.6). |
 | `plan_vram.py <plan> [--kv 262144]` | prints base / pool / total MiB and the plan hash. Must print 4520.00 / 726.00 / 5246.00 for the default plan. |
+| `plan_vram.py <plan> [--kv 262144] [--np N] [--n-stream S]` | resolves `POOL auto` for N sequences in S streams ([TAG_TURBOT_POOL_AUTO]) the way the parser does; default plan written with `POOL auto 65536`: 4726.31 / 4909.23 / 5092.15 / 5246.00 MiB at --np 1 / 2 / 3 / 4. |
 | `b0_gate.py <perf log turbot> <perf log turbo5p>` | prints the 7.8 ratio table and GO / NO-GO |
 | `blob_roundtrip.py` | server park/resume and prompt-cache restore, including turbo5p ↔ turbot refusal and restore into a different slot id |
 
