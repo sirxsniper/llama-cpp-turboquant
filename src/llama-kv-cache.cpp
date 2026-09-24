@@ -677,6 +677,28 @@ llama_kv_cache::llama_kv_cache(
                 turbot_plan->pool_cells, turbot_plan->pool_cells / GGML_TURBOT_GRANULE, pool_streams.c_str(), turbot_plan->cap_cells,
                 (unsigned long long) turbot_plan->hash);
 
+        // [TAG_TURBOT_BAND_INFO] young cells per sequence by the quota (SPEC 9.6): one active sequence, and n_seq_max
+        // sequences that each hold an equal share of the cache. Log only.
+        {
+            const uint32_t n_seq_s = std::min<uint32_t>(LLAMA_MAX_SEQ, (std::max<uint32_t>(1, n_seq_max) + n_stream - 1) / n_stream);
+            uint32_t n_cells[LLAMA_MAX_SEQ];
+            uint64_t y[LLAMA_MAX_SEQ];
+            n_cells[0] = kv_size;
+            llama_turbot_young_quota(n_cells, 1, turbot_pool_s, turbot_plan->cap_cells, false, y);
+            const uint64_t band_1 = y[0];
+            for (uint32_t s = 0; s < n_seq_s; ++s) {
+                n_cells[s] = kv_size / n_seq_s;
+            }
+            llama_turbot_young_quota(n_cells, n_seq_s, turbot_pool_s, turbot_plan->cap_cells, false, y);
+            const uint64_t band_n = *std::min_element(y, y + n_seq_s);
+            LLAMA_LOG_INFO("%s: turbot: young band per sequence: %llu with 1 active sequence, %llu with %u active (CAP %u, POOL %u)\n", __func__,
+                    (unsigned long long) band_1, (unsigned long long) band_n, n_seq_s, turbot_plan->cap_cells, turbot_pool_s);
+            if (band_n < turbot_plan->cap_cells / 2) {
+                LLAMA_LOG_WARN("%s: turbot: with %u active sequences each keeps only %llu young cells, below half of CAP %u\n", __func__,
+                        n_seq_s, (unsigned long long) band_n, turbot_plan->cap_cells);
+            }
+        }
+
         LLAMA_LOG_INFO("%s: size = %7.2f MiB (%6u cells, %3d layers, %2u/%u seqs), K (turbot): %7.2f MiB, V (turbot): %7.2f MiB, young pool: %7.2f MiB\n", __func__,
                 (float)memory_size_total / (1024.0f * 1024.0f), kv_size, (int) layers.size(), n_seq_max, n_stream,
                 (float)memory_size_k    / (1024.0f * 1024.0f),
