@@ -1046,6 +1046,10 @@ static void spec_dft_dump_rows(FILE * f, const float * lattice, int32_t n_embd, 
     fflush(f);
 }
 
+// [TAG_4C_PROBE] process() calls of <= 64 rows, and how many of them synchronized the drafter (SPEC_PHASE_PROBE=1 only)
+static uint64_t g_spec_dft_sync_calls  = 0;
+static uint64_t g_spec_dft_sync_synced = 0;
+
 struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     // [TAG_SPEC_PREFILL_TAIL_EXTRACT] The per-sequence skip decision, shared by process() and by the
     // server, which asks BEFORE the target decode so that llama can skip extracting the five layer
@@ -1120,6 +1124,31 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
     const int32_t * target_layer_ids   = nullptr; // model_dft's extract layer indices
     uint32_t        target_layer_ids_n = 0;
+
+    std::vector<int32_t> sync_rows_seq; // [TAG_4C_DFT_SYNC] rows per sequence in the batch, reused
+
+    // [TAG_4C_DFT_SYNC] a prefill batch: prompt rows still follow, or one sequence has more rows than one
+    // verify block (n_max + 1). A sequence id out of range counts as prefill, so the sync stays.
+    bool dft_sync_is_prefill(const llama_batch & batch_in) {
+        if (n_prefill_after > 0) {
+            return true;
+        }
+
+        const int32_t n_rows_max = n_max + 1;
+
+        sync_rows_seq.assign(n_seq, 0);
+        for (int32_t i = 0; i < batch_in.n_tokens; ++i) {
+            const int32_t n_ids = batch_in.n_seq_id ? batch_in.n_seq_id[i] : 1;
+            for (int32_t k = 0; k < n_ids; ++k) {
+                const llama_seq_id s = batch_in.seq_id ? batch_in.seq_id[i][k] : 0;
+                if (s < 0 || s >= (llama_seq_id) n_seq || ++sync_rows_seq[s] > n_rows_max) {
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
 
     common_speculative_impl_draft_dflash(const common_params_speculative & params, uint32_t n_seq,
             common_speculative_type type = COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH)
@@ -1573,35 +1602,63 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             // 1500-token samples: 34.00 ms/step with the sync against 33.22 without, -2.3%.
             //   SPEC_DFT_SYNC=1 forces the old always-sync behaviour.
             //   SPEC_DFT_SYNC=0 forces it off even for multiple sequences (measurement only).
+            // [TAG_4C_DFT_SYNC] Auto now skips the sync with several live sequences as well. Until the next
+            // draft decode, the server touches the drafter context only through host metadata (seq_rm,
+            // seq_add, seq_cp, seq_pos_min/max), through state get/set, which synchronize first
+            // (llama_state_seq_*_data_ext), and through the next llama_decode(ctx_dft). That decode is queued on
+            // the same drafter stream, so it runs after this one, and its host inputs are uploaded before it
+            // returns ([TAG_SCHED_INPUT_BATCH]); every output getter synchronizes.
+            // Prefill is now decided per sequence (dft_sync_is_prefill): "n_tokens > 8" made every step with
+            // 3 or more generating slots a prefill, so 4 slots synced every step whatever SPEC_DFT_SYNC said.
+            //   SPEC_DFT_SYNC=0          the pre-4C 0 rule, exactly (still syncs every step at 3+ slots)
+            //   SPEC_DFT_SYNC=2          the pre-4C auto rule, exactly (kill switch)
+            //   SPEC_DFT_SYNC_PREFILL=0  also skip the sync after prefill chunks (auto only)
             static const int dft_sync_mode = [] {
                 const char * e = getenv("SPEC_DFT_SYNC");
                 return (e && e[0]) ? atoi(e) : -1;   // -1 = auto
             }();
-            const bool is_prefill = n_prefill_after > 0 || n_tokens > 8;
-            // [TAG_SPEC_DFT_SYNC_LIVE] "a single sequence" means one sequence IN THIS BATCH, not a
-            // context built for one. n_seq is n_seq_max (= --parallel), so under -np 4 auto mode
-            // synced on every step even with one agent generating - the measured -2.3% was never
-            // delivered to the deployed config. Count the sequences actually present (a verify
-            // batch is at most n_parallel * (1 + n_draft) tokens, so this is a few iterations).
-            // Several live sequences keep the conservative sync, exactly as before.
-            int n_live_seq = 0;
-            {
-                llama_seq_id first = -1;
-                for (int32_t i = 0; i < batch_in.n_tokens && n_live_seq < 2; ++i) {
-                    if (batch_in.n_seq_id == nullptr || batch_in.n_seq_id[i] <= 0) {
-                        continue;
-                    }
-                    const llama_seq_id s = batch_in.seq_id[i][0];
-                    if (n_live_seq == 0) {
-                        first      = s;
-                        n_live_seq = 1;
-                    } else if (s != first) {
-                        n_live_seq = 2;
+            static const bool dft_sync_prefill = [] {
+                const char * e = getenv("SPEC_DFT_SYNC_PREFILL");
+                return e == nullptr || e[0] == '\0' || atoi(e) != 0;
+            }();
+            bool sync_needed = false;
+            if (dft_sync_mode == 1) {
+                sync_needed = true;
+            } else if (dft_sync_mode == 0) {
+                sync_needed = n_prefill_after > 0 || n_tokens > 8;
+            } else if (dft_sync_mode == 2) {
+                const bool is_prefill = n_prefill_after > 0 || n_tokens > 8;
+                // [TAG_SPEC_DFT_SYNC_LIVE] "a single sequence" means one sequence IN THIS BATCH, not a
+                // context built for one. n_seq is n_seq_max (= --parallel), so under -np 4 auto mode
+                // synced on every step even with one agent generating - the measured -2.3% was never
+                // delivered to the deployed config. Count the sequences actually present (a verify
+                // batch is at most n_parallel * (1 + n_draft) tokens, so this is a few iterations).
+                // Several live sequences keep the conservative sync, exactly as before.
+                int n_live_seq = 0;
+                {
+                    llama_seq_id first = -1;
+                    for (int32_t i = 0; i < batch_in.n_tokens && n_live_seq < 2; ++i) {
+                        if (batch_in.n_seq_id == nullptr || batch_in.n_seq_id[i] <= 0) {
+                            continue;
+                        }
+                        const llama_seq_id s = batch_in.seq_id[i][0];
+                        if (n_live_seq == 0) {
+                            first      = s;
+                            n_live_seq = 1;
+                        } else if (s != first) {
+                            n_live_seq = 2;
+                        }
                     }
                 }
+                sync_needed = is_prefill || n_live_seq > 1;
+            } else {
+                sync_needed = dft_sync_prefill && dft_sync_is_prefill(batch_in);
             }
-            const bool sync_needed = dft_sync_mode == 1 || is_prefill ||
-                                     (dft_sync_mode != 0 && n_live_seq > 1);
+            // [TAG_4C_PROBE] one count per process() call of <= 64 rows
+            if (offset == 0 && n_tokens <= 64 && common_speculative_probe_enabled()) {
+                g_spec_dft_sync_calls++;
+                g_spec_dft_sync_synced += sync_needed ? 1 : 0;
+            }
             if (sync_needed) {
                 llama_synchronize(ctx_dft);
             }
@@ -3523,10 +3580,121 @@ bool common_speculative_probe_enabled() {
     return v;
 }
 
+// [TAG_4C_PROBE] Server step accounting, see common_speculative_probe_step_begin() in speculative.h.
+// Phases added inside an open step wait in g_spec_step_ms and count only when the step does.
+static double   g_spec_step_ms[COMMON_SPEC_PHASE_COUNT] = {0};
+static bool     g_spec_step_open    = false;
+static bool     g_spec_prev_counted = false;
+static double   g_spec_step_gap     = -1.0;   // loop gap before the open step, -1 = none
+static double   g_spec_wall_ms      = 0.0;    // wall time of the counted steps
+static double   g_spec_gap_ms       = 0.0;    // end of a counted step -> begin of the next counted step
+static unsigned g_spec_gap_n        = 0;
+static double   g_spec_win_ms[COMMON_SPEC_PHASE_COUNT] = {0};
+static double   g_spec_win_wall     = 0.0;
+static double   g_spec_win_gap      = 0.0;
+static unsigned g_spec_win_gap_n    = 0;
+static unsigned g_spec_win_steps    = 0;
+static std::chrono::steady_clock::time_point g_spec_step_t0;
+static std::chrono::steady_clock::time_point g_spec_step_t1;   // end of the last step
+
+static double spec_probe_ms(std::chrono::steady_clock::duration d) {
+    return std::chrono::duration<double, std::milli>(d).count();
+}
+
+// SPEC_PHASE_PROBE_EVERY=N prints a report every N counted steps (default 128)
+static unsigned spec_probe_every() {
+    static const unsigned v = [] {
+        const char * e = getenv("SPEC_PHASE_PROBE_EVERY");
+        const int n = e ? atoi(e) : 0;
+        return n > 0 ? (unsigned) n : 128u;
+    }();
+    return v;
+}
+
 void common_speculative_probe_add(int phase, double ms) {
     if (phase >= 0 && phase < COMMON_SPEC_PHASE_COUNT) {
-        g_spec_phase_ms[phase] += ms;
+        (g_spec_step_open ? g_spec_step_ms : g_spec_phase_ms)[phase] += ms;
     }
+}
+
+void common_speculative_probe_step_begin() {
+    if (!common_speculative_probe_enabled()) {
+        return;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (g_spec_step_open) {
+        g_spec_prev_counted = false;   // the last step never ended: no gap across it
+    }
+    std::fill(g_spec_step_ms, g_spec_step_ms + COMMON_SPEC_PHASE_COUNT, 0.0);
+    g_spec_step_gap  = g_spec_prev_counted ? spec_probe_ms(now - g_spec_step_t1) : -1.0;
+    g_spec_step_t0   = now;
+    g_spec_step_open = true;
+}
+
+void common_speculative_probe_step_end(bool gen) {
+    if (!common_speculative_probe_enabled() || !g_spec_step_open) {
+        return;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    g_spec_step_open    = false;
+    g_spec_step_t1      = now;
+    g_spec_prev_counted = gen;
+    if (!gen) {
+        return;
+    }
+
+    const double wall = spec_probe_ms(now - g_spec_step_t0);
+    for (int i = 0; i < COMMON_SPEC_PHASE_COUNT; ++i) {
+        g_spec_phase_ms[i] += g_spec_step_ms[i];
+        g_spec_win_ms[i]   += g_spec_step_ms[i];
+    }
+    g_spec_wall_ms  += wall;
+    g_spec_win_wall += wall;
+    if (g_spec_step_gap >= 0.0) {
+        g_spec_gap_ms  += g_spec_step_gap;
+        g_spec_win_gap += g_spec_step_gap;
+        g_spec_gap_n++;
+        g_spec_win_gap_n++;
+    }
+    g_spec_phase_steps++;
+    if (++g_spec_win_steps < spec_probe_every()) {
+        return;
+    }
+
+    // the first six lines keep the old format: cumulative phases, % of their sum
+    const char * nm[COMMON_SPEC_PHASE_COUNT] = {"tgt_decode","spec_process","spec_draft","spec_accept","sample"};
+    const double n = (double) g_spec_phase_steps;
+    double tot = 0.0;
+    for (int i = 0; i < COMMON_SPEC_PHASE_COUNT; ++i) tot += g_spec_phase_ms[i];
+    fprintf(stderr, "turbo-probe: spec-phase over %u steps (%.2f ms/step total)\n", g_spec_phase_steps, tot / n);
+    for (int i = 0; i < COMMON_SPEC_PHASE_COUNT; ++i) {
+        fprintf(stderr, "turbo-probe:   %-12s %8.3f ms/step  %5.1f%%\n",
+                nm[i], g_spec_phase_ms[i] / n, tot > 0.0 ? 100.0 * g_spec_phase_ms[i] / tot : 0.0);
+    }
+    fprintf(stderr, "turbo-probe:   %-12s %8.3f ms/step  %5.1f%% of step wall %.3f ms/step, loop_gap %.3f ms/step\n",
+            "host_other", (g_spec_wall_ms - tot) / n,
+            g_spec_wall_ms > 0.0 ? 100.0 * (g_spec_wall_ms - tot) / g_spec_wall_ms : 0.0,
+            g_spec_wall_ms / n, g_spec_gap_n ? g_spec_gap_ms / g_spec_gap_n : 0.0);
+
+    // the last window alone, so a run that changes the load between reports can be split
+    const double w = (double) g_spec_win_steps;
+    double win_tot = 0.0;
+    for (int i = 0; i < COMMON_SPEC_PHASE_COUNT; ++i) win_tot += g_spec_win_ms[i];
+    fprintf(stderr, "turbo-probe:   window %u steps: wall %.3f tgt %.3f proc %.3f draft %.3f accept %.3f smp %.3f "
+            "host_other %.3f loop_gap %.3f ms/step\n", g_spec_win_steps, g_spec_win_wall / w,
+            g_spec_win_ms[COMMON_SPEC_PHASE_TGT_DECODE] / w, g_spec_win_ms[COMMON_SPEC_PHASE_PROCESS] / w,
+            g_spec_win_ms[COMMON_SPEC_PHASE_DRAFT] / w, g_spec_win_ms[COMMON_SPEC_PHASE_ACCEPT] / w,
+            g_spec_win_ms[COMMON_SPEC_PHASE_SAMPLE] / w, (g_spec_win_wall - win_tot) / w,
+            g_spec_win_gap_n ? g_spec_win_gap / g_spec_win_gap_n : 0.0);
+    fprintf(stderr, "turbo-probe:   dft_sync %" PRIu64 " of %" PRIu64 " process calls of <= 64 rows synced\n",
+            g_spec_dft_sync_synced, g_spec_dft_sync_calls);
+    fflush(stderr);
+
+    std::fill(g_spec_win_ms, g_spec_win_ms + COMMON_SPEC_PHASE_COUNT, 0.0);
+    g_spec_win_wall  = 0.0;
+    g_spec_win_gap   = 0.0;
+    g_spec_win_gap_n = 0;
+    g_spec_win_steps = 0;
 }
 
 void common_speculative_probe_step() {

@@ -152,6 +152,14 @@ bool common_speculative_probe_enabled();
 void common_speculative_probe_add(int phase, double ms);
 void common_speculative_probe_step();
 
+// [TAG_4C_PROBE] One server loop iteration. The phases added between begin and end count only when end gets
+// gen = true (the caller passes it for a batch of 1-64 rows), and then the step wall time counts too. The report,
+// every SPEC_PHASE_PROBE_EVERY counted steps (default 128), adds host_other = step wall - sum of the phases,
+// loop_gap = time from the end of one counted step to the begin of the next, the same numbers for the last
+// window alone, and how many drafter inject calls synchronized. Replaces common_speculative_probe_step().
+void common_speculative_probe_step_begin();
+void common_speculative_probe_step_end(bool gen);
+
 void common_speculative_print_stats(const common_speculative * spec);
 
 struct common_speculative_deleter {

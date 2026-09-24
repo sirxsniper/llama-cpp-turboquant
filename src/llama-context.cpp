@@ -2751,6 +2751,76 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
     return false; // all sequences use backend sampling
 }
 
+// [TAG_4C_PROBE] SPEC_PHASE_PROBE=1: ubatches per llama_decode of <= 64 tokens, per context. More than one means
+// the batch was split into extra forwards (split_equal with uneven sequences). A report every
+// SPEC_PHASE_PROBE_EVERY such decodes (default 128). Nothing runs when the variable is unset.
+static bool llama_probe_ubatch_enabled() {
+    static const bool v = [] {
+        const char * e = getenv("SPEC_PHASE_PROBE");
+        return e != nullptr && e[0] == '1';
+    }();
+    return v;
+}
+
+static void llama_probe_ubatch_add(const llama_context * ctx, const char * arch, uint32_t n_tokens, uint32_t n_ubatch) {
+    struct entry {
+        const llama_context * ctx;
+        uint64_t n_dec;       // this window
+        uint64_t n_ubatch;
+        uint64_t n_tokens;
+        uint64_t n_split;
+        uint32_t ubatch_max;
+        uint64_t n_dec_all;   // since start
+        uint64_t n_split_all;
+    };
+    static thread_local entry tab[8] = {};
+    static const uint64_t every = [] {
+        const char * e = getenv("SPEC_PHASE_PROBE_EVERY");
+        const int n = e ? atoi(e) : 0;
+        return n > 0 ? (uint64_t) n : (uint64_t) 128;
+    }();
+
+    int idx = -1;
+    for (int i = 0; i < 8 && idx < 0; ++i) {
+        if (tab[i].ctx == ctx) {
+            idx = i;
+        }
+    }
+    for (int i = 0; i < 8 && idx < 0; ++i) {
+        if (tab[i].ctx == nullptr) {
+            idx = i;
+            tab[i].ctx = ctx;
+        }
+    }
+    if (idx < 0) {
+        return;
+    }
+
+    entry & e = tab[idx];
+    e.n_dec++;
+    e.n_ubatch   += n_ubatch;
+    e.n_tokens   += n_tokens;
+    e.n_split    += n_ubatch > 1 ? 1 : 0;
+    e.ubatch_max  = std::max(e.ubatch_max, n_ubatch);
+    e.n_dec_all++;
+    e.n_split_all += n_ubatch > 1 ? 1 : 0;
+    if (e.n_dec < every) {
+        return;
+    }
+
+    fprintf(stderr, "turbo-probe: decode-ubatch ctx%d %s: %" PRIu64 " decodes of <= 64 tokens, %.3f ubatches/decode (max %u), "
+            "%" PRIu64 " split, %.1f tokens/decode; %" PRIu64 " of %" PRIu64 " split since start\n",
+            idx, arch, e.n_dec, (double) e.n_ubatch / e.n_dec, e.ubatch_max, e.n_split, (double) e.n_tokens / e.n_dec,
+            e.n_split_all, e.n_dec_all);
+    fflush(stderr);
+
+    e.n_dec      = 0;
+    e.n_ubatch   = 0;
+    e.n_tokens   = 0;
+    e.n_split    = 0;
+    e.ubatch_max = 0;
+}
+
 int llama_context::decode(const llama_batch & batch_inp) {
     // MTP hook batches carry both token (next-token id) and embd (h_nextn row),
     // so accept either present rather than requiring exactly one.
@@ -2912,6 +2982,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     int64_t n_outputs_prev = 0;
     int64_t n_tokens_prev  = 0;
+    uint32_t n_ubatch_done = 0; // [TAG_4C_PROBE]
 
     do {
         const auto & ubatch = mctx->get_ubatch();
@@ -3116,7 +3187,13 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
         n_outputs_prev += n_outputs;
         n_tokens_prev  += ubatch.n_tokens;
+        n_ubatch_done++;
     } while (mctx->next());
+
+    // [TAG_4C_PROBE]
+    if (n_tokens_all <= 64 && llama_probe_ubatch_enabled()) {
+        llama_probe_ubatch_add(this, llm_arch_name(model.arch), n_tokens_all, n_ubatch_done);
+    }
 
     // set to total number of outputs in the batch, for use in llama_get_logits_ith
     n_outputs = n_outputs_all;

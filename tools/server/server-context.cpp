@@ -5154,6 +5154,8 @@ private:
             }
         }
 
+        common_speculative_probe_step_begin(); // [TAG_4C_PROBE] no-op unless SPEC_PHASE_PROBE=1
+
         try {
             scoped_timer t(t_pre_decode, n_pre_decode);
             pre_decode();
@@ -5246,6 +5248,9 @@ private:
                 break; // stop any further processing
             }
         }
+
+        // [TAG_4C_PROBE] the step counts when it decoded a generation-sized batch, the same <= 64 rule as tgt_decode
+        common_speculative_probe_step_end(batch.size() > 0 && batch.size() <= 64);
 
         // [TAG_POOL_PREEMPT] an image that does not fit was held back by the prompt pass: make room for it now
         if (pool_want_room >= 0) {
@@ -6619,10 +6624,10 @@ private:
                        slot.spec_dists.size() == slot.spec_draft.size())
                         ? common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft, slot.spec_dists)
                         : common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
+                // [TAG_4C_PROBE] the step is counted once per update_slots() by probe_step_end, not once per slot
                 if (common_speculative_probe_enabled()) {
                     common_speculative_probe_add(COMMON_SPEC_PHASE_SAMPLE,
                         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_smp0).count());
-                    common_speculative_probe_step();
                 }
                 slot.spec_i_batch.clear();
 
