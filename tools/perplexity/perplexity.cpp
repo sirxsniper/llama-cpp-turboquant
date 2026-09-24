@@ -11,6 +11,7 @@
 #include <clocale>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <fstream>
@@ -198,7 +199,16 @@ struct kl_divergence_result {
     size_t count            = 0.0;
 };
 
-static std::pair<double, float> log_softmax(int n_vocab, const float * logits, const uint16_t * base_log_prob, int tok, kl_divergence_result & kld) {
+// [TAG_PPL_TQ8] per-token values of one scored token (the LLAMA_PPL_KLD_DUMP file)
+struct kld_token_result {
+    double  kld;
+    float   p_diff;
+    float   nll;
+    float   nll_base;
+    uint8_t same_top;
+};
+
+static kld_token_result log_softmax(int n_vocab, const float * logits, const uint16_t * base_log_prob, int tok, kl_divergence_result & kld) {
     float max_logit = logits[0];
     int imax = 0;
     for (int i = 1; i < n_vocab; ++i) {
@@ -258,16 +268,17 @@ static std::pair<double, float> log_softmax(int n_vocab, const float * logits, c
     kld.sum_p_diff4 += p_diff2*p_diff2;
     kld.max_p_diff = std::max(kld.max_p_diff, std::fabs(p_diff));
 
-    return std::make_pair(sum, p_diff);
+    return { sum, p_diff, nll, nll_base, (uint8_t) (imax == imax_base ? 1 : 0) };
 }
 
 static void process_logits(int n_vocab, const float * logits, const int * tokens, int n_token,
         std::vector<std::thread> & workers, const uint16_t * base_log_probs, kl_divergence_result & kld,
-        float * kld_values, float * p_diff_values) {
+        float * kld_values, float * p_diff_values, float * nll_values, float * nll_base_values, uint8_t * same_top_values) {
     std::mutex mutex;
     const int nv = 2*((n_vocab + 1)/2) + 4;
     int counter = 0;
-    auto compute = [&mutex, &counter, &base_log_probs, &kld, n_vocab, logits, tokens, n_token, nv, kld_values, p_diff_values] () {
+    auto compute = [&mutex, &counter, &base_log_probs, &kld, n_vocab, logits, tokens, n_token, nv, kld_values, p_diff_values,
+                    nll_values, nll_base_values, same_top_values] () {
         kl_divergence_result local_kld;
         while (true) {
             std::unique_lock<std::mutex> lock(mutex);
@@ -289,9 +300,12 @@ static void process_logits(int n_vocab, const float * logits, const int * tokens
                 break;
             }
             lock.unlock();
-            std::pair<double, float> v = log_softmax(n_vocab, logits + size_t(i)*n_vocab, base_log_probs + size_t(i)*nv, tokens[i+1], local_kld);
-            kld_values[i]    = (float)v.first;
-            p_diff_values[i] = v.second;
+            const kld_token_result v = log_softmax(n_vocab, logits + size_t(i)*n_vocab, base_log_probs + size_t(i)*nv, tokens[i+1], local_kld);
+            kld_values[i]      = (float)v.kld;
+            p_diff_values[i]   = v.p_diff;
+            nll_values[i]      = v.nll;
+            nll_base_values[i] = v.nll_base;
+            same_top_values[i] = v.same_top;
         }
     };
     for (auto & w : workers) {
@@ -301,6 +315,407 @@ static void process_logits(int n_vocab, const float * logits, const int * tokens
     for (auto & w : workers) {
         w.join();
     }
+}
+
+//
+// [TAG_PPL_TQ8] tq8 measurement: per-token dump (C1a), sparse top-K base writer and reader (C1b, C1c), decoys (C1d)
+//
+
+// integer env value, def when unset or empty
+static int ppl_env_int(const char * name, int def) {
+    const char * v = getenv(name);
+    return v != nullptr && v[0] != '\0' ? atoi(v) : def;
+}
+
+// run f(i) for i in [0, n) on the workers and this thread
+template <typename F>
+static void ppl_parallel_for(std::vector<std::thread> & workers, int n, F && f) {
+    std::atomic<int> counter(0);
+    auto compute = [&]() {
+        for (int i = counter.fetch_add(1); i < n; i = counter.fetch_add(1)) {
+            f(i);
+        }
+    };
+    for (auto & w : workers) {
+        w = std::thread(compute);
+    }
+    compute();
+    for (auto & w : workers) {
+        w.join();
+    }
+}
+
+// Per-token dump for tq8_paired.py when env LLAMA_PPL_KLD_DUMP=<file>. Little endian: "KLDTOK1\0", int32 n_chunk, rows,
+// first, stride, flags (bit0 sparse base, bit1 copy, bit2 decoys), float kld[n], p_diff[n], nll[n], nll_base[n],
+// uint8 same_top[n], n = n_chunk*rows, chunk-major.
+static void kld_dump_write(int n_chunk, int rows, int first, int stride, int flags, const std::vector<float> & kld_values,
+        const std::vector<float> & p_diff_values, const std::vector<float> & nll_values, const std::vector<float> & nll_base_values,
+        const std::vector<uint8_t> & same_top_values) {
+    const char * path = getenv("LLAMA_PPL_KLD_DUMP");
+    if (path == nullptr || path[0] == '\0') {
+        return;
+    }
+    const size_t n = size_t(n_chunk)*rows;
+    GGML_ASSERT(kld_values.size() >= n && p_diff_values.size() >= n && nll_values.size() >= n && nll_base_values.size() >= n &&
+            same_top_values.size() >= n);
+    std::ofstream out(path, std::ios::binary);
+    if (!out) {
+        LOG_ERR("%s: cannot open %s for writing\n", __func__, path);
+        return;
+    }
+    const int32_t hdr[5] = { n_chunk, rows, first, stride, flags };
+    out.write("KLDTOK1\0", 8);
+    out.write((const char *) hdr, sizeof(hdr));
+    out.write((const char *) kld_values.data(),      n*sizeof(float));
+    out.write((const char *) p_diff_values.data(),   n*sizeof(float));
+    out.write((const char *) nll_values.data(),      n*sizeof(float));
+    out.write((const char *) nll_base_values.data(), n*sizeof(float));
+    out.write((const char *) same_top_values.data(), n);
+    out.close();
+    if (out.fail()) {
+        LOG_ERR("%s: failed writing %s\n", __func__, path);
+        return;
+    }
+    LOG_INF("%s: wrote %zu per-token rows (%d chunks x %d, first %d, stride %d, flags %d) to %s\n", __func__, n, n_chunk, rows,
+            first, stride, flags, path);
+}
+
+// Env LLAMA_PPL_DECOYS=d: d more sequences stay in one unified cache while every chunk is scored as seq 0, as with d
+// other agents. Seq 0 takes cells [0, n_ctx) first (chunk 0, placeholder) so the decoys (chunks n_chunk_file-1 down to
+// n_chunk_file-d) sit above them; then seq 0 is removed and each scored chunk reuses its cells.
+static bool kld_decoys_setup(llama_context * ctx, const std::vector<llama_token> & tokens, int n_ctx, int n_chunk_file,
+        int n_decoys, int n_batch, bool add_bos, const llama_vocab * vocab) {
+    if (n_decoys <= 0) {
+        return true;
+    }
+    if ((int64_t) llama_n_seq_max(ctx) < n_decoys + 1 || (int64_t) llama_n_ctx(ctx) < (int64_t) (n_decoys + 1)*n_ctx) {
+        LOG_ERR("%s: %d decoys need %d sequences and %lld cells, the context has %u sequences and %u cells\n", __func__,
+                n_decoys, n_decoys + 1, (long long) (n_decoys + 1)*n_ctx, llama_n_seq_max(ctx), llama_n_ctx(ctx));
+        return false;
+    }
+    if (n_chunk_file < n_decoys + 1) {
+        LOG_ERR("%s: %d decoys need %d chunks in the base file, it has %d\n", __func__, n_decoys, n_decoys + 1, n_chunk_file);
+        return false;
+    }
+    llama_memory_t mem = llama_get_memory(ctx);
+    llama_memory_clear(mem, true);
+    llama_batch batch = llama_batch_init(n_batch, 0, 1);
+    for (int k = 0; k <= n_decoys; ++k) {
+        const int chunk = k == 0 ? 0 : n_chunk_file - k;
+        const llama_token * toks = tokens.data() + size_t(chunk)*n_ctx;
+        for (int j = 0; j < n_ctx; j += n_batch) {
+            const int n = std::min(n_batch, n_ctx - j);
+            common_batch_clear(batch);
+            for (int i = 0; i < n; ++i) {
+                const llama_token t = add_bos && j + i == 0 ? llama_vocab_bos(vocab) : toks[j + i];
+                common_batch_add(batch, t, j + i, { k }, false);
+            }
+            if (llama_decode(ctx, batch)) {
+                LOG_ERR("%s: failed to decode decoy %d\n", __func__, k);
+                llama_batch_free(batch);
+                return false;
+            }
+        }
+    }
+    llama_batch_free(batch);
+    llama_memory_seq_rm(mem, 0, -1, -1);
+    int64_t used = 0;
+    for (int k = 1; k <= n_decoys; ++k) {
+        used += (int64_t) llama_memory_seq_pos_max(mem, k) - llama_memory_seq_pos_min(mem, k) + 1;
+    }
+    LOG_INF("%s: decoys: %d sequences x %d tokens, cells used %lld\n", __func__, n_decoys, n_ctx, (long long) used);
+    return true;
+}
+
+// Sparse base row of one scored token, 16 + 8*K bytes: float nll_base, float tail_p = max(0, 1 - sum of the top-K p),
+// int32 top1, int32 0, int32 id[K], float logp[K] (the K largest base log-probs, descending, ties by lower id).
+static size_t sparse_row_bytes(int K) {
+    return 16 + size_t(K)*8;
+}
+
+static void sparse_base_row(int n_vocab, const float * logits, int tok, int K, std::vector<std::pair<float, int32_t>> & heap, uint8_t * row) {
+    float max_logit = logits[0];
+    int   imax      = 0;
+    for (int i = 1; i < n_vocab; ++i) {
+        if (logits[i] > max_logit) {
+            max_logit = logits[i];
+            imax      = i;
+        }
+    }
+    double sum_exp = 0.0;
+    for (int i = 0; i < n_vocab; ++i) {
+        sum_exp += expf(logits[i] - max_logit);
+    }
+    const float log_sum_exp = log(sum_exp);
+
+    // better(a, b): higher logit, then lower id. With it as the heap order the front is the worst of the K kept.
+    auto better = [](const std::pair<float, int32_t> & a, const std::pair<float, int32_t> & b) {
+        return a.first > b.first || (a.first == b.first && a.second < b.second);
+    };
+    heap.clear();
+    for (int i = 0; i < n_vocab; ++i) {
+        const std::pair<float, int32_t> e(logits[i], i);
+        if ((int) heap.size() < K) {
+            heap.push_back(e);
+            std::push_heap(heap.begin(), heap.end(), better);
+        } else if (better(e, heap.front())) {
+            std::pop_heap(heap.begin(), heap.end(), better);
+            heap.back() = e;
+            std::push_heap(heap.begin(), heap.end(), better);
+        }
+    }
+    std::sort_heap(heap.begin(), heap.end(), better);
+
+    const float   nll_base = max_logit + log_sum_exp - logits[tok];
+    double        sum_p    = 0.0;
+    uint8_t     * ids      = row + 16;
+    uint8_t     * lps      = row + 16 + size_t(K)*4;
+    for (int k = 0; k < K; ++k) {
+        const int32_t id = heap[k].second;
+        const float   lp = heap[k].first - max_logit - log_sum_exp;
+        sum_p += exp((double) lp);
+        memcpy(ids + size_t(k)*4, &id, 4);
+        memcpy(lps + size_t(k)*4, &lp, 4);
+    }
+    const float   tail_p = (float) std::max(0.0, 1.0 - sum_p);
+    const int32_t top1   = imax;
+    const int32_t zero   = 0;
+    memcpy(row + 0,  &nll_base, 4);
+    memcpy(row + 4,  &tail_p,   4);
+    memcpy(row + 8,  &top1,     4);
+    memcpy(row + 12, &zero,     4);
+}
+
+// KL of one scored token against a sparse base row:
+//   sum over the stored ids of p_i*(logp_i - logq_i) + tail_p*(ln tail_p - ln max(1 - sum of the stored q_i, 1e-30))
+// the tail term only when tail_p > 1e-12. same_top: the arm's argmax is the base top1.
+static kld_token_result kld_sparse_token(int n_vocab, const float * logits, const uint8_t * row, int K, int tok) {
+    float max_logit = logits[0];
+    int   imax      = 0;
+    for (int i = 1; i < n_vocab; ++i) {
+        if (logits[i] > max_logit) {
+            max_logit = logits[i];
+            imax      = i;
+        }
+    }
+    double sum_exp = 0.0;
+    for (int i = 0; i < n_vocab; ++i) {
+        sum_exp += expf(logits[i] - max_logit);
+    }
+    const float log_sum_exp = log(sum_exp);
+
+    float   nll_base;
+    float   tail_p;
+    int32_t top1;
+    memcpy(&nll_base, row + 0, 4);
+    memcpy(&tail_p,   row + 4, 4);
+    memcpy(&top1,     row + 8, 4);
+
+    const float nll = max_logit + log_sum_exp - logits[tok];
+
+    const uint8_t * ids = row + 16;
+    const uint8_t * lps = row + 16 + size_t(K)*4;
+    double sum   = 0.0;
+    double sum_q = 0.0;
+    for (int k = 0; k < K; ++k) {
+        int32_t id;
+        float   lp;
+        memcpy(&id, ids + size_t(k)*4, 4);
+        memcpy(&lp, lps + size_t(k)*4, 4);
+        const float lq = logits[id] - max_logit - log_sum_exp;
+        sum   += exp((double) lp) * ((double) lp - (double) lq);
+        sum_q += exp((double) lq);
+    }
+    if (tail_p > 1e-12f) {
+        sum += (double) tail_p * (log((double) tail_p) - log(std::max(1.0 - sum_q, 1e-30)));
+    }
+    const uint8_t same_top = imax == top1 ? 1 : 0;
+
+    const float p_base = expf(-nll_base);
+    const float p = expf(-nll);
+    const float p_diff = p - p_base;
+
+    return { sum, p_diff, nll, nll_base, same_top };
+}
+
+// the sums of one scored token, as the full-row log_softmax adds them; called in row order, so a run is reproducible
+static void kld_add_token(kl_divergence_result & kld, const kld_token_result & t) {
+    const float nll      = t.nll;
+    const float nll_base = t.nll_base;
+    kld.sum_nll  += nll;
+    kld.sum_nll2 += nll*nll;
+
+    kld.sum_nll_base  += nll_base;
+    kld.sum_nll_base2 += nll_base*nll_base;
+
+    kld.sum_nll_nll_base += nll*nll_base;
+
+    kld.sum_kld  += t.kld;
+    kld.sum_kld2 += t.kld*t.kld;
+    ++kld.count;
+    kld.n_same_top += t.same_top;
+
+    const float p_diff = t.p_diff;
+    kld.sum_p_diff  += p_diff;
+    const double p_diff2 = p_diff*p_diff;
+    kld.sum_p_diff2 += p_diff2;
+    kld.sum_p_diff4 += p_diff2*p_diff2;
+    kld.max_p_diff = std::max(kld.max_p_diff, std::fabs(p_diff));
+}
+
+// Sparse streaming base writer: env LLAMA_PPL_SPARSE_K=K with --kl-divergence-base and without --kl-divergence. Only the
+// scored positions p = first, first + stride, ... <= n_ctx - 2 get logits (LLAMA_PPL_SCORE_FIRST, default n_ctx/2;
+// LLAMA_PPL_SCORE_STRIDE, default 1); each batch's rows are appended to the file, no n_ctx x n_vocab buffer.
+// LLAMA_PPL_COPY=1: chunk c is corpus tokens [c*n_ctx/2, (c+1)*n_ctx/2) twice, stored in the file.
+// File: "_logitsS", uint32 n_ctx, int32 n_vocab, n_chunk, first, stride, n_scored, K, flags (bit0 copy),
+// llama_token tokens[n_ctx*n_chunk], then n_chunk*n_scored rows of sparse_row_bytes(K).
+static results_perplexity perplexity_sparse_base(llama_context * ctx, const common_params & params, const int32_t n_ctx, const int K) {
+    const llama_model * model = llama_get_model(ctx);
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+
+    const bool add_bos = llama_vocab_get_add_bos(vocab);
+    GGML_ASSERT(!llama_vocab_get_add_eos(vocab));
+
+    const int  n_vocab = llama_vocab_n_tokens(vocab);
+    const int  first   = ppl_env_int("LLAMA_PPL_SCORE_FIRST", n_ctx/2);
+    const int  stride  = ppl_env_int("LLAMA_PPL_SCORE_STRIDE", 1);
+    const bool copy    = ppl_env_int("LLAMA_PPL_COPY", 0) != 0;
+
+    if (K < 16 || K > 1024 || K > n_vocab) {
+        LOG_ERR("%s: LLAMA_PPL_SPARSE_K=%d must be in [16, 1024] and at most n_vocab %d\n", __func__, K, n_vocab);
+        return {};
+    }
+    if (first < 0 || first > n_ctx - 2 || stride < 1) {
+        LOG_ERR("%s: LLAMA_PPL_SCORE_FIRST=%d must be in [0, %d] and LLAMA_PPL_SCORE_STRIDE=%d at least 1\n", __func__,
+                first, n_ctx - 2, stride);
+        return {};
+    }
+    if (copy && n_ctx % 2 != 0) {
+        LOG_ERR("%s: LLAMA_PPL_COPY needs an even context, got %d\n", __func__, n_ctx);
+        return {};
+    }
+    const int n_scored = (n_ctx - 2 - first)/stride + 1;
+
+    // written as <file>.part and renamed at the end, so a failed run leaves no file that looks complete
+    const std::string part = params.logits_file + ".part";
+    std::ofstream out(part.c_str(), std::ios::binary);
+    if (!out.is_open()) {
+        LOG_ERR("%s: failed to open %s for writing\n", __func__, part.c_str());
+        return {};
+    }
+    auto fail = [&]() -> results_perplexity {
+        out.close();
+        std::remove(part.c_str());
+        return {};
+    };
+
+    LOG_INF("%s: tokenizing the input ..\n", __func__);
+    const std::vector<llama_token> corpus = common_tokenize(ctx, params.prompt, true);
+
+    const int half        = n_ctx/2;
+    const int n_chunk_max = copy ? int(corpus.size()/half) : int(corpus.size()/n_ctx);
+    const int n_chunk     = params.n_chunks < 0 ? n_chunk_max : std::min(params.n_chunks, n_chunk_max);
+    if (n_chunk < 1) {
+        LOG_ERR("%s: the data file tokenizes to %zu tokens, one chunk needs %d\n", __func__, corpus.size(), copy ? half : n_ctx);
+        return fail();
+    }
+
+    std::vector<llama_token> tokens(size_t(n_chunk)*n_ctx);
+    for (int c = 0; c < n_chunk; ++c) {
+        for (int i = 0; i < n_ctx; ++i) {
+            tokens[size_t(c)*n_ctx + i] = copy ? corpus[size_t(c)*half + i % half] : corpus[size_t(c)*n_ctx + i];
+        }
+    }
+
+    const int     flags = copy ? 1 : 0;
+    const int32_t hdr[7] = { n_vocab, n_chunk, first, stride, n_scored, K, flags };
+    const uint32_t n_ctx_u = (uint32_t) n_ctx;
+    out.write("_logitsS", 8);
+    out.write((const char *) &n_ctx_u, sizeof(n_ctx_u));
+    out.write((const char *) hdr, sizeof(hdr));
+    out.write((const char *) tokens.data(), tokens.size()*sizeof(llama_token));
+
+    const size_t row_bytes = sparse_row_bytes(K);
+    LOG_INF("%s: sparse base: K %d, %d chunks x %d scored rows (first %d, stride %d)%s, %.1f MiB of rows, writing %s\n", __func__,
+            K, n_chunk, n_scored, first, stride, copy ? ", copy corpus" : "", (double) n_chunk*n_scored*row_bytes/(1024.0*1024.0),
+            params.logits_file.c_str());
+
+    const int n_batch = std::min(params.n_batch, n_ctx);
+    llama_batch batch = llama_batch_init(n_batch, 0, 1);
+
+    std::vector<std::thread> workers(std::thread::hardware_concurrency() - 1);
+    std::vector<uint8_t> rows;
+    std::vector<int>     pos_out;
+
+    double nll   = 0.0;
+    size_t count = 0;
+
+    for (int c = 0; c < n_chunk; ++c) {
+        const auto t_start = std::chrono::high_resolution_clock::now();
+        llama_memory_clear(llama_get_memory(ctx), true);
+
+        const llama_token * toks = tokens.data() + size_t(c)*n_ctx;
+        for (int j = 0; j < n_ctx; j += n_batch) {
+            const int n = std::min(n_batch, n_ctx - j);
+            common_batch_clear(batch);
+            pos_out.clear();
+            for (int i = 0; i < n; ++i) {
+                const int  pos    = j + i;
+                const bool scored = pos >= first && pos <= n_ctx - 2 && (pos - first) % stride == 0;
+                common_batch_add(batch, add_bos && pos == 0 ? llama_vocab_bos(vocab) : toks[pos], pos, { 0 }, scored);
+                if (scored) {
+                    pos_out.push_back(pos);
+                }
+            }
+            if (llama_decode(ctx, batch)) {
+                LOG_ERR("%s: failed to decode\n", __func__);
+                llama_batch_free(batch);
+                return fail();
+            }
+            if (pos_out.empty()) {
+                continue;
+            }
+            const float * logits = llama_get_logits(ctx);
+            rows.resize(pos_out.size()*row_bytes);
+            ppl_parallel_for(workers, (int) pos_out.size(), [&](int o) {
+                std::vector<std::pair<float, int32_t>> heap;
+                heap.reserve(K);
+                sparse_base_row(n_vocab, logits + size_t(o)*n_vocab, toks[pos_out[o] + 1], K, heap, rows.data() + size_t(o)*row_bytes);
+            });
+            for (size_t o = 0; o < pos_out.size(); ++o) {
+                float nb;
+                memcpy(&nb, rows.data() + o*row_bytes, 4);
+                nll += nb;
+                ++count;
+            }
+            out.write((const char *) rows.data(), rows.size());
+        }
+
+        if (c == 0) {
+            const auto t_end = std::chrono::high_resolution_clock::now();
+            const float t_total = std::chrono::duration<float>(t_end - t_start).count();
+            LOG_INF("%s: %.2f seconds per pass - ETA %.2f minutes\n", __func__, t_total, t_total*n_chunk/60.0);
+        }
+        LOG("[%d]%.4lf,", c + 1, std::exp(nll/count));
+    }
+    LOG("\n");
+
+    llama_batch_free(batch);
+    out.close();
+    if (out.fail()) {
+        LOG_ERR("%s: failed writing %s\n", __func__, part.c_str());
+        return fail();
+    }
+    std::remove(params.logits_file.c_str());
+    if (std::rename(part.c_str(), params.logits_file.c_str()) != 0) {
+        LOG_ERR("%s: cannot rename %s to %s\n", __func__, part.c_str(), params.logits_file.c_str());
+        return {};
+    }
+
+    const double ppl = std::exp(nll/count);
+    LOG_INF("Final estimate: PPL = %.4lf (sparse base, %zu scored tokens)\n", ppl, count);
+
+    return {tokens, ppl, {}, {}};
 }
 
 static results_perplexity perplexity_v2(llama_context * ctx, const common_params & params) {
@@ -1702,6 +2117,339 @@ static void multiple_choice_score(llama_context * ctx, const common_params & par
     LOG_INF("\n");
 }
 
+static std::pair<double, double> kld_mean_and_uncertainty(double sum, double sum2, size_t count) {
+    if (count < 1) {
+        return std::make_pair(0., 0.);
+    }
+    double f = sum/count;
+    double df = sum2/count - f*f;
+    df = df > 0 && count > 10 ? sqrt(df/(count-1)) : 0.;
+    return std::make_pair(f, df);
+}
+
+static double kld_covariance(double suma, double sumb, double sumab, size_t count) {
+    if (count < 10) {
+        return 0.0;
+    }
+    double var = sumab/count - (suma/count)*(sumb/count);
+    var /= count - 1;
+    return var;
+}
+
+// one row of the KL chunk table (running values after chunk chunk_no)
+static void kld_print_row(const kl_divergence_result & kld, int chunk_no) {
+    LOG("%4d", chunk_no);
+
+    auto log_ppl = kld_mean_and_uncertainty(kld.sum_nll, kld.sum_nll2, kld.count);
+    const double ppl_val = exp(log_ppl.first);
+    const double ppl_unc = ppl_val * log_ppl.second;
+    LOG("    %9.4lf ± %9.4lf", ppl_val, ppl_unc);
+
+    auto log_ppl_base = kld_mean_and_uncertainty(kld.sum_nll_base, kld.sum_nll_base2, kld.count);
+    const double log_ppl_cov = kld_covariance(kld.sum_nll, kld.sum_nll_base, kld.sum_nll_nll_base, kld.count);
+    const double log_ppl_ratio_val = log_ppl.first - log_ppl_base.first;
+    const double log_ppl_ratio_unc = sqrt(log_ppl.second*log_ppl.second + log_ppl_base.second*log_ppl_base.second - 2.0*log_ppl_cov);
+    LOG("    %10.5lf ± %10.5lf", log_ppl_ratio_val, log_ppl_ratio_unc);
+
+    auto kl_div = kld_mean_and_uncertainty(kld.sum_kld, kld.sum_kld2, kld.count);
+    LOG("    %10.5lf ± %10.5lf", kl_div.first, kl_div.second);
+
+    auto p_diff_mse   = kld_mean_and_uncertainty(kld.sum_p_diff2, kld.sum_p_diff4, kld.count);
+    const double p_diff_rms_val = sqrt(p_diff_mse.first);
+    const double p_diff_rms_unc = 0.5/p_diff_rms_val * p_diff_mse.second;
+    LOG("    %6.3lf ± %6.3lf %%", 100.0*p_diff_rms_val, 100.0*p_diff_rms_unc);
+
+    double p_top_val = 1.*kld.n_same_top/kld.count;
+    double p_top_unc = sqrt(p_top_val*(1 - p_top_val)/(kld.count - 1));
+    LOG("    %6.3lf ± %6.3lf %%", 100.0*p_top_val, 100.0*p_top_unc);
+
+    LOG("\n");
+}
+
+// the statistics after the chunk table; sorts the value arrays
+static void kld_print_summary(const kl_divergence_result & kld, std::vector<float> & kld_values, std::vector<float> & p_diff_values) {
+    if (kld.count < 100) return; // we do not wish to do statistics on so few values
+
+    std::sort(kld_values.begin(), kld_values.end());
+    std::sort(p_diff_values.begin(), p_diff_values.end());
+
+    LOG("====== Perplexity statistics ======\n");
+
+    auto log_ppl = kld_mean_and_uncertainty(kld.sum_nll, kld.sum_nll2, kld.count);
+    const double ppl_val = exp(log_ppl.first);
+    const double ppl_unc = ppl_val * log_ppl.second; // ppl_unc = sqrt( (dexp(x) / dx) ** 2 * log_ppl.second ** 2 )
+    LOG("Mean PPL(Q)                   : %10.6lf ± %10.6lf\n", ppl_val, ppl_unc);
+
+    auto log_ppl_base = kld_mean_and_uncertainty(kld.sum_nll_base, kld.sum_nll_base2, kld.count);
+    const double ppl_base_val = exp(log_ppl_base.first);
+    const double ppl_base_unc = ppl_base_val * log_ppl_base.second; // ppl_base_unc = sqrt( (dexp(x) / dx) ** 2 * log_ppl_base.second ** 2 )
+    LOG("Mean PPL(base)                : %10.6lf ± %10.6lf\n", ppl_base_val, ppl_base_unc);
+
+    const double log_ppl_cov = kld_covariance(kld.sum_nll, kld.sum_nll_base, kld.sum_nll_nll_base, kld.count);
+    // LOG("Cov(ln(PPL(Q)), ln(PPL(base))): %10.6lf\n", log_ppl_cov);
+    const double log_ppl_cor = log_ppl_cov / (log_ppl.second*log_ppl_base.second);
+    LOG("Cor(ln(PPL(Q)), ln(PPL(base))): %6.2lf%%\n", 100.0*log_ppl_cor);
+
+    const double log_ppl_ratio_val = log_ppl.first - log_ppl_base.first;
+    const double log_ppl_ratio_unc = sqrt(log_ppl.second*log_ppl.second + log_ppl_base.second*log_ppl_base.second - 2.0*log_ppl_cov);
+    LOG("Mean ln(PPL(Q)/PPL(base))     : %10.6lf ± %10.6lf\n", log_ppl_ratio_val, log_ppl_ratio_unc);
+
+    const double ppl_ratio_val = exp(log_ppl_ratio_val);
+    const double ppl_ratio_unc = ppl_ratio_val * log_ppl_ratio_unc; // ppl_ratio_unc = sqrt( (dexp(x) / dx) ** 2 * log_ppl_ratio.second ** 2 )
+    LOG("Mean PPL(Q)/PPL(base)         : %10.6lf ± %10.6lf\n", ppl_ratio_val, ppl_ratio_unc);
+
+    const double ppl_cov = ppl_val * ppl_base_val * log_ppl_cov;
+    const double ppl_diff_val = ppl_val - ppl_base_val;
+    const double ppl_diff_unc = sqrt(ppl_unc*ppl_unc + ppl_base_unc*ppl_base_unc - 2.0*ppl_cov);
+    LOG("Mean PPL(Q)-PPL(base)         : %10.6lf ± %10.6lf\n", ppl_diff_val, ppl_diff_unc);
+
+    LOG("\n");
+
+    LOG("====== KL divergence statistics ======\n");
+    auto kl_div = kld_mean_and_uncertainty(kld.sum_kld, kld.sum_kld2, kld.count);
+    LOG("Mean    KLD: %10.6lf ± %10.6lf\n", kl_div.first, kl_div.second);
+    auto kld_median = kld_values.size()%2 == 0 ? 0.5f*(kld_values[kld_values.size()/2] + kld_values[kld_values.size()/2-1])
+                                               : kld_values[kld_values.size()/2];
+
+    auto percentile = [] (std::vector<float> values, float fraction) {
+        if (fraction <= 0) return values.front();
+        if (fraction >= 1) return values.back();
+        float p = fraction*(values.size() - 1);
+        size_t ip = size_t(p); p -= ip;
+        return (1 - p)*values[ip] + p*values[std::min(ip+1, values.size()-1)];
+    };
+
+    LOG("Maximum KLD: %10.6f\n", kld_values.back());
+    LOG("99.9%%   KLD: %10.6f\n", percentile(kld_values, 0.999f));
+    LOG("99.0%%   KLD: %10.6f\n", percentile(kld_values, 0.990f));
+    LOG("95.0%%   KLD: %10.6f\n", percentile(kld_values, 0.950f));
+    LOG("90.0%%   KLD: %10.6f\n", percentile(kld_values, 0.900f));
+    LOG("Median  KLD: %10.6f\n", kld_median);
+    LOG("10.0%%   KLD: %10.6f\n", percentile(kld_values, 0.100f));
+    LOG(" 5.0%%   KLD: %10.6f\n", percentile(kld_values, 0.050f));
+    LOG(" 1.0%%   KLD: %10.6f\n", percentile(kld_values, 0.010f));
+    LOG(" 0.1%%   KLD: %10.6f\n", percentile(kld_values, 0.001f));
+    LOG("Minimum KLD: %10.6f\n", kld_values.front());
+
+    LOG("\n");
+
+    LOG("====== Token probability statistics ======\n");
+
+    auto p_diff = kld_mean_and_uncertainty(kld.sum_p_diff, kld.sum_p_diff2, kld.count);
+    LOG("Mean    Δp: %6.3lf ± %5.3lf %%\n",  100.0*p_diff.first, 100.0*p_diff.second);
+
+    auto p_diff_median = p_diff_values.size()%2 == 0 ? 0.5f*(p_diff_values[p_diff_values.size()/2] + p_diff_values[p_diff_values.size()/2-1])
+                                               : p_diff_values[p_diff_values.size()/2];
+
+    LOG("Maximum Δp: %6.3lf%%\n",  100.0*p_diff_values.back());
+    LOG("99.9%%   Δp: %6.3lf%%\n", 100.0*percentile(p_diff_values, 0.999f));
+    LOG("99.0%%   Δp: %6.3lf%%\n", 100.0*percentile(p_diff_values, 0.990f));
+    LOG("95.0%%   Δp: %6.3lf%%\n", 100.0*percentile(p_diff_values, 0.950f));
+    LOG("90.0%%   Δp: %6.3lf%%\n", 100.0*percentile(p_diff_values, 0.900f));
+    LOG("75.0%%   Δp: %6.3lf%%\n", 100.0*percentile(p_diff_values, 0.750f));
+    LOG("Median  Δp: %6.3lf%%\n",  100.0*p_diff_median);
+    LOG("25.0%%   Δp: %6.3lf%%\n", 100.0*percentile(p_diff_values, 0.250f));
+    LOG("10.0%%   Δp: %6.3lf%%\n", 100.0*percentile(p_diff_values, 0.100f));
+    LOG(" 5.0%%   Δp: %6.3lf%%\n", 100.0*percentile(p_diff_values, 0.050f));
+    LOG(" 1.0%%   Δp: %6.3lf%%\n", 100.0*percentile(p_diff_values, 0.010f));
+    LOG(" 0.1%%   Δp: %6.3lf%%\n", 100.0*percentile(p_diff_values, 0.001f));
+    LOG("Minimum Δp: %6.3lf%%\n",  100.0*p_diff_values.front());
+
+    auto p_diff_mse = kld_mean_and_uncertainty(kld.sum_p_diff2, kld.sum_p_diff4, kld.count);
+    // LOG("MSE Δp    : %10.6lf ± %10.6lf\n", p_diff_mse.first, p_diff_mse.second);
+
+    const double p_diff_rms_val = sqrt(p_diff_mse.first);
+    const double p_diff_rms_unc = 0.5/p_diff_rms_val * p_diff_mse.second;
+    LOG("RMS Δp    : %6.3lf ± %5.3lf %%\n", 100.0*p_diff_rms_val, 100.0*p_diff_rms_unc);
+
+    const double same_top_p = 1.0*kld.n_same_top/kld.count;
+    LOG("Same top p: %6.3lf ± %5.3lf %%\n", 100.0*same_top_p, 100.0*sqrt(same_top_p*(1.0 - same_top_p)/(kld.count - 1)));
+}
+
+// [TAG_PPL_TQ8] KL divergence against a sparse base (magic "_logitsS", perplexity_sparse_base): logits only for the scored
+// positions, scored per batch, the same summary lines and chunk table as kl_divergence, and the LLAMA_PPL_KLD_DUMP file.
+static void kl_divergence_sparse(llama_context * ctx, const common_params & params, std::ifstream & in) {
+    const llama_model * model = llama_get_model(ctx);
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+    const int n_vocab = llama_vocab_n_tokens(vocab);
+
+    uint32_t n_ctx  = 0;
+    int32_t  hdr[7] = {};
+    in.read((char *) &n_ctx, sizeof(n_ctx));
+    in.read((char *) hdr, sizeof(hdr));
+    if (in.fail()) {
+        LOG_ERR("%s: failed reading the header of %s\n", __func__, params.logits_file.c_str());
+        return;
+    }
+    const int n_vocab_f = hdr[0];
+    int       n_chunk   = hdr[1];
+    const int first     = hdr[2];
+    const int stride    = hdr[3];
+    const int n_scored  = hdr[4];
+    const int K         = hdr[5];
+    const int flags_f   = hdr[6];
+    if (n_vocab_f != n_vocab) {
+        LOG_ERR("%s: inconsistent vocabulary (%d vs %d)\n", __func__, n_vocab_f, n_vocab);
+        return;
+    }
+    if (n_ctx < 2 || n_chunk < 1 || K < 16 || K > 1024 || K > n_vocab || first < 0 || first > (int) n_ctx - 2 || stride < 1 ||
+            n_scored != ((int) n_ctx - 2 - first)/stride + 1) {
+        LOG_ERR("%s: bad sparse header in %s: n_ctx %u, n_chunk %d, first %d, stride %d, n_scored %d, K %d\n", __func__,
+                params.logits_file.c_str(), n_ctx, n_chunk, first, stride, n_scored, K);
+        return;
+    }
+    if (n_ctx > llama_n_ctx(ctx)) {
+        LOG_ERR("%s: %s has been computed with %u, while the current context is %u. Increase it with -c and retry\n",
+                __func__, params.logits_file.c_str(), n_ctx, llama_n_ctx(ctx));
+        return;
+    }
+
+    std::vector<llama_token> tokens(size_t(n_ctx) * n_chunk);
+    if (in.read((char *) tokens.data(), tokens.size()*sizeof(tokens[0])).fail()) {
+        LOG_ERR("%s: failed reading evaluation tokens from %s\n", __func__, params.logits_file.c_str());
+        return;
+    }
+
+    const int n_chunk_file = n_chunk;
+    if (params.n_chunks > 0 && params.n_chunks < n_chunk) {
+        LOG_INF("%s: limiting to the first %d of %d chunks (--chunks)\n", __func__, params.n_chunks, n_chunk);
+        n_chunk = params.n_chunks;
+    }
+
+    const bool   add_bos   = llama_vocab_get_add_bos(vocab);
+    const int    n_batch   = std::min(params.n_batch, (int) n_ctx);
+    const size_t row_bytes = sparse_row_bytes(K);
+    const int    n_decoys  = ppl_env_int("LLAMA_PPL_DECOYS", 0);
+    GGML_ASSERT(!llama_vocab_get_add_eos(vocab));
+
+    LOG_INF("%s: sparse base: K %d, %d scored rows per chunk (first %d, stride %d)%s\n", __func__, K, n_scored, first, stride,
+            (flags_f & 1) ? ", copy corpus" : "");
+    LOG_INF("%s: computing over %d chunks, n_ctx=%u, batch_size=%d, n_seq=1\n", __func__, n_chunk, n_ctx, n_batch);
+
+    if (!kld_decoys_setup(ctx, tokens, (int) n_ctx, n_chunk_file, n_decoys, n_batch, add_bos, vocab)) {
+        return;
+    }
+
+    std::vector<std::thread> workers(std::thread::hardware_concurrency() - 1);
+
+    const size_t n_tok = size_t(n_chunk)*n_scored;
+    std::vector<float>   kld_values(n_tok);
+    std::vector<float>   p_diff_values(n_tok);
+    std::vector<float>   nll_values(n_tok);
+    std::vector<float>   nll_base_values(n_tok);
+    std::vector<uint8_t> same_top_values(n_tok);
+
+    std::vector<uint8_t>          base(size_t(n_scored)*row_bytes);
+    std::vector<int>              pos_out;
+    std::vector<kld_token_result> res;
+    kl_divergence_result          kld;
+
+    llama_batch batch = llama_batch_init(n_batch, 0, 1);
+
+    for (int c = 0; c < n_chunk; ++c) {
+        const auto t_start = std::chrono::high_resolution_clock::now();
+
+        if (in.read((char *) base.data(), base.size()).fail()) {
+            LOG_ERR("%s: failed reading the base rows of chunk %d\n", __func__, c);
+            llama_batch_free(batch);
+            return;
+        }
+        for (int r = 0; r < n_scored; ++r) {
+            const uint8_t * row = base.data() + size_t(r)*row_bytes;
+            int32_t id;
+            bool    ok = true;
+            memcpy(&id, row + 8, 4);
+            ok = ok && id >= 0 && id < n_vocab;
+            for (int k = 0; ok && k < K; ++k) {
+                memcpy(&id, row + 16 + size_t(k)*4, 4);
+                ok = id >= 0 && id < n_vocab;
+            }
+            if (!ok) {
+                LOG_ERR("%s: chunk %d row %d of %s holds a token id outside the vocabulary\n", __func__, c, r, params.logits_file.c_str());
+                llama_batch_free(batch);
+                return;
+            }
+        }
+
+        if (n_decoys > 0) {
+            llama_memory_seq_rm(llama_get_memory(ctx), 0, -1, -1);
+        } else {
+            llama_memory_clear(llama_get_memory(ctx), true);
+        }
+
+        const llama_token * toks = tokens.data() + size_t(c)*n_ctx;
+        int r0 = 0;
+        for (int j = 0; j < (int) n_ctx; j += n_batch) {
+            const int n = std::min(n_batch, (int) n_ctx - j);
+            common_batch_clear(batch);
+            pos_out.clear();
+            for (int i = 0; i < n; ++i) {
+                const int  pos    = j + i;
+                const bool scored = pos >= first && pos <= (int) n_ctx - 2 && (pos - first) % stride == 0;
+                common_batch_add(batch, add_bos && pos == 0 ? llama_vocab_bos(vocab) : toks[pos], pos, { 0 }, scored);
+                if (scored) {
+                    pos_out.push_back(pos);
+                }
+            }
+            if (llama_decode(ctx, batch)) {
+                LOG_ERR("%s : failed to decode\n", __func__);
+                llama_batch_free(batch);
+                return;
+            }
+            const int n_out = (int) pos_out.size();
+            if (n_out == 0) {
+                continue;
+            }
+            GGML_ASSERT(r0 + n_out <= n_scored);
+            const float * logits = llama_get_logits(ctx);
+            res.resize(n_out);
+            ppl_parallel_for(workers, n_out, [&](int o) {
+                res[o] = kld_sparse_token(n_vocab, logits + size_t(o)*n_vocab, base.data() + size_t(r0 + o)*row_bytes, K, toks[pos_out[o] + 1]);
+            });
+            for (int o = 0; o < n_out; ++o) {
+                kld_add_token(kld, res[o]);
+                const size_t t = size_t(c)*n_scored + r0 + o;
+                kld_values[t]      = (float) res[o].kld;
+                p_diff_values[t]   = res[o].p_diff;
+                nll_values[t]      = res[o].nll;
+                nll_base_values[t] = res[o].nll_base;
+                same_top_values[t] = res[o].same_top;
+            }
+            r0 += n_out;
+        }
+        if (r0 != n_scored) {
+            LOG_ERR("%s: chunk %d scored %d rows, the base has %d\n", __func__, c, r0, n_scored);
+            llama_batch_free(batch);
+            return;
+        }
+
+        if (c == 0) {
+            llama_synchronize(ctx);
+            const auto t_end = std::chrono::high_resolution_clock::now();
+            const float t_total = std::chrono::duration<float>(t_end - t_start).count();
+            LOG_INF("%s: %.2f seconds per pass - ETA ", __func__, t_total);
+            int total_seconds = (int)(t_total * n_chunk);
+            if (total_seconds >= 60*60) {
+                LOG("%d hours ", total_seconds / (60*60));
+                total_seconds = total_seconds % (60*60);
+            }
+            LOG("%.2f minutes\n", total_seconds / 60.0);
+            LOG("\n");
+            LOG("chunk             PPL               ln(PPL(Q)/PPL(base))          KL Divergence              Δp RMS            Same top p\n");
+        }
+
+        kld_print_row(kld, c + 1);
+    }
+
+    llama_batch_free(batch);
+    LOG("\n");
+
+    kld_dump_write(n_chunk, n_scored, first, stride, 1 | ((flags_f & 1) ? 2 : 0) | (n_decoys > 0 ? 4 : 0), kld_values, p_diff_values,
+            nll_values, nll_base_values, same_top_values);
+
+    kld_print_summary(kld, kld_values, p_diff_values);
+}
+
 static void kl_divergence(llama_context * ctx, const common_params & params) {
     const llama_model * model = llama_get_model(ctx);
     const llama_vocab * vocab = llama_model_get_vocab(model);
@@ -1718,6 +2466,10 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {
     {
         char check[9]; check[8] = 0;
         in.read(check, 8);
+        if (!in.fail() && strncmp("_logitsS", check, 8) == 0) {   // [TAG_PPL_TQ8] sparse top-K base
+            kl_divergence_sparse(ctx, params, in);
+            return;
+        }
         if (in.fail() || strncmp("_logits_", check, 8) != 0) {
             LOG_ERR("%s: %s does not look like a file containing log-probabilities\n", __func__, params.logits_file.c_str());
             return;
@@ -1820,6 +2572,9 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {
     std::vector<uint16_t> log_probs_uint16(map_view != nullptr ? 0 : size_t(n_ctx - 1 - n_ctx/2) * nv);   // [TAG_PPL_KLD_FAST] unused when mapped
     std::vector<float>    kld_values(size_t(n_ctx - 1 - n_ctx/2)*n_chunk);
     std::vector<float> p_diff_values(size_t(n_ctx - 1 - n_ctx/2)*n_chunk);
+    std::vector<float>   nll_values     (size_t(n_ctx - 1 - n_ctx/2)*n_chunk);   // [TAG_PPL_TQ8] LLAMA_PPL_KLD_DUMP
+    std::vector<float>   nll_base_values(size_t(n_ctx - 1 - n_ctx/2)*n_chunk);
+    std::vector<uint8_t> same_top_values(size_t(n_ctx - 1 - n_ctx/2)*n_chunk);
     std::vector<float> logits;
     if (num_batches > 1) {
         logits.reserve(size_t(n_ctx - n_ctx/2) * n_vocab);   // [TAG_PPL_KLD_FAST] only positions >= n_ctx/2 are ever inserted
@@ -1827,29 +2582,26 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {
 
     LOG_INF("%s: computing over %d chunks, n_ctx=%u, batch_size=%d, n_seq=%d\n", __func__, n_chunk, n_ctx, n_batch, n_seq);
 
-    std::vector<std::thread> workers(std::thread::hardware_concurrency() - 1);
+    // [TAG_PPL_TQ8] decoys (LLAMA_PPL_DECOYS): only seq 0 is cleared per chunk
+    const int n_decoys = ppl_env_int("LLAMA_PPL_DECOYS", 0);
+    if (n_decoys > 0 && n_seq > 1) {
+        LOG_ERR("%s: LLAMA_PPL_DECOYS needs one scored sequence per batch (n_seq %d): use -b <= -c\n", __func__, n_seq);
+        llama_batch_free(batch);
+        return;
+    }
+    if (!kld_decoys_setup(ctx, tokens, (int) n_ctx, n_chunk_file, n_decoys, n_batch, add_bos, vocab)) {
+        llama_batch_free(batch);
+        return;
+    }
 
-    auto mean_and_uncertainty = [] (double sum, double sum2, size_t count) {
-        if (count < 1) {
-            return std::make_pair(0., 0.);
-        }
-        double f = sum/count;
-        double df = sum2/count - f*f;
-        df = df > 0 && count > 10 ? sqrt(df/(count-1)) : 0.;
-        return std::make_pair(f, df);
-    };
-    auto covariance = [] (double suma, double sumb, double sumab, size_t count) {
-        if (count < 10) {
-            return 0.0;
-        }
-        double var = sumab/count - (suma/count)*(sumb/count);
-        var /= count - 1;
-        return var;
-    };
+    std::vector<std::thread> workers(std::thread::hardware_concurrency() - 1);
 
     kl_divergence_result kld;
     auto    kld_ptr =    kld_values.data();
     auto p_diff_ptr = p_diff_values.data();
+    auto      nll_ptr =      nll_values.data();
+    auto nll_base_ptr = nll_base_values.data();
+    auto same_top_ptr = same_top_values.data();
 
     const int first = n_ctx/2;
 
@@ -1896,32 +2648,7 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {
         });
     };
     auto print_row = [&](int chunk_no) {
-        LOG("%4d", chunk_no);
-
-        auto log_ppl = mean_and_uncertainty(kld.sum_nll, kld.sum_nll2, kld.count);
-        const double ppl_val = exp(log_ppl.first);
-        const double ppl_unc = ppl_val * log_ppl.second;
-        LOG("    %9.4lf ± %9.4lf", ppl_val, ppl_unc);
-
-        auto log_ppl_base = mean_and_uncertainty(kld.sum_nll_base, kld.sum_nll_base2, kld.count);
-        const double log_ppl_cov = covariance(kld.sum_nll, kld.sum_nll_base, kld.sum_nll_nll_base, kld.count);
-        const double log_ppl_ratio_val = log_ppl.first - log_ppl_base.first;
-        const double log_ppl_ratio_unc = sqrt(log_ppl.second*log_ppl.second + log_ppl_base.second*log_ppl_base.second - 2.0*log_ppl_cov);
-        LOG("    %10.5lf ± %10.5lf", log_ppl_ratio_val, log_ppl_ratio_unc);
-
-        auto kl_div = mean_and_uncertainty(kld.sum_kld, kld.sum_kld2, kld.count);
-        LOG("    %10.5lf ± %10.5lf", kl_div.first, kl_div.second);
-
-        auto p_diff_mse   = mean_and_uncertainty(kld.sum_p_diff2, kld.sum_p_diff4, kld.count);
-        const double p_diff_rms_val = sqrt(p_diff_mse.first);
-        const double p_diff_rms_unc = 0.5/p_diff_rms_val * p_diff_mse.second;
-        LOG("    %6.3lf ± %6.3lf %%", 100.0*p_diff_rms_val, 100.0*p_diff_rms_unc);
-
-        double p_top_val = 1.*kld.n_same_top/kld.count;
-        double p_top_unc = sqrt(p_top_val*(1 - p_top_val)/(kld.count - 1));
-        LOG("    %6.3lf ± %6.3lf %%", 100.0*p_top_val, 100.0*p_top_unc);
-
-        LOG("\n");
+        kld_print_row(kld, chunk_no);
     };
     auto finish_pending = [&]() {
         if (scorer.joinable()) {
@@ -1938,13 +2665,19 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {
         const float    * all_logits = logits.data();
         const int      * toks       = tokens.data() + chunk_start + first;
         const uint16_t * base       = base_rows(chunk);
-        float * kp = kld_ptr;
-        float * pp = p_diff_ptr;
-        kld_ptr    += n_ctx - 1 - first;
-        p_diff_ptr += n_ctx - 1 - first;
+        float   * kp  = kld_ptr;
+        float   * pp  = p_diff_ptr;
+        float   * np  = nll_ptr;
+        float   * nbp = nll_base_ptr;
+        uint8_t * sp  = same_top_ptr;
+        kld_ptr      += n_ctx - 1 - first;
+        p_diff_ptr   += n_ctx - 1 - first;
+        nll_ptr      += n_ctx - 1 - first;
+        nll_base_ptr += n_ctx - 1 - first;
+        same_top_ptr += n_ctx - 1 - first;
         pending_chunk = chunk;
-        scorer = std::thread([&, all_logits, toks, base, kp, pp]() {
-            process_logits(n_vocab, all_logits, toks, n_ctx - 1 - first, workers, base, kld, kp, pp);
+        scorer = std::thread([&, all_logits, toks, base, kp, pp, np, nbp, sp]() {
+            process_logits(n_vocab, all_logits, toks, n_ctx - 1 - first, workers, base, kld, kp, pp, np, nbp, sp);
         });
         prefetch(chunk + 1);     // the next chunk's rows page in during its GPU phase
     };
@@ -1961,8 +2694,12 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {
 
         const auto t_start = std::chrono::high_resolution_clock::now();
 
-        // clear the KV cache
-        llama_memory_clear(llama_get_memory(ctx), true);
+        // clear the KV cache ([TAG_PPL_TQ8] only seq 0 with decoys)
+        if (n_decoys > 0) {
+            llama_memory_seq_rm(llama_get_memory(ctx), 0, -1, -1);
+        } else {
+            llama_memory_clear(llama_get_memory(ctx), true);
+        }
 
         for (int j = 0; j < num_batches; ++j) {
             const int batch_start = start + j * n_batch;
@@ -2041,36 +2778,15 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {
             const float * all_logits = num_batches > 1 ? logits.data() : llama_get_logits_ith(ctx, seq*n_ctx + first);
 
             process_logits(n_vocab, all_logits, tokens.data() + start + seq*n_ctx + first, n_ctx - 1 - first,
-                    workers, map_view != nullptr ? base_rows(i + seq) : log_probs_uint16.data(), kld, kld_ptr, p_diff_ptr);
-            p_diff_ptr += n_ctx - 1 - first;
-            kld_ptr    += n_ctx - 1 - first;
+                    workers, map_view != nullptr ? base_rows(i + seq) : log_probs_uint16.data(), kld, kld_ptr, p_diff_ptr,
+                    nll_ptr, nll_base_ptr, same_top_ptr);
+            p_diff_ptr   += n_ctx - 1 - first;
+            kld_ptr      += n_ctx - 1 - first;
+            nll_ptr      += n_ctx - 1 - first;
+            nll_base_ptr += n_ctx - 1 - first;
+            same_top_ptr += n_ctx - 1 - first;
 
-            LOG("%4d", i + seq + 1);
-
-            auto log_ppl = mean_and_uncertainty(kld.sum_nll, kld.sum_nll2, kld.count);
-            const double ppl_val = exp(log_ppl.first);
-            const double ppl_unc = ppl_val * log_ppl.second;
-            LOG("    %9.4lf ± %9.4lf", ppl_val, ppl_unc);
-
-            auto log_ppl_base = mean_and_uncertainty(kld.sum_nll_base, kld.sum_nll_base2, kld.count);
-            const double log_ppl_cov = covariance(kld.sum_nll, kld.sum_nll_base, kld.sum_nll_nll_base, kld.count);
-            const double log_ppl_ratio_val = log_ppl.first - log_ppl_base.first;
-            const double log_ppl_ratio_unc = sqrt(log_ppl.second*log_ppl.second + log_ppl_base.second*log_ppl_base.second - 2.0*log_ppl_cov);
-            LOG("    %10.5lf ± %10.5lf", log_ppl_ratio_val, log_ppl_ratio_unc);
-
-            auto kl_div = mean_and_uncertainty(kld.sum_kld, kld.sum_kld2, kld.count);
-            LOG("    %10.5lf ± %10.5lf", kl_div.first, kl_div.second);
-
-            auto p_diff_mse   = mean_and_uncertainty(kld.sum_p_diff2, kld.sum_p_diff4, kld.count);
-            const double p_diff_rms_val = sqrt(p_diff_mse.first);
-            const double p_diff_rms_unc = 0.5/p_diff_rms_val * p_diff_mse.second;
-            LOG("    %6.3lf ± %6.3lf %%", 100.0*p_diff_rms_val, 100.0*p_diff_rms_unc);
-
-            double p_top_val = 1.*kld.n_same_top/kld.count;
-            double p_top_unc = sqrt(p_top_val*(1 - p_top_val)/(kld.count - 1));
-            LOG("    %6.3lf ± %6.3lf %%", 100.0*p_top_val, 100.0*p_top_unc);
-
-            LOG("\n");
+            kld_print_row(kld, i + seq + 1);
         }
 
         logits.clear();
@@ -2083,102 +2799,11 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {
     llama_batch_free(batch);
     LOG("\n");
 
-    if (kld.count < 100) return; // we do not wish to do statistics on so few values
+    // [TAG_PPL_TQ8]
+    kld_dump_write(n_chunk, n_ctx - 1 - first, first, 1, n_decoys > 0 ? 4 : 0, kld_values, p_diff_values, nll_values, nll_base_values,
+            same_top_values);
 
-    std::sort(kld_values.begin(), kld_values.end());
-    std::sort(p_diff_values.begin(), p_diff_values.end());
-
-    LOG("====== Perplexity statistics ======\n");
-
-    auto log_ppl = mean_and_uncertainty(kld.sum_nll, kld.sum_nll2, kld.count);
-    const double ppl_val = exp(log_ppl.first);
-    const double ppl_unc = ppl_val * log_ppl.second; // ppl_unc = sqrt( (dexp(x) / dx) ** 2 * log_ppl.second ** 2 )
-    LOG("Mean PPL(Q)                   : %10.6lf ± %10.6lf\n", ppl_val, ppl_unc);
-
-    auto log_ppl_base = mean_and_uncertainty(kld.sum_nll_base, kld.sum_nll_base2, kld.count);
-    const double ppl_base_val = exp(log_ppl_base.first);
-    const double ppl_base_unc = ppl_base_val * log_ppl_base.second; // ppl_base_unc = sqrt( (dexp(x) / dx) ** 2 * log_ppl_base.second ** 2 )
-    LOG("Mean PPL(base)                : %10.6lf ± %10.6lf\n", ppl_base_val, ppl_base_unc);
-
-    const double log_ppl_cov = covariance(kld.sum_nll, kld.sum_nll_base, kld.sum_nll_nll_base, kld.count);
-    // LOG("Cov(ln(PPL(Q)), ln(PPL(base))): %10.6lf\n", log_ppl_cov);
-    const double log_ppl_cor = log_ppl_cov / (log_ppl.second*log_ppl_base.second);
-    LOG("Cor(ln(PPL(Q)), ln(PPL(base))): %6.2lf%%\n", 100.0*log_ppl_cor);
-
-    const double log_ppl_ratio_val = log_ppl.first - log_ppl_base.first;
-    const double log_ppl_ratio_unc = sqrt(log_ppl.second*log_ppl.second + log_ppl_base.second*log_ppl_base.second - 2.0*log_ppl_cov);
-    LOG("Mean ln(PPL(Q)/PPL(base))     : %10.6lf ± %10.6lf\n", log_ppl_ratio_val, log_ppl_ratio_unc);
-
-    const double ppl_ratio_val = exp(log_ppl_ratio_val);
-    const double ppl_ratio_unc = ppl_ratio_val * log_ppl_ratio_unc; // ppl_ratio_unc = sqrt( (dexp(x) / dx) ** 2 * log_ppl_ratio.second ** 2 )
-    LOG("Mean PPL(Q)/PPL(base)         : %10.6lf ± %10.6lf\n", ppl_ratio_val, ppl_ratio_unc);
-
-    const double ppl_cov = ppl_val * ppl_base_val * log_ppl_cov;
-    const double ppl_diff_val = ppl_val - ppl_base_val;
-    const double ppl_diff_unc = sqrt(ppl_unc*ppl_unc + ppl_base_unc*ppl_base_unc - 2.0*ppl_cov);
-    LOG("Mean PPL(Q)-PPL(base)         : %10.6lf ± %10.6lf\n", ppl_diff_val, ppl_diff_unc);
-
-    LOG("\n");
-
-    LOG("====== KL divergence statistics ======\n");
-    auto kl_div = mean_and_uncertainty(kld.sum_kld, kld.sum_kld2, kld.count);
-    LOG("Mean    KLD: %10.6lf ± %10.6lf\n", kl_div.first, kl_div.second);
-    auto kld_median = kld_values.size()%2 == 0 ? 0.5f*(kld_values[kld_values.size()/2] + kld_values[kld_values.size()/2-1])
-                                               : kld_values[kld_values.size()/2];
-
-    auto percentile = [] (std::vector<float> values, float fraction) {
-        if (fraction <= 0) return values.front();
-        if (fraction >= 1) return values.back();
-        float p = fraction*(values.size() - 1);
-        size_t ip = size_t(p); p -= ip;
-        return (1 - p)*values[ip] + p*values[std::min(ip+1, values.size()-1)];
-    };
-
-    LOG("Maximum KLD: %10.6f\n", kld_values.back());
-    LOG("99.9%%   KLD: %10.6f\n", percentile(kld_values, 0.999f));
-    LOG("99.0%%   KLD: %10.6f\n", percentile(kld_values, 0.990f));
-    LOG("95.0%%   KLD: %10.6f\n", percentile(kld_values, 0.950f));
-    LOG("90.0%%   KLD: %10.6f\n", percentile(kld_values, 0.900f));
-    LOG("Median  KLD: %10.6f\n", kld_median);
-    LOG("10.0%%   KLD: %10.6f\n", percentile(kld_values, 0.100f));
-    LOG(" 5.0%%   KLD: %10.6f\n", percentile(kld_values, 0.050f));
-    LOG(" 1.0%%   KLD: %10.6f\n", percentile(kld_values, 0.010f));
-    LOG(" 0.1%%   KLD: %10.6f\n", percentile(kld_values, 0.001f));
-    LOG("Minimum KLD: %10.6f\n", kld_values.front());
-
-    LOG("\n");
-
-    LOG("====== Token probability statistics ======\n");
-
-    auto p_diff = mean_and_uncertainty(kld.sum_p_diff, kld.sum_p_diff2, kld.count);
-    LOG("Mean    Δp: %6.3lf ± %5.3lf %%\n",  100.0*p_diff.first, 100.0*p_diff.second);
-
-    auto p_diff_median = p_diff_values.size()%2 == 0 ? 0.5f*(p_diff_values[p_diff_values.size()/2] + p_diff_values[p_diff_values.size()/2-1])
-                                               : p_diff_values[p_diff_values.size()/2];
-
-    LOG("Maximum Δp: %6.3lf%%\n",  100.0*p_diff_values.back());
-    LOG("99.9%%   Δp: %6.3lf%%\n", 100.0*percentile(p_diff_values, 0.999f));
-    LOG("99.0%%   Δp: %6.3lf%%\n", 100.0*percentile(p_diff_values, 0.990f));
-    LOG("95.0%%   Δp: %6.3lf%%\n", 100.0*percentile(p_diff_values, 0.950f));
-    LOG("90.0%%   Δp: %6.3lf%%\n", 100.0*percentile(p_diff_values, 0.900f));
-    LOG("75.0%%   Δp: %6.3lf%%\n", 100.0*percentile(p_diff_values, 0.750f));
-    LOG("Median  Δp: %6.3lf%%\n",  100.0*p_diff_median);
-    LOG("25.0%%   Δp: %6.3lf%%\n", 100.0*percentile(p_diff_values, 0.250f));
-    LOG("10.0%%   Δp: %6.3lf%%\n", 100.0*percentile(p_diff_values, 0.100f));
-    LOG(" 5.0%%   Δp: %6.3lf%%\n", 100.0*percentile(p_diff_values, 0.050f));
-    LOG(" 1.0%%   Δp: %6.3lf%%\n", 100.0*percentile(p_diff_values, 0.010f));
-    LOG(" 0.1%%   Δp: %6.3lf%%\n", 100.0*percentile(p_diff_values, 0.001f));
-    LOG("Minimum Δp: %6.3lf%%\n",  100.0*p_diff_values.front());
-
-    auto p_diff_mse = mean_and_uncertainty(kld.sum_p_diff2, kld.sum_p_diff4, kld.count);
-    // LOG("MSE Δp    : %10.6lf ± %10.6lf\n", p_diff_mse.first, p_diff_mse.second);
-
-    const double p_diff_rms_val = sqrt(p_diff_mse.first);
-    const double p_diff_rms_unc = 0.5/p_diff_rms_val * p_diff_mse.second;
-    LOG("RMS Δp    : %6.3lf ± %5.3lf %%\n", 100.0*p_diff_rms_val, 100.0*p_diff_rms_unc);
-
-    const double same_top_p = 1.0*kld.n_same_top/kld.count;
-    LOG("Same top p: %6.3lf ± %5.3lf %%\n", 100.0*same_top_p, 100.0*sqrt(same_top_p*(1.0 - same_top_p)/(kld.count - 1)));
+    kld_print_summary(kld, kld_values, p_diff_values);
 }
 
 // satisfies -Wmissing-declarations
@@ -2209,6 +2834,12 @@ int llama_perplexity(int argc, char ** argv) {
         params.kv_unified = true;
     } else { // Perplexity & KL divergence
         params.n_parallel = std::max(1, params.n_batch / n_ctx);
+        // [TAG_PPL_TQ8] LLAMA_PPL_DECOYS=d (KL mode): d more sequences in one unified cache
+        const int n_decoys = ppl_env_int("LLAMA_PPL_DECOYS", 0);
+        if (params.kl_divergence && n_decoys > 0) {
+            params.n_parallel = n_decoys + 1;
+            params.kv_unified = true;
+        }
     }
     params.n_ctx = params.n_parallel * n_ctx;
     params.n_batch = std::min(params.n_batch, params.n_ctx);
@@ -2260,6 +2891,8 @@ int llama_perplexity(int argc, char ** argv) {
         multiple_choice_score(ctx, params);
     } else if (params.kl_divergence) {
         kl_divergence(ctx, params);
+    } else if (!params.logits_file.empty() && ppl_env_int("LLAMA_PPL_SPARSE_K", 0) > 0) {
+        results = perplexity_sparse_base(ctx, params, n_ctx, ppl_env_int("LLAMA_PPL_SPARSE_K", 0));   // [TAG_PPL_TQ8]
     } else {
         results = perplexity(ctx, params, n_ctx);
     }
