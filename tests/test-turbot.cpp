@@ -1841,6 +1841,34 @@ static void test_pool_auto() {
         ok = parse(body + "POOL auto\n", shape_of(layers, 256, 4, 16384, 1, 1), pa, err);
         TCHECK(ok && pa.pool_cells == 16384, "POOL auto above a 16384-cell cache: ok %d pool %u, want the clamp 16384 (%s)", (int) ok, pa.pool_cells, err.c_str());
     }
+    // [TAG_TURBOT_POOL_AUTO] the resolved pool must hold n full bands plus one ubatch in flight: n sequences prefilled to
+    // 17000 cells, then each growing by ubatches in turn, evict nothing after warm-up and keep every band. ub 512 is the
+    // production -ub and is checked; ub 2048 is the SPEC 9.1 limit and only printed (worst case about 1 granule short per
+    // sequence when a band holds its slack plus a partial granule; a nonzero count there is a finding, not a failure).
+    for (uint32_t n_seq = 1; n_seq <= 3; ++n_seq) {
+        const uint32_t pool = n_seq == 1 ? 18624 : n_seq == 2 ? 35136 : 51648;
+        for (uint32_t ub : { 512u, 2048u }) {
+            tier_sim sim(131072, pool, 16384);
+            for (llama_seq_id s = 0; s < (llama_seq_id) n_seq; ++s) {
+                sim.prefill(s, 17000, ub);
+            }
+            const uint64_t ev_warm = sim.tier.n_evictions();
+            for (int round = 0; round < 8; ++round) {
+                for (llama_seq_id s = 0; s < (llama_seq_id) n_seq; ++s) {
+                    sim.decode(s, ub);
+                }
+            }
+            const uint64_t ev = sim.tier.n_evictions() - ev_warm;
+            if (ub == 512) {
+                TCHECK(ev == 0, "POOL auto %u, %u sequences, ub %u: %" PRIu64 " evictions after warm-up", pool, n_seq, ub, ev);
+                for (llama_seq_id s = 0; s < (llama_seq_id) n_seq; ++s) {
+                    sim.check_band(s, 16384, 128 + 64, "POOL auto ub 512");
+                }
+            } else {
+                printf("  info: POOL auto %u, %u sequences, ub %u: %" PRIu64 " evictions after warm-up\n", pool, n_seq, ub, ev);
+            }
+        }
+    }
     for (const char * bad : { "POOL auto x\n", "POOL auto 100\n", "POOL auto -64\n", "POOL auto 64 64\n", "POOL 65536\nPOOL auto\n",
                               "POOL auto\nPOOL 65536\n" }) {
         llama_turbot_plan p;
