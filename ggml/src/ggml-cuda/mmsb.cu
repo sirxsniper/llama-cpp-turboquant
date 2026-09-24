@@ -44,6 +44,12 @@
 #define MMSB_YB        144     // bytes per block_q8_1_mmq: 16 bytes of scales + 128 int8
 #define MMSB_RED_STRIDE 17     // shared-memory reduction stride per column (16 rows + 1 pad)
 
+// Default row limit. MMQ is faster once its 128-row tiles fill the GPU; this kernel only wins on weights with few rows,
+// where MMQ gets at most 8 tiles. 5090, K = 5120, 9-16 columns, MMQ -> this kernel: 48 rows 33 -> 7 us, 1024 rows
+// 13.4 -> 11.3 us; 2048 rows 13.0 -> 14.8 us, 4096 rows 15.3 -> 24.4 us, 17408 rows 35 -> 82 us.
+// GGML_CUDA_SMALLB_MAX_ROWS=0 removes the limit.
+#define MMSB_MAX_ROWS_DEFAULT 1024
+
 static_assert(sizeof(block_q8_1_mmq) == MMSB_YB, "mmsb: unexpected block_q8_1_mmq size");
 static_assert(QK8_1_MMQ == MMSB_UNIT, "mmsb: unexpected block_q8_1_mmq length");
 
@@ -56,7 +62,7 @@ struct mmsb_env_t {
     int     min_n;     // 0 = keep every width MMVQ takes today; n = also take widths >= n (phase 2: 2)
     int     max_n;     // upper width, 1..16
     int     rg;        // 0 = automatic, else 1 / 2 / 4
-    int64_t max_rows;  // 0 = no limit, else decline weights with more rows
+    int64_t max_rows;  // decline weights with more rows (default MMSB_MAX_ROWS_DEFAULT, 0 = no limit)
     bool    xpf;       // test only: prefetch the weights before the PDL wait for any src0 buffer
     bool    probe;     // TURBO_PATH_PROBE=1
 };
@@ -76,7 +82,7 @@ static const mmsb_env_t & mmsb_env() {
         const int rg = mmsb_env_int("GGML_CUDA_SMALLB_RG", 0);
         v.rg    = (rg == 1 || rg == 2 || rg == 4) ? rg : 0;
         const char * r = getenv("GGML_CUDA_SMALLB_MAX_ROWS");
-        v.max_rows = (r && r[0]) ? std::max<int64_t>(0, (int64_t) atoll(r)) : 0;
+        v.max_rows = (r && r[0]) ? std::max<int64_t>(0, (int64_t) atoll(r)) : MMSB_MAX_ROWS_DEFAULT;
         v.xpf   = mmsb_env_int("GGML_CUDA_SMALLB_XPF", 0) != 0;
         const char * p = getenv("TURBO_PATH_PROBE");
         v.probe = p && p[0] == '1';

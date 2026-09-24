@@ -13568,6 +13568,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
                 test_cases.emplace_back(new test_mul_mat(s.type, GGML_TYPE_F32, s.m, n, s.k, {1, 1}, {1, 1}));
             }
         }
+        // row counts around the default row limit of mmsb.cu (MMSB_MAX_ROWS_DEFAULT)
+        for (int64_t m : {2048, 3072}) {
+            for (ggml_type type : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0}) {
+                for (int64_t n : {8, 12, 16}) {
+                    test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, m, n, 5120, {1, 1}, {1, 1}));
+                }
+            }
+        }
     }
 
     // ---- Qwen3.8-27B (qwen35) PREFILL-scale coverage -----------------------
