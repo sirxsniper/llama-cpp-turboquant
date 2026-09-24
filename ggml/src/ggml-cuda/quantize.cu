@@ -562,10 +562,13 @@ static __global__ void quantize_mmq_q8_1(
 // exclusive, common.cuh). The kernel above and its launchers are unchanged, so MMQ keeps today's code.
 template <mmq_q8_1_ds_layout ds_layout>
 static __global__ void quantize_mmq_q8_1_pdl(
-        const float * GGML_CUDA_RESTRICT x, const int32_t * GGML_CUDA_RESTRICT ids, void * GGML_CUDA_RESTRICT vy,
+        const float * x_ptr, const int32_t * ids_ptr, void * vy_ptr,
         const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
         const int64_t ne0, const int ne1, const int ne2) {
     ggml_cuda_pdl_lc();
+    const float   * GGML_CUDA_RESTRICT x   = x_ptr;
+    const int32_t * GGML_CUDA_RESTRICT ids = ids_ptr;
+    void          * GGML_CUDA_RESTRICT vy  = vy_ptr;
 
     constexpr int vals_per_scale = ds_layout == MMQ_Q8_1_DS_LAYOUT_D2S6 ? 64 : 32;
     constexpr int vals_per_sum   = ds_layout == MMQ_Q8_1_DS_LAYOUT_D2S6 ? 16 : 32;
