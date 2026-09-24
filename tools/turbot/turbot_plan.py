@@ -155,16 +155,20 @@ def _int(s):
         return None
 
 
-def parse_text(text, attn_layers=None, kv_size=None, shape=None):
-    """-> dict(layers={il: dict(bk, bv, yk, yv, flags)}, pool, cap, ignored) or raises PlanError naming the line.
+def parse_text(text, attn_layers=None, kv_size=None, shape=None, n_seq_max=1, n_stream=1):
+    """-> dict(layers={il: dict(bk, bv, yk, yv, flags)}, pool, cap, ignored, pool_auto) or raises PlanError naming the line.
     shape (make_shape / ctx_shape) gives every layer its runs and the cells (kv_size*n_stream) POOL is clamped to;
-    without it every layer has 4 runs (4 KV heads x 256) and attn_layers / kv_size work as before."""
+    without it every layer has 4 runs (4 KV heads x 256) and attn_layers / kv_size work as before.
+    [TAG_TURBOT_POOL_AUTO] 'POOL auto [max]' is resolved with the shape's n_seq_max / n_stream, else with the
+    n_seq_max / n_stream arguments (pool_auto = the maximum, None for a numeric POOL)."""
     flags = None
     kv_cells = kv_size
     if shape is not None:
         flags = shape_flags(shape)
         attn_layers = sorted(flags)
         kv_cells = shape["kv_size"] * max(1, shape.get("n_stream", 1))
+        n_seq_max = shape.get("n_seq_max", 1)
+        n_stream = shape.get("n_stream", 1)
     elif attn_layers is not None:
         flags = {int(il): 0 for il in attn_layers}
 
@@ -172,7 +176,7 @@ def parse_text(text, attn_layers=None, kv_size=None, shape=None):
         return geom_nr(flags[il]) if flags is not None and il in flags else N_HEAD
 
     L, Y = {}, {}
-    pool = cap = None
+    pool = cap = pool_auto = None
     ignored = []
     for ln, raw in enumerate(text.splitlines(), 1):
         line = raw.split("#", 1)[0].strip()
@@ -197,6 +201,17 @@ def parse_text(text, attn_layers=None, kv_size=None, shape=None):
             if il in dst:
                 raise PlanError("%s: duplicate %s line for layer %d" % (where, tag, il))
             dst[il] = (k, v, where)
+        elif tag == "POOL" and len(tok) >= 2 and tok[1] == "auto":
+            if pool is not None or pool_auto is not None:
+                raise PlanError("%s: duplicate POOL" % where)
+            if len(tok) > 3:
+                raise PlanError("%s: malformed, expected 'POOL auto [max]'" % where)
+            try:
+                pool_auto = int(tok[2]) if len(tok) == 3 else POOL_DEFAULT
+            except ValueError:
+                raise PlanError("%s: malformed number" % where)
+            if pool_auto < 0 or pool_auto % GRANULE != 0:
+                raise PlanError("%s: POOL auto maximum must be a non-negative multiple of 64" % where)
         elif tag in ("POOL", "CAP"):
             if len(tok) != 2:
                 raise PlanError("%s: malformed" % where)
@@ -205,7 +220,7 @@ def parse_text(text, attn_layers=None, kv_size=None, shape=None):
             except ValueError:
                 raise PlanError("%s: malformed number" % where)
             if tag == "POOL":
-                if pool is not None:
+                if pool is not None or pool_auto is not None:
                     raise PlanError("%s: duplicate POOL" % where)
                 if val < 0 or val % GRANULE != 0:
                     raise PlanError("%s: POOL must be a non-negative multiple of 64" % where)
@@ -243,16 +258,29 @@ def parse_text(text, attn_layers=None, kv_size=None, shape=None):
                 raise PlanError("L line for layer %d, which the cache does not hold" % il)
     if not layers:
         raise PlanError("no L lines")
+    if cap is None:
+        cap = CAP_DEFAULT
+    if pool_auto is not None:
+        pool = pool_auto_cells(pool_auto, cap, n_seq_max, n_stream)
     if pool is None:
         pool = POOL_DEFAULT
     if kv_cells is not None and pool > kv_cells:
         pool = (kv_cells // GRANULE) * GRANULE    # clamped to the cache in whole granules, as the C++ parser does
-    return dict(layers=layers, pool=pool, cap=CAP_DEFAULT if cap is None else cap, ignored=sorted(set(ignored)))
+    return dict(layers=layers, pool=pool, cap=cap, ignored=sorted(set(ignored)), pool_auto=pool_auto)
 
 
-def parse_file(path, attn_layers=None, kv_size=None, shape=None):
+def pool_auto_cells(mx, cap, n_seq_max=1, n_stream=1):
+    """[TAG_TURBOT_POOL_AUTO] llama-kv-tier.cpp: per stream ceil(n_seq_max / n_stream) * (CAP + 128) + 2112 cells (a
+    2048-row ubatch in flight and one partly filled granule) in whole granules, times n_stream, at most mx."""
+    n_stream = max(1, int(n_stream))
+    n_seq = max(1, int(n_seq_max))
+    need = (n_seq + n_stream - 1) // n_stream * (cap + GRANULE * 2) + 33 * GRANULE
+    return min(mx, n_stream * ((need + GRANULE - 1) // GRANULE * GRANULE))
+
+
+def parse_file(path, attn_layers=None, kv_size=None, shape=None, n_seq_max=1, n_stream=1):
     with io.open(path, encoding="utf-8") as f:
-        return parse_text(f.read(), attn_layers, kv_size, shape)
+        return parse_text(f.read(), attn_layers, kv_size, shape, n_seq_max, n_stream)
 
 
 def _pad4(w):

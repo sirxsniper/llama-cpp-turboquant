@@ -251,6 +251,7 @@ static bool llama_turbot_plan_parse_impl(const std::string & text, const std::st
     int     line_cap  = 0;
     int64_t pool      = GGML_TURBOT_POOL_DEFAULT;
     int64_t cap       = GGML_TURBOT_CAP_DEFAULT;
+    bool    pool_auto = false;   // [TAG_TURBOT_POOL_AUTO] pool holds the maximum until every line is read
 
     int line_bench = 0;
 
@@ -338,6 +339,21 @@ static bool llama_turbot_plan_parse_impl(const std::string & text, const std::st
                 return fail(line_no, format("duplicate %s line for layer %d (first on line %d)", tag.c_str(), (int) il, it->second.line_no));
             }
             dst[(int32_t) il] = wl;
+        } else if (tag == "POOL" && tok.size() >= 2 && tok[1] == "auto") {
+            // [TAG_TURBOT_POOL_AUTO] "POOL auto [<max>]": set from CAP and the shape once every line is read
+            if (line_pool) {
+                return fail(line_no, format("duplicate POOL line (first on line %d)", line_pool));
+            }
+            int64_t mx = GGML_TURBOT_POOL_DEFAULT;
+            if (tok.size() > 3 || (tok.size() == 3 && !llama_turbot_parse_int(tok[2], mx))) {
+                return fail(line_no, "malformed POOL line, expected 'POOL auto [<max cells>]'");
+            }
+            if (mx < 0 || mx % GGML_TURBOT_GRANULE != 0) {
+                return fail(line_no, format("POOL auto %lld: the maximum must be a non-negative multiple of %d", (long long) mx, GGML_TURBOT_GRANULE));
+            }
+            line_pool = line_no;
+            pool      = mx;
+            pool_auto = true;
         } else if (tag == "POOL" || tag == "CAP") {
             const bool is_pool = tag == "POOL";
             int64_t    v       = 0;
@@ -373,6 +389,21 @@ static bool llama_turbot_plan_parse_impl(const std::string & text, const std::st
             }
         } else {
             return fail(line_no, "unknown tag '" + tag + "'");
+        }
+    }
+
+    // [TAG_TURBOT_POOL_AUTO] per stream: ceil(n_seq_max / n_stream) sequences of CAP young cells plus the quota slack,
+    // plus 33 granules (a 2048-row ubatch in flight and one partly filled granule), in whole granules; then the maximum
+    if (pool_auto) {
+        const int64_t n_stream = std::max<uint32_t>(1, shape.n_stream);
+        const int64_t n_seq    = std::max<uint32_t>(1, shape.n_seq_max);
+        const int64_t slack    = (int64_t) GGML_TURBOT_GRANULE*GGML_TURBOT_QUOTA_SLACK_GRANULES;
+        const int64_t need     = (n_seq + n_stream - 1)/n_stream*(cap + slack) + 33*GGML_TURBOT_GRANULE;
+        const int64_t want     = n_stream*((need + GGML_TURBOT_GRANULE - 1)/GGML_TURBOT_GRANULE*GGML_TURBOT_GRANULE);
+        pool = std::min(pool, want);
+        if (!quiet) {
+            LLAMA_LOG_INFO("%s: turbot plan %s line %d: POOL auto = %lld cells (n_seq_max %lld, n_stream %lld, CAP %lld)\n", __func__,
+                    source.c_str(), line_pool, (long long) pool, (long long) n_seq, (long long) n_stream, (long long) cap);
         }
     }
 

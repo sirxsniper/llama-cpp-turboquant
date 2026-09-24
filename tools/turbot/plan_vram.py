@@ -4,6 +4,8 @@
 #   [TAG_TURBOT_ANY_GEOM] other shapes: --geom <head dim>x<KV heads> for every layer, or --shape il:DxH,il:DxH,...
 #   python tools/turbot/plan_vram.py ornith35.plan --attn-layers 3,7,11,15,19,23,27,31,35,39 --geom 256x2
 #   [TAG_TURBOT_ANY_STREAMS] --n-stream N: N streams of --kv cells each (-np N without --kv-unified), one pool
+#   [TAG_TURBOT_POOL_AUTO] --np N: n_seq_max for a 'POOL auto [max]' line (default 1); with --n-stream it is resolved
+#   like llama-kv-tier.cpp (e.g. --np 4 for the 4-slot unified server)
 #
 # Must print base 4520.00 / young pool 726.00 / total 5246.00 MiB for the default plan. The hash is the value
 # llama_kv_cache logs ("hash 0x...") and the state blob v2 carries; tests/test-turbot.cpp checks the same number.
@@ -27,6 +29,7 @@ def main():
     ap.add_argument("plan")
     ap.add_argument("--kv", type=int, default=P.KV_DEFAULT, help="cells per stream (default 262144)")
     ap.add_argument("--n-stream", type=int, default=1, help="KV streams (default 1)")
+    ap.add_argument("--np", type=int, default=1, help="n_seq_max for POOL auto (default 1)")
     ap.add_argument("--layers", action="store_true", help="print the per-layer byte table")
     ap.add_argument("--attn-layers", default=",".join(map(str, P.QWEN38_ATTN_LAYERS)),
                     help="attention layers the cache holds (default Qwen3.8-27B: 3,7,...,63); '' skips the check")
@@ -41,17 +44,17 @@ def main():
             for item in args.shape.split(","):
                 il, g = item.split(":")
                 layers[int(il)] = parse_geom(g)
-            shape = P.make_shape(layers, kv_size=args.kv, n_stream=args.n_stream)
+            shape = P.make_shape(layers, kv_size=args.kv, n_stream=args.n_stream, n_seq_max=args.np)
         else:
             attn = [int(x) for x in args.attn_layers.split(",") if x.strip()]
             d, h = parse_geom(args.geom)
             if attn and ((d, h) != (256, 4) or args.n_stream != 1):
-                shape = P.make_shape(attn, d, h, kv_size=args.kv, n_stream=args.n_stream)
+                shape = P.make_shape(attn, d, h, kv_size=args.kv, n_stream=args.n_stream, n_seq_max=args.np)
         if shape is not None:
             plan = P.parse_file(args.plan, shape=shape)
         else:
             attn = [int(x) for x in args.attn_layers.split(",") if x.strip()] or None
-            plan = P.parse_file(args.plan, attn, args.kv * args.n_stream)
+            plan = P.parse_file(args.plan, attn, args.kv * args.n_stream, n_seq_max=args.np, n_stream=args.n_stream)
     except (P.PlanError, OSError, ValueError) as e:
         print("REFUSED: %s" % e)
         return 1
@@ -72,6 +75,8 @@ def main():
         pool_s = ", %d cells per stream" % (plan["pool"] // args.n_stream // P.GRANULE * P.GRANULE)
     print("young pool  %10.2f MiB  (%d B, POOL %d cells = %d granules%s, CAP %d)"
           % (v["pool"] / P.MIB, v["pool"], plan["pool"], plan["pool"] // 64, pool_s, plan["cap"]))
+    if plan.get("pool_auto") is not None:
+        print("POOL auto   max %d, resolved at -np %d, %d stream(s)" % (plan["pool_auto"], args.np, args.n_stream))
     print("total       %10.2f MiB  (%d B)" % (v["total"] / P.MIB, v["total"]))
     print("%-11s %10.2f MiB  (margin %.2f MiB)%s" % (v["fallback_type"], v["fallback"] / P.MIB, (v["fallback"] - v["total"]) / P.MIB,
                                                    "" if v["total"] <= v["fallback"] else "  WARNING: above %s" % v["fallback_type"]))

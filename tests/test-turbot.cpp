@@ -1793,6 +1793,63 @@ static std::string replace_first(std::string s, const std::string & from, const 
     return s.replace(p, from.size(), to);
 }
 
+// [TAG_TURBOT_POOL_AUTO] "POOL auto [<max>]": per stream ceil(n_seq_max / n_stream) x (CAP + 128) + 2112 cells in whole
+// granules, times n_stream, at most max, then the cache clamp. Values and hashes from tools/turbot/plan_vram.py --np N.
+static void test_pool_auto() {
+    printf("[7a''] POOL auto\n");
+    const auto        layers = qwen38_attn_layers();
+    const std::string body   = replace_first(DEFAULT_PLAN_TEXT, "POOL 65536\n", "");
+
+    auto parse = [&](const std::string & text, const llama_turbot_cache_shape & shape, llama_turbot_plan & p, std::string & err) {
+        return llama_turbot_plan_parse_shape(text, "<pool auto>", shape, p, err);
+    };
+
+    const struct { uint32_t n_seq; uint32_t pool; uint64_t hash; } cases[] = {
+        { 1, 18624, 0x6353ed30f20f3168ull },
+        { 2, 35136, 0xffe1c6ca4132aa83ull },
+        { 3, 51648, 0xd4262394cdf8ec43ull },
+        { 4, 65536, DEFAULT_PLAN_HASH     },   // 68160 capped to the maximum: the built-in plan, same hash
+    };
+    for (const auto & c : cases) {
+        for (const char * line : { "POOL auto\n", "POOL auto 65536\n" }) {
+            llama_turbot_plan p;
+            std::string       err;
+            const bool ok = parse(body + line, shape_of(layers, 256, 4, 262144, 1, c.n_seq), p, err);
+            TCHECK(ok && p.pool_cells == c.pool && p.cap_cells == 16384, "%s at n_seq_max %u: ok %d pool %u cap %u (%s)", line, c.n_seq,
+                    (int) ok, p.pool_cells, p.cap_cells, err.c_str());
+            TCHECK(p.hash == c.hash, "POOL auto at n_seq_max %u: hash 0x%016" PRIx64 ", expected 0x%016" PRIx64, c.n_seq, p.hash, c.hash);
+        }
+    }
+    {
+        llama_turbot_plan pa;
+        llama_turbot_plan pn;
+        std::string       err;
+        const bool oka = parse(body + "POOL auto\n", shape_of(layers, 256, 4, 32768, 1, 1), pa, err);
+        const bool okn = parse(body + "POOL 18624\n", shape_of(layers, 256, 4, 32768, 1, 1), pn, err);
+        TCHECK(oka && okn && pa.hash == pn.hash && pa.pool_cells == 18624, "POOL auto at 1 sequence is not POOL 18624: pool %u, hash 0x%016" PRIx64 " vs 0x%016" PRIx64,
+                pa.pool_cells, pa.hash, pn.hash);
+
+        bool ok = parse(body + "POOL auto 32768\n", shape_of(layers, 256, 4, 262144, 1, 4), pa, err);
+        TCHECK(ok && pa.pool_cells == 32768, "POOL auto 32768 at 4 sequences: ok %d pool %u (%s)", (int) ok, pa.pool_cells, err.c_str());
+
+        ok = parse(replace_first(body, "CAP 16384\n", "CAP 32768\n") + "POOL auto\n", shape_of(layers, 256, 4, 262144, 1, 1), pa, err);
+        TCHECK(ok && pa.pool_cells == 35008, "POOL auto with CAP 32768 at 1 sequence: ok %d pool %u, want 35008 (%s)", (int) ok, pa.pool_cells, err.c_str());
+
+        ok = parse(body + "POOL auto 131072\n", shape_of(layers, 256, 4, 65536, 4, 4), pa, err);
+        TCHECK(ok && pa.pool_cells == 74496, "POOL auto 131072 at 4 streams x 1 sequence: ok %d pool %u, want 74496 (%s)", (int) ok, pa.pool_cells, err.c_str());
+
+        ok = parse(body + "POOL auto\n", shape_of(layers, 256, 4, 16384, 1, 1), pa, err);
+        TCHECK(ok && pa.pool_cells == 16384, "POOL auto above a 16384-cell cache: ok %d pool %u, want the clamp 16384 (%s)", (int) ok, pa.pool_cells, err.c_str());
+    }
+    for (const char * bad : { "POOL auto x\n", "POOL auto 100\n", "POOL auto -64\n", "POOL auto 64 64\n", "POOL 65536\nPOOL auto\n",
+                              "POOL auto\nPOOL 65536\n" }) {
+        llama_turbot_plan p;
+        std::string       err;
+        const bool ok = parse(body + bad, shape_of(layers, 256, 4, 262144, 1, 4), p, err);
+        TCHECK(!ok && !err.empty(), "'%s' accepted", bad);
+    }
+}
+
 static std::string temp_path(const char * tag) {
     std::random_device rd;
     return (std::filesystem::temp_directory_path() / (std::string("test-turbot-") + tag + "-" + std::to_string(rd()) + ".plan")).string();
@@ -3134,6 +3191,7 @@ int main(int argc, char ** argv) {
     test_params_layout();
 #ifdef TURBOT_TEST_TIER
     test_plan_parser();
+    test_pool_auto();   // [TAG_TURBOT_POOL_AUTO]
     test_default_plan();
     test_tier();
     // [TAG_TURBOT_ANY_*]
