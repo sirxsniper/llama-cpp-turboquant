@@ -2380,33 +2380,96 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
 // [TAG_FA_POS_MASK] one position per cell of the current n_kv window: the cell's position when it belongs to
 // the batch's sequence, -1 when it is empty or belongs to another sequence. With causal attention the kernel
 // derives the mask from this and the query positions instead of reading an [n_kv, n_tokens] F16 mask.
+//
+// [TAG_4C_POSMASK_MS] A [n_kv, 2] dst is the multi-sequence form (llama-graph.cpp build_attn_inp_kv_impl, one KV
+// stream only): row 0 as above for the ubatch's sequences, row 1 the cell's sequence set over the ubatch - bit b set
+// iff the cell belongs to ubatch->seq_id_unq[b] - and 0 for a cell of none of them (row 0 is then -1). A cell shared by
+// several sequences (seq_cp, prompt sharing) carries several bits. set_input_q_pos writes the query side with the
+// same bit numbering (ubatch->seq_idx), so a query sees a cell iff the cell carries its sequence: exactly the
+// cells.seq_has(j, seq_id[i][0]) test of set_input_kq_mask.
+//
+// The one-row form describes ONE sequence and is what leaked context between slots when a multi-sequence ubatch
+// reached it ([TAG_FA_POS_MASK_SEQ], llama-graph.cpp). It now refuses such a ubatch outright.
 void llama_kv_cache::set_input_kv_pos(ggml_tensor * dst, const llama_ubatch * ubatch) const {
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
     GGML_ASSERT(dst->type == GGML_TYPE_I32);
     int32_t * data = (int32_t *) dst->data;
-    const int64_t n_kv = dst->ne[0];
-    const llama_seq_id seq_id = ubatch->seq_id[0][0];
-    const auto & cells = v_cells.at(seq_to_stream[seq_id]);
-    const int64_t n_cells = cells.size();
-    // [TAG_MASK_PROBE] same probe as the explicit mask: this walk runs once per single-sequence ubatch
+    const int64_t n_kv   = dst->ne[0];
+    const int64_t n_rows = dst->ne[1];
+    // [TAG_MASK_PROBE] same probe as the explicit mask: this walk runs once per ubatch that uses the positional mask
     static const bool pos_probe = [] {
         const char * e = getenv("TURBO_MASK_PROBE");
         return e != nullptr && atoi(e) != 0;
     }();
     const int64_t t_start = pos_probe ? ggml_time_us() : 0;
-    for (int64_t j = 0; j < n_kv; ++j) {
-        data[j] = (j < n_cells && !cells.is_empty(j) && cells.seq_has(j, seq_id)) ? cells.pos_get(j) : -1;
+    if (n_rows == 1) {
+        // [TAG_4C_POSMASK_MS] the leak guard: one row holds one sequence
+        GGML_ASSERT(ubatch->n_seqs_unq == 1 && "kv_pos: a single-sequence positional mask for a multi-sequence ubatch");
+        const llama_seq_id seq_id = ubatch->seq_id[0][0];
+        const auto & cells = v_cells.at(seq_to_stream[seq_id]);
+        const int64_t n_cells = cells.size();
+        for (int64_t j = 0; j < n_kv; ++j) {
+            data[j] = (j < n_cells && !cells.is_empty(j) && cells.seq_has(j, seq_id)) ? cells.pos_get(j) : -1;
+        }
+    } else {
+        GGML_ASSERT(n_rows == 2 && ggml_is_contiguous(dst));
+        const uint32_t n_seqs = ubatch->n_seqs_unq;
+        GGML_ASSERT(n_seqs >= 1 && n_seqs <= 32 && "kv_pos: at most 32 sequences fit the sequence set");
+        // every sequence of the ubatch must live in the same stream: the vector covers one stream's cells
+        const uint32_t strm = seq_to_stream[ubatch->seq_id_unq[0]];
+        llama_seq_id ids[32];
+        for (uint32_t b = 0; b < n_seqs; ++b) {
+            GGML_ASSERT(seq_to_stream[ubatch->seq_id_unq[b]] == strm && "kv_pos: a multi-sequence positional mask needs one KV stream");
+            ids[b] = ubatch->seq_id_unq[b];
+            GGML_ASSERT(ids[b] >= 0 && ids[b] < LLAMA_MAX_SEQ);
+        }
+        const auto & cells = v_cells.at(strm);
+        const int64_t n_cells = cells.size();
+        int32_t * seqs = data + n_kv;
+        for (int64_t j = 0; j < n_kv; ++j) {
+            uint32_t set = 0;
+            if (j < n_cells && !cells.is_empty(j)) {
+                const auto & cs = cells.seq_get_all(j);
+                for (uint32_t b = 0; b < n_seqs; ++b) {
+                    set |= (uint32_t) cs[ids[b]] << b;   // ids were range-checked above
+                }
+            }
+            data[j] = set != 0 ? cells.pos_get(j) : -1;
+            seqs[j] = (int32_t) set;
+        }
     }
     if (pos_probe) {
-        static int64_t acc_us = 0, acc_cells = 0, calls = 0, max_kv = 0;
+        static int64_t acc_us = 0, acc_cells = 0, calls = 0, max_kv = 0, calls_ms = 0;
         acc_us    += ggml_time_us() - t_start;
         acc_cells += n_kv;
         max_kv     = std::max<int64_t>(max_kv, n_kv);
+        calls_ms  += n_rows == 2;
         if (++calls % 512 == 0) {
-            fprintf(stderr, "turbo-probe: kv-pos fill %lld calls  avg %.3f ms/call  %.2f ns/cell  max n_kv %lld\n",
-                    (long long) calls, acc_us / 1000.0 / calls, acc_cells ? 1000.0 * acc_us / acc_cells : 0.0, (long long) max_kv);
+            fprintf(stderr, "turbo-probe: kv-pos fill %lld calls (%lld multi-seq)  avg %.3f ms/call  %.2f ns/cell  max n_kv %lld\n",
+                    (long long) calls, (long long) calls_ms, acc_us / 1000.0 / calls, acc_cells ? 1000.0 * acc_us / acc_cells : 0.0,
+                    (long long) max_kv);
         }
     }
+}
+
+// [TAG_4C_POSMASK_MS] The query side of the positional mask: row 0 the ubatch positions (the first n_tokens entries of
+// ubatch->pos, what llama-graph.cpp uploaded directly before), row 1 of a two-row dst the bit of each token's sequence
+// in the numbering of set_input_kv_pos. Like set_input_kq_mask, a token carrying several sequence ids is keyed on its
+// first one.
+void llama_kv_cache::set_input_q_pos(ggml_tensor * dst, const llama_ubatch * ubatch) const {
+    GGML_ASSERT(dst->type == GGML_TYPE_I32 && dst->ne[0] == (int64_t) ubatch->n_tokens);
+    ggml_backend_tensor_set(dst, ubatch->pos, 0, ubatch->n_tokens*ggml_element_size(dst));
+    if (dst->ne[1] == 1) {
+        return;
+    }
+    GGML_ASSERT(dst->ne[1] == 2 && ggml_is_contiguous(dst) && ubatch->n_seqs_unq <= 32);
+    std::vector<int32_t> bits(ubatch->n_tokens);
+    for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
+        const int32_t b = ubatch->seq_idx[ubatch->seq_id[i][0]];
+        GGML_ASSERT(b >= 0 && b < (int32_t) ubatch->n_seqs_unq);
+        bits[i] = (int32_t) (1u << b);
+    }
+    ggml_backend_tensor_set(dst, bits.data(), dst->nb[1], ubatch->n_tokens*ggml_element_size(dst));
 }
 
 void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
@@ -4163,6 +4226,10 @@ void llama_kv_cache_context::set_input_kq_mask(ggml_tensor * dst, const llama_ub
 
 void llama_kv_cache_context::set_input_kv_pos(ggml_tensor * dst, const llama_ubatch * ubatch) const {
     kv->set_input_kv_pos(dst, ubatch);
+}
+
+void llama_kv_cache_context::set_input_q_pos(ggml_tensor * dst, const llama_ubatch * ubatch) const {
+    kv->set_input_q_pos(dst, ubatch);
 }
 
 void llama_kv_cache_context::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {

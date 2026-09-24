@@ -657,6 +657,8 @@ static __device__ __forceinline__ void flash_attn_ext_turbot_iter(
         const half   * const __restrict__ mask_h,
         const int32_t * const __restrict__ kv_pos,   // [TAG_FA_POS_MASK]
         const int32_t * const __restrict__ q_pos,
+        const int32_t * const __restrict__ kv_seq,   // [TAG_4C_POSMASK_MS] sequence sets, or nullptr
+        const int32_t * const __restrict__ q_seq,
         float2       * const __restrict__ dstk,
         float2       * const __restrict__ dstk_fixup,
         const float scale,
@@ -723,7 +725,7 @@ static __device__ __forceinline__ void flash_attn_ext_turbot_iter(
         constexpr bool use_cp_async = false;
         if (kv_pos) {   // [TAG_FA_POS_MASK]
             flash_attn_ext_f16_gen_mask<ncols1, nwarps, nbatch_fa, oob_check>
-                (kv_pos + k_VKQ_0, q_pos, tile_mask, k_VKQ_sup, jt*ncols1, ne01);
+                (kv_pos + k_VKQ_0, q_pos, fattn_seq_at(kv_seq, k_VKQ_0), q_seq, tile_mask, k_VKQ_sup, jt*ncols1, ne01);
         } else if (ncols2 > 1 || mask_h) {
             // [TAG_SYNC_LOAD_MASK] upstream load_mask takes the tile start and a sparse index list; turbot never
             // uses sparse FA, so use_sparse = false and no indices (same addresses as the old mask_h + k_VKQ_0).
@@ -1098,7 +1100,7 @@ static __device__ __forceinline__ void flash_attn_ext_turbot_iter(
         __syncthreads(); // Only needed if tile_K == tile_V.
     }
 #else
-    GGML_UNUSED_VARS(Q_f2, K_row, V_row, pool, gtab, mask_h, kv_pos, q_pos, dstk, dstk_fixup,
+    GGML_UNUSED_VARS(Q_f2, K_row, V_row, pool, gtab, mask_h, kv_pos, q_pos, kv_seq, q_seq, dstk, dstk_fixup,
         scale, slope, logit_softcap, ne01, ne02, nb11, nb21, nb_pool, stride_mask,
         tile_Q, tile_K, tile_V, tile_mask, lut, Q_B, VKQ_C, KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup, hs, eb);
     NO_DEVICE_CODE;
@@ -1119,6 +1121,8 @@ static __device__ __forceinline__ void flash_attn_ext_turbot_process_tile(
         const half   * const __restrict__ mask_h,
         const int32_t * const __restrict__ kv_pos,   // [TAG_FA_POS_MASK]
         const int32_t * const __restrict__ q_pos,
+        const int32_t * const __restrict__ kv_seq,   // [TAG_4C_POSMASK_MS] sequence sets, or nullptr
+        const int32_t * const __restrict__ q_seq,
         const float  * const __restrict__ sinks_f,
         float2       * const __restrict__ dstk,
         float2       * const __restrict__ dstk_fixup,
@@ -1317,7 +1321,7 @@ static __device__ __forceinline__ void flash_attn_ext_turbot_process_tile(
             flash_attn_ext_turbot_iter
                 <DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, needs_fixup, is_fixup, last_iter, oob_check,
                  T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>
-                (Q_f2, K_row, V_row, pool, gtab, mask_h, kv_pos, q_pos, dstk, dstk_fixup, scale, slope, logit_softcap,
+                (Q_f2, K_row, V_row, pool, gtab, mask_h, kv_pos, q_pos, kv_seq, q_seq, dstk, dstk_fixup, scale, slope, logit_softcap,
                  ne01, ne02, nb11, nb21, nb_pool, stride_mask, tile_Q, tile_K, tile_V, tile_mask, lut, Q_B, VKQ_C,
                  KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup, hs, eb);
         }
@@ -1326,7 +1330,7 @@ static __device__ __forceinline__ void flash_attn_ext_turbot_process_tile(
         flash_attn_ext_turbot_iter
             <DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, needs_fixup, is_fixup, last_iter, oob_check,
               T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>
-            (Q_f2, K_row, V_row, pool, gtab, mask_h, kv_pos, q_pos, dstk, dstk_fixup, scale, slope, logit_softcap,
+            (Q_f2, K_row, V_row, pool, gtab, mask_h, kv_pos, q_pos, kv_seq, q_seq, dstk, dstk_fixup, scale, slope, logit_softcap,
              ne01, ne02, nb11, nb21, nb_pool, stride_mask, tile_Q, tile_K, tile_V, tile_mask, lut, Q_B, VKQ_C,
              KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup, hs, eb);
     } else {
@@ -1337,7 +1341,7 @@ static __device__ __forceinline__ void flash_attn_ext_turbot_process_tile(
             flash_attn_ext_turbot_iter
                 <DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, needs_fixup, is_fixup, last_iter, oob_check,
                  T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>
-                (Q_f2, K_row, V_row, pool, gtab, mask_h, kv_pos, q_pos, dstk, dstk_fixup, scale, slope, logit_softcap,
+                (Q_f2, K_row, V_row, pool, gtab, mask_h, kv_pos, q_pos, kv_seq, q_seq, dstk, dstk_fixup, scale, slope, logit_softcap,
                  ne01, ne02, nb11, nb21, nb_pool, stride_mask, tile_Q, tile_K, tile_V, tile_mask, lut, Q_B, VKQ_C,
                  KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup, hs, eb);
         }
@@ -1346,7 +1350,7 @@ static __device__ __forceinline__ void flash_attn_ext_turbot_process_tile(
         flash_attn_ext_turbot_iter
             <DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, needs_fixup, is_fixup, last_iter, oob_check,
              T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>
-            (Q_f2, K_row, V_row, pool, gtab, mask_h, kv_pos, q_pos, dstk, dstk_fixup, scale, slope, logit_softcap,
+            (Q_f2, K_row, V_row, pool, gtab, mask_h, kv_pos, q_pos, kv_seq, q_seq, dstk, dstk_fixup, scale, slope, logit_softcap,
              ne01, ne02, nb11, nb21, nb_pool, stride_mask, tile_Q, tile_K, tile_V, tile_mask, lut, Q_B, VKQ_C,
              KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup, hs, eb);
     }
@@ -1734,7 +1738,7 @@ static __device__ __forceinline__ void flash_attn_ext_turbot_process_tile(
         }
     }
 #else
-    GGML_UNUSED_VARS(Q_f2, K_row, V_row, pool, gtab, mask_h, kv_pos, q_pos, sinks_f, dstk, dstk_fixup,
+    GGML_UNUSED_VARS(Q_f2, K_row, V_row, pool, gtab, mask_h, kv_pos, q_pos, kv_seq, q_seq, sinks_f, dstk, dstk_fixup,
         scale, slope, logit_softcap, ne01, ne02, gqa_ratio, ne11,
         stride_Q1, stride_Q2, nb11, nb21, nb_pool, stride_mask,
         jt, zt_gqa, kb0_start, kb0_stop, kb0_stride, hs, eb);
@@ -1836,6 +1840,9 @@ static __global__ void flash_attn_ext_turbot(
     const int stride_Q2   = nb02 / sizeof(float2);
     const int stride_mask = nb31 / sizeof(half);
 
+    // [TAG_4C_POSMASK_MS] sequence sets of a multi-sequence positional mask (fattn-common.cuh), or nullptr
+    const fattn_pos_seq pos_seq = fattn_pos_seq_of(kv_pos, q_pos, ne31, nb31, nb32);
+
     const int iter_k     = (ne11      + (nbatch_fa - 1)) / nbatch_fa;
     const int iter_j     = (ne01.z    + (ncols1    - 1)) / ncols1;
     const int iter_z_gqa = (gqa_ratio + (ncols2    - 1)) / ncols2;
@@ -1934,13 +1941,13 @@ static __global__ void flash_attn_ext_turbot(
         if (block_owns_tile_start) {
             constexpr bool needs_fixup = false; // CUDA block is working on an entire tile.
             flash_attn_ext_turbot_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, needs_fixup, is_fixup>
-                (Q_f2, K_row, V_row, pool, gtab, mask_h, kv_pos, q_pos, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
+                (Q_f2, K_row, V_row, pool, gtab, mask_h, kv_pos, q_pos, pos_seq.kv, pos_seq.q, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
                  ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, (int64_t) nb11, (int64_t) nb21, nb_pool, stride_mask,
                  jt, zt_gqa, kb0_start, kb0_stop, kb0_stride, hs, eb);
         } else {
             constexpr bool needs_fixup = true; // CUDA block is missing the beginning of a tile.
             flash_attn_ext_turbot_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, needs_fixup, is_fixup>
-                (Q_f2, K_row, V_row, pool, gtab, mask_h, kv_pos, q_pos, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
+                (Q_f2, K_row, V_row, pool, gtab, mask_h, kv_pos, q_pos, pos_seq.kv, pos_seq.q, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
                  ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, (int64_t) nb11, (int64_t) nb21, nb_pool, stride_mask,
                  jt, zt_gqa, kb0_start, kb0_stop, kb0_stride, hs, eb);
         }
@@ -2006,7 +2013,7 @@ static __global__ void flash_attn_ext_turbot(
     constexpr bool is_fixup = true; // Last index writes its data to fixup buffer to avoid data races with other blocks.
     constexpr bool needs_fixup = false;
     flash_attn_ext_turbot_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, needs_fixup, is_fixup>
-        (Q_f2, K_row, V_row, pool, gtab, mask_h, kv_pos, q_pos, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
+        (Q_f2, K_row, V_row, pool, gtab, mask_h, kv_pos, q_pos, pos_seq.kv, pos_seq.q, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
          ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, (int64_t) nb11, (int64_t) nb21, nb_pool, stride_mask,
          jt, zt_gqa, kb0_start, kb0_stop, kb0_stride, hs, eb);
 #else
@@ -2849,6 +2856,9 @@ static void launch_fattn_turbot(
     GGML_ASSERT(!mask || mask->type == GGML_TYPE_F16);
     GGML_ASSERT(Q->ne[3] == 1);
 
+    // [TAG_4C_POSMASK_MS] the turbot kernel reads the sequence sets of a two-row positional mask (gen_mask)
+    const bool pos_ms = kv_pos_t != nullptr && kv_pos_t->ne[1] == 2;
+
     const ggml_turbot_layer layer = ggml_cuda_fattn_turbot_layer_of(dst);
     int64_t turbot_desc0 = 0;
     int64_t turbot_desc1 = 0;
@@ -2926,10 +2936,13 @@ static void launch_fattn_turbot(
         const int iter_k = K->ne[1] / FATTN_KQ_STRIDE;
         KV_max.alloc(2*ntiles_x);    // [TAG_FA_KVMIN] {max, min} per entry
         ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num_KV_max, block_dim_KV_max, 0, main_stream);
+        // [TAG_4C_POSMASK_MS] row 1 of each vector when the mask carries sequence sets
+        const int32_t * kv_seq_d = pos_ms ? (const int32_t *) ((const char *) kv_pos_t->data + kv_pos_t->nb[1]) : nullptr;
+        const int32_t * q_seq_d  = pos_ms ? (const int32_t *) ((const char *) q_pos_t->data  + q_pos_t->nb[1])  : nullptr;
         ggml_cuda_kernel_launch(flash_attn_pos_to_KV_max<ncols1>, launch_params,
-            (const int32_t *) kv_pos_t->data, (const int32_t *) q_pos_t->data, KV_max.ptr, iter_k, ne01_pos);
+            (const int32_t *) kv_pos_t->data, (const int32_t *) q_pos_t->data, kv_seq_d, q_seq_d, KV_max.ptr, iter_k, ne01_pos);
         CUDA_CHECK(cudaGetLastError());
-        kv_scan = "pos<ncols1>";
+        kv_scan = pos_ms ? "pos-ms<ncols1>" : "pos<ncols1>";
     }
 
     const dim3 block_dim(warp_size, nwarps, 1);
@@ -3155,8 +3168,9 @@ static void launch_fattn_turbot(
         Q->ne[0], ne01,     Q->ne[2], Q->ne[3], Q->nb[1], Q->nb[2], Q->nb[3],
         K->ne[0], K->ne[1], K->ne[2], K->ne[3], nb11, nb12, nb13,
         nb21, nb22, nb23,
-        mask ? mask->ne[1] : 0, mask ? mask->ne[2] : 0, mask ? mask->ne[3] : 0,
-        mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0,
+        // [TAG_4C_POSMASK_MS] the launch_fattn convention: ne31 = 2 and the kv_pos / q_pos row strides for sequence sets
+        mask ? mask->ne[1] : (pos_ms ? 2 : 0), mask ? mask->ne[2] : 0, mask ? mask->ne[3] : 0,
+        mask ? mask->nb[1] : (pos_ms ? kv_pos_t->nb[1] : 0), mask ? mask->nb[2] : (pos_ms ? q_pos_t->nb[1] : 0), mask ? mask->nb[3] : 0,
         (const char *) pool_t->data,
         (const int32_t *) gtab_t->data,
         (int64_t) pool_t->nb[1],

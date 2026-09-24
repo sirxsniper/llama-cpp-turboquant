@@ -979,9 +979,13 @@ static __device__ __forceinline__ void flash_attn_ext_turbo5p512_load_tile(
 
 // [TAG_FA_POS_MASK] Same tile layout as flash_attn_ext_f16_load_mask, but the values come from positions:
 // -INF where the cell is empty or later than the query, 0 otherwise. kv_pos is already offset to the tile.
+// [TAG_4C_POSMASK_MS] kv_seq (offset to the tile like kv_pos) and q_seq are the sequence sets of a multi-sequence
+// positional mask, or nullptr: a cell outside the query's sequence is -INF as well. The same 0 / -INF values the
+// explicit mask of llama_kv_cache::set_input_kq_mask holds, so the attention arithmetic is unchanged.
 template<int ncols1, int nwarps, int nbatch_fa, bool oob_check>
 static __device__ __forceinline__ void flash_attn_ext_f16_gen_mask(
-        const int32_t * const __restrict__ kv_pos, const int32_t * const __restrict__ q_pos, half * const __restrict__ tile_mask,
+        const int32_t * const __restrict__ kv_pos, const int32_t * const __restrict__ q_pos,
+        const int32_t * const __restrict__ kv_seq, const int32_t * const __restrict__ q_seq, half * const __restrict__ tile_mask,
         const int i_sup, const int j0, const uint3 ne01) {
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 #pragma unroll
@@ -991,18 +995,24 @@ static __device__ __forceinline__ void flash_attn_ext_f16_gen_mask(
         if (j1 + nwarps > ncols1 && j_sram >= ncols1) {
             break;
         }
-        const int qp = q_pos[j_vram];
+        const int      qp = q_pos[j_vram];
+        const uint32_t qs = kv_seq ? (uint32_t) q_seq[j_vram] : 0u;   // [TAG_4C_POSMASK_MS]
 #pragma unroll
         for (int i0 = 0; i0 < nbatch_fa; i0 += warp_size) {
             const int i = i0 + threadIdx.x;
             float v = 0.0f;
             if (!oob_check || i < i_sup) {
                 const int kp = kv_pos[i];
-                v = (kp < 0 || kp > qp) ? -INFINITY : 0.0f;
+                v = (kp < 0 || kp > qp || (kv_seq && ((uint32_t) kv_seq[i] & qs) == 0)) ? -INFINITY : 0.0f;
             }
             tile_mask[j_sram*(nbatch_fa + 8) + i] = __float2half(v);
         }
     }
+}
+
+// [TAG_4C_POSMASK_MS] kv_seq advanced to a tile, or nullptr (no pointer arithmetic on a null pointer)
+static __device__ __forceinline__ const int32_t * fattn_seq_at(const int32_t * kv_seq, const int k) {
+    return kv_seq ? kv_seq + k : nullptr;
 }
 
 template<int ncols1, int nwarps, int nbatch_fa, bool use_cp_async, bool oob_check, bool use_sparse>
@@ -1103,6 +1113,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         const int32_t * const __restrict__ indices,
         const int32_t * const __restrict__ kv_pos,   // [TAG_FA_POS_MASK]
         const int32_t * const __restrict__ q_pos,
+        const int32_t * const __restrict__ kv_seq,   // [TAG_4C_POSMASK_MS] sequence sets, or nullptr
+        const int32_t * const __restrict__ q_seq,
         float2       * const __restrict__ dstk,
         float2       * const __restrict__ dstk_fixup,
         const float scale,
@@ -1175,7 +1187,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         constexpr bool use_cp_async = nstages == 1 && !use_sparse;
         if (kv_pos) {   // [TAG_FA_POS_MASK]
             flash_attn_ext_f16_gen_mask<ncols1, nwarps, nbatch_fa, oob_check>
-                (kv_pos + k_VKQ_0, q_pos, tile_mask, k_VKQ_sup, jt*ncols1, ne01);
+                (kv_pos + k_VKQ_0, q_pos, fattn_seq_at(kv_seq, k_VKQ_0), q_seq, tile_mask, k_VKQ_sup, jt*ncols1, ne01);
         } else if (ncols2 > 1 || mask_h) {
             flash_attn_ext_f16_load_mask<ncols1, nwarps, nbatch_fa, use_cp_async, oob_check, use_sparse>
                 (mask_h, tile_mask, stride_mask, k_VKQ_0, k_VKQ_sup, jt*ncols1, ne01, indices);
@@ -1558,7 +1570,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         if (!last_iter) {
             if (kv_pos) {   // [TAG_FA_POS_MASK]
                 flash_attn_ext_f16_gen_mask<ncols1, nwarps, nbatch_fa, oob_check>
-                    (kv_pos + k_VKQ_0 + nbatch_fa, q_pos, tile_mask, k_VKQ_sup, jt*ncols1, ne01);
+                    (kv_pos + k_VKQ_0 + nbatch_fa, q_pos, fattn_seq_at(kv_seq, k_VKQ_0 + nbatch_fa), q_seq,
+                     tile_mask, k_VKQ_sup, jt*ncols1, ne01);
             } else if (ncols2 > 1 || mask_h) {
                 flash_attn_ext_f16_load_mask<ncols1, nwarps, nbatch_fa, use_cp_async, oob_check, use_sparse>
                     (mask_h, tile_mask, stride_mask, k_VKQ_0 + nbatch_fa, k_VKQ_sup, jt*ncols1, ne01, nullptr);
@@ -1657,7 +1670,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         }
     }
 #else
-    GGML_UNUSED_VARS(Q_f2, K_h2, V_h2, mask_h, indices, kv_pos, q_pos, dstk, dstk_fixup,
+    GGML_UNUSED_VARS(Q_f2, K_h2, V_h2, mask_h, indices, kv_pos, q_pos, kv_seq, q_seq, dstk, dstk_fixup,
         scale, slope, logit_softcap, ne01, ne02,
         stride_K, stride_V, stride_mask,
         tile_Q, tile_K, tile_V, tile_mask,
@@ -1790,6 +1803,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
         const int32_t * const __restrict__ indices,
         const int32_t * const __restrict__ kv_pos,   // [TAG_FA_POS_MASK]
         const int32_t * const __restrict__ q_pos,
+        const int32_t * const __restrict__ kv_seq,   // [TAG_4C_POSMASK_MS] sequence sets, or nullptr
+        const int32_t * const __restrict__ q_seq,
         const float  * const __restrict__ sinks_f,
         float2       * const __restrict__ dstk,
         float2       * const __restrict__ dstk_fixup,
@@ -1938,7 +1953,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
         constexpr int  k_VKQ_sup    = nbatch_fa;
         if (kv_pos) {   // [TAG_FA_POS_MASK]
             flash_attn_ext_f16_gen_mask<ncols1, nwarps, nbatch_fa, oob_check>
-                (kv_pos + kb0*nbatch_fa, q_pos, tile_mask, k_VKQ_sup, jt*ncols1, ne01);
+                (kv_pos + kb0*nbatch_fa, q_pos, fattn_seq_at(kv_seq, kb0*nbatch_fa), q_seq, tile_mask, k_VKQ_sup, jt*ncols1, ne01);
         } else if (ncols2 > 1 || mask_h) {
             flash_attn_ext_f16_load_mask<ncols1, nwarps, nbatch_fa, use_cp_async, oob_check, use_sparse>
                 (mask_h, tile_mask, stride_mask, kb0*nbatch_fa, k_VKQ_sup, jt*ncols1, ne01, nullptr);
@@ -1956,7 +1971,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
             flash_attn_ext_f16_iter
                 <DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, turbo_KV, use_sparse, needs_fixup, is_fixup, last_iter, oob_check,
                  T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>
-                (Q_f2, K_h2, V_h2, mask_h, indices, kv_pos, q_pos, dstk, dstk_fixup, scale, slope, logit_softcap,
+                (Q_f2, K_h2, V_h2, mask_h, indices, kv_pos, q_pos, kv_seq, q_seq, dstk, dstk_fixup, scale, slope, logit_softcap,
                  ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
                  KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup, turbo_e0);
         }
@@ -1965,7 +1980,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
         flash_attn_ext_f16_iter
             <DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, turbo_KV, use_sparse, needs_fixup, is_fixup, last_iter, oob_check,
               T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>
-            (Q_f2, K_h2, V_h2, mask_h, indices, kv_pos, q_pos, dstk, dstk_fixup, scale, slope, logit_softcap,
+            (Q_f2, K_h2, V_h2, mask_h, indices, kv_pos, q_pos, kv_seq, q_seq, dstk, dstk_fixup, scale, slope, logit_softcap,
              ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
              KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup, turbo_e0);
     } else {
@@ -1976,7 +1991,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
             flash_attn_ext_f16_iter
                 <DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, turbo_KV, use_sparse, needs_fixup, is_fixup, last_iter, oob_check,
                  T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>
-                (Q_f2, K_h2, V_h2, mask_h, indices, kv_pos, q_pos, dstk, dstk_fixup, scale, slope, logit_softcap,
+                (Q_f2, K_h2, V_h2, mask_h, indices, kv_pos, q_pos, kv_seq, q_seq, dstk, dstk_fixup, scale, slope, logit_softcap,
                  ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
                  KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup, turbo_e0);
         }
@@ -1985,7 +2000,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
         flash_attn_ext_f16_iter
             <DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, turbo_KV, use_sparse, needs_fixup, is_fixup, last_iter, oob_check,
              T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>
-            (Q_f2, K_h2, V_h2, mask_h, indices, kv_pos, q_pos, dstk, dstk_fixup, scale, slope, logit_softcap,
+            (Q_f2, K_h2, V_h2, mask_h, indices, kv_pos, q_pos, kv_seq, q_seq, dstk, dstk_fixup, scale, slope, logit_softcap,
              ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
              KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup, turbo_e0);
     }
@@ -2381,7 +2396,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
         }
     }
 #else
-    GGML_UNUSED_VARS(Q_f2, K_h2, V_h2, mask_h, indices, kv_pos, q_pos, sinks_f, dstk, dstk_fixup,
+    GGML_UNUSED_VARS(Q_f2, K_h2, V_h2, mask_h, indices, kv_pos, q_pos, kv_seq, q_seq, sinks_f, dstk, dstk_fixup,
         scale, slope, logit_softcap, ne01, ne02, gqa_ratio,
         stride_Q1, stride_Q2, stride_K, stride_V, stride_mask,
         jt, kb0_start, kb0_stop, turbo_e0);
@@ -2491,6 +2506,9 @@ static __global__ void flash_attn_ext_f16(
     const int stride_K    = nb11 / sizeof(half2);
     const int stride_mask = nb31 / sizeof(half);
 
+    // [TAG_4C_POSMASK_MS] sequence sets of a multi-sequence positional mask (fattn-common.cuh), or nullptr
+    const fattn_pos_seq pos_seq = fattn_pos_seq_of(kv_pos, q_pos, ne31, nb31, nb32);
+
     const int stride_V = V_is_K_view ? stride_K : nb21 / sizeof(half2);
 
     const int iter_k     = (ne11      + (nbatch_fa - 1)) / nbatch_fa;
@@ -2581,12 +2599,12 @@ static __global__ void flash_attn_ext_f16(
         if (block_owns_tile_start) {
             constexpr bool needs_fixup = false; // CUDA block is working on an entire tile.
             flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, turbo_KV, use_sparse, needs_fixup, is_fixup>
-                (Q_f2, K_h2, V_h2, mask_h, indices, kv_pos, q_pos, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
+                (Q_f2, K_h2, V_h2, mask_h, indices, kv_pos, q_pos, pos_seq.kv, pos_seq.q, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
                  ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, zt_gqa, kb0_start, kb0_stop, turbo_e0);
         } else {
             constexpr bool needs_fixup = true; // CUDA block is missing the beginning of a tile.
             flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, turbo_KV, use_sparse, needs_fixup, is_fixup>
-                (Q_f2, K_h2, V_h2, mask_h, indices, kv_pos, q_pos, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
+                (Q_f2, K_h2, V_h2, mask_h, indices, kv_pos, q_pos, pos_seq.kv, pos_seq.q, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
                  ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, zt_gqa, kb0_start, kb0_stop, turbo_e0);
         }
 
@@ -2661,7 +2679,7 @@ static __global__ void flash_attn_ext_f16(
     constexpr bool is_fixup = true; // Last index writes its data to fixup buffer to avoid data races with other blocks.
     constexpr bool needs_fixup = false;
     flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, turbo_KV, use_sparse, needs_fixup, is_fixup>
-        (Q_f2, K_h2, V_h2, mask_h, indices, kv_pos, q_pos, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
+        (Q_f2, K_h2, V_h2, mask_h, indices, kv_pos, q_pos, pos_seq.kv, pos_seq.q, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
          ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, zt_gqa, kb0_start, kb0_stop, turbo_e0);
 #else
     GGML_UNUSED_VARS(Q_ptr, K_ptr, V_ptr, mask_ptr, sinks_ptr, kv_pos, q_pos, KV_max_ptr, dst_ptr, dst_meta_ptr, scale,
@@ -2886,8 +2904,9 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
 
     // When reading the cache natively there is nothing to convert: tell launch_fattn not
     // to allocate or fill the F16 scratch at all.
+    // [TAG_4C_POSMASK_MS] pos_ms_ok: gen_mask reads the sequence sets of a multi-sequence positional mask
     launch_fattn<DV, ncols1, ncols2>
-        (ctx, dst, fattn_kernel, nwarps, nbytes_shared_total, nbatch_fa, !turbo_ok, !turbo_ok, true, use_sparse, warp_size_host);
+        (ctx, dst, fattn_kernel, nwarps, nbytes_shared_total, nbatch_fa, !turbo_ok, !turbo_ok, true, use_sparse, warp_size_host, true);
 }
 
 

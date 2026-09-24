@@ -5792,6 +5792,12 @@ void ggml_flash_attn_ext_set_pos(
     GGML_ASSERT(kv_pos->type == GGML_TYPE_I32 && q_pos->type == GGML_TYPE_I32);
     GGML_ASSERT(kv_pos->ne[0] == a->src[1]->ne[1]);   // one entry per KV cell
     GGML_ASSERT(q_pos->ne[0]  == a->src[0]->ne[1]);   // one entry per query token
+    // [TAG_4C_POSMASK_MS] one row (positions) or two (positions, then sequence sets), the same for both
+    GGML_ASSERT(kv_pos->ne[1] == q_pos->ne[1] && (kv_pos->ne[1] == 1 || kv_pos->ne[1] == 2));
+    GGML_ASSERT(kv_pos->ne[2] == 1 && kv_pos->ne[3] == 1 && q_pos->ne[2] == 1 && q_pos->ne[3] == 1);
+    if (kv_pos->ne[1] == 2) {
+        GGML_ASSERT(ggml_is_contiguous(kv_pos) && ggml_is_contiguous(q_pos));
+    }
     a->src[5] = kv_pos;
     a->src[6] = q_pos;
 }

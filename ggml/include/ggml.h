@@ -2605,6 +2605,11 @@ extern "C" {
     // [TAG_FA_POS_MASK] optional positional mask instead of an explicit one: kv_pos [n_kv] (I32, -1 = not
     // visible) and q_pos [n_q] (I32). Equivalent to a mask of -INF where kv_pos < 0 or kv_pos > q_pos and
     // 0 elsewhere (plain causal attention over a single sequence). Requires no mask (src[3] == NULL).
+    // [TAG_4C_POSMASK_MS] several sequences in one KV stream: kv_pos I32 [n_kv, 2] and q_pos I32 [n_q, 2], both
+    // contiguous. Row 0 holds the positions as above; row 1 of kv_pos holds the cell's sequence set (bit b = the
+    // cell belongs to sequence b of the batch, 0 = none) and row 1 of q_pos the query's sequence bit. A cell is
+    // visible iff (kv_seq & q_seq) != 0 && kv_pos >= 0 && kv_pos <= q_pos; -INF elsewhere. Both tensors must have
+    // the same number of rows (1 or 2).
     GGML_API void ggml_flash_attn_ext_set_pos(
             struct ggml_tensor * a,
             struct ggml_tensor * kv_pos,

@@ -1226,6 +1226,90 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
     return f16_extra.end - (uintptr_t) dst->data;
 }
 
+// [TAG_4C_POSMASK_MS] Explicit F16 mask from a multi-sequence positional one (fattn-common.cuh): one row per query,
+// 0 where the cell is visible and -INF elsewhere, the values llama_kv_cache::set_input_kq_mask writes on the host.
+// For the kernels that do not read sequence sets (VEC, TILE) and for every kernel under GGML_CUDA_FA_POS_MS=0.
+// Rows n_q .. n_rows-1 are padding, all -INF (see ggml_cuda_flash_attn_ext_pos_ms_explicit); grid y strides the rows.
+static __global__ void flash_attn_pos_ms_to_mask(
+        const int32_t * __restrict__ kv_pos, const int32_t * __restrict__ kv_seq,
+        const int32_t * __restrict__ q_pos,  const int32_t * __restrict__ q_seq,
+        half * __restrict__ mask, const int n_kv, const int n_q, const int n_rows, const int64_t s1) {
+    ggml_cuda_pdl_sync();
+    const int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= n_kv) {
+        return;
+    }
+    const int      kp = kv_pos[i];
+    const uint32_t ks = (uint32_t) kv_seq[i];
+    for (int j = blockIdx.y; j < n_rows; j += gridDim.y) {
+        const bool vis = j < n_q && kp >= 0 && kp <= q_pos[j] && (ks & (uint32_t) q_seq[j]) != 0;
+        mask[(int64_t) j*s1 + i] = __float2half(vis ? 0.0f : -INFINITY);
+    }
+}
+
+// [TAG_4C_POSMASK_MS] GGML_CUDA_FA_POS_MS=0: the MMA kernels no longer read sequence sets either; every multi-sequence
+// positional mask becomes an explicit mask on the GPU (the host still saves the fill, the upload and the compute buffer).
+// A/B for the kernel side on its own; LLAMA_KQ_MASK_POS_MS=0 turns the whole path off on the host.
+static bool ggml_cuda_fa_pos_ms_native_on() {
+    static const bool on = [] {
+        const char * e = getenv("GGML_CUDA_FA_POS_MS");
+        return !(e && e[0] == '0');
+    }();
+    return on;
+}
+
+// [TAG_4C_POSMASK_MS] Runs dst with the equivalent explicit mask: the same node with src[3] = the materialised mask and
+// no positional vectors, so kernel selection, scratch and launch are exactly those of an explicit-mask FA. Rows are
+// padded to 16 bytes so the GQA-packing stride test the router applies to a mask passes, as it does with no mask.
+// The buffer holds n_q rounded up to 64 rows, the padding all -INF: the mask-based KV bounds scan of launch_fattn
+// (flash_attn_mask_to_KV_max) reads ncols1 whole rows per query tile, i.e. up to GGML_PAD(n_q, ncols1) rows, and
+// ncols1 <= 64 divides 64. A pool buffer of exactly n_q rows would let that scan read past its end (at 262K cells one
+// row is 512 KiB, so possibly past the pool mapping). -INF rows never stop a tile from being skipped, so the bounds, and
+// every kernel (they index rows modulo n_q), are unchanged.
+static void ggml_cuda_flash_attn_ext_pos_ms_explicit(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * Q      = dst->src[0];
+    const ggml_tensor * K      = dst->src[1];
+    const ggml_tensor * kv_pos = dst->src[5];
+    const ggml_tensor * q_pos  = dst->src[6];
+    GGML_ASSERT(dst->src[3] == nullptr && kv_pos->ne[1] == 2 && q_pos->ne[1] == 2);
+    GGML_ASSERT(ggml_is_contiguous(kv_pos) && ggml_is_contiguous(q_pos));
+
+    const int64_t n_kv   = K->ne[1];
+    const int64_t n_q    = Q->ne[1];
+    const int64_t n_rows = GGML_PAD(n_q, 64);
+    GGML_ASSERT(kv_pos->ne[0] == n_kv && q_pos->ne[0] == n_q && n_rows <= INT32_MAX && n_kv <= INT32_MAX);
+    const int64_t s1 = GGML_PAD(n_kv, 8);
+
+    ggml_cuda_pool_alloc<half> mask_buf(ctx.pool(), s1*n_rows);
+    {
+        const dim3 block_dim(256, 1, 1);
+        const dim3 block_nums((unsigned) ((n_kv + 255) / 256), (unsigned) std::min<int64_t>(n_rows, 65535), 1);
+        const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dim, 0, ctx.stream());
+        ggml_cuda_kernel_launch(flash_attn_pos_ms_to_mask, launch_params,
+            (const int32_t *) kv_pos->data, (const int32_t *) ((const char *) kv_pos->data + kv_pos->nb[1]),
+            (const int32_t *) q_pos->data,  (const int32_t *) ((const char *) q_pos->data  + q_pos->nb[1]),
+            mask_buf.ptr, (int) n_kv, (int) n_q, (int) n_rows, s1);
+    }
+
+    ggml_tensor mask = {};
+    mask.type  = GGML_TYPE_F16;
+    mask.ne[0] = n_kv;
+    mask.ne[1] = n_q;
+    mask.ne[2] = 1;
+    mask.ne[3] = 1;
+    mask.nb[0] = sizeof(half);
+    mask.nb[1] = s1*sizeof(half);
+    mask.nb[2] = mask.nb[1]*n_rows;
+    mask.nb[3] = mask.nb[2];
+    mask.data  = mask_buf.ptr;
+
+    ggml_tensor d = *dst;
+    d.src[3] = &mask;
+    d.src[5] = nullptr;
+    d.src[6] = nullptr;
+    ggml_cuda_flash_attn_ext(ctx, &d);
+}
+
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
     // Diagnostic: report ONCE per (kernel, K type, decode/prefill) which FA kernel runs.
@@ -1237,6 +1321,13 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     // so every attention op paid two full passes of a function that queries device info
     // and walks four tensors by four dimensions.
     const best_fattn_kernel kprobe = ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst);
+    // [TAG_4C_POSMASK_MS] Only the MMA kernels (f16/turbo and turbot) read the sequence sets of a multi-sequence
+    // positional mask. Any other choice would see positions alone and attend across sequences, so it gets the
+    // equivalent explicit mask instead (and so does every kernel under GGML_CUDA_FA_POS_MS=0).
+    if (ggml_cuda_fattn_pos_rows(dst) == 2 && (kprobe != BEST_FATTN_KERNEL_MMA_F16 || !ggml_cuda_fa_pos_ms_native_on())) {
+        ggml_cuda_flash_attn_ext_pos_ms_explicit(ctx, dst);
+        return;
+    }
     {
         static std::set<int> seen;
         const ggml_tensor * Kp = dst->src[1];
@@ -1292,6 +1383,13 @@ bool ggml_cuda_flash_attn_ext_supported(int device, const ggml_tensor * dst) {
     if (dst->src[5] != nullptr) {
         if (dst->src[3] != nullptr || dst->src[6] == nullptr || dst->src[5]->type != GGML_TYPE_I32 || dst->src[6]->type != GGML_TYPE_I32 ||
             dst->src[0]->ne[3] != 1 || !ggml_is_contiguous(dst->src[5]) || !ggml_is_contiguous(dst->src[6])) {
+            return false;
+        }
+        // [TAG_4C_POSMASK_MS] one row (positions) or two (positions + sequence sets), the same on both vectors
+        const ggml_tensor * kvp = dst->src[5];
+        const ggml_tensor * qp  = dst->src[6];
+        if (kvp->ne[1] != qp->ne[1] || (kvp->ne[1] != 1 && kvp->ne[1] != 2) || kvp->ne[2] != 1 || kvp->ne[3] != 1 ||
+            qp->ne[2] != 1 || qp->ne[3] != 1) {
             return false;
         }
     }

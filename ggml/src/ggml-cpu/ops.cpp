@@ -8845,6 +8845,10 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
         // [TAG_FA_POS_MASK] positional mask: -INF where the cell is not visible from this query
         const int32_t * kvp  = dst->src[5] ? (const int32_t *) dst->src[5]->data : NULL;
         const int32_t   qpos = (kvp && dst->src[6]) ? ((const int32_t *) dst->src[6]->data)[iq1] : 0;
+        // [TAG_4C_POSMASK_MS] several sequences: row 1 of kv_pos is the cell's sequence set, row 1 of q_pos the
+        // query's sequence bit; a cell outside the query's sequence is -INF like an empty one
+        const int32_t * kvs  = (kvp && dst->src[5]->ne[1] == 2) ? (const int32_t *) ((const char *) dst->src[5]->data + dst->src[5]->nb[1]) : NULL;
+        const uint32_t  qseq = kvs ? (uint32_t) ((const int32_t *) ((const char *) dst->src[6]->data + dst->src[6]->nb[1]))[iq1] : 0;
 
         // k indices
         const int ik3 = iq3 / rk3;
@@ -8862,7 +8866,8 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
         // ref: https://arxiv.org/pdf/2112.05682.pdf
 
         for (int64_t ic = ic_start; ic < ic_end; ++ic) {
-            const float mv = mp ? slope*GGML_CPU_FP16_TO_FP32(mp[ic]) : (kvp ? ((kvp[ic] < 0 || kvp[ic] > qpos) ? -INFINITY : 0.0f) : 0.0f);
+            const float mv = mp ? slope*GGML_CPU_FP16_TO_FP32(mp[ic]) : (kvp ? ((kvp[ic] < 0 || kvp[ic] > qpos ||
+                (kvs && ((uint32_t) kvs[ic] & qseq) == 0)) ? -INFINITY : 0.0f) : 0.0f);
             if (mv == -INFINITY) {
                 continue;
             }

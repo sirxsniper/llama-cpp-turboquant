@@ -541,7 +541,7 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
     }
     if (self_kv_pos && self_kv_pos->buffer) {   // [TAG_FA_POS_MASK]
         mctx->set_input_kv_pos(self_kv_pos, ubatch);
-        ggml_backend_tensor_set(self_q_pos, ubatch->pos, 0, ubatch->n_tokens*ggml_element_size(self_q_pos));
+        mctx->set_input_q_pos (self_q_pos,  ubatch);   // [TAG_4C_POSMASK_MS] positions, plus sequence bits for two rows
     }
 
     if (self_k_rot && self_k_rot->buffer) {
@@ -569,6 +569,9 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
     if (self_kv_pos) {   // [TAG_FA_POS_MASK]
         res &= self_kv_pos->ne[0] == mctx->get_n_kv();
         res &= self_q_pos->ne[0]  == params.ubatch.n_tokens;
+        // [TAG_4C_POSMASK_MS] one row describes one sequence only: never reuse it for several (allow_reuse already
+        // requires the same n_seqs_unq; this keeps the leak guard local)
+        res &= self_kv_pos->ne[1] == (params.ubatch.n_seqs_unq > 1 ? 2 : 1);
     }
 
     res &= can_reuse_turbot(this, mctx, params.ubatch);   // [TAG_TURBOT]
@@ -1183,7 +1186,7 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
     }
     if (inp_attn->self_kv_pos) {   // [TAG_FA_POS_MASK]
         mctx->get_attn()->set_input_kv_pos(inp_attn->self_kv_pos, ubatch);
-        ggml_backend_tensor_set(inp_attn->self_q_pos, ubatch->pos, 0, ubatch->n_tokens*ggml_element_size(inp_attn->self_q_pos));
+        mctx->get_attn()->set_input_q_pos (inp_attn->self_q_pos,  ubatch);   // [TAG_4C_POSMASK_MS]
     }
 
     if (inp_attn->self_k_rot) {
@@ -1227,6 +1230,7 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
     if (inp_attn->self_kv_pos) {   // [TAG_FA_POS_MASK]
         res &= inp_attn->self_kv_pos->ne[0] == mctx->get_attn()->get_n_kv();
         res &= inp_attn->self_q_pos->ne[0]  == params.ubatch.n_tokens;
+        res &= inp_attn->self_kv_pos->ne[1] == (params.ubatch.n_seqs_unq > 1 ? 2 : 1);   // [TAG_4C_POSMASK_MS]
     }
 
     // [TAG_TURBOT] this check re-implements the attention input's instead of delegating, so the turbot conditions go
@@ -2810,6 +2814,11 @@ ggml_tensor * llm_graph_context::build_attn_mha(
     // split the batch into streams if needed
     const auto n_stream = k->ne[3];
 
+    // [TAG_4C_POSMASK_MS] a multi-sequence positional mask covers the cells of ONE stream (a unified cache) and exists
+    // only for the flash-attention kernels; anything else would attend without it
+    GGML_ASSERT((kv_pos == nullptr || kv_pos->ne[1] == 1 || (n_stream == 1 && cparams.flash_attn && kq_b == nullptr)) &&
+                "multi-sequence positional mask: one KV stream and flash attention only");
+
     q = ggml_view_4d(ctx0, q, q->ne[0], q->ne[1], q->ne[2]/n_stream, n_stream, q->nb[1], q->nb[2], q->nb[3]/n_stream, 0);
 
     q = ggml_permute(ctx0, q, 0, 2, 1, 3);
@@ -2866,7 +2875,9 @@ ggml_tensor * llm_graph_context::build_attn_mha(
             // q, k, v and the mask along dim 3, and the stream's slice of the granule table (stream-major, global
             // slots into the one young pool of the layer). Same scale, softcap, sinks, pool and params; the outputs
             // are concatenated along dim 3 in stream order, which is the layout the single FA would have written.
-            GGML_ASSERT(kv_pos == nullptr && "turbot: the positional mask covers a single sequence, not several streams");
+            // [TAG_4C_POSMASK_MS] several streams means a non-unified cache: each stream gets its slice of the explicit
+            // mask. The positional mask (one sequence, or several with sequence sets) exists only for a single stream.
+            GGML_ASSERT(kv_pos == nullptr && "turbot: the positional mask covers one KV stream, not several streams");
             GGML_ASSERT(turbot_gtab != nullptr && turbot_gtab->ne[0] % k->ne[3] == 0);
 
             const int64_t n_strm   = k->ne[3];
@@ -3163,15 +3174,47 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
         // explicit per-sequence KQ mask, which is correct by construction. Restoring the
         // optimisation for multi-sequence batches needs an [n_kv, n_seqs] vector and matching
         // kernel support - a bigger change than belongs in a correctness fix.
+        //
+        // [TAG_4C_POSMASK_MS] ...which is what this now is. With several sequences in one KV stream the vectors get a
+        // second row: each cell's SET of the ubatch's sequences (a bitmask, so a cell shared through seq_cp / prompt
+        // sharing is visible to each of its sequences) and each query's sequence bit, and the kernels test
+        // (kv_seq & q_seq) != 0 next to the position test. The leak cannot come back through this path:
+        //   - the sequence test is in the data, per cell and per query - no "the ubatch's sequence" anywhere;
+        //   - a one-row vector is still built only for n_seqs_unq == 1, set_input_kv_pos refuses a one-row vector for
+        //     a multi-sequence ubatch, can_reuse refuses to reuse one for it, and the CUDA launcher refuses a two-row
+        //     vector for any kernel that does not read the sets (the others get an explicit mask built from them);
+        //   - test-backend-ops test_flash_attn_ext_pos_ms checks positional == explicit per backend, with interleaved
+        //     sequences that carry distinct values and cells shared by two sequences.
+        // Conditions: a unified cache (one KV stream: without --kv-unified each sequence has its own stream and its
+        // own explicit mask slice), at most 32 sequences (the set is an I32), and no M-RoPE embedding batch - an image
+        // shares one temporal position across its tokens, where set_input_kq_mask applies the 2-D rule the positional
+        // test does not have (token batches never reach that rule: a text token shares no position with another cell
+        // of its sequence).
+        // LLAMA_KQ_MASK_POS_MS=0 restores the single-sequence rule above; LLAMA_KQ_MASK_POS=0 still turns the
+        // positional mask off everywhere.
+        static const bool pos_mask_ms_env = [] {
+            const char * e = getenv("LLAMA_KQ_MASK_POS_MS");
+            return !(e && e[0] == '0');
+        }();
+        const bool pos_mask_ms = pos_mask_ms_env && cparams.kv_unified && ubatch.n_seqs_unq > 1 &&
+            ubatch.n_seqs_unq <= 32 && (ubatch.token != nullptr || !ubatch.is_pos_2d());
         const bool use_pos_mask = pos_mask_env && cparams.flash_attn && cparams.causal_attn &&
-            hparams.f_max_alibi_bias == 0.0f && ubatch.n_seqs_unq == 1 &&
+            hparams.f_max_alibi_bias == 0.0f && (ubatch.n_seqs_unq == 1 || pos_mask_ms) &&
             !has_sparse_attn_indexer;
         if (use_pos_mask) {
             const auto n_kv = mctx_cur->get_n_kv();
-            inp->self_kv_pos = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_kv);
-            ggml_set_input(inp->self_kv_pos);
-            inp->self_q_pos = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, ubatch.n_tokens);
-            ggml_set_input(inp->self_q_pos);
+            if (ubatch.n_seqs_unq == 1) {
+                inp->self_kv_pos = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_kv);
+                ggml_set_input(inp->self_kv_pos);
+                inp->self_q_pos = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, ubatch.n_tokens);
+                ggml_set_input(inp->self_q_pos);
+            } else {
+                // [TAG_4C_POSMASK_MS] row 0 positions, row 1 sequence sets / bits (set_input_kv_pos, set_input_q_pos)
+                inp->self_kv_pos = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_kv, 2);
+                ggml_set_input(inp->self_kv_pos);
+                inp->self_q_pos = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, ubatch.n_tokens, 2);
+                ggml_set_input(inp->self_q_pos);
+            }
         } else {
             inp->self_kq_mask = build_attn_inp_kq_mask(ctx0, mctx_cur, ubatch, cparams);
             inp->self_kq_mask_cnv = inp->self_kq_mask;

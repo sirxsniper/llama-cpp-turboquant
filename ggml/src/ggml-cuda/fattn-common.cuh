@@ -44,6 +44,35 @@ typedef void (* fattn_kernel_t)(
                             const int32_t ne31, const int32_t ne32, const int32_t ne33,
                             const int32_t nb31, const int32_t nb32, const int64_t nb33);
 
+// [TAG_4C_POSMASK_MS] Positional mask over several sequences of one KV stream (ggml_flash_attn_ext_set_pos with two
+// rows): row 1 of kv_pos is each cell's sequence set, row 1 of q_pos each query's sequence bit, and a cell is visible
+// iff (kv_seq & q_seq) != 0 && 0 <= kv_pos <= q_pos. The kernels take no new arguments for it. A positional mask
+// never comes with an explicit one, so the mask-shape arguments are free: the launchers pass ne31 = 2, nb31 = the row
+// stride of kv_pos and nb32 = that of q_pos in bytes, and fattn_pos_seq_of() derives the row-1 pointers. With one row
+// (or an explicit mask) they pass what they always passed, fattn_pos_seq_of() returns nullptr and every kernel runs
+// exactly as before. Only the MMA kernels (f16/turbo and turbot) read the sequence sets: launch_fattn refuses a
+// two-row mask unless its caller says it does (pos_ms_ok), and ggml_cuda_flash_attn_ext hands every other kernel an
+// explicit mask materialised from the positions instead.
+struct fattn_pos_seq {
+    const int32_t * kv;   // [n_kv] sequence set of each cell, or nullptr (one sequence)
+    const int32_t * q;    // [n_q]  sequence bit of each query
+};
+
+static __device__ __forceinline__ fattn_pos_seq fattn_pos_seq_of(
+        const int32_t * kv_pos, const int32_t * q_pos, const int ne31, const int nb31, const int nb32) {
+    fattn_pos_seq s = { nullptr, nullptr };
+    if (kv_pos && ne31 == 2) {
+        s.kv = (const int32_t *) ((const char *) kv_pos + nb31);
+        s.q  = (const int32_t *) ((const char *) q_pos  + nb32);
+    }
+    return s;
+}
+
+// [TAG_4C_POSMASK_MS] rows of the positional mask of an FA node: 0 none, 1 positions, 2 positions + sequence sets
+static inline int ggml_cuda_fattn_pos_rows(const ggml_tensor * dst) {
+    return dst->src[5] ? (int) dst->src[5]->ne[1] : 0;
+}
+
 // [TAG_TURBO4P_ROW_ELEM0] row_elem0 is the index, WITHIN the block K_c points at, of the
 // first element of this K row. Every layout whose blocks map a contiguous run of elements
 // onto a contiguous run of bytes can point K_c straight at the row and pass 0, which is
@@ -2422,9 +2451,14 @@ constexpr __device__ dequantize_V_t get_dequantize_V() {
 
 // [TAG_FA_POS_MASK] same job as flash_attn_mask_to_KV_max below, from cell positions: a KV tile is skippable for
 // this query tile when every cell in it is either empty (pos < 0) or later than the latest query position.
+// [TAG_4C_POSMASK_MS] with sequence sets (kv_seq != nullptr) a cell outside every sequence of the query tile is
+// skippable as well. The test stays conservative (latest position and union of sequences over the tile), so it only
+// ever skips cells that are -INF for every query of the tile, and skipping those is arithmetically exact.
 template <int ncols1>
 static __global__ void flash_attn_pos_to_KV_max(
-        const int32_t * __restrict__ kv_pos, const int32_t * __restrict__ q_pos, int * KV_max_ptr, const int ne30, const uint3 ne01) {
+        const int32_t * __restrict__ kv_pos, const int32_t * __restrict__ q_pos,
+        const int32_t * __restrict__ kv_seq, const int32_t * __restrict__ q_seq,
+        int * KV_max_ptr, const int ne30, const uint3 ne01) {
     int * GGML_CUDA_RESTRICT KV_max = KV_max_ptr;
     const int tid = threadIdx.x;
     const int jt  = blockIdx.x;
@@ -2432,19 +2466,30 @@ static __global__ void flash_attn_pos_to_KV_max(
     if (tid < WARP_SIZE) {
         buf_iw[tid] = 1;
     }
-    int q_max = -1;
+    int      q_max = -1;
+    uint32_t q_set = 0;   // [TAG_4C_POSMASK_MS] union of the tile's query sequences
 #pragma unroll
     for (int j = 0; j < ncols1; ++j) {
-        q_max = max(q_max, q_pos[fastmodulo(jt*ncols1 + j, ne01)]);
+        const int jq = fastmodulo(jt*ncols1 + j, ne01);
+        q_max = max(q_max, q_pos[jq]);
+        if (kv_seq) {
+            q_set |= (uint32_t) q_seq[jq];
+        }
     }
+    // a cell no query of the tile can see
+    auto hidden = [&](const int c, const int i) -> bool {
+        return c < 0 || c > q_max || (kv_seq && ((uint32_t) kv_seq[i] & q_set) == 0);
+    };
     ggml_cuda_pdl_sync();
     __syncthreads();
     int KV_max_sj = (ne30 - 1) * FATTN_KQ_STRIDE;
     for (; KV_max_sj >= 0; KV_max_sj -= FATTN_KQ_STRIDE) {
         // each thread checks two cells, like the half2 mask scan
-        const int c0 = kv_pos[KV_max_sj + 2*tid + 0];
-        const int c1 = kv_pos[KV_max_sj + 2*tid + 1];
-        int all_inf = int(c0 < 0 || c0 > q_max) && int(c1 < 0 || c1 > q_max);
+        const int i0 = KV_max_sj + 2*tid + 0;
+        const int i1 = KV_max_sj + 2*tid + 1;
+        const int c0 = kv_pos[i0];
+        const int c1 = kv_pos[i1];
+        int all_inf = int(hidden(c0, i0)) && int(hidden(c1, i1));
         all_inf = warp_reduce_all(all_inf);
         if (tid % WARP_SIZE == 0) {
             buf_iw[tid / WARP_SIZE] = all_inf;
@@ -2468,9 +2513,13 @@ static __global__ void flash_attn_pos_to_KV_max(
     const int KV_max_out = KV_max_sj + FATTN_KQ_STRIDE;
     int KV_min_sj = 0;
     for (; KV_min_sj < KV_max_out; KV_min_sj += FATTN_KQ_STRIDE) {
-        const int c0 = kv_pos[KV_min_sj + 2*tid + 0];
-        const int c1 = kv_pos[KV_min_sj + 2*tid + 1];
-        int all_empty = int(c0 < 0) && int(c1 < 0);
+        const int i0 = KV_min_sj + 2*tid + 0;
+        const int i1 = KV_min_sj + 2*tid + 1;
+        const int c0 = kv_pos[i0];
+        const int c1 = kv_pos[i1];
+        // [TAG_4C_POSMASK_MS] a cell of another sequence counts as empty here
+        int all_empty = int(c0 < 0 || (kv_seq && ((uint32_t) kv_seq[i0] & q_set) == 0)) &&
+                        int(c1 < 0 || (kv_seq && ((uint32_t) kv_seq[i1] & q_set) == 0));
         all_empty = warp_reduce_all(all_empty);
         if (tid % WARP_SIZE == 0) {
             buf_iw[tid / WARP_SIZE] = all_empty;
@@ -2834,7 +2883,7 @@ template <int DV, int ncols1, int ncols2>
 void launch_fattn(
     ggml_backend_cuda_context & ctx, ggml_tensor * dst, fattn_kernel_t fattn_kernel, const int nwarps, const size_t nbytes_shared,
     const int nbatch_fa, const bool need_f16_K, const bool need_f16_V, const bool stream_k, const bool use_sparse,
-    const int warp_size = WARP_SIZE
+    const int warp_size = WARP_SIZE, const bool pos_ms_ok = false   // [TAG_4C_POSMASK_MS] the kernel reads sequence sets
 ) {
     constexpr int ncols = ncols1 * ncols2;
 
@@ -2848,6 +2897,12 @@ void launch_fattn(
     const ggml_tensor * sinks = dst->src[4];
     const ggml_tensor * kv_pos_t = dst->src[5];   // [TAG_FA_POS_MASK]
     const ggml_tensor * q_pos_t  = dst->src[6];
+
+    // [TAG_4C_POSMASK_MS] A kernel that does not read the sequence sets would treat every sequence's cells as its own:
+    // the cross-slot leak of [TAG_FA_POS_MASK_SEQ]. ggml_cuda_flash_attn_ext never sends it one; refuse loudly if a
+    // new path ever does.
+    const bool pos_ms = kv_pos_t != nullptr && kv_pos_t->ne[1] == 2;
+    GGML_ASSERT((!pos_ms || pos_ms_ok) && "FA: this kernel cannot read a multi-sequence positional mask");
 
     ggml_tensor * KQV = dst;
 
@@ -3097,8 +3152,11 @@ void launch_fattn(
         const int iter_k = K->ne[1] / FATTN_KQ_STRIDE;
         KV_max.alloc(2*ntiles_x);    // [TAG_FA_KVMIN] {max, min} per entry
         ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num_KV_max, block_dim_KV_max, 0, main_stream);
+        // [TAG_4C_POSMASK_MS] row 1 of each vector when the mask carries sequence sets
+        const int32_t * kv_seq_d = pos_ms ? (const int32_t *) ((const char *) kv_pos_t->data + kv_pos_t->nb[1]) : nullptr;
+        const int32_t * q_seq_d  = pos_ms ? (const int32_t *) ((const char *) q_pos_t->data  + q_pos_t->nb[1])  : nullptr;
         ggml_cuda_kernel_launch(flash_attn_pos_to_KV_max<ncols1>, launch_params,
-            (const int32_t *) kv_pos_t->data, (const int32_t *) q_pos_t->data, KV_max.ptr, iter_k, ne01_pos);
+            (const int32_t *) kv_pos_t->data, (const int32_t *) q_pos_t->data, kv_seq_d, q_seq_d, KV_max.ptr, iter_k, ne01_pos);
         CUDA_CHECK(cudaGetLastError());
     }
 
@@ -3226,8 +3284,10 @@ void launch_fattn(
         Q->ne[0], ne01,     Q->ne[2], Q->ne[3], Q->nb[1], Q->nb[2], Q->nb[3],
         K->ne[0], n_kv, K->ne[2], K->ne[3], nb11, nb12, nb13,
         nb21, nb22, nb23,
-        mask ? mask->ne[1] : 0, mask ? mask->ne[2] : 0, mask ? mask->ne[3] : 0,
-        mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0
+        // [TAG_4C_POSMASK_MS] no explicit mask with a positional one: ne31 = 2 and nb31 / nb32 = the row strides of
+        // kv_pos / q_pos say the vectors carry sequence sets (fattn_pos_seq_of); zeros otherwise, as before
+        mask ? mask->ne[1] : (pos_ms ? 2 : 0), mask ? mask->ne[2] : 0, mask ? mask->ne[3] : 0,
+        mask ? mask->nb[1] : (pos_ms ? kv_pos_t->nb[1] : 0), mask ? mask->nb[2] : (pos_ms ? q_pos_t->nb[1] : 0), mask ? mask->nb[3] : 0
     );
     CUDA_CHECK(cudaGetLastError());
 

@@ -8785,6 +8785,327 @@ struct test_flash_attn_ext_turbo5p_ref : public test_case {
     }
 };
 
+// ==== [TAG_4C_POSMASK_MS] multi-sequence positional mask (begin) ====================================================
+// Several sequences interleaved in ONE unified KV stream, the way four agents leave a --kv-unified pool:
+//   - cells [0, 37) empty, so the sequences start mid-tile (never on a tile or granule start);
+//   - a prefix shared by sequences 0 and 1 (seq_cp / prompt sharing: one cell, two sequence bits);
+//   - then the sequences cell by cell, one decode step each: every 11th cell a hole, every 13th a cell of a sequence
+//     outside the batch (empty set but a valid position, so only the set test can hide it);
+//   - the last sequence joins late and holds about 30 cells, so one leaked cell moves its rows measurably;
+//   - V rows carry a per-sequence offset (none on shared cells): reading another sequence's cells shifts the output.
+//     Its sign alternates with the cell position, so a sequence's own offsets cancel: an F16 V accumulator (the CPU
+//     one_chunk kernel, i.e. the reference) stays small and does not drop the terms of the late cells.
+// Queries: nb rows over n_seq sequences, grouped (split_equal order) or interleaved; each row is one of its
+// sequence's newest positions (a verify step), so it sees its own cell and earlier rows must mask later cells.
+//
+// The graph runs the SAME inputs through two FA nodes, one with the explicit F16 mask llama_kv_cache::set_input_kq_mask
+// would build and one with the two-row positional mask, and returns both (concat on dim 3). err() checks
+//   1. the usual NMSE between the two backends over both halves;
+//   2. on each backend on its own, positional == explicit: max |diff| <= 1e-3 * max |explicit| (exactly 0 on the CPU
+//      reference, where both run the same arithmetic). The explicit mask is the path the [TAG_FA_POS_MASK_SEQ] leak fix
+//      proved, so a cell the positional path shows or hides differently fails here even when both backends agree with
+//      each other. Where the tested backend runs the two nodes on different kernels (the CPU backend, F16, 64+ rows),
+//      its positional half may instead match the reference's positional half within the same bound.
+// f16, q8_0 and turbo5p read the llama_kv_cache head view of a [hs*hkv, kv_size] cache; turbot reads the turbot cache of
+// test_flash_attn_ext_turbot. `test-backend-ops -o FLASH_ATTN_EXT -p pos_ms` selects exactly these cases. Run them again
+// under GGML_CUDA_FA_POS_MS=0, where CUDA materialises the explicit mask for every kernel.
+struct pos_ms_layout {
+    std::vector<int32_t> kv_pos;   // [kv] row 0 of kv_pos
+    std::vector<int32_t> kv_set;   // [kv] row 1 of kv_pos
+    std::vector<int32_t> q_pos;    // [nb] row 0 of q_pos
+    std::vector<int32_t> q_set;    // [nb] row 1 of q_pos
+    std::vector<int>     v_seq;    // [kv] sequence whose V offset the cell carries, -1 none
+
+    bool visible(int64_t c, int64_t j) const {
+        return (kv_set[c] & q_set[j]) != 0 && kv_pos[c] >= 0 && kv_pos[c] <= q_pos[j];
+    }
+
+    // V offset of cell c: +-3*(s+1) for a cell of sequence s, the sign alternating with its position
+    float v_off(int64_t c) const {
+        return v_seq[c] < 0 ? 0.0f : ((kv_pos[c] & 1) ? -3.0f : 3.0f) * (float) (v_seq[c] + 1);
+    }
+};
+
+static void pos_ms_make_layout(int64_t kv, int64_t nb, int n_seq, bool interleave, pos_ms_layout & L) {
+    GGML_ASSERT(n_seq >= 2 && n_seq <= 32 && nb >= 1);
+    L.kv_pos.assign(kv, -1);
+    L.kv_set.assign(kv, 0);
+    L.v_seq.assign(kv, -1);
+    std::vector<int32_t> next(n_seq, 0);   // next position of each sequence
+
+    const int64_t off      = 37;
+    const int64_t n_shared = std::min<int64_t>(kv / 8, 300);
+    const int64_t late     = kv - 40 * n_seq;   // the last sequence's first cell
+    GGML_ASSERT(off + n_shared < late);
+
+    int64_t c = off;
+    for (int64_t k = 0; k < n_shared; ++k, ++c) {
+        L.kv_pos[c] = next[0];
+        L.kv_set[c] = 0x3;   // sequences 0 and 1
+        ++next[0];
+        ++next[1];
+    }
+    int64_t rr = 0;
+    for (int64_t k = 0; c < kv; ++c, ++k) {
+        if (k % 11 == 10) {
+            continue;   // hole
+        }
+        if (k % 13 == 12) {
+            L.kv_pos[c] = (int32_t) k;   // a cell of a sequence outside the batch: valid position, no bit
+            continue;
+        }
+        const int n_active = c < late ? n_seq - 1 : n_seq;
+        const int s        = (int) (rr++ % n_active);
+        L.kv_pos[c] = next[s]++;
+        L.kv_set[c] = (int32_t) (1u << s);
+        L.v_seq[c]  = s;
+    }
+
+    std::vector<int>     row_seq(nb);
+    std::vector<int64_t> cnt(n_seq, 0);
+    const int64_t per = (nb + n_seq - 1) / n_seq;
+    for (int64_t i = 0; i < nb; ++i) {
+        row_seq[i] = interleave ? (int) (i % n_seq) : (int) std::min<int64_t>(i / per, n_seq - 1);
+        ++cnt[row_seq[i]];
+    }
+    std::vector<int64_t> seen(n_seq, 0);
+    L.q_pos.resize(nb);
+    L.q_set.resize(nb);
+    for (int64_t i = 0; i < nb; ++i) {
+        const int s = row_seq[i];
+        GGML_ASSERT(next[s] >= cnt[s] && "pos_ms layout: a sequence is shorter than its query rows");
+        L.q_pos[i] = next[s] - (int32_t) cnt[s] + (int32_t) seen[s]++;
+        L.q_set[i] = (int32_t) (1u << s);
+    }
+}
+
+struct test_flash_attn_ext_pos_ms : public test_case {
+    const ggml_type          type_KV;   // f16, q8_0, turbo5p; ignored when turbot
+    const bool               turbot;
+    const int64_t            kv;
+    const int64_t            nb;
+    const int                n_seq;
+    const bool               interleave;
+    const int64_t            hs  = 256;  // the Qwen3.8-27B geometry: 4 KV heads x 256, 24 query heads
+    const int64_t            hkv = 4;
+    const int64_t            hq  = 24;
+    turbot_test_cache        cache;
+    pos_ms_layout            layout;
+
+    std::string vars() override {
+        return std::string("pos_ms=") + (turbot ? std::string("turbot") : std::string(ggml_type_name(type_KV))) + "," +
+               VARS_TO_STR4(kv, nb, n_seq, interleave);
+    }
+
+    // the compared node is the concat of the two FA outputs; list the case under FLASH_ATTN_EXT for -o
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "FLASH_ATTN_EXT";
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    bool run_whole_graph() override {
+        return true;
+    }
+
+    // max |x - y| relative to max |y|
+    static double rel_diff(const float * x, const float * y, size_t n) {
+        double d = 0.0;
+        double m = 0.0;
+        for (size_t i = 0; i < n; ++i) {
+            d = std::max(d, (double) fabsf(x[i] - y[i]));
+            m = std::max(m, (double) fabsf(y[i]));
+        }
+        return d / std::max(m, 1e-6);
+    }
+
+    // a: tested backend, b: CPU reference; each is [explicit | positional]. The CPU backend runs an explicit node of
+    // 64+ F16 rows on its tiled kernel (F32 V sum) and the positional one on one_chunk (F16 V sum), so there its
+    // positional half may differ from its explicit half by rounding; it must then match the reference's positional half.
+    double err(const float * a, const float * b, size_t n) override {
+        GGML_ASSERT(n % 2 == 0);
+        const size_t h = n/2;
+        double e = nmse(a, b, n);
+        const double sa  = rel_diff(a + h, a, h);
+        const double sb  = rel_diff(b + h, b, h);
+        const double sab = rel_diff(a + h, b + h, h);
+        if (sb > 1e-3 || (sa > 1e-3 && sab > 1e-3)) {
+            printf("[pos_ms: positional != explicit, max rel diff %.3g / %.3g, vs ref positional %.3g, nmse %.3g] ", sa, sb, sab, e);
+            e = std::max(e, 1.0);
+        }
+        return e;
+    }
+
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return 2 * 2 * hq * nb * (hs + hs) * kv;
+    }
+
+    test_flash_attn_ext_pos_ms(ggml_type type_KV, bool turbot, int64_t kv, int64_t nb, int n_seq, bool interleave)
+        : type_KV(type_KV), turbot(turbot), kv(kv), nb(nb), n_seq(n_seq), interleave(interleave) {}
+
+    uint64_t seed() const {
+        return (uint64_t) kv * 1000003u + (uint64_t) nb * 7919u + (uint64_t) n_seq * 131u + (uint64_t) interleave * 17u +
+               (turbot ? 0x7475726274ull : (uint64_t) type_KV);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        pos_ms_make_layout(kv, nb, n_seq, interleave, layout);
+
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hs, nb, hq, 1);
+        ggml_set_name(q, "q");
+
+        ggml_tensor * k    = nullptr;
+        ggml_tensor * v    = nullptr;
+        ggml_tensor * pool = nullptr;
+        ggml_tensor * gtab = nullptr;
+        if (turbot) {
+            cache.layer   = turbot_test_layer_geom(TURBOT_TW_L23, 0);
+            cache.kv_size = GGML_PAD(kv, 64) + 64;
+            turbot_test_plan_granules(cache, kv, TURBOT_MIX_ALT);
+            const ggml_turbot_layer & l = cache.layer;
+            ggml_tensor * kc = ggml_new_tensor_2d(ctx, ggml_turbot_type_of_s(l.k.s), 1024, cache.kv_size);
+            ggml_set_name(kc, "turbot_k");
+            ggml_tensor * vc = ggml_new_tensor_2d(ctx, ggml_turbot_type_of_s(l.v.s), 1024, cache.kv_size);
+            ggml_set_name(vc, "turbot_v");
+            pool = ggml_new_tensor_2d(ctx, GGML_TYPE_I8, l.pool_row_bytes, cache.n_pool_rows);
+            ggml_set_name(pool, "turbot_pool");
+            gtab = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, (int64_t) cache.gtab.size());
+            ggml_set_name(gtab, "turbot_gtab");
+            k = turbot_test_fa_view(ctx, kc, kv);
+            v = turbot_test_fa_view(ctx, vc, kv);
+        } else {
+            const int64_t kv_size = GGML_PAD(kv, 256) + 256;   // the view covers part of a larger cache
+            ggml_tensor * kc = ggml_new_tensor_2d(ctx, type_KV, hs*hkv, kv_size);
+            ggml_set_name(kc, "kc");
+            ggml_tensor * vc = ggml_new_tensor_2d(ctx, type_KV, hs*hkv, kv_size);
+            ggml_set_name(vc, "vc");
+            k = turbot_test_fa_view(ctx, kc, kv, hs, hkv);
+            v = turbot_test_fa_view(ctx, vc, kv, hs, hkv);
+        }
+
+        ggml_tensor * m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, nb, 1, 1);
+        ggml_set_name(m, "m");
+        ggml_tensor * kv_pos = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, kv, 2);
+        ggml_set_name(kv_pos, "kv_pos");
+        ggml_tensor * q_pos = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, nb, 2);
+        ggml_set_name(q_pos, "q_pos");
+
+        const float scale = 1.0f/sqrtf((float) hs);
+        auto build_fa = [&](bool positional) {
+            ggml_tensor * fa = ggml_flash_attn_ext(ctx, q, k, v, positional ? nullptr : m, scale, 0.0f, 0.0f);
+            if (positional) {
+                ggml_flash_attn_ext_set_pos(fa, kv_pos, q_pos);
+            }
+            ggml_flash_attn_ext_set_prec(fa, GGML_PREC_F32);
+            if (turbot) {
+                ggml_turbot_op_params p;
+                ggml_turbot_op_params_make(&p, &cache.layer, GGML_TURBOT_SIDE_BOTH);
+                ggml_flash_attn_ext_set_turbot(fa, pool, gtab, &p);
+            }
+            return fa;
+        };
+        ggml_tensor * out_e = build_fa(false);
+        ggml_set_name(out_e, "out_explicit");
+        ggml_tensor * out_p = build_fa(true);
+        ggml_set_name(out_p, "out_positional");
+
+        ggml_tensor * out = ggml_concat(ctx, out_e, out_p, 3);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    // K and V rows of the non-turbot caches: the turbot fixture's rows, V plus layout.v_off() on the cells of a sequence
+    void init_cache(ggml_tensor * t, bool is_v) {
+        const int64_t row_n   = t->ne[0];
+        const int64_t kv_size = t->ne[1];
+        std::vector<float> src(row_n * kv_size);
+        std::vector<float> x(1024);
+        const uint64_t s = seed() ^ (is_v ? 0x76ull : 0x6bull);
+        for (int64_t c = 0; c < kv_size; ++c) {
+            turbot_test_row(s, c, x.data());
+            const float o = (is_v && c < kv) ? layout.v_off(c) : 0.0f;
+            for (int64_t i = 0; i < row_n; ++i) {
+                src[row_n*c + i] = x[i] + o;
+            }
+        }
+        std::vector<uint8_t> data(ggml_nbytes(t));
+        ggml_quantize_chunk(t->type, src.data(), data.data(), 0, kv_size, row_n, nullptr);
+        ggml_backend_tensor_set(t, data.data(), 0, data.size());
+    }
+
+    // turbot: the V side of every sequence cell re-encoded with its offset, young part included
+    void offset_turbot_v() {
+        const ggml_turbot_layer & l = cache.layer;
+        const size_t rv  = l.v.base_row_bytes;
+        const size_t prb = l.pool_row_bytes;
+        std::vector<float> x(1024);
+        for (int64_t c = 0; c < kv; ++c) {
+            if (layout.v_seq[c] < 0) {
+                continue;
+            }
+            turbot_test_row(seed(), 2 * c + 1, x.data());
+            const float o = layout.v_off(c);
+            for (float & e : x) {
+                e += o;
+            }
+            const int32_t slot  = cache.gtab[c / 64];
+            uint8_t *     young = slot >= 0 ? cache.pool.data() + (size_t) ggml_turbot_pool_row(slot, (uint32_t) c) * prb : nullptr;
+            ggml_turbot_encode_side(x.data(), &l.v, cache.base_v.data() + (size_t) c * rv, young ? young + l.pool_v_off : nullptr);
+        }
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        if (turbot) {
+            turbot_test_encode(cache, seed(), 0);
+            offset_turbot_v();
+        }
+        std::vector<ggml_fp16_t> mask(kv * nb);
+        for (int64_t j = 0; j < nb; ++j) {
+            for (int64_t c = 0; c < kv; ++c) {
+                mask[j*kv + c] = ggml_fp32_to_fp16(layout.visible(c, j) ? 0.0f : -INFINITY);
+            }
+        }
+        std::vector<int32_t> kvp(layout.kv_pos);
+        kvp.insert(kvp.end(), layout.kv_set.begin(), layout.kv_set.end());
+        std::vector<int32_t> qp(layout.q_pos);
+        qp.insert(qp.end(), layout.q_set.begin(), layout.q_set.end());
+
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->view_src != nullptr || t->op != GGML_OP_NONE) {
+                continue;   // the K/V head views and the FA / concat nodes
+            }
+            if (strcmp(t->name, "turbot_k") == 0) {
+                turbot_test_set(t, cache.base_k.data(), cache.base_k.size());
+            } else if (strcmp(t->name, "turbot_v") == 0) {
+                turbot_test_set(t, cache.base_v.data(), cache.base_v.size());
+            } else if (strcmp(t->name, "turbot_pool") == 0) {
+                turbot_test_set(t, cache.pool.data(), cache.pool.size());
+            } else if (strcmp(t->name, "turbot_gtab") == 0) {
+                turbot_test_set(t, cache.gtab.data(), cache.gtab.size() * sizeof(int32_t));
+            } else if (strcmp(t->name, "kc") == 0) {
+                init_cache(t, false);
+            } else if (strcmp(t->name, "vc") == 0) {
+                init_cache(t, true);
+            } else if (strcmp(t->name, "m") == 0) {
+                turbot_test_set(t, mask.data(), mask.size() * sizeof(ggml_fp16_t));
+            } else if (strcmp(t->name, "kv_pos") == 0) {
+                turbot_test_set(t, kvp.data(), kvp.size() * sizeof(int32_t));
+            } else if (strcmp(t->name, "q_pos") == 0) {
+                turbot_test_set(t, qp.data(), qp.size() * sizeof(int32_t));
+            } else if (strcmp(t->name, "q") == 0) {
+                turbot_test_init_uniform(t, seed() ^ 0x71756572ull, -1.0f, 1.0f);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+// ==== [TAG_4C_POSMASK_MS] multi-sequence positional mask (end) ======================================================
+
 // GGML_OP_TURBOT_SET_ROWS (SPEC 5.2, 6.1, 8): K and V writers into host-encoded caches, fill entries, then a turbot FA
 // whose mask shows only the written cells and the filled granules, so every written byte reaches the compared output.
 // perf = true times the K writer alone (turbot_perf=writer_*).
@@ -12168,6 +12489,26 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int64_t nb : { 1280, 2048 }) {
         for (ggml_type tkv : { GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_TURBO5P_0 }) {
             test_cases.emplace_back(new test_flash_attn_ext_pos(256, 4, 6, 4096, nb, (4096*3/8) | 1, tkv));
+        }
+    }
+    // [TAG_4C_POSMASK_MS] several sequences in one KV stream, positional (two-row) vs explicit mask on each backend
+    // (test_flash_attn_ext_pos_ms). nb 4 / 16 / 64 are 1 / 4 / 16 rows per slot at 4 slots (decode, verify, prefill
+    // chunk); nb 2 (two slots decoding) and nb 1 (a token of two sequences) take the VEC route for q8_0 and turbo5p at
+    // kv 4096, i.e. the explicit mask ggml_cuda_flash_attn_ext materialises; kv 1000 is not a multiple of the 256-cell
+    // stride (no KV bounds scan, a partial last tile), kv 4096 scans them from the sequence sets.
+    for (int64_t kv : { 1000, 4096 }) {
+        for (int turbot_case = 0; turbot_case < 4; ++turbot_case) {
+            const bool      tb  = turbot_case == 3;
+            const ggml_type tkv = turbot_case == 0 ? GGML_TYPE_F16 : turbot_case == 1 ? GGML_TYPE_Q8_0 : GGML_TYPE_TURBO5P_0;
+            for (int64_t nb : { 4, 16, 64 }) {
+                for (int n_seq : { 2, 4 }) {
+                    test_cases.emplace_back(new test_flash_attn_ext_pos_ms(tkv, tb, kv, nb, n_seq, false));
+                }
+            }
+            test_cases.emplace_back(new test_flash_attn_ext_pos_ms(tkv, tb, kv, 16, 4, true));
+            test_cases.emplace_back(new test_flash_attn_ext_pos_ms(tkv, tb, kv, 64, 4, true));
+            test_cases.emplace_back(new test_flash_attn_ext_pos_ms(tkv, tb, kv,  2, 2, false));
+            test_cases.emplace_back(new test_flash_attn_ext_pos_ms(tkv, tb, kv,  1, 2, false));
         }
     }
 
