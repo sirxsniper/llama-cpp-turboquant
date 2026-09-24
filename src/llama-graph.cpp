@@ -355,6 +355,33 @@ static void rs_set_input_planes(ggml_tensor * s_copy_planes, const llama_memory_
     }
 }
 
+// [TAG_4C_GDN_REPLAY] after the s_copy loop, which consumed rs_idx and staged the replay counts
+static void rs_set_input_replay(const llm_graph_input_rs * inp, const llama_memory_recurrent_context * mctx, uint32_t n_seqs) {
+    if (inp->s_copy_r == nullptr) {
+        return;
+    }
+
+    // an input that no node uses has no buffer
+    if (inp->s_copy_r->buffer) {
+        GGML_ASSERT(ggml_backend_buffer_is_host(inp->s_copy_r->buffer));
+        int32_t * src = (int32_t *) inp->s_copy_r->data;
+
+        const uint32_t n_rs = mctx->get_n_rs();
+        for (uint32_t i = 0; i < n_rs; ++i) {
+            src[i] = mctx->s_copy_r((int) i);
+        }
+    }
+
+    if (inp->ring_n->buffer) {
+        GGML_ASSERT(ggml_backend_buffer_is_host(inp->ring_n->buffer));
+        int32_t * rn = (int32_t *) inp->ring_n->data;
+
+        for (uint32_t s = 0; s < n_seqs; ++s) {
+            rn[s] = mctx->ring_n((int) s);
+        }
+    }
+}
+
 void llm_graph_input_rs::set_input(const llama_ubatch * ubatch) {
     const int64_t n_rs = mctx->get_n_rs();
 
@@ -371,6 +398,8 @@ void llm_graph_input_rs::set_input(const llama_ubatch * ubatch) {
     if (s_copy_planes != nullptr) {
         rs_set_input_planes(s_copy_planes, mctx, ubatch->n_seqs);
     }
+
+    rs_set_input_replay(this, mctx, ubatch->n_seqs); // [TAG_4C_GDN_REPLAY]
 }
 
 bool llm_graph_input_rs::can_reuse(const llm_graph_params & params) {
@@ -1212,6 +1241,8 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
     if (inp_rs->s_copy_planes != nullptr) {
         rs_set_input_planes(inp_rs->s_copy_planes, mctx->get_recr(), ubatch->n_seqs);
     }
+
+    rs_set_input_replay(inp_rs.get(), mctx->get_recr(), ubatch->n_seqs); // [TAG_4C_GDN_REPLAY]
 }
 
 bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
@@ -1272,6 +1303,8 @@ void llm_graph_input_mem_hybrid_k::set_input(const llama_ubatch * ubatch) {
     if (inp_rs->s_copy_planes != nullptr) {
         rs_set_input_planes(inp_rs->s_copy_planes, mctx->get_recr(), ubatch->n_seqs);
     }
+
+    rs_set_input_replay(inp_rs.get(), mctx->get_recr(), ubatch->n_seqs); // [TAG_4C_GDN_REPLAY]
 }
 
 bool llm_graph_input_mem_hybrid_k::can_reuse(const llm_graph_params & params) {
@@ -1355,6 +1388,8 @@ void llm_graph_input_mem_hybrid_iswa::set_input(const llama_ubatch * ubatch) {
     if (inp_rs->s_copy_planes != nullptr) {
         rs_set_input_planes(inp_rs->s_copy_planes, mctx->get_recr(), ubatch->n_seqs);
     }
+
+    rs_set_input_replay(inp_rs.get(), mctx->get_recr(), ubatch->n_seqs); // [TAG_4C_GDN_REPLAY]
 }
 
 bool llm_graph_input_mem_hybrid_iswa::can_reuse(const llm_graph_params & params) {
@@ -4077,6 +4112,20 @@ static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
         ggml_set_name(inp->s_copy_planes, "rs_s_copy_planes");
     }
 
+    // [TAG_4C_GDN_REPLAY] same shapes as s_copy and its main view, so the existing reuse checks cover them
+    if (mctx_cur->get_replay()) {
+        inp->s_copy_r = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_rs);
+        ggml_set_input(inp->s_copy_r);
+        ggml_set_name(inp->s_copy_r, "rs_s_copy_r");
+
+        inp->s_copy_r_main  = ggml_view_1d(ctx0, inp->s_copy_r, n_seqs, 0);
+        inp->s_copy_r_extra = ggml_view_1d(ctx0, inp->s_copy_r, n_rs - n_seqs, n_seqs * inp->s_copy_r->nb[0]);
+
+        inp->ring_n = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_seqs);
+        ggml_set_input(inp->ring_n);
+        ggml_set_name(inp->ring_n, "rs_ring_n");
+    }
+
     inp->head = mctx_cur->get_head();
     inp->rs_z = mctx_cur->get_rs_z();
 
@@ -4098,6 +4147,14 @@ ggml_tensor * llm_graph_context::build_rs(
             int32_t   n_seqs,
         const llm_graph_get_rows_fn & get_state_rows) const {
     const auto * kv_state = inp->mctx;
+
+    // [TAG_4C_GDN_REPLAY] a tensor with one row per cell (committed state, ring) under the replay layout: group-0
+    //   sources, and no snapshot groups to move. The conv rows keep their groups and the path below.
+    if (inp->s_copy_r != nullptr && ggml_nelements(s) == (int64_t) state_size*kv_state->get_size()) {
+        return build_rs(s, inp->s_copy_r_main, inp->s_copy_r_extra, state_size, n_seqs,
+                kv_state->get_n_rs(), kv_state->get_head(), kv_state->get_size(), kv_state->get_rs_z(),
+                get_state_rows);
+    }
 
     ggml_tensor * output_states = build_rs(s, inp->s_copy_main, inp->s_copy_extra, state_size, n_seqs,
                     kv_state->get_n_rs(), kv_state->get_head(), kv_state->get_size(), kv_state->get_rs_z(),

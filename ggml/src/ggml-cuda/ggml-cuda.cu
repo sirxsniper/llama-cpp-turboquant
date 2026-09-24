@@ -2437,6 +2437,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_GATED_DELTA_NET:
             ggml_cuda_op_gated_delta_net(ctx, dst);
             break;
+        case GGML_OP_GATED_DELTA_NET_REPLAY: // [TAG_4C_GDN_REPLAY]
+            ggml_cuda_op_gated_delta_net_replay(ctx, dst, nullptr);
+            break;
         case GGML_OP_DSV4_HC_COMB:
             ggml_cuda_op_dsv4_hc_comb(ctx, dst);
             break;
@@ -2907,6 +2910,70 @@ static int ggml_cuda_try_gdn_cache_fusion(
 
     fused_state_cpy.data        = (float *) dst->data; // rollback group 0 (newest)
     fused_state_cpy.slot_stride = K > 1 ? (int64_t) (dst->nb[2] / sizeof(float)) : 0;
+    return skip;
+}
+
+// [TAG_4C_GDN_REPLAY] match gated_delta_net_replay + the cpy of its committed states into the cache + the cpy of its new
+// rings into the ring cache, so the kernel writes both and the two cpys are skipped
+static int ggml_cuda_try_gdn_replay_fusion(const ggml_cgraph * cgraph, int node_idx, ggml_cuda_gdn_replay_out & out) {
+    const ggml_tensor * gdn = cgraph->nodes[node_idx];
+    // the kernel skips the state and ring tails, so the op output must not be a graph output
+    if (gdn->op != GGML_OP_GATED_DELTA_NET_REPLAY || gdn->type != GGML_TYPE_F32 ||
+        (gdn->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return 0;
+    }
+
+    const ggml_tensor * src_v    = gdn->src[2];
+    const int64_t       S_v      = src_v->ne[0];
+    const int64_t       H        = src_v->ne[1];
+    const int64_t       n_tokens = src_v->ne[2];
+    const int64_t       n_seqs   = src_v->ne[3];
+    const int64_t       D        = S_v * S_v * H;
+    const int64_t       ring_row = gdn->src[6]->ne[0];
+
+    const size_t  offs[2] = {
+        ggml_row_size(GGML_TYPE_F32, S_v * H * n_tokens * n_seqs),
+        ggml_row_size(GGML_TYPE_F32, S_v * H * n_tokens * n_seqs + D * n_seqs),
+    };
+    const int64_t rows[2] = { D, ring_row };
+
+    // the state cpy and then the ring cpy are the next two real nodes (skip views/no-ops)
+    const ggml_tensor * cpys[2] = { nullptr, nullptr };
+    int n_cpy = 0;
+    int skip  = 0;
+    for (int j = node_idx + 1; j < cgraph->n_nodes && n_cpy < 2; ++j) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        if (ggml_cuda_is_view_or_noop(n)) {
+            continue;
+        }
+        if (n->op != GGML_OP_CPY || (n->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+            return 0;
+        }
+        cpys[n_cpy++] = n;
+        skip = j - node_idx;
+    }
+    if (n_cpy < 2) {
+        return 0;
+    }
+
+    float * ptrs[2] = { nullptr, nullptr };
+    for (int c = 0; c < 2; ++c) {
+        const ggml_tensor * src = cpys[c]->src[0]; // view of the op output tail
+        const ggml_tensor * dst = cpys[c]->src[1]; // cache rows [head, head + n_seqs)
+        if (src->op != GGML_OP_VIEW || src->view_src != gdn || src->view_offs != offs[c] || !ggml_is_contiguous(src) ||
+            src->ne[0] != rows[c] || src->ne[1] != n_seqs) {
+            return 0;
+        }
+        if (dst->op != GGML_OP_VIEW || dst->type != GGML_TYPE_F32 || dst->data == nullptr ||
+            dst->ne[0] != rows[c] || dst->ne[1] != n_seqs || dst->ne[2] != 1 || dst->ne[3] != 1 ||
+            dst->nb[0] != ggml_type_size(GGML_TYPE_F32) || dst->nb[1] != (size_t) ggml_row_size(GGML_TYPE_F32, rows[c])) {
+            return 0;
+        }
+        ptrs[c] = (float *) dst->data;
+    }
+
+    out.state = ptrs[0];
+    out.ring  = ptrs[1];
     return skip;
 }
 
@@ -3769,6 +3836,16 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                           __func__, node->name, nodes_to_skip);
 #endif
             ggml_cuda_op_gated_delta_net_fused_cache(*cuda_ctx, node, fused_state_cpy);
+            return nodes_to_skip;
+        }
+    }
+
+    // [TAG_4C_GDN_REPLAY] gated_delta_net_replay -> cpy (state) -> cpy (ring): write both straight into the caches
+    if (node->op == GGML_OP_GATED_DELTA_NET_REPLAY) {
+        ggml_cuda_gdn_replay_out fused_out;
+        const int nodes_to_skip = ggml_cuda_try_gdn_replay_fusion(cgraph, i, fused_out);
+        if (nodes_to_skip > 0) {
+            ggml_cuda_op_gated_delta_net_replay(*cuda_ctx, node, &fused_out);
             return nodes_to_skip;
         }
     }
@@ -5896,6 +5973,12 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return false;
 #else
             return true;
+#endif // GGML_USE_MUSA
+        case GGML_OP_GATED_DELTA_NET_REPLAY: // [TAG_4C_GDN_REPLAY] same MUSA limit as GATED_DELTA_NET
+#ifdef GGML_USE_MUSA
+            return false;
+#else
+            return ggml_cuda_gdn_replay_supported(op);
 #endif // GGML_USE_MUSA
         case GGML_OP_DSV4_HC_COMB:
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&

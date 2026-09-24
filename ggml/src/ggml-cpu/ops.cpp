@@ -11447,6 +11447,233 @@ void ggml_compute_forward_gated_delta_net(
     }
 }
 
+// ggml_compute_forward_gated_delta_net_replay [TAG_4C_GDN_REPLAY]
+// The per-token arithmetic is the scalar-gate path of ggml_compute_forward_gated_delta_net_one_chunk, so a replayed
+// token gives the same state bits as when it was a new token.
+static void ggml_compute_forward_gated_delta_net_replay_one_chunk(
+    const ggml_compute_params * params,
+    ggml_tensor * dst,
+    int64_t ir0,
+    int64_t ir1) {
+
+    ggml_tensor * src_q     = dst->src[0];
+    ggml_tensor * src_k     = dst->src[1];
+    ggml_tensor * src_v     = dst->src[2];
+    ggml_tensor * src_g     = dst->src[3];
+    ggml_tensor * src_beta  = dst->src[4];
+    ggml_tensor * src_state = dst->src[5];
+    ggml_tensor * src_ring  = dst->src[6];
+    ggml_tensor * src_rn    = dst->src[7];
+
+    const int64_t S_v      = src_v->ne[0];
+    const int64_t H        = src_v->ne[1];
+    const int64_t n_tokens = src_v->ne[2];
+    const int64_t n_seqs   = src_v->ne[3];
+
+    GGML_TENSOR_LOCALS(int64_t, neq, src_q, ne);
+    GGML_TENSOR_LOCALS(size_t,  nbq, src_q, nb);
+    GGML_TENSOR_LOCALS(int64_t, nek, src_k, ne);
+    GGML_TENSOR_LOCALS(size_t,  nbk, src_k, nb);
+    GGML_TENSOR_LOCALS(int64_t, nev, src_v, ne);
+    GGML_TENSOR_LOCALS(size_t,  nbv, src_v, nb);
+    GGML_TENSOR_LOCALS(size_t,  nbg, src_g, nb);
+    GGML_TENSOR_LOCALS(size_t,  nbb, src_beta, nb);
+
+    GGML_ASSERT(src_g->ne[0] == 1);
+
+    const int64_t n_ring   = ggml_get_op_params_i32(dst, 0);
+    const int64_t ring_row = src_ring->ne[0];
+    const int64_t slot     = ring_row / n_ring;
+    const int64_t H_k      = nek1;
+    const int64_t off_v    = S_v*H_k;
+    const int64_t off_g    = off_v + S_v*H;
+    const int64_t off_b    = off_g + H;
+    const int64_t n_used   = off_b + H;
+    const int64_t n_w      = std::min(n_tokens, n_ring);
+
+    const int64_t per_thread = S_v + S_v*S_v;
+    const int ith = params->ith;
+
+    float * delta  = (float *)params->wdata + ith * per_thread + CACHE_LINE_SIZE_F32;
+    float * s_work = delta + S_v;
+
+    // output layout: [attn_scores | committed states | new rings]
+    const int64_t attn_score_elems = S_v * H * n_tokens * n_seqs;
+    float * attn_out_base  = (float *)dst->data;
+    float * state_out_base = attn_out_base + attn_score_elems;
+    float * ring_out_base  = state_out_base + S_v * S_v * H * n_seqs;
+
+    const float   * state_in_base    = (const float *)src_state->data;
+    const int64_t   state_seq_stride = src_state->nb[3] / sizeof(float);
+    const int32_t * rn               = (const int32_t *)src_rn->data;
+
+    const int64_t rq3 = nev3 / neq3;
+    const int64_t rk3 = nev3 / nek3;
+
+    const float scale = 1.0f / sqrtf((float) S_v);
+
+    for (int64_t ir = ir0; ir < ir1; ++ir) {
+        const int64_t iv1 = ir % H; // head_index
+        const int64_t iv3 = ir / H; // sequence
+
+        const int64_t iq1 = iv1 % neq1;
+        const int64_t ik1 = iv1 % nek1;
+
+        const int64_t iq3 = iv3 / rq3;
+        const int64_t ik3 = iv3 / rk3;
+
+        const float * s_in = state_in_base + iv3 * state_seq_stride + iv1 * S_v * S_v;
+        memcpy(s_work, s_in, S_v * S_v * sizeof(float));
+
+        const int64_t m        = std::min<int64_t>(std::max<int32_t>(rn[iv3], 0), n_ring);
+        const int64_t t_commit = m + n_tokens - n_w;
+
+        float       * s_commit = state_out_base + (iv3 * H + iv1) * S_v * S_v;
+        const float * ring_in  = (const float *)((const char *)src_ring->data + iv3 * src_ring->nb[1]);
+        float       * ring_out = ring_out_base + iv3 * ring_row;
+        float       * attn_data = attn_out_base + (iv3 * n_tokens * H + iv1) * S_v;
+
+        if (t_commit == 0) {
+            memcpy(s_commit, s_work, S_v * S_v * sizeof(float));
+        }
+
+        for (int64_t t = 0; t < m + n_tokens; t++) {
+            const bool    rpl = t < m;
+            const int64_t tn  = t - m;
+
+            const float * q_d = nullptr;
+            const float * k_d;
+            const float * v_d;
+            const float * g_d;
+            float beta_val;
+            if (rpl) {
+                const float * sl = ring_in + t * slot;
+                k_d      = sl + ik1 * S_v;
+                v_d      = sl + off_v + iv1 * S_v;
+                g_d      = sl + off_g + iv1;
+                beta_val = sl[off_b + iv1];
+            } else {
+                q_d      = (const float *)((const char *)src_q->data + iq3 * nbq3 + tn * nbq2 + iq1 * nbq1);
+                k_d      = (const float *)((const char *)src_k->data + ik3 * nbk3 + tn * nbk2 + ik1 * nbk1);
+                v_d      = (const float *)((const char *)src_v->data + iv3 * nbv3 + tn * nbv2 + iv1 * nbv1);
+                beta_val = *(const float *)((const char *)src_beta->data + iv3 * nbb3 + tn * nbb2 + iv1 * nbb1);
+                g_d      =  (const float *)((const char *)src_g->data    + iv3 * nbg3 + tn * nbg2 + iv1 * nbg1);
+            }
+
+            ggml_vec_scale_f32(S_v * S_v, s_work, expf(g_d[0]));
+
+            for (int64_t j = 0; j < S_v; ++j) {
+                float sum = 0.0f;
+                ggml_vec_dot_f32(S_v, &sum, 0, &s_work[j * S_v], 0, k_d, 0, 1);
+                delta[j] = (v_d[j] - sum) * beta_val;
+            }
+
+            for (int64_t j = 0; j < S_v; ++j) {
+                ggml_vec_mad_f32(S_v, &s_work[j * S_v], k_d, delta[j]);
+            }
+
+            if (!rpl) {
+                for (int64_t j = 0; j < S_v; ++j) {
+                    float sum = 0.0f;
+                    ggml_vec_dot_f32(S_v, &sum, 0, &s_work[j * S_v], 0, q_d, 0, 1);
+                    attn_data[j] = sum * scale;
+                }
+
+                attn_data += S_v * H;
+
+                // the last n_w new tokens go to the ring; each (seq, head) writes its v, g, beta, and heads < H_k their k
+                const int64_t js = tn - (n_tokens - n_w);
+                if (js >= 0) {
+                    float * so = ring_out + js * slot;
+                    memcpy(so + off_v + iv1 * S_v, v_d, S_v * sizeof(float));
+                    so[off_g + iv1] = g_d[0];
+                    so[off_b + iv1] = beta_val;
+                    if (iv1 < H_k) {
+                        memcpy(so + iv1 * S_v, k_d, S_v * sizeof(float));
+                    }
+                }
+            }
+
+            if (t + 1 == t_commit) {
+                memcpy(s_commit, s_work, S_v * S_v * sizeof(float));
+            }
+        }
+
+        for (int64_t js = n_w; js < n_ring; ++js) {
+            float * so = ring_out + js * slot;
+            memset(so + off_v + iv1 * S_v, 0, S_v * sizeof(float));
+            so[off_g + iv1] = 0.0f;
+            so[off_b + iv1] = 0.0f;
+            if (iv1 < H_k) {
+                memset(so + iv1 * S_v, 0, S_v * sizeof(float));
+            }
+        }
+        if (iv1 == 0 && slot > n_used) {
+            for (int64_t js = 0; js < n_ring; ++js) {
+                memset(ring_out + js * slot + n_used, 0, (slot - n_used) * sizeof(float));
+            }
+        }
+    }
+}
+
+static void ggml_compute_forward_gated_delta_net_replay_f32(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+
+    ggml_tensor * V = dst->src[2];
+    int64_t nr = V->ne[1] * V->ne[3];
+
+    // disable for NUMA
+    const bool disable_chunking = ggml_is_numa();
+
+    int nth = params->nth;
+    int ith = params->ith;
+
+    // 4x chunks per thread
+    int nth_scaled = nth * 4;
+    int64_t chunk_size = (nr + nth_scaled - 1) / nth_scaled;
+    int64_t nchunk     = (nr + chunk_size - 1) / chunk_size;
+
+    if (nth == 1 || nchunk < nth || disable_chunking) {
+      nchunk = nth;
+    }
+
+    if (ith == 0) {
+      ggml_threadpool_chunk_set(params->threadpool, nth);
+    }
+
+    ggml_barrier(params->threadpool);
+
+    const int64_t dr = (nr + nchunk - 1) / nchunk;
+
+    int current_chunk = ith;
+
+    while (current_chunk < nchunk) {
+        const int64_t ir0 = dr * current_chunk;
+        const int64_t ir1 = MIN(ir0 + dr, nr);
+
+        ggml_compute_forward_gated_delta_net_replay_one_chunk(params, dst, ir0, ir1);
+        current_chunk = ggml_threadpool_chunk_add(params->threadpool, 1);
+    }
+}
+
+void ggml_compute_forward_gated_delta_net_replay(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+
+    switch (src0->type) {
+        case GGML_TYPE_F32:
+            {
+                ggml_compute_forward_gated_delta_net_replay_f32(params, dst);
+            } break;
+        default:
+            {
+                GGML_ABORT("fatal error");
+            }
+    }
+}
+
 
 // ggml_compute_forward_dsv4_hc_comb
 

@@ -2250,6 +2250,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_turbot_set_rows(params, tensor);
             } break;
+        case GGML_OP_GATED_DELTA_NET_REPLAY: // [TAG_4C_GDN_REPLAY]
+            {
+                ggml_compute_forward_gated_delta_net_replay(params, tensor);
+            } break;
         case GGML_OP_MAP_CUSTOM1:
             {
                 ggml_compute_forward_map_custom1(params, tensor);
@@ -2430,6 +2434,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_COUNT_EQUAL:
         case GGML_OP_SOLVE_TRI:
         case GGML_OP_GATED_DELTA_NET:
+        case GGML_OP_GATED_DELTA_NET_REPLAY: // [TAG_4C_GDN_REPLAY]
         case GGML_OP_DSV4_HC_COMB:
         case GGML_OP_DSV4_HC_PRE:
         case GGML_OP_DSV4_HC_POST:
@@ -3188,6 +3193,11 @@ struct ggml_cplan ggml_graph_plan(
                         const int64_t K   = ggml_get_op_params_i32(node, 0);
                         const int64_t per_thread = S_v + (K > 1 ? S_v * S_v : 0);
                         cur = per_thread * sizeof(float) * n_tasks;
+                    } break;
+                case GGML_OP_GATED_DELTA_NET_REPLAY: // [TAG_4C_GDN_REPLAY] delta and a working state per thread
+                    {
+                        const int64_t S_v = node->src[2]->ne[0];
+                        cur = (S_v + S_v * S_v) * sizeof(float) * n_tasks;
                     } break;
                 case GGML_OP_TURBO_WHT:
                     {

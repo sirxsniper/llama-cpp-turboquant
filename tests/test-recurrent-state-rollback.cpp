@@ -10,8 +10,12 @@
 #include <clocale>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <set>
+#include <string>
+#include <utility>
 #include <vector>
 
 static bool decode_tokens(llama_context * ctx, const std::vector<llama_token> & tokens, uint32_t count) {
@@ -631,6 +635,174 @@ static bool test_displaced_extra_rollback(const common_params & params, llama_mo
     return true;
 }
 
+// [TAG_4C_GDN_REPLAY] GDN_REPLAY is read when a context creates its recurrent memory
+static void set_env_gdn_replay(const char * value) {
+#ifdef _WIN32
+    _putenv_s("GDN_REPLAY", value == nullptr ? "" : value);
+#else
+    if (value == nullptr) {
+        unsetenv("GDN_REPLAY");
+    } else {
+        setenv("GDN_REPLAY", value, 1);
+    }
+#endif
+}
+
+// [TAG_4C_GDN_REPLAY] The replay layout (one committed state and a ring of token inputs) must give the logits of the
+// snapshot layout (GDN_REPLAY=0) bit for bit: a prefill, verify steps on two sequences with rollbacks of 0..3 tokens, a
+// single-token decode, and a save/restore of a sequence with a pending rollback. Models without the replay layout
+// compare two identical contexts.
+static bool test_replay_vs_snapshot(const common_params & params, llama_model * model, uint8_t fill) {
+    const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+
+    // only these archs have the replay layout; elsewhere both contexts would be the same
+    char arch[64] = {};
+    llama_model_meta_val_str(model, "general.architecture", arch, sizeof(arch));
+    if (strcmp(arch, "qwen35") != 0 && strcmp(arch, "qwen35moe") != 0) {
+        fprintf(stderr, "%s : skipping for arch %s\n", __func__, arch);
+        return true;
+    }
+
+    constexpr uint32_t n_rs_seq = 3;
+
+    const char * env_old = getenv("GDN_REPLAY");
+    const std::string env_old_s = env_old ? env_old : "";
+
+    const auto make = [&](const char * replay) {
+        set_env_gdn_replay(replay);
+        auto cparams = common_context_params_to_llama(params);
+        cparams.n_seq_max  = 2;
+        cparams.n_rs_seq   = n_rs_seq;
+        cparams.n_ctx      = 256;
+        cparams.n_batch    = 256;
+        cparams.n_ubatch   = 64;
+        cparams.kv_unified = true;
+        return init_ctx(model, cparams, fill);
+    };
+
+    llama_context * ctx_snap = make("0");
+    llama_context * ctx_rpl  = make("1");
+    set_env_gdn_replay(env_old ? env_old_s.c_str() : nullptr);
+
+    const auto cleanup = [&]() {
+        llama_free(ctx_snap);
+        llama_free(ctx_rpl);
+    };
+
+    if (ctx_snap == nullptr || ctx_rpl == nullptr) {
+        fprintf(stderr, "%s : failed to init contexts\n", __func__);
+        cleanup();
+        return false;
+    }
+
+    if (llama_n_rs_seq(ctx_snap) < n_rs_seq) {
+        fprintf(stderr, "%s : skipping because n_rs_seq is too small\n", __func__);
+        cleanup();
+        return true;
+    }
+
+    const auto tok = [&](llama_seq_id seq, llama_pos pos) {
+        return (llama_token) ((7*(uint32_t) pos + 31*(uint32_t) seq + 1) % (uint32_t) n_vocab);
+    };
+    const auto tok_bad = [&](llama_seq_id seq, llama_pos pos) {
+        return (llama_token) ((13*(uint32_t) pos + 5*(uint32_t) seq + 3) % (uint32_t) n_vocab);
+    };
+
+    llama_pos pos_next[2] = { 0, 0 };
+
+    // decode the same rows in both contexts and compare every output row bitwise; n_bad trailing rows are rejected drafts
+    const auto step = [&](const char * what, std::vector<std::pair<llama_seq_id, std::pair<uint32_t, uint32_t>>> rows) {
+        uint32_t n_tokens = 0;
+        for (const auto & r : rows) {
+            n_tokens += r.second.first;
+        }
+        llama_batch batch = llama_batch_init(n_tokens, 0, 1);
+        for (const auto & r : rows) {
+            const llama_seq_id seq   = r.first;
+            const uint32_t     n     = r.second.first;
+            const uint32_t     n_bad = r.second.second;
+            for (uint32_t i = 0; i < n; ++i) {
+                const llama_pos pos = pos_next[seq] + (llama_pos) i;
+                common_batch_add(batch, i + n_bad >= n && i > 0 ? tok_bad(seq, pos) : tok(seq, pos), pos, { seq }, true);
+            }
+            pos_next[seq] += (llama_pos) n;
+        }
+        bool ok = llama_decode(ctx_snap, batch) == 0;
+        ok = ok && llama_decode(ctx_rpl, batch) == 0;
+        llama_batch_free(batch);
+        if (!ok) {
+            fprintf(stderr, "%s : %s: decode failed\n", __func__, what);
+            return false;
+        }
+        for (uint32_t i = 0; i < n_tokens; ++i) {
+            const float * l_snap = llama_get_logits_ith(ctx_snap, i);
+            const float * l_rpl  = llama_get_logits_ith(ctx_rpl,  i);
+            if (l_snap == nullptr || l_rpl == nullptr) {
+                fprintf(stderr, "%s : %s: missing logits at row %u\n", __func__, what, i);
+                return false;
+            }
+            for (int t = 0; t < n_vocab; ++t) {
+                if (logit_diff(l_snap[t], l_rpl[t]) > 0.0f) {
+                    fprintf(stderr, "%s : %s: logits differ at row %u token %d (%g vs %g), nmse %g\n", __func__, what, i, t,
+                            (double) l_snap[t], (double) l_rpl[t], nmse(l_snap, l_rpl, n_vocab));
+                    return false;
+                }
+            }
+        }
+        return true;
+    };
+
+    const auto rollback = [&](llama_seq_id seq, llama_pos n) {
+        if (n == 0) {
+            return true;
+        }
+        pos_next[seq] -= n;
+        const bool ok_snap = llama_memory_seq_rm(llama_get_memory(ctx_snap), seq, pos_next[seq], -1);
+        const bool ok_rpl  = llama_memory_seq_rm(llama_get_memory(ctx_rpl),  seq, pos_next[seq], -1);
+        if (!ok_snap || !ok_rpl) {
+            fprintf(stderr, "%s : rollback of %d on seq %d failed (snapshot %d, replay %d)\n", __func__, n, seq, ok_snap, ok_rpl);
+            return false;
+        }
+        return true;
+    };
+
+    const auto save_restore = [&](llama_seq_id seq) {
+        for (llama_context * ctx : { ctx_snap, ctx_rpl }) {
+            std::vector<uint8_t> buf(llama_state_seq_get_size(ctx, seq));
+            if (llama_state_seq_get_data(ctx, buf.data(), buf.size(), seq) != buf.size()) {
+                fprintf(stderr, "%s : save of seq %d failed\n", __func__, seq);
+                return false;
+            }
+            llama_memory_seq_rm(llama_get_memory(ctx), seq, -1, -1);
+            if (llama_state_seq_set_data(ctx, buf.data(), buf.size(), seq) != buf.size()) {
+                fprintf(stderr, "%s : restore of seq %d failed\n", __func__, seq);
+                return false;
+            }
+        }
+        return true;
+    };
+
+    bool ok = true;
+    ok = ok && step("prefill",  { { 0, { 10, 0 } }, { 1, {  7, 0 } } });
+    ok = ok && step("verify 1", { { 0, {  4, 3 } }, { 1, {  4, 2 } } });
+    ok = ok && rollback(0, 3) && rollback(1, 2);
+    ok = ok && step("verify 2", { { 0, {  4, 1 } }, { 1, {  4, 0 } } });
+    ok = ok && rollback(0, 1);
+    ok = ok && step("decode",   { { 0, {  1, 0 } } });
+    ok = ok && step("verify 3", { { 1, {  4, 3 } } });
+    ok = ok && rollback(1, 3);
+    ok = ok && save_restore(1);
+    ok = ok && step("verify 4", { { 0, {  4, 2 } }, { 1, {  4, 0 } } });
+    ok = ok && rollback(0, 2);
+    ok = ok && step("decode 2", { { 0, {  1, 0 } }, { 1, {  1, 0 } } });
+
+    if (ok) {
+        fprintf(stderr, "%s : replay and snapshot layouts gave identical logits\n", __func__);
+    }
+    cleanup();
+    return ok;
+}
+
 int main(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
 
@@ -664,6 +836,9 @@ int main(int argc, char ** argv) {
             return 1;
         }
         if (!test_displaced_extra_rollback(params, model, fill)) {
+            return 1;
+        }
+        if (!test_replay_vs_snapshot(params, model, fill)) { // [TAG_4C_GDN_REPLAY]
             return 1;
         }
     }

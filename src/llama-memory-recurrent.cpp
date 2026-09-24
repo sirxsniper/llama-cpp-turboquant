@@ -23,6 +23,110 @@ static bool llama_xseq_fix_enabled() {
     return enabled;
 }
 
+// [TAG_4C_GDN_REPLAY] Gated DeltaNet state replay instead of snapshot groups. Design note:
+//
+// Old layout: s_l has 1 + n_rs_seq row groups per cell. A ubatch writes the state after each of its last K tokens,
+//   and a rollback of r tokens (seq_rm, rs_idx = r) reads group r. Qwen3.8-27B, 4 slots, n_rs_seq 3: 2,304 MiB f32.
+// Replay layout (default; GDN_REPLAY=0 when the memory is created keeps the old layout and kernels):
+//   - s_l has one row per cell: the committed state C.
+//   - ring_l has, per cell and layer, the inputs (k, v, g, beta) of the n_ring <= n_rs_seq tokens that follow C.
+//     The state of the sequence is C with those tokens applied. cell.n_ring counts them.
+//   - A ubatch of T tokens (GGML_OP_GATED_DELTA_NET_REPLAY) first applies the live ring tokens of the cell to C
+//     without output, then runs the T new tokens. It commits the state before its last n_w = min(T, n_rs_seq) new
+//     tokens as the new C and stores those n_w tokens as the new ring.
+//   - Rollback of r tokens stays metadata: seq_rm sets rs_idx = r as before (refused when r > n_rb, where the old
+//     groups gave a stale state), and the next ubatch replays n_ring - r ring tokens (s_copy consumes rs_idx).
+//   - The conv state keeps its 1 + n_rs_seq groups (5.6 MiB per cell per group at Qwen3.8-27B), unchanged. cell.n_rb
+//     (<= n_ring) counts the tokens whose conv groups are valid: n_w after a ubatch, 0 after a restore (only group 0
+//     is saved) or after an extra folded a rollback (its groups are not shifted).
+// State readers:
+//   - graph: s_copy_r gives the group-0 source rows of C and the ring; build_rs moves every extra cell's row, so a
+//     cell that find_slot relocates carries C, ring and n_ring (swapped with pos/src). A pending rollback of such an
+//     extra folds into its n_ring. [TAG_XSEQ_PLANES] still moves the conv groups.
+//   - seq_cp shares the cell, with C, ring and n_ring; find_slot copies n_ring when it splits a shared cell.
+//   - state_write/state_read (slot save/restore, prompt cache, park/resume, context checkpoints) store C, the ring and
+//     the live ring count instead of a materialized state: a host-side replay would round differently from the GPU
+//     kernel, and the restored sequence would not continue bit-identically. Old-format data loads as C with an empty
+//     ring. Ring-format data needs GDN_REPLAY on (a clear load error otherwise, and the caller re-processes).
+// Why decode stays bit-identical: each token applies the same f32 update to the same f32 inputs in the same order as
+//   in the snapshot kernel. C and the ring are exact copies, so the state after the replay has the bits of the group
+//   the old path would read, and the new tokens then run the old per-token code. The old kernel is not changed.
+// Prefill: unchanged, the sequential kernel as with K > 1 before. A single committed state would let the chunked
+//   kernel run the first T - n_w tokens of a long ubatch; that is a follow-up and is not bit-identical.
+// Cost: the kernel runs up to n_rs_seq extra state-only token steps and writes 1 state per cell instead of K.
+static bool llama_gdn_replay_env() {
+    // read at every memory creation, so a test can compare both layouts in one process
+    const char * e = getenv("GDN_REPLAY");
+    return !(e && e[0] == '0' && e[1] == '\0');
+}
+
+// archs whose recurrent layers are scalar-gate gated delta nets built by llm_build_delta_net_base
+static bool llama_gdn_replay_arch(llm_arch arch) {
+    switch (arch) {
+        case LLM_ARCH_QWEN35:
+        case LLM_ARCH_QWEN35MOE:
+            return true;
+        default:
+            return false;
+    }
+}
+
+// one ring token: k [S_k*H_v] (H_v heads, the graph repeats k when the fused op is off) | v [S_v*H_v] | g [H_v] |
+// beta [H_v], padded to 4 floats for the float4 loads of the CUDA kernel
+static int64_t llama_gdn_ring_slot(const llama_hparams & hparams) {
+    const int64_t H_v = hparams.ssm_dt_rank;
+    const int64_t S_k = hparams.ssm_d_state;
+    const int64_t S_v = hparams.ssm_d_inner / H_v;
+    return GGML_PAD(S_k*H_v + S_v*H_v + 2*H_v, 4);
+}
+
+static bool llama_gdn_replay_shape_ok(const llama_hparams & hparams) {
+    const int64_t H_v = hparams.ssm_dt_rank;
+    const int64_t H_k = hparams.ssm_n_group;
+    if (H_v <= 0 || H_k <= 0 || H_v % H_k != 0 || hparams.ssm_d_inner % H_v != 0) {
+        return false;
+    }
+    const int64_t S_v = hparams.ssm_d_inner / H_v;
+    return (int64_t) hparams.ssm_d_state == S_v && (int64_t) hparams.n_embd_s() == S_v*S_v*H_v;
+}
+
+// the replay op has to run on the device of each recurrent layer; a device without it keeps the old layout
+static bool llama_gdn_replay_dev_ok(ggml_backend_dev_t dev, const llama_hparams & hparams, uint32_t n_ring) {
+    if (dev == nullptr) {
+        return true;
+    }
+
+    const int64_t H_v = hparams.ssm_dt_rank;
+    const int64_t H_k = hparams.ssm_n_group;
+    const int64_t S_v = hparams.ssm_d_inner / H_v;
+
+    ggml_init_params params = {
+        /*.mem_size   =*/ 16*ggml_tensor_overhead(),
+        /*.mem_buffer =*/ NULL,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context_ptr ctx { ggml_init(params) };
+    if (!ctx) {
+        return false;
+    }
+
+    ggml_tensor * q    = ggml_new_tensor_4d(ctx.get(), GGML_TYPE_F32, S_v, H_k, 1, 1);
+    ggml_tensor * k    = ggml_new_tensor_4d(ctx.get(), GGML_TYPE_F32, S_v, H_k, 1, 1);
+    ggml_tensor * v    = ggml_new_tensor_4d(ctx.get(), GGML_TYPE_F32, S_v, H_v, 1, 1);
+    ggml_tensor * g    = ggml_new_tensor_4d(ctx.get(), GGML_TYPE_F32, 1, H_v, 1, 1);
+    ggml_tensor * b    = ggml_new_tensor_4d(ctx.get(), GGML_TYPE_F32, 1, H_v, 1, 1);
+    ggml_tensor * s    = ggml_new_tensor_4d(ctx.get(), GGML_TYPE_F32, S_v, S_v, H_v, 1);
+    ggml_tensor * ring = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, n_ring*llama_gdn_ring_slot(hparams), 1);
+    ggml_tensor * rn   = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, 1);
+
+    ggml_tensor * op = ggml_gated_delta_net_replay(ctx.get(), q, k, v, g, b, s, ring, rn, (int32_t) n_ring);
+
+    return ggml_backend_dev_supports_op(dev, op);
+}
+
+// the ring format of state_write_data reuses its s_trans word (0 = old format), so an old reader rejects it
+static constexpr uint32_t LLAMA_RS_STATE_FMT_RING = 2;
+
 //
 // llama_memory_recurrent
 //
@@ -45,6 +149,24 @@ llama_memory_recurrent::llama_memory_recurrent(
     this->n_rs_seq = n_rs_seq;
     rs_idx.assign(n_seq_max, 0);
 
+    // [TAG_4C_GDN_REPLAY] decided before any tensor is created, because it sets the s_l row count
+    replay = n_rs_seq > 0 && llama_gdn_replay_env() && llama_gdn_replay_arch(model.arch) &&
+        type_s == GGML_TYPE_F32 && model.split_mode() != LLAMA_SPLIT_MODE_TENSOR && llama_gdn_replay_shape_ok(hparams);
+    if (replay) {
+        for (int i = 0; i < n_layer && replay; i++) {
+            if (filter && !filter(i)) {
+                continue;
+            }
+            // the CPU backend always has the op, so only the layer device is checked (also with offload off)
+            if (!llama_gdn_replay_dev_ok(model.dev_layer(i), hparams, n_rs_seq)) {
+                LLAMA_LOG_WARN("%s: layer %d: device has no GATED_DELTA_NET_REPLAY, keeping %u recurrent snapshot groups\n",
+                        __func__, i, 1 + n_rs_seq);
+                replay = false;
+            }
+        }
+    }
+    const int64_t ring_slot = replay ? llama_gdn_ring_slot(hparams) : 0;
+
     cells.clear();
     cells.resize(mem_size);
 
@@ -61,8 +183,8 @@ llama_memory_recurrent::llama_memory_recurrent(
         auto it = ctx_map.find(buft);
         if (it == ctx_map.end()) {
             ggml_init_params params = {
-                // r and s per layer, plus the separate PLE conv row where the model has one
-                /*.mem_size   =*/ size_t((hparams.ple_conv_state() > 0 ? 3u : 2u)*n_layer*ggml_tensor_overhead()),
+                // r and s per layer, plus the separate PLE conv row where the model has one, plus the replay ring
+                /*.mem_size   =*/ size_t(((hparams.ple_conv_state() > 0 ? 3u : 2u) + (replay ? 1u : 0u))*n_layer*ggml_tensor_overhead()),
                 /*.mem_buffer =*/ NULL,
                 /*.no_alloc   =*/ true,
             };
@@ -83,6 +205,7 @@ llama_memory_recurrent::llama_memory_recurrent(
     r_l.resize(n_layer);
     s_l.resize(n_layer);
     p_l.resize(n_layer);
+    ring_l.resize(n_layer);
 
     for (int i = 0; i < n_layer; i++) {
         if (filter && !filter(i)) {
@@ -110,11 +233,18 @@ llama_memory_recurrent::llama_memory_recurrent(
 
         const uint32_t n_rows = mem_size * (1 + n_rs_seq);
         ggml_tensor * r = ggml_new_tensor_2d(ctx, type_r, hparams.n_embd_r(), n_rows);
-        ggml_tensor * s = ggml_new_tensor_2d(ctx, type_s, hparams.n_embd_s(), n_rows);
+        ggml_tensor * s = ggml_new_tensor_2d(ctx, type_s, hparams.n_embd_s(), replay ? mem_size : n_rows); // [TAG_4C_GDN_REPLAY]
         ggml_format_name(r, "cache_r_l%d", i);
         ggml_format_name(s, "cache_s_l%d", i);
         r_l[i] = r;
         s_l[i] = s;
+
+        // [TAG_4C_GDN_REPLAY] token inputs of up to n_rs_seq tokens after the committed state
+        if (replay) {
+            ggml_tensor * ring = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_rs_seq*ring_slot, mem_size);
+            ggml_format_name(ring, "cache_ring_l%d", i);
+            ring_l[i] = ring;
+        }
 
         // the PLE history needs its own row: Meta must mirror it while the delta-net conv state next door stays split
         if (hparams.ple_conv_state() > 0 && hparams.is_ple(i)) {
@@ -136,15 +266,21 @@ llama_memory_recurrent::llama_memory_recurrent(
     }
 
     {
-        const size_t memory_size_r = size_r_bytes();
-        const size_t memory_size_s = size_s_bytes();
-        const size_t memory_size_p = size_p_bytes();
+        const size_t memory_size_r    = size_r_bytes();
+        const size_t memory_size_s    = size_s_bytes();
+        const size_t memory_size_p    = size_p_bytes();
+        const size_t memory_size_ring = size_ring_bytes();
 
         LLAMA_LOG_INFO("%s: size = %7.2f MiB (%6u cells, %3d layers, %2u seqs %2u rs_seq), R (%s): %7.2f MiB, S (%s): %7.2f MiB, P (%s): %7.2f MiB\n", __func__,
-                (float)(memory_size_r + memory_size_s + memory_size_p) / (1024.0f * 1024.0f), mem_size, n_layer, n_seq_max, n_rs_seq,
+                (float)(memory_size_r + memory_size_s + memory_size_p + memory_size_ring) / (1024.0f * 1024.0f), mem_size, n_layer, n_seq_max, n_rs_seq,
                 ggml_type_name(type_r), (float)memory_size_r / (1024.0f * 1024.0f),
                 ggml_type_name(type_s), (float)memory_size_s / (1024.0f * 1024.0f),
                 ggml_type_name(type_r), (float)memory_size_p / (1024.0f * 1024.0f));
+
+        if (replay) {
+            LLAMA_LOG_INFO("%s: [TAG_4C_GDN_REPLAY] GDN replay: 1 committed state per cell, ring of %u tokens (%.2f MiB), GDN_REPLAY=0 keeps %u snapshot groups\n",
+                    __func__, n_rs_seq, (float)memory_size_ring / (1024.0f * 1024.0f), 1 + n_rs_seq);
+        }
     }
 }
 
@@ -154,6 +290,8 @@ void llama_memory_recurrent::clear(bool data) {
         cells[i].seq_id.clear();
         cells[i].src = -1;
         cells[i].tail = -1;
+        cells[i].n_ring = 0; // [TAG_4C_GDN_REPLAY]
+        cells[i].n_rb   = 0;
     }
 
     head = 0;
@@ -205,7 +343,9 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
                 const llama_pos rollback = cell.pos - (p0 - 1);
                 // pending rollback is single-use
                 const bool pending = rs_idx[seq_id] != 0;
-                if (!pending && rollback >= 1 && rollback <= (llama_pos) n_rs_seq) {
+                // [TAG_4C_GDN_REPLAY] only the last n_rb tokens have a ring entry and a valid conv group
+                const bool in_ring = !replay || rollback <= (llama_pos) cell.n_rb;
+                if (!pending && in_ring && rollback >= 1 && rollback <= (llama_pos) n_rs_seq) {
                     set_rs_idx(seq_id, (uint32_t) rollback);
                     cell.pos = p0 - 1;
                     return true;
@@ -241,6 +381,8 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
                 }
                 cells[i].pos = -1;
                 cells[i].src = -1;
+                cells[i].n_ring = 0; // [TAG_4C_GDN_REPLAY]
+                cells[i].n_rb   = 0;
                 if (new_head == size) {
                     new_head = i;
                 }
@@ -281,6 +423,8 @@ void llama_memory_recurrent::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id
             if (cell_dst.seq_id.empty()) {
                 cell_dst.pos = -1;
                 cell_dst.src = -1;
+                cell_dst.n_ring = 0; // [TAG_4C_GDN_REPLAY]
+                cell_dst.n_rb   = 0;
                 used -= 1;
             }
         }
@@ -308,6 +452,8 @@ void llama_memory_recurrent::seq_keep(llama_seq_id seq_id) {
 
             cells[i].pos = -1;
             cells[i].src = -1;
+            cells[i].n_ring = 0; // [TAG_4C_GDN_REPLAY]
+            cells[i].n_rb   = 0;
             cells[i].seq_id.clear();
 
             if (new_head == size){
@@ -557,6 +703,8 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
                     if (cell.seq_id.empty()) {
                         cell.pos = -1;
                         cell.src = -1;
+                        cell.n_ring = 0; // [TAG_4C_GDN_REPLAY]
+                        cell.n_rb   = 0;
                         used -= 1;
                     }
                 }
@@ -615,6 +763,8 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
                 auto & orig_cell = cells[seq_meta.tail];
                 empty_cell.pos = orig_cell.pos;
                 empty_cell.src = orig_cell.src;
+                empty_cell.n_ring = orig_cell.n_ring; // [TAG_4C_GDN_REPLAY] the ring is copied with the state
+                empty_cell.n_rb   = orig_cell.n_rb;
                 orig_cell.seq_id.erase(seq_id);
                 empty_cell.seq_id.insert(seq_id); // will be overwritten
                 GGML_ASSERT(!orig_cell.is_empty()); // has at least one remaining seq_id
@@ -646,6 +796,8 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
             std::swap(dst_cell.pos, src_cell.pos);
             std::swap(dst_cell.src, src_cell.src);
             std::swap(dst_cell.seq_id, src_cell.seq_id);
+            std::swap(dst_cell.n_ring, src_cell.n_ring); // [TAG_4C_GDN_REPLAY] moves with the data like src
+            std::swap(dst_cell.n_rb,   src_cell.n_rb);
 
             // swap tails
             for (uint32_t j = 0; j < size; ++j) {
@@ -704,6 +856,8 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
             if (cells[i].src < 0) {
                 GGML_ASSERT(rs_z >= 0);
                 cells[i].src0 = rs_z;
+                cells[i].n_ring = 0; // [TAG_4C_GDN_REPLAY] a zeroed state has no ring tokens
+                cells[i].n_rb   = 0;
             } else {
                 // Stage the source ids for all used cells to allow correct seq_* behavior
                 // and still make these values available when setting the inputs
@@ -728,6 +882,11 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
             }
         }
     }
+
+    // [TAG_4C_GDN_REPLAY] s_copy updates the ring counts when it consumes rs_idx: the first n_seqs cells then keep the
+    //   last n_w tokens of this ubatch, the extras keep their ring minus a pending rollback
+    rs_n_main = n_seqs;
+    rs_n_w    = std::min(n_seq_tokens, n_rs_seq);
 
     // allow getting the range of used cells, from head to head + n
     head = min;
@@ -789,11 +948,25 @@ size_t llama_memory_recurrent::size_p_bytes() const {
     return size_p_bytes;
 }
 
+size_t llama_memory_recurrent::size_ring_bytes() const {
+    size_t size_ring_bytes = 0;
+
+    for (const auto & ring : ring_l) {
+        if (ring != nullptr) {
+            size_ring_bytes += ggml_nbytes(ring);
+        }
+    }
+
+    return size_ring_bytes;
+}
+
 void llama_memory_recurrent::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
     GGML_UNUSED(flags);
 
     std::vector<std::pair<uint32_t, uint32_t>> cell_ranges; // ranges, from inclusive, to exclusive
     std::vector<std::pair<uint32_t, uint32_t>> cell_ranges_data; // logical source row ranges
+    std::vector<std::pair<uint32_t, uint32_t>> cell_ranges_data0; // [TAG_4C_GDN_REPLAY] group-0 rows of C and the ring
+    std::vector<uint32_t> ring_live;                              // [TAG_4C_GDN_REPLAY] live ring tokens per cell
     uint32_t cell_count = 0;
 
     // Count the number of cells with the specified seq_id
@@ -833,6 +1006,18 @@ void llama_memory_recurrent::state_write(llama_io_write_i & io, llama_seq_id seq
                 cell_ranges_data.back().second++;
             }
 
+            // [TAG_4C_GDN_REPLAY] the conv rows above include the pending rollback; C and the ring are group 0, and the
+            //   rollback shortens the live ring instead
+            if (replay) {
+                const uint32_t cell_id0 = cell.src >= 0 ? cell.src : (int32_t) i;
+                if (cell_ranges_data0.empty() || cell_ranges_data0.back().second != cell_id0) {
+                    cell_ranges_data0.emplace_back(cell_id0, cell_id0 + 1);
+                } else {
+                    cell_ranges_data0.back().second++;
+                }
+                ring_live.push_back(cell.n_ring >= rs_idx_cur ? cell.n_ring - rs_idx_cur : 0);
+            }
+
             if (cell_range_begin == size) {
                 cell_range_begin = i;
             }
@@ -867,7 +1052,7 @@ void llama_memory_recurrent::state_write(llama_io_write_i & io, llama_seq_id seq
     io.write(&cell_count, sizeof(cell_count));
 
     state_write_meta(io, cell_ranges, seq_id);
-    state_write_data(io, cell_ranges_data);
+    state_write_data(io, cell_ranges_data, cell_ranges_data0, ring_live);
 }
 
 void llama_memory_recurrent::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
@@ -920,12 +1105,24 @@ void llama_memory_recurrent::state_write_meta(llama_io_write_i & io, const std::
     }
 }
 
-void llama_memory_recurrent::state_write_data(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges) const {
+void llama_memory_recurrent::state_write_data(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges,
+        const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges0, const std::vector<uint32_t> & ring_live) const {
     const uint32_t s_trans = 0;
     const uint32_t n_layer = hparams.n_layer();
 
-    io.write(&s_trans, sizeof(s_trans));
+    // [TAG_4C_GDN_REPLAY] the ring format takes the s_trans word, so a reader without replay rejects it
+    const uint32_t s_fmt = replay ? LLAMA_RS_STATE_FMT_RING : s_trans;
+
+    io.write(&s_fmt,   sizeof(s_fmt));
     io.write(&n_layer, sizeof(n_layer));
+
+    if (replay) {
+        const uint32_t n_ring = n_rs_seq;
+        io.write(&n_ring, sizeof(n_ring));
+        if (!ring_live.empty()) {
+            io.write(ring_live.data(), ring_live.size()*sizeof(uint32_t));
+        }
+    }
 
     // Iterate and write all the R tensors first, each row is a cell
     // Get whole range at a time
@@ -976,10 +1173,27 @@ void llama_memory_recurrent::state_write_data(llama_io_write_i & io, const std::
 
             // Write each logical cell row range. With pending recurrent rollback,
             // the logical current state may live in a rollback snapshot plane.
-            for (const auto & range : cell_ranges) {
+            // [TAG_4C_GDN_REPLAY] with replay it is the committed state in group 0
+            for (const auto & range : (replay ? cell_ranges0 : cell_ranges)) {
                 const size_t range_size = range.second - range.first;
                 const size_t buf_size = range_size * s_size_row;
                 io.write_tensor(s_l[il], range.first * s_size_row, buf_size);
+            }
+        }
+
+        // [TAG_4C_GDN_REPLAY] the rings, after all S rows
+        for (uint32_t il = 0; replay && il < n_layer; ++il) {
+            if (ring_l[il] == nullptr) continue;
+
+            const int32_t ring_type_i = (int32_t) ring_l[il]->type;
+            io.write(&ring_type_i, sizeof(ring_type_i));
+
+            const uint64_t ring_size_row = ggml_row_size(ring_l[il]->type, ring_l[il]->ne[0]);
+            io.write(&ring_size_row, sizeof(ring_size_row));
+
+            for (const auto & range : cell_ranges0) {
+                const size_t range_size = range.second - range.first;
+                io.write_tensor(ring_l[il], range.first * ring_size_row, range_size * ring_size_row);
             }
         }
     } else {
@@ -1125,6 +1339,34 @@ bool llama_memory_recurrent::state_read_data(llama_io_read_i & io, uint32_t cell
         LLAMA_LOG_ERROR("%s: not enough cells in kv cache to restore state (%u > %u)\n", __func__, cell_count, size);
         return false;
     }
+
+    // [TAG_4C_GDN_REPLAY] ring format: live ring counts here, the rings after the S rows
+    const bool fmt_ring = s_trans == LLAMA_RS_STATE_FMT_RING;
+    std::vector<uint32_t> ring_live;
+    if (fmt_ring) {
+        if (!replay) {
+            LLAMA_LOG_ERROR("%s: the state was saved with the GDN replay layout, which this context does not use (GDN_REPLAY=0?)\n", __func__);
+            return false;
+        }
+        uint32_t n_ring;
+        io.read(&n_ring, sizeof(n_ring));
+        if (n_ring != n_rs_seq) {
+            LLAMA_LOG_ERROR("%s: mismatched GDN replay ring (%u tokens instead of %u)\n", __func__, n_ring, n_rs_seq);
+            return false;
+        }
+        ring_live.resize(cell_count);
+        if (cell_count) {
+            io.read(ring_live.data(), cell_count*sizeof(uint32_t));
+        }
+        for (const uint32_t n : ring_live) {
+            if (n > n_rs_seq) {
+                LLAMA_LOG_ERROR("%s: invalid GDN replay ring count %u\n", __func__, n);
+                return false;
+            }
+        }
+        s_trans = 0;
+    }
+
     if (false != (bool) s_trans) {
         LLAMA_LOG_ERROR("%s: incompatible s transposition\n", __func__);
         return false;
@@ -1202,6 +1444,30 @@ bool llama_memory_recurrent::state_read_data(llama_io_read_i & io, uint32_t cell
                 io.read_tensor(s_l[il], head * s_size_row, cell_count * s_size_row);
             }
         }
+
+        // [TAG_4C_GDN_REPLAY] the rings, after all S rows
+        for (uint32_t il = 0; fmt_ring && il < n_layer; ++il) {
+            if (ring_l[il] == nullptr) continue;
+
+            int32_t ring_type_i_ref;
+            io.read(&ring_type_i_ref, sizeof(ring_type_i_ref));
+            if ((int32_t) ring_l[il]->type != ring_type_i_ref) {
+                LLAMA_LOG_ERROR("%s: mismatched ring type (%d != %d, layer %d)\n", __func__, (int32_t) ring_l[il]->type, ring_type_i_ref, il);
+                return false;
+            }
+
+            uint64_t ring_size_row_ref;
+            io.read(&ring_size_row_ref, sizeof(ring_size_row_ref));
+            const size_t ring_size_row = ggml_row_size(ring_l[il]->type, ring_l[il]->ne[0]);
+            if (ring_size_row != ring_size_row_ref) {
+                LLAMA_LOG_ERROR("%s: mismatched ring row size (%zu != %zu, layer %d)\n", __func__, ring_size_row, (size_t) ring_size_row_ref, il);
+                return false;
+            }
+
+            if (cell_count) {
+                io.read_tensor(ring_l[il], head * ring_size_row, cell_count * ring_size_row);
+            }
+        }
     } else {
         // For each layer, read the values for each cell (transposed)
         for (uint32_t il = 0; il < n_layer; ++il) {
@@ -1243,6 +1509,15 @@ bool llama_memory_recurrent::state_read_data(llama_io_read_i & io, uint32_t cell
                     io.read_tensor(s_l[il], dst_offset, cell_count * s_size_el);
                 }
             }
+        }
+    }
+
+    // [TAG_4C_GDN_REPLAY] old-format data is a materialized state: the committed state with an empty ring. Only conv
+    //   group 0 is restored, so no rollback before the next ubatch.
+    if (replay) {
+        for (uint32_t i = 0; i < cell_count; ++i) {
+            cells[head + i].n_ring = fmt_ring ? ring_live[i] : 0;
+            cells[head + i].n_rb   = 0;
         }
     }
 
@@ -1346,7 +1621,35 @@ int32_t llama_memory_recurrent_context::s_copy(int i) const {
             mem->rs_idx[seq] = 0;
         }
     }
+
+    // [TAG_4C_GDN_REPLAY] the consumed rollback shortens the ring: the ubatch cells replay the rest and then keep the
+    //   ring of their last tokens, an extra keeps the rest (its C and ring rows move unchanged). An extra that folds a
+    //   rollback keeps its conv groups unshifted, so it allows no further rollback until its next ubatch.
+    if (mem->replay) {
+        auto & cell = mem->cells[cell_idx];
+        const bool is_main = (uint32_t) i < mem->rs_n_main;
+        cell.n_rpl  = cell.n_ring >= idx ? cell.n_ring - idx : 0;
+        cell.n_ring = is_main ? mem->rs_n_w : cell.n_rpl;
+        cell.n_rb   = is_main ? mem->rs_n_w : (idx > 0 ? 0 : std::min(cell.n_rb, cell.n_ring));
+    }
+
     return (int32_t)(idx * mem->size) + src0;
+}
+
+ggml_tensor * llama_memory_recurrent_context::get_ring_l(int32_t il) const {
+    return mem->ring_l[il];
+}
+
+bool llama_memory_recurrent_context::get_replay() const {
+    return mem->replay;
+}
+
+int32_t llama_memory_recurrent_context::s_copy_r(int i) const {
+    return mem->cells[i + mem->head].src0;
+}
+
+int32_t llama_memory_recurrent_context::ring_n(int i) const {
+    return (int32_t) mem->cells[i + mem->head].n_rpl;
 }
 
 uint32_t llama_memory_recurrent_context::get_n_mv() const {

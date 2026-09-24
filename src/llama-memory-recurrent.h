@@ -90,12 +90,27 @@ public:
     //   sequence reads the snapshot another sequence wrote into the new row. 0 when LLAMA_XSEQ_FIX=0.
     uint32_t rs_n_mv = 0;
 
+    // [TAG_4C_GDN_REPLAY] s_l holds one committed state per cell and ring_l the inputs of up to n_rs_seq later tokens
+    //   (design note in llama-memory-recurrent.cpp). false: s_l has 1 + n_rs_seq snapshot groups as before.
+    bool replay = false;
+
+    // [TAG_4C_GDN_REPLAY] of the current ubatch: its sequence count, and the ring tokens each of them keeps
+    uint32_t rs_n_main = 0;
+    uint32_t rs_n_w    = 0;
+
     // TODO: optimize for recurrent state needs
     struct mem_cell {
         llama_pos pos  = -1;
         int32_t   src  = -1; // used to know where states should be copied from
         int32_t   src0 = -1; // like src, but only used when setting the inputs (allowing to copy once)
         int32_t   tail = -1;
+
+        // [TAG_4C_GDN_REPLAY] ring tokens that follow the committed state of this cell's data, and the part of them
+        //   the current ubatch replays (set by s_copy for the graph inputs)
+        uint32_t n_ring = 0;
+        uint32_t n_rpl  = 0;
+        // [TAG_4C_GDN_REPLAY] rollback limit (<= n_ring): tokens whose conv snapshot groups are also valid
+        uint32_t n_rb   = 0;
 
         std::set<llama_seq_id> seq_id;
 
@@ -119,6 +134,8 @@ public:
     std::vector<ggml_tensor *> s_l;
     // a second conv history that must stay replicated across devices, so it cannot share the r row
     std::vector<ggml_tensor *> p_l;
+    // [TAG_4C_GDN_REPLAY] per layer ring of token inputs, F32 [n_rs_seq*slot, mem_size], only when replay
+    std::vector<ggml_tensor *> ring_l;
 
 private:
     //const llama_model & model;
@@ -134,9 +151,12 @@ private:
     size_t size_r_bytes() const;
     size_t size_s_bytes() const;
     size_t size_p_bytes() const;
+    size_t size_ring_bytes() const;
 
     void state_write_meta(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges, llama_seq_id seq_id = -1) const;
-    void state_write_data(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges) const;
+    // [TAG_4C_GDN_REPLAY] cell_ranges0 (group-0 rows) and ring_live are used only with replay
+    void state_write_data(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges,
+            const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges0, const std::vector<uint32_t> & ring_live) const;
 
     bool state_read_meta(llama_io_read_i & io, uint32_t cell_count, llama_seq_id dest_seq_id = -1);
     bool state_read_data(llama_io_read_i & io, uint32_t cell_count);
@@ -189,6 +209,16 @@ public:
 
     // source row of snapshot group `plane` (1..n_rs_seq) for cell i (relative to head); does not consume rs_idx
     int32_t s_copy_plane(int i, uint32_t plane) const;
+
+    // [TAG_4C_GDN_REPLAY] nullptr when the memory keeps snapshot groups instead of rings
+    ggml_tensor * get_ring_l(int32_t il) const;
+    bool get_replay() const;
+
+    // source row of the one-group tensors (committed state, ring) for cell i (relative to head); no plane offset
+    int32_t s_copy_r(int i) const;
+
+    // ring tokens that cell i (relative to head) replays in the current ubatch
+    int32_t ring_n(int i) const;
 
 private:
     const llama_memory_status status;

@@ -280,6 +280,12 @@ public:
     //   only present when find_slot moved an extra cell (rare), otherwise nullptr
     ggml_tensor * s_copy_planes = nullptr;
 
+    // [TAG_4C_GDN_REPLAY] only with the replay layout, otherwise nullptr
+    ggml_tensor * s_copy_r       = nullptr; // I32 [n_rs], group-0 source rows of the committed states and rings
+    ggml_tensor * s_copy_r_main  = nullptr; // I32 [n_seqs]
+    ggml_tensor * s_copy_r_extra = nullptr; // I32 [n_rs - n_seqs]
+    ggml_tensor * ring_n         = nullptr; // I32 [n_seqs], ring tokens each ubatch sequence replays
+
     const llama_memory_recurrent_context * mctx;
 
     // used in view offsets, need to match for valid graph reuse

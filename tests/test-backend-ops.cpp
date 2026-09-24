@@ -5002,6 +5002,313 @@ struct test_gated_delta_net_cache_fusion : public test_case {
     }
 };
 
+// [TAG_4C_GDN_REPLAY] ring rows of GGML_OP_GATED_DELTA_NET_REPLAY: unit-norm k per head, v, g and beta in the ranges of
+// the other GDN tests, zero pad
+static void init_gdn_replay_ring(ggml_tensor * t, int64_t S, int64_t H_k, int64_t H, int n_ring) {
+    const int64_t slot = t->ne[0] / n_ring;
+    std::mt19937 rng((uint32_t) (t->ne[0]*31 + t->ne[1]));
+    std::uniform_real_distribution<float> dk(-1.0f, 1.0f);
+    std::uniform_real_distribution<float> dv(-0.3f, 5.0f);
+    std::uniform_real_distribution<float> dg(-20.0f, -1e-4f);
+    std::uniform_real_distribution<float> db(0.0f, 1.0f);
+    std::vector<float> data(ggml_nelements(t), 0.0f);
+    for (int64_t r = 0; r < t->ne[1]; ++r) {
+        for (int j = 0; j < n_ring; ++j) {
+            float * sl = data.data() + r*t->ne[0] + j*slot;
+            for (int64_t h = 0; h < H_k; ++h) {
+                float norm = 0.0f;
+                for (int64_t i = 0; i < S; ++i) {
+                    sl[h*S + i] = dk(rng);
+                    norm += sl[h*S + i]*sl[h*S + i];
+                }
+                for (int64_t i = 0; i < S; ++i) {
+                    sl[h*S + i] /= sqrtf(norm + 1e-6f);
+                }
+            }
+            for (int64_t i = 0; i < S*H; ++i) {
+                sl[S*H_k + i] = dv(rng);
+            }
+            for (int64_t i = 0; i < H; ++i) {
+                sl[S*H_k + S*H + i]     = dg(rng);
+                sl[S*H_k + S*H + H + i] = db(rng);
+            }
+        }
+    }
+    ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
+}
+
+// [TAG_4C_GDN_REPLAY] replay counts that cover 0..n_ring across the sequences
+static void init_gdn_replay_ring_n(ggml_tensor * t, int n_ring) {
+    std::vector<int32_t> data(ggml_nelements(t));
+    for (size_t s = 0; s < data.size(); ++s) {
+        data[s] = (int32_t) ((s*3 + 1) % (size_t) (n_ring + 1));
+    }
+    ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
+}
+
+// GGML_OP_GATED_DELTA_NET_REPLAY [TAG_4C_GDN_REPLAY]
+struct test_gated_delta_net_replay : public test_case {
+    const ggml_type type;
+
+    const int64_t head_count; // k heads
+    const int64_t head_size;
+    const int64_t n_seq_tokens;
+    const int64_t n_seqs;
+    const int     v_repeat;
+    const int     n_ring;
+    const int64_t pad;        // extra floats per ring slot
+    const bool    strided_v;  // V is a view into a fused QKV buffer (model path)
+    const bool    cache;      // also copy the state and ring tails into caches (the CUDA fusion)
+
+    ggml_tensor * cpy_state = nullptr;
+    ggml_tensor * cpy_ring  = nullptr;
+
+    std::string vars() override {
+        return VARS_TO_STR10(type, head_count, head_size, n_seq_tokens, n_seqs, v_repeat, n_ring, pad, strided_v, cache);
+    }
+
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return (uint64_t)2 * n_seqs * head_count * (n_seq_tokens + n_ring) * head_size * head_size * v_repeat;
+    }
+
+    test_gated_delta_net_replay(ggml_type type = GGML_TYPE_F32,
+            int64_t head_count = 4, int64_t head_size = 32, int64_t n_seq_tokens = 4, int64_t n_seqs = 2,
+            int v_repeat = 1, int n_ring = 3, int64_t pad = 0, bool strided_v = false, bool cache = false)
+        : type(type), head_count(head_count), head_size(head_size), n_seq_tokens(n_seq_tokens), n_seqs(n_seqs),
+          v_repeat(v_repeat), n_ring(n_ring), pad(pad), strided_v(strided_v), cache(cache) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t S = head_size;
+        const int64_t H = head_count * v_repeat;
+
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, type, S, head_count, n_seq_tokens, n_seqs);
+        ggml_tensor * k = ggml_new_tensor_4d(ctx, type, S, head_count, n_seq_tokens, n_seqs);
+        ggml_tensor * v;
+        if (strided_v) {
+            const int64_t qkv_dim = S * (2 * head_count + H);
+            ggml_tensor * qkv = ggml_new_tensor_3d(ctx, type, qkv_dim, n_seq_tokens, n_seqs);
+            ggml_set_name(qkv, "v_qkv");
+            const size_t nb1_qkv = ggml_row_size(type, qkv_dim);
+            v = ggml_view_4d(ctx, qkv, S, H, n_seq_tokens, n_seqs,
+                    ggml_row_size(type, S), nb1_qkv, nb1_qkv * n_seq_tokens, ggml_row_size(type, 2 * S * head_count));
+        } else {
+            v = ggml_new_tensor_4d(ctx, type, S, H, n_seq_tokens, n_seqs);
+        }
+        ggml_set_name(q, "q");
+        ggml_set_name(k, "k");
+        ggml_set_name(v, "v");
+        ggml_tensor * g      = ggml_new_tensor_4d(ctx, type, 1, H, n_seq_tokens, n_seqs);
+        ggml_tensor * beta   = ggml_new_tensor_4d(ctx, type, 1, H, n_seq_tokens, n_seqs);
+        ggml_tensor * state  = ggml_new_tensor_4d(ctx, type, S, S, H, n_seqs);
+        const int64_t slot   = S*head_count + S*H + 2*H + pad;
+        ggml_tensor * ring   = ggml_new_tensor_2d(ctx, type, n_ring*slot, n_seqs);
+        ggml_tensor * ring_n = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_seqs);
+        ggml_set_name(g,      "g");
+        ggml_set_name(beta,   "beta");
+        ggml_set_name(state,  "state");
+        ggml_set_name(ring,   "ring");
+        ggml_set_name(ring_n, "ring_n");
+
+        q = ggml_l2_norm(ctx, q, 1e-6f);
+        k = ggml_l2_norm(ctx, k, 1e-6f);
+
+        ggml_tensor * out = ggml_gated_delta_net_replay(ctx, q, k, v, g, beta, state, ring, ring_n, n_ring);
+        if (!cache) {
+            return out;
+        }
+
+        // the model graph: committed states and new rings copied into caches right after the op
+        const int64_t D        = S * S * H;
+        const int64_t ring_row = n_ring * slot;
+        const int64_t n_attn   = S * H * n_seq_tokens * n_seqs;
+
+        ggml_tensor * cache_s = ggml_new_tensor_2d(ctx, type, D, n_seqs);
+        ggml_tensor * cache_r = ggml_new_tensor_2d(ctx, type, ring_row, n_seqs);
+        ggml_set_name(cache_s, "cache");
+        ggml_set_name(cache_r, "cache_ring");
+
+        cpy_state = ggml_cpy(ctx,
+                ggml_view_2d(ctx, out, D, n_seqs, ggml_row_size(type, D), ggml_row_size(type, n_attn)),
+                ggml_view_2d(ctx, cache_s, D, n_seqs, cache_s->nb[1], 0));
+        cpy_ring = ggml_cpy(ctx,
+                ggml_view_2d(ctx, out, ring_row, n_seqs, ggml_row_size(type, ring_row), ggml_row_size(type, n_attn + D*n_seqs)),
+                ggml_view_2d(ctx, cache_r, ring_row, n_seqs, cache_r->nb[1], 0));
+
+        // one node reads both copies, so they follow the op back to back as in the model graph
+        return ggml_concat(ctx, cpy_state, cpy_ring, 0);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return cache ? "GATED_DELTA_NET_REPLAY_CACHE_FUSION" : "GATED_DELTA_NET_REPLAY";
+    }
+
+    bool run_whole_graph() override { return cache; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override {
+        if (!cache) {
+            return {};
+        }
+        return { cpy_state, cpy_ring };
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (ggml_is_view_op(t->op)) { continue; }
+            if (strcmp(t->name, "g") == 0) {
+                init_tensor_uniform(t, -20.0f, -1e-4f);
+            } else if (strcmp(t->name, "beta") == 0) {
+                init_tensor_uniform(t, 0.0f, 1.0f);
+            } else if (strcmp(t->name, "v") == 0 || strcmp(t->name, "v_qkv") == 0) {
+                init_tensor_uniform(t, -0.3f, 5.0f);
+            } else if (strcmp(t->name, "ring") == 0) {
+                init_gdn_replay_ring(t, head_size, head_count, head_count * v_repeat, n_ring);
+            } else if (strcmp(t->name, "ring_n") == 0) {
+                init_gdn_replay_ring_n(t, n_ring);
+            } else if (strcmp(t->name, "cache") == 0 || strcmp(t->name, "cache_ring") == 0) {
+                init_tensor_uniform(t, 0.0f, 0.0f);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
+// GGML_OP_GATED_DELTA_NET_REPLAY against GGML_OP_GATED_DELTA_NET on the same backend [TAG_4C_GDN_REPLAY]. Two replay
+// calls with a rollback of n_rb tokens between them must give the bits of one snapshot-kernel call (K = n_ring + 1, the
+// old layout) over the kept tokens. The output is the difference of the last n_tok2 attention rows and must be exactly
+// zero on every backend: a nonzero value means the replay path is not bit-identical there.
+struct test_gated_delta_net_replay_exact : public test_case {
+    const int64_t head_count; // k heads
+    const int64_t head_size;
+    const int64_t n_tok1;
+    const int64_t n_tok2;
+    const int64_t n_seqs;
+    const int     v_repeat;
+    const int     n_ring;
+    const int     n_rb;       // tokens rolled back after the first call, <= min(n_tok1, n_ring)
+
+    std::string vars() override {
+        return VARS_TO_STR8(head_count, head_size, n_tok1, n_tok2, n_seqs, v_repeat, n_ring, n_rb);
+    }
+
+    test_gated_delta_net_replay_exact(int64_t head_count = 4, int64_t head_size = 32, int64_t n_tok1 = 4, int64_t n_tok2 = 4,
+            int64_t n_seqs = 2, int v_repeat = 1, int n_ring = 3, int n_rb = 1)
+        : head_count(head_count), head_size(head_size), n_tok1(n_tok1), n_tok2(n_tok2), n_seqs(n_seqs),
+          v_repeat(v_repeat), n_ring(n_ring), n_rb(n_rb) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const ggml_type type = GGML_TYPE_F32;
+
+        const int64_t S = head_size;
+        const int64_t H = head_count * v_repeat;
+        const int64_t T = n_tok1 + n_tok2;
+        const int64_t n_w1 = std::min<int64_t>(n_tok1, n_ring);
+        GGML_ASSERT(n_rb >= 0 && n_rb <= n_w1);
+
+        ggml_tensor * q     = ggml_new_tensor_4d(ctx, type, S, head_count, T, n_seqs);
+        ggml_tensor * k     = ggml_new_tensor_4d(ctx, type, S, head_count, T, n_seqs);
+        ggml_tensor * v     = ggml_new_tensor_4d(ctx, type, S, H, T, n_seqs);
+        ggml_tensor * g     = ggml_new_tensor_4d(ctx, type, 1, H, T, n_seqs);
+        ggml_tensor * beta  = ggml_new_tensor_4d(ctx, type, 1, H, T, n_seqs);
+        ggml_tensor * state = ggml_new_tensor_4d(ctx, type, S, S, H, n_seqs);
+        const int64_t slot  = S*head_count + S*H + 2*H;
+        ggml_tensor * ring0 = ggml_new_tensor_2d(ctx, type, n_ring*slot, n_seqs);
+        ggml_tensor * rn0   = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_seqs);
+        ggml_tensor * rn1   = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_seqs);
+        ggml_set_name(q,     "q");
+        ggml_set_name(k,     "k");
+        ggml_set_name(v,     "v");
+        ggml_set_name(g,     "g");
+        ggml_set_name(beta,  "beta");
+        ggml_set_name(state, "state");
+        ggml_set_name(ring0, "ring0");
+        ggml_set_name(rn0,   "rn0");
+        ggml_set_name(rn1,   "rn1");
+
+        q = ggml_l2_norm(ctx, q, 1e-6f);
+        k = ggml_l2_norm(ctx, k, 1e-6f);
+
+        // tokens [t0, t0 + nt) of a [.., .., T, n_seqs] tensor, contiguous
+        auto tok = [&](ggml_tensor * t, int64_t t0, int64_t nt) {
+            return ggml_cont(ctx, ggml_view_4d(ctx, t, t->ne[0], t->ne[1], nt, t->ne[3], t->nb[1], t->nb[2], t->nb[3], t0*t->nb[2]));
+        };
+
+        // replay layout: call A over the first n_tok1 tokens, roll back n_rb, call B over the rest
+        ggml_tensor * a = ggml_gated_delta_net_replay(ctx, tok(q, 0, n_tok1), tok(k, 0, n_tok1), tok(v, 0, n_tok1),
+                tok(g, 0, n_tok1), tok(beta, 0, n_tok1), state, ring0, rn0, n_ring);
+
+        const int64_t D      = S * S * H;
+        const int64_t n_attn = S * H * n_tok1 * n_seqs;
+        ggml_tensor * c1    = ggml_view_4d(ctx, a, S, S, H, n_seqs, ggml_row_size(type, S), ggml_row_size(type, S*S),
+                ggml_row_size(type, D), ggml_row_size(type, n_attn));
+        ggml_tensor * ring1 = ggml_view_2d(ctx, a, n_ring*slot, n_seqs, ggml_row_size(type, n_ring*slot),
+                ggml_row_size(type, n_attn + D*n_seqs));
+
+        ggml_tensor * b = ggml_gated_delta_net_replay(ctx, tok(q, n_tok1, n_tok2), tok(k, n_tok1, n_tok2), tok(v, n_tok1, n_tok2),
+                tok(g, n_tok1, n_tok2), tok(beta, n_tok1, n_tok2), c1, ring1, rn1, n_ring);
+        ggml_tensor * attn_b = ggml_cont(ctx, ggml_view_4d(ctx, b, S, H, n_tok2, n_seqs,
+                ggml_row_size(type, S), ggml_row_size(type, S*H), ggml_row_size(type, S*H*n_tok2), 0));
+
+        // snapshot layout: one call over the kept tokens [0, n_tok1 - n_rb) and [n_tok1, T)
+        const int64_t n_keep = n_tok1 - n_rb;
+        auto kept = [&](ggml_tensor * t) {
+            if (n_keep == 0) {
+                return tok(t, n_tok1, n_tok2);
+            }
+            return ggml_concat(ctx, tok(t, 0, n_keep), tok(t, n_tok1, n_tok2), 2);
+        };
+        ggml_tensor * ref = ggml_gated_delta_net(ctx, kept(q), kept(k), kept(v), kept(g), kept(beta), state, n_ring + 1);
+        const int64_t T_ref = n_keep + n_tok2;
+        ggml_tensor * attn_ref = ggml_cont(ctx, ggml_view_4d(ctx, ref, S, H, n_tok2, n_seqs,
+                ggml_row_size(type, S), ggml_row_size(type, S*H), ggml_row_size(type, S*H*T_ref), ggml_row_size(type, S*H*n_keep)));
+
+        return ggml_sub(ctx, attn_b, attn_ref);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "GATED_DELTA_NET_REPLAY_EXACT";
+    }
+
+    // only the difference is compared, and both backends must give exactly zero
+    bool run_whole_graph() override { return true; }
+
+    double max_nmse_err() override {
+        return 0.0;
+    }
+
+    double err(const float * a, const float * b, size_t n) override {
+        double m = 0.0;
+        for (size_t i = 0; i < n; i++) {
+            m = std::max(m, (double) std::max(fabsf(a[i]), fabsf(b[i])));
+        }
+        return m;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        const int64_t n_w1 = std::min<int64_t>(n_tok1, n_ring);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (ggml_is_view_op(t->op)) { continue; }
+            if (strcmp(t->name, "g") == 0) {
+                init_tensor_uniform(t, -20.0f, -1e-4f);
+            } else if (strcmp(t->name, "beta") == 0) {
+                init_tensor_uniform(t, 0.0f, 1.0f);
+            } else if (strcmp(t->name, "v") == 0) {
+                init_tensor_uniform(t, -0.3f, 5.0f);
+            } else if (strcmp(t->name, "ring0") == 0) {
+                init_tensor_uniform(t, 0.0f, 0.0f);
+            } else if (strcmp(t->name, "rn0") == 0 || strcmp(t->name, "rn1") == 0) {
+                const int32_t n = strcmp(t->name, "rn0") == 0 ? 0 : (int32_t) (n_w1 - n_rb);
+                std::vector<int32_t> data(ggml_nelements(t), n);
+                ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_OP_GATED_LINEAR_ATTN
 struct test_gla : public test_case {
     const ggml_type type;
@@ -12945,6 +13252,26 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   4, 1, 4));
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 8, 32,   4, 2, 4));
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   8, 1, 4));
+
+    // [TAG_4C_GDN_REPLAY] replay op: (k heads, head size, tokens, seqs, v_repeat, n_ring, pad, strided_v, cache)
+    test_cases.emplace_back(new test_gated_delta_net_replay(GGML_TYPE_F32, 4,  32,   4, 2, 1, 3));
+    test_cases.emplace_back(new test_gated_delta_net_replay(GGML_TYPE_F32, 4,  32,   1, 4, 1, 3));
+    test_cases.emplace_back(new test_gated_delta_net_replay(GGML_TYPE_F32, 4,  32,   2, 4, 1, 3, 4));
+    test_cases.emplace_back(new test_gated_delta_net_replay(GGML_TYPE_F32, 2,  16,   3, 2, 1, 8));
+    test_cases.emplace_back(new test_gated_delta_net_replay(GGML_TYPE_F32, 4,  64,  16, 2, 2, 3, 0, true));
+    test_cases.emplace_back(new test_gated_delta_net_replay(GGML_TYPE_F32, 4, 128,   4, 4, 3, 3));         // Qwen3.8 head ratio
+    test_cases.emplace_back(new test_gated_delta_net_replay(GGML_TYPE_F32, 4, 128, 200, 1, 3, 3));         // prefill ubatch
+    test_cases.emplace_back(new test_gated_delta_net_replay(GGML_TYPE_F32, 4, 128,   4, 4, 3, 3, 0, true, true));
+    test_cases.emplace_back(new test_gated_delta_net_replay(GGML_TYPE_F32, 4,  32,   2, 2, 1, 3, 4, false, true));
+    // [TAG_4C_GDN_REPLAY] bit-identity with the snapshot kernel: (k heads, head size, tokens 1, tokens 2, seqs, v_repeat,
+    // n_ring, rollback)
+    test_cases.emplace_back(new test_gated_delta_net_replay_exact(4,  32, 4, 4, 2, 1, 3, 0));
+    test_cases.emplace_back(new test_gated_delta_net_replay_exact(4,  32, 4, 4, 2, 1, 3, 1));
+    test_cases.emplace_back(new test_gated_delta_net_replay_exact(4,  32, 4, 4, 2, 1, 3, 3));
+    test_cases.emplace_back(new test_gated_delta_net_replay_exact(4, 128, 4, 4, 4, 3, 3, 2));
+    test_cases.emplace_back(new test_gated_delta_net_replay_exact(4,  64, 2, 4, 2, 1, 3, 2));
+    test_cases.emplace_back(new test_gated_delta_net_replay_exact(2,  16, 9, 4, 1, 1, 8, 5));
+    test_cases.emplace_back(new test_gated_delta_net_replay_exact(4, 128, 40, 4, 2, 3, 3, 1));
 
 #if 0
     // these tests are disabled to save execution time, sbut they can be handy for debugging

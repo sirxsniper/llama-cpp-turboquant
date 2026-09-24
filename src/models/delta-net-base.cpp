@@ -563,6 +563,48 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
     const int64_t D = S_v * S_v * H_v;
     const int64_t K = cparams.n_rs_seq + 1;
 
+    // [TAG_4C_GDN_REPLAY] replay layout (design note in llama-memory-recurrent.cpp): s is the committed state of each
+    //   sequence, the op replays the live part of the old ring before the new tokens, then the committed state and the
+    //   new ring go back into the caches (the CUDA backend writes both from the kernel and skips the two copies)
+    if (ggml_tensor * ring_all = mctx_cur->get_ring_l(il); ring_all != nullptr) {
+        const int64_t ring_row = ring_all->ne[0];
+
+        ggml_tensor * ring = build_rs(inp, ring_all, (int32_t) ring_row, (int32_t) n_seqs);
+
+        ggml_tensor * gdn_out = ggml_gated_delta_net_replay(ctx0, q, k, v, g, b, s, ring, inp->ring_n, (int32_t) mctx_cur->get_n_rs_seq());
+        res->add_fused_node({n_seq_tokens > 1 ? LLM_FUSED_OP_GDN_CH : LLM_FUSED_OP_GDN_AR, gdn_out, il});
+
+        const int64_t attn_score_elems = S_v * H_v * n_seq_tokens * n_seqs;
+
+        ggml_tensor * output = ggml_view_4d(ctx0, gdn_out,
+            S_v, H_v, n_seq_tokens, n_seqs,
+            ggml_row_size(gdn_out->type, S_v),
+            ggml_row_size(gdn_out->type, S_v * H_v),
+            ggml_row_size(gdn_out->type, S_v * H_v * n_seq_tokens),
+            0);
+        cb(output, "attn_output", il);
+
+        const size_t row_size = hparams.n_embd_s() * ggml_element_size(ssm_states_all);
+
+        ggml_tensor * state_src = ggml_view_2d(ctx0, gdn_out, D, n_seqs,
+            ggml_row_size(gdn_out->type, D),
+            ggml_row_size(gdn_out->type, attn_score_elems));
+        ggml_tensor * state_dst = ggml_view_2d(ctx0, ssm_states_all, D, n_seqs,
+            ssm_states_all->nb[1],
+            (size_t) kv_head * row_size);
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, state_src, state_dst));
+
+        ggml_tensor * ring_src = ggml_view_2d(ctx0, gdn_out, ring_row, n_seqs,
+            ggml_row_size(gdn_out->type, ring_row),
+            ggml_row_size(gdn_out->type, attn_score_elems + D * n_seqs));
+        ggml_tensor * ring_dst = ggml_view_2d(ctx0, ring_all, ring_row, n_seqs,
+            ring_all->nb[1],
+            (size_t) kv_head * ring_all->nb[1]);
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, ring_src, ring_dst));
+
+        return output;
+    }
+
     // state s is 4D [S_v, S_v, H_v, n_seqs]; K snapshot slots are written into the output.
     ggml_tensor * gdn_out = ggml_gated_delta_net(ctx0, q, k, v, g, b, s, K);
     if (n_seq_tokens > 1) {

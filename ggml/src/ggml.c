@@ -1215,10 +1215,12 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 
     "TURBOT_SET_ROWS",
+
+    "GATED_DELTA_NET_REPLAY",
 };
 
-static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
-static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");  // +1 GGML_OP_TURBO_WHT (TurboQuant fork), +1 GGML_OP_LIGHTNING_INDEXER, +1 GGML_OP_TURBOT_SET_ROWS [TAG_TURBOT]
+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");  // +1 GGML_OP_TURBO_WHT (TurboQuant fork), +1 GGML_OP_LIGHTNING_INDEXER, +1 GGML_OP_TURBOT_SET_ROWS [TAG_TURBOT], +1 GGML_OP_GATED_DELTA_NET_REPLAY [TAG_4C_GDN_REPLAY]
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1334,10 +1336,12 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 
     "turbot_set_rows(x)",
+
+    "gated_delta_net_replay(q, k, v, g, beta, s, ring, ring_n)",
 };
 
-static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
-static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");  // +1 GGML_OP_TURBO_WHT (TurboQuant fork), +1 GGML_OP_LIGHTNING_INDEXER, +1 GGML_OP_TURBOT_SET_ROWS [TAG_TURBOT]
+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");  // +1 GGML_OP_TURBO_WHT (TurboQuant fork), +1 GGML_OP_LIGHTNING_INDEXER, +1 GGML_OP_TURBOT_SET_ROWS [TAG_TURBOT], +1 GGML_OP_GATED_DELTA_NET_REPLAY [TAG_4C_GDN_REPLAY]
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6670,6 +6674,74 @@ struct ggml_tensor * ggml_gated_delta_net(
     result->src[3] = g;
     result->src[4] = beta;
     result->src[5] = state;
+
+    return result;
+}
+
+// ggml_gated_delta_net_replay [TAG_4C_GDN_REPLAY]
+
+struct ggml_tensor * ggml_gated_delta_net_replay(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * g,
+        struct ggml_tensor  * beta,
+        struct ggml_tensor  * state,
+        struct ggml_tensor  * ring,
+        struct ggml_tensor  * ring_n,
+        int32_t               n_ring) {
+    GGML_ASSERT(ggml_is_contiguous_rows(q));
+    GGML_ASSERT(ggml_is_contiguous_rows(k));
+    GGML_ASSERT(ggml_is_contiguous_rows(v));
+    GGML_ASSERT(ggml_is_contiguous(g));
+    GGML_ASSERT(ggml_is_contiguous(beta));
+    GGML_ASSERT(ggml_is_contiguous(state));
+    GGML_ASSERT(ggml_is_contiguous(ring));
+    GGML_ASSERT(ggml_is_contiguous(ring_n));
+
+    GGML_ASSERT(q->type == GGML_TYPE_F32);
+    GGML_ASSERT(k->type == GGML_TYPE_F32);
+    GGML_ASSERT(v->type == GGML_TYPE_F32);
+    GGML_ASSERT(g->type == GGML_TYPE_F32);
+    GGML_ASSERT(beta->type == GGML_TYPE_F32);
+    GGML_ASSERT(state->type == GGML_TYPE_F32);
+    GGML_ASSERT(ring->type == GGML_TYPE_F32);
+    GGML_ASSERT(ring_n->type == GGML_TYPE_I32);
+
+    const int64_t S_v      = v->ne[0];
+    const int64_t H        = v->ne[1];
+    const int64_t n_tokens = v->ne[2];
+    const int64_t n_seqs   = v->ne[3];
+    const int64_t S_k      = k->ne[0];
+    const int64_t H_k      = k->ne[1];
+
+    GGML_ASSERT(S_k == S_v && q->ne[0] == S_k && q->ne[1] == H_k);
+    GGML_ASSERT(H % H_k == 0);
+    GGML_ASSERT(q->ne[2] == n_tokens && k->ne[2] == n_tokens && q->ne[3] == k->ne[3] && n_seqs % q->ne[3] == 0);
+    GGML_ASSERT(g->ne[0] == 1 && g->ne[1] == H && g->ne[2] == n_tokens && g->ne[3] == n_seqs);   // scalar gate only
+    GGML_ASSERT(beta->ne[0] == 1 && beta->ne[1] == H && beta->ne[2] == n_tokens && beta->ne[3] == n_seqs);
+    GGML_ASSERT(state->ne[0] == S_v && state->ne[1] == S_v && state->ne[2] == H && state->ne[3] == n_seqs);
+
+    GGML_ASSERT(n_ring >= 1);
+    GGML_ASSERT(ring->ne[0] % n_ring == 0 && ring->ne[1] == n_seqs && ring->ne[2] == 1 && ring->ne[3] == 1);
+    GGML_ASSERT(ring->ne[0] / n_ring >= S_k*H_k + S_v*H + 2*H);
+    GGML_ASSERT(ring_n->ne[0] == n_seqs && ggml_nelements(ring_n) == n_seqs);
+
+    const int64_t ne[4] = { S_v*H*n_tokens*n_seqs + S_v*S_v*H*n_seqs + ring->ne[0]*n_seqs, 1, 1, 1 };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 1, ne);
+
+    ggml_set_op_params_i32(result, 0, n_ring);
+
+    result->op     = GGML_OP_GATED_DELTA_NET_REPLAY;
+    result->src[0] = q;
+    result->src[1] = k;
+    result->src[2] = v;
+    result->src[3] = g;
+    result->src[4] = beta;
+    result->src[5] = state;
+    result->src[6] = ring;
+    result->src[7] = ring_n;
 
     return result;
 }

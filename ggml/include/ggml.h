@@ -654,6 +654,8 @@ extern "C" {
 
         GGML_OP_TURBOT_SET_ROWS, // [TAG_TURBOT] appended last so that no existing op value moves
 
+        GGML_OP_GATED_DELTA_NET_REPLAY, // [TAG_4C_GDN_REPLAY] appended last so that no existing op value moves
+
         GGML_OP_COUNT,
     };
 
@@ -2773,6 +2775,27 @@ extern "C" {
             struct ggml_tensor  * beta,
             struct ggml_tensor  * state,
             int64_t               K);
+
+    // [TAG_4C_GDN_REPLAY] gated_delta_net with one committed state per sequence and a ring of recent token inputs
+    // instead of K state snapshots. Scalar gate only. For each sequence s the op first applies the first ring_n[s]
+    // ring tokens to state (no attention output for them), then the n_tokens new tokens, with the per-token arithmetic
+    // of ggml_gated_delta_net. With n_w = min(n_tokens, n_ring):
+    //   ring   : F32 [n_ring*slot, n_seqs], token slot = k [S_k*H_k] | v [S_v*H_v] | g [H_v] | beta [H_v] | zero pad
+    //   ring_n : I32 [n_seqs], values in [0, n_ring]
+    // the output is 1D and packs the attention scores [S_v, H_v, n_tokens, n_seqs], then the state before the last n_w
+    // new tokens [S_v, S_v, H_v, n_seqs], then the new ring [n_ring*slot, n_seqs] (the last n_w new tokens in slots
+    // 0..n_w-1, zeros after them and in the pad).
+    GGML_API struct ggml_tensor * ggml_gated_delta_net_replay(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * g,
+            struct ggml_tensor  * beta,
+            struct ggml_tensor  * state,
+            struct ggml_tensor  * ring,
+            struct ggml_tensor  * ring_n,
+            int32_t               n_ring);
 
     // DSA lightning indexer
     //
