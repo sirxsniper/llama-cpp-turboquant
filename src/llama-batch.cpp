@@ -11,6 +11,7 @@
 #include <cstring>
 #include <algorithm>
 #include <sstream>
+#include <utility>
 
 llama_batch_allocr::llama_batch_allocr(uint32_t n_pos_per_embd) : n_pos_per_embd(n_pos_per_embd) {
     const char * LLAMA_BATCH_DEBUG = getenv("LLAMA_BATCH_DEBUG");
@@ -84,9 +85,9 @@ bool llama_batch_allocr::init(
         }
     }
 
-    if (has_embd) {
-        embd_vec = batch_inp.embd;
-    }
+    // [TAG_SYNC_BATCH_EXT_COMPAT] the rows are read in place (batch.embd below): batch_inp outlives every use of
+    // `batch`, which ends with the decode/encode call that passed it, and ubatch_add copies the rows it takes.
+    // The old llama_batch path did the same (a shallow copy of the caller's batch).
 
     //
     // build flat pos array
@@ -137,6 +138,11 @@ bool llama_batch_allocr::init(
             seq_id[i]   = seq_id_data.data() + off;
             off += n_seq_id[i];
 
+            // [TAG_SYNC_BATCH_EXT_COMPAT] seq_ids is an unordered_set, whose order differs between MSVC (insertion
+            // order) and libstdc++ (reversed). seq_id[i][0] picks the KV stream, the turbot row stamp and the
+            // split_seq group, so sort to make it the same on every platform
+            std::sort(seq_id[i], seq_id[i] + n_seq_id[i]);
+
             for (int32_t s = 0; s < n_seq_id[i]; ++s) {
                 if (seq_id[i][s] < 0 || seq_id[i][s] >= (llama_seq_id) n_seq_max) {
                     LLAMA_LOG_ERROR("%s: invalid seq_id[%d][%d] = %d >= %d\n", __func__, i, s, seq_id[i][s], (llama_seq_id) n_seq_max);
@@ -174,7 +180,7 @@ bool llama_batch_allocr::init(
 
     batch.n_tokens = n_tok;
     batch.token    = has_token ? token_vec.data() : nullptr;
-    batch.embd     = has_embd  ? embd_vec.data()  : nullptr;
+    batch.embd     = has_embd  ? const_cast<float *>(batch_inp.embd.data()) : nullptr; // [TAG_SYNC_BATCH_EXT_COMPAT] read only
     batch.pos      = pos.data();
     batch.n_seq_id = n_seq_id.data();
     batch.seq_id   = seq_id.data();
@@ -758,7 +764,6 @@ void llama_batch_allocr::clear() {
     batch = {};
 
     token_vec   .clear();
-    embd_vec    .clear();
     seq_id_data .clear();
     pos         .clear();
     n_seq_id    .clear();
@@ -1261,9 +1266,22 @@ void llama_batch_compat::init(llama_batch_ext & dst, const llama_batch & batch_i
     static const int32_t      default_n_seq_id  = 1;
 
     // auto-generates positions locally when batch_inp.pos is null, continuing from memory
-    std::vector<llama_pos> pos_next(batch_ext->n_seq_max);
-    for (llama_seq_id s = 0; s < (llama_seq_id) batch_ext->n_seq_max; ++s) {
-        pos_next[s] = llama_memory_seq_pos_max(batch_ext->mem, s) + 1; // assume next pos
+    // [TAG_SYNC_BATCH_EXT_COMPAT] only queried when positions are missing: every decode goes through here
+    std::vector<llama_pos> pos_next;
+    if (!batch_inp.pos) {
+        pos_next.resize(batch_ext->n_seq_max);
+        for (llama_seq_id s = 0; s < (llama_seq_id) batch_ext->n_seq_max; ++s) {
+            pos_next[s] = llama_memory_seq_pos_max(batch_ext->mem, s) + 1; // assume next pos
+        }
+    }
+
+    // [TAG_SYNC_BATCH_EXT_COMPAT] reserve up front: a DFlash2 inject row is n_target_layers * n_embd floats
+    // (100 KiB for Qwen3.8-27B), and growing the vector row by row copies a prefill chunk several times over
+    if (batch_inp.n_tokens > 0) {
+        batch_ext->tokens.reserve(batch_ext->tokens.size() + (size_t) batch_inp.n_tokens);
+        if (has_embd) {
+            batch_ext->embd.reserve(batch_ext->embd.size() + (size_t) batch_inp.n_tokens * n_embd_row);
+        }
     }
 
     for (int32_t i = 0; i < batch_inp.n_tokens; ++i) {
@@ -1290,7 +1308,12 @@ void llama_batch_compat::init(llama_batch_ext & dst, const llama_batch & batch_i
             }
         } else {
             // auto-generate position from the first seq_id
-            t.pos[0] = pos_next[sids[0]]++;
+            // [TAG_SYNC_BATCH_EXT_COMPAT] an out-of-range seq id keeps pos 0 instead of indexing past pos_next;
+            // llama_batch_allocr::init then rejects the batch with "invalid seq_id"
+            const llama_seq_id s0 = sids[0];
+            if (s0 >= 0 && s0 < (llama_seq_id) pos_next.size()) {
+                t.pos[0] = pos_next[s0]++;
+            }
         }
 
         // token id and/or embeddings
@@ -1312,7 +1335,7 @@ void llama_batch_compat::init(llama_batch_ext & dst, const llama_batch & batch_i
             ? (batch_inp.logits[i] != 0)
             : (i == batch_inp.n_tokens - 1);
 
-        batch_ext->tokens.push_back(t);
+        batch_ext->tokens.push_back(std::move(t)); // [TAG_SYNC_BATCH_EXT_COMPAT] no copy of the seq_ids set
     }
 }
 

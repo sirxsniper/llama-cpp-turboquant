@@ -5820,14 +5820,47 @@ size_t llama_state_seq_load_file(llama_context * ctx, const char * filepath, lla
 
 // compat: llama_batch -> llama_batch_ext -> encode/decode
 
+// [TAG_SYNC_BATCH_EXT_COMPAT] one conversion buffer per context, reused across calls. decode(ext) only forwards the
+// ext to encode(ext) and nothing inside encode/decode calls back into the llama_batch overloads, so the buffer is
+// never filled twice within one call.
+llama_batch_ext & llama_context::batch_compat_get() {
+    if (!batch_compat) {
+        batch_compat = std::make_unique<llama_batch_ext>(this);
+    }
+    batch_compat->clear();
+    batch_compat->mem = memory.get();
+
+    return *batch_compat;
+}
+
 int llama_context::encode(const llama_batch & batch_inp) {
-    llama_batch_compat compat(this, batch_inp, model.hparams.n_embd_inp_enc());
-    return encode(*compat.batch_ext);
+    llama_batch_ext & batch_ext = batch_compat_get();
+    llama_batch_compat::init(batch_ext, batch_inp, model.hparams.n_embd_inp_enc());
+
+    // [TAG_SYNC_BATCH_EXT_COMPAT] encode outputs every token. Without a logits array compat marks only the last one,
+    // and llama_batch_allocr::init would then warn on every call (every EAGLE3 encode chunk) before overriding it.
+    if (!batch_inp.logits) {
+        for (auto & tok : batch_ext.tokens) {
+            tok.output = true;
+        }
+    }
+
+    return encode(batch_ext);
 }
 
 int llama_context::decode(const llama_batch & batch_inp) {
-    llama_batch_compat compat(this, batch_inp);
-    return decode(*compat.batch_ext);
+    llama_batch_ext & batch_ext = batch_compat_get();
+    llama_batch_compat::init(batch_ext, batch_inp);
+
+    // [TAG_SYNC_BATCH_EXT_COMPAT] embedding contexts output every token; the old llama_batch path filled the outputs
+    // silently when no logits array was given, keep that instead of the per-call override warning
+    if (cparams.embeddings && !batch_inp.logits) {
+        for (auto & tok : batch_ext.tokens) {
+            tok.output = true;
+        }
+    }
+
+    return decode(batch_ext);
 }
 
 ///

@@ -345,6 +345,14 @@ private:
     // reuse the batch_allocr to avoid unnecessary memory allocations
     std::unique_ptr<llama_batch_allocr> balloc;
 
+    // [TAG_SYNC_BATCH_EXT_COMPAT] reused llama_batch -> llama_batch_ext conversion for encode/decode(const llama_batch &).
+    // A fresh llama_batch_ext per call regrew its embd vector row by row and, above ~512 KiB on Windows, faulted in
+    // new pages every time; the DFlash2 inject rows (100 KiB each) made that a per-step and per-prefill-chunk cost.
+    // Created on first use; cleared (capacity kept) on every call.
+    std::unique_ptr<llama_batch_ext> batch_compat;
+
+    llama_batch_ext & batch_compat_get();
+
     uint32_t n_input_tensors = 0; // number of tensors marked as input during the last graph reserve
     uint32_t n_outputs = 0; // number of actually-used outputs in the current ubatch or last logical batch
 
