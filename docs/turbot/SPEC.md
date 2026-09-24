@@ -933,6 +933,9 @@ ubatch in flight plus one partly filled granule. max must be a non-negative mult
 POOL. Unified cache, CAP 16384: -np 1 / 2 / 3 / 4 give 18624 / 35136 / 51648 / 65536 cells (the last capped), so -np 4
 keeps the built-in plan's hash 0x56c3503c949a7749. One INFO line: `turbot plan <src> line N: POOL auto = P cells
 (n_seq_max S, n_stream N, CAP C)`. `tools/turbot/plan_vram.py --np N` resolves it the same way.
+The 33-granule headroom assumes -ub <= 2048 (the ubatch whose rows are in flight). A larger -ub with a full
+band can find no free pool row: the tier then evicts young granules (or writes the row old-only), which
+costs quality, not correctness. Use a numeric POOL for such runs.
 
 POOL 0 is allowed as a diagnostic arm:
 - every row is written old-only (young rows −1, gtab all −1, no fill);
