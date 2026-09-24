@@ -648,10 +648,23 @@ static void set_env_gdn_replay(const char * value) {
 #endif
 }
 
+// [TAG_GDN_CHUNKED_PF] nullptr removes the variable
+static void set_env_var(const char * name, const char * value) {
+#ifdef _WIN32
+    _putenv_s(name, value == nullptr ? "" : value);
+#else
+    if (value == nullptr) {
+        unsetenv(name);
+    } else {
+        setenv(name, value, 1);
+    }
+#endif
+}
+
 // [TAG_4C_GDN_REPLAY] The replay layout (one committed state and a ring of token inputs) must give the logits of the
 // snapshot layout (GDN_REPLAY=0) bit for bit: a prefill, verify steps on two sequences with rollbacks of 0..3 tokens, a
-// single-token decode, and a save/restore of a sequence with a pending rollback. Models without the replay layout
-// compare two identical contexts.
+// single-token decode, a save/restore of a sequence with a pending rollback, and a longer prefill on the chunked prefill
+// split ([TAG_GDN_CHUNKED_PF]). Models without the replay layout compare two identical contexts.
 static bool test_replay_vs_snapshot(const common_params & params, llama_model * model, uint8_t fill) {
     const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
 
@@ -684,9 +697,16 @@ static bool test_replay_vs_snapshot(const common_params & params, llama_model * 
     llama_context * ctx_rpl  = make("1");
     set_env_gdn_replay(env_old ? env_old_s.c_str() : nullptr);
 
+    // [TAG_GDN_CHUNKED_PF] threshold 16: the 32-token ubatches of "prefill 2" take the chunked prefill split. main keeps
+    //   the CUDA chunked kernel off, so the split runs sequential kernels and must stay bitwise equal as well.
+    const char * pf_old = getenv("GDN_CHUNKED_PF_MIN");
+    const std::string pf_old_s = pf_old ? pf_old : "";
+    set_env_var("GDN_CHUNKED_PF_MIN", "16");
+
     const auto cleanup = [&]() {
         llama_free(ctx_snap);
         llama_free(ctx_rpl);
+        set_env_var("GDN_CHUNKED_PF_MIN", pf_old ? pf_old_s.c_str() : nullptr);
     };
 
     if (ctx_snap == nullptr || ctx_rpl == nullptr) {
@@ -794,6 +814,11 @@ static bool test_replay_vs_snapshot(const common_params & params, llama_model * 
     ok = ok && save_restore(1);
     ok = ok && step("verify 4", { { 0, {  4, 2 } }, { 1, {  4, 0 } } });
     ok = ok && rollback(0, 2);
+    // [TAG_GDN_CHUNKED_PF] a ubatch of 32 tokens per sequence with 1 (seq 0) and 3 (seq 1) ring tokens pending takes the
+    //   split, the next ubatch of 8 replays its ring
+    ok = ok && step("prefill 2", { { 0, { 40, 0 } }, { 1, { 40, 0 } } });
+    ok = ok && step("verify 5",  { { 0, {  4, 3 } }, { 1, {  4, 1 } } });
+    ok = ok && rollback(0, 3) && rollback(1, 1);
     ok = ok && step("decode 2", { { 0, {  1, 0 } }, { 1, {  1, 0 } } });
 
     if (ok) {
@@ -814,6 +839,12 @@ int main(int argc, char ** argv) {
 
     if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_COMMON)) {
         return 1;
+    }
+
+    // [TAG_GDN_CHUNKED_PF] the bitwise checks need the sequential GDN kernels (the CUDA backend reads this once); the
+    //   chunked prefill kernel is checked by test-backend-ops GATED_DELTA_NET_REPLAY_CHUNKED_PF
+    if (getenv("GGML_CUDA_DISABLE_GDN_CHUNK") == nullptr) {
+        set_env_var("GGML_CUDA_DISABLE_GDN_CHUNK", "1");
     }
 
     ggml_backend_load_all();

@@ -5309,6 +5309,187 @@ struct test_gated_delta_net_replay_exact : public test_case {
     }
 };
 
+// [TAG_GDN_CHUNKED_PF] the chunked prefill split of src/models/delta-net-base.cpp (replay op over token 0, K = 1 op with
+// the chunk-min hint over the first n_pre = T - n_w tokens, replay op over the last n_w tokens with ring_n = 0) against
+// one replay op over the same inputs. The output is [split | single], each packed as [attn | committed state | ring].
+// err() checks the ring of the split against the single op exactly on the tested backend (the cache layout), the
+// split against the single op exactly on the CPU reference (sequential code everywhere), and the split of the tested
+// backend (chunked prefix where eligible) against the CPU single op, the sequential reference, within max_nmse_err.
+struct test_gated_delta_net_replay_chunked_pf : public test_case {
+    const int64_t head_count; // k heads
+    const int64_t head_size;
+    const int64_t n_seq_tokens;
+    const int64_t n_seqs;
+    const int     v_repeat;
+    const int     n_ring;
+    const bool    strided_v;
+
+    // sizes of one packed result, set by build_graph
+    size_t n_attn  = 0;
+    size_t n_state = 0;
+    size_t n_rings = 0;
+
+    std::string vars() override {
+        return VARS_TO_STR7(head_count, head_size, n_seq_tokens, n_seqs, v_repeat, n_ring, strided_v);
+    }
+
+    test_gated_delta_net_replay_chunked_pf(int64_t head_count = 4, int64_t head_size = 128, int64_t n_seq_tokens = 128,
+            int64_t n_seqs = 1, int v_repeat = 1, int n_ring = 3, bool strided_v = false)
+        : head_count(head_count), head_size(head_size), n_seq_tokens(n_seq_tokens), n_seqs(n_seqs),
+          v_repeat(v_repeat), n_ring(n_ring), strided_v(strided_v) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const ggml_type type = GGML_TYPE_F32;
+
+        const int64_t S     = head_size;
+        const int64_t H     = head_count * v_repeat;
+        const int64_t T     = n_seq_tokens;
+        const int64_t n_w   = std::min<int64_t>(T, n_ring);
+        const int64_t n_pre = T - n_w;
+        GGML_ASSERT(n_pre >= 1);
+
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, type, S, head_count, T, n_seqs);
+        ggml_tensor * k = ggml_new_tensor_4d(ctx, type, S, head_count, T, n_seqs);
+        ggml_tensor * v;
+        if (strided_v) {
+            const int64_t qkv_dim = S * (2 * head_count + H);
+            ggml_tensor * qkv = ggml_new_tensor_3d(ctx, type, qkv_dim, T, n_seqs);
+            ggml_set_name(qkv, "v_qkv");
+            const size_t nb1_qkv = ggml_row_size(type, qkv_dim);
+            v = ggml_view_4d(ctx, qkv, S, H, T, n_seqs,
+                    ggml_row_size(type, S), nb1_qkv, nb1_qkv * T, ggml_row_size(type, 2 * S * head_count));
+        } else {
+            v = ggml_new_tensor_4d(ctx, type, S, H, T, n_seqs);
+        }
+        ggml_set_name(q, "q");
+        ggml_set_name(k, "k");
+        ggml_set_name(v, "v");
+        ggml_tensor * g      = ggml_new_tensor_4d(ctx, type, 1, H, T, n_seqs);
+        ggml_tensor * beta   = ggml_new_tensor_4d(ctx, type, 1, H, T, n_seqs);
+        ggml_tensor * state  = ggml_new_tensor_4d(ctx, type, S, S, H, n_seqs);
+        const int64_t slot   = S*head_count + S*H + 2*H;
+        ggml_tensor * ring   = ggml_new_tensor_2d(ctx, type, n_ring*slot, n_seqs);
+        ggml_tensor * ring_n = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_seqs);
+        ggml_set_name(g,      "g");
+        ggml_set_name(beta,   "beta");
+        ggml_set_name(state,  "state");
+        ggml_set_name(ring,   "ring");
+        ggml_set_name(ring_n, "ring_n");
+
+        q = ggml_l2_norm(ctx, q, 1e-6f);
+        k = ggml_l2_norm(ctx, k, 1e-6f);
+
+        // same token views as the model graph
+        auto tok = [&](ggml_tensor * t, int64_t t0, int64_t nt, bool need_cont) {
+            ggml_tensor * r = ggml_view_4d(ctx, t, t->ne[0], t->ne[1], nt, t->ne[3], t->nb[1], t->nb[2], t->nb[3], (size_t) t0*t->nb[2]);
+            return need_cont && !ggml_is_contiguous(r) ? ggml_cont(ctx, r) : r;
+        };
+
+        const int64_t D        = S * S * H;
+        const int64_t ring_row = n_ring * slot;
+
+        ggml_tensor * head = ggml_gated_delta_net_replay(ctx, tok(q, 0, 1, false), tok(k, 0, 1, false), tok(v, 0, 1, false),
+                tok(g, 0, 1, true), tok(beta, 0, 1, true), state, ring, ring_n, n_ring);
+        ggml_tensor * s_pre = ggml_view_4d(ctx, head, S, S, H, n_seqs, ggml_row_size(type, S), ggml_row_size(type, S*S),
+                ggml_row_size(type, D), ggml_row_size(type, S*H*n_seqs));
+
+        ggml_tensor * pre = ggml_gated_delta_net(ctx, tok(q, 0, n_pre, false), tok(k, 0, n_pre, false), tok(v, 0, n_pre, false),
+                tok(g, 0, n_pre, true), tok(beta, 0, n_pre, true), s_pre, 1);
+        ggml_gated_delta_net_set_chunk_min(pre, (int32_t) n_pre);
+        ggml_tensor * attn_pre = ggml_view_4d(ctx, pre, S, H, n_pre, n_seqs, ggml_row_size(type, S), ggml_row_size(type, S*H),
+                ggml_row_size(type, S*H*n_pre), 0);
+        ggml_tensor * s_tail = ggml_view_4d(ctx, pre, S, S, H, n_seqs, ggml_row_size(type, S), ggml_row_size(type, S*S),
+                ggml_row_size(type, D), ggml_row_size(type, S*H*n_pre*n_seqs));
+
+        ggml_tensor * ring_n_zero = ggml_cast(ctx, ggml_fill(ctx, ggml_view_1d(ctx, ring, n_seqs, 0), 0.0f), GGML_TYPE_I32);
+        ggml_tensor * tail = ggml_gated_delta_net_replay(ctx, tok(q, n_pre, n_w, false), tok(k, n_pre, n_w, false),
+                tok(v, n_pre, n_w, false), tok(g, n_pre, n_w, true), tok(beta, n_pre, n_w, true), s_tail, ring,
+                ring_n_zero, n_ring);
+        ggml_tensor * attn_tail = ggml_view_4d(ctx, tail, S, H, n_w, n_seqs, ggml_row_size(type, S), ggml_row_size(type, S*H),
+                ggml_row_size(type, S*H*n_w), 0);
+
+        ggml_tensor * attn  = ggml_concat(ctx, attn_pre, attn_tail, 2);
+        ggml_tensor * rest  = ggml_view_1d(ctx, tail, D*n_seqs + ring_row*n_seqs, ggml_row_size(type, S*H*n_w*n_seqs));
+        ggml_tensor * split = ggml_concat(ctx, ggml_reshape_1d(ctx, attn, ggml_nelements(attn)), rest, 0);
+
+        ggml_tensor * single = ggml_gated_delta_net_replay(ctx, q, k, v, g, beta, state, ring, ring_n, n_ring);
+
+        n_attn  = (size_t) (S*H*T*n_seqs);
+        n_state = (size_t) (D*n_seqs);
+        n_rings = (size_t) (ring_row*n_seqs);
+        GGML_ASSERT((size_t) ggml_nelements(split) == n_attn + n_state + n_rings);
+        GGML_ASSERT(ggml_nelements(single) == ggml_nelements(split));
+
+        ggml_tensor * out = ggml_concat(ctx, split, single, 0);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "GATED_DELTA_NET_REPLAY_CHUNKED_PF";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    double max_nmse_err() override {
+        // head size 128 can take the mixed fp16 chunked CUDA kernel; the other sizes run the sequential code
+        return head_size == 128 ? 1e-6 : 1e-7;
+    }
+
+    double err(const float * a, const float * b, size_t n) override {
+        const size_t N = n_attn + n_state + n_rings;
+        GGML_ASSERT(n == 2*N);
+        const float * a_split  = a;
+        const float * a_single = a + N;
+        const float * b_split  = b;
+        const float * b_single = b + N;
+        auto same = [](const float * x, const float * y, size_t m) {
+            for (size_t i = 0; i < m; i++) {
+                if (!(x[i] == y[i])) {
+                    return false;
+                }
+            }
+            return true;
+        };
+        // the ring is a copy of the tail inputs: bit for bit the single op's ring
+        if (!same(a_split + n_attn + n_state, a_single + n_attn + n_state, n_rings)) {
+            printf("[split ring differs from the single op] ");
+            return 1.0;
+        }
+        // the CPU runs the sequential per-token code in every step, so the split is the single op there
+        if (!same(b_split, b_single, N)) {
+            printf("[CPU split differs from the CPU single op] ");
+            return 1.0;
+        }
+        // no head size but 128 has a chunked kernel, so the split is the single op on the tested backend too
+        if (head_size != 128 && !same(a_split, a_single, N)) {
+            printf("[sequential split differs from the single op] ");
+            return 1.0;
+        }
+        return std::max(nmse(a_split, b_single, N), nmse(a_single, b_single, N));
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (ggml_is_view_op(t->op)) { continue; }
+            if (strcmp(t->name, "g") == 0) {
+                init_tensor_uniform(t, -20.0f, -1e-4f);
+            } else if (strcmp(t->name, "beta") == 0) {
+                init_tensor_uniform(t, 0.0f, 1.0f);
+            } else if (strcmp(t->name, "v") == 0 || strcmp(t->name, "v_qkv") == 0) {
+                init_tensor_uniform(t, -0.3f, 5.0f);
+            } else if (strcmp(t->name, "ring") == 0) {
+                init_gdn_replay_ring(t, head_size, head_count, head_count * v_repeat, n_ring);
+            } else if (strcmp(t->name, "ring_n") == 0) {
+                init_gdn_replay_ring_n(t, n_ring);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_OP_GATED_LINEAR_ATTN
 struct test_gla : public test_case {
     const ggml_type type;
@@ -13272,6 +13453,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net_replay_exact(4,  64, 2, 4, 2, 1, 3, 2));
     test_cases.emplace_back(new test_gated_delta_net_replay_exact(2,  16, 9, 4, 1, 1, 8, 5));
     test_cases.emplace_back(new test_gated_delta_net_replay_exact(4, 128, 40, 4, 2, 3, 3, 1));
+    // [TAG_GDN_CHUNKED_PF] chunked prefill split vs one replay op: (k heads, head size, tokens, seqs, v_repeat, n_ring,
+    // strided_v). Head size 128 takes the CUDA chunked kernel (NVIDIA Ampere+), the others the sequential one.
+    test_cases.emplace_back(new test_gated_delta_net_replay_chunked_pf(4, 128, 128, 1, 3, 3));         // Qwen3.8 head ratio
+    test_cases.emplace_back(new test_gated_delta_net_replay_chunked_pf(4, 128, 128, 4, 3, 3, true));   // 4 prompts, QKV view
+    test_cases.emplace_back(new test_gated_delta_net_replay_chunked_pf(4, 128, 200, 2, 2, 1));         // n_ring 1
+    test_cases.emplace_back(new test_gated_delta_net_replay_chunked_pf(4, 128,  67, 3, 1, 3, true));   // prefix 64
+    test_cases.emplace_back(new test_gated_delta_net_replay_chunked_pf(4,  32,  80, 2, 1, 3));
+    test_cases.emplace_back(new test_gated_delta_net_replay_chunked_pf(2,  16,  40, 4, 1, 8, true));   // long ring
 
 #if 0
     // these tests are disabled to save execution time, sbut they can be handy for debugging

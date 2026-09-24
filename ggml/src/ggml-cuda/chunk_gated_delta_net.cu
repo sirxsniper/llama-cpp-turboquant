@@ -147,7 +147,9 @@ __launch_bounds__(128, 4) __global__ void cgdr_fwdsub_intra_kernel(
     int       K_dim,
     int       V_dim,
     int       num_k_heads,   // q/k head count (H if MHA; H is the v-head count for GQA)
-    long long v_tok_stride)  // elements between V tokens (H*V_dim if contiguous; QKV row width if fused)
+    long long v_tok_stride,  // elements between V tokens (H*V_dim if contiguous; QKV row width if fused)
+    long long k_seq_stride,  // [TAG_GDN_CHUNKED_PF] elements between K sequences (seq_len*num_k_heads*K_dim if contiguous)
+    long long v_seq_stride)  // [TAG_GDN_CHUNKED_PF] elements between V sequences (seq_len*v_tok_stride if packed)
 {
     static_assert(BK == 128, "cgdr_fwdsub_intra_kernel: BK=128 only");
 
@@ -175,9 +177,9 @@ __launch_bounds__(128, 4) __global__ void cgdr_fwdsub_intra_kernel(
 
     // V may be a strided view of the fused QKV buffer: token stride is v_tok_stride (not H*V_dim),
     // but v-heads stay packed (head stride V_dim) and elements contiguous, so only the token stride
-    // and seq stride (= seq_len * v_tok_stride) differ from the contiguous [B,T,H,V] case.
-    const float * k_chunk    = K + (long long) b * seq_len * HK + t_off * HK + h_k * K_dim;
-    const float * v_chunk    = V + (long long) b * seq_len * v_tok_stride + t_off * v_tok_stride + h * V_dim;
+    // and seq stride differ from the contiguous [B,T,H,V] case. K may have its own seq stride too.
+    const float * k_chunk    = K + (long long) b * k_seq_stride + t_off * HK + h_k * K_dim;
+    const float * v_chunk    = V + (long long) b * v_seq_stride + t_off * v_tok_stride + h * V_dim;
     const float * beta_chunk = Beta + (long long) b * seq_len * H + t_off * H + h;
     const float * g_chunk    = G + (long long) b * seq_len * H + t_off * H + h;
 
@@ -293,7 +295,8 @@ __launch_bounds__(32, 8) __global__ void cgdr_precompute_qk_wmma_kernel(const fl
                                                                         float scale,
                                                                         int   H,
                                                                         int   num_k_heads,
-                                                                        int   seq_len) {
+                                                                        int   seq_len,
+                                                                        long long qk_seq_stride) {
 #ifdef GDN_TC_AVAILABLE
     static_assert(CS == 16, "preqk requires CS=16");
     static_assert(BK % 16 == 0, "BK must be a multiple of 16");
@@ -315,8 +318,8 @@ __launch_bounds__(32, 8) __global__ void cgdr_precompute_qk_wmma_kernel(const fl
     const long long HK    = (long long) num_k_heads * BK;  // q/k token stride (un-repeated k-head count)
     const int       t_off = c * CS;
 
-    const float * Q_chunk = Q_raw + (long long) b_idx * seq_len * HK + t_off * HK + h_k * BK;
-    const float * K_chunk = K_raw + (long long) b_idx * seq_len * HK + t_off * HK + h_k * BK;
+    const float * Q_chunk = Q_raw + (long long) b_idx * qk_seq_stride + t_off * HK + h_k * BK;
+    const float * K_chunk = K_raw + (long long) b_idx * qk_seq_stride + t_off * HK + h_k * BK;
 
     if (tid < CS) {  // only CS of the 32 threads have work
         s_gcum[tid] = g_cum[(bh * num_chunks + c) * CS + tid];
@@ -359,6 +362,7 @@ __launch_bounds__(32, 8) __global__ void cgdr_precompute_qk_wmma_kernel(const fl
     (void) H;
     (void) num_k_heads;
     (void) seq_len;
+    (void) qk_seq_stride;
     __trap();
 #endif
 }
@@ -390,7 +394,8 @@ __launch_bounds__(NT, OCC) __global__ void cgdr_state_wmma_kernel(
     int   H,
     int   num_k_heads,
     int   V_dim,
-    int   seq_len) {
+    int   seq_len,
+    long long qk_seq_stride) {  // [TAG_GDN_CHUNKED_PF] elements between Q/K sequences
 #if defined(GDN_TC_AVAILABLE) || !defined(__CUDA_ARCH__)
     static_assert(BK == 128, "fp16 state kernel requires BK=128");
     static_assert(CS == 16, "fp16 state kernel requires CS=16");
@@ -452,8 +457,8 @@ __launch_bounds__(NT, OCC) __global__ void cgdr_state_wmma_kernel(
     const long long HK      = (long long) num_k_heads * BK;  // q/k token stride (un-repeated k-head count)
     const long long T_total = seq_len;                       // actual token count (NOT num_chunks*CS, which rounds up)
     float *       out_bh = Output + (long long) b_idx * T_total * H * V_dim + (long long) h_idx * V_dim + v_off;
-    const float * Kraw_bh = K_raw + (long long) b_idx * seq_len * HK + h_k * BK;
-    const float * Qraw_bh = Q_raw + (long long) b_idx * seq_len * HK + h_k * BK;
+    const float * Kraw_bh = K_raw + (long long) b_idx * qk_seq_stride + h_k * BK;
+    const float * Qraw_bh = Q_raw + (long long) b_idx * qk_seq_stride + h_k * BK;
 
     // FP32 H state in thread registers -- persistent across all chunks (no per-chunk fp16 rounding).
     float h_regs[EPT_H];
@@ -632,6 +637,7 @@ __launch_bounds__(NT, OCC) __global__ void cgdr_state_wmma_kernel(
     (void) num_k_heads;
     (void) V_dim;
     (void) seq_len;
+    (void) qk_seq_stride;
     __trap();
 #endif
 }
@@ -674,6 +680,8 @@ static void ggml_cuda_op_gated_delta_net_chunked_impl(ggml_backend_cuda_context 
                                                       const float *               s_d,
                                                       float                       scale,
                                                       long long                   v_tok_stride,
+                                                      long long                   v_seq_stride,
+                                                      long long                   qk_seq_stride,
                                                       cudaStream_t                stream) {
     ggml_cuda_pool & pool = ctx.pool();
 
@@ -696,7 +704,7 @@ static void ggml_cuda_op_gated_delta_net_chunked_impl(ggml_backend_cuda_context 
         const dim3   intra_grid(B * H, num_chunks, 1);
         cgdr_fwdsub_intra_kernel<CS, 128><<<intra_grid, 128, fs_smem, stream>>>(
             k_in, v_in, b_in, g_in, v_corr_buf.get(), k_cumdecay_buf.get(), g_cum_buf.get(), B, T, H, num_chunks, K_dim,
-            V_dim, num_k_heads, v_tok_stride);
+            V_dim, num_k_heads, v_tok_stride, qk_seq_stride, v_seq_stride);
     }
     CUDA_CHECK(cudaGetLastError());
 
@@ -705,7 +713,7 @@ static void ggml_cuda_op_gated_delta_net_chunked_impl(ggml_backend_cuda_context 
         const size_t qk_smem = cgdr_smem_preqk_wmma(CS, K_dim);  // 9.1 KB < 48 KB -> no opt-in needed
         const dim3   qk_grid(B * H, num_chunks, 1);
         cgdr_precompute_qk_wmma_kernel<CS, 128><<<qk_grid, 32, qk_smem, stream>>>(
-            q_in, k_in, g_cum_buf.get(), qk_buf.get(), num_chunks, scale, H, num_k_heads, T);
+            q_in, k_in, g_cum_buf.get(), qk_buf.get(), num_chunks, scale, H, num_k_heads, T, qk_seq_stride);
     }
     CUDA_CHECK(cudaGetLastError());
 
@@ -726,7 +734,7 @@ static void ggml_cuda_op_gated_delta_net_chunked_impl(ggml_backend_cuda_context 
 #endif
         cgdr_state_wmma_kernel<CS, 128, BV, NT, OCC><<<state_grid, state_block, st_smem, stream>>>(
             v_corr_buf.get(), k_cumdecay_buf.get(), k_in, q_in, g_cum_buf.get(), qk_buf.get(), (float *) dst->data,
-            s_d, state_dst, scale, num_chunks, H, num_k_heads, V_dim, T);
+            s_d, state_dst, scale, num_chunks, H, num_k_heads, V_dim, T, qk_seq_stride);
     }
     CUDA_CHECK(cudaGetLastError());
 }
@@ -751,21 +759,24 @@ void ggml_cuda_op_gated_delta_net_chunked(ggml_backend_cuda_context & ctx, ggml_
     const int K_dim       = (int) neq0;
     const int num_k_heads = (int) neq1;  // q/k head count; <= H (v-head count) for GQA
 
-    GGML_ASSERT(ggml_is_contiguous(src_q));
-    GGML_ASSERT(ggml_is_contiguous(src_k));
+    // [TAG_GDN_CHUNKED_PF] Q/K: tokens packed (head stride K_dim, token stride num_k_heads*K_dim), same strides, any
+    // sequence stride, so the prefix of a longer ubatch (a view) runs here too. G/beta/state stay contiguous.
+    const size_t qsz = ggml_type_size(src_q->type);
+    GGML_ASSERT(src_q->nb[0] == qsz && src_q->nb[1] == (size_t) K_dim * qsz &&
+                src_q->nb[2] == (size_t) num_k_heads * src_q->nb[1] && ggml_are_same_stride(src_q, src_k) &&
+                "chunked GDN requires Q/K tokens packed, with the same strides");
+    GGML_ASSERT(src_q->ne[3] == B && src_k->ne[3] == B && "chunked GDN: no Q/K broadcast over sequences");
     GGML_ASSERT(ggml_is_contiguous(src_g));
     GGML_ASSERT(ggml_is_contiguous(src_beta));
     GGML_ASSERT(ggml_is_contiguous(src_state));
-    // V may be a strided view of the fused QKV buffer (no cont in the model graph). The intra kernel
-    // handles an arbitrary token stride (nb2), but the rest of the V layout must be packed, because
-    // the kernels derive the per-sequence stride as seq_len * token_stride: elements packed
-    // (nb0 == elt), v-heads packed (nb1 == V_dim*elt), and sequences packed with no padding
-    // (nb3 == T*nb2). Q/K/G/beta/state get all of this from the ggml_is_contiguous asserts above.
+    const long long qk_seq_stride = (long long) (src_q->nb[3] / qsz);
+    // V may be a strided view of the fused QKV buffer (no cont in the model graph): elements packed (nb0 == elt) and
+    // v-heads packed (nb1 == V_dim*elt); the token stride (nb2) and sequence stride (nb3) are passed to the kernels.
     const size_t vsz = ggml_type_size(src_v->type);
     GGML_ASSERT(src_v->nb[0] == vsz && src_v->nb[1] == (size_t) V_dim * vsz &&
-                src_v->nb[3] == (size_t) T * src_v->nb[2] &&
-                "chunked GDN requires V packed within a token and across sequences (nb3 == T*nb2)");
+                "chunked GDN requires V packed within a token");
     const long long v_tok_stride = (long long) (src_v->nb[2] / vsz);
+    const long long v_seq_stride = (long long) (src_v->nb[3] / vsz);
     // The state kernel uses BK=128 as the state's key-row stride, but GGML stores the state square
     // ([S_v, S_v] per head), so the layouts only line up at K_dim == V_dim == 128. The eligibility
     // predicate already guarantees this; re-assert so a future dispatch bug fails loudly instead of
@@ -794,5 +805,6 @@ void ggml_cuda_op_gated_delta_net_chunked(ggml_backend_cuda_context & ctx, ggml_
     // num_chunks = ceil(T/CS): the last chunk may be partial; the kernels guard the padding tokens.
     const int num_chunks = (T + 15) / 16;
     ggml_cuda_op_gated_delta_net_chunked_impl(ctx, dst, B, T, H, num_k_heads, K_dim, V_dim, num_chunks, q_in, k_in,
-                                              v_in, g_in, b_in, s_d, scale, v_tok_stride, stream);
+                                              v_in, g_in, b_in, s_d, scale, v_tok_stride, v_seq_stride, qk_seq_stride,
+                                              stream);
 }

@@ -6678,6 +6678,15 @@ struct ggml_tensor * ggml_gated_delta_net(
     return result;
 }
 
+// [TAG_GDN_CHUNKED_PF]
+void ggml_gated_delta_net_set_chunk_min(
+        struct ggml_tensor * a,
+        int32_t              n_min) {
+    GGML_ASSERT(a->op == GGML_OP_GATED_DELTA_NET);
+    GGML_ASSERT(ggml_get_op_params_i32(a, 0) == 1); // the chunked kernels keep the final state only
+    ggml_set_op_params_i32(a, 1, n_min);
+}
+
 // ggml_gated_delta_net_replay [TAG_4C_GDN_REPLAY]
 
 struct ggml_tensor * ggml_gated_delta_net_replay(

@@ -51,8 +51,8 @@ static bool llama_xseq_fix_enabled() {
 // Why decode stays bit-identical: each token applies the same f32 update to the same f32 inputs in the same order as
 //   in the snapshot kernel. C and the ring are exact copies, so the state after the replay has the bits of the group
 //   the old path would read, and the new tokens then run the old per-token code. The old kernel is not changed.
-// Prefill: unchanged, the sequential kernel as with K > 1 before. A single committed state would let the chunked
-//   kernel run the first T - n_w tokens of a long ubatch; that is a follow-up and is not bit-identical.
+// Prefill: [TAG_GDN_CHUNKED_PF] a long ubatch runs its first T - n_w tokens on the chunked kernel and the last n_w on the
+//   replay op, with the same committed state and ring layout (design note in src/models/delta-net-base.cpp).
 // Cost: the kernel runs up to n_rs_seq extra state-only token steps and writes 1 state per cell instead of K.
 static bool llama_gdn_replay_env() {
     // read at every memory creation, so a test can compare both layouts in one process

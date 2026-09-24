@@ -250,6 +250,14 @@ static void launch_gated_delta_net(
     }
 }
 
+// [TAG_GDN_CHUNKED_PF] Q/K layout of the chunked kernels: tokens packed (head stride ne0, token stride ne1*ne0) with any
+// sequence stride, so a token range of a longer ubatch (a view) is accepted
+static bool gdn_chunk_qk_packed(const ggml_tensor * t) {
+    const size_t ts = ggml_type_size(t->type);
+    return t->nb[0] == ts && t->nb[1] == (size_t) t->ne[0] * ts && t->nb[2] == (size_t) t->ne[1] * t->nb[1] &&
+        t->nb[3] % ts == 0;
+}
+
 // Shared routing predicate for dispatch and CUDA-graph eligibility. Both must use the same result
 // because the chunked path uses pool allocations that cannot be captured.
 bool ggml_cuda_gdn_op_is_chunked(const ggml_tensor * dst) {
@@ -271,6 +279,10 @@ bool ggml_cuda_gdn_op_is_chunked(const ggml_tensor * dst) {
     const int64_t nev1     = src_v->ne[1];   // v head count
     const bool    kda      = (src_g->ne[0] == S_v);
     const int     K        = ggml_get_op_params_i32(dst, 0);
+    // [TAG_GDN_CHUNKED_PF] the prefix op of a chunked replay-layout prefill brings its own token threshold
+    // (ggml_gated_delta_net_set_chunk_min); every other op keeps 128
+    const int     n_min_pf = ggml_get_op_params_i32(dst, 1);
+    const int64_t n_min    = n_min_pf > 0 ? n_min_pf : 128;
 
     // Disabled only when explicitly truthy; "0" (or unset) keeps the chunked path on.
     static const bool chunk_disabled = [] {
@@ -282,20 +294,21 @@ bool ggml_cuda_gdn_op_is_chunked(const ggml_tensor * dst) {
     const bool is_nvidia = GGML_CUDA_CC_IS_NVIDIA(cc_dev);
 
     // - NVIDIA Ampere+ (fp16 WMMA); not KDA; K == 1 (final state only)
-    // - Q/K/G/beta/state must be contiguous
-    //   (nb[0]/nb[1] packed) with arbitrary token stride (fused QKV view) 
-    // - V is packed per token (nb[2]) and across sequences (nb[3] == n_tokens*nb[2]).
-    // - 128-wide heads, GQA-aligned head counts, n_tokens >= 128
+    // - Q/K: same shape and strides, tokens packed, any sequence stride, no broadcast over sequences
+    // - G/beta/state contiguous
+    // - V packed within a token (nb[0]/nb[1]), any token stride (fused QKV view) and sequence stride
+    // - 128-wide heads, GQA-aligned head counts, n_tokens >= n_min
     return is_nvidia
         && cc_dev >= GGML_CUDA_CC_AMPERE
         && !chunk_disabled
         && !kda && K == 1
         && neq0 == 128 && S_v == 128 && nev1 % neq1 == 0
         && src_k->ne[1] == neq1
-        && n_tokens >= 128
-        && ggml_is_contiguous(src_q) && ggml_is_contiguous(src_k) && ggml_is_contiguous(src_g)
+        && src_q->ne[3] == src_v->ne[3]
+        && n_tokens >= n_min
+        && gdn_chunk_qk_packed(src_q) && ggml_are_same_shape(src_q, src_k) && ggml_are_same_stride(src_q, src_k)
+        && ggml_is_contiguous(src_g)
         && src_v->nb[0] == ggml_type_size(src_v->type) && src_v->nb[1] == (size_t)S_v * ggml_type_size(src_v->type)
-        && src_v->nb[3] == (size_t) n_tokens * src_v->nb[2]
         && ggml_is_contiguous(src_beta) && ggml_is_contiguous(src_state);
 }
 
@@ -314,8 +327,10 @@ static void turbo_probe_gdn(const ggml_tensor * dst, bool chunked) {
     // that and answered the wrong question.
     static bool done_large = false;   // n_tokens >= 128: prefill, chunk-eligible size
     static bool done_small = false;   // n_tokens <  128: decode / verify / warm-up
+    static bool done_pf    = false;   // [TAG_GDN_CHUNKED_PF] prefix op of a chunked replay-layout prefill
+    const int   n_min_pf   = ggml_get_op_params_i32(dst, 1);
     const bool  is_large   = dst->src[2]->ne[2] >= 128;
-    bool &      done       = is_large ? done_large : done_small;
+    bool &      done       = n_min_pf > 0 ? done_pf : (is_large ? done_large : done_small);
     if (done) {
         return;
     }
@@ -334,21 +349,32 @@ static void turbo_probe_gdn(const ggml_tensor * dst, bool chunked) {
     const ggml_tensor * st = dst->src[5];
     const int64_t S_v = v->ne[0];
 
-    fprintf(stderr, "turbo-probe: GDN path = %s  (n_tokens=%d S_v=%d neq0=%d)\n",
-                  chunked ? "CHUNKED (fast)" : "SEQUENTIAL (slow)",
-                  (int) v->ne[2], (int) S_v, (int) q->ne[0]);
+    if (n_min_pf > 0) {
+        fprintf(stderr, "turbo-probe: GDN path = %s [TAG_GDN_CHUNKED_PF] (prefix n_tokens=%d n_seqs=%d S_v=%d, then REPLAY tail)\n",
+                      chunked ? "CHUNKED-PF (fast)" : "SEQUENTIAL-PF (slow)",
+                      (int) v->ne[2], (int) v->ne[3], (int) S_v);
+    } else {
+        fprintf(stderr, "turbo-probe: GDN path = %s  (n_tokens=%d S_v=%d neq0=%d)\n",
+                      chunked ? "CHUNKED (fast)" : "SEQUENTIAL (slow)",
+                      (int) v->ne[2], (int) S_v, (int) q->ne[0]);
+    }
     if (!chunked) {
-        fprintf(stderr, "turbo-probe:   kda=%d K=%d neq0_128=%d S_v_128=%d ntok_ge_128=%d\n",
+        const int  n_min  = n_min_pf > 0 ? n_min_pf : 128;
+        const int  cc_dev = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+        const char * dis  = getenv("GGML_CUDA_DISABLE_GDN_CHUNK");
+        fprintf(stderr, "turbo-probe:   nvidia=%d ampere=%d GGML_CUDA_DISABLE_GDN_CHUNK=%s\n",
+                      (int) GGML_CUDA_CC_IS_NVIDIA(cc_dev), (int) (cc_dev >= GGML_CUDA_CC_AMPERE), dis ? dis : "(unset)");
+        fprintf(stderr, "turbo-probe:   kda=%d K=%d neq0_128=%d S_v_128=%d ntok_ge_min=%d (min %d)\n",
                       (int) (g->ne[0] == S_v), ggml_get_op_params_i32(dst, 0),
-                      (int) (q->ne[0] == 128), (int) (S_v == 128), (int) (v->ne[2] >= 128));
-        fprintf(stderr, "turbo-probe:   contig q=%d k=%d g=%d beta=%d state=%d\n",
-                      (int) ggml_is_contiguous(q),  (int) ggml_is_contiguous(k),
+                      (int) (q->ne[0] == 128), (int) (S_v == 128), (int) (v->ne[2] >= n_min), n_min);
+        fprintf(stderr, "turbo-probe:   qk packed=%d same=%d seqs=%d, contig g=%d beta=%d state=%d\n",
+                      (int) gdn_chunk_qk_packed(q), (int) (ggml_are_same_shape(q, k) && ggml_are_same_stride(q, k)),
+                      (int) (q->ne[3] == v->ne[3]),
                       (int) ggml_is_contiguous(g),  (int) ggml_is_contiguous(b),
                       (int) ggml_is_contiguous(st));
-        fprintf(stderr, "turbo-probe:   v nb0ok=%d nb1ok=%d nb3ok=%d\n",
+        fprintf(stderr, "turbo-probe:   v nb0ok=%d nb1ok=%d\n",
                       (int) (v->nb[0] == ggml_type_size(v->type)),
-                      (int) (v->nb[1] == (size_t) S_v * ggml_type_size(v->type)),
-                      (int) (v->nb[3] == (size_t) v->ne[2] * v->nb[2]));
+                      (int) (v->nb[1] == (size_t) S_v * ggml_type_size(v->type)));
     }
     fflush(stderr);
 }
@@ -816,7 +842,9 @@ void ggml_cuda_op_gated_delta_net_replay(ggml_backend_cuda_context & ctx, ggml_t
     }
 
     // like turbo_probe_gdn: once for decode-sized and once for prefill-sized calls; TURBO_PATH_PROBE=0 silences it
-    {
+    // [TAG_GDN_CHUNKED_PF] the head and tail ops of a chunked prefill take token views of q (a plain ubatch never does);
+    // the prefix op reports that path, so they skip this line
+    if (src_q->op != GGML_OP_VIEW) {
         static bool done_large = false;
         static bool done_small = false;
         bool & done = n_tokens >= 128 ? done_large : done_small;

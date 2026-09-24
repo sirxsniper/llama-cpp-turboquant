@@ -3,12 +3,49 @@
 #include "llama-impl.h"
 #include "llama-memory-recurrent.h"
 
+#include <algorithm>
+#include <cstdlib>
+
 // utility to get one slice from the third dimension
 // input dim:  [x, y, c, b]
 // output dim: [x, y, 1, b]
 static ggml_tensor * get_slice_2d(ggml_context * ctx0, ggml_tensor * t, int64_t c) {
     return ggml_view_4d(ctx0, t, t->ne[0], t->ne[1], 1, t->ne[3],
         t->nb[1], t->nb[2], t->nb[3], t->nb[2] * c);
+}
+
+// [TAG_GDN_CHUNKED_PF] Chunked prefill of the GDN replay layout. Design note:
+//   The replay op ([TAG_4C_GDN_REPLAY], note in llama-memory-recurrent.cpp) runs each token of a ubatch through the
+//   sequential per-token kernel, also in prefill. When a ubatch has n_pre = T - n_w >= GDN_CHUNKED_PF_MIN tokens per
+//   sequence before its last n_w = min(T, n_ring) tokens, build_recurrent_attn uses three ops instead of one:
+//     1. head:   replay op over token 0. Its committed state is C with the live ring tokens applied (t_commit = m),
+//                done by the replay kernel itself. Its output and ring are not used.
+//     2. prefix: ggml_gated_delta_net (K = 1) over tokens [0, n_pre) from that state, with a chunk-min hint, so a
+//                backend with a chunked kernel (CUDA: NVIDIA Ampere+, S_v 128) runs it there.
+//     3. tail:   replay op over tokens [n_pre, T) from the prefix state, with ring_n = 0. It commits its input state
+//                unchanged (t_commit = 0, the state before the last n_w tokens) and stores the n_w tokens as the ring:
+//                the layout of the single op, written to the caches by the same cpys (or the CUDA fusion).
+//   The attention output is the prefix and tail outputs, concatenated on the token axis.
+//   Bits: where the prefix runs the sequential kernel (CPU, other GPUs, other head sizes), each token uses the same
+//   expressions as in the single op, so the result is bit-identical to it. The chunked kernel (fp16 tensor-core
+//   operands, fp32 state) is the one llama-perplexity uses at K = 1, so prefill numerics change a little there.
+//   Decode and verify ubatches (n_pre below the threshold) build the single op as before.
+//   Extra cost per layer: the 1-token head op, a copy of the attention output (concat), and small copies of the g and
+//   beta token ranges when n_seqs > 1 (q, k and v stay views; the CUDA chunked kernel takes their sequence strides).
+//   GDN_CHUNKED_PF=0 builds the single op for every ubatch. GDN_CHUNKED_PF_MIN sets the threshold (default 64, min 16),
+//   which is also the chunk-min hint of the prefix op.
+// Returns the threshold, or 0 when the split is off. Read at each graph build, so a test can change it in one process.
+static int32_t llama_gdn_chunked_pf_min() {
+    const char * e = getenv("GDN_CHUNKED_PF");
+    if (e && e[0] == '0' && e[1] == '\0') {
+        return 0;
+    }
+    int32_t n_min = 64;
+    const char * m = getenv("GDN_CHUNKED_PF_MIN");
+    if (m && m[0]) {
+        n_min = std::max(16, atoi(m));
+    }
+    return n_min;
 }
 
 llm_build_delta_net_base::llm_build_delta_net_base(const llm_graph_params & params) : llm_graph_context(params) {}
@@ -568,21 +605,86 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
     //   new ring go back into the caches (the CUDA backend writes both from the kernel and skips the two copies)
     if (ggml_tensor * ring_all = mctx_cur->get_ring_l(il); ring_all != nullptr) {
         const int64_t ring_row = ring_all->ne[0];
+        const int32_t n_ring   = (int32_t) mctx_cur->get_n_rs_seq();
 
         ggml_tensor * ring = build_rs(inp, ring_all, (int32_t) ring_row, (int32_t) n_seqs);
 
-        ggml_tensor * gdn_out = ggml_gated_delta_net_replay(ctx0, q, k, v, g, b, s, ring, inp->ring_n, (int32_t) mctx_cur->get_n_rs_seq());
-        res->add_fused_node({n_seq_tokens > 1 ? LLM_FUSED_OP_GDN_CH : LLM_FUSED_OP_GDN_AR, gdn_out, il});
+        // [TAG_GDN_CHUNKED_PF] head, chunked prefix and tail for long ubatches (design note at the top of this file)
+        const int64_t n_w    = std::min<int64_t>(n_seq_tokens, n_ring);
+        const int64_t n_pre  = n_seq_tokens - n_w;
+        const int32_t pf_min = llama_gdn_chunked_pf_min();
 
-        const int64_t attn_score_elems = S_v * H_v * n_seq_tokens * n_seqs;
+        ggml_tensor * gdn_out = nullptr;      // the op whose committed states and rings go to the caches
+        ggml_tensor * output  = nullptr;      // attention scores [S_v, H_v, n_seq_tokens, n_seqs]
+        int64_t       n_out   = n_seq_tokens; // tokens in the attention part of gdn_out
 
-        ggml_tensor * output = ggml_view_4d(ctx0, gdn_out,
-            S_v, H_v, n_seq_tokens, n_seqs,
-            ggml_row_size(gdn_out->type, S_v),
-            ggml_row_size(gdn_out->type, S_v * H_v),
-            ggml_row_size(gdn_out->type, S_v * H_v * n_seq_tokens),
-            0);
+        if (pf_min > 0 && n_pre >= pf_min) {
+            // tokens [t0, t0 + nt) of a [.., .., n_seq_tokens, n_seqs] tensor; the ops need g and beta contiguous
+            auto tok = [&](ggml_tensor * t, int64_t t0, int64_t nt, bool need_cont) {
+                ggml_tensor * r = ggml_view_4d(ctx0, t, t->ne[0], t->ne[1], nt, t->ne[3],
+                        t->nb[1], t->nb[2], t->nb[3], (size_t) t0 * t->nb[2]);
+                return need_cont && !ggml_is_contiguous(r) ? ggml_cont(ctx0, r) : r;
+            };
+
+            ggml_tensor * head = ggml_gated_delta_net_replay(ctx0, tok(q, 0, 1, false), tok(k, 0, 1, false),
+                    tok(v, 0, 1, false), tok(g, 0, 1, true), tok(b, 0, 1, true), s, ring, inp->ring_n, n_ring);
+            res->add_fused_node({LLM_FUSED_OP_GDN_CH, head, il});
+            cb(head, "gdn_pf_head", il);
+
+            ggml_tensor * s_pre = ggml_view_4d(ctx0, head, S_v, S_v, H_v, n_seqs,
+                    ggml_row_size(head->type, S_v),
+                    ggml_row_size(head->type, S_v * S_v),
+                    ggml_row_size(head->type, D),
+                    ggml_row_size(head->type, S_v * H_v * n_seqs));
+
+            ggml_tensor * pre = ggml_gated_delta_net(ctx0, tok(q, 0, n_pre, false), tok(k, 0, n_pre, false),
+                    tok(v, 0, n_pre, false), tok(g, 0, n_pre, true), tok(b, 0, n_pre, true), s_pre, 1);
+            ggml_gated_delta_net_set_chunk_min(pre, pf_min);
+            res->add_fused_node({LLM_FUSED_OP_GDN_CH, pre, il});
+            cb(pre, "gdn_pf_prefix", il);
+
+            ggml_tensor * attn_pre = ggml_view_4d(ctx0, pre, S_v, H_v, n_pre, n_seqs,
+                    ggml_row_size(pre->type, S_v),
+                    ggml_row_size(pre->type, S_v * H_v),
+                    ggml_row_size(pre->type, S_v * H_v * n_pre),
+                    0);
+            ggml_tensor * s_tail = ggml_view_4d(ctx0, pre, S_v, S_v, H_v, n_seqs,
+                    ggml_row_size(pre->type, S_v),
+                    ggml_row_size(pre->type, S_v * S_v),
+                    ggml_row_size(pre->type, D),
+                    ggml_row_size(pre->type, S_v * H_v * n_pre * n_seqs));
+
+            // the prefix state already has the ring tokens: the tail replays none (I32 zeros from an F32 fill)
+            ggml_tensor * ring_n_zero = ggml_cast(ctx0, ggml_fill(ctx0, ggml_view_1d(ctx0, ring, n_seqs, 0), 0.0f), GGML_TYPE_I32);
+            cb(ring_n_zero, "gdn_pf_ring_n_zero", il);
+
+            gdn_out = ggml_gated_delta_net_replay(ctx0, tok(q, n_pre, n_w, false), tok(k, n_pre, n_w, false),
+                    tok(v, n_pre, n_w, false), tok(g, n_pre, n_w, true), tok(b, n_pre, n_w, true), s_tail, ring,
+                    ring_n_zero, n_ring);
+            res->add_fused_node({LLM_FUSED_OP_GDN_CH, gdn_out, il});
+            n_out = n_w;
+
+            ggml_tensor * attn_tail = ggml_view_4d(ctx0, gdn_out, S_v, H_v, n_w, n_seqs,
+                    ggml_row_size(gdn_out->type, S_v),
+                    ggml_row_size(gdn_out->type, S_v * H_v),
+                    ggml_row_size(gdn_out->type, S_v * H_v * n_w),
+                    0);
+
+            output = ggml_concat(ctx0, attn_pre, attn_tail, 2);
+        } else {
+            gdn_out = ggml_gated_delta_net_replay(ctx0, q, k, v, g, b, s, ring, inp->ring_n, n_ring);
+            res->add_fused_node({n_seq_tokens > 1 ? LLM_FUSED_OP_GDN_CH : LLM_FUSED_OP_GDN_AR, gdn_out, il});
+
+            output = ggml_view_4d(ctx0, gdn_out,
+                S_v, H_v, n_seq_tokens, n_seqs,
+                ggml_row_size(gdn_out->type, S_v),
+                ggml_row_size(gdn_out->type, S_v * H_v),
+                ggml_row_size(gdn_out->type, S_v * H_v * n_seq_tokens),
+                0);
+        }
         cb(output, "attn_output", il);
+
+        const int64_t attn_score_elems = S_v * H_v * n_out * n_seqs;
 
         const size_t row_size = hparams.n_embd_s() * ggml_element_size(ssm_states_all);
 
