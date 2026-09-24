@@ -23,8 +23,9 @@ void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_LOGIT_SCALE,                 hparams.f_logit_scale, false);
     hparams.f_final_logit_softcapping = 0.0f;
     ml.get_key(LLM_KV_FINAL_LOGIT_SOFTCAPPING,     hparams.f_final_logit_softcapping, false);
-    // [TAG_SYNC_DFLASH_EMBD_SCALE] the fork also read LLM_KV_EMBEDDING_SCALE here (pre-merge DFlash2 PR);
-    // dropped with upstream: Qwen3.8-27B-DFlash2-Q8_0.gguf carries no embedding_scale key.
+    // [TAG_SYNC_DFLASH_EMBD_SCALE] LLM_KV_EMBEDDING_SCALE is read again at the top of this function
+    // (upstream 633733d0a, Gemma4 DSpark). Qwen3.8-27B-DFlash2-Q8_0.gguf has no such key, so f_embedding_scale
+    // stays 0 and the graph adds no scale op for it.
 
     // drafts for M-RoPE targets carry degenerate sections [n_rot/2, 0, 0, 0]
     ml.get_key_or_arr(LLM_KV_ROPE_DIMENSION_SECTIONS, hparams.rope_sections, 4, false);

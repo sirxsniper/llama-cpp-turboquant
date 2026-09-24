@@ -2600,7 +2600,8 @@ int llama_context::encode(const llama_batch_ext & batch_inp) {
     // eagle3/DFlash: features as encoder input, and non-draft paths fall back to model's input dim
     const int64_t n_vocab = model.vocab.n_tokens();
 
-    // note: during encode, we always output all tokens and skip position continuity checks (output_all=true)
+    // note: during encode, we always output all tokens (output_all=true). Position continuity is still checked
+    // against the context memory when batch_inp.mem is set (llama_batch_ext(ctx) sets it).
     if (!balloc->init(batch_inp, model.vocab, true)) {
         LLAMA_LOG_ERROR("%s: failed to initialize batch\n", __func__);
         return -1;
