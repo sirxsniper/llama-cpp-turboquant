@@ -2815,6 +2815,305 @@ static void test_streams() {
     }
 }
 
+// ---------------------------------------------------------------------------------------------------------------
+// [TAG_4C_QUOTA] young quota: water-filling (default) against the proportional rule (TURBOT_QUOTA=prop)
+// ---------------------------------------------------------------------------------------------------------------
+
+static std::vector<uint64_t> young_quota(const std::vector<uint32_t> & n, uint32_t pool, uint32_t cap, bool prop) {
+    std::vector<uint64_t> y(n.size(), UINT64_MAX);
+    llama_turbot_young_quota(n.data(), (uint32_t) n.size(), pool, cap, prop, y.data());
+    return y;
+}
+
+static std::string quota_str(const std::vector<uint64_t> & y) {
+    std::string s;
+    for (uint64_t v : y) {
+        s += " " + std::to_string(v);
+    }
+    return s;
+}
+
+static std::string quota_mix_str(const std::vector<uint32_t> & n, uint32_t pool, uint32_t cap) {
+    std::string s = "pool " + std::to_string(pool) + " cap " + std::to_string(cap) + " n";
+    for (uint32_t v : n) {
+        s += " " + std::to_string(v);
+    }
+    return s;
+}
+
+// both sims ran the same script: same graph inputs of every ubatch, granule table, stamps, young cells and cuts
+static bool same_tier_state(const tier_sim & a, const tier_sim & b) {
+    bool same = a.hist == b.hist && a.tier.granule_slots() == b.tier.granule_slots() && a.tier.n_evictions() == b.tier.n_evictions();
+    for (uint32_t c = 0; c < a.kv_size && same; ++c) {
+        same = a.tier.stamp(c) == b.tier.stamp(c) && a.tier.cell_young(c) == b.tier.cell_young(c);
+    }
+    for (llama_seq_id s = 0; s < 8 && same; ++s) {
+        int64_t ca = 0;
+        int64_t cb = 0;
+        const bool ha = a.tier.seq_cut(s, ca);
+        const bool hb = b.tier.seq_cut(s, cb);
+        same = ha == hb && (!ha || ca == cb) && a.tier.row_counter(s) == b.tier.row_counter(s);
+    }
+    return same;
+}
+
+static void test_quota() {
+    printf("[8f] young quota water-filling ([TAG_4C_QUOTA])\n");
+
+    set_env("TURBOT_QUOTA", nullptr);
+
+    const auto expect = [](const char * what, const std::vector<uint32_t> & n, uint32_t pool, uint32_t cap, bool prop,
+                           const std::vector<uint64_t> & want) {
+        const auto got = young_quota(n, pool, cap, prop);
+        TCHECK(got == want, "%s, %s (%s): got%s, expected%s", what, prop ? "prop" : "wf", quota_mix_str(n, pool, cap).c_str(),
+                quota_str(got).c_str(), quota_str(want).c_str());
+    };
+
+    // named mixes (default plan: POOL 65536, CAP 16384, N_eff = 65536 - 128 per active sequence)
+    expect("four equal sequences", { 17000, 17000, 17000, 17000 }, 65536, 16384, true,  { 16256, 16256, 16256, 16256 });
+    expect("four equal sequences", { 17000, 17000, 17000, 17000 }, 65536, 16384, false, { 16256, 16256, 16256, 16256 });
+    expect("1x200K + 3x2K",        { 200000, 2048, 2048, 2048 },   65536, 16384, true,  { 16384, 646, 646, 646 });
+    expect("1x200K + 3x2K",        { 200000, 2048, 2048, 2048 },   65536, 16384, false, { 16384, 2048, 2048, 2048 });
+    expect("1x200K + 3x2K, idle ids between", { 0, 200000, 0, 2048, 2048, 0, 2048 }, 65536, 16384, false, { 0, 16384, 0, 2048, 2048, 0, 2048 });
+    expect("3x200K + 1x16K",       { 200000, 200000, 200000, 16000 }, 65536, 16384, true,  { 16384, 16384, 16384, 1688 });
+    expect("3x200K + 1x16K",       { 200000, 200000, 200000, 16000 }, 65536, 16384, false, { 16341, 16341, 16341, 16000 });
+    expect("near-equal",           { 17000, 17000, 17000, 16200 }, 65536, 16384, true,  { 16384, 16384, 16384, 15675 });
+    expect("near-equal",           { 17000, 17000, 17000, 16200 }, 65536, 16384, false, { 16274, 16274, 16274, 16200 });
+    expect("four long, unequal",   { 20000, 40000, 60000, 100000 }, 65536, 16384, true,  { 5911, 11822, 16384, 16384 });
+    expect("four long, unequal",   { 20000, 40000, 60000, 100000 }, 65536, 16384, false, { 16256, 16256, 16256, 16256 });
+    expect("8 sequences, small pool", { 100000, 1000, 1000, 1000, 1000, 1000, 1000, 1000 }, 16384, 16384, true,
+            { 14355, 143, 143, 143, 143, 143, 143, 143 });
+    expect("8 sequences, small pool", { 100000, 1000, 1000, 1000, 1000, 1000, 1000, 1000 }, 16384, 16384, false,
+            { 8360, 1000, 1000, 1000, 1000, 1000, 1000, 1000 });
+    expect("8 sequences, one level", { 100000, 2000, 2000, 2000, 2000, 2000, 2000, 2000 }, 16384, 16384, false,
+            { 1920, 1920, 1920, 1920, 1920, 1920, 1920, 1920 });
+    expect("one sequence, POOL below CAP", { 50000 }, 4096, 16384, false, { 3968 });
+    expect("POOL 0",               { 100, 200 }, 0, 16384, false, { 0, 0 });
+    expect("no sequence",          { 0, 0, 0 },  65536, 16384, false, { 0, 0, 0 });
+
+    // equal lengths: water-filling gives exactly the proportional quota
+    {
+        int n_bad = 0;
+        std::string first;
+        const std::pair<uint32_t, uint32_t> pc[] = { { 65536, 16384 }, { 16384, 4096 }, { 4096, 100000 }, { 0, 16384 }, { 512, 64 } };
+        for (uint32_t k : { 1u, 2u, 3u, 4u, 8u }) {
+            for (uint32_t len : { 1u, 300u, 2048u, 16000u, 16256u, 16257u, 17000u, 200000u }) {
+                for (const auto & [pool, cap] : pc) {
+                    const std::vector<uint32_t> n(k, len);
+                    const auto w = young_quota(n, pool, cap, false);
+                    const auto p = young_quota(n, pool, cap, true);
+                    if (w != p) {
+                        if (n_bad++ == 0) {
+                            first = quota_mix_str(n, pool, cap) + ": wf" + quota_str(w) + ", prop" + quota_str(p);
+                        }
+                    }
+                }
+            }
+        }
+        TCHECK(n_bad == 0, "equal lengths: %d mixes differ from the proportional quota, first: %s", n_bad, first.c_str());
+    }
+
+    // random mixes: prop is the SPEC 9.6 formula; water-filling fits N_eff, is the proportional quota when the total
+    // fits or the lengths are equal, is monotone in n, and a sequence below min(CAP, n) is at the top level
+    {
+        std::mt19937 gen(20260924);
+        const uint32_t pools[] = { 0, 512, 4096, 16384, 65536 };
+        const uint32_t caps[]  = { 64, 1000, 4096, 16384, 100000 };
+        const int n_iter = g_quick ? 2000 : 20000;
+        int n_bad = 0;
+        std::string first;
+        for (int it = 0; it < n_iter; ++it) {
+            const uint32_t k    = 1 + gen() % 8;
+            const uint32_t pool = pools[gen() % 5];
+            const uint32_t cap  = caps[gen() % 5];
+            std::vector<uint32_t> n(k);
+            for (auto & v : n) {
+                switch (gen() % 4) {
+                    case 0:  v = 0;                  break;
+                    case 1:  v = 1 + gen() % 300;    break;
+                    case 2:  v = 1 + gen() % 5000;   break;
+                    default: v = 1 + gen() % 300000; break;
+                }
+            }
+
+            const auto p = young_quota(n, pool, cap, true);
+            const auto w = young_quota(n, pool, cap, false);
+
+            uint32_t n_active = 0;
+            uint64_t sum_n    = 0;
+            uint64_t sum_w    = 0;
+            bool     equal    = true;
+            uint32_t len0     = 0;
+            for (uint32_t s = 0; s < k; ++s) {
+                if (n[s] == 0) {
+                    continue;
+                }
+                equal = equal && (len0 == 0 || n[s] == len0);
+                len0  = n[s];
+                n_active++;
+                sum_n += n[s];
+                sum_w += w[s];
+            }
+            const uint64_t slack = 64ull*GGML_TURBOT_QUOTA_SLACK_GRANULES*n_active;
+            const uint64_t n_eff = pool > slack ? pool - slack : 0;
+
+            bool ok = sum_w <= n_eff || sum_n == 0;
+            for (size_t s = 0; s < k; ++s) {
+                ok = ok && p[s] == tier_quota(pool, cap, n, s);
+            }
+            if (sum_n <= n_eff || equal) {
+                ok = ok && w == p;
+            }
+            for (uint32_t a = 0; a < k; ++a) {
+                for (uint32_t b = 0; b < k; ++b) {
+                    ok = ok && !(n[a] > 0 && n[a] <= n[b] && w[a] > w[b]);
+                }
+            }
+            if (w != p) {
+                for (uint32_t s = 0; s < k; ++s) {
+                    const uint64_t d = std::min<uint64_t>(cap, n[s]);
+                    ok = ok && w[s] <= d;
+                    if (w[s] < d) {
+                        for (uint32_t t = 0; t < k; ++t) {
+                            ok = ok && w[t] <= w[s];
+                        }
+                    }
+                }
+            }
+            if (!ok && n_bad++ == 0) {
+                first = quota_mix_str(n, pool, cap) + ": wf" + quota_str(w) + ", prop" + quota_str(p);
+            }
+        }
+        TCHECK(n_bad == 0, "quota invariants: %d of %d mixes fail, first: %s", n_bad, n_iter, first.c_str());
+    }
+
+    // tier runs, water-filling vs TURBOT_QUOTA=prop: identical while the total fits or the lengths stay equal
+    {
+        // four sequences, equal lengths at every commit, 4 x 2807 cells against N_eff 3584 (the water-filling path)
+        const auto script_equal = [](tier_sim & sim) {
+            std::vector<llama_seq_id> seqs;
+            for (llama_seq_id s = 0; s < 4; ++s) {
+                seqs.insert(seqs.end(), 64, s);
+            }
+            for (int k = 0; k < 40; ++k) {
+                sim.ubatch(seqs, sim.lowest_empty(256));
+            }
+            for (int t = 0; t < 200; ++t) {
+                sim.ubatch({ 0, 1, 2, 3 }, sim.lowest_empty(4));
+            }
+            for (llama_seq_id s = 0; s < 4; ++s) {
+                sim.seq_rm(s, sim.next_pos(s) - 3, -1);
+            }
+            for (int t = 0; t < 50; ++t) {
+                sim.ubatch({ 0, 1, 2, 3 }, sim.lowest_empty(4));
+            }
+        };
+        // unequal lengths whose total fits, with a stamp gap (middle seq_rm) and a seq_cp: the proportional quota path
+        const auto script_fits = [](tier_sim & sim) {
+            sim.prefill(0, 1000, 256);
+            sim.prefill(1, 500, 128);
+            sim.prefill(2, 300, 100);
+            for (int t = 0; t < 50; ++t) {
+                sim.ubatch({ 0, 1, 2 }, sim.lowest_empty(3));
+            }
+            sim.seq_rm(0, 100, 200);
+            for (int t = 0; t < 20; ++t) {
+                sim.ubatch({ 0, 1, 2 }, sim.lowest_empty(3));
+            }
+            sim.seq_cp(0, 3);
+            sim.decode(3, 5);
+            sim.decode(0, 1);
+        };
+
+        for (int k = 0; k < 2; ++k) {
+            const char * what = k == 0 ? "equal lengths" : "total fits";
+            tier_sim a(16384, 4096, 2048);
+            set_env("TURBOT_QUOTA", "prop");
+            tier_sim b(16384, 4096, 2048);
+            set_env("TURBOT_QUOTA", nullptr);
+            a.record = true;
+            b.record = true;
+            if (k == 0) {
+                script_equal(a);
+                script_equal(b);
+            } else {
+                script_fits(a);
+                script_fits(b);
+                for (llama_seq_id s = 0; s < 4; ++s) {
+                    TCHECK(a.n_young(s) == a.n_live(s), "%s: seq %d has %u young of %u live cells", what, s, a.n_young(s), a.n_live(s));
+                }
+            }
+            TCHECK(same_tier_state(a, b), "%s: water-filling and TURBOT_QUOTA=prop runs differ", what);
+        }
+    }
+
+    // tier runs where the quotas differ: the cut of the last commit is row_ctr - Y of llama_turbot_young_quota, and
+    // the short sequences keep every cell young only with water-filling
+    for (int mode = 0; mode < 2; ++mode) {
+        const bool prop = mode == 1;
+        const char * tag = prop ? "prop" : "wf";
+
+        // 1x200K + 3x2K on the default plan's POOL and CAP (fourconn plan A6 / T9)
+        {
+            set_env("TURBOT_QUOTA", prop ? "prop" : nullptr);
+            tier_sim sim(262144, 65536, 16384);
+            set_env("TURBOT_QUOTA", nullptr);
+            sim.prefill(0, 200000, 2048);
+            for (llama_seq_id s = 1; s < 4; ++s) {
+                sim.prefill(s, 2048, 2048);
+            }
+            for (int t = 0; t < 32; ++t) {
+                sim.ubatch({ 0, 1, 2, 3 }, sim.lowest_empty(4));
+            }
+            const std::vector<uint32_t> n = { sim.n_live(0), sim.n_live(1), sim.n_live(2), sim.n_live(3) };
+            const auto y = young_quota(n, 65536, 16384, prop);
+            for (llama_seq_id s = 0; s < 4; ++s) {
+                int64_t cut = 0;
+                TCHECK(sim.tier.seq_cut(s, cut) && cut == (int64_t) sim.tier.row_counter(s) - (int64_t) y[s],
+                        "1x200K + 3x2K (%s): seq %d cut %lld, expected %lld", tag, s, (long long) cut,
+                        (long long) ((int64_t) sim.tier.row_counter(s) - (int64_t) y[s]));
+            }
+            TCHECK(sim.tier.n_evictions() == 0, "1x200K + 3x2K (%s): %" PRIu64 " evictions", tag, sim.tier.n_evictions());
+            TCHECK(y[0] == 16384, "1x200K + 3x2K (%s): long quota %" PRIu64, tag, y[0]);
+            sim.check_band(0, (uint32_t) y[0], 128, prop ? "1x200K + 3x2K (prop)" : "1x200K + 3x2K (wf)");
+            for (llama_seq_id s = 1; s < 4; ++s) {
+                if (prop) {
+                    TCHECK(y[s] == 655, "1x200K + 3x2K (prop): seq %d quota %" PRIu64 ", expected 655", s, y[s]);
+                    sim.check_band(s, (uint32_t) y[s], 128, "1x200K + 3x2K (prop)");
+                    TCHECK(sim.n_young(s) < n[s], "1x200K + 3x2K (prop): seq %d has all %u cells young", s, n[s]);
+                } else {
+                    TCHECK(y[s] == n[s] && sim.n_young(s) == n[s], "1x200K + 3x2K (wf): seq %d quota %" PRIu64 ", young %u of %u",
+                            s, y[s], sim.n_young(s), n[s]);
+                }
+            }
+        }
+
+        // oversubscribed: three long sequences above the level and a short one, POOL 8192, CAP 4096
+        {
+            set_env("TURBOT_QUOTA", prop ? "prop" : nullptr);
+            tier_sim sim(32768, 8192, 4096);
+            set_env("TURBOT_QUOTA", nullptr);
+            sim.prefill(0, 6400, 64);
+            sim.prefill(2, 5120, 64);
+            sim.prefill(3, 4096, 64);
+            sim.prefill(1, 320, 64);
+            const std::vector<uint32_t> n = { sim.n_live(0), sim.n_live(1), sim.n_live(2), sim.n_live(3) };
+            const auto y = young_quota(n, 8192, 4096, prop);
+            const std::vector<uint64_t> want = prop ? std::vector<uint64_t>{ 3084, 154, 2467, 1973 } : std::vector<uint64_t>{ 2453, 320, 2453, 2453 };
+            TCHECK(y == want, "oversubscribed (%s): quota%s, expected%s", tag, quota_str(y).c_str(), quota_str(want).c_str());
+            for (llama_seq_id s = 0; s < 4; ++s) {
+                int64_t cut = 0;
+                TCHECK(sim.tier.seq_cut(s, cut) && cut == (int64_t) sim.tier.row_counter(s) - (int64_t) y[s],
+                        "oversubscribed (%s): seq %d cut %lld", tag, s, (long long) cut);
+                sim.check_band(s, (uint32_t) y[s], 128, prop ? "oversubscribed (prop)" : "oversubscribed (wf)");
+            }
+            TCHECK(sim.tier.n_evictions() == 0, "oversubscribed (%s): %" PRIu64 " evictions", tag, sim.tier.n_evictions());
+            TCHECK(prop ? sim.n_young(1) < n[1] : sim.n_young(1) == n[1], "oversubscribed (%s): short sequence has %u young of %u",
+                    tag, sim.n_young(1), n[1]);
+        }
+    }
+}
+
 #endif // TURBOT_TEST_TIER
 
 int main(int argc, char ** argv) {
@@ -2843,6 +3142,8 @@ int main(int argc, char ** argv) {
     test_plan_choose();
     test_plan_scope();
     test_streams();
+    // [TAG_4C_QUOTA]
+    test_quota();
 #else
     printf("[7] plan parser and llama_kv_tier: SKIPPED (internal llama symbols do not link in this build, see docs/turbot/TESTING.md)\n");
 #endif

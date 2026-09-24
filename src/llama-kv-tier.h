@@ -277,6 +277,13 @@ inline void llama_turbot_for_each_seq(const std::bitset<LLAMA_MAX_SEQ> & seqs, F
     }
 }
 
+// [TAG_4C_QUOTA] young quota Y[s] of SPEC 9.6 for s < n_seq (0 where n[s] == 0), n[s] = live cells of s. Pure.
+//   prop:  Y = min(CAP, N_eff*n/sum), the rule before [TAG_4C_QUOTA] (env TURBOT_QUOTA=prop).
+//   else:  the same Y when it gives every sequence min(CAP, n) or more (so nothing changes when the total fits).
+//          Otherwise water-filling: a sequence whose min(CAP, n) fits in the equal share of the cells left gets all
+//          of it, and the longer sequences share the rest equally. One long sequence no longer starves short ones.
+LLAMA_API void llama_turbot_young_quota(const uint32_t * n, uint32_t n_seq, uint32_t pool_cells, uint32_t cap_cells, bool prop, uint64_t * y);
+
 class LLAMA_API llama_kv_tier {
 public:
     llama_kv_tier(uint32_t kv_size, uint32_t pool_cells, uint32_t cap_cells);
@@ -369,6 +376,9 @@ private:
 
     // env LLAMA_TURBOT_DEBUG: 1 = one line per commit, 2 = also the full invariant check (9.8)
     int debug = 0;
+
+    // [TAG_4C_QUOTA] env TURBOT_QUOTA=prop: the proportional young quota (llama_turbot_young_quota)
+    bool quota_prop = false;
 
     // DEBUG=1 counters since the last commit
     uint64_t dbg_reclaimed  = 0;

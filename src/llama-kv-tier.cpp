@@ -1312,6 +1312,12 @@ llama_kv_tier::llama_kv_tier(uint32_t kv_size, uint32_t pool_cells, uint32_t cap
 
     const char * LLAMA_TURBOT_DEBUG = getenv("LLAMA_TURBOT_DEBUG");
     debug = LLAMA_TURBOT_DEBUG ? atoi(LLAMA_TURBOT_DEBUG) : 0;
+
+    // [TAG_4C_QUOTA]
+    quota_prop = llama_turbot_env_is("TURBOT_QUOTA", "prop");
+    if (quota_prop && n_slot > 0) {
+        LLAMA_LOG_INFO("%s: turbot: TURBOT_QUOTA=prop, the young quota is proportional to the sequence lengths\n", __func__);
+    }
 }
 
 uint32_t llama_kv_tier::n_granules() const {
@@ -1626,29 +1632,85 @@ void llama_kv_tier::begin_ubatch(const llama_ubatch & ubatch, const std::vector<
     }
 }
 
-void llama_kv_tier::commit_ubatch(const llama_kv_cells & kvc) {
-    // quota (SPEC 9.6)
-    uint32_t                   n_cells[LLAMA_MAX_SEQ];
-    std::bitset<LLAMA_MAX_SEQ> live;
+// [TAG_4C_QUOTA]
+void llama_turbot_young_quota(const uint32_t * n, uint32_t n_seq, uint32_t pool_cells, uint32_t cap_cells, bool prop, uint64_t * y) {
+    GGML_ASSERT(n_seq <= LLAMA_MAX_SEQ);
+
+    std::bitset<LLAMA_MAX_SEQ> open;
 
     uint32_t n_active = 0;
     uint64_t sum      = 0;
 
-    for (llama_seq_id s = 0; s < (llama_seq_id) LLAMA_MAX_SEQ; ++s) {
-        n_cells[s] = kvc.seq_n_cells(s);
-        if (n_cells[s] > 0) {
-            live.set(s);
+    for (uint32_t s = 0; s < n_seq; ++s) {
+        y[s] = 0;
+        if (n[s] > 0) {
+            open.set(s);
             n_active++;
-            sum += n_cells[s];
+            sum += n[s];
         }
+    }
+
+    if (sum == 0) {
+        return;
     }
 
     const int64_t n_eff = std::max<int64_t>(0,
             (int64_t) pool_cells - (int64_t) GGML_TURBOT_GRANULE*GGML_TURBOT_QUOTA_SLACK_GRANULES*(int64_t) n_active);
 
+    // the proportional rule stays whenever no sequence gets less than it can use
+    bool starved = false;
+    llama_turbot_for_each_seq(open, [&](llama_seq_id s) {
+        y[s] = std::min<uint64_t>(cap_cells, (uint64_t) n_eff*n[s]/sum);
+        starved = starved || y[s] < std::min<uint64_t>(cap_cells, n[s]);
+    });
+
+    if (prop || !starved) {
+        return;
+    }
+
+    // water-filling. The equal share left/n_open only grows when a sequence at or below it is served, so the order of
+    // the passes does not change the result.
+    uint64_t left   = (uint64_t) n_eff;
+    uint32_t n_open = n_active;
+
+    for (bool again = true; again; ) {
+        again = false;
+        const std::bitset<LLAMA_MAX_SEQ> cur = open;
+        llama_turbot_for_each_seq(cur, [&](llama_seq_id s) {
+            const uint64_t d = std::min<uint64_t>(cap_cells, n[s]);
+            if (d <= left/n_open) {
+                y[s]  = d;
+                left -= d;
+                n_open--;
+                open.reset(s);
+                again = true;
+            }
+        });
+    }
+
+    llama_turbot_for_each_seq(open, [&](llama_seq_id s) {
+        y[s] = left/n_open;
+    });
+}
+
+void llama_kv_tier::commit_ubatch(const llama_kv_cells & kvc) {
+    // quota (SPEC 9.6)
+    uint32_t                   n_cells[LLAMA_MAX_SEQ];
+    std::bitset<LLAMA_MAX_SEQ> live;
+
+    for (llama_seq_id s = 0; s < (llama_seq_id) LLAMA_MAX_SEQ; ++s) {
+        n_cells[s] = kvc.seq_n_cells(s);
+        if (n_cells[s] > 0) {
+            live.set(s);
+        }
+    }
+
+    // [TAG_4C_QUOTA]
+    uint64_t y[LLAMA_MAX_SEQ];
+    llama_turbot_young_quota(n_cells, LLAMA_MAX_SEQ, pool_cells, cap_cells, quota_prop, y);
+
     llama_turbot_for_each_seq(live, [&](llama_seq_id s) {
-        const uint64_t y = sum ? std::min<uint64_t>(cap_cells, (uint64_t) n_eff*n_cells[s]/sum) : 0;
-        cut[s] = (int64_t) row_ctr[s] - (int64_t) y;
+        cut[s] = (int64_t) row_ctr[s] - (int64_t) y[s];
     });
     has_cut = live;
 
@@ -1701,13 +1763,16 @@ void llama_kv_tier::commit_ubatch(const llama_kv_cells & kvc) {
         }
 
         std::string per_seq;
+        std::string per_quota;
         llama_turbot_for_each_seq(live, [&](llama_seq_id s) {
-            per_seq += format(" s%d %u/%u", s, young_n[s], n_cells[s]);
+            per_seq   += format(" s%d %u/%u", s, young_n[s], n_cells[s]);
+            per_quota += format(" s%d %" PRIu64, s, y[s]);
         });
 
         LLAMA_LOG_INFO("%s: turbot: slots used %u/%u, freed %" PRIu64 ", empty reclaimed %" PRIu64 ", evicted %" PRIu64
-                ", filled cells %" PRIu64 ", young/live:%s\n", __func__,
-                n_slot - (uint32_t) free_slots.size(), n_slot, n_freed, dbg_reclaimed, dbg_evicted, dbg_fill_cells, per_seq.c_str());
+                ", filled cells %" PRIu64 ", young/live:%s, quota %s:%s\n", __func__,
+                n_slot - (uint32_t) free_slots.size(), n_slot, n_freed, dbg_reclaimed, dbg_evicted, dbg_fill_cells, per_seq.c_str(),
+                quota_prop ? "prop" : "wf", per_quota.c_str());
 
         dbg_reclaimed  = 0;
         dbg_evicted    = 0;
