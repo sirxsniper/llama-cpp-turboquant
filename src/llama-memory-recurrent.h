@@ -98,6 +98,11 @@ public:
     uint32_t rs_n_main = 0;
     uint32_t rs_n_w    = 0;
 
+    // [TAG_RS_SNAP_DEPTH] snapshot layout: rollback depth after a ubatch of rs_n_tok tokens. rs_pre_state: the graph also
+    //   writes the state before the ubatch (group rs_n_tok), so a rollback of the whole ubatch is exact
+    uint32_t rs_n_tok      = 0;
+    bool     rs_pre_state  = false;
+
     // TODO: optimize for recurrent state needs
     struct mem_cell {
         llama_pos pos  = -1;

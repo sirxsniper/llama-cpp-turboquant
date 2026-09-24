@@ -73,6 +73,18 @@ static bool llama_gdn_replay_arch(llm_arch arch) {
 
 // one ring token: k [S_k*H_v] (H_v heads, the graph repeats k when the fused op is off) | v [S_v*H_v] | g [H_v] |
 // beta [H_v], padded to 4 floats for the float4 loads of the CUDA kernel
+// [TAG_RS_SNAP_DEPTH] graphs that write the state before the ubatch into group n_seq_tokens (delta-net-base conv + GDN)
+static bool llama_rs_pre_state_arch(llm_arch arch) {
+    switch (arch) {
+        case LLM_ARCH_QWEN35:
+        case LLM_ARCH_QWEN35MOE:
+        case LLM_ARCH_QWEN3NEXT:
+            return true;
+        default:
+            return false;
+    }
+}
+
 static int64_t llama_gdn_ring_slot(const llama_hparams & hparams) {
     const int64_t H_v = hparams.ssm_dt_rank;
     const int64_t S_k = hparams.ssm_d_state;
@@ -150,6 +162,8 @@ llama_memory_recurrent::llama_memory_recurrent(
     rs_idx.assign(n_seq_max, 0);
 
     // [TAG_4C_GDN_REPLAY] decided before any tensor is created, because it sets the s_l row count
+    rs_pre_state = llama_rs_pre_state_arch(model.arch);
+
     replay = n_rs_seq > 0 && llama_gdn_replay_env() && llama_gdn_replay_arch(model.arch) &&
         type_s == GGML_TYPE_F32 && model.split_mode() != LLAMA_SPLIT_MODE_TENSOR && llama_gdn_replay_shape_ok(hparams);
     if (replay) {
@@ -888,6 +902,7 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
     //   last n_w tokens of this ubatch, the extras keep their ring minus a pending rollback
     rs_n_main = n_seqs;
     rs_n_w    = std::min(n_seq_tokens, n_rs_seq);
+    rs_n_tok  = n_seq_tokens;
 
     // allow getting the range of used cells, from head to head + n
     head = min;
@@ -1631,10 +1646,12 @@ int32_t llama_memory_recurrent_context::s_copy(int i) const {
         cell.n_ring = is_main ? mem->rs_n_w : cell.n_rpl;
         cell.n_rb   = is_main ? mem->rs_n_w : (idx > 0 ? 0 : std::min(cell.n_rb, cell.n_ring));
     } else {
-        // [TAG_RS_SNAP_DEPTH] a main cell has groups for the last rs_n_w tokens, an extra that folds a rollback has none
+        // [TAG_RS_SNAP_DEPTH] a main cell has groups for the last rs_n_w tokens (without the pre-ubatch state: not the
+        //   whole ubatch), an extra that folds a rollback has none
         auto & cell = mem->cells[cell_idx];
-        const bool is_main = (uint32_t) i < mem->rs_n_main;
-        cell.n_rb = is_main ? mem->rs_n_w : (idx > 0 ? 0 : cell.n_rb);
+        const bool     is_main = (uint32_t) i < mem->rs_n_main;
+        const uint32_t n_main  = mem->rs_pre_state ? mem->rs_n_w : std::min(mem->rs_n_w, mem->rs_n_tok > 0 ? mem->rs_n_tok - 1 : 0);
+        cell.n_rb = is_main ? n_main : (idx > 0 ? 0 : cell.n_rb);
     }
 
     return (int32_t)(idx * mem->size) + src0;
