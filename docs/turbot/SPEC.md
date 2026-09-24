@@ -913,6 +913,7 @@ LLAMA_API void llama_turbot_set_plan_path(const char * path);
 L <il> K <b0> <b1> <b2> <b3> V <b0> <b1> <b2> <b3>      required for every attention layer the cache holds
 Y <il> K <y0> <y1> <y2> <y3> V <y0> <y1> <y2> <y3>      optional, default y = 7 for every head of that layer
 POOL <cells>                                            optional, default 65536
+POOL auto [<max>]                                       instead of POOL <cells> ([TAG_TURBOT_POOL_AUTO]), max default 65536
 CAP <cells>                                             optional, default 16384
 W <n> | W2 <n> | M <bits>                               kvfq bench keys: accepted, ignored, one warning
 ```
@@ -924,6 +925,14 @@ W <n> | W2 <n> | M <bits>                               kvfq bench keys: accepte
 - a missing L line for an attention layer, or an L/Y line for a layer the cache does not hold;
 - POOL not a multiple of 64 (a POOL above kv_size, explicit or the implicit default, is not refused: it is clamped to kv_size in whole granules with a warning, so llama-bench at low depth, perplexity at 32K and fit probes run; the 262144-cell server keeps POOL 65536; coordinator change 2026-09-15);
 - CAP < 0.
+
+`POOL auto [<max>]` ([TAG_TURBOT_POOL_AUTO], 2026-09-24) sets POOL from CAP and the cache shape once every line is read:
+POOL = min(max, n_stream * round_up_64(ceil(n_seq_max / n_stream) * (CAP + 128) + 2112)), then the clamp to the cache
+above. 128 is the quota slack per sequence (`GGML_TURBOT_QUOTA_SLACK_GRANULES` x 64), 2112 is 33 granules: a 2048-row
+ubatch in flight plus one partly filled granule. max must be a non-negative multiple of 64. The hash uses the resolved
+POOL. Unified cache, CAP 16384: -np 1 / 2 / 3 / 4 give 18624 / 35136 / 51648 / 65536 cells (the last capped), so -np 4
+keeps the built-in plan's hash 0x56c3503c949a7749. One INFO line: `turbot plan <src> line N: POOL auto = P cells
+(n_seq_max S, n_stream N, CAP C)`. `tools/turbot/plan_vram.py --np N` resolves it the same way.
 
 POOL 0 is allowed as a diagnostic arm:
 - every row is written old-only (young rows −1, gtab all −1, no fill);
