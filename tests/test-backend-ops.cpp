@@ -8783,6 +8783,9 @@ enum turbot_test_widths {
     TURBOT_TW_NR1_B4,    // K 4 (young 7), V 5 (young 7): the NR 1 perf layer
     TURBOT_TW_NR1_B5,    // K 5 (young 7), V 6 (young 8)
     TURBOT_TW_NR1_B6,    // K 6 (young 8), V 2 (young 7)
+    // [TAG_TURBOT_YOUNG_CT_EXT] appended: every (b, y) of the compiled y = 8 and y = 6 young loaders
+    TURBOT_TW_Y8,        // K 2 3 4 5, V 6 4 5 3, young 8 everywhere
+    TURBOT_TW_Y6,        // K 2 3 4 5, V 5 4 3 2, young 6 everywhere
 };
 
 enum turbot_test_mix {
@@ -8808,6 +8811,8 @@ static const char * turbot_test_widths_name(turbot_test_widths w) {
         case TURBOT_TW_NR1_B4:   return "nr1b4";
         case TURBOT_TW_NR1_B5:   return "nr1b5";
         case TURBOT_TW_NR1_B6:   return "nr1b6";
+        case TURBOT_TW_Y8:       return "y8";
+        case TURBOT_TW_Y6:       return "y6";
     }
     return "?";
 }
@@ -8830,6 +8835,8 @@ static ggml_turbot_layer turbot_test_layer(turbot_test_widths w) {
     static const uint8_t mix_bv[4] = { 4, 2, 6, 3 }, mix_yv[4] = { 7, 7, 8, 5 };
     static const uint8_t u5[4]     = { 5, 5, 5, 5 }, y7[4]     = { 7, 7, 7, 7 };
     static const uint8_t u6[4]     = { 6, 6, 6, 6 };
+    static const uint8_t y8_bk[4]  = { 2, 3, 4, 5 }, y8_bv[4]  = { 6, 4, 5, 3 }, y8[4] = { 8, 8, 8, 8 };
+    static const uint8_t y6_bk[4]  = { 2, 3, 4, 5 }, y6_bv[4]  = { 5, 4, 3, 2 }, y6[4] = { 6, 6, 6, 6 };
     ggml_turbot_layer l{};
     bool ok = false;
     switch (w) {
@@ -8837,6 +8844,8 @@ static ggml_turbot_layer turbot_test_layer(turbot_test_widths w) {
         case TURBOT_TW_MIXED:    ok = ggml_turbot_layer_init(&l, mix_bk, mix_bv, mix_yk, mix_yv); break;
         case TURBOT_TW_UNIFORM5: ok = ggml_turbot_layer_init(&l, u5, u5, y7, y7);                 break;
         case TURBOT_TW_UNIFORM6: ok = ggml_turbot_layer_init(&l, u6, u6, y7, y7);                 break;
+        case TURBOT_TW_Y8:       ok = ggml_turbot_layer_init(&l, y8_bk, y8_bv, y8, y8);           break;   // [TAG_TURBOT_YOUNG_CT_EXT]
+        case TURBOT_TW_Y6:       ok = ggml_turbot_layer_init(&l, y6_bk, y6_bv, y6, y6);           break;
         default: break;   // [TAG_TURBOT_ANY_TEST] the NR < 4 widths only exist through turbot_test_layer_geom
     }
     GGML_ASSERT(ok);
@@ -8859,6 +8868,8 @@ static int turbot_test_widths_of(turbot_test_widths w, uint8_t bk[4], uint8_t bv
         /* NR1_B4   */ { { 4, 0, 0, 0 }, { 5, 0, 0, 0 }, { 7, 0, 0, 0 }, { 7, 0, 0, 0 }, 1 },
         /* NR1_B5   */ { { 5, 0, 0, 0 }, { 6, 0, 0, 0 }, { 7, 0, 0, 0 }, { 8, 0, 0, 0 }, 1 },
         /* NR1_B6   */ { { 6, 0, 0, 0 }, { 2, 0, 0, 0 }, { 8, 0, 0, 0 }, { 7, 0, 0, 0 }, 1 },
+        /* Y8       */ { { 2, 3, 4, 5 }, { 6, 4, 5, 3 }, { 8, 8, 8, 8 }, { 8, 8, 8, 8 }, 4 },
+        /* Y6       */ { { 2, 3, 4, 5 }, { 5, 4, 3, 2 }, { 6, 6, 6, 6 }, { 6, 6, 6, 6 }, 4 },
     };
     const int i = (int) w;
     GGML_ASSERT(i >= 0 && i < (int) (sizeof(rows)/sizeof(rows[0])));
@@ -13247,6 +13258,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // [TAG_TURBOT_YOUNG_CT_EXT] every compiled young (b, y) of the EXT build: y = 8 with b 2..6 and y = 6 with b 2..5, on
+    // the "mixed" kv / nb of the loops above (nb 512 and kv 1000 / 4096 are compiled-width kernels, nb 1 / 4 the Q <= 4
+    // route). The default build runs the same cases on the runtime young loader.
+    for (turbot_test_widths w : { TURBOT_TW_Y8, TURBOT_TW_Y6 }) {
+        for (int64_t kv : { 1000, 4096 }) {
+            for (int64_t nb : { 1, 4, 512 }) {
+                for (turbot_test_mix mix : { TURBOT_MIX_YOUNG, TURBOT_MIX_ALT, TURBOT_MIX_BAND16K }) {
+                    test_cases.emplace_back(new test_flash_attn_ext_turbot(w, kv, nb, mix, 1, false, 0.0f, false));
+                }
+            }
+        }
+    }
+
     // [TAG_TURBOT] writer read back through the turbot FA: rows 1 / 4 / 16 / 1280, I64 and I32 cells, young rows none /
     // all / mixed, fill entries present / absent, K widths != V widths with b = 2 and b = 6 heads
     for (int64_t rows : { 1, 4, 16, 1280 }) {
@@ -13256,11 +13280,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
         test_cases.emplace_back(new test_turbot_set_rows(TURBOT_TW_L23, rows, GGML_TYPE_I32, 2, true, false));
+        // [TAG_TURBOT_YOUNG_CT_EXT] the y = 8 and y = 6 young rows written and read back
+        test_cases.emplace_back(new test_turbot_set_rows(TURBOT_TW_Y8, rows, GGML_TYPE_I64, 2, true, false));
+        test_cases.emplace_back(new test_turbot_set_rows(TURBOT_TW_Y6, rows, GGML_TYPE_I64, 2, true, false));
     }
 
     // [TAG_TURBOT_ANY_TEST] turbot on other KV geometries (ggml_turbot_geom_*, WP2 CUDA kernels). Every case below prints
     // d/hkv/hq after the widths ("turbot=<w>,d=..,hkv=..,hq=..,kv=.."), so "^turbot=[a-z0-9]+,kv=" still selects exactly
-    // the 195 Qwen3.8-27B FA cases above and "^turbot=[a-z0-9]+,d=" exactly these. Rows of fewer than 4 runs rotate
+    // the Qwen3.8-27B FA cases above (195, plus the 36 [TAG_TURBOT_YOUNG_CT_EXT] y8 / y6 cases) and "^turbot=[a-z0-9]+,d=" exactly these. Rows of fewer than 4 runs rotate
     // through the S < 8 widths (NR 1: b 2..6, NR 2: (2,2) and (3,4)) in registration order, so every width is covered at
     // every geometry that has it. kv 16384 takes nb 1 / 4 / 512 only and nb 1280 kv 1000 / 4096 only, as above.
     {

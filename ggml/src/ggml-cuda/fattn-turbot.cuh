@@ -39,6 +39,12 @@
 #define GGML_CUDA_TURBOT_OLD_I8 1
 #endif // GGML_CUDA_TURBOT_OLD_I8
 
+// [TAG_TURBOT_YOUNG_CT_EXT] 1 = also compile the young loaders for y = 8 (b 2..6) and y = 6 (b 2..5), not only y = 7.
+// CMake option GGML_CUDA_TURBOT_YOUNG_CT_EXT (default OFF: the y = 7 kernels only, SASS unchanged).
+#ifndef GGML_CUDA_TURBOT_YOUNG_CT_EXT
+#define GGML_CUDA_TURBOT_YOUNG_CT_EXT 0
+#endif // GGML_CUDA_TURBOT_YOUNG_CT_EXT
+
 // ------------------------------------------------------------------------------------------------------------------
 // [TAG_TURBOT_I8] int8 register LUTs of the old codebooks.
 //
@@ -634,6 +640,32 @@ static __device__ __forceinline__ void flash_attn_ext_turbot_load_tile_young_dis
                 default: break;
             }
         }
+#if GGML_CUDA_TURBOT_YOUNG_CT_EXT
+        // [TAG_TURBOT_YOUNG_CT_EXT] after the y = 7 switch, which stays first
+#define TURBOT_YOUNG_CASE_Y(BB, YY)                                                                           \
+    case BB: flash_attn_ext_turbot_load_tile_young<BB, YY - BB, stride_tile, nwarps, nbatch_fa, oob_check>   \
+        (row0, prow0, tile_KV, D2, stride_row, stride_prow, elem0, st, lut_young, i_sup); return;
+        if (!generic && st.b + st.r == 8) {
+            switch (st.b) {
+                TURBOT_YOUNG_CASE_Y(2, 8)
+                TURBOT_YOUNG_CASE_Y(3, 8)
+                TURBOT_YOUNG_CASE_Y(4, 8)
+                TURBOT_YOUNG_CASE_Y(5, 8)
+                TURBOT_YOUNG_CASE_Y(6, 8)
+                default: break;
+            }
+        }
+        if (!generic && st.b + st.r == 6) {
+            switch (st.b) {
+                TURBOT_YOUNG_CASE_Y(2, 6)
+                TURBOT_YOUNG_CASE_Y(3, 6)
+                TURBOT_YOUNG_CASE_Y(4, 6)
+                TURBOT_YOUNG_CASE_Y(5, 6)
+                default: break;
+            }
+        }
+#undef TURBOT_YOUNG_CASE_Y
+#endif // GGML_CUDA_TURBOT_YOUNG_CT_EXT
     } else {
         (void) generic;   // [TAG_TURBOT_CT_SPILL] ncols <= 16: runtime loader only
     }
@@ -2811,10 +2843,15 @@ static __host__ void ggml_cuda_fattn_turbot_balance_weights(
     } else {
         const bool ct          = ncols >= TURBOT_CT_WIDTH_MIN_NCOLS && !ggml_cuda_fattn_turbot_generic_on();
         const int  b6_extra    = ct ? (ncols >= 64 ?  4 :  1) : (ncols >= 64 ?  8 : 24);
-        const int  young_extra = ct ? (ncols >= 64 ? 10 : 22) : (ncols >= 64 ? 25 : 45);
+        // [TAG_TURBOT_YOUNG_CT_EXT] per side: the compiled-width weight only for a y the kernel has a compiled loader
+        // for (7, plus 6 and 8 in the EXT build; y = 0 of an unused run keeps it too), else the runtime-loader weight
+        const auto young_extra = [&](const int y) {
+            const bool y_ct = y == 0 || y == 7 || (GGML_CUDA_TURBOT_YOUNG_CT_EXT && (y == 6 || y == 8));
+            return ct && y_ct ? (ncols >= 64 ? 10 : 22) : (ncols >= 64 ? 25 : 45);
+        };
         for (int h = 0; h < GGML_TURBOT_MAX_RUNS; ++h) {   // [TAG_TURBOT_ANY_NHEAD] runs r >= nr: b = 0, unused
             const int ho = 200 + (l.k.b[h] == 6 ? b6_extra : 0) + (l.v.b[h] == 6 ? b6_extra : 0);
-            const int hy = ho + 2*young_extra;
+            const int hy = ho + young_extra(l.k.y[h]) + young_extra(l.v.y[h]);
             wo |= (uint64_t) ho << (16*h);
             wy |= (uint64_t) hy << (16*h);
         }

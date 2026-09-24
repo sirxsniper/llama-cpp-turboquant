@@ -137,6 +137,12 @@ if (CUDAToolkit_FOUND)
         add_compile_definitions(GGML_CUDA_FA_TURBOT_D128=0)
         set(GGML_CUDA_FA_TURBOT_D128_COUNT 0)
     endif()
+    # [TAG_TURBOT_YOUNG_CT_EXT] compiled young loaders for y = 8 and y = 6 next to y = 7 (fattn-turbot.cuh). OFF keeps
+    # the turbot kernels bit-identical to builds without the option; ON may add registers, check cuobjdump -res-usage.
+    option(GGML_CUDA_TURBOT_YOUNG_CT_EXT "ggml: compile the turbot young loaders for y = 6 and y = 8 too" OFF)
+    if (GGML_CUDA_TURBOT_YOUNG_CT_EXT)
+        add_compile_definitions(GGML_CUDA_TURBOT_YOUNG_CT_EXT=1)
+    endif()
     message(STATUS "FlashAttention turbo VEC instances: ${GGML_CUDA_FA_TURBO_VEC_COUNT}, turbot MMA instances: ${GGML_CUDA_FA_TURBOT_MMA_COUNT} (D=256) + ${GGML_CUDA_FA_TURBOT_D128_COUNT} (D=128)")
 
     ggml_add_backend_library(ggml-cuda
