@@ -12691,6 +12691,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_concat(GGML_TYPE_I64, {11, 12, 13, 14}, 7, dim, v));
         }
     }
+    // [TAG_CONCAT_SMALL] the GDN conv state: 3 kept + 4 new values per channel, 10240 channels, 4 sequences
+    for (int v : { 0, 2, 3 }) {
+        test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {3, 10240, 4, 1}, 4, 0, v));
+    }
 
     for (ggml_type type_a : { GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q8_0 }) {
         for (int v : { 0, 4, 8, 12 }) {
@@ -12741,6 +12745,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {8192,   nrows, 1, 1}, k, true));
             test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {202048, nrows, 1, 1}, k, true));
         }
+    }
+    // [TAG_TOPK_SPLIT] the multi-block select (top-k.cu): the Qwen3.5/3.8 vocabulary at 1/4/16 rows (the backend
+    // sampler asks one row at a time, the DFlash selector 16), k up to 64, ties, the 16384 / 262144 column limits
+    // and a row count above the split's 64-row limit.
+    for (int k : {1, 20, 40, 64}) {
+        for (int nrows : {1, 4, 16}) {
+            test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {248320, nrows, 1, 1}, k));
+            test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {248320, nrows, 1, 1}, k, true));
+        }
+        test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {16384,  3, 1, 1}, k));
+        test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {16383,  1, 1, 1}, k));
+        test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {262144, 2, 1, 1}, k, true));
+        test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {262145, 1, 1, 1}, k));
+        test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {32768, 65, 1, 1}, k));
     }
 
     for (int k : {1, 2, 3, 7, 15}) {
@@ -14294,6 +14312,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // backend sampler: one row of the vocab (llama-sampler.cpp top_k)
     for (auto k : {20, 40}) {
         test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {151936, 1, 1, 1}, k));
+    }
+    // [TAG_TOPK_SPLIT] Qwen3.5/3.8 vocabulary: the sampler's one-row calls and the DFlash selector's 16 rows. Plus the
+    // GDN conv-state concat [TAG_CONCAT_SMALL] at 1 and 4 sequences (non-contiguous new values).
+    for (auto k : {1, 20, 64}) {
+        for (auto nrows : {1, 4, 16}) {
+            test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {248320, nrows, 1, 1}, k));
+        }
+    }
+    for (int64_t nseq : {1, 4}) {
+        test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {3, 10240, nseq, 1}, 4, 0, 2));
     }
 
     // short rows, many of them: MoE routing and group selection. The opposite corner from
