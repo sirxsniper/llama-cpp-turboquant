@@ -34,6 +34,7 @@
 #include "ggml-cuda/mmf.cuh"
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/mmsb.cuh"   // [TAG_MMSB] [TAG_SMALLB]
+#include "ggml-cuda/mmqsn.cuh"  // [TAG_MMQSN]
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
 #include "ggml-cuda/moe-weighted-reduction.cuh"
@@ -1897,6 +1898,12 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     // widths; MMQ itself is unchanged (prefill). GGML_CUDA_SMALLB=0 restores today's dispatch exactly.
     if (ggml_cuda_should_use_mmsb(src0, src1, dst, cc)) {
         ggml_cuda_mul_mat_sb(ctx, src0, src1, dst);
+        return;
+    }
+    // [TAG_MMQSN] MMQ with a cp.async weight ring (mmqsn.cu) for the 5..16-column widths MMQ takes today on weights with
+    // >= 2048 rows; bit-identical to MMQ. Off unless GGML_CUDA_MMQSN=1/2, so the default dispatch is unchanged.
+    if (ggml_cuda_should_use_mmqsn(src0, src1, dst, cc)) {
+        ggml_cuda_mul_mat_qsn(ctx, src0, src1, dst);
         return;
     }
     if (ggml_cuda_should_use_mmvq(src0->type, cc, ne11, /*ne01 =*/ src0->ne[1])) {

@@ -12102,6 +12102,35 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // [TAG_MMQSN] ring MMQ for 5..16 columns (ggml-cuda/mmqsn.cu), active with GGML_CUDA_MMQSN=1/2. k = 256/768/5376:
+    // 1/3/21 steps per tile (5376: Q6_K rows of 4410 B, so the 16-byte window offset changes per row). m = 2048/4096 leave most
+    // of 170 stream-k blocks empty or partial; m = 43520 is 340 tiles = 2 full waves (tiling, persistent grid); k_v = 5376 is a
+    // row stride larger than the row.
+    for (ggml_type ta : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0}) {
+        for (int n : {5, 8, 9, 12, 16}) {
+            test_cases.emplace_back(new test_mul_mat(ta, GGML_TYPE_F32, 2048, n,  256, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(ta, GGML_TYPE_F32, 4096, n,  768, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(ta, GGML_TYPE_F32, 2048, n, 5376, {1, 1}, {1, 1}));
+        }
+        for (int n : {8, 16}) {
+            test_cases.emplace_back(new test_mul_mat(ta, GGML_TYPE_F32, 43520, n, 768, {1, 1}, {1, 1}));
+        }
+        for (int n : {6, 12}) {
+            test_cases.emplace_back(new test_mul_mat(ta, GGML_TYPE_F32, 2048, n, 5120, {1, 1}, {1, 1}, {0, 1, 2, 3}, 5376));
+        }
+        // m = 25600: 200 tiles, stream-k with 3.5-6 steps per block, so a block writes dst mid-loop and goes on into
+        // the next tile. m = 42240: 330 tiles, tiling with a persistent grid where blocks own 2 or 1 tiles.
+        // m = 20480: 160 tiles, tiling with one block per tile.
+        for (int n : {7, 16}) {
+            test_cases.emplace_back(new test_mul_mat(ta, GGML_TYPE_F32, 25600, n,  768, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(ta, GGML_TYPE_F32, 25600, n, 1280, {1, 1}, {1, 1}));
+        }
+        for (int n : {8, 13}) {
+            test_cases.emplace_back(new test_mul_mat(ta, GGML_TYPE_F32, 42240, n,  768, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(ta, GGML_TYPE_F32, 20480, n,  768, {1, 1}, {1, 1}));
+        }
+    }
+
 #if 0
     {
         // Test paths in OpenCL
@@ -13636,6 +13665,28 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
                 }
             }
         }
+    }
+
+    // [TAG_MMQSN] larger-than-L2 shapes with the Qwen3.8-27B row counts (same stream-k geometry, weights from DRAM), and a
+    // 1 GiB pure read that calibrates the card's streaming rate.
+    {
+        struct mmqsn_perf_shape { ggml_type type; int64_t m; int64_t k; };
+        const mmqsn_perf_shape dram_shapes[] = {
+            {GGML_TYPE_Q5_K, 17408, 20480},   // ffn gate/up rows, 245 MB
+            {GGML_TYPE_Q6_K,  5120, 69632},   // ffn_down rows, 293 MB
+            {GGML_TYPE_Q5_K, 10240, 20480},   // attn_qkv rows, 144 MB
+            {GGML_TYPE_Q5_K,  6144, 30720},   // attn_gate rows, 130 MB
+            {GGML_TYPE_Q6_K,  5120, 30720},   // ssm_out / attn_output rows, 129 MB
+            {GGML_TYPE_Q6_K, 12288, 20480},   // attn_q rows, 206 MB
+            {GGML_TYPE_Q4_K, 17408, 20480},   // 200 MB
+            {GGML_TYPE_Q8_0, 17408, 20480},   // drafter rows, 379 MB (not routed in v1: MMQ baseline for v2)
+        };
+        for (int64_t n : {2, 4, 6, 8, 12, 16}) {
+            for (const mmqsn_perf_shape & s : dram_shapes) {
+                test_cases.emplace_back(new test_mul_mat(s.type, GGML_TYPE_F32, s.m, n, s.k, {1, 1}, {1, 1}));
+            }
+        }
+        test_cases.emplace_back(new test_sum_rows(GGML_TYPE_F32, {4096, 65536, 1, 1}));
     }
 
     // ---- Qwen3.8-27B (qwen35) PREFILL-scale coverage -----------------------

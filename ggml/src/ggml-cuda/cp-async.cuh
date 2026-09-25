@@ -1,3 +1,5 @@
+#pragma once
+
 // Simplified API for asynchronous data loading.
 
 #include "common.cuh"
@@ -54,4 +56,46 @@ static __device__ __forceinline__ void cp_async_wait_all() {
 #else
     NO_DEVICE_CODE;
 #endif // CP_ASYNC_AVAILABLE
+}
+
+// [TAG_MMQSN] Commit-group API for multi-stage pipelines (mmqsn-impl.cuh). A thread's cp.async copies issued since
+// its last commit form one group; cp_async_wait_group<N> waits until at most N of the thread's groups are pending.
+// Like cp_async_wait_all, neither call synchronizes threads: a __syncthreads is still needed before other threads read.
+static __device__ __forceinline__ void cp_async_commit_group() {
+#ifdef CP_ASYNC_AVAILABLE
+    asm volatile("cp.async.commit_group;" : : : "memory");
+#else
+    NO_DEVICE_CODE;
+#endif // CP_ASYNC_AVAILABLE
+}
+
+template <int N>
+static __device__ __forceinline__ void cp_async_wait_group() {
+    static_assert(N >= 0 && N <= 7, "bad N");
+#ifdef CP_ASYNC_AVAILABLE
+    asm volatile("cp.async.wait_group %0;" : : "n"(N) : "memory");
+#else
+    NO_DEVICE_CODE;
+#endif // CP_ASYNC_AVAILABLE
+}
+
+// [TAG_MMQSN] Asks L2 to fetch [p, p + nbytes) from global memory; nothing is returned to the thread and nothing waits
+// for it. sm >= 90: one bulk prefetch (p must be 16-byte aligned, nbytes a multiple of 16). Older GPUs, or builds with
+// -DGGML_CUDA_MMQSN_LINE_PREFETCH: one prefetch per 128-byte line from p, plus the line of the last byte.
+static __device__ __forceinline__ void ggml_cuda_prefetch_l2(const void * p, const uint32_t nbytes) {
+#if defined(CP_ASYNC_AVAILABLE) && __CUDA_ARCH__ >= GGML_CUDA_CC_HOPPER && !defined(GGML_CUDA_MMQSN_LINE_PREFETCH)
+    asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" : : "l"(p), "r"(nbytes) : "memory");
+#elif defined(CP_ASYNC_AVAILABLE)
+    const char * c = (const char *) p;
+    for (uint32_t off = 0; off < nbytes; off += 128) {
+        asm volatile("prefetch.global.L2 [%0];" : : "l"(c + off));
+    }
+    if (nbytes > 0) {
+        asm volatile("prefetch.global.L2 [%0];" : : "l"(c + nbytes - 1));
+    }
+#else
+    GGML_UNUSED(p);
+    GGML_UNUSED(nbytes);
+    NO_DEVICE_CODE;
+#endif // defined(CP_ASYNC_AVAILABLE) && __CUDA_ARCH__ >= GGML_CUDA_CC_HOPPER && !defined(GGML_CUDA_MMQSN_LINE_PREFETCH)
 }
