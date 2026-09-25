@@ -6,13 +6,14 @@
 // mmqsn.cu). Bit-identical to MMQ; it only overlaps the weight loads with the compute. Routed after mmsb and before
 // MMVQ/MMQ in ggml_cuda_mul_mat; MMQ itself is untouched (prefill is not affected).
 //
-// Environment (read once; unset GGML_CUDA_MMQSN = today's routing exactly):
-//   GGML_CUDA_MMQSN=1                 on for cc 1200 (RTX 50xx) only; =2 on for any Ampere+ NVIDIA GPU (tests)
+// Environment (read once). [TAG_MMQSN_DEFAULT] on by default on cc 1200; GGML_CUDA_MMQSN=0 restores MMQ exactly:
+//   GGML_CUDA_MMQSN=1                 (default) on for cc 1200 (RTX 50xx) only; =2 on for any Ampere+ NVIDIA GPU (tests);
+//                                     =0 off
 //   GGML_CUDA_MMQSN_MODE=ring|pf|stream  K-loop: cp.async ring (default), L2 prefetch only, or the ring without compute
 //                                     (stream measures the ceiling and gives WRONG output)
 //   GGML_CUDA_MMQSN_PF=n              L2 prefetch distance in steps (default 0 for ring, 2 for pf)
 //   GGML_CUDA_MMQSN_PF_RUN=1|2|4      steps per prefetch run (contiguous bytes per row), default 1
-//   GGML_CUDA_MMQSN_L2HINT=1          cp.async with the .L2::256B hint
+//   GGML_CUDA_MMQSN_L2HINT=0|1        cp.async with the .L2::256B hint (default 1)
 //   GGML_CUDA_MMQSN_MIN=n             0 (default) = only the widths MMQ takes today; n = also MMVQ's widths >= n
 //   GGML_CUDA_MMQSN_MAX=n             widest src1 batch, 2..16 (default 16)
 //   GGML_CUDA_MMQSN_MIN_ROWS=n        smallest weight row count (default 2048)

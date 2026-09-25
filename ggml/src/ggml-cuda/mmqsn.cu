@@ -53,7 +53,9 @@ static const char * mmqsn_mode_name(const int loop) {
 static const mmqsn_env_t & mmqsn_env() {
     static const mmqsn_env_t env = [] {
         mmqsn_env_t v;
-        const int m = mmqsn_env_int("GGML_CUDA_MMQSN", 0);
+        // [TAG_MMQSN_DEFAULT] on by default where it was measured (cc 1200): server ms/step -5 % at 4 streams, -6 % at 2,
+        // bit-identical output. GGML_CUDA_MMQSN=0 is the kill switch, =2 enables it on any Ampere+ NVIDIA GPU (tests).
+        const int m = mmqsn_env_int("GGML_CUDA_MMQSN", 1);
         v.mode = (m == 1 || m == 2) ? m : 0;
         const char * lm = getenv("GGML_CUDA_MMQSN_MODE");
         v.loop = MMQSN_RING;
@@ -65,7 +67,7 @@ static const mmqsn_env_t & mmqsn_env() {
         v.pf_dist  = std::max(0, mmqsn_env_int("GGML_CUDA_MMQSN_PF", v.loop == MMQSN_PF ? 2 : 0));
         const int run = mmqsn_env_int("GGML_CUDA_MMQSN_PF_RUN", 1);
         v.pf_run   = (run == 2 || run == 4) ? run : 1;
-        v.l2hint   = mmqsn_env_int("GGML_CUDA_MMQSN_L2HINT", 0) != 0 ? 1 : 0;
+        v.l2hint   = mmqsn_env_int("GGML_CUDA_MMQSN_L2HINT", 1) != 0 ? 1 : 0;   // [TAG_MMQSN_DEFAULT] best in G0/G2
         v.min_n    = std::max(0, mmqsn_env_int("GGML_CUDA_MMQSN_MIN", 0));
         v.max_n    = std::min(16, std::max(2, mmqsn_env_int("GGML_CUDA_MMQSN_MAX", 16)));
         const char * r0 = getenv("GGML_CUDA_MMQSN_MIN_ROWS");

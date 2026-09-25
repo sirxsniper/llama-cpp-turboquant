@@ -1901,7 +1901,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         return;
     }
     // [TAG_MMQSN] MMQ with a cp.async weight ring (mmqsn.cu) for the 5..16-column widths MMQ takes today on weights with
-    // >= 2048 rows; bit-identical to MMQ. Off unless GGML_CUDA_MMQSN=1/2, so the default dispatch is unchanged.
+    // >= 2048 rows; bit-identical to MMQ. [TAG_MMQSN_DEFAULT] On by default on cc 1200, GGML_CUDA_MMQSN=0 turns it off.
     if (ggml_cuda_should_use_mmqsn(src0, src1, dst, cc)) {
         ggml_cuda_mul_mat_qsn(ctx, src0, src1, dst);
         return;

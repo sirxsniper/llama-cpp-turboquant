@@ -12113,7 +12113,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
-    // [TAG_MMQSN] ring MMQ for 5..16 columns (ggml-cuda/mmqsn.cu), active with GGML_CUDA_MMQSN=1/2. k = 256/768/5376:
+    // [TAG_MMQSN] ring MMQ for 5..16 columns (ggml-cuda/mmqsn.cu), on by default on cc 1200 (=2: any GPU). k = 256/768/5376:
     // 1/3/21 steps per tile (5376: Q6_K rows of 4410 B, so the 16-byte window offset changes per row). m = 2048/4096 leave most
     // of 170 stream-k blocks empty or partial; m = 43520 is 340 tiles = 2 full waves (tiling, persistent grid); k_v = 5376 is a
     // row stride larger than the row.
