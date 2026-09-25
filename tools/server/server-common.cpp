@@ -1360,9 +1360,12 @@ json oaicompat_chat_params_parse(
 
     // Apply chat template to the list of messages
     // [TAG_TURN_TIMING] the whole conversation is rendered on every turn; make its cost visible
-    const int64_t t_tmpl0 = ggml_time_us();
+    // steady_clock, not ggml_time_us: on Windows that divides by a timer frequency that is 0 until ggml_time_init,
+    // and callers such as test-chat never init ggml
+    const auto t_tmpl0 = std::chrono::steady_clock::now();
     auto chat_params = common_chat_templates_apply(opt.tmpls.get(), inputs);
-    SRV_INF("chat template applied: %.1f ms, %zu bytes\n", (ggml_time_us() - t_tmpl0) / 1000.0, chat_params.prompt.size());
+    SRV_INF("chat template applied: %.1f ms, %zu bytes\n",
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_tmpl0).count(), chat_params.prompt.size());
 
     llama_params["chat_format"] = static_cast<int>(chat_params.format);
     llama_params["prompt"]      = chat_params.prompt;
