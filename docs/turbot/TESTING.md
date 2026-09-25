@@ -774,3 +774,89 @@ Vision (4033-token image, 262144 x 4, `-ub 1024`), `-mmdev gpu` vs `cpu`: encode
 - **Slot-file restore with DFlash2** (`save_restore` of `blob_roundtrip.py`) fails on OLD and NEW alike: see 9.9 G7.
 - **NEO-CODER-MAX fine-tunes** decode a short greedy answer at 44-47 t/s with DFlash2 on OLD and NEW alike (UD-Q5_K_XL: ~110): DFlash2 was trained on the base weights. Measure their acceptance and the speed without a drafter before choosing their profile.
 - Not run: G10 quota under mixed load (1 x 200K + 3 x 2K) with short-slot KLD; G9 at 61440 depth.
+
+## 11. Upstream sync to `84e76d8a2` (up80, 2026-09-25)
+
+Branch `up80` = `b5a5c7d54` (4C) + merge of upstream `84e76d8a2` (80 commits, `b11093` -> `b11173`) + the fork commits below. OLD = the build deployed on 2026-09-25 (`329febd80`, `D:\Projects\LocalAI\llama-turboquant`; SHA1 of all 12 exe/DLL files equal to `build-mmq16`). NEW = `build-up80` (`77eda6b60` for stages 3-5, `5680a6a4f` from stage 6b on). Outputs under `E:\turbot-gates\up80\<stage>`. Every GPU job went through the guard (STOP_GPU, one GPU process, memory, port 8091) and the post-check (no nvlddmkm / Display 4101 event, model file cache clean).
+
+| Commit | Change |
+|---|---|
+| `648743dbc` | merge of upstream `84e76d8a2`; conflicts in `fattn-mma-f16.cuh` (fork sparse guard kept with upstream's new `ncols2` argument), `llama-context.cpp`, `test-batch-alloc.cpp`, `test-save-load-state.cpp` |
+| `f2e61b700` | two comments made stale by the merge (dflash embedding scale, encode position check) |
+| `ad67cf71c`, `9d52ab267`, `77eda6b60` | `[TAG_SYNC_BATCH_EXT_COMPAT]`: one reused `llama_batch_ext` per context for the `llama_batch` overloads, embedding rows borrowed from the caller instead of copied (cold 16K prefill -0.49 % -> -0.15 % against OLD); `n_embd` reset per call; test-batch-alloc case `embd_borrowed_in_place` |
+| `4d0c8b623` | merge of mmq16 (`329febd80` SET_ROWS tolerance, `c84f91456` docs) |
+| `369c4c430` | test-batch-alloc builds with MSVC |
+| `548ebb452` | `[TAG_TURBO_QFNS_ROT]` test-quantize-fns checks the turbo KV types in their WHT basis (failed on every earlier build) |
+| `959ed44a6` | `[TAG_TURN_TIMING]` chat-template timing with steady_clock: test-chat divided by zero on Windows |
+| `e23dea34d` | `[TAG_RS_SNAP_DEPTH]` pre-ubatch recurrent state kept for every rollback arch (Mamba-2 conv + scan, LFM2 conv, Ling 3 conv; Kimi K3 / Qwen4exp) |
+| `5680a6a4f` | `[TAG_MTMD_EXTREME_ASPECT]` the dyn_size preprocessor shrinks a side above 65536 instead of failing the request (test-mtmd-impl case `test_image_preprocessor_dyn_size_extreme_aspect`) |
+
+No new switches: the production command and every Jarvis profile are unchanged. Only `--host` changed upstream (it now takes a comma-separated list; a single address works as before).
+
+### 11.1 Gates and results
+
+| Gate | OLD | NEW |
+|---|---|---|
+| ctest (shared build) | 36/37 | 37/37; static build 16/16 |
+| test-llama-archs (CPU and CUDA0) | - | 132/132 each; test-save-load-state on CUDA 127/127 |
+| test-recurrent-state-rollback (CPU and CUDA, `GDN_REPLAY` 0 and 1, 4 tiny fixtures + 10 generated) | 6/20 | 20/20, max diff 0; the `LLAMA_XSEQ_FIX=0` positive control fails as required (rc 1, nmse 0.0116) |
+| kernels (stage 2) | - | FA hsk=512 22/22, turbot FA 1641/1641, TOPK_MOE / MUL_MAT_ID / CONV_2D / CONV_2D_DW / CONV_3D / GDN 3696/3696, test-turbot-backend OK |
+| validate.ps1 | 18714/18714 | `GATE PASSED`, test-backend-ops 18995/18995 (the new cases: CONV_3D 276, CONV_2D_DW +4, sparse FA), smoke 90/90, texts identical |
+| crosstalk (production preset, 20 runs) | - | 160/160 own passphrases, 0 CROSS-SLOT, 0 LOST, no assert / seq_id / decode-failed line in any log |
+| KLD 16 x 32K turbot (existing bases) | code 0.001139 / 99.273 % / PPL 1.536336, prose 0.001856 / 98.174 % / 6.189125 | identical in every printed line, per-chunk lines too |
+| needles | 131K, 245K, 3-needle found | same answers |
+| vision, production preset | encode GPU 1.65 / 1.42 s, CPU 34.49 / 35.15 s | GPU 1.45 / 1.41 s, CPU 35.02 / 34.76 s; answers identical; iGPU answers match the CPU |
+| extreme aspect (1 x 20000 and 20000 x 1 PNG) | 4526 tokens (over the 4096 budget), GPU 3.6 s, CPU 44.7 s | 2048 tokens, HTTP 200, GPU 1.3 s, CPU 12.2 s (the plain merge: HTTP 400) |
+| Vulkan iGPU (stage 8) | - | ops 3163/3163, FA hsk=72 1010/1010, hsk=96 112/112 |
+| other local models (stage 7) | - | all 14 load and answer (facts, tools, vision); Muse Glimmer + DFlash, Nemotron 3.5 + MTP sidecar, Ornith-1.5-9B + MTP md5-identical to OLD |
+| Jarvis production command of UD-Q5_K_XL on `build-up80\bin` (port 8091, Vulkan not disabled, as Jarvis runs it) | - | facts right (`Paris; 391.`), image right (`CODE 74219`, blue square, red circle, green triangle; 1139 prompt tokens in 0.8 s), no error in the log (`E:\turbot-gates\up80\deploy\jarvis_smoke_new.txt`) |
+
+### 11.2 Measured, OLD `329febd80` vs NEW
+
+Production preset (Qwen3.8-27B UD-Q5_K_XL, 262144 x 4 slots, turbot, DFlash2-Q8_0 n_max 3, `--spec-rs-seq 3`, `-b 2048 -ub 1024`, vision on the GPU), ABBA interleaved, identical flags. Decode, steady ms/step:
+
+| Streams | Depth | Code, OLD vs NEW | Prose, OLD vs NEW |
+|---|---|---|---|
+| 1 | 0 | 27.031 vs 27.090 | 26.880 vs 26.820 |
+| 1 | 32K | 28.842 vs 28.807 | 29.122 vs 29.073 |
+| 2 | 0 | 30.455 vs 30.375 | 30.900 vs 30.858 |
+| 2 | 32K | 34.575 vs 34.437 | 34.382 vs 34.511 |
+| 4 | 0 | 37.545 vs 37.144 | 38.575 vs 38.383 |
+| 4 | 32K | 54.190 vs 53.513 | 52.559 vs 53.015 |
+
+Geomean -0.22 % (NEW slightly faster); OLD against OLD varies up to +-2 % per row. 1-stream texts and acceptance identical in every pair (0.924, 0.643, 0.912, 0.355). 4 streams, depth 0, total t/s: code 282.8 vs 277.3, prose 252.2 vs 250.5 (acceptance depends on batch timing there; OLD against OLD differs by up to +-4 %).
+
+| Measure | OLD | NEW |
+|---|---|---|
+| cold 16K prefill, 1 stream, server t/s (code / prose) | 2584.1 / 2573.2 (12 repeats) | 2578.8 / 2569.3 (6 repeats) |
+| cold 16K prefill, 4 streams, server t/s (code / prose) | 6526.4 / 6520.2 | 6511.9 / 6518.4 |
+| VRAM after load | 29680 MiB | 29678-29741 MiB |
+| buffers (target, KV, RS, compute; drafter model, KV, compute) | 18114.41, 5246.00, 693.21, 246.06; 1950.71, 52.98, 36.79 MiB | identical |
+| host RAM after the 4-stream cold row | 58665-58802 MB | 58773-58818 MB (+0.2 %) |
+| needle 131K, prompt / generation t/s | 1708 / 91.0 | 1720 / 91.6 |
+| needle 245K | 1249 / 84.1 | 1256 / 84.1 |
+| 3 needles at 131K | 1707 / 102.3 | 1929 / 116.2 |
+
+Cold prefill geomean -0.15 % (single repeats vary +-1 %, OLD against OLD -0.13 % to +0.14 % per row).
+
+Other models:
+
+| Model | OLD | NEW |
+|---|---|---|
+| Ornith-1.5-35B perplexity, 4K x 32 chunks (CPU reference 7.2940) | 7.3844, 7.3984 (differs per run; llama-perplexity crashes at exit, rc 139/127) | 7.3339, deterministic, no crash |
+| same, `GGML_CUDA_DISABLE_FUSION=1` | 7.3657 | 7.3657, per-chunk values byte-identical to OLD |
+| Ornith-1.5-35B perplexity, 32K x 4 chunks | 6.9564, 6.9385, 6.9564 | 6.7894 (3 runs) |
+| Ornith-1.5-35B decode, doc / code t/s | 167.1 / 176.2 | 168.7 / 177.6; with in-model MTP about 3 % faster per step (code 277.8 -> 291.0 t/s) |
+| Nemotron 3.5 + MTP sidecar, ms/step | 8.37 | 8.28, output md5 identical |
+| Ornith-1.5-9B, prose t/s | 194.9 | 195.8, md5 identical |
+
+The Ornith-35B text differs from OLD because upstream's top-k MoE fusion (`1a679828f`, with its allocator dependencies) now fires on that model. With fusion off both builds give the same per-chunk values; OLD with fusion on changes from run to run, so the OLD fused path was the defect.
+
+### 11.3 Open items
+
+- **Host RAM +75 to +143 MB (0.2 %) during the cold 4 x 16K prefill.** VRAM is unaffected. Plan: UMDH heap snapshots of llama-server before and after that row on both builds; if the extra is the per-token `std::unordered_set` seq_ids in `llama_batch_ext::token` built on every compat conversion, keep the token objects across `clear()` (clear the sets instead of destroying them) or let the compat path write a flat seq-id array; otherwise compare against upstream's `tools/server/server-http.cpp` rewrite.
+- **An image follow-up can re-encode the image (OLD too).** The prompt-cache entry of an image prompt has 0 checkpoints, because upstream makes no checkpoint in a batch after a media chunk (`tools/server/server-context.cpp`, upstream `ab9d4c367`). A follow-up whose re-rendered history matches more than `--spec-rs-seq` (3) tokens short of the cached end re-processes the whole prompt, image included: once in `vis_cpu_u80` rep 0 (4148 of 4152 tokens matched, 4213 re-processed, 36 s with the CPU projector). Plan: on hybrid models allow one checkpoint at the start of the text tail after the last media chunk once it is fully decoded, check the M-RoPE position bookkeeping, then verify with `up80_perf_vision.py` (the after-image turn must show a small `prompt_n`) and crosstalk.
+- **The extreme-aspect clamp only limits a side to 65536.** With `--image-max-tokens` below 2048 a 1 x 20000 image still gives 32 x 65536 = 2048 tokens: over the budget but encodable (OLD gave more). Plan: in `calc_size_preserved_ratio`, when a side is clamped also cap the long side at `floor_by_factor(max_pixels / short_side)`, and add a 1024-token case to `test_image_preprocessor_dyn_size_extreme_aspect`. The llava-uhd, MiniCPM-V and Pixtral preprocessors still answer HTTP 400 for such images; no local model uses them.
+- **OLD's llama-perplexity exit crash on Ornith-35B** was not root-caused; NEW does not crash.
+- `hrm_text` on CUDA: nmse 1.0e-5 to 1.09e-5 against the 1e-4 limit; there is no OLD CUDA baseline.
+- Not run (no local workload): `--host a,b` multi-bind, `video_url` (ffmpeg is not in PATH), sleep/wake with `/v1/messages/count_tokens`, router mode, images in a Responses `function_call_output`. Latent with no local model: the fork's 16-column FA tier bypasses sparse attention (only DeepSeek V4), a DFlash draft with `token_embd` but no `output` now uses its own head, the Mistral 4 MoE down-projection runs on the CPU under CUDA/Vulkan.

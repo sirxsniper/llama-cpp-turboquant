@@ -8,7 +8,7 @@
 [![CUDA](https://img.shields.io/badge/CUDA-13.1-76b900?style=for-the-badge&logo=nvidia&logoColor=white)](https://developer.nvidia.com/cuda-downloads)
 [![Arch](https://img.shields.io/badge/SM-75%20→%20121-8957e5?style=for-the-badge)](#build)
 [![KV](https://img.shields.io/badge/KV%20cache-4.25%20bpw-e3b341?style=for-the-badge)](#the-turbo-formats)
-[![Base](https://img.shields.io/badge/llama.cpp-b11093-6e7681?style=for-the-badge)](https://github.com/ggml-org/llama.cpp)
+[![Base](https://img.shields.io/badge/llama.cpp-b11173-6e7681?style=for-the-badge)](https://github.com/ggml-org/llama.cpp)
 
 <br>
 
@@ -601,6 +601,15 @@ Qwen3.8-27B is the model this fork is tuned for: hybrid Gated DeltaNet, 16 atten
 > ```
 > Fallbacks: `-b 1024 -ub 512` when decode matters more than prefill (0.5 % faster per step, 5 % slower prefill); `-mmdev cpu` when the desktop needs more than about 2.2 GB of VRAM (the image then takes about 36 s, but the other slots keep generating while it encodes).
 
+> **Status, 2026-09-25: upstream sync to `84e76d8a2` (`b11173`)** (branch `up80`, `docs/turbot/TESTING.md` section 11). 80 upstream commits merged on top of the four-connection build (`329febd80`, OLD below), plus 9 fork commits. Every fork feature is kept (every `[TAG_*]` marker is still in the tree), the production command above is unchanged, and OLD and NEW were run interleaved with identical flags:
+> - **Qwen3.8-27B is unchanged.** KLD 16 x 32K turbot identical in every printed digit (code 0.001139, same top token 99.273 %, PPL 1.536336; prose 0.001856, 98.174 %, 6.189125). Needles at 131K, 245K and the 3-needle test give the same answers. Every VRAM buffer is the same size (target 18114.41, KV 5246.00, RS 693.21, compute 246.06 MiB; drafter 1950.71 / 52.98 / 36.79 MiB).
+> - **Speed is the same.** Decode ms/step geomean -0.22 % over 12 rows (1/2/4 streams, depth 0/32K, code/prose), every row inside OLD's own run-to-run spread; 1-stream texts and acceptance identical. Cold 16K prefill -0.15 % geomean (1 stream code 2584 vs 2579 t/s, 4 streams 6526 vs 6512 t/s server), the same as OLD against itself.
+> - **Correctness.** validate.ps1 `GATE PASSED` with test-backend-ops 18995/18995 (OLD 18714/18714); crosstalk 160/160 own passphrases, 0 CROSS-SLOT, 0 LOST; test-recurrent-state-rollback 20/20 exact on CPU and CUDA (OLD 6/20); ctest 37/37 (OLD 36/37); test-llama-archs 132/132 on CPU and on CUDA; test-save-load-state 127/127.
+> - **Ornith-1.5-35B (qwen35moe) is fixed.** Upstream's top-k MoE fusion (`1a679828f`) now always fires. OLD gave different results from run to run and its llama-perplexity crashed at exit. NEW is deterministic and closer to the CPU reference: perplexity 4K x 32 CPU 7.2940, NEW 7.3339, OLD 7.3844 / 7.3984; 32K x 4 NEW 6.7894 (3 runs), OLD 6.9564 / 6.9385 / 6.9564. Decode 0.8-0.9 % faster, in-model MTP about 3 % faster per step (code 277.8 -> 291.0 t/s).
+> - **New in the sync:** the `llama_batch_ext` API (the fork converts every `llama_batch` call through it at no measurable cost, `[TAG_SYNC_BATCH_EXT_COMPAT]`), CONV_3D on CUDA (276 cases), 4 more CONV_2D_DW cases, sparse flash attention for DeepSeek V4 prefill, and the new model support listed under "Architectures new with the sync". Server additions that no local workload uses and that were not exercised here: `--host a,b` multi-bind, OpenAI `video_url` content (needs ffmpeg, `--video-ffmpeg-dir`), images in a Responses `function_call_output`.
+> - **Fork fixes on top:** exact rollback of the last ubatch on 7 more recurrent archs (Nemotron-H dense and MoE, Kimi K3, Qwen4exp, LFM2, LFM2-MoE, Ling 3; `[TAG_RS_SNAP_DEPTH]`, no cost on Nemotron: 8.28 vs 8.37 ms/step); very wide or tall images are encoded instead of refused (`[TAG_MTMD_EXTREME_ASPECT]`: a 1 x 20000 PNG gives 2048 tokens and HTTP 200, OLD 4526 tokens over the 4096 budget, the plain merge HTTP 400; GPU encode 3.6 -> 1.3 s); test-quantize-fns passes for the turbo KV types, test-chat no longer crashes on Windows, test-batch-alloc builds with MSVC.
+> - **Other local models:** all 14 load and answer (facts, tool calls, vision). Muse Glimmer + DFlash, Nemotron 3.5 + MTP sidecar and Ornith-1.5-9B + MTP give md5-identical output to OLD. Vision on GPU, CPU and the AMD iGPU (Vulkan ops 3163/3163) answers as before.
+
 ### KV cache type, resolved per model
 
 Ask for a cache type with `-ctk`/`-ctv` as before. `llama_init_from_model` now checks the request against the model before the cache is built (`[TAG_KV_RESOLVE]`, `src/llama-context.cpp`). When the model cannot take a type, it steps down this chain:
@@ -866,8 +875,17 @@ Each switch restores the build of 2026-09-22 for its part. Leave them unset in p
 | `deepseek4v` (mtmd projector) | DeepSeek-V4-Flash-Vision-Exp (#28133) | The DeepSeek V4 text model takes no turbo type. |
 | `nemotron_h` (NemotronHPuzzle) | Nemotron-3-Puzzle-75B-A9B (#25444) | Needs the cherry-picked #28717 below for the CUDA SSM scan. |
 
+New with the `84e76d8a2` sync (2026-09-25). No local model files exist for these yet; `test-llama-archs` passes on CPU and CUDA for every arch it covers (132/132), and apart from the Ling 3 rollback state below the fork's M-RoPE, rollback and drafter code needed no per-model change:
+
+| Arch | Model | Notes on this fork |
+|:--|:--|:--|
+| `bailingmoe3` + `ling3vl` projector | Ling 3.0 VL (#29151) | The text model uses M-RoPE when the GGUF has rope sections, otherwise normal RoPE as before, so text-only Ling 3 files are unchanged. Images go through the fork's M-RoPE paths (positional FA mask, park/resume, checkpoints, drafter media positions). Rollback of the last ubatch is exact since `[TAG_RS_SNAP_DEPTH]` was extended. |
+| `hunyuan_vl` | DFlash drafter for HunyuanOCR (#28890) | The target now exposes its layer inputs to a DFlash draft. A DFlash draft on a HunYuan-MoE target still aborts, as upstream. |
+| `mimo2` | MiMo-V2.6 (#29257) | Conversion only (MXFP4 routed experts); the runtime arch already existed. MXFP4 weights keep upstream's MMQ/MMVQ path. |
+| `dflash` | Gemma4 DSpark draft backbone (#29226), DFlash/DSpark drafts for vision targets (#29339) | Embedding scale, attention scale, activation, post norms and `rope_freqs` are read from the draft GGUF when present. The Qwen3.8 DFlash2 and Muse Glimmer drafters have none of these keys, so their graph is unchanged op for op. A draft that ships `token_embd` but no `output` now uses its own embeddings as the head instead of the target's. |
+
 Upstream PRs cherry-picked on top of the sync, before they were merged upstream:
-- **#29242:** the Muse Glimmer parser fix for a reply that starts with a tool call (`common/parsers/muse-glimmer.cpp`, with `test-chat` cases).
+- **#29242:** the Muse Glimmer parser fix for a reply that starts with a tool call (`common/parsers/muse-glimmer.cpp`, with `test-chat` cases). Upstream merged it as `7ab4ee7ba`, part of the `84e76d8a2` sync.
 - **#28717:** the CUDA SSM scan for state size 96 (Nemotron 3 Puzzle), with `test-backend-ops` SSM_SCAN cases.
 
 Models checked on this branch (single stream, 2K-token prompt; KV type as picked by the resolver from `-ctk turbot -ctv turbot`):
@@ -1001,6 +1019,22 @@ Contract and tests: [docs/turbot/SPEC.md](docs/turbot/SPEC.md), [docs/turbot/TES
 ---
 
 ## Engineering log
+
+<details open>
+<summary><b>September 2026 — upstream sync to 84e76d8a2</b> &nbsp;·&nbsp; <code>same speed and KLD, Ornith-35B deterministic, 7 more exact-rollback archs</code></summary>
+
+<br>
+
+80 upstream commits (`fb34fc262` -> `84e76d8a2`, `b11093` -> `b11173`) merged into the four-connection build. Four files conflicted (`fattn-mma-f16.cuh`, `llama-context.cpp`, `test-batch-alloc.cpp`, `test-save-load-state.cpp`); the flash-attention conflict keeps the fork's sparse guard together with upstream's new `ncols2` argument. The merge alone was not enough, so these fork commits followed:
+
+- **Batch conversion at no cost.** Upstream routes every `llama_decode` / `llama_encode` through the new `llama_batch_ext`. For a DFlash2 inject batch (128 rows x 100 KiB of target features) that meant a new buffer per call and a second full copy of the rows: cold 16K prefill measured 0.49 % slower. The context now keeps one conversion buffer, and it borrows the caller's embedding rows instead of copying them (`[TAG_SYNC_BATCH_EXT_COMPAT]`, `ad67cf71c`, `9d52ab267`, `77eda6b60`). Prefill is now level with the old build (-0.15 %, inside its own spread).
+- **Exact rollback on every recurrent arch.** Upstream's ctest rolls back the whole last ubatch on Nemotron-H and Kimi K3, and it failed on the fork, as it did on Qwen4exp, Nemotron-H MoE, LFM2, LFM2-MoE and Ling 3. The pre-ubatch state that the fork keeps for Qwen3.5 is now kept for all of them (`e23dea34d`): 20/20 rollback tests exact, where the old build passed 6. Nemotron decode is unchanged (8.28 vs 8.37 ms/step).
+- **Extreme aspect-ratio images.** Upstream's new image checks refuse a side above 65536. The Qwen-VL preprocessor made such a side from a 1 x 20000 image, so the server answered HTTP 400 where the old build encoded 4526 tokens, over the 4096 budget. The long side is now shrunk to the limit: 2048 tokens and HTTP 200, and the encode drops from 3.6 to 1.3 s on the GPU (`[TAG_MTMD_EXTREME_ASPECT]`, `5680a6a4f`).
+- **Tests.** test-quantize-fns compared the turbo KV types against unrotated data and failed on every build; it now checks them in their Walsh-Hadamard basis (`548ebb452`). test-chat divided by zero on Windows (`959ed44a6`), and test-batch-alloc did not build with MSVC (`369c4c430`).
+
+What upstream brought: the Ornith-1.5-35B top-k MoE fusion fix (the old build was non-deterministic and further from the CPU reference: perplexity 7.3844 / 7.3984 against 7.3339 deterministic, CPU 7.2940), CONV_3D and more CONV_2D_DW on CUDA (test-backend-ops 18714 -> 18995 cases, all passing), DeepSeek V4 sparse prefill attention, Ling 3.0 VL, HunyuanOCR DFlash, MiMo-V2.6 and Gemma4 DSpark. Qwen3.8-27B is unchanged: the same KLD to every digit, the same needle answers, the same buffer sizes, and decode -0.22 % ms/step. Details: [docs/turbot/TESTING.md](docs/turbot/TESTING.md) section 11.
+
+</details>
 
 <details open>
 <summary><b>September 2026 — four connections</b> &nbsp;·&nbsp; <code>-6.6% step time at 4 streams, 2.0 GB less VRAM</code></summary>
@@ -1239,13 +1273,13 @@ Long-context throughput on a single RTX 5090: holding a full 262,144-token conte
 
 This fork stands on work by several people. Attribution follows the commit history.
 
-**Upstream** — [llama.cpp](https://github.com/ggml-org/llama.cpp), Georgi Gerganov and contributors. The base this is forked from, currently `b11093` (`fb34fc262`, merged 2026-09-21; the benchmarks above were measured on `b10655`).
+**Upstream** — [llama.cpp](https://github.com/ggml-org/llama.cpp), Georgi Gerganov and contributors. The base this is forked from, currently `b11173` (`84e76d8a2`, merged 2026-09-25; before that `b11093`, `fb34fc262`, merged 2026-09-21; the benchmarks above were measured on `b10655`).
 
 **The TurboQuant formats** — original CUDA port by **Gabe Ortiz** (March 2026): `turbo2_0`/`turbo3_0`/`turbo4_0`, the Walsh-Hadamard rotation, InnerQ per-channel equalization, and the type-id allocation. Method paper: [arXiv 2504.19874](https://arxiv.org/abs/2504.19874) (ICLR 2026).
 
 **TriAttention** — KV-cache pruning by **atomicmilkshake** (April 2026), on the `feature/triattention` branch. Method paper: [arXiv 2604.04921](https://arxiv.org/abs/2604.04921).
 
-**The long-context performance work** — [@sirxsniper](https://github.com/sirxsniper). Everything documented above: native `turbo4` reads at depth, the MMA shared-tile loader, the K and V byte-permute centroid gathers, coalesced dequant stores, GQA packing by exact divisor, the `nbatch_fa` retune, the speculative prefill tail, memory-fit estimation for unmeasurable drafters, GDN decode-shape test coverage, the Windows CUDA build recipe, and upstream merge and conflict resolution across `b8650` to `b11093`.
+**The long-context performance work** — [@sirxsniper](https://github.com/sirxsniper). Everything documented above: native `turbo4` reads at depth, the MMA shared-tile loader, the K and V byte-permute centroid gathers, coalesced dequant stores, GQA packing by exact divisor, the `nbatch_fa` retune, the speculative prefill tail, memory-fit estimation for unmeasurable drafters, GDN decode-shape test coverage, the Windows CUDA build recipe, and upstream merge and conflict resolution across `b8650` to `b11173`.
 
 <sub><a href="CREDITS.md">CREDITS.md</a> holds the per-file inventory, with authorship derived from the commit history.</sub>
 
