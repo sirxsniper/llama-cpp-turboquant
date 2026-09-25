@@ -304,7 +304,7 @@ static __global__ void mul_mat_qsn(
     const char * GGML_CUDA_RESTRICT x   = x_ptr;
     const int  * GGML_CUDA_RESTRICT y   = y_ptr;
     float      * GGML_CUDA_RESTRICT dst = dst_ptr;
-    float      * GGML_CUDA_RESTRICT tmp = tmp_ptr;
+    [[maybe_unused]] float * GGML_CUDA_RESTRICT tmp = tmp_ptr;   // unused in STREAM mode
 
     constexpr int qk              = ggml_cuda_type_traits<type>::qk;
     constexpr int I               = MMQSN_I;
@@ -328,7 +328,6 @@ static __global__ void mul_mat_qsn(
     int  * ids    = data_mul_mat_qsn;
     int  * tile_y = ids + J;
     int  * tile_x = tile_y + 2*ny;
-    char * stage  = (char *) (tile_x + I*MMQSN_X_STRIDE);   // RING / STREAM only
 
     const int tid = threadIdx.y*WARP_SIZE + threadIdx.x;
     const int64_t row_bytes = (int64_t) stride_row_x*bs;
@@ -356,13 +355,12 @@ static __global__ void mul_mat_qsn(
     }
     const int nsteps = s.nsteps;
 
-    float sum[J*I / MMQSN_NTHREADS] = {0.0f};
+    [[maybe_unused]] float sum[J*I / MMQSN_NTHREADS] = {0.0f};   // unused in STREAM mode
     int yr[2][nyr] = {{0}};
 
     if constexpr (mode == MMQSN_PF) {
         // ---- PF: stock load_tiles from global memory, L2 prefetch pf_dist steps ahead, y one step ahead. ----
         constexpr ggml_cuda_mmq_load_tiles_t load_tiles = ggml_cuda_mmq_get_load_tiles<type, J, false, false>();
-        GGML_UNUSED(stage);
         GGML_UNUSED(l2hint);
 
         if (x_pf) {
@@ -418,6 +416,7 @@ static __global__ void mul_mat_qsn(
     } else {
         // ---- RING (and STREAM): 2-slot cp.async ring of raw weight bytes, y one step ahead in registers. ----
         constexpr int pitch = mmqsn_raw<type>::pitch;
+        char * stage = (char *) (tile_x + I*MMQSN_X_STRIDE);
         const unsigned int stage_s = ggml_cuda_cvta_generic_to_shared(stage);
 
         // Prologue: steps 0 and 1. Always 2 commits per thread, so the wait_group<1> count below stays right.
@@ -452,7 +451,7 @@ static __global__ void mul_mat_qsn(
         }
 
         mmqsn_load_y<J>(y, ne11, mmqsn_step(s, 0).y, yr, tid);
-        int sink = 0;   // STREAM: keeps the y loads alive
+        [[maybe_unused]] int sink = 0;   // STREAM: keeps the y loads alive
 
 #pragma unroll 1
         for (int g = 0; g < nsteps; ++g) {
