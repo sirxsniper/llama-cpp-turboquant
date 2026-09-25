@@ -549,7 +549,15 @@ ggml_tensor * llama_model_qwen3next::graph::build_layer_attn_linear(
     ggml_tensor * attn_out_norm = build_norm_gated(output, model.layers[il].ssm_norm, z_2d, il);
 
     // Final reshape: [head_dim, n_heads, n_tokens, n_seqs] -> [n_tokens, n_seqs, n_heads * head_dim]
-    ggml_tensor * final_output = ggml_reshape_3d(ctx0, attn_out_norm, head_v_dim * num_v_heads, n_seq_tokens, n_seqs);
+    // [TAG_GDN_OUT_FLAT] 2-D [n_heads * head_dim, n_tokens * n_seqs] so ssm_out is one matmul over all columns
+    // (see qwen35.cpp). LLAMA_GDN_OUT_FLAT=0 restores the 3-D form.
+    static const bool out_flat = [] {
+        const char * e = getenv("LLAMA_GDN_OUT_FLAT");
+        return !(e && e[0] == '0');
+    }();
+    ggml_tensor * final_output = out_flat
+        ? ggml_reshape_2d(ctx0, attn_out_norm, head_v_dim * num_v_heads, n_seq_tokens * n_seqs)
+        : ggml_reshape_3d(ctx0, attn_out_norm, head_v_dim * num_v_heads, n_seq_tokens, n_seqs);
     cb(final_output, "final_output", il);
 
     // Output projection
