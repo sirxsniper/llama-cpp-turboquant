@@ -2621,9 +2621,23 @@ struct test_set_rows : public test_case {
         // 1.03e-6, then two passes, purely on random-data luck. 1e-7 is not attainable here
         // for any correct implementation. 5e-6 still catches what matters - a wrong rotation
         // basis and a broken broadcast mapping both measured 0.38 to 1.27.
-        if (type_dst == GGML_TYPE_TURBO2_0 || type_dst == GGML_TYPE_TURBO3_0 ||
-            type_dst == GGML_TYPE_TURBO4_0 || type_dst == GGML_TYPE_TURBO4P_0 || type_dst == GGML_TYPE_TURBO5P_0) {
-            return 5e-6;
+        //
+        // 5e-6 is below ONE flip for the 2- and 3-bit tables. The output holds the rotated values: a unit vector of a
+        // 128-value group times the group norm, so one flip across a centroid gap g costs g^2 * 128 / n_out of NMSE
+        // (the mean square cancels). turbo3, ne=[256,11,1,2] nr23=[2,3]: 7.0e-6 per inner flip, measured 6.8e-6 and
+        // 7.6e-6; ne=[1024,5,1,3]: 1.5e-5, measured 1.49e-5. Allow 4 flips of the widest gap of the type's table.
+        double gap = 0.0;
+        switch (type_dst) {
+            case GGML_TYPE_TURBO2_0:  gap = 0.093468; break; // CENTROIDS_2BIT
+            case GGML_TYPE_TURBO3_0:  gap = 0.072853; break; // CENTROIDS_3BIT
+            case GGML_TYPE_TURBO4_0:
+            case GGML_TYPE_TURBO4P_0: gap = 0.058655; break; // CENTROIDS_4BIT
+            case GGML_TYPE_TURBO5P_0: gap = 0.049725; break; // CENTROIDS_5BIT
+            default: break;
+        }
+        if (gap > 0.0) {
+            const double n_out = double(ne[0] * ne[1] * ne[2]*nr23[0] * ne[3]*nr23[1]);
+            return std::max(5e-6, 4.0 * gap*gap * 128.0 / n_out);
         }
         return 1e-7;
     }

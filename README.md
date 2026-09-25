@@ -53,7 +53,7 @@ at those depths.</sub>
 | [Benchmarks](#benchmarks) | full results, with methodology |
 | [Build](#build) | Windows and Linux, from source |
 | [Configuration](#configuration) | launch recipes, flag reference, tuning knobs |
-| [Any model](#using-the-fork-with-any-model) | KV type resolved per model, built-in turbot plan, turbot on other models, context checkpoints in slot files, vision device, new switches and architectures |
+| [Any model](#using-the-fork-with-any-model) | four connections (status, production command, switches), KV type resolved per model, built-in turbot plan, turbot on other models, context checkpoints in slot files, vision device, new switches and architectures |
 | [How it works](#how-it-works) | the turbo formats and the attention path |
 | [turbot](#turbot-tiered-kv-cache) | a tiered KV cache: better quality than turbo5p in the same VRAM |
 | [Engineering log](#engineering-log) | every change, with before and after |
@@ -580,6 +580,27 @@ Qwen3.8-27B is the model this fork is tuned for: hybrid Gated DeltaNet, 16 atten
 >
 > Qwen3.8-27B is bit-identical to the measured build (gate G2): the same SASS for every gated turbot kernel, the same test cases, the same greedy transcripts and DFlash2 acceptance, the same plan and size log lines, and KLD code 0.001139 and prose 0.001856 exactly. `LLAMA_TURBOT_ANY=0` with `GGML_TURBOT_ANY=0`, and `LLAMA_SLOT_FILE_CKPT=0`, restore the behaviour before these changes.
 
+> **Status, 2026-09-25: four connections, deployed** (`docs/turbot/TESTING.md` section 10). Commits `0ae47b552`..`b5a5c7d54` make 4 concurrent streams faster and the production server about 2 GB smaller, with the same quality. Measured against the build deployed on 2026-09-22 (`f76a7a4b5`), interleaved runs with identical flags:
+> - **Decode** (ms per speculative step, the fair metric when greedy texts fork at near-ties): 1 stream +0.3 % (inside the 1 % run-to-run spread), 2 streams -2 %, 4 streams -6.6 %. 4 streams at d=0: code 261.8 -> 290.6 t/s total, prose 235.7 -> 259.3.
+> - **Prefill**, cold 16K code prompts: 1 stream 2515 t/s (old) -> 2559 (new, old flags) -> 2630 (new, `-b 2048 -ub 1024`); 4 streams 2075 -> 2093 -> 2262 t/s total. Cold 131K, back to back: prose 1670 -> 1708 t/s, code 1691 -> 1702.
+> - **VRAM**: about 2.0 GB less (28.8 -> 26.7 GB after load). The recurrent state buffer drops from 2394 to 693 MiB, the target compute buffer from 397 to 124 MiB, the drafter's from 138 to 37 MiB. That leaves room for the vision encoder on the GPU: a 4000-token image encodes in 1.4 s instead of 36 s on the CPU.
+> - **Quality**: KLD 16 x 32K identical to the old build bit for bit (turbot code 0.001139, prose 0.001856); needles at 131K and 245K and the 3-needle test pass; 1-stream greedy texts identical to the old build (with `GDN_CHUNKED_PF=0`; the chunked prefill changes the computation order, KL 0.0011 against a floor of 0.0010 for any order change).
+> - **Correctness**: validate.ps1 `GATE PASSED` on the deployed binaries (test-backend-ops 18714/18714), compute-sanitizer 0 errors on the new kernels, crosstalk 0 cross-slot answers in 152 requests (vision on the GPU, a shared 4K prefix, UD-Q4_K_XL and Uncensored included), eos_repro 320 graded requests with 0 anomalous tokens (14 differences, all near-ties), slot park/resume and prompt-cache restore token-identical. Every Jarvis profile (Ornith, Nemotron, Muse, Spark, MiniCPM5, the NEO-CODER fine-tunes) passed its smoke test on the new build.
+>
+> Production command since 2026-09-25 (`launch-qwen38-dflash2.bat` and the Jarvis profiles of UD-Q5_K_XL, UD-Q4_K_XL and Uncensored-Q5_K_M; changes against the previous one marked):
+> ```
+> set SPEC_DFT_UBATCH=128
+> set GGML_DISABLE_VULKAN=1              (a Vulkan build would list the 5090 again as Vulkan0)
+> llama-server -m Qwen3.8-27B-UD-Q5_K_XL.gguf -c 262144 -ctk turbot -ctv turbot -bs -fa on --kv-unified -ngl 99
+>   -b 2048 -ub 1024                     (was -b 1024 -ub 512)
+>   --parallel 4 --threads 16 --load-mode none --cache-ram 45056 --ctx-checkpoints 32 --cache-idle-slots
+>   --spec-draft-model Qwen3.8-27B-DFlash2-Q8_0.gguf --spec-type draft-dflash --spec-draft-n-max 3 --spec-rs-seq 3
+>   --mmproj mmproj-Qwen3.8-27B-F16.gguf -mmdev gpu --image-min-tokens 1024 --image-max-tokens 4096   (was the CPU)
+>   --device CUDA0 --spec-draft-device CUDA0
+>   --jinja --chat-template-file qwen-fixed-chat-template.jinja --reasoning-format deepseek --reasoning-budget -1
+> ```
+> Fallbacks: `-b 1024 -ub 512` when decode matters more than prefill (0.5 % faster per step, 5 % slower prefill); `-mmdev cpu` when the desktop needs more than about 2.2 GB of VRAM (the image then takes about 36 s, but the other slots keep generating while it encodes).
+
 ### KV cache type, resolved per model
 
 Ask for a cache type with `-ctk`/`-ctv` as before. `llama_init_from_model` now checks the request against the model before the cache is built (`[TAG_KV_RESOLVE]`, `src/llama-context.cpp`). When the model cannot take a type, it steps down this chain:
@@ -820,6 +841,20 @@ Every switch defaults to the new behaviour. The defaults are what the measuremen
 
 `TURBO_MMA_NATIVE` matters here because turbo5p512 now has its own MMA kernel at head size 256 (`[TAG_TURBO5P512_MMA]`). Before, a turbo5p512 cache whose rows were a multiple of 1024 reached the f16 kernel with raw turbo5p512 bytes and produced garbage. Caches with 512-element rows took the slower F16 conversion. The new kernel passes the `split_plane` FLASH_ATTN_EXT cases and compute-sanitizer memcheck (0 errors).
 
+### Four connections: switches
+
+Each switch restores the build of 2026-09-22 for its part. Leave them unset in production.
+
+| Variable | Default | Effect when set |
+|:--|:--|:--|
+| `SPEC_DFT_SYNC` | auto | The DFlash2 drafter is synchronized after the inject only while a sequence is in prefill. `2` restores the old auto rule, which synced on every step with 3 or more generating slots. `0` is the old `0` rule, `1` syncs after every chunk. `SPEC_DFT_SYNC_PREFILL=0` also skips the prefill sync. |
+| `DFLASH_RESERVE_FULL` | off | `1` reserves the drafter's token graph at `n_ubatch` (128) rows again: 137.53 MiB instead of about 37. |
+| `TURBOT_QUOTA` | water-filling | `prop` restores the proportional young-pool quota (SPEC 9.6). Water-filling gives short slots next to a long one their whole young tier: 1 x 200K + 3 x 2K gives each 2K slot 2048 young cells instead of 646. |
+| `LLAMA_KQ_MASK_POS_MS` | on | `0` builds the F16 explicit attention mask on the host for ubatches of several sequences, as before (256 MiB of compute buffer and 276 MiB of pinned host memory at 4 slots). `GGML_CUDA_FA_POS_MS=0` keeps the positional mask on the host but builds the explicit mask on the GPU for every CUDA kernel. |
+| `GDN_REPLAY` | on | `0` keeps `1 + n_rs_seq` recurrent state snapshots per slot (2394 MiB at 4 slots) instead of one committed state and a ring of the last `n_rs_seq` tokens (693 MiB). Read when the context is created. Older slot files load under replay; a file written with replay does not load under `GDN_REPLAY=0`, and the server then processes the prompt again. |
+| `GDN_CHUNKED_PF` | on | `0` runs prompt prefill under replay on the sequential per-token GDN kernel. `GDN_CHUNKED_PF_MIN` (default 64, minimum 16) is the number of tokens per sequence before the last `n_rs_seq` from which a ubatch takes the chunked kernel. |
+| `GGML_CUDA_SMALLB` | on (Blackwell) | `0` sends 5-16 column batches back to MMQ. `1` also enables the kernel on other Ampere+ NVIDIA GPUs. `GGML_CUDA_SMALLB_MAX_ROWS` (default 1024, `0` = no limit) is the largest weight row count it takes; above that MMQ is faster. |
+
 ### Architectures new with the sync
 
 | Arch | Model | KV on this fork |
@@ -966,6 +1001,31 @@ Contract and tests: [docs/turbot/SPEC.md](docs/turbot/SPEC.md), [docs/turbot/TES
 ---
 
 ## Engineering log
+
+<details open>
+<summary><b>September 2026 — four connections</b> &nbsp;·&nbsp; <code>-6.6% step time at 4 streams, 2.0 GB less VRAM</code></summary>
+
+<br>
+
+With four agents on the server, a speculative step took 40 ms at d=0 against 26 ms for one stream, and the production server held 28.8 GB. Probes that attribute every step (`SPEC_PHASE_PROBE=1`) showed where both went. Seven changes, each with its own kill switch:
+
+- **Drafter sync.** The DFlash2 drafter was synchronized after every inject whenever a batch held more than one live sequence, so every 4-slot step waited for it. It now syncs only while a sequence is in prefill (`SPEC_DFT_SYNC`).
+- **Drafter reserve.** The drafter's token graph was reserved at `n_ubatch` = 128 rows, but a draft batch is `n_max + 1` rows per slot: 16 at 4 slots. 137.53 -> 36.79 MiB (`DFLASH_RESERVE_FULL`).
+- **Positional mask for several sequences.** Since the cross-slot leak fix, multi-slot ubatches built a 256 MiB F16 attention mask on the host every step. The positional mask now carries a second row, the cell's set of sequences, and the flash-attention kernels test `(kv_seq & q_seq) != 0` beside the position (`LLAMA_KQ_MASK_POS_MS`). Target compute buffer 396.97 -> 124.04 MiB, pinned host 276 -> 22 MiB.
+- **GDN rollback by replay.** Rolling back a rejected draft kept `1 + n_rs_seq` full recurrent states per slot. Now one committed state and a ring of the last 3 tokens' k, v, g and beta are kept, and a new op replays the ring before the new tokens. RS buffer 2394 -> 693 MiB. Replay is bit-identical to the snapshot kernel on decode (`GDN_REPLAY`).
+- **Chunked prefill under replay.** With replay, 512-token prefill ubatches ran the per-token kernel. The prefix of each ubatch now takes the chunked kernel and only the last 3 tokens replay (`GDN_CHUNKED_PF`).
+- **Small-batch tensor-core matmul.** At 2 and 4 streams the target runs 8 and 16 rows, which went to MMQ's 128-row tiles. A kernel that streams the weights once into int8 MMA fragments wins where MMQ gets few tiles: 48 rows 33 -> 7 us, 1024 rows 13.4 -> 11.3 us. At 2048 rows and more MMQ is faster, so it takes only weights of at most 1024 rows (`GGML_CUDA_SMALLB`, `GGML_CUDA_SMALLB_MAX_ROWS`).
+- **Water-filling quota.** Short slots next to a long one lost their young tier to it (646 young cells for a 2K slot next to a 200K one). Each short slot now keeps all it can use and the long ones share the rest (`TURBOT_QUOTA`).
+
+| ms per step (d=0) | old | new | |
+|:--|--:|--:|:--|
+| 1 stream, code / prose | 26.33 / 26.23 | 26.43 / 26.15 | within the 1% spread |
+| 2 streams | 30.61 / 30.85 | 29.72 / 30.03 | -2.9% / -2.7% |
+| 4 streams | 39.65 / 40.41 | 36.54 / 37.61 | **-7.8% / -6.9%** |
+
+KLD is unchanged bit for bit, the greedy texts of one stream are identical to the old build, and 4-stream total throughput at d=0 went 261.8 -> 290.6 t/s on code. The 2 GB freed pays for the vision encoder on the GPU (a 4000-token image: 36 s -> 1.4 s) and for `-ub 1024`, which prefills 5% faster. Details and every gate: [docs/turbot/TESTING.md](docs/turbot/TESTING.md) section 10.
+
+</details>
 
 <details open>
 <summary><b>September 2026 — turbot tiered KV cache</b> &nbsp;·&nbsp; <code>code KLD -30%, prose -28% vs turbo5p in the same VRAM</code></summary>
@@ -1170,6 +1230,7 @@ Long-context throughput on a single RTX 5090: holding a full 262,144-token conte
 - **Prefill attention has headroom, but not from tuning.** The MMA config is swept out — `ncols2` and `nbatch_fa` won, `nthreads`, `occupancy` and `ncols1` all lose. Attention is 77% of prefill at depth at ~101 TFLOPS. Further gain needs kernel work.
 - **Wide-Q native turbo reads.** Prefill still uses F16 conversion, because it amortises across many Q tiles. Measured: an `f16` cache prefills only ~3% faster, so the conversion is close to free and this is not a promising lever.
 - **turbot prefill.** The tiered cache still prefills 4-8% slower than turbo5p at depth. Two-token verify batches now run the `<4,8>` instance (+3.6% / +4.8% at 131K / 245K).
+- **Four connections.** Deployed 2026-09-25: 4-stream steps 6.6% faster and 2.0 GB less VRAM (see [the status note](#using-the-fork-with-any-model)). Left: the small-batch matmul loses to MMQ above 1024 weight rows (shared-memory activations, fewer registers, deeper prefetch), and a many-prompt acceptance A/B at 2 and 4 streams (SMALLB on/off, `-ub 512/1024`).
 - **turbot on other models.** turbot now takes six KV shapes, with an automatic plan for models that do not match the built-in one (see [turbot on other models](#turbot-on-other-models)). Gated on 2026-09-22: 4 × 256 passed and is the only shape with an automatic plan by default; 2 × 256 failed on Ornith-1.5-35B and needs `LLAMA_TURBOT_AUTO_PLAN=all`; speed is not measured yet. The automatic plan is uncalibrated, so a calibrated per-model plan still needs a calibration run. It can then ship as a verified sidecar.
 
 ---
