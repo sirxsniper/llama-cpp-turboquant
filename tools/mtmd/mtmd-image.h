@@ -121,6 +121,8 @@ struct mtmd_image_preprocessor_fixed_size : mtmd_image_preprocessor {
 struct mtmd_image_preprocessor_dyn_size : mtmd_image_preprocessor {
     mtmd_image_preprocessor_dyn_size(const clip_ctx * ctx) : mtmd_image_preprocessor(ctx) {}
     mtmd_image_preproc_out preprocess(const clip_image_u8 & img) const override;
+    // the size preprocess() resizes an image to (public for test-mtmd-impl) [TAG_MTMD_EXTREME_ASPECT]
+    static clip_image_size calc_target_size(const clip_hparams & hparams, const clip_image_size & original_size);
 };
 
 // similar to mtmd_image_preprocessor_dyn_size, but resize the image to have longest edge equal to hparams.image_longest_edge, while preserving aspect ratio

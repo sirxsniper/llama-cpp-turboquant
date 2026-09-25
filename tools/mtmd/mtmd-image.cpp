@@ -153,6 +153,24 @@ struct img_tool {
             w_bar = ceil_by_factor(width * beta);
         }
 
+        // [TAG_MTMD_EXTREME_ASPECT] resize_pillow() refuses a target side above 65536 (upstream sanity check 73c941b11).
+        // An image with an extreme aspect ratio gets such a side here: its short side is clamped up to align_size and
+        // the min_pixels upscale then stretches the long side, e.g. 1x20000 -> 32x144832 at 1024..4096 tokens. The
+        // deployed build encoded that image (4526 tokens, above max_pixels); with the check alone it is refused with
+        // "Failed to tokenize prompt". Shrink the long side to the limit instead, so the image is encoded within the
+        // token budget. Sizes of at most 65536 per side (every normal image) are not touched.
+        constexpr int max_side = 65536;
+        if (w_bar > max_side || h_bar > max_side) {
+            const int lim = std::max(opts.align_size, (max_side / opts.align_size) * opts.align_size);
+            if (h_bar >= w_bar) {
+                w_bar = std::max(opts.align_size, floor_by_factor(static_cast<float>(w_bar) * lim / h_bar));
+                h_bar = lim;
+            } else {
+                h_bar = std::max(opts.align_size, floor_by_factor(static_cast<float>(h_bar) * lim / w_bar));
+                w_bar = lim;
+            }
+        }
+
         return {w_bar, h_bar};
     }
 
@@ -769,13 +787,11 @@ mtmd_image_preproc_out mtmd_image_preprocessor_fixed_size::preprocess(const clip
 // mtmd_image_preprocessor_dyn_size
 //
 
-mtmd_image_preproc_out mtmd_image_preprocessor_dyn_size::preprocess(const clip_image_u8 & img) const {
-    GGML_ASSERT(hparams.image_min_pixels > 0 && hparams.image_max_pixels > 0);
-    clip_image_u8 resized_image;
-    const clip_image_size original_size = img.get_size();
+clip_image_size mtmd_image_preprocessor_dyn_size::calc_target_size(const clip_hparams & hparams,
+                                                                    const clip_image_size & original_size) {
     // the original pixtral model doesn't have n_merge
     const int cur_merge = hparams.n_merge;
-    const clip_image_size target_size = img_tool::calc_size_preserved_ratio(
+    return img_tool::calc_size_preserved_ratio(
         original_size,
         {
             /* align_size   */ hparams.patch_size * cur_merge,
@@ -783,6 +799,12 @@ mtmd_image_preproc_out mtmd_image_preprocessor_dyn_size::preprocess(const clip_i
             /* max_pixels   */ hparams.image_max_pixels,
             /* longest_edge */ 0,
         });
+}
+
+mtmd_image_preproc_out mtmd_image_preprocessor_dyn_size::preprocess(const clip_image_u8 & img) const {
+    GGML_ASSERT(hparams.image_min_pixels > 0 && hparams.image_max_pixels > 0);
+    clip_image_u8 resized_image;
+    const clip_image_size target_size = calc_target_size(hparams, img.get_size());
     img_tool::resize(img, resized_image, target_size,
                         hparams.image_resize_algo,
                         hparams.image_resize_pad,

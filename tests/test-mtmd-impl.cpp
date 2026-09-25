@@ -3,6 +3,8 @@
 #include "mtmd-image.h"
 #include "mtmd-internal.h"
 
+#include <algorithm>
+#include <cmath>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -68,6 +70,59 @@ MAKE_TEST(test_image_preprocessor_lfm2) {
             std::string(expected ? "tiled" : "single"),
             std::string(actual   ? "tiled" : "single"));
     }
+}
+
+// [TAG_MTMD_EXTREME_ASPECT] dyn_size (Qwen2/2.5/3-VL, ...) target sizes. Normal images keep upstream's smart_resize
+// size exactly; an extreme aspect ratio (1x20000) must give a size resize_pillow() accepts (sides <= 65536) inside the
+// token budget, instead of the "resize target 8x144832 is out of range" refusal.
+MAKE_TEST(test_image_preprocessor_dyn_size_extreme_aspect) {
+    clip_hparams hparams;
+    hparams.patch_size = 16;
+    hparams.n_merge = 2;
+    hparams.set_limit_image_tokens(1024, 4096); // the Qwen3.8 server setting (--image-min/max-tokens 1024/4096)
+    const int align = 32;
+
+    // upstream's calc_size_preserved_ratio (no longest_edge), without the side limit
+    auto reference = [&](const clip_image_size & in) {
+        auto round_f = [&](float x) { return static_cast<int>(std::round(x / static_cast<float>(align))) * align; };
+        auto ceil_f  = [&](float x) { return static_cast<int>(std::ceil(x / static_cast<float>(align))) * align; };
+        auto floor_f = [&](float x) { return static_cast<int>(std::floor(x / static_cast<float>(align))) * align; };
+        int w_bar = std::max(align, round_f(in.width));
+        int h_bar = std::max(align, round_f(in.height));
+        if (h_bar * w_bar > hparams.image_max_pixels) {
+            const auto beta = std::sqrt(static_cast<float>(in.height) * in.width / hparams.image_max_pixels);
+            h_bar = std::max(align, floor_f(in.height / beta));
+            w_bar = std::max(align, floor_f(in.width / beta));
+        } else if (h_bar * w_bar < hparams.image_min_pixels) {
+            const auto beta = std::sqrt(static_cast<float>(hparams.image_min_pixels) / (static_cast<float>(in.height) * in.width));
+            h_bar = ceil_f(in.height * beta);
+            w_bar = ceil_f(in.width * beta);
+        }
+        return std::to_string(w_bar) + "x" + std::to_string(h_bar);
+    };
+    auto str = [](const clip_image_size & s) { return std::to_string(s.width) + "x" + std::to_string(s.height); };
+
+    const std::vector<clip_image_size> normal = {
+        { 2560, 1600 }, { 640, 400 }, { 1920, 1080 }, { 4000, 3000 }, { 1080, 20000 }, { 20000, 1080 },
+        { 32, 60000 }, { 1, 3000 }, { 3, 4 }, { 1, 1 },
+    };
+    for (const auto & in : normal) {
+        t.assert_equal("dyn_size " + str(in) + " keeps the smart_resize size", reference(in),
+                       str(mtmd_image_preprocessor_dyn_size::calc_target_size(hparams, in)));
+    }
+
+    const std::vector<clip_image_size> extreme = {
+        { 1, 20000 }, { 20000, 1 }, { 32, 70000 }, { 70000, 32 }, { 2, 100000 }, { 1, 10000000 },
+    };
+    for (const auto & in : extreme) {
+        const clip_image_size out = mtmd_image_preprocessor_dyn_size::calc_target_size(hparams, in);
+        const long long px = (long long) out.width * out.height;
+        const bool ok = out.width >= align && out.height >= align && out.width <= 65536 && out.height <= 65536 &&
+                        out.width % align == 0 && out.height % align == 0 && px <= hparams.image_max_pixels;
+        t.assert_true("dyn_size " + str(in) + " -> " + str(out) + " is encodable (sides 32..65536, <= max_pixels)", ok);
+    }
+    t.assert_equal("dyn_size 1x20000", std::string("32x65536"),
+                   str(mtmd_image_preprocessor_dyn_size::calc_target_size(hparams, { 1, 20000 })));
 }
 
 //
