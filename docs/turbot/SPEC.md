@@ -1104,6 +1104,24 @@ cut[s]   = (int64) row_ctr[s] − (int64) Y[s];   has_cut = live
 - **Why the slack.** Granules are fixed 64-cell ranges that find_slot does not align. A band of Y cells that starts off a granule boundary touches up to Y/64 + 2 granules. Without slack, 4 sequences at 16,384 each need about 1,028 granules against 1,024 slots and would evict a wanted granule on every step. Refinement cannot come back (no transcode).
 - Default plan: one sequence keeps Y = 16,384 (the measured configuration); four equal sequences get 16,256. VRAM is unchanged.
 
+**Water-filling** (`[TAG_4C_QUOTA]`, `llama_turbot_young_quota` in `src/llama-kv-tier.cpp`, default since 2026-09-24). The proportional Y above starves short sequences next to a long one: with 1 x 200K + 3 x 2K cells each 2K sequence got 646 young cells. The quota is now:
+
+```
+Y[s] = min(cap, floor(N_eff · n[s] / sum))                 // the proportional rule, as above
+if no live s has Y[s] < min(cap, n[s]): done               // every mix whose total fits (every d=0 run): unchanged
+left = N_eff; open = live
+repeat until nothing changes:                              // water-filling
+    for s in open: d = min(cap, n[s]); if d <= left / |open|: Y[s] = d; left -= d; open -= s
+for s in open: Y[s] = left / |open|                        // the longer sequences split the rest equally
+```
+
+- The equal share `left / |open|` only grows when a sequence at or below it is served, so the pass order does not change the result.
+- Equal lengths give the proportional values bit for bit, and one live sequence is always unchanged.
+- Examples at POOL 65,536 / CAP 16,384 (N_eff = 65,536 − 64·2·4 = 65,024 for 4 live sequences): 1 x 200K + 3 x 2K gives 2,048 to each short sequence (was 646); 3 x 200K + 1 x 16,000 gives 16,341 x 3 and 16,000 (was 16,384 x 3 and 1,688); 20K / 40K / 60K / 100K gives 16,256 each (was 5,911 / 11,822 / 16,384 / 16,384).
+- `cut[s] = row_ctr[s] − Y[s]` as before. `LLAMA_TURBOT_DEBUG=1` appends `quota wf: sN Y ...` (or `quota prop:`) to the commit line.
+- **Kill switch:** `TURBOT_QUOTA=prop` (this exact string, read in each tier constructor, one INFO line) restores the proportional rule. A deep multi-slot run with unequal lengths above the level moves by a few cells per sequence, so a bit-exact comparison against a build before 2026-09-24 needs `TURBOT_QUOTA=prop`.
+- Tests: `tests/test-turbot.cpp` [8f] `test_quota` (named mixes, equal lengths at every slot count, 20,000 random mixes checked for the invariants: Y[s] <= min(cap, n[s]), sum of Y <= N_eff, a served sequence gets all it can use, the open ones get equal shares).
+
 **Slot allocation `alloc_slot(G)`**, used by begin_ubatch and restore_cells:
 1. The lowest free slot.
 2. Otherwise build `victims`, on the first need within this call. Candidates are every owned slot whose granule is not in `in_flight` and, during restore, whose slot is not in `restored`. Order ascending by:

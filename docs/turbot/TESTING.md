@@ -75,6 +75,7 @@ Pass: exit 0 and the last line is `OK`. What it checks:
 | 7a plan parser | the default plan parses with the expected hash. kvfq keys ignored. Y, POOL 0 and a trailing comment accepted. Refused: unknown tag, malformed line, duplicates, widths out of range, a missing L line, a layer the cache does not hold, POOL not a multiple of 64 or above kv_size, negative CAP |
 | 7a' built-in plan ([TAG_TURBOT_EMBED_PLAN]) | the built-in text is LF with hash `0x56c3503c949a7749`. `llama_turbot_plan_matches` is true for the Qwen3.8 layers (also at kv 4096). It is false for Spark's 9 layers (the reason names layer 39), a shifted list, 17 layers and an empty list. `default` resolves to the built-in plan and `./no-such-dir/default` to a file |
 | 7b tier | scenarios of SPEC 11.1 item 7 driving a real `llama_kv_cells`: single-sequence band 16,384; 4 sequences at quota 16,256 with 0 evictions after warm-up; eviction order (smallest margin, never the previous ubatch's granule); empty owned slot first; release then prefill or restore with 0 evictions; 10,000-step draft loop (counter == live rows, band intact); seq_cp adoption; restore into a larger counter; stale bits; trim then fill entry; failure then abort, re-queued fill and counter rollback; `abort_restore`; POOL 0; seq id 255; determinism |
+| 8f quota ([TAG_4C_QUOTA], SPEC 9.6 water-filling) | named mixes (1 x 200K + 3 x 2K gives 2,048 per short sequence; 3 x 200K + 1 x 16,000; 20K / 40K / 60K / 100K gives 16,256 each); equal lengths give the proportional values bit for bit at every slot count; 20,000 random mixes (2,000 with `--quick`): Y <= min(CAP, n), sum Y <= N_eff, a served sequence gets all it can use, the open ones share equally; tier runs under both `TURBOT_QUOTA` modes |
 
 `--quick` cuts the nesting and Monte Carlo sizes for a smoke run.
 
@@ -678,3 +679,98 @@ Builds: NEW = `build-sync-any` at `840a8e9e7` (Vulkan on), BASE = `turboquant-re
 | G7 slot-file checkpoints | `save_restore`: `prompt_n` 20015 → 4, `saved 2 context checkpoints`, `restored 2 of 2 ... draft state restored`; tokens identical **without** the draft model, but with DFlash2 the tokens differ from token 87 of 96 (deterministic; draft acceptance 67/84 after the restore against 65/86 in the reference run), so the arm fails on the production command. The RAM prompt cache arm (`prompt_cache`) on NEW passes (`prompt_n` 4, identical tokens) although its drafts also change after the restore (acceptance 64/93 against 63/96), so a different draft after a restore is not new; with a slot file it flipped a greedy token in this sample. A file from the deployed build (no section) restores with 200, no warning, full prompt, identical tokens. `LLAMA_SLOT_FILE_CKPT=0`: file 711706994 B (the old `n_written`), full prompt, identical tokens and acceptance. Last byte flipped: restore 200, `checkpoint section ignored (the draft state fails its checksum)`, full prompt, identical tokens, `/health` 200. Budget arm not run |
 | G8 VALIDATED list and switch defaults | VALIDATED = {256 × 4}. 256 × 2 left the list (G5 failed on Ornith-1.5-35B): Ornith-35B and Spark-1.7B now take turbo5p512 with one warning; `LLAMA_TURBOT_AUTO_PLAN=all` still gives turbot. NR 1 stays opt-in (not measured). Multi-stream and iSWA: iSWA checked on Spark-4B only |
 
+---
+
+## 10. Four connections: faster decode, less VRAM (4C, 2026-09-24/25)
+
+Branch `mmq16`, commits `0ae47b552`..`b5a5c7d54` (plus the test fix `329febd80`) on top of `f76a7a4b5` (the build deployed on 2026-09-22, OLD below). Outputs under `E:\turbot-gates\fourconn` (G-list) and `E:\turbot-gates\final` (correctness, quality, perf, rbfix, deploy). Every switch defaults to the new behaviour; each kill switch restores the OLD behaviour of its part.
+
+| Commit | Change | Kill switch |
+|---|---|---|
+| `0ae47b552` | DFlash2 drafter sync after the inject only on prefill, decided per sequence (`[TAG_4C_DFT_SYNC]`); step attribution probes (`[TAG_4C_PROBE]`, `SPEC_PHASE_PROBE=1`) | `SPEC_DFT_SYNC=2` |
+| `58bc7b48e` | drafter token graph reserved at its real batch width (16 rows at 4 slots, was 128) (`[TAG_4C_DFT_RESERVE]`) | `DFLASH_RESERVE_FULL=1` |
+| `35d89c465` | water-filling young-pool quota (SPEC 9.6, `[TAG_4C_QUOTA]`) | `TURBOT_QUOTA=prop` |
+| `f5d6ae1c2` | positional FA mask for ubatches of 2-32 sequences (`[TAG_4C_POSMASK_MS]`): no 256 MiB F16 mask at 4 slots | `LLAMA_KQ_MASK_POS_MS=0` (host), `GGML_CUDA_FA_POS_MS=0` (CUDA builds the explicit mask on the GPU) |
+| `2ae27225b`, `fd5e54594` | GDN rollback by replay: one committed state per cell plus a ring of the last `n_rs_seq` tokens instead of `1 + n_rs_seq` snapshot planes (`[TAG_4C_GDN_REPLAY]`); replay kernel register cap | `GDN_REPLAY=0` |
+| `225722664` | chunked GDN kernel for prompt prefill under replay (`[TAG_GDN_CHUNKED_PF]`) | `GDN_CHUNKED_PF=0`; `GDN_CHUNKED_PF_MIN` (default 64, min 16) sets the token threshold |
+| `513db7375`, `32431f8b1`, `b5a5c7d54` | tensor-core small-batch matmul for 5-16 column batches of Q4_K / Q5_K / Q6_K / Q8_0 weights with at most 1024 rows (`[TAG_MMSB]`, `[TAG_SMALLB]`) | `GGML_CUDA_SMALLB=0`; `GGML_CUDA_SMALLB_MAX_ROWS=0` removes the row limit (slower, see below) |
+| `367e1d88c`, `125288e5f`, `c1445574a` | exact snapshot rollback of a whole ubatch, deeper rollbacks refused (`[TAG_RS_SNAP_DEPTH]`); hybrid models without attention layers skip the attention inputs (`[TAG_KV_NO_LAYERS]`); triattention links without CUDA | - |
+| `081c911e4` | build: the git index of a worktree with a Windows gitdir path is found, so `--version` shows the real commit | - |
+| `329febd80` | test-backend-ops: the turbo SET_ROWS tolerance allows 4 centroid flips of the type's widest gap (`[TAG_TURBO_SET_ROWS_TOL]`); the fixed 5e-6 was below one flip of the 3-bit table | - |
+
+**`SPEC_DFT_SYNC`**: unset (or any value other than 0, 1, 2) = the new auto rule: the drafter is synchronized after the inject only while a sequence is still in prefill (prompt rows follow, more than `n_max + 1` rows for one sequence, or an out-of-range sequence id). `2` = the OLD auto rule verbatim (sync whenever the batch looked like prefill or held more than one live sequence, so every 4-slot step synced). `0` = the OLD `0` rule verbatim. `1` = sync after every chunk. `SPEC_DFT_SYNC_PREFILL=0` (auto only) also skips the sync after prefill chunks.
+
+### 10.1 Gates and results
+
+| Gate | Result |
+|---|---|
+| validate.ps1 | `GATE PASSED` on `c5d636d3a` (test-backend-ops 18714/18714; thresh 20/20 and difflen 10/10 for turbo4, turbo5p and turbot) and on the deployed binaries `329febd80` (18714/18714, see 10.2) |
+| kernels | FLASH_ATTN_EXT 5815/5815; `pos_ms` 80/80 with the default, `GGML_CUDA_FA_POS_MS=0` and `FA_KVMAX_MIN_KV=1`; GATED_DELTA_NET 88/88 with the chunked kernel on and off; MUL_MAT 1809/1809 on the row-limit build; compute-sanitizer memcheck 0 errors on MMSB (430 cases), GDN (88) and test-turbot-backend |
+| recurrent rollback (CUDA) | test-recurrent-state-rollback passes on every tiny hybrid fixture with `GDN_REPLAY=0` and `1`, including the dense fixture that aborted before `367e1d88c` |
+| cross-slot leak | crosstalk 96/96 own passphrases over 12 arms, then 24/24 on the final build (default, `-ub 1024`, `-ub 1024` with a 4K shared prefix); 0 CROSS-SLOT, 0 LOST |
+| greedy identity | 1 stream with `GDN_CHUNKED_PF=0`: 12/12 texts identical to OLD. At 2 and 4 streams the texts depend on batch timing (the repeatability control differs run to run on one build), so those rows are compared by ms/step, acceptance and KLD |
+| KLD 16 x 32K, turbot | NEW = OLD bit for bit: code 0.001139, prose 0.001856, PPL identical |
+| SMALLB on / off (KLD, f16 KV, existing bases) | 16 columns: code 0.000816 / 0.000832, prose 0.001436 / 0.001432. 8 columns: code 0.000839 / 0.000846, prose 0.001401 / 0.001383. Equal within the error bars |
+| chunked prefill, teacher-forced (64 positions at 16K) | KL(off -> on) 0.00112, the floor for any computation-order change is 0.00104; against the f16 reference on 0.00130, off 0.00129; NLL on - off -0.0055 +- 0.0048; a rerun of on is bit-identical |
+| `-ub 1024` (KLD) | code 0.000899 vs 0.000860 (`-ub 512`), prose 0.001489 vs 0.001523; PPL slightly lower on both |
+| needles | 131K, 245K and the 3-needle test pass on OLD, NEW and the final config (`-b 2048 -ub 1024`, vision on the GPU) |
+
+### 10.2 Deploy gates (2026-09-25)
+
+Run on the binaries that were deployed (`build-mmq16\bin` at `329febd80` = `b5a5c7d54` plus the test fix; only the commit strings differ from `b5a5c7d54`, `ggml-cuda.dll` is the same file) with the final flags (`-b 2048 -ub 1024`, vision on the GPU). Outputs under `E:\turbot-gates\final\deploy`; every server went through the guard (STOP_GPU, one GPU process, memory, port 8091) and the post-check (no nvlddmkm / Display 4101 event, model file cache clean) every time.
+
+| Gate | Result |
+|---|---|
+| validate.ps1 | first run on `b5a5c7d54`: 1 new FAIL, `SET_ROWS(f32 -> turbo3, ne=[1024,5,1,3])` ERR 1.49e-5 > 5e-6; the smoke arms passed. The case is flaky on every build: the 17 turbo SET_ROWS cases failed in 2 of 30 and 1 of 150 runs on `b5a5c7d54`, 1 of 150 on `80f44b5d8` and 1 of 30 on `f52b7db3b` (random inputs from `std::random_device`). One flip across a centroid gap g costs g^2 x 128 / n_out of NMSE: 7.0e-6 for the inner 3-bit gap at ne=[256,11,1,2] nr23=[2,3] (measured 6.8e-6, 7.6e-6) and 1.5e-5 at ne=[1024,5,1,3] (measured 1.49e-5), so 5e-6 was below a single flip. Fixed in `329febd80` (tolerance 4 flips of the widest gap, at most 2.3e-3, far below the 0.38-1.27 of a wrong rotation). Then 200/200 runs of the 17 cases pass and validate.ps1 `GATE PASSED`: test-backend-ops 18714/18714, thresh 20/20 and difflen 10/10 for turbo4, turbo5p and turbot |
+| blob_roundtrip (production profile) | `prompt_cache` PASS (`prompt_n` 4 on another slot, tokens identical), `park_resume` PASS (1 park, 1 resume, tokens identical); log: RS buffer 693.21 MiB, `GDN path = CHUNKED-PF` for the prompt and `REPLAY` for decode |
+| eos_repro arm A, 4 waves | 320 graded: 306 ok, 1 early EOS, 13 diverged, 0 errors. All 14 post-checked: near-ties (the picked token is at most 0.121 nats below the top one), **0 anomalous** |
+| crosstalk | vision on the GPU 8/8; with a 4K shared prefix 8/8 (`share_prefix: task` 3 times in the log); UD-Q4_K_XL 8/8; Uncensored-Q5_K_M 8/8. 0 CROSS-SLOT, 0 LOST, no CUDA error or assert in any log |
+| other Qwen3.8-27B weights, final flags | UD-Q4_K_XL (DFlash2-Q4_K_M drafter) and Uncensored-Q5_K_M: facts right, thresh 20/20, difflen 10/10 |
+| cold 131K prefill, back to back | OLD / final, server t/s (2 interleaved pairs): prose 1648 / 1702, 1692 / 1713; code 1688 / 1699, 1694 / 1705. Means: prose 1670 -> 1708 (+2.2 %), code 1691 -> 1702 (+0.6 %). Lowest free VRAM during the run: OLD 1507 MiB, final 2216-2226 MiB with vision on the GPU |
+| every Jarvis profile, its own command on the new exe | Ornith-1.5-9B (MTP), Ornith-1.5-35B (MTP), Nemotron 3.5 (MTP sidecar), Muse Glimmer (DFlash), Spark-X2.5-4B, MiniCPM5-2B and both NEO-CODER-MAX fine-tunes (DFlash2): facts right, thresh 20/20, difflen 10/10, no CUDA error |
+| live folder after the copy | the Jarvis production command of UD-Q5_K_XL (port 8091, Vulkan not disabled, as Jarvis runs it): facts right, thresh 20/20, difflen 10/10, projector on CUDA0; `launch-qwen38-dflash2.bat`'s command: facts right |
+
+### 10.3 Measured, OLD `f76a7a4b5` vs NEW `b5a5c7d54`
+
+Production server: Qwen3.8-27B UD-Q5_K_XL, 262144 x 4 slots, `--kv-unified`, turbot (built-in plan), DFlash2-Q8_0 n_max 3, `--spec-rs-seq 3`, `-bs`, `SPEC_DFT_UBATCH=128`. OLD and NEW runs interleaved with identical flags. Decode: per-stream t/s | total t/s | ms/step, medians (OLD 2 runs, NEW 3, `-ub 1024` 2). ms/step is the fair metric when the greedy texts differ (they fork at near-ties at 2 and 4 streams, which moves acceptance).
+
+| Streams | Depth, corpus | OLD | NEW `-b 1024 -ub 512` | NEW `-b 2048 -ub 1024` |
+|---|---|---|---|---|
+| 1 | 0, code | 141.2 \| 136.2 \| 26.33 | 140.7 \| 138.2 \| 26.43 | 140.3 \| 136.1 \| 26.51 |
+| 1 | 0, prose | 110.6 \| 107.8 \| 26.23 | 110.9 \| 109.3 \| 26.15 | 110.2 \| 107.8 \| 26.33 |
+| 1 | 32K, code | 120.4 \| 107.0 \| 28.51 | 123.1 \| 112.6 \| 28.65 | 125.5 \| 113.6 \| 28.75 |
+| 1 | 32K, prose | 71.1 \| 66.5 \| 28.81 | 70.8 \| 67.2 \| 28.93 | 69.9 \| 66.0 \| 28.85 |
+| 2 | 0, code | 108.1 \| 180.0 \| 30.61 | 105.5 \| 167.9 \| 29.72 | 105.1 \| 165.7 \| 29.84 |
+| 2 | 0, prose | 96.0 \| 173.6 \| 30.85 | 95.2 \| 180.4 \| 30.03 | 94.4 \| 174.5 \| 30.28 |
+| 2 | 32K, code | 99.1 \| 138.0 \| 33.79 | 100.9 \| 142.8 \| 33.17 | 88.4 \| 130.7 \| 34.23 |
+| 2 | 32K, prose | 63.8 \| 92.6 \| 34.49 | 64.5 \| 98.4 \| 33.88 | 63.4 \| 97.5 \| 34.08 |
+| 4 | 0, code | 83.7 \| 261.8 \| 39.65 | 92.5 \| 290.6 \| 36.54 | 92.2 \| 287.3 \| 36.61 |
+| 4 | 0, prose | 68.3 \| 235.7 \| 40.41 | 72.3 \| 259.3 \| 37.61 | 71.7 \| 255.9 \| 37.91 |
+| 4 | 32K, code | 63.2 \| 147.3 \| 54.79 | 66.9 \| 154.3 \| 51.29 | 59.7 \| 147.2 \| 51.86 |
+| 4 | 32K, prose | 43.8 \| 109.1 \| 55.01 | 46.9 \| 116.8 \| 52.13 | 45.0 \| 116.7 \| 52.91 |
+
+ms/step NEW vs OLD (geometric mean): about +0.3 % at 1 stream (run-to-run spread about 1 %), -2 % at 2 streams, -6.6 % at 4 streams.
+
+| Measure | OLD | NEW `-ub 512` | NEW `-ub 1024` |
+|---|---|---|---|
+| cold 16K prefill, 1 stream (server t/s, code / prose) | 2515 / 2510 | 2559 / 2558 | 2630 / 2637 |
+| cold 16K prefill, 4 streams (client wall t/s, code / prose) | 2075 / 2065 | 2093 / 2071 | 2262 / 2214 |
+| cold 131K prefill, 1 stream, back to back (server t/s, prose / code) | 1670 / 1691 | - | 1708 / 1702 (vision on the GPU) |
+| VRAM after load (server MiB, desktop subtracted) | 28787-28795 | 26692-26737 | 26845 (27982 with vision on the GPU) |
+| VRAM peak after 4 streams | 29027-29172 | 26953-27094 | 27159-27280 |
+| RS buffer | 2394.00 MiB | 693.21 MiB | 693.21 MiB |
+| target compute buffer (CUDA0 / pinned host) | 396.97 / 276.04 MiB | 124.04 / 22.04 MiB | 246.06 / 42.06 MiB |
+| drafter compute buffer | 137.53 MiB | 36.79 MiB | 36.79 MiB |
+
+Vision (4033-token image, 262144 x 4, `-ub 1024`), `-mmdev gpu` vs `cpu`: encode 1.32-1.46 s vs 34.75-36.2 s, time to first token 2.93-3.65 s vs 36.3-37.95 s, all answers right. While an image encodes on the GPU the other streams pause for 2.83-3.02 s; on the CPU they keep generating. Lowest free VRAM during a run with vision on the GPU: 1610-1615 MiB (OLD with vision on the CPU: 1135-1467).
+
+**Small-batch matmul row limit.** Per op on the 5090 (K = 5120, 9-16 columns), MMQ -> SMALLB: 48 rows 33 -> 7 us, 1024 rows 13.4 -> 11.3 us, 2048 rows 13.0 -> 14.8 us, 4096 rows 15.3 -> 24.4 us, 17408 rows 35 -> 82 us. Without the limit the server was slower at 2 and 4 streams (+20 % / +11 % ms/step); with it, 4 streams d=0 run 38.5 -> 36.1 ms/step (code) and 39.2 -> 37.4 (prose) against `GGML_CUDA_SMALLB=0`.
+
+### 10.4 Open items
+
+- **SMALLB above 1024 rows.** The kernel reaches 0.69-0.75 TB/s against MMQ's 1.12-1.18 at 2048+ rows (2 blocks per SM at 128 registers, one unit of prefetch, activations reloaded before every MMA). Plan: stage a K slice of the activations in shared memory (cp.async, double-buffered), aim for 64 registers and 4+ blocks per SM, prefetch the weights 2-4 units ahead; or an MMQ variant with `mmq_x` 8/16 and no stream-k. Accept only if the per-op time beats MMQ at 2048+ rows (`GGML_CUDA_SMALLB_MAX_ROWS=0` with the perf cases) and 4-stream server ms/step improves.
+- **Acceptance at 2 and 4 streams** moved with SMALLB and with `-ub 1024` on the 2 test prompts (for example `-ub 1024`, 4 streams, 32K code 0.845 -> 0.73) while KLD is unchanged, so these are most likely texts forking at near-ties. A many-prompt A/B (16+ prompts, 2 and 4 streams, SMALLB on/off, `-ub 512/1024`, mean acceptance with standard errors) is still to run.
+- **`-ub 1024` decode cost**: +0.52 % ms/step geomean (worst row 2 streams 32K code, +3.2 % against `-ub 512`) for +5.3 % prefill. `-b 1024 -ub 512` stays the fallback when decode matters more.
+- **Slot-file restore with DFlash2** (`save_restore` of `blob_roundtrip.py`) fails on OLD and NEW alike: see 9.9 G7.
+- **NEO-CODER-MAX fine-tunes** decode a short greedy answer at 44-47 t/s with DFlash2 on OLD and NEW alike (UD-Q5_K_XL: ~110): DFlash2 was trained on the base weights. Measure their acceptance and the speed without a drafter before choosing their profile.
+- Not run: G10 quota under mixed load (1 x 200K + 3 x 2K) with short-slot KLD; G9 at 61440 depth.
