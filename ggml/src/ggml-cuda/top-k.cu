@@ -278,6 +278,219 @@ static void top_k_select_cuda(const float * x, int * dst, const int64_t ncols, c
     }
 }
 
+// [TAG_TOPK_SPLIT] Top k (k <= TOPK_SELECT_MAX_K) of a few wide rows on many blocks. k_top_k_select runs ONE block
+// per row, and the backend sampler calls it with one row at a time (16 launches per 4-stream verify step), so each
+// call read a 248K-entry row five times on a single SM: ~95 us per row, 1.5-2.7 ms per step. Here:
+//   stage 1: every row is cut into nchunks equal chunks (>= k entries each); a block loads its chunk into shared
+//            memory and selects the chunk's top k exactly, under the total order (value desc, index asc), writing
+//            the survivors in index order;
+//   stage 2: one block per row selects the top k of the row's nchunks*k candidates (index order again) and writes
+//            them values descending, ties by ascending index, the order k_top_k_select writes.
+// Every entry of the row's top k is in its chunk's top k under the same total order, so the result is the same
+// set in the same order as k_top_k_select. GGML_CUDA_TOPK_SPLIT=0 restores the one-block-per-row kernel.
+#define TOPK_SPLIT_THREADS    256
+#define TOPK_SPLIT_MAX_N      4096   // entries per block: the chunk length in stage 1, nchunks*k in stage 2
+#define TOPK_SPLIT_MAX_CHUNKS 64
+#define TOPK_SPLIT_MIN_COLS   16384
+#define TOPK_SPLIT_MAX_ROWS   64     // more rows keep enough blocks busy with k_top_k_select
+
+static_assert(TOPK_SPLIT_THREADS == 256, "topk split: one histogram bin per thread");
+static_assert(TOPK_SPLIT_MAX_CHUNKS*TOPK_SELECT_MAX_K <= TOPK_SPLIT_MAX_N, "topk split: stage 2 candidates");
+
+// Block-wide exclusive prefix sum of v; *total gets the sum over the block. sh: >= TOPK_SPLIT_THREADS/WARP_SIZE ints.
+static __device__ __forceinline__ int topk_split_scan(const int v, int * sh, int * total) {
+    const int lane = threadIdx.x % WARP_SIZE;
+    const int warp = threadIdx.x / WARP_SIZE;
+    int inc = v;
+#pragma unroll
+    for (int o = 1; o < WARP_SIZE; o <<= 1) {
+        const int t = __shfl_up_sync(0xFFFFFFFF, inc, o);
+        if (lane >= o) {
+            inc += t;
+        }
+    }
+    if (lane == WARP_SIZE - 1) {
+        sh[warp] = inc;
+    }
+    __syncthreads();
+    int base = 0;
+    int tot  = 0;
+#pragma unroll
+    for (int w = 0; w < TOPK_SPLIT_THREADS/WARP_SIZE; ++w) {
+        const int s = sh[w];
+        base += w < warp ? s : 0;
+        tot  += s;
+    }
+    __syncthreads();   // sh is reused right after
+    *total = tot;
+    return base + inc - v;
+}
+
+// Top k of keys[0, n) (k <= n <= TOPK_SPLIT_MAX_N, shared memory, storage order = index order): calls
+// out(pos, i) once for each of the k survivors, pos = its rank in storage order (0..k-1). The survivors are every key
+// above the k-th largest key T plus the first `need` keys equal to T, found by four 8-bit radix passes (MSB first).
+// hist: 8*256 ints, sh: 16 ints, both shared. Every thread of the block must call this.
+template <typename F>
+static __device__ __forceinline__ void topk_split_select(
+        const uint32_t * keys, const int n, const int k, int * hist, int * sh, F out) {
+    const int tid  = threadIdx.x;
+    const int warp = tid / WARP_SIZE;
+
+    uint32_t prefix = 0;
+    uint32_t pmask  = 0;
+    int      need   = k;
+    for (int pass = 0; pass < 4; ++pass) {
+        const int shift = 24 - 8*pass;
+        for (int b = tid; b < 8*256; b += TOPK_SPLIT_THREADS) {
+            hist[b] = 0;
+        }
+        __syncthreads();
+        for (int i = tid; i < n; i += TOPK_SPLIT_THREADS) {
+            const uint32_t key = keys[i];
+            if ((key & pmask) == prefix) {
+                atomicAdd(&hist[warp*256 + ((key >> shift) & 0xFFu)], 1);
+            }
+        }
+        __syncthreads();
+        // thread t owns bin 255 - t, so the exclusive prefix over t counts the keys in the higher bins
+        const int bin = 255 - tid;
+        int c = 0;
+#pragma unroll
+        for (int w = 0; w < 8; ++w) {
+            c += hist[w*256 + bin];
+        }
+        int tot;
+        const int above = topk_split_scan(c, sh, &tot);
+        if (above < need && above + c >= need) {
+            sh[8] = bin;
+            sh[9] = need - above;
+        }
+        __syncthreads();
+        prefix |= (uint32_t) sh[8] << shift;
+        pmask  |= 0xFFu << shift;
+        need    = sh[9];
+        __syncthreads();
+    }
+    const uint32_t T = prefix;
+
+    // compaction in storage order: thread t takes the contiguous segment [t*seg, t*seg + seg)
+    const int seg = (n + TOPK_SPLIT_THREADS - 1) / TOPK_SPLIT_THREADS;
+    const int i0  = min(n, tid*seg);
+    const int i1  = min(n, i0 + seg);
+    int ngt = 0;
+    int neq = 0;
+    for (int i = i0; i < i1; ++i) {
+        const uint32_t key = keys[i];
+        ngt += key >  T ? 1 : 0;
+        neq += key == T ? 1 : 0;
+    }
+    int tot;
+    const int before = topk_split_scan(ngt | (neq << 16), sh, &tot);   // both counts <= 4096
+    int gt_before = before & 0xFFFF;
+    int eq_before = before >> 16;
+    for (int i = i0; i < i1; ++i) {
+        const uint32_t key = keys[i];
+        if (key > T) {
+            out(gt_before + min(eq_before, need), i);
+            ++gt_before;
+        } else if (key == T) {
+            if (eq_before < need) {
+                out(gt_before + eq_before, i);
+            }
+            ++eq_before;
+        }
+    }
+}
+
+// stage 1: grid (nchunks, nrows). Chunk c of a row is [c*ncols/nchunks, (c+1)*ncols/nchunks).
+static __global__ void __launch_bounds__(TOPK_SPLIT_THREADS)
+k_top_k_split_chunk(const float * __restrict__ x, uint32_t * __restrict__ ckey, int * __restrict__ cidx,
+        const int ncols, const int nchunks, const int k) {
+    __shared__ uint32_t keys[TOPK_SPLIT_MAX_N];
+    __shared__ int      hist[8*256];
+    __shared__ int      sh[16];
+
+    const int     c   = blockIdx.x;
+    const int     row = blockIdx.y;
+    const int64_t c0  = (int64_t) c       * ncols / nchunks;
+    const int64_t c1  = (int64_t) (c + 1) * ncols / nchunks;
+    const int     n   = (int) (c1 - c0);
+
+    const float * xr = x + (int64_t) row*ncols + c0;
+    for (int i = threadIdx.x; i < n; i += TOPK_SPLIT_THREADS) {
+        keys[i] = topk_select_key(xr[i]);
+    }
+    __syncthreads();
+
+    uint32_t * ok = ckey + ((int64_t) row*nchunks + c)*k;
+    int      * oi = cidx + ((int64_t) row*nchunks + c)*k;
+    topk_split_select(keys, n, k, hist, sh, [&](const int pos, const int i) {
+        ok[pos] = keys[i];
+        oi[pos] = (int) (c0 + i);
+    });
+}
+
+// stage 2: grid nrows. The n = nchunks*k candidates of a row are in index order.
+static __global__ void __launch_bounds__(TOPK_SPLIT_THREADS)
+k_top_k_split_merge(const uint32_t * __restrict__ ckey, const int * __restrict__ cidx, int * __restrict__ dst,
+        const int n, const int k) {
+    __shared__ uint32_t keys[TOPK_SPLIT_MAX_N];
+    __shared__ int      idx[TOPK_SPLIT_MAX_N];
+    __shared__ int      hist[8*256];
+    __shared__ int      sh[16];
+    __shared__ uint32_t skey[TOPK_SELECT_MAX_K];
+    __shared__ int      sidx[TOPK_SELECT_MAX_K];
+
+    const int row = blockIdx.x;
+    for (int i = threadIdx.x; i < n; i += TOPK_SPLIT_THREADS) {
+        keys[i] = ckey[(int64_t) row*n + i];
+        idx[i]  = cidx[(int64_t) row*n + i];
+    }
+    __syncthreads();
+
+    topk_split_select(keys, n, k, hist, sh, [&](const int pos, const int i) {
+        skey[pos] = keys[i];
+        sidx[pos] = idx[i];
+    });
+    __syncthreads();
+
+    // rank sort of the k survivors: values descending, ties by ascending index
+    if ((int) threadIdx.x < k) {
+        const uint32_t mk = skey[threadIdx.x];
+        const int      mi = sidx[threadIdx.x];
+        int rank = 0;
+        for (int j = 0; j < k; ++j) {
+            const uint32_t kj = skey[j];
+            rank += (kj > mk || (kj == mk && sidx[j] < mi)) ? 1 : 0;
+        }
+        dst[(int64_t) row*k + rank] = mi;
+    }
+}
+
+// Returns false (nothing launched) where the split does not apply.
+static bool top_k_split_cuda(ggml_cuda_pool & pool, const float * x, int * dst, const int64_t ncols, const int64_t nrows,
+        const int64_t k, cudaStream_t stream) {
+    static const bool enabled = [] {
+        const char * e = getenv("GGML_CUDA_TOPK_SPLIT");
+        return !(e && e[0] == '0');
+    }();
+    if (!enabled || k < 1 || k > TOPK_SELECT_MAX_K || nrows < 1 || nrows > TOPK_SPLIT_MAX_ROWS ||
+            ncols < TOPK_SPLIT_MIN_COLS || ncols > (int64_t) TOPK_SPLIT_MAX_CHUNKS*TOPK_SPLIT_MAX_N) {
+        return false;
+    }
+    // as many chunks as fit the stage-2 candidate buffer (every chunk holds >= ncols/64 >= 256 >= k entries)
+    const int nchunks = TOPK_SPLIT_MAX_CHUNKS;
+    GGML_ASSERT((ncols + nchunks - 1)/nchunks <= TOPK_SPLIT_MAX_N && ncols/nchunks >= k);
+
+    ggml_cuda_pool_alloc<uint32_t> ckey(pool, (size_t) nrows*nchunks*k);
+    ggml_cuda_pool_alloc<int>      cidx(pool, (size_t) nrows*nchunks*k);
+    k_top_k_split_chunk<<<dim3(nchunks, (unsigned) nrows, 1), TOPK_SPLIT_THREADS, 0, stream>>>(
+        x, ckey.get(), cidx.get(), (int) ncols, nchunks, (int) k);
+    k_top_k_split_merge<<<(unsigned) nrows, TOPK_SPLIT_THREADS, 0, stream>>>(
+        ckey.get(), cidx.get(), dst, nchunks*(int) k, (int) k);
+    return true;
+}
+
 #if !defined(GGML_CUDA_USE_CUB) && defined(GGML_USE_HIP)
 
 static __device__ __forceinline__ uint32_t top_k_float_to_ordered(float value) {
@@ -468,6 +681,10 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     static const bool topk_force_ordered = getenv("TURBO_TOPK_ORDERED") != nullptr;
     const bool topk_ordered = topk_force_ordered || dst->op_params[0] == 0;
     if ((k <= TOPK_SELECT_MAX_K || !topk_ordered) && ncols >= 2048 && ncols <= INT32_MAX) {
+        // [TAG_TOPK_SPLIT] few wide rows, small k: many blocks per row (same result and order)
+        if (top_k_split_cuda(pool, src0_d, dst_d, ncols, nrows, k, stream)) {
+            return;
+        }
         top_k_select_cuda(src0_d, dst_d, ncols, nrows, k, topk_ordered, stream);
         return;
     }
