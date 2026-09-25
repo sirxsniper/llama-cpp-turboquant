@@ -12104,6 +12104,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         for (int n : {6, 12}) {
             test_cases.emplace_back(new test_mul_mat(ta, GGML_TYPE_F32, 2048, n, 5120, {1, 1}, {1, 1}, {0, 1, 2, 3}, 5376));
         }
+        // m = 25600: 200 tiles, stream-k with 3.5-6 steps per block, so a block writes dst mid-loop and goes on into
+        // the next tile. m = 42240: 330 tiles, tiling with a persistent grid where blocks own 2 or 1 tiles.
+        // m = 20480: 160 tiles, tiling with one block per tile.
+        for (int n : {7, 16}) {
+            test_cases.emplace_back(new test_mul_mat(ta, GGML_TYPE_F32, 25600, n,  768, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(ta, GGML_TYPE_F32, 25600, n, 1280, {1, 1}, {1, 1}));
+        }
+        for (int n : {8, 13}) {
+            test_cases.emplace_back(new test_mul_mat(ta, GGML_TYPE_F32, 42240, n,  768, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(ta, GGML_TYPE_F32, 20480, n,  768, {1, 1}, {1, 1}));
+        }
     }
 
 #if 0
