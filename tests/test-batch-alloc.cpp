@@ -772,7 +772,7 @@ static void test_mrope(testing & t) {
     });
 
     t.test("pos_jump_allowed", [&](testing & t) {
-        const uint32_t n_pos  = 4;
+        static constexpr uint32_t n_pos = 4; // array bound in the nested lambda below: MSVC rejects a captured local
         const uint32_t n_embd = 2;
 
         mock_memory mem;
