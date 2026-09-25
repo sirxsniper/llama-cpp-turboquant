@@ -539,6 +539,9 @@ static __global__ void mul_mat_qsn_fixup(
         const int stride_col_dst) {
 #if defined(TURING_MMA_AVAILABLE) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
     ggml_cuda_pdl_lc();
+    // Wait before the early exits: if no block of this grid waited, it could finish before mul_mat_qsn, and a PDL
+    // kernel after it would then only wait for this grid (and could reuse the q8_1/tmp pool memory too early).
+    ggml_cuda_pdl_sync();
     float       * GGML_CUDA_RESTRICT dst           = dst_ptr;
     const float * GGML_CUDA_RESTRICT tmp_last_tile = tmp_ptr;
 
@@ -569,8 +572,6 @@ static __global__ void mul_mat_qsn_fixup(
     if (did_not_have_any_data || wrote_beginning_of_tile || did_not_write_last) {
         return;
     }
-
-    ggml_cuda_pdl_sync();   // tmp and dst are written by mul_mat_qsn
 
     bool any_fixup = false;
 
