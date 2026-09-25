@@ -73,12 +73,20 @@ static bool llama_gdn_replay_arch(llm_arch arch) {
 
 // one ring token: k [S_k*H_v] (H_v heads, the graph repeats k when the fused op is off) | v [S_v*H_v] | g [H_v] |
 // beta [H_v], padded to 4 floats for the float4 loads of the CUDA kernel
-// [TAG_RS_SNAP_DEPTH] graphs that write the state before the ubatch into group n_seq_tokens (delta-net-base conv + GDN)
+// [TAG_RS_SNAP_DEPTH] graphs that write the state before the ubatch into group n_seq_tokens: delta-net-base conv +
+// GDN/KDA, the Kimi K3 / Qwen4exp / Ling 3 conv (all slots, clamped), the Mamba-2 conv + scan and the LFM2 conv
 static bool llama_rs_pre_state_arch(llm_arch arch) {
     switch (arch) {
         case LLM_ARCH_QWEN35:
         case LLM_ARCH_QWEN35MOE:
         case LLM_ARCH_QWEN3NEXT:
+        case LLM_ARCH_KIMI_K3:
+        case LLM_ARCH_QWEN4EXP:
+        case LLM_ARCH_BAILINGMOE3:
+        case LLM_ARCH_NEMOTRON_H:
+        case LLM_ARCH_NEMOTRON_H_MOE:
+        case LLM_ARCH_LFM2:
+        case LLM_ARCH_LFM2MOE:
             return true;
         default:
             return false;

@@ -198,7 +198,8 @@ static ggml_tensor * bailingmoe3_causal_conv1d(
     ggml_tensor * conv_x = ggml_concat(ctx0, conv_state, ggml_transpose(ctx0, x_proj), 0);
 
     const int64_t K = (int64_t) n_rs_seq + 1;
-    const int64_t n_written = std::min<int64_t>(n_seq_tokens, K);
+    // [TAG_RS_SNAP_DEPTH] slot n_seq_tokens (offset 0) is the state before the ubatch, for a whole-ubatch rollback
+    const int64_t n_written = std::min<int64_t>(n_seq_tokens + (K > 1 ? 1 : 0), K);
 
     for (int64_t slot = 0; slot < n_written; ++slot) {
         ggml_tensor * conv_snap = ggml_view_3d(ctx0, conv_x, d_conv - 1, d_inner, n_seqs,
