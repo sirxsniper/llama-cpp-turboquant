@@ -180,7 +180,8 @@ bool llama_batch_allocr::init(
 
     batch.n_tokens = n_tok;
     batch.token    = has_token ? token_vec.data() : nullptr;
-    batch.embd     = has_embd  ? const_cast<float *>(batch_inp.embd.data()) : nullptr; // [TAG_SYNC_BATCH_EXT_COMPAT] read only
+    // [TAG_SYNC_BATCH_EXT_COMPAT] read only; embd_ref = rows borrowed from the caller's llama_batch (compat path)
+    batch.embd     = has_embd  ? const_cast<float *>(batch_inp.embd_ref ? batch_inp.embd_ref : batch_inp.embd.data()) : nullptr;
     batch.pos      = pos.data();
     batch.n_seq_id = n_seq_id.data();
     batch.seq_id   = seq_id.data();
@@ -1070,9 +1071,17 @@ llama_batch_ext::llama_batch_ext(
     clear();
 }
 
+void llama_batch_ext::own_embd() {
+    if (embd_ref) {
+        embd.assign(embd_ref, embd_ref + tokens.size() * n_embd);
+        embd_ref = nullptr;
+    }
+}
+
 void llama_batch_ext::clear() {
     tokens.clear();
     embd  .clear();
+    embd_ref = nullptr;
     n_embd = 0;
 }
 
@@ -1147,6 +1156,8 @@ bool llama_batch_ext::set_token_embd(int32_t idx, llama_embd embd_in) {
         LLAMA_LOG_ERROR("%s: embedding for token %d is already set\n", __func__, idx);
         return false;
     }
+
+    own_embd(); // [TAG_SYNC_BATCH_EXT_COMPAT] no-op unless compat borrowed the rows
 
     t.has_embd = true;
     t.embd_off = embd.size();
@@ -1251,7 +1262,7 @@ bool llama_batch_ext_set_output_logits(llama_batch_ext * batch, int32_t idx, boo
 
 // llama_batch_compat
 
-void llama_batch_compat::init(llama_batch_ext & dst, const llama_batch & batch_inp, size_t n_embd_row) {
+void llama_batch_compat::init(llama_batch_ext & dst, const llama_batch & batch_inp, size_t n_embd_row, bool borrow_embd) {
     llama_batch_ext * batch_ext = &dst;
 
     if (n_embd_row == 0) {
@@ -1261,6 +1272,19 @@ void llama_batch_compat::init(llama_batch_ext & dst, const llama_batch & batch_i
     // a batch can carry both, for example the MTP hook batches
     const bool has_token = batch_inp.token != nullptr;
     const bool has_embd  = batch_inp.embd  != nullptr;
+
+    // [TAG_SYNC_BATCH_EXT_COMPAT] the old llama_batch path read the caller's rows in place (llama_batch_allocr::init
+    // kept a shallow copy of the batch). Copying them here cost one extra pass over every embd batch: a DFlash2
+    // inject chunk is 128 rows x 100 KiB, so 1.6 GB per 16K-token prefill (~55 ms, -0.5% prefill t/s measured).
+    // Borrow them instead when the ext holds nothing else, so the offsets are simply i * n_embd_row.
+    // Appending to an ext that already borrowed rows copies those first, so old and new offsets index one array.
+    if (batch_inp.n_tokens > 0) {
+        batch_ext->own_embd();
+    }
+    const bool borrow = has_embd && borrow_embd && batch_ext->tokens.empty() && batch_ext->embd.empty();
+    if (borrow) {
+        batch_ext->embd_ref = batch_inp.embd;
+    }
 
     static const llama_seq_id default_seq_id    = 0;
     static const int32_t      default_n_seq_id  = 1;
@@ -1279,7 +1303,7 @@ void llama_batch_compat::init(llama_batch_ext & dst, const llama_batch & batch_i
     // (100 KiB for Qwen3.8-27B), and growing the vector row by row copies a prefill chunk several times over
     if (batch_inp.n_tokens > 0) {
         batch_ext->tokens.reserve(batch_ext->tokens.size() + (size_t) batch_inp.n_tokens);
-        if (has_embd) {
+        if (has_embd && !borrow) {
             batch_ext->embd.reserve(batch_ext->embd.size() + (size_t) batch_inp.n_tokens * n_embd_row);
         }
     }
@@ -1323,9 +1347,13 @@ void llama_batch_compat::init(llama_batch_ext & dst, const llama_batch & batch_i
 
         if (has_embd) {
             t.has_embd = true;
-            t.embd_off = batch_ext->embd.size();
-            const float * src = batch_inp.embd + (size_t) i * n_embd_row;
-            batch_ext->embd.insert(batch_ext->embd.end(), src, src + n_embd_row);
+            if (borrow) {
+                t.embd_off = (size_t) i * n_embd_row;
+            } else {
+                t.embd_off = batch_ext->embd.size();
+                const float * src = batch_inp.embd + (size_t) i * n_embd_row;
+                batch_ext->embd.insert(batch_ext->embd.end(), src, src + n_embd_row);
+            }
             batch_ext->n_embd = n_embd_row;
         }
 

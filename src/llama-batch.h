@@ -107,6 +107,15 @@ struct llama_batch_ext {
     std::vector<token> tokens;
     std::vector<float> embd;
 
+    // [TAG_SYNC_BATCH_EXT_COMPAT] rows borrowed from the caller's llama_batch by llama_batch_compat::init with
+    // borrow_embd (the llama_context encode/decode(llama_batch) path): n_tokens rows of n_embd floats in token order,
+    // embd stays empty and embd_off indexes these rows. Valid only until the call that converted the batch returns;
+    // clear() drops it. nullptr = the rows are in embd.
+    const float * embd_ref = nullptr;
+
+    // copy borrowed rows into embd (before anything is appended), so every embd_off indexes embd again
+    void own_embd();
+
     llama_batch_ext(llama_context * ctx);
 
     // build without a llama_context, used by tests
@@ -244,5 +253,7 @@ struct llama_batch_compat {
 
     // fill an existing llama_batch_ext from a llama_batch (old API)
     // note: this is called directly by the tests, skipping llama_context creation
-    static void init(llama_batch_ext & batch_ext, const llama_batch & batch_inp, size_t n_embd_row = 0);
+    // [TAG_SYNC_BATCH_EXT_COMPAT] borrow_embd: point embd_ref at batch_inp.embd instead of copying the rows, when
+    // batch_ext is empty. Only for a caller that uses batch_ext within the lifetime of batch_inp.
+    static void init(llama_batch_ext & batch_ext, const llama_batch & batch_inp, size_t n_embd_row = 0, bool borrow_embd = false);
 };

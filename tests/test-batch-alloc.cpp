@@ -1092,6 +1092,67 @@ static void test_compat(testing & t) {
         llama_ubatch ub = ba.split_simple(2);
         t.assert_equal("ubatch uses the encoder stride", 6.0f, ub.embd[n_embd_enc]);
     });
+
+    // [TAG_SYNC_BATCH_EXT_COMPAT] the llama_context path borrows the caller's rows instead of copying them
+    t.test("embd_borrowed_in_place", [&](testing & t) {
+        const uint32_t n_embd_enc = 6;
+        float embd[3*n_embd_enc];
+        for (int i = 0; i < 3*6; ++i) {
+            embd[i] = (float) i;
+        }
+        llama_pos    pos[3]      = { 7, 8, 9 };
+        int32_t      n_seq_id[3] = { 1, 1, 1 };
+        llama_seq_id s0[1]       = { 1 };
+        llama_seq_id * seq_id[4] = { s0, s0, s0, nullptr };
+
+        llama_batch lb = {};
+        lb.n_tokens = 3;
+        lb.embd     = embd;
+        lb.pos      = pos;
+        lb.n_seq_id = n_seq_id;
+        lb.seq_id   = seq_id;
+
+        batch_builder bb(2, nullptr, 4, 1, 0, n_embd_enc);
+        llama_batch_compat::init(bb.b, lb, n_embd_enc, /*borrow_embd*/ true);
+
+        t.assert_true("no copy", bb.b.embd.empty() && bb.b.embd_ref == embd);
+        t.assert_equal((size_t) n_embd_enc, bb.b.n_embd);
+        for (int i = 0; i < 3; ++i) {
+            t.assert_true(bb.b.tokens[i].has_embd);
+            t.assert_equal((size_t) i*n_embd_enc, bb.b.tokens[i].embd_off);
+        }
+
+        llama_batch_allocr ba(1);
+        t.assert_true(ba.init(bb.b, vocab, false));
+        t.assert_true("allocator reads the caller's rows", ba.get_batch().embd == embd);
+        llama_ubatch ub = ba.split_simple(3);
+        for (int i = 0; i < 3*6; ++i) {
+            t.assert_equal("ubatch row copy", (float) i, ub.embd[i]);
+        }
+
+        // a second conversion into a non-empty ext copies, the borrowed rows first, so all offsets index embd
+        llama_pos   pos2[3] = { 10, 11, 12 };
+        llama_batch lb2     = lb;
+        lb2.pos = pos2;
+        llama_batch_compat::init(bb.b, lb2, n_embd_enc, /*borrow_embd*/ true);
+        t.assert_equal((size_t) 6, bb.b.tokens.size());
+        t.assert_true("appending owns the rows", bb.b.embd_ref == nullptr && bb.b.embd.size() == 6*n_embd_enc);
+        t.assert_equal((size_t) 3*n_embd_enc, bb.b.tokens[3].embd_off);
+        {
+            llama_batch_allocr ba2(1);
+            t.assert_true(ba2.init(bb.b, vocab, false));
+            llama_ubatch ub2 = ba2.split_simple(6);
+            for (int i = 0; i < 6*6; ++i) {
+                t.assert_equal("appended rows", (float) (i % 18), ub2.embd[i]);
+            }
+        }
+
+        // clear() drops the borrowed pointer; without borrow_embd the rows are copied as before
+        bb.b.clear();
+        t.assert_true("clear drops the borrow", bb.b.embd_ref == nullptr);
+        llama_batch_compat::init(bb.b, lb, n_embd_enc);
+        t.assert_true("default still copies", bb.b.embd_ref == nullptr && bb.b.embd.size() == 3*n_embd_enc);
+    });
 }
 
 static void test_mtp_embd_width(testing & t) {

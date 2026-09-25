@@ -5839,7 +5839,8 @@ llama_batch_ext & llama_context::batch_compat_get() {
 
 int llama_context::encode(const llama_batch & batch_inp) {
     llama_batch_ext & batch_ext = batch_compat_get();
-    llama_batch_compat::init(batch_ext, batch_inp, model.hparams.n_embd_inp_enc());
+    // [TAG_SYNC_BATCH_EXT_COMPAT] borrow the embd rows: batch_inp outlives this call, which is the only use of batch_ext
+    llama_batch_compat::init(batch_ext, batch_inp, model.hparams.n_embd_inp_enc(), /*borrow_embd =*/ true);
 
     // [TAG_SYNC_BATCH_EXT_COMPAT] encode outputs every token. Without a logits array compat marks only the last one,
     // and llama_batch_allocr::init would then warn on every call (every EAGLE3 encode chunk) before overriding it.
@@ -5854,7 +5855,7 @@ int llama_context::encode(const llama_batch & batch_inp) {
 
 int llama_context::decode(const llama_batch & batch_inp) {
     llama_batch_ext & batch_ext = batch_compat_get();
-    llama_batch_compat::init(batch_ext, batch_inp);
+    llama_batch_compat::init(batch_ext, batch_inp, 0, /*borrow_embd =*/ true);   // [TAG_SYNC_BATCH_EXT_COMPAT] see encode
 
     // [TAG_SYNC_BATCH_EXT_COMPAT] embedding contexts output every token; the old llama_batch path filled the outputs
     // silently when no logits array was given, keep that instead of the per-call override warning
