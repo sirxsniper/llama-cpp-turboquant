@@ -2,6 +2,7 @@
 
 #include "ggml.h"
 #include "ggml-cpu.h"
+#include "ggml-turbot.h"
 
 #undef NDEBUG
 #include <assert.h>
@@ -32,6 +33,53 @@ constexpr float MAX_DOT_PRODUCT_ERROR_TERNARY = 0.15f;
 
 static const char* RESULT_STR[] = {"ok", "FAILED"};
 
+// [TAG_TURBO_QFNS_ROT] the turbo KV types store and dequantize the 128-point signed WHT of the data (the graph
+// rotates Q the same way), so their round trip is checked against WHT(x) and their F32 vec_dot operand is rotated too
+static bool type_is_wht_rotated(ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_TURBO2_0:
+        case GGML_TYPE_TURBO3_0:
+        case GGML_TYPE_TURBO4_0:
+        case GGML_TYPE_TURBO4P_0:
+        case GGML_TYPE_TURBO5P_0:
+        case GGML_TYPE_TURBO5P512_0:
+            return true;
+        default:
+            return false;
+    }
+}
+
+static std::vector<float> wht_rotated(const float * x, size_t n) {
+    assert(n % 128 == 0);
+    std::vector<float> r(x, x + n);
+    for (size_t i = 0; i < n; i += 128) {
+        ggml_turbot_fwht128(r.data() + i);
+    }
+    return r;
+}
+
+// Lloyd-Max codebooks on the rotated (near-Gaussian) values: error about 0.0076 (2 bits), 0.0039 (3), 0.0021 (4),
+// 0.0011 (5) on this data; a wrong basis gives about 0.031
+static float max_turbo_quantization_error(ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_TURBO2_0:     return 0.0095f;
+        case GGML_TYPE_TURBO3_0:     return 0.0052f;
+        case GGML_TYPE_TURBO4_0:
+        case GGML_TYPE_TURBO4P_0:    return 0.0028f;
+        default:                     return 0.0015f; // turbo5p, turbo5p512
+    }
+}
+
+// the norm correction keeps |x| but shrinks the part along x by about sqrt(1 - D) (D = codebook MSE), so on this
+// correlated data the dot error is mostly that bias: about 0.066 (2 bits), 0.019 (3), 0.0065 (4), 0.0013 (5)
+static float max_turbo_dot_product_error(ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_TURBO2_0: return 0.09f;
+        case GGML_TYPE_TURBO3_0: return MAX_DOT_PRODUCT_ERROR_LOWBIT;
+        default:                 return MAX_DOT_PRODUCT_ERROR;
+    }
+}
+
 
 // Generate synthetic data
 static void generate_data(float offset, size_t n, float * dst, float amplitude = 2.0f) {
@@ -51,12 +99,15 @@ static float array_rmse(const float * a1, const float * a2, size_t n) {
 }
 
 // Total quantization error on test data
-static float total_quantization_error(const ggml_type_traits * qfns, const ggml_type_traits_cpu * qfns_cpu, size_t test_size, const float * test_data) {
+static float total_quantization_error(const ggml_type_traits * qfns, const ggml_type_traits_cpu * qfns_cpu, size_t test_size, const float * test_data, bool rotated = false) {
     std::vector<uint8_t> tmp_q(2*test_size);
     std::vector<float> tmp_out(test_size);
 
     qfns_cpu->from_float(test_data, tmp_q.data(), test_size);
     qfns->to_float(tmp_q.data(), tmp_out.data(), test_size);
+    if (rotated) {
+        return array_rmse(wht_rotated(test_data, test_size).data(), tmp_out.data(), test_size);
+    }
     return array_rmse(test_data, tmp_out.data(), test_size);
 }
 
@@ -98,7 +149,13 @@ static float dot_product_error(const ggml_type_traits_cpu * qfns_cpu, ggml_type 
     std::vector<uint8_t> tmp_q2(by * nrc);
 
     qfns_cpu->from_float(test_data1, tmp_q1.data(), test_size);
-    vdot->from_float(test_data2, tmp_q2.data(), test_size);
+    if (type_is_wht_rotated(src0_type)) {
+        // [TAG_TURBO_QFNS_ROT] the WHT is orthonormal: <WHT(x), WHT(y)> = <x, y>, so the reference below is unchanged
+        GGML_ASSERT(nrc == 1 && qfns_cpu->vec_dot_type == GGML_TYPE_F32);
+        vdot->from_float(wht_rotated(test_data2, test_size).data(), tmp_q2.data(), test_size);
+    } else {
+        vdot->from_float(test_data2, tmp_q2.data(), test_size);
+    }
 
     if (nrc == 1) {
         float result = INFINITY;
@@ -186,8 +243,10 @@ static int test_vec_dot_q(bool verbose) {
         ggml_quantize_init(ei);
 
         if (qfns_cpu->from_float && qfns->to_float) {
-            const float total_error = total_quantization_error(qfns, qfns_cpu, test_size, test_data.data());
+            const bool rotated = type_is_wht_rotated(type);
+            const float total_error = total_quantization_error(qfns, qfns_cpu, test_size, test_data.data(), rotated);
             const float max_quantization_error =
+                rotated                   ? max_turbo_quantization_error(type) :
                 type == GGML_TYPE_Q1_0    ? MAX_QUANTIZATION_TOTAL_ERROR_BINARY :
                 type == GGML_TYPE_TQ1_0   ? MAX_QUANTIZATION_TOTAL_ERROR_TERNARY :
                 type == GGML_TYPE_TQ2_0   ? MAX_QUANTIZATION_TOTAL_ERROR_TERNARY :
@@ -215,6 +274,8 @@ static int test_vec_dot_q(bool verbose) {
             const float max_allowed_error = type == GGML_TYPE_Q2_K || type == GGML_TYPE_IQ2_XS || type == GGML_TYPE_IQ2_XXS ||
                 type == GGML_TYPE_IQ3_XXS || type == GGML_TYPE_IQ3_S || type == GGML_TYPE_IQ2_S
                 ? MAX_DOT_PRODUCT_ERROR_LOWBIT
+                : type_is_wht_rotated(type)
+                ? max_turbo_dot_product_error(type)
                 : type == GGML_TYPE_Q1_0
                 ? MAX_DOT_PRODUCT_ERROR_BINARY
                 : type == GGML_TYPE_TQ1_0 || type == GGML_TYPE_TQ2_0 || type == GGML_TYPE_Q2_0
