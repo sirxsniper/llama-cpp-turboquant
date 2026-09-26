@@ -2804,6 +2804,10 @@ extern "C" {
             struct ggml_tensor  * ring_n,
             int32_t               n_ring);
 
+    // [TAG_GDN_NW_CAP] keep at most n_w of the new tokens in the ring (and commit the state before them); 0 = min(n_tokens,
+    // n_ring). The ring capacity and layout stay n_ring slots.
+    GGML_API void ggml_gated_delta_net_replay_set_n_w(struct ggml_tensor * t, int32_t n_w);
+
     // DSA lightning indexer
     //
     // q:       [n_embd_idx, n_head_idx, n_batch, ne3 ]

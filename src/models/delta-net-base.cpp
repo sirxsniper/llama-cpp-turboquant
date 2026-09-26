@@ -545,8 +545,10 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
             const char * e = getenv("GGML_CONV_WB_ALL");
             return e && e[0] == '1';
         }();
+        // [TAG_GDN_NW_CAP] the groups 0..n_w, n_w = llama_rs_n_w(T, n_rs_seq) as the memory counts them
         const int64_t n_tok = conv_input->ne[0] - conv_states->ne[0];
-        const int64_t t_beg = wb_all ? 1 : std::max<int64_t>(1, K - n_tok);
+        const int64_t n_rb  = llama_rs_n_w((uint32_t) n_tok, cparams.n_rs_seq);
+        const int64_t t_beg = wb_all ? 1 : std::max<int64_t>(1, K - n_rb);
 
         for (int64_t t = t_beg; t <= K; ++t) {
             const int64_t s_idx  = std::max<int64_t>(0, conv_input->ne[0] - conv_states->ne[0] - K + t);
@@ -620,7 +622,7 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
         ggml_tensor * ring = build_rs(inp, ring_all, (int32_t) ring_row, (int32_t) n_seqs);
 
         // [TAG_GDN_CHUNKED_PF] head, chunked prefix and tail for long ubatches (design note at the top of this file)
-        const int64_t n_w    = std::min<int64_t>(n_seq_tokens, n_ring);
+        const int64_t n_w    = llama_rs_n_w((uint32_t) n_seq_tokens, (uint32_t) n_ring); // [TAG_GDN_NW_CAP]
         const int64_t n_pre  = n_seq_tokens - n_w;
         const int32_t pf_min = llama_gdn_chunked_pf_min();
 
@@ -683,6 +685,9 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
             output = ggml_concat(ctx0, attn_pre, attn_tail, 2);
         } else {
             gdn_out = ggml_gated_delta_net_replay(ctx0, q, k, v, g, b, s, ring, inp->ring_n, n_ring);
+            if (n_w < std::min<int64_t>(n_seq_tokens, n_ring)) {
+                ggml_gated_delta_net_replay_set_n_w(gdn_out, (int32_t) n_w); // [TAG_GDN_NW_CAP]
+            }
             res->add_fused_node({n_seq_tokens > 1 ? LLM_FUSED_OP_GDN_CH : LLM_FUSED_OP_GDN_AR, gdn_out, il});
 
             output = ggml_view_4d(ctx0, gdn_out,

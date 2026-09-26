@@ -32,8 +32,9 @@ static bool llama_xseq_fix_enabled() {
 //   - ring_l has, per cell and layer, the inputs (k, v, g, beta) of the n_ring <= n_rs_seq tokens that follow C.
 //     The state of the sequence is C with those tokens applied. cell.n_ring counts them.
 //   - A ubatch of T tokens (GGML_OP_GATED_DELTA_NET_REPLAY) first applies the live ring tokens of the cell to C
-//     without output, then runs the T new tokens. It commits the state before its last n_w = min(T, n_rs_seq) new
-//     tokens as the new C and stores those n_w tokens as the new ring.
+//     without output, then runs the T new tokens. It commits the state before its last n_w = llama_rs_n_w(T, n_rs_seq)
+//     new tokens ([TAG_GDN_NW_CAP]: T - 1 for 2..n_rs_seq tokens, else min(T, n_rs_seq)) as the new C and stores those n_w
+//     tokens as the new ring.
 //   - Rollback of r tokens stays metadata: seq_rm sets rs_idx = r as before (refused when r > n_rb, where the old
 //     groups gave a stale state), and the next ubatch replays n_ring - r ring tokens (s_copy consumes rs_idx).
 //   - The conv state keeps its 1 + n_rs_seq groups (5.6 MiB per cell per group at Qwen3.8-27B), unchanged. cell.n_rb
@@ -54,6 +55,17 @@ static bool llama_xseq_fix_enabled() {
 // Prefill: [TAG_GDN_CHUNKED_PF] a long ubatch runs its first T - n_w tokens on the chunked kernel and the last n_w on the
 //   replay op, with the same committed state and ring layout (design note in src/models/delta-net-base.cpp).
 // Cost: the kernel runs up to n_rs_seq extra state-only token steps and writes 1 state per cell instead of K.
+uint32_t llama_rs_n_w(uint32_t n_seq_tokens, uint32_t n_rs_seq) {
+    static const bool cap = [] {
+        const char * e = getenv("GDN_NW_CAP");
+        return !(e && e[0] == '0' && e[1] == '\0');
+    }();
+    if (cap && n_seq_tokens >= 2) {
+        return std::min(n_seq_tokens - 1, n_rs_seq);
+    }
+    return std::min(n_seq_tokens, n_rs_seq);
+}
+
 static bool llama_gdn_replay_env() {
     // read at every memory creation, so a test can compare both layouts in one process
     const char * e = getenv("GDN_REPLAY");
@@ -909,7 +921,7 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
     // [TAG_4C_GDN_REPLAY] s_copy updates the ring counts when it consumes rs_idx: the first n_seqs cells then keep the
     //   last n_w tokens of this ubatch, the extras keep their ring minus a pending rollback
     rs_n_main = n_seqs;
-    rs_n_w    = std::min(n_seq_tokens, n_rs_seq);
+    rs_n_w    = llama_rs_n_w(n_seq_tokens, n_rs_seq); // [TAG_GDN_NW_CAP]
     rs_n_tok  = n_seq_tokens;
 
     // allow getting the range of used cells, from head to head + n

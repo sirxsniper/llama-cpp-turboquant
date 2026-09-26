@@ -8,6 +8,11 @@
 #include <set>
 #include <vector>
 
+// [TAG_GDN_NW_CAP] new tokens of a ubatch that stay rollback-able (ring tokens and conv groups): a 2..n_rs_seq-token
+// ubatch keeps T - 1 (a speculative step rolls back at most its draft, T - 1 tokens), a longer one n_rs_seq, one token 1.
+// A 4-token verify step with n_rs_seq 7 then does the n_rs_seq 3 work. GDN_NW_CAP=0: min(T, n_rs_seq) (old).
+uint32_t llama_rs_n_w(uint32_t n_seq_tokens, uint32_t n_rs_seq);
+
 //
 // llama_memory_recurrent
 //

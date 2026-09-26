@@ -6741,6 +6741,7 @@ struct ggml_tensor * ggml_gated_delta_net_replay(
     struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 1, ne);
 
     ggml_set_op_params_i32(result, 0, n_ring);
+    ggml_set_op_params_i32(result, 1, 0); // [TAG_GDN_NW_CAP] no cap
 
     result->op     = GGML_OP_GATED_DELTA_NET_REPLAY;
     result->src[0] = q;
@@ -6753,6 +6754,12 @@ struct ggml_tensor * ggml_gated_delta_net_replay(
     result->src[7] = ring_n;
 
     return result;
+}
+
+void ggml_gated_delta_net_replay_set_n_w(struct ggml_tensor * t, int32_t n_w) {
+    GGML_ASSERT(t->op == GGML_OP_GATED_DELTA_NET_REPLAY);
+    GGML_ASSERT(n_w >= 0 && n_w <= ggml_get_op_params_i32(t, 0));
+    ggml_set_op_params_i32(t, 1, n_w);
 }
 
 // ggml_lightning_indexer

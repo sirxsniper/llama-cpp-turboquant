@@ -535,6 +535,7 @@ gated_delta_net_replay_cuda(const float *   q,
                             const uint3     rq3_magic,
                             float           scale,
                             int             n_ring,
+                            int             n_w_cap,
                             int64_t         slot,
                             int64_t         ring_row) {
     const uint32_t h_idx    = blockIdx.x;
@@ -588,7 +589,9 @@ gated_delta_net_replay_cuda(const float *   q,
         }
     }
 
-    const int n_w      = n_tokens < n_ring ? (int) n_tokens : n_ring;
+    // [TAG_GDN_NW_CAP] n_w_cap > 0 keeps fewer new tokens in the ring than it holds
+    const int n_w_full = n_tokens < n_ring ? (int) n_tokens : n_ring;
+    const int n_w      = n_w_cap > 0 && n_w_cap < n_w_full ? n_w_cap : n_w_full;
     const int m        = min(max(ring_n[sequence], 0), n_ring);
     const int t_commit = m + (int) n_tokens - n_w;
 
@@ -830,6 +833,7 @@ void ggml_cuda_op_gated_delta_net_replay(ggml_backend_cuda_context & ctx, ggml_t
     const float scale = 1.0f / sqrtf((float) S_v);
 
     const int     n_ring   = ggml_get_op_params_i32(dst, 0);
+    const int     n_w_cap  = ggml_get_op_params_i32(dst, 1); // [TAG_GDN_NW_CAP]
     const int64_t ring_row = src_ring->ne[0];
     const int64_t slot     = ring_row / n_ring;
 
@@ -875,7 +879,7 @@ void ggml_cuda_op_gated_delta_net_replay(ggml_backend_cuda_context & ctx, ggml_t
         (const float *) src_g->data, (const float *) src_beta->data, (const float *) src_state->data,            \
         (const float *) src_ring->data, (const int32_t *) src_rn->data, dst_d, state_d, ring_d,                  \
         H, nek1, n_tokens, sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1_magic, rq3_magic, scale,           \
-        n_ring, slot, ring_row)
+        n_ring, n_w_cap, slot, ring_row)
 
     switch (S_v) {
         case 16:  GDN_REPLAY_LAUNCH(16);  break;

@@ -11489,7 +11489,8 @@ static void ggml_compute_forward_gated_delta_net_replay_one_chunk(
     const int64_t off_g    = off_v + S_v*H;
     const int64_t off_b    = off_g + H;
     const int64_t n_used   = off_b + H;
-    const int64_t n_w      = std::min(n_tokens, n_ring);
+    const int64_t n_w_cap  = ggml_get_op_params_i32(dst, 1); // [TAG_GDN_NW_CAP]
+    const int64_t n_w      = n_w_cap > 0 ? std::min(std::min(n_tokens, n_ring), n_w_cap) : std::min(n_tokens, n_ring);
 
     const int64_t per_thread = S_v + S_v*S_v;
     const int ith = params->ith;

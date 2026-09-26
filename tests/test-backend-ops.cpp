@@ -5081,12 +5081,17 @@ struct test_gated_delta_net_replay : public test_case {
     const int64_t pad;        // extra floats per ring slot
     const bool    strided_v;  // V is a view into a fused QKV buffer (model path)
     const bool    cache;      // also copy the state and ring tails into caches (the CUDA fusion)
+    const int     n_w_cap;    // [TAG_GDN_NW_CAP] ggml_gated_delta_net_replay_set_n_w (0 = none)
 
     ggml_tensor * cpy_state = nullptr;
     ggml_tensor * cpy_ring  = nullptr;
 
     std::string vars() override {
-        return VARS_TO_STR10(type, head_count, head_size, n_seq_tokens, n_seqs, v_repeat, n_ring, pad, strided_v, cache);
+        std::string s = VARS_TO_STR10(type, head_count, head_size, n_seq_tokens, n_seqs, v_repeat, n_ring, pad, strided_v, cache);
+        if (n_w_cap > 0) {
+            s += ",n_w_cap=" + std::to_string(n_w_cap);
+        }
+        return s;
     }
 
     uint64_t op_flops(ggml_tensor * t) override {
@@ -5096,9 +5101,9 @@ struct test_gated_delta_net_replay : public test_case {
 
     test_gated_delta_net_replay(ggml_type type = GGML_TYPE_F32,
             int64_t head_count = 4, int64_t head_size = 32, int64_t n_seq_tokens = 4, int64_t n_seqs = 2,
-            int v_repeat = 1, int n_ring = 3, int64_t pad = 0, bool strided_v = false, bool cache = false)
+            int v_repeat = 1, int n_ring = 3, int64_t pad = 0, bool strided_v = false, bool cache = false, int n_w_cap = 0)
         : type(type), head_count(head_count), head_size(head_size), n_seq_tokens(n_seq_tokens), n_seqs(n_seqs),
-          v_repeat(v_repeat), n_ring(n_ring), pad(pad), strided_v(strided_v), cache(cache) {}
+          v_repeat(v_repeat), n_ring(n_ring), pad(pad), strided_v(strided_v), cache(cache), n_w_cap(n_w_cap) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t S = head_size;
@@ -5136,6 +5141,9 @@ struct test_gated_delta_net_replay : public test_case {
         k = ggml_l2_norm(ctx, k, 1e-6f);
 
         ggml_tensor * out = ggml_gated_delta_net_replay(ctx, q, k, v, g, beta, state, ring, ring_n, n_ring);
+        if (n_w_cap > 0) {
+            ggml_gated_delta_net_replay_set_n_w(out, n_w_cap);
+        }
         if (!cache) {
             return out;
         }
@@ -13608,6 +13616,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net_replay(GGML_TYPE_F32, 4, 128, 200, 1, 3, 3));         // prefill ubatch
     test_cases.emplace_back(new test_gated_delta_net_replay(GGML_TYPE_F32, 4, 128,   4, 4, 3, 3, 0, true, true));
     test_cases.emplace_back(new test_gated_delta_net_replay(GGML_TYPE_F32, 4,  32,   2, 2, 1, 3, 4, false, true));
+    // [TAG_GDN_NW_CAP] a 4-token verify step with a 7-token ring keeps 3 (the n_rs_seq 3 layout), plain and fused
+    test_cases.emplace_back(new test_gated_delta_net_replay(GGML_TYPE_F32, 4, 128,   4, 4, 3, 7, 0, false, false, 3));
+    test_cases.emplace_back(new test_gated_delta_net_replay(GGML_TYPE_F32, 4, 128,   4, 4, 3, 7, 0, true,  true,  3));
+    test_cases.emplace_back(new test_gated_delta_net_replay(GGML_TYPE_F32, 2,  16,   3, 2, 1, 8, 0, false, false, 2));
+    test_cases.emplace_back(new test_gated_delta_net_replay(GGML_TYPE_F32, 4,  32,   2, 2, 1, 7, 4, false, true,  1));
     // [TAG_4C_GDN_REPLAY] bit-identity with the snapshot kernel: (k heads, head size, tokens 1, tokens 2, seqs, v_repeat,
     // n_ring, rollback)
     test_cases.emplace_back(new test_gated_delta_net_replay_exact(4,  32, 4, 4, 2, 1, 3, 0));
