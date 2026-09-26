@@ -698,6 +698,153 @@ void ggml_vec_dot_q1_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
 #endif
 }
 
+#if defined(__AVX2__)
+// [TAG_Q2_0_CPU] Q2_0 holds 4 codes per byte, element 4*b + s in bits 2*s of byte b, weight = code - 1. The helpers
+// return int32 partial sums of sum((code - 1) * y) per 32 weight half (one Q8_0 block). The codes stay unsigned for
+// maddubs/dpbusd, so the sum of y is taken off.
+
+// 4 bytes to every dword, as one broadcast load
+static inline __m256i ggml_q2_0_bcast4(const uint8_t * p) {
+    return _mm256_castps_si256(_mm256_broadcast_ss((const float *) p));
+}
+
+// one half: its 8 code bytes against the 32 y values of its Q8_0 block
+static inline __m256i ggml_q2_0_dot_half_avx2(const uint8_t * GGML_RESTRICT qs, const int8_t * GGML_RESTRICT y) {
+    // lane 0 repeats code bytes 0..3 (elements 0..15), lane 1 code bytes 4..7 (elements 16..31)
+    const __m256i q = _mm256_blend_epi32(ggml_q2_0_bcast4(qs), ggml_q2_0_bcast4(qs + 4), 0xF0);
+    // dword s of a lane: byte b holds element 4*b + s; the shuffle moves it to byte 4*b + s
+    const __m256i wt = _mm256_and_si256(_mm256_srlv_epi32(q, _mm256_setr_epi32(0, 2, 4, 6, 0, 2, 4, 6)), _mm256_set1_epi8(3));
+    const __m256i w  = _mm256_shuffle_epi8(wt, _mm256_setr_epi8(0, 4, 8, 12, 1, 5, 9, 13, 2, 6, 10, 14, 3, 7, 11, 15,
+                                                                0, 4, 8, 12, 1, 5, 9, 13, 2, 6, 10, 14, 3, 7, 11, 15));
+    const __m256i yv   = _mm256_loadu_si256((const __m256i *) y);
+    const __m256i ones = _mm256_set1_epi8(1);
+#if defined(__AVX512VNNI__) && defined(__AVX512VL__)
+    return _mm256_sub_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), w, yv), _mm256_dpbusd_epi32(_mm256_setzero_si256(), ones, yv));
+#elif defined(__AVXVNNI__)
+    return _mm256_sub_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), w, yv), _mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), ones, yv));
+#else
+    const __m256i p = _mm256_sub_epi16(_mm256_maddubs_epi16(w, yv), _mm256_maddubs_epi16(ones, yv));
+    return _mm256_madd_epi16(p, _mm256_set1_epi16(1));
+#endif
+}
+
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VBMI__)
+// one block: the low 256 bits sum the first half (y0), the high 256 bits the second half (y1)
+static inline __m512i ggml_q2_0_dot_avx512(const uint8_t * GGML_RESTRICT qs, const int8_t * GGML_RESTRICT y0, const int8_t * GGML_RESTRICT y1) {
+    // qwords 0..3: code bytes 0..7 (first half), qwords 4..7: code bytes 8..15
+    const __m512i q = _mm512_permutexvar_epi64(_mm512_set_epi64(1, 1, 1, 1, 0, 0, 0, 0),
+                                               _mm512_castsi128_si512(_mm_loadu_si128((const __m128i *) qs)));
+    // byte j of qword i: element 8*(i%4) + j of its half, at bit 16*(i%4) + 2*j
+    const __m512i ctrl = _mm512_set_epi64(0x3E3C3A3836343230LL, 0x2E2C2A2826242220LL, 0x1E1C1A1816141210LL, 0x0E0C0A0806040200LL,
+                                          0x3E3C3A3836343230LL, 0x2E2C2A2826242220LL, 0x1E1C1A1816141210LL, 0x0E0C0A0806040200LL);
+    const __m512i w  = _mm512_and_si512(_mm512_multishift_epi64_epi8(ctrl, q), _mm512_set1_epi8(3));
+    const __m512i yv = _mm512_inserti64x4(_mm512_castsi256_si512(_mm256_loadu_si256((const __m256i *) y0)),
+                                          _mm256_loadu_si256((const __m256i *) y1), 1);
+    const __m512i ones = _mm512_set1_epi8(1);
+#if defined(__AVX512VNNI__)
+    return _mm512_sub_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), w, yv), _mm512_dpbusd_epi32(_mm512_setzero_si512(), ones, yv));
+#else
+    const __m512i p = _mm512_sub_epi16(_mm512_maddubs_epi16(w, yv), _mm512_maddubs_epi16(ones, yv));
+    return _mm512_madd_epi16(p, _mm512_set1_epi16(1));
+#endif
+}
+#endif
+
+// the float steps of ggml_vec_dot_q2_0_q8_0_generic for one block, in its order: bit-exact with it for the same
+// integer sums, whatever the compiler does with multiply-add contraction (the expressions are the same)
+static inline float ggml_q2_0_scale_block(float sumf, const block_q2_0 * GGML_RESTRICT x, const block_q8_0 * GGML_RESTRICT y, int sumi0, int sumi1) {
+    const float d0 = GGML_CPU_FP16_TO_FP32(x->d);
+    float sumi = 0.0f;
+    sumi += GGML_CPU_FP16_TO_FP32(y[0].d) * sumi0;
+    sumi += GGML_CPU_FP16_TO_FP32(y[1].d) * sumi1;
+    return sumf + d0 * sumi;
+}
+#endif
+
+void ggml_vec_dot_q2_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    const int qk = QK2_0;
+    const int nb = n / qk;
+
+    assert(n % qk == 0);
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+
+#if defined(__AVX2__)
+    // [TAG_Q2_0_CPU] opt-in (GGML_CPU_Q2_0_SIMD=1) until measured; the generic code is the reference
+    if (!ggml_cpu_q2_0_simd) {
+        ggml_vec_dot_q2_0_q8_0_generic(n, s, bs, vx, bx, vy, by, nrc);
+        return;
+    }
+
+    const block_q2_0 * GGML_RESTRICT x = vx;
+    const block_q8_0 * GGML_RESTRICT y = vy;
+
+    float sumf = 0.0f;
+    int ib = 0;
+
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VBMI__)
+    for (; ib + 3 < nb; ib += 4) {
+        const __m512i p0 = ggml_q2_0_dot_avx512(x[ib + 0].qs, y[2*ib + 0].qs, y[2*ib + 1].qs);
+        const __m512i p1 = ggml_q2_0_dot_avx512(x[ib + 1].qs, y[2*ib + 2].qs, y[2*ib + 3].qs);
+        const __m512i p2 = ggml_q2_0_dot_avx512(x[ib + 2].qs, y[2*ib + 4].qs, y[2*ib + 5].qs);
+        const __m512i p3 = ggml_q2_0_dot_avx512(x[ib + 3].qs, y[2*ib + 6].qs, y[2*ib + 7].qs);
+
+        // 128 bit lane L of u: [sum(p0.L), sum(p1.L), sum(p2.L), sum(p3.L)]
+        const __m512i t01 = _mm512_add_epi32(_mm512_unpacklo_epi32(p0, p1), _mm512_unpackhi_epi32(p0, p1));
+        const __m512i t23 = _mm512_add_epi32(_mm512_unpacklo_epi32(p2, p3), _mm512_unpackhi_epi32(p2, p3));
+        const __m512i u   = _mm512_add_epi32(_mm512_unpacklo_epi64(t01, t23), _mm512_unpackhi_epi64(t01, t23));
+        // lanes 0 + 1 are the first halves, lanes 2 + 3 the second halves
+        const __m512i r   = _mm512_add_epi32(u, _mm512_shuffle_i32x4(u, u, _MM_SHUFFLE(2, 3, 0, 1)));
+
+        int32_t isum[8];
+        _mm_storeu_si128((__m128i *) (isum + 0), _mm512_castsi512_si128(r));
+        _mm_storeu_si128((__m128i *) (isum + 4), _mm512_extracti32x4_epi32(r, 2));
+
+        for (int b = 0; b < 4; ++b) {
+            sumf = ggml_q2_0_scale_block(sumf, &x[ib + b], &y[2*(ib + b)], isum[b], isum[4 + b]);
+        }
+    }
+#else
+    for (; ib + 3 < nb; ib += 4) {
+        const __m256i h0 = ggml_q2_0_dot_half_avx2(x[ib + 0].qs,     y[2*ib + 0].qs);
+        const __m256i h1 = ggml_q2_0_dot_half_avx2(x[ib + 0].qs + 8, y[2*ib + 1].qs);
+        const __m256i h2 = ggml_q2_0_dot_half_avx2(x[ib + 1].qs,     y[2*ib + 2].qs);
+        const __m256i h3 = ggml_q2_0_dot_half_avx2(x[ib + 1].qs + 8, y[2*ib + 3].qs);
+        const __m256i h4 = ggml_q2_0_dot_half_avx2(x[ib + 2].qs,     y[2*ib + 4].qs);
+        const __m256i h5 = ggml_q2_0_dot_half_avx2(x[ib + 2].qs + 8, y[2*ib + 5].qs);
+        const __m256i h6 = ggml_q2_0_dot_half_avx2(x[ib + 3].qs,     y[2*ib + 6].qs);
+        const __m256i h7 = ggml_q2_0_dot_half_avx2(x[ib + 3].qs + 8, y[2*ib + 7].qs);
+
+        // [sum(h0), sum(h1), ..., sum(h7)]
+        const __m256i r0123 = _mm256_hadd_epi32(_mm256_hadd_epi32(h0, h1), _mm256_hadd_epi32(h2, h3));
+        const __m256i r4567 = _mm256_hadd_epi32(_mm256_hadd_epi32(h4, h5), _mm256_hadd_epi32(h6, h7));
+        const __m256i r = _mm256_add_epi32(_mm256_permute2x128_si256(r0123, r4567, 0x20), _mm256_permute2x128_si256(r0123, r4567, 0x31));
+
+        int32_t isum[8];
+        _mm256_storeu_si256((__m256i *) isum, r);
+
+        for (int b = 0; b < 4; ++b) {
+            sumf = ggml_q2_0_scale_block(sumf, &x[ib + b], &y[2*(ib + b)], isum[2*b], isum[2*b + 1]);
+        }
+    }
+#endif
+
+    for (; ib < nb; ++ib) {
+        const int sumi0 = hsum_i32_8(ggml_q2_0_dot_half_avx2(x[ib].qs,     y[2*ib + 0].qs));
+        const int sumi1 = hsum_i32_8(ggml_q2_0_dot_half_avx2(x[ib].qs + 8, y[2*ib + 1].qs));
+        sumf = ggml_q2_0_scale_block(sumf, &x[ib], &y[2*ib], sumi0, sumi1);
+    }
+
+    *s = sumf;
+#else
+    UNUSED(nb);
+    ggml_vec_dot_q2_0_q8_0_generic(n, s, bs, vx, bx, vy, by, nrc);
+#endif
+}
+
 void ggml_vec_dot_q4_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     const int qk = QK8_0;
     const int nb = n / qk;
