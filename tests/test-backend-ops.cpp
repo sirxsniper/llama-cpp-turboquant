@@ -176,6 +176,17 @@ static bool backend_is_cpu(ggml_backend_t backend) {
     return ggml_backend_dev_type(ggml_backend_get_device(backend)) == GGML_BACKEND_DEVICE_TYPE_CPU;
 }
 
+// [TAG_Q2_0_CPU] error allowed between the CPU Q2_0 kernels and the scalar one of the use_ref CPU backend. Same integer
+// sums and float steps: 0 where the compiler does not contract a*b + c (MSVC); elsewhere a contraction the compiler
+// makes in one of the two and not in the other can change a rounding
+static double q2_0_cpu_max_nmse() {
+#if defined(_MSC_VER) && !defined(__clang__)
+    return 0.0;
+#else
+    return 1e-12;
+#endif
+}
+
 // generate an F16 mask where certain blocks are randomly masked with -INF value
 static void init_tensor_kq_mask(ggml_tensor * tensor, float min = -1.0f, float max = 1.0f) {
     GGML_ASSERT(tensor->type == GGML_TYPE_F16);
@@ -5630,9 +5641,9 @@ struct test_mul_mat : public test_case {
         if ((type_a == GGML_TYPE_MXFP4 || type_a == GGML_TYPE_NVFP4) && backend_has_feature(backend, "BLACKWELL_NATIVE_FP4")) {
             return 2e-2;
         }
-        // [TAG_Q2_0_CPU] the CPU Q2_0 kernels are bit-exact with the scalar one of the use_ref CPU backend
+        // [TAG_Q2_0_CPU] the CPU Q2_0 kernels against the scalar one of the use_ref CPU backend
         if (type_a == GGML_TYPE_Q2_0 && backend_is_cpu(backend)) {
-            return 0.0;
+            return q2_0_cpu_max_nmse();
         }
         return max_nmse_err();
     }
@@ -5859,9 +5870,9 @@ struct test_mul_mat_id : public test_case {
         if ((type_a == GGML_TYPE_MXFP4 || type_a == GGML_TYPE_NVFP4) && backend_has_feature(backend, "BLACKWELL_NATIVE_FP4")) {
             return 2e-2;
         }
-        // [TAG_Q2_0_CPU] the CPU Q2_0 kernels are bit-exact with the scalar one of the use_ref CPU backend
+        // [TAG_Q2_0_CPU] the CPU Q2_0 kernels against the scalar one of the use_ref CPU backend
         if (type_a == GGML_TYPE_Q2_0 && backend_is_cpu(backend)) {
-            return 0.0;
+            return q2_0_cpu_max_nmse();
         }
         return max_nmse_err();
     }
@@ -14626,7 +14637,7 @@ static bool run_fa_vec_slice(ggml_backend_t backend, ggml_backend_t backend_cpu,
 }
 
 // [TAG_Q2_0_CPU] one MUL_MAT (n_exp == 0) or MUL_MAT_ID case: Q2_0 weights in the CPU_REPACK buffer on the tested CPU
-// backend against plain weights on the use_ref CPU backend (scalar dot product). The outputs must be bit-exact.
+// backend against plain weights on the use_ref CPU backend (scalar dot product), within q2_0_cpu_max_nmse().
 // Returns false on a mismatch; *supported is false when the repack buffer does not take the weights.
 static bool run_cpu_q2_0_repack_case(ggml_backend_t backend, ggml_backend_t backend_ref, ggml_backend_buffer_type_t buft_repack,
                                      int64_t k, int64_t m, int64_t n, int n_exp, int n_used, bool * supported) {
@@ -14719,11 +14730,13 @@ static bool run_cpu_q2_0_repack_case(ggml_backend_t backend, ggml_backend_t back
             max_diff = std::max(max_diff, (double) std::fabs(out[0][i] - out[1][i]));
         }
     }
+    const double err = nmse(out[1].data(), out[0].data(), out[0].size());
+    const bool   ok  = n_diff == 0 || err <= q2_0_cpu_max_nmse();
     if (n_diff > 0) {
-        printf("  FAIL Q2_0 repack %s k=%" PRId64 " m=%" PRId64 " n=%" PRId64 " n_exp=%d n_used=%d: %zu of %zu values differ, max |diff| %g\n",
-               id ? "MUL_MAT_ID" : "MUL_MAT", k, m, n, n_exp, n_used, n_diff, out[0].size(), max_diff);
+        printf("  %s Q2_0 repack %s k=%" PRId64 " m=%" PRId64 " n=%" PRId64 " n_exp=%d n_used=%d: %zu of %zu values differ, max |diff| %g, NMSE %g\n",
+               ok ? "note:" : "FAIL", id ? "MUL_MAT_ID" : "MUL_MAT", k, m, n, n_exp, n_used, n_diff, out[0].size(), max_diff, err);
     }
-    return n_diff == 0;
+    return ok;
 }
 
 // [TAG_Q2_0_CPU] the Q2_0 8x8 repack path (GGML_CPU_Q2_0_REPACK=1) against the scalar reference. test_case::eval cannot

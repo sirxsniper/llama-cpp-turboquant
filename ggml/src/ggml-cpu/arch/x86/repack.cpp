@@ -3655,16 +3655,29 @@ static inline void ggml_q2_0x8_gemm_half(const uint8_t * qs, const int8_t * y, c
 #endif
 }
 
-// 0 + d1 * sum, the first step of the scalar code. The explicit 0 + keeps a contracted multiply-add (GCC) on the same
-// product as there.
+// a*b + c as the scalar code rounds it: MSVC does not contract it there and GCC contracts it in both places, clang
+// (-ffp-contract=on) only within one expression, so for clang the fused form is written out (clang-cl not verified)
+#if defined(__clang__) && !defined(_MSC_VER) && defined(__FMA__)
+#define GGML_Q2_0X8_MADD(a, b, c) _mm256_fmadd_ps(a, b, c)
+#else
+#define GGML_Q2_0X8_MADD(a, b, c) _mm256_add_ps(_mm256_mul_ps(a, b), c)
+#endif
+
+// 0 + d1 * sum, the first step of the scalar code (the explicit 0 keeps a contraction on the same product as there)
 static inline __m256 ggml_q2_0x8_sumi_first(float d1, __m256i isum) {
-    return _mm256_add_ps(_mm256_setzero_ps(), _mm256_mul_ps(_mm256_set1_ps(d1), _mm256_cvtepi32_ps(isum)));
+    return GGML_Q2_0X8_MADD(_mm256_set1_ps(d1), _mm256_cvtepi32_ps(isum), _mm256_setzero_ps());
 }
 
 static inline __m256 ggml_q2_0x8_sumi_next(__m256 sumi, float d1, __m256i isum) {
-    return _mm256_add_ps(sumi, _mm256_mul_ps(_mm256_set1_ps(d1), _mm256_cvtepi32_ps(isum)));
+    return GGML_Q2_0X8_MADD(_mm256_set1_ps(d1), _mm256_cvtepi32_ps(isum), sumi);
 }
 
+// sumf + d0 * sumi per column
+static inline __m256 ggml_q2_0x8_acc(__m256 acc, __m256 d0, __m256 sumi) {
+    return GGML_Q2_0X8_MADD(d0, sumi, acc);
+}
+
+#undef GGML_Q2_0X8_MADD
 #undef GGML_Q2_0X8_DPBUSD
 
 #endif // defined(__AVX2__)
@@ -3711,7 +3724,7 @@ void ggml_gemv_q2_0_8x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
 
                 const __m256 d0 = GGML_F32Cx8_LOAD((ggml_fp16_t *) b_ptr[l].d);
                 const __m256 sumi = ggml_q2_0x8_sumi_next(ggml_q2_0x8_sumi_first(yd[c + 0], i0), yd[c + 1], i1);
-                acc = _mm256_add_ps(acc, _mm256_mul_ps(d0, sumi));
+                acc = ggml_q2_0x8_acc(acc, d0, sumi);
             }
 
             _mm256_storeu_ps(s + 8 * x, acc);
@@ -3786,10 +3799,10 @@ void ggml_gemm_q2_0_8x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
                     sumi3 = ggml_q2_0x8_sumi_next(sumi3, yd[c + 7], i3);
 
                     const __m256 d0 = GGML_F32Cx8_LOAD((ggml_fp16_t *) b_ptr[l].d);
-                    acc0 = _mm256_add_ps(acc0, _mm256_mul_ps(d0, sumi0));
-                    acc1 = _mm256_add_ps(acc1, _mm256_mul_ps(d0, sumi1));
-                    acc2 = _mm256_add_ps(acc2, _mm256_mul_ps(d0, sumi2));
-                    acc3 = _mm256_add_ps(acc3, _mm256_mul_ps(d0, sumi3));
+                    acc0 = ggml_q2_0x8_acc(acc0, d0, sumi0);
+                    acc1 = ggml_q2_0x8_acc(acc1, d0, sumi1);
+                    acc2 = ggml_q2_0x8_acc(acc2, d0, sumi2);
+                    acc3 = ggml_q2_0x8_acc(acc3, d0, sumi3);
                 }
 
                 _mm256_storeu_ps(s_row0 + 0 * bs + 8 * x, acc0);
