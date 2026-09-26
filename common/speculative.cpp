@@ -1179,6 +1179,15 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         float pareto  = 0.01f;   // SPEC_DFT_ADAPT_PARETO: largest predicted slow-down of any stream for a longer k (< 0: off)
         bool  probe   = false;   // SPEC_DFT_ADAPT_PROBE=1: a k histogram every 256 draft calls
         bool  trace   = false;   // SPEC_DFT_ADAPT_PROBE=2: also one line per decision
+        float rdecay  = 0.95f;   // SPEC_DFT_ADAPT_RDECAY: weight of a sequence's past realized tokens/step per step
+        float rw0     = 2.0f;    // SPEC_DFT_ADAPT_RW0: the model estimate is worth this many realized steps (0: model only)
+        bool  rel     = true;    // SPEC_DFT_ADAPT_REL: a position's prior is the sequence's previous position times the pooled
+                                 //   ratio of the two (0: the pooled value itself)
+        bool  solo    = true;    // SPEC_DFT_ADAPT_SOLO: one drafting sequence drafts the cap (at most the trained block)
+        bool  duo     = true;    // SPEC_DFT_ADAPT_DUO: two drafting sequences follow the rule below, not the model
+        float duo_deep = 8192.0f; // SPEC_DFT_ADAPT_DUO_DEEP: mean depth from which two sequences need ...
+        float duo_acc  = 0.80f;  // SPEC_DFT_ADAPT_DUO_ACC: ... this first-position acceptance each for the long draft
+        float duo_band = 0.05f;  // SPEC_DFT_ADAPT_DUO_BAND: +- band around duo_acc (hysteresis)
     };
     adapt_cfg ad;
 
@@ -1247,6 +1256,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     std::vector<float>   ad_ok;
     std::vector<float>   ad_gtr;
     std::vector<float>   ad_gok;
+    // [TAG_DFL_ADAPT_REAL] per sequence and draft length: decayed realized tokens per step and step count, [s*(n_max+1) + k]
+    std::vector<float>   ad_rt;
+    std::vector<float>   ad_rn;
     std::vector<int32_t> ad_last;  // draft length handed out in the last draft() per sequence (0 = none pending)
     int32_t  ad_k       = 0;       // the current common length (0 = not chosen yet)
     uint64_t ad_calls   = 0;
@@ -1314,6 +1326,16 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         ad_gtr.assign((size_t) std::max(1, n_max), 0.0f);
         ad_gok.assign((size_t) std::max(1, n_max), 0.0f);
         ad_last.assign(n_seq, 0);
+        ad.rdecay  = std::min(0.999f, std::max(0.0f, adapt_env_f("SPEC_DFT_ADAPT_RDECAY", ad.rdecay)));
+        ad.rw0     = std::max(0.0f, adapt_env_f("SPEC_DFT_ADAPT_RW0", ad.rw0));
+        ad.rel     = adapt_env_f("SPEC_DFT_ADAPT_REL", 1.0f) != 0.0f;
+        ad.solo    = adapt_env_f("SPEC_DFT_ADAPT_SOLO", 1.0f) != 0.0f;
+        ad.duo     = adapt_env_f("SPEC_DFT_ADAPT_DUO", 1.0f) != 0.0f;
+        ad.duo_deep = std::max(0.0f, adapt_env_f("SPEC_DFT_ADAPT_DUO_DEEP", ad.duo_deep));
+        ad.duo_acc  = std::min(1.0f, std::max(0.0f, adapt_env_f("SPEC_DFT_ADAPT_DUO_ACC", ad.duo_acc)));
+        ad.duo_band = std::max(0.0f, adapt_env_f("SPEC_DFT_ADAPT_DUO_BAND", ad.duo_band));
+        ad_rt.assign((size_t) n_seq*(std::max(1, n_max) + 1), 0.0f);
+        ad_rn.assign((size_t) n_seq*(std::max(1, n_max) + 1), 0.0f);
         ad_hist.assign(n_max + 1, 0);
         if (ad.on) {
             std::string kcap;
@@ -1346,7 +1368,16 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             return (ad_ok[i] + tgt*ad.shrink) / (ad_tr[i] + ad.shrink);
         }
         const float g = (ad_gok[j] + ad.prior*ad.prior_w) / (ad_gtr[j] + ad.prior_w);
-        return (ad_ok[i] + g*ad.shrink) / (ad_tr[i] + ad.shrink);
+        float tgt = g;
+        if (j > 0 && ad.rel) {
+            // [TAG_DFL_ADAPT_REL] the deep positions of a sequence have few trials of their own (a trial needs every
+            // earlier position accepted); the pooled value there mostly reflects other content (code at 0.9 made prose
+            // at 32K look like a k = 7 case). Scale the sequence's own previous position by the pooled step instead.
+            const float gp = (ad_gok[j - 1] + ad.prior*ad.prior_w) / (ad_gtr[j - 1] + ad.prior_w);
+            const float r  = std::min(1.25f, std::max(0.5f, g / std::max(1e-3f, gp)));
+            tgt = std::min(0.999f, adapt_alpha(s, j - 1)*r);
+        }
+        return (ad_ok[i] + tgt*ad.shrink) / (ad_tr[i] + ad.shrink);
     }
 
     // expected tokens per step for a draft of k tokens (the bonus token included): 1 + sum_j prod_{i <= j} alpha_i
@@ -1357,6 +1388,19 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             e += p;
         }
         return e;
+    }
+
+    // [TAG_DFL_ADAPT_REAL] tokens per step for length k: the sequence's recent realized value at k, with the model
+    // estimate as a prior worth rw0 steps. The model alone over-rated the long draft where the deep positions had few
+    // trials of their own (prose at 32K, 2 streams: it kept k = 7 and lost 16 % against the n_max 3 step); a length
+    // not used lately fades back to the model, which retries it now and then.
+    double adapt_eblend(llama_seq_id s, int k) const {
+        const double em = adapt_expect(s, k);
+        if (ad.rw0 <= 0.0f || k < 0 || k > n_max) {
+            return em;
+        }
+        const size_t i = (size_t) s*(n_max + 1) + k;
+        return (ad_rt[i] + em*ad.rw0) / (ad_rn[i] + ad.rw0);
     }
 
 
@@ -1384,6 +1428,40 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         const int32_t k_hi = ad.kbyn.empty() ? n_max :
             std::min<int32_t>(n_max, ad.kbyn[std::min(ds.size(), ad.kbyn.size()) - 1]);
         const int32_t k_lo = std::min(ad.k_min, k_hi);
+        // [TAG_DFL_ADAPT] one drafting sequence: the long draft, no model. Its extra verify rows cost ~8 % per step and it
+        // won every measured one-stream case (24 prompts: +19 % greedy, +35 % sampled; fourconn code/prose at 0 and 32K:
+        // +61/+13/+58/+2 %), while the model sometimes settled on 3 from a few bad early steps
+        if (ad.solo && ds.size() == 1 && k_hi > std::min(ad.short_k, n_max)) {
+            const int32_t k1 = trained_max > 0 ? std::min(k_hi, trained_max) : k_hi;
+            ad_k = k1;
+            if (ad.probe) {
+                ad_hist[std::min<size_t>(k1, ad_hist.size() - 1)]++;
+            }
+            return k1;
+        }
+        // [TAG_DFL_ADAPT] two drafting sequences: the long draft, except deep in the context, where the long draft pays only
+        // when both sequences accept their first draft token often. Measured at 2 streams, long vs short: code +62 % /
+        // prose 0 % at depth 0, code +29 % / prose -16 % at 32K (first-position acceptance code 0.92, prose 0.65-0.71).
+        // The model (SPEC_DFT_ADAPT_DUO=0) switched back and forth on these and lost up to 9 %: each switch changes the
+        // verify and drafter shapes, and its deep-position estimates rest on few trials.
+        if (ad.duo && ds.size() == 2 && k_hi > std::min(ad.short_k, n_max)) {
+            const int32_t k2  = trained_max > 0 ? std::min(k_hi, trained_max) : k_hi;
+            const int32_t k_s = std::min(ad.short_k, n_max);
+            int32_t k = k2;
+            if (depth / 2.0 >= ad.duo_deep) {
+                const float thr = ad.duo_acc + (ad_k == k2 ? -ad.duo_band : ad.duo_band);
+                for (llama_seq_id s : ds) {
+                    if (adapt_alpha(s, 0) < thr) {
+                        k = k_s;
+                    }
+                }
+            }
+            ad_k = k;
+            if (ad.probe) {
+                ad_hist[std::min<size_t>(k, ad_hist.size() - 1)]++;
+            }
+            return k;
+        }
         if (k_hi <= std::min(ad.short_k, n_max)) {
             ad_k = k_hi;
             if (ad.probe) {
@@ -1406,7 +1484,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             const double c = cost_of(k);
             double v = 0.0;
             for (llama_seq_id s : ds) {
-                const double e = adapt_expect(s, k);
+                const double e = adapt_eblend(s, k);
                 v += ad.fair ? std::log(e / c) : e / c;
             }
             return ad.fair ? std::exp(v / n) : v;   // fair: the geometric mean of the per-stream rates
@@ -1421,7 +1499,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             }
             const double cr = cost_of(k_short) / cost_of(k);
             for (llama_seq_id s : ds) {
-                if (adapt_expect(s, k) / adapt_expect(s, k_short) * cr < 1.0 - ad.pareto) {
+                if (adapt_eblend(s, k) / adapt_eblend(s, k_short) * cr < 1.0 - ad.pareto) {
                     return false;
                 }
             }
@@ -1457,7 +1535,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             std::string tr;
             for (int32_t k = k_lo; k <= k_hi; ++k) {
                 if (adapt_cand(k, k_short, k_hi)) {
-                    tr += string_format(" k%d:E=%.2f,C=%.3f,t=%.3f", k, adapt_expect(ds[0], k), cost_of(k), through(k));
+                    tr += string_format(" k%d:E=%.2f,C=%.3f,t=%.3f", k, adapt_eblend(ds[0], k), cost_of(k), through(k));
                 }
             }
             fprintf(stderr, "turbo-probe: dft-adapt-trace n=%d depth=%.0f prev=%d k=%d%s\n", (int) ds.size(), depth / n, ad_k, k_best, tr.c_str());
@@ -1697,6 +1775,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         // [TAG_DFL_ADAPT] a new generation starts from the prior
         std::fill(ad_tr.begin() + (size_t) seq_id*n_max, ad_tr.begin() + (size_t) (seq_id + 1)*n_max, 0.0f);
         std::fill(ad_ok.begin() + (size_t) seq_id*n_max, ad_ok.begin() + (size_t) (seq_id + 1)*n_max, 0.0f);
+        std::fill(ad_rt.begin() + (size_t) seq_id*(n_max + 1), ad_rt.begin() + (size_t) (seq_id + 1)*(n_max + 1), 0.0f);
+        std::fill(ad_rn.begin() + (size_t) seq_id*(n_max + 1), ad_rn.begin() + (size_t) (seq_id + 1)*(n_max + 1), 0.0f);
         ad_last[seq_id] = 0;
 
         const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(params.ctx_dft), seq_id);
@@ -2310,6 +2390,17 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             return;
         }
         const int32_t a = std::min<int32_t>(n_accepted, k);
+        // [TAG_DFL_ADAPT_REAL] realized tokens of this step (bonus token included) under length k
+        for (int32_t kk = 0; kk <= n_max; ++kk) {
+            const size_t i = (size_t) seq_id*(n_max + 1) + kk;
+            ad_rt[i] *= ad.rdecay;
+            ad_rn[i] *= ad.rdecay;
+        }
+        if (k <= n_max) {
+            const size_t i = (size_t) seq_id*(n_max + 1) + k;
+            ad_rt[i] += (float) (a + 1);
+            ad_rn[i] += 1.0f;
+        }
         for (int32_t j = 0; j < n_max; ++j) {
             const size_t i = (size_t) seq_id*n_max + j;
             const float  t = j < k && j <= a ? 1.0f : 0.0f;   // position j was verified
