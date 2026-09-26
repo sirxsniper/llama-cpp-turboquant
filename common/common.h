@@ -328,6 +328,7 @@ struct common_params_speculative_draft {
 
     float p_split = 0.1f; // speculative decoding split probability
     float p_min   = 0.0f; // minimum speculative decoding probability (greedy)
+    int32_t adapt = -1;   // [TAG_DFL_ADAPT] DFlash draft length from recent acceptance: -1 = default (SPEC_DFT_ADAPT, else on when n_max > 3), 0 = off, 1 = on
 
     bool backend_sampling = true; // offload draft sampling to the backend (default: on)
 

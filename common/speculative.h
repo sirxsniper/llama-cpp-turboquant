@@ -80,6 +80,11 @@ struct common_speculative_draft_params {
 
     float temperature = 0.0f;
     uint32_t seed = LLAMA_DEFAULT_SEED;
+
+    // [TAG_DFL_QTRUNC] the request's truncation, for drafters that sample their own proposal (0 / 1 / 0 = none)
+    int32_t top_k = 0;
+    float   top_p = 1.0f;
+    float   min_p = 0.0f;
 };
 
 common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);

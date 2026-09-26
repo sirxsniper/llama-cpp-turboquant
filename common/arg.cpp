@@ -4367,6 +4367,21 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_P_SPLIT"));
     add_opt(common_arg(
+        {"--spec-draft-adapt"}, "on|off",
+        "[TAG_DFL_ADAPT] DFlash/DFlash2: pick one draft length per step for all streams, 3 or --spec-draft-n-max, from recent "
+        "acceptance and the verify cost; with 3 or more drafting streams it stays at 3. "
+        "Default: the SPEC_DFT_ADAPT environment variable, else on when --spec-draft-n-max is above 3",
+        [](common_params & params, const std::string & value) {
+            if (is_truthy(value)) {
+                params.speculative.draft.adapt = 1;
+            } else if (is_falsey(value)) {
+                params.speculative.draft.adapt = 0;
+            } else {
+                throw std::invalid_argument("invalid value, expected on or off");
+            }
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_ADAPT"));
+    add_opt(common_arg(
         {"--spec-draft-p-min", "--draft-p-min"}, "P",
         string_format("minimum speculative decoding probability (greedy) (default: %.2f)", (double)params.speculative.draft.p_min),
         [](common_params & params, const std::string & value) {

@@ -5444,6 +5444,9 @@ private:
                             /* .dists    = */ &slot.spec_dists,
                             /* .temperature = */ slot.task->params.sampling.temp,
                             /* .seed     = */ common_sampler_get_seed(slot.smpl.get()),
+                            /* .top_k    = */ slot.task->params.sampling.top_k,
+                            /* .top_p    = */ slot.task->params.sampling.top_p,
+                            /* .min_p    = */ slot.task->params.sampling.min_p,
                         };
 
                         drafting.push_back(&slot);

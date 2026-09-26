@@ -1125,6 +1125,351 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
     std::vector<int32_t> sync_rows_seq; // [TAG_4C_DFT_SYNC] rows per sequence in the batch, reused
 
+    // [TAG_DFL_ADAPT] content-adaptive draft length (--spec-draft-adapt on, or SPEC_DFT_ADAPT=1), for n_max up to the
+    // trained block (DFlash2: 7). Chosen per step, BEFORE the drafter decode, as ONE length k for all drafting sequences:
+    // on the hybrid target a batch of different lengths is split (split_equal) and every distinct verify shape resets the
+    // CUDA graphs, so ragged lengths cost far more than they save. Candidates are the short draft (3, the old fixed
+    // default, drafted with the short 4-token block, so a k = 3 step is the n_max 3 step) and the full block (n_max).
+    // Per sequence and draft position j the conditional acceptance alpha_j (P(j accepted | j - 1 accepted)) is tracked
+    // with decayed counts, shrunk towards the same counts pooled over all sequences (the position profile is not flat).
+    // k maximises the geometric mean over the drafting sequences of E_s(k) / C(k) (proportional fairness: a length that
+    // speeds up the batch while one stream slows down must win clearly), with
+    //     E_s(k) = 1 + sum_{j < k} prod_{i <= j} alpha_i        expected tokens per step, bonus token included
+    //     C(k)   = 1 + seq*n + cost*R + step*[R > rows]         relative step time; n = drafting sequences, R = n*(k + 1)
+    // seq, cost and step grow per 32768 tokens of mean depth; the step term is the jump when the verify batch leaves the
+    // kernels for <= 16 columns. Defaults: least-squares fit of the fixed n_max 3 / 7 sweep of Qwen3.8-27B-UD-Q5_K_XL +
+    // DFlash2 on the RTX 5090 at 1/2/4 streams (ms/step = 21.0 + 0.53 n + 0.43 R + 3.3 [R > 16] at depth 0,
+    // 18.7 + 3.3 n + 0.62 R + 3.6 [R > 16] at 32K). A hysteresis keeps the verify shape (and its graphs) stable, and
+    // SPEC_DFT_ADAPT_KBYN caps k by the number of drafting sequences. Default cap: n_max with 1 or 2 drafting sequences,
+    // short_k with 3 or more. Measured (24 prompts, 4 streams): the model above picked k = 7 on most steps and lost 7-11 %
+    // against a fixed 3, because it prices the extra verify rows but not the lower acceptance of the long block's first
+    // positions at this batch width. With the cap, 3-4 streams run the n_max 3 step exactly.
+    // On by default when n_max > short_k (with n_max <= short_k it is the fixed draft, bit for bit).
+    struct adapt_cfg {
+        bool  on      = false;
+        float cost    = 0.021f;  // SPEC_DFT_ADAPT_COST: relative step cost of one more verify row
+        float step    = 0.158f;  // SPEC_DFT_ADAPT_STEP: one-off relative cost when R exceeds `rows`
+        float over    = 0.0f;    // SPEC_DFT_ADAPT_OVER: extra relative cost of each row above `rows`
+        float seq_d   = 0.153f;  // SPEC_DFT_ADAPT_SEQ_D:  seq  added per 32768 tokens of mean depth
+        float cost_d  = 0.012f;  // SPEC_DFT_ADAPT_COST_D: cost added per 32768 tokens of mean depth
+        float step_d  = 0.033f;  // SPEC_DFT_ADAPT_STEP_D: step added per 32768 tokens of mean depth
+        float seq     = 0.025f;  // SPEC_DFT_ADAPT_SEQ: relative cost of one more drafting sequence
+        int   rows    = 16;      // SPEC_DFT_ADAPT_ROWS
+        int   k_min   = 1;       // SPEC_DFT_ADAPT_KMIN
+        int   short_k = 3;       // SPEC_DFT_ADAPT_SHORT: the short candidate
+        std::vector<int> kbyn;   // SPEC_DFT_ADAPT_KBYN=k1,k2,...: cap on k with 1, 2, ... drafting sequences (the last
+                                 //   entry covers more); a cap of short_k or less fixes k (and the short block).
+                                 //   Unset: n_max,n_max,short_k. 0: no cap
+        bool  all_k   = false;   // SPEC_DFT_ADAPT_ALLK=1: every length from k_min to n_max is a candidate
+        float decay   = 0.95f;   // SPEC_DFT_ADAPT_DECAY: weight of the past per accepted step
+        float prior   = 0.6f;    // SPEC_DFT_ADAPT_PRIOR: alpha of a new sequence ...
+        float prior_w = 2.0f;    // ... worth this many trials (pooled estimate)
+        float shrink  = 3.0f;    // SPEC_DFT_ADAPT_SHRINK: the pooled estimate is worth this many of a sequence's trials
+        float gdecay  = 0.995f;  // SPEC_DFT_ADAPT_GDECAY: decay of the pooled counts per verified position
+        float hyst    = 0.02f;   // SPEC_DFT_ADAPT_HYST: a new k must gain this fraction, plus ...
+        float hyst_dn = 0.06f;   // SPEC_DFT_ADAPT_HYST_DOWN: ... this one for a shorter k with ONE stream: its extra verify
+                                 //   rows are nearly free, and a short draft loses far more once the text turns
+                                 //   predictable again (the estimate lags) than a long one loses in a hard stretch
+        float hyst_rows = 0.06f; // SPEC_DFT_ADAPT_HYST_ROWS: ... and this one when the switch crosses `rows`
+        int   small   = 3;       // SPEC_DFT_ADAPT_SMALL: drafter block of small + 1 while k <= small (0 = always full).
+                                 //   Measured: the full block cut to 3 accepts the same as the short block (2.95 vs 2.96
+                                 //   tokens/step greedy, 24 prompts) and only costs drafter time (-3 % at 1 stream)
+        bool  fair    = true;    // SPEC_DFT_ADAPT_FAIR: 1 = proportional-fair share of the streams, 0 = batch total
+        float pareto  = 0.01f;   // SPEC_DFT_ADAPT_PARETO: largest predicted slow-down of any stream for a longer k (< 0: off)
+        bool  probe   = false;   // SPEC_DFT_ADAPT_PROBE=1: a k histogram every 256 draft calls
+    };
+    adapt_cfg ad;
+
+    // [TAG_DFL_QTRUNC] SPEC_DFT_QTRUNC=1: a sampled DFlash2 draft picks from its proposal cut the way the request cuts the
+    // target (top-k, top-p, min-p over the selector candidates, renormalised). The cut proposal is the one handed to
+    // the verifier, so the output distribution stays exact; the drafter just stops proposing tail tokens the target's
+    // own cut would reject.
+    bool dft_qtrunc = false;
+
+    static void dfl_qtrunc(std::vector<float> & probs, int32_t top_k, float top_p, float min_p) {
+        const int32_t n = (int32_t) probs.size();
+        std::vector<int32_t> ord(n);
+        for (int32_t i = 0; i < n; ++i) {
+            ord[i] = i;
+        }
+        std::stable_sort(ord.begin(), ord.end(), [&](int32_t a, int32_t b) { return probs[a] > probs[b]; });
+        int32_t keep = n;
+        if (top_k > 0 && top_k < keep) {
+            keep = top_k;
+        }
+        if (top_p < 1.0f) {
+            float cum = 0.0f;
+            for (int32_t i = 0; i < keep; ++i) {
+                cum += probs[ord[i]];
+                if (cum >= top_p) {
+                    keep = i + 1;
+                    break;
+                }
+            }
+        }
+        if (min_p > 0.0f && n > 0) {
+            const float thr = min_p*probs[ord[0]];
+            int32_t m = 1;
+            while (m < keep && probs[ord[m]] >= thr) {
+                ++m;
+            }
+            keep = m;
+        }
+        if (keep >= n || keep <= 0) {
+            return;
+        }
+        float sum = 0.0f;
+        for (int32_t i = 0; i < keep; ++i) {
+            sum += probs[ord[i]];
+        }
+        for (int32_t i = keep; i < n; ++i) {
+            probs[ord[i]] = 0.0f;
+        }
+        if (sum > 0.0f) {
+            for (int32_t i = 0; i < keep; ++i) {
+                probs[ord[i]] /= sum;
+            }
+        }
+    }
+
+    // per sequence and draft position j (0-based): decayed trials (drafts that reached j: every earlier position was
+    // accepted) and successes (j accepted), [s*n_max + j]; the same pooled over all sequences with a slower decay. A
+    // position a sequence has not drafted lately falls back to the pooled one: the conditional acceptance is NOT flat
+    // (measured: after three accepted positions the next ones are accepted more often, most of all when sampling)
+    std::vector<float>   ad_tr;
+    std::vector<float>   ad_ok;
+    std::vector<float>   ad_gtr;
+    std::vector<float>   ad_gok;
+    std::vector<int32_t> ad_last;  // draft length handed out in the last draft() per sequence (0 = none pending)
+    int32_t  ad_k       = 0;       // the current common length (0 = not chosen yet)
+    uint64_t ad_calls   = 0;
+    std::vector<uint64_t> ad_hist; // probe: steps per chosen k
+
+    static float adapt_env_f(const char * name, float def) {
+        const char * e = getenv(name);
+        return (e && e[0]) ? (float) atof(e) : def;
+    }
+
+    void adapt_init() {
+        // --spec-draft-adapt on|off wins; otherwise SPEC_DFT_ADAPT=0|1; otherwise on when n_max > short_k
+        ad.short_k = std::max(1,    (int) adapt_env_f("SPEC_DFT_ADAPT_SHORT", (float) ad.short_k));
+        const char * e = getenv("SPEC_DFT_ADAPT");
+        ad.on      = params.adapt >= 0 ? params.adapt == 1 : ((e && e[0]) ? e[0] == '1' : n_max > ad.short_k);
+        ad.cost    = std::max(0.0f, adapt_env_f("SPEC_DFT_ADAPT_COST",  ad.cost));
+        ad.step    = std::max(0.0f, adapt_env_f("SPEC_DFT_ADAPT_STEP",  ad.step));
+        ad.over    = std::max(0.0f, adapt_env_f("SPEC_DFT_ADAPT_OVER",  ad.over));
+        ad.seq_d   = std::max(0.0f, adapt_env_f("SPEC_DFT_ADAPT_SEQ_D",  ad.seq_d));
+        ad.cost_d  = std::max(0.0f, adapt_env_f("SPEC_DFT_ADAPT_COST_D", ad.cost_d));
+        ad.step_d  = std::max(0.0f, adapt_env_f("SPEC_DFT_ADAPT_STEP_D", ad.step_d));
+        ad.seq     = std::max(0.0f, adapt_env_f("SPEC_DFT_ADAPT_SEQ",   ad.seq));
+        ad.rows    = std::max(1,    (int) adapt_env_f("SPEC_DFT_ADAPT_ROWS", (float) ad.rows));
+        ad.k_min   = std::max(1,    (int) adapt_env_f("SPEC_DFT_ADAPT_KMIN", (float) ad.k_min));
+        ad.all_k   = adapt_env_f("SPEC_DFT_ADAPT_ALLK", 0.0f) != 0.0f;
+        ad.kbyn.clear();
+        const char * kb = getenv("SPEC_DFT_ADAPT_KBYN");
+        if (kb && kb[0]) {
+            for (const auto & t : string_split<std::string>(kb, ',')) {
+                if (t.empty()) {
+                    continue;
+                }
+                const int v = atoi(t.c_str());
+                if (v <= 0) {   // 0: no cap
+                    ad.kbyn.clear();
+                    break;
+                }
+                ad.kbyn.push_back(v);
+            }
+        } else {
+            ad.kbyn = { n_max, n_max, std::min(ad.short_k, n_max) };
+        }
+        {
+            const char * q = getenv("SPEC_DFT_QTRUNC");
+            dft_qtrunc = (q && q[0]) ? q[0] == '1' : dft_qtrunc;
+        }
+        ad.decay   = std::min(0.999f, std::max(0.0f, adapt_env_f("SPEC_DFT_ADAPT_DECAY", ad.decay)));
+        ad.prior   = std::min(0.99f,  std::max(0.01f, adapt_env_f("SPEC_DFT_ADAPT_PRIOR", ad.prior)));
+        ad.prior_w = std::max(0.0f, adapt_env_f("SPEC_DFT_ADAPT_PRIOR_W", ad.prior_w));
+        ad.shrink  = std::max(0.01f, adapt_env_f("SPEC_DFT_ADAPT_SHRINK", ad.shrink));
+        ad.gdecay  = std::min(0.9999f, std::max(0.0f, adapt_env_f("SPEC_DFT_ADAPT_GDECAY", ad.gdecay)));
+        ad.hyst    = std::max(0.0f, adapt_env_f("SPEC_DFT_ADAPT_HYST",  ad.hyst));
+        ad.hyst_rows = std::max(0.0f, adapt_env_f("SPEC_DFT_ADAPT_HYST_ROWS", ad.hyst_rows));
+        ad.hyst_dn = std::max(0.0f, adapt_env_f("SPEC_DFT_ADAPT_HYST_DOWN", ad.hyst_dn));
+        ad.small   = std::max(0,    (int) adapt_env_f("SPEC_DFT_ADAPT_SMALL", (float) ad.small));
+        ad.fair    = adapt_env_f("SPEC_DFT_ADAPT_FAIR", 1.0f) != 0.0f;
+        ad.pareto  = adapt_env_f("SPEC_DFT_ADAPT_PARETO", ad.pareto);
+        const char * p = getenv("SPEC_DFT_ADAPT_PROBE");
+        ad.probe   = p && p[0] == '1';
+        ad_tr .assign((size_t) n_seq*std::max(1, n_max), 0.0f);
+        ad_ok .assign((size_t) n_seq*std::max(1, n_max), 0.0f);
+        ad_gtr.assign((size_t) std::max(1, n_max), 0.0f);
+        ad_gok.assign((size_t) std::max(1, n_max), 0.0f);
+        ad_last.assign(n_seq, 0);
+        ad_hist.assign(n_max + 1, 0);
+        if (ad.on) {
+            std::string kcap;
+            for (size_t i = 0; i < ad.kbyn.size(); ++i) {
+                kcap += string_format("%s%d", i ? "," : "", ad.kbyn[i]);
+            }
+            LOG_INF("%s: [TAG_DFL_ADAPT] adaptive draft length on: k in [%d, %d], cap by drafting sequences {%s}, cost %.3f/seq %.3f/row, %.3f + %.3f/row "
+                    "above %d rows, +%.3f/%.3f/%.3f per 32K of depth, decay %.2f, prior %.2f x %.1f, hysteresis up %.3f down %.3f "
+                    "rows +%.3f, %s, block %s\n",
+                    __func__, std::min(ad.k_min, n_max), n_max, kcap.empty() ? "none" : kcap.c_str(), ad.seq, ad.cost, ad.step, ad.over, ad.rows, ad.seq_d, ad.cost_d,
+                    ad.step_d, ad.decay, ad.prior, ad.prior_w, ad.hyst, ad.hyst_dn, ad.hyst_rows,
+                    ad.fair ? "proportional-fair" : "batch total", ad.small > 0 ? "short while k <= small" : "full");
+        }
+        LOG_INF("%s: [TAG_DFL_QTRUNC] sampled drafts cut to the request's top-k/top-p/min-p: %s\n", __func__, dft_qtrunc ? "on" : "off");
+    }
+
+    // conditional acceptance of position j: the sequence's own counts, shrunk towards the pooled estimate (which is
+    // shrunk towards the prior)
+    float adapt_alpha(llama_seq_id s, int j) const {
+        const float g = (ad_gok[j] + ad.prior*ad.prior_w) / (ad_gtr[j] + ad.prior_w);
+        const size_t i = (size_t) s*n_max + j;
+        return (ad_ok[i] + g*ad.shrink) / (ad_tr[i] + ad.shrink);
+    }
+
+    // expected tokens per step for a draft of k tokens (the bonus token included): 1 + sum_j prod_{i <= j} alpha_i
+    double adapt_expect(llama_seq_id s, int k) const {
+        double e = 1.0, p = 1.0;
+        for (int j = 0; j < k; ++j) {
+            p *= adapt_alpha(s, j);
+            e += p;
+        }
+        return e;
+    }
+
+
+    // [TAG_DFL_ADAPT] the common draft length for this step, chosen BEFORE the drafter decode (it depends only on the
+    // acceptance history, the number of drafting sequences and their depth), so the drafter block can follow it
+    int32_t adapt_choose(const common_speculative_draft_params_vec & dparams) {
+        std::vector<llama_seq_id> ds;
+        double depth = 0.0;
+        for (llama_seq_id s = 0; s < (llama_seq_id) n_seq; ++s) {
+            if (!dparams[s].drafting) {
+                continue;
+            }
+            ds.push_back(s);
+            depth += (double) dparams[s].pos0;
+        }
+        if (ds.empty() || n_max <= 0) {
+            return n_max;
+        }
+        // the per-concurrency cap
+        const int32_t k_hi = ad.kbyn.empty() ? n_max :
+            std::min<int32_t>(n_max, ad.kbyn[std::min(ds.size(), ad.kbyn.size()) - 1]);
+        const int32_t k_lo = std::min(ad.k_min, k_hi);
+        if (k_hi <= std::min(ad.short_k, n_max)) {
+            ad_k = k_hi;
+            if (ad.probe) {
+                ad_hist[std::min<size_t>(k_hi, ad_hist.size() - 1)]++;
+            }
+            return k_hi;
+        }
+        const double  n    = (double) ds.size();
+        const double  dz   = std::min(8.0, depth / n / 32768.0);   // mean depth in units of 32K
+        const double  c_seq  = ad.seq  + ad.seq_d *dz;
+        const double  c_row  = ad.cost + ad.cost_d*dz;
+        const double  c_step = ad.step + ad.step_d*dz;
+        // fair (default): sum_s log(E_s(k) / C(k)), the proportional-fair share: a length that speeds up the whole batch
+        // but slows one stream down must win clearly on the others. Not fair: sum_s E_s(k) / C(k), the batch total.
+        auto cost_of = [&](int32_t k) {
+            const double rows = n*(k + 1);
+            return 1.0 + c_seq*n + c_row*rows + (rows > ad.rows ? c_step : 0.0) + ad.over*std::max(0.0, rows - ad.rows);
+        };
+        auto through = [&](int32_t k) {
+            const double c = cost_of(k);
+            double v = 0.0;
+            for (llama_seq_id s : ds) {
+                const double e = adapt_expect(s, k);
+                v += ad.fair ? std::log(e / c) : e / c;
+            }
+            return ad.fair ? std::exp(v / n) : v;   // fair: the geometric mean of the per-stream rates
+        };
+        // Pareto guard: a length longer than the short candidate is allowed only when no stream is predicted to get
+        // slower than with the short one by more than `pareto`. Measured without it, 2 code + 2 prose streams at k = 7:
+        // the code requests finished 13 % sooner, the prose requests 7 % (greedy) to 17 % (sampled) later.
+        const int32_t k_short = std::min(ad.short_k, n_max);
+        auto safe = [&](int32_t k) {
+            if (k <= k_short || ad.pareto < 0.0f) {
+                return true;
+            }
+            const double cr = cost_of(k_short) / cost_of(k);
+            for (llama_seq_id s : ds) {
+                if (adapt_expect(s, k) / adapt_expect(s, k_short) * cr < 1.0 - ad.pareto) {
+                    return false;
+                }
+            }
+            return true;
+        };
+        // candidates: the short draft (`short_k`, the old fixed default) and the full block (n_max), or every length from
+        // k_min with SPEC_DFT_ADAPT_ALLK=1. Measured: the lengths in between cost the per-row steps of the verify kernels
+        // (MMVQ/MMQ-SN widths, FA rows per sequence) without the full block's acceptance.
+        int32_t k_best = k_lo;
+        double  t_best = -1.0;
+        for (int32_t k = k_lo; k <= k_hi; ++k) {
+            if ((!ad.all_k && k != k_short && k != k_hi) || !safe(k)) {
+                continue;
+            }
+            const double t = through(k);
+            if (t > t_best) {
+                t_best = t;
+                k_best = k;
+            }
+        }
+        // near the break-even point the estimate wanders across it: a new verify shape must pay for itself, a shorter
+        // one more than a longer one, and crossing the row budget (the kernels for <= `rows` columns) more again
+        const bool   crosses = ad_k > 0 && ((n*(ad_k + 1) > ad.rows) != (n*(k_best + 1) > ad.rows));
+        const double margin  = ad.hyst + (k_best < ad_k && ds.size() == 1 ? ad.hyst_dn : 0.0) +
+                               (crosses ? ad.hyst_rows : 0.0);
+        const bool   ad_k_ok = ad_k >= k_lo && ad_k <= k_hi && (ad.all_k || ad_k == k_short || ad_k == k_hi) && safe(ad_k);
+        if (ad_k_ok && ad_k != k_best && through(ad_k)*(1.0 + margin) >= t_best) {
+            k_best = ad_k;   // not worth a new verify shape
+        }
+        ad_k = k_best;
+        if (ad.probe) {
+            ad_hist[std::min<size_t>(k_best, ad_hist.size() - 1)]++;
+            if (++ad_calls % 256 == 0) {
+                std::string h;
+                for (size_t k = 0; k < ad_hist.size(); ++k) {
+                    h += string_format("%s%zu:%llu", k ? " " : "", k, (unsigned long long) ad_hist[k]);
+                }
+                std::string al;
+                for (llama_seq_id s : ds) {
+                    al += string_format("%s%d:%.2f/%.2f/%.2f", al.empty() ? "" : " ", (int) s, adapt_alpha(s, 0),
+                                        adapt_alpha(s, std::min(2, n_max - 1)), adapt_alpha(s, n_max - 1));
+                }
+                fprintf(stderr, "turbo-probe: dft-adapt calls=%llu k now %d (n=%d, depth %.0f) hist {%s} alpha {%s}\n",
+                        (unsigned long long) ad_calls, k_best, (int) ds.size(), depth / n, h.c_str(), al.c_str());
+                fflush(stderr);
+            }
+        }
+        return k_best;
+    }
+
+    // [TAG_DFL_ADAPT] drafter block for a chosen length k: the short block (anchor + `small` masks, bit-identical to a
+    // fixed --spec-draft-n-max `small` drafter) while k fits in it, else the full block (the trained layout when
+    // n_max = block_size - 1)
+    int32_t adapt_block(int32_t k) const {
+        return (ad.small > 0 && k <= ad.small) ? std::min(ad.small, n_max) : n_max;
+    }
+
+    // [TAG_DFL_ADAPT] cut every drafted sequence's draft (and its distributions) to the chosen common length
+    static void adapt_cut(common_speculative_draft_params_vec & dparams, const std::vector<int32_t> & i_block_beg, int32_t k) {
+        for (size_t s = 0; s < dparams.size(); ++s) {
+            if (i_block_beg[s] < 0) {
+                continue;
+            }
+            auto & result = *dparams[s].result;
+            if ((int32_t) result.size() > k) {
+                result.resize(k);
+                // [TAG_SPEC_DISTS_TRUNC] the per-draft distributions go with the draft
+                if (dparams[s].dists && dparams[s].dists->size() > result.size()) {
+                    dparams[s].dists->resize(result.size());
+                }
+            }
+        }
+    }
+
     // [TAG_4C_DFT_SYNC] a prefill batch: prompt rows still follow, or one sequence has more rows than one
     // verify block (n_max + 1). A sequence id out of range counts as prefill, so the sync stays.
     bool dft_sync_is_prefill(const llama_batch & batch_in) {
@@ -1214,6 +1559,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         }
         this->n_max = this->params.n_max;
 
+        adapt_init(); // [TAG_DFL_ADAPT]
+
         batch        = llama_batch_init(llama_n_batch(ctx_dft), 0,          n_seq);
         batch_inject = llama_batch_init(llama_n_ubatch(ctx_dft), n_embd_enc, n_seq);
 
@@ -1290,6 +1637,11 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         }
 
         selector_reset[seq_id] = true;
+
+        // [TAG_DFL_ADAPT] a new generation starts from the prior
+        std::fill(ad_tr.begin() + (size_t) seq_id*n_max, ad_tr.begin() + (size_t) (seq_id + 1)*n_max, 0.0f);
+        std::fill(ad_ok.begin() + (size_t) seq_id*n_max, ad_ok.begin() + (size_t) (seq_id + 1)*n_max, 0.0f);
+        ad_last[seq_id] = 0;
 
         const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(params.ctx_dft), seq_id);
         if (pos_max < N - 1) {
@@ -1675,6 +2027,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         std::vector<int32_t> i_block_beg(n_seq, -1);
         std::vector<int32_t> n_block    (n_seq,  0);
 
+        // [TAG_DFL_ADAPT] common length k for this step and the drafter block that serves it
+        const int32_t k_adapt = ad.on ? adapt_choose(dparams) : params.n_max;
+        const int32_t n_draft = ad.on ? adapt_block(k_adapt)  : params.n_max;
+
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             auto & dp = dparams[seq_id];
             if (!dp.drafting) {
@@ -1684,8 +2040,6 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             common_sampler_reset(smpls[seq_id].get());
 
             const int32_t n = (int32_t) dp.pos0;
-
-            const int32_t n_draft = params.n_max;
 
             const int32_t n_block_tokens = n_draft + (is_dspark && sample_from_anchor ? 0 : 1);
             i_block_beg[seq_id] = batch.n_tokens;
@@ -1766,6 +2120,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                         }
                         for (float & p : dist.probs) {
                             p /= sum;
+                        }
+                        if (dft_qtrunc) {
+                            dfl_qtrunc(dist.probs, dp.top_k, dp.top_p, dp.min_p);
                         }
                         std::discrete_distribution<int32_t> sample(dist.probs.begin(), dist.probs.end());
                         predecessor = sample(selector_rng[seq_id]);
@@ -1872,10 +2229,42 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 result.clear();
             }
         }
+
+        // [TAG_DFL_ADAPT] one common draft length for this step, then remember what each sequence was given
+        if (ad.on) {
+            adapt_cut(dparams, i_block_beg, k_adapt);
+        }
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+            if (i_block_beg[seq_id] >= 0) {
+                ad_last[seq_id] = (int32_t) dparams[seq_id].result->size();
+            }
+        }
     }
 
-    void accept(llama_seq_id /*seq_id*/, uint16_t /*n_accepted*/, bool /*is_other*/) override {
-        // noop
+    // [TAG_DFL_ADAPT] one Bernoulli trial per drafted position up to the first rejection: n_accepted successes, plus
+    // one failure when the draft was cut short. The server may still shorten a draft after draft() (the slot's
+    // remaining budget), so the trial count is capped by what was handed out.
+    void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) override {
+        if (is_other || seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+            return;
+        }
+        const int32_t k = ad_last[seq_id];
+        ad_last[seq_id] = 0;
+        if (k <= 0) {
+            return;
+        }
+        const int32_t a = std::min<int32_t>(n_accepted, k);
+        for (int32_t j = 0; j < n_max; ++j) {
+            const size_t i = (size_t) seq_id*n_max + j;
+            const float  t = j < k && j <= a ? 1.0f : 0.0f;   // position j was verified
+            const float  o = j < a ? 1.0f : 0.0f;             // and accepted
+            ad_tr[i]  = ad.decay*ad_tr[i] + t;
+            ad_ok[i]  = ad.decay*ad_ok[i] + o;
+            if (t > 0.0f) {
+                ad_gtr[j] = ad.gdecay*ad_gtr[j] + t;
+                ad_gok[j] = ad.gdecay*ad_gok[j] + o;
+            }
+        }
     }
 };
 
