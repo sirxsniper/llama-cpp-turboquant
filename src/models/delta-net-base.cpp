@@ -538,7 +538,17 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
 
         const int64_t K = (int64_t) cparams.n_rs_seq + 1;
 
-        for (int64_t t = 1; t <= K; ++t) {
+        // [TAG_DFL_CONV_WB] write only the groups a rollback can read: seq_rm allows r <= n_rb = min(T, n_rs_seq), and
+        // every group past T would get the pre-ubatch state again. A 4-token verify step with n_rs_seq 7 wrote 8 groups
+        // per layer for 5 useful ones. GGML_CONV_WB_ALL=1 writes all K groups (old behaviour).
+        static const bool wb_all = [] {
+            const char * e = getenv("GGML_CONV_WB_ALL");
+            return e && e[0] == '1';
+        }();
+        const int64_t n_tok = conv_input->ne[0] - conv_states->ne[0];
+        const int64_t t_beg = wb_all ? 1 : std::max<int64_t>(1, K - n_tok);
+
+        for (int64_t t = t_beg; t <= K; ++t) {
             const int64_t s_idx  = std::max<int64_t>(0, conv_input->ne[0] - conv_states->ne[0] - K + t);
             const int64_t s_slot = K - t;
 
