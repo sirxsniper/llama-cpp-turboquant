@@ -1452,10 +1452,61 @@ struct ggml_cuda_stream_context {
     }
 };
 
+// [TAG_MMVQ_Q8_REUSE] the q8_1 copy of the src1 of the last MMVQ node, kept so that the next MMVQ nodes that read the
+// same tensor skip the quantize launch (see mmvq.cu). The buffer is allocated once and never moved, because captured
+// CUDA graphs keep its address.
+struct ggml_cuda_mmvq_q8_cache {
+    void *              buf      = nullptr;
+    size_t              cap      = 0;
+    const ggml_tensor * src1     = nullptr; // nullptr: the buffer holds nothing that can be reused
+    const void *        data     = nullptr; // src1->data when the copy was made
+    size_t              span     = 0;       // bytes of src1 read by the copy, for the write check
+    size_t              nbytes   = 0;       // bytes of the q8_1 copy
+    int64_t             ne[GGML_MAX_DIMS] = { 0 };
+    size_t              nb[GGML_MAX_DIMS] = { 0 };
+    uint64_t            n_hit    = 0;
+    uint64_t            n_miss   = 0;
+
+    // the graph node being computed: only the src1 of a MUL_MAT node of the graph may use the cache, never a tensor an
+    // op builds on the stack (the MUL_MAT_ID per-expert slices reuse one address and one pool buffer)
+    const ggml_cgraph * cgraph   = nullptr;
+    int                 node_idx = -1;
+
+    void reset() {
+        src1   = nullptr;
+        data   = nullptr;
+        span   = 0;
+        nbytes = 0;
+    }
+};
+
+// [TAG_GRAPH_KEY_MEMO] structural CUDA graph keys of recent split graphs, by uid (ggml-cuda.cu)
+struct ggml_cuda_graph_key_memo {
+    uint64_t            uid     = 0;
+    const ggml_cgraph * cgraph  = nullptr;
+    int                 n_nodes = 0;
+    const void *        key     = nullptr;
+    int                 compat  = -1; // ggml_cuda_graph_check_compability of this split, -1 = not known yet
+};
+
+// [TAG_GRAPH_HOST_PROBE] host time of graph_compute calls, per context (ggml-cuda.cu)
+struct ggml_cuda_graph_host_probe {
+    uint64_t n       = 0;
+    double   key_us  = 0.0;
+    double   chk_us  = 0.0;
+    double   tot_us  = 0.0;
+    uint64_t n_graph = 0; // calls that ran as a CUDA graph
+};
+
 struct ggml_backend_cuda_context {
     int device;
     std::string name;
     cudaEvent_t copy_event = nullptr;
+
+    ggml_cuda_mmvq_q8_cache mmvq_q8;                // [TAG_MMVQ_Q8_REUSE]
+    ggml_cuda_graph_key_memo graph_key_memo[16];    // [TAG_GRAPH_KEY_MEMO]
+    int graph_key_memo_next = 0;
+    ggml_cuda_graph_host_probe graph_host_probe;    // [TAG_GRAPH_HOST_PROBE]
 
     cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = { { nullptr } };
     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {nullptr};

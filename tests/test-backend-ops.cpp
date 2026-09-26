@@ -7816,6 +7816,66 @@ struct test_mul_mat_vec_fusion : public test_case {
     }
 };
 
+// [TAG_MMVQ_Q8_REUSE] Several mat-vec products of one activation, like the Qwen3.8 GDN projections (qkv, z, alpha,
+// beta) or attention q, k, v; the results are joined with concat. With reshape_third the third product reads a
+// reshape of the activation (another tensor over the same bytes, so a new q8_1 copy). With GGML_CUDA_MMVQ_Q8_REUSE=1
+// the CUDA backend reuses one q8_1 copy for the MMVQ products that read the same tensor.
+struct test_mul_mat_shared_src1 : public test_case {
+    const std::array<ggml_type, 4> types; // GGML_TYPE_COUNT: no product
+    const std::array<int64_t, 4>   rows;
+    const int64_t cols;
+    const int64_t k;
+    const bool    reshape_third;
+
+    std::string vars() override {
+        return VARS_TO_STR5(types, rows, cols, k, reshape_third);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_SHARED_SRC1";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        uint64_t n = 0;
+        for (size_t i = 0; i < types.size(); ++i) {
+            n += types[i] == GGML_TYPE_COUNT ? 0 : 2 * rows[i] * cols * k;
+        }
+        return n;
+    }
+
+    test_mul_mat_shared_src1(std::array<ggml_type, 4> types, std::array<int64_t, 4> rows, int64_t cols, int64_t k,
+            bool reshape_third = true)
+        : types(types), rows(rows), cols(cols), k(k), reshape_third(reshape_third) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, cols);
+        ggml_set_name(b, "b");
+
+        ggml_tensor * out = nullptr;
+        for (size_t i = 0; i < types.size(); ++i) {
+            if (types[i] == GGML_TYPE_COUNT) {
+                continue;
+            }
+            ggml_tensor * a = ggml_new_tensor_2d(ctx, types[i], k, rows[i]);
+            ggml_set_name(a, ("a" + std::to_string(i)).c_str());
+
+            ggml_tensor * bi = i == 2 && reshape_third ? ggml_reshape_2d(ctx, b, k, cols) : b;
+            ggml_tensor * p  = ggml_mul_mat(ctx, a, bi);
+            out = out ? ggml_concat(ctx, out, p, 0) : p;
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // GGML_OP_SUM
 struct test_sum : public test_case {
     const ggml_type type;
@@ -13463,6 +13523,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             true, 16, 8, b, false, true, false));
     }
 
+    // [TAG_MMVQ_Q8_REUSE] one activation, several weights (the Qwen3.8 UD-Q5_K_XL mix), 1..8 columns (MMVQ widths)
+    for (int64_t cols : {1, 2, 4, 5, 8}) {
+        for (bool reshape_third : {false, true}) {
+            test_cases.emplace_back(new test_mul_mat_shared_src1({GGML_TYPE_Q5_K, GGML_TYPE_Q5_K, GGML_TYPE_Q5_K, GGML_TYPE_Q4_K},
+                {256, 128, 48, 48}, cols, 1024, reshape_third));
+            test_cases.emplace_back(new test_mul_mat_shared_src1({GGML_TYPE_Q6_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0, GGML_TYPE_COUNT},
+                {512, 64, 64, 0}, cols, 5120, reshape_third));
+            test_cases.emplace_back(new test_mul_mat_shared_src1({GGML_TYPE_Q4_0, GGML_TYPE_F16, GGML_TYPE_Q5_K, GGML_TYPE_Q5_K},
+                {64, 64, 64, 64}, cols, 256, reshape_third));
+        }
+    }
+
     // Fused row-pair coverage: minimum rows, an even pair, and an odd tail.
     // TODO: the max_nmse_err() for these cases is not estimated correctly causing sporadic false failures.
     //for (ggml_glu_op glu_op : { GGML_GLU_OP_SWIGLU, GGML_GLU_OP_GEGLU }) {
@@ -13710,6 +13782,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
                 }
             }
         }
+    }
+
+    // [TAG_MMVQ_Q8_REUSE] per-layer groups of the Qwen3.8-27B UD-Q5_K_XL projections that read one activation, at the
+    // decode width and the 1-stream n_max 3 verify width: A/B with GGML_CUDA_MMVQ_Q8_REUSE=1 against unset.
+    for (int64_t n : {1, 4}) {
+        test_cases.emplace_back(new test_mul_mat_shared_src1({GGML_TYPE_Q5_K, GGML_TYPE_Q5_K, GGML_TYPE_Q5_K, GGML_TYPE_Q4_K},
+            {10240, 6144, 48, 48}, n, 5120, false)); // GDN: qkv, z, alpha, beta
+        test_cases.emplace_back(new test_mul_mat_shared_src1({GGML_TYPE_Q6_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0, GGML_TYPE_COUNT},
+            {12288, 1024, 1024, 0}, n, 5120, false)); // attention: q (with gate), k, v
     }
 
     // [TAG_MMQSN] larger-than-L2 shapes with the Qwen3.8-27B row counts (same stream-k geometry, weights from DRAM), and a
