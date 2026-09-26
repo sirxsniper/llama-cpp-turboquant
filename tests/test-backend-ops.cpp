@@ -7255,16 +7255,18 @@ struct test_top_k : public test_case {
     const std::array<int64_t, 4> ne;
     const int k;
     const bool ties;
+    const bool unordered; // [TAG_TOPK_UNORDERED] ggml_top_k_unordered: same set, any order
     ggml_tensor * input {};
 
     std::string vars() override {
-        return VARS_TO_STR4(type, ne, k, ties);
+        // the ordered cases keep their names
+        return VARS_TO_STR4(type, ne, k, ties) + (unordered ? ",unordered=1" : "");
     }
 
     test_top_k(ggml_type type = GGML_TYPE_F32,
             std::array<int64_t, 4> ne = {16, 10, 10, 10},
-            int k = 4, bool ties = false)
-        : type(type), ne(ne), k(k), ties(ties) {}
+            int k = 4, bool ties = false, bool unordered = false)
+        : type(type), ne(ne), k(k), ties(ties), unordered(unordered) {}
 
     double max_err() override {
         return 0.0;
@@ -7342,7 +7344,7 @@ struct test_top_k : public test_case {
         // Save 'a' for err()
         input = a;
 
-        ggml_tensor * out = ggml_top_k(ctx, a, k);
+        ggml_tensor * out = unordered ? ggml_top_k_unordered(ctx, a, k) : ggml_top_k(ctx, a, k);
         ggml_set_name(out, "out");
 
         return out;
@@ -12783,6 +12785,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, { 8192,  2, 1, 1 }, 2051, true));
     test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, { 33024, 4, 1, 1 }, 2051, true));
 
+    // [TAG_TOPK_UNORDERED] the qwen4exp indexer's unordered top-k (TURBO_QSA_TOPK_UNORDERED=1): CUDA radix-selects
+    // any k once the row is >= 2048 wide; decode rows (1), prefill rows (64), ties, a 262144 row, k not a power of 2
+    test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, { 2048,   1,  1, 1 }, 2048, false, true));
+    test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, { 4096,   1,  1, 1 }, 2048, false, true));
+    test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, { 8192,   2,  1, 1 }, 2051, false, true));
+    test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, { 8193,   3,  1, 1 }, 2051, false, true));
+    test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, { 33024,  4,  1, 1 }, 2051, false, true));
+    test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, { 65536,  64, 1, 1 }, 2051, false, true));
+    test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, { 262144, 1,  1, 1 }, 2051, false, true));
+    test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, { 8192,   2,  1, 1 }, 2051, true,  true));
+    test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, { 33024,  4,  1, 1 }, 2051, true,  true));
+    test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, { 262144, 2,  1, 1 }, 2051, true,  true));
+    test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, { 4096,   1,  1, 1 }, 16,   false, true));
+    test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, { 1024,   2,  1, 1 }, 512,  false, true));   // < 2048: ordered path
+
     // qwen4exp QSA indexer top-k fusion (get_rows + f16 mask + top_k)
     test_cases.emplace_back(new test_topk_qsa(512,  2048,  1, 1, 1500));
     test_cases.emplace_back(new test_topk_qsa(512,  2048,  2, 1, 1500));
@@ -14307,6 +14324,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     for (auto cols : {8192, 32768, 131072}) {
         for (auto nrows : {1, 2, 4, 8, 16, 32}) {
             test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {cols, nrows, 1, 1}, 2048));
+            test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {cols, nrows, 1, 1}, 2051, false, true)); // [TAG_TOPK_UNORDERED]
         }
     }
     // backend sampler: one row of the vocab (llama-sampler.cpp top_k)
