@@ -2752,7 +2752,7 @@ static const void * ggml_cuda_graph_get_key(ggml_backend_cuda_context * cuda_ctx
 
     const void * key = ggml_cuda_graph_get_key_hash(cgraph);
 
-    constexpr int n_memo = (int) (sizeof(cuda_ctx->graph_key_memo) / sizeof(cuda_ctx->graph_key_memo[0]));
+    constexpr int n_memo = (int) (sizeof(ggml_backend_cuda_context::graph_key_memo) / sizeof(ggml_cuda_graph_key_memo));
     ggml_cuda_graph_key_memo & m = cuda_ctx->graph_key_memo[cuda_ctx->graph_key_memo_next];
     cuda_ctx->graph_key_memo_next = (cuda_ctx->graph_key_memo_next + 1) % n_memo;
     m.uid     = cgraph->uid;
