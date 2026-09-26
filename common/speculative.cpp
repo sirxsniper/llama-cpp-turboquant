@@ -1101,6 +1101,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     int32_t n_embd_tgt = 0;  // target model hidden size
 
     int32_t     block_size    = 0;
+    int32_t     trained_max   = 0;   // [TAG_DFL_BLOCK_EXT] longest draft of the trained block
     llama_token mask_token_id = 0;
 
     bool    is_dflash2     = false;
@@ -1177,14 +1178,20 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         bool  fair    = true;    // SPEC_DFT_ADAPT_FAIR: 1 = proportional-fair share of the streams, 0 = batch total
         float pareto  = 0.01f;   // SPEC_DFT_ADAPT_PARETO: largest predicted slow-down of any stream for a longer k (< 0: off)
         bool  probe   = false;   // SPEC_DFT_ADAPT_PROBE=1: a k histogram every 256 draft calls
+        bool  trace   = false;   // SPEC_DFT_ADAPT_PROBE=2: also one line per decision
     };
     adapt_cfg ad;
 
     // [TAG_DFL_QTRUNC] SPEC_DFT_QTRUNC=1: a sampled DFlash2 draft picks from its proposal cut the way the request cuts the
     // target (top-k, top-p, min-p over the selector candidates, renormalised). The cut proposal is the one handed to
     // the verifier, so the output distribution stays exact; the drafter just stops proposing tail tokens the target's
-    // own cut would reject.
+    // own cut would reject. NEGATIVE RESULT (24 prompts, 1 stream, temp 1 / top-p 0.95 / top-k 20): acceptance
+    // 0.41 -> 0.35, -11 % decode. The proposal is not too flat; cutting it makes the accepted ratio p/q smaller.
     bool dft_qtrunc = false;
+    // [TAG_DFL_QTEMP] SPEC_DFT_QTEMP=x: the sampled DFlash2 proposal uses temperature x * the request's (default 1). The
+    // verifier gets the same proposal, so the output stays exact; only the acceptance changes. NEGATIVE RESULT (same
+    // set): x 1.25 -9 %, x 0.8 -14 %; the selector's own temperature-1 proposal is the best of the three.
+    float dft_qtemp = 1.0f;
 
     static void dfl_qtrunc(std::vector<float> & probs, int32_t top_k, float top_p, float min_p) {
         const int32_t n = (int32_t) probs.size();
@@ -1280,11 +1287,13 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 ad.kbyn.push_back(v);
             }
         } else {
-            ad.kbyn = { n_max, n_max, std::min(ad.short_k, n_max) };
+            // [TAG_DFL_BLOCK_EXT] past the trained block the 2-stream cap is the trained block
+            ad.kbyn = { n_max, (trained_max > 0 ? std::min(n_max, trained_max) : n_max), std::min(ad.short_k, n_max) };
         }
         {
             const char * q = getenv("SPEC_DFT_QTRUNC");
             dft_qtrunc = (q && q[0]) ? q[0] == '1' : dft_qtrunc;
+            dft_qtemp  = std::min(4.0f, std::max(0.25f, adapt_env_f("SPEC_DFT_QTEMP", dft_qtemp)));
         }
         ad.decay   = std::min(0.999f, std::max(0.0f, adapt_env_f("SPEC_DFT_ADAPT_DECAY", ad.decay)));
         ad.prior   = std::min(0.99f,  std::max(0.01f, adapt_env_f("SPEC_DFT_ADAPT_PRIOR", ad.prior)));
@@ -1298,7 +1307,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         ad.fair    = adapt_env_f("SPEC_DFT_ADAPT_FAIR", 1.0f) != 0.0f;
         ad.pareto  = adapt_env_f("SPEC_DFT_ADAPT_PARETO", ad.pareto);
         const char * p = getenv("SPEC_DFT_ADAPT_PROBE");
-        ad.probe   = p && p[0] == '1';
+        ad.probe   = p && (p[0] == '1' || p[0] == '2');
+        ad.trace   = p && p[0] == '2';
         ad_tr .assign((size_t) n_seq*std::max(1, n_max), 0.0f);
         ad_ok .assign((size_t) n_seq*std::max(1, n_max), 0.0f);
         ad_gtr.assign((size_t) std::max(1, n_max), 0.0f);
@@ -1317,14 +1327,25 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     ad.step_d, ad.decay, ad.prior, ad.prior_w, ad.hyst, ad.hyst_dn, ad.hyst_rows,
                     ad.fair ? "proportional-fair" : "batch total", ad.small > 0 ? "short while k <= small" : "full");
         }
-        LOG_INF("%s: [TAG_DFL_QTRUNC] sampled drafts cut to the request's top-k/top-p/min-p: %s\n", __func__, dft_qtrunc ? "on" : "off");
+        LOG_INF("%s: [TAG_DFL_QTRUNC] sampled drafts cut to the request's top-k/top-p/min-p: %s, proposal temperature x%.2f\n", __func__, dft_qtrunc ? "on" : "off", dft_qtemp);
     }
 
     // conditional acceptance of position j: the sequence's own counts, shrunk towards the pooled estimate (which is
     // shrunk towards the prior)
     float adapt_alpha(llama_seq_id s, int j) const {
-        const float g = (ad_gok[j] + ad.prior*ad.prior_w) / (ad_gtr[j] + ad.prior_w);
         const size_t i = (size_t) s*n_max + j;
+        const int    t = trained_max - 1;
+        if (j > t && t >= 0 && trained_max < n_max) {
+            // [TAG_DFL_BLOCK_EXT] a position past the trained block: the sequence's own last trained position times the
+            // pooled ratio of this position to that one (prior 1), so a sequence tries the long block while its trained
+            // positions are accepted and stops when the pooled data for the extra positions says they are not
+            const float g_t = (ad_gok[t] + ad.prior*ad.prior_w) / (ad_gtr[t] + ad.prior_w);
+            const float g_j = (ad_gok[j] + g_t*ad.prior_w) / (ad_gtr[j] + ad.prior_w);
+            const float r   = std::min(1.1f, std::max(0.1f, g_j / std::max(1e-3f, g_t)));
+            const float tgt = std::min(0.999f, adapt_alpha(s, t)*r);
+            return (ad_ok[i] + tgt*ad.shrink) / (ad_tr[i] + ad.shrink);
+        }
+        const float g = (ad_gok[j] + ad.prior*ad.prior_w) / (ad_gtr[j] + ad.prior_w);
         return (ad_ok[i] + g*ad.shrink) / (ad_tr[i] + ad.shrink);
     }
 
@@ -1338,6 +1359,11 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         return e;
     }
 
+
+    // [TAG_DFL_ADAPT] candidate lengths: the short draft, the cap, and (with [TAG_DFL_BLOCK_EXT]) the trained block
+    bool adapt_cand(int32_t k, int32_t k_short, int32_t k_hi) const {
+        return k == k_short || k == k_hi || (trained_max > k_short && trained_max < k_hi && k == trained_max);
+    }
 
     // [TAG_DFL_ADAPT] the common draft length for this step, chosen BEFORE the drafter decode (it depends only on the
     // acceptance history, the number of drafting sequences and their depth), so the drafter block can follow it
@@ -1407,7 +1433,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         int32_t k_best = k_lo;
         double  t_best = -1.0;
         for (int32_t k = k_lo; k <= k_hi; ++k) {
-            if ((!ad.all_k && k != k_short && k != k_hi) || !safe(k)) {
+            if ((!ad.all_k && !adapt_cand(k, k_short, k_hi)) || !safe(k)) {
                 continue;
             }
             const double t = through(k);
@@ -1419,11 +1445,22 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         // near the break-even point the estimate wanders across it: a new verify shape must pay for itself, a shorter
         // one more than a longer one, and crossing the row budget (the kernels for <= `rows` columns) more again
         const bool   crosses = ad_k > 0 && ((n*(ad_k + 1) > ad.rows) != (n*(k_best + 1) > ad.rows));
-        const double margin  = ad.hyst + (k_best < ad_k && ds.size() == 1 ? ad.hyst_dn : 0.0) +
+        // [TAG_DFL_BLOCK_EXT] the one-stream bias against a shorter draft holds inside the trained block only: past it
+        // the extra verify rows cost 10-13 % per step, not "nearly free"
+        const double margin  = ad.hyst + (k_best < ad_k && ds.size() == 1 && ad_k <= trained_max ? ad.hyst_dn : 0.0) +
                                (crosses ? ad.hyst_rows : 0.0);
-        const bool   ad_k_ok = ad_k >= k_lo && ad_k <= k_hi && (ad.all_k || ad_k == k_short || ad_k == k_hi) && safe(ad_k);
+        const bool   ad_k_ok = ad_k >= k_lo && ad_k <= k_hi && (ad.all_k || adapt_cand(ad_k, k_short, k_hi)) && safe(ad_k);
         if (ad_k_ok && ad_k != k_best && through(ad_k)*(1.0 + margin) >= t_best) {
             k_best = ad_k;   // not worth a new verify shape
+        }
+        if (ad.trace) {
+            std::string tr;
+            for (int32_t k = k_lo; k <= k_hi; ++k) {
+                if (adapt_cand(k, k_short, k_hi)) {
+                    tr += string_format(" k%d:E=%.2f,C=%.3f,t=%.3f", k, adapt_expect(ds[0], k), cost_of(k), through(k));
+                }
+            }
+            fprintf(stderr, "turbo-probe: dft-adapt-trace n=%d depth=%.0f prev=%d k=%d%s\n", (int) ds.size(), depth / n, ad_k, k_best, tr.c_str());
         }
         ad_k = k_best;
         if (ad.probe) {
@@ -1450,7 +1487,11 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     // fixed --spec-draft-n-max `small` drafter) while k fits in it, else the full block (the trained layout when
     // n_max = block_size - 1)
     int32_t adapt_block(int32_t k) const {
-        return (ad.small > 0 && k <= ad.small) ? std::min(ad.small, n_max) : n_max;
+        if (ad.small > 0 && k <= ad.small) {
+            return std::min(ad.small, n_max);
+        }
+        // [TAG_DFL_BLOCK_EXT] a draft that fits the trained block uses the trained block
+        return (trained_max > 0 && trained_max < n_max && k <= trained_max) ? trained_max : n_max;
     }
 
     // [TAG_DFL_ADAPT] cut every drafted sequence's draft (and its distributions) to the chosen common length
@@ -1550,7 +1591,22 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         // DFlash input is [id_last, <mask> * (block_size-1)]: in-place denoising yields at most
         // block_size-1 draft tokens, anchor-first DSpark yields a full block_size draft tokens
-        const int32_t n_draft_max = is_dspark && sample_from_anchor ? block_size : block_size - 1;
+        int32_t n_draft_max = is_dspark && sample_from_anchor ? block_size : block_size - 1;
+        // [TAG_DFL_BLOCK_EXT] NEGATIVE RESULT, kept as an opt-in. A DFlash drafter may decode a block longer than it was
+        // trained for (up to 2*block_size - 1 draft tokens); the positions past the trained block are extrapolated.
+        // Qwen3.8-27B + DFlash2 (block 8), 24 prompts at 1 stream against the adaptive n_max 7: fixed 15 -4.6 % greedy,
+        // -22 % sampled; adaptive 3/7/15 +2.9 % greedy (+1.3 % without looping texts), -7.5 % sampled. The single-prompt
+        // "+43 %" was a repetitive text that the long block copies.
+        trained_max = n_draft_max;
+        if (!is_dspark) {
+            // opt-in only (SPEC_DFT_BLOCK_EXT=N, then --spec-draft-n-max up to N): on 24 prompts at 1 stream it lost
+            const char * e = getenv("SPEC_DFT_BLOCK_EXT");
+            const int32_t ext = (e && e[0]) ? std::min(atoi(e), 2*block_size - 1) : 0;
+            if (ext > n_draft_max) {
+                LOG_WRN("%s: [TAG_DFL_BLOCK_EXT] drafts up to %d tokens, trained block %d\n", __func__, ext, block_size);
+                n_draft_max = ext;
+            }
+        }
         if (this->params.n_max > n_draft_max || this->params.n_min > n_draft_max) {
             LOG_WRN("%s: requested draft size (n_max=%d, n_min=%d) exceeds the trained block size %d -- clamping to %d\n",
                     __func__, this->params.n_max, this->params.n_min, block_size, n_draft_max);
@@ -2115,7 +2171,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                         float sum = 0.0f;
                         for (int32_t k = 0; k < selector_top_k; ++k) {
                             dist.ids[k] = (llama_token) row[k];
-                            dist.probs[k] = std::exp((scores[k] - max_score) / dp.temperature);
+                            dist.probs[k] = std::exp((scores[k] - max_score) / (dp.temperature*dft_qtemp));
                             sum += dist.probs[k];
                         }
                         for (float & p : dist.probs) {

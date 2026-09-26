@@ -499,7 +499,9 @@ static void build_dflash2_selector(llm_graph_context & g, const llama_model & mo
     }
 
     const int64_t tokens_per_block = n_tokens / n_blocks;
-    const int64_t block_size = std::min<int64_t>(tokens_per_block, hparams.dflash_block_size);
+    // [TAG_DFL_BLOCK_EXT] every position of the block gets a lattice row: drafting never builds a block longer than the
+    // trained one unless SPEC_DFT_BLOCK_EXT asks for it (common/speculative.cpp), and draft() reads row block*tokens_per_block + pos
+    const int64_t block_size = tokens_per_block;
     const int64_t row_used   = top_k + top_k * top_k;
 
     ggml_tensor * candidates  = ggml_top_k(ctx0, res->t_logits, top_k);
