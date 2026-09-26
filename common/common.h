@@ -373,6 +373,9 @@ struct common_params_speculative_ngram_cache {
     std::string lookup_cache_dynamic; // path of dynamic ngram cache file for lookup decoding
 };
 
+// [TAG_DFL_LABD] longest lookup-augmented DFlash draft (SPEC_DFT_LABD=1): at least n_max; 0 when off (speculative.cpp)
+int32_t common_speculative_labd_n_max(int32_t n_max);
+
 struct common_params_speculative {
     std::vector<enum common_speculative_type> types = { COMMON_SPECULATIVE_TYPE_NONE };
 
@@ -423,7 +426,13 @@ struct common_params_speculative {
             return (uint32_t) rs_seq_override;
         }
 
-        return needs_rs_seq ? draft.n_max : 0u;
+        // [TAG_DFL_LABD] lookup rows past n_max must roll back too
+        const bool dflash = std::any_of(types.begin(), types.end(), [&](auto t) {
+            return t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
+        });
+        const int32_t n_labd = dflash ? common_speculative_labd_n_max(draft.n_max) : 0;
+
+        return needs_rs_seq ? (n_labd > draft.n_max ? (uint32_t) n_labd : (uint32_t) draft.n_max) : 0u;
     }
 };
 
