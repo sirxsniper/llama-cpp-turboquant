@@ -293,6 +293,26 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
         layer.nextn.hc_head_down     = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_DOWN,     "weight", il), { hc_dim, hc_lr },     mtp_flags);
         layer.nextn.hc_head_up       = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_UP,       "weight", il), { hc_lr, hc_dim },     mtp_flags);
     }
+
+    // [TAG_QWEN4EXP_MTP] without MTP the block above is skipped, and the generic scale pass of load_tensors keys on the
+    // loaded weights, so it never asks for the block's optional ".scale" / ".input_scale" tensors (NVFP4, or any file
+    // the saver wrote): skip them here too, or the tensor count of such a file fails. Absent ones are ignored.
+    if (!ml.load_mtp) {
+        const int skip = TENSOR_NOT_REQUIRED | TENSOR_SKIP;
+        for (int il = n_layer; il < n_layer_all; ++il) {
+            for (const char * suffix : { "scale", "input_scale" }) {
+                for (const llm_tensor t : { LLM_TENSOR_ATTN_Q, LLM_TENSOR_ATTN_K, LLM_TENSOR_ATTN_V, LLM_TENSOR_ATTN_OUT,
+                        LLM_TENSOR_ATTN_QKV, LLM_TENSOR_ATTN_GATE, LLM_TENSOR_FFN_GATE_SHEXP, LLM_TENSOR_FFN_DOWN_SHEXP,
+                        LLM_TENSOR_FFN_UP_SHEXP, LLM_TENSOR_SSM_OUT, LLM_TENSOR_SSM_ALPHA, LLM_TENSOR_SSM_BETA,
+                        LLM_TENSOR_NEXTN_EH_PROJ, LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD }) {
+                    create_tensor(tn(t, suffix, il), { 1 }, skip);
+                }
+                for (const llm_tensor t : { LLM_TENSOR_FFN_GATE_EXPS, LLM_TENSOR_FFN_DOWN_EXPS, LLM_TENSOR_FFN_UP_EXPS }) {
+                    create_tensor(tn(t, suffix, il), { n_expert }, skip);
+                }
+            }
+        }
+    }
 }
 
 std::unique_ptr<llm_graph_context> llama_model_qwen4exp::build_arch_graph(const llm_graph_params & params) const {
