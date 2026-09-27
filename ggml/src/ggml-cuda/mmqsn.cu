@@ -19,6 +19,7 @@
 #include <set>
 #include <string>
 #include <tuple>
+#include <unordered_map>
 
 // ------------------------------------------------------------------------------------------------------------------
 // Environment
@@ -31,7 +32,7 @@ struct mmqsn_env_t {
     int     pf_run;     // steps per prefetch run: 1, 2 or 4
     int     l2hint;     // 1 = cp.async .L2::256B
     int     min_n;      // 0 = only the widths MMQ takes today; n = also MMVQ's widths >= n
-    int     max_n;      // widest src1 batch, 2..16
+    int     max_n;      // widest src1 batch, 2..16 (2..32 with wide)
     int64_t min_rows;   // smallest weight row count
     int64_t max_rows;   // largest weight row count, 0 = no limit
     int     types;      // 1 = Q4_K, 2 = Q5_K, 4 = Q6_K
@@ -39,6 +40,8 @@ struct mmqsn_env_t {
     bool    xpf;        // test only: weight copies before the PDL wait for any src0 buffer
     bool    check;      // compare against stock MMQ
     bool    probe;      // TURBO_PATH_PROBE=1
+    bool    wide;       // [TAG_MMQSN_WIDE] 17..32 columns (J = 24/32, RING mode)
+    bool    fusefix;    // [TAG_MMQSN_FUSEFIX] stream-k fixup inside the RING kernel
 };
 
 static int mmqsn_env_int(const char * name, const int def) {
@@ -69,7 +72,12 @@ static const mmqsn_env_t & mmqsn_env() {
         v.pf_run   = (run == 2 || run == 4) ? run : 1;
         v.l2hint   = mmqsn_env_int("GGML_CUDA_MMQSN_L2HINT", 1) != 0 ? 1 : 0;   // [TAG_MMQSN_DEFAULT] best in G0/G2
         v.min_n    = std::max(0, mmqsn_env_int("GGML_CUDA_MMQSN_MIN", 0));
-        v.max_n    = std::min(16, std::max(2, mmqsn_env_int("GGML_CUDA_MMQSN_MAX", 16)));
+        // [TAG_MMQSN_WIDE] off by default until measured: without it the widest batch stays 16 (today's routing).
+        v.wide     = mmqsn_env_int("GGML_CUDA_MMQSN_WIDE", 0) != 0;
+        const int max_cap = v.wide ? 32 : 16;
+        v.max_n    = std::min(max_cap, std::max(2, mmqsn_env_int("GGML_CUDA_MMQSN_MAX", max_cap)));
+        // [TAG_MMQSN_FUSEFIX] off by default until measured.
+        v.fusefix  = mmqsn_env_int("GGML_CUDA_MMQSN_FUSEFIX", 0) != 0;
         const char * r0 = getenv("GGML_CUDA_MMQSN_MIN_ROWS");
         v.min_rows = (r0 && r0[0]) ? std::max<int64_t>(0, (int64_t) atoll(r0)) : 2048;
         const char * r1 = getenv("GGML_CUDA_MMQSN_MAX_ROWS");
@@ -82,9 +90,10 @@ static const mmqsn_env_t & mmqsn_env() {
         v.probe = p && p[0] == '1';
         if (v.probe) {
             fprintf(stderr, "turbo-probe: mmqsn env on=%d mode=%s pf=%d pf_run=%d l2hint=%d min=%d max=%d min_rows=%lld "
-                    "max_rows=%lld types=%d persist=%d xpf=%d check=%d\n",
+                    "max_rows=%lld types=%d persist=%d xpf=%d check=%d wide=%d fusefix=%d\n",
                     v.mode, mmqsn_mode_name(v.loop), v.pf_dist, v.pf_run, v.l2hint, v.min_n, v.max_n,
-                    (long long) v.min_rows, (long long) v.max_rows, v.types, v.persist, (int) v.xpf, (int) v.check);
+                    (long long) v.min_rows, (long long) v.max_rows, v.types, v.persist, (int) v.xpf, (int) v.check,
+                    (int) v.wide, (int) v.fusefix);
             fflush(stderr);
         }
         if (v.mode != 0 && v.loop == MMQSN_STREAM) {
@@ -104,6 +113,15 @@ static int mmqsn_type_bit(const ggml_type type) {
         case GGML_TYPE_Q6_K: return 4;
         default:             return 0;
     }
+}
+
+// MMQ's J for 2..32 columns on NVIDIA (mul_mat_q_switch_J: the smallest J with one column tile), which the result
+// depends on. STREAM always runs J = 16. [TAG_MMQSN_WIDE] 24 and 32 exist in RING mode only.
+static int mmqsn_pick_J(const int64_t ne11, const int loop) {
+    if (loop == MMQSN_STREAM) {
+        return 16;
+    }
+    return ne11 <= 8 ? 8 : (ne11 <= 16 ? 16 : (ne11 <= 24 ? 24 : 32));
 }
 
 // ------------------------------------------------------------------------------------------------------------------
@@ -175,6 +193,9 @@ bool ggml_cuda_should_use_mmqsn(const ggml_tensor * src0, const ggml_tensor * sr
     if (ne11 < 2 || ne11 > env.max_n) {
         return false;                                   // ne11 == 1 stays on MMVQ (fused gate/up/GLU)
     }
+    if (ne11 > 16 && env.loop != MMQSN_RING) {
+        return false;                                   // [TAG_MMQSN_WIDE] J = 24/32 are RING kernels only
+    }
     // Phase gate: by default MMVQ keeps every width it takes today (Blackwell: Q4_K/Q5_K <= 5, Q6_K <= 7).
     // GGML_CUDA_MMQSN_MIN=n also takes those widths from n up (not bit-identical: MMVQ quantizes differently).
     if (ne11 < (env.min_n ? env.min_n : INT_MAX) && ggml_cuda_should_use_mmvq(type, cc, ne11, ne01)) {
@@ -183,7 +204,7 @@ bool ggml_cuda_should_use_mmqsn(const ggml_tensor * src0, const ggml_tensor * sr
     if (!ggml_cuda_should_use_mmq(type, cc, ne11, /*n_experts =*/ 0)) {
         return false;
     }
-    const int J = (env.loop == MMQSN_STREAM || ne11 > 8) ? 16 : 8;
+    const int J = mmqsn_pick_J(ne11, env.loop);
     const size_t smpbo = ggml_cuda_info().devices[ggml_cuda_get_device()].smpbo;
     if (mmqsn_nbytes_shared_rt(type, J, env.loop) > smpbo) {
         return false;
@@ -268,6 +289,43 @@ static void mmqsn_check(ggml_backend_cuda_context & ctx, const ggml_tensor * src
 }
 
 // ------------------------------------------------------------------------------------------------------------------
+// [TAG_MMQSN_FUSEFIX] Tile counters for the in-kernel fixup
+// ------------------------------------------------------------------------------------------------------------------
+
+// One zeroed buffer of MMQSN_FIXUP_CNT_MAX counters (16 KB) per stream: kernels of one stream run in order (a PDL
+// kernel reads the counters only after its grid-dependency wait), and every launch leaves its counters at 0. Allocated
+// on the first use outside graph capture; until then, for more tiles, or if the allocation fails, the caller launches
+// the fixup kernel instead. The buffers live until the process ends.
+#define MMQSN_FIXUP_CNT_MAX 4096
+
+static int * mmqsn_fixup_counters(cudaStream_t stream, const int ntiles) {
+    if (ntiles > MMQSN_FIXUP_CNT_MAX) {
+        return nullptr;
+    }
+    static std::mutex cnt_mutex;
+    static std::unordered_map<cudaStream_t, int *> cnt_bufs;
+    std::lock_guard<std::mutex> lock(cnt_mutex);
+    const auto it = cnt_bufs.find(stream);
+    if (it != cnt_bufs.end()) {
+        return it->second;
+    }
+    cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+    CUDA_CHECK(cudaStreamIsCapturing(stream, &capture));
+    if (capture != cudaStreamCaptureStatusNone) {
+        return nullptr;
+    }
+    int * buf = nullptr;
+    if (cudaMalloc((void **) &buf, (size_t) MMQSN_FIXUP_CNT_MAX*sizeof(int)) != cudaSuccess) {
+        (void) cudaGetLastError();
+        cnt_bufs[stream] = nullptr;   // do not retry: this stream keeps the fixup kernel
+        return nullptr;
+    }
+    CUDA_CHECK(cudaMemsetAsync(buf, 0, (size_t) MMQSN_FIXUP_CNT_MAX*sizeof(int), stream));
+    cnt_bufs[stream] = buf;
+    return buf;
+}
+
+// ------------------------------------------------------------------------------------------------------------------
 // Host entry
 // ------------------------------------------------------------------------------------------------------------------
 
@@ -277,7 +335,7 @@ void ggml_cuda_mul_mat_qsn(ggml_backend_cuda_context & ctx, const ggml_tensor * 
 
     GGML_ASSERT(src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
     GGML_ASSERT(ne00 % QK_K == 0 && ne01 % MMQSN_I == 0);
-    GGML_ASSERT(ne11 >= 2 && ne11 <= 16);
+    GGML_ASSERT(ne11 >= 2 && ne11 <= 32);
     GGML_ASSERT(nb10 == sizeof(float) && nb0 == sizeof(float));
 
     const mmqsn_env_t & env = mmqsn_env();
@@ -295,10 +353,11 @@ void ggml_cuda_mul_mat_qsn(ggml_backend_cuda_context & ctx, const ggml_tensor * 
     quantize_mmq_q8_1_pdl_cuda((const float *) src1->data, nullptr, q8.get(), type, ne10,
         nb11/sizeof(float), nb12/sizeof(float), nb13/sizeof(float), ne10_padded, ne11, 1, 1, stream);
 
-    // 2. MMQ's J (smallest tile count: 8 up to 8 columns, else 16) and grid rule: tiling (one block per tile) when its
-    //    efficiency is >= 90 %, else nsm stream-k blocks plus a fixup when ntiles % nsm != 0. Persistent tiling runs
-    //    min(ntiles, nsm) blocks over the same tiles, each summed start to end, so the result does not change.
-    const int J      = (env.loop == MMQSN_STREAM || ne11 > 8) ? 16 : 8;
+    // 2. MMQ's J (smallest tile count: 8 up to 8 columns, else 16; [TAG_MMQSN_WIDE] 24 / 32 up to 24 / 32) and grid
+    //    rule: tiling (one block per tile) when its efficiency is >= 90 %, else nsm stream-k blocks plus a fixup when
+    //    ntiles % nsm != 0. Persistent tiling runs min(ntiles, nsm) blocks over the same tiles, each summed start to
+    //    end, so the result does not change.
+    const int J      = mmqsn_pick_J(ne11, env.loop);
     const int ntiles = (int) (ne01/MMQSN_I);
     const int nwaves = (ntiles + nsm - 1)/nsm;
     const bool tiling = 100*ntiles/(nsm*nwaves) >= 90;
@@ -311,18 +370,26 @@ void ggml_cuda_mul_mat_qsn(ggml_backend_cuda_context & ctx, const ggml_tensor * 
         tmp.alloc((size_t) grid*J*MMQSN_I);
     }
 
+    // [TAG_MMQSN_FUSEFIX] the RING kernel does the fixup itself when it has zeroed tile counters for this stream.
+    int * cnt = nullptr;
+    if (fixup_needed && env.fusefix && env.loop == MMQSN_RING) {
+        cnt = mmqsn_fixup_counters(stream, ntiles);
+    }
+
     const int x_pf = (env.xpf || (src0->buffer && ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS)) ? 1 : 0;
 
     if (env.probe) {
         static std::mutex    probe_mutex;
         static std::set<int> probe_seen;
-        const int key = ((int) type << 16) | (J << 8) | (env.loop << 4) | ((int) persist << 2) | ((int) fixup_needed << 1) | (grid == nsm);
+        const int key = ((int) type << 16) | (J << 8) | (env.loop << 4) | ((cnt != nullptr) << 3) | ((int) persist << 2) |
+            ((int) fixup_needed << 1) | (grid == nsm);
         std::lock_guard<std::mutex> lock(probe_mutex);
         if (probe_seen.insert(key).second) {
-            fprintf(stderr, "turbo-probe: mmqsn type=%s J=%d mode=%s grid=%d persist=%d fixup=%d (first: ne01=%lld ne00=%lld "
-                    "ne11=%lld ntiles=%d x_pf=%d pf=%d pf_run=%d l2hint=%d)\n",
+            fprintf(stderr, "turbo-probe: mmqsn type=%s J=%d mode=%s grid=%d persist=%d fixup=%d fused=%d (first: ne01=%lld "
+                    "ne00=%lld ne11=%lld ntiles=%d x_pf=%d pf=%d pf_run=%d l2hint=%d yh=%d)\n",
                     ggml_type_name(type), J, mmqsn_mode_name(env.loop), grid, (int) persist, (int) fixup_needed,
-                    (long long) ne01, (long long) ne00, (long long) ne11, ntiles, x_pf, env.pf_dist, env.pf_run, env.l2hint);
+                    (int) (cnt != nullptr), (long long) ne01, (long long) ne00, (long long) ne11, ntiles, x_pf, env.pf_dist,
+                    env.pf_run, env.l2hint, mmqsn_y_halves_rt(type, J, env.loop));
             fflush(stderr);
         }
     }
@@ -342,11 +409,12 @@ void ggml_cuda_mul_mat_qsn(ggml_backend_cuda_context & ctx, const ggml_tensor * 
     a.grid           = grid;
     a.ntiles         = ntiles;
     a.persist        = persist ? 1 : 0;
-    a.fixup          = fixup_needed ? 1 : 0;
+    a.fixup          = fixup_needed && cnt == nullptr ? 1 : 0;
     a.x_pf           = x_pf;
     a.pf_dist        = env.pf_dist;
     a.pf_run         = env.pf_run;
     a.l2hint         = env.l2hint;
+    a.cnt            = cnt;
 
     switch (type) {
         case GGML_TYPE_Q4_K:

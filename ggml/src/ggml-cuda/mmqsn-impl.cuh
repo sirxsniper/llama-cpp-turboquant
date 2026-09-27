@@ -17,6 +17,12 @@
 // Loop modes: MMQSN_RING (default), MMQSN_PF (stock load_tiles from global memory plus L2 prefetch, no ring) and
 // MMQSN_STREAM (the ring without unpack/vec_dot/write_back: measures the ceiling of this access pattern, output is
 // garbage).
+//
+// [TAG_MMQSN_WIDE] RING also has J = 24/32 (17..32 columns: 3-4 streams x 5-8 verify rows), MMQ's own J for those
+// widths, so vec_dot/write_back and the result are MMQ's again. Q6_K at J = 24/32 does not fit both y halves next to
+// the ring: it keeps one y half in shared memory at a time (4 barriers per step, MMQ's order).
+// [TAG_MMQSN_FUSEFIX] RING can also do the stream-k fixup inside the kernel (last block of a split tile adds the
+// partial sums in the fixup kernel's order), which removes the mul_mat_qsn_fixup launch.
 
 #include "common.cuh"
 #include "cp-async.cuh"
@@ -50,11 +56,26 @@ static_assert(sizeof(block_q6_K) == 210, "mmqsn: unexpected block_q6_K size");
 static_assert(sizeof(block_q8_1_mmq) == 4*MMQ_TILE_Y_K, "mmqsn: unexpected block_q8_1_mmq size");
 
 // Dynamic shared memory, in this order (all offsets multiples of 16 bytes):
-//   ids[J] | tile_y[2*J*MMQ_TILE_Y_K] (both y halves) | tile_x[MMQSN_I*MMQSN_X_STRIDE] | RING/STREAM: 2 slots of I*pitch
+//   ids[J] | tile_y[nyh*J*MMQ_TILE_Y_K] | tile_x[MMQSN_I*MMQSN_X_STRIDE] | RING/STREAM: 2 slots of I*pitch
+// nyh is the number of y halves kept in shared memory: 2 (2 barriers per step) wherever that fits, else 1
+// ([TAG_MMQSN_WIDE] Q6_K at J = 24/32).
+static constexpr __host__ __device__ size_t mmqsn_nbytes_shared_nyh(const int pitch, const int J, const int mode, const int nyh) {
+    return (size_t) J*sizeof(int) + (size_t) nyh*J*MMQ_TILE_Y_K*sizeof(int) + (size_t) MMQSN_I*MMQSN_X_STRIDE*sizeof(int) +
+        (mode == MMQSN_PF ? (size_t) 0 : (size_t) 2*MMQSN_I*pitch);
+}
+
+static constexpr __host__ __device__ int mmqsn_y_halves_pitch(const int pitch, const int J, const int mode) {
+    return mmqsn_nbytes_shared_nyh(pitch, J, mode, 2) <= MMQSN_SMEM_MAX ? 2 : 1;
+}
+
+template <ggml_type type, int J, int mode>
+static constexpr __host__ __device__ int mmqsn_y_halves() {
+    return mmqsn_y_halves_pitch(mmqsn_raw<type>::pitch, J, mode);
+}
+
 template <ggml_type type, int J, int mode>
 static constexpr __host__ __device__ size_t mmqsn_nbytes_shared() {
-    return (size_t) J*sizeof(int) + (size_t) 2*J*MMQ_TILE_Y_K*sizeof(int) + (size_t) MMQSN_I*MMQSN_X_STRIDE*sizeof(int) +
-        (mode == MMQSN_PF ? (size_t) 0 : (size_t) 2*MMQSN_I*mmqsn_raw<type>::pitch);
+    return mmqsn_nbytes_shared_nyh(mmqsn_raw<type>::pitch, J, mode, mmqsn_y_halves<type, J, mode>());
 }
 
 static_assert(mmqsn_nbytes_shared<GGML_TYPE_Q4_K, 16, MMQSN_RING>() ==  80448, "mmqsn: shared memory layout");
@@ -65,13 +86,33 @@ static_assert(mmqsn_nbytes_shared<GGML_TYPE_Q6_K, 16, MMQSN_PF>()   ==  43584, "
 static_assert(mmqsn_nbytes_shared<GGML_TYPE_Q6_K, 16, MMQSN_STREAM>() <= MMQSN_SMEM_MAX, "mmqsn: shared memory");
 static_assert(mmqsn_nbytes_shared<GGML_TYPE_Q6_K,  8, MMQSN_PF>() % 16 == 0, "mmqsn: shared memory alignment");
 static_assert((8*sizeof(int) + 2*8*MMQ_TILE_Y_K*sizeof(int)) % 16 == 0, "mmqsn: tile_x alignment (J = 8)");
+static_assert(mmqsn_y_halves<GGML_TYPE_Q6_K, 16, MMQSN_RING>() == 2, "mmqsn: J <= 16 keeps both y halves");
 
-// Runtime form of mmqsn_nbytes_shared for the host (routing check).
+// [TAG_MMQSN_WIDE] J = 24/32 (RING only). Q4_K/Q5_K keep both y halves; Q6_K keeps one.
+static_assert(mmqsn_nbytes_shared<GGML_TYPE_Q4_K, 24, MMQSN_RING>() ==  82784, "mmqsn: shared memory layout");
+static_assert(mmqsn_nbytes_shared<GGML_TYPE_Q4_K, 32, MMQSN_RING>() ==  85120, "mmqsn: shared memory layout");
+static_assert(mmqsn_nbytes_shared<GGML_TYPE_Q5_K, 24, MMQSN_RING>() ==  90976, "mmqsn: shared memory layout");
+static_assert(mmqsn_nbytes_shared<GGML_TYPE_Q5_K, 32, MMQSN_RING>() ==  93312, "mmqsn: shared memory layout");
+static_assert(mmqsn_y_halves<GGML_TYPE_Q5_K, 32, MMQSN_RING>() == 2, "mmqsn: Q5_K J = 32 keeps both y halves");
+static_assert(mmqsn_y_halves<GGML_TYPE_Q6_K, 24, MMQSN_RING>() == 1, "mmqsn: Q6_K J = 24 keeps one y half");
+static_assert(mmqsn_y_halves<GGML_TYPE_Q6_K, 32, MMQSN_RING>() == 1, "mmqsn: Q6_K J = 32 keeps one y half");
+static_assert(mmqsn_nbytes_shared<GGML_TYPE_Q6_K, 24, MMQSN_RING>() ==  99808, "mmqsn: shared memory layout");
+static_assert(mmqsn_nbytes_shared<GGML_TYPE_Q6_K, 32, MMQSN_RING>() == 100992, "mmqsn: shared memory layout");
+static_assert((24*sizeof(int) + 1*24*MMQ_TILE_Y_K*sizeof(int)) % 16 == 0, "mmqsn: tile_x alignment (J = 24, one y half)");
+static_assert((24*sizeof(int) + 2*24*MMQ_TILE_Y_K*sizeof(int)) % 16 == 0, "mmqsn: tile_x alignment (J = 24)");
+
+// Runtime forms of mmqsn_y_halves and mmqsn_nbytes_shared for the host (routing check, probe).
+static int mmqsn_pitch_rt(const ggml_type type) {
+    return type == GGML_TYPE_Q4_K ? mmqsn_raw<GGML_TYPE_Q4_K>::pitch :
+           type == GGML_TYPE_Q5_K ? mmqsn_raw<GGML_TYPE_Q5_K>::pitch : mmqsn_raw<GGML_TYPE_Q6_K>::pitch;
+}
+
+static int mmqsn_y_halves_rt(const ggml_type type, const int J, const int mode) {
+    return mmqsn_y_halves_pitch(mmqsn_pitch_rt(type), J, mode);
+}
+
 static size_t mmqsn_nbytes_shared_rt(const ggml_type type, const int J, const int mode) {
-    const int pitch = type == GGML_TYPE_Q4_K ? mmqsn_raw<GGML_TYPE_Q4_K>::pitch :
-                      type == GGML_TYPE_Q5_K ? mmqsn_raw<GGML_TYPE_Q5_K>::pitch : mmqsn_raw<GGML_TYPE_Q6_K>::pitch;
-    return (size_t) J*sizeof(int) + (size_t) 2*J*MMQ_TILE_Y_K*sizeof(int) + (size_t) MMQSN_I*MMQSN_X_STRIDE*sizeof(int) +
-        (mode == MMQSN_PF ? (size_t) 0 : (size_t) 2*MMQSN_I*pitch);
+    return mmqsn_nbytes_shared_nyh(mmqsn_pitch_rt(type), J, mode, mmqsn_y_halves_rt(type, J, mode));
 }
 
 // ------------------------------------------------------------------------------------------------------------------
@@ -198,6 +239,109 @@ static __device__ __forceinline__ void mmqsn_store_y(
     }
 }
 
+// [TAG_MMQSN_WIDE] One y half (h) of step kb, for the kernels that keep one y half in shared memory (Q6_K at J = 24/32).
+// Same addressing and padding reads as mmqsn_load_y.
+template <int J>
+static __device__ __forceinline__ void mmqsn_load_y_half(
+        const int * y, const int ne11, const int kb, const int h, int (&yh)[(J*MMQ_TILE_Y_K + MMQSN_NTHREADS - 1)/MMQSN_NTHREADS],
+        const int tid) {
+    constexpr int ny  = J*MMQ_TILE_Y_K;
+    constexpr int nyr = (ny + MMQSN_NTHREADS - 1)/MMQSN_NTHREADS;
+    const int * by = y + (int64_t) ne11*(2*kb + h)*MMQ_TILE_Y_K;
+#pragma unroll
+    for (int r = 0; r < nyr; ++r) {
+        const int l = tid + r*MMQSN_NTHREADS;
+        if (r < nyr - 1 || ny % MMQSN_NTHREADS == 0 || l < ny) {
+            yh[r] = by[l];
+        }
+    }
+}
+
+template <int J>
+static __device__ __forceinline__ void mmqsn_store_y_half(
+        int * tile_y, const int (&yh)[(J*MMQ_TILE_Y_K + MMQSN_NTHREADS - 1)/MMQSN_NTHREADS], const int tid) {
+    constexpr int ny  = J*MMQ_TILE_Y_K;
+    constexpr int nyr = (ny + MMQSN_NTHREADS - 1)/MMQSN_NTHREADS;
+#pragma unroll
+    for (int r = 0; r < nyr; ++r) {
+        const int l = tid + r*MMQSN_NTHREADS;
+        if (r < nyr - 1 || ny % MMQSN_NTHREADS == 0 || l < ny) {
+            tile_y[l] = yh[r];
+        }
+    }
+}
+
+// [TAG_MMQSN_FUSEFIX] Stream-k fixup inside mul_mat_qsn, in place of the mul_mat_qsn_fixup launch. A block that wrote
+// part of a split tile (its partial sum in tmp, or the tile end in dst) adds its K step count to the tile's counter. The
+// block that brings the count to nkb sums the tmp partials exactly as mul_mat_qsn_fixup does (same blocks, same order:
+// from the tile-end block downwards, starting from 0) and adds the sum to dst, then sets the counter back to 0, so the
+// counters are all 0 again when the grid ends. No block waits for another, so no residency assumption is needed.
+// Called by all threads of the block (block-uniform), after the segment's write_back.
+template <int J>
+static __device__ __forceinline__ void mmqsn_fixup_arrive(
+        int * cnt, const int tile, const int seg_len, float * dst, const float * tmp, const uint3 nkb_fd, const int ntiles,
+        const int ne11, const int stride_col_dst, const int tid) {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    constexpr int I   = MMQSN_I;
+    constexpr int nel = J*I/MMQSN_NTHREADS;
+    const int nkb = (int) nkb_fd.z;
+
+    __threadfence();            // this thread's dst/tmp stores are visible to all blocks before the count
+    __syncthreads();
+    int count = 0;
+    if (tid == 0) {
+        count = atomicAdd(&cnt[tile], seg_len) + seg_len;
+    }
+    if (!__syncthreads_or(count == nkb)) {
+        return;                 // another block of this tile is still running
+    }
+    __threadfence();
+
+    // The tile-end block b_last holds K step (tile + 1)*nkb - 1 in the partition of mul_mat_qsn
+    // (kbc(b) = b*ntiles*nkb/gridDim.x); it wrote its part to dst, the blocks before it to tmp.
+    const int64_t total  = (int64_t) ntiles*nkb;
+    const int     b_last = (int) (((int64_t) (tile + 1)*nkb*gridDim.x - 1) / total);
+
+    float acc[nel] = {0.0f};
+    int bidx     = b_last - 1;
+    int kbc_stop = (int) ((int64_t) b_last*total / gridDim.x);
+    while (true) {
+        const int kbc = (int) ((int64_t) bidx*total / gridDim.x);
+        if (kbc == kbc_stop) {  // no data
+            bidx--;
+            kbc_stop = kbc;
+            continue;
+        }
+#pragma unroll
+        for (int l = 0; l < nel; ++l) {
+            acc[l] += __ldcg(tmp + (int64_t) bidx*(J*I) + tid + l*MMQSN_NTHREADS);   // element j*I + i
+        }
+        if (fastmodulo((uint32_t) kbc, nkb_fd) == 0 || (int) fastdiv((uint32_t) kbc, nkb_fd) < tile) {
+            break;              // this block started the tile
+        }
+        bidx--;
+        kbc_stop = kbc;
+    }
+
+#pragma unroll
+    for (int l = 0; l < nel; ++l) {
+        const int e = tid + l*MMQSN_NTHREADS;
+        const int j = e / I;
+        const int i = e - j*I;
+        if (j < ne11) {
+            float * d = dst + (int64_t) tile*I + (int64_t) j*stride_col_dst + i;
+            *d = __ldcg(d) + acc[l];
+        }
+    }
+    if (tid == 0) {
+        cnt[tile] = 0;
+    }
+#else
+    GGML_UNUSED_VARS(cnt, tile, seg_len, dst, tmp, nkb_fd, ntiles, ne11, stride_col_dst, tid);
+    NO_DEVICE_CODE;
+#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+}
+
 // Q6_K block of tile row i in a staged slot: the window of row i starts 16-byte aligned, the block at
 // (row_lo + i*row_step) & 15 in it (row_lo = block address of row 0 mod 16, row_step = row stride in bytes mod 16).
 static __device__ __forceinline__ const block_q6_K * mmqsn_q6_K_row(
@@ -293,18 +437,21 @@ static __device__ __forceinline__ void mmqsn_unpack(
 // x: weights; y: q8_1 in MMQ's block layout; tmp: stream-k fixup buffer (grid*J*I floats, only when a fixup runs).
 // persist = 1 only where MMQ would use its tiling grid (then grid <= ntiles). x_pf = 1: the weight copies (or the PF
 // mode prefetches) of the first steps are issued before the PDL wait; only valid for weights buffers.
-template <ggml_type type, int J, int mode>
+// fusefix, cnt_ptr: [TAG_MMQSN_FUSEFIX] (RING only) the stream-k fixup runs in this kernel with ntiles zeroed tile
+// counters at cnt_ptr, and mul_mat_qsn_fixup is not launched. A template flag, so the other kernels do not change.
+template <ggml_type type, int J, int mode, bool fusefix>
 __launch_bounds__(MMQSN_NTHREADS, 1)
 static __global__ void mul_mat_qsn(
         const char * x_ptr, const int * y_ptr, float * dst_ptr, float * tmp_ptr, const uint3 nkb_fd,
         const int nrows_x, const int ne11, const int stride_row_x, const int stride_col_dst, const int ntiles,
-        const int persist, const int x_pf, const int pf_dist, const int pf_run, const int l2hint) {
+        const int persist, const int x_pf, const int pf_dist, const int pf_run, const int l2hint, int * cnt_ptr) {
 #if defined(TURING_MMA_AVAILABLE) && defined(CP_ASYNC_AVAILABLE) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
     // PDL and __restrict__ are mutually exclusive (common.cuh): plain or GGML_CUDA_RESTRICT locals only.
     const char * GGML_CUDA_RESTRICT x   = x_ptr;
     const int  * GGML_CUDA_RESTRICT y   = y_ptr;
     float      * GGML_CUDA_RESTRICT dst = dst_ptr;
     [[maybe_unused]] float * GGML_CUDA_RESTRICT tmp = tmp_ptr;   // unused in STREAM mode
+    [[maybe_unused]] int   * cnt = cnt_ptr;                      // fusefix only
 
     constexpr int qk              = ggml_cuda_type_traits<type>::qk;
     constexpr int I               = MMQSN_I;
@@ -312,6 +459,9 @@ static __global__ void mul_mat_qsn(
     constexpr int ny              = J*MMQ_TILE_Y_K;
     constexpr int nyr             = (ny + MMQSN_NTHREADS - 1)/MMQSN_NTHREADS;
     constexpr int bs              = mmqsn_raw<type>::bs;
+    constexpr int nyh             = mmqsn_y_halves<type, J, mode>();   // y halves in shared memory
+    static_assert(nyh == 2 || mode == MMQSN_RING, "mmqsn: one y half at a time only in RING mode");
+    static_assert(!fusefix || mode == MMQSN_RING, "mmqsn: in-kernel fixup only in RING mode");
     static_assert(ggml_cuda_mmq_get_I(type, J, false, false) == I, "mmqsn: MMQ tile height must be 128");
     static_assert(ggml_cuda_mmq_get_nthreads(type, J, false, false) == MMQSN_NTHREADS, "mmqsn: MMQ must use 256 threads");
     static_assert(ggml_cuda_mmq_get_K_vram(type, J, false, false) == MMQ_ITER_K, "mmqsn: one 256-value step per iteration");
@@ -327,7 +477,7 @@ static __global__ void mul_mat_qsn(
     extern __shared__ __align__(16) int data_mul_mat_qsn[];
     int  * ids    = data_mul_mat_qsn;
     int  * tile_y = ids + J;
-    int  * tile_x = tile_y + 2*ny;
+    int  * tile_x = tile_y + nyh*ny;
 
     const int tid = threadIdx.y*WARP_SIZE + threadIdx.x;
     const int64_t row_bytes = (int64_t) stride_row_x*bs;
@@ -452,6 +602,7 @@ static __global__ void mul_mat_qsn(
 
         mmqsn_load_y<J>(y, ne11, mmqsn_step(s, 0).y, yr, tid);
         [[maybe_unused]] int sink = 0;   // STREAM: keeps the y loads alive
+        [[maybe_unused]] int kb_seg0 = fusefix ? mmqsn_step(s, 0).y : 0;   // [TAG_MMQSN_FUSEFIX] first K step of the segment
 
 #pragma unroll 1
         for (int g = 0; g < nsteps; ++g) {
@@ -463,7 +614,11 @@ static __global__ void mul_mat_qsn(
 
             if constexpr (mode == MMQSN_RING) {
                 mmqsn_unpack<type, J>(stage + slot*(I*pitch), tile_x, x, tk, row_bytes);
-                mmqsn_store_y<J>(tile_y, yr, tid);
+                if constexpr (nyh == 2) {
+                    mmqsn_store_y<J>(tile_y, yr, tid);
+                } else {
+                    mmqsn_store_y_half<J>(tile_y, yr[0], tid);   // [TAG_MMQSN_WIDE] half 1 follows after barrier C
+                }
             } else {
                 GGML_UNUSED(tk);
 #pragma unroll
@@ -485,12 +640,27 @@ static __global__ void mul_mat_qsn(
                 mmqsn_prefetch<type>(x, s, g + 2 + pf_dist, 2, pf_run, row_bytes, tid);
             }
             if (g + 1 < nsteps) {
-                mmqsn_load_y<J>(y, ne11, mmqsn_step(s, g + 1).y, yr, tid);   // L2 hit, hidden behind vec_dot
+                if constexpr (nyh == 2) {
+                    mmqsn_load_y<J>(y, ne11, mmqsn_step(s, g + 1).y, yr, tid);   // L2 hit, hidden behind vec_dot
+                } else {
+                    mmqsn_load_y_half<J>(y, ne11, mmqsn_step(s, g + 1).y, 0, yr[0], tid);
+                }
             }
 
             if constexpr (mode == MMQSN_RING) {
-                vec_dot(tile_x, tile_y,      sum, 0);
-                vec_dot(tile_x, tile_y + ny, sum, MMQ_TILE_NE_K);
+                vec_dot(tile_x, tile_y, sum, 0);
+                if constexpr (nyh == 2) {
+                    vec_dot(tile_x, tile_y + ny, sum, MMQ_TILE_NE_K);
+                } else {
+                    // [TAG_MMQSN_WIDE] one y half in shared memory: MMQ's barrier order for the second half.
+                    __syncthreads();    // C: every warp finished reading y half 0
+                    mmqsn_store_y_half<J>(tile_y, yr[1], tid);
+                    __syncthreads();    // D: y half 1 ready
+                    if (g + 1 < nsteps) {
+                        mmqsn_load_y_half<J>(y, ne11, mmqsn_step(s, g + 1).y, 1, yr[1], tid);
+                    }
+                    vec_dot(tile_x, tile_y, sum, MMQ_TILE_NE_K);
+                }
 
                 const bool tile_end = tk.y == (int) nkb_fd.z - 1;
                 if (tile_end || g == nsteps - 1) {
@@ -502,6 +672,14 @@ static __global__ void mul_mat_qsn(
 #pragma unroll
                     for (int l = 0; l < J*I / MMQSN_NTHREADS; ++l) {
                         sum[l] = 0.0f;
+                    }
+                    if constexpr (fusefix) {
+                        // [TAG_MMQSN_FUSEFIX] a segment that is not a whole tile is part of a split tile.
+                        const int seg_len = tk.y + 1 - kb_seg0;
+                        if (seg_len != (int) nkb_fd.z) {
+                            mmqsn_fixup_arrive<J>(cnt, tk.x, seg_len, dst, tmp, nkb_fd, ntiles, ne11, stride_col_dst, tid);
+                        }
+                        kb_seg0 = 0;
                     }
                 }
             }
@@ -524,7 +702,7 @@ static __global__ void mul_mat_qsn(
     ggml_cuda_pdl_lc();
 #else
     GGML_UNUSED_VARS(x_ptr, y_ptr, dst_ptr, tmp_ptr, nkb_fd, nrows_x, ne11, stride_row_x, stride_col_dst, ntiles,
-        persist, x_pf, pf_dist, pf_run, l2hint);
+        persist, x_pf, pf_dist, pf_run, l2hint, cnt_ptr);
     NO_DEVICE_CODE;
 #endif // defined(TURING_MMA_AVAILABLE) && defined(CP_ASYNC_AVAILABLE) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 }
@@ -645,31 +823,34 @@ struct mmqsn_args {
     int ne11;                   // src1 columns = dst columns
     int stride_row_x;           // nb01 in blocks
     int stride_col_dst;         // nb1 in floats
-    int J;                      // 8 or 16
+    int J;                      // 8, 16, or [TAG_MMQSN_WIDE] 24, 32 (RING only)
     int mode;                   // mmqsn_mode
     int grid;
     int ntiles;
     int persist;
-    int fixup;
+    int fixup;                  // launch mul_mat_qsn_fixup after the matmul
     int x_pf;
     int pf_dist;
     int pf_run;
     int l2hint;
+    int * cnt;                  // [TAG_MMQSN_FUSEFIX] tile counters for the in-kernel fixup, or nullptr
 };
 
-template <ggml_type type, int J, int mode>
+template <ggml_type type, int J, int mode, bool fusefix = false>
 static void mmqsn_launch(const mmqsn_args & a, cudaStream_t stream) {
     constexpr size_t nbytes_shared = mmqsn_nbytes_shared<type, J, mode>();
-    CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_qsn<type, J, mode>), nbytes_shared);
+    CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_qsn<type, J, mode, fusefix>), nbytes_shared);
 
     const uint3 nkb_fd = init_fastdiv_values(a.ncols_x / QK_K);
 
+    GGML_ASSERT(fusefix == (a.cnt != nullptr) && !(fusefix && a.fixup));
+
     const dim3 block_nums(a.grid, 1, 1);
     const dim3 block_dims(WARP_SIZE, MMQSN_NTHREADS/WARP_SIZE, 1);
-    ggml_cuda_kernel_launch(mul_mat_qsn<type, J, mode>,
+    ggml_cuda_kernel_launch(mul_mat_qsn<type, J, mode, fusefix>,
         ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream),
         a.x, a.y, a.dst, a.tmp, nkb_fd, a.nrows_x, a.ne11, a.stride_row_x, a.stride_col_dst, a.ntiles,
-        a.persist, a.x_pf, a.pf_dist, a.pf_run, a.l2hint);
+        a.persist, a.x_pf, a.pf_dist, a.pf_run, a.l2hint, a.cnt);
 
     if (!a.fixup) {
         return;
@@ -681,7 +862,18 @@ static void mmqsn_launch(const mmqsn_args & a, cudaStream_t stream) {
         a.dst, (const float *) a.tmp, nkb_fd, a.ntiles, a.ne11, a.stride_col_dst);
 }
 
-// Instantiates RING and PF for J = 8 and 16 and STREAM for J = 16 (5 kernels + 2 fixups per type).
+// RING at one J, with the in-kernel fixup ([TAG_MMQSN_FUSEFIX]) when the host passed tile counters.
+template <ggml_type type, int J>
+static void mmqsn_launch_ring(const mmqsn_args & a, cudaStream_t stream) {
+    if (a.cnt != nullptr) {
+        mmqsn_launch<type, J, MMQSN_RING, true>(a, stream);
+    } else {
+        mmqsn_launch<type, J, MMQSN_RING, false>(a, stream);
+    }
+}
+
+// Instantiates RING for J = 8, 16 and [TAG_MMQSN_WIDE] 24, 32, each also with [TAG_MMQSN_FUSEFIX], PF for J = 8 and
+// 16, and STREAM for J = 16 (11 kernels + 4 fixups per type).
 template <ggml_type type>
 void mmqsn_case(const mmqsn_args & a, cudaStream_t stream) {
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
@@ -689,18 +881,27 @@ void mmqsn_case(const mmqsn_args & a, cudaStream_t stream) {
         mmqsn_launch<type, 16, MMQSN_STREAM>(a, stream);
         return;
     }
+    if (a.J == 24 || a.J == 32) {
+        GGML_ASSERT(a.mode == MMQSN_RING);
+        if (a.J == 24) {
+            mmqsn_launch_ring<type, 24>(a, stream);
+        } else {
+            mmqsn_launch_ring<type, 32>(a, stream);
+        }
+        return;
+    }
     if (a.J == 8) {
         if (a.mode == MMQSN_PF) {
             mmqsn_launch<type,  8, MMQSN_PF>(a, stream);
         } else {
-            mmqsn_launch<type,  8, MMQSN_RING>(a, stream);
+            mmqsn_launch_ring<type,  8>(a, stream);
         }
     } else {
         GGML_ASSERT(a.J == 16);
         if (a.mode == MMQSN_PF) {
             mmqsn_launch<type, 16, MMQSN_PF>(a, stream);
         } else {
-            mmqsn_launch<type, 16, MMQSN_RING>(a, stream);
+            mmqsn_launch_ring<type, 16>(a, stream);
         }
     }
 #else

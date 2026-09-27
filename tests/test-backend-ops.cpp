@@ -12150,6 +12150,25 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // [TAG_MMQSN_WIDE] ring MMQ for 17..32 columns (J = 24/32; Q6_K keeps one y half in shared memory), routed with
+    // GGML_CUDA_MMQSN_WIDE=1; [TAG_MMQSN_FUSEFIX] in-kernel stream-k fixup with GGML_CUDA_MMQSN_FUSEFIX=1 (all J). Same
+    // geometry as the block above: k = 256 (1 step per tile, most blocks empty), k = 768 with m = 4096 (3-step tiles split
+    // over several blocks with empty ones between them), k = 5376 (21 steps, Q6_K window offset changes per row),
+    // m = 25600 (blocks that finish a tile mid-loop and go on), m = 42240 (persistent tiling), and a row stride larger
+    // than the row. The model shapes at n = 23/24/32 are in the "Real decoder shapes" block.
+    for (ggml_type ta : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K}) {
+        for (int n : {17, 24, 25, 32}) {
+            test_cases.emplace_back(new test_mul_mat(ta, GGML_TYPE_F32,  2048, n,  256, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(ta, GGML_TYPE_F32,  4096, n,  768, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(ta, GGML_TYPE_F32,  2048, n, 5376, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(ta, GGML_TYPE_F32, 25600, n,  768, {1, 1}, {1, 1}));
+        }
+        for (int n : {20, 29}) {
+            test_cases.emplace_back(new test_mul_mat(ta, GGML_TYPE_F32, 42240, n,  768, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(ta, GGML_TYPE_F32,  2048, n, 5120, {1, 1}, {1, 1}, {0, 1, 2, 3}, 5376));
+        }
+    }
+
 #if 0
     {
         // Test paths in OpenCL
@@ -13745,6 +13764,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             }
         }
         test_cases.emplace_back(new test_sum_rows(GGML_TYPE_F32, {4096, 65536, 1, 1}));
+        // [TAG_MMQSN_WIDE] the verify widths of 3-4 streams (n = 20..32, J = 24/32) on the same shapes, plus the LM head.
+        for (int64_t n : {20, 24, 28, 32}) {
+            for (const mmqsn_perf_shape & s : dram_shapes) {
+                test_cases.emplace_back(new test_mul_mat(s.type, GGML_TYPE_F32, s.m, n, s.k, {1, 1}, {1, 1}));
+            }
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 248320, n, 5120, {1, 1}, {1, 1}));
+        }
     }
 
     // ---- Qwen3.8-27B (qwen35) PREFILL-scale coverage -----------------------
