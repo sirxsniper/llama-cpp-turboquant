@@ -147,6 +147,7 @@ struct common_speculative_impl {
 
     uint32_t n_seq;
     int32_t n_max; // maximum draft length after implementation-specific limits
+    int32_t n_max_ext = 0; // [TAG_DFL_LABD] longest draft with lookup rows past n_max (0 = n_max)
 
     size_t n_call_begin  = 0; // number of times this implementation was called for refresh.
     size_t n_call_draft  = 0; // number of times this implementation was called for generation.
@@ -1048,6 +1049,27 @@ static void spec_dft_dump_rows(FILE * f, const float * lattice, int32_t n_embd, 
 static uint64_t g_spec_dft_sync_calls  = 0;
 static uint64_t g_spec_dft_sync_synced = 0;
 
+// [TAG_DFL_LABD] lookup-augmented DFlash drafting, SPEC_DFT_LABD=1 (default off). Read once per process.
+static int32_t spec_labd_env_i(const char * name, int32_t def) {
+    const char * e = getenv(name);
+    return (e && e[0]) ? (int32_t) atoi(e) : def;
+}
+
+static bool spec_labd_on() {
+    static const bool on = spec_labd_env_i("SPEC_DFT_LABD", 0) == 1;
+    return on;
+}
+
+// longest draft of a lookup copy run (SPEC_DFT_LABD_MAX, default 15 = 16 verify rows)
+static int32_t spec_labd_max() {
+    static const int32_t mx = std::min(31, std::max(1, spec_labd_env_i("SPEC_DFT_LABD_MAX", 15)));
+    return mx;
+}
+
+int32_t common_speculative_labd_n_max(int32_t n_max) {
+    return spec_labd_on() ? std::max(n_max, spec_labd_max()) : 0;
+}
+
 struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     // [TAG_SPEC_PREFILL_TAIL_EXTRACT] The per-sequence skip decision, shared by process() and by the
     // server, which asks BEFORE the target decode so that llama can skip extracting the five layer
@@ -1596,7 +1618,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             return true;
         }
 
-        const int32_t n_rows_max = n_max + 1;
+        const int32_t n_rows_max = std::max(n_max, n_max_ext) + 1;   // [TAG_DFL_LABD] a lookup tail verifies more rows
 
         sync_rows_seq.assign(n_seq, 0);
         for (int32_t i = 0; i < batch_in.n_tokens; ++i) {
@@ -1610,6 +1632,511 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         }
 
         return false;
+    }
+
+    // [TAG_DFL_LABD] Lookup-augmented drafting (HyperQwen "LABD"), SPEC_DFT_LABD=1, default off.
+    // The drafter sees a 2048-token window, so when the model copies text that sits in the context (reproduce or edit a
+    // file, quote a document) it guesses what the context already holds. Per sequence, a suffix-match index over the
+    // prompt and the output (every token the target decoded, by position) finds the longest earlier occurrence of the
+    // text that ends at id_last (up to nmax tokens, newest on a tie); its continuation is the lookup draft.
+    //   head (the common k positions): the lookup takes over when the match is long (>= nstrong, decided on the history
+    //     alone, so the drafter rows of that sequence are skipped) or when it is >= nmin and the drafter's first `agree`
+    //     tokens are the lookup's (those positions stay the drafter's, with its own q). Otherwise the drafter's draft.
+    //   tail (positions >= k, up to SPEC_DFT_LABD_MAX = 15 drafts = 16 verify rows): lookup tokens only, when exactly ONE
+    //     sequence drafts this step (several keep one common k: ragged verify lengths measured 48-97 ms/step), the head
+    //     is the lookup's or the drafter agreed on all k, and a copy run is on: the last two steps each accepted a full
+    //     short block (>= `full` draft tokens), held for `sticky` steps after that drops.
+    // Exact at temp > 0: a lookup position carries the point mass q = 1 on its token, a legal proposal for the residual
+    // sampler (accept with p(x), else sample p without x). A position keeps the drafter's q only when the choice to keep
+    // it depends on the history and on EARLIER drafter tokens alone, never on its own drafter token; that is why the
+    // agreement prefix stays the drafter's. Greedy never reads q. The output never depends on the history being right:
+    // a wrong history only gives a worse draft.
+    // History: stacking the ngram drafters on DFlash2 (whole drafts replaced, up to 48 tokens) was +52 % on code edits
+    // but -5 % on code generation. Here the head changes only on a long or confirmed match, the tail only in a copy run,
+    // and `guard` stops history-only take-overs for a sequence whose lookup drafts keep failing at their first token.
+    // Cost: rows past the drafter's k need --spec-rs-seq >= SPEC_DFT_LABD_MAX on a hybrid target (automatic unless
+    // --spec-rs-seq is given; a lower value caps the tail). Qwen3.8-27B (48 GDN layers), per slot and extra rollback
+    // row: 7.9 MiB of VRAM (conv group 5.6 + GDN replay ring 2.3), so 4 slots at 7 -> 15 = +253 MiB; a saved sequence
+    // state (context checkpoint, prompt cache, park) carries the whole ring, +18 MiB of host RAM each. The pinned host
+    // output buffer grows to the widest verify decode only: 16 rows at one slot (+8 rows x 3.8 MiB with -bs), no change
+    // at 4 slots (4 x 8 rows is wider). Host RAM for the index: ~20 B per position and 2 MiB of hash heads per slot.
+    struct labd_cfg {
+        bool    on        = false;
+        int32_t max       = 15;    // SPEC_DFT_LABD_MAX: longest draft (head + lookup tail)
+        int32_t nmin      = 6;     // SPEC_DFT_LABD_NMIN: shortest match that takes the head with drafter agreement
+        int32_t nmax      = 12;    // SPEC_DFT_LABD_NMAX: matches compare up to this length (longer = equal, newest wins)
+        int32_t nstrong   = 8;     // SPEC_DFT_LABD_NSTRONG: a match this long takes the head on the history alone
+        int32_t agree     = 2;     // SPEC_DFT_LABD_AGREE: drafter tokens that must agree for nmin <= match < nstrong
+                                   //   (0: every match >= nmin takes the head on the history alone)
+        int32_t nmin_tail = 4;     // SPEC_DFT_LABD_NMIN_TAIL: shortest match that fills the tail of a running long block
+        int32_t longmin   = 6;     // SPEC_DFT_LABD_LONGMIN: shortest match that starts a long block
+        bool    adaptive  = true;  // SPEC_DFT_LABD_ADAPTIVE: 1 = long block only in a copy run, 0 = whenever a tail matches
+        int32_t sticky    = 3;     // SPEC_DFT_LABD_STICKY: steps the long block is held after the copy-run flag drops
+        int32_t full      = 0;     // SPEC_DFT_LABD_FULL: accepted draft tokens of a "full" step (0 = the trained block)
+        bool    skip      = true;  // SPEC_DFT_LABD_SKIP: no drafter rows for a sequence whose head the history takes
+        float   guard     = 0.5f;  // SPEC_DFT_LABD_GUARD: history-only take-overs need this first-token acceptance (0: off)
+        int32_t chain     = 64;    // SPEC_DFT_LABD_CHAIN: candidates checked per hash chain
+        bool    probe     = false; // SPEC_DFT_LABD_PROBE=1: counters every 256 draft calls
+    };
+    labd_cfg lk;
+
+    static constexpr int LABD_HB = 18;   // hash heads per key length: 2^18
+
+    // per sequence: the token history by position (LLAMA_TOKEN_NULL where unknown, e.g. media rows) and a hash-chain
+    // index of the n-grams ending at every position < n_idx. Positions are added in order and undone newest first, so
+    // every chain is exact: strictly decreasing positions with their current tokens.
+    struct labd_seq {
+        std::vector<llama_token> tok;
+        std::vector<int32_t>     prev_s, prev_l;   // previous position with the same short / long key hash
+        std::vector<int32_t>     hash_s, hash_l;   // key hash of each position (-1 = not indexed)
+        std::vector<int32_t>     head_s, head_l;   // newest position per key hash
+        int32_t n_idx = 0;
+        bool    bad   = false;   // rewound below the index outside a new request (context shift): off until begin()
+        int32_t run   = 0;       // consecutive full steps
+        int32_t hold  = 0;       // long-block steps left after the run drops
+        bool    tail  = false;   // the last draft had a lookup tail
+        float   g_tr  = 0.0f;    // decayed trials / successes of the first lookup-owned position (guard)
+        float   g_ok  = 0.0f;
+        int32_t own   = -1;      // first lookup-owned position of the pending draft (-1 = none)
+        int32_t mlen  = 0;       // match length of this step
+        std::vector<llama_token> cont;   // lookup continuation of this step
+    };
+    std::vector<labd_seq> lks;
+    std::vector<int32_t>  lk_pmin;   // labd_track(): lowest position per sequence in the batch
+    int32_t  lk_ks = 0;              // short key: min(nmin, nmin_tail)
+    int32_t  lk_kl = 0;              // long key: nstrong (0 = no long table)
+    uint64_t lk_n_calls = 0, lk_n_hist = 0, lk_n_agree = 0, lk_n_tail = 0, lk_n_skip = 0, lk_n_tok = 0, lk_n_acc = 0;
+
+    static uint32_t labd_hash(const llama_token * t, int32_t n) {
+        uint64_t h = 0;
+        for (int32_t i = 0; i < n; ++i) {
+            h = (h + (uint32_t) t[i] + 1) * 0x9E3779B97F4A7C15ull;
+            h ^= h >> 31;
+        }
+        return (uint32_t) (h >> (64 - LABD_HB));
+    }
+
+    void labd_init() {
+        lk.on = spec_labd_on();
+        if (!lk.on) {
+            return;
+        }
+        lk.nmin      = std::max(1, spec_labd_env_i("SPEC_DFT_LABD_NMIN",      lk.nmin));
+        lk.nmax      = std::min(64, std::max(1, spec_labd_env_i("SPEC_DFT_LABD_NMAX", lk.nmax)));
+        lk.nstrong   = std::max(1, spec_labd_env_i("SPEC_DFT_LABD_NSTRONG",   lk.nstrong));
+        lk.agree     = std::max(0, spec_labd_env_i("SPEC_DFT_LABD_AGREE",     lk.agree));
+        lk.nmin_tail = std::max(1, spec_labd_env_i("SPEC_DFT_LABD_NMIN_TAIL", lk.nmin_tail));
+        lk.longmin   = std::max(1, spec_labd_env_i("SPEC_DFT_LABD_LONGMIN",   lk.longmin));
+        lk.adaptive  = spec_labd_env_i("SPEC_DFT_LABD_ADAPTIVE", 1) != 0;
+        lk.sticky    = std::max(0, spec_labd_env_i("SPEC_DFT_LABD_STICKY",    lk.sticky));
+        lk.full      = std::max(0, spec_labd_env_i("SPEC_DFT_LABD_FULL",      lk.full));
+        lk.skip      = spec_labd_env_i("SPEC_DFT_LABD_SKIP", 1) != 0;
+        lk.guard     = adapt_env_f("SPEC_DFT_LABD_GUARD", lk.guard);
+        lk.chain     = std::max(1, spec_labd_env_i("SPEC_DFT_LABD_CHAIN",     lk.chain));
+        lk.probe     = spec_labd_env_i("SPEC_DFT_LABD_PROBE", 0) != 0;
+        if (lk.full <= 0) {
+            lk.full = trained_max > 0 ? trained_max : std::max(1, n_max);
+        }
+        // matches longer than nmax compare equal, so a threshold above it could never be reached
+        lk.nstrong = std::min(lk.nstrong, lk.nmax);
+        lk.nmin    = std::min(lk.nmin,    lk.nmax);
+        lk.longmin = std::min(lk.longmin, lk.nmax);
+        lk_ks = std::min(lk.nmin, lk.nmin_tail);
+        lk_kl = lk.nstrong > lk_ks ? lk.nstrong : 0;
+
+        // the tail must fit the target's rollback: a longer draft takes the checkpoint path (a state save every step)
+        int32_t mx = common_speculative_labd_n_max(n_max);
+        const llama_model * model_tgt = llama_get_model(params.ctx_tgt);
+        const uint32_t      n_rs      = llama_n_rs_seq(params.ctx_tgt);
+        if (n_rs > 0 && (uint32_t) mx > n_rs) {
+            LOG_WRN("%s: [TAG_DFL_LABD] the target rolls back %u tokens (--spec-rs-seq): lookup drafts capped at %d, not %d\n",
+                    __func__, n_rs, std::max<int32_t>(n_max, (int32_t) n_rs), mx);
+            mx = std::max<int32_t>(n_max, (int32_t) n_rs);
+        } else if (n_rs == 0 && (llama_model_is_recurrent(model_tgt) || llama_model_is_hybrid(model_tgt))) {
+            LOG_WRN("%s: [TAG_DFL_LABD] recurrent target without partial rollback (--spec-rs-seq 0): no lookup tail\n", __func__);
+            mx = n_max;
+        }
+        lk.max    = std::max(n_max, mx);
+        n_max_ext = lk.max > n_max ? lk.max : 0;
+
+        lks.assign(n_seq, labd_seq{});
+        LOG_INF("%s: [TAG_DFL_LABD] lookup-augmented drafting on: drafts up to %d (drafter %d), match %d..%d, strong %d, "
+                "agree %d, tail %d/%d, %s, sticky %d, full %d, skip %d, guard %.2f, chain %d\n",
+                __func__, lk.max, n_max, lk.nmin, lk.nmax, lk.nstrong, lk.agree, lk.nmin_tail, lk.longmin,
+                lk.adaptive ? "long block in copy runs" : "long block always", lk.sticky, lk.full, (int) lk.skip,
+                lk.guard, lk.chain);
+    }
+
+    // the n-gram of length K that ends at e: add to its chain
+    static void labd_put(labd_seq & q, int32_t e, int32_t K, std::vector<int32_t> & head, std::vector<int32_t> & prev,
+            std::vector<int32_t> & hv) {
+        hv[e]   = -1;
+        prev[e] = -1;
+        if (K <= 0 || e + 1 < K) {
+            return;
+        }
+        for (int32_t i = e - K + 1; i <= e; ++i) {
+            if (q.tok[i] == LLAMA_TOKEN_NULL) {
+                return;
+            }
+        }
+        const uint32_t h = labd_hash(q.tok.data() + e - K + 1, K);
+        hv[e]   = (int32_t) h;
+        prev[e] = head[h];
+        head[h] = e;
+    }
+
+    static void labd_pop(int32_t e, std::vector<int32_t> & head, std::vector<int32_t> & prev, std::vector<int32_t> & hv) {
+        if (hv[e] >= 0 && head[hv[e]] == e) {
+            head[hv[e]] = prev[e];
+        }
+        hv[e] = -1;
+    }
+
+    // index the n-grams that end at the positions [n_idx, upto): their tokens are final
+    void labd_index(labd_seq & q, int32_t upto) {
+        upto = std::min<int32_t>(upto, (int32_t) q.tok.size());
+        if (upto <= q.n_idx) {
+            return;
+        }
+        if (q.head_s.empty()) {
+            q.head_s.assign((size_t) 1 << LABD_HB, -1);
+            if (lk_kl > 0) {
+                q.head_l.assign((size_t) 1 << LABD_HB, -1);
+            }
+        }
+        if ((int32_t) q.prev_s.size() < upto) {
+            const size_t n = std::max<size_t>((size_t) upto, q.tok.capacity());
+            q.prev_s.resize(n, -1);
+            q.hash_s.resize(n, -1);
+            if (lk_kl > 0) {
+                q.prev_l.resize(n, -1);
+                q.hash_l.resize(n, -1);
+            }
+        }
+        for (int32_t e = q.n_idx; e < upto; ++e) {
+            labd_put(q, e, lk_ks, q.head_s, q.prev_s, q.hash_s);
+            if (lk_kl > 0) {
+                labd_put(q, e, lk_kl, q.head_l, q.prev_l, q.hash_l);
+            }
+        }
+        q.n_idx = upto;
+    }
+
+    // undo the index from position m on, newest first
+    void labd_rewind(labd_seq & q, int32_t m) {
+        m = std::max(0, m);
+        for (int32_t e = q.n_idx - 1; e >= m; --e) {
+            labd_pop(e, q.head_s, q.prev_s, q.hash_s);
+            if (lk_kl > 0) {
+                labd_pop(e, q.head_l, q.prev_l, q.hash_l);
+            }
+        }
+        q.n_idx = std::min(q.n_idx, m);
+    }
+
+    // [TAG_DFL_LABD] every target batch (prompt ubatches, verify rows) writes its tokens at their positions; a batch
+    // that starts at p makes the positions below p final
+    void labd_track(const llama_batch & b) {
+        if (b.pos == nullptr || b.n_seq_id == nullptr || b.seq_id == nullptr) {
+            return;
+        }
+        lk_pmin.assign(n_seq, INT32_MAX);
+        for (int32_t i = 0; i < b.n_tokens; ++i) {
+            for (int32_t k = 0; k < b.n_seq_id[i]; ++k) {
+                const llama_seq_id s = b.seq_id[i][k];
+                if (s >= 0 && s < (llama_seq_id) n_seq && b.pos[i] >= 0) {
+                    lk_pmin[s] = std::min<int32_t>(lk_pmin[s], b.pos[i]);
+                }
+            }
+        }
+        for (llama_seq_id s = 0; s < (llama_seq_id) n_seq; ++s) {
+            if (lk_pmin[s] == INT32_MAX) {
+                continue;
+            }
+            auto & q = lks[s];
+            const int32_t p = lk_pmin[s];
+            if (p < q.n_idx) {
+                // below the verified text: a new request (begin() follows and checks) or a context shift (stays off)
+                labd_rewind(q, p);
+                q.bad = true;
+            }
+            q.tok.resize(p, LLAMA_TOKEN_NULL);
+            labd_index(q, p);
+        }
+        for (int32_t i = 0; i < b.n_tokens; ++i) {
+            const llama_pos p = b.pos[i];
+            if (p < 0) {
+                continue;
+            }
+            for (int32_t k = 0; k < b.n_seq_id[i]; ++k) {
+                const llama_seq_id s = b.seq_id[i][k];
+                if (s < 0 || s >= (llama_seq_id) n_seq) {
+                    continue;
+                }
+                auto & tok = lks[s].tok;
+                if ((int32_t) tok.size() <= p) {
+                    tok.resize(p + 1, LLAMA_TOKEN_NULL);
+                }
+                tok[p] = b.token ? b.token[i] : LLAMA_TOKEN_NULL;   // media rows: unknown
+            }
+        }
+    }
+
+    // [TAG_DFL_LABD] a new generation. The prompt (text tokens) is the reference for a text-only history; this also
+    // repairs positions restored from a cache without a target batch.
+    void labd_begin(llama_seq_id s, const llama_tokens & prompt) {
+        auto & q = lks[s];
+        q.run  = 0;
+        q.hold = 0;
+        q.tail = false;
+        q.g_tr = 0.0f;
+        q.g_ok = 0.0f;
+        q.own  = -1;
+        const int32_t n = (int32_t) prompt.size();
+        if ((int32_t) q.tok.size() == n) {
+            int32_t m = 0;
+            while (m < n && q.tok[m] == prompt[m]) {
+                ++m;
+            }
+            if (m < n) {
+                labd_rewind(q, m);
+                std::copy(prompt.begin() + m, prompt.end(), q.tok.begin() + m);
+            }
+        } else if ((int32_t) q.tok.size() < n) {
+            labd_rewind(q, 0);
+            q.tok = prompt;
+        }
+        // more positions than text tokens: media rows; the positions the target batches wrote are kept
+        q.bad = false;
+    }
+
+    // length of the common suffix of the text ending at e and the text ending at n - 1 (e < n - 1), at most cap
+    static int32_t labd_match(const labd_seq & q, int32_t e, int32_t n, int32_t cap) {
+        const llama_token * t = q.tok.data();
+        int32_t j = 0;
+        while (j < cap && e - j >= 0 && t[e - j] == t[n - 1 - j] && t[e - j] != LLAMA_TOKEN_NULL) {
+            ++j;
+        }
+        return j;
+    }
+
+    void labd_walk(const labd_seq & q, const std::vector<int32_t> & head, const std::vector<int32_t> & prev, int32_t K,
+            int32_t n, int32_t & best_len, int32_t & best_e) const {
+        if (K <= 0 || n - 1 < K || head.empty()) {
+            return;
+        }
+        for (int32_t i = n - K; i < n; ++i) {
+            if (q.tok[i] == LLAMA_TOKEN_NULL) {
+                return;
+            }
+        }
+        int32_t e     = head[labd_hash(q.tok.data() + n - K, K)];
+        int32_t bound = n - 1;
+        for (int32_t c = 0; c < lk.chain && e >= 0 && e < bound; ++c) {
+            const int32_t len = labd_match(q, e, n, lk.nmax);
+            if (len >= K && len > best_len) {   // newest first: a tie keeps the newer one
+                best_len = len;
+                best_e   = e;
+                if (len >= lk.nmax) {
+                    break;
+                }
+            }
+            bound = e;
+            e     = prev[e];
+        }
+    }
+
+    // [TAG_DFL_LABD] the lookup of one drafting sequence, before the drafter decode. 0 = no match, 1 = a match the
+    // drafter has to confirm (or that can only fill a tail), 2 = the history takes the head
+    int8_t labd_find(llama_seq_id s, const common_speculative_draft_params & dp, int32_t k_head) {
+        auto & q = lks[s];
+        q.mlen = 0;
+        q.cont.clear();
+        if (q.bad || dp.pos0 < 0 || k_head <= 0) {
+            return 0;
+        }
+        const int32_t p0 = (int32_t) dp.pos0;
+        if (p0 < q.n_idx) {
+            labd_rewind(q, p0);   // not expected: a batch that rewinds went through labd_track() first
+        }
+        q.tok.resize(p0, LLAMA_TOKEN_NULL);
+        q.tok.push_back(dp.id_last);
+        labd_index(q, p0);
+
+        const int32_t n = p0 + 1;
+        int32_t best_len = 0;
+        int32_t best_e   = -1;
+        labd_walk(q, q.head_l, q.prev_l, lk_kl, n, best_len, best_e);
+        if (lk_kl == 0 || best_len < lk_kl) {
+            labd_walk(q, q.head_s, q.prev_s, lk_ks, n, best_len, best_e);
+        }
+        if (best_e < 0) {
+            return 0;
+        }
+        for (int32_t j = best_e + 1; j < n && (int32_t) q.cont.size() < lk.max; ++j) {
+            if (q.tok[j] == LLAMA_TOKEN_NULL) {
+                break;
+            }
+            q.cont.push_back(q.tok[j]);
+        }
+        q.mlen = best_len;
+        if (q.cont.empty()) {
+            return 0;
+        }
+        const bool hist  = q.mlen >= lk.nstrong || (lk.agree == 0 && q.mlen >= lk.nmin);
+        const bool trust = lk.guard <= 0.0f || (q.g_ok + 0.8f*2.0f) / (q.g_tr + 2.0f) >= lk.guard;
+        return hist && trust && (int32_t) q.cont.size() >= k_head ? 2 : 1;
+    }
+
+    // [TAG_DFL_LABD] the long block for the one drafting sequence: in a copy run (two full steps in a row), then held
+    // for `sticky` steps after the run drops
+    bool labd_long(labd_seq & q) {
+        if (!lk.adaptive) {
+            return true;
+        }
+        if (q.run >= 2) {
+            q.hold = lk.sticky;
+            return true;
+        }
+        if (q.hold > 0) {
+            q.hold--;
+            return true;
+        }
+        return false;
+    }
+
+    // [TAG_DFL_LABD] merge the lookup continuation into one sequence's draft (after the drafter and the common cut)
+    void labd_fuse(common_speculative_draft_params & dp, labd_seq & q, int8_t mode, int32_t k_head, bool long_ok) {
+        auto & result = *dp.result;
+        const bool    want_q = dp.temperature > 0.0f && dp.dists != nullptr;
+        const int32_t valid  = (int32_t) q.cont.size();
+        q.own = -1;
+        if (mode == 0 || valid == 0) {
+            q.tail = false;
+            return;
+        }
+
+        bool    take = false;
+        int32_t beg  = 0;
+        if (mode == 2) {
+            // decided on the history alone: every head position is the lookup's
+            result.clear();
+            if (dp.dists) {
+                dp.dists->clear();
+            }
+            take = true;
+        } else if (lk.agree > 0 && q.mlen >= lk.nmin && valid >= k_head && (int32_t) result.size() >= lk.agree) {
+            take = std::equal(result.begin(), result.begin() + lk.agree, q.cont.begin());
+            beg  = lk.agree;
+        }
+        // the drafter's own q covers the draft so far (a sampled DFlash2 draft); otherwise the verifier compares tokens
+        const bool q_ok = want_q && dp.dists->size() == result.size();
+        auto push = [&](llama_token id) {
+            result.push_back(id);
+            if (q_ok) {
+                common_speculative_token_dist d;
+                d.ids   = { id };
+                d.probs = { 1.0f };
+                dp.dists->push_back(std::move(d));
+            }
+        };
+
+        if (take && beg < k_head) {
+            result.resize(beg);
+            if (q_ok) {
+                dp.dists->resize(beg);
+            }
+            for (int32_t j = beg; j < k_head; ++j) {
+                push(q.cont[j]);
+            }
+            q.own = beg;
+            if (mode == 2) {
+                lk_n_hist++;
+            } else {
+                lk_n_agree++;
+            }
+        }
+
+        // the tail: positions the drafter never proposed
+        bool agree_all = false;
+        if (!take && (int32_t) result.size() == k_head && valid > k_head) {
+            agree_all = std::equal(result.begin(), result.end(), q.cont.begin());
+        }
+        const int32_t n_end = std::min(std::min(lk.max, valid), dp.n_max > 0 ? dp.n_max : lk.max);
+        const bool    tail  = long_ok && (take || agree_all) && (int32_t) result.size() == k_head && n_end > k_head &&
+                              q.mlen >= lk.nmin_tail && (q.mlen >= lk.longmin || q.tail);
+        if (tail) {
+            if (q.own < 0) {
+                q.own = k_head;
+            }
+            for (int32_t j = k_head; j < n_end; ++j) {
+                push(q.cont[j]);
+            }
+            lk_n_tail++;
+        }
+        q.tail = tail;
+        if (q.own >= 0) {
+            lk_n_tok += (uint64_t) ((int32_t) result.size() - q.own);
+        }
+    }
+
+    // [TAG_DFL_LABD] after the verify: copy-run state, guard and counters. Returns the drafter's own positions of the
+    // step, the only ones its acceptance statistics may count.
+    int32_t labd_accept(labd_seq & q, int32_t k, int32_t n_acc) {
+        q.run = n_acc >= std::min(k, lk.full) ? q.run + 1 : 0;
+        int32_t k_dr = k;
+        if (q.own >= 0 && q.own < k) {
+            k_dr = q.own;
+            if (n_acc >= q.own) {   // the first lookup position was verified
+                q.g_tr = 0.9f*q.g_tr + 1.0f;
+                q.g_ok = 0.9f*q.g_ok + (n_acc > q.own ? 1.0f : 0.0f);
+            }
+            lk_n_acc += (uint64_t) std::max(0, std::min(n_acc, k) - q.own);
+        }
+        q.own = -1;
+        return k_dr;
+    }
+
+    // [TAG_DFL_ADAPT] [TAG_DFL_LABD] the end of draft(): the common cut, the lookup, what each sequence was given
+    void draft_finish(common_speculative_draft_params_vec & dparams, const std::vector<int32_t> & i_block_beg,
+            int32_t k_adapt, const std::vector<int8_t> & lk_mode, int32_t n_drafting) {
+        if (ad.on) {
+            adapt_cut(dparams, i_block_beg, k_adapt);
+        }
+        if (lk.on) {
+            for (llama_seq_id s = 0; s < (llama_seq_id) n_seq; ++s) {
+                auto & dp = dparams[s];
+                if (!dp.drafting) {
+                    continue;
+                }
+                auto & q = lks[s];
+                // only one drafting sequence may run a long block; with several there is no hold (one k per step)
+                bool long_ok = false;
+                if (n_drafting == 1) {
+                    long_ok = labd_long(q);
+                } else {
+                    q.hold = 0;
+                }
+                if (i_block_beg[s] < 0 && lk_mode[s] != 2) {
+                    continue;
+                }
+                labd_fuse(dp, q, lk_mode[s], k_adapt, long_ok);
+            }
+            if (lk.probe && ++lk_n_calls % 256 == 0) {
+                fprintf(stderr, "turbo-probe: dft-labd calls=%llu head hist=%llu agree=%llu tail=%llu drafter blocks skipped=%llu "
+                        "lookup tokens %llu accepted %llu (%.3f)\n",
+                        (unsigned long long) lk_n_calls, (unsigned long long) lk_n_hist, (unsigned long long) lk_n_agree,
+                        (unsigned long long) lk_n_tail, (unsigned long long) lk_n_skip, (unsigned long long) lk_n_tok,
+                        (unsigned long long) lk_n_acc, lk_n_tok ? (double) lk_n_acc / (double) lk_n_tok : 0.0);
+                fflush(stderr);
+            }
+        }
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+            if (i_block_beg[seq_id] >= 0 || (lk.on && lk_mode[seq_id] == 2 && dparams[seq_id].drafting)) {
+                ad_last[seq_id] = (int32_t) dparams[seq_id].result->size();
+            }
+        }
     }
 
     common_speculative_impl_draft_dflash(const common_params_speculative & params, uint32_t n_seq,
@@ -1694,6 +2221,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         this->n_max = this->params.n_max;
 
         adapt_init(); // [TAG_DFL_ADAPT]
+        labd_init();  // [TAG_DFL_LABD]
 
         batch        = llama_batch_init(llama_n_batch(ctx_dft), 0,          n_seq);
         batch_inject = llama_batch_init(llama_n_ubatch(ctx_dft), n_embd_enc, n_seq);
@@ -1779,6 +2307,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         std::fill(ad_rn.begin() + (size_t) seq_id*(n_max + 1), ad_rn.begin() + (size_t) (seq_id + 1)*(n_max + 1), 0.0f);
         ad_last[seq_id] = 0;
 
+        if (lk.on) {
+            labd_begin(seq_id, prompt); // [TAG_DFL_LABD]
+        }
+
         const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(params.ctx_dft), seq_id);
         if (pos_max < N - 1) {
             LOG_WRN("%s: ctx_dft pos_max=%d < N-1=%d - process() did not run on every prefill ubatch. "
@@ -1790,6 +2322,11 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     bool process(const llama_batch & batch_in) override {
         if (batch_in.n_tokens <= 0) {
             return true;
+        }
+
+        // [TAG_DFL_LABD] before any early return: every target batch updates the lookup history
+        if (lk.on) {
+            labd_track(batch_in);
         }
 
         // Target prefill may contain token IDs or multimodal embeddings. Both
@@ -2167,9 +2704,26 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         const int32_t k_adapt = ad.on ? adapt_choose(dparams) : params.n_max;
         const int32_t n_draft = ad.on ? adapt_block(k_adapt)  : params.n_max;
 
+        // [TAG_DFL_LABD] the lookup of every drafting sequence first: a head the history takes needs no drafter rows
+        std::vector<int8_t> lk_mode;
+        int32_t n_drafting = 0;
+        if (lk.on) {
+            lk_mode.assign(n_seq, 0);
+            for (llama_seq_id s = 0; s < (llama_seq_id) n_seq; ++s) {
+                if (dparams[s].drafting) {
+                    n_drafting++;
+                    lk_mode[s] = labd_find(s, dparams[s], k_adapt);
+                }
+            }
+        }
+
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             auto & dp = dparams[seq_id];
             if (!dp.drafting) {
+                continue;
+            }
+            if (lk.on && lk.skip && lk_mode[seq_id] == 2) {
+                lk_n_skip++;
                 continue;
             }
 
@@ -2186,6 +2740,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         }
 
         if (batch.n_tokens == 0) {
+            // [TAG_DFL_LABD] every drafting sequence takes its draft from the lookup: no drafter decode
+            draft_finish(dparams, i_block_beg, k_adapt, lk_mode, n_drafting);
             return;
         }
 
@@ -2367,14 +2923,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         }
 
         // [TAG_DFL_ADAPT] one common draft length for this step, then remember what each sequence was given
-        if (ad.on) {
-            adapt_cut(dparams, i_block_beg, k_adapt);
-        }
-        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
-            if (i_block_beg[seq_id] >= 0) {
-                ad_last[seq_id] = (int32_t) dparams[seq_id].result->size();
-            }
-        }
+        draft_finish(dparams, i_block_beg, k_adapt, lk_mode, n_drafting);
     }
 
     // [TAG_DFL_ADAPT] one Bernoulli trial per drafted position up to the first rejection: n_accepted successes, plus
@@ -2389,21 +2938,25 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         if (k <= 0) {
             return;
         }
-        const int32_t a = std::min<int32_t>(n_accepted, k);
-        // [TAG_DFL_ADAPT_REAL] realized tokens of this step (bonus token included) under length k
-        for (int32_t kk = 0; kk <= n_max; ++kk) {
-            const size_t i = (size_t) seq_id*(n_max + 1) + kk;
-            ad_rt[i] *= ad.rdecay;
-            ad_rn[i] *= ad.rdecay;
-        }
-        if (k <= n_max) {
-            const size_t i = (size_t) seq_id*(n_max + 1) + k;
-            ad_rt[i] += (float) (a + 1);
-            ad_rn[i] += 1.0f;
+        // [TAG_DFL_LABD] a step with lookup positions: the drafter's statistics take its own positions only (k_dr)
+        const int32_t k_dr = lk.on ? labd_accept(lks[seq_id], k, n_accepted) : k;
+        const int32_t a = std::min<int32_t>(n_accepted, k_dr);
+        // [TAG_DFL_ADAPT_REAL] realized tokens of this step (bonus token included) under length k; not for a lookup step
+        if (k_dr == k) {
+            for (int32_t kk = 0; kk <= n_max; ++kk) {
+                const size_t i = (size_t) seq_id*(n_max + 1) + kk;
+                ad_rt[i] *= ad.rdecay;
+                ad_rn[i] *= ad.rdecay;
+            }
+            if (k <= n_max) {
+                const size_t i = (size_t) seq_id*(n_max + 1) + k;
+                ad_rt[i] += (float) (a + 1);
+                ad_rn[i] += 1.0f;
+            }
         }
         for (int32_t j = 0; j < n_max; ++j) {
             const size_t i = (size_t) seq_id*n_max + j;
-            const float  t = j < k && j <= a ? 1.0f : 0.0f;   // position j was verified
+            const float  t = j < k_dr && j <= a ? 1.0f : 0.0f;   // position j was verified
             const float  o = j < a ? 1.0f : 0.0f;             // and accepted
             ad_tr[i]  = ad.decay*ad_tr[i] + t;
             ad_ok[i]  = ad.decay*ad_ok[i] + o;
@@ -3533,9 +4086,13 @@ int32_t common_speculative_n_max(const common_params_speculative * spec) {
             case COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE:
             case COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3:
             case COMMON_SPECULATIVE_TYPE_DRAFT_MTP:
+                n_max = std::max(n_max, std::max(0, spec->draft.n_max));
+                break;
             case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH:
             case COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK:
                 n_max = std::max(n_max, std::max(0, spec->draft.n_max));
+                // [TAG_DFL_LABD] lookup rows past the drafter's block (0 when off)
+                n_max = std::max(n_max, common_speculative_labd_n_max(spec->draft.n_max));
                 break;
             case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE:
                 n_max = std::max(n_max, (int32_t) spec->ngram_simple.size_m);
@@ -3570,6 +4127,7 @@ int32_t common_speculative_n_max(const common_speculative * spec) {
 
     for (const auto & impl : spec->impls) {
         n_max = std::max(n_max, std::max(0, impl->n_max));
+        n_max = std::max(n_max, impl->n_max_ext); // [TAG_DFL_LABD]
     }
 
     return n_max;
