@@ -80,7 +80,12 @@ static void dfl_head_init_extra(llama_model_dflash & m, int64_t n_vocab) {
         LLAMA_LOG_WARN("%s: [TAG_DFL_HEAD] %zu extra rows, keeping the first %zu\n", __func__, extra.size(), max_extra);
         extra.resize(max_extra);
     }
-    m.dfl_head_extra_f.assign(extra.begin(), extra.end());
+    // the same ids as f32 for the id map; token ids < 2^24 convert exactly
+    m.dfl_head_extra_f.clear();
+    m.dfl_head_extra_f.reserve(extra.size());
+    for (const int32_t id : extra) {
+        m.dfl_head_extra_f.push_back((float) id);
+    }
 }
 
 void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
