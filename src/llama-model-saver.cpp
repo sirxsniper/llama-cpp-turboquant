@@ -298,7 +298,22 @@ void llama_model_saver::add_kv_from_model() {
     add_kv(LLM_KV_ATTENTION_INDEXER_BLOCK_SIZE,      hparams.indexer_block_size);
     add_kv(LLM_KV_ATTENTION_INDEXER_LOCAL_BLOCKS,    hparams.indexer_local_blocks);
     add_kv(LLM_KV_ATTENTION_INDEXER_TYPES,           hparams.is_indexer_full_impl, true);
-    add_kv(LLM_KV_ATTENTION_RECURRENT_LAYERS,        hparams.is_recr_impl, true);
+    {
+        // [TAG_QWEN4EXP_MTP] one entry per layer, nextn layers included: the qwen4exp loader reads n_layer_all entries
+        // (as for the compress ratios below), so a trunk-only array would not load once the file has an MTP block.
+        // Without nextn layers this is the per-layer write above: n_layer_all == n_layer().
+        const uint32_t n_all = hparams.n_layer_all;
+        bool all_same = true;
+        for (uint32_t il = 1; il < n_all; ++il) {
+            all_same = all_same && hparams.is_recr_impl[il] == hparams.is_recr_impl[0];
+        }
+        if (n_all > 0 && all_same) {
+            add_kv(LLM_KV_ATTENTION_RECURRENT_LAYERS, hparams.is_recr_impl[0]);
+        } else if (n_all > 0) {
+            gguf_set_arr_data(gguf_ctx, llm_kv(LLM_KV_ATTENTION_RECURRENT_LAYERS).c_str(), GGUF_TYPE_BOOL,
+                    hparams.is_recr_impl.data(), n_all);
+        }
+    }
     add_kv(LLM_KV_ATTENTION_OUTPUT_GROUP_COUNT,      hparams.dsv4_o_group_count);
     add_kv(LLM_KV_ATTENTION_OUTPUT_LORA_RANK,        hparams.dsv4_o_lora_rank);
     add_kv(LLM_KV_ATTENTION_COMPRESS_ROPE_FREQ_BASE, hparams.dsv4_compress_rope_base);
