@@ -148,6 +148,45 @@ static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float m
     }
 }
 
+// [TAG_Q2_0_CPU] raw Q2_0 blocks (fp16 scale + 16 bytes of 2 bit codes) with every code: the reference quantizer
+// never writes code 3 (weight +2)
+static std::vector<uint8_t> make_q2_0_blocks(size_t nblocks, std::default_random_engine & gen) {
+    const size_t block_size = ggml_type_size(GGML_TYPE_Q2_0);
+    std::vector<uint8_t> data(nblocks * block_size);
+    std::uniform_real_distribution<float> scale(-1.0f, 1.0f);
+    std::uniform_int_distribution<int> byte(0, 255);
+    for (size_t i = 0; i < nblocks; i++) {
+        const ggml_fp16_t d = ggml_fp32_to_fp16(scale(gen));
+        memcpy(data.data() + i * block_size, &d, sizeof(d));
+        for (size_t j = sizeof(d); j < block_size; j++) {
+            data[i * block_size + j] = (uint8_t) byte(gen);
+        }
+    }
+    return data;
+}
+
+static void init_tensor_q2_0_codes(ggml_tensor * tensor) {
+    GGML_ASSERT(tensor->type == GGML_TYPE_Q2_0 && ggml_is_contiguous(tensor));
+    std::default_random_engine gen(std::random_device{}());
+    const std::vector<uint8_t> data = make_q2_0_blocks(ggml_nelements(tensor) / ggml_blck_size(tensor->type), gen);
+    ggml_backend_tensor_set(tensor, data.data(), 0, data.size());
+}
+
+static bool backend_is_cpu(ggml_backend_t backend) {
+    return ggml_backend_dev_type(ggml_backend_get_device(backend)) == GGML_BACKEND_DEVICE_TYPE_CPU;
+}
+
+// [TAG_Q2_0_CPU] error allowed between the CPU Q2_0 kernels and the scalar one of the use_ref CPU backend. Same integer
+// sums and float steps: 0 where the compiler does not contract a*b + c (MSVC); elsewhere a contraction the compiler
+// makes in one of the two and not in the other can change a rounding
+static double q2_0_cpu_max_nmse() {
+#if defined(_MSC_VER) && !defined(__clang__)
+    return 0.0;
+#else
+    return 1e-12;
+#endif
+}
+
 // generate an F16 mask where certain blocks are randomly masked with -INF value
 static void init_tensor_kq_mask(ggml_tensor * tensor, float min = -1.0f, float max = 1.0f) {
     GGML_ASSERT(tensor->type == GGML_TYPE_F16);
@@ -5610,7 +5649,22 @@ struct test_mul_mat : public test_case {
         if ((type_a == GGML_TYPE_MXFP4 || type_a == GGML_TYPE_NVFP4) && backend_has_feature(backend, "BLACKWELL_NATIVE_FP4")) {
             return 2e-2;
         }
+        // [TAG_Q2_0_CPU] the CPU Q2_0 kernels against the scalar one of the use_ref CPU backend
+        if (type_a == GGML_TYPE_Q2_0 && backend_is_cpu(backend)) {
+            return q2_0_cpu_max_nmse();
+        }
         return max_nmse_err();
+    }
+
+    // [TAG_Q2_0_CPU] every 2 bit code in Q2_0 weights
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_Q2_0 && t->view_src == nullptr && ggml_is_contiguous(t)) {
+                init_tensor_q2_0_codes(t);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
     }
 
     int64_t grad_nmax() override {
@@ -5788,6 +5842,8 @@ static void init_mul_mat_id_tensors(ggml_context * ctx, int n_mats, float amax =
     for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
         if (t->type == GGML_TYPE_I32) {
             continue;
+        } else if (t->type == GGML_TYPE_Q2_0 && t->view_src == nullptr && ggml_is_contiguous(t)) {
+            init_tensor_q2_0_codes(t); // [TAG_Q2_0_CPU] every 2 bit code
         } else if (amax != 1.0f && t->type == GGML_TYPE_F32) {
             init_tensor_uniform(t, -amax, amax);
         } else {
@@ -5821,6 +5877,10 @@ struct test_mul_mat_id : public test_case {
         // for blackwell we quantize activations to mxfp4 instead of q8_1 so we add higher tolerance
         if ((type_a == GGML_TYPE_MXFP4 || type_a == GGML_TYPE_NVFP4) && backend_has_feature(backend, "BLACKWELL_NATIVE_FP4")) {
             return 2e-2;
+        }
+        // [TAG_Q2_0_CPU] the CPU Q2_0 kernels against the scalar one of the use_ref CPU backend
+        if (type_a == GGML_TYPE_Q2_0 && backend_is_cpu(backend)) {
+            return q2_0_cpu_max_nmse();
         }
         return max_nmse_err();
     }
@@ -12335,6 +12395,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                              GGML_TYPE_IQ3_S, GGML_TYPE_IQ1_S, GGML_TYPE_IQ1_M, GGML_TYPE_IQ4_XS}) {
         test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 16, 10, 256, {1, 1}, {1, 1}));
     }
+
+    // [TAG_Q2_0_CPU] Q2_0 rows of 1..5 and 65 blocks: the 4 block loop of the x86 dot product and its tail
+    for (int64_t k : {64, 128, 192, 256, 320, 4160}) {
+        for (int n : {1, 3, 8}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q2_0, GGML_TYPE_F32, 24, n, k, {1, 1}, {1, 1}));
+        }
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q2_0, GGML_TYPE_F32, 8, 2, false, 16, 5, k));
+    }
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q2_0, GGML_TYPE_F32, 4, 4, true, 32, 1, 320));
 #else
     // m = a rows
     // n = b rows
@@ -14687,6 +14756,172 @@ static bool run_fa_vec_slice(ggml_backend_t backend, ggml_backend_t backend_cpu,
     return n_fail == 0;
 }
 
+// [TAG_Q2_0_CPU] one MUL_MAT (n_exp == 0) or MUL_MAT_ID case: Q2_0 weights in the CPU_REPACK buffer on the tested CPU
+// backend against plain weights on the use_ref CPU backend (scalar dot product), within q2_0_cpu_max_nmse().
+// Returns false on a mismatch; *supported is false when the repack buffer does not take the weights.
+static bool run_cpu_q2_0_repack_case(ggml_backend_t backend, ggml_backend_t backend_ref, ggml_backend_buffer_type_t buft_repack,
+                                     int64_t k, int64_t m, int64_t n, int n_exp, int n_used, bool * supported) {
+    const bool id = n_exp > 0;
+    std::default_random_engine gen(std::random_device{}());
+
+    const std::vector<uint8_t> a_data = make_q2_0_blocks((size_t) (k / ggml_blck_size(GGML_TYPE_Q2_0)) * m * (id ? n_exp : 1), gen);
+
+    std::vector<float> b_data((size_t) k * (id ? n_used : 1) * n);
+    std::uniform_real_distribution<float> uni(-1.0f, 1.0f);
+    for (float & v : b_data) {
+        v = uni(gen);
+    }
+
+    std::vector<int32_t> ids_data;
+    if (id) {
+        std::vector<int32_t> experts(n_exp);
+        for (int i = 0; i < n_exp; i++) {
+            experts[i] = i;
+        }
+        for (int64_t t = 0; t < n; t++) {
+            std::shuffle(experts.begin(), experts.end(), gen);
+            ids_data.insert(ids_data.end(), experts.begin(), experts.begin() + n_used);
+        }
+    }
+
+    std::vector<float> out[2];
+    for (int v = 0; v < 2; v++) {
+        // v == 0: tested backend with repacked weights, v == 1: reference
+        ggml_backend_t be = v == 0 ? backend : backend_ref;
+
+        ggml_init_params params = {
+            /* .mem_size = */ ggml_tensor_overhead()*8 + ggml_graph_overhead(),
+            /* .mem_base = */ NULL,
+            /* .no_alloc = */ true,
+        };
+        ggml_context_ptr ctx_w(ggml_init(params));
+        ggml_context_ptr ctx(ggml_init(params));
+
+        ggml_tensor * a   = id ? ggml_new_tensor_3d(ctx_w.get(), GGML_TYPE_Q2_0, k, m, n_exp) : ggml_new_tensor_2d(ctx_w.get(), GGML_TYPE_Q2_0, k, m);
+        ggml_tensor * b   = nullptr;
+        ggml_tensor * ids = nullptr;
+        ggml_tensor * o   = nullptr;
+        if (id) {
+            b   = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, k, n_used, n);
+            ids = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, n_used, n);
+            o   = ggml_mul_mat_id(ctx.get(), a, b, ids);
+        } else {
+            b = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, k, n);
+            o = ggml_mul_mat(ctx.get(), a, b);
+        }
+
+        ggml_backend_buffer_ptr buf_w(v == 0 ? ggml_backend_alloc_ctx_tensors_from_buft(ctx_w.get(), buft_repack)
+                                             : ggml_backend_alloc_ctx_tensors(ctx_w.get(), be));
+        ggml_backend_buffer_ptr buf(ggml_backend_alloc_ctx_tensors(ctx.get(), be));
+        if (buf_w == nullptr || buf == nullptr) {
+            printf("  Q2_0 repack: failed to allocate tensors\n");
+            return false;
+        }
+
+        // the repack buffer takes only the types and shapes it has a layout for (and Q2_0 only when enabled);
+        // decided before the weights are written, as writing them repacks
+        if (!ggml_backend_supports_op(be, o)) {
+            *supported = false;
+            return true;
+        }
+
+        ggml_backend_tensor_set(a, a_data.data(), 0, a_data.size());
+        ggml_backend_tensor_set(b, b_data.data(), 0, b_data.size() * sizeof(float));
+        if (ids) {
+            ggml_backend_tensor_set(ids, ids_data.data(), 0, ids_data.size() * sizeof(int32_t));
+        }
+
+        ggml_cgraph * gf = ggml_new_graph(ctx.get());
+        ggml_build_forward_expand(gf, o);
+        if (ggml_backend_graph_compute(be, gf) != GGML_STATUS_SUCCESS) {
+            printf("  Q2_0 repack: graph compute failed\n");
+            return false;
+        }
+
+        out[v].resize(ggml_nelements(o));
+        ggml_backend_tensor_get(o, out[v].data(), 0, ggml_nbytes(o));
+    }
+
+    size_t n_diff   = 0;
+    double max_diff = 0.0;
+    for (size_t i = 0; i < out[0].size(); i++) {
+        if (memcmp(&out[0][i], &out[1][i], sizeof(float)) != 0) {
+            n_diff++;
+            max_diff = std::max(max_diff, (double) std::fabs(out[0][i] - out[1][i]));
+        }
+    }
+    const double err = nmse(out[1].data(), out[0].data(), out[0].size());
+    const bool   ok  = n_diff == 0 || err <= q2_0_cpu_max_nmse();
+    if (n_diff > 0) {
+        printf("  %s Q2_0 repack %s k=%" PRId64 " m=%" PRId64 " n=%" PRId64 " n_exp=%d n_used=%d: %zu of %zu values differ, max |diff| %g, NMSE %g\n",
+               ok ? "note:" : "FAIL", id ? "MUL_MAT_ID" : "MUL_MAT", k, m, n, n_exp, n_used, n_diff, out[0].size(), max_diff, err);
+    }
+    return ok;
+}
+
+// [TAG_Q2_0_CPU] the Q2_0 8x8 repack path (GGML_CPU_Q2_0_REPACK=1) against the scalar reference. test_case::eval cannot
+// hold a repacked weight: comparing copies the graph, which reads the weight back, and the repack buffer cannot.
+static bool run_cpu_q2_0_repack(ggml_backend_t backend, ggml_backend_t backend_ref, const char * op_names_filter) {
+    if (!backend_is_cpu(backend)) {
+        return true;
+    }
+    const bool do_mm   = op_names_filter_selects(op_names_filter, "MUL_MAT");
+    const bool do_mmid = op_names_filter_selects(op_names_filter, "MUL_MAT_ID");
+    if (!do_mm && !do_mmid) {
+        return true;
+    }
+
+    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    auto get_extra_bufts = (ggml_backend_dev_get_extra_bufts_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_get_extra_bufts");
+    ggml_backend_buffer_type_t buft_repack = nullptr;
+    if (get_extra_bufts) {
+        for (ggml_backend_buffer_type_t * b = get_extra_bufts(dev); b && *b; ++b) {
+            if (strcmp(ggml_backend_buft_name(*b), "CPU_REPACK") == 0) {
+                buft_repack = *b;
+            }
+        }
+    }
+    if (buft_repack == nullptr) {
+        return true;
+    }
+
+    struct q2_0_case { int64_t k, m, n; int n_exp, n_used; };
+    // n > 3 runs the 4 row gemm on n - n % 4 rows and the gemv on the rest; 4160 = 65 blocks crosses the chunks of
+    // both kernels (64 and 32 blocks)
+    const q2_0_case cases[] = {
+        {   64,  8,  1, 0, 0 },
+        {  192, 16,  3, 0, 0 },
+        {  320, 24,  4, 0, 0 },
+        {  256, 64, 13, 0, 0 },
+        { 4160, 16,  7, 0, 0 },
+        { 2112,  8, 33, 0, 0 },
+        {  128, 16,  1, 4, 2 },
+        {  320, 32,  5, 8, 3 },
+        { 4160, 16,  3, 4, 4 },
+    };
+
+    int n_run  = 0;
+    int n_fail = 0;
+    for (const q2_0_case & c : cases) {
+        if (!(c.n_exp > 0 ? do_mmid : do_mm)) {
+            continue;
+        }
+        bool supported = true;
+        const bool ok = run_cpu_q2_0_repack_case(backend, backend_ref, buft_repack, c.k, c.m, c.n, c.n_exp, c.n_used, &supported);
+        if (!supported) {
+            printf("  Q2_0 repack: not enabled (GGML_CPU_Q2_0_REPACK=1 on an AVX2 build), skipped\n");
+            return true;
+        }
+        n_run++;
+        n_fail += ok ? 0 : 1;
+    }
+
+    printf("  Q2_0 repack vs scalar reference: %d cases run, %d failed\n", n_run, n_fail);
+
+    return n_fail == 0;
+}
+
 static bool test_backend(ggml_backend_t backend, ggml_backend_dev_t dev, test_mode mode, const char * op_names_filter, const char * params_filter,
                          printer * output_printer, const char * test_file_path, int parallel_workers) {
     auto filter_test_cases = [](std::vector<std::unique_ptr<test_case>> & test_cases, const char * params_filter) {
@@ -14826,7 +15061,9 @@ static bool test_backend(ggml_backend_t backend, ggml_backend_dev_t dev, test_mo
 
         const bool slice_ok = run_fa_vec_slice(backend, backend_cpu.get(), op_names_filter);
 
-        return n_ok == tests_run && slice_ok;
+        const bool q2_0_repack_ok = run_cpu_q2_0_repack(backend, backend_cpu.get(), op_names_filter); // [TAG_Q2_0_CPU]
+
+        return n_ok == tests_run && slice_ok && q2_0_repack_ok;
     }
 
     if (mode == MODE_GRAD) {

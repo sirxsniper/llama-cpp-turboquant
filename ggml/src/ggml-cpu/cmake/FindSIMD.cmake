@@ -98,3 +98,74 @@ if (NOT ${AVX512_FOUND})
 else()
     set(GGML_AVX512 ON)
 endif()
+
+# [TAG_Q2_0_CPU] MSVC defines no macros for the AVX512 extensions or BMI2, so /arch:AVX512 alone leaves their code paths
+# off. Opt-in: run a probe for each on the build machine and turn on the ones it has. VNNI, VBMI and BMI2 are integer
+# instructions (same results expected); BF16 has its own switch as its dot product rounds differently.
+set(AVX512_VNNI_CODE "
+    #include <immintrin.h>
+    int main(int argc, char ** argv)
+    {
+        (void) argv;
+        __m512i a = _mm512_set1_epi8((char) argc);
+        __m512i c = _mm512_dpbusd_epi32(_mm512_setzero_si512(), a, a);
+        return _mm_cvtsi128_si32(_mm512_castsi512_si128(c)) == 4*argc*argc ? 0 : 1;
+    }
+")
+
+set(AVX512_VBMI_CODE "
+    #include <immintrin.h>
+    int main(int argc, char ** argv)
+    {
+        (void) argv;
+        __m512i a = _mm512_set1_epi8((char) argc);
+        __m512i c = _mm512_multishift_epi64_epi8(_mm512_setzero_si512(), a);
+        return (_mm_cvtsi128_si32(_mm512_castsi512_si128(c)) & 0xFF) == argc ? 0 : 1;
+    }
+")
+
+set(AVX512_BF16_CODE "
+    #include <immintrin.h>
+    int main(int argc, char ** argv)
+    {
+        (void) argv;
+        __m512 a = _mm512_set1_ps((float) argc);
+        __m512 c = _mm512_dpbf16_ps(_mm512_setzero_ps(), _mm512_cvtne2ps_pbh(a, a), _mm512_cvtne2ps_pbh(a, a));
+        return _mm_cvtss_f32(_mm512_castps512_ps128(c)) == 2.0f*argc*argc ? 0 : 1;
+    }
+")
+
+set(BMI2_CODE "
+    #include <immintrin.h>
+    int main(int argc, char ** argv)
+    {
+        (void) argv;
+        return _pdep_u32((unsigned) argc, 0xFFu) == (unsigned) argc ? 0 : 1;
+    }
+")
+
+if (GGML_NATIVE_MSVC_EXT)
+    check_sse("BMI2" " ;/arch:AVX2")
+    if (${BMI2_FOUND})
+        set(GGML_BMI2 ON)
+    endif()
+    if (${AVX512_FOUND})
+        check_sse("AVX512_VNNI" " ;/arch:AVX512")
+        if (${AVX512_VNNI_FOUND})
+            set(GGML_AVX512_VNNI ON)
+        endif()
+        check_sse("AVX512_VBMI" " ;/arch:AVX512")
+        if (${AVX512_VBMI_FOUND})
+            set(GGML_AVX512_VBMI ON)
+        endif()
+    endif()
+    message(STATUS "GGML_NATIVE_MSVC_EXT: BMI2 ${BMI2_FOUND}, AVX512-VNNI ${AVX512_VNNI_FOUND}, AVX512-VBMI ${AVX512_VBMI_FOUND}")
+endif()
+
+if (GGML_NATIVE_MSVC_BF16 AND ${AVX512_FOUND})
+    check_sse("AVX512_BF16" " ;/arch:AVX512")
+    if (${AVX512_BF16_FOUND})
+        set(GGML_AVX512_BF16 ON)
+    endif()
+    message(STATUS "GGML_NATIVE_MSVC_BF16: AVX512-BF16 ${AVX512_BF16_FOUND}")
+endif()

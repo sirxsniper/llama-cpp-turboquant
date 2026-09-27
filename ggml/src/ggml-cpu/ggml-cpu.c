@@ -8,6 +8,7 @@
 #include "ggml-cpu-impl.h"
 #include "ggml-impl.h"
 #include "quants.h"
+#include "arch-fallback.h" // [TAG_Q2_0_CPU] names the generic Q2_0 dot of this arch
 #include "ggml-quants.h"
 #include "ggml-threading.h"
 #include "unary-ops.h"
@@ -1219,6 +1220,18 @@ void ggml_set_f32_nd(const struct ggml_tensor * tensor, int i0, int i1, int i2, 
 
 ////////////////////////////////////////////////////////////////////////////////
 
+// [TAG_Q2_0_CPU] SIMD Q2_0 dot product on x86, off by default; initialized once in ggml_cpu_init(), read-only afterwards
+bool ggml_cpu_q2_0_simd = false;
+
+// [TAG_Q2_0_CPU] the use_ref backend (the reference of test-backend-ops -b CPU) runs the scalar Q2_0 dot product, so the
+// SIMD one is compared against it
+static inline ggml_vec_dot_t ggml_cpu_mul_mat_vec_dot(enum ggml_type type, bool use_ref) {
+    if (use_ref && type == GGML_TYPE_Q2_0) {
+        return ggml_vec_dot_q2_0_q8_0_generic;
+    }
+    return type_traits_cpu[type].vec_dot;
+}
+
 // ggml_compute_forward_mul_mat
 
 static void ggml_compute_forward_mul_mat_one_chunk(
@@ -1238,7 +1251,7 @@ static void ggml_compute_forward_mul_mat_one_chunk(
 
     const bool src1_cont = ggml_is_contiguous(src1);
 
-    ggml_vec_dot_t const vec_dot      = type_traits_cpu[type].vec_dot;
+    ggml_vec_dot_t const vec_dot      = ggml_cpu_mul_mat_vec_dot(type, params->use_ref);
     enum ggml_type const vec_dot_type = type_traits_cpu[type].vec_dot_type;
 
     // broadcast factors
@@ -1549,13 +1562,14 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
     const struct mmid_row_mapping * matrix_rows,
     const size_t row_size,
     const bool src1_cont,
-    const void * wdata) {
+    const void * wdata,
+    const bool use_ref) {
 
     GGML_TENSOR_BINARY_OP_LOCALS
 
     const enum ggml_type type = src0->type;
 
-    ggml_vec_dot_t    const vec_dot      = type_traits_cpu[type].vec_dot;
+    ggml_vec_dot_t    const vec_dot      = ggml_cpu_mul_mat_vec_dot(type, use_ref);
     enum ggml_type    const vec_dot_type = type_traits_cpu[type].vec_dot_type;
 
     const int64_t blck_0 = 16;
@@ -1860,7 +1874,7 @@ static void ggml_compute_forward_mul_mat_id(
             ggml_compute_forward_mul_mat_id_one_chunk(
                 dst, src0, src1, ids, cur_a,
                 ir0_start, ir0_end, ir1_start, ir1_end,
-                src0_cur, matrix_rows, row_size, src1_cont, wdata
+                src0_cur, matrix_rows, row_size, src1_cont, wdata, params->use_ref
             );
 
             if (nth >= nchunk0 * nchunk1) {
@@ -4228,6 +4242,12 @@ void ggml_cpu_init(void) {
         {
             const char * env = getenv("GGML_CPU_DISABLE_FUSION");
             ggml_cpu_disable_fusion = (env != NULL && atoi(env) == 1);
+        }
+
+        {
+            // [TAG_Q2_0_CPU]
+            const char * env = getenv("GGML_CPU_Q2_0_SIMD");
+            ggml_cpu_q2_0_simd = (env != NULL && atoi(env) == 1);
         }
 
         is_first_call = false;

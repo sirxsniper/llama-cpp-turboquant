@@ -11,6 +11,9 @@
 extern "C" {
 #endif
 
+// [TAG_Q2_0_CPU] SIMD Q2_0 dot product on x86, off by default: set once in ggml_cpu_init() from GGML_CPU_Q2_0_SIMD=1
+extern bool ggml_cpu_q2_0_simd;
+
 // Quantization
 void quantize_row_q1_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k);
 void quantize_row_q2_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k);
