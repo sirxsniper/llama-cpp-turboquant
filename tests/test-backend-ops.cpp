@@ -7898,7 +7898,13 @@ struct test_mul_mat_shared_src1 : public test_case {
     const bool    reshape_third;
 
     std::string vars() override {
-        return VARS_TO_STR5(types, rows, cols, k, reshape_third);
+        // GGML_TYPE_COUNT marks an unused slot: ggml_type_name() has no entry for it (an out-of-bounds read)
+        std::string ts = "types=[";
+        for (size_t i = 0; i < types.size(); ++i) {
+            ts += (i > 0 ? "," : "");
+            ts += types[i] == GGML_TYPE_COUNT ? "none" : ggml_type_name(types[i]);
+        }
+        return ts + "]," + VARS_TO_STR4(rows, cols, k, reshape_third);
     }
 
     std::string op_desc(ggml_tensor * t) override {
