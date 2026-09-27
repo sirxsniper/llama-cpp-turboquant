@@ -639,7 +639,8 @@ static bool llama_kv_resolve_attn_layer(const llama_model & model, llama_context
     // dense MTP heads of hybrid models get a plain attention cache over the nextn layers
     const bool mtp_on_hybrid = mtp &&
         (arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE ||
-         arch == LLM_ARCH_BAILINGMOE3 || arch == LLM_ARCH_NEMOTRON_H_MOE);
+         arch == LLM_ARCH_BAILINGMOE3 || arch == LLM_ARCH_NEMOTRON_H_MOE ||
+         arch == LLM_ARCH_QWEN4EXP);   // [TAG_QWEN4EXP_MTP]
 
     if (llm_arch_is_hybrid(arch) && !mtp_on_hybrid) {
         switch (arch) {
@@ -672,7 +673,7 @@ static bool llama_kv_resolve_attn_layer(const llama_model & model, llama_context
 
 // [TAG_KV_RESOLVE] archs whose attention input has no turbo query rotation (llama-graph.cpp: build_attn for
 // llm_graph_input_attn_k_dsa / k_dsa_iswa / k_iswa): a turbo cache there would be read without the rotation
-static bool llama_kv_resolve_turbo_graph(const llama_model & model) {
+static bool llama_kv_resolve_turbo_graph(const llama_model & model, llama_context_type ctx_type) {
     switch (model.arch) {
         case LLM_ARCH_DEEPSEEK32:
         case LLM_ARCH_GLM_DSA:
@@ -689,6 +690,11 @@ static bool llama_kv_resolve_turbo_graph(const llama_model & model) {
                 // build_attn_qsa) call build_attn_mha without the forward WHT on Q; dense-only checkpoints are fine
                 const auto & hp = model.hparams;
                 if (hp.indexer_head_size == 0) {
+                    return true;
+                }
+                // [TAG_QWEN4EXP_MTP] an MTP context holds only the nextn block, and graph_mtp runs it through the
+                // dense build_attn (no indexer cache there), which applies the rotation
+                if (ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
                     return true;
                 }
                 for (uint32_t il = 0; il < hp.n_layer_all && il < LLAMA_MAX_LAYERS; ++il) {
@@ -811,7 +817,7 @@ static llama_kv_resolve_input llama_kv_resolve_make_input(const llama_model & mo
     in.no_kv          = llm_arch_is_recurrent(model.arch);
     in.mla            = hp.is_mla();
     in.same_type      = hp.is_mla() || model.arch == LLM_ARCH_DEEPSEEK4;
-    in.turbo_graph    = llama_kv_resolve_turbo_graph(model);
+    in.turbo_graph    = llama_kv_resolve_turbo_graph(model, params.ctx_type);
     in.swa            = hp.swa_type != LLAMA_SWA_TYPE_NONE || hp.n_swa > 0;
     in.shared_cells   = model.arch == LLM_ARCH_GEMMA4_ASSISTANT && params.ctx_other != nullptr;
     in.iswa           = llama_kv_resolve_iswa_memory(model, params.ctx_type);   // [TAG_TURBOT_ANY_ISWA]

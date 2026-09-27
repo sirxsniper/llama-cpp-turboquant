@@ -9,8 +9,10 @@
 
 // TODO: replace with #include "llama-ext.h" in the future
 #include "../src/llama-arch.h"
+#include "../src/llama-ext.h"   // [TAG_QWEN4EXP_MTP] llama_set_embeddings_nextn / llama_get_embeddings_nextn(_ith)
 #include "../src/llama-model-saver.h"
 
+#include <algorithm>
 #include <cinttypes>
 #include <cmath>
 #include <cstddef>
@@ -94,12 +96,14 @@ static void usage(char ** argv) {
     LOG("  -o, --out <dir>          Save generated test models to <dir> instead of running backend tests\n");
     LOG("  -v <N>                   Set log verbosity level\n");
     LOG("  -b, --backend <backend>  Run only on the given backend device\n");
+    LOG("  --mtp                    Test the in-model MTP head instead (archs with an MTP fixture: qwen4exp)\n");
     LOG("  -h, --help               Show this help message\n\n");
     LOG("Examples:\n");
     LOG("  %s\n", argv[0]);
     LOG("  %s -a qwen35moe\n", argv[0]);
     LOG("  %s -a deepseek4 -o tests/test-models/\n", argv[0]);
     LOG("  %s -a cohere2moe -v 5\n", argv[0]);
+    LOG("  %s -a qwen4exp --mtp\n", argv[0]);
 }
 
 static std::vector<llama_token> get_tokens(const uint32_t n_tokens, const uint32_t n_vocab, const size_t seed){
@@ -908,6 +912,281 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
     return all_ok ? 0 : 1;
 }
 
+// [TAG_QWEN4EXP_MTP] --mtp: the in-model MTP (nextn) head, for the archs whose fixture can carry one.
+// Per device: asking the target for h_nextn (masked or not) must not change its logits, the MTP context must run
+// on the target's h_nextn rows and give finite logits that match the CPU, and a save/load round trip must keep the
+// head (load_mtp = true) or skip it without changing the trunk (load_mtp = false).
+static bool mtp_fixture_supported(const llm_arch arch) {
+    return arch == LLM_ARCH_QWEN4EXP;
+}
+
+// the MoE fixture plus one dense nextn block after the trunk
+static gguf_context_ptr get_gguf_ctx_mtp(const llm_arch arch) {
+    gguf_context_ptr ret = get_gguf_ctx(arch, /*moe =*/ true);
+    llama_model_saver ms(arch, ret.get());
+
+    const int64_t kid = gguf_find_key(ret.get(), ms.llm_kv(LLM_KV_BLOCK_COUNT).c_str());
+    GGML_ASSERT(kid >= 0);
+    const uint32_t n_layer = gguf_get_val_u32(ret.get(), kid);
+
+    std::vector<uint32_t> compress_ratios(n_layer, 4);
+    compress_ratios.push_back(0);
+
+    ms.add_kv(LLM_KV_BLOCK_COUNT,               n_layer + 1);
+    ms.add_kv(LLM_KV_NEXTN_PREDICT_LAYERS,      uint32_t(1));
+    ms.add_kv(LLM_KV_ATTENTION_COMPRESS_RATIOS, compress_ratios);
+
+    return ret;
+}
+
+static llama_model_ptr get_model_mtp(struct gguf_context * gguf_ctx, FILE * file, const size_t seed, const float stdev,
+        const std::vector<ggml_backend_dev_t> & devs, const bool load_mtp) {
+    GGML_ASSERT((gguf_ctx == nullptr) != (file == nullptr));
+    llama_model_params model_params = llama_model_default_params();
+    model_params.progress_callback = silent_model_load_progress;
+    std::vector<ggml_backend_dev_t> devs_copy = devs;
+    devs_copy.push_back(nullptr);
+    model_params.devices  = devs_copy.data();
+    model_params.load_mtp = load_mtp;
+
+    tensor_data_params tensor_params = { seed, stdev };
+    llama_model_ptr model(gguf_ctx != nullptr ?
+        llama_model_init_from_user(gguf_ctx, set_tensor_data, &tensor_params, model_params) :
+        llama_model_load_from_file_ptr(file, model_params));
+    if (!model) {
+        throw std::runtime_error("failed to create llama model");
+    }
+    return model;
+}
+
+static llama_context_ptr get_ctx_mtp(llama_model * model, const enum llama_context_type ctx_type) {
+    llama_context_params ctx_params = llama_context_default_params();
+    ctx_params.n_ctx           = 0;
+    ctx_params.n_threads       = 4;
+    ctx_params.n_threads_batch = 4;
+    ctx_params.n_ubatch        = 64;
+    ctx_params.ctx_type        = ctx_type;
+    llama_context_ptr lctx(llama_init_from_model(model, ctx_params));
+    if (!lctx) {
+        throw std::runtime_error("failed to create llama context");
+    }
+    return lctx;
+}
+
+// target logits, and the h_nextn row of every token when nextn is on
+static std::vector<float> get_logits_tgt(llama_model * model, const std::vector<llama_token> & tokens,
+        const bool nextn, const bool masked, std::vector<float> * h_out) {
+    llama_context_ptr lctx = get_ctx_mtp(model, LLAMA_CONTEXT_TYPE_DEFAULT);
+    if (nextn) {
+        llama_set_embeddings_nextn(lctx.get(), true, masked);
+    }
+    std::vector<float> ret = get_logits(model, lctx.get(), tokens);
+    if (h_out != nullptr) {
+        const size_t n_embd = llama_model_n_embd_out(model);
+        const float * h = llama_get_embeddings_nextn(lctx.get());
+        if (h == nullptr) {
+            throw std::runtime_error("target returned no nextn embeddings");
+        }
+        h_out->assign(h, h + tokens.size()*n_embd);
+    }
+    return ret;
+}
+
+// one MTP pass over the prompt (token i paired with the target's h of token i-1, as the MTP driver does), then one
+// chained draft step on the head's own h; returns the logits of every row of both
+static std::vector<float> get_logits_mtp(llama_model * model, const std::vector<llama_token> & tokens,
+        const std::vector<float> & h_tgt) {
+    const uint32_t n_vocab  = llama_vocab_n_tokens(llama_model_get_vocab(model));
+    const int32_t  n_embd   = llama_model_n_embd_out(model);
+    const uint32_t n_tokens = tokens.size();
+    GGML_ASSERT(h_tgt.size() == (size_t) n_tokens*n_embd);
+
+    llama_context_ptr lctx = get_ctx_mtp(model, LLAMA_CONTEXT_TYPE_MTP);
+    llama_set_embeddings_nextn(lctx.get(), true, /*masked*/ true);
+
+    std::vector<float> ret;
+    ret.reserve((size_t) (n_tokens + 1)*n_vocab);
+
+    // llama_batch_init allocates only one of token/embd, and the MTP graph needs both
+    llama_batch batch = llama_batch_init(n_tokens, n_embd, 1);
+    batch.token = (llama_token *) malloc(sizeof(llama_token)*n_tokens);
+
+    for (uint32_t i = 0; i < n_tokens; i++) {
+        batch.token[i]     = tokens[i];
+        batch.pos[i]       = i;
+        batch.n_seq_id[i]  = 1;
+        batch.seq_id[i][0] = 0;
+        batch.logits[i]    = true;
+        float * row = batch.embd + (size_t) i*n_embd;
+        if (i == 0) {
+            std::fill(row, row + n_embd, 0.0f);
+        } else {
+            std::copy(h_tgt.begin() + (size_t) (i - 1)*n_embd, h_tgt.begin() + (size_t) i*n_embd, row);
+        }
+    }
+    batch.n_tokens = n_tokens;
+    if (llama_decode(lctx.get(), batch)) {
+        llama_batch_free(batch);
+        throw std::runtime_error("failed to decode the MTP batch");
+    }
+    for (uint32_t i = 0; i < n_tokens; i++) {
+        const float * logits_ith = llama_get_logits_ith(lctx.get(), i);
+        ret.insert(ret.end(), logits_ith, logits_ith + n_vocab);
+    }
+
+    // chained step: the next draft reads the head's own h of the last row
+    const float * h_last = llama_get_embeddings_nextn_ith(lctx.get(), n_tokens - 1);
+    if (h_last == nullptr) {
+        llama_batch_free(batch);
+        throw std::runtime_error("MTP context returned no nextn embeddings");
+    }
+    batch.token[0]     = tokens[0];
+    batch.pos[0]       = n_tokens;
+    batch.n_seq_id[0]  = 1;
+    batch.seq_id[0][0] = 0;
+    batch.logits[0]    = true;
+    std::copy(h_last, h_last + n_embd, batch.embd);
+    batch.n_tokens = 1;
+    if (llama_decode(lctx.get(), batch)) {
+        llama_batch_free(batch);
+        throw std::runtime_error("failed to decode the chained MTP step");
+    }
+    const float * logits_last = llama_get_logits_ith(lctx.get(), 0);
+    ret.insert(ret.end(), logits_last, logits_last + n_vocab);
+
+    llama_batch_free(batch);
+    return ret;
+}
+
+static bool all_finite(const std::vector<float> & v) {
+    for (const float x : v) {
+        if (!std::isfinite(x)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static int test_mtp(const std::string & arch_filter, const size_t seed, const float stdev, const int verbosity, const char * target_backend) {
+    struct user_data_t {
+        struct {
+            ggml_log_callback callback;
+            void * user_data;
+        } log_old;
+
+        int verbosity;
+
+        user_data_t(int verbosity) : verbosity(verbosity) {
+            llama_log_get(&log_old.callback, &log_old.user_data);
+        }
+    };
+    user_data_t ud(verbosity);
+
+    llama_log_set([](ggml_log_level level, const char * text, void * user_data) {
+        const user_data_t * ud = (const user_data_t *) user_data;
+        int verbosity = common_log_get_verbosity(level);
+        if (verbosity <= ud->verbosity) {
+            ud->log_old.callback(level, text, ud->log_old.user_data);
+        }
+    }, &ud);
+
+    const std::vector<llama_token> tokens = get_tokens(128, 128, seed);
+
+    // the CPU first: every other device is compared against it
+    std::vector<std::pair<std::string, std::vector<ggml_backend_dev_t>>> dev_configs;
+    dev_configs.emplace_back("CPU", std::vector<ggml_backend_dev_t>{});
+    for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        if (ggml_backend_dev_buffer_type(dev) == ggml_backend_cpu_buffer_type()) {
+            continue;
+        }
+        if (target_backend != nullptr && strcmp(target_backend, ggml_backend_dev_name(dev)) != 0) {
+            continue;
+        }
+        dev_configs.emplace_back(ggml_backend_dev_description(dev), std::vector<ggml_backend_dev_t>{dev});
+    }
+
+    size_t n_tests  = 0;
+    size_t n_failed = 0;
+    auto check = [&](const char * arch_name, const std::string & dev, const char * what, const bool ok, const double val) {
+        n_tests++;
+        n_failed += ok ? 0 : 1;
+        LOG("|%s|%s|%-32s|%s (%.2e)\n", arch_name, dev.c_str(), what, ok ? "\033[1;32mOK\033[0m" : "\033[1;31mFAIL\033[0m", val);
+    };
+
+    for (const llm_arch & arch : llm_arch_all()) {
+        if (arch == LLM_ARCH_UNKNOWN || !arch_matches(arch_filter, arch) || !mtp_fixture_supported(arch) || !arch_supported(arch)) {
+            continue;
+        }
+        const char * arch_name = llm_arch_name(arch);
+        gguf_context_ptr gguf_ctx = get_gguf_ctx_mtp(arch);
+
+        std::vector<float> logits_mtp_cpu;
+        for (const auto & dc : dev_configs) {
+            const std::string & label = dc.first;
+            const std::vector<ggml_backend_dev_t> & devs = dc.second;
+
+            llama_model_ptr model = get_model_mtp(gguf_ctx.get(), nullptr, seed, stdev, devs, /*load_mtp =*/ true);
+
+            std::vector<float> h_tgt;
+            const std::vector<float> logits_off      = get_logits_tgt(model.get(), tokens, false, false, nullptr);
+            const std::vector<float> logits_unmasked = get_logits_tgt(model.get(), tokens, true,  false, &h_tgt);
+            const std::vector<float> logits_masked   = get_logits_tgt(model.get(), tokens, true,  true,  nullptr);
+
+            // the trunk crop moves when h_nextn is needed for every token; the logits must not
+            const double nmse_unmasked = nmse(logits_off, logits_unmasked);
+            const double nmse_masked   = nmse(logits_off, logits_masked);
+            check(arch_name, label, "target logits, nextn unmasked", nmse_unmasked <= 1e-8, nmse_unmasked);
+            check(arch_name, label, "target logits, nextn masked",   nmse_masked   <= 1e-8, nmse_masked);
+            check(arch_name, label, "target h_nextn finite",         all_finite(h_tgt),     0.0);
+
+            const std::vector<float> logits_mtp = get_logits_mtp(model.get(), tokens, h_tgt);
+            check(arch_name, label, "MTP logits finite", all_finite(logits_mtp), 0.0);
+            if (logits_mtp_cpu.empty()) {
+                logits_mtp_cpu = logits_mtp;
+            } else {
+                const double nmse_dev = nmse(logits_mtp_cpu, logits_mtp);
+                check(arch_name, label, "MTP logits vs. CPU", nmse_dev <= 1e-4, nmse_dev);
+            }
+
+            // round trip through a file: with the head, and with it skipped
+            FILE * file = tmpfile(); // can be null on Windows without administrator privileges
+            if (file != nullptr) {
+                llama_model_saver ms = llama_model_saver(model.get());
+                ms.add_kv_from_model();
+                ms.add_tensors_from_model();
+                ms.save(file);
+
+                rewind(file);
+                llama_model_ptr model_rt = get_model_mtp(nullptr, file, seed, stdev, devs, /*load_mtp =*/ true);
+                const std::vector<float> logits_mtp_rt = get_logits_mtp(model_rt.get(), tokens, h_tgt);
+                const double nmse_rt = nmse(logits_mtp, logits_mtp_rt);
+                check(arch_name, label, "MTP round trip", nmse_rt == 0.0, nmse_rt);
+                model_rt.reset();
+
+                rewind(file);
+                llama_model_ptr model_skip = get_model_mtp(nullptr, file, seed, stdev, devs, /*load_mtp =*/ false);
+                const std::vector<float> logits_skip = get_logits_tgt(model_skip.get(), tokens, false, false, nullptr);
+                const double nmse_skip = nmse(logits_off, logits_skip);
+                check(arch_name, label, "target with the head skipped", nmse_skip <= 1e-8, nmse_skip);
+
+                fclose(file);
+            }
+        }
+    }
+
+    if (n_tests == 0) {
+        LOG("Summary: no MTP tests executed\n");
+    } else if (n_failed == 0) {
+        LOG("Summary: all %zu MTP check(s) passed\n", n_tests);
+    } else {
+        LOG("Summary: %zu MTP check(s) executed, %zu failed\n", n_tests, n_failed);
+    }
+
+    llama_log_set(ud.log_old.callback, ud.log_old.user_data);
+    return n_failed == 0 ? 0 : 1;
+}
+
 int main(int argc, char ** argv) {
     // init the logger at max verbosity. filter with a custom callback respecting the user-configure verbosity
     common_log_set_verbosity_thold(LOG_LEVEL_DEBUG);
@@ -922,6 +1201,7 @@ int main(int argc, char ** argv) {
     const char * target_backend = nullptr;
 
     int verbosity = LOG_LEVEL_ERROR;
+    bool mtp = false;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
@@ -974,6 +1254,8 @@ int main(int argc, char ** argv) {
                 usage(argv);
                 return 1;
             }
+        } else if (strcmp(argv[i], "--mtp") == 0) {
+            mtp = true;
         } else if (strcmp(argv[i], "-b") == 0 || strcmp(argv[i], "--backend") == 0) {
             if (i + 1 < argc) {
                 const char * backend_name = argv[++i];
@@ -1002,6 +1284,9 @@ int main(int argc, char ** argv) {
     try {
         if (!out.empty()) {
             return save_models(arch_filter, seed, stdev, verbosity, out);
+        }
+        if (mtp) {
+            return test_mtp(arch_filter, seed, stdev, verbosity, target_backend);
         }
         return test_backends(arch_filter, seed, stdev, verbosity, target_backend);
     } catch (const std::exception & err) {
