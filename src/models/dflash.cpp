@@ -4,6 +4,85 @@
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
 
+#include <algorithm>
+#include <cctype>
+#include <cstdlib>
+#include <fstream>
+
+static int64_t dfl_env_int(const char * name, int64_t def) {
+    const char * e = getenv(name);
+    return (e && e[0]) ? (int64_t) atoll(e) : def;
+}
+
+// [TAG_DFL_HEAD] tokens past the head prefix that stay draftable: control and user-defined tokens (<|im_end|>, <think>,
+// <tool_call>, ...) and punctuation-only pieces such as "**." or ".**", which the merges added after the main vocabulary.
+// Measured on 187K tokens of Qwen3.8-27B output: with rows = 98304 these two groups are 0.17 % and 0.10 % of all tokens.
+static bool dfl_head_extra_token(const llama_vocab & vocab, llama_token id) {
+    const llama_token_attr attr = vocab.token_get_attr(id);
+    if (attr & (LLAMA_TOKEN_ATTR_CONTROL | LLAMA_TOKEN_ATTR_USER_DEFINED)) {
+        return true;
+    }
+    if (!(attr & LLAMA_TOKEN_ATTR_NORMAL)) {
+        return false;
+    }
+    const std::string & piece = vocab.token_to_piece(id);
+    if (piece.empty()) {
+        return false;
+    }
+    for (const unsigned char c : piece) {
+        if (c >= 0x7f || isalnum(c) || (c < 0x20 && c != '\t' && c != '\n' && c != '\r')) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// [TAG_DFL_HEAD] the extra rows: the tokens above, plus the ids in the file LLAMA_DFLASH_HEAD_EXTRA names (separated by
+// spaces, commas or new lines, '#' starts a comment), e.g. from scripts/dflash-draft-vocab.py
+static void dfl_head_init_extra(llama_model_dflash & m, int64_t n_vocab) {
+    std::vector<int32_t> & extra = m.dfl_head_extra;
+    extra.clear();
+    for (int64_t id = m.dfl_head_rows; id < n_vocab; ++id) {
+        if (dfl_head_extra_token(m.vocab, (llama_token) id)) {
+            extra.push_back((int32_t) id);
+        }
+    }
+    const char * path = getenv("LLAMA_DFLASH_HEAD_EXTRA");
+    if (path && path[0]) {
+        std::ifstream f(path);
+        if (!f) {
+            LLAMA_LOG_WARN("%s: [TAG_DFL_HEAD] cannot read LLAMA_DFLASH_HEAD_EXTRA '%s'\n", __func__, path);
+        }
+        std::string line;
+        while (std::getline(f, line)) {
+            line = line.substr(0, line.find('#'));
+            std::replace(line.begin(), line.end(), ',', ' ');
+            size_t pos = 0;
+            while (pos < line.size()) {
+                const size_t beg = line.find_first_not_of(" \t\r", pos);
+                if (beg == std::string::npos) {
+                    break;
+                }
+                const size_t end = line.find_first_of(" \t\r", beg);
+                const int64_t id = atoll(line.substr(beg, end - beg).c_str());
+                if (id >= m.dfl_head_rows && id < n_vocab) {
+                    extra.push_back((int32_t) id);
+                }
+                pos = end;
+            }
+        }
+    }
+    std::sort(extra.begin(), extra.end());
+    extra.erase(std::unique(extra.begin(), extra.end()), extra.end());
+    // every extra row costs a dequantized row and an f32 dot product per draft position
+    const size_t max_extra = 4096;
+    if (extra.size() > max_extra) {
+        LLAMA_LOG_WARN("%s: [TAG_DFL_HEAD] %zu extra rows, keeping the first %zu\n", __func__, extra.size(), max_extra);
+        extra.resize(max_extra);
+    }
+    m.dfl_head_extra_f.assign(extra.begin(), extra.end());
+}
+
 void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
 
     ml.get_key(LLM_KV_EMBEDDING_SCALE, hparams.f_embedding_scale, false);
@@ -171,6 +250,32 @@ void llama_model_dflash::load_arch_tensors(llama_model_loader &) {
     output   = create_tensor(tn(LLM_TENSOR_OUTPUT,     "weight"), { n_embd, n_vocab_draft }, TENSOR_NOT_REQUIRED);
     if (output == nullptr && tok_embd != nullptr) {
         output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab_draft }, TENSOR_DUPLICATED);
+    }
+
+    // [TAG_DFL_HEAD] [TAG_DFL_LEAN] opt-in DFlash2 drafter paths (a DSpark Markov head keeps the full vocabulary)
+    if (selector_meta && !markov_meta) {
+        dfl_lean = dfl_env_int("LLAMA_DFLASH_LEAN", 0) != 0;
+        if (dfl_lean) {
+            LLAMA_LOG_INFO("%s: [TAG_DFL_LEAN] DFlash2 conv and selector with fewer graph ops\n", __func__);
+        }
+        if (d2t != nullptr) {
+            if (dfl_env_int("LLAMA_DFLASH_D2T_COMPACT", 0) != 0) {
+                if (d2t->type == GGML_TYPE_I32 && output != nullptr) {
+                    dfl_d2t_compact = true;
+                    LLAMA_LOG_INFO("%s: [TAG_DFL_HEAD] DFlash2 selects in the %lld-token draft vocabulary\n", __func__, (long long) n_vocab_draft);
+                } else {
+                    LLAMA_LOG_WARN("%s: [TAG_DFL_HEAD] LLAMA_DFLASH_D2T_COMPACT needs an i32 d2t and an own lm_head, keeping the full-vocabulary scatter\n", __func__);
+                }
+            }
+        } else if (output == nullptr) {
+            const int64_t rows = dfl_env_int("LLAMA_DFLASH_HEAD_ROWS", 0);
+            if (rows > 0 && rows < n_vocab) {
+                dfl_head_rows = rows;
+                dfl_head_init_extra(*this, n_vocab);
+                LLAMA_LOG_INFO("%s: [TAG_DFL_HEAD] DFlash2 reads target lm_head rows [0, %lld) plus %zu more rows (%.1f%% of the head)\n", __func__,
+                        (long long) rows, dfl_head_extra.size(), 100.0*(rows + (int64_t) dfl_head_extra.size())/n_vocab);
+            }
+        }
     }
 
     if (hparams.dsv4_hc_mult > 0) {
@@ -476,12 +581,81 @@ static ggml_tensor * build_dflash2_conv(
     return result;
 }
 
+// [TAG_DFL_LEAN] build_dflash2_conv with the same values bit for bit (same products, same sums, same order) in 6 graph
+// ops instead of 10 for kernel 2: the coefficients and the tap weights are read through strided views instead of
+// copies, and a shifted tap is one left pad instead of fill + concat. The drafter runs 20 of these per step.
+static ggml_tensor * build_dflash2_conv_lean(
+        llm_graph_context & g,
+        ggml_tensor * hidden,
+        ggml_tensor * dynamic,
+        ggml_tensor * base,
+        int side) {
+    const auto & hparams = g.hparams;
+    const int64_t hidden_size = hidden->ne[0];
+    const int64_t n_tokens    = hidden->ne[1];
+    const int64_t n_blocks    = g.ubatch.n_seqs_unq;
+    const int64_t kernel_size = hparams.dflash_conv_kernel_size;
+    const int64_t group_size  = hparams.dflash_conv_group_size;
+    const int64_t n_groups    = hidden_size / group_size;
+
+    GGML_ASSERT(n_blocks > 0 && n_tokens % n_blocks == 0);
+    GGML_ASSERT(dynamic && base && side >= 0 && side < 2);
+
+    const int64_t block_size = n_tokens / n_blocks;
+    ggml_context * ctx0 = g.ctx0;
+    if (!ggml_is_contiguous(hidden) || hidden->ne[1] != n_tokens) {
+        hidden = ggml_cont_2d(ctx0, hidden, hidden_size, n_tokens);
+    }
+    if (!ggml_is_contiguous(dynamic) || dynamic->ne[1] != n_tokens) {
+        dynamic = ggml_cont_2d(ctx0, dynamic, dynamic->ne[0], n_tokens);
+    }
+    GGML_ASSERT(dynamic->ne[0] == n_groups * kernel_size * 2);
+
+    // a dynamic row is [n_groups, kernel_size, 2] per token: this side as [1, n_groups, kernel_size, n_tokens]
+    const size_t esize = ggml_element_size(dynamic);
+    ggml_tensor * coeff = ggml_view_4d(ctx0, dynamic, 1, n_groups, kernel_size, n_tokens,
+            esize, n_groups * esize, dynamic->nb[1], side * n_groups * kernel_size * esize);
+    ggml_tensor * coeff_all = ggml_repeat_4d(ctx0, coeff, group_size, n_groups, kernel_size, n_tokens);
+
+    ggml_tensor * base_side = ggml_reshape_4d(ctx0,
+            ggml_view_1d(ctx0, base, hidden_size * kernel_size, side * base->nb[2]),
+            group_size, n_groups, kernel_size, 1);
+
+    ggml_tensor * weight_all = ggml_add(ctx0, coeff_all, base_side);
+
+    ggml_tensor * blocks = ggml_reshape_3d(ctx0, hidden, hidden_size, block_size, n_blocks);
+    ggml_tensor * result = nullptr;
+    for (int64_t tap = 0; tap < kernel_size; ++tap) {
+        ggml_tensor * values = hidden;
+        if (tap > 0) {
+            if (tap < block_size) {
+                ggml_tensor * previous = ggml_view_3d(ctx0, blocks, hidden_size, block_size - tap, n_blocks,
+                        blocks->nb[1], blocks->nb[2], 0);
+                values = ggml_pad_ext(ctx0, previous, 0, 0, (int) tap, 0, 0, 0, 0, 0);
+            } else {
+                values = ggml_fill(ctx0, ggml_new_tensor_3d(ctx0, hidden->type, hidden_size, block_size, n_blocks), 0.0f);
+            }
+            values = ggml_reshape_2d(ctx0, values, hidden_size, n_tokens);
+        }
+
+        // this tap's weights of every token, [hidden_size, n_tokens] with rows hidden_size * kernel_size apart
+        ggml_tensor * weight = ggml_view_2d(ctx0, weight_all, hidden_size, n_tokens, weight_all->nb[3], tap * weight_all->nb[2]);
+
+        ggml_tensor * term = ggml_mul(ctx0, weight, values);
+        result = result ? ggml_add(ctx0, result, term) : term;
+    }
+    return result;
+}
+
 // DFlash2 selector: top-k candidates per block position plus the pairwise
 // transition scores, packed into the nextn output slot for the CPU-side walk.
 // [TAG_SYNC_DFLASH2_LATTICE] common/speculative.cpp draft() reads row (block * block_size + pos) as
 // [top_k ids as f32 | top_k x top_k scores, predecessor-major (successor fastest) | zero pad], row 0 of
 // each block all zeros. The fork built the same layout in build_post_sampling; keep it if this changes.
-static void build_dflash2_selector(llm_graph_context & g, const llama_model & model, ggml_tensor * tokens) {
+// [TAG_DFL_HEAD] logits: [n_rows, n_tokens]; vocab_map: nullptr when row i is target token i, else [n_rows] i32 or f32
+// target ids of the rows (a draft vocabulary). The lattice always carries target ids.
+static void build_dflash2_selector(llm_graph_context & g, const llama_model & model, ggml_tensor * tokens,
+        ggml_tensor * logits, ggml_tensor * vocab_map, bool lean) {
     ggml_context * ctx0 = g.ctx0;
     auto         & res  = g.res;
 
@@ -493,7 +667,7 @@ static void build_dflash2_selector(llm_graph_context & g, const llama_model & mo
     const int64_t rank     = hparams.dflash_selector_rank;
     const int64_t n_blocks = g.ubatch.n_seqs_unq;
     GGML_ASSERT(n_blocks > 0 && n_tokens % n_blocks == 0);
-    GGML_ASSERT(res->t_logits->ne[1] == n_tokens);
+    GGML_ASSERT(logits->ne[1] == n_tokens);
     if (!tokens) {
         return;
     }
@@ -504,11 +678,21 @@ static void build_dflash2_selector(llm_graph_context & g, const llama_model & mo
     const int64_t block_size = tokens_per_block;
     const int64_t row_used   = top_k + top_k * top_k;
 
-    ggml_tensor * candidates  = ggml_top_k(ctx0, res->t_logits, top_k);
-    ggml_tensor * logits_rows = ggml_reshape_3d(ctx0, res->t_logits, 1, res->t_logits->ne[0], n_tokens);
+    ggml_tensor * candidates  = ggml_top_k(ctx0, logits, top_k);
+    ggml_tensor * logits_rows = ggml_reshape_3d(ctx0, logits, 1, logits->ne[0], n_tokens);
     ggml_tensor * unary       = ggml_reshape_2d(ctx0,
             ggml_get_rows(ctx0, logits_rows, candidates), top_k, n_tokens);
     ggml_tensor * gate        = g.build_lora_mm(model.dflash_selector_hidden, res->t_embd);
+
+    if (vocab_map) {
+        // [TAG_DFL_HEAD] draft rows -> target token ids, before anything reads the selector tables
+        ggml_tensor * ids = ggml_get_rows(ctx0, ggml_reshape_2d(ctx0, vocab_map, 1, vocab_map->ne[0]),
+                ggml_reshape_1d(ctx0, candidates, top_k * n_tokens));
+        if (ids->type != GGML_TYPE_I32) {
+            ids = ggml_cast(ctx0, ids, GGML_TYPE_I32); // f32 ids < 2^24 convert exactly
+        }
+        candidates = ggml_reshape_2d(ctx0, ids, top_k, n_tokens);
+    }
 
     // Everything below indexes [.., tokens_per_block, n_blocks]: the block
     // position varies fastest, sequences are the outer dimension.
@@ -518,13 +702,11 @@ static void build_dflash2_selector(llm_graph_context & g, const llama_model & mo
 
     // a position's score reads only the candidate sets at pos-1 and pos, so a run
     // of positions has no internal dependency and scores in one batched matmul
+    // [TAG_DFL_LEAN] lean: the same values with fewer ops. The gate and the unary scores broadcast from strided views
+    // (no copies, no repeats), and the rows are padded once at the end instead of per run plus a zero row and two concats.
     auto score_run = [&](int64_t beg_pos, int64_t n_pos, ggml_tensor * pred_ids) {
         ggml_tensor * cand_run = ggml_cont(ctx0, ggml_view_3d(ctx0, cand_blk, top_k, n_pos, n_blocks,
                     cand_blk->nb[1], cand_blk->nb[2], beg_pos * cand_blk->nb[1]));
-        ggml_tensor * unary_run = ggml_cont(ctx0, ggml_view_3d(ctx0, unary_blk, top_k, n_pos, n_blocks,
-                    unary_blk->nb[1], unary_blk->nb[2], beg_pos * unary_blk->nb[1]));
-        ggml_tensor * gate_run = ggml_cont(ctx0, ggml_view_3d(ctx0, gate_blk, rank, n_pos, n_blocks,
-                    gate_blk->nb[1], gate_blk->nb[2], beg_pos * gate_blk->nb[1]));
 
         const int64_t n_pred = pred_ids->ne[0] / (n_pos * n_blocks);
 
@@ -535,37 +717,65 @@ static void build_dflash2_selector(llm_graph_context & g, const llama_model & mo
                 ggml_get_rows(ctx0, model.dflash_selector_prev, pred_ids),
                 rank, n_pred, n_pos, n_blocks);
 
-        ggml_tensor * gate_bcast = ggml_reshape_4d(ctx0, gate_run, rank, 1, n_pos, n_blocks);
-        ggml_tensor * cond  = ggml_mul(ctx0, predecessor, ggml_repeat(ctx0, gate_bcast, predecessor));
-        ggml_tensor * score = ggml_mul_mat(ctx0, successor, cond);
-        if (n_pred == 1) {
-            score = ggml_repeat_4d(ctx0, score, top_k, top_k, n_pos, n_blocks);
+        ggml_tensor * score = nullptr;
+        if (lean) {
+            ggml_tensor * gate_bcast = ggml_view_4d(ctx0, gate_blk, rank, 1, n_pos, n_blocks,
+                    gate_blk->nb[1], gate_blk->nb[1], gate_blk->nb[2], beg_pos * gate_blk->nb[1]);
+            ggml_tensor * cond = ggml_mul(ctx0, predecessor, gate_bcast);
+            score = ggml_mul_mat(ctx0, successor, cond);
+            if (n_pred == 1) {
+                score = ggml_repeat_4d(ctx0, score, top_k, top_k, n_pos, n_blocks);
+            }
+            ggml_tensor * unary_bcast = ggml_view_4d(ctx0, unary_blk, top_k, 1, n_pos, n_blocks,
+                    unary_blk->nb[1], unary_blk->nb[1], unary_blk->nb[2], beg_pos * unary_blk->nb[1]);
+            score = ggml_add(ctx0, score, unary_bcast);
+        } else {
+            ggml_tensor * unary_run = ggml_cont(ctx0, ggml_view_3d(ctx0, unary_blk, top_k, n_pos, n_blocks,
+                        unary_blk->nb[1], unary_blk->nb[2], beg_pos * unary_blk->nb[1]));
+            ggml_tensor * gate_run = ggml_cont(ctx0, ggml_view_3d(ctx0, gate_blk, rank, n_pos, n_blocks,
+                        gate_blk->nb[1], gate_blk->nb[2], beg_pos * gate_blk->nb[1]));
+
+            ggml_tensor * gate_bcast = ggml_reshape_4d(ctx0, gate_run, rank, 1, n_pos, n_blocks);
+            ggml_tensor * cond = ggml_mul(ctx0, predecessor, ggml_repeat(ctx0, gate_bcast, predecessor));
+            score = ggml_mul_mat(ctx0, successor, cond);
+            if (n_pred == 1) {
+                score = ggml_repeat_4d(ctx0, score, top_k, top_k, n_pos, n_blocks);
+            }
+            ggml_tensor * unary_bcast = ggml_reshape_4d(ctx0, unary_run, top_k, 1, n_pos, n_blocks);
+            score = ggml_add(ctx0, score, ggml_repeat(ctx0, unary_bcast, score));
         }
-        ggml_tensor * unary_bcast = ggml_reshape_4d(ctx0, unary_run, top_k, 1, n_pos, n_blocks);
-        score = ggml_add(ctx0, score, ggml_repeat(ctx0, unary_bcast, score));
 
         ggml_tensor * row = ggml_concat(ctx0,
                 ggml_cast(ctx0, cand_run, GGML_TYPE_F32),
                 ggml_reshape_3d(ctx0, score, top_k * top_k, n_pos, n_blocks), 0);
-        return ggml_pad(ctx0, row, n_embd - row_used, 0, 0, 0);
+        return lean ? row : ggml_pad(ctx0, row, n_embd - row_used, 0, 0, 0);
     };
 
-    ggml_tensor * packed = ggml_fill(ctx0,
+    ggml_tensor * packed = lean ? nullptr : ggml_fill(ctx0,
             ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_embd, 1, n_blocks), 0.0f);
+    auto add_rows = [&](ggml_tensor * rows) {
+        packed = packed ? ggml_concat(ctx0, packed, rows, 1) : rows;
+    };
 
     if (block_size > 1) {
         // Position 1 alone: its predecessor is the anchor token, one id per
         // sequence rather than a candidate set.
         ggml_tensor * anchor_ids = ggml_cont_1d(ctx0,
                 ggml_view_2d(ctx0, tokens, 1, n_blocks, tokens_per_block * tokens->nb[0], 0), n_blocks);
-        packed = ggml_concat(ctx0, packed, score_run(1, 1, anchor_ids), 1);
+        add_rows(score_run(1, 1, anchor_ids));
     }
     if (block_size > 2) {
         ggml_tensor * prev_ids = ggml_reshape_1d(ctx0,
                 ggml_cont(ctx0, ggml_view_3d(ctx0, cand_blk, top_k, block_size - 2, n_blocks,
                         cand_blk->nb[1], cand_blk->nb[2], cand_blk->nb[1])),
                 top_k * (block_size - 2) * n_blocks);
-        packed = ggml_concat(ctx0, packed, score_run(2, block_size - 2, prev_ids), 1);
+        add_rows(score_run(2, block_size - 2, prev_ids));
+    }
+
+    if (lean) {
+        // the zero row 0 of every block, and the zero pad past row_used
+        packed = packed ? ggml_pad_ext(ctx0, packed, 0, (int) (n_embd - row_used), 1, 0, 0, 0, 0, 0)
+                        : ggml_fill(ctx0, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_embd, 1, n_blocks), 0.0f);
     }
 
     packed = ggml_reshape_2d(ctx0, packed, n_embd, block_size * n_blocks);
@@ -573,6 +783,34 @@ static void build_dflash2_selector(llm_graph_context & g, const llama_model & mo
     res->t_h_nextn = packed;
     ggml_build_forward_expand(g.gf, packed);
 }
+
+// [TAG_DFL_HEAD] target ids of the extra head rows (fixed at load), as i32 for get_rows and as f32 for the id map
+class llm_graph_input_dflash_head : public llm_graph_input_i {
+public:
+    llm_graph_input_dflash_head(const std::vector<int32_t> & ids_host, const std::vector<float> & ids_f_host) :
+        ids_host(ids_host), ids_f_host(ids_f_host) {}
+
+    void set_input(const llama_ubatch * ubatch) override {
+        GGML_UNUSED(ubatch);
+        if (ids && ids->buffer) {
+            ggml_backend_tensor_set(ids, ids_host.data(), 0, ggml_nbytes(ids));
+        }
+        if (ids_f && ids_f->buffer) {
+            ggml_backend_tensor_set(ids_f, ids_f_host.data(), 0, ggml_nbytes(ids_f));
+        }
+    }
+
+    bool can_reuse(const llm_graph_params & params) override {
+        GGML_UNUSED(params);
+        return true;
+    }
+
+    ggml_tensor * ids   = nullptr; // I32 [n_extra]
+    ggml_tensor * ids_f = nullptr; // F32 [n_extra]
+
+    const std::vector<int32_t> & ids_host;
+    const std::vector<float>   & ids_f_host;
+};
 
 // DFlash decoder, dual-mode by batch type:
 //   * embd batch  -> fused target features: project + inject K/V into the cache.
@@ -684,6 +922,13 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
         return;
     }
 
+    // [TAG_DFL_HEAD] [TAG_DFL_LEAN] the opt-in paths, read at load (graph<false> is only built for llama_model_dflash)
+    const auto & dfl = static_cast<const llama_model_dflash &>(model);
+    auto conv = [&](ggml_tensor * hidden, ggml_tensor * dynamic, ggml_tensor * base, int side) {
+        return dfl.dfl_lean ? build_dflash2_conv_lean(*this, hidden, dynamic, base, side)
+                            : build_dflash2_conv     (*this, hidden, dynamic, base, side);
+    };
+
     // tok_embd from the target model (shared via ctx_other)
     auto * tok_embd = model.tok_embd;
     if (tok_embd == nullptr) {
@@ -719,7 +964,7 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
         ggml_tensor * attn_dynamic = nullptr;
         if (layer.dflash_attn_conv_proj) {
             attn_dynamic = build_lora_mm(layer.dflash_attn_conv_proj, noise_norm);
-            noise_norm = build_dflash2_conv(*this, noise_norm, attn_dynamic, layer.dflash_attn_conv_base, 0);
+            noise_norm = conv(noise_norm, attn_dynamic, layer.dflash_attn_conv_base, 0);
             cb(noise_norm, "attn_conv_in", il);
         }
 
@@ -750,7 +995,7 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
             : build_attn(inp_attn,      layer.wo, NULL, layer.wo_s, Qcur, Kcur, Vcur, nullptr, layer.attn_sinks, nullptr, kq_scale, il);
 
         if (attn_dynamic) {
-            cur = build_dflash2_conv(*this, cur, attn_dynamic, layer.dflash_attn_conv_base, 1);
+            cur = conv(cur, attn_dynamic, layer.dflash_attn_conv_base, 1);
             cb(cur, "attn_conv_out", il);
         }
 
@@ -768,7 +1013,7 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
         ggml_tensor * ffn_dynamic = nullptr;
         if (layer.dflash_ffn_conv_proj) {
             ffn_dynamic = build_lora_mm(layer.dflash_ffn_conv_proj, cur);
-            cur = build_dflash2_conv(*this, cur, ffn_dynamic, layer.dflash_ffn_conv_base, 0);
+            cur = conv(cur, ffn_dynamic, layer.dflash_ffn_conv_base, 0);
             cb(cur, "ffn_conv_in", il);
         }
 
@@ -781,7 +1026,7 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
         cb(cur, "ffn_out", il);
 
         if (ffn_dynamic) {
-            cur = build_dflash2_conv(*this, cur, ffn_dynamic, layer.dflash_ffn_conv_base, 1);
+            cur = conv(cur, ffn_dynamic, layer.dflash_ffn_conv_base, 1);
             cb(cur, "ffn_conv_out", il);
         }
 
@@ -815,7 +1060,42 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
         output_s = model_other->output_s;
     }
 
-    cur = build_lora_mm(output, cur, output_s);
+    // [TAG_DFL_HEAD] the logits below cover a draft vocabulary; vocab_map: draft row -> target id (nullptr: row i is id i)
+    bool          draft_vocab = false;
+    ggml_tensor * vocab_map   = nullptr;
+
+    if (dfl.dfl_head_rows > 0 && model.output == nullptr && output->ne[1] == (int64_t) model.vocab.n_tokens()) {
+        // [TAG_DFL_HEAD] LLAMA_DFLASH_HEAD_ROWS=N: read only rows [0, N) of the shared target head, a contiguous view,
+        // plus the few extra rows past N (control tokens, markdown punctuation). Qwen3.8 keeps its Latin and code
+        // tokens below ~96K (CJK from ~96K, other scripts above 150K): N = 98304 and its 131 extra rows read 39.6 % of
+        // the 1.04 GB Q6_K head and covered 99.86 % of 187K tokens of the model's own output (99.59 % without them).
+        // Not for --split-mode row: the view assumes the head is one plain tensor.
+        const int64_t n_rows  = dfl.dfl_head_rows;
+        const int64_t n_extra = (int64_t) dfl.dfl_head_extra.size();
+        ggml_tensor * normed  = cur;
+        draft_vocab = true;
+
+        cur = build_lora_mm(ggml_view_2d(ctx0, output, output->ne[0], n_rows, output->nb[1], 0), normed, output_s);
+        if (n_extra > 0) {
+            auto inp_head = std::make_unique<llm_graph_input_dflash_head>(dfl.dfl_head_extra, dfl.dfl_head_extra_f);
+            inp_head->ids   = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_extra);
+            inp_head->ids_f = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, n_extra);
+            ggml_set_input(inp_head->ids);
+            ggml_set_input(inp_head->ids_f);
+
+            // the extra rows, dequantized to f32 on every step (a few hundred rows at most)
+            ggml_tensor * extra = ggml_mul_mat(ctx0, ggml_get_rows(ctx0, output, inp_head->ids), normed);
+            if (output_s) {
+                extra = ggml_mul(ctx0, extra, output_s);
+            }
+            cur       = ggml_concat(ctx0, cur, extra, 0);
+            vocab_map = ggml_concat(ctx0, ggml_arange(ctx0, 0.0f, (float) n_rows, 1.0f), inp_head->ids_f, 0);
+
+            res->add_input(std::move(inp_head));
+        }
+    } else {
+        cur = build_lora_mm(output, cur, output_s);
+    }
 
     // DFlash2 feeds these logits to the selector, so they need the target's output
     // transforms; DFlash1 and DSpark read them through the sampler instead
@@ -831,12 +1111,19 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
     }
 
     // reduced-draft-vocab exports: scatter the draft logits to the target vocabulary via d2t
-    if (model.d2t) {
+    if (model.d2t && dfl.dfl_d2t_compact) {
+        // [TAG_DFL_HEAD] LLAMA_DFLASH_D2T_COMPACT=1: the selector picks in the draft vocabulary and maps its candidates
+        // through d2t, instead of a -inf fill of n_vocab x n_tokens floats, a scatter and a top-k over the full vocabulary
+        GGML_ASSERT(model.d2t->type == GGML_TYPE_I32);
+        GGML_ASSERT(model.d2t->ne[0] == cur->ne[0]);
+        draft_vocab = true;
+        vocab_map   = model.d2t;
+    } else if (model.d2t) {
         const int64_t n_draft_vocab = cur->ne[0];
         const int64_t n_outputs     = cur->ne[1];
         const int64_t n_vocab       = (int64_t) model.vocab.n_tokens();
 
-        GGML_ASSERT(model.d2t->type == GGML_TYPE_I64);
+        GGML_ASSERT(model.d2t->type == GGML_TYPE_I64 || model.d2t->type == GGML_TYPE_I32); // set_rows takes both
         GGML_ASSERT(model.d2t->ne[0] == n_draft_vocab);
 
         ggml_tensor * logits = ggml_fill(ctx0, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 1, n_vocab, n_outputs), -INFINITY);
@@ -846,7 +1133,10 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
         cur = ggml_reshape_2d(ctx0, cur, n_vocab, n_outputs);
     }
     cb(cur, "result_output", -1);
-    res->t_logits = cur;
+    // [TAG_DFL_HEAD] draft-vocabulary logits are not n_vocab wide, so they are no graph output. DFlash2 never reads
+    // raw drafter logits (speculative.cpp asks for no outputs and reads the lattice), and a caller that asked for
+    // logits would otherwise read past the tensor.
+    res->t_logits = draft_vocab ? nullptr : cur;
 
     ggml_build_forward_expand(gf, cur);
 
@@ -856,7 +1146,7 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
     }
 
     if (model.dflash_selector_hidden) {
-        build_dflash2_selector(*this, model, inp_tokens);
+        build_dflash2_selector(*this, model, inp_tokens, cur, vocab_map, dfl.dfl_lean);
     }
 }
 
