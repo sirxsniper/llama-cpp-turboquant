@@ -82,6 +82,7 @@
 #include <array>
 #include <atomic>
 #include <charconv>
+#include <chrono>
 #include <cinttypes>
 #include <condition_variable>
 #include <cstddef>
@@ -745,6 +746,11 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
                 CUDA_CHECK(cudaFree(cublas_workspaces[i][j]));
             }
         }
+    }
+    if (mmvq_q8.buf != nullptr) { // [TAG_MMVQ_Q8_REUSE]
+        ggml_cuda_set_device(device);
+        CUDA_CHECK(cudaFree(mmvq_q8.buf));
+        mmvq_q8.buf = nullptr;
     }
 }
 
@@ -2119,8 +2125,13 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                          t->type == GGML_TYPE_TURBO4_0 || t->type == GGML_TYPE_TURBO4P_0 || t->type == GGML_TYPE_TURBO5P_0 ||
                          t->type == GGML_TYPE_TURBO5P512_0);
         };
-        const char * e = getenv("TURBO_OP_PROBE");
-        if (e && e[0] == '1' && (is_turbo(a) || is_turbo(b))) {
+        // read once: getenv takes the CRT environment lock and walks the environment, and this runs for every node of
+        // every eager or captured evaluation
+        static const bool op_probe = [] {
+            const char * e = getenv("TURBO_OP_PROBE");
+            return e != nullptr && e[0] == '1';
+        }();
+        if (op_probe && (is_turbo(a) || is_turbo(b))) {
             const int key = ((int) dst->op << 8) | (int) (a ? a->type : GGML_TYPE_COUNT);
             if (seen.insert(key).second) {
                 fprintf(stderr, "turbo-op: %s src0=%s[%d,%d] src1=%s dst=%s\n",
@@ -2685,7 +2696,7 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 // ggml_cuda_graph_update_required still decides whether it can be replayed, so a shape whose
 // allocation moved simply re-warms as before. Distinct shapes get distinct objects, and the 10 s
 // eviction sweep bounds the map.
-static const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
+static const void * ggml_cuda_graph_get_key_hash(ggml_cgraph * cgraph) {
     uint64_t h = 1469598103934665603ull;   // FNV-1a
     auto mix = [&h](uint64_t v) { h ^= v; h *= 1099511628211ull; };
     mix((uint64_t) cgraph->n_nodes);
@@ -2706,10 +2717,72 @@ static const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
     return reinterpret_cast<const void *>((uintptr_t) h);
 }
 
+// [TAG_GRAPH_KEY_MEMO] The structural key above walks every node and every character of its name, and one
+// graph_compute asks for it twice (here and in ggml_cuda_graph_update_required): about 3900 nodes per Qwen3.8-27B
+// decode step, all on the host while the GPU waits for the next launch. The scheduler gives each split a new uid when
+// it splits a new graph, and llama replays the same splits while its graph reuse holds, so with
+// GGML_CUDA_GRAPH_KEY_MEMO=1 the key of a (uid, cgraph, n_nodes) is computed once and then read back. uid 0 (graphs
+// that did not come from the scheduler, and the split views passed to graph_optimize) always hashes. The key only
+// picks the ggml_cuda_graph object; ggml_cuda_graph_update_required still compares every node property before a
+// replay, so a stale key could only cost a re-warm, never a wrong result. Off by default until measured.
+static bool ggml_cuda_graph_key_memo_enabled() {
+    static const bool on = [] {
+        const char * e = getenv("GGML_CUDA_GRAPH_KEY_MEMO");
+        return e != nullptr && e[0] == '1';
+    }();
+    return on;
+}
+
+static ggml_cuda_graph_key_memo * ggml_cuda_graph_key_memo_find(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph) {
+    for (ggml_cuda_graph_key_memo & m : cuda_ctx->graph_key_memo) {
+        if (m.uid == cgraph->uid && m.cgraph == cgraph && m.n_nodes == cgraph->n_nodes && m.key != nullptr) {
+            return &m;
+        }
+    }
+    return nullptr;
+}
+
+static const void * ggml_cuda_graph_get_key(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph) {
+    if (cuda_ctx == nullptr || cgraph->uid == 0 || !ggml_cuda_graph_key_memo_enabled()) {
+        return ggml_cuda_graph_get_key_hash(cgraph);
+    }
+
+    if (const ggml_cuda_graph_key_memo * m = ggml_cuda_graph_key_memo_find(cuda_ctx, cgraph)) {
+        return m->key;
+    }
+
+    const void * key = ggml_cuda_graph_get_key_hash(cgraph);
+
+    constexpr int n_memo = (int) (sizeof(ggml_backend_cuda_context::graph_key_memo) / sizeof(ggml_cuda_graph_key_memo));
+    ggml_cuda_graph_key_memo & m = cuda_ctx->graph_key_memo[cuda_ctx->graph_key_memo_next];
+    cuda_ctx->graph_key_memo_next = (cuda_ctx->graph_key_memo_next + 1) % n_memo;
+    m.uid     = cgraph->uid;
+    m.cgraph  = cgraph;
+    m.n_nodes = cgraph->n_nodes;
+    m.key     = key;
+    m.compat  = -1;
+
+    return key;
+}
+
+// [TAG_GRAPH_KEY_MEMO] the compatibility walk only looks at node ops and shapes, which a uid does not change either
+static bool ggml_cuda_graph_check_compability_memo(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph) {
+    ggml_cuda_graph_key_memo * m = cgraph->uid != 0 && ggml_cuda_graph_key_memo_enabled()
+        ? ggml_cuda_graph_key_memo_find(cuda_ctx, cgraph) : nullptr;
+    if (m != nullptr && m->compat >= 0) {
+        return m->compat != 0;
+    }
+    const bool compat = ggml_cuda_graph_check_compability(cgraph);
+    if (m != nullptr) {
+        m->compat = compat ? 1 : 0;
+    }
+    return compat;
+}
+
 static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph) {
     bool res = false;
 
-    const void * graph_key = ggml_cuda_graph_get_key(cgraph);
+    const void * graph_key = ggml_cuda_graph_get_key(cuda_ctx, cgraph);
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
 
     if (cgraph->uid != 0 &&
@@ -4625,6 +4698,12 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         if (!use_cuda_graph || cuda_graph_update_required) {
             [[maybe_unused]] int prev_i = 0;
 
+            // [TAG_MMVQ_Q8_REUSE] a q8_1 copy never outlives the evaluation that made it
+            const bool mmvq_q8_reuse = ggml_cuda_mmvq_q8_reuse_enabled();
+            if (mmvq_q8_reuse) {
+                ggml_cuda_mmvq_q8_cache_reset(*cuda_ctx);
+            }
+
             if (stream_ctx.concurrent_events.size() > 0) {
                 should_launch_concurrent_events = true;
                 for (const auto & [tensor, event] : stream_ctx.concurrent_events) {
@@ -4729,9 +4808,22 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
 
+                // [TAG_MMVQ_Q8_REUSE] drop the q8_1 copy before a node writes the bytes it was made from
+                if (mmvq_q8_reuse) {
+                    ggml_cuda_mmvq_q8_cache_note_write(*cuda_ctx, node);
+                    cuda_ctx->mmvq_q8.cgraph   = cgraph;
+                    cuda_ctx->mmvq_q8.node_idx = i;
+                }
+
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
 
                 if (nodes_to_skip != 0) {
+                    // [TAG_MMVQ_Q8_REUSE] the fused nodes wrote their outputs too
+                    if (mmvq_q8_reuse) {
+                        for (int k = 1; k <= nodes_to_skip && i + k < cgraph->n_nodes; ++k) {
+                            ggml_cuda_mmvq_q8_cache_note_write(*cuda_ctx, cgraph->nodes[i + k]);
+                        }
+                    }
 #ifdef GGML_CUDA_DEBUG
                     const int last_fused = i + nodes_to_skip;
                     GGML_LOG_INFO("nodes_fused: %d, first: %s (%s), last: %s (%s)\n",
@@ -4768,6 +4860,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     try_launch_concurrent_event(node);
                }
             }
+
+            // [TAG_MMVQ_Q8_REUSE] no graph node is being computed any more
+            cuda_ctx->mmvq_q8.cgraph   = nullptr;
+            cuda_ctx->mmvq_q8.node_idx = -1;
         }
 
 #ifdef USE_CUDA_GRAPH
@@ -4871,8 +4967,24 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     bool cuda_graph_update_required = false;
     const void * graph_key = nullptr;
 
+    // [TAG_GRAPH_HOST_PROBE] TURBO_GRAPH_HOST_PROBE=1: host time of this call per context (the key, the key plus the
+    // compatibility and property checks, and the whole call including the launch or the eager evaluation), mean over
+    // 512 calls. In a serial decode loop the GPU waits for all of it. Diagnostic only.
+    static const bool host_probe = [] {
+        const char * e = getenv("TURBO_GRAPH_HOST_PROBE");
+        return e != nullptr && e[0] == '1';
+    }();
+    using host_probe_clock = std::chrono::steady_clock;
+    host_probe_clock::time_point hp_t0, hp_t1, hp_t2;
+    if (host_probe) {
+        hp_t0 = host_probe_clock::now();
+    }
+
 #ifdef USE_CUDA_GRAPH
-    graph_key = ggml_cuda_graph_get_key(cgraph);
+    graph_key = ggml_cuda_graph_get_key(cuda_ctx, cgraph); // [TAG_GRAPH_KEY_MEMO]
+    if (host_probe) {
+        hp_t1 = host_probe_clock::now();
+    }
 
     ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
 
@@ -4885,7 +4997,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     // TURBO_GRAPH_PROBE=0 silences; it prints every 512 calls.
     int gp_reason = 0; // 0=graph used, 1=disabled, 2=incompatible, 3=props changed, 4=warmup
     if (graph->is_enabled()) {
-        const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
+        const bool graph_compatible = ggml_cuda_graph_check_compability_memo(cuda_ctx, cgraph); // [TAG_GRAPH_KEY_MEMO]
         if (graph_compatible) {
             const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
 
@@ -4916,6 +5028,9 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         }
     } else {
         gp_reason = 1;
+    }
+    if (host_probe) {
+        hp_t2 = host_probe_clock::now();
     }
     {
         static const bool probe_on = [] {
@@ -4948,6 +5063,39 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     }
 
     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
+
+    if (host_probe) {
+        const auto us = [](host_probe_clock::duration d) {
+            return std::chrono::duration<double, std::micro>(d).count();
+        };
+        const host_probe_clock::time_point hp_t3 = host_probe_clock::now();
+#ifndef USE_CUDA_GRAPH
+        hp_t1 = hp_t0;
+        hp_t2 = hp_t0;
+#endif // USE_CUDA_GRAPH
+        ggml_cuda_graph_host_probe & p = cuda_ctx->graph_host_probe;
+        p.n++;
+        p.key_us  += us(hp_t1 - hp_t0);
+        p.chk_us  += us(hp_t2 - hp_t0);
+        p.tot_us  += us(hp_t3 - hp_t0);
+        p.n_graph += use_cuda_graph && !cuda_graph_update_required ? 1 : 0;
+        if (p.n >= 512) {
+#ifdef USE_CUDA_GRAPH
+            const int memo_on = ggml_cuda_graph_key_memo_enabled() ? 1 : 0;
+#else
+            const int memo_on = 0;
+#endif // USE_CUDA_GRAPH
+            fprintf(stderr, "turbo-probe: graph-host %s ctx %p: %" PRIu64 " calls, nodes %d, key %.1f us, key+checks %.1f us, "
+                    "call %.1f us, graph replays %" PRIu64 ", mmvq q8 reuse hit %" PRIu64 " miss %" PRIu64 " (memo %d, reuse %d)\n",
+                    cuda_ctx->name.c_str(), (void *) cuda_ctx, p.n, cgraph->n_nodes, p.key_us / p.n, p.chk_us / p.n,
+                    p.tot_us / p.n, p.n_graph, cuda_ctx->mmvq_q8.n_hit, cuda_ctx->mmvq_q8.n_miss,
+                    memo_on, ggml_cuda_mmvq_q8_reuse_enabled() ? 1 : 0);
+            fflush(stderr);
+            p = {};
+            cuda_ctx->mmvq_q8.n_hit  = 0;
+            cuda_ctx->mmvq_q8.n_miss = 0;
+        }
+    }
 
     return GGML_STATUS_SUCCESS;
 }
@@ -5070,7 +5218,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
     }
 
 #ifdef USE_CUDA_GRAPH
-    const void * graph_key = ggml_cuda_graph_get_key(cgraph);
+    const void * graph_key = ggml_cuda_graph_get_key(cuda_ctx, cgraph); // uid 0 here: always hashed
     const bool use_cuda_graph = ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
 #else
     const bool use_cuda_graph = false;

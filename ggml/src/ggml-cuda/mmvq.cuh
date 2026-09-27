@@ -11,6 +11,12 @@ int get_mmvq_mmid_max_batch(ggml_type type, int cc);
 void ggml_cuda_mul_mat_vec_q(ggml_backend_cuda_context & ctx,
     const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst, const ggml_cuda_mm_fusion_args_host * fusion = nullptr);
 
+// [TAG_MMVQ_Q8_REUSE] GGML_CUDA_MMVQ_Q8_REUSE=1: MMVQ nodes that read the same src1 tensor share one q8_1 copy.
+// The graph evaluation empties the cache when it starts and before every node that writes the bytes it was made from.
+bool ggml_cuda_mmvq_q8_reuse_enabled();
+void ggml_cuda_mmvq_q8_cache_reset(ggml_backend_cuda_context & ctx);
+void ggml_cuda_mmvq_q8_cache_note_write(ggml_backend_cuda_context & ctx, const ggml_tensor * node);
+
 void ggml_cuda_op_mul_mat_vec_q(
     ggml_backend_cuda_context & ctx,
     const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, const char * src0_dd_i, const float * src1_ddf_i,

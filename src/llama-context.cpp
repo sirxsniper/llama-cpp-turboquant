@@ -1769,6 +1769,99 @@ void llama_context::sched_reserve() {
             __func__, (t_end_us - t_start_us)/1000.0, ggml_backend_sched_get_n_copies(sched.get()));
 }
 
+// [TAG_HOST_GAP_PROBE] LLAMA_HOST_GAP_PROBE=1: in a serial decode loop the GPU has nothing queued from the end of
+// the synchronize that returned the last token until the next graph is launched. For each decode of <= 64 tokens
+// whose first ubatch follows a real synchronize of this context, split that time into: caller (end of synchronize to
+// llama_decode: sampling, server loop, detokenize, batch), setup (llama_decode to graph_compute: batch split, memory
+// slot, graph reuse check, set_inputs) and launch (inside graph_compute: scheduler, CUDA graph key and checks, graph
+// launch). Mean per context every LLAMA_HOST_GAP_PROBE_EVERY such decodes (default 256). Nothing runs when unset.
+// With a drafter, caller also holds the drafter's own decode for the target context.
+static bool llama_host_gap_probe_enabled() {
+    static const bool v = [] {
+        const char * e = getenv("LLAMA_HOST_GAP_PROBE");
+        return e != nullptr && e[0] == '1';
+    }();
+    return v;
+}
+
+struct llama_host_gap_probe_entry {
+    const llama_context * ctx = nullptr;
+    int64_t  t_sync_end  = 0;
+    int64_t  t_dec_entry = 0;
+    bool     armed       = false; // a synchronize ended since the last measured graph_compute
+    uint64_t n           = 0;
+    uint64_t n_reused    = 0;
+    double   caller_us   = 0.0;
+    double   setup_us    = 0.0;
+    double   launch_us   = 0.0;
+};
+
+static llama_host_gap_probe_entry * llama_host_gap_probe_get(const llama_context * ctx) {
+    static thread_local llama_host_gap_probe_entry tab[8];
+    for (auto & e : tab) {
+        if (e.ctx == ctx) {
+            return &e;
+        }
+    }
+    for (auto & e : tab) {
+        if (e.ctx == nullptr) {
+            e.ctx = ctx;
+            return &e;
+        }
+    }
+    return nullptr;
+}
+
+static void llama_host_gap_probe_sync(const llama_context * ctx) {
+    if (auto * e = llama_host_gap_probe_get(ctx)) {
+        e->t_sync_end = ggml_time_us();
+        e->armed      = true;
+    }
+}
+
+static void llama_host_gap_probe_decode(const llama_context * ctx) {
+    if (auto * e = llama_host_gap_probe_get(ctx)) {
+        e->t_dec_entry = ggml_time_us();
+    }
+}
+
+static void llama_host_gap_probe_compute(const llama_context * ctx, uint32_t n_tokens, int64_t t_c0, int64_t t_c1, bool reused) {
+    auto * e = llama_host_gap_probe_get(ctx);
+    if (e == nullptr) {
+        return;
+    }
+    const bool valid = e->armed && n_tokens <= 64 && e->t_sync_end <= e->t_dec_entry && e->t_dec_entry <= t_c0;
+    e->armed = false;
+    if (!valid) {
+        return;
+    }
+    e->n++;
+    e->n_reused  += reused ? 1 : 0;
+    e->caller_us += (double) (e->t_dec_entry - e->t_sync_end);
+    e->setup_us  += (double) (t_c0 - e->t_dec_entry);
+    e->launch_us += (double) (t_c1 - t_c0);
+
+    static const uint64_t every = [] {
+        const char * s = getenv("LLAMA_HOST_GAP_PROBE_EVERY");
+        const int v = s ? atoi(s) : 0;
+        return v > 0 ? (uint64_t) v : (uint64_t) 256;
+    }();
+    if (e->n < every) {
+        return;
+    }
+    const double n = (double) e->n;
+    fprintf(stderr, "turbo-probe: host-gap ctx %p: %" PRIu64 " decodes of <= 64 tokens after a sync: GPU-idle host time "
+            "%.1f us = caller %.1f + setup %.1f + launch %.1f; graph reused %" PRIu64 "\n",
+            (const void *) ctx, e->n, (e->caller_us + e->setup_us + e->launch_us) / n, e->caller_us / n, e->setup_us / n,
+            e->launch_us / n, e->n_reused);
+    fflush(stderr);
+    e->n         = 0;
+    e->n_reused  = 0;
+    e->caller_us = 0.0;
+    e->setup_us  = 0.0;
+    e->launch_us = 0.0;
+}
+
 void llama_context::synchronize() {
     if (!sched) {
         return;
@@ -1790,9 +1883,15 @@ void llama_context::synchronize() {
         return;
     }
 
+    const bool was_pending = sched_pending;
+
     ggml_backend_sched_synchronize(sched.get());
 
     sched_pending = false;
+
+    if (was_pending && llama_host_gap_probe_enabled()) { // [TAG_HOST_GAP_PROBE]
+        llama_host_gap_probe_sync(this);
+    }
 
     // FIXME: if multiple single tokens are evaluated without a synchronization,
     // the stats will be added to the prompt evaluation stats
@@ -2514,6 +2613,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
 
+    bool graph_reused = false; // [TAG_HOST_GAP_PROBE]
+
     if (!graph_reuse_disable && gf_res_prev_active == res && res->can_reuse(gparams)) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
@@ -2525,6 +2626,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
 
         n_reused++;
+        graph_reused = true;
     } else {
         gf_res_prev_active = nullptr;
         res->reset();
@@ -2571,7 +2673,15 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
+    const bool    gap_probe = llama_host_gap_probe_enabled(); // [TAG_HOST_GAP_PROBE]
+    const int64_t t_gap_c0  = gap_probe ? ggml_time_us() : 0;
+
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+
+    if (gap_probe) {
+        llama_host_gap_probe_compute(this, ubatch.n_tokens, t_gap_c0, ggml_time_us(), graph_reused);
+    }
+
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
@@ -2897,6 +3007,10 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     if (!memory) {
         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
         return encode(batch_inp);
+    }
+
+    if (llama_host_gap_probe_enabled()) { // [TAG_HOST_GAP_PROBE]
+        llama_host_gap_probe_decode(this);
     }
 
     if (batch_inp.tokens.empty()) {
