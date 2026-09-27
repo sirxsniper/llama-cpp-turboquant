@@ -1146,7 +1146,9 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
     }
 
     if (model.dflash_selector_hidden) {
-        build_dflash2_selector(*this, model, inp_tokens, cur, vocab_map, dfl.dfl_lean);
+        // [TAG_DFL_HEAD] without a draft vocabulary the selector reads res->t_logits as before (a DSpark Markov head may
+        // have replaced it with the biased logits above); with one, t_logits is null and the draft-vocab logits are cur.
+        build_dflash2_selector(*this, model, inp_tokens, draft_vocab ? cur : res->t_logits, vocab_map, dfl.dfl_lean);
     }
 }
 
