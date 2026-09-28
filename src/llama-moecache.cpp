@@ -639,12 +639,21 @@ bool llama_moe_hot_init(const llama_model & model) {
             headroom = (size_t) std::max(0, atoi(e));
         }
         ggml_backend_dev_t dev = ggml_backend_buft_get_device(layers[0].buft);
-        size_t free = 0, total = 0;
+        size_t mem_free = 0, mem_total = 0;
         if (dev) {
-            ggml_backend_dev_memory(dev, &free, &total);
+            ggml_backend_dev_memory(dev, &mem_free, &mem_total);
         }
-        budget = free > (headroom << 20) ? free - (headroom << 20) : 0;
-        LLAMA_LOG_INFO("moe-hot: auto budget: %.0f MiB free - %zu MiB headroom\n", free/1048576.0, headroom);
+        budget = mem_free > (headroom << 20) ? mem_free - (headroom << 20) : 0;
+        // LLAMA_MOE_HOT_CAP_MIB: keep device use (all processes) at or below this, e.g. 28500 on a 32 GB card whose
+        // decode degrades above ~28.5 GB well before it spills
+        if (const char * e = getenv("LLAMA_MOE_HOT_CAP_MIB"); e && atoi(e) > 0) {
+            const size_t cap  = (size_t) atoi(e) << 20;
+            const size_t used = mem_total > mem_free ? mem_total - mem_free : 0;
+            const size_t room = cap > used + (headroom << 20) ? cap - used - (headroom << 20) : 0;
+            budget = std::min(budget, room);
+        }
+        LLAMA_LOG_INFO("moe-hot: auto budget %.0f MiB: %.0f MiB free of %.0f, %zu MiB headroom\n", budget/1048576.0,
+                mem_free/1048576.0, mem_total/1048576.0, headroom);
     } else if (mib) {
         budget = (size_t) (std::max(0.0, atof(mib))*1048576.0);
     }
