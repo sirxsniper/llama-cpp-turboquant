@@ -1414,7 +1414,7 @@ llama_context::llama_context(
 
         // [TAG_FN_MOE_HOT] sized after the reserve, so LLAMA_MOE_HOT_MIB=auto sees what the KV cache and the compute
         // buffers left; decode graphs then carry the hot chain, so reserve again with it
-        if (llama_moe_hot_init(model)) {
+        if (llama_moe_hot_init(model, this)) {
             sched_need_reserve = true;
             sched_reserve();
         }
@@ -3492,7 +3492,11 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     //synchronize();
 
     // apply throttled MoE expert-cache updates between graph executions
-    llama_moe_cache_step();
+    // [TAG_FN_MOE_HOT_ADAPT] an adaptive hot set changes its tables only when no graph of its owner runs
+    if (llama_moe_hot_adapt_owner() == this) {
+        ggml_backend_sched_synchronize(sched.get());
+    }
+    llama_moe_cache_step(this);
 
     return 0;
 }
