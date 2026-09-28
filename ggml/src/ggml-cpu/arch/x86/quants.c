@@ -4341,11 +4341,11 @@ static inline __m512i ggml_fn_load_2x32(const void * p0, const void * p1) {
 
 // the 32 nibbles of each of two 16 byte blocks, as two bytes_from_nibbles_32: 128-bit lanes [low nibbles of q0,
 // high nibbles of q0, low nibbles of q1, high nibbles of q1]
+// [TAG_FN_CPU_MMID_MR] built with broadcast loads: MSVC compiles _mm512_castsi256_si512 of a register as a 32-byte store
+// and a 64-byte reload, a store-forwarding stall that made the 512-bit bodies ~3x slower than the 256-bit ones
 static inline __m512i ggml_fn_nibbles_2x32(const uint8_t * q0, const uint8_t * q1) {
-    const __m256i v = _mm256_inserti128_si256(_mm256_castsi128_si256(_mm_loadu_si128((const __m128i *) q0)),
-                                              _mm_loadu_si128((const __m128i *) q1), 1);
-    const __m512i z = _mm512_castsi256_si512(v);
-    const __m512i t = _mm512_shuffle_i64x2(z, z, _MM_SHUFFLE(1, 1, 0, 0)); // [q0, q0, q1, q1]
+    const __m512i t = _mm512_mask_broadcast_i32x4(_mm512_broadcast_i32x4(_mm_loadu_si128((const __m128i *) q0)),
+                                                  (__mmask16) 0xFF00, _mm_loadu_si128((const __m128i *) q1)); // [q0, q0, q1, q1]
     // shift the 16-bit words of lanes 1 and 3 (words 8..15 and 24..31) to bring the high nibbles down
     return _mm512_and_si512(_mm512_mask_srli_epi16(t, (__mmask32) 0xFF00FF00u, t, 4), _mm512_set1_epi8(0x0F));
 }
@@ -4570,9 +4570,9 @@ static GGML_FN_INLINE void ggml_fn_q4_K_row_avx2(const int nb, const block_q4_K 
         GGML_FN_Q4_K_FIN(acc, accm, sumi_, y);                                                                          \
     } while (0)
 
-// 16-bit element k of the low 256 bits and k + 1 of the high 256 bits, everywhere (for _mm512_permutexvar_epi16)
+// 16-bit element k in the low 256 bits and k + 1 in the high 256 bits (indices for _mm512_permutexvar_epi16)
 static inline __m512i ggml_fn_bcast16_pair_idx(const int k) {
-    return _mm512_inserti64x4(_mm512_castsi256_si512(_mm256_set1_epi16((short) k)), _mm256_set1_epi16((short) (k + 1)), 1);
+    return _mm512_mask_blend_epi32((__mmask16) 0xFF00, _mm512_set1_epi16((short) k), _mm512_set1_epi16((short) (k + 1)));
 }
 
 static GGML_FN_INLINE void ggml_fn_q4_K_row_avx512(const int nb, const block_q4_K * GGML_RESTRICT x,
@@ -4599,7 +4599,8 @@ static GGML_FN_INLINE void ggml_fn_q4_K_row_avx512(const int nb, const block_q4_
 
         const __m256i mins_and_scales = ggml_fn_k4_mins_and_scales(x[i].scales);
         const __m128i mins = _mm256_extracti128_si256(mins_and_scales, 1);
-        const __m512i sc   = _mm512_castsi256_si512(mins_and_scales); // 16-bit elements 0..7: the scales
+        // 16-bit elements 0..7: the scales (no widening cast, see ggml_fn_nibbles_2x32)
+        const __m512i sc   = _mm512_inserti64x4(_mm512_setzero_si512(), mins_and_scales, 0);
         const __m512i sc0  = _mm512_permutexvar_epi16(si0, sc);
         const __m512i sc1  = _mm512_permutexvar_epi16(si1, sc);
         const __m512i sc2  = _mm512_permutexvar_epi16(si2, sc);
