@@ -164,8 +164,8 @@ bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(const int cc, const ggml_
     const int64_t n_gather = (ncols1 == 1 ? std::min<int64_t>(Q->ne[1], 64/ncols2) : ncols1) * (int64_t) n_kv_max;
 
     // [TAG_SYNC_SPARSE_TURBOT] a turbot K/V has its own kernel with no sparse gather, and the sparse branch in
-    // ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1 calls the f16 case directly (past the turbot dispatch). The
-    // turbot graph passes n_kv_max = 0, so this only guards an API caller that sets n_kv_max on a turbot FA.
+    // ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1 calls the f16 case directly (past the turbot dispatch). Keep this
+    // test: [TAG_FN_TURBOT_QSA] the qwen4exp QSA layers set n_kv_max > 0 on a turbot FA, which must run dense under the mask.
     return GGML_CUDA_CC_IS_NVIDIA(cc) && turing_mma_available(cc) && !ggml_turbot_is_type(K->type) &&
         mask != nullptr && n_kv_max > 0 && max_bias == 0.0f && logit_softcap == 0.0f &&
         mask->ne[0] == K->ne[1] && mask->ne[1] >= Q->ne[1] && mask->ne[2] == 1 &&
