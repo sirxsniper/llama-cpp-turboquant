@@ -10,6 +10,10 @@
 
 class llama_memory_hybrid_idx_context;
 
+// [TAG_FN_MTP_HEAD_ROWS] ids >= head_rows that a head-rows view keeps draftable: control and user-defined tokens,
+// punctuation-only pieces, and the ids in the file at path (may be null); sorted, at most 4096 (dflash.cpp)
+std::vector<int32_t> llama_head_extra_rows(const llama_vocab & vocab, int64_t head_rows, int64_t n_vocab, const char * path);
+
 // ref: https://github.com/ggml-org/llama.cpp/pull/28068
 static inline ggml_tensor * build_gdn_l2_norm(ggml_context * ctx, ggml_tensor * x, float eps) {
     const float n = x->ne[0];
@@ -2396,6 +2400,10 @@ struct llama_model_qwen4exp : public llama_model_base {
     llama_model_qwen4exp(const struct llama_model_params & params) : llama_model_base(params) {}
 
     class llm_graph_input_qsa;
+
+    // [TAG_FN_MTP_HEAD_ROWS] LLAMA_MTP_HEAD_ROWS=N: the MTP draft head reads rows [0, N) of the LM head plus these ids
+    int64_t              mtp_head_rows = 0;
+    std::vector<int32_t> mtp_head_extra;
 
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;

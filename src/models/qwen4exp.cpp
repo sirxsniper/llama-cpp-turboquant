@@ -296,6 +296,20 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
         layer.nextn.hc_head_up       = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_UP,       "weight", il), { hc_lr, hc_dim },     mtp_flags);
     }
 
+    // [TAG_FN_MTP_HEAD_ROWS] LLAMA_MTP_HEAD_ROWS=N (0 = off, the default): the MTP draft head reads rows [0, N) of the LM
+    // head plus the draftable ids above N; the rest of the draft logits is -inf. Only drafts change: verify uses the
+    // full head. For the Qwen3.5-family vocabulary 98304 is the value DFlash measured (LLAMA_MTP_HEAD_EXTRA=<file> adds ids).
+    if (ml.load_mtp && n_layer_all > n_layer) {
+        const char * e = getenv("LLAMA_MTP_HEAD_ROWS");
+        const int64_t rows = e ? atoll(e) : 0;
+        if (rows > 0 && rows < (int64_t) n_vocab) {
+            mtp_head_rows  = rows;
+            mtp_head_extra = llama_head_extra_rows(vocab, rows, n_vocab, getenv("LLAMA_MTP_HEAD_EXTRA"));
+            LLAMA_LOG_INFO("%s: [TAG_FN_MTP_HEAD_ROWS] MTP drafts read LM head rows [0, %lld) plus %zu more rows (%.1f%% of the head)\n",
+                    __func__, (long long) rows, mtp_head_extra.size(), 100.0*(rows + (int64_t) mtp_head_extra.size())/n_vocab);
+        }
+    }
+
     // [TAG_QWEN4EXP_MTP] without MTP the block above is skipped, and the generic scale pass of load_tensors keys on the
     // loaded weights, so it never asks for the block's optional ".scale" / ".input_scale" tensors (NVFP4, or any file
     // the saver wrote): skip them here too, or the tensor count of such a file fails. Absent ones are ignored.
@@ -1529,6 +1543,25 @@ ggml_tensor * llama_model_qwen4exp::graph::build_ple(
     return ggml_add(ctx0, hidden, ggml_add(ctx0, gated, conv_out));
 }
 
+// [TAG_FN_MTP_HEAD_ROWS] a constant I32 input (the head's extra row ids)
+class llm_graph_input_ids_const : public llm_graph_input_i {
+public:
+    llm_graph_input_ids_const(const std::vector<int32_t> & v) : v(v) {}
+    virtual ~llm_graph_input_ids_const() = default;
+
+    void set_input(const llama_ubatch * /*ubatch*/) override {
+        ggml_backend_tensor_set(ids, v.data(), 0, v.size()*sizeof(int32_t));
+    }
+
+    bool can_reuse(const llm_graph_params & /*params*/) override {
+        return true;
+    }
+
+    ggml_tensor * ids = nullptr;
+
+    const std::vector<int32_t> & v;
+};
+
 // [TAG_QWEN4EXP_MTP] The nextn block, run as the draft context of an MTP decode step. Structurally
 // deepseek4::graph_mtp with the qwen4exp hyper-connection helpers: both keep a wide residual of hc parallel streams,
 // so eh_proj is applied per stream and the state stays [n_embd, hc, T] until the block's own output mixer.
@@ -1650,7 +1683,37 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     ggml_tensor * head_w = layer.nextn.shared_head_head ? layer.nextn.shared_head_head   : model.output;
     ggml_tensor * head_s = layer.nextn.shared_head_head ? layer.nextn.shared_head_head_s : model.output_s;
     GGML_ASSERT(head_w && "QWEN4EXP MTP missing LM head");
-    cur = build_lora_mm(head_w, cur, head_s);
+
+    // [TAG_FN_MTP_HEAD_ROWS] rows [0, N) of the head as a contiguous view, the extra ids by get_rows, -inf elsewhere:
+    // the logits keep the full vocabulary width, so the draft driver and backend sampling are unchanged
+    const auto & pm = static_cast<const llama_model_qwen4exp &>(model);
+    const int64_t n_vocab_head = head_w->ne[1];
+    if (pm.mtp_head_rows > 0 && pm.mtp_head_rows < n_vocab_head && head_s == nullptr && loras->empty() &&
+            n_vocab_head == (int64_t) model.vocab.n_tokens()) {
+        const int64_t n_rows  = pm.mtp_head_rows;
+        const int64_t n_extra = (int64_t) pm.mtp_head_extra.size();
+        const int64_t n_out   = cur->ne[1];
+        ggml_tensor * normed  = cur;
+
+        cur = ggml_mul_mat(ctx0, ggml_view_2d(ctx0, head_w, head_w->ne[0], n_rows, head_w->nb[1], 0), normed);
+        cur = ggml_concat(ctx0, cur,
+                ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_vocab_head - n_rows, n_out), -INFINITY), 0);
+        if (n_extra > 0) {
+            auto inp_ids = std::make_unique<llm_graph_input_ids_const>(pm.mtp_head_extra);
+            inp_ids->ids = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_extra);
+            ggml_set_input(inp_ids->ids);
+
+            ggml_tensor * extra = ggml_mul_mat(ctx0, ggml_get_rows(ctx0, head_w, inp_ids->ids), normed);
+            cur = ggml_set_rows(ctx0, ggml_reshape_3d(ctx0, cur, 1, n_vocab_head, n_out),
+                    ggml_reshape_3d(ctx0, extra, 1, n_extra, n_out),
+                    ggml_reshape_2d(ctx0, inp_ids->ids, n_extra, 1));
+            cur = ggml_reshape_2d(ctx0, cur, n_vocab_head, n_out);
+
+            res->add_input(std::move(inp_ids));
+        }
+    } else {
+        cur = build_lora_mm(head_w, cur, head_s);
+    }
     cb(cur, "result_output", -1);
     res->t_logits = cur;
 
