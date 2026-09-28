@@ -1414,7 +1414,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             // [TAG_DFL_ADAPT_CONTENT]
             const char * c = getenv("SPEC_DFT_ADAPT_CONTENT");
             const bool want = c && c[0] == '1';
-            cx.on     = want && ad.on;
+            // the long draft of the rule must be longer than the short one, else there is nothing to choose
+            const int32_t k_long = trained_max > 0 ? std::min(n_max, trained_max) : n_max;
+            cx.on     = want && ad.on && k_long > std::min(ad.short_k, n_max);
             cx.est    = adapt_env_f("SPEC_DFT_ADAPT_CONTENT_EST", 1.0f) != 0.0f ? 1 : 0;
             cx.warm   = std::max(0, (int) adapt_env_f("SPEC_DFT_ADAPT_CONTENT_WARM",  (float) cx.warm));
             cx.dwell  = std::max(1, (int) adapt_env_f("SPEC_DFT_ADAPT_CONTENT_DWELL", (float) cx.dwell));
@@ -1439,8 +1441,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                         __func__, std::min(ad.short_k, n_max), cx.est ? "split" : "per-length", cx.warm, cx.dwell, cx.probe, cx.up,
                         cx.down, cx.w0, cx.decay, cx.tdecay, cx.tage, cx.verbose);
             } else if (want) {
-                LOG_WRN("%s: [TAG_DFL_ADAPT_CONTENT] needs the adaptive draft length (--spec-draft-adapt on, or --spec-draft-n-max above %d): off\n",
-                        __func__, ad.short_k);
+                LOG_WRN("%s: [TAG_DFL_ADAPT_CONTENT] needs the adaptive draft length (--spec-draft-adapt not off) and a long draft above %d "
+                        "(--spec-draft-n-max above %d): off\n", __func__, ad.short_k, ad.short_k);
             }
         }
         LOG_INF("%s: [TAG_DFL_QTRUNC] sampled drafts cut to the request's top-k/top-p/min-p: %s, proposal temperature x%.2f\n", __func__, dft_qtrunc ? "on" : "off", dft_qtemp);
@@ -1723,7 +1725,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             cx_since = 0;
             cx_short = 0;
         }
-        cx_since++;
+        if (cx_since < (1 << 30)) {
+            cx_since++;   // saturate: cx_k is kept across generations
+        }
     }
 
     // [TAG_DFL_ADAPT_CONTENT] the common length: today's rule first (it keeps its own state in ad_k), then with 1-2
@@ -1793,9 +1797,14 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         }
         adapt_content_note(k);
         bool probe = false;
-        if (k == k_s && cx.probe > 0 && ++cx_short >= cx.probe) {
-            cx_short = 0;
-            probe    = true;
+        if (k == k_s && cx.probe > 0) {
+            // `probe` short steps, then one long step
+            if (cx_short >= cx.probe) {
+                cx_short = 0;
+                probe    = true;
+            } else {
+                cx_short++;
+            }
         }
         const int32_t k_out = probe ? k_l : k;
         if (probe) {
