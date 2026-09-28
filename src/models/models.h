@@ -2484,6 +2484,11 @@ struct llama_model_qwen4exp : public llama_model_base {
         ggml_tensor * build_inp_ple(
   const llama_memory_hybrid_idx_context * mctx_hyb);
 
+        // [TAG_FN_PLE_HOST_GATHER] token rows dequantized on the host into an f32 input, or nullptr when not usable
+        ggml_tensor * build_inp_embd_host(
+                    ggml_tensor * table,
+                    ggml_tensor ** h_out);
+
         ggml_tensor * build_ple(
              llm_graph_input_rs * inp,
                     ggml_tensor * emb,
