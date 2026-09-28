@@ -2531,7 +2531,7 @@ static void test_plan_choose() {
 
 // [TAG_FN_TURBOT_TESTS] (4b) the quality plan: golden text and hash, widths, POOL, the chooser and the loader
 static void test_quality_plan() {
-    printf("[8e] quality plan ([TAG_FN_TURBOT_PLAN])\n");
+    printf("[8c'] quality plan ([TAG_FN_TURBOT_PLAN])\n");
     reset_turbot_env();
 
     // text, hash, and every run at old 6 / young 8

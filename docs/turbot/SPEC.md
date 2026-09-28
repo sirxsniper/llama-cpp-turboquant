@@ -1883,8 +1883,8 @@ Owner's bar (2026-09-28): turbot must run on Flash-Next, with no q4 or other low
 | 262144, -np 4 unified | 3264.00 (all young) | 3264 | 2016 | 6144 |
 
 - Why these widths (a proxy; gate F2-F4 in TESTING.md 13 decides):
-  - per value, young y 8 has about 1.6x the q8_0 squared error on Gaussian rows and much less than q8_0 on K-like rows with outlier channels, which the WHT flattens (test-turbot-geom (i));
-  - old b 6 is about 6.3e-4 nMSE, 4x below turbo5p's 5 bits;
+  - per value (test-turbot-geom (i), 2000 rows of 2 x 256): young y 8 has 1.38x the q8_0 squared error on Gaussian rows (nMSE 3.9e-5 against 2.9e-5) and 0.54x on K-like rows with 8 outlier channels, which the WHT flattens;
+  - old b 6 is 6.2e-4 / 6.0e-4 nMSE (21x / 9x q8_0), about 4x below turbo5p's 5 bits;
   - on the 27B a uniform 7-bit cache measured at the f16 floor (S3 fq_t7), and the accepted default plan has only 16K cells at 7 bits over a ~4.3-bit old tier;
   - QSA can put all attention mass on old cells, so the old tier is 6 bits and the band 64K. If the old tier fails the gate, the fallback is a sidecar with CAP = the cache (all young, q8_0 bytes).
 - Speed note: the default build compiles young loaders only for y = 7; y = 8 runs the runtime young loader. `-DGGML_CUDA_TURBOT_YOUNG_CT_EXT=ON` compiles it (TESTING.md 12.3); gate F6 measures both.
@@ -1909,7 +1909,7 @@ Every other model: unchanged (the flags are set for qwen4exp only).
 
 ### 15.7 Tests
 
-- `test-kv-resolve` `test_flash_next`; `test-turbot` [8e]; `test-turbot-geom` (g) D 256 NR 2 GQA 12 with the quality widths and a QSA-shaped mask, and (i) the quality widths against q8_0.
+- `test-kv-resolve` `test_flash_next`; `test-turbot` [8c']; `test-turbot-geom` (g) D 256 NR 2 GQA 12 with the quality widths and a QSA-shaped mask, and (i) the quality widths against q8_0.
 - `test-backend-ops` (GPU): FA at `d=256,hkv=2,hq=24` for `nr2q` (the quality widths), `nr2a`, `nr2b` and `nr2l`, mask modes 1, 2 and 3 (3 = a QSA mask with n_kv_max set as `build_attn_qsa` sets it), kv 96..65536, nb 1..1280; the writer at `nr2q`; perf `nr2q` against turbo5p512 and q8_0 at kv 32K / 131K / 262K.
 - GPU gates F0-F8: TESTING.md section 13.
 

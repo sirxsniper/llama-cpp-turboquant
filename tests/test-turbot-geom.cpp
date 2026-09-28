@@ -720,8 +720,8 @@ static const uint8_t QUALITY_Y[4] = { 8, 8, 8, 8 };
 // nMSE (sum of squared error over sum of squares) of the young (y 8) and old (b 6) decode of 2 x 256 rows against the q8_0
 // round trip of the same rows: Gaussian rows, and K-like rows with 8 channels 6x larger. A proxy for the q8-level claim
 // of the plan (the real gate is KLD against f16 on the GPU): the young tier must stay within 2.5x of q8_0 (8-bit Lloyd-Max
-// on a Gaussian is about 1.6x the q8_0 error, and far below it on K-like rows, which the WHT flattens), the old tier
-// below 1e-3 (6-bit Lloyd-Max on a Gaussian is about 6.3e-4; turbo5p's 5 bits about 2.5e-3).
+// has 1.38x the q8_0 error on the Gaussian rows here, 0.54x on the K-like rows, which the WHT flattens), the old tier
+// below 1e-3 (6.2e-4 / 6.0e-4 measured; turbo5p's 5 bits are about 2.5e-3).
 static void test_quality_widths() {
     printf("[i] quality plan widths (old 6, young 8) against q8_0, 2 x 256 rows\n");
 
@@ -739,7 +739,7 @@ static void test_quality_widths() {
     std::normal_distribution<float> nd(0.0f, 1.0f);
 
     for (int kind = 0; kind < 2; ++kind) {
-        std::vector<float>   x(row), dy(row), dold(row), dq(row);
+        std::vector<float>   x(row), xr(row), dy(row), dold(row), dq(row);
         std::vector<uint8_t> base(l.k.base_row_bytes), young(l.pool_row_bytes), q8(ggml_row_size(GGML_TYPE_Q8_0, row));
         double e_y = 0.0, e_o = 0.0, e_q = 0.0, e_x = 0.0;
         for (int n = 0; n < 2000; ++n) {
@@ -756,9 +756,14 @@ static void test_quality_widths() {
             ggml_turbot_decode_side(base.data(), nullptr, &l.k, dold.data());
             ggml_quantize_chunk(GGML_TYPE_Q8_0, x.data(), q8.data(), 0, 1, row, nullptr);
             tq->to_float(q8.data(), dq.data(), row);
+            // turbot decodes to the WHT-128 domain (FA rotates Q the same way); the WHT is orthonormal, so compare there
+            xr = x;
+            for (int g = 0; g < row/128; ++g) {
+                ggml_turbot_fwht128(xr.data() + 128*g);
+            }
             for (int i = 0; i < row; ++i) {
-                e_y += (double) (dy[i]   - x[i]) * (dy[i]   - x[i]);
-                e_o += (double) (dold[i] - x[i]) * (dold[i] - x[i]);
+                e_y += (double) (dy[i]   - xr[i]) * (dy[i]   - xr[i]);
+                e_o += (double) (dold[i] - xr[i]) * (dold[i] - xr[i]);
                 e_q += (double) (dq[i]   - x[i]) * (dq[i]   - x[i]);
                 e_x += (double) x[i] * x[i];
             }

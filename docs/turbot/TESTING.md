@@ -931,7 +931,7 @@ rules apply to every GPU step; every KLD base is a sparse top-256 base (12.5), n
 
 | Gate | What | Pass |
 |---|---|---|
-| F0 | build-fnkv; `test-kv-resolve` (test_flash_next), `test-turbot` [8e], `test-turbot-geom` (g) GQA 12 + QSA mask and (i) | all OK; `turbot_plan.py quality --gguf <shard 1> -c 262144` prints hash 0xcc97a64e9786d761 |
+| F0 | build-fnkv; `test-kv-resolve` (test_flash_next), `test-turbot` [8c'], `test-turbot-geom` (g) GQA 12 + QSA mask and (i) | all OK; `turbot_plan.py quality --gguf <shard 1> -c 262144` prints hash 0xcc97a64e9786d761 |
 | F1 | memcheck, then `test-backend-ops -o FLASH_ATTN_EXT,TURBOT_SET_ROWS -p "turbot=[a-z0-9]+,d=256,hkv=2,hq=24"` (GQA 12, mask modes 1/2/3), then `validate.ps1` | 0 memcheck errors, N/N passed, GATE PASSED |
 | F2 | server smoke, q8_0 and turbot arms | no `KV cache type for` line; `turbot plan <quality>` and the quality-plan INFO line; indexer q8_0; correct probes; 16K needle |
 | F3 | 32K x 8 chunks, second half scored: f16 repeat, f16 `-ub 1024` floor, q8_0, turbot, turbot CAP 4096 (old tier), turbot with an f16 indexer, turbo5p512 | turbot and turbot CAP 4096 q8-level against q8_0 and the floor (`fn_paired.py --refs`), the indexer arm not worse |
