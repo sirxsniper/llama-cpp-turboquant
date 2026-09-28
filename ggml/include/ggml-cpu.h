@@ -125,6 +125,18 @@ extern "C" {
 
     GGML_BACKEND_API void ggml_cpu_init(void);
 
+    // [TAG_FN_CPU_SWITCHES] switches of the CPU expert path (Flash-Next work package WP-CPU), all off by default.
+    // ggml_cpu_init() reads each one once from its environment variable (ggml_cpu_fn_switch_env). Tests and
+    // benchmarks may change them with ggml_cpu_fn_set_switch(), but only while no graph is being computed.
+    enum ggml_cpu_fn_switch {
+        GGML_CPU_FN_APPLY_ONCE = 0, // GGML_CPU_APPLY_ONCE=1: skip re-applying an unchanged thread priority / affinity
+        GGML_CPU_FN_SWITCH_COUNT,
+    };
+
+    GGML_BACKEND_API int          ggml_cpu_fn_get_switch(enum ggml_cpu_fn_switch sw);
+    GGML_BACKEND_API void         ggml_cpu_fn_set_switch(enum ggml_cpu_fn_switch sw, int value);
+    GGML_BACKEND_API const char * ggml_cpu_fn_switch_env(enum ggml_cpu_fn_switch sw); // environment variable name
+
     //
     // CPU backend
     //

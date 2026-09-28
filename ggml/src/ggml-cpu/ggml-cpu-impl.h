@@ -29,6 +29,10 @@ struct ggml_compute_params {
     bool use_ref;
 };
 
+// [TAG_FN_CPU_SWITCHES] values of the switches of enum ggml_cpu_fn_switch (ggml-cpu.h), indexed by it: set once in
+// ggml_cpu_init() from the environment and afterwards only by ggml_cpu_fn_set_switch() while no graph is computing
+extern int ggml_cpu_fn_sw[];
+
 
 #if defined(_MSC_VER)
 

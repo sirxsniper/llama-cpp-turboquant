@@ -1223,6 +1223,41 @@ void ggml_set_f32_nd(const struct ggml_tensor * tensor, int i0, int i1, int i2, 
 // [TAG_Q2_0_CPU] SIMD Q2_0 dot product on x86, off by default; initialized once in ggml_cpu_init(), read-only afterwards
 bool ggml_cpu_q2_0_simd = false;
 
+// [TAG_FN_CPU_SWITCHES] the switches of enum ggml_cpu_fn_switch: environment variable names and values (0 = off)
+static const char * const ggml_cpu_fn_sw_env[] = {
+    /* GGML_CPU_FN_APPLY_ONCE */ "GGML_CPU_APPLY_ONCE",
+};
+static_assert(sizeof(ggml_cpu_fn_sw_env)/sizeof(ggml_cpu_fn_sw_env[0]) == GGML_CPU_FN_SWITCH_COUNT, "one name per switch");
+
+int ggml_cpu_fn_sw[GGML_CPU_FN_SWITCH_COUNT] = { 0 };
+
+static void ggml_cpu_fn_switches_init(void) {
+    for (int i = 0; i < GGML_CPU_FN_SWITCH_COUNT; i++) {
+        const char * env = getenv(ggml_cpu_fn_sw_env[i]);
+        ggml_cpu_fn_sw[i] = env != NULL ? atoi(env) : 0;
+        if (ggml_cpu_fn_sw[i] != 0) {
+            GGML_LOG_INFO("%s: %s=%d\n", __func__, ggml_cpu_fn_sw_env[i], ggml_cpu_fn_sw[i]);
+        }
+    }
+}
+
+int ggml_cpu_fn_get_switch(enum ggml_cpu_fn_switch sw) {
+    ggml_cpu_init();
+    GGML_ASSERT((int) sw >= 0 && (int) sw < GGML_CPU_FN_SWITCH_COUNT);
+    return ggml_cpu_fn_sw[sw];
+}
+
+void ggml_cpu_fn_set_switch(enum ggml_cpu_fn_switch sw, int value) {
+    ggml_cpu_init(); // so that a later first ggml_cpu_init() cannot overwrite the value with the environment's
+    GGML_ASSERT((int) sw >= 0 && (int) sw < GGML_CPU_FN_SWITCH_COUNT);
+    ggml_cpu_fn_sw[sw] = value;
+}
+
+const char * ggml_cpu_fn_switch_env(enum ggml_cpu_fn_switch sw) {
+    GGML_ASSERT((int) sw >= 0 && (int) sw < GGML_CPU_FN_SWITCH_COUNT);
+    return ggml_cpu_fn_sw_env[sw];
+}
+
 // [TAG_Q2_0_CPU] the use_ref backend (the reference of test-backend-ops -b CPU) runs the scalar Q2_0 dot product, so the
 // SIMD one is compared against it
 static inline ggml_vec_dot_t ggml_cpu_mul_mat_vec_dot(enum ggml_type type, bool use_ref) {
@@ -2882,6 +2917,46 @@ static bool ggml_thread_apply_priority(int32_t prio) {
 
 #endif
 
+// [TAG_FN_CPU_APPLY_ONCE] GGML_CPU_APPLY_ONCE=1. With OpenMP every graph compute (one per CPU split of the scheduler)
+// opens a parallel region in which each thread re-applies the priority and the affinity mask: on Windows that is
+// SetThreadInformation + SetThreadPriority + SetThreadAffinityMask per thread per split, about 2N regions per token
+// with N CPU expert layers. The OS keeps both per thread, so each thread remembers what it applied last and skips the
+// calls when nothing changed. Only successful calls are remembered (a failed one is retried by the next region), and
+// clear_numa_thread_affinity() forgets the mask it resets. The OpenMP runtime keeps its worker threads, so after the
+// first region the calls are skipped until the requested priority or mask changes.
+#ifdef GGML_USE_OPENMP
+#if defined(_MSC_VER)
+#define GGML_CPU_FN_TLS __declspec(thread)
+#else
+#define GGML_CPU_FN_TLS _Thread_local
+#endif
+
+static GGML_CPU_FN_TLS bool    ggml_fn_prio_known   = false;
+static GGML_CPU_FN_TLS int32_t ggml_fn_prio_applied = 0;
+static GGML_CPU_FN_TLS bool    ggml_fn_mask_known   = false;
+static GGML_CPU_FN_TLS bool    ggml_fn_mask_applied[GGML_MAX_N_THREADS];
+
+static void ggml_thread_apply_priority_once(int32_t prio) {
+    if (ggml_fn_prio_known && ggml_fn_prio_applied == prio) {
+        return;
+    }
+    ggml_fn_prio_known = ggml_thread_apply_priority(prio);
+    ggml_fn_prio_applied = prio;
+}
+
+static void ggml_thread_apply_affinity_once(bool * mask) {
+    if (ggml_fn_mask_known && memcmp(ggml_fn_mask_applied, mask, GGML_MAX_N_THREADS) == 0) {
+        return;
+    }
+    ggml_fn_mask_known = ggml_thread_apply_affinity(mask);
+    memcpy(ggml_fn_mask_applied, mask, GGML_MAX_N_THREADS);
+}
+
+static void ggml_thread_apply_forget_mask(void) {
+    ggml_fn_mask_known = false;
+}
+#endif // GGML_USE_OPENMP
+
 static bool ggml_thread_cpumask_is_valid(const bool * mask) {
     for (int i = 0; i < GGML_MAX_N_THREADS; i++) {
         if (mask[i]) { return true; }
@@ -3622,9 +3697,17 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
             // Apply thread CPU mask and priority
             int ith = omp_get_thread_num();
 
-            ggml_thread_apply_priority(threadpool->prio);
-            if (ggml_thread_cpumask_is_valid(threadpool->workers[ith].cpumask)) {
-                ggml_thread_apply_affinity(threadpool->workers[ith].cpumask);
+            if (ggml_cpu_fn_sw[GGML_CPU_FN_APPLY_ONCE]) {
+                // [TAG_FN_CPU_APPLY_ONCE] same settings, applied only when they differ from this thread's last ones
+                ggml_thread_apply_priority_once(threadpool->prio);
+                if (ggml_thread_cpumask_is_valid(threadpool->workers[ith].cpumask)) {
+                    ggml_thread_apply_affinity_once(threadpool->workers[ith].cpumask);
+                }
+            } else {
+                ggml_thread_apply_priority(threadpool->prio);
+                if (ggml_thread_cpumask_is_valid(threadpool->workers[ith].cpumask)) {
+                    ggml_thread_apply_affinity(threadpool->workers[ith].cpumask);
+                }
             }
             ggml_graph_compute_thread(&threadpool->workers[ith]);
         }
@@ -3647,6 +3730,11 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
 
     // don't leave affinity set on the main thread
     clear_numa_thread_affinity();
+#ifdef GGML_USE_OPENMP
+    if (ggml_is_numa()) {
+        ggml_thread_apply_forget_mask(); // [TAG_FN_CPU_APPLY_ONCE] the mask was just reset
+    }
+#endif
 
     enum ggml_status ret = threadpool->ec;
 
@@ -4249,6 +4337,8 @@ void ggml_cpu_init(void) {
             const char * env = getenv("GGML_CPU_Q2_0_SIMD");
             ggml_cpu_q2_0_simd = (env != NULL && atoi(env) == 1);
         }
+
+        ggml_cpu_fn_switches_init(); // [TAG_FN_CPU_SWITCHES]
 
         is_first_call = false;
     }
