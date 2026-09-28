@@ -1226,6 +1226,7 @@ bool ggml_cpu_q2_0_simd = false;
 // [TAG_FN_CPU_SWITCHES] the switches of enum ggml_cpu_fn_switch: environment variable names and values (0 = off)
 static const char * const ggml_cpu_fn_sw_env[] = {
     /* GGML_CPU_FN_APPLY_ONCE */ "GGML_CPU_APPLY_ONCE",
+    /* GGML_CPU_FN_Q5_1_AVX512 */ "GGML_CPU_Q5_1_AVX512",
 };
 static_assert(sizeof(ggml_cpu_fn_sw_env)/sizeof(ggml_cpu_fn_sw_env[0]) == GGML_CPU_FN_SWITCH_COUNT, "one name per switch");
 
@@ -1264,6 +1265,12 @@ static inline ggml_vec_dot_t ggml_cpu_mul_mat_vec_dot(enum ggml_type type, bool 
     if (use_ref && type == GGML_TYPE_Q2_0) {
         return ggml_vec_dot_q2_0_q8_0_generic;
     }
+#if defined(GGML_CPU_FN_X86_ARCH)
+    // [TAG_FN_CPU_Q5_1_AVX512] the reference keeps the AVX2 q5_1 dot product whatever GGML_CPU_Q5_1_AVX512 says
+    if (use_ref && type == GGML_TYPE_Q5_1) {
+        return ggml_vec_dot_q5_1_q8_1_base;
+    }
+#endif
     return type_traits_cpu[type].vec_dot;
 }
 

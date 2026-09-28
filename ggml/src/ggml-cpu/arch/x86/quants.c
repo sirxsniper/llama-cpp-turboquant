@@ -1366,7 +1366,8 @@ void ggml_vec_dot_q5_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
 #endif
 }
 
-void ggml_vec_dot_q5_1_q8_1(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+// [TAG_FN_CPU_Q5_1_AVX512] the unswitched body; ggml_vec_dot_q5_1_q8_1 (end of file) selects between it and the AVX-512 one
+void ggml_vec_dot_q5_1_q8_1_base(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     const int qk = QK8_1;
     const int nb = n / qk;
 
@@ -4252,4 +4253,188 @@ void ggml_vec_dot_iq4_xs_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const v
     UNUSED(nb);
     ggml_vec_dot_iq4_xs_q8_K_generic(n, s, bs, vx, bx, vy, by, nrc);
 #endif
+}
+
+//===================================== CPU expert path kernels (Flash-Next WP-CPU) =====================================
+//
+// [TAG_FN_CPU_Q5_1_AVX512] [TAG_FN_CPU_MMID_MR]
+// Row kernels that take one weight row and up to 4 columns (tokens). Every value they produce is bitwise equal to the
+// AVX2 ggml_vec_dot_<type> above on the same row and column, as long as the compiler does not contract a*b + c
+// differently in the two functions (MSVC never contracts):
+// - integer parts: the same int32 lane sums. The lanes cover the same bytes (4i..4i+3 of each 32 byte block), integer
+//   adds are exact in any order, and for these types no maddubs pair reaches the int16 limit, so VNNI dpbusd gives the
+//   same sums as maddubs + madd.
+// - float parts: the same operations in the same order. Per block (or super-block) the same scale product and one
+//   fmadd into a per-column accumulator, in block order, then the same horizontal sums and scalar additions.
+// The 512-bit bodies do the integer work of two blocks at once and split the result into its two 256-bit halves for
+// the float steps, so they keep that order too.
+
+#if defined(GGML_CPU_FN_X86)
+
+#if defined(_MSC_VER)
+#define GGML_FN_INLINE __forceinline
+#else
+#define GGML_FN_INLINE inline __attribute__((always_inline))
+#endif
+
+// one block of the AVX2 ggml_vec_dot_q5_1_q8_1 loop for one column; qx (the unpacked weight block), dx and fm (its
+// scale and min) and ib come from the caller
+#define GGML_FN_Q5_1_COL(acc, summs, y) do {                                             \
+        (summs) += fm * GGML_CPU_FP16_TO_FP32((y)[ib].s);                                \
+        const __m256  dy_ = _mm256_set1_ps(GGML_CPU_FP16_TO_FP32((y)[ib].d));            \
+        const __m256i qy_ = _mm256_loadu_si256((const __m256i *) (y)[ib].qs);            \
+        const __m256  q_  = mul_sum_us8_pairs_float(qx, qy_);                            \
+        (acc) = _mm256_fmadd_ps(q_, _mm256_mul_ps(dx, dy_), (acc));                      \
+    } while (0)
+
+// one q5_1 row against nc (1..4, a constant after inlining) q8_1 columns: s[c*bs] = dot(x, yc)
+static GGML_FN_INLINE void ggml_fn_q5_1_row_avx2(const int nb, const block_q5_1 * GGML_RESTRICT x,
+        const block_q8_1 * y0, const block_q8_1 * y1, const block_q8_1 * y2, const block_q8_1 * y3,
+        const int nc, float * GGML_RESTRICT s, const size_t bs) {
+    __m256 acc0 = _mm256_setzero_ps();
+    __m256 acc1 = acc0;
+    __m256 acc2 = acc0;
+    __m256 acc3 = acc0;
+    float summs0 = 0.0f;
+    float summs1 = 0.0f;
+    float summs2 = 0.0f;
+    float summs3 = 0.0f;
+
+    for (int ib = 0; ib < nb; ++ib) {
+        const __m256 dx = _mm256_set1_ps(GGML_CPU_FP16_TO_FP32(x[ib].d));
+        const float  fm = GGML_CPU_FP16_TO_FP32(x[ib].m);
+
+        __m256i qx = bytes_from_nibbles_32(x[ib].qs);
+        __m256i bxhi = bytes_from_bits_32(x[ib].qh);
+        bxhi = _mm256_and_si256(bxhi, _mm256_set1_epi8(0x10));
+        qx = _mm256_or_si256(qx, bxhi);
+
+        GGML_FN_Q5_1_COL(acc0, summs0, y0);
+        if (nc > 1) { GGML_FN_Q5_1_COL(acc1, summs1, y1); }
+        if (nc > 2) { GGML_FN_Q5_1_COL(acc2, summs2, y2); }
+        if (nc > 3) { GGML_FN_Q5_1_COL(acc3, summs3, y3); }
+    }
+
+    s[0] = hsum_float_8(acc0) + summs0;
+    if (nc > 1) { s[1*bs] = hsum_float_8(acc1) + summs1; }
+    if (nc > 2) { s[2*bs] = hsum_float_8(acc2) + summs2; }
+    if (nc > 3) { s[3*bs] = hsum_float_8(acc3) + summs3; }
+}
+
+#if defined(GGML_CPU_FN_X86_AVX512)
+
+// unsigned x bytes times signed y bytes, summed in groups of 4 into 16 int32 lanes (maddubs + madd, or VNNI dpbusd,
+// which is the same for inputs whose byte pairs stay inside int16)
+static inline __m512i ggml_fn_dot_us8_512(const __m512i ax, const __m512i sy) {
+#if defined(__AVX512VNNI__)
+    return _mm512_dpbusd_epi32(_mm512_setzero_si512(), ax, sy);
+#else
+    return _mm512_madd_epi16(_mm512_maddubs_epi16(ax, sy), _mm512_set1_epi16(1));
+#endif
+}
+
+// 32 bytes at p0 in the low half, 32 bytes at p1 in the high half
+static inline __m512i ggml_fn_load_2x32(const void * p0, const void * p1) {
+    return _mm512_inserti64x4(_mm512_castsi256_si512(_mm256_loadu_si256((const __m256i *) p0)),
+                              _mm256_loadu_si256((const __m256i *) p1), 1);
+}
+
+// the 32 nibbles of each of two 16 byte blocks, as two bytes_from_nibbles_32: 128-bit lanes [low nibbles of q0,
+// high nibbles of q0, low nibbles of q1, high nibbles of q1]
+static inline __m512i ggml_fn_nibbles_2x32(const uint8_t * q0, const uint8_t * q1) {
+    const __m256i v = _mm256_inserti128_si256(_mm256_castsi128_si256(_mm_loadu_si128((const __m128i *) q0)),
+                                              _mm_loadu_si128((const __m128i *) q1), 1);
+    const __m512i z = _mm512_castsi256_si512(v);
+    const __m512i t = _mm512_shuffle_i64x2(z, z, _MM_SHUFFLE(1, 1, 0, 0)); // [q0, q0, q1, q1]
+    // shift the 16-bit words of lanes 1 and 3 (words 8..15 and 24..31) to bring the high nibbles down
+    return _mm512_and_si512(_mm512_mask_srli_epi16(t, (__mmask32) 0xFF00FF00u, t, 4), _mm512_set1_epi8(0x0F));
+}
+
+// blocks ib and ib + 1 of the AVX2 ggml_vec_dot_q5_1_q8_1 loop for one column, from one 512-bit integer dot; qx, dx0,
+// dx1, fm0, fm1 and ib come from the caller
+#define GGML_FN_Q5_1_COL2(acc, summs, y) do {                                                               \
+        const __m512 q_ = _mm512_cvtepi32_ps(ggml_fn_dot_us8_512(qx, ggml_fn_load_2x32((y)[ib].qs, (y)[ib + 1].qs))); \
+        (summs) += fm0 * GGML_CPU_FP16_TO_FP32((y)[ib].s);                                                   \
+        (acc) = _mm256_fmadd_ps(_mm512_castps512_ps256(q_),                                                  \
+                    _mm256_mul_ps(dx0, _mm256_set1_ps(GGML_CPU_FP16_TO_FP32((y)[ib].d))), (acc));            \
+        (summs) += fm1 * GGML_CPU_FP16_TO_FP32((y)[ib + 1].s);                                               \
+        (acc) = _mm256_fmadd_ps(_mm512_extractf32x8_ps(q_, 1),                                               \
+                    _mm256_mul_ps(dx1, _mm256_set1_ps(GGML_CPU_FP16_TO_FP32((y)[ib + 1].d))), (acc));        \
+    } while (0)
+
+// as ggml_fn_q5_1_row_avx2, two blocks per step: the high bits come from a 64-bit mask (a masked add of 0x10 to the
+// nibbles is the same as or-ing bytes_from_bits_32 & 0x10), the four byte products per lane from one 512-bit dot
+static GGML_FN_INLINE void ggml_fn_q5_1_row_avx512(const int nb, const block_q5_1 * GGML_RESTRICT x,
+        const block_q8_1 * y0, const block_q8_1 * y1, const block_q8_1 * y2, const block_q8_1 * y3,
+        const int nc, float * GGML_RESTRICT s, const size_t bs) {
+    __m256 acc0 = _mm256_setzero_ps();
+    __m256 acc1 = acc0;
+    __m256 acc2 = acc0;
+    __m256 acc3 = acc0;
+    float summs0 = 0.0f;
+    float summs1 = 0.0f;
+    float summs2 = 0.0f;
+    float summs3 = 0.0f;
+
+    const __m512i m10 = _mm512_set1_epi8(0x10);
+
+    int ib = 0;
+    for (; ib + 1 < nb; ib += 2) {
+        const __m256 dx0 = _mm256_set1_ps(GGML_CPU_FP16_TO_FP32(x[ib + 0].d));
+        const __m256 dx1 = _mm256_set1_ps(GGML_CPU_FP16_TO_FP32(x[ib + 1].d));
+        const float  fm0 = GGML_CPU_FP16_TO_FP32(x[ib + 0].m);
+        const float  fm1 = GGML_CPU_FP16_TO_FP32(x[ib + 1].m);
+
+        uint32_t qh0;
+        uint32_t qh1;
+        memcpy(&qh0, x[ib + 0].qh, sizeof(qh0));
+        memcpy(&qh1, x[ib + 1].qh, sizeof(qh1));
+
+        __m512i qx = ggml_fn_nibbles_2x32(x[ib + 0].qs, x[ib + 1].qs);
+        qx = _mm512_mask_add_epi8(qx, (__mmask64) ((uint64_t) qh0 | ((uint64_t) qh1 << 32)), qx, m10);
+
+        GGML_FN_Q5_1_COL2(acc0, summs0, y0);
+        if (nc > 1) { GGML_FN_Q5_1_COL2(acc1, summs1, y1); }
+        if (nc > 2) { GGML_FN_Q5_1_COL2(acc2, summs2, y2); }
+        if (nc > 3) { GGML_FN_Q5_1_COL2(acc3, summs3, y3); }
+    }
+    for (; ib < nb; ++ib) {
+        // an odd last block: the 256-bit step
+        const __m256 dx = _mm256_set1_ps(GGML_CPU_FP16_TO_FP32(x[ib].d));
+        const float  fm = GGML_CPU_FP16_TO_FP32(x[ib].m);
+
+        __m256i qx = bytes_from_nibbles_32(x[ib].qs);
+        __m256i bxhi = bytes_from_bits_32(x[ib].qh);
+        bxhi = _mm256_and_si256(bxhi, _mm256_set1_epi8(0x10));
+        qx = _mm256_or_si256(qx, bxhi);
+
+        GGML_FN_Q5_1_COL(acc0, summs0, y0);
+        if (nc > 1) { GGML_FN_Q5_1_COL(acc1, summs1, y1); }
+        if (nc > 2) { GGML_FN_Q5_1_COL(acc2, summs2, y2); }
+        if (nc > 3) { GGML_FN_Q5_1_COL(acc3, summs3, y3); }
+    }
+
+    s[0] = hsum_float_8(acc0) + summs0;
+    if (nc > 1) { s[1*bs] = hsum_float_8(acc1) + summs1; }
+    if (nc > 2) { s[2*bs] = hsum_float_8(acc2) + summs2; }
+    if (nc > 3) { s[3*bs] = hsum_float_8(acc3) + summs3; }
+}
+
+#endif // GGML_CPU_FN_X86_AVX512
+
+#endif // GGML_CPU_FN_X86
+
+// [TAG_FN_CPU_Q5_1_AVX512] GGML_CPU_Q5_1_AVX512=1 on an AVX512F/BW/DQ build: the 512-bit body, bitwise equal to the
+// AVX2 one (see above); otherwise ggml_vec_dot_q5_1_q8_1_base
+void ggml_vec_dot_q5_1_q8_1(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+#if defined(GGML_CPU_FN_X86_AVX512)
+    if (ggml_cpu_fn_sw[GGML_CPU_FN_Q5_1_AVX512]) {
+        assert(n % QK5_1 == 0);
+        assert(nrc == 1);
+        const block_q8_1 * y = (const block_q8_1 *) vy;
+        ggml_fn_q5_1_row_avx512(n / QK5_1, (const block_q5_1 *) vx, y, y, y, y, 1, s, 0);
+        return;
+    }
+#endif
+    ggml_vec_dot_q5_1_q8_1_base(n, s, bs, vx, bx, vy, by, nrc);
 }

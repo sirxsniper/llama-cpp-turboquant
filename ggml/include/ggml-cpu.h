@@ -130,6 +130,7 @@ extern "C" {
     // benchmarks may change them with ggml_cpu_fn_set_switch(), but only while no graph is being computed.
     enum ggml_cpu_fn_switch {
         GGML_CPU_FN_APPLY_ONCE = 0, // GGML_CPU_APPLY_ONCE=1: skip re-applying an unchanged thread priority / affinity
+        GGML_CPU_FN_Q5_1_AVX512,    // GGML_CPU_Q5_1_AVX512=1: AVX-512 q5_1 x q8_1 dot product (bitwise equal to AVX2)
         GGML_CPU_FN_SWITCH_COUNT,
     };
 

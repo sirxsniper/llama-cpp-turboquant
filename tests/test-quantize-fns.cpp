@@ -10,6 +10,8 @@
 #include <cmath>
 #include <math.h>
 #include <stdio.h>
+#include <cstring>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -304,6 +306,85 @@ static int test_vec_dot_q(bool verbose) {
     return num_failed;
 }
 
+// [TAG_FN_CPU_Q5_1_AVX512] [TAG_FN_CPU_MMID_MR] the kernels of the CPU expert path claim to be bitwise equal to the
+// AVX2 dot products. That holds exactly where the compiler does not contract a*b + c differently in the two functions
+// (MSVC never contracts); elsewhere allow a rounding step.
+static bool fn_same_float(float a, float b) {
+#if defined(_MSC_VER) && !defined(__clang__)
+    return memcmp(&a, &b, sizeof(float)) == 0;
+#else
+    return a == b || fabsf(a - b) <= 1e-6f * std::max(1.0f, fabsf(a));
+#endif
+}
+
+// raw blocks with random bytes and random scales in the first nhalf fp16 fields of each block (all bit patterns of
+// the packed quants, including the q5_1 high bits)
+static std::vector<uint8_t> fn_random_blocks(ggml_type type, int n, int nhalf, std::mt19937 & rng) {
+    const size_t bsize = ggml_type_size(type);
+    const size_t nblk  = (size_t) n / ggml_blck_size(type);
+    std::vector<uint8_t> data(bsize * nblk);
+    std::uniform_int_distribution<int> byte(0, 255);
+    std::uniform_real_distribution<float> scale(-0.05f, 0.05f);
+    for (size_t b = 0; b < nblk; b++) {
+        uint8_t * blk = data.data() + b * bsize;
+        for (size_t j = 0; j < bsize; j++) {
+            blk[j] = (uint8_t) byte(rng);
+        }
+        for (int h = 0; h < nhalf; h++) {
+            const ggml_fp16_t v = ggml_fp32_to_fp16(scale(rng));
+            memcpy(blk + h * sizeof(ggml_fp16_t), &v, sizeof(v));
+        }
+    }
+    return data;
+}
+
+// the activation side: random floats quantized with the CPU from_float of the type (so the q8_1 sums are consistent)
+static std::vector<uint8_t> fn_random_act(ggml_type vec_dot_type, int n, std::mt19937 & rng) {
+    std::vector<float> f(n);
+    std::uniform_real_distribution<float> uni(-1.0f, 1.0f);
+    for (float & v : f) {
+        v = uni(rng);
+    }
+    std::vector<uint8_t> q(ggml_row_size(vec_dot_type, n));
+    ggml_get_type_traits_cpu(vec_dot_type)->from_float(f.data(), q.data(), n);
+    return q;
+}
+
+// [TAG_FN_CPU_Q5_1_AVX512] GGML_CPU_Q5_1_AVX512 must not change a single bit: the q5_1 dot product with the switch on
+// against the same call with it off, on random blocks (every high bit pattern) and odd block counts (the 256-bit tail)
+static int test_fn_q5_1_avx512(bool verbose) {
+    const auto * q51 = ggml_get_type_traits_cpu(GGML_TYPE_Q5_1);
+    const int saved = ggml_cpu_fn_get_switch(GGML_CPU_FN_Q5_1_AVX512);
+
+    std::mt19937 rng(1234);
+    int num_failed = 0;
+    int n_cases    = 0;
+    for (int n : {32, 64, 96, 640, 672, 2560}) {
+        for (int rep = 0; rep < 16; ++rep) {
+            const std::vector<uint8_t> xq = fn_random_blocks(GGML_TYPE_Q5_1, n, 2, rng); // d, m
+            const std::vector<uint8_t> yq = fn_random_act(GGML_TYPE_Q8_1, n, rng);
+            float r[2];
+            for (int v = 0; v < 2; ++v) {
+                ggml_cpu_fn_set_switch(GGML_CPU_FN_Q5_1_AVX512, v);
+                q51->vec_dot(n, &r[v], 0, xq.data(), 0, yq.data(), 0, 1);
+            }
+            n_cases++;
+            const bool failed = !fn_same_float(r[0], r[1]);
+            num_failed += failed;
+            if (failed || (verbose && rep == 0)) {
+                printf(" q5_1 AVX-512 vs AVX2 n=%4d:        %s (%.9g vs %.9g)\n", n, RESULT_STR[failed], r[1], r[0]);
+            }
+        }
+    }
+    ggml_cpu_fn_set_switch(GGML_CPU_FN_Q5_1_AVX512, saved);
+
+    if (num_failed || verbose) {
+        printf(" q5_1 AVX-512 dot product: %d cases, %d not bitwise equal to AVX2%s\n", n_cases, num_failed,
+               ggml_cpu_has_avx512() ? "" : " (no AVX-512 in this build: both runs took the AVX2 body)");
+    }
+    return num_failed;
+}
+
 int main(int argc, char * argv[]) {
     bool verbose = false;
 
@@ -325,6 +406,7 @@ int main(int argc, char * argv[]) {
 
     num_failed += test_vec_dot_f32(verbose);
     num_failed += test_vec_dot_q(verbose);
+    num_failed += test_fn_q5_1_avx512(verbose); // [TAG_FN_CPU_Q5_1_AVX512]
 
     if (num_failed || verbose) {
         printf("%d tests failed\n", num_failed);
