@@ -1984,6 +1984,42 @@ static const uint64_t AUTO_2X128_T5P_HASH = 0xb856a10f462c3c1full;
 
 static const std::vector<int32_t> NEMO_IL = { 4, 12, 20, 28, 36, 44 };
 
+// [TAG_FN_TURBOT_TESTS] tools/turbot/turbot_plan.py quality (goldens: the same text and hash from the Python mirror).
+// Qwen3.8-Flash-Next: 12 attention layers 3, 7, ..., 47, 2 KV heads x 256, one sequence at 262144 cells.
+static const char * QUALITY_FN_262K =
+    "# turbot quality plan v1\n"
+    "# shape: 12 attention layers: 12 x 2x256 (KV heads x head dim); kv_size 262144, n_stream 1, n_seq_max 1\n"
+    "# widths: old 6, young 8 on every run; the newest 65536 cells of each sequence are young; uncalibrated\n"
+    "# size: 2623.38 MiB (q8_0 3264.00 MiB)\n"
+    "L 3 K 6 6 V 6 6\n"
+    "L 7 K 6 6 V 6 6\n"
+    "L 11 K 6 6 V 6 6\n"
+    "L 15 K 6 6 V 6 6\n"
+    "L 19 K 6 6 V 6 6\n"
+    "L 23 K 6 6 V 6 6\n"
+    "L 27 K 6 6 V 6 6\n"
+    "L 31 K 6 6 V 6 6\n"
+    "L 35 K 6 6 V 6 6\n"
+    "L 39 K 6 6 V 6 6\n"
+    "L 43 K 6 6 V 6 6\n"
+    "L 47 K 6 6 V 6 6\n"
+    "Y 3 K 8 8 V 8 8\n"
+    "Y 7 K 8 8 V 8 8\n"
+    "Y 11 K 8 8 V 8 8\n"
+    "Y 15 K 8 8 V 8 8\n"
+    "Y 19 K 8 8 V 8 8\n"
+    "Y 23 K 8 8 V 8 8\n"
+    "Y 27 K 8 8 V 8 8\n"
+    "Y 31 K 8 8 V 8 8\n"
+    "Y 35 K 8 8 V 8 8\n"
+    "Y 39 K 8 8 V 8 8\n"
+    "Y 43 K 8 8 V 8 8\n"
+    "Y 47 K 8 8 V 8 8\n"
+    "POOL 67776\n"
+    "CAP 65536\n";
+static const uint64_t QUALITY_FN_262K_HASH = 0xcc97a64e9786d761ull;
+static const std::vector<int32_t> FN_IL = { 3, 7, 11, 15, 19, 23, 27, 31, 35, 39, 43, 47 };
+
 // (1) and (2): the built-in plan through both parsers, the old error strings, the other geometries
 static void test_any_plan_parser() {
     printf("[8a] plan parser: shapes and geometries ([TAG_TURBOT_ANY_PLAN], [TAG_TURBOT_ANY_GEOM])\n");
@@ -2488,6 +2524,192 @@ static void test_plan_choose() {
         TCHECK(!choose(ornith) && why.find("cannot open plan file auto") != std::string::npos, "ANY=0 'auto': '%s'", why.c_str());
         llama_turbot_set_plan_path(nullptr);
         set_env("LLAMA_TURBOT_ANY", nullptr);
+    }
+
+    reset_turbot_env();
+}
+
+// [TAG_FN_TURBOT_TESTS] (4b) the quality plan: golden text and hash, widths, POOL, the chooser and the loader
+static void test_quality_plan() {
+    printf("[8e] quality plan ([TAG_FN_TURBOT_PLAN])\n");
+    reset_turbot_env();
+
+    // text, hash, and every run at old 6 / young 8
+    const auto check = [](const char * what, const llama_turbot_cache_shape & shape, const char * want_text, const char * want_pool,
+                          const char * want_size, uint64_t want_hash) {
+        std::string text, why;
+        const bool ok = llama_turbot_plan_quality_text(shape, text, why);
+        TCHECK(ok, "%s: refused: %s", what, why.c_str());
+        if (!ok) {
+            return;
+        }
+        TCHECK(want_text == nullptr || text == want_text, "%s: text differs:\n%s\n--- expected ---\n%s", what, text.c_str(), want_text);
+        TCHECK(want_pool == nullptr || text.find(want_pool) != std::string::npos, "%s: no '%s' in\n%s", what, want_pool, text.c_str());
+        TCHECK(want_size == nullptr || text.find(want_size) != std::string::npos, "%s: no '%s' in\n%s", what, want_size, text.c_str());
+        llama_turbot_plan p;
+        std::string       err;
+        TCHECK(llama_turbot_plan_parse_shape(text, LLAMA_TURBOT_PLAN_QUALITY_NAME, shape, p, err, true), "%s: does not parse: %s", what, err.c_str());
+        TCHECK(p.hash == want_hash && rehash(p) == want_hash, "%s: hash 0x%016" PRIx64 ", turbot_plan.py 0x%016" PRIx64, what, p.hash, want_hash);
+        TCHECK(p.cap_cells == LLAMA_TURBOT_QUALITY_CAP && p.pool_cells % (GGML_TURBOT_GRANULE*std::max<uint32_t>(1, shape.n_stream)) == 0,
+               "%s: CAP %u POOL %u", what, p.cap_cells, p.pool_cells);
+        uint64_t base = 0, young = 0, q8 = 0;
+        for (const auto & it : p.layers) {
+            const ggml_turbot_layer & l = it.second;
+            for (int r = 0; r < l.k.nr; ++r) {
+                TCHECK(l.k.b[r] == LLAMA_TURBOT_QUALITY_B && l.k.y[r] == LLAMA_TURBOT_QUALITY_Y && l.v.b[r] == LLAMA_TURBOT_QUALITY_B &&
+                       l.v.y[r] == LLAMA_TURBOT_QUALITY_Y, "%s: layer %d run %d: K b%d y%d, V b%d y%d", what, it.first, r, l.k.b[r], l.k.y[r],
+                       l.v.b[r], l.v.y[r]);
+            }
+            base  += (uint64_t) l.k.base_row_bytes + l.v.base_row_bytes;
+            young += l.pool_row_bytes;
+            const uint32_t row = (uint32_t) ggml_turbot_geom_row_elems(l.flags);
+            q8    += 2*ggml_row_size(GGML_TYPE_Q8_0, row);
+        }
+        // an all-young NR 2 row is exactly a q8_0 row, NR 4 one is smaller: the plan never costs more than q8_0 there
+        const uint64_t cells = (uint64_t) shape.kv_size*std::max<uint32_t>(1, shape.n_stream);
+        TCHECK(cells*base + (uint64_t) p.pool_cells*young <= cells*q8, "%s: %" PRIu64 " B above q8_0 %" PRIu64 " B", what,
+               cells*base + (uint64_t) p.pool_cells*young, cells*q8);
+        std::string again;
+        TCHECK(llama_turbot_plan_quality_text(shape, again, why) && again == text, "%s: not deterministic", what);
+    };
+
+    check("Flash-Next at 262144", shape_of(FN_IL, 256, 2, 262144), QUALITY_FN_262K, nullptr, nullptr, QUALITY_FN_262K_HASH);
+    check("Flash-Next at 131072", shape_of(FN_IL, 256, 2, 131072), nullptr, "\nPOOL 67776\n", "# size: 1423.38 MiB (q8_0 1632.00 MiB)",
+          QUALITY_FN_262K_HASH);
+    check("Flash-Next at 32768 (all young)", shape_of(FN_IL, 256, 2, 32768), nullptr, "\nPOOL 32768\n", "# size: 408.00 MiB (q8_0 408.00 MiB)",
+          0x66929c735d9f9960ull);
+    check("Flash-Next at 262144, 4 sequences unified", shape_of(FN_IL, 256, 2, 262144, 1, 4), nullptr, "\nPOOL 262144\n",
+          "# size: 3264.00 MiB (q8_0 3264.00 MiB)", 0x8229f267ff501fc4ull);
+    check("Flash-Next, 4 streams of 65536", shape_of(FN_IL, 256, 2, 65536, 4, 4), nullptr, "\nPOOL 262144\n",
+          "# size: 3264.00 MiB (q8_0 3264.00 MiB)", 0x8229f267ff501fc4ull);
+    check("Flash-Next at 1024", shape_of(FN_IL, 256, 2, 1024), nullptr, "\nPOOL 1024\n", nullptr, 0x251a4fc58ed8524cull);
+    check("Qwen3.8-27B shape (4 x 256)", shape_of(qwen38_attn_layers(), 256, 4, 262144), nullptr, "\nPOOL 67776\n",
+          "# size: 6834.59 MiB (q8_0 8704.00 MiB)", 0x921ad083b8aa751dull);
+    check("Ornith-35B shape", shape_of(il_range(3, 39, 4), 256, 2, 262144), nullptr, nullptr, "# size: 2186.15 MiB (q8_0 2720.00 MiB)",
+          0xaf37c2fe911ed45full);
+    {
+        std::string text, why;
+        TCHECK(!llama_turbot_plan_quality_text(shape_of(FN_IL, 256, 2, 1000), text, why) && why.find("kv_size 1000") != std::string::npos,
+               "kv_size 1000: '%s'", why.c_str());
+        TCHECK(!llama_turbot_plan_quality_text(shape_of({}, 256, 2, 32768), text, why), "no layers accepted");
+        TCHECK(!llama_turbot_plan_quality_text(shape_of({ 3 }, 96, 4, 32768), text, why), "head dim 96 accepted");
+        set_env("LLAMA_TURBOT_ANY", "0");
+        TCHECK(!llama_turbot_plan_quality_text(shape_of(FN_IL, 256, 2, 262144), text, why) && why.find("LLAMA_TURBOT_ANY=0") != std::string::npos,
+               "ANY=0 took 2 x 256: '%s'", why.c_str());
+        set_env("LLAMA_TURBOT_ANY", nullptr);
+    }
+
+    // the chooser: step 4 makes the quality plan for a quality shape of the main context
+    static int                     fake_model_storage = 0;
+    const llama_model *            fake_model         = reinterpret_cast<const llama_model *>(&fake_model_storage);
+    llama_turbot_cache_shape       fn                 = shape_of(FN_IL, 256, 2, 262144, 1, 1, true);
+    fn.quality = true;
+    llama_turbot_plan_choice c;
+    std::string              why;
+    const auto choose = [&](const llama_turbot_cache_shape & s) {
+        c = llama_turbot_plan_choice();
+        why = "stale";
+        const bool ok = llama_turbot_plan_choose(s, c, why);
+        TCHECK(!ok || why.empty(), "a successful choice left why '%s'", why.c_str());
+        return ok;
+    };
+
+    TCHECK(choose(fn) && c.kind == LLAMA_TURBOT_PLAN_KIND_QUALITY && c.name == LLAMA_TURBOT_PLAN_QUALITY_NAME && c.text == QUALITY_FN_262K,
+           "Flash-Next: kind %d name '%s' (%s)", (int) c.kind, c.name.c_str(), why.c_str());
+    {
+        llama_turbot_cache_shape s = fn;
+        s.auto_ok = false;
+        TCHECK(!choose(s) && why.find("main context") != std::string::npos, "Flash-Next draft: '%s'", why.c_str());
+        s = fn;
+        s.quality = false;
+        TCHECK(!choose(s) && why.find("not validated") != std::string::npos, "2 x 256 without the quality flag: '%s'", why.c_str());
+    }
+    set_env("LLAMA_TURBOT_AUTO_PLAN", "0");
+    TCHECK(!choose(fn) && why.find("LLAMA_TURBOT_AUTO_PLAN=0") != std::string::npos, "AUTO_PLAN=0: '%s'", why.c_str());
+    set_env("LLAMA_TURBOT_AUTO_PLAN", "quality");
+    TCHECK(choose(shape_of(il_range(3, 39, 4), 256, 2, 262144, 1, 1, true)) && c.kind == LLAMA_TURBOT_PLAN_KIND_QUALITY,
+           "AUTO_PLAN=quality on Ornith-35B: kind %d (%s)", (int) c.kind, why.c_str());
+    TCHECK(choose(shape_of(qwen38_attn_layers(), 256, 4, 262144, 1, 1, true)) && c.kind == LLAMA_TURBOT_PLAN_KIND_BUILTIN,
+           "AUTO_PLAN=quality on Qwen: the built-in plan must win (kind %d)", (int) c.kind);
+    set_env("LLAMA_TURBOT_AUTO_PLAN", "all");
+    TCHECK(choose(fn) && c.kind == LLAMA_TURBOT_PLAN_KIND_QUALITY, "AUTO_PLAN=all on Flash-Next: kind %d", (int) c.kind);
+    set_env("LLAMA_TURBOT_AUTO_PLAN", nullptr);
+
+    // "quality": forced, also without auto_ok and on the Qwen shape; "./quality" is a file
+    {
+        llama_turbot_set_plan_path(LLAMA_TURBOT_PLAN_KEYWORD_QUALITY);
+        const llama_turbot_plan_source src = llama_turbot_plan_get_source();
+        TCHECK(src.origin == LLAMA_TURBOT_PLAN_QUALITY_FORCED && src.name == LLAMA_TURBOT_PLAN_QUALITY_NAME, "'quality' source: origin %d", (int) src.origin);
+        llama_turbot_cache_shape s = fn;
+        s.auto_ok = false;
+        s.quality = false;
+        TCHECK(choose(s) && c.kind == LLAMA_TURBOT_PLAN_KIND_QUALITY && c.text == QUALITY_FN_262K, "'quality' without auto_ok: kind %d", (int) c.kind);
+        TCHECK(choose(shape_of(qwen38_attn_layers(), 256, 4, 262144, 1, 1, true)) && c.kind == LLAMA_TURBOT_PLAN_KIND_QUALITY,
+               "'quality' on Qwen: kind %d", (int) c.kind);
+        std::string text, err;
+        TCHECK(!llama_turbot_plan_read(src, text, err) && !err.empty(), "reading 'quality' as text succeeded");
+        TCHECK(!choose(shape_of(FN_IL, 256, 2, 1000, 1, 1, true)) && why.find(LLAMA_TURBOT_PLAN_QUALITY_NAME) != std::string::npos,
+               "'quality' on kv_size 1000: '%s'", why.c_str());
+        llama_turbot_set_plan_path(nullptr);
+        set_env("LLAMA_TURBOT_PLAN", "quality");
+        TCHECK(choose(s) && c.kind == LLAMA_TURBOT_PLAN_KIND_QUALITY, "LLAMA_TURBOT_PLAN=quality: kind %d", (int) c.kind);
+        set_env("LLAMA_TURBOT_PLAN", nullptr);
+        llama_turbot_set_plan_path("./quality");
+        TCHECK(llama_turbot_plan_get_source().origin == LLAMA_TURBOT_PLAN_FILE, "'./quality' is not a file");
+        llama_turbot_set_plan_path(nullptr);
+        set_env("LLAMA_TURBOT_ANY", "0");
+        llama_turbot_set_plan_path(LLAMA_TURBOT_PLAN_KEYWORD_QUALITY);
+        TCHECK(llama_turbot_plan_get_source().origin == LLAMA_TURBOT_PLAN_FILE, "ANY=0: 'quality' is not a file name again");
+        llama_turbot_set_plan_path(nullptr);
+        set_env("LLAMA_TURBOT_ANY", nullptr);
+    }
+
+    // a verified sidecar of this model wins over the quality plan
+    {
+        const std::string fp   = "arch=qwen4exp basename= size=512x56B layers=3,7,11,15,19,23,27,31,35,39,43,47 geom=256x2";
+        const std::string path = temp_path("fn-sidecar");
+        write_file(path, std::string("# model: ") + fp + "\n# verified: 2026-09-28 test\n" + QUALITY_FN_262K);
+        llama_turbot_set_sidecar_path(path.c_str());
+        llama_turbot_test_set_model_fingerprint(fp.c_str());
+        llama_turbot_cache_shape with_model = fn;
+        with_model.model = fake_model;
+        TCHECK(llama_turbot_fingerprint_text("qwen4exp", "", "512x56B", with_model) == fp, "Flash-Next fingerprint: %s",
+               llama_turbot_fingerprint_text("qwen4exp", "", "512x56B", with_model).c_str());
+        TCHECK(choose(with_model) && c.kind == LLAMA_TURBOT_PLAN_KIND_SIDECAR && c.name == path, "Flash-Next sidecar: kind %d (%s)", (int) c.kind, why.c_str());
+        write_file(path, std::string("# model: ") + fp + "\n" + QUALITY_FN_262K);   // no stamp: the quality plan
+        TCHECK(choose(with_model) && c.kind == LLAMA_TURBOT_PLAN_KIND_QUALITY, "unstamped sidecar used: kind %d", (int) c.kind);
+        std::filesystem::remove(path);
+        llama_turbot_set_sidecar_path(nullptr);
+        llama_turbot_test_set_model_fingerprint(nullptr);
+    }
+
+    // the loader: a quality scope parses against the constructor's shape; the keyword without a scope, and the dump
+    {
+        llama_turbot_plan p;
+        std::string       err;
+        llama_turbot_plan_choice q;
+        q.kind = LLAMA_TURBOT_PLAN_KIND_QUALITY;
+        q.text = QUALITY_FN_262K;
+        q.name = LLAMA_TURBOT_PLAN_QUALITY_NAME;
+        const llama_turbot_cache_shape fn_ctor = shape_of(FN_IL, 256, 2, 262144);   // no auto_ok / quality: the constructor's shape
+        {
+            llama_turbot_plan_scope sq(q);
+            TCHECK(llama_turbot_plan_load(fn_ctor, p, err) && p.hash == QUALITY_FN_262K_HASH && p.path == LLAMA_TURBOT_PLAN_QUALITY_NAME &&
+                   p.pool_cells == 67776 && p.cap_cells == 65536, "quality scope: hash 0x%016" PRIx64 " (%s)", p.hash, err.c_str());
+        }
+        TCHECK(!llama_turbot_plan_load(fn_ctor, p, err) && !err.empty(), "no scope, no plan: Flash-Next loaded the built-in plan");
+        set_env("LLAMA_TURBOT_PLAN", "quality");
+        const std::string dump = temp_path("fn-dump");
+        set_env("LLAMA_TURBOT_AUTO_PLAN_DUMP", dump.c_str());
+        TCHECK(llama_turbot_plan_load(fn_ctor, p, err) && p.hash == QUALITY_FN_262K_HASH && p.path == LLAMA_TURBOT_PLAN_QUALITY_NAME,
+               "no scope, 'quality': hash 0x%016" PRIx64 " (%s)", p.hash, err.c_str());
+        std::ifstream f(dump, std::ios::binary);
+        const std::string got((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+        TCHECK(got == QUALITY_FN_262K, "LLAMA_TURBOT_AUTO_PLAN_DUMP of the quality plan:\n%s", got.c_str());
+        f.close();
+        std::filesystem::remove(dump);
+        set_env("LLAMA_TURBOT_AUTO_PLAN_DUMP", nullptr);
+        set_env("LLAMA_TURBOT_PLAN", nullptr);
     }
 
     reset_turbot_env();
@@ -3226,6 +3448,7 @@ int main(int argc, char ** argv) {
     test_any_plan_parser();
     test_auto_plan();
     test_plan_choose();
+    test_quality_plan();   // [TAG_FN_TURBOT_TESTS]
     test_plan_scope();
     test_streams();
     // [TAG_4C_QUOTA]

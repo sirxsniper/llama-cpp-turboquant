@@ -9070,6 +9070,8 @@ enum turbot_test_widths {
     // [TAG_TURBOT_YOUNG_CT_EXT] appended: every (b, y) of the compiled y = 8 and y = 6 young loaders
     TURBOT_TW_Y8,        // K 2 3 4 5, V 6 4 5 3, young 8 everywhere
     TURBOT_TW_Y6,        // K 2 3 4 5, V 5 4 3 2, young 6 everywhere
+    // [TAG_FN_TURBOT_TESTS] appended: the quality plan (llama_turbot_plan_quality_text) on NR 2 rows, Qwen3.8-Flash-Next
+    TURBOT_TW_NR2_Q8,    // K 6 6, V 6 6, young 8 everywhere
 };
 
 enum turbot_test_mix {
@@ -9097,6 +9099,7 @@ static const char * turbot_test_widths_name(turbot_test_widths w) {
         case TURBOT_TW_NR1_B6:   return "nr1b6";
         case TURBOT_TW_Y8:       return "y8";
         case TURBOT_TW_Y6:       return "y6";
+        case TURBOT_TW_NR2_Q8:   return "nr2q";   // [TAG_FN_TURBOT_TESTS]
     }
     return "?";
 }
@@ -9154,6 +9157,7 @@ static int turbot_test_widths_of(turbot_test_widths w, uint8_t bk[4], uint8_t bv
         /* NR1_B6   */ { { 6, 0, 0, 0 }, { 2, 0, 0, 0 }, { 8, 0, 0, 0 }, { 7, 0, 0, 0 }, 1 },
         /* Y8       */ { { 2, 3, 4, 5 }, { 6, 4, 5, 3 }, { 8, 8, 8, 8 }, { 8, 8, 8, 8 }, 4 },
         /* Y6       */ { { 2, 3, 4, 5 }, { 5, 4, 3, 2 }, { 6, 6, 6, 6 }, { 6, 6, 6, 6 }, 4 },
+        /* NR2_Q8   */ { { 6, 6, 0, 0 }, { 6, 6, 0, 0 }, { 8, 8, 0, 0 }, { 8, 8, 0, 0 }, 2 },   // [TAG_FN_TURBOT_TESTS]
     };
     const int i = (int) w;
     GGML_ASSERT(i >= 0 && i < (int) (sizeof(rows)/sizeof(rows[0])));
@@ -9398,6 +9402,34 @@ static void turbot_test_init_uniform(ggml_tensor * t, uint64_t seed, float lo, f
     ggml_backend_tensor_set(t, f.data(), 0, ggml_nbytes(t));
 }
 
+// [TAG_FN_TURBOT_TESTS] a QSA mask (models/qwen4exp.cpp build_attn_qsa): per query row, whole blocks of 4 cells picked by
+// the indexer's top-k (512 blocks = 2048 cells in all, a different set per row, so at long kv most tiles are fully masked)
+// and the newest 3 cells (the unpooled tail): 0 there, -inf elsewhere. Below 2052 cells every block is picked (dense).
+static void turbot_test_init_qsa_mask(ggml_tensor * t, uint64_t seed) {
+    GGML_ASSERT(t->type == GGML_TYPE_F16 && ggml_is_contiguous(t));
+    const int64_t  ne0   = t->ne[0];
+    const int64_t  nrows = ggml_nrows(t);
+    const int64_t  n_blk = ne0 / 4;
+    const uint64_t pick  = (uint64_t) std::min<int64_t>(n_blk, 512);
+    const ggml_fp16_t zero = ggml_fp32_to_fp16(0.0f);
+    const ggml_fp16_t ninf = ggml_fp32_to_fp16(-INFINITY);
+    std::vector<ggml_fp16_t> m((size_t) (ne0 * nrows), ninf);
+    for (int64_t r = 0; r < nrows; ++r) {
+        uint64_t s = seed ^ ((uint64_t) r * 0x9e3779b97f4a7c15ull);
+        for (int64_t b = 0; b < n_blk; ++b) {
+            if (turbot_test_splitmix(s) % (uint64_t) n_blk < pick) {
+                for (int64_t j = 4*b; j < 4*b + 4; ++j) {
+                    m[(size_t) (r*ne0 + j)] = zero;
+                }
+            }
+        }
+        for (int64_t j = std::max<int64_t>(0, ne0 - 3); j < ne0; ++j) {
+            m[(size_t) (r*ne0 + j)] = zero;
+        }
+    }
+    ggml_backend_tensor_set(t, m.data(), 0, ggml_nbytes(t));
+}
+
 // GGML_OP_FLASH_ATTN_EXT over turbot K/V (SPEC 7, 11.2). perf = true names the case turbot_perf for gate B0.
 // [TAG_TURBOT_ANY_TEST] (d, hkv, hq) = head size, KV heads, query heads; 256 / 4 / 24 is Qwen3.8-27B, and only other
 // geometries print them, so the names (and seeds) of the Qwen cases are unchanged.
@@ -9406,7 +9438,8 @@ struct test_flash_attn_ext_turbot : public test_case {
     const int64_t            kv;
     const int64_t            nb;
     const turbot_test_mix    mix_id;
-    const int                mask_mode;      // 0 no mask, 1 explicit F16 mask, 2 positional (kv_pos / q_pos)
+    const int                mask_mode;      // 0 no mask, 1 explicit F16 mask, 2 positional (kv_pos / q_pos), [TAG_FN_TURBOT_TESTS]
+                                             // 3 a QSA mask with n_kv_max set, as build_attn_qsa builds it
     const bool               sinks;
     const float              logit_softcap;
     const bool               perf;
@@ -9461,7 +9494,7 @@ struct test_flash_attn_ext_turbot : public test_case {
         ggml_set_name(gtab, "turbot_gtab");
 
         ggml_tensor * m = nullptr;
-        if (mask_mode == 1) {
+        if (mask_mode == 1 || mask_mode == 3) {
             m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, nb, 1, 1);
             ggml_set_name(m, "m");
         }
@@ -9476,6 +9509,10 @@ struct test_flash_attn_ext_turbot : public test_case {
         ggml_tensor * out = ggml_flash_attn_ext(ctx, q, turbot_test_fa_view(ctx, kc, kv, d, hkv), turbot_test_fa_view(ctx, vc, kv, d, hkv), m,
                                                 scale, 0.0f, logit_softcap);
         ggml_flash_attn_ext_add_sinks(out, s);
+        if (mask_mode == 3) {
+            // [TAG_FN_TURBOT_TESTS] the top-k budget, as build_attn_qsa passes it: a turbot FA has no sparse gather and must ignore it
+            ggml_flash_attn_ext_set_n_kv_max(out, (int32_t) std::min<int64_t>(kv, 2051));
+        }
         if (mask_mode == 2) {
             ggml_tensor * kv_pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, kv);
             ggml_set_name(kv_pos, "kv_pos");
@@ -9518,7 +9555,11 @@ struct test_flash_attn_ext_turbot : public test_case {
             } else if (strcmp(t->name, "q_pos") == 0) {
                 turbot_test_set(t, qp.data(), qp.size() * sizeof(int32_t));
             } else if (strcmp(t->name, "m") == 0) {
-                turbot_test_init_mask(t, seed ^ 0x6d61736bull);
+                if (mask_mode == 3) {
+                    turbot_test_init_qsa_mask(t, seed ^ 0x717361ull);   // [TAG_FN_TURBOT_TESTS]
+                } else {
+                    turbot_test_init_mask(t, seed ^ 0x6d61736bull);
+                }
             } else if (strcmp(t->name, "s") == 0) {
                 turbot_test_init_uniform(t, seed ^ 0x73696e6bull, -10.0f, 10.0f);
             } else if (strcmp(t->name, "q") == 0) {
@@ -13728,6 +13769,55 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // [TAG_FN_TURBOT_TESTS] Qwen3.8-Flash-Next (qwen4exp): D 256, 2 KV heads, 24 query heads. GQA 12 is new: at Q <= 8 it
+    // packs ncols2 8 (2 z-tiles per KV head, the second with 4 padded columns), above that ncols2 4 in 3 passes (kv % 256
+    // == 0 and a mask; kv 96, 100 and 1000 take ncols2 1). Widths: the quality plan (old 6 / young 8, "nr2q") everywhere, the
+    // other NR 2 widths (nr2a, nr2b, nr2l) on kv 4096. Masks: explicit (1), positional (2) and the QSA mask with n_kv_max set
+    // (3), the only one the model uses: every attention layer runs build_attn_qsa. -p "turbot=[a-z0-9]+,d=256,hkv=2,hq=24"
+    // selects them (and the writer cases below).
+    {
+        auto keep = [](int64_t kv, int64_t nb) {
+            return !(kv == 16384 && nb != 1 && nb != 4 && nb != 512) && !(nb == 1280 && kv != 1000 && kv != 4096);
+        };
+        for (int64_t kv : { 96, 100, 1000, 4096, 16384 }) {
+            for (int64_t nb : { 1, 2, 4, 8, 16, 64, 512, 1280 }) {
+                if (!keep(kv, nb)) {
+                    continue;
+                }
+                for (turbot_test_mix mix : { TURBOT_MIX_OLD, TURBOT_MIX_YOUNG, TURBOT_MIX_ALT, TURBOT_MIX_TAIL }) {
+                    test_cases.emplace_back(new test_flash_attn_ext_turbot(TURBOT_TW_NR2_Q8, kv, nb, mix, 1, false, 0.0f, false, 256, 2, 24));
+                }
+                test_cases.emplace_back(new test_flash_attn_ext_turbot(TURBOT_TW_NR2_Q8, kv, nb, TURBOT_MIX_ALT, 2, false, 0.0f, false, 256, 2, 24));
+                for (turbot_test_mix mix : { TURBOT_MIX_ALT, TURBOT_MIX_TAIL }) {
+                    test_cases.emplace_back(new test_flash_attn_ext_turbot(TURBOT_TW_NR2_Q8, kv, nb, mix, 3, false, 0.0f, false, 256, 2, 24));
+                }
+            }
+        }
+        // the other NR 2 widths at GQA 12 (the float and int8 old paths, y 5 / 7 / 8)
+        for (turbot_test_widths w : { TURBOT_TW_NR2_A, TURBOT_TW_NR2_B, TURBOT_TW_NR2_L }) {
+            for (int64_t nb : { 1, 4, 512 }) {
+                test_cases.emplace_back(new test_flash_attn_ext_turbot(w, 4096, nb, TURBOT_MIX_ALT, 1, false, 0.0f, false, 256, 2, 24));
+                test_cases.emplace_back(new test_flash_attn_ext_turbot(w, 4096, nb, TURBOT_MIX_ALT, 3, false, 0.0f, false, 256, 2, 24));
+            }
+        }
+        // long contexts under the QSA mask: most tiles fully masked, the old tier past the band (the quality plan's CAP is 65536)
+        for (int64_t kv : { 32768, 65536 }) {
+            for (int64_t nb : { 1, 2, 4, 8, 16 }) {
+                test_cases.emplace_back(new test_flash_attn_ext_turbot(TURBOT_TW_NR2_Q8, kv, nb, TURBOT_MIX_BAND16K, 3, false, 0.0f, false, 256, 2, 24));
+            }
+            if (kv == 32768) {   // the CPU reference of nb 512 at kv 65536 would take minutes
+                test_cases.emplace_back(new test_flash_attn_ext_turbot(TURBOT_TW_NR2_Q8, kv, 512, TURBOT_MIX_BAND16K, 3, false, 0.0f, false, 256, 2, 24));
+            }
+        }
+        // the writer at the quality widths: young rows none / all / mixed, fill entries, I64 and I32 cells
+        for (int64_t rows : { 1, 4, 16, 1280 }) {
+            test_cases.emplace_back(new test_turbot_set_rows(TURBOT_TW_NR2_Q8, rows, GGML_TYPE_I64, 0, true,  false, 256, 2, 24));
+            test_cases.emplace_back(new test_turbot_set_rows(TURBOT_TW_NR2_Q8, rows, GGML_TYPE_I64, 1, false, false, 256, 2, 24));
+            test_cases.emplace_back(new test_turbot_set_rows(TURBOT_TW_NR2_Q8, rows, GGML_TYPE_I64, 2, true,  false, 256, 2, 24));
+            test_cases.emplace_back(new test_turbot_set_rows(TURBOT_TW_NR2_Q8, rows, GGML_TYPE_I32, 2, true,  false, 256, 2, 24));
+        }
+    }
+
     // FLASH_ATTN_EXT MMA: non-pow2 head size and MLA K/V view.
     test_cases.emplace_back(new test_flash_attn_ext(192, 128, 8, {8, 1}, 4096, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {20, 1}, 512, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true));
@@ -14275,6 +14365,25 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             }
         }
     }
+
+    // [TAG_FN_TURBOT_TESTS] Qwen3.8-Flash-Next: turbot at the quality widths (nr2q) against turbo5p512 (the comparison
+    // baseline) and q8_0 (the type this model ran with before), D 256, 2 KV heads, 24 query heads, kv 32768 / 131072 /
+    // 262144, nb 1 / 4 / 512, tiers old / band64k (the plan's CAP) / young. The QSA mask reads the same bytes (turbot and
+    // q8_0 have no sparse gather), so the explicit mask stands in for it:
+    //   test-backend-ops perf -b CUDA0 -o FLASH_ATTN_EXT -p "turbot_perf=nr2q,d=256,hkv=2,hq=24|turbot_ref=[a-z0-9_]+,d=256,hkv=2,hq=24"
+    for (int64_t kv : { 32768, 131072, 262144 }) {
+        for (int64_t nb : { 1, 4, 512 }) {
+            for (turbot_test_mix mix : { TURBOT_MIX_OLD, TURBOT_MIX_BAND64K, TURBOT_MIX_YOUNG }) {
+                if (mix == TURBOT_MIX_YOUNG && kv != 32768) {
+                    continue;
+                }
+                test_cases.emplace_back(new test_flash_attn_ext_turbot(TURBOT_TW_NR2_Q8, kv, nb, mix, 1, false, 0.0f, true, 256, 2, 24));
+            }
+            test_cases.emplace_back(new test_flash_attn_ext_turbo5p_ref(kv, nb, GGML_TYPE_TURBO5P512_0, 256, 2, 24));
+            test_cases.emplace_back(new test_flash_attn_ext_turbo5p_ref(kv, nb, GGML_TYPE_Q8_0, 256, 2, 24));
+        }
+    }
+    test_cases.emplace_back(new test_turbot_set_rows(TURBOT_TW_NR2_Q8, 2048, GGML_TYPE_I64, 1, false, true, 256, 2, 24));
 
     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
     // note: same bytes either way, so a backend that indexes them differently shows it here
