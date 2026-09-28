@@ -2,6 +2,7 @@
 #include <typeinfo>
 
 #include "llama-moecache.h"
+#include "llama-moetrace.h" // [TAG_FN_MOE_TRACE]
 
 #include "llama-impl.h"
 #include "llama-model.h"
@@ -1501,6 +1502,13 @@ void llm_graph_result::reset() {
     t_sampled_logits.clear();
     t_candidates.clear();
 
+    t_moe_il.clear(); // [TAG_FN_MOE_TRACE]
+    t_moe_n_expert.clear();
+    t_moe_ids.clear();
+    t_moe_w.clear();
+    t_moe_pred.clear();
+    t_moe_pred_next.clear();
+
     params = {};
 
     inputs.clear();
@@ -2319,6 +2327,24 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     //call early so that topk-moe can be used
     ggml_build_forward_expand(gf, weights);
+
+    // [TAG_FN_MOE_TRACE] routing capture: contiguous copies of the ids and final weights as graph outputs
+    if (llama_moe_trace_active() && il >= 0 && n_tokens > 0) {
+        ggml_tensor * t_ids = ggml_cont(ctx0, selected_experts);
+        ggml_tensor * t_w   = ggml_cont(ctx0, ggml_reshape_2d(ctx0, weights, n_expert_used, n_tokens));
+        ggml_format_name(t_ids, "moe_trace_ids-%d", il);
+        ggml_format_name(t_w,   "moe_trace_w-%d",   il);
+        ggml_set_output(t_ids);
+        ggml_set_output(t_w);
+        ggml_build_forward_expand(gf, t_ids);
+        ggml_build_forward_expand(gf, t_w);
+        const auto it = res->t_moe_pred_next.find(il);
+        res->t_moe_il.push_back(il);
+        res->t_moe_n_expert.push_back(n_expert);
+        res->t_moe_ids.push_back(t_ids);
+        res->t_moe_w.push_back(t_w);
+        res->t_moe_pred.push_back(it != res->t_moe_pred_next.end() ? it->second : nullptr);
+    }
 
     // MoE expert cache (see llama-moecache.h): during single-token decode on a
     // layer whose experts live in host memory, run a parallel mul_mat_id chain

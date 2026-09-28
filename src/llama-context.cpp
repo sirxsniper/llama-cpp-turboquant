@@ -1,6 +1,7 @@
 #include "llama-context.h"
 
 #include "llama-moecache.h"
+#include "llama-moetrace.h" // [TAG_FN_MOE_TRACE]
 
 #include "ggml.h"
 #include "llama-arch.h"
@@ -1426,6 +1427,8 @@ llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
 
+    llama_moe_trace_flush(); // [TAG_FN_MOE_TRACE]
+
     // when training, ggml_opt allocates extra buffers through the scheduler, so the sizes no longer match the expectation
     if (!model.hparams.no_alloc && !opt_ctx) {
         for (size_t i = 0; i < backend_ptrs.size(); ++i) {
@@ -2692,6 +2695,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
         return nullptr;
+    }
+
+    if (!res->t_moe_ids.empty()) { // [TAG_FN_MOE_TRACE] only built when a trace switch is set
+        llama_moe_trace_collect(sched.get(), res, ubatch, gtype == LLM_GRAPH_TYPE_DECODER_MTP);
     }
 
     ret = GGML_STATUS_SUCCESS;

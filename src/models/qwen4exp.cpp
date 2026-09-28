@@ -2,6 +2,7 @@
 #include "llama-impl.h"
 #include "llama-memory-hybrid-idx.h"
 #include "llama-memory-recurrent.h"
+#include "llama-moetrace.h" // [TAG_FN_MOE_TRACE]
 
 #include <algorithm>
 #include <cinttypes>
@@ -1075,6 +1076,16 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
 
 ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, const int il) {
     GGML_ASSERT(model.layers[il].ffn_gate_inp != nullptr);
+
+    // [TAG_FN_MOE_TRACE] LLAMA_MOE_TRACE_PRED: the next layer's router on this layer's FFN input (prefetch study)
+    if (const int pred_k = llama_moe_trace_pred_k(); pred_k > 0 && il + 1 < n_layer && model.layers[il + 1].ffn_gate_inp) {
+        ggml_tensor * lg = build_lora_mm(model.layers[il + 1].ffn_gate_inp, cur);
+        ggml_tensor * pr = ggml_cont(ctx0, ggml_argsort_top_k(ctx0, lg, std::min<int>(pred_k, (int) n_expert)));
+        ggml_format_name(pr, "moe_trace_pred-%d", il + 1);
+        ggml_set_output(pr);
+        ggml_build_forward_expand(gf, pr);
+        res->t_moe_pred_next[il + 1] = pr;
+    }
 
     ggml_tensor * moe_out =
         build_moe_ffn(cur,

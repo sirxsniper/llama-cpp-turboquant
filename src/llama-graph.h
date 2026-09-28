@@ -971,6 +971,14 @@ public:
     std::vector<ggml_tensor *> t_sampled_logits;
     std::vector<ggml_tensor *> t_candidates;
 
+    // [TAG_FN_MOE_TRACE] routing capture per MoE layer, only built when llama_moe_trace_active(); aligned vectors
+    std::vector<int>             t_moe_il;
+    std::vector<int64_t>         t_moe_n_expert;
+    std::vector<ggml_tensor *>   t_moe_ids;       // [n_used, T] i32, output
+    std::vector<ggml_tensor *>   t_moe_w;         // [n_used, T] f32, output
+    std::vector<ggml_tensor *>   t_moe_pred;      // [pred_k, T] i32 or nullptr
+    std::map<int, ggml_tensor *> t_moe_pred_next; // target layer -> its router applied one layer early
+
     std::vector<llm_graph_input_ptr> inputs;
     std::vector<llm_graph_fused_node> fused_nodes;
 
