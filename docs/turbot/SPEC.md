@@ -1891,7 +1891,7 @@ Owner's bar (2026-09-28): turbot must run on Flash-Next, with no q4 or other low
 
 ### 15.5 Fallback and the draft cache (`[TAG_FN_TURBOT_HQ]`, `[TAG_FN_TURBOT_MTP]`)
 
-- `llama_kv_resolve_input::hq_fallback` (qwen4exp; `LLAMA_KV_HQ_FALLBACK=0` clears it, `=1` sets it for every model): the chain walk passes over every turbo type that was not asked for. The WARN line says `turbo5p, turbo4: not a fallback for this model (its KV bar is q8_0; LLAMA_KV_HQ_FALLBACK=0 allows it)`. A refused turbot goes to q8_0, then f16. A turbo type that was asked for is kept (turbo5p runs as turbo5p512 on 512-value rows).
+- `llama_kv_resolve_input::hq_fallback` (qwen4exp; `LLAMA_KV_HQ_FALLBACK=0` clears it, `=1` sets it for every model): the chain walk passes over every turbo type that was not asked for. The WARN line says `turbo5p, turbo4: not a fallback for this model (its KV bar is q8_0; LLAMA_KV_HQ_FALLBACK=0 allows it)`. A refused turbot goes to q8_0, then f16. A turbo type that was asked for is kept (turbo5p runs as turbo5p512 on 512-value rows). The `LLAMA_TURBOT=0` kill switch follows the same bar: q8_0 on qwen4exp, turbo5p elsewhere.
 - The MTP draft context (`--spec-type draft-mtp --spec-draft-model mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf`) never uses turbot (9.1). For a qwen4exp target (general.architecture read from the GGUF header) common's swap now gives q8_0 instead of turbo5p, which became turbo5p512. +104 MiB at 262144 cells; it changes draft acceptance only.
 
 ### 15.6 Expected types on Flash-Next

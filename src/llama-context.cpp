@@ -798,6 +798,15 @@ static std::string llama_kv_resolve_turbot_kernel_refusal(uint32_t il, ggml_back
     return "";
 }
 
+// [TAG_FN_TURBOT_HQ] Qwen3.8-Flash-Next (qwen4exp): the owner's KV bar is q8_0, so a refused or disabled turbot steps to
+// q8_0, never to turbo5p512 or turbo4. LLAMA_KV_HQ_FALLBACK=0 restores the turbo steps, =1 applies the rule to every model.
+static bool llama_kv_hq_fallback(const llama_model & model) {
+    const char * e   = getenv("LLAMA_KV_HQ_FALLBACK");
+    const bool   on  = e != nullptr && strcmp(e, "1") == 0;
+    const bool   off = e != nullptr && strcmp(e, "0") == 0;
+    return on || (!off && model.arch == LLM_ARCH_QWEN4EXP);
+}
+
 // [TAG_KV_RESOLVE] the resolver input for model and params, without the plan check. turbot_refused: the turbot cache
 // constructor refused anyway (the llama_context constructor's fallback), so turbot is out.
 static llama_kv_resolve_input llama_kv_resolve_make_input(const llama_model & model, const llama_context_params & params,
@@ -824,14 +833,7 @@ static llama_kv_resolve_input llama_kv_resolve_make_input(const llama_model & mo
     // (common also swaps turbot out of every draft context, [TAG_TURBOT] in common/speculative.cpp)
     in.ctx_default    = params.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && model.arch != LLM_ARCH_DFLASH;
 
-    // [TAG_FN_TURBOT_HQ] Qwen3.8-Flash-Next (qwen4exp): the owner's KV bar is q8_0, so a refused turbot steps to q8_0,
-    // never to turbo5p512 or turbo4. LLAMA_KV_HQ_FALLBACK=0 restores the turbo steps, =1 applies the rule to every model.
-    {
-        const char * e = getenv("LLAMA_KV_HQ_FALLBACK");
-        const bool   on  = e != nullptr && strcmp(e, "1") == 0;
-        const bool   off = e != nullptr && strcmp(e, "0") == 0;
-        in.hq_fallback = on || (!off && model.arch == LLM_ARCH_QWEN4EXP);
-    }
+    in.hq_fallback = llama_kv_hq_fallback(model);   // [TAG_FN_TURBOT_HQ]
 
     // [TAG_FN_TURBOT_PLAN] and turbot takes the quality plan there (old 6 / young 8 bits) when no verified sidecar is given,
     // instead of the turbo5p512-budget automatic plan, which is not validated on 2 KV heads x 256 anyway
@@ -5220,9 +5222,12 @@ llama_context * llama_init_from_model(
     if (ggml_turbot_is_type(params.type_k) || ggml_turbot_is_type(params.type_v)) {
         const char * LLAMA_TURBOT = getenv("LLAMA_TURBOT");
         if (LLAMA_TURBOT && strcmp(LLAMA_TURBOT, "0") == 0) {
-            LLAMA_LOG_WARN("%s: LLAMA_TURBOT=0: turbot disabled, using turbo5p\n", __func__);
-            params.type_k = GGML_TYPE_TURBO5P_0;
-            params.type_v = GGML_TYPE_TURBO5P_0;
+            // [TAG_FN_TURBOT_HQ] a model whose KV bar is q8_0 gets q8_0 here too, not turbo5p
+            const bool hq = llama_kv_hq_fallback(*model);
+            LLAMA_LOG_WARN("%s: LLAMA_TURBOT=0: turbot disabled, using %s\n", __func__,
+                    hq ? "q8_0 (this model's KV bar is q8_0; LLAMA_KV_HQ_FALLBACK=0 gives turbo5p)" : "turbo5p");
+            params.type_k = hq ? GGML_TYPE_Q8_0 : GGML_TYPE_TURBO5P_0;
+            params.type_v = hq ? GGML_TYPE_Q8_0 : GGML_TYPE_TURBO5P_0;
         }
     }
 
