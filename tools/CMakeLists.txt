@@ -42,4 +42,7 @@ else()
         add_subdirectory(tuning)
     endif()
     add_subdirectory(results)
+    if (GGML_CUDA)
+        add_subdirectory(moe-bridge-probe) # [TAG_FN_BRIDGE_PROBE]
+    endif()
 endif()
