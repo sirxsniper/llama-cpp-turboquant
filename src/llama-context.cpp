@@ -310,6 +310,7 @@ llama_turbot_cache_shape llama_kv_resolve_turbot_shape_of(const llama_kv_resolve
     shape.n_stream  = in.n_stream;
     shape.n_seq_max = in.n_seq_max;
     shape.auto_ok   = in.ctx_default;
+    shape.quality   = in.turbot_quality;   // [TAG_FN_TURBOT_PLAN]
     shape.model     = nullptr;
     return shape;
 }
@@ -831,6 +832,10 @@ static llama_kv_resolve_input llama_kv_resolve_make_input(const llama_model & mo
         const bool   off = e != nullptr && strcmp(e, "0") == 0;
         in.hq_fallback = on || (!off && model.arch == LLM_ARCH_QWEN4EXP);
     }
+
+    // [TAG_FN_TURBOT_PLAN] and turbot takes the quality plan there (old 6 / young 8 bits) when no verified sidecar is given,
+    // instead of the turbo5p512-budget automatic plan, which is not validated on 2 KV heads x 256 anyway
+    in.turbot_quality = model.arch == LLM_ARCH_QWEN4EXP;
 
     const bool want_turbot = ggml_turbot_is_type(params.type_k) || ggml_turbot_is_type(params.type_v);
     if (want_turbot) {

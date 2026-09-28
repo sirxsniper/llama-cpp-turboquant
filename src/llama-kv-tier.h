@@ -61,6 +61,8 @@ LLAMA_API bool llama_turbot_plan_parse_file(const std::string & path, const std:
 //      switch LLAMA_TURBOT_AUTO_PLAN on, and every layer geometry allowed: the validated list
 //      (llama_turbot_auto_geom_validated: 256x4 as head dim x KV heads), every supported geometry with
 //      LLAMA_TURBOT_AUTO_PLAN=all, and the one-run geometries (128x2, 256x1) with LLAMA_TURBOT_AUTO_BUDGET=turbo5p.
+//      [TAG_FN_TURBOT_PLAN] With shape.quality (a model whose KV bar is q8_0: qwen4exp) or LLAMA_TURBOT_AUTO_PLAN=quality
+//      it is the quality plan instead (llama_turbot_plan_quality_text), for every supported geometry.
 //
 
 // one attention layer of the cache: model layer il, head dim (K = V) and KV heads
@@ -76,6 +78,7 @@ struct llama_turbot_cache_shape {
     uint32_t                             n_stream  = 1;   // KV streams (1 with --kv-unified or one sequence)
     uint32_t                             n_seq_max = 1;
     bool                                 auto_ok   = false;     // step 4 may run (main context, resolver on)
+    bool                                 quality   = false;     // [TAG_FN_TURBOT_PLAN] step 4 makes the quality plan
     const llama_model *                  model     = nullptr;   // sidecar fingerprint; nullptr disables the sidecar
 };
 
@@ -84,6 +87,7 @@ enum llama_turbot_plan_kind {
     LLAMA_TURBOT_PLAN_KIND_BUILTIN,
     LLAMA_TURBOT_PLAN_KIND_SIDECAR,
     LLAMA_TURBOT_PLAN_KIND_AUTO,
+    LLAMA_TURBOT_PLAN_KIND_QUALITY,   // [TAG_FN_TURBOT_PLAN] llama_turbot_plan_quality_text
 };
 
 struct llama_turbot_plan_choice {
@@ -99,6 +103,14 @@ struct llama_turbot_plan_choice {
 // the sidecar next to a model file: <model path> LLAMA_TURBOT_SIDECAR_SUFFIX
 #define LLAMA_TURBOT_SIDECAR_SUFFIX       ".turbot.plan"
 
+// [TAG_FN_TURBOT_PLAN] the quality plan: its name in log lines, errors and llama_turbot_plan::path, the keyword that
+// selects it in --kv-tier-plan / LLAMA_TURBOT_PLAN (use "./quality" for a file of that name), and its widths and CAP
+#define LLAMA_TURBOT_PLAN_QUALITY_NAME    "<quality>"
+#define LLAMA_TURBOT_PLAN_KEYWORD_QUALITY "quality"
+#define LLAMA_TURBOT_QUALITY_B            6       // old width of every run (GGML_TURBOT_B_MAX)
+#define LLAMA_TURBOT_QUALITY_Y            8       // young width of every run (GGML_TURBOT_Y_MAX)
+#define LLAMA_TURBOT_QUALITY_CAP          65536   // young cells per sequence: the newest 64K positions at 8 bits
+
 // Which plan a turbot cache of this shape would use (precedence above). Quiet (no log line) and pure except for getenv
 // and reading the plan / sidecar files. true: choice holds the text, why is cleared. false: no plan fits, why says why.
 LLAMA_API bool llama_turbot_plan_choose(const llama_turbot_cache_shape & shape, llama_turbot_plan_choice & choice, std::string & why);
@@ -110,6 +122,14 @@ LLAMA_API bool llama_turbot_plan_choose(const llama_turbot_cache_shape & shape, 
 // type (turbo5p, turbo5p512 or turbo4 by the rows; the turbo5p rate with LLAMA_TURBOT_AUTO_BUDGET=turbo5p), then shrinks
 // POOL when even all-4 does not fit. false and why when POOL would drop below n_seq_max*(1024+128) cells.
 LLAMA_API bool llama_turbot_plan_auto_text(const llama_turbot_cache_shape & shape, std::string & text, std::string & why);
+
+// [TAG_FN_TURBOT_PLAN] The quality plan of shape: the q8-level default for a model whose KV bar is q8_0, uncalibrated.
+// Old width 6 and young width 8 on every run of every layer (Y lines), CAP 65536, POOL = the POOL auto rule of the
+// parser for that CAP (per stream ceil(n_seq_max / n_stream) x (CAP + 128) + 2112 cells in whole granules, times
+// n_stream), at most the cache, a multiple of 64*n_stream. An all-young row costs about a q8_0 row (NR 4: 3% less, NR 2:
+// equal, NR 1: 6% more); an old row 6.25 bits per value against 8.5. tools/turbot/turbot_plan.py quality prints the same
+// text and hash. false and why when turbot has no layout for a layer or kv_size is not a positive multiple of 64.
+LLAMA_API bool llama_turbot_plan_quality_text(const llama_turbot_cache_shape & shape, std::string & text, std::string & why);
 
 // Parse text against shape: every layer of the shape needs an L line with 4+2*nr tokens (nr = runs of its geometry,
 // 12 tokens for 4 KV heads x 256), POOL is clamped to kv_size*n_stream. quiet: no warning lines.
@@ -140,6 +160,8 @@ LLAMA_API const llama_turbot_plan_choice * llama_turbot_plan_scope_current();
 //   any                  LLAMA_TURBOT_ANY != 0
 //   auto_plan            LLAMA_TURBOT_AUTO_PLAN unset, 1 or all (0: no automatic plan, fall back to turbo5p)
 //   auto_all             LLAMA_TURBOT_AUTO_PLAN=all: every supported geometry may get an automatic plan
+//   auto_quality         [TAG_FN_TURBOT_PLAN] LLAMA_TURBOT_AUTO_PLAN=quality: step 4 makes the quality plan for every
+//                        supported geometry (as shape.quality does)
 //   auto_budget_turbo5p  LLAMA_TURBOT_AUTO_BUDGET=turbo5p: the automatic plan may use the turbo5p rate (656 B per 1024
 //                        values) instead of the fallback type's bytes, and the one-run geometries may get one
 //   sidecar              LLAMA_TURBOT_SIDECAR != 0
@@ -150,6 +172,7 @@ struct llama_turbot_switches {
     bool        any                 = true;
     bool        auto_plan           = true;
     bool        auto_all            = false;
+    bool        auto_quality        = false;   // [TAG_FN_TURBOT_PLAN]
     bool        auto_budget_turbo5p = false;
     bool        sidecar             = true;
     bool        iswa                = true;
@@ -223,6 +246,7 @@ enum llama_turbot_plan_origin {
     LLAMA_TURBOT_PLAN_FILE,             // a plan file
     LLAMA_TURBOT_PLAN_AUTO_FORCED,      // [TAG_TURBOT_ANY_PLAN] --kv-tier-plan auto or LLAMA_TURBOT_PLAN=auto
     LLAMA_TURBOT_PLAN_SIDECAR,          // [TAG_TURBOT_ANY_SIDECAR] <model>.turbot.plan (llama_turbot_plan_sidecar_source)
+    LLAMA_TURBOT_PLAN_QUALITY_FORCED,   // [TAG_FN_TURBOT_PLAN] --kv-tier-plan quality or LLAMA_TURBOT_PLAN=quality
 };
 
 struct llama_turbot_plan_source {
@@ -235,7 +259,8 @@ struct llama_turbot_plan_source {
 // Where the plan of a turbot cache comes from, in this order: llama_turbot_set_plan_path() (--kv-tier-plan, or env
 // LLAMA_ARG_KV_TIER_PLAN, set by common), then env LLAMA_TURBOT_PLAN, then the built-in plan. An empty value counts as
 // unset; the value "default" in either place selects the built-in plan, and [TAG_TURBOT_ANY_PLAN] "auto" the automatic
-// plan (origin LLAMA_TURBOT_PLAN_AUTO_FORCED; with LLAMA_TURBOT_ANY=0 "auto" is a file name, as before). The sidecar
+// plan (origin LLAMA_TURBOT_PLAN_AUTO_FORCED; with LLAMA_TURBOT_ANY=0 "auto" is a file name, as before), and
+// [TAG_FN_TURBOT_PLAN] "quality" the quality plan (LLAMA_TURBOT_PLAN_QUALITY_FORCED, the same rule). The sidecar
 // is not a source here: llama_turbot_plan_choose checks it (step 2).
 LLAMA_API llama_turbot_plan_source llama_turbot_plan_get_source();
 
@@ -244,8 +269,8 @@ LLAMA_API llama_turbot_plan_source llama_turbot_plan_get_source();
 LLAMA_API llama_turbot_plan_source llama_turbot_plan_sidecar_source();
 
 // The plan text of src: the built-in text, or the file contents (FILE, SIDECAR). false and err ("turbot: cannot open
-// plan file ...") when the file cannot be read. AUTO_FORCED has no text without a shape: false, err names
-// llama_turbot_plan_auto_text.
+// plan file ...") when the file cannot be read. AUTO_FORCED and QUALITY_FORCED have no text without a shape: false,
+// err names llama_turbot_plan_auto_text / llama_turbot_plan_quality_text.
 LLAMA_API bool llama_turbot_plan_read(const llama_turbot_plan_source & src, std::string & text, std::string & err);
 
 // The turbot cache constructor's plan loader: llama_turbot_plan_get_source + llama_turbot_plan_read + parse, with
@@ -258,7 +283,8 @@ LLAMA_API bool llama_turbot_plan_load(const std::vector<int32_t> & attn_layers, 
 //   - a live llama_turbot_plan_scope: its text parsed against shape (plan.path = its name); an error is returned, the
 //     llama_context retry without turbot is the safety net
 //   - no scope (LLAMA_KV_RESOLVE=0, or a cache built outside llama_context): the old precedence above, plus the "auto"
-//     keyword, whose plan is generated from shape (no validated-list or auto_ok check: it was asked for)
+//     and [TAG_FN_TURBOT_PLAN] "quality" keywords, whose plans are generated from shape (no validated-list or auto_ok
+//     check: they were asked for)
 // Logs: the built-in plan lines of before; one INFO line for an automatic plan (widths, POOL, CAP, size against the
 // fallback type, hash) and LLAMA_TURBOT_AUTO_PLAN_DUMP=<file> writes its text; one INFO line for a sidecar, and one
 // (once per path) when a sidecar was set but not used.

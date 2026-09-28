@@ -14,6 +14,9 @@
 #   python tools/turbot/turbot_plan.py auto --gguf <model.gguf> -c 262144 --budget turbo5p -o <model.gguf>.turbot.plan
 #     -c is n_ctx, -np n_seq_max, --unified one KV stream for all sequences (else -np streams of n_ctx/np cells, as
 #     llama_context), --budget turbo5p = LLAMA_TURBOT_AUTO_BUDGET=turbo5p. The text goes to stdout (or -o), the hash to stderr.
+# [TAG_FN_TURBOT_PLAN] the quality plan of llama_turbot_plan_quality_text (old 6 / young 8, CAP 65536), same text and hash:
+#   python tools/turbot/turbot_plan.py quality --gguf D:/Projects/LocalAI/models/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf -c 262144
+#   python tools/turbot/turbot_plan.py quality --layers 3,7,11,15,19,23,27,31,35,39,43,47 --n-head-kv 2 -c 131072
 # [TAG_TURBOT_ANY_SIDECAR] the '# model:' line of a verified plan (llama_turbot_fingerprint_text):
 #   python tools/turbot/turbot_plan.py fingerprint --gguf <model.gguf>
 #     The attention layers are read from the GGUF metadata (full_attention_interval, sliding_window_pattern,
@@ -467,6 +470,72 @@ def auto_plan(shape, budget_turbo5p=False):
     return "\n".join(out) + "\n"
 
 
+# ---------------------------------------------------------------------------------------------------------------
+# [TAG_FN_TURBOT_PLAN] quality plan: llama_turbot_quality_impl (src/llama-kv-tier.cpp), line for line
+# ---------------------------------------------------------------------------------------------------------------
+
+QUALITY_B, QUALITY_Y, QUALITY_CAP = 6, 8, 65536
+Q8_0_BLOCK = (34, 32)   # ggml type_size / blck_size of q8_0
+
+
+def quality_plan(shape):
+    """The text of llama_turbot_plan_quality_text for shape: old 6 / young 8 on every run, CAP 65536, POOL by the POOL auto
+    rule at most the cache; PlanError with the C++ reason when it refuses."""
+    flags = shape_flags(shape)
+    if not flags:
+        raise PlanError("the cache holds no attention layers")
+    kv_size = shape["kv_size"]
+    if kv_size <= 0 or kv_size % GRANULE:
+        raise PlanError("kv_size %d is not a positive multiple of %d" % (kv_size, GRANULE))
+
+    n_stream = max(1, shape.get("n_stream", 1))
+    n_seq = max(1, shape.get("n_seq_max", 1))
+    kv_cells = kv_size * n_stream
+    step = GRANULE * n_stream
+    cap = QUALITY_CAP
+    slack = GRANULE * QUOTA_SLACK_GRANULES
+    b, y = QUALITY_B, QUALITY_Y
+
+    need = (n_seq + n_stream - 1) // n_stream * (cap + slack) + 33 * GRANULE
+    pool = n_stream * ((need + GRANULE - 1) // GRANULE * GRANULE)
+    pool = min(pool, kv_cells // GRANULE * GRANULE)
+    pool = pool // step * step
+
+    base = young = q8 = 0
+    for f in flags.values():
+        nr = geom_nr(f)
+        base += 2 * (32 * b * nr + 16)
+        young += 2 * (32 * (y - b) * nr + 16)
+        q8 += 2 * (geom_row_elems(f) // Q8_0_BLOCK[1] * Q8_0_BLOCK[0])
+    total = kv_cells * base + pool * young
+
+    groups = []   # [(KV heads, head dim), count] in order of first appearance by il
+    for il in sorted(flags):
+        d, h = shape["layers"][il]
+        for g in groups:
+            if g[0] == (h, d):
+                g[1] += 1
+                break
+        else:
+            groups.append([(h, d), 1])
+    geo = ", ".join("%d x %dx%d" % (c, hd[0], hd[1]) for hd, c in groups)
+
+    out = ["# turbot quality plan v1",
+           "# shape: %d attention layers: %s (KV heads x head dim); kv_size %d, n_stream %d, n_seq_max %d"
+           % (len(flags), geo, kv_size, n_stream, n_seq),
+           "# widths: old %d, young %d on every run; the newest %d cells of each sequence are young; uncalibrated" % (b, y, cap),
+           "# size: %.2f MiB (q8_0 %.2f MiB)" % (total / MIB, kv_cells * q8 / MIB)]
+    for il in sorted(flags):
+        nr = geom_nr(flags[il])
+        out.append("L %d K%s V%s" % (il, " %d" % b * nr, " %d" % b * nr))
+    for il in sorted(flags):
+        nr = geom_nr(flags[il])
+        out.append("Y %d K%s V%s" % (il, " %d" % y * nr, " %d" % y * nr))
+    out.append("POOL %d" % pool)
+    out.append("CAP %d" % cap)
+    return "\n".join(out) + "\n"
+
+
 def auto_allowed(shape, auto_all=False, budget_turbo5p=False):
     """llama_turbot_auto_allowed: may the chooser's step 4 give shape an automatic plan? -> (bool, why)."""
     for il, f in shape_flags(shape).items():
@@ -628,6 +697,7 @@ def main():
     c.add_argument("--kv", type=int, default=KV_DEFAULT, help="cells for the VRAM line (default 262144)")
     c.add_argument("-o", "--out", default=None, help="output plan file (default: print)")
     for name, hlp in (("auto", "the automatic plan of llama_turbot_plan_auto_text (same text and hash)"),
+                      ("quality", "the quality plan of llama_turbot_plan_quality_text (same text and hash)"),
                       ("fingerprint", "the '# model:' fingerprint of a model")):
         a = sub.add_parser(name, help=hlp)
         a.add_argument("--gguf", default=None, help="read the attention layers and their geometry from this model")
@@ -641,16 +711,18 @@ def main():
             a.add_argument("--budget", choices=("fallback", "turbo5p"), default="fallback",
                            help="turbo5p = LLAMA_TURBOT_AUTO_BUDGET=turbo5p")
             a.add_argument("-o", "--out", default=None, help="output plan file (default: print)")
+        elif name == "quality":
+            a.add_argument("-o", "--out", default=None, help="output plan file (default: print)")
         else:
             a.add_argument("--arch", default=None)
             a.add_argument("--basename", default=None)
             a.add_argument("--size", default=None)
     args = ap.parse_args()
 
-    if args.cmd == "auto":
+    if args.cmd in ("auto", "quality"):
         try:
             shape, _ = _cli_shape(args)
-            text = auto_plan(shape, args.budget == "turbo5p")
+            text = auto_plan(shape, args.budget == "turbo5p") if args.cmd == "auto" else quality_plan(shape)
             plan = parse_text(text, shape=shape)
         except (PlanError, OSError, KeyError, ValueError) as e:
             print("REFUSED: %s" % e)
