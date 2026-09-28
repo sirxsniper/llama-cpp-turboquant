@@ -581,7 +581,7 @@ struct ggml_compute_state {
 static inline void ggml_thread_cpu_relax(void) {
     __asm__ volatile("yield" ::: "memory");
 }
-#elif defined(__x86_64__)
+#elif defined(__x86_64__) || defined(_M_X64) // [TAG_FN_CPU_RELAX_MSVC] MSVC defines _M_X64 only, so its spin loops had no pause
 static inline void ggml_thread_cpu_relax(void) {
     _mm_pause();
 }
