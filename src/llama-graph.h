@@ -1237,7 +1237,8 @@ struct llm_graph_context {
                     int   il,
             ggml_tensor * kv_pos,
             ggml_tensor * q_pos,
-            ggml_tensor * turbot_gtab) const;
+            ggml_tensor * turbot_gtab,
+                int64_t   n_kv_max = 0) const;   // [TAG_FN_TURBOT_QSA] the sparse-attention budget (build_attn_mha)
 
     llm_graph_input_attn_no_cache * build_attn_inp_no_cache() const;
 

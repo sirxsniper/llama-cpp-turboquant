@@ -812,8 +812,15 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
         const auto & k_idxs = inp->get_k_idxs();
         const auto & v_idxs = inp->get_v_idxs();
 
-        ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
-        ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
+        if (mctx_cur->is_turbot()) {
+            // [TAG_FN_TURBOT_QSA] the turbot writer, as in llm_graph_context::build_attn: base code, the young rows of
+            // young granules and the center fills of this ubatch
+            ggml_build_forward_expand(gf, mctx_cur->turbot_cpy_k(ctx0, k_cur, k_idxs, inp->self_turbot_young, inp->self_turbot_fill, il));
+            ggml_build_forward_expand(gf, mctx_cur->turbot_cpy_v(ctx0, v_cur, v_idxs, inp->self_turbot_young, inp->self_turbot_fill, il));
+        } else {
+            ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
+            ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
+        }
     }
 
     ggml_tensor * kq_mask = inp->get_kq_mask();
@@ -848,7 +855,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, nullptr, kq_mask_top_k, nullptr, nullptr, top_k->ne[0], kq_scale, il);
+    // [TAG_FN_TURBOT_QSA] the read side of the dense path: the forward WHT on Q for a turbo or turbot K (12260c288, lost
+    // in the 09-21 upstream sync), and for turbot the young pool, the granule table and the op params. f16 and q8_0 get
+    // the same nodes as before. A turbot FA reads every cell under the top-k mask (no sparse gather).
+    ggml_tensor * cur = build_attn_mha_kv(mctx_cur, q, k, v, nullptr, kq_mask_top_k, nullptr, nullptr, kq_scale, il,
+            nullptr, nullptr, inp->self_turbot_gtab, top_k->ne[0]);
     cb(cur, "kqv_out", il);
 
     // the rotation is its own inverse, so undo it on the value side of the output

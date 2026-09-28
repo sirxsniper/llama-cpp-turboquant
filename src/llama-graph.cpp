@@ -3289,7 +3289,8 @@ ggml_tensor * llm_graph_context::build_attn_mha_kv(
                 int   il,
         ggml_tensor * kv_pos,
         ggml_tensor * q_pos,
-        ggml_tensor * turbot_gtab) const {
+        ggml_tensor * turbot_gtab,
+            int64_t   n_kv_max) const {
     // TurboQuant pre-rotate-queries: O(d log d) WHT rotation via custom op
     // Q shape: (n_embd_head, n_head, n_tokens)
     // For zero-padded models (head_dim not 128-aligned), pad Q to match padded K dim first.
@@ -3316,7 +3317,9 @@ ggml_tensor * llm_graph_context::build_attn_mha_kv(
         mctx_cur->get_turbot_op_params(il, GGML_TURBOT_SIDE_BOTH, turbot_params);
     }
 
-    return build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il, kv_pos, q_pos,
+    // [TAG_FN_TURBOT_QSA] n_kv_max > 0 only from a sparse-attention caller. A turbot FA has no sparse gather and reads
+    // every cell under the mask (ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse is false for turbot).
+    return build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, n_kv_max, kq_scale, il, kv_pos, q_pos,
             turbot ? mctx_cur->get_turbot_pool(il) : nullptr,
             turbot ? turbot_gtab                   : nullptr,
             turbot ? &turbot_params                : nullptr);

@@ -679,6 +679,8 @@ static bool llama_kv_resolve_attn_layer(const llama_model & model, llama_context
 // [TAG_KV_RESOLVE] archs whose attention input has no turbo query rotation (llama-graph.cpp: build_attn for
 // llm_graph_input_attn_k_dsa / k_dsa_iswa / k_iswa): a turbo cache there would be read without the rotation
 static bool llama_kv_resolve_turbo_graph(const llama_model & model, llama_context_type ctx_type) {
+    GGML_UNUSED(ctx_type);   // [TAG_FN_TURBOT_QSA] no arch keys on it any more (qwen4exp did)
+
     switch (model.arch) {
         case LLM_ARCH_DEEPSEEK32:
         case LLM_ARCH_GLM_DSA:
@@ -690,25 +692,10 @@ static bool llama_kv_resolve_turbo_graph(const llama_model & model, llama_contex
         case LLM_ARCH_MINIMAX_M3:
             return false;
         case LLM_ARCH_QWEN4EXP:
-            {
-                // [TAG_KV_RESOLVE] the QSA layers (compress ratio > 0 with the indexer cache, models/qwen4exp.cpp
-                // build_attn_qsa) call build_attn_mha without the forward WHT on Q; dense-only checkpoints are fine
-                const auto & hp = model.hparams;
-                if (hp.indexer_head_size == 0) {
-                    return true;
-                }
-                // [TAG_QWEN4EXP_MTP] an MTP context holds only the nextn block, and graph_mtp runs it through the
-                // dense build_attn (no indexer cache there), which applies the rotation
-                if (ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
-                    return true;
-                }
-                for (uint32_t il = 0; il < hp.n_layer_all && il < LLAMA_MAX_LAYERS; ++il) {
-                    if (hp.dsv4_compress_ratios[il] > 0) {
-                        return false;
-                    }
-                }
-                return true;
-            }
+            // [TAG_FN_TURBOT_QSA] the QSA layers (models/qwen4exp.cpp build_attn_qsa) read through build_attn_mha_kv like
+            // the dense path: forward WHT on Q, turbot writer, young pool and granule table. The indexer cache takes its
+            // own type (llama-memory-hybrid-idx.cpp [TAG_FN_TURBOT_IDX]). The MTP context runs the dense build_attn.
+            return true;
         case LLM_ARCH_DFLASH:
             return model.hparams.dsv4_hc_mult == 0;   // the DeepSeek V4 DSpark stages use k_iswa
         default:
