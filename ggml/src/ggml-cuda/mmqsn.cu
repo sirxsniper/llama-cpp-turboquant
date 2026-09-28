@@ -72,8 +72,10 @@ static const mmqsn_env_t & mmqsn_env() {
         v.pf_run   = (run == 2 || run == 4) ? run : 1;
         v.l2hint   = mmqsn_env_int("GGML_CUDA_MMQSN_L2HINT", 1) != 0 ? 1 : 0;   // [TAG_MMQSN_DEFAULT] best in G0/G2
         v.min_n    = std::max(0, mmqsn_env_int("GGML_CUDA_MMQSN_MIN", 0));
-        // [TAG_MMQSN_WIDE] off by default until measured: without it the widest batch stays 16 (today's routing).
-        v.wide     = mmqsn_env_int("GGML_CUDA_MMQSN_WIDE", 0) != 0;
+        // [TAG_MMQSN_WIDE] [TAG_MMQSN_WIDE_DEFAULT] on by default since 2026-09-28: bit-identical to MMQ (CHECK 0 mismatches
+        // on every Qwen3.8 shape, KLD identical), -2.6 % / -2.2 % ms/step at 4 streams x 8 verify rows (32 columns).
+        // GGML_CUDA_MMQSN_WIDE=0 keeps the widest batch at 16 (the routing before).
+        v.wide     = mmqsn_env_int("GGML_CUDA_MMQSN_WIDE", 1) != 0;
         const int max_cap = v.wide ? 32 : 16;
         v.max_n    = std::min(max_cap, std::max(2, mmqsn_env_int("GGML_CUDA_MMQSN_MAX", max_cap)));
         // [TAG_MMQSN_FUSEFIX] off by default until measured.

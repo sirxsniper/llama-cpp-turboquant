@@ -3,7 +3,7 @@
 #include "common.cuh"
 
 // [TAG_MMQSN] MMQ with a cp.async weight ring for 5..16 src1 columns of Q4_K / Q5_K / Q6_K weights (mmqsn-impl.cuh,
-// mmqsn.cu), [TAG_MMQSN_WIDE] 17..32 with GGML_CUDA_MMQSN_WIDE=1. Bit-identical to MMQ; it only overlaps the weight
+// mmqsn.cu), [TAG_MMQSN_WIDE] 17..32 (default on). Bit-identical to MMQ; it only overlaps the weight
 // loads with the compute. Routed after mmsb and before MMVQ/MMQ in ggml_cuda_mul_mat; MMQ itself is untouched (prefill
 // is not affected).
 //
@@ -16,9 +16,9 @@
 //   GGML_CUDA_MMQSN_PF_RUN=1|2|4      steps per prefetch run (contiguous bytes per row), default 1
 //   GGML_CUDA_MMQSN_L2HINT=0|1        cp.async with the .L2::256B hint (default 1)
 //   GGML_CUDA_MMQSN_MIN=n             0 (default) = only the widths MMQ takes today; n = also MMVQ's widths >= n
-//   GGML_CUDA_MMQSN_MAX=n             widest src1 batch, 2..16 (default 16; 2..32 and default 32 with WIDE=1)
-//   GGML_CUDA_MMQSN_WIDE=1            [TAG_MMQSN_WIDE] also 17..32 columns (MMQ's J = 24/32, RING mode only; 3-4
-//                                     streams x 5-8 verify rows), default 0 = off until measured
+//   GGML_CUDA_MMQSN_MAX=n             widest src1 batch, 2..32 (default 32; 2..16 and default 16 with WIDE=0)
+//   GGML_CUDA_MMQSN_WIDE=0|1          [TAG_MMQSN_WIDE] also 17..32 columns (MMQ's J = 24/32, RING mode only; 3-4
+//                                     streams x 5-8 verify rows), default 1 since 2026-09-28 (measured), 0 = off
 //   GGML_CUDA_MMQSN_FUSEFIX=1         [TAG_MMQSN_FUSEFIX] stream-k fixup inside the RING kernel (the last block of a
 //                                     split tile adds the partial sums in the fixup kernel's order) instead of the
 //                                     mul_mat_qsn_fixup launch, default 0 = off until measured

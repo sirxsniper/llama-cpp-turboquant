@@ -1908,7 +1908,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     }
     // [TAG_MMQSN] MMQ with a cp.async weight ring (mmqsn.cu) for the 5..16-column widths MMQ takes today on weights with
     // >= 2048 rows; bit-identical to MMQ. [TAG_MMQSN_DEFAULT] On by default on cc 1200, GGML_CUDA_MMQSN=0 turns it off.
-    // [TAG_MMQSN_WIDE] GGML_CUDA_MMQSN_WIDE=1 also takes 17..32 columns (off by default).
+    // [TAG_MMQSN_WIDE] also 17..32 columns (on by default since 2026-09-28, GGML_CUDA_MMQSN_WIDE=0 turns it off).
     if (ggml_cuda_should_use_mmqsn(src0, src1, dst, cc)) {
         ggml_cuda_mul_mat_qsn(ctx, src0, src1, dst);
         return;
@@ -2721,14 +2721,17 @@ static const void * ggml_cuda_graph_get_key_hash(ggml_cgraph * cgraph) {
 // graph_compute asks for it twice (here and in ggml_cuda_graph_update_required): about 3900 nodes per Qwen3.8-27B
 // decode step, all on the host while the GPU waits for the next launch. The scheduler gives each split a new uid when
 // it splits a new graph, and llama replays the same splits while its graph reuse holds, so with
-// GGML_CUDA_GRAPH_KEY_MEMO=1 the key of a (uid, cgraph, n_nodes) is computed once and then read back. uid 0 (graphs
+// the memo on, the key of a (uid, cgraph, n_nodes) is computed once and then read back. uid 0 (graphs
 // that did not come from the scheduler, and the split views passed to graph_optimize) always hashes. The key only
 // picks the ggml_cuda_graph object; ggml_cuda_graph_update_required still compares every node property before a
-// replay, so a stale key could only cost a re-warm, never a wrong result. Off by default until measured.
+// replay, so a stale key could only cost a re-warm, never a wrong result.
+// [TAG_GRAPH_KEY_MEMO_DEFAULT] on by default since 2026-09-28 (host time per graph_compute 449 -> 105 us at 1-token
+// decode; with the q8_1 reuse -3.1 % ms/step at 1 stream, -2.2 % at 4, identical KLD and texts).
+// GGML_CUDA_GRAPH_KEY_MEMO=0 is the kill switch (hash every time, as before).
 static bool ggml_cuda_graph_key_memo_enabled() {
     static const bool on = [] {
         const char * e = getenv("GGML_CUDA_GRAPH_KEY_MEMO");
-        return e != nullptr && e[0] == '1';
+        return e == nullptr || e[0] != '0';
     }();
     return on;
 }

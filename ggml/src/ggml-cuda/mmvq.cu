@@ -1517,19 +1517,21 @@ static void mul_mat_vec_q_switch_type(
 // [TAG_MMVQ_Q8_REUSE] Every MMVQ node quantizes its src1 to q8_1 before the mat-vec kernel. Qwen3.8 feeds one normed
 // activation to 4 projections in each GDN layer (qkv, z, alpha, beta) and to 3 in each attention layer (q, k, v), and
 // at 2..8 columns also to ffn gate and up, so a decode step quantizes the same tensor 369 times where 129 would do.
-// With GGML_CUDA_MMVQ_Q8_REUSE=1 the q8_1 copy of the last src1 stays in a fixed buffer of the context and a later MMVQ
+// With the reuse on, the q8_1 copy of the last src1 stays in a fixed buffer of the context and a later MMVQ
 // node with the same src1 tensor (same object, data, ne and nb) reads it instead of quantizing again. quantize_q8_1
 // does not depend on src0, so the bytes are the same and the output is bit-identical. The cache is emptied when a
 // graph evaluation starts, by a miss (the new src1 replaces it) and before any node whose output overlaps the bytes it
 // was made from (ggml_cuda_mmvq_q8_cache_note_write). Captured CUDA graphs keep the decisions of the capture, which
 // stay valid because a replay runs the same nodes on the same addresses. MUL_MAT_ID (ids) and the side streams of
-// GGML_CUDA_GRAPH_OPT keep the pool path. Off by default until measured.
+// GGML_CUDA_GRAPH_OPT keep the pool path. [TAG_MMVQ_Q8_REUSE_DEFAULT] on by default since 2026-09-28 (704 of 1732 q8_1
+// quantizations of a Qwen3.8 decode step reused; KLD statistics identical at -b 1 and -b 4). GGML_CUDA_MMVQ_Q8_REUSE=0
+// is the kill switch (every MMVQ node quantizes into the pool, as before).
 static constexpr size_t GGML_CUDA_MMVQ_Q8_CACHE_BYTES = 4u*1024u*1024u;
 
 bool ggml_cuda_mmvq_q8_reuse_enabled() {
     static const bool on = [] {
         const char * e = getenv("GGML_CUDA_MMVQ_Q8_REUSE");
-        return e != nullptr && e[0] == '1';
+        return e == nullptr || e[0] != '0';
     }();
     return on;
 }
