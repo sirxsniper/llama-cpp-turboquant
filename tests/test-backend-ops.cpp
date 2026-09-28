@@ -7952,6 +7952,154 @@ struct test_mul_mat_shared_src1 : public test_case {
     }
 };
 
+// [TAG_DFL_LEAN] the DFlash2 drafter conv of LLAMA_DFLASH_LEAN=1 (src/models/dflash.cpp build_dflash2_conv_lean), at
+// Qwen3.8-27B's DFlash2 shapes: the coefficients read through a strided 4-D view and repeated, the shifted tap as a left
+// pad of a strided view, and MUL with a strided src0. Every op is shipped; these strided shapes are new on the backends.
+struct test_dflash_lean_conv : public test_case {
+    const int64_t hidden;
+    const int64_t group;
+    const int64_t kernel;
+    const int64_t block;
+    const int64_t n_blocks;
+    const int     side;
+
+    std::string vars() override {
+        return VARS_TO_STR6(hidden, group, kernel, block, n_blocks, side);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "DFLASH_LEAN_CONV";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    double max_nmse_err() override {
+        return 1e-6;
+    }
+
+    test_dflash_lean_conv(int64_t hidden = 5120, int64_t group = 16, int64_t kernel = 2, int64_t block = 8,
+            int64_t n_blocks = 1, int side = 0)
+        : hidden(hidden), group(group), kernel(kernel), block(block), n_blocks(n_blocks), side(side) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t n_tokens = block * n_blocks;
+        const int64_t n_groups = hidden / group;
+
+        ggml_tensor * hid = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hidden, n_tokens);
+        ggml_set_name(hid, "hidden");
+        ggml_tensor * dyn = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_groups * kernel * 2, n_tokens);
+        ggml_set_name(dyn, "dynamic");
+        ggml_tensor * base = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, hidden, kernel, 2);
+        ggml_set_name(base, "base");
+
+        // a dynamic row is [n_groups, kernel, 2] per token: this side as [1, n_groups, kernel, n_tokens]
+        const size_t es = ggml_element_size(dyn);
+        ggml_tensor * coeff = ggml_view_4d(ctx, dyn, 1, n_groups, kernel, n_tokens,
+                es, n_groups * es, dyn->nb[1], side * n_groups * kernel * es);
+        ggml_tensor * coeff_all  = ggml_repeat_4d(ctx, coeff, group, n_groups, kernel, n_tokens);
+        ggml_tensor * base_side  = ggml_reshape_4d(ctx, ggml_view_1d(ctx, base, hidden * kernel, side * base->nb[2]),
+                group, n_groups, kernel, 1);
+        ggml_tensor * weight_all = ggml_add(ctx, coeff_all, base_side);
+
+        ggml_tensor * blocks = ggml_reshape_3d(ctx, hid, hidden, block, n_blocks);
+        ggml_tensor * out = nullptr;
+        for (int64_t tap = 0; tap < kernel; ++tap) {
+            ggml_tensor * values = hid;
+            if (tap > 0) {
+                if (tap < block) {
+                    ggml_tensor * prev = ggml_view_3d(ctx, blocks, hidden, block - tap, n_blocks, blocks->nb[1], blocks->nb[2], 0);
+                    values = ggml_pad_ext(ctx, prev, 0, 0, (int) tap, 0, 0, 0, 0, 0);
+                } else {
+                    values = ggml_fill(ctx, ggml_new_tensor_3d(ctx, GGML_TYPE_F32, hidden, block, n_blocks), 0.0f);
+                }
+                values = ggml_reshape_2d(ctx, values, hidden, n_tokens);
+            }
+            ggml_tensor * w    = ggml_view_2d(ctx, weight_all, hidden, n_tokens, weight_all->nb[3], tap * weight_all->nb[2]);
+            ggml_tensor * term = ggml_mul(ctx, w, values);
+            out = out ? ggml_add(ctx, out, term) : term;
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
+// [TAG_DFL_LEAN] the DFlash2 selector scoring of LLAMA_DFLASH_LEAN=1 (build_dflash2_selector): the gate and the unary
+// scores broadcast from strided 4-D views (nb2 == nb1), and the packed rows get the zero row 0 of every block and the
+// zero pad past the used columns in one pad_ext. Random successor / predecessor rows stand in for the two get_rows.
+struct test_dflash_lean_selector : public test_case {
+    const int64_t n_embd;
+    const int64_t top_k;
+    const int64_t rank;
+    const int64_t block;
+    const int64_t n_blocks;
+
+    std::string vars() override {
+        return VARS_TO_STR5(n_embd, top_k, rank, block, n_blocks);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "DFLASH_LEAN_SELECTOR";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    double max_nmse_err() override {
+        return 5e-6;
+    }
+
+    test_dflash_lean_selector(int64_t n_embd = 5120, int64_t top_k = 16, int64_t rank = 256, int64_t block = 8,
+            int64_t n_blocks = 1)
+        : n_embd(n_embd), top_k(top_k), rank(rank), block(block), n_blocks(n_blocks) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t n_tokens = block * n_blocks;
+        ggml_tensor * gate  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, rank,  n_tokens);
+        ggml_tensor * unary = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, top_k, n_tokens);
+        ggml_tensor * cand  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, top_k, n_tokens);
+        ggml_set_name(gate, "gate");
+        ggml_set_name(unary, "unary");
+        ggml_set_name(cand, "cand");
+        ggml_tensor * gate_blk  = ggml_reshape_3d(ctx, gate,  rank,  block, n_blocks);
+        ggml_tensor * unary_blk = ggml_reshape_3d(ctx, unary, top_k, block, n_blocks);
+        ggml_tensor * cand_blk  = ggml_reshape_3d(ctx, cand,  top_k, block, n_blocks);
+
+        auto score_run = [&](int64_t beg, int64_t n_pos, int64_t n_pred) {
+            ggml_tensor * cand_run = ggml_cont(ctx, ggml_view_3d(ctx, cand_blk, top_k, n_pos, n_blocks,
+                        cand_blk->nb[1], cand_blk->nb[2], beg * cand_blk->nb[1]));
+            ggml_tensor * succ = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, rank, top_k,  n_pos, n_blocks);
+            ggml_tensor * pred = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, rank, n_pred, n_pos, n_blocks);
+            ggml_tensor * gate_bcast = ggml_view_4d(ctx, gate_blk, rank, 1, n_pos, n_blocks,
+                    gate_blk->nb[1], gate_blk->nb[1], gate_blk->nb[2], beg * gate_blk->nb[1]);
+            ggml_tensor * cond  = ggml_mul(ctx, pred, gate_bcast);
+            ggml_tensor * score = ggml_mul_mat(ctx, succ, cond);
+            if (n_pred == 1) {
+                score = ggml_repeat_4d(ctx, score, top_k, top_k, n_pos, n_blocks);
+            }
+            ggml_tensor * unary_bcast = ggml_view_4d(ctx, unary_blk, top_k, 1, n_pos, n_blocks,
+                    unary_blk->nb[1], unary_blk->nb[1], unary_blk->nb[2], beg * unary_blk->nb[1]);
+            score = ggml_add(ctx, score, unary_bcast);
+            return ggml_concat(ctx, cand_run, ggml_reshape_3d(ctx, score, top_k * top_k, n_pos, n_blocks), 0);
+        };
+
+        ggml_tensor * packed = nullptr;
+        if (block > 1) {
+            packed = score_run(1, 1, 1);
+        }
+        if (block > 2) {
+            ggml_tensor * rows = score_run(2, block - 2, top_k);
+            packed = packed ? ggml_concat(ctx, packed, rows, 1) : rows;
+        }
+        const int64_t row_used = top_k + top_k * top_k;
+        GGML_ASSERT(packed != nullptr && n_embd >= row_used);
+        packed = ggml_pad_ext(ctx, packed, 0, (int) (n_embd - row_used), 1, 0, 0, 0, 0, 0);
+        packed = ggml_reshape_2d(ctx, packed, n_embd, n_tokens);
+        ggml_set_name(packed, "out");
+        return packed;
+    }
+};
+
 // GGML_OP_SUM
 struct test_sum : public test_case {
     const ggml_type type;
@@ -13653,6 +13801,33 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 {64, 64, 64, 64}, cols, 256, reshape_third));
         }
     }
+
+    // [TAG_DFL_HEAD] [TAG_DFL_LEAN] the DFlash2 drafter with LLAMA_DFLASH_HEAD_ROWS=98304 and LLAMA_DFLASH_LEAN=1 at
+    // Qwen3.8-27B shapes: 4..32 drafter rows (block 4 or 8 x 1..4 drafting sequences), the 5120-wide Q6_K target head
+    // read as rows [0, 98304) plus 131 extra rows (get_rows, f32 product, concat), the 98435-wide selector top-k, the
+    // unary-score get_rows and the id map (get_rows + cast f32 -> i32); the lean conv and selector graphs
+    for (int64_t n : {4, 8, 12, 16, 24, 32}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 98304, n, 5120, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {98435, n, 1, 1}, 16));
+        test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32, 1, 98435, 16, (int) n));
+        test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32, 1, 98435, (int) (16 * n), 1));
+        test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_I32, {16 * n, 1, 1, 1}));
+    }
+    for (int64_t n : {8, 32}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 131, n, 5120, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {98304, n, 1, 1}, 131, 0, 0));
+    }
+    test_cases.emplace_back(new test_get_rows(GGML_TYPE_Q6_K, 5120, 1024, 131, 1));
+    test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {98304, 1, 1, 1}, 131, 0, 0));
+    for (int64_t block : {4, 8}) {
+        for (int64_t nb : {1, 2, 4}) {
+            for (int side : {0, 1}) {
+                test_cases.emplace_back(new test_dflash_lean_conv(5120, 16, 2, block, nb, side));
+            }
+            test_cases.emplace_back(new test_dflash_lean_selector(5120, 16, 256, block, nb));
+        }
+    }
+    test_cases.emplace_back(new test_dflash_lean_conv(5120, 16, 2, 1, 2, 0)); // block 1: the shifted tap is all zero (fill)
 
     // Fused row-pair coverage: minimum rows, an even pair, and an odd tail.
     // TODO: the max_nmse_err() for these cases is not estimated correctly causing sporadic false failures.
