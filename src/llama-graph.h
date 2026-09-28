@@ -956,6 +956,12 @@ public:
 
     void set_params(const llm_graph_params & params);
 
+    // [TAG_FN_GRAPH_PER_WIDTH] the scheduler rewrites node sources and sets data pointers when it splits and allocates a
+    // graph, so a graph can be split again only after its post-build state is restored
+    void save_build_state();
+    void restore_build_state();
+    bool has_build_state() const { return !build_state.empty(); }
+
     // important graph nodes
     ggml_tensor * t_inp_tokens  = nullptr;
     ggml_tensor * t_inp_embd    = nullptr; // [n_embd_inp, n_tokens]
@@ -999,6 +1005,17 @@ private:
 
     // env: LLAMA_GRAPH_RESULT_DEBUG
     int debug = 0;
+
+    // [TAG_FN_GRAPH_PER_WIDTH]
+    struct tensor_state {
+        ggml_tensor *                t;
+        void *                       data;
+        struct ggml_backend_buffer * buffer;
+        void *                       extra;
+        int32_t                      flags;
+        ggml_tensor *                src[GGML_MAX_SRC];
+    };
+    std::vector<tensor_state> build_state;
 };
 
 using llm_graph_result_ptr = std::unique_ptr<llm_graph_result>;

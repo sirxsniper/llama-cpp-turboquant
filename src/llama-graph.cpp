@@ -1502,6 +1502,8 @@ void llm_graph_result::reset() {
     t_sampled_logits.clear();
     t_candidates.clear();
 
+    build_state.clear(); // [TAG_FN_GRAPH_PER_WIDTH]
+
     t_moe_il.clear(); // [TAG_FN_MOE_TRACE]
     t_moe_n_expert.clear();
     t_moe_ids.clear();
@@ -1607,6 +1609,36 @@ bool llm_graph_result::can_reuse(const llm_graph_params & params) {
     }
 
     return res;
+}
+
+// [TAG_FN_GRAPH_PER_WIDTH] every tensor of this result's compute context, as model.build_graph left it
+void llm_graph_result::save_build_state() {
+    build_state.clear();
+    for (ggml_tensor * t = ggml_get_first_tensor(ctx_compute.get()); t != nullptr; t = ggml_get_next_tensor(ctx_compute.get(), t)) {
+        tensor_state s;
+        s.t      = t;
+        s.data   = t->data;
+        s.buffer = t->buffer;
+        s.extra  = t->extra;
+        s.flags  = t->flags;
+        for (int j = 0; j < GGML_MAX_SRC; ++j) {
+            s.src[j] = t->src[j];
+        }
+        build_state.push_back(s);
+    }
+}
+
+void llm_graph_result::restore_build_state() {
+    for (const tensor_state & s : build_state) {
+        ggml_tensor * t = s.t;
+        t->data   = s.data;
+        t->buffer = s.buffer;
+        t->extra  = s.extra;
+        t->flags  = s.flags;
+        for (int j = 0; j < GGML_MAX_SRC; ++j) {
+            t->src[j] = s.src[j];
+        }
+    }
 }
 
 llm_graph_input_i * llm_graph_result::add_input(llm_graph_input_ptr input) {
