@@ -633,6 +633,13 @@ static __global__ void flash_attn_ext_vec(
             }
 #endif // V_DOT2_F32_F16_AVAILABLE
         }
+
+        // [TAG_FA_VEC_WAR_SYNC] The V loop above reads this warp's KQ slots written by the other lanes
+        // (KQ[j*nthreads + k]); the next iteration overwrites them (KQ[j*nthreads + tid]). The shuffles in
+        // between make the lanes meet but give no shared-memory ordering, so without a barrier here a lane
+        // may store its next KQ value before another lane has loaded the current one (racecheck: WAR hazard
+        // fattn-vec.cuh KQ write vs V-loop read). Same values, same order of arithmetic.
+        ggml_cuda_syncwarp();
     }
 
     if (sinks && blockIdx.y == 0) {
