@@ -453,6 +453,11 @@ static ggml_type llama_kv_resolve_walk(const llama_kv_resolve_input & in, const 
         ggml_type req_k, ggml_type req_v, llama_kv_resolve_notes & notes) {
     for (size_t i = 0; i < chain.size(); ++i) {
         const ggml_type t = chain[i];
+        // [TAG_FN_TURBOT_HQ] a model with a q8_0 KV bar passes over the turbo types it did not ask for, and says so
+        if (in.hq_fallback && llama_kv_resolve_is_turbo(t) && t != req_k && t != req_v && i + 1 < chain.size()) {
+            notes.add(t, "not a fallback for this model (its KV bar is q8_0; LLAMA_KV_HQ_FALLBACK=0 allows it)");
+            continue;
+        }
         std::string why;
         if (ggml_turbot_is_type(t)) {
             why = llama_kv_resolve_turbot_refusal(in,
@@ -830,6 +835,15 @@ static llama_kv_resolve_input llama_kv_resolve_make_input(const llama_model & mo
     // [TAG_TURBOT_ANY_RESOLVE] only the main context may get an automatic plan: not an MTP context, not a draft model
     // (common also swaps turbot out of every draft context, [TAG_TURBOT] in common/speculative.cpp)
     in.ctx_default    = params.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && model.arch != LLM_ARCH_DFLASH;
+
+    // [TAG_FN_TURBOT_HQ] Qwen3.8-Flash-Next (qwen4exp): the owner's KV bar is q8_0, so a refused turbot steps to q8_0,
+    // never to turbo5p512 or turbo4. LLAMA_KV_HQ_FALLBACK=0 restores the turbo steps, =1 applies the rule to every model.
+    {
+        const char * e = getenv("LLAMA_KV_HQ_FALLBACK");
+        const bool   on  = e != nullptr && strcmp(e, "1") == 0;
+        const bool   off = e != nullptr && strcmp(e, "0") == 0;
+        in.hq_fallback = on || (!off && model.arch == LLM_ARCH_QWEN4EXP);
+    }
 
     const bool want_turbot = ggml_turbot_is_type(params.type_k) || ggml_turbot_is_type(params.type_v);
     if (want_turbot) {

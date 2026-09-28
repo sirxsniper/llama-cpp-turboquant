@@ -196,6 +196,11 @@ struct llama_kv_resolve_input {
     // get an automatic plan (llama_turbot_cache_shape::auto_ok). MTP and draft contexts never do.
     bool ctx_default = false;
 
+    // [TAG_FN_TURBOT_HQ] the KV quality bar of this model is q8_0: a step down the chain never takes a turbo type that
+    // was not asked for (turbot -> q8_0 -> f16, not turbot -> turbo5p -> turbo4). llama_context sets it for qwen4exp;
+    // env LLAMA_KV_HQ_FALLBACK=0 clears it, =1 sets it for every model.
+    bool hq_fallback = false;
+
     std::string env_refusal;     // llama_turbot_env_refusal() of the process
     std::string turbot_refused;  // non-empty: turbot is refused with this reason (the constructor threw it anyway)
 
