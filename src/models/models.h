@@ -1378,14 +1378,15 @@ struct llama_model_dflash : public llama_model_base {
     // [TAG_SYNC_DFLASH2_LATTICE] upstream builds the DFlash2 selector inside graph() (build_dflash2_selector),
     // so the fork's build_post_sampling() override and its model member are gone.
 
-    // [TAG_DFL_HEAD] DFlash2 draft head in a smaller draft vocabulary, set once at load from the environment (default off).
+    // [TAG_DFL_HEAD] DFlash2 draft head in a smaller draft vocabulary, set once at load from the environment
+    // ([TAG_DFL_HEAD_AUTO] default 98304 rows on the Qwen3.5-family vocabulary, off on any other; =0 turns it off).
     // The drafter only proposes tokens; the target verifies them with its full head, so this changes acceptance, never
     // the output. See dflash.cpp.
     int64_t              dfl_head_rows   = 0;     // LLAMA_DFLASH_HEAD_ROWS: shared target head read as rows [0, rows) ...
     std::vector<int32_t> dfl_head_extra;          // ... plus these target ids (all >= rows)
     std::vector<float>   dfl_head_extra_f;        // the same ids as f32, for the id map
     bool                 dfl_d2t_compact = false; // LLAMA_DFLASH_D2T_COMPACT: own head + i32 d2t, top-k in the draft vocab
-    bool                 dfl_lean        = false; // [TAG_DFL_LEAN] LLAMA_DFLASH_LEAN: same values with fewer graph ops
+    bool                 dfl_lean        = false; // [TAG_DFL_LEAN] LLAMA_DFLASH_LEAN (default 1): same values, fewer graph ops
 
     template <bool is_enc>
     struct graph : public llm_graph_context {

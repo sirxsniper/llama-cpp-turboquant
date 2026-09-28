@@ -257,9 +257,11 @@ void llama_model_dflash::load_arch_tensors(llama_model_loader &) {
         output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab_draft }, TENSOR_DUPLICATED);
     }
 
-    // [TAG_DFL_HEAD] [TAG_DFL_LEAN] opt-in DFlash2 drafter paths (a DSpark Markov head keeps the full vocabulary)
+    // [TAG_DFL_HEAD] [TAG_DFL_LEAN] DFlash2 drafter paths (a DSpark Markov head keeps the full vocabulary)
     if (selector_meta && !markov_meta) {
-        dfl_lean = dfl_env_int("LLAMA_DFLASH_LEAN", 0) != 0;
+        // [TAG_DFL_LEAN_DEFAULT] on by default since 2026-09-28: the same values bit for bit (texts, drafted and accepted
+        // counts identical 48/48 on Qwen3.8-27B), drafter graph 780 -> 585 nodes. LLAMA_DFLASH_LEAN=0 is the kill switch.
+        dfl_lean = dfl_env_int("LLAMA_DFLASH_LEAN", 1) != 0;
         if (dfl_lean) {
             LLAMA_LOG_INFO("%s: [TAG_DFL_LEAN] DFlash2 conv and selector with fewer graph ops\n", __func__);
         }
@@ -273,7 +275,12 @@ void llama_model_dflash::load_arch_tensors(llama_model_loader &) {
                 }
             }
         } else if (output == nullptr) {
-            const int64_t rows = dfl_env_int("LLAMA_DFLASH_HEAD_ROWS", 0);
+            // [TAG_DFL_HEAD_AUTO] unset: 98304 rows for the Qwen3.5-family tokenizer (pre-tokenizer qwen35, 248320 tokens;
+            // Qwen3.8-27B keeps its Latin and code tokens below ~96K), measured +2.2 % t/s at 1 stream, +2.5 % at 2 with the
+            // lean graph, acceptance unchanged; no draft head on any other vocabulary. The target verifies with its full
+            // head, so this changes only the drafts. LLAMA_DFLASH_HEAD_ROWS=0 is the kill switch, =N sets the rows.
+            const bool qwen35_vocab = vocab.get_pre_type() == LLAMA_VOCAB_PRE_TYPE_QWEN35 && n_vocab == 248320;
+            const int64_t rows = dfl_env_int("LLAMA_DFLASH_HEAD_ROWS", qwen35_vocab ? 98304 : 0);
             if (rows > 0 && rows < n_vocab) {
                 dfl_head_rows = rows;
                 dfl_head_init_extra(*this, n_vocab);
@@ -1057,19 +1064,21 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
     // lm_head from the target model (shared via ctx_other)
     auto * output   = model.output;
     auto * output_s = model.output_s;
+    bool   head_plain = true; // [TAG_DFL_HEAD_AUTO] the head-rows view needs a plain target head (no row / tensor split)
     if (output == nullptr) {
         GGML_ASSERT(cparams.ctx_other != nullptr);
         const auto * model_other = llama_get_model(cparams.ctx_other);
         GGML_ASSERT(model_other->output != nullptr && "DFlash decoder requires the target model's output projection");
         output   = model_other->output;
         output_s = model_other->output_s;
+        head_plain = model_other->split_mode() == LLAMA_SPLIT_MODE_NONE || model_other->split_mode() == LLAMA_SPLIT_MODE_LAYER;
     }
 
     // [TAG_DFL_HEAD] the logits below cover a draft vocabulary; vocab_map: draft row -> target id (nullptr: row i is id i)
     bool          draft_vocab = false;
     ggml_tensor * vocab_map   = nullptr;
 
-    if (dfl.dfl_head_rows > 0 && model.output == nullptr && output->ne[1] == (int64_t) model.vocab.n_tokens()) {
+    if (dfl.dfl_head_rows > 0 && model.output == nullptr && head_plain && output->ne[1] == (int64_t) model.vocab.n_tokens()) {
         // [TAG_DFL_HEAD] LLAMA_DFLASH_HEAD_ROWS=N: read only rows [0, N) of the shared target head, a contiguous view,
         // plus the few extra rows past N (control tokens, markdown punctuation). Qwen3.8 keeps its Latin and code
         // tokens below ~96K (CJK from ~96K, other scripts above 150K): N = 98304 and its 131 extra rows read 39.6 % of
