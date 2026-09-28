@@ -94,6 +94,47 @@ std::vector<int> physical_core_cpus() {
     return cpus;
 }
 
+// the CPU the calling thread is pinned to, or -1 if its affinity allows more than one
+int current_thread_single_cpu() {
+#if defined(_WIN32)
+    DWORD_PTR proc_mask = 0;
+    DWORD_PTR sys_mask  = 0;
+    if (!GetProcessAffinityMask(GetCurrentProcess(), &proc_mask, &sys_mask) || proc_mask == 0) {
+        return -1;
+    }
+    // SetThreadAffinityMask returns the previous mask: set the process mask, then put the old one back
+    const DWORD_PTR prev = SetThreadAffinityMask(GetCurrentThread(), proc_mask);
+    if (prev == 0) {
+        return -1;
+    }
+    SetThreadAffinityMask(GetCurrentThread(), prev);
+    int cpu = -1;
+    for (int b = 0; b < 64; b++) {
+        if ((prev >> b) & 1) {
+            if (cpu >= 0) {
+                return -1;
+            }
+            cpu = b;
+        }
+    }
+    return cpu;
+#elif defined(__linux__)
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    if (pthread_getaffinity_np(pthread_self(), sizeof(set), &set) != 0 || CPU_COUNT(&set) != 1) {
+        return -1;
+    }
+    for (int c = 0; c < CPU_SETSIZE; c++) {
+        if (CPU_ISSET(c, &set)) {
+            return c;
+        }
+    }
+    return -1;
+#else
+    return -1;
+#endif
+}
+
 void pin_current_thread(int cpu) {
     if (cpu < 0) {
         return;
@@ -222,6 +263,9 @@ struct ggml_cpu_moe_pool_params ggml_cpu_moe_pool_params_default(int n_threads) 
     return p;
 }
 
+// Workers spin between jobs, so they must not share CPUs with other spinning threads (a ggml threadpool with --poll
+// in a GGML_OPENMP=OFF build: pause it with ggml_threadpool_pause while the pool runs, or give the two disjoint CPUs);
+// measured: a shared CPU turns every barrier into a scheduler time slice (~64 ms per job instead of ~0.5 ms).
 struct ggml_cpu_moe_pool * ggml_cpu_moe_pool_new(const struct ggml_cpu_moe_pool_params * pp) {
     ggml_cpu_init();
     if (pp == nullptr || pp->n_threads < 1 || pp->n_threads > GGML_MAX_N_THREADS) {
@@ -240,6 +284,15 @@ struct ggml_cpu_moe_pool * ggml_cpu_moe_pool_new(const struct ggml_cpu_moe_pool_
     }
     if (list.empty()) {
         list = physical_core_cpus();
+    }
+    // worker 0 is the caller: if it is pinned to one CPU of the list now (the ggml threadpool of a GGML_OPENMP=OFF build
+    // pins the main thread to the last CPU of its mask), that CPU moves to the front so no worker shares it
+    const int caller_cpu = current_thread_single_cpu();
+    for (size_t i = 1; i < list.size(); i++) {
+        if (list[i] == caller_cpu) {
+            std::swap(list[0], list[i]);
+            break;
+        }
     }
     p->cpus.assign(p->n_threads, -1);
     for (int k = 1; k < p->n_threads; k++) {

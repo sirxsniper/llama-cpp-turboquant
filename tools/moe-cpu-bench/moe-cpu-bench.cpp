@@ -836,7 +836,9 @@ int run_check(run_ctx & rc, split_graphs & sg, const weight_set & ws) {
     }
     if (rc.pool) {
         set_switches(base);
+        ggml_threadpool_pause(rc.tp);
         sg.run_pool(rc.pool, ws.n_expert, rc.p.n_used, false);
+        ggml_threadpool_resume(rc.tp);
         size_t n_diff = 0;
         for (size_t i = 0; i < ref.size(); i++) {
             n_diff += memcmp(&sg.pool_out[i], &ref[i], sizeof(float)) != 0;
@@ -902,8 +904,11 @@ void run_set(run_ctx & rc, const weight_set & ws, int & n_bad) {
         printf("   T=%d split: %8.1f us median %8.1f mean %8.1f p90 %8.1f max  %6.1f GiB/s   fixed (all experts skipped): %6.1f us\n",
                T, s_split.median(), s_split.mean(), s_split.pct(0.9), s_split.pct(1.0), s_split.gibs(), s_fixed.median());
         if (rc.pool) {
+            // the pool's workers spin: the ggml threadpool (GGML_OPENMP=OFF builds poll after each graph) must sleep
+            ggml_threadpool_pause(rc.tp);
             const stat_acc s_pool  = measure(rc, sg, ws, which::pool,       rc.p.iters, rc.p.warmup, rng, layer_rr);
             const stat_acc s_pfix  = measure(rc, sg, ws, which::pool_fixed, rc.p.iters, rc.p.warmup, rng, layer_rr);
+            ggml_threadpool_resume(rc.tp);
             printf("        pool (%d workers): %8.1f us median %8.1f mean %8.1f p90 %8.1f max  %6.1f GiB/s   fixed (all experts skipped): %6.1f us\n",
                    rc.p.pool_threads, s_pool.median(), s_pool.mean(), s_pool.pct(0.9), s_pool.pct(1.0), s_pool.gibs(), s_pfix.median());
         }
