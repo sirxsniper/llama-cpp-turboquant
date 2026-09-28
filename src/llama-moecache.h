@@ -59,3 +59,19 @@ const llama_moe_cache_layer * llama_moe_cache_lookup(const ggml_tensor * up_exps
 
 // apply throttled LRU updates; call between graph executions only
 void llama_moe_cache_step();
+
+// [TAG_FN_MOE_HOT] static per-expert hot set, chosen once from a routing profile (tools/moe-trace, LLAMA_MOE_PROFILE):
+//   LLAMA_MOE_HOT_PROFILE=<file.moeprof>  enables it (the LRU cache above is then not built)
+//   LLAMA_MOE_HOT_MIB=<n>|auto            VRAM budget; auto = free VRAM after the reserve minus LLAMA_MOE_HOT_HEADROOM_MIB (1536)
+//   LLAMA_MOE_HOT_MAX_T=<n>               graphs of up to n tokens (MTP verify, 2 streams) use it, 1..8, default 8
+//   LLAMA_MOE_HOT_SECTION=<name>          profile section, default decode_union
+//   LLAMA_MOE_HOT_COST=<type=f,...>       relative CPU cost per byte by type, default q5_1=1.3
+//   LLAMA_MOE_HOT_STATS=1                 hit rate per layer every 256 decode steps
+// The same companion-tensor + two-table mechanism as the LRU cache, with a variable slot count per layer; the tables
+// are written once at init, and there is no worker and no step, so nothing races with a running graph (the CPU
+// observer is set only for LLAMA_MOE_HOT_STATS, and only counts).
+// Returns true when this call enabled it (the caller then reserves the scheduler again). Once per process.
+bool llama_moe_hot_init(const llama_model & model);
+
+// max graph width for the hot chain, 0 when hot mode is off
+int llama_moe_hot_max_t();

@@ -1412,6 +1412,13 @@ llama_context::llama_context(
 
         sched_reserve();
 
+        // [TAG_FN_MOE_HOT] sized after the reserve, so LLAMA_MOE_HOT_MIB=auto sees what the KV cache and the compute
+        // buffers left; decode graphs then carry the hot chain, so reserve again with it
+        if (llama_moe_hot_init(model)) {
+            sched_need_reserve = true;
+            sched_reserve();
+        }
+
         if (!cparams.flash_attn) {
             if (ggml_is_quantized(params.type_v)) {
                 throw std::runtime_error("quantized V cache was requested, but this requires Flash Attention");

@@ -52,9 +52,6 @@ struct trace_state {
     uint64_t n_tokens_prefill = 0;
     uint64_t n_ubatch_draft   = 0;
 
-    llama_moe_trace_hit_fn hit_fn = nullptr;
-    void *                 hit_ud = nullptr;
-
     ~trace_state() {
         write_profile();
         if (ftrace) {
@@ -116,9 +113,8 @@ const env_cfg & cfg() {
         env_cfg r;
         const char * p = getenv("LLAMA_MOE_PROFILE");
         const char * t = getenv("LLAMA_MOE_TRACE");
-        const char * h = getenv("LLAMA_MOE_HOT_STATS");
         const char * k = getenv("LLAMA_MOE_TRACE_PRED");
-        r.active = (p && *p) || (t && *t) || (h && atoi(h) != 0);
+        r.active = (p && *p) || (t && *t);
         if (k && atoi(k) != 0) {
             const char * kk = getenv("LLAMA_MOE_TRACE_PRED_K");
             r.pred_k = kk ? std::max(1, std::min(64, atoi(kk))) : 16;
@@ -165,13 +161,6 @@ bool llama_moe_trace_active() {
 
 int llama_moe_trace_pred_k() {
     return cfg().active ? cfg().pred_k : 0;
-}
-
-void llama_moe_trace_set_hit_cb(llama_moe_trace_hit_fn fn, void * ud) {
-    trace_state * st = g_state();
-    std::lock_guard<std::mutex> lk(st->mtx);
-    st->hit_fn = fn;
-    st->hit_ud = ud;
 }
 
 void llama_moe_trace_flush() {
@@ -270,9 +259,6 @@ void llama_moe_trace_collect(ggml_backend_sched * sched, const llm_graph_result 
                     }
                 }
             }
-        }
-        if (st->hit_fn && !prefill) {
-            st->hit_fn(il, ids[i].data(), n_used, T, st->hit_ud);
         }
     }
 
