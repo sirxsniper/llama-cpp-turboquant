@@ -133,6 +133,8 @@ extern "C" {
         GGML_CPU_FN_Q5_1_AVX512,    // GGML_CPU_Q5_1_AVX512=1: AVX-512 q5_1 x q8_1 dot product (bitwise equal to AVX2)
         GGML_CPU_FN_MMID_MR,        // GGML_CPU_MMID_MR=1: MUL_MAT_ID dots up to 4 tokens per decoded weight row
                                     //   (bitwise equal); =2: the same with the 256-bit bodies only
+        GGML_CPU_FN_MOE_FUSE,       // GGML_CPU_MOE_FUSE=1: the MoE split up / gate / swiglu / down as one op with one
+                                    //   barrier, for up to 16 tokens (bitwise equal to the unfused nodes)
         GGML_CPU_FN_SWITCH_COUNT,
     };
 
@@ -146,6 +148,48 @@ extern "C" {
     // when this build has none for the type.
     GGML_BACKEND_API bool ggml_cpu_fn_vec_dot_mr(enum ggml_type type, int n, float * s, size_t bs, const void * vx, size_t bx,
                                                  int nr, const void * const * vy, int nc);
+
+    // [TAG_FN_CPU_MOE_FUSE] a persistent CPU worker pool that runs the host experts of one MoE layer for a few tokens,
+    // outside any graph (the CPU side of a GPU/CPU doorbell). It computes what the fused graph op computes: for every
+    // (slot, token) whose expert passes the table, down(swiglu(gate(x), up(x))) with the CPU kernels of this build.
+    struct ggml_cpu_moe_layer {              // one MoE layer with host-resident experts, fixed for the model's life
+        const struct ggml_tensor * up;       // [n_embd, n_ff, n_expert]
+        const struct ggml_tensor * gate;     // [n_embd, n_ff, n_expert]
+        const struct ggml_tensor * down;     // [n_ff, n_embd, n_expert]
+        const int32_t * table;               // [n_expert] or NULL; expert e is computed only if table[e] == table_miss
+        int32_t         table_miss;          // the moe-cache host_table uses n_slots
+    };
+
+    struct ggml_cpu_moe_job {
+        const struct ggml_cpu_moe_layer * layer;
+        int32_t n_tokens;                    // 1..16
+        int32_t n_used;                      // experts per token
+        const float   * x;                   // [n_embd, n_tokens] f32
+        const int32_t * ids;                 // [n_used, n_tokens]
+        const float   * w;                   // [n_used, n_tokens] or NULL
+        float         * out;                 // w != NULL: [n_embd, n_tokens] = sum over the computed slots, in slot order, of w * expert(x)
+                                             // w == NULL: [n_embd, n_used, n_tokens], rows of slots not computed here zeroed
+    };
+
+    struct ggml_cpu_moe_pool_params {
+        int  n_threads;                      // workers including the calling thread (worker 0)
+        bool cpumask[GGML_MAX_N_THREADS];    // worker k >= 1 is pinned to the k-th CPU of the mask; all false: the
+                                             // k-th physical core (SMT siblings skipped); the caller keeps its affinity
+        int  prio;                           // enum ggml_sched_priority
+        int  spin_us;                        // idle workers spin this long, then sleep until the next job
+    };
+
+    struct ggml_cpu_moe_pool;
+
+    GGML_BACKEND_API struct ggml_cpu_moe_pool_params ggml_cpu_moe_pool_params_default(int n_threads);
+    GGML_BACKEND_API struct ggml_cpu_moe_pool *      ggml_cpu_moe_pool_new (const struct ggml_cpu_moe_pool_params * p);
+    GGML_BACKEND_API void                           ggml_cpu_moe_pool_free(struct ggml_cpu_moe_pool * pool);
+    // blocking; one job at a time per pool. GGML_STATUS_FAILED for a job the fused kernel does not take (types,
+    // shapes, n_tokens > 16): the caller then runs the layer another way
+    GGML_BACKEND_API enum ggml_status               ggml_cpu_moe_run      (struct ggml_cpu_moe_pool * pool, const struct ggml_cpu_moe_job * job);
+
+    // [TAG_FN_CPU_MOE_FUSE] test / benchmark hook: how many fused MoE graph ops have run in this process
+    GGML_BACKEND_API uint64_t ggml_cpu_fn_moe_fused_calls(void);
 
     //
     // CPU backend

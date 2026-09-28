@@ -15470,6 +15470,237 @@ static bool run_cpu_fn_mmid_mr(ggml_backend_t backend, ggml_backend_t backend_re
     return n_fail == 0;
 }
 
+// [TAG_FN_CPU_MOE_FUSE] the CPU MoE split as llama-graph builds it: up, gate, swiglu_split(gate, up), down, all with
+// the same ids, optionally with the expert skip table on the three MUL_MAT_ID; returns the down output
+struct cpu_fn_moe_case {
+    ggml_type tu, tg, td;
+    int64_t   n_embd, n_ff;
+    int       n_exp, n_used;
+};
+
+static std::vector<float> cpu_fn_moe_graph(ggml_backend_t be, const cpu_fn_moe_case & c, int64_t T,
+                                           const std::vector<uint8_t> & wu, const std::vector<uint8_t> & wg, const std::vector<uint8_t> & wd,
+                                           const std::vector<float> & x, const std::vector<int32_t> & ids,
+                                           const std::vector<int32_t> * tbl, int32_t miss) {
+    ggml_init_params params = {
+        /* .mem_size = */ ggml_tensor_overhead()*16 + ggml_graph_overhead(),
+        /* .mem_base = */ NULL,
+        /* .no_alloc = */ true,
+    };
+    ggml_context_ptr ctx(ggml_init(params));
+
+    ggml_tensor * a_u  = ggml_new_tensor_3d(ctx.get(), c.tu, c.n_embd, c.n_ff, c.n_exp);
+    ggml_tensor * a_g  = ggml_new_tensor_3d(ctx.get(), c.tg, c.n_embd, c.n_ff, c.n_exp);
+    ggml_tensor * a_d  = ggml_new_tensor_3d(ctx.get(), c.td, c.n_ff, c.n_embd, c.n_exp);
+    ggml_tensor * tx   = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, c.n_embd, 1, T);
+    ggml_tensor * tids = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, c.n_used, T);
+    ggml_tensor * ttbl = tbl ? ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, c.n_exp) : nullptr;
+
+    ggml_tensor * up   = ggml_mul_mat_id(ctx.get(), a_u, tx, tids);
+    ggml_tensor * gate = ggml_mul_mat_id(ctx.get(), a_g, tx, tids);
+    ggml_tensor * par  = ggml_swiglu_split(ctx.get(), gate, up);
+    ggml_tensor * out  = ggml_mul_mat_id(ctx.get(), a_d, par, tids);
+    if (ttbl) {
+        for (ggml_tensor * t : { up, gate, out }) {
+            t->src[3]       = ttbl;
+            t->op_params[0] = miss;
+        }
+    }
+
+    ggml_backend_buffer_ptr buf(ggml_backend_alloc_ctx_tensors(ctx.get(), be));
+    if (buf == nullptr) {
+        return {};
+    }
+    ggml_backend_tensor_set(a_u, wu.data(), 0, wu.size());
+    ggml_backend_tensor_set(a_g, wg.data(), 0, wg.size());
+    ggml_backend_tensor_set(a_d, wd.data(), 0, wd.size());
+    ggml_backend_tensor_set(tx, x.data(), 0, x.size() * sizeof(float));
+    ggml_backend_tensor_set(tids, ids.data(), 0, ids.size() * sizeof(int32_t));
+    if (ttbl) {
+        ggml_backend_tensor_set(ttbl, tbl->data(), 0, tbl->size() * sizeof(int32_t));
+    }
+
+    ggml_cgraph * gf = ggml_new_graph(ctx.get());
+    ggml_build_forward_expand(gf, out);
+    if (ggml_backend_graph_compute(be, gf) != GGML_STATUS_SUCCESS) {
+        return {};
+    }
+    std::vector<float> r(ggml_nelements(out));
+    ggml_backend_tensor_get(out, r.data(), 0, ggml_nbytes(out));
+    return r;
+}
+
+static bool cpu_fn_same(const std::vector<float> & a, const std::vector<float> & b, size_t * n_diff, double * err) {
+    *n_diff = 0;
+    for (size_t i = 0; i < a.size(); i++) {
+        *n_diff += memcmp(&a[i], &b[i], sizeof(float)) != 0;
+    }
+    *err = nmse(b.data(), a.data(), a.size());
+    return *n_diff == 0 || *err <= q2_0_cpu_max_nmse();
+}
+
+// [TAG_FN_CPU_MOE_FUSE] GGML_CPU_MOE_FUSE on the tested CPU backend (switch flipped in process; with and without
+// GGML_CPU_MMID_MR) and the ggml_cpu_moe_run worker pool (plain and weighted-sum outputs) against the unfused nodes of
+// the use_ref CPU backend: bitwise equal (q2_0_cpu_max_nmse(), 0 on MSVC). Q4K-MTP style type mixes, a mixed q8_K /
+// q8_0 input pair, 1..16 tokens, with and without the skip table. The fused-op counter proves the fusion ran.
+static bool run_cpu_fn_moe_fuse(ggml_backend_t backend, ggml_backend_t backend_ref, const char * op_names_filter) {
+    if (!backend_is_cpu(backend) || !op_names_filter_selects(op_names_filter, "MUL_MAT_ID")) {
+        return true;
+    }
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+    using get_sw_t   = int  (*)(enum ggml_cpu_fn_switch);
+    using set_sw_t   = void (*)(enum ggml_cpu_fn_switch, int);
+    using calls_t    = uint64_t (*)(void);
+    using pp_def_t   = ggml_cpu_moe_pool_params (*)(int);
+    using pool_new_t = ggml_cpu_moe_pool * (*)(const ggml_cpu_moe_pool_params *);
+    using pool_free_t = void (*)(ggml_cpu_moe_pool *);
+    using pool_run_t = ggml_status (*)(ggml_cpu_moe_pool *, const ggml_cpu_moe_job *);
+    auto get_sw    = (get_sw_t)    ggml_backend_reg_get_proc_address(reg, "ggml_cpu_fn_get_switch");
+    auto set_sw    = (set_sw_t)    ggml_backend_reg_get_proc_address(reg, "ggml_cpu_fn_set_switch");
+    auto calls     = (calls_t)     ggml_backend_reg_get_proc_address(reg, "ggml_cpu_fn_moe_fused_calls");
+    auto pp_def    = (pp_def_t)    ggml_backend_reg_get_proc_address(reg, "ggml_cpu_moe_pool_params_default");
+    auto pool_new  = (pool_new_t)  ggml_backend_reg_get_proc_address(reg, "ggml_cpu_moe_pool_new");
+    auto pool_free = (pool_free_t) ggml_backend_reg_get_proc_address(reg, "ggml_cpu_moe_pool_free");
+    auto pool_run  = (pool_run_t)  ggml_backend_reg_get_proc_address(reg, "ggml_cpu_moe_run");
+    if (!get_sw || !set_sw || !calls || !pp_def || !pool_new || !pool_free || !pool_run) {
+        return true;
+    }
+    const int saved_fuse = get_sw(GGML_CPU_FN_MOE_FUSE);
+    const int saved_mr   = get_sw(GGML_CPU_FN_MMID_MR);
+
+    const cpu_fn_moe_case cases[] = {
+        { GGML_TYPE_Q4_K,   GGML_TYPE_Q4_K,   GGML_TYPE_Q5_1,   512, 128, 16, 4 }, // UD-Q4_K_XL
+        { GGML_TYPE_Q4_K,   GGML_TYPE_Q4_K,   GGML_TYPE_Q8_0,   512, 128, 16, 4 }, // its q8_0 down layers
+        { GGML_TYPE_Q4_K,   GGML_TYPE_Q4_K,   GGML_TYPE_IQ4_NL, 512, 128, 16, 4 }, // the iq4_nl down retype
+        { GGML_TYPE_Q4_K,   GGML_TYPE_IQ4_NL, GGML_TYPE_Q5_1,   512,  96, 16, 4 }, // q8_K and q8_0 inputs, 3 row pieces
+        { GGML_TYPE_Q5_K,   GGML_TYPE_Q5_K,   GGML_TYPE_Q5_1,   256,  64, 12, 3 },
+    };
+
+    std::default_random_engine gen(std::random_device{}());
+    std::uniform_real_distribution<float> uni(-1.0f, 1.0f);
+
+    auto nhalf = [](ggml_type t) { return t == GGML_TYPE_Q8_0 || t == GGML_TYPE_IQ4_NL ? 1 : 2; };
+
+    int n_run  = 0;
+    int n_fail = 0;
+    for (const cpu_fn_moe_case & c : cases) {
+        const std::vector<uint8_t> wu = cpu_fn_raw_blocks(c.tu, (size_t) (c.n_embd / ggml_blck_size(c.tu)) * c.n_ff * c.n_exp, nhalf(c.tu), gen);
+        const std::vector<uint8_t> wg = cpu_fn_raw_blocks(c.tg, (size_t) (c.n_embd / ggml_blck_size(c.tg)) * c.n_ff * c.n_exp, nhalf(c.tg), gen);
+        const std::vector<uint8_t> wd = cpu_fn_raw_blocks(c.td, (size_t) (c.n_ff / ggml_blck_size(c.td)) * c.n_embd * c.n_exp, nhalf(c.td), gen);
+
+        for (int64_t T : {1, 2, 3, 4, 5, 8, 16}) {
+            std::vector<float> x((size_t) c.n_embd * T);
+            for (float & v : x) {
+                v = uni(gen);
+            }
+            std::vector<int32_t> ids;
+            std::vector<int32_t> experts(c.n_exp);
+            for (int i = 0; i < c.n_exp; i++) {
+                experts[i] = i;
+            }
+            for (int64_t t = 0; t < T; t++) {
+                std::shuffle(experts.begin(), experts.end(), gen);
+                ids.insert(ids.end(), experts.begin(), experts.begin() + c.n_used);
+            }
+            std::vector<float> w((size_t) c.n_used * T);
+            for (float & v : w) {
+                v = 0.5f + 0.5f * uni(gen);
+            }
+            std::vector<int32_t> tbl(c.n_exp);
+            for (int e = 0; e < c.n_exp; e++) {
+                tbl[e] = e % 3 == 1 ? e / 3 : c.n_exp;
+            }
+
+            for (int with_tbl = 0; with_tbl < 2; with_tbl++) {
+                const std::vector<int32_t> * tp = with_tbl ? &tbl : nullptr;
+                const std::vector<float> ref = cpu_fn_moe_graph(backend_ref, c, T, wu, wg, wd, x, ids, tp, c.n_exp);
+
+                // the fused graph op, with and without the multi-row kernels
+                for (int mr : {0, 1}) {
+                    set_sw(GGML_CPU_FN_MOE_FUSE, 1);
+                    set_sw(GGML_CPU_FN_MMID_MR, mr);
+                    const uint64_t n0 = calls();
+                    const std::vector<float> out = cpu_fn_moe_graph(backend, c, T, wu, wg, wd, x, ids, tp, c.n_exp);
+                    const uint64_t n1 = calls();
+                    set_sw(GGML_CPU_FN_MOE_FUSE, saved_fuse);
+                    set_sw(GGML_CPU_FN_MMID_MR, saved_mr);
+                    n_run++;
+                    size_t n_diff = 0;
+                    double err = 0.0;
+                    const bool ok = !ref.empty() && out.size() == ref.size() && n1 > n0 && cpu_fn_same(out, ref, &n_diff, &err);
+                    if (!ok || n_diff > 0) {
+                        printf("  %s moe fuse %s/%s/%s T=%" PRId64 " table=%d mr=%d: fused %s, %zu values differ, NMSE %g\n",
+                               ok ? "note:" : "FAIL", ggml_type_name(c.tu), ggml_type_name(c.tg), ggml_type_name(c.td), T, with_tbl, mr,
+                               n1 > n0 ? "yes" : "NO", n_diff, err);
+                    }
+                    n_fail += ok ? 0 : 1;
+                }
+
+                // the worker pool, graph layout and weighted sum
+                {
+                    ggml_init_params params = { ggml_tensor_overhead()*4, NULL, true };
+                    ggml_context_ptr ctx(ggml_init(params));
+                    ggml_tensor * a_u = ggml_new_tensor_3d(ctx.get(), c.tu, c.n_embd, c.n_ff, c.n_exp);
+                    ggml_tensor * a_g = ggml_new_tensor_3d(ctx.get(), c.tg, c.n_embd, c.n_ff, c.n_exp);
+                    ggml_tensor * a_d = ggml_new_tensor_3d(ctx.get(), c.td, c.n_ff, c.n_embd, c.n_exp);
+                    a_u->data = (void *) wu.data();
+                    a_g->data = (void *) wg.data();
+                    a_d->data = (void *) wd.data();
+
+                    ggml_cpu_moe_layer layer = { a_u, a_g, a_d, with_tbl ? tbl.data() : nullptr, c.n_exp };
+                    ggml_cpu_moe_pool_params pp = pp_def(4);
+                    pp.spin_us = 50;
+                    ggml_cpu_moe_pool * pool = pool_new(&pp);
+
+                    std::vector<float> out_p(ref.size(), 12345.0f);
+                    ggml_cpu_moe_job job = { &layer, (int32_t) T, c.n_used, x.data(), ids.data(), nullptr, out_p.data() };
+                    const bool ran_p = pool && pool_run(pool, &job) == GGML_STATUS_SUCCESS;
+
+                    std::vector<float> out_w((size_t) c.n_embd * T, 12345.0f);
+                    job.w   = w.data();
+                    job.out = out_w.data();
+                    const bool ran_w = pool && pool_run(pool, &job) == GGML_STATUS_SUCCESS;
+                    pool_free(pool);
+
+                    // the weighted sum of the reference rows, in slot order, skipped slots left out
+                    std::vector<float> exp_w((size_t) c.n_embd * T);
+                    for (int64_t t = 0; t < T; t++) {
+                        for (int64_t r = 0; r < c.n_embd; r++) {
+                            float sum = 0.0f;
+                            for (int slot = 0; slot < c.n_used; slot++) {
+                                const int32_t e = ids[t * c.n_used + slot];
+                                if (with_tbl && tbl[e] != c.n_exp) {
+                                    continue;
+                                }
+                                sum += w[slot + (size_t) c.n_used * t] * ref[((size_t) t * c.n_used + slot) * c.n_embd + r];
+                            }
+                            exp_w[(size_t) t * c.n_embd + r] = sum;
+                        }
+                    }
+
+                    size_t nd_p = 0, nd_w = 0;
+                    double err_p = 0.0, err_w = 0.0;
+                    const bool ok_p = ran_p && !ref.empty() && cpu_fn_same(out_p, ref, &nd_p, &err_p);
+                    const bool ok_w = ran_w && !ref.empty() && cpu_fn_same(out_w, exp_w, &nd_w, &err_w);
+                    n_run += 2;
+                    if (!ok_p || !ok_w || nd_p > 0 || nd_w > 0) {
+                        printf("  %s moe pool %s/%s/%s T=%" PRId64 " table=%d: ran %d/%d, graph layout %zu values differ (NMSE %g), weighted %zu differ (NMSE %g)\n",
+                               ok_p && ok_w ? "note:" : "FAIL", ggml_type_name(c.tu), ggml_type_name(c.tg), ggml_type_name(c.td), T, with_tbl,
+                               (int) ran_p, (int) ran_w, nd_p, err_p, nd_w, err_w);
+                    }
+                    n_fail += (ok_p ? 0 : 1) + (ok_w ? 0 : 1);
+                }
+            }
+        }
+    }
+    set_sw(GGML_CPU_FN_MOE_FUSE, saved_fuse);
+    set_sw(GGML_CPU_FN_MMID_MR, saved_mr);
+
+    printf("  fused MoE split and CPU MoE pool vs the unfused reference: %d cases run, %d failed\n", n_run, n_fail);
+
+    return n_fail == 0;
+}
+
 static bool test_backend(ggml_backend_t backend, ggml_backend_dev_t dev, test_mode mode, const char * op_names_filter, const char * params_filter,
                          printer * output_printer, const char * test_file_path, int parallel_workers) {
     auto filter_test_cases = [](std::vector<std::unique_ptr<test_case>> & test_cases, const char * params_filter) {
@@ -15615,7 +15846,9 @@ static bool test_backend(ggml_backend_t backend, ggml_backend_dev_t dev, test_mo
 
         const bool fn_mmid_mr_ok = run_cpu_fn_mmid_mr(backend, backend_cpu.get(), op_names_filter); // [TAG_FN_CPU_MMID_MR]
 
-        return n_ok == tests_run && slice_ok && q2_0_repack_ok && fn_repack_skip_ok && fn_mmid_mr_ok;
+        const bool fn_moe_fuse_ok = run_cpu_fn_moe_fuse(backend, backend_cpu.get(), op_names_filter); // [TAG_FN_CPU_MOE_FUSE]
+
+        return n_ok == tests_run && slice_ok && q2_0_repack_ok && fn_repack_skip_ok && fn_mmid_mr_ok && fn_moe_fuse_ok;
     }
 
     if (mode == MODE_GRAD) {

@@ -765,6 +765,22 @@ static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const ch
     if (strcmp(name, "ggml_cpu_fn_set_switch") == 0) {
         return (void *)ggml_cpu_fn_set_switch;
     }
+    // [TAG_FN_CPU_MOE_FUSE] the CPU MoE worker pool and the fused-op counter
+    if (strcmp(name, "ggml_cpu_moe_pool_params_default") == 0) {
+        return (void *)ggml_cpu_moe_pool_params_default;
+    }
+    if (strcmp(name, "ggml_cpu_moe_pool_new") == 0) {
+        return (void *)ggml_cpu_moe_pool_new;
+    }
+    if (strcmp(name, "ggml_cpu_moe_pool_free") == 0) {
+        return (void *)ggml_cpu_moe_pool_free;
+    }
+    if (strcmp(name, "ggml_cpu_moe_run") == 0) {
+        return (void *)ggml_cpu_moe_run;
+    }
+    if (strcmp(name, "ggml_cpu_fn_moe_fused_calls") == 0) {
+        return (void *)ggml_cpu_fn_moe_fused_calls;
+    }
 
     // threadpool - TODO:  move to ggml-base
     if (strcmp(name, "ggml_threadpool_new") == 0) {
