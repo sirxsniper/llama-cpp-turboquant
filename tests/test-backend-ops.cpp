@@ -19,6 +19,7 @@
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cpp.h"
+#include "ggml-cpu.h" // [TAG_FN_CPU_MMID_MR] enum ggml_cpu_fn_switch
 #include "ggml-turbot.h"
 
 #include <algorithm>
@@ -5931,6 +5932,28 @@ struct test_mul_mat_id : public test_case {
 
     void reinit_perf_iter(ggml_context * ctx) override {
         init_mul_mat_id_ids(ctx, n_mats);
+    }
+};
+
+// [TAG_FN_CPU_MMID_MR] MUL_MAT_ID for the CPU expert path benchmark: perf mode reports GB/s over the bytes a call reads
+// (the rows of the n_used x n routed experts, capped at n_mats, plus src1 and dst) instead of GFLOPS. The perf loop
+// repeats the node on the same ids, so the rate is the cache-resident kernel rate (an upper bound for DRAM streaming;
+// tools/moe-cpu-bench measures that with rotating experts).
+struct test_mul_mat_id_fn : public test_mul_mat_id {
+    using test_mul_mat_id::test_mul_mat_id;
+
+    std::string vars() override {
+        return test_mul_mat_id::vars() + ",rate=expert_bytes";
+    }
+
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return 0;
+    }
+
+    size_t op_size(ggml_tensor * t) override {
+        const int64_t n_touched = std::min<int64_t>(n_mats, (int64_t) n_used * n);
+        return (size_t) n_touched * t->src[0]->nb[2] + ggml_nbytes(t->src[1]) + ggml_nbytes(t);
     }
 };
 
@@ -14492,6 +14515,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
+    // [TAG_FN_CPU_MMID_MR] Qwen3.8-Flash-Next experts (10 used): gate/up 2560 -> 640 from one shared input row, down
+    // 640 -> 2560 from one row per expert slot, at the decode widths (1 token, MTP verify 2-3, 2 streams 4-6, 8).
+    // 64 experts keep the weight init short; the rate counts the routed experts only (see test_mul_mat_id_fn).
+    // Run with GGML_CPU_MMID_MR=0 / 1 / 2 and -p rate=expert_bytes for the kernel A/B.
+    for (int bs : {1, 2, 3, 4, 8}) {
+        for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_IQ4_NL}) {
+            test_cases.emplace_back(new test_mul_mat_id_fn(type_a, GGML_TYPE_F32, 64, 10, true, 640, bs, 2560));
+        }
+        for (ggml_type type_a : {GGML_TYPE_Q5_1, GGML_TYPE_Q8_0, GGML_TYPE_IQ4_NL}) {
+            test_cases.emplace_back(new test_mul_mat_id_fn(type_a, GGML_TYPE_F32, 64, 10, false, 2560, bs, 640));
+        }
+    }
+
     for (int K : {3, 5}) {
         for (int IC : {256, 2560}) {
             for (int IW_IH : {32, 64, 256}) {
@@ -15293,6 +15329,147 @@ static bool run_cpu_fn_repack_skip(ggml_backend_t backend, ggml_backend_t backen
     return n_fail == 0;
 }
 
+// [TAG_FN_CPU_MMID_MR] raw blocks of a weight type with random bytes and random fp16 scales in the first nhalf fields
+static std::vector<uint8_t> cpu_fn_raw_blocks(ggml_type type, size_t nblocks, int nhalf, std::default_random_engine & gen) {
+    const size_t bsize = ggml_type_size(type);
+    std::vector<uint8_t> data(nblocks * bsize);
+    std::uniform_real_distribution<float> scale(-0.05f, 0.05f);
+    std::uniform_int_distribution<int> byte(0, 255);
+    for (size_t i = 0; i < nblocks; i++) {
+        uint8_t * blk = data.data() + i * bsize;
+        for (size_t j = 0; j < bsize; j++) {
+            blk[j] = (uint8_t) byte(gen);
+        }
+        for (int h = 0; h < nhalf; h++) {
+            const ggml_fp16_t d = ggml_fp32_to_fp16(scale(gen));
+            memcpy(blk + h * sizeof(d), &d, sizeof(d));
+        }
+    }
+    return data;
+}
+
+// [TAG_FN_CPU_MMID_MR] one MUL_MAT_ID on backend be with the given weights / input / ids; empty on failure
+static std::vector<float> cpu_fn_mmid_run(ggml_backend_t be, ggml_type type, int64_t k, int64_t m, int64_t n, int n_exp, int n_used,
+                                          bool bcast, const std::vector<uint8_t> & a_q, const std::vector<float> & b_data,
+                                          const std::vector<int32_t> & ids_data) {
+    ggml_init_params params = {
+        /* .mem_size = */ ggml_tensor_overhead()*8 + ggml_graph_overhead(),
+        /* .mem_base = */ NULL,
+        /* .no_alloc = */ true,
+    };
+    ggml_context_ptr ctx(ggml_init(params));
+
+    ggml_tensor * a   = ggml_new_tensor_3d(ctx.get(), type, k, m, n_exp);
+    ggml_tensor * b   = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, k, bcast ? 1 : n_used, n);
+    ggml_tensor * ids = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, n_used, n);
+    ggml_tensor * o   = ggml_mul_mat_id(ctx.get(), a, b, ids);
+
+    ggml_backend_buffer_ptr buf(ggml_backend_alloc_ctx_tensors(ctx.get(), be));
+    if (buf == nullptr || !ggml_backend_supports_op(be, o)) {
+        return {};
+    }
+    ggml_backend_tensor_set(a, a_q.data(), 0, a_q.size());
+    ggml_backend_tensor_set(b, b_data.data(), 0, b_data.size() * sizeof(float));
+    ggml_backend_tensor_set(ids, ids_data.data(), 0, ids_data.size() * sizeof(int32_t));
+
+    ggml_cgraph * gf = ggml_new_graph(ctx.get());
+    ggml_build_forward_expand(gf, o);
+    if (ggml_backend_graph_compute(be, gf) != GGML_STATUS_SUCCESS) {
+        return {};
+    }
+    std::vector<float> out(ggml_nelements(o));
+    ggml_backend_tensor_get(o, out.data(), 0, ggml_nbytes(o));
+    return out;
+}
+
+// [TAG_FN_CPU_MMID_MR] GGML_CPU_MMID_MR (both bodies: 1 and 2) on the tested CPU backend against the per-(row, token)
+// vec_dot path of the use_ref CPU backend, at the Flash-Next expert shapes: gate/up (k 2560 -> m 64 rows, one input
+// row shared by all experts) and down (k 640 -> m 256, one input row per expert slot), 16 experts with 10 used so tokens
+// share experts (groups of 1..4 and 4 + rest), 1..8 tokens, random raw weight blocks. The kernels are bitwise equal to
+// vec_dot, so the bound is q2_0_cpu_max_nmse() (0 on MSVC). The switch is flipped in process and restored.
+static bool run_cpu_fn_mmid_mr(ggml_backend_t backend, ggml_backend_t backend_ref, const char * op_names_filter) {
+    if (!backend_is_cpu(backend) || !op_names_filter_selects(op_names_filter, "MUL_MAT_ID")) {
+        return true;
+    }
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+    using get_sw_t = int  (*)(enum ggml_cpu_fn_switch);
+    using set_sw_t = void (*)(enum ggml_cpu_fn_switch, int);
+    auto get_sw = (get_sw_t) ggml_backend_reg_get_proc_address(reg, "ggml_cpu_fn_get_switch");
+    auto set_sw = (set_sw_t) ggml_backend_reg_get_proc_address(reg, "ggml_cpu_fn_set_switch");
+    if (get_sw == nullptr || set_sw == nullptr) {
+        return true;
+    }
+    const int saved = get_sw(GGML_CPU_FN_MMID_MR);
+
+    struct mr_case { ggml_type type; int nhalf; int64_t k, m; bool bcast; };
+    const mr_case cases[] = {
+        { GGML_TYPE_Q4_K,   2, 2560,  64, true  },
+        { GGML_TYPE_Q5_K,   2, 2560,  64, true  },
+        { GGML_TYPE_IQ4_NL, 1, 2560,  64, true  },
+        { GGML_TYPE_Q5_1,   2,  640, 256, false },
+        { GGML_TYPE_Q8_0,   1,  640, 256, false },
+        { GGML_TYPE_IQ4_NL, 1,  640, 256, false },
+        { GGML_TYPE_Q5_1,   2,  672,  48, false }, // odd block count: the 256-bit tail
+        { GGML_TYPE_IQ4_NL, 1,  672,  48, false },
+    };
+    const int n_exp  = 16;
+    const int n_used = 10;
+
+    std::default_random_engine gen(std::random_device{}());
+    std::uniform_real_distribution<float> uni(-1.0f, 1.0f);
+
+    int n_run  = 0;
+    int n_fail = 0;
+    for (const mr_case & c : cases) {
+        const std::vector<uint8_t> a_q = cpu_fn_raw_blocks(c.type, (size_t) (c.k / ggml_blck_size(c.type)) * c.m * n_exp, c.nhalf, gen);
+        for (int64_t n = 1; n <= 8; n++) {
+            std::vector<float> b_data((size_t) c.k * (c.bcast ? 1 : n_used) * n);
+            for (float & v : b_data) {
+                v = uni(gen);
+            }
+            std::vector<int32_t> ids_data;
+            std::vector<int32_t> experts(n_exp);
+            for (int i = 0; i < n_exp; i++) {
+                experts[i] = i;
+            }
+            for (int64_t t = 0; t < n; t++) {
+                std::shuffle(experts.begin(), experts.end(), gen);
+                ids_data.insert(ids_data.end(), experts.begin(), experts.begin() + n_used);
+            }
+
+            const std::vector<float> ref = cpu_fn_mmid_run(backend_ref, c.type, c.k, c.m, n, n_exp, n_used, c.bcast, a_q, b_data, ids_data);
+            for (int body : {1, 2}) {
+                set_sw(GGML_CPU_FN_MMID_MR, body);
+                const std::vector<float> out = cpu_fn_mmid_run(backend, c.type, c.k, c.m, n, n_exp, n_used, c.bcast, a_q, b_data, ids_data);
+                set_sw(GGML_CPU_FN_MMID_MR, saved);
+                n_run++;
+                if (ref.empty() || out.size() != ref.size()) {
+                    n_fail++;
+                    printf("  FAIL mmid_mr %s k=%" PRId64 " m=%" PRId64 " n=%" PRId64 " body=%d: compute failed\n",
+                           ggml_type_name(c.type), c.k, c.m, n, body);
+                    continue;
+                }
+                size_t n_diff = 0;
+                for (size_t i = 0; i < out.size(); i++) {
+                    n_diff += memcmp(&out[i], &ref[i], sizeof(float)) != 0;
+                }
+                const double err = nmse(ref.data(), out.data(), out.size());
+                const bool   ok  = n_diff == 0 || err <= q2_0_cpu_max_nmse();
+                if (!ok || n_diff > 0) {
+                    printf("  %s mmid_mr %s k=%" PRId64 " m=%" PRId64 " n=%" PRId64 " body=%d: %zu of %zu values differ, NMSE %g\n",
+                           ok ? "note:" : "FAIL", ggml_type_name(c.type), c.k, c.m, n, body, n_diff, out.size(), err);
+                }
+                n_fail += ok ? 0 : 1;
+            }
+        }
+    }
+    set_sw(GGML_CPU_FN_MMID_MR, saved);
+
+    printf("  MUL_MAT_ID multi-row x multi-token kernels vs the vec_dot reference: %d cases run, %d failed\n", n_run, n_fail);
+
+    return n_fail == 0;
+}
+
 static bool test_backend(ggml_backend_t backend, ggml_backend_dev_t dev, test_mode mode, const char * op_names_filter, const char * params_filter,
                          printer * output_printer, const char * test_file_path, int parallel_workers) {
     auto filter_test_cases = [](std::vector<std::unique_ptr<test_case>> & test_cases, const char * params_filter) {
@@ -15436,7 +15613,9 @@ static bool test_backend(ggml_backend_t backend, ggml_backend_dev_t dev, test_mo
 
         const bool fn_repack_skip_ok = run_cpu_fn_repack_skip(backend, backend_cpu.get(), op_names_filter); // [TAG_FN_CPU_REPACK_MMID_SKIP]
 
-        return n_ok == tests_run && slice_ok && q2_0_repack_ok && fn_repack_skip_ok;
+        const bool fn_mmid_mr_ok = run_cpu_fn_mmid_mr(backend, backend_cpu.get(), op_names_filter); // [TAG_FN_CPU_MMID_MR]
+
+        return n_ok == tests_run && slice_ok && q2_0_repack_ok && fn_repack_skip_ok && fn_mmid_mr_ok;
     }
 
     if (mode == MODE_GRAD) {

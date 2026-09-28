@@ -758,6 +758,13 @@ static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const ch
     if (strcmp(name, "ggml_backend_cpu_set_use_ref") == 0) {
         return (void *)ggml_backend_cpu_set_use_ref;
     }
+    // [TAG_FN_CPU_SWITCHES] the CPU expert path switches, for tests and benchmarks that load backends dynamically
+    if (strcmp(name, "ggml_cpu_fn_get_switch") == 0) {
+        return (void *)ggml_cpu_fn_get_switch;
+    }
+    if (strcmp(name, "ggml_cpu_fn_set_switch") == 0) {
+        return (void *)ggml_cpu_fn_set_switch;
+    }
 
     // threadpool - TODO:  move to ggml-base
     if (strcmp(name, "ggml_threadpool_new") == 0) {

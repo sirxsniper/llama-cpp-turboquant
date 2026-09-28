@@ -67,6 +67,20 @@ void ggml_vec_dot_q8_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
 void ggml_vec_dot_q5_1_q8_1_base(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
 #endif
 
+// [TAG_FN_CPU_MMID_MR] multi-row x multi-token dot product: s[c*bs + r] = dot(row r of vx (row stride bx), column vy[c])
+// for r < nr and c < nc <= GGML_CPU_FN_MR_MAX_NC, the columns in the type's vec_dot_type. Each value is bitwise equal to
+// the type's vec_dot on the same row and column (see arch/x86/quants.c).
+#define GGML_CPU_FN_MR_MAX_NC 4
+typedef void (*ggml_vec_dot_mr_t)(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, int nr,
+                                  const void * const * GGML_RESTRICT vy, int nc);
+#if defined(GGML_CPU_FN_X86)
+void ggml_vec_dot_q4_K_q8_K_mr  (int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, int nr, const void * const * GGML_RESTRICT vy, int nc);
+void ggml_vec_dot_q5_K_q8_K_mr  (int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, int nr, const void * const * GGML_RESTRICT vy, int nc);
+void ggml_vec_dot_q5_1_q8_1_mr  (int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, int nr, const void * const * GGML_RESTRICT vy, int nc);
+void ggml_vec_dot_q8_0_q8_0_mr  (int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, int nr, const void * const * GGML_RESTRICT vy, int nc);
+void ggml_vec_dot_iq4_nl_q8_0_mr(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, int nr, const void * const * GGML_RESTRICT vy, int nc);
+#endif
+
 void ggml_vec_dot_mxfp4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
 void ggml_vec_dot_nvfp4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
 

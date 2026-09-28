@@ -1227,6 +1227,7 @@ bool ggml_cpu_q2_0_simd = false;
 static const char * const ggml_cpu_fn_sw_env[] = {
     /* GGML_CPU_FN_APPLY_ONCE */ "GGML_CPU_APPLY_ONCE",
     /* GGML_CPU_FN_Q5_1_AVX512 */ "GGML_CPU_Q5_1_AVX512",
+    /* GGML_CPU_FN_MMID_MR     */ "GGML_CPU_MMID_MR",
 };
 static_assert(sizeof(ggml_cpu_fn_sw_env)/sizeof(ggml_cpu_fn_sw_env[0]) == GGML_CPU_FN_SWITCH_COUNT, "one name per switch");
 
@@ -1257,6 +1258,33 @@ void ggml_cpu_fn_set_switch(enum ggml_cpu_fn_switch sw, int value) {
 const char * ggml_cpu_fn_switch_env(enum ggml_cpu_fn_switch sw) {
     GGML_ASSERT((int) sw >= 0 && (int) sw < GGML_CPU_FN_SWITCH_COUNT);
     return ggml_cpu_fn_sw_env[sw];
+}
+
+// [TAG_FN_CPU_MMID_MR] the multi-row x multi-token dot product of a weight type, or NULL
+static ggml_vec_dot_mr_t ggml_cpu_fn_mr_kernel(enum ggml_type type) {
+#if defined(GGML_CPU_FN_X86)
+    switch (type) {
+        case GGML_TYPE_Q4_K:   return ggml_vec_dot_q4_K_q8_K_mr;
+        case GGML_TYPE_Q5_K:   return ggml_vec_dot_q5_K_q8_K_mr;
+        case GGML_TYPE_Q5_1:   return ggml_vec_dot_q5_1_q8_1_mr;
+        case GGML_TYPE_Q8_0:   return ggml_vec_dot_q8_0_q8_0_mr;
+        case GGML_TYPE_IQ4_NL: return ggml_vec_dot_iq4_nl_q8_0_mr;
+        default:               break;
+    }
+#endif
+    GGML_UNUSED(type);
+    return NULL;
+}
+
+bool ggml_cpu_fn_vec_dot_mr(enum ggml_type type, int n, float * s, size_t bs, const void * vx, size_t bx,
+                            int nr, const void * const * vy, int nc) {
+    ggml_cpu_init();
+    const ggml_vec_dot_mr_t mr = ggml_cpu_fn_mr_kernel(type);
+    if (mr == NULL || nc < 1 || nc > GGML_CPU_FN_MR_MAX_NC || nr < 1) {
+        return false;
+    }
+    mr(n, s, bs, vx, bx, nr, vy, nc);
+    return true;
 }
 
 // [TAG_Q2_0_CPU] the use_ref backend (the reference of test-backend-ops -b CPU) runs the scalar Q2_0 dot product, so the
@@ -1605,7 +1633,8 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
     const size_t row_size,
     const bool src1_cont,
     const void * wdata,
-    const bool use_ref) {
+    const bool use_ref,
+    const ggml_vec_dot_mr_t vec_dot_mr) {
 
     GGML_TENSOR_BINARY_OP_LOCALS
 
@@ -1616,6 +1645,41 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
 
     const int64_t blck_0 = 16;
     const int64_t blck_1 = 16;
+
+    if (vec_dot_mr != NULL) {
+        // [TAG_FN_CPU_MMID_MR] rows in blocks of 16, the tokens of this expert in groups of up to 4: every weight row is
+        // unpacked once per group instead of once per token. Same values as the per-(row, token) vec_dot calls below.
+        float tmp_mr[GGML_CPU_FN_MR_MAX_NC*16];
+        for (int64_t iir0 = ir0_start; iir0 < ir0_end; iir0 += blck_0) {
+            const int64_t nr = MIN(iir0 + blck_0, ir0_end) - iir0;
+            for (int64_t ir1 = ir1_start; ir1 < ir1_end; ir1 += GGML_CPU_FN_MR_MAX_NC) {
+                const int nc = (int) MIN(GGML_CPU_FN_MR_MAX_NC, ir1_end - ir1);
+
+                const void * cols[GGML_CPU_FN_MR_MAX_NC];
+                float      * dst_cols[GGML_CPU_FN_MR_MAX_NC];
+                for (int c = 0; c < nc; ++c) {
+                    const struct mmid_row_mapping row_mapping = MMID_MATRIX_ROW(cur_a, ir1 + c);
+
+                    const int     id  = row_mapping.i1; // expert slot of the token
+                    const int64_t i11 = id % ne11;
+                    const int64_t i12 = row_mapping.i2; // token
+
+                    cols[c] = (const char *) wdata +
+                        (src1_cont || src1->type != vec_dot_type
+                        ? (i11      + i12*ne11)*row_size
+                        : (i11*nb11 + i12*nb12));
+                    dst_cols[c] = (float *) ((char *) dst->data + (id*nb1 + i12*nb2));
+                }
+
+                vec_dot_mr((int) ne00, tmp_mr, 16, src0_cur + iir0*nb01, nb01, (int) nr, cols, nc);
+
+                for (int c = 0; c < nc; ++c) {
+                    memcpy(&dst_cols[c][iir0], tmp_mr + c*16, nr*sizeof(float));
+                }
+            }
+        }
+        return;
+    }
 
     float tmp[16];
 
@@ -1736,6 +1800,10 @@ static void ggml_compute_forward_mul_mat_id(
     // IQ panel gemm (see iqp.h); per expert eligibility is decided below, but the work buffer is
     // reserved for the whole node (ggml_graph_plan sizes it without params, use_ref only skips the dispatch)
     const bool iqp = ggml_cpu_iqp_supports_mul_mat_id(dst) && !params->use_ref;
+
+    // [TAG_FN_CPU_MMID_MR] GGML_CPU_MMID_MR: several tokens per decoded weight row; the use_ref reference keeps the
+    // per-(row, token) vec_dot path
+    const ggml_vec_dot_mr_t vec_dot_mr = ggml_cpu_fn_sw[GGML_CPU_FN_MMID_MR] && !params->use_ref ? ggml_cpu_fn_mr_kernel(type) : NULL;
 
     char * iqp_panels = NULL;
 
@@ -1916,7 +1984,7 @@ static void ggml_compute_forward_mul_mat_id(
             ggml_compute_forward_mul_mat_id_one_chunk(
                 dst, src0, src1, ids, cur_a,
                 ir0_start, ir0_end, ir1_start, ir1_end,
-                src0_cur, matrix_rows, row_size, src1_cont, wdata, params->use_ref
+                src0_cur, matrix_rows, row_size, src1_cont, wdata, params->use_ref, vec_dot_mr
             );
 
             if (nth >= nchunk0 * nchunk1) {

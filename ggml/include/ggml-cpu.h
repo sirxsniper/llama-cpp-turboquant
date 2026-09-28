@@ -131,12 +131,21 @@ extern "C" {
     enum ggml_cpu_fn_switch {
         GGML_CPU_FN_APPLY_ONCE = 0, // GGML_CPU_APPLY_ONCE=1: skip re-applying an unchanged thread priority / affinity
         GGML_CPU_FN_Q5_1_AVX512,    // GGML_CPU_Q5_1_AVX512=1: AVX-512 q5_1 x q8_1 dot product (bitwise equal to AVX2)
+        GGML_CPU_FN_MMID_MR,        // GGML_CPU_MMID_MR=1: MUL_MAT_ID dots up to 4 tokens per decoded weight row
+                                    //   (bitwise equal); =2: the same with the 256-bit bodies only
         GGML_CPU_FN_SWITCH_COUNT,
     };
 
     GGML_BACKEND_API int          ggml_cpu_fn_get_switch(enum ggml_cpu_fn_switch sw);
     GGML_BACKEND_API void         ggml_cpu_fn_set_switch(enum ggml_cpu_fn_switch sw, int value);
     GGML_BACKEND_API const char * ggml_cpu_fn_switch_env(enum ggml_cpu_fn_switch sw); // environment variable name
+
+    // [TAG_FN_CPU_MMID_MR] test / benchmark hook: s[c*bs + r] = dot(row r of vx (row stride bx), column vy[c]) for
+    // r < nr and c < nc <= 4, the columns already in the type's vec_dot_type, with the multi-row x multi-token kernel of
+    // this build (GGML_CPU_MMID_MR picks its body; the kernel runs whatever the switch's on/off state). Returns false
+    // when this build has none for the type.
+    GGML_BACKEND_API bool ggml_cpu_fn_vec_dot_mr(enum ggml_type type, int n, float * s, size_t bs, const void * vx, size_t bx,
+                                                 int nr, const void * const * vy, int nc);
 
     //
     // CPU backend
