@@ -1217,7 +1217,13 @@ static __device__ __forceinline__ void quantize_q8_1_to_shared(
         }
     }
 
-    yq32[threadIdx.x] = q32;
+    // [TAG_FA_Q8_SHARED_NI] Only the ni lanes that quantized a value store it. With ni < WARP_SIZE (D=64: ni=16) the
+    // other lanes used to store their zero past yq32[ni-1], i.e. onto the q8_1 scales the caller keeps right behind
+    // the quants (yds = yq32 + D/sizeof(int)), racing the (d, sum) store below from lanes 0 and 8 (racecheck:
+    // write-write hazard in flash_attn_ext_vec<64,...,q4_0|q8_0>). Nothing reads yq32 past ni.
+    if (ni == WARP_SIZE || threadIdx.x < ni) {
+        yq32[threadIdx.x] = q32;
+    }
     if (threadIdx.x % QI8_1 == 0 && (ni == WARP_SIZE || threadIdx.x < ni)) {
         if (std::is_same<Tds, half2>::value) {
             ((half2  *) yds)[threadIdx.x/QI8_1] =  make_half2(d, sum);
