@@ -74,6 +74,7 @@ struct bench_params {
     bool             check     = false;
     bool             per_op    = true;
     int              pool_threads = 0;   // --pool: 0 = off
+    int              max_layers   = 0;   // --gguf: layers per type group (0 = all)
     int              pool_spin_us = 1000;
     std::vector<std::pair<int, int>> ab; // switch, value
 };
@@ -138,6 +139,7 @@ void usage(const char * argv0) {
     printf("usage: %s [options]\n", argv0);
     printf("  --random               random weight pool (default)\n");
     printf("  --gguf FILE            real experts of a model shard, mapped read-only\n");
+    printf("  --max-layers N         --gguf: use at most N layers per type group (default all)\n");
     printf("  --pool-gib F           random pool size (default 8)\n");
     printf("  --up T --gate T --down T   weight types in random mode (default q4_K q4_K q5_1)\n");
     printf("  --all                  random mode: gate/up q4_K, q5_K x down q5_1, q8_0, iq4_nl\n");
@@ -177,6 +179,8 @@ bench_params parse_args(int argc, char ** argv) {
             p.gguf_path.clear();
         } else if (a == "--gguf") {
             p.gguf_path = next();
+        } else if (a == "--max-layers") {
+            p.max_layers = atoi(next());
         } else if (a == "--pool-gib") {
             p.pool_gib = atof(next());
         } else if (a == "--up") {
@@ -435,7 +439,7 @@ struct mapped_file {
 };
 
 // the expert tensors of a shard, grouped by their (up, gate, down) types
-bool load_gguf_weights(const char * path, mapped_file & mf, std::vector<weight_set> & sets) {
+bool load_gguf_weights(const char * path, int max_layers, mapped_file & mf, std::vector<weight_set> & sets) {
     gguf_init_params gp = { /*.no_alloc =*/ true, /*.ctx =*/ nullptr };
     gguf_context * g = gguf_init_from_file(path, gp);
     if (!g) {
@@ -490,6 +494,9 @@ bool load_gguf_weights(const char * path, mapped_file & mf, std::vector<weight_s
             ws = &sets.back();
             ws->up_t = tu; ws->gate_t = tg; ws->down_t = td;
             ws->n_embd = neu[0]; ws->n_ff = neu[1]; ws->n_expert = (int) neu[2];
+        }
+        if (max_layers > 0 && (int) ws->layers.size() >= max_layers) {
+            continue;
         }
         ws->layers.push_back({ pu, pg, pd, il });
         ws->regions.emplace_back(pu, su);
@@ -957,7 +964,7 @@ int main(int argc, char ** argv) {
     if (!p.gguf_path.empty()) {
         mapped_file mf;
         std::vector<weight_set> sets;
-        if (!load_gguf_weights(p.gguf_path.c_str(), mf, sets)) {
+        if (!load_gguf_weights(p.gguf_path.c_str(), p.max_layers, mf, sets)) {
             ggml_threadpool_free(rc.tp);
             return 1;
         }
