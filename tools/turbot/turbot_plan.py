@@ -480,7 +480,7 @@ Q8_0_BLOCK = (34, 32)   # ggml type_size / blck_size of q8_0
 
 def quality_plan(shape):
     """The text of llama_turbot_plan_quality_text for shape: old 6 / young 8 on every run, CAP 65536, POOL by the POOL auto
-    rule at most the cache; PlanError with the C++ reason when it refuses."""
+    rule at most the cache (CAP max(65536, kv_size) when POOL is the whole cache); PlanError with the C++ reason when it refuses."""
     flags = shape_flags(shape)
     if not flags:
         raise PlanError("the cache holds no attention layers")
@@ -500,6 +500,8 @@ def quality_plan(shape):
     pool = n_stream * ((need + GRANULE - 1) // GRANULE * GRANULE)
     pool = min(pool, kv_cells // GRANULE * GRANULE)
     pool = pool // step * step
+    if pool >= kv_cells:   # the pool is the whole cache: no per-sequence cap
+        cap = max(cap, kv_size)
 
     base = young = q8 = 0
     for f in flags.values():

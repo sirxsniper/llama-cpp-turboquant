@@ -2550,8 +2550,11 @@ static void test_quality_plan() {
         std::string       err;
         TCHECK(llama_turbot_plan_parse_shape(text, LLAMA_TURBOT_PLAN_QUALITY_NAME, shape, p, err, true), "%s: does not parse: %s", what, err.c_str());
         TCHECK(p.hash == want_hash && rehash(p) == want_hash, "%s: hash 0x%016" PRIx64 ", turbot_plan.py 0x%016" PRIx64, what, p.hash, want_hash);
-        TCHECK(p.cap_cells == LLAMA_TURBOT_QUALITY_CAP && p.pool_cells % (GGML_TURBOT_GRANULE*std::max<uint32_t>(1, shape.n_stream)) == 0,
-               "%s: CAP %u POOL %u", what, p.cap_cells, p.pool_cells);
+        // CAP 65536, or max(65536, kv_size) when POOL is the whole cache (no cell goes old while the pool has room)
+        const uint64_t n_cells  = (uint64_t) shape.kv_size*std::max<uint32_t>(1, shape.n_stream);
+        const uint32_t want_cap = p.pool_cells >= n_cells ? std::max<uint32_t>(LLAMA_TURBOT_QUALITY_CAP, shape.kv_size) : LLAMA_TURBOT_QUALITY_CAP;
+        TCHECK(p.cap_cells == want_cap && p.pool_cells % (GGML_TURBOT_GRANULE*std::max<uint32_t>(1, shape.n_stream)) == 0,
+               "%s: CAP %u (want %u) POOL %u", what, p.cap_cells, want_cap, p.pool_cells);
         uint64_t base = 0, young = 0, q8 = 0;
         for (const auto & it : p.layers) {
             const ggml_turbot_layer & l = it.second;
@@ -2578,8 +2581,27 @@ static void test_quality_plan() {
           QUALITY_FN_262K_HASH);
     check("Flash-Next at 32768 (all young)", shape_of(FN_IL, 256, 2, 32768), nullptr, "\nPOOL 32768\n", "# size: 408.00 MiB (q8_0 408.00 MiB)",
           0x66929c735d9f9960ull);
-    check("Flash-Next at 262144, 4 sequences unified", shape_of(FN_IL, 256, 2, 262144, 1, 4), nullptr, "\nPOOL 262144\n",
-          "# size: 3264.00 MiB (q8_0 3264.00 MiB)", 0x8229f267ff501fc4ull);
+    check("Flash-Next at 262144, 4 sequences unified", shape_of(FN_IL, 256, 2, 262144, 1, 4), nullptr, "\nPOOL 262144\nCAP 262144\n",
+          "# size: 3264.00 MiB (q8_0 3264.00 MiB)", 0x821fc067ff477649ull);
+    check("Flash-Next at 131072, 4 sequences unified", shape_of(FN_IL, 256, 2, 131072, 1, 4), nullptr, "\nPOOL 131072\nCAP 131072\n",
+          "# size: 1632.00 MiB (q8_0 1632.00 MiB)", 0xc8f9c4022369b029ull);
+    check("Flash-Next at 262144, 2 sequences unified", shape_of(FN_IL, 256, 2, 262144, 1, 2), nullptr, "\nPOOL 133440\nCAP 65536\n",
+          "# size: 2839.80 MiB (q8_0 3264.00 MiB)", 0xa8124b16cf664ecdull);
+    {
+        // the pool is the whole cache: a 250000-cell sequence next to a short one in a full cache keeps every cell young but
+        // the quota slack (CAP 65536 would make 184K of its cells old)
+        std::string text, why;
+        llama_turbot_plan p;
+        std::string       err;
+        TCHECK(llama_turbot_plan_quality_text(shape_of(FN_IL, 256, 2, 262144, 1, 4), text, why) &&
+               llama_turbot_plan_parse_shape(text, LLAMA_TURBOT_PLAN_QUALITY_NAME, shape_of(FN_IL, 256, 2, 262144, 1, 4), p, err, true),
+               "np 4 unified: %s%s", why.c_str(), err.c_str());
+        const uint32_t n[2] = { 250000, 12000 };
+        uint64_t       y[2] = {};
+        llama_turbot_young_quota(n, 2, p.pool_cells, p.cap_cells, false, y);
+        TCHECK(y[0] > LLAMA_TURBOT_QUALITY_CAP && y[0] + GGML_TURBOT_GRANULE*GGML_TURBOT_QUOTA_SLACK_GRANULES*2 >= n[0] && y[1] == n[1],
+               "np 4 unified, 250000 + 12000 cells: young quota %" PRIu64 " + %" PRIu64, y[0], y[1]);
+    }
     check("Flash-Next, 4 streams of 65536", shape_of(FN_IL, 256, 2, 65536, 4, 4), nullptr, "\nPOOL 262144\n",
           "# size: 3264.00 MiB (q8_0 3264.00 MiB)", 0x8229f267ff501fc4ull);
     check("Flash-Next at 1024", shape_of(FN_IL, 256, 2, 1024), nullptr, "\nPOOL 1024\n", nullptr, 0x251a4fc58ed8524cull);

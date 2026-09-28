@@ -693,7 +693,8 @@ llama_kv_cache::llama_kv_cache(
             const uint64_t band_n = *std::min_element(y, y + n_seq_s);
             LLAMA_LOG_INFO("%s: turbot: young band per sequence: %llu with 1 active sequence, %llu with %u active (CAP %u, POOL %u)\n", __func__,
                     (unsigned long long) band_1, (unsigned long long) band_n, n_seq_s, turbot_plan->cap_cells, turbot_pool_s);
-            if (band_n < turbot_plan->cap_cells / 2) {
+            // [TAG_FN_TURBOT_PLAN] against what a sequence can hold: a CAP above the equal share (the quality plan's CAP = kv_size) is no shortfall
+            if (band_n < std::min<uint64_t>(turbot_plan->cap_cells, kv_size / n_seq_s) / 2) {
                 LLAMA_LOG_WARN("%s: turbot: with %u active sequences each keeps only %llu young cells, below half of CAP %u\n", __func__,
                         n_seq_s, (unsigned long long) band_n, turbot_plan->cap_cells);
             }

@@ -1868,7 +1868,7 @@ Owner's bar (2026-09-28): turbot must run on Flash-Next, with no q4 or other low
 
 - `llama_turbot_plan_quality_text(shape)`:
   - old width 6 and young width 8 on every run of every layer (Y lines);
-  - CAP 65536: the newest 64K cells of each sequence are young;
+  - CAP 65536: the newest 64K cells of each sequence are young; when POOL is the whole cache (it costs the q8_0 bytes then), CAP is max(65536, kv_size), so no cell goes old while the pool has room (review fix: `-np 4 --kv-unified` at 262144 used to keep a long sequence at 64K young and 6 bits beyond, at the q8_0 bytes);
   - POOL: the POOL auto rule for that CAP (per stream ceil(n_seq_max / n_stream) x (CAP + 128) + 2112 cells in whole granules, times n_stream), at most the cache, a multiple of 64 x n_stream;
   - uncalibrated; the text starts `# turbot quality plan v1` and has a size line against q8_0. `tools/turbot/turbot_plan.py quality` prints the same text and hash.
 - Chooser (14.6): step 4 makes the quality plan instead of the byte-budget automatic plan when `shape.quality` is set (llama_context sets it for the qwen4exp main context) or with `LLAMA_TURBOT_AUTO_PLAN=quality`. `--kv-tier-plan quality` / `LLAMA_TURBOT_PLAN=quality` force it (step 1). A verified sidecar (step 2) still wins, so a calibrated Flash-Next plan replaces it without a code change. `LLAMA_TURBOT_AUTO_PLAN=0` turns it off (and then 15.5 gives q8_0).
@@ -1880,7 +1880,7 @@ Owner's bar (2026-09-28): turbot must run on Flash-Next, with no q4 or other low
 | 32768, 1 sequence | 408.00 (all young) | 408 | 252 | 768 |
 | 131072, 1 sequence | 1423.38 | 1632 | 1008 | 3072 |
 | 262144, 1 sequence | 2623.38 | 3264 | 2016 | 6144 |
-| 262144, -np 4 unified | 3264.00 (all young) | 3264 | 2016 | 6144 |
+| 262144, -np 4 unified | 3264.00 (all young, CAP 262144) | 3264 | 2016 | 6144 |
 
 - Why these widths (a proxy; gate F2-F4 in TESTING.md 13 decides):
   - per value (test-turbot-geom (i), 2000 rows of 2 x 256): young y 8 has 1.38x the q8_0 squared error on Gaussian rows (nMSE 3.9e-5 against 2.9e-5) and 0.54x on K-like rows with 8 outlier channels, which the WHT flattens;

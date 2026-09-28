@@ -905,7 +905,7 @@ static bool llama_turbot_quality_impl(const llama_turbot_cache_shape & shape, co
     const uint64_t kv_cells = llama_turbot_shape_cells(shape);
     const uint64_t gran     = GGML_TURBOT_GRANULE;
     const uint64_t step     = gran*n_stream;
-    const uint64_t cap      = LLAMA_TURBOT_QUALITY_CAP;
+    uint64_t       cap      = LLAMA_TURBOT_QUALITY_CAP;
     const uint64_t slack    = gran*GGML_TURBOT_QUOTA_SLACK_GRANULES;
     const int      b        = LLAMA_TURBOT_QUALITY_B;
     const int      y        = LLAMA_TURBOT_QUALITY_Y;
@@ -915,6 +915,12 @@ static bool llama_turbot_quality_impl(const llama_turbot_cache_shape & shape, co
     uint64_t pool = n_stream*((need + gran - 1)/gran*gran);
     pool = std::min(pool, kv_cells/gran*gran);
     pool = pool/step*step;
+
+    // a pool of the whole cache costs the q8_0 bytes anyway: no per-sequence cap then, so no cell goes old while young
+    // room is free (-np 4 unified at 262144: one long sequence stays at 8 bits, not 64K at 8 and the rest at 6)
+    if (pool >= kv_cells) {
+        cap = std::max<uint64_t>(cap, shape.kv_size);
+    }
 
     uint64_t base  = 0;
     uint64_t young = 0;

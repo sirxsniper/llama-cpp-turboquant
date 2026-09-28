@@ -109,7 +109,7 @@ struct llama_turbot_plan_choice {
 #define LLAMA_TURBOT_PLAN_KEYWORD_QUALITY "quality"
 #define LLAMA_TURBOT_QUALITY_B            6       // old width of every run (GGML_TURBOT_B_MAX)
 #define LLAMA_TURBOT_QUALITY_Y            8       // young width of every run (GGML_TURBOT_Y_MAX)
-#define LLAMA_TURBOT_QUALITY_CAP          65536   // young cells per sequence: the newest 64K positions at 8 bits
+#define LLAMA_TURBOT_QUALITY_CAP          65536   // young cells per sequence: the newest 64K positions at 8 bits (kv_size when POOL is the whole cache)
 
 // Which plan a turbot cache of this shape would use (precedence above). Quiet (no log line) and pure except for getenv
 // and reading the plan / sidecar files. true: choice holds the text, why is cleared. false: no plan fits, why says why.
@@ -126,7 +126,8 @@ LLAMA_API bool llama_turbot_plan_auto_text(const llama_turbot_cache_shape & shap
 // [TAG_FN_TURBOT_PLAN] The quality plan of shape: the q8-level default for a model whose KV bar is q8_0, uncalibrated.
 // Old width 6 and young width 8 on every run of every layer (Y lines), CAP 65536, POOL = the POOL auto rule of the
 // parser for that CAP (per stream ceil(n_seq_max / n_stream) x (CAP + 128) + 2112 cells in whole granules, times
-// n_stream), at most the cache, a multiple of 64*n_stream. An all-young row costs about a q8_0 row (NR 4: 3% less, NR 2:
+// n_stream), at most the cache, a multiple of 64*n_stream. When POOL is the whole cache, CAP is max(65536, kv_size): no
+// cell goes old while the pool has room. An all-young row costs about a q8_0 row (NR 4: 3% less, NR 2:
 // equal, NR 1: 6% more); an old row 6.25 bits per value against 8.5. tools/turbot/turbot_plan.py quality prints the same
 // text and hash. false and why when turbot has no layout for a layer or kv_size is not a positive multiple of 64.
 LLAMA_API bool llama_turbot_plan_quality_text(const llama_turbot_cache_shape & shape, std::string & text, std::string & why);
