@@ -129,11 +129,18 @@ void ggml_cuda_mul_mat_q(
     const bool fallback = ne01 % 128 != 0;
 
     const bool use_native_fp4 = blackwell_mma_available(cc) && (src0->type == GGML_TYPE_MXFP4 || src0->type == GGML_TYPE_NVFP4);
-    const size_t y_block_size       = use_native_fp4 ? sizeof(block_fp4_mmq) : sizeof(block_q8_1_mmq);
-    const size_t y_values_per_block = use_native_fp4 ? QK_FP4_MMQ            : QK8_1_MMQ;
+    // [TAG_MMQ_FP4_YPAD] The y tile loads read J (= mmq_x) columns of a unit from each tile's first column, so they run
+    // past the quantized data at the end; the buffer carries J_max q8_1 blocks of padding for that, J_max being ne11
+    // rounded DOWN to a multiple of 8. Upstream #25613 then cut the native-FP4 buffer to the FP4 data alone plus that
+    // padding, and the FP4 tiles read further: compute-sanitizer memcheck on a no-VMM build (test-backend-ops MUL_MAT
+    // mxfp4 m=16 n=9 k=256, J=16, the last stream-k block) read up to 397 bytes past the pool buffer at mmq.cuh:932. Size
+    // the native-FP4 buffer as before #25613 (the q8_1 size, twice the FP4 data), so the reads stay inside it. The q8_1
+    // path keeps its size; the layout, strides and results do not change.
+    const size_t y_alloc_block_size       = sizeof(block_q8_1_mmq);
+    const size_t y_alloc_values_per_block = QK8_1_MMQ;
 
     if (!ids) {
-        const size_t nbytes_src1_q8_1 = ne13*ne12 * ne11*ne10_padded * y_block_size/y_values_per_block +
+        const size_t nbytes_src1_q8_1 = ne13*ne12 * ne11*ne10_padded * y_alloc_block_size/y_alloc_values_per_block +   // [TAG_MMQ_FP4_YPAD]
             ggml_cuda_mmq_get_J_max(src0->type, fallback, /*has_ids =*/ false, cc, ne11) * sizeof(block_q8_1_mmq);
         ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), nbytes_src1_q8_1);
         ggml_cuda_pool_alloc<float> src1_scale(ctx.pool());
@@ -185,7 +192,12 @@ void ggml_cuda_mul_mat_q(
     GGML_ASSERT(ne1 == n_expert_used);
 
     ggml_cuda_pool_alloc<int32_t> ids_src1(ctx.pool(), ne_get_rows);
-    ggml_cuda_pool_alloc<int32_t> ids_dst(ctx.pool(), ne_get_rows);
+    // [TAG_MMQ_IDS_PAD] mul_mat_q (and its stream-k tail and fixup) loads ids_dst[col_low + jt*J + j] for every j < J into
+    // shared memory, also past the expert's last column (col_high); for the last expert's partial tile that is past
+    // the end of this buffer (compute-sanitizer memcheck on a no-VMM build: MUL_MAT_ID mxfp4, mmq.cuh:1131, up to 41+
+    // bytes past a 256-byte buffer). Those entries are never used (write_back stops at col_diff). Pad the buffer by the
+    // widest J (ggml_cuda_mmq_get_J_max caps J at 512) so every load stays inside it.
+    ggml_cuda_pool_alloc<int32_t> ids_dst(ctx.pool(), ne_get_rows + 512);
     ggml_cuda_pool_alloc<int32_t> expert_bounds(ctx.pool(), ne02 + 1);
 
     // gate/up activations are broadcast across experts (ne11 == 1): quantize each token once and
@@ -202,7 +214,7 @@ void ggml_cuda_mul_mat_q(
         CUDA_CHECK(cudaGetLastError());
     }
 
-    const size_t nbytes_src1_q8_1 = ne12*n_expert_used*ne10_padded * y_block_size/y_values_per_block +
+    const size_t nbytes_src1_q8_1 = ne12*n_expert_used*ne10_padded * y_alloc_block_size/y_alloc_values_per_block +   // [TAG_MMQ_FP4_YPAD]
         ggml_cuda_mmq_get_J_max(src0->type, fallback, /*has_ids =*/ true, cc, ne11) * sizeof(block_q8_1_mmq);
     ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), nbytes_src1_q8_1);
     ggml_cuda_pool_alloc<float> src1_scale(ctx.pool());
