@@ -2961,7 +2961,7 @@ static void launch_fattn_turbot(
         } else {
             kv_scan = "common<ncols1>";
             ggml_cuda_kernel_launch(flash_attn_mask_to_KV_max<ncols1>, launch_params,
-                (const half2 *) mask->data, KV_max.ptr, iter_k, s31, s33);
+                (const half2 *) mask->data, KV_max.ptr, iter_k, s31, s33, init_fastdiv_values(Q->ne[1]));   // [TAG_FA_KVMAX_ROWS]
         }
         CUDA_CHECK(cudaGetLastError());
     }

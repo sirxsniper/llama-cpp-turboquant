@@ -2542,7 +2542,7 @@ static __global__ void flash_attn_pos_to_KV_max(
 template <int ncols1>
 __launch_bounds__(FATTN_KQ_STRIDE/2, 1)
 static __global__ void flash_attn_mask_to_KV_max(
-        const half2 * mask_ptr, int * KV_max_ptr, const int ne30, const int64_t s31, const int64_t s33) {
+        const half2 * mask_ptr, int * KV_max_ptr, const int ne30, const int64_t s31, const int64_t s33, const uint3 ne01) {
     const half2 * GGML_CUDA_RESTRICT mask   = mask_ptr;
     int         * GGML_CUDA_RESTRICT KV_max = KV_max_ptr;
 
@@ -2551,7 +2551,14 @@ static __global__ void flash_attn_mask_to_KV_max(
     const int sequence = blockIdx.y;
     const int jt       = blockIdx.x;
 
-    mask += sequence*s33 + jt*ncols1*s31;
+    // [TAG_FA_KVMAX_ROWS] The mask has exactly Q->ne[1] (= ne01) rows, but a query tile covers ncols1 rows: the last tile
+    // of a Q that is not a multiple of ncols1 (a decode or verify batch under a wider instance) used to read rows
+    // jt*ncols1 + j >= ne01, i.e. past the end of the mask - up to (ncols1 - 1) rows of ne30*FATTN_KQ_STRIDE halves, into
+    // whatever follows it or into unmapped memory (compute-sanitizer memcheck: Invalid __global__ read, test-backend-ops
+    // FLASH_ATTN_EXT hsk=128 nr23=[8,1] kv=4096 nb=4). Wrap the row index modulo ne01, the rows the FA kernels' own mask
+    // loads read (fastmodulo(j0 + j, ne01) in fattn-mma-f16 / fattn-tile, and flash_attn_turbot_mask_to_KV_max): a repeated
+    // real row cannot change the AND over rows, and every row of a full tile is its own, so full tiles are unchanged.
+    mask += sequence*s33;
 
     __shared__ int buf_iw[WARP_SIZE];
     if (tid < WARP_SIZE) {
@@ -2566,7 +2573,8 @@ static __global__ void flash_attn_mask_to_KV_max(
 
 #pragma unroll
         for (int j = 0; j < ncols1; ++j) {
-            const float2 tmp = __half22float2(mask[j*s31 + KV_max_sj/2 + tid]);
+            const int64_t row = fastmodulo(jt*ncols1 + j, ne01);   // [TAG_FA_KVMAX_ROWS]
+            const float2 tmp = __half22float2(mask[row*s31 + KV_max_sj/2 + tid]);
             all_inf = all_inf && int(isinf(tmp.x)) && int(isinf(tmp.y));
         }
 
@@ -2599,7 +2607,8 @@ static __global__ void flash_attn_mask_to_KV_max(
 
 #pragma unroll
         for (int j = 0; j < ncols1; ++j) {
-            const float2 tmp = __half22float2(mask[j*s31 + KV_min_sj/2 + tid]);
+            const int64_t row = fastmodulo(jt*ncols1 + j, ne01);   // [TAG_FA_KVMAX_ROWS]
+            const float2 tmp = __half22float2(mask[row*s31 + KV_min_sj/2 + tid]);
             all_inf = all_inf && int(isinf(tmp.x)) && int(isinf(tmp.y));
         }
 
@@ -3132,7 +3141,7 @@ void launch_fattn(
         KV_max.alloc(2*ne_KV_max);   // [TAG_FA_KVMIN] {max, min} per entry
         ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num_KV_max, block_dim_KV_max, 0, main_stream);
         ggml_cuda_kernel_launch(flash_attn_mask_to_KV_max<ncols1>, launch_params,
-            (const half2 *) mask->data, KV_max.ptr, iter_k, s31, s33);
+            (const half2 *) mask->data, KV_max.ptr, iter_k, s31, s33, init_fastdiv_values(Q->ne[1]));   // [TAG_FA_KVMAX_ROWS]
         CUDA_CHECK(cudaGetLastError());
     }
     const uint3 ne01_pos = init_fastdiv_values(Q->ne[1]);   // [TAG_FA_POS_MASK]
