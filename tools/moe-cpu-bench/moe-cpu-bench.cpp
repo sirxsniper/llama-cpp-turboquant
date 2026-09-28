@@ -15,7 +15,9 @@
 // for each matrix alone, the fixed cost of a split (every expert skipped with the src[3] table, so only the
 // quantization, routing and barriers remain) and a streaming-read roofline taken with the same threads.
 // --check compares each CPU expert path switch with all switches off on the same data; --ab NAME=V[,NAME=V] runs
-// paired, alternating rounds of the current switches (A) and the same plus NAME=V (B).
+// paired, alternating rounds of the current switches (A) and the same plus NAME=V (B). --pool N also runs the split
+// through the persistent CPU MoE worker pool (ggml_cpu_moe_run, N workers including the caller), as the GPU/CPU
+// doorbell would, and --check then compares it with the graph too.
 // CPU only: it links ggml-base and ggml-cpu, never a GPU backend.
 
 #include "ggml.h"
@@ -71,6 +73,8 @@ struct bench_params {
     int              rounds    = 6;      // --ab
     bool             check     = false;
     bool             per_op    = true;
+    int              pool_threads = 0;   // --pool: 0 = off
+    int              pool_spin_us = 1000;
     std::vector<std::pair<int, int>> ab; // switch, value
 };
 
@@ -149,6 +153,8 @@ void usage(const char * argv0) {
     printf("  --check                every switch against all switches off, same data\n");
     printf("  --ab NAME=V[,NAME=V]   paired alternating rounds: current switches vs these added\n");
     printf("  --rounds N             rounds for --ab (default 6)\n");
+    printf("  --pool N               also run the split on the CPU MoE worker pool with N workers (mask from --cpumask)\n");
+    printf("  --pool-spin-us N       pool workers spin this long before sleeping (default 1000)\n");
     printf("switches (environment variables, read at start): ");
     for (int i = 0; i < GGML_CPU_FN_SWITCH_COUNT; i++) {
         printf("%s%s", i ? ", " : "", ggml_cpu_fn_switch_env((ggml_cpu_fn_switch) i));
@@ -211,6 +217,10 @@ bench_params parse_args(int argc, char ** argv) {
             p.per_op = false;
         } else if (a == "--check") {
             p.check = true;
+        } else if (a == "--pool") {
+            p.pool_threads = atoi(next());
+        } else if (a == "--pool-spin-us") {
+            p.pool_spin_us = atoi(next());
         } else if (a == "--ab") {
             std::string list = next();
             size_t pos = 0;
@@ -530,6 +540,7 @@ void read_regions(ggml_tensor * dst, const ggml_tensor * a, int ith, int nth, vo
 struct run_ctx {
     const bench_params & p;
     ggml_threadpool *    tp;
+    ggml_cpu_moe_pool *  pool = nullptr;
     std::vector<uint8_t> work;
 
     explicit run_ctx(const bench_params & p_) : p(p_), tp(nullptr) {}
@@ -559,6 +570,7 @@ struct split_graphs {
     ggml_tensor * x = nullptr, * ids = nullptr, * tbl = nullptr, * par_in = nullptr;
     ggml_tensor * out = nullptr;
     ggml_cgraph * g_split = nullptr, * g_fixed = nullptr, * g_up = nullptr, * g_gate = nullptr, * g_down = nullptr;
+    std::vector<float> pool_out; // [n_embd, n_used, T], graph layout
 
     ~split_graphs() {
         if (ctx)   { ggml_free(ctx); }
@@ -627,6 +639,19 @@ struct split_graphs {
         for (int e = 0; e < ws.n_expert; e++) {
             ((int32_t *) tbl->data)[e] = 0;
         }
+        pool_out.assign((size_t) ws.n_embd * n_used * T, 0.0f);
+    }
+
+    // the split on the worker pool; fixed: every expert skipped through the table
+    double run_pool(ggml_cpu_moe_pool * pool, int n_expert, int n_used, bool fixed) {
+        ggml_cpu_moe_layer layer = { w_up, w_gate, w_down, fixed ? (const int32_t *) tbl->data : nullptr, n_expert };
+        ggml_cpu_moe_job job = { &layer, T, n_used, (const float *) x->data, (const int32_t *) ids->data, nullptr, pool_out.data() };
+        const int64_t t0 = ggml_time_us();
+        if (ggml_cpu_moe_run(pool, &job) != GGML_STATUS_SUCCESS) {
+            fprintf(stderr, "ggml_cpu_moe_run refused the job (types %s/%s/%s)\n", ggml_type_name(w_up->type), ggml_type_name(w_gate->type), ggml_type_name(w_down->type));
+            exit(1);
+        }
+        return (double) (ggml_time_us() - t0);
     }
 
     void set_layer(const layer_ptrs & l) {
@@ -676,7 +701,7 @@ struct stat_acc {
     double gibs() const { return time > 0 ? bytes / (time * 1e-6) / 1073741824.0 : 0.0; }
 };
 
-enum class which { split, fixed, up, gate, down };
+enum class which { split, fixed, up, gate, down, pool, pool_fixed };
 
 stat_acc measure(run_ctx & rc, split_graphs & sg, const weight_set & ws, which w, int iters, int warmup, std::mt19937 & rng, size_t & layer_rr) {
     const size_t e_up   = expert_bytes(ws.up_t,   ws.n_embd, ws.n_ff);
@@ -688,10 +713,14 @@ stat_acc measure(run_ctx & rc, split_graphs & sg, const weight_set & ws, which w
     for (int it = 0; it < warmup + iters; it++) {
         sg.set_layer(ws.layers[layer_rr++ % ws.layers.size()]);
         const int nd = sg.set_random_ids(rng, ws.n_expert, rc.p.n_used);
-        const double t = rc.compute(g);
+        const double t = w == which::pool || w == which::pool_fixed
+            ? sg.run_pool(rc.pool, ws.n_expert, rc.p.n_used, w == which::pool_fixed)
+            : rc.compute(g);
         double b = 0.0;
         switch (w) {
+            case which::pool:
             case which::split: b = (double) nd * (e_up + e_gate + e_down); break;
+            case which::pool_fixed:
             case which::fixed: b = 0.0; break;
             case which::up:    b = (double) nd * e_up;   break;
             case which::gate:  b = (double) nd * e_gate; break;
@@ -796,6 +825,16 @@ int run_check(run_ctx & rc, split_graphs & sg, const weight_set & ws) {
         }
         printf("\n");
     }
+    if (rc.pool) {
+        set_switches(base);
+        sg.run_pool(rc.pool, ws.n_expert, rc.p.n_used, false);
+        size_t n_diff = 0;
+        for (size_t i = 0; i < ref.size(); i++) {
+            n_diff += memcmp(&sg.pool_out[i], &ref[i], sizeof(float)) != 0;
+        }
+        printf("  check T=%d %-40s %s\n", sg.T, "worker pool (ggml_cpu_moe_run)", n_diff == 0 ? "bitwise equal" : "DIFFERS");
+        n_bad += n_diff != 0;
+    }
     set_switches(saved);
     return n_bad;
 }
@@ -853,6 +892,12 @@ void run_set(run_ctx & rc, const weight_set & ws, int & n_bad) {
         const stat_acc s_fixed = measure(rc, sg, ws, which::fixed, rc.p.iters, rc.p.warmup, rng, layer_rr);
         printf("   T=%d split: %8.1f us median %8.1f mean  %6.1f GiB/s   fixed (all experts skipped): %6.1f us\n",
                T, s_split.median(), s_split.mean(), s_split.gibs(), s_fixed.median());
+        if (rc.pool) {
+            const stat_acc s_pool  = measure(rc, sg, ws, which::pool,       rc.p.iters, rc.p.warmup, rng, layer_rr);
+            const stat_acc s_pfix  = measure(rc, sg, ws, which::pool_fixed, rc.p.iters, rc.p.warmup, rng, layer_rr);
+            printf("        pool (%d workers): %8.1f us median %8.1f mean  %6.1f GiB/s   fixed (all experts skipped): %6.1f us\n",
+                   rc.p.pool_threads, s_pool.median(), s_pool.mean(), s_pool.gibs(), s_pfix.median());
+        }
         if (rc.p.per_op) {
             const stat_acc s_up   = measure(rc, sg, ws, which::up,   rc.p.iters, rc.p.warmup, rng, layer_rr);
             const stat_acc s_gate = measure(rc, sg, ws, which::gate, rc.p.iters, rc.p.warmup, rng, layer_rr);
@@ -890,8 +935,22 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    printf("moe-cpu-bench: threads %d, cpumask 0x%" PRIx64 ", strict %d, poll %d, prio %d, avx512 %d, avx512_vnni %d, avx512_bf16 %d\n",
-           p.n_threads, p.cpumask, (int) p.strict, p.poll, p.prio, ggml_cpu_has_avx512(), ggml_cpu_has_avx512_vnni(), ggml_cpu_has_avx512_bf16());
+    if (p.pool_threads > 0) {
+        ggml_cpu_moe_pool_params pp = ggml_cpu_moe_pool_params_default(p.pool_threads);
+        for (int i = 0; i < 64 && i < GGML_MAX_N_THREADS; i++) {
+            pp.cpumask[i] = (p.cpumask >> i) & 1;
+        }
+        pp.prio    = p.prio;
+        pp.spin_us = p.pool_spin_us;
+        rc.pool = ggml_cpu_moe_pool_new(&pp);
+        if (!rc.pool) {
+            fprintf(stderr, "failed to create the CPU MoE pool\n");
+            return 1;
+        }
+    }
+
+    printf("moe-cpu-bench: threads %d, cpumask 0x%" PRIx64 ", strict %d, poll %d, prio %d, pool %d, avx512 %d, avx512_vnni %d, avx512_bf16 %d\n",
+           p.n_threads, p.cpumask, (int) p.strict, p.poll, p.prio, p.pool_threads, ggml_cpu_has_avx512(), ggml_cpu_has_avx512_vnni(), ggml_cpu_has_avx512_bf16());
     printf("switches: %s\n", switches_str(get_switches()).c_str());
 
     int n_bad = 0;
@@ -929,6 +988,7 @@ int main(int argc, char ** argv) {
     }
 
     ggml_threadpool_free(rc.tp);
+    ggml_cpu_moe_pool_free(rc.pool);
 
     if (p.check) {
         printf("\ncheck: %d switch configuration%s not bitwise equal to all switches off\n", n_bad, n_bad == 1 ? "" : "s");
