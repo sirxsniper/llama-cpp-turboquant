@@ -696,14 +696,16 @@ struct stat_acc {
     double bytes = 0.0;
     double time  = 0.0;
     void add(double t_us, double b) { us.push_back(t_us); bytes += b; time += t_us; }
-    double median() const {
+    double pct(double q) const {
         if (us.empty()) {
             return 0.0;
         }
         std::vector<double> v = us;
-        std::nth_element(v.begin(), v.begin() + v.size() / 2, v.end());
-        return v[v.size() / 2];
+        const size_t k = std::min(v.size() - 1, (size_t) (q * v.size()));
+        std::nth_element(v.begin(), v.begin() + k, v.end());
+        return v[k];
     }
+    double median() const { return pct(0.5); }
     double mean() const { return us.empty() ? 0.0 : time / us.size(); }
     double gibs() const { return time > 0 ? bytes / (time * 1e-6) / 1073741824.0 : 0.0; }
 };
@@ -897,13 +899,13 @@ void run_set(run_ctx & rc, const weight_set & ws, int & n_bad) {
 
         const stat_acc s_split = measure(rc, sg, ws, which::split, rc.p.iters, rc.p.warmup, rng, layer_rr);
         const stat_acc s_fixed = measure(rc, sg, ws, which::fixed, rc.p.iters, rc.p.warmup, rng, layer_rr);
-        printf("   T=%d split: %8.1f us median %8.1f mean  %6.1f GiB/s   fixed (all experts skipped): %6.1f us\n",
-               T, s_split.median(), s_split.mean(), s_split.gibs(), s_fixed.median());
+        printf("   T=%d split: %8.1f us median %8.1f mean %8.1f p90 %8.1f max  %6.1f GiB/s   fixed (all experts skipped): %6.1f us\n",
+               T, s_split.median(), s_split.mean(), s_split.pct(0.9), s_split.pct(1.0), s_split.gibs(), s_fixed.median());
         if (rc.pool) {
             const stat_acc s_pool  = measure(rc, sg, ws, which::pool,       rc.p.iters, rc.p.warmup, rng, layer_rr);
             const stat_acc s_pfix  = measure(rc, sg, ws, which::pool_fixed, rc.p.iters, rc.p.warmup, rng, layer_rr);
-            printf("        pool (%d workers): %8.1f us median %8.1f mean  %6.1f GiB/s   fixed (all experts skipped): %6.1f us\n",
-                   rc.p.pool_threads, s_pool.median(), s_pool.mean(), s_pool.gibs(), s_pfix.median());
+            printf("        pool (%d workers): %8.1f us median %8.1f mean %8.1f p90 %8.1f max  %6.1f GiB/s   fixed (all experts skipped): %6.1f us\n",
+                   rc.p.pool_threads, s_pool.median(), s_pool.mean(), s_pool.pct(0.9), s_pool.pct(1.0), s_pool.gibs(), s_pfix.median());
         }
         if (rc.p.per_op) {
             const stat_acc s_up   = measure(rc, sg, ws, which::up,   rc.p.iters, rc.p.warmup, rng, layer_rr);
