@@ -5,7 +5,8 @@
 # 1. test-backend-ops -b CUDA0 on the new op shapes: the hot chain (remap + zero slot, T 1..8), the QSA-chunk top-k /
 #    concat / cast shapes, and the MTP head-rows shapes
 # 2. test-llama-archs -a qwen4exp (trunk) and --mtp (MTP head) once with every switch off and once per switch, so each
-#    switched graph still runs and matches the CPU backend with random weights (the switches are read once per process)
+#    switched graph still runs and matches the CPU backend with random weights (the switches are read once per process);
+#    skipped on Windows shared builds, where tests/CMakeLists.txt does not build test-llama-archs
 # 3. python tools/moe-trace/route_sim.py --selftest
 # Refuses beside any llama/ggml/test process; stops at the first failure.
 param(
@@ -50,9 +51,14 @@ $switches = [ordered]@{
   "trace"       = @{ LLAMA_MOE_PROFILE = (Join-Path $Out "archs.moeprof"); LLAMA_MOE_TRACE = (Join-Path $Out "archs.moet"); LLAMA_MOE_TRACE_PRED = "1" }
   "all"         = @{ GGML_SCHED_SPLIT_ASYNC = "1"; LLAMA_PLE_HOST_GATHER = "1"; LLAMA_GRAPH_PER_WIDTH = "1"; TURBO_QSA_CHUNK = "2"; LLAMA_MTP_HEAD_ROWS = "64" }
 }
-foreach ($s in $switches.Keys) {
-  Run "archs_$s"     $tla @("-a", "qwen4exp") $switches[$s]
-  Run "archs_mtp_$s" $tla @("-a", "qwen4exp", "--mtp") $switches[$s]
+if (Test-Path $tla) {
+  foreach ($s in $switches.Keys) {
+    Run "archs_$s"     $tla @("-a", "qwen4exp") $switches[$s]
+    Run "archs_mtp_$s" $tla @("-a", "qwen4exp", "--mtp") $switches[$s]
+  }
+} else {
+  # tests/CMakeLists.txt builds test-llama-archs only when NOT (WIN32 and BUILD_SHARED_LIBS); use fn_synth_check.py
+  "test-llama-archs.exe not built (Windows shared build): run tools\qwen4exp\fn_synth_check.py for the qwen4exp graphs"
 }
 & python "D:\Projects\LocalAI\source-build\wt-fn\tools\moe-trace\route_sim.py" --selftest
 if ($LASTEXITCODE -ne 0) { "route_sim selftest FAILED"; exit 1 }

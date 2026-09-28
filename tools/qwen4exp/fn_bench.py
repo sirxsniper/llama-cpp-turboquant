@@ -59,6 +59,10 @@ IDENTITY_PROMPTS = [
 
 SPEC_FLAGS = {"--spec-type", "--spec-draft-n-max", "--spec-draft-p-min", "--spec-draft-n-min"}
 
+# --depth: every prompt starts with the same ~N-token prefix (prose corpus text), cached by the server after the warm-up
+DEPTH_PREFIX = ""
+CACHE_PROMPT = False
+
 
 def log(msg):
     print("[%s] %s" % (time.strftime("%H:%M:%S"), msg), flush=True)
@@ -167,13 +171,15 @@ def post(path, body, timeout=3600):
 
 
 def chat_prompt(user):
+    if DEPTH_PREFIX:
+        user = "Reference material:" + DEPTH_PREFIX + "Task: " + user
     r = post("/apply-template", {"messages": [{"role": "user", "content": user}],
                                  "chat_template_kwargs": {"enable_thinking": False}})
     return r["prompt"]
 
 
 def complete(prompt, n, greedy, seed=1234, tokens=False):
-    body = {"prompt": prompt, "n_predict": n, "ignore_eos": True, "cache_prompt": False, "seed": seed,
+    body = {"prompt": prompt, "n_predict": n, "ignore_eos": True, "cache_prompt": CACHE_PROMPT, "seed": seed,
             "return_tokens": tokens}
     if greedy:
         body.update({"temperature": 0.0, "top_k": 1})
@@ -318,6 +324,8 @@ def main():
     ap.add_argument("--reps", type=int, default=3)
     ap.add_argument("--n", type=int, default=512)
     ap.add_argument("--warmup", type=int, default=800)
+    ap.add_argument("--depth", type=int, default=0, help="prefix every prompt with ~N tokens of corpus text (context depth)")
+    ap.add_argument("--depth-file", default="E:/kv-bar-s0/prose_corpus.txt")
     ap.add_argument("--streams", type=int, default=1)
     ap.add_argument("--identity", action="store_true", help="sha1 of 4 x --n greedy tokens per arm; spec flags removed")
     ap.add_argument("--identity-keep-spec", action="store_true")
@@ -328,6 +336,12 @@ def main():
     ap.add_argument("--max-commit-gb", type=int, default=50)
     a = ap.parse_args()
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    if a.depth > 0:
+        global DEPTH_PREFIX, CACHE_PROMPT
+        with open(a.depth_file, encoding="utf-8", errors="replace") as f:
+            text = f.read(a.depth * 4)   # ~4 characters per token
+        DEPTH_PREFIX = chr(10) + text + chr(10) + chr(10)
+        CACHE_PROMPT = True
     errs = preflight(a.max_commit_gb)
     if errs:
         for e in errs:
