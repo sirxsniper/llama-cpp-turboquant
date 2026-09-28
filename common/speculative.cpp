@@ -224,6 +224,9 @@ struct common_speculative_impl {
     // (optional) serialize/restore per-seq internal state (e.g. eagle3's deferred boundary).
     virtual bool get_state(llama_seq_id /*seq_id*/, std::vector<uint8_t> & /*data*/) const { return false; }
     virtual void set_state(llama_seq_id /*seq_id*/, const std::vector<uint8_t> & /*data*/) {}
+
+    // (optional) more statistics at the end of a generation, from common_speculative_print_stats()
+    virtual void print_stats_extra() {}
 };
 
 struct common_speculative_impl_draft_simple : public common_speculative_impl {
@@ -1286,6 +1289,42 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     uint64_t ad_calls   = 0;
     std::vector<uint64_t> ad_hist; // probe: steps per chosen k
 
+    // [TAG_DFL_ADAPT_CONTENT] content-aware length for 1-2 drafting sequences, SPEC_DFT_ADAPT_CONTENT=1 (default off).
+    // Today's rule (solo: long, duo: long unless deep and the first position is weak) stays an upper bound; the policy
+    // only replaces its long draft by the short one when that gives more tokens per unit of step time. Per sequence:
+    //     E_short = 1 + E[min(a, s)]      one sample per realized step of either length (the long block cut to s
+    //                                     accepts as much as the short block: 2.95 vs 2.96 tokens/step, 24 prompts)
+    //     E_long  = E_short + F*T         F = P(a >= s), T = E[a - s | a >= s] from long steps only, kept per sample
+    // each shrunk towards the position model (adapt_alpha), value = E / C(k) with the cost model of adapt_choose(),
+    // combined over the sequences like the model (SPEC_DFT_ADAPT_FAIR). The split keeps the long estimate fresh on the
+    // short draft: F moves every step, only T needs long steps. A hysteresis, a dwell and a periodic long probe step
+    // keep the verify shape stable. Exact: only the draft length changes.
+    struct adapt_content_cfg {
+        bool  on     = false;
+        int   est    = 1;       // SPEC_DFT_ADAPT_CONTENT_EST: 1 = the split above, 0 = adapt_eblend() per length ([TAG_DFL_ADAPT_REAL])
+        int   warm   = 16;      // SPEC_DFT_ADAPT_CONTENT_WARM: realized steps per sequence before the policy acts (rule until then)
+        int   dwell  = 16;      // SPEC_DFT_ADAPT_CONTENT_DWELL: policy steps at a length before the next switch
+        int   probe  = 32;      // SPEC_DFT_ADAPT_CONTENT_PROBE: one long step after this many short steps (0 = never)
+        float up     = 0.03f;   // SPEC_DFT_ADAPT_CONTENT_UP: short -> long needs this relative gain
+        float down   = 0.05f;   // SPEC_DFT_ADAPT_CONTENT_DOWN: long -> short needs this relative gain
+        float w0     = 2.0f;    // SPEC_DFT_ADAPT_CONTENT_W0: the position model is worth this many samples
+        float decay  = 0.95f;   // SPEC_DFT_ADAPT_CONTENT_DECAY: weight of the past per realized step (E_short, F)
+        float tdecay = 0.9f;    // SPEC_DFT_ADAPT_CONTENT_TDECAY: weight of the past per tail sample (T)
+        float tage   = 0.995f;  // SPEC_DFT_ADAPT_CONTENT_TAGE: weight of the tail samples per realized step
+        int   verbose = 0;      // SPEC_DFT_ADAPT_CONTENT_LOG: 1 = step counters at generation end, 2 = also one line per step
+    };
+    adapt_content_cfg cx;
+    std::vector<float>   cx_n, cx_e, cx_f;   // per sequence: decayed steps, sum of min(a, s) + 1, steps with a >= s
+    std::vector<float>   cx_tn, cx_tt;       // per sequence: decayed tail samples and their sum of a - s
+    std::vector<int32_t> cx_seen;            // per sequence: realized steps since begin()
+    int32_t  cx_k     = 0;   // the policy's length (a probe does not change it; 0 = none yet)
+    int32_t  cx_since = 0;   // policy steps at cx_k
+    int32_t  cx_short = 0;   // short steps since the last probe
+    int32_t  cx_klong = 0;   // the long length of the last step
+    uint64_t cx_n_warm = 0, cx_n_rule = 0, cx_n_short = 0, cx_n_long = 0, cx_n_probe = 0, cx_n_switch = 0;   // since the last report
+    double   cx_r_tok[2] = { 0.0, 0.0 };     // realized tokens at the short / long length since the last report
+    uint64_t cx_r_n[2]   = { 0, 0 };
+
     static float adapt_env_f(const char * name, float def) {
         const char * e = getenv(name);
         return (e && e[0]) ? (float) atof(e) : def;
@@ -1370,6 +1409,39 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     __func__, std::min(ad.k_min, n_max), n_max, kcap.empty() ? "none" : kcap.c_str(), ad.seq, ad.cost, ad.step, ad.over, ad.rows, ad.seq_d, ad.cost_d,
                     ad.step_d, ad.decay, ad.prior, ad.prior_w, ad.hyst, ad.hyst_dn, ad.hyst_rows,
                     ad.fair ? "proportional-fair" : "batch total", ad.small > 0 ? "short while k <= small" : "full");
+        }
+        {
+            // [TAG_DFL_ADAPT_CONTENT]
+            const char * c = getenv("SPEC_DFT_ADAPT_CONTENT");
+            const bool want = c && c[0] == '1';
+            cx.on     = want && ad.on;
+            cx.est    = adapt_env_f("SPEC_DFT_ADAPT_CONTENT_EST", 1.0f) != 0.0f ? 1 : 0;
+            cx.warm   = std::max(0, (int) adapt_env_f("SPEC_DFT_ADAPT_CONTENT_WARM",  (float) cx.warm));
+            cx.dwell  = std::max(1, (int) adapt_env_f("SPEC_DFT_ADAPT_CONTENT_DWELL", (float) cx.dwell));
+            cx.probe  = std::max(0, (int) adapt_env_f("SPEC_DFT_ADAPT_CONTENT_PROBE", (float) cx.probe));
+            cx.up     = std::max(0.0f, adapt_env_f("SPEC_DFT_ADAPT_CONTENT_UP",   cx.up));
+            cx.down   = std::max(0.0f, adapt_env_f("SPEC_DFT_ADAPT_CONTENT_DOWN", cx.down));
+            cx.w0     = std::max(0.01f, adapt_env_f("SPEC_DFT_ADAPT_CONTENT_W0",  cx.w0));
+            cx.decay  = std::min(0.999f, std::max(0.0f, adapt_env_f("SPEC_DFT_ADAPT_CONTENT_DECAY",  cx.decay)));
+            cx.tdecay = std::min(0.999f, std::max(0.0f, adapt_env_f("SPEC_DFT_ADAPT_CONTENT_TDECAY", cx.tdecay)));
+            cx.tage   = std::min(1.0f,   std::max(0.0f, adapt_env_f("SPEC_DFT_ADAPT_CONTENT_TAGE",   cx.tage)));
+            cx.verbose = std::max(0, (int) adapt_env_f("SPEC_DFT_ADAPT_CONTENT_LOG", 0.0f));
+            cx_n   .assign(n_seq, 0.0f);
+            cx_e   .assign(n_seq, 0.0f);
+            cx_f   .assign(n_seq, 0.0f);
+            cx_tn  .assign(n_seq, 0.0f);
+            cx_tt  .assign(n_seq, 0.0f);
+            cx_seen.assign(n_seq, 0);
+            if (cx.on) {
+                LOG_INF("%s: [TAG_DFL_ADAPT_CONTENT] content-aware draft length on for 1-2 drafting sequences: short %d, %s estimate, "
+                        "rule for the first %d steps, dwell %d, probe every %d short steps, margin up %.3f down %.3f, model weight %.1f, "
+                        "decay %.3f, tail %.3f x %.4f per step, log %d\n",
+                        __func__, std::min(ad.short_k, n_max), cx.est ? "split" : "per-length", cx.warm, cx.dwell, cx.probe, cx.up,
+                        cx.down, cx.w0, cx.decay, cx.tdecay, cx.tage, cx.verbose);
+            } else if (want) {
+                LOG_WRN("%s: [TAG_DFL_ADAPT_CONTENT] needs the adaptive draft length (--spec-draft-adapt on, or --spec-draft-n-max above %d): off\n",
+                        __func__, ad.short_k);
+            }
         }
         LOG_INF("%s: [TAG_DFL_QTRUNC] sampled drafts cut to the request's top-k/top-p/min-p: %s, proposal temperature x%.2f\n", __func__, dft_qtrunc ? "on" : "off", dft_qtemp);
     }
@@ -1609,6 +1681,180 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 }
             }
         }
+    }
+
+    // [TAG_DFL_ADAPT_CONTENT] relative step time C(k), the cost model of adapt_choose()
+    double adapt_cost(double n, double dz, int32_t k) const {
+        const double rows = n*(k + 1);
+        return 1.0 + (ad.seq + ad.seq_d*dz)*n + (ad.cost + ad.cost_d*dz)*rows + (rows > ad.rows ? ad.step + ad.step_d*dz : 0.0) +
+               ad.over*std::max(0.0, rows - ad.rows);
+    }
+
+    // [TAG_DFL_ADAPT_CONTENT] expected tokens per step of sequence s with the short (k_s) and the long (k_l) draft
+    void adapt_content_est(llama_seq_id s, int32_t k_s, int32_t k_l, double & e_s, double & e_l) const {
+        if (cx.est == 0) {
+            e_s = adapt_eblend(s, k_s);
+            e_l = adapt_eblend(s, k_l);
+            return;
+        }
+        // the position model: E(k_s), P(the first k_s accepted) and the expected tail after them
+        double em = 1.0, f0 = 1.0, t0 = 0.0, q = 1.0;
+        for (int32_t j = 0; j < k_l; ++j) {
+            const double al = adapt_alpha(s, j);
+            if (j < k_s) {
+                f0 *= al;
+                em += f0;
+            } else {
+                q  *= al;
+                t0 += q;
+            }
+        }
+        const double w = cx.w0;
+        const double f = (cx_f[s]  + w*f0) / (cx_n[s]  + w);
+        const double t = (cx_tt[s] + w*t0) / (cx_tn[s] + w);
+        e_s = (cx_e[s] + w*em) / (cx_n[s] + w);
+        e_l = e_s + f*t;
+    }
+
+    void adapt_content_note(int32_t k) {
+        if (k != cx_k) {
+            cx_n_switch += cx_k > 0 ? 1 : 0;
+            cx_k     = k;
+            cx_since = 0;
+            cx_short = 0;
+        }
+        cx_since++;
+    }
+
+    // [TAG_DFL_ADAPT_CONTENT] the common length: today's rule first (it keeps its own state in ad_k), then with 1-2
+    // drafting sequences and the rule at the long draft, the policy's choice (or a probe step)
+    int32_t adapt_content(const common_speculative_draft_params_vec & dparams) {
+        const int32_t k_rule = adapt_choose(dparams);
+        std::vector<llama_seq_id> ds;
+        double depth = 0.0;
+        for (llama_seq_id s = 0; s < (llama_seq_id) n_seq; ++s) {
+            if (dparams[s].drafting) {
+                ds.push_back(s);
+                depth += (double) dparams[s].pos0;
+            }
+        }
+        if (ds.empty() || ds.size() > 2 || n_max <= 0) {
+            return k_rule;
+        }
+        const int32_t k_hi = ad.kbyn.empty() ? n_max :
+            std::min<int32_t>(n_max, ad.kbyn[std::min(ds.size(), ad.kbyn.size()) - 1]);
+        const int32_t k_s  = std::min(ad.short_k, n_max);
+        const int32_t k_l  = trained_max > 0 ? std::min(k_hi, trained_max) : k_hi;   // the long draft of the rule
+        if (k_l <= k_s) {
+            return k_rule;
+        }
+        cx_klong = k_l;
+        bool warm = false;
+        for (llama_seq_id s : ds) {
+            warm = warm || cx_seen[s] < cx.warm;
+        }
+        if (warm) {
+            adapt_content_note(k_rule);   // the policy starts from the rule
+            cx_n_warm++;
+            return k_rule;
+        }
+        if (k_rule != k_l) {
+            cx_n_rule++;                  // the rule is an upper bound (duo: deep and a weak first position)
+            return k_rule;
+        }
+        const double n   = (double) ds.size();
+        const double dz  = std::min(8.0, depth / n / 32768.0);
+        const double c_s = adapt_cost(n, dz, k_s);
+        const double c_l = adapt_cost(n, dz, k_l);
+        double v_s = 0.0, v_l = 0.0, e0_s = 0.0, e0_l = 0.0;
+        for (llama_seq_id s : ds) {
+            double e_s = 0.0, e_l = 0.0;
+            adapt_content_est(s, k_s, k_l, e_s, e_l);
+            if (s == ds[0]) {
+                e0_s = e_s;
+                e0_l = e_l;
+            }
+            v_s += ad.fair ? std::log(e_s / c_s) : e_s / c_s;
+            v_l += ad.fair ? std::log(e_l / c_l) : e_l / c_l;
+        }
+        if (ad.fair) {
+            v_s = std::exp(v_s / n);
+            v_l = std::exp(v_l / n);
+        }
+        int32_t k = cx_k;
+        if (k != k_s && k != k_l) {
+            k = v_l >= v_s ? k_l : k_s;
+        } else if (cx_since >= cx.dwell) {
+            if (k == k_s && v_l > v_s*(1.0 + cx.up)) {
+                k = k_l;
+            } else if (k == k_l && v_s > v_l*(1.0 + cx.down)) {
+                k = k_s;
+            }
+        }
+        adapt_content_note(k);
+        bool probe = false;
+        if (k == k_s && cx.probe > 0 && ++cx_short >= cx.probe) {
+            cx_short = 0;
+            probe    = true;
+        }
+        const int32_t k_out = probe ? k_l : k;
+        if (probe) {
+            cx_n_probe++;
+        } else if (k == k_s) {
+            cx_n_short++;
+        } else {
+            cx_n_long++;
+        }
+        if (ad.probe && k_out != k_rule) {
+            // the rule counted its own length
+            ad_hist[std::min<size_t>(k_rule, ad_hist.size() - 1)]--;
+            ad_hist[std::min<size_t>(k_out,  ad_hist.size() - 1)]++;
+        }
+        if (cx.verbose >= 2) {
+            fprintf(stderr, "turbo-probe: dft-adapt-content n=%d depth=%.0f k=%d%s since=%d v%d=%.3f v%d=%.3f seq%d E%d=%.2f E%d=%.2f\n",
+                    (int) ds.size(), depth / n, k_out, probe ? " (probe)" : "", cx_since, k_s, v_s, k_l, v_l, (int) ds[0],
+                    k_s, e0_s, k_l, e0_l);
+        }
+        return k_out;
+    }
+
+    // [TAG_DFL_ADAPT_CONTENT] one realized step (no lookup position) of sequence s: k drafted, a accepted
+    void adapt_content_accept(llama_seq_id s, int32_t k, int32_t a) {
+        const int32_t k_s = std::min(ad.short_k, n_max);
+        if (k < k_s) {
+            return;   // a draft cut below k_s: the short draft's outcome is unknown
+        }
+        cx_n[s]  = cx.decay*cx_n[s] + 1.0f;
+        cx_e[s]  = cx.decay*cx_e[s] + (float) (std::min(a, k_s) + 1);
+        cx_f[s]  = cx.decay*cx_f[s] + (a >= k_s ? 1.0f : 0.0f);
+        cx_tn[s] *= cx.tage;
+        cx_tt[s] *= cx.tage;
+        if (k > k_s && k == cx_klong && a >= k_s) {
+            cx_tn[s] = cx.tdecay*cx_tn[s] + 1.0f;
+            cx_tt[s] = cx.tdecay*cx_tt[s] + (float) (a - k_s);
+        }
+        cx_seen[s]++;
+        if (k == k_s || k == cx_klong) {
+            const int i = k == k_s ? 0 : 1;
+            cx_r_tok[i] += (double) (a + 1);
+            cx_r_n[i]++;
+        }
+    }
+
+    // [TAG_DFL_ADAPT_CONTENT] SPEC_DFT_ADAPT_CONTENT_LOG=1: the step counters since the last report, at generation end
+    void print_stats_extra() override {
+        if (!cx.on || cx.verbose <= 0) {
+            return;
+        }
+        LOG_INF("%s: [TAG_DFL_ADAPT_CONTENT] steps: warm-up %llu, rule %llu, short %llu, long %llu, probe %llu, switches %llu; "
+                "realized tokens/step: short %.2f (%llu steps), long %.2f (%llu steps)\n", __func__,
+                (unsigned long long) cx_n_warm, (unsigned long long) cx_n_rule, (unsigned long long) cx_n_short,
+                (unsigned long long) cx_n_long, (unsigned long long) cx_n_probe, (unsigned long long) cx_n_switch,
+                cx_r_n[0] ? cx_r_tok[0] / (double) cx_r_n[0] : 0.0, (unsigned long long) cx_r_n[0],
+                cx_r_n[1] ? cx_r_tok[1] / (double) cx_r_n[1] : 0.0, (unsigned long long) cx_r_n[1]);
+        cx_n_warm = cx_n_rule = cx_n_short = cx_n_long = cx_n_probe = cx_n_switch = 0;
+        cx_r_tok[0] = cx_r_tok[1] = 0.0;
+        cx_r_n[0]   = cx_r_n[1]   = 0;
     }
 
     // [TAG_4C_DFT_SYNC] a prefill batch: prompt rows still follow, or one sequence has more rows than one
@@ -2306,6 +2552,11 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         std::fill(ad_rt.begin() + (size_t) seq_id*(n_max + 1), ad_rt.begin() + (size_t) (seq_id + 1)*(n_max + 1), 0.0f);
         std::fill(ad_rn.begin() + (size_t) seq_id*(n_max + 1), ad_rn.begin() + (size_t) (seq_id + 1)*(n_max + 1), 0.0f);
         ad_last[seq_id] = 0;
+        if (cx.on) {
+            // [TAG_DFL_ADAPT_CONTENT] the same: the rule decides again until this sequence has `warm` realized steps
+            cx_n[seq_id] = cx_e[seq_id] = cx_f[seq_id] = cx_tn[seq_id] = cx_tt[seq_id] = 0.0f;
+            cx_seen[seq_id] = 0;
+        }
 
         if (lk.on) {
             labd_begin(seq_id, prompt); // [TAG_DFL_LABD]
@@ -2701,7 +2952,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         std::vector<int32_t> n_block    (n_seq,  0);
 
         // [TAG_DFL_ADAPT] common length k for this step and the drafter block that serves it
-        const int32_t k_adapt = ad.on ? adapt_choose(dparams) : params.n_max;
+        const int32_t k_adapt = ad.on ? (cx.on ? adapt_content(dparams) : adapt_choose(dparams)) : params.n_max;   // [TAG_DFL_ADAPT_CONTENT]
         const int32_t n_draft = ad.on ? adapt_block(k_adapt)  : params.n_max;
 
         // [TAG_DFL_LABD] the lookup of every drafting sequence first: a head the history takes needs no drafter rows
@@ -2952,6 +3203,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 const size_t i = (size_t) seq_id*(n_max + 1) + k;
                 ad_rt[i] += (float) (a + 1);
                 ad_rn[i] += 1.0f;
+            }
+            if (cx.on) {
+                adapt_content_accept(seq_id, k, a); // [TAG_DFL_ADAPT_CONTENT] the same steps
             }
         }
         for (int32_t j = 0; j < n_max; ++j) {
@@ -5061,5 +5315,7 @@ void common_speculative_print_stats(const common_speculative * spec) {
                 impl->n_acc_tokens,
                 str_stats.c_str(),
                 str_perf.c_str());
+
+        impl->print_stats_extra(); // [TAG_DFL_ADAPT_CONTENT]
     }
 }
