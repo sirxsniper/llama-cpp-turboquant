@@ -1765,7 +1765,16 @@ static __device__ __forceinline__ void flash_attn_ext_turbot_process_tile(
                 }
             }
         }
-        if (np > 1) {
+        // [TAG_FA_MMA_COMBINE_SYNC] With np == 1 the combine above reads rows of tile_Q that OTHER warps wrote (warp y
+        // reads rows y, y + nwarps, ...; it wrote rows y*cols_per_warp ...). The next writes to tile_Q are the next k00
+        // chunk's VKQ rows or, when this block goes on to its next tile (stream-k, balanced slices), the next call's Q
+        // load. Only when a single pass covers DV and the Q load has the combine's row stride (nbatch_combine == DV/2 ==
+        // DKQ/2) does every thread overwrite exactly the half2 it read itself. Otherwise a fast warp overwrote rows a
+        // slow warp was still reading: racecheck error, flash_attn_ext_f16<192,128,4,16> (stride 100 vs 68),
+        // FLASH_ATTN_EXT hsk=192 hsv=128 nr23=[16,1] kv=512 nb=32/75. The barrier is compiled in only for those
+        // configs, so every DKQ == DV config (every turbot config on Ampere and newer) keeps its code.
+        constexpr bool combine_trailing_sync = np > 1 || nbatch_combine != DV/2 || nbatch_combine != DKQ/2;
+        if (combine_trailing_sync) {
             __syncthreads();
         }
     }
