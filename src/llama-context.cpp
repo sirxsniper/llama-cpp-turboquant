@@ -4,6 +4,7 @@
 #include "llama-moetrace.h" // [TAG_FN_MOE_TRACE]
 #include "llama-moe-bridge.h" // [TAG_MOE_BRIDGE]
 #include "llama-moe-gen5.h" // [TAG_MOE_DMA_SHARE] [TAG_FN_PREFILL_STREAM]
+#include "llama-fn-auto.h" // [TAG_FN_AUTO] [TAG_FN_VRAM_FIT]
 
 #include "ggml.h"
 #include "llama-arch.h"
@@ -1431,9 +1432,17 @@ llama_context::llama_context(
 
         // [TAG_FN_MOE_HOT] sized after the reserve, so LLAMA_MOE_HOT_MIB=auto sees what the KV cache and the compute
         // buffers left; decode graphs then carry the hot chain, so reserve again with it
-        if (llama_moe_hot_init(model, this)) {
-            sched_need_reserve = true;
-            sched_reserve();
+        // [TAG_FN_VRAM_FIT] with the VRAM fit the trunk context waits until every context of the model exists (the MTP
+        // draft context comes after it). The MTP draft context never owns the hot set.
+        if (cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP) {
+            if (llama_moe_hot_fit_wanted(model) && llama_moe_hot_device(model) != nullptr) {
+                moe_hot_pending = true;
+                LLAMA_LOG_INFO("%s: moe-hot: the VRAM fit sizes the hot set at the first decode after every context of the "
+                        "model exists\n", __func__);
+            } else if (llama_moe_hot_init(model, this)) {
+                sched_need_reserve = true;
+                sched_reserve();
+            }
         }
 
         if (!cparams.flash_attn) {
@@ -1452,11 +1461,18 @@ llama_context::llama_context(
             sampling.token_ids_full_vocab[i] = i;
         }
     }
+
+    // [TAG_FN_VRAM_FIT] last, so a constructor that throws never leaves a context in the list
+    if (!hparams.vocab_only) {
+        llama_fn_ctx_add(model, this, (int) cparams.ctx_type);
+    }
 }
 
 llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
+
+    llama_fn_ctx_remove(model, this); // [TAG_FN_VRAM_FIT]
 
     llama_moe_bridge_free(moe_bridge); // [TAG_MOE_BRIDGE] no graph runs now
     moe_bridge = nullptr;
@@ -3196,6 +3212,11 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     n_queued_tokens += n_tokens_all;
 
     output_swaps.clear();
+
+    // [TAG_FN_VRAM_FIT] size the deferred hot set now that the model's other contexts exist
+    if (moe_hot_pending) {
+        moe_hot_fit_try();
+    }
 
     sched_reserve();
 
@@ -5008,6 +5029,92 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
         }
     }
     return ret;
+}
+
+// [TAG_FN_VRAM_FIT] the deferred hot set: once every context of the model exists (or at the second decode, when an
+// expected MTP draft context never came), size it to the VRAM that the model, the KV caches (turbot pool, indexer
+// cache), the compute buffers (QSA temporaries grow with -ub) and the draft context left, under a device-use ceiling
+void llama_context::moe_hot_fit_try() {
+    moe_hot_waits++;
+
+    const auto & hp = model.hparams;
+    const bool mtp_expected = model.fn_auto ? model.fn_auto->mtp_loaded :
+        hp.n_layer_all > hp.n_layer() && model.layers.size() > hp.n_layer() && model.layers[hp.n_layer()].ffn_gate_inp != nullptr;
+    const auto ctxs = llama_fn_ctx_list(model);
+    bool have_mtp = false;
+    for (const auto & c : ctxs) {
+        have_mtp = have_mtp || c.second == LLAMA_CONTEXT_TYPE_MTP;
+    }
+    if (mtp_expected && !have_mtp && moe_hot_waits < 2) {
+        LLAMA_LOG_DEBUG("%s: moe-hot: waiting for the MTP draft context before the VRAM fit\n", __func__);
+        return;
+    }
+    moe_hot_pending = false;
+    if (llama_moe_hot_max_t() > 0) {
+        return; // another context of the process owns the hot set
+    }
+
+    ggml_backend_dev_t dev = llama_moe_hot_device(model);
+    if (!dev) {
+        return;
+    }
+    size_t mem_free = 0, mem_total = 0;
+    ggml_backend_dev_memory(dev, &mem_free, &mem_total);
+
+    constexpr double MiB = 1024.0*1024.0;
+    size_t m_model = 0, m_kv = 0, m_compute = 0;
+    bool model_seen = false;
+    std::string per;
+    for (const auto & [c, type] : ctxs) {
+        size_t md = 0, kv = 0, cp = 0;
+        for (const auto & [buft, mb] : c->memory_breakdown()) {
+            if (!buft || ggml_backend_buft_is_host(buft) || ggml_backend_buft_get_device(buft) != dev) {
+                continue;
+            }
+            md += mb.model;
+            kv += mb.context;
+            cp += mb.compute;
+        }
+        if (!model_seen) { // every context reports the same model
+            m_model    = md;
+            model_seen = true;
+        }
+        m_kv      += kv;
+        m_compute += cp;
+        per += format(" %s KV %.0f + compute %.0f MiB;", type == LLAMA_CONTEXT_TYPE_MTP ? "MTP draft:" : c == this ? "trunk:" : "other:",
+                kv/MiB, cp/MiB);
+    }
+    const size_t used  = mem_total > mem_free ? mem_total - mem_free : 0;
+    const size_t known = m_model + m_kv + m_compute;
+    const size_t other = used > known ? used - known : 0;
+
+    size_t ceiling = llama_fn_vram_ceiling_default(mem_total);
+    const char * cap_src = "default: total - max(1536 MiB, total/8)";
+    if (const char * e = llama_fn_env(model, "LLAMA_MOE_HOT_CAP_MIB"); e && atoi(e) > 0) {
+        ceiling = (size_t) atoi(e) << 20;
+        cap_src = "LLAMA_MOE_HOT_CAP_MIB";
+    }
+    size_t margin = (size_t) 768 << 20;
+    if (const char * e = llama_fn_env(model, "LLAMA_MOE_HOT_HEADROOM_MIB")) {
+        margin = (size_t) std::max(0, atoi(e)) << 20;
+    }
+    const size_t budget = llama_fn_vram_fit_budget(mem_total, mem_free, ceiling, margin);
+
+    LLAMA_LOG_INFO("moe-hot: VRAM fit on %s: %.0f of %.0f MiB used = model %.0f + KV %.0f + compute %.0f + other %.0f "
+            "(CUDA runtime, other processes)\n", ggml_backend_dev_name(dev), used/MiB, mem_total/MiB, m_model/MiB, m_kv/MiB,
+            m_compute/MiB, other/MiB);
+    LLAMA_LOG_INFO("moe-hot: VRAM fit:%s ceiling %.0f MiB (%s), margin %.0f MiB (LLAMA_MOE_HOT_HEADROOM_MIB) -> hot set "
+            "budget %.0f MiB\n", per.c_str(), ceiling/MiB, cap_src, margin/MiB, budget/MiB);
+    if (budget == 0) {
+        LLAMA_LOG_WARN("moe-hot: VRAM fit: no room under the ceiling - no hot set\n");
+        return;
+    }
+    if (llama_moe_hot_init(model, this, budget)) {
+        sched_need_reserve = true;
+        const size_t hot = llama_moe_hot_device_bytes();
+        LLAMA_LOG_INFO("moe-hot: VRAM fit: hot set %.0f MiB, device use about %.0f MiB with it (ceiling %.0f MiB)\n",
+                hot/MiB, (used + hot)/MiB, ceiling/MiB);
+    }
 }
 
 //

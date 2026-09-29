@@ -218,6 +218,27 @@ static std::vector<size_t> flash_next_expert_bytes() {
     return bytes;
 }
 
+static void test_vram_fit() {
+    // RTX 5090: cudaMemGetInfo total 32607 MiB -> ceiling 28531.1 MiB ("<= ~28.5 GB")
+    const size_t t5090 = (size_t) 32607 * MiB;
+    const size_t c5090 = llama_fn_vram_ceiling_default(t5090);
+    TCHECK(c5090 == t5090 - t5090/8, "5090 ceiling is total - total/8");
+    TCHECK(c5090 / MiB == 28531, "5090 ceiling %zu MiB", c5090 / MiB);
+    TCHECK(llama_fn_vram_ceiling_default((size_t) 8192 * MiB) == (size_t) (8192 - 1536) * MiB, "8 GB card keeps 1536 MiB");
+    TCHECK(llama_fn_vram_ceiling_default((size_t) 1024 * MiB) == 0, "tiny card: no room");
+
+    // 262K example: model 7.4 GB + turbot pool/indexer 3.0 + compute 2.7 + MTP draft 0.7 + other 1.8 = 15.6 GB used
+    const size_t used = (size_t) 15607 * MiB;
+    const size_t b = llama_fn_vram_fit_budget(t5090, t5090 - used, c5090, 768 * MiB);
+    TCHECK(b == c5090 - used - 768 * MiB, "budget = ceiling - used - margin");
+    TCHECK(b / MiB == 12156, "262K budget %zu MiB", b / MiB);
+    TCHECK(llama_fn_vram_fit_budget(t5090, (size_t) 1000 * MiB, t5090, 768 * MiB) == 232 * MiB, "free - margin when the ceiling is the card");
+    TCHECK(llama_fn_vram_fit_budget(t5090, (size_t) 3000 * MiB, c5090, 768 * MiB) == 0, "used above the ceiling: 0");
+    TCHECK(llama_fn_vram_fit_budget(t5090, (size_t) 500 * MiB, t5090, 768 * MiB) == 0, "free below the margin: 0");
+    TCHECK(llama_fn_vram_fit_budget(t5090, t5090 - used, c5090, 0) == c5090 - used, "no margin");
+    TCHECK(llama_fn_even_slots(flash_next_expert_bytes(), b, 512) == 84, "262K budget as even slots: 84 per layer");
+}
+
 // [TAG_FN_AUTO] even slots at Flash-Next UD-Q4_K_XL
 static void test_even_slots() {
     const size_t b = ((size_t) 32607 * MiB - ((size_t) 32607 * MiB) / 8) - (size_t) 15607 * MiB - 768 * MiB;
@@ -243,6 +264,7 @@ int main() {
     test_lookup();
     test_inject();
     test_even_slots();
+    test_vram_fit();
 
     printf("test-fn-auto: %d checks, %d failed\n", g_checks, g_fail);
     return g_fail == 0 ? 0 : 1;

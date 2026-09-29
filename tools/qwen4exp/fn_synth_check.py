@@ -24,6 +24,12 @@
 # [TAG_MOE_BRIDGE] --mode bridge: the candidate runs with the MoE host bridge instead (LLAMA_MOE_BRIDGE=1, one device
 # graph per ubatch, the experts on the CPU pool); --mode bridge-hot: bridge and hot set together. --wait hostfunc
 # selects the host-function wait. The log must show the bridge and no bridge timeout.
+#
+# [TAG_FN_AUTO] every run pins LLAMA_FLASHNEXT_PROFILE=off unless its mode sets it: the synthetic model is qwen4exp with
+# host experts, so the automatic profile would otherwise change the base and band runs. --mode auto: the candidate runs
+# the default profile (safe) with --n-cpu-moe 1, so the automatic placement must move every layer's experts to the host,
+# and the hot set is the even, adaptive one sized by the VRAM fit at the first decode. --mode auto-fast: the fast profile.
+# The log must show the fn-auto placement line, the VRAM fit and the adaptive hot set.
 from __future__ import annotations
 
 import argparse
@@ -43,6 +49,7 @@ CORPUS = "E:/kv-bar-s0/code_corpus.txt"
 
 def run(argv, env, log):
     e = dict(os.environ)
+    e.setdefault("LLAMA_FLASHNEXT_PROFILE", "off")  # [TAG_FN_AUTO] unless the caller's env sets it below
     e.update(env)
     with open(log, "w", encoding="utf-8", errors="replace") as f:
         f.write(" ".join(argv) + "\n" + repr(env) + "\n")
@@ -91,7 +98,7 @@ def main():
     ap.add_argument("--layers", type=int, default=8)
     ap.add_argument("--hot-mib", type=float, default=0, help="hot budget (default: half of the expert bytes)")
     ap.add_argument("--max-commit-gb", type=int, default=50)
-    ap.add_argument("--mode", choices=["hot", "bridge", "bridge-hot"], default="hot")  # [TAG_MOE_BRIDGE]
+    ap.add_argument("--mode", choices=["hot", "bridge", "bridge-hot", "auto", "auto-fast"], default="hot")  # [TAG_MOE_BRIDGE] [TAG_FN_AUTO]
     ap.add_argument("--wait", choices=["spin", "hostfunc"], default="spin")
     ap.add_argument("--no-band", action="store_true", help="[TAG_FN_MERGE] absolute rule (KLD <= 1e-3, same-top >= 99)")
     a = ap.parse_args()
@@ -141,12 +148,20 @@ def main():
             env.update({"LLAMA_MOE_HOT_PROFILE": prof, "LLAMA_MOE_HOT_MIB": "%.1f" % hot_mib, "LLAMA_MOE_HOT_STATS": "1"})
         if a.mode in ("bridge", "bridge-hot"):  # [TAG_MOE_BRIDGE]
             env.update({"LLAMA_MOE_BRIDGE": "1", "LLAMA_MOE_BRIDGE_STATS": "1", "LLAMA_MOE_BRIDGE_WAIT": a.wait})
-        rc, txt = run(common + ["-ub", str(T), "--kl-divergence-base", base, "--kl-divergence"], env,
+        cand = list(common)
+        if a.mode in ("auto", "auto-fast"):  # [TAG_FN_AUTO]
+            env.update({"LLAMA_FLASHNEXT_PROFILE": "safe" if a.mode == "auto" else "fast", "LLAMA_MOE_HOT_STATS": "1"})
+            cand[cand.index("--n-cpu-moe") + 1] = "1"
+        rc, txt = run(cand + ["-ub", str(T), "--kl-divergence-base", base, "--kl-divergence"], env,
                       os.path.join(a.dir, "%s_ub%d.log" % (a.mode, T)))
         kld = re.search(r"Mean\s+KLD:\s*([0-9.eE+-]+)", txt)
         top = re.search(r"Same top p:\s*([0-9.]+)", txt)
         hot = re.search(r"moe-hot: (\d+) layers, ([0-9.]+) MiB", txt) if a.mode != "bridge" else re.search(r"MoE bridge \d+ on \S+: (\d+) host expert layers", txt)
         if hot and a.mode == "bridge-hot" and not re.search(r"MoE bridge \d+ on \S+: (\d+) host expert layers", txt):
+            hot = None
+        if hot and a.mode in ("auto", "auto-fast") and not (  # [TAG_FN_AUTO]
+                re.search(r"fn-auto:   placement: the routed experts of all %d trunk layers" % a.layers, txt) and
+                re.search(r"moe-hot: VRAM fit on ", txt) and re.search(r"moe-hot: adaptive: admit after", txt)):
             hot = None
         fatal = re.search(r"CUDA error|illegal memory access|GGML_ASSERT|ggml_abort|wait timeout|host job failed", txt)
         st = same_top(txt)

@@ -363,6 +363,20 @@ int32_t llama_fn_even_slots(const std::vector<size_t> & bytes_per_expert, size_t
     return (int32_t) std::min<size_t>((size_t) n_expert, budget / sum);
 }
 
+// [TAG_FN_VRAM_FIT] -----------------------------------------------------------------------------------------------
+
+size_t llama_fn_vram_ceiling_default(size_t total) {
+    const size_t keep = std::max<size_t>((size_t) 1536 << 20, total / 8);
+    return total > keep ? total - keep : 0;
+}
+
+size_t llama_fn_vram_fit_budget(size_t total, size_t free, size_t ceiling, size_t margin) {
+    const size_t used = total > free ? total - free : 0;
+    const size_t a = free > margin ? free - margin : 0;
+    const size_t b = ceiling > used + margin ? ceiling - used - margin : 0;
+    return std::min(a, b);
+}
+
 // model hooks ---------------------------------------------------------------------------------------------------------
 
 void llama_fn_auto_on_load(llama_model & model, llama_model_loader & ml, const std::string & fname, const llama_model_params & params) {

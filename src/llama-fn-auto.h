@@ -87,6 +87,11 @@ LLAMA_API void llama_fn_state_undo  (llama_fn_auto_state & st);
 // at most n_expert
 LLAMA_API int32_t llama_fn_even_slots(const std::vector<size_t> & bytes_per_expert, size_t budget, int32_t n_expert);
 
+// [TAG_FN_VRAM_FIT] default device-use ceiling: total - max(1536 MiB, total/8), 28531 MiB on a 32607 MiB card
+LLAMA_API size_t llama_fn_vram_ceiling_default(size_t total);
+// hot-set budget: min(free - margin, ceiling - (total - free) - margin), 0 when negative
+LLAMA_API size_t llama_fn_vram_fit_budget(size_t total, size_t free, size_t ceiling, size_t margin);
+
 //
 // model hooks (src/llama.cpp) and lookups
 //
