@@ -5,6 +5,7 @@
 #include "llama-moetrace.h" // [TAG_FN_MOE_TRACE]
 #include "llama-moe-bridge.h" // [TAG_MOE_BRIDGE]
 #include "ggml-moe-bridge.h"  // [TAG_MOE_BRIDGE]
+#include "llama-moe-gen5.h" // [TAG_MOE_DMA_SHARE] [TAG_FN_PREFILL_STREAM]
 
 #include "llama-impl.h"
 #include "llama-model.h"
@@ -2258,6 +2259,25 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     const int64_t n_tokens = cur->ne[1];
     const bool weight_before_ffn = arch == LLM_ARCH_LLAMA4; // for llama4, we apply the sigmoid-ed weights before the FFN
 
+    // [TAG_FN_PREFILL_STREAM] large ubatches read this layer's host experts from a VRAM bank the streamer fills; the gate
+    // node waits for the bank before the router runs
+    // the gen5 host nodes (gate, release, plan, fence) are CPU custom ops: pin them to the CPU backend
+    auto pin_cpu = [&](ggml_tensor * t) {
+        if (sched && backend_cpu) {
+            ggml_backend_sched_set_tensor_backend(sched, t, backend_cpu);
+        }
+    };
+    const llama_pfs_view * pfs = nullptr;
+    if (!gate_up_exps && gate_exps && down_exps && loras->empty()) {
+        pfs = llama_prefill_stream_lookup(sched, up_exps, n_tokens);
+    }
+    if (pfs) {
+        pin_cpu(llama_prefill_stream_build_gate(ctx0, gf, pfs, cur));
+        up_exps   = pfs->up;
+        gate_exps = pfs->gate;
+        down_exps = pfs->down;
+    }
+
     ggml_tensor * logits = nullptr;
 
     if (probs_in == nullptr) {
@@ -2420,10 +2440,11 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     const int hot_max_t = llama_moe_hot_max_t();
     const llama_moe_cache_layer * mcache = nullptr;
     ggml_tensor * mc_slot_ids = nullptr;
-    if ((n_tokens == 1 || n_tokens <= hot_max_t) && !gate_up_exps && gate_exps && down_exps &&
+    const bool slot_chain_ok = !gate_up_exps && gate_exps && down_exps &&
         !up_exps_b && !gate_exps_b && !down_exps_b &&
         !up_exps_s && !gate_exps_s && !down_exps_s &&
-        type_op == LLM_FFN_SILU && !weight_before_ffn && loras->empty()) {
+        type_op == LLM_FFN_SILU && !weight_before_ffn && loras->empty();
+    if ((n_tokens == 1 || n_tokens <= hot_max_t) && slot_chain_ok) {
         mcache = llama_moe_cache_lookup(up_exps);
     }
 
@@ -2446,6 +2467,21 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         res->n_moe_bridge++;
     }
 
+    // [TAG_MOE_DMA_SHARE] [TAG_MOE_PREFETCH] a CPU plan node picks the cold experts that go over PCIe to a VRAM bank; its
+    // table (hot + those) replaces the hot set's table in src[3] of the CPU MUL_MAT_IDs. Not with the LRU cache.
+    // [TAG_FN_MERGE] never on a bridged layer: the bridge has no CPU split for the plan and fence nodes to live in (the
+    // context also turns DMA share / prefetch off at init while a bridge exists, see llama_moe_gen5_init)
+    const llama_moe_dma_view * mdma = nullptr;
+    ggml_tensor * dma_tbl = nullptr;
+    if (!br_ticket && slot_chain_ok && !pfs && !(mcache && hot_max_t == 0)) {
+        mdma = llama_moe_dma_lookup(sched, up_exps, n_tokens);
+    }
+    if (mdma) {
+        const auto it = res->t_moe_pred_next.find(il + 1);
+        dma_tbl = llama_moe_dma_build_plan(ctx0, mdma, selected_experts, it != res->t_moe_pred_next.end() ? it->second : nullptr,
+                mcache ? mcache->host_table : nullptr, mcache ? mcache->n_slots : 0);
+        pin_cpu(dma_tbl);
+    }
     if (mcache && hot_max_t == 0) {
         mc_slot_ids = ggml_get_rows(ctx0, mcache->dev_table, selected_experts); // [1, n_expert_used, 1]
         mc_slot_ids = ggml_reshape_2d(ctx0, mc_slot_ids, n_expert_used, 1);
@@ -2463,11 +2499,12 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     // device-side chain over the cached experts, mirroring the LLM_FFN_SILU activation below (the only type_op the
     // cache path is enabled for); uncached ids map to the zero slot
-    auto build_cache_chain = [&]() -> ggml_tensor * {
-        ggml_tensor * up_g   = ggml_mul_mat_id(ctx0, mcache->up_c,   mc_inp, mc_slot_ids);
-        ggml_tensor * gate_g = ggml_mul_mat_id(ctx0, mcache->gate_c, mc_inp, mc_slot_ids);
-        cb(up_g,   "ffn_moe_cache_up",   il);
-        cb(gate_g, "ffn_moe_cache_gate", il);
+    // [TAG_MOE_DMA_SHARE] the same chain over the DMA bank (dma = true)
+    auto build_slot_chain = [&](ggml_tensor * up_c, ggml_tensor * gate_c, ggml_tensor * down_c, ggml_tensor * slot_ids, bool dma) -> ggml_tensor * {
+        ggml_tensor * up_g   = ggml_mul_mat_id(ctx0, up_c,   mc_inp, slot_ids);
+        ggml_tensor * gate_g = ggml_mul_mat_id(ctx0, gate_c, mc_inp, slot_ids);
+        cb(up_g,   dma ? "ffn_moe_dma_up"   : "ffn_moe_cache_up",   il);
+        cb(gate_g, dma ? "ffn_moe_dma_gate" : "ffn_moe_cache_gate", il);
 
         ggml_tensor * act_g = nullptr;
         {
@@ -2488,9 +2525,22 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             }
         }
 
-        ggml_tensor * down_g = ggml_mul_mat_id(ctx0, mcache->down_c, act_g, mc_slot_ids);
-        cb(down_g, "ffn_moe_cache_down", il);
+        ggml_tensor * down_g = ggml_mul_mat_id(ctx0, down_c, act_g, slot_ids);
+        cb(down_g, dma ? "ffn_moe_dma_down" : "ffn_moe_cache_down", il);
         return down_g;
+    };
+    auto build_cache_chain = [&]() -> ggml_tensor * {
+        return build_slot_chain(mcache->up_c, mcache->gate_c, mcache->down_c, mc_slot_ids, false);
+    };
+    // expert skip table of the CPU MUL_MAT_IDs: the DMA plan's (hot + DMA) or the hot set's
+    auto set_skip = [&](ggml_tensor * t) {
+        if (dma_tbl) {
+            t->src[3] = dma_tbl;
+            t->op_params[0] = 0;
+        } else if (mcache) {
+            t->src[3] = mcache->host_table;
+            t->op_params[0] = mcache->n_slots;
+        }
     };
 
     // [TAG_FN_MOE_HOT] the hot chain is built before the CPU chain, so it lands in the GPU split in front of it
@@ -2559,10 +2609,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         up = build_lora_mm_id(up_exps, cur, selected_experts, up_exps_s); // [n_ff, n_expert_used, n_tokens]
         cb(up, "ffn_moe_up", il);
 
-        if (mcache) {
-            up->src[3] = mcache->host_table;
-            up->op_params[0] = mcache->n_slots;
-        }
+        set_skip(up);
 
         if (up_exps_s) {
             cb(up, "ffn_moe_up_scaled", il);
@@ -2577,10 +2624,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             cur = build_lora_mm_id(gate_exps, cur, selected_experts, gate_exps_s); // [n_ff, n_expert_used, n_tokens]
             cb(cur, "ffn_moe_gate", il);
 
-            if (mcache) {
-                cur->src[3] = mcache->host_table;
-                cur->op_params[0] = mcache->n_slots;
-            }
+            set_skip(cur);
         } else {
             cur = up;
         }
@@ -2687,14 +2731,32 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     }
     cb(experts, "ffn_moe_down", il);
 
-    if (mcache) {
-        experts->src[3] = mcache->host_table;
-        experts->op_params[0] = mcache->n_slots;
+    // [TAG_FN_PREFILL_STREAM] the bank of this layer may be refilled once its down projection is done
+    if (pfs) {
+        pin_cpu(llama_prefill_stream_build_release(ctx0, gf, pfs, experts));
+    }
 
+    set_skip(experts);
+
+    // [TAG_MOE_DMA_SHARE] the fence closes the CPU split: the bank chain below runs after the copies have landed
+    if (mdma) {
+        pin_cpu(llama_moe_dma_build_fence(ctx0, gf, mdma, experts));
+    }
+
+    if (mcache) {
         ggml_tensor * down_g = hot_down ? hot_down : build_cache_chain();
 
         experts = ggml_add(ctx0, experts, down_g);
         cb(experts, "ffn_moe_cache_merged", il);
+    }
+
+    if (mdma) {
+        ggml_tensor * ids_flat = ggml_reshape_1d(ctx0, ggml_cont(ctx0, selected_experts), n_expert_used*n_tokens);
+        ggml_tensor * dma_ids  = ggml_reshape_2d(ctx0, ggml_get_rows(ctx0, mdma->dev_table, ids_flat), n_expert_used, n_tokens);
+        cb(dma_ids, "ffn_moe_dma_slots", il);
+
+        experts = ggml_add(ctx0, experts, build_slot_chain(mdma->up, mdma->gate, mdma->down, dma_ids, true));
+        cb(experts, "ffn_moe_dma_merged", il);
     }
 
     if (down_exps_s) {

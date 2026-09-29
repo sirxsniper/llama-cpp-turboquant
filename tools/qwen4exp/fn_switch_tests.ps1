@@ -39,6 +39,10 @@ Run "tbo_topk"        $tbo @("-b", "CUDA0", "-o", "TOP_K", "-p", "k=2051") @{}
 Run "tbo_concat"      $tbo @("-b", "CUDA0", "-o", "CONCAT") @{}
 Run "tbo_set_rows"    $tbo @("-b", "CUDA0", "-o", "SET_ROWS", "-p", "248320") @{}
 Run "tbo_mul_mat"     $tbo @("-b", "CUDA0", "-o", "MUL_MAT", "-p", "m=98304") @{}
+# [TAG_MOE_DMA_SHARE] [TAG_FN_PREFILL_STREAM] the gen5 plan/fence/gate logic on the CPU backend (no GPU); the GPU side is
+# tools/qwen4exp/fn_gen5_check.py
+$g5 = Join-Path $Bin "test-moe-gen5.exe"
+if (Test-Path $g5) { Run "moe_gen5_cpu" $g5 @("--cpu") @{ CUDA_VISIBLE_DEVICES = "-1" } }
 
 $tla = Join-Path $Bin "test-llama-archs.exe"
 $switches = [ordered]@{

@@ -14007,6 +14007,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_moe_hot_chain(GGML_TYPE_Q4_K, 2560, 640, 512, 400, 10, 6)); // most ids hot
     test_cases.emplace_back(new test_moe_hot_chain(GGML_TYPE_Q4_K, 2560, 640, 512, 1,   10, 4)); // almost all ids zero slot
 
+    // [TAG_MOE_DMA_SHARE] the DMA bank chain: LLAMA_MOE_DMA_SLOTS (8) slots + the zero slot, the ids of 10 x T remapped
+    // through the bank table (most to the zero slot), gate/up q4_K and q5_K, down q5_1 and q8_0
+    for (int t : {1, 3, 8}) {
+        test_cases.emplace_back(new test_moe_hot_chain(GGML_TYPE_Q4_K, 2560, 640, 512, 8, 10, t));
+        test_cases.emplace_back(new test_moe_hot_chain(GGML_TYPE_Q5_K, 2560, 640, 512, 8, 10, t));
+        test_cases.emplace_back(new test_moe_hot_chain(GGML_TYPE_Q5_1, 640, 2560, 512, 8, 10, t));
+        test_cases.emplace_back(new test_moe_hot_chain(GGML_TYPE_Q8_0, 640, 2560, 512, 8, 10, t));
+    }
+
     // [TAG_FN_QSA_CHUNK] TURBO_QSA_CHUNK=64: indexer top-k of a 64-query chunk over n_kv cells, the chunks' indices
     // concatenated along the query axis (i32), and the chunk's mask rows cast to f32
     for (int64_t n_kv : {4096, 16384, 65536}) {

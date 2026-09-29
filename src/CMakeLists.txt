@@ -40,6 +40,9 @@ set(LLAMA_CORE_SOURCES
     llama-moecache.cpp       # [TAG_SYNC_CORE_SOURCES] fork-only
     llama-moetrace.cpp       # [TAG_FN_MOE_TRACE] fork-only
     llama-moe-bridge.cpp     # [TAG_MOE_BRIDGE] fork-only
+    llama-moe-gen5.cpp       # [TAG_MOE_DMA_SHARE] [TAG_FN_PREFILL_STREAM] fork-only
+    llama-moe-dma.cpp        # [TAG_MOE_DMA_SHARE] [TAG_MOE_PREFETCH] fork-only
+    llama-prefill-stream.cpp # [TAG_FN_PREFILL_STREAM] fork-only
     llama-quant.cpp
     llama-sampler.cpp
     llama-triattention.cpp   # [TAG_SYNC_CORE_SOURCES] fork-only

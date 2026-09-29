@@ -3,6 +3,7 @@
 #include "llama-moecache.h"
 #include "llama-moetrace.h" // [TAG_FN_MOE_TRACE]
 #include "llama-moe-bridge.h" // [TAG_MOE_BRIDGE]
+#include "llama-moe-gen5.h" // [TAG_MOE_DMA_SHARE] [TAG_FN_PREFILL_STREAM]
 
 #include "ggml.h"
 #include "llama-arch.h"
@@ -1422,6 +1423,10 @@ llama_context::llama_context(
         // [TAG_MOE_BRIDGE] LLAMA_MOE_BRIDGE=1: before the reserve, so decode graphs are reserved with the bridge ops
         moe_bridge = llama_moe_bridge_create(model, (int) cparams.n_threads);
 
+        // [TAG_MOE_DMA_SHARE] [TAG_FN_PREFILL_STREAM] before the reserve: the graphs it builds use the gen5 banks
+        // [TAG_FN_MERGE] with a host bridge the DMA share / prefetch stay off (they need the CPU split the bridge removes)
+        llama_moe_gen5_init(model, this, backend_ptrs, moe_bridge != nullptr);
+
         sched_reserve();
 
         // [TAG_FN_MOE_HOT] sized after the reserve, so LLAMA_MOE_HOT_MIB=auto sees what the KV cache and the compute
@@ -1455,6 +1460,7 @@ llama_context::~llama_context() {
 
     llama_moe_bridge_free(moe_bridge); // [TAG_MOE_BRIDGE] no graph runs now
     moe_bridge = nullptr;
+    llama_moe_gen5_free(this); // [TAG_MOE_DMA_SHARE] [TAG_FN_PREFILL_STREAM]
 
     llama_moe_trace_flush(); // [TAG_FN_MOE_TRACE]
 
@@ -3528,6 +3534,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         ggml_backend_sched_synchronize(sched.get());
     }
     llama_moe_cache_step(this);
+    llama_moe_gen5_step(this); // [TAG_MOE_DMA_SHARE] ring admission and stats, owner only
 
     return 0;
 }
