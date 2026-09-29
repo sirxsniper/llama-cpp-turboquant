@@ -10,6 +10,8 @@
 #include <cmath>
 #include <math.h>
 #include <stdio.h>
+#include <cstring>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -304,6 +306,189 @@ static int test_vec_dot_q(bool verbose) {
     return num_failed;
 }
 
+// [TAG_FN_CPU_Q5_1_AVX512] [TAG_FN_CPU_MMID_MR] the kernels of the CPU expert path claim to be bitwise equal to the
+// AVX2 dot products. That holds exactly where the compiler does not contract a*b + c differently in the two functions
+// (MSVC never contracts); elsewhere allow a rounding step.
+static bool fn_same_float(float a, float b) {
+#if defined(_MSC_VER) && !defined(__clang__)
+    return memcmp(&a, &b, sizeof(float)) == 0;
+#else
+    return a == b || fabsf(a - b) <= 1e-6f * std::max(1.0f, fabsf(a));
+#endif
+}
+
+// raw blocks with random bytes and random scales in the first nhalf fp16 fields of each block (all bit patterns of
+// the packed quants, including the q5_1 high bits)
+static std::vector<uint8_t> fn_random_blocks(ggml_type type, int n, int nhalf, std::mt19937 & rng) {
+    const size_t bsize = ggml_type_size(type);
+    const size_t nblk  = (size_t) n / ggml_blck_size(type);
+    std::vector<uint8_t> data(bsize * nblk);
+    std::uniform_int_distribution<int> byte(0, 255);
+    std::uniform_real_distribution<float> scale(-0.05f, 0.05f);
+    for (size_t b = 0; b < nblk; b++) {
+        uint8_t * blk = data.data() + b * bsize;
+        for (size_t j = 0; j < bsize; j++) {
+            blk[j] = (uint8_t) byte(rng);
+        }
+        for (int h = 0; h < nhalf; h++) {
+            const ggml_fp16_t v = ggml_fp32_to_fp16(scale(rng));
+            memcpy(blk + h * sizeof(ggml_fp16_t), &v, sizeof(v));
+        }
+    }
+    return data;
+}
+
+// the activation side: random floats quantized with the CPU from_float of the type (so the q8_1 sums are consistent)
+static std::vector<uint8_t> fn_random_act(ggml_type vec_dot_type, int n, std::mt19937 & rng) {
+    std::vector<float> f(n);
+    std::uniform_real_distribution<float> uni(-1.0f, 1.0f);
+    for (float & v : f) {
+        v = uni(rng);
+    }
+    std::vector<uint8_t> q(ggml_row_size(vec_dot_type, n));
+    ggml_get_type_traits_cpu(vec_dot_type)->from_float(f.data(), q.data(), n);
+    return q;
+}
+
+// [TAG_FN_CPU_Q5_1_AVX512] GGML_CPU_Q5_1_AVX512 must not change a single bit: the q5_1 dot product with the switch on
+// against the same call with it off, on random blocks (every high bit pattern) and odd block counts (the 256-bit tail)
+static int test_fn_q5_1_avx512(bool verbose) {
+    const auto * q51 = ggml_get_type_traits_cpu(GGML_TYPE_Q5_1);
+    const int saved = ggml_cpu_fn_get_switch(GGML_CPU_FN_Q5_1_AVX512);
+
+    std::mt19937 rng(1234);
+    int num_failed = 0;
+    int n_cases    = 0;
+    for (int n : {32, 64, 96, 640, 672, 2560}) {
+        for (int rep = 0; rep < 16; ++rep) {
+            const std::vector<uint8_t> xq = fn_random_blocks(GGML_TYPE_Q5_1, n, 2, rng); // d, m
+            const std::vector<uint8_t> yq = fn_random_act(GGML_TYPE_Q8_1, n, rng);
+            float r[2];
+            for (int v = 0; v < 2; ++v) {
+                ggml_cpu_fn_set_switch(GGML_CPU_FN_Q5_1_AVX512, v);
+                q51->vec_dot(n, &r[v], 0, xq.data(), 0, yq.data(), 0, 1);
+            }
+            n_cases++;
+            const bool failed = !fn_same_float(r[0], r[1]);
+            num_failed += failed;
+            if (failed || (verbose && rep == 0)) {
+                printf(" q5_1 AVX-512 vs AVX2 n=%4d:        %s (%.9g vs %.9g)\n", n, RESULT_STR[failed], r[1], r[0]);
+            }
+        }
+    }
+    ggml_cpu_fn_set_switch(GGML_CPU_FN_Q5_1_AVX512, saved);
+
+    if (num_failed || verbose) {
+        printf(" q5_1 AVX-512 dot product: %d cases, %d not bitwise equal to AVX2%s\n", n_cases, num_failed,
+               ggml_cpu_has_avx512() ? "" : " (no AVX-512 in this build: both runs took the AVX2 body)");
+    }
+    return num_failed;
+}
+
+// [TAG_FN_CPU_MMID_MR] the multi-row x multi-token kernels against vec_dot, value by value: nr rows (3 and 16 cover
+// the row loop), nc = 1..4 tokens, both bodies (GGML_CPU_MMID_MR=1: 512-bit where built, =2: 256-bit), row lengths
+// with odd block counts (the tails), random raw weight blocks with random fp16 scales
+static int test_fn_mmid_mr(bool verbose) {
+    struct mr_type { ggml_type type; int nhalf; std::vector<int> ns; };
+    const mr_type types[] = {
+        { GGML_TYPE_Q4_K,   2, { 256, 768, 2560 } },       // d, dmin
+        { GGML_TYPE_Q5_K,   2, { 256, 768, 2560 } },       // d, dmin
+        { GGML_TYPE_Q5_1,   2, { 32, 96, 640, 672, 2560 } }, // d, m
+        { GGML_TYPE_Q8_0,   1, { 32, 96, 640, 672, 2560 } }, // d
+        { GGML_TYPE_IQ4_NL, 1, { 32, 96, 640, 672, 2560 } }, // d
+    };
+
+    const int saved_mr   = ggml_cpu_fn_get_switch(GGML_CPU_FN_MMID_MR);
+    const int saved_q5_1 = ggml_cpu_fn_get_switch(GGML_CPU_FN_Q5_1_AVX512);
+    ggml_cpu_fn_set_switch(GGML_CPU_FN_Q5_1_AVX512, 0); // vec_dot = the AVX2 bodies
+
+    std::mt19937 rng(4321);
+    int num_failed = 0;
+    int n_values   = 0;
+    for (const mr_type & t : types) {
+        const auto * tr = ggml_get_type_traits_cpu(t.type);
+        {
+            // does this build have a kernel for the type
+            const int n0 = (int) ggml_blck_size(t.type);
+            std::vector<uint8_t> x0(ggml_row_size(t.type, n0), 0);
+            std::vector<uint8_t> y0(ggml_row_size(tr->vec_dot_type, n0), 0);
+            const void * c0[1] = { y0.data() };
+            float o0 = 0.0f;
+            if (!ggml_cpu_fn_vec_dot_mr(t.type, n0, &o0, 1, x0.data(), 0, 1, c0, 1)) {
+                printf(" %6s mmid_mr: no kernel in this build, skipped\n", ggml_type_name(t.type));
+                continue;
+            }
+        }
+        for (int n : t.ns) {
+            const int    max_nr = 16;
+            const size_t bx     = ggml_row_size(t.type, n);
+            const size_t by     = ggml_row_size(tr->vec_dot_type, n);
+            const std::vector<uint8_t> xq = fn_random_blocks(t.type, n * max_nr, t.nhalf, rng); // max_nr rows
+            std::vector<std::vector<uint8_t>> yq;
+            for (int c = 0; c < 4; ++c) {
+                yq.push_back(fn_random_act(tr->vec_dot_type, n, rng));
+            }
+            GGML_ASSERT(xq.size() == bx * max_nr && yq[0].size() == by);
+
+            // reference: vec_dot per (row, column)
+            float ref[4][max_nr];
+            for (int c = 0; c < 4; ++c) {
+                for (int r = 0; r < max_nr; ++r) {
+                    tr->vec_dot(n, &ref[c][r], 0, xq.data() + r * bx, 0, yq[c].data(), 0, 1);
+                }
+            }
+
+            for (int body : {1, 2}) {
+                ggml_cpu_fn_set_switch(GGML_CPU_FN_MMID_MR, body);
+                for (int nr : {1, 3, max_nr}) {
+                    for (int nc = 1; nc <= 4; ++nc) {
+                        const void * cols[4] = { yq[0].data(), yq[1].data(), yq[2].data(), yq[3].data() };
+                        const size_t bs = 24; // padded like the MUL_MAT_ID scratch
+                        std::vector<float> out(bs * 4, NAN);
+                        if (!ggml_cpu_fn_vec_dot_mr(t.type, n, out.data(), bs, xq.data(), bx, nr, cols, nc)) {
+                            num_failed++;
+                            printf(" %6s mmid_mr n=%4d nr=%2d nc=%d: FAILED, the kernel refused the call\n", ggml_type_name(t.type), n, nr, nc);
+                            continue;
+                        }
+                        for (int c = 0; c < nc; ++c) {
+                            for (int r = 0; r < nr; ++r) {
+                                n_values++;
+                                const bool failed = !fn_same_float(out[c * bs + r], ref[c][r]);
+                                num_failed += failed;
+                                if (failed) {
+                                    printf(" %6s mmid_mr n=%4d nr=%2d nc=%d body=%d (r=%d, c=%d): FAILED (%.9g vs vec_dot %.9g)\n",
+                                           ggml_type_name(t.type), n, nr, nc, body, r, c, out[c * bs + r], ref[c][r]);
+                                }
+                            }
+                        }
+                        // nothing written outside the nr x nc block
+                        for (int c = 0; c < 4; ++c) {
+                            for (int r = 0; r < (int) bs; ++r) {
+                                if ((c >= nc || r >= nr) && !std::isnan(out[c * bs + r])) {
+                                    num_failed++;
+                                    printf(" %6s mmid_mr n=%4d nr=%2d nc=%d body=%d: FAILED, wrote s[%d]\n",
+                                           ggml_type_name(t.type), n, nr, nc, body, c * (int) bs + r);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if (verbose) {
+            printf(" %6s mmid_mr: checked against vec_dot\n", ggml_type_name(t.type));
+        }
+    }
+
+    ggml_cpu_fn_set_switch(GGML_CPU_FN_MMID_MR, saved_mr);
+    ggml_cpu_fn_set_switch(GGML_CPU_FN_Q5_1_AVX512, saved_q5_1);
+
+    if (num_failed || verbose) {
+        printf(" mmid_mr kernels: %d values, %d not bitwise equal to vec_dot\n", n_values, num_failed);
+    }
+    return num_failed;
+}
+
 int main(int argc, char * argv[]) {
     bool verbose = false;
 
@@ -325,6 +510,8 @@ int main(int argc, char * argv[]) {
 
     num_failed += test_vec_dot_f32(verbose);
     num_failed += test_vec_dot_q(verbose);
+    num_failed += test_fn_q5_1_avx512(verbose); // [TAG_FN_CPU_Q5_1_AVX512]
+    num_failed += test_fn_mmid_mr(verbose);     // [TAG_FN_CPU_MMID_MR]
 
     if (num_failed || verbose) {
         printf("%d tests failed\n", num_failed);

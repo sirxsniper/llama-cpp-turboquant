@@ -33,6 +33,7 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         ggml-cpu/repack.h
         ggml-cpu/iqp.cpp
         ggml-cpu/iqp.h
+        ggml-cpu/moe-pool.cpp
         ggml-cpu/hbm.cpp
         ggml-cpu/hbm.h
         ggml-cpu/quants.c

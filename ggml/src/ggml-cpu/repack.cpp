@@ -5009,6 +5009,17 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
             // initialize matrix_row_counts
             memset(matrix_row_counts, 0, n_as * sizeof(int64_t));
 
+            // [TAG_FN_CPU_REPACK_MMID_SKIP] the llama MoE expert cache (and the hot expert set) passes src[3], an I32
+            // table expert id -> device slot with op_params[0] the "not on the device" value: the device computes
+            // the other experts, so skip them and zero their dst rows, exactly as ggml_compute_forward_mul_mat_id
+            // does. Without this, repacked host experts (--no-host) were added twice.
+            const int32_t * moe_tbl   = nullptr;
+            int32_t         moe_dummy = 0;
+            if (op->src[3]) {
+                moe_tbl   = (const int32_t *) op->src[3]->data;
+                moe_dummy = ggml_get_op_params_i32(op, 0);
+            }
+
             // group rows by src0 matrix
             for (int32_t iid1 = 0; iid1 < ids->ne[1]; ++iid1) {
                 for (int32_t id = 0; id < n_ids; ++id) {
@@ -5016,6 +5027,11 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                         *(const int32_t *) ((const char *) ids->data + iid1 * ids->nb[1] + id * ids->nb[0]);
 
                     GGML_ASSERT(i02 >= 0 && i02 < n_as);
+
+                    if (moe_tbl && moe_tbl[i02] != moe_dummy) {
+                        memset((char *) dst->data + id * nb1 + iid1 * nb2, 0, ne0 * sizeof(float));
+                        continue;
+                    }
 
                     MMID_MATRIX_ROW(i02, matrix_row_counts[i02]) = { id, iid1 };
                     matrix_row_counts[i02] += 1;
@@ -5049,7 +5065,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
             }
 
             if (src0_cur_start >= src0_cur_end) {
-                return;
+                continue; // [TAG_FN_CPU_REPACK_MMID_SKIP] (the range is the same for every expert, so this only reads clearer)
             }
 
             for (int ir1 = 0; ir1 < nr1; ir1++) {
@@ -5391,6 +5407,10 @@ class extra_buffer_type : ggml::cpu::extra_buffer_type {
                 && ggml_repack_get_optimal_repack_type(op->src[0])
                 ) {
             if (op->src[1]->buffer && !ggml_backend_buft_is_host(op->src[1]->buffer->buft)) {
+                return false;
+            }
+            // [TAG_FN_CPU_REPACK_MMID_SKIP] the expert skip table is read on the host
+            if (op->src[3] && op->src[3]->buffer && !ggml_backend_buft_is_host(op->src[3]->buffer->buft)) {
                 return false;
             }
             if (op->src[1]->type == GGML_TYPE_F32) {

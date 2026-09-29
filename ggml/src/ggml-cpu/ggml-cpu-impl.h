@@ -29,6 +29,41 @@ struct ggml_compute_params {
     bool use_ref;
 };
 
+// [TAG_FN_CPU_SWITCHES] values of the switches of enum ggml_cpu_fn_switch (ggml-cpu.h), indexed by it: set once in
+// ggml_cpu_init() from the environment and afterwards only by ggml_cpu_fn_set_switch() while no graph is computing
+extern int ggml_cpu_fn_sw[];
+
+// [TAG_FN_CPU_MOE_FUSE] the fused CPU MoE split (ggml-cpu.c), shared by the graph op and the worker pool (moe-pool.cpp)
+#define GGML_FN_MOE_MAX_T 16
+
+struct ggml_fn_moe_args {
+    const struct ggml_tensor * up;      // [n_embd, n_ff, n_expert]
+    const struct ggml_tensor * gate;    // [n_embd, n_ff, n_expert]
+    const struct ggml_tensor * down;    // [n_ff, n_embd, n_expert]
+    const int32_t * table;              // or NULL: expert e is computed only if table[e] == table_miss
+    int32_t         table_miss;
+    int             n_tokens;           // 1..GGML_FN_MOE_MAX_T
+    int             n_used;
+    const char *    x;                  // token t: (const float *) (x + t*x_nb)
+    size_t          x_nb;
+    const char *    ids;                // ids[slot, t]: *(const int32_t *) (ids + slot*ids_nb0 + t*ids_nb1)
+    size_t          ids_nb0;
+    size_t          ids_nb1;
+    char *          out;                // row (slot, t): (float *) (out + slot*out_nb1 + t*out_nb2), n_embd floats
+    size_t          out_nb1;
+    size_t          out_nb2;
+    const float *   w;                  // or NULL: [n_used, n_tokens] weights of the weighted sum
+    float *         out_sum;            // w != NULL: [n_embd, n_tokens]
+    void *          wdata;              // ggml_fn_moe_work_size() bytes
+};
+
+// false if the fused kernel does not take these weights (types, shapes)
+bool   ggml_fn_moe_supported(const struct ggml_tensor * up, const struct ggml_tensor * gate, const struct ggml_tensor * down);
+size_t ggml_fn_moe_work_size(const struct ggml_tensor * up, const struct ggml_tensor * gate, const struct ggml_tensor * down,
+                             int n_used, int n_tokens, int nth);
+// every one of the nth threads calls it with its ith; barrier(barrier_ctx) must synchronize all of them
+void   ggml_fn_moe_compute(const struct ggml_fn_moe_args * a, int ith, int nth, void (*barrier)(void *), void * barrier_ctx);
+
 
 #if defined(_MSC_VER)
 
