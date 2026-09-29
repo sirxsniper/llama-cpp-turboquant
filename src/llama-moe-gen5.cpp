@@ -219,8 +219,16 @@ void copy_pool::copy(void * dst, const void * src, size_t n) {
 static bool gen5_model_layers(const llama_model & model, std::vector<llama_moe_gen5_layer_desc> & out, ggml_backend_dev_t & dev) {
     out.clear();
     dev = nullptr;
+    // nextn (MTP) layers run in an MTP context's graphs only, never in the owner's: a prefill stream job for one would
+    // copy it every ubatch and hold its bank until the next ubatch (the KV filter of create_memory)
+    // [TAG_FN_PREFILL_STREAM] [TAG_MOE_DMA_SHARE]
+    const auto & hp = model.hparams;
+    const bool nextn_split = hp.n_layer_nextn > 0 && hp.n_layer() > 0 && hp.router_layer < 0;
     for (size_t il = 0; il < model.layers.size(); ++il) {
         const auto & l = model.layers[il];
+        if (nextn_split && il >= hp.n_layer()) {
+            continue;
+        }
         if (!l.ffn_up_exps || !l.ffn_gate_exps || !l.ffn_down_exps || !l.ffn_gate_inp || l.ffn_gate_up_exps) {
             continue;
         }

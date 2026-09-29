@@ -50,6 +50,11 @@ struct pfs_bank {
     bool complete = false; // all copies of holds are issued and ev_done follows them
     bool consumed = true;  // holds has been used, or is not needed: a new job may overwrite the bank
 
+    // [TAG_FN_PREFILL_STREAM] the gate of used_pos passed in generation used_gen: a late "keep" of a queued job for that
+    // layer must not take the bank back after the layer's release (the next job of the bank would wait forever)
+    uint64_t used_gen = 0;
+    int      used_pos = -1;
+
     ggml_backend_event_t ev_done = nullptr; // copy stream, after the copies of holds
     ggml_backend_event_t ev_free = nullptr; // compute stream, at the last release
 };
@@ -127,8 +132,11 @@ void pfs_run(pfs_state * s) {
             job = s->queue.front();
             pfs_bank & b0 = s->banks[s->layers[job.pos].bank];
             if (b0.holds == job.pos && b0.complete) {
-                // the bank has this layer already (weights never change): keep it until the layer's release
-                b0.consumed = false;
+                // the bank has this layer already (weights never change): keep it until the layer's release, unless
+                // the layer's gate already took it in this generation (then its release frees it, maybe already did)
+                if (!(b0.used_gen == s->gen && b0.used_pos == job.pos)) {
+                    b0.consumed = false;
+                }
                 s->queue.pop_front();
                 s->cv_done.notify_all();
                 continue;
@@ -334,6 +342,13 @@ void pfs_gate_op(ggml_tensor * dst, int ith, int nth, void * ud) {
                 s->cv.notify_all();
             }
             s->cv_done.wait(lk);
+        }
+        // the layer is in use from here to its release: claim the bank, also when its data is left from an earlier
+        // ubatch and the streamer has not reached this layer's job yet
+        if (B.holds == L->pos && B.complete) {
+            B.consumed = false;
+            B.used_gen = s->gen;
+            B.used_pos = L->pos;
         }
     }
     gen5::ev_wait(s->compute, B.ev_done, s->copy);

@@ -36,6 +36,7 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <vector>
 
 namespace {
@@ -852,7 +853,11 @@ bool llama_moe_dma_init_layers(const std::vector<llama_moe_gen5_layer_desc> & la
         int64_t   ne[3][2];
         int64_t   n_exp;
         int       parity;
-        bool operator<(const gkey & o) const { return memcmp(this, &o, sizeof(gkey)) < 0; }
+        // field by field: memcmp would also compare the padding bytes, which a copy need not keep
+        bool operator<(const gkey & o) const {
+            return std::tie(t[0], t[1], t[2], ne[0][0], ne[0][1], ne[1][0], ne[1][1], ne[2][0], ne[2][1], n_exp, parity) <
+                   std::tie(o.t[0], o.t[1], o.t[2], o.ne[0][0], o.ne[0][1], o.ne[1][0], o.ne[1][1], o.ne[2][0], o.ne[2][1], o.n_exp, o.parity);
+        }
     };
     std::map<gkey, int> bank_of;
     s->layers.resize(layers.size());
