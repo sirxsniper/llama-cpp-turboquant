@@ -706,6 +706,11 @@ std::string llama_ple_dio::stats_line() const {
     return pimpl->line();
 }
 
+void llama_ple_dio::reset_stats() {
+    std::lock_guard<std::mutex> lock(pimpl->mtx);
+    pimpl->st = llama_ple_dio_stats();
+}
+
 void llama_ple_dio::read_rows(const int32_t * rows, int64_t n, uint8_t * dst, int64_t n_tokens, const uint8_t * fallback) {
     impl & d = *pimpl;
     std::lock_guard<std::mutex> lock(d.mtx);

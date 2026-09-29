@@ -80,6 +80,7 @@ static std::unique_ptr<llama_ple_dio> qwen4exp_open_ple_copy(const llama_ple_dio
             return nullptr;
         }
         if (qwen4exp_ple_copy_matches(*dio, shard)) {
+            dio->reset_stats(); // the check rows are not model reads
             return dio;
         }
         LLAMA_LOG_WARN("%s: [TAG_FN_PLE_DIRECT_IO] %s does not match the table in the model file\n", __func__, path.c_str());

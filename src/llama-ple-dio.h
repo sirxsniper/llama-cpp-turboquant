@@ -73,6 +73,7 @@ struct llama_ple_dio {
     bool                direct() const; // false: POSIX fallback without O_DIRECT (pread + fadvise DONTNEED)
     llama_ple_dio_stats stats() const;
     std::string         stats_line() const;
+    void                reset_stats();
 
     struct impl;
 
