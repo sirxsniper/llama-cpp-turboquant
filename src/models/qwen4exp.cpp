@@ -774,32 +774,49 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     ggml_tensor * k_all = mctx_idx->get_k(ctx0, il);
     k_all = ggml_view_3d(ctx0, k_all, idx_dim, n_kv, n_stream, k_all->nb[2], k_all->nb[3], 0);
 
-    // gathers per stream: blk_cells row s indexes stream s's own cells
-    ggml_tensor * members = ggml_get_rows(ctx0, k_all, inp->blk_cells);
-    members = ggml_reshape_4d(ctx0, members, idx_dim, r, n_blocks, n_stream);
+    // [TAG_FN_QSA_FUSED] TURBO_QSA_FUSED=1: ggml_qsa_score builds each pooled key from the raw key cache inside the
+    // kernel and scores it against the queries, and ggml_qsa_topk picks the cells, v = block score + mask, without the
+    // [n_kv x n_tokens] f32 tensors (ggml.h). The pooled key has the bits of the graph below; the scores differ from
+    // mul_mat by float rounding, so the selection agrees except at near-ties. Default off.
+    static const bool qsa_fused_env = [] {
+        const char * e = getenv("TURBO_QSA_FUSED");
+        return e && e[0] == '1';
+    }();
+    const bool qsa_fused = qsa_fused_env && model.layers[il].index_k_norm != nullptr &&
+        model.layers[il].index_k_norm->type == GGML_TYPE_F32 &&
+        (rope_type & GGML_ROPE_TYPE_MROPE) && rope_type != GGML_ROPE_TYPE_VISION &&
+        idx_dim % 32 == 0 && idx_dim <= 256 && n_idx_h <= (idx_dim <= 128 ? 64 : 32) &&
+        (k_all->type == GGML_TYPE_F32 || k_all->type == GGML_TYPE_F16 || k_all->type == GGML_TYPE_BF16 ||
+         k_all->type == GGML_TYPE_Q8_0);
 
-    // mean over the block members; r is small, so summing slices beats a transpose plus sum_rows
     ggml_tensor * pooled = nullptr;
-    for (int64_t i = 0; i < r; ++i) {
-        ggml_tensor * slice = ggml_cont(ctx0,
-                ggml_view_3d(ctx0, members, idx_dim, n_blocks, n_stream,
-                        members->nb[2], members->nb[3], i*members->nb[1]));
-        pooled = pooled ? ggml_add(ctx0, pooled, slice) : slice;
+    if (!qsa_fused) {
+        // gathers per stream: blk_cells row s indexes stream s's own cells
+        ggml_tensor * members = ggml_get_rows(ctx0, k_all, inp->blk_cells);
+        members = ggml_reshape_4d(ctx0, members, idx_dim, r, n_blocks, n_stream);
+
+        // mean over the block members; r is small, so summing slices beats a transpose plus sum_rows
+        for (int64_t i = 0; i < r; ++i) {
+            ggml_tensor * slice = ggml_cont(ctx0,
+                    ggml_view_3d(ctx0, members, idx_dim, n_blocks, n_stream,
+                            members->nb[2], members->nb[3], i*members->nb[1]));
+            pooled = pooled ? ggml_add(ctx0, pooled, slice) : slice;
+        }
+        pooled = ggml_scale(ctx0, pooled, 1.0f/(float) r);
+        cb(pooled, "indexer_k_pooled", il);
+
+        // count blocks along ne1: rms_norm launches gridDim.y = ne2, capped at 65535, and 262144/4 = 65536
+        pooled = ggml_reshape_3d(ctx0, pooled, idx_dim, n_blocks*n_stream, 1);
+        pooled = build_norm(pooled, model.layers[il].index_k_norm, nullptr, LLM_NORM_RMS, il);
+
+        // rope wants [n_dims, n_head, n_tokens]: lay every stream's blocks flat, split after.
+        pooled = ggml_reshape_3d(ctx0, pooled, idx_dim, 1, n_blocks*n_stream);
+        pooled = ggml_rope_multi(ctx0, pooled, inp->blk_pos, nullptr,
+                n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
+                ext_factor, attn_factor, beta_fast, beta_slow);
+        pooled = ggml_reshape_3d(ctx0, pooled, idx_dim, n_blocks, n_stream);
+        cb(pooled, "indexer_k", il);
     }
-    pooled = ggml_scale(ctx0, pooled, 1.0f/(float) r);
-    cb(pooled, "indexer_k_pooled", il);
-
-    // count blocks along ne1: rms_norm launches gridDim.y = ne2, capped at 65535, and 262144/4 = 65536
-    pooled = ggml_reshape_3d(ctx0, pooled, idx_dim, n_blocks*n_stream, 1);
-    pooled = build_norm(pooled, model.layers[il].index_k_norm, nullptr, LLM_NORM_RMS, il);
-
-    // rope wants [n_dims, n_head, n_tokens]: lay every stream's blocks flat, split after.
-    pooled = ggml_reshape_3d(ctx0, pooled, idx_dim, 1, n_blocks*n_stream);
-    pooled = ggml_rope_multi(ctx0, pooled, inp->blk_pos, nullptr,
-            n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
-            ext_factor, attn_factor, beta_fast, beta_slow);
-    pooled = ggml_reshape_3d(ctx0, pooled, idx_dim, n_blocks, n_stream);
-    cb(pooled, "indexer_k", il);
 
     ggml_tensor * q = build_lora_mm(model.layers[il].index_q_proj, cur);
     q = ggml_reshape_3d(ctx0, q, idx_dim, n_idx_h, n_tokens);
@@ -824,6 +841,15 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     // scores and top-k for nt queries per stream: q_part [idx_dim, n_idx_h, nt*n_stream], bias_part / mask_part hold
     // the matching rows of inp->bias / kq_mask
     auto score_top_k = [&](ggml_tensor * q_part, int64_t nt, ggml_tensor * bias_part, ggml_tensor * mask_part) {
+        if (qsa_fused) {
+            // [TAG_FN_QSA_FUSED] the block bias goes into the score, the per-cell term (mask or bias) into the top-k
+            ggml_tensor * score = ggml_qsa_score(ctx0, k_all, inp->blk_cells, inp->blk_pos, model.layers[il].index_k_norm,
+                    q_part, blk_bias ? bias_part : nullptr, (int) r, hparams.f_norm_rms_eps,
+                    n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow);
+            cb(score, "indexer_score", il);
+            return ggml_qsa_topk(ctx0, score, inp->cell_blk, blk_bias ? mask_part : bias_part, (int) width);
+        }
+
         // rectify each head dot product before the sum, as in the DeepSeek lightning indexer
         // mul_mat matches ne[2], so the queries of stream s only meet the blocks of stream s
         ggml_tensor * score = ggml_mul_mat(ctx0, pooled,
@@ -868,10 +894,13 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     // [TAG_FN_QSA_CHUNK] TURBO_QSA_CHUNK=<n>: score the queries n at a time, so the f32 [n_kv x n_ubatch] temporaries
     // (expanded scores, cast mask, bias add) shrink to [n_kv x n]. Top-k is per query, so the indices are the same;
     // the chunks' indices are concatenated for the unchanged attention below. Single stream only; 0 (default) = off.
-    static const int64_t qsa_chunk = [] {
+    static const int64_t qsa_chunk_env = [] {
         const char * e = getenv("TURBO_QSA_CHUNK");
-        return e ? std::max<int64_t>(0, atoll(e)) : 0;
+        return e ? std::max<int64_t>(0, atoll(e)) : -1;
     }();
+    // [TAG_FN_QSA_FUSED] the fused path chunks by 64 unless TURBO_QSA_CHUNK says otherwise: its [n_blocks x chunk] block
+    // scores are then 16 MiB at 262144 cells, whatever the ubatch
+    const int64_t qsa_chunk = qsa_chunk_env >= 0 ? qsa_chunk_env : (qsa_fused ? 64 : 0);
 
     ggml_tensor * top_k = nullptr;
     if (qsa_chunk > 0 && n_stream == 1 && blk_bias && n_tps > qsa_chunk && kq_mask->ne[2] == 1) {
