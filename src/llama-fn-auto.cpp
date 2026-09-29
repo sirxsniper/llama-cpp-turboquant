@@ -377,6 +377,48 @@ size_t llama_fn_vram_fit_budget(size_t total, size_t free, size_t ceiling, size_
     return std::min(a, b);
 }
 
+// [TAG_FN_RAM_FIT] -------------------------------------------------------------------------------------------------
+
+llama_ram_fit_out llama_ram_fit_plan(const llama_ram_fit_in & in) {
+    constexpr int64_t MiB = 1 << 20;
+
+    llama_ram_fit_out out;
+    out.cache_ram_mib = in.cache_ram_mib;
+    out.ckpt_mib      = in.ckpt_mib;
+
+    const int64_t n_slots = std::max<int32_t>(1, in.n_slots);
+    const int64_t limit   = (int64_t) (std::max(0.0, std::min(1.0, in.frac)) * (double) in.ram_total);
+    const int64_t fixed   = (int64_t) (in.model_host + in.host_buffers);
+    const int64_t p_req   = in.cache_ram_mib < 0 ? (int64_t) in.ram_total : in.cache_ram_mib*MiB;
+    const int64_t c_req   = std::max<int64_t>(0, in.ckpt_mib)*MiB*n_slots;
+
+    out.limit = (uint64_t) limit;
+    out.need  = (uint64_t) (fixed + p_req + c_req);
+    if (fixed + p_req + c_req <= limit) {
+        return out;
+    }
+    out.over = true;
+
+    const int64_t room_mib = (limit - fixed) / MiB; // negative when the model alone passes the limit
+
+    // checkpoints first: they save re-prefills of the running conversation; never raised, never below the minimum
+    if (!in.ckpt_set && in.ckpt_mib > 0) {
+        const int64_t per_slot = room_mib > 0 ? room_mib / n_slots : 0;
+        out.ckpt_mib = std::min<int64_t>(in.ckpt_mib, std::max<int64_t>(in.ckpt_min_mib, per_slot));
+    }
+    // then the prompt cache (idle conversations): what is left, and nothing below 256 MiB
+    if (!in.cache_ram_set && in.cache_ram_mib != 0) {
+        const int64_t left = room_mib - std::max<int64_t>(0, out.ckpt_mib)*n_slots;
+        int64_t p = left < 256 ? 0 : left;
+        if (in.cache_ram_mib > 0) {
+            p = std::min<int64_t>(p, in.cache_ram_mib);
+        }
+        out.cache_ram_mib = p;
+    }
+    out.changed = out.cache_ram_mib != in.cache_ram_mib || out.ckpt_mib != in.ckpt_mib;
+    return out;
+}
+
 // model hooks ---------------------------------------------------------------------------------------------------------
 
 void llama_fn_auto_on_load(llama_model & model, llama_model_loader & ml, const std::string & fname, const llama_model_params & params) {

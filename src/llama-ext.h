@@ -168,6 +168,34 @@ LLAMA_API const char * llama_model_fn_env(const struct llama_model * model, cons
 // [TAG_FN_AUTO] "safe", "fast" or "fast-dma" while the automatic defaults are active for this model, else nullptr
 LLAMA_API const char * llama_model_fn_profile(const struct llama_model * model);
 
+// [TAG_FN_RAM_FIT] host memory plan for a model bigger than RAM (mmap): when the host-resident model bytes, the host
+// buffers, the prompt cache and the context checkpoints need more than frac of physical RAM, the checkpoint budget is
+// lowered (never below ckpt_min_mib per slot) and then the prompt cache (0 below 256 MiB), so the mapped expert pages
+// stay in the page cache. Values the user set are kept. Nothing is raised.
+struct llama_ram_fit_in {
+    uint64_t ram_total     = 0;     // physical RAM, bytes
+    uint64_t model_host    = 0;     // model bytes on host buffers (mapped or not)
+    uint64_t host_buffers  = 0;     // host KV / recurrent / compute buffers of the contexts, bytes
+    int64_t  cache_ram_mib = 0;     // prompt cache (--cache-ram), -1 = no limit, 0 = off
+    bool     cache_ram_set = false; // set by the user
+    int64_t  ckpt_mib      = 0;     // context checkpoint byte budget per slot, 0 = none or no byte bound
+    bool     ckpt_set      = false; // set by the user (--ctx-checkpoints or LLAMA_CTX_CHECKPOINT_BUDGET_MIB)
+    int32_t  n_slots       = 1;
+    double   frac          = 0.85;
+    int64_t  ckpt_min_mib  = 512;
+};
+
+struct llama_ram_fit_out {
+    bool     over          = false; // the request passed frac x RAM
+    bool     changed       = false; // a value below differs from the request
+    uint64_t limit         = 0;     // frac x RAM, bytes
+    uint64_t need          = 0;     // bytes of the request
+    int64_t  cache_ram_mib = 0;     // prompt cache to use
+    int64_t  ckpt_mib      = 0;     // checkpoint budget per slot to use
+};
+
+LLAMA_API llama_ram_fit_out llama_ram_fit_plan(const llama_ram_fit_in & in);
+
 // retrieves the whole token embedding matrix in F32 format (n_embd * n_vocab)
 // returns total number of elements or 0 on error
 // if out is nullptr, returns the number of tokens without writing to out

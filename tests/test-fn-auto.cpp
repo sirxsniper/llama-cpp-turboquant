@@ -256,6 +256,84 @@ static void test_even_slots() {
     TCHECK(llama_fn_even_slots({}, b, 512) == 0, "no layers");
 }
 
+static void test_ram_fit() {
+    // Flash-Next on a 96 GB box: host experts (72 GB) + PLE (28.8 GB) mapped, bigger than RAM on their own
+    llama_ram_fit_in fn;
+    fn.ram_total     = 96 * GiB;
+    fn.model_host    = 101 * GiB;
+    fn.host_buffers  = 3 * GiB;
+    fn.cache_ram_mib = 8192;
+    fn.ckpt_mib      = 2048;
+    fn.n_slots       = 1;
+    llama_ram_fit_out o = llama_ram_fit_plan(fn);
+    TCHECK(o.over && o.changed, "Flash-Next passes 85%% of RAM");
+    TCHECK(o.cache_ram_mib == 0, "prompt cache off (%lld)", (long long) o.cache_ram_mib);
+    TCHECK(o.ckpt_mib == 512, "checkpoints down to the minimum (%lld)", (long long) o.ckpt_mib);
+    TCHECK(o.limit == (uint64_t) (0.85 * (double) (96 * GiB)), "limit is 85%% of RAM");
+
+    // the test servers' --cache-ram 16384 given by the user: kept; checkpoints still capped
+    llama_ram_fit_in fu = fn;
+    fu.cache_ram_mib = 16384;
+    fu.cache_ram_set = true;
+    o = llama_ram_fit_plan(fu);
+    TCHECK(o.over && o.cache_ram_mib == 16384 && o.ckpt_mib == 512, "explicit --cache-ram kept");
+    llama_ram_fit_in fc = fn;
+    fc.ckpt_set = true;
+    o = llama_ram_fit_plan(fc);
+    TCHECK(o.over && o.ckpt_mib == 2048 && o.cache_ram_mib == 0, "explicit checkpoints kept");
+
+    // Qwen3.8-27B fully on the GPU: nothing on the host, nothing changes
+    llama_ram_fit_in q5;
+    q5.ram_total     = 96 * GiB;
+    q5.model_host    = 1 * GiB;
+    q5.host_buffers  = 2 * GiB;
+    q5.cache_ram_mib = 16384;
+    q5.ckpt_mib      = 2048;
+    q5.n_slots       = 4;
+    o = llama_ram_fit_plan(q5);
+    TCHECK(!o.over && !o.changed && o.cache_ram_mib == 16384 && o.ckpt_mib == 2048, "27B unchanged");
+
+    // partial room: 64 GB RAM, 40 GB model, 4 GB buffers, 2 slots -> checkpoints kept, prompt cache shrunk to the rest
+    llama_ram_fit_in pr;
+    pr.ram_total     = 64 * GiB;
+    pr.model_host    = 40 * GiB;
+    pr.host_buffers  = 4 * GiB;
+    pr.cache_ram_mib = 16384;
+    pr.ckpt_mib      = 2048;
+    pr.n_slots       = 2;
+    o = llama_ram_fit_plan(pr);
+    const int64_t room = ((int64_t) (0.85 * (double) (64 * GiB)) - (int64_t) (44 * GiB)) / (int64_t) MiB;
+    TCHECK(o.over && o.ckpt_mib == 2048, "checkpoints fit (%lld)", (long long) o.ckpt_mib);
+    TCHECK(o.cache_ram_mib == room - 2 * 2048, "prompt cache = room - checkpoints (%lld vs %lld)", (long long) o.cache_ram_mib,
+           (long long) (room - 2 * 2048));
+
+    // unlimited prompt cache (-1, not given explicitly) is bounded; a disabled one and disabled checkpoints stay off
+    llama_ram_fit_in un = pr;
+    un.cache_ram_mib = -1;
+    o = llama_ram_fit_plan(un);
+    TCHECK(o.over && o.cache_ram_mib == room - 2 * 2048, "unlimited prompt cache bounded");
+    llama_ram_fit_in off = fn;
+    off.cache_ram_mib = 0;
+    off.ckpt_mib      = 0;
+    o = llama_ram_fit_plan(off);
+    TCHECK(o.over && o.cache_ram_mib == 0 && o.ckpt_mib == 0 && !o.changed, "off stays off");
+    // never raised: a budget below the minimum is kept
+    llama_ram_fit_in lo = fn;
+    lo.ckpt_mib = 256;
+    o = llama_ram_fit_plan(lo);
+    TCHECK(o.ckpt_mib == 256, "a small budget is not raised to the minimum");
+    // a prompt cache left below 256 MiB is turned off
+    llama_ram_fit_in sm;
+    sm.ram_total     = 100 * GiB;
+    sm.model_host    = 84 * GiB + 900 * MiB;
+    sm.host_buffers  = 0;
+    sm.cache_ram_mib = 8192;
+    sm.ckpt_mib      = 0;
+    sm.n_slots       = 1;
+    o = llama_ram_fit_plan(sm);
+    TCHECK(o.over && o.cache_ram_mib == 0, "less than 256 MiB left: prompt cache off (%lld)", (long long) o.cache_ram_mib);
+}
+
 int main() {
     // no ggml_backend_load_all(): the backends are linked in (GGML_BACKEND_DL=OFF); run with CUDA_VISIBLE_DEVICES=-1
     test_profile_names();
@@ -265,6 +343,7 @@ int main() {
     test_inject();
     test_even_slots();
     test_vram_fit();
+    test_ram_fit();
 
     printf("test-fn-auto: %d checks, %d failed\n", g_checks, g_fail);
     return g_fail == 0 ? 0 : 1;
