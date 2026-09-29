@@ -675,11 +675,193 @@ static __device__ __forceinline__ void flash_attn_ext_turbot_load_tile_young_dis
 }
 
 // ------------------------------------------------------------------------------------------------------------------
+// [TAG_FN_TURBOT_SPARSE] Gather loader of the sparse turbot FA (the QSA layers of qwen4exp). Row i of the tile is cell
+// idx[i]; a row at or past i_sup, or with idx[i] < 0, is a zero row (its mask entry is -inf). The granule of each cell
+// picks the young or the old read, so one tile may hold both. The chunk decode is the runtime-width body of
+// flash_attn_ext_turbot_load_tile_old / _young above, copied: a cell gives the same halves as in the dense kernel.
+template<int stride_tile, int nwarps, int nbatch_fa>
+static __device__ __forceinline__ void flash_attn_ext_turbot_load_tile_sparse(
+        const char * const __restrict__ row_base,   // base row of cell 0
+        const char * const __restrict__ pool,       // young pool of the layer
+        const int32_t * const __restrict__ gtab,    // granule table
+        const int32_t * const __restrict__ idx,     // index list of this tile
+        half2 * const __restrict__ tile_KV,
+        const int D2,                                // half2 per row to produce, a multiple of 16
+        const int64_t stride_row,                    // base row bytes
+        const int64_t stride_prow,                   // pool row bytes
+        const int elem0,                             // first element inside the run, a multiple of 32
+        const turbot_side_state & st,
+        const float * const __restrict__ lut_old,    // shared copy of C_b (only read by the float old path)
+        const float * const __restrict__ lut_young,  // shared copy of LUT_{b,y}
+        const int i_sup) {
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+
+    constexpr int h2_per_chunk   = 16;
+    constexpr int elem_per_chunk = 2*h2_per_chunk;
+    const int chunks_per_row = D2 / h2_per_chunk;
+
+    constexpr bool old_i8 = GGML_CUDA_TURBOT_OLD_I8 != 0;
+
+    const turbot_planes_state & base = st.base;
+    const turbot_planes_state & pl   = st.pool;
+    const int                   bb   = st.b;
+    const int                   rr   = st.r;
+
+    auto load = [&] __device__ (const int n) {
+        const int stride_k = warp_size >> n;
+        const int k0_start = stride_k == warp_size ? 0 : chunks_per_row - chunks_per_row % (2*stride_k);
+        const int k0_stop  =                             chunks_per_row - chunks_per_row % (1*stride_k);
+        const int stride_i = warp_size / stride_k;
+
+        if (k0_start == k0_stop) {
+            return;
+        }
+
+#pragma unroll
+        for (int i0 = 0; i0 < nbatch_fa; i0 += nwarps*stride_i) {
+            const int i = i0 + threadIdx.y*stride_i + (stride_k == warp_size ? 0 : threadIdx.x / stride_k);
+
+            if (i0 + nwarps*stride_i > nbatch_fa && i >= nbatch_fa) {
+                break;
+            }
+
+            const int32_t cell = i < i_sup ? idx[i] : -1;
+            const int32_t slot = cell >= 0 ? gtab[cell >> GGML_TURBOT_LOG2_GRANULE] : -1;
+            const char * __restrict__ row  = row_base + (size_t) (cell >= 0 ? cell : 0) * (size_t) stride_row;
+            const char * __restrict__ prow = pool +
+                ((size_t) (slot >= 0 ? slot : 0) * (size_t) GGML_TURBOT_GRANULE + (size_t) (cell & (GGML_TURBOT_GRANULE - 1))) * (size_t) stride_prow;
+
+#pragma unroll
+            for (int k0 = k0_start; k0 < k0_stop; k0 += stride_k) {
+                const int k = k0 + (stride_k == warp_size ? threadIdx.x : threadIdx.x % stride_k);
+
+                __align__(16) half2 out[h2_per_chunk];
+
+                if (cell < 0) {
+#pragma unroll
+                    for (int e = 0; e < h2_per_chunk; ++e) {
+                        out[e] = make_half2(0.0f, 0.0f);
+                    }
+                } else {
+                    const int e0 = elem0 + k*elem_per_chunk;
+
+                    __align__(16) uint32_t b4[4] = {0u, 0u, 0u, 0u};
+                    __align__(16) uint32_t b2[2] = {0u, 0u};
+                    uint32_t b1 = 0u;
+                    if (base.has4) {
+                        ggml_cuda_memcpy_1<16>(b4, row + base.p4 + (e0 >> 1));
+                    }
+                    if (base.has2) {
+                        ggml_cuda_memcpy_1<8>(b2, row + base.p2 + (e0 >> 2));
+                    }
+                    if (base.has1) {
+                        ggml_cuda_memcpy_1<4>(&b1, row + base.p1 + (e0 >> 3));
+                    }
+
+                    if (slot >= 0) {
+                        // young: flash_attn_ext_turbot_load_tile_young<-1, -1>
+                        __align__(16) uint32_t r4[4] = {0u, 0u, 0u, 0u};
+                        __align__(16) uint32_t r2[2] = {0u, 0u};
+                        uint32_t r1 = 0u;
+                        if (pl.has4) {
+                            ggml_cuda_memcpy_1<16>(r4, prow + pl.p4 + (e0 >> 1));
+                        }
+                        if (pl.has2) {
+                            ggml_cuda_memcpy_1<8>(r2, prow + pl.p2 + (e0 >> 2));
+                        }
+                        if (pl.has1) {
+                            ggml_cuda_memcpy_1<4>(&r1, prow + pl.p1 + (e0 >> 3));
+                        }
+
+                        const float gain = __half2float(((const ggml_half *) (prow + st.pool_gain))[e0 >> 7]);
+
+#pragma unroll
+                        for (int p = 0; p < h2_per_chunk; ++p) {
+                            const int      e_0  = 2*p;
+                            const int      e_1  = 2*p + 1;
+                            const unsigned idx0 = (turbot_code(b4[e_0 >> 3], b2[e_0 >> 4], b1, e_0, base) << rr) |
+                                                   turbot_code(r4[e_0 >> 3], r2[e_0 >> 4], r1, e_0, pl);
+                            const unsigned idx1 = (turbot_code(b4[e_1 >> 3], b2[e_1 >> 4], b1, e_1, base) << rr) |
+                                                   turbot_code(r4[e_1 >> 3], r2[e_1 >> 4], r1, e_1, pl);
+                            out[p] = make_half2(lut_young[idx0] * gain, lut_young[idx1] * gain);
+                        }
+                    } else {
+                        // old: flash_attn_ext_turbot_load_tile_old<-1>
+                        const float gain = __half2float(((const ggml_half *) (row + st.base_gain))[e0 >> 7]);
+
+                        if (old_i8 && bb == 4) {
+                            turbo4_int8_lut lut;
+                            lut.init();
+                            const float nscale = gain * TURBO_INT8_4BIT_SCALE_REVERSE;
+#pragma unroll
+                            for (int w = 0; w < 4; ++w) {
+                                const int g0 = (int) lut.gather4( b4[w]        & 0xFFFFu);
+                                const int g1 = (int) lut.gather4((b4[w] >> 16) & 0xFFFFu);
+
+                                out[4*w + 0] = make_half2((float) (int8_t) (g0      ) * nscale, (float) (int8_t) (g0 >>  8) * nscale);
+                                out[4*w + 1] = make_half2((float) (int8_t) (g0 >> 16) * nscale, (float) (int8_t) (g0 >> 24) * nscale);
+                                out[4*w + 2] = make_half2((float) (int8_t) (g1      ) * nscale, (float) (int8_t) (g1 >>  8) * nscale);
+                                out[4*w + 3] = make_half2((float) (int8_t) (g1 >> 16) * nscale, (float) (int8_t) (g1 >> 24) * nscale);
+                            }
+                        } else if (old_i8 && bb == 5) {
+                            turbo5_int8_lut lut;
+                            lut.init();
+                            const float nscale = gain * TURBO_INT8_5BIT_SCALE_REVERSE;
+#pragma unroll
+                            for (int w = 0; w < 4; ++w) {
+                                const int g0 = (int) lut.gather4( b4[w]        & 0xFFFFu, (b1 >> (8*w    )) & 0xFu);
+                                const int g1 = (int) lut.gather4((b4[w] >> 16) & 0xFFFFu, (b1 >> (8*w + 4)) & 0xFu);
+
+                                out[4*w + 0] = make_half2((float) (int8_t) (g0      ) * nscale, (float) (int8_t) (g0 >>  8) * nscale);
+                                out[4*w + 1] = make_half2((float) (int8_t) (g0 >> 16) * nscale, (float) (int8_t) (g0 >> 24) * nscale);
+                                out[4*w + 2] = make_half2((float) (int8_t) (g1      ) * nscale, (float) (int8_t) (g1 >>  8) * nscale);
+                                out[4*w + 3] = make_half2((float) (int8_t) (g1 >> 16) * nscale, (float) (int8_t) (g1 >> 24) * nscale);
+                            }
+                        } else if (old_i8 && bb <= 3) {
+                            const uint32_t pw0    = bb == 2 ? (uint32_t) TURBOT_I8_B2_W0 : (uint32_t) TURBOT_I8_B3_W0;
+                            const uint32_t pw1    = bb == 2 ? 0u                         : (uint32_t) TURBOT_I8_B3_W1;
+                            const float    nscale = gain * (bb == 2 ? (float) TURBOT_I8_B2_SCALE : (float) TURBOT_I8_B3_SCALE);
+#pragma unroll
+                            for (int m = 0; m < 8; ++m) {
+                                uint32_t nib = (b2[m >> 2] >> (8*(m & 3))) & 0xFFu;
+                                nib = (nib | (nib << 4)) & 0x0F0Fu;
+                                nib = (nib | (nib << 2)) & 0x3333u;
+                                uint32_t hib = (b1 >> (4*m)) & 0xFu;
+                                hib = (hib | (hib << 6)) & 0x0303u;
+                                hib = (hib | (hib << 3)) & 0x1111u;
+                                const int g = (int) __byte_perm(pw0, pw1, nib | (hib << 2));
+
+                                out[2*m + 0] = make_half2((float) (int8_t) (g      ) * nscale, (float) (int8_t) (g >>  8) * nscale);
+                                out[2*m + 1] = make_half2((float) (int8_t) (g >> 16) * nscale, (float) (int8_t) (g >> 24) * nscale);
+                            }
+                        } else {
+#pragma unroll
+                            for (int p = 0; p < h2_per_chunk; ++p) {
+                                const unsigned c0 = turbot_code(b4[(2*p    ) >> 3], b2[(2*p    ) >> 4], b1, 2*p,     base);
+                                const unsigned c1 = turbot_code(b4[(2*p + 1) >> 3], b2[(2*p + 1) >> 4], b1, 2*p + 1, base);
+                                out[p] = make_half2(lut_old[c0] * gain, lut_old[c1] * gain);
+                            }
+                        }
+                    }
+                }
+
+#pragma unroll
+                for (int c = 0; c < h2_per_chunk/4; ++c) {
+                    ggml_cuda_memcpy_1<16>(tile_KV + i*stride_tile + k*h2_per_chunk + 4*c, out + 4*c);
+                }
+            }
+        }
+    };
+    ggml_cuda_unroll<6>{}(load);
+}
+
+// ------------------------------------------------------------------------------------------------------------------
 // Copy of flash_attn_ext_f16_iter for turbot: nstages = 0, V_is_K_view = false, Q in registers.
 
 template<int DKQ, int DV, int ncols1, int ncols2, int nwarps,
     bool use_logit_softcap, bool needs_fixup, bool is_fixup, bool last_iter, bool oob_check,
-    typename T_A_KQ, typename T_B_KQ, typename T_C_KQ, typename T_A_VKQ, typename T_B_VKQ, typename T_C_VKQ>
+    typename T_A_KQ, typename T_B_KQ, typename T_C_KQ, typename T_A_VKQ, typename T_B_VKQ, typename T_C_VKQ,
+    bool use_sparse = false>   // [TAG_FN_TURBOT_SPARSE] KV tile kb0 is entries [kb0*nbatch_fa, ...) of the index list
 static __device__ __forceinline__ void flash_attn_ext_turbot_iter(
         const float2 * const __restrict__ Q_f2,
         const char   * const __restrict__ K_row,     // [TAG_TURBOT] base row of cell 0 (row base, not a head base)
@@ -715,7 +897,8 @@ static __device__ __forceinline__ void flash_attn_ext_turbot_iter(
         const int kb0,
         const int k_VKQ_sup,
         const turbot_head_state & hs,
-        const int eb) {                              // [TAG_TURBOT_ANY_D128] head element base in its run, 0 for D=256
+        const int eb,                                // [TAG_TURBOT_ANY_D128] head element base in its run, 0 for D=256
+        const int32_t * const __restrict__ indices = nullptr) {   // [TAG_FN_TURBOT_SPARSE] the query tile's index list
 #if defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
     constexpr int  warp_size       = ggml_cuda_get_physical_warp_size();
     constexpr int  ncols           = ncols1 * ncols2;
@@ -746,7 +929,8 @@ static __device__ __forceinline__ void flash_attn_ext_turbot_iter(
     // [TAG_TURBOT] One granule table load per KV tile. k_VKQ_0 is the tile's first cell and a tile lies inside one
     // granule, so every lane of the block reads the same entry: the OLD/YOUNG branch below is lane-uniform. The lookup
     // stays in range, (ne11 - 1) >> 6 < n_granules (asserted on the host). Pool addresses are size_t.
-    const int32_t      slot    = gtab[k_VKQ_0 >> GGML_TURBOT_LOG2_GRANULE];
+    // [TAG_FN_TURBOT_SPARSE] a sparse tile is a slice of the index list: no granule of its own, the loader reads gtab per cell
+    const int32_t      slot    = use_sparse ? -1 : gtab[k_VKQ_0 >> GGML_TURBOT_LOG2_GRANULE];
     const bool         young   = slot >= 0;
     const char * const K_base0 = K_row + (size_t) k_VKQ_0 * (size_t) nb11;
     const char * const V_base0 = V_row + (size_t) k_VKQ_0 * (size_t) nb21;
@@ -755,14 +939,20 @@ static __device__ __forceinline__ void flash_attn_ext_turbot_iter(
 
     {
         constexpr bool use_cp_async = false;
+        if constexpr (use_sparse) {
+            // [TAG_FN_TURBOT_SPARSE] mask entries of the listed cells, -inf past the list (never a positional mask)
+            flash_attn_ext_f16_load_mask<ncols1, nwarps, nbatch_fa, use_cp_async, oob_check, true>
+                (mask_h, tile_mask, stride_mask, k_VKQ_0, k_VKQ_sup, jt*ncols1, ne01, indices);
+        } else {
         if (kv_pos) {   // [TAG_FA_POS_MASK]
             flash_attn_ext_f16_gen_mask<ncols1, nwarps, nbatch_fa, oob_check>
                 (kv_pos + k_VKQ_0, q_pos, fattn_seq_at(kv_seq, k_VKQ_0), q_seq, tile_mask, k_VKQ_sup, jt*ncols1, ne01);
         } else if (ncols2 > 1 || mask_h) {
-            // [TAG_SYNC_LOAD_MASK] upstream load_mask takes the tile start and a sparse index list; turbot never
-            // uses sparse FA, so use_sparse = false and no indices (same addresses as the old mask_h + k_VKQ_0).
+            // [TAG_SYNC_LOAD_MASK] upstream load_mask takes the tile start and a sparse index list; the dense turbot
+            // path uses use_sparse = false and no indices (same addresses as the old mask_h + k_VKQ_0).
             flash_attn_ext_f16_load_mask<ncols1, nwarps, nbatch_fa, use_cp_async, oob_check, false>
                 (mask_h, tile_mask, stride_mask, k_VKQ_0, k_VKQ_sup, jt*ncols1, ne01, nullptr);
+        }
         }
     }
 
@@ -773,7 +963,11 @@ static __device__ __forceinline__ void flash_attn_ext_turbot_iter(
 
         // [TAG_TURBOT] K side: element offset inside the head is k0_start*2 (the rows are row bases, no head bias).
         // [TAG_TURBOT_ANY_D128] inside the run: k0_start*2 + eb for D=128, k0_start*2 exactly for D=256.
-        if (young) {
+        if constexpr (use_sparse) {
+            flash_attn_ext_turbot_load_tile_sparse<stride_tile_K, nwarps, nbatch_fa>
+                (K_row, pool, gtab, indices + k_VKQ_0, tile_K, k0_diff, nb11, nb_pool, turbot_elem_base<DKQ>(k0_start*2, eb), hs.k,
+                 lut + TURBOT_LUT_K_OLD, lut + TURBOT_LUT_K_YOUNG, k_VKQ_sup);
+        } else if (young) {
             flash_attn_ext_turbot_load_tile_young_dispatch<(ncols >= TURBOT_CT_WIDTH_MIN_NCOLS), stride_tile_K, nwarps, nbatch_fa, oob_check>
                 (hs.generic, K_base0, prow0, tile_K, k0_diff, nb11, nb_pool, turbot_elem_base<DKQ>(k0_start*2, eb), hs.k, lut + TURBOT_LUT_K_YOUNG, k_VKQ_sup);
         } else {
@@ -1077,7 +1271,11 @@ static __device__ __forceinline__ void flash_attn_ext_turbot_iter(
 
         // [TAG_TURBOT] V side: V base row offsets, V refinement at pool_v_off (folded into hs.v.pool).
         // [TAG_TURBOT_ANY_D128] first element i0_start + eb for D=128, i0_start exactly for D=256.
-        if (young) {
+        if constexpr (use_sparse) {
+            flash_attn_ext_turbot_load_tile_sparse<stride_tile_V, nwarps, nbatch_fa>
+                (V_row, pool, gtab, indices + k_VKQ_0, tile_V, i0_diff/2, nb21, nb_pool, turbot_elem_base<DKQ>(i0_start, eb), hs.v,
+                 lut + TURBOT_LUT_V_OLD, lut + TURBOT_LUT_V_YOUNG, k_VKQ_sup);
+        } else if (young) {
             flash_attn_ext_turbot_load_tile_young_dispatch<(ncols >= TURBOT_CT_WIDTH_MIN_NCOLS), stride_tile_V, nwarps, nbatch_fa, oob_check>
                 (hs.generic, V_base0, prow0, tile_V, i0_diff/2, nb21, nb_pool, turbot_elem_base<DKQ>(i0_start, eb), hs.v, lut + TURBOT_LUT_V_YOUNG, k_VKQ_sup);
         } else {
@@ -1134,7 +1332,7 @@ static __device__ __forceinline__ void flash_attn_ext_turbot_iter(
 #else
     GGML_UNUSED_VARS(Q_f2, K_row, V_row, pool, gtab, mask_h, kv_pos, q_pos, kv_seq, q_seq, dstk, dstk_fixup,
         scale, slope, logit_softcap, ne01, ne02, nb11, nb21, nb_pool, stride_mask,
-        tile_Q, tile_K, tile_V, tile_mask, lut, Q_B, VKQ_C, KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup, hs, eb);
+        tile_Q, tile_K, tile_V, tile_mask, lut, Q_B, VKQ_C, KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup, hs, eb, indices);
     NO_DEVICE_CODE;
 #endif // defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
 }
@@ -1143,7 +1341,8 @@ static __device__ __forceinline__ void flash_attn_ext_turbot_iter(
 // Copy of flash_attn_ext_f16_process_tile for turbot: nstages = 0, V_is_K_view = false, Q in registers, plus the
 // shared-memory LUT copy.
 
-template<int DKQ, int DV, int ncols1, int ncols2, int nwarps, bool use_logit_softcap, bool needs_fixup, bool is_fixup>
+template<int DKQ, int DV, int ncols1, int ncols2, int nwarps, bool use_logit_softcap, bool needs_fixup, bool is_fixup,
+    bool use_sparse = false>   // [TAG_FN_TURBOT_SPARSE]
 static __device__ __forceinline__ void flash_attn_ext_turbot_process_tile(
         const float2 * const __restrict__ Q_f2,
         const char   * const __restrict__ K_row,     // [TAG_TURBOT] base row of cell 0
@@ -1177,7 +1376,8 @@ static __device__ __forceinline__ void flash_attn_ext_turbot_process_tile(
         const int kb0_stop,
         const int kb0_stride,                        // [TAG_TURBOT_FA_STRIPE] 1, or the stripe of a striped block
         const turbot_head_state & hs,
-        const int eb) {                              // [TAG_TURBOT_ANY_D128] head element base in its run, 0 for D=256
+        const int eb,                                // [TAG_TURBOT_ANY_D128] head element base in its run, 0 for D=256
+        const int32_t * const __restrict__ indices = nullptr) {   // [TAG_FN_TURBOT_SPARSE] index list, ne11 entries
 #if defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
     //In this kernel Q, K, V are matrices while i, j, k are matrix indices.
 
@@ -1345,26 +1545,27 @@ static __device__ __forceinline__ void flash_attn_ext_turbot_process_tile(
     int kb0 = kb0_start;
 
     // kb0_start is always < kb0_stop so the last iter can be executed unconditionally.
-    if constexpr (ncols2 == 1) {
+    // [TAG_FN_TURBOT_SPARSE] a sparse tile always checks its bounds: the list length ne11 need not be a tile multiple
+    if constexpr (ncols2 == 1 || use_sparse) {
         constexpr bool oob_check = true;
         for (; kb0 + kb0_stride < kb0_stop; kb0 += kb0_stride) {   // [TAG_TURBOT_FA_STRIPE] stride 1: kb0 < kb0_stop-1
             constexpr bool last_iter = false;
             constexpr int  k_VKQ_sup = nbatch_fa;
             flash_attn_ext_turbot_iter
                 <DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, needs_fixup, is_fixup, last_iter, oob_check,
-                 T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>
+                 T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ, use_sparse>
                 (Q_f2, K_row, V_row, pool, gtab, mask_h, kv_pos, q_pos, kv_seq, q_seq, dstk, dstk_fixup, scale, slope, logit_softcap,
                  ne01, ne02, nb11, nb21, nb_pool, stride_mask, tile_Q, tile_K, tile_V, tile_mask, lut, Q_B, VKQ_C,
-                 KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup, hs, eb);
+                 KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup, hs, eb, indices);
         }
         constexpr bool last_iter = true;
         const     int  k_VKQ_sup = ne11 - kb0*nbatch_fa;
         flash_attn_ext_turbot_iter
             <DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, needs_fixup, is_fixup, last_iter, oob_check,
-              T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>
+              T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ, use_sparse>
             (Q_f2, K_row, V_row, pool, gtab, mask_h, kv_pos, q_pos, kv_seq, q_seq, dstk, dstk_fixup, scale, slope, logit_softcap,
              ne01, ne02, nb11, nb21, nb_pool, stride_mask, tile_Q, tile_K, tile_V, tile_mask, lut, Q_B, VKQ_C,
-             KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup, hs, eb);
+             KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup, hs, eb, indices);
     } else {
         constexpr bool oob_check = false;
         for (; kb0 + kb0_stride < kb0_stop; kb0 += kb0_stride) {   // [TAG_TURBOT_FA_STRIPE] stride 1: kb0 < kb0_stop-1
@@ -1782,7 +1983,7 @@ static __device__ __forceinline__ void flash_attn_ext_turbot_process_tile(
     GGML_UNUSED_VARS(Q_f2, K_row, V_row, pool, gtab, mask_h, kv_pos, q_pos, kv_seq, q_seq, sinks_f, dstk, dstk_fixup,
         scale, slope, logit_softcap, ne01, ne02, gqa_ratio, ne11,
         stride_Q1, stride_Q2, nb11, nb21, nb_pool, stride_mask,
-        jt, zt_gqa, kb0_start, kb0_stop, kb0_stride, hs, eb);
+        jt, zt_gqa, kb0_start, kb0_stop, kb0_stride, hs, eb, indices);
     NO_DEVICE_CODE;
 #endif // defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
 }
@@ -1790,7 +1991,10 @@ static __device__ __forceinline__ void flash_attn_ext_turbot_process_tile(
 // ------------------------------------------------------------------------------------------------------------------
 // Kernel entry: every parameter of fattn_kernel_t in the same order, then the turbot inputs (SPEC 7.2).
 
-template<int DKQ, int DV, int ncols1, int ncols2, bool use_logit_softcap>
+// [TAG_FN_TURBOT_SPARSE] use_sparse: KV_max holds one index list of ne11 entries per (sequence, query tile), then the
+// live count of each list (the layout of ggml_cuda_flash_attn_ext_compact_mask, as flash_attn_ext_f16 reads it). KV
+// tile kb0 is list entries [kb0*nbatch_fa, kb0*nbatch_fa + nbatch_fa); no KV bounds scan, no seam table.
+template<int DKQ, int DV, int ncols1, int ncols2, bool use_logit_softcap, bool use_sparse = false>
 __launch_bounds__(ggml_cuda_fattn_mma_get_nthreads(DKQ, DV, ncols1*ncols2), ggml_cuda_fattn_mma_get_occupancy(DKQ, DV, ncols1*ncols2))
 static __global__ void flash_attn_ext_turbot(
         const char * Q_ptr,
@@ -1888,6 +2092,12 @@ static __global__ void flash_attn_ext_turbot(
     const int iter_j     = (ne01.z    + (ncols1    - 1)) / ncols1;
     const int iter_z_gqa = (gqa_ratio + (ncols2    - 1)) / ncols2;
 
+    // [TAG_FN_TURBOT_SPARSE] the lists first, the counts after them
+    const int * GGML_CUDA_RESTRICT sparse_lists = use_sparse ? KV_max_ptr : nullptr;
+    if constexpr (use_sparse) {
+        KV_max = KV_max_ptr + int64_t(iter_j)*ne33*ne11;
+    }
+
     // kbc == k block continuous, current index in continuous ijk space.
     // [TAG_TURBOT_FA_BALANCE] With a seam table the block's [kbc, kbc_stop) is the work-balanced slice the host
     // launched flash_attn_turbot_balance_bounds for; without one it is the uniform slice of launch_fattn. Everything
@@ -1954,7 +2164,17 @@ static __global__ void flash_attn_ext_turbot(
         // nothing for any query in the tile, so starting the accumulators at kb0_min and normalising here is exact.
         const bool block_owns_tile_start = kb0_start == 0;
 
-        if (KV_max) {
+        // [TAG_FN_TURBOT_SPARSE] the query tile's list; its tiles past the live count are all -1 (zero contribution)
+        const int32_t * indices = use_sparse ? sparse_lists + (int64_t(sequence % ne33)*iter_j + jt)*ne11 : nullptr;
+
+        if constexpr (use_sparse) {
+            kb0_stop = min(kb0_stop, (KV_max[(sequence % ne33)*iter_j + jt] + nbatch_fa - 1) / nbatch_fa);
+            if (stripe > 0 && kb0_start >= kb0_stop) {
+                // [TAG_TURBOT_FA_STRIPE] no live tile left on this stripe: one zero-contribution tile of it
+                kb0_start = kbc % iter_k;
+                kb0_stop  = kb0_start + 1;
+            }
+        } else if (KV_max) {
             // [TAG_FA_KVMIN] the array holds {max, min} pairs
             const int kvb = 2*(sequence*iter_j + jt);
             kb0_stop = min(kb0_stop, KV_max[kvb + 0] / nbatch_fa);
@@ -1981,16 +2201,16 @@ static __global__ void flash_attn_ext_turbot(
         constexpr bool is_fixup = false; // All but (potentially) the last iterations write their data to dst rather than the fixup buffer.
         if (block_owns_tile_start) {
             constexpr bool needs_fixup = false; // CUDA block is working on an entire tile.
-            flash_attn_ext_turbot_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, needs_fixup, is_fixup>
+            flash_attn_ext_turbot_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, needs_fixup, is_fixup, use_sparse>
                 (Q_f2, K_row, V_row, pool, gtab, mask_h, kv_pos, q_pos, pos_seq.kv, pos_seq.q, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
                  ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, (int64_t) nb11, (int64_t) nb21, nb_pool, stride_mask,
-                 jt, zt_gqa, kb0_start, kb0_stop, kb0_stride, hs, eb);
+                 jt, zt_gqa, kb0_start, kb0_stop, kb0_stride, hs, eb, indices);
         } else {
             constexpr bool needs_fixup = true; // CUDA block is missing the beginning of a tile.
-            flash_attn_ext_turbot_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, needs_fixup, is_fixup>
+            flash_attn_ext_turbot_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, needs_fixup, is_fixup, use_sparse>
                 (Q_f2, K_row, V_row, pool, gtab, mask_h, kv_pos, q_pos, pos_seq.kv, pos_seq.q, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
                  ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, (int64_t) nb11, (int64_t) nb21, nb_pool, stride_mask,
-                 jt, zt_gqa, kb0_start, kb0_stop, kb0_stride, hs, eb);
+                 jt, zt_gqa, kb0_start, kb0_stop, kb0_stride, hs, eb, indices);
         }
 
         kbc += iter_k;
@@ -2027,7 +2247,16 @@ static __global__ void flash_attn_ext_turbot(
 
     const float slope = ncols2 == 1 ? get_alibi_slope(max_bias, zt_Q, n_head_log2, m0, m1) : 1.0f;
 
-    if (KV_max) {
+    // [TAG_FN_TURBOT_SPARSE] as in the loop above
+    const int32_t * indices = use_sparse ? sparse_lists + (int64_t(sequence % ne33)*iter_j + jt)*ne11 : nullptr;
+
+    if constexpr (use_sparse) {
+        kb0_stop = min(kb0_stop, (KV_max[(sequence % ne33)*iter_j + jt] + nbatch_fa - 1) / nbatch_fa);
+        if (stripe > 0 && kb0_start >= kb0_stop) {
+            kb0_start = kbc % iter_k;
+            kb0_stop  = kb0_start + 1;
+        }
+    } else if (KV_max) {
         // [TAG_FA_KVMIN] the array holds {max, min} pairs
         const int kvb = 2*(sequence*iter_j + jt);
         kb0_stop = min(kb0_stop, KV_max[kvb + 0] / nbatch_fa);
@@ -2053,10 +2282,10 @@ static __global__ void flash_attn_ext_turbot(
 
     constexpr bool is_fixup = true; // Last index writes its data to fixup buffer to avoid data races with other blocks.
     constexpr bool needs_fixup = false;
-    flash_attn_ext_turbot_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, needs_fixup, is_fixup>
+    flash_attn_ext_turbot_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, needs_fixup, is_fixup, use_sparse>
         (Q_f2, K_row, V_row, pool, gtab, mask_h, kv_pos, q_pos, pos_seq.kv, pos_seq.q, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
          ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, (int64_t) nb11, (int64_t) nb21, nb_pool, stride_mask,
-         jt, zt_gqa, kb0_start, kb0_stop, kb0_stride, hs, eb);
+         jt, zt_gqa, kb0_start, kb0_stop, kb0_stride, hs, eb, indices);
 #else
     GGML_UNUSED_VARS(Q_ptr, K_ptr, V_ptr, mask_ptr, sinks_ptr, kv_pos, q_pos, KV_max_ptr, dst_ptr, dst_meta_ptr, scale,
         max_bias, m0, m1, n_head_log2, logit_softcap,
@@ -2871,10 +3100,14 @@ static __host__ void ggml_cuda_fattn_turbot_balance_weights(
 
 // Copy of launch_fattn (fattn-common.cuh) without the F16 conversion: same asserts, same KV_max scans with the same
 // gates, same stream_k block layout and fixup launches, plus the turbot kernel arguments.
+// [TAG_FN_TURBOT_SPARSE] use_sparse: fattn_kernel is a use_sparse instance. The mask is compacted into one index list per
+// query tile (ggml_cuda_flash_attn_ext_compact_mask, min(Q, ncols1) * n_kv_max entries), no KV bounds scan and no seam
+// table run, and the kernel walks the lists (ne11 = the list length) with the uniform stream_k layout (striped when the
+// fixup layout is uniform, so every block of an output tile gets its share of the live list).
 template <int DV, int ncols1, int ncols2>
 static void launch_fattn_turbot(
     ggml_backend_cuda_context & ctx, ggml_tensor * dst, fattn_turbot_kernel_t fattn_kernel, const int nwarps, const size_t nbytes_shared,
-    const int nbatch_fa, const int warp_size = WARP_SIZE
+    const int nbatch_fa, const int warp_size = WARP_SIZE, const bool use_sparse = false
 ) {
     constexpr int ncols = ncols1 * ncols2;
     constexpr bool stream_k = true;   // what ggml_cuda_flash_attn_ext_mma_f16_case passes
@@ -2945,8 +3178,24 @@ static void launch_fattn_turbot(
     }();
     const bool kvmax_worth_it = kvmax_min_kv > 0 && K->ne[1] >= kvmax_min_kv;
 
-    const char * kv_scan = "none";   // [TAG_TURBOT_FA_DEBUG]
-    if (mask && K->ne[1] % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1 || kvmax_worth_it)) {
+    // [TAG_FN_TURBOT_SPARSE] the index lists and their counts live where KV_max lives
+    int64_t n_kv_list = K->ne[1];
+    if (use_sparse) {
+        GGML_ASSERT(mask != nullptr && kv_pos_t == nullptr && mask->ne[2] == 1);
+        const int32_t n_kv_max_query = ggml_get_op_params_i32(KQV, 4);
+        GGML_ASSERT(n_kv_max_query > 0);
+        n_kv_list = std::min<int64_t>(K->ne[1], std::min<int64_t>(Q->ne[1], ncols1)*n_kv_max_query);
+        GGML_ASSERT(n_kv_list > 0 && n_kv_list <= INT32_MAX);
+
+        const size_t n_lists = (size_t) ntiles_x * (size_t) mask->ne[3];
+
+        KV_max.alloc((size_t) n_kv_list*n_lists + n_lists);
+        ggml_cuda_flash_attn_ext_compact_mask(mask, KV_max.ptr, KV_max.ptr + (size_t) n_kv_list*n_lists, (int32_t) Q->ne[1], ncols1,
+            (int32_t) n_kv_list, main_stream);
+    }
+
+    const char * kv_scan = use_sparse ? "sparse" : "none";   // [TAG_TURBOT_FA_DEBUG]
+    if (!use_sparse && mask && K->ne[1] % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1 || kvmax_worth_it)) {
         const int64_t s31 = mask->nb[1] / sizeof(half2);
         const int64_t s33 = mask->nb[3] / sizeof(half2);
 
@@ -2976,7 +3225,7 @@ static void launch_fattn_turbot(
     }
     const uint3 ne01_pos = init_fastdiv_values(Q->ne[1]);   // [TAG_FA_POS_MASK]
     // [TAG_FA_KVMAX_POS] same gate as launch_fattn.
-    if (kv_pos_t && K->ne[1] % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || kvmax_worth_it)) {   // [TAG_FA_POS_MASK]
+    if (!use_sparse && kv_pos_t && K->ne[1] % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || kvmax_worth_it)) {   // [TAG_FA_POS_MASK]
         const dim3 blocks_num_KV_max(ntiles_x, 1, 1);
         const dim3 block_dim_KV_max(FATTN_KQ_STRIDE/2, 1, 1);
         const int iter_k = K->ne[1] / FATTN_KQ_STRIDE;
@@ -2997,7 +3246,7 @@ static void launch_fattn_turbot(
     GGML_ASSERT(max_blocks_per_sm > 0);
     int parallel_blocks = max_blocks_per_sm;
 
-    const int ntiles_KV = (K->ne[1] + nbatch_fa - 1) / nbatch_fa; // Max. number of parallel blocks limited by KV cache length.
+    const int ntiles_KV = (n_kv_list + nbatch_fa - 1) / nbatch_fa; // Max. number of parallel blocks limited by KV cache length.
 
     // [TAG_TURBOT_FA_BALANCE]
     const ggml_cuda_fattn_turbot_balance_cfg & balance_cfg = ggml_cuda_fattn_turbot_balance_cfg_get();
@@ -3048,7 +3297,8 @@ static void launch_fattn_turbot(
         if (balance_cfg.mode != 0 && balance_cfg.stripe && uniform_fixup_layout) {
             balance_stripe = (int) blocks_num.x / ntiles_dst;
         }
-        balanced = balance_cfg.mode != 0 && balance_stripe == 0 && ntiles_dst % (int) blocks_num.x != 0;
+        // [TAG_FN_TURBOT_SPARSE] the seams weigh granules of a dense walk; a list walk keeps the uniform slice
+        balanced = !use_sparse && balance_cfg.mode != 0 && balance_stripe == 0 && ntiles_dst % (int) blocks_num.x != 0;
         if (balanced) {
             uint64_t shape_key = 0xCBF29CE484222325ull;
             for (const uint64_t v : { (uint64_t) Q->ne[1], (uint64_t) K->ne[1], (uint64_t) ncols1, (uint64_t) ncols2,
@@ -3212,7 +3462,7 @@ static void launch_fattn_turbot(
         !stream_k && parallel_blocks > 1 ? dst_tmp.ptr : (float *) KQV->data, dst_tmp_meta.ptr,
         scale, max_bias, m0, m1, n_head_log2, logit_softcap,
         Q->ne[0], ne01,     Q->ne[2], Q->ne[3], Q->nb[1], Q->nb[2], Q->nb[3],
-        K->ne[0], K->ne[1], K->ne[2], K->ne[3], nb11, nb12, nb13,
+        K->ne[0], (int32_t) n_kv_list, K->ne[2], K->ne[3], nb11, nb12, nb13,   // [TAG_FN_TURBOT_SPARSE] ne11 = list length
         nb21, nb22, nb23,
         // [TAG_4C_POSMASK_MS] the launch_fattn convention: ne31 = 2 and the kv_pos / q_pos row strides for sequence sets
         mask ? mask->ne[1] : (pos_ms ? 2 : 0), mask ? mask->ne[2] : 0, mask ? mask->ne[3] : 0,
@@ -3389,6 +3639,70 @@ void ggml_cuda_flash_attn_ext_turbot_case(ggml_backend_cuda_context & ctx, ggml_
 #endif // !defined(GGML_USE_MUSA)
 
     launch_fattn_turbot<DV, ncols1, ncols2>(ctx, dst, fattn_kernel, nwarps, nbytes_shared_total, nbatch_fa, warp_size_host);
+}
+
+// [TAG_FN_TURBOT_SPARSE] The sparse (selected-cells) turbot FA: the dense case above with the use_sparse kernel. Shared
+// memory is the dense layout (the tiles do not change). No softcap instance: fattn.cu routes only softcap 0 here.
+template <int DKQ, int DV, int ncols1, int ncols2>
+void ggml_cuda_flash_attn_ext_turbot_sparse_case(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    static_assert(DKQ == 256 && DV == 256, "sparse turbot FA exists for D=256 only");
+
+    const ggml_tensor * KQV = dst;
+    const int id = ggml_cuda_get_device();
+    const int cc = ggml_cuda_info().devices[id].cc;
+
+    constexpr int ncols = ncols1 * ncols2;
+
+    const ggml_turbot_layer layer = ggml_cuda_fattn_turbot_layer_of(dst);
+    GGML_ASSERT(ggml_turbot_geom_head_dim(layer.flags) == DKQ);
+
+    const int  nthreads       = ggml_cuda_fattn_mma_get_nthreads      (DKQ, DV, ncols, cc);
+    const int  nbatch_fa      = turbot_nbatch_fa                      (DKQ, DV, ncols, cc);
+    const int  nbatch_K2      = ggml_cuda_fattn_mma_get_nbatch_K2     (DKQ, DV, ncols, cc);
+    const int  nbatch_V2      = ggml_cuda_fattn_mma_get_nbatch_V2     (DKQ, DV, ncols, cc);
+    const int  nbatch_combine = ggml_cuda_fattn_mma_get_nbatch_combine(DKQ, DV, ncols, cc);
+    const bool Q_in_reg       = ggml_cuda_fattn_mma_get_Q_in_reg      (DKQ, DV, ncols, cc);
+
+    GGML_ASSERT(Q_in_reg);
+    GGML_ASSERT(nbatch_fa > 0 && GGML_TURBOT_GRANULE % nbatch_fa == 0);
+    GGML_ASSERT(nbatch_K2 % 16 == 0 && nbatch_V2 % 16 == 0);
+
+    const int cols_per_warp = std::min(ncols, get_cols_per_warp(cc));
+    const int warp_size_host = ggml_cuda_info().devices[ctx.device].warp_size;
+    const int nwarps         = nthreads / warp_size_host;
+
+    const size_t nbytes_shared_KV_1stage = nbatch_fa            * std::max(nbatch_K2 + 4,  nbatch_V2 + 4) * sizeof(half2);
+    const size_t nbytes_shared_Q         = ncols                * (DKQ/2 + 4)                             * sizeof(half2);
+    const size_t nbytes_shared_mask      = ncols1               * (nbatch_fa/2 + 4)                       * sizeof(half2);
+    const size_t nbytes_shared_combine   = nwarps*cols_per_warp * (nbatch_combine + 4)                    * sizeof(half2);
+
+    const size_t lut_off = (size_t) ggml_cuda_fattn_turbot_lut_off(nbatch_fa, nbatch_K2, nbatch_V2, ncols1);
+    GGML_ASSERT(lut_off == GGML_PAD(nbytes_shared_KV_1stage + nbytes_shared_mask, 16));
+
+    const size_t nbytes_shared_total = std::max(nbytes_shared_combine, std::max(nbytes_shared_Q, lut_off + TURBOT_NBYTES_SHARED_LUT));
+
+    float logit_softcap;
+    memcpy(&logit_softcap, (const float *) KQV->op_params + 2, sizeof(float));
+    GGML_ASSERT(logit_softcap == 0.0f);
+
+#if defined(GGML_USE_HIP)
+    using fattn_kernel_ptr_t = const void*;
+#else
+    using fattn_kernel_ptr_t = fattn_turbot_kernel_t;
+#endif // defined(GGML_USE_HIP)
+    constexpr bool use_logit_softcap = false;
+    constexpr bool use_sparse        = true;
+    const fattn_turbot_kernel_t fattn_kernel = flash_attn_ext_turbot<DKQ, DV, ncols1, ncols2, use_logit_softcap, use_sparse>;
+
+#if !defined(GGML_USE_MUSA)
+    static bool shared_memory_limit_raised[GGML_CUDA_MAX_DEVICES] = {false};
+    if (!shared_memory_limit_raised[id]) {
+        CUDA_CHECK(cudaFuncSetAttribute(reinterpret_cast<fattn_kernel_ptr_t>(fattn_kernel), cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes_shared_total));
+        shared_memory_limit_raised[id] = true;
+    }
+#endif // !defined(GGML_USE_MUSA)
+
+    launch_fattn_turbot<DV, ncols1, ncols2>(ctx, dst, fattn_kernel, nwarps, nbytes_shared_total, nbatch_fa, warp_size_host, use_sparse);
 }
 
 // Declarations shared with fattn.cu (explicit instantiation declarations of the 20 instances and the macro the

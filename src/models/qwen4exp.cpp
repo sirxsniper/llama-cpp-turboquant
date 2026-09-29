@@ -975,9 +975,17 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
 
     // [TAG_FN_TURBOT_QSA] the read side of the dense path: the forward WHT on Q for a turbo or turbot K (12260c288, lost
     // in the 09-21 upstream sync), and for turbot the young pool, the granule table and the op params. f16 and q8_0 get
-    // the same nodes as before. A turbot FA reads every cell under the top-k mask (no sparse gather).
+    // the same nodes as before.
+    // [TAG_FN_TURBOT_SPARSE] TURBO_QSA_SPARSE=1: a turbot FA gets the top-k budget as n_kv_max too, so CUDA gathers only
+    // the selected cells (at most 2051 per query) instead of reading every cell under the mask. Default off: the turbot
+    // FA gets n_kv_max 0 and runs dense (f16 keeps its own gather either way).
+    static const bool qsa_sparse_turbot = [] {
+        const char * e = getenv("TURBO_QSA_SPARSE");
+        return e && e[0] == '1';
+    }();
+    const int64_t n_kv_max = !mctx_cur->is_turbot() || qsa_sparse_turbot ? top_k->ne[0] : 0;
     ggml_tensor * cur = build_attn_mha_kv(mctx_cur, q, k, v, nullptr, kq_mask_top_k, nullptr, nullptr, kq_scale, il,
-            nullptr, nullptr, inp->self_turbot_gtab, top_k->ne[0]);
+            nullptr, nullptr, inp->self_turbot_gtab, n_kv_max);
     cb(cur, "kqv_out", il);
 
     // the rotation is its own inverse, so undo it on the value side of the output

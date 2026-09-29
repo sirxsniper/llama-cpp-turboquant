@@ -9508,22 +9508,29 @@ static void turbot_test_init_uniform(ggml_tensor * t, uint64_t seed, float lo, f
 // [TAG_FN_TURBOT_TESTS] a QSA mask (models/qwen4exp.cpp build_attn_qsa): per query row, whole blocks of 4 cells picked by
 // the indexer's top-k (512 blocks = 2048 cells in all, a different set per row, so at long kv most tiles are fully masked)
 // and the newest 3 cells (the unpooled tail): 0 there, -inf elsewhere. Below 2052 cells every block is picked (dense).
+// [TAG_FN_TURBOT_SPARSE] exactly `pick` blocks per row (a partial shuffle), so a row never has more than the 2051 finite
+// entries the n_kv_max budget promises: the sparse turbot FA gathers at most that many per query.
 static void turbot_test_init_qsa_mask(ggml_tensor * t, uint64_t seed) {
     GGML_ASSERT(t->type == GGML_TYPE_F16 && ggml_is_contiguous(t));
     const int64_t  ne0   = t->ne[0];
     const int64_t  nrows = ggml_nrows(t);
     const int64_t  n_blk = ne0 / 4;
-    const uint64_t pick  = (uint64_t) std::min<int64_t>(n_blk, 512);
+    const int64_t  pick  = std::min<int64_t>(n_blk, 512);
     const ggml_fp16_t zero = ggml_fp32_to_fp16(0.0f);
     const ggml_fp16_t ninf = ggml_fp32_to_fp16(-INFINITY);
     std::vector<ggml_fp16_t> m((size_t) (ne0 * nrows), ninf);
+    std::vector<int32_t> blk((size_t) n_blk);
     for (int64_t r = 0; r < nrows; ++r) {
         uint64_t s = seed ^ ((uint64_t) r * 0x9e3779b97f4a7c15ull);
         for (int64_t b = 0; b < n_blk; ++b) {
-            if (turbot_test_splitmix(s) % (uint64_t) n_blk < pick) {
-                for (int64_t j = 4*b; j < 4*b + 4; ++j) {
-                    m[(size_t) (r*ne0 + j)] = zero;
-                }
+            blk[(size_t) b] = (int32_t) b;
+        }
+        for (int64_t i = 0; i < pick; ++i) {
+            const int64_t j = i + (int64_t) (turbot_test_splitmix(s) % (uint64_t) (n_blk - i));
+            std::swap(blk[(size_t) i], blk[(size_t) j]);
+            const int64_t b = blk[(size_t) i];
+            for (int64_t c = 4*b; c < 4*b + 4; ++c) {
+                m[(size_t) (r*ne0 + c)] = zero;
             }
         }
         for (int64_t j = std::max<int64_t>(0, ne0 - 3); j < ne0; ++j) {
@@ -13919,6 +13926,24 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 test_cases.emplace_back(new test_flash_attn_ext_turbot(TURBOT_TW_NR2_Q8, kv, 512, TURBOT_MIX_BAND16K, 3, false, 0.0f, false, 256, 2, 24));
             }
         }
+        // [TAG_FN_TURBOT_SPARSE] the sparse turbot FA (CUDA gathers the listed cells when kv >= 2 * min(nb, ncols1) * 2051):
+        // the deployed 262144-cell shapes at the decode and MTP verify widths nb 1-4 (<4, 8>) and nb 5 / 8 (<8, 8>), the
+        // quality plan's young band (band64k) and an all-old / alternating cache, and wider batches (prefill tiles) at
+        // 65536. Every case compares against the dense CPU reference. -p "turbot=nr2q,d=256,hkv=2,hq=24,kv=(65536|262144)"
+        for (int64_t nb : { 1, 2, 3, 4, 5, 8 }) {
+            for (turbot_test_mix mix : { TURBOT_MIX_BAND64K, TURBOT_MIX_ALT }) {
+                test_cases.emplace_back(new test_flash_attn_ext_turbot(TURBOT_TW_NR2_Q8, 262144, nb, mix, 3, false, 0.0f, false, 256, 2, 24));
+            }
+        }
+        test_cases.emplace_back(new test_flash_attn_ext_turbot(TURBOT_TW_NR2_Q8, 262144, 1, TURBOT_MIX_OLD, 3, false, 0.0f, false, 256, 2, 24));
+        test_cases.emplace_back(new test_flash_attn_ext_turbot(TURBOT_TW_NR2_Q8, 262144, 3, TURBOT_MIX_OLD, 3, true,  0.0f, false, 256, 2, 24));
+        for (int64_t nb : { 3, 32, 64, 128 }) {
+            test_cases.emplace_back(new test_flash_attn_ext_turbot(TURBOT_TW_NR2_Q8, 65536, nb, TURBOT_MIX_BAND16K, 3, false, 0.0f, false, 256, 2, 24));
+        }
+        // the other NR 2 widths (float old path b 6, the int8 old paths) through the gather loader
+        for (turbot_test_widths w : { TURBOT_TW_NR2_A, TURBOT_TW_NR2_B, TURBOT_TW_NR2_L }) {
+            test_cases.emplace_back(new test_flash_attn_ext_turbot(w, 65536, 2, TURBOT_MIX_ALT, 3, false, 0.0f, false, 256, 2, 24));
+        }
         // the writer at the quality widths: young rows none / all / mixed, fill entries, I64 and I32 cells
         for (int64_t rows : { 1, 4, 16, 1280 }) {
             test_cases.emplace_back(new test_turbot_set_rows(TURBOT_TW_NR2_Q8, rows, GGML_TYPE_I64, 0, true,  false, 256, 2, 24));
@@ -14530,6 +14555,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             }
             test_cases.emplace_back(new test_flash_attn_ext_turbo5p_ref(kv, nb, GGML_TYPE_TURBO5P512_0, 256, 2, 24));
             test_cases.emplace_back(new test_flash_attn_ext_turbo5p_ref(kv, nb, GGML_TYPE_Q8_0, 256, 2, 24));
+        }
+    }
+    // [TAG_FN_TURBOT_SPARSE] the QSA mask with its n_kv_max budget (mask_mode 3), the shape the qwen4exp layers run: sparse
+    // gather by default, dense with GGML_CUDA_TURBOT_SPARSE=0 (the same cases, A/B on one binary). nb 3 is the MTP verify
+    // width (n_max 2), 512 a prefill ubatch.
+    //   test-backend-ops perf -b CUDA0 -o FLASH_ATTN_EXT -p "turbot_perf=nr2q,d=256,hkv=2,hq=24,kv=[0-9]+,nb=[0-9]+,mix=[a-z0-9]+,mask_mode=3"
+    for (int64_t kv : { 32768, 131072, 262144 }) {
+        for (int64_t nb : { 1, 3, 512 }) {
+            test_cases.emplace_back(new test_flash_attn_ext_turbot(TURBOT_TW_NR2_Q8, kv, nb, TURBOT_MIX_BAND64K, 3, false, 0.0f, true, 256, 2, 24));
         }
     }
     test_cases.emplace_back(new test_turbot_set_rows(TURBOT_TW_NR2_Q8, 2048, GGML_TYPE_I64, 1, false, true, 256, 2, 24));
