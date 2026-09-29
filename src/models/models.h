@@ -7,6 +7,7 @@
 // note: almost all graphs require at least sqrtf, so include cmath globally
 #include <cmath>
 #include <map>
+#include <mutex> // [TAG_FN_MTP_HEAD_IDS]
 
 class llama_memory_hybrid_idx_context;
 
@@ -2404,6 +2405,22 @@ struct llama_model_qwen4exp : public llama_model_base {
     // [TAG_FN_MTP_HEAD_ROWS] LLAMA_MTP_HEAD_ROWS=N: the MTP draft head reads rows [0, N) of the LM head plus these ids
     int64_t              mtp_head_rows = 0;
     std::vector<int32_t> mtp_head_extra;
+
+    // [TAG_FN_MTP_HEAD_IDS] LLAMA_MTP_HEAD_IDS=<file>: a calibrated draft vocabulary (sorted ids). Its LM head rows are
+    // copied once, at the first MTP graph, into a compact tensor on the head's buffer type; drafts multiply only those.
+    std::vector<int32_t> mtp_head_ids;
+    struct mtp_head_compact {
+        ggml_context *        ctx = nullptr;
+        ggml_backend_buffer_t buf = nullptr;
+        ggml_tensor *         w   = nullptr; // [n_embd, n_ids], the head's type, rows byte-copied
+        ggml_tensor *         ids = nullptr; // I32 [n_ids], the token id of each row
+        ~mtp_head_compact();
+    };
+    mutable std::mutex                        mtp_head_mutex;
+    mutable bool                              mtp_head_tried = false;
+    mutable std::unique_ptr<mtp_head_compact> mtp_head_c;
+    // nullptr: no draft vocabulary, or the head cannot be copied (the full head is used)
+    const mtp_head_compact * mtp_head_get(const ggml_tensor * head_w) const;
 
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;

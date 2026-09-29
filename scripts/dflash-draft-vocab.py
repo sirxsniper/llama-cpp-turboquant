@@ -10,6 +10,8 @@
 #   extra  write a LLAMA_DFLASH_HEAD_EXTRA file: the ids >= --rows seen at least --min-count times
 #   build  write a DFlash drafter GGUF that carries its own head: the target lm_head rows of a calibrated list, byte
 #          for byte, plus an i32 d2t (run it with LLAMA_DFLASH_D2T_COMPACT=1)
+#   ids    [TAG_FN_MTP_HEAD_IDS] write a calibrated list as an id file for LLAMA_MTP_HEAD_IDS (qwen4exp MTP drafts;
+#          the loader copies those head rows once and adds the control tokens itself)
 #
 # Token ids come from JSON/JSONL files (every "tokens" list of ints, e.g. a harness that saved the server's tokens;
 # identical sequences count once) or from plain text tokenized with --tokenizer (a byte-level BPE tokenizer.json).
@@ -327,6 +329,20 @@ def cmd_build(args, vocab: Vocab, target: gguf.GGUFReader):
           f'{head.tensor_type.name}) + i32 d2t; run with LLAMA_DFLASH_D2T_COMPACT=1')
 
 
+def cmd_ids(args, vocab: Vocab):
+    # [TAG_FN_MTP_HEAD_IDS] the calibrated list of cmd_build as a text id file, one id per line with its piece and count
+    counts = counts_of(load_sequences(args, vocab.n)[0], vocab.n)
+    ids = np.sort(calibrated_list(counts, vocab, args.size))
+    total = int(counts.sum())
+    cov = counts[ids].sum() / max(1, total)
+    with open(args.output, 'w', encoding='utf-8') as f:
+        f.write(f'# LLAMA_MTP_HEAD_IDS: {len(ids)} ids of {vocab.n} ({100.0*len(ids)/vocab.n:.1f}% of the head), '
+                f'{100.0*cov:.3f}% of {total} calibration tokens\n')
+        for i in ids:
+            f.write(f'{int(i)}  # {vocab.pieces[i].decode("utf-8", errors="replace")!r} x{int(counts[i])}\n')
+    print(f'{len(ids)} ids -> {args.output}, in-sample coverage {100.0*cov:.3f}% (stats --sizes {args.size} gives the held-out one)')
+
+
 def main():
     ap = argparse.ArgumentParser(description='DFlash2 draft vocabulary from local token counts')
     sub = ap.add_subparsers(dest='cmd', required=True)
@@ -358,6 +374,11 @@ def main():
     p.add_argument('--list', help='use these target ids instead (whitespace or comma separated)')
     p.add_argument('-o', '--output', required=True)
 
+    p = sub.add_parser('ids', help='write a calibrated id file for LLAMA_MTP_HEAD_IDS (qwen4exp MTP drafts)')
+    inputs(p)
+    p.add_argument('--size', type=int, default=40960, help='draft vocabulary size (calibrated list)')
+    p.add_argument('-o', '--output', required=True)
+
     args = ap.parse_args()
     target = gguf.GGUFReader(args.target)
     vocab = Vocab(target)
@@ -365,6 +386,8 @@ def main():
         cmd_stats(args, vocab)
     elif args.cmd == 'extra':
         cmd_extra(args, vocab)
+    elif args.cmd == 'ids':
+        cmd_ids(args, vocab)
     else:
         cmd_build(args, vocab, target)
 

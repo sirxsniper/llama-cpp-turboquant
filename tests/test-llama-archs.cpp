@@ -1167,6 +1167,70 @@ static int test_mtp(const std::string & arch_filter, const size_t seed, const fl
             // head switch already in the environment (fn_switch_tests.ps1) has no plain reference, so it skips them
             const bool mtp_env_free = !getenv("LLAMA_MTP_HEAD_ROWS") && !getenv("LLAMA_MTP_HEAD_IDS") && !getenv("LLAMA_MTP_ATTN_WINDOW");
 
+            // [TAG_FN_MTP_HEAD_IDS] a draft vocabulary (every third id): its rows keep the full head's logits, the others
+            // are -inf. Control tokens join the list on their own, so they are skipped here.
+            if (mtp_env_free) {
+                const uint32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model.get()));
+                const char *   path    = "test-llama-archs-mtp-ids.tmp";
+                std::vector<bool> listed(n_vocab, false);
+                if (FILE * f = fopen(path, "w")) {
+                    fprintf(f, "# every third id\n");
+                    for (uint32_t id = 0; id < n_vocab; id += 3) {
+                        fprintf(f, "%u%s", id, id % 30 == 27 ? "\n" : ", ");
+                        listed[id] = true;
+                    }
+                    fclose(f);
+                    mtp_test_set_env("LLAMA_MTP_HEAD_IDS", path);
+                    llama_model_ptr model_ids = get_model_mtp(gguf_ctx.get(), nullptr, seed, stdev, devs, /*load_mtp =*/ true);
+                    mtp_test_set_env("LLAMA_MTP_HEAD_IDS", nullptr);
+                    const std::vector<float> logits_ids = get_logits_mtp(model_ids.get(), tokens, h_tgt);
+                    remove(path);
+
+                    const llama_vocab * vocab = llama_model_get_vocab(model.get());
+                    double max_rel = 0.0;
+                    bool   ok_inf  = true;
+                    size_t n_kept  = 0;
+                    for (size_t i = 0; i < logits_ids.size(); ++i) {
+                        const uint32_t id = (uint32_t) (i % n_vocab);
+                        if (llama_vocab_get_attr(vocab, (llama_token) id) & (LLAMA_TOKEN_ATTR_CONTROL | LLAMA_TOKEN_ATTR_USER_DEFINED)) {
+                            continue;
+                        }
+                        if (listed[id]) {
+                            max_rel = std::max(max_rel, (double) std::fabs(logits_ids[i] - logits_mtp[i])/(1.0 + std::fabs(logits_mtp[i])));
+                            n_kept++;
+                        } else if (!(std::isinf(logits_ids[i]) && logits_ids[i] < 0.0f)) {
+                            ok_inf = false;
+                        }
+                    }
+                    check(arch_name, label, "MTP head ids: listed rows", n_kept > 0 && max_rel <= 1e-4, max_rel);
+                    check(arch_name, label, "MTP head ids: others -inf", ok_inf, 0.0);
+                }
+
+                // [TAG_FN_MTP_HEAD_ROWS] the head prefix: rows [0, n_vocab/2) keep their logits, the rest are -inf
+                {
+                    const uint32_t rows = n_vocab/2;
+                    mtp_test_set_env("LLAMA_MTP_HEAD_ROWS", std::to_string(rows).c_str());
+                    llama_model_ptr model_rows = get_model_mtp(gguf_ctx.get(), nullptr, seed, stdev, devs, /*load_mtp =*/ true);
+                    mtp_test_set_env("LLAMA_MTP_HEAD_ROWS", nullptr);
+                    const std::vector<float> logits_rows = get_logits_mtp(model_rows.get(), tokens, h_tgt);
+
+                    const llama_vocab * vocab = llama_model_get_vocab(model.get());
+                    double max_rel = 0.0;
+                    bool   ok_inf  = true;
+                    for (size_t i = 0; i < logits_rows.size(); ++i) {
+                        const uint32_t id = (uint32_t) (i % n_vocab);
+                        if (id < rows) {
+                            max_rel = std::max(max_rel, (double) std::fabs(logits_rows[i] - logits_mtp[i])/(1.0 + std::fabs(logits_mtp[i])));
+                        } else if (!(llama_vocab_get_attr(vocab, (llama_token) id) & (LLAMA_TOKEN_ATTR_CONTROL | LLAMA_TOKEN_ATTR_USER_DEFINED)) &&
+                                   !(std::isinf(logits_rows[i]) && logits_rows[i] < 0.0f)) {
+                            ok_inf = false;
+                        }
+                    }
+                    check(arch_name, label, "MTP head rows: prefix rows", max_rel <= 1e-4, max_rel);
+                    check(arch_name, label, "MTP head rows: others -inf", ok_inf, 0.0);
+                }
+            }
+
             // [TAG_FN_MTP_ATTN_WINDOW] a draft window of 16 positions: rows whose keys all lie inside it are unchanged, the
             // later rows see fewer keys and change
             if (mtp_env_free) {
