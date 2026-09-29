@@ -1772,6 +1772,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     pending_h2d |= 1u << split_backend_id;
                     continue;
                 }
+                // [TAG_FN_SCHED_SPLIT_ASYNC] the blocking copy below writes host memory that a queued upload may still read
+                if (split_is_host && pending_h2d != 0) {
+                    ggml_backend_sched_sync_mask(sched, pending_h2d);
+                }
 
                 // wait for the split backend to finish using the input before overwriting it
                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
