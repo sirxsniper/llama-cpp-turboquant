@@ -22,6 +22,7 @@
 
 #include "ggml-turbot.h"
 
+#include <algorithm>
 #include <cassert>
 #include <cmath>
 #include <cstring>
@@ -1503,6 +1504,8 @@ void llm_graph_result::reset() {
     t_candidates.clear();
 
     build_state.clear(); // [TAG_FN_GRAPH_PER_WIDTH]
+    build_nodes.clear();
+    build_pins.clear();
 
     t_moe_il.clear(); // [TAG_FN_MOE_TRACE]
     t_moe_n_expert.clear();
@@ -1612,8 +1615,23 @@ bool llm_graph_result::can_reuse(const llm_graph_params & params) {
 }
 
 // [TAG_FN_GRAPH_PER_WIDTH] every tensor of this result's compute context, as model.build_graph left it
-void llm_graph_result::save_build_state() {
+void llm_graph_result::save_build_state(ggml_backend_sched_t sched) {
     build_state.clear();
+    build_pins.clear();
+
+    // the node order: graph_optimize reorders the nodes of each split view in place
+    const int n_nodes = ggml_graph_n_nodes(gf);
+    build_nodes.assign(ggml_graph_nodes(gf), ggml_graph_nodes(gf) + n_nodes);
+
+    // the backends that graph_get_cb / build_attn pinned during the build (norm, l_last, attention output without
+    // offload_kqv): ggml_backend_sched_reset clears them, so a re-split without them could assign these nodes elsewhere
+    for (int i = 0; i < n_nodes; ++i) {
+        ggml_tensor * t = ggml_graph_node(gf, i);
+        if (ggml_backend_t b = ggml_backend_sched_get_tensor_backend(sched, t)) {
+            build_pins.emplace_back(t, b);
+        }
+    }
+
     for (ggml_tensor * t = ggml_get_first_tensor(ctx_compute.get()); t != nullptr; t = ggml_get_next_tensor(ctx_compute.get(), t)) {
         tensor_state s;
         s.t      = t;
@@ -1628,7 +1646,8 @@ void llm_graph_result::save_build_state() {
     }
 }
 
-void llm_graph_result::restore_build_state() {
+// call after ggml_backend_sched_reset
+void llm_graph_result::restore_build_state(ggml_backend_sched_t sched) {
     for (const tensor_state & s : build_state) {
         ggml_tensor * t = s.t;
         t->data   = s.data;
@@ -1639,6 +1658,15 @@ void llm_graph_result::restore_build_state() {
             t->src[j] = s.src[j];
         }
     }
+    GGML_ASSERT(ggml_graph_n_nodes(gf) == (int) build_nodes.size());
+    std::copy(build_nodes.begin(), build_nodes.end(), ggml_graph_nodes(gf));
+    for (const auto & [t, b] : build_pins) {
+        ggml_backend_sched_set_tensor_backend(sched, t, b);
+    }
+}
+
+bool llm_graph_result::has_build_state() const {
+    return !build_state.empty() && gf != nullptr && ggml_graph_n_nodes(gf) == (int) build_nodes.size();
 }
 
 llm_graph_input_i * llm_graph_result::add_input(llm_graph_input_ptr input) {

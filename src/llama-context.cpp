@@ -2673,7 +2673,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
         }
 
-        res->restore_build_state();
+        res->restore_build_state(sched.get());
         if (!ggml_backend_sched_alloc_graph(sched.get(), res->get_gf())) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
@@ -2709,7 +2709,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
 
         if (graph_per_width && !cparams.pipeline_parallel) {
-            res->save_build_state(); // [TAG_FN_GRAPH_PER_WIDTH] before the scheduler rewrites it
+            res->save_build_state(sched.get()); // [TAG_FN_GRAPH_PER_WIDTH] before the scheduler rewrites it
         }
 
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
