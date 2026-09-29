@@ -37,9 +37,10 @@ ROOT = "E:/turbot-gates"
 PORT = 8091
 M = "D:/Projects/LocalAI/models/"
 MODEL_A = M + "Qwen3.8-Flash-Next-UD-Q4_K_XL-MTP-00001-of-00005.gguf"
-BIN = "D:/Projects/LocalAI/source-build/wt-fn/build-fn/bin"
+BIN = "D:/Projects/LocalAI/source-build/wt-flash/build-flash/bin"  # [TAG_FN_MERGE] the merged branch (flashnext/all)
 
-BASE_131K = ("-c 131072 -ngl 99 --n-cpu-moe 38 -fit off -fa on -ctk turbo4 -ctv turbo4 -b 2048 -ub 512 -t 16 "
+# [TAG_FN_MERGE] turbot KV only on Flash-Next (owner, 2026-09-28: no q4 / turbo4 KV); ncmoe 39 = the F0 fit (32K, MTP on)
+BASE_131K = ("-c 131072 -ngl 99 --n-cpu-moe 39 -fit off -fa on -ctk turbot -ctv turbot -b 2048 -ub 512 -t 16 "
              "--cpu-mask 55555555 --cpu-strict 1 --prio 2 --parallel 1 "
              "--spec-type draft-mtp --spec-draft-n-max 2 --spec-draft-p-min 0.5")
 BASE_ENV = {"SPEC_DFT_UBATCH": "128"}
@@ -90,7 +91,16 @@ def preflight(max_commit_gb, allow_no_six=False):
             errs.append("commit %s GB > %d GB" % (commit, max_commit_gb))
     except ValueError:
         errs.append("could not read the commit charge (%r)" % commit)
+    # [TAG_FN_MERGE] as in the speed stage's copy (2026-09-29): the gpucorr_guard.ps1 -Mode pre rule. The boot time is
+    # the newer of LastBootUpTime and the latest Kernel-Boot 27 event (Fast Startup), and events at or before the
+    # newest FAULT line of E:/turbot-gates/imp/gpu_faults.txt are acknowledged (recorded crashes, handled by the
+    # FAULT/FIXED protocol). Without it every event since a Fast Startup boot refused the run.
     ev = ps("$b = (Get-CimInstance Win32_OperatingSystem).LastBootUpTime; "
+            "$kb = Get-WinEvent -FilterHashtable @{LogName='System';ProviderName='Microsoft-Windows-Kernel-Boot';Id=27} -MaxEvents 1 -ErrorAction SilentlyContinue; "
+            "if ($kb -and $kb.TimeCreated -gt $b) { $b = $kb.TimeCreated }; "
+            "$f = 'E:/turbot-gates/imp/gpu_faults.txt'; $ack = $null; "
+            "if (Test-Path $f) { foreach ($l in Get-Content $f) { if ($l -match '^FAULT\\|([^|]+)\\|') { $d = [datetime]::Parse($Matches[1]); if (-not $ack -or $d -gt $ack) { $ack = $d } } } }; "
+            "if ($ack -and $ack.AddSeconds(1) -gt $b) { $b = $ack.AddSeconds(1) }; "
             "@(Get-WinEvent -FilterHashtable @{LogName='System'; ProviderName='nvlddmkm'; StartTime=$b} -ErrorAction SilentlyContinue).Count")
     if ev not in ("", "0"):
         errs.append("%s nvlddmkm events since boot: check event 153 and reboot first" % ev)
