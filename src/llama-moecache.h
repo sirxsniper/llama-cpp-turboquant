@@ -25,6 +25,7 @@
 //
 // Enabled via llama_context_params.n_moe_cache_slots (CLI: --moe-expert-cache).
 
+#include <cstddef>
 #include <cstdint>
 
 struct llama_model;
@@ -73,7 +74,25 @@ void llama_moe_cache_step(const void * ctx);
 // are written once at init, and there is no worker and no step, so nothing races with a running graph (the CPU
 // observer is set only for LLAMA_MOE_HOT_STATS, and only counts).
 // Returns true when this call enabled it (the caller then reserves the scheduler again). Once per process.
-bool llama_moe_hot_init(const llama_model & model, const void * owner);
+// [TAG_FN_AUTO] every variable is read through llama_fn_env(), so the qwen4exp profile (src/llama-fn-auto.h) supplies
+// the ones the environment does not set. LLAMA_MOE_HOT_PROFILE=even: no routing profile; every host layer gets the same
+// number of slots, empty at start, and the adaptive set (required) fills them. =off / 0 / none: no hot set.
+// [TAG_FN_VRAM_FIT] budget_bytes > 0: the VRAM fit's budget (LLAMA_MOE_HOT_MIB is then not read).
+bool llama_moe_hot_init(const llama_model & model, const void * owner, size_t budget_bytes = 0);
+
+// [TAG_FN_AUTO] a hot set is configured for this model (LLAMA_MOE_HOT_PROFILE names a file or "even")
+bool llama_moe_hot_wanted(const llama_model & model);
+
+// [TAG_FN_VRAM_FIT] the budget comes from the VRAM fit (LLAMA_MOE_HOT_MIB=auto and LLAMA_MOE_HOT_FIT=1): the context
+// defers llama_moe_hot_init until every context of the model exists, then sizes it from what is left
+bool llama_moe_hot_fit_wanted(const llama_model & model);
+
+// [TAG_FN_VRAM_FIT] the device of the hot set (the router device of the first host-expert layer), or nullptr
+struct ggml_backend_device;
+struct ggml_backend_device * llama_moe_hot_device(const llama_model & model);
+
+// [TAG_FN_VRAM_FIT] device bytes the hot set holds, 0 without one
+size_t llama_moe_hot_device_bytes();
 
 // [TAG_FN_MOE_HOT_ADAPT] LLAMA_MOE_HOT_ADAPT=1: windowed-frequency admission into the hot slots, evict first, publish
 // after the upload has landed (LLAMA_MOE_HOT_ADMIT=N/W default 3/16, LLAMA_MOE_HOT_HYST=1, LLAMA_MOE_HOT_ADAPT_MIB=64 per

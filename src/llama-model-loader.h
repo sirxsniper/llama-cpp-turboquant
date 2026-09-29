@@ -84,6 +84,10 @@ struct llama_model_loader {
     bool no_alloc;
     bool load_mtp;
 
+    // [TAG_FN_AUTO] > 0: the routed expert tensors of blk.0 .. blk.<n-1> that no override places go to the host, like a
+    // CPU override (the qwen4exp automatic placement, src/llama-fn-auto.h)
+    int fn_host_experts_n_layer = 0;
+
     // handle TENSOR_READ_LAZY
     // use case: keep PLE / engrams embd tensors on disk, read them on demand
     struct lazy_read {

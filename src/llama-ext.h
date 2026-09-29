@@ -162,6 +162,12 @@ LLAMA_API void llama_turbot_set_plan_path(const char * path);
 // plan. LLAMA_TURBOT_SIDECAR=0 (or LLAMA_TURBOT_ANY=0) ignores it. nullptr or "" clears it.
 LLAMA_API void llama_turbot_set_sidecar_path(const char * path);
 
+// [TAG_FN_AUTO] getenv(name), else the automatic value of this model (LLAMA_FLASHNEXT_PROFILE on qwen4exp with host
+// experts, src/llama-fn-auto.h), else nullptr. model may be nullptr (then plain getenv).
+LLAMA_API const char * llama_model_fn_env(const struct llama_model * model, const char * name);
+// [TAG_FN_AUTO] "safe", "fast" or "fast-dma" while the automatic defaults are active for this model, else nullptr
+LLAMA_API const char * llama_model_fn_profile(const struct llama_model * model);
+
 // retrieves the whole token embedding matrix in F32 format (n_embd * n_vocab)
 // returns total number of elements or 0 on error
 // if out is nullptr, returns the number of tokens without writing to out

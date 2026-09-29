@@ -1259,6 +1259,14 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             }
         }
 
+        // [TAG_FN_AUTO] qwen4exp automatic placement: every trunk layer's routed experts on the host; the hot set moves the
+        // hot ones to VRAM. An override that matched above keeps its choice.
+        if (!buft && fn_host_experts_n_layer > 0 && tn.bid >= 0 && tn.bid < fn_host_experts_n_layer &&
+                (tn.tensor == LLM_TENSOR_FFN_UP_EXPS   || tn.tensor == LLM_TENSOR_FFN_GATE_EXPS ||
+                 tn.tensor == LLM_TENSOR_FFN_DOWN_EXPS || tn.tensor == LLM_TENSOR_FFN_GATE_UP_EXPS)) {
+            buft = select_weight_buft(hparams, t_meta, op, buft_list_cpu);
+        }
+
         if (!buft) {
             buft = select_weight_buft(hparams, t_meta, op, buft_list);
             if (!buft) {

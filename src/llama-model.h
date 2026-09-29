@@ -613,6 +613,8 @@ struct llama_meta_device_get_split_state_userdata {
 
 struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const struct ggml_tensor * tensor, void * userdata);
 
+struct llama_fn_auto_state; // [TAG_FN_AUTO] src/llama-fn-auto.h
+
 struct llama_model {
     llm_type type = LLM_TYPE_UNKNOWN;
     llm_arch arch = LLM_ARCH_UNKNOWN;
@@ -721,6 +723,9 @@ struct llama_model {
 
     int64_t t_load_us  = 0;
     int64_t t_start_us = 0;
+
+    // [TAG_FN_AUTO] automatic qwen4exp defaults (LLAMA_FLASHNEXT_PROFILE), nullptr for every other model
+    std::shared_ptr<llama_fn_auto_state> fn_auto;
 
     explicit llama_model(const llama_model_params & params);
     virtual ~llama_model();

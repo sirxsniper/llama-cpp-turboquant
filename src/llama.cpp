@@ -10,6 +10,7 @@
 #include "llama-model-loader.h"
 #include "llama-model-saver.h"
 #include "llama-model.h"
+#include "llama-fn-auto.h" // [TAG_FN_AUTO]
 
 #include "ggml.h"
 #include "ggml-cpp.h"
@@ -366,9 +367,14 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
             return {0, model_ptr.release()};
         }
 
+        // [TAG_FN_AUTO] qwen4exp with host experts: the profile's placement and fast levers, before any tensor exists
+        llama_fn_auto_on_load(*model, ml, fname, params);
+
         if (!model->load_tensors(ml)) {
             return {-2, nullptr};
         }
+
+        llama_fn_auto_after_load(*model); // [TAG_FN_AUTO]
 
         return {0, model_ptr.release()};
     } catch (const std::exception & err) {

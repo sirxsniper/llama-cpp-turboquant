@@ -337,6 +337,10 @@ endif()
 # [TAG_FN_MTP_COST] cost-aware MTP draft length (common/speculative-mtp-cost.h): pieces and a step simulation, CPU only
 llama_build_and_test(test-mtp-cost.cpp)
 
+# [TAG_FN_AUTO] [TAG_FN_VRAM_FIT] [TAG_FN_RAM_FIT] the automatic qwen4exp defaults (src/llama-fn-auto.h): profiles, option
+# lookup and environment handling, expert placement detection, VRAM fit and RAM fit plans. CPU only, no model.
+llama_build_and_test(test-fn-auto.cpp)
+
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model")
 llama_build_and_test(test-autorelease.cpp       LABEL "model")
 llama_build_and_test(test-backend-sampler.cpp   LABEL "model")
