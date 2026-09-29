@@ -276,10 +276,12 @@ static __global__ void k_mb_wait(const mb_dev v, const int chan, const int32_t *
                 g->wait_ns     = g->wait_ns + (mb_now_ns() - t0);
             }
         }
+        // acquire: the host wrote out before done. The fence is in the thread that read done and comes before the
+        // barrier that hands the result to the other threads, so their reads of out are ordered after the host's writes.
+        __threadfence_system();
         s_ok = ok;
     }
     __syncthreads();
-    __threadfence_system(); // acquire: the host wrote out before done
 
     const float * out    = (const float *) (v.data + (size_t) chan*v.chan_bytes + v.off_out);
     const int     stride = gridDim.x*blockDim.x;
@@ -402,8 +404,10 @@ ggml_moe_bridge * ggml_backend_cuda_moe_bridge_new(const ggml_moe_bridge_params 
 
     auto * b = new ggml_moe_bridge();
     b->params = *p;
-    b->params.timeout_ms = std::min(10000, std::max(1, p->timeout_ms));
-    b->params.job_max_ms = p->job_max_ms > 0 ? std::min(10000, std::max(b->params.timeout_ms, p->job_max_ms))
+    // one wait kernel spins at most job_max_ms: keep it well below the ~2 s Windows driver watchdog (TDR)
+    constexpr int max_ms = 1500;
+    b->params.timeout_ms = std::min(max_ms, std::max(1, p->timeout_ms));
+    b->params.job_max_ms = p->job_max_ms > 0 ? std::min(max_ms, std::max(b->params.timeout_ms, p->job_max_ms))
                                              : std::max(b->params.timeout_ms, 1000);
 
     const int64_t n_embd = p->n_embd;
@@ -548,13 +552,16 @@ bool ggml_backend_cuda_moe_bridge_poll(ggml_moe_bridge * b, ggml_moe_bridge_job 
     std::atomic_thread_fence(std::memory_order_acquire);
     const uint32_t chan = *(const volatile uint32_t *) &e->chan;
     const uint32_t seq  = *(const volatile uint32_t *) &e->seq;
-    b->served.store(next, std::memory_order_release);
     if (chan >= (uint32_t) b->params.n_chan) {
+        b->served.store(next, std::memory_order_release);
         return false;
     }
+    // owed before served: reset() reads served first, so it never sees this job served but not yet owed (it would then
+    // let a new post overwrite the channel this job still reads)
+    b->taken.fetch_add(1, std::memory_order_seq_cst);
+    b->served.store(next, std::memory_order_seq_cst);
     mb_make_job(b, (int32_t) chan, seq, job);
     mb_mark_taken(b, job);
-    b->taken.fetch_add(1, std::memory_order_relaxed);
     if (!mb_job_valid(b, job)) {
         ggml_backend_cuda_moe_bridge_complete(b, job, false);
         return false;

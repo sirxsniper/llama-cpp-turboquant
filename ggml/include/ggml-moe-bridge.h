@@ -43,7 +43,7 @@ struct ggml_moe_bridge_params {
     int     wait_mode;   // enum ggml_moe_bridge_wait_mode
     int     timeout_ms;  // a wait gives up after this long if the host has not taken the job
     int     job_max_ms;  // ... or after this long once it has (a slow job: page faults); <= 0: max(timeout_ms, 1000).
-                         // Both stay far below the ~2 s driver watchdog.
+                         // Both are clamped to 1500 ms, below the ~2 s driver watchdog.
     bool    stats;       // keep device wait statistics
 };
 
