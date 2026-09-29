@@ -1504,8 +1504,10 @@ struct ggml_backend_cuda_context {
     cudaEvent_t copy_event = nullptr;
 
     ggml_cuda_mmvq_q8_cache mmvq_q8;                // [TAG_MMVQ_Q8_REUSE]
-    ggml_cuda_graph_key_memo graph_key_memo[16];    // [TAG_GRAPH_KEY_MEMO]
-    int graph_key_memo_next = 0;
+    // [TAG_FN_GRAPH_KEY_MEMO] 256 entries, 4-way by uid: a Flash-Next step has ~45-100 splits per graph, and one
+    // graph per verify width (LLAMA_GRAPH_PER_WIDTH) keeps up to 4 graphs live; 16 round-robin entries always missed
+    static constexpr int GRAPH_KEY_MEMO_N = 256;
+    ggml_cuda_graph_key_memo graph_key_memo[GRAPH_KEY_MEMO_N];    // [TAG_GRAPH_KEY_MEMO]
     ggml_cuda_graph_host_probe graph_host_probe;    // [TAG_GRAPH_HOST_PROBE]
 
     cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = { { nullptr } };

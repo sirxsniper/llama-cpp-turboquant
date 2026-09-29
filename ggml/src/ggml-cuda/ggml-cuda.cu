@@ -2736,8 +2736,14 @@ static bool ggml_cuda_graph_key_memo_enabled() {
     return on;
 }
 
+// [TAG_FN_GRAPH_KEY_MEMO] 4-way set lookup by uid: O(1) per call with 256 entries (uids are consecutive per graph split)
+static constexpr int GGML_CUDA_GRAPH_KEY_MEMO_WAYS = 4;
+
 static ggml_cuda_graph_key_memo * ggml_cuda_graph_key_memo_find(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph) {
-    for (ggml_cuda_graph_key_memo & m : cuda_ctx->graph_key_memo) {
+    constexpr int n_memo = ggml_backend_cuda_context::GRAPH_KEY_MEMO_N;
+    const int base = (int) (cgraph->uid % n_memo);
+    for (int w = 0; w < GGML_CUDA_GRAPH_KEY_MEMO_WAYS; ++w) {
+        ggml_cuda_graph_key_memo & m = cuda_ctx->graph_key_memo[(base + w) % n_memo];
         if (m.uid == cgraph->uid && m.cgraph == cgraph && m.n_nodes == cgraph->n_nodes && m.key != nullptr) {
             return &m;
         }
@@ -2756,9 +2762,21 @@ static const void * ggml_cuda_graph_get_key(ggml_backend_cuda_context * cuda_ctx
 
     const void * key = ggml_cuda_graph_get_key_hash(cgraph);
 
-    constexpr int n_memo = (int) (sizeof(ggml_backend_cuda_context::graph_key_memo) / sizeof(ggml_cuda_graph_key_memo));
-    ggml_cuda_graph_key_memo & m = cuda_ctx->graph_key_memo[cuda_ctx->graph_key_memo_next];
-    cuda_ctx->graph_key_memo_next = (cuda_ctx->graph_key_memo_next + 1) % n_memo;
+    // [TAG_FN_GRAPH_KEY_MEMO] replace an empty way, else the oldest (smallest uid) of the set
+    constexpr int n_memo = ggml_backend_cuda_context::GRAPH_KEY_MEMO_N;
+    const int base = (int) (cgraph->uid % n_memo);
+    int victim = base;
+    for (int w = 0; w < GGML_CUDA_GRAPH_KEY_MEMO_WAYS; ++w) {
+        const int i = (base + w) % n_memo;
+        if (cuda_ctx->graph_key_memo[i].key == nullptr) {
+            victim = i;
+            break;
+        }
+        if (cuda_ctx->graph_key_memo[i].uid < cuda_ctx->graph_key_memo[victim].uid) {
+            victim = i;
+        }
+    }
+    ggml_cuda_graph_key_memo & m = cuda_ctx->graph_key_memo[victim];
     m.uid     = cgraph->uid;
     m.cgraph  = cgraph;
     m.n_nodes = cgraph->n_nodes;

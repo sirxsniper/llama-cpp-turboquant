@@ -37,6 +37,7 @@
 #include <fstream>
 #include <memory>
 #include <mutex>
+#include <numeric>
 #include <random>
 #include <regex>
 #include <set>
@@ -7975,6 +7976,83 @@ struct test_mul_mat_shared_src1 : public test_case {
     }
 };
 
+// [TAG_FN_MOE_HOT] the hot-set chain of build_moe_ffn (src/llama-graph.cpp) at Flash-Next shapes: the routed ids of
+// T tokens (cont of a top-k view, flattened) remapped through an expert -> slot table by GET_ROWS, then MUL_MAT_ID over
+// the slot tensor whose last slot is all zeros; most ids map to that zero slot, several times per token
+struct test_moe_hot_chain : public test_case {
+    const ggml_type type_a;
+    const int64_t   k;        // input width (2560 for gate/up, 640 for down)
+    const int64_t   m;        // output rows
+    const int       n_expert;
+    const int       n_hot;
+    const int       n_used;
+    const int       n_tokens;
+
+    std::string vars() override {
+        return VARS_TO_STR7(type_a, k, m, n_expert, n_hot, n_used, n_tokens);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    test_moe_hot_chain(ggml_type type_a = GGML_TYPE_Q4_K, int64_t k = 2560, int64_t m = 640,
+            int n_expert = 512, int n_hot = 96, int n_used = 10, int n_tokens = 3)
+        : type_a(type_a), k(k), m(m), n_expert(n_expert), n_hot(n_hot), n_used(n_used), n_tokens(n_tokens) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * slots = ggml_new_tensor_3d(ctx, type_a, k, m, n_hot + 1);
+        ggml_set_name(slots, "slots");
+        ggml_tensor * table = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1, n_expert);
+        ggml_set_name(table, "table");
+        // the routed ids arrive as the first n_used of a wider top-k row, like ggml_argsort_top_k's view
+        ggml_tensor * sel_all = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used + 6, n_tokens);
+        ggml_set_name(sel_all, "sel_all");
+        ggml_tensor * sel = ggml_view_2d(ctx, sel_all, n_used, n_tokens, sel_all->nb[1], 0);
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, 1, n_tokens);
+        ggml_set_name(x, "x");
+
+        ggml_tensor * ids_flat = ggml_reshape_1d(ctx, ggml_cont(ctx, sel), n_used*n_tokens);
+        ggml_tensor * slot_ids = ggml_reshape_2d(ctx, ggml_get_rows(ctx, table, ids_flat), n_used, n_tokens);
+        ggml_tensor * out = ggml_mul_mat_id(ctx, slots, x, slot_ids);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 rng(1234);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            const std::string name = ggml_get_name(t);
+            if (name == "slots") {
+                init_tensor_uniform(t);
+                std::vector<uint8_t> zero(t->nb[2], 0);
+                ggml_backend_tensor_set(t, zero.data(), (size_t) n_hot*t->nb[2], t->nb[2]);
+            } else if (name == "table") {
+                // n_hot experts get a slot, all others the zero slot n_hot
+                std::vector<int32_t> perm(n_expert);
+                std::iota(perm.begin(), perm.end(), 0);
+                std::shuffle(perm.begin(), perm.end(), rng);
+                std::vector<int32_t> tbl(n_expert, n_hot);
+                for (int s = 0; s < n_hot; ++s) {
+                    tbl[perm[s]] = s;
+                }
+                ggml_backend_tensor_set(t, tbl.data(), 0, tbl.size()*sizeof(int32_t));
+            } else if (name == "sel_all") {
+                std::vector<int32_t> ids(t->ne[0]*t->ne[1]);
+                for (int64_t r = 0; r < t->ne[1]; ++r) {
+                    std::vector<int32_t> perm(n_expert);
+                    std::iota(perm.begin(), perm.end(), 0);
+                    std::shuffle(perm.begin(), perm.end(), rng);
+                    std::copy(perm.begin(), perm.begin() + t->ne[0], ids.begin() + r*t->ne[0]);
+                }
+                ggml_backend_tensor_set(t, ids.data(), 0, ids.size()*sizeof(int32_t));
+            } else if (t->type == GGML_TYPE_F32 && !ggml_is_view_op(t->op)) {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // [TAG_DFL_LEAN] the DFlash2 drafter conv of LLAMA_DFLASH_LEAN=1 (src/models/dflash.cpp build_dflash2_conv_lean), at
 // Qwen3.8-27B's DFlash2 shapes: the coefficients read through a strided 4-D view and repeated, the shifted tap as a left
 // pad of a strided view, and MUL with a strided src0. Every op is shipped; these strided shapes are new on the backends.
@@ -13824,6 +13902,36 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 {64, 64, 64, 64}, cols, 256, reshape_third));
         }
     }
+
+    // [TAG_FN_MOE_HOT] the Flash-Next hot-set chain: gate/up 2560 -> 640 (q4_K, q5_K), down 640 -> 2560 (q5_1, q8_0,
+    // iq4_nl), 10 routed experts per token, T = 1..8 (MTP verify, 2 streams); most ids hit the zero slot
+    for (int t : {1, 2, 3, 4, 8}) {
+        test_cases.emplace_back(new test_moe_hot_chain(GGML_TYPE_Q4_K,   2560, 640, 512, 96, 10, t));
+        test_cases.emplace_back(new test_moe_hot_chain(GGML_TYPE_Q5_1,   640, 2560, 512, 96, 10, t));
+        test_cases.emplace_back(new test_moe_hot_chain(GGML_TYPE_Q8_0,   640, 2560, 512, 96, 10, t));
+        test_cases.emplace_back(new test_moe_hot_chain(GGML_TYPE_IQ4_NL, 640, 2560, 512, 96, 10, t));
+    }
+    test_cases.emplace_back(new test_moe_hot_chain(GGML_TYPE_Q5_K, 2560, 640, 512, 96,  10, 2));
+    test_cases.emplace_back(new test_moe_hot_chain(GGML_TYPE_Q4_K, 2560, 640, 512, 400, 10, 6)); // most ids hot
+    test_cases.emplace_back(new test_moe_hot_chain(GGML_TYPE_Q4_K, 2560, 640, 512, 1,   10, 4)); // almost all ids zero slot
+
+    // [TAG_FN_QSA_CHUNK] TURBO_QSA_CHUNK=64: indexer top-k of a 64-query chunk over n_kv cells, the chunks' indices
+    // concatenated along the query axis (i32), and the chunk's mask rows cast to f32
+    for (int64_t n_kv : {4096, 16384, 65536}) {
+        test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {n_kv, 64, 1, 1}, 2051));
+        test_cases.emplace_back(new test_cpy(GGML_TYPE_F16, GGML_TYPE_F32, {n_kv, 64, 1, 1}));
+    }
+    test_cases.emplace_back(new test_concat(GGML_TYPE_I32, {2051, 64, 1, 1},  64, 1, 0));
+    test_cases.emplace_back(new test_concat(GGML_TYPE_I32, {2051, 448, 1, 1}, 64, 1, 0));
+
+    // [TAG_FN_MTP_HEAD_ROWS] LLAMA_MTP_HEAD_ROWS=98304 on Flash-Next: rows [0, 98304) of the 2560-wide q8_0 head, the
+    // -inf rest of the 248320 vocabulary concatenated, and the extra rows (get_rows + f32 product) set by id
+    for (int64_t n : {1, 2, 3}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 98304, n, 2560, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {98304, n, 1, 1}, 248320 - 98304, 0, 0));
+        test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, GGML_TYPE_F32, GGML_TYPE_I32, {1, 248320, 1, 1}, {(int) n, 1}, 131));
+    }
+    test_cases.emplace_back(new test_get_rows(GGML_TYPE_Q8_0, 2560, 1024, 131, 1));
 
     // [TAG_DFL_HEAD] [TAG_DFL_LEAN] the DFlash2 drafter with LLAMA_DFLASH_HEAD_ROWS=98304 and LLAMA_DFLASH_LEAN=1 at
     // Qwen3.8-27B shapes: 4..32 drafter rows (block 4 or 8 x 1..4 drafting sequences), the 5120-wide Q6_K target head

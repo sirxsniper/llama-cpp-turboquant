@@ -6,13 +6,17 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 
+#include <algorithm>
 #include <cinttypes>
 #include <condition_variable>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <fstream>
 #include <map>
 #include <mutex>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -36,6 +40,14 @@ struct layer_state {
 
     uint64_t n_hit  = 0;
     uint64_t n_miss = 0;
+
+    // [TAG_FN_MOE_HOT_ADAPT] sightings per expert in the last W decode steps; the observer fills cur_* during a step
+    std::vector<uint16_t>             win_cnt;   // [n_expert]
+    std::vector<std::vector<int32_t>> win_ring;  // W steps of unique ids
+    std::vector<int32_t>              cur_ids;   // unique ids of the running step
+    std::vector<uint8_t>              cur_seen;  // [n_expert]
+    std::vector<double>               prof;      // static profile counts (eviction tie-break)
+    int64_t                           tbl_off = 0; // row offset in the group's table tensor
 };
 
 struct upload_job {
@@ -60,6 +72,35 @@ struct moe_cache {
     std::vector<ggml_context *>         ctxs;
     std::vector<ggml_backend_buffer_t>  bufs;
 
+    // [TAG_FN_MOE_HOT] static hot set: tables written once, no observer / worker / step
+    bool    hot       = false;
+    int     hot_max_t = 0;
+    uint64_t hot_steps = 0;
+
+    // [TAG_FN_MOE_HOT_ADAPT] adaptive hot set: tables change only in step() of the owning context, after its compute
+    // has been synchronized; victims leave both tables before their slot is overwritten, and a new expert enters them
+    // only after its upload (own backend and stream, pinned staging) has completed
+    bool          adapt       = false;
+    const void *  owner       = nullptr;
+    int           ad_win      = 16;
+    int           ad_min      = 3;
+    int           ad_hyst     = 1;
+    size_t        ad_bytes    = 64u << 20;
+    int           ad_verify   = 0;
+    int           ad_pos      = 0;
+    uint64_t      ad_steps    = 0;
+    uint64_t      ad_admitted = 0;
+    uint64_t      ad_bad      = 0;
+    bool          ad_stats    = false;
+    ggml_backend_t        up_backend = nullptr;
+    ggml_backend_buffer_t staging    = nullptr;
+    uint8_t *             stage_ptr  = nullptr;
+    size_t                stage_size = 0;
+    std::vector<uint8_t>  stage_buf;
+    ggml_tensor *         tbl_all    = nullptr; // one group's device tables, [1, n_expert, n_layers]
+    std::vector<int32_t>  tbl_mirror;
+    bool                  tbl_dirty  = false;
+
     // async upload worker: slices are copied to the device off the decode
     // thread; the new table mapping is only published at a later step() once
     // the upload has completed, so a running graph never reads a torn slot
@@ -72,6 +113,8 @@ struct moe_cache {
 };
 
 moe_cache * g_cache = nullptr;
+
+void hot_adapt_step(moe_cache * mc); // [TAG_FN_MOE_HOT_ADAPT]
 std::mutex g_init_mtx;
 bool g_init_done = false;
 
@@ -154,6 +197,13 @@ void set_table_entry(llama_moe_cache_layer & pub, int32_t expert, int32_t slot_o
 void llama_moe_cache_init(const llama_model & model, int32_t n_slots, int32_t max_inserts) {
     std::lock_guard<std::mutex> init_lock(g_init_mtx);
     if (g_init_done) {
+        return;
+    }
+    // [TAG_FN_MOE_HOT] a hot profile replaces the LRU cache; llama_moe_hot_init builds it after the scheduler reserve
+    if (const char * hp = getenv("LLAMA_MOE_HOT_PROFILE"); hp && hp[0]) {
+        if (n_slots > 0) {
+            LLAMA_LOG_WARN("%s: LLAMA_MOE_HOT_PROFILE is set, --moe-expert-cache %d is ignored\n", __func__, n_slots);
+        }
         return;
     }
     [&]() {
@@ -338,9 +388,15 @@ const llama_moe_cache_layer * llama_moe_cache_lookup(const ggml_tensor * up_exps
     return &g_cache->layers[it->second].pub;
 }
 
-void llama_moe_cache_step() {
+void llama_moe_cache_step(const void * ctx) {
     moe_cache * mc = g_cache;
     if (!mc) {
+        return;
+    }
+    if (mc->hot) { // [TAG_FN_MOE_HOT] a static hot set never changes; an adaptive one only in its owner's step
+        if (mc->adapt && ctx == mc->owner) {
+            hot_adapt_step(mc);
+        }
         return;
     }
 
@@ -416,4 +472,733 @@ void llama_moe_cache_step() {
         LLAMA_LOG_DEBUG("moe-cache: steps=%" PRIu64 " hits=%" PRIu64 " misses=%" PRIu64 " hit-rate=%.1f%%\n",
                 mc->n_steps, h, m, h + m ? 100.0*h/(h + m) : 0.0);
     }
+}
+
+// [TAG_FN_MOE_HOT] ------------------------------------------------------------------------------------------------
+
+namespace {
+
+struct hot_stats {
+    std::vector<uint64_t> hit;   // by layer index
+    std::vector<uint64_t> tot;
+    int first_il = -1;
+};
+
+hot_stats g_hot_stats;
+
+// LLAMA_MOE_HOT_STATS: the CPU MUL_MAT_ID of every host-resident ffn_gate_exps reports its routed ids here (the
+// observer hook of the LRU cache, ggml-cpu.c); decode ubatches only, counted against the fixed host table
+void hot_obs_cb(const char * name, const struct ggml_tensor * ids, void * ud) {
+    moe_cache * mc = (moe_cache *) ud;
+    const int64_t n_used   = ids->ne[0];
+    const int64_t n_tokens = ids->ne[1];
+    if (n_tokens > mc->hot_max_t) {
+        return; // prefill: not counted, and the adaptive set stays frozen
+    }
+    const int il = parse_layer_from_name(name);
+    layer_state * ls = nullptr;
+    for (auto & l : mc->layers) {
+        if (l.pub.il == il) { ls = &l; break; }
+    }
+    const bool stats = mc->ad_stats && il >= 0 && il < (int) g_hot_stats.hit.size();
+    if (ls) {
+        const int32_t * tbl = (const int32_t *) ls->pub.host_table->data;
+        const int64_t n_exp = ls->pub.host_table->ne[1];
+        for (int64_t t = 0; t < n_tokens; ++t) {
+            for (int64_t i = 0; i < n_used; ++i) {
+                const int32_t e = *(const int32_t *) ((const char *) ids->data + t*ids->nb[1] + i*ids->nb[0]);
+                if (e < 0 || e >= n_exp) {
+                    continue;
+                }
+                if (stats) {
+                    g_hot_stats.tot[il]++;
+                    g_hot_stats.hit[il] += tbl[e] != ls->pub.n_slots;
+                }
+                // [TAG_FN_MOE_HOT_ADAPT] one sighting per expert and step
+                if (mc->adapt && !ls->cur_seen.empty() && !ls->cur_seen[e]) {
+                    ls->cur_seen[e] = 1;
+                    ls->cur_ids.push_back(e);
+                }
+            }
+        }
+    }
+    if (!stats || il != g_hot_stats.first_il) {
+        return;
+    }
+    if (++mc->hot_steps % 256 != 0) {
+        return;
+    }
+    uint64_t h = 0, t = 0;
+    double lo = 1.0, hi = 0.0;
+    for (size_t i = 0; i < g_hot_stats.hit.size(); ++i) {
+        if (g_hot_stats.tot[i] == 0) {
+            continue;
+        }
+        h += g_hot_stats.hit[i];
+        t += g_hot_stats.tot[i];
+        const double r = (double) g_hot_stats.hit[i] / g_hot_stats.tot[i];
+        lo = std::min(lo, r);
+        hi = std::max(hi, r);
+    }
+    LLAMA_LOG_INFO("moe-hot: %" PRIu64 " decode steps, hit rate %.3f (host layers only; layer min %.3f max %.3f)%s\n",
+            mc->hot_steps, t ? (double) h / t : 0.0, lo, hi, mc->adapt ? " adaptive" : "");
+    if (mc->adapt) {
+        LLAMA_LOG_INFO("moe-hot: adaptive: %" PRIu64 " experts admitted, %" PRIu64 " verify mismatches\n", mc->ad_admitted, mc->ad_bad);
+    }
+}
+
+// moeprof v1 (src/llama-moetrace.cpp, tools/moe-trace/make_profile.py): "<section> <il> c0 c1 ..."
+bool hot_read_profile(const char * path, const std::string & want, std::map<int, std::vector<double>> & out, std::string & used) {
+    std::ifstream f(path);
+    if (!f) {
+        LLAMA_LOG_WARN("moe-hot: cannot read %s\n", path);
+        return false;
+    }
+    std::string line;
+    std::getline(f, line);
+    if (line.rfind("moeprof v1", 0) != 0) {
+        LLAMA_LOG_WARN("moe-hot: %s is not a moeprof v1 file\n", path);
+        return false;
+    }
+    std::map<std::string, std::map<int, std::vector<double>>> sec;
+    while (std::getline(f, line)) {
+        if (line.empty() || line[0] == '#') {
+            continue;
+        }
+        std::istringstream ss(line);
+        std::string name;
+        int il = -1;
+        if (!(ss >> name >> il) || il < 0) {
+            continue;
+        }
+        std::vector<double> v;
+        double x;
+        while (ss >> x) {
+            v.push_back(x);
+        }
+        sec[name][il] = std::move(v);
+    }
+    for (const std::string & s : { want, std::string("decode_union"), std::string("decode_tokens"), std::string("prefill_tokens") }) {
+        auto it = sec.find(s);
+        if (it != sec.end() && !it->second.empty()) {
+            out  = it->second;
+            used = s;
+            return true;
+        }
+    }
+    LLAMA_LOG_WARN("moe-hot: %s has no usable section\n", path);
+    return false;
+}
+
+double hot_type_cost(ggml_type t, const std::map<std::string, double> & cost) {
+    auto it = cost.find(ggml_type_name(t));
+    return it != cost.end() ? it->second : 1.0;
+}
+
+// [TAG_FN_MOE_HOT_ADAPT] -------------------------------------------------------------------------------------------
+
+// one table entry: the host table directly (CPU memory, read only by the next graph), the device table through the
+// mirror that step() uploads once
+void hot_adapt_set_entry(moe_cache * mc, layer_state & ls, int32_t expert, int32_t v) {
+    ((int32_t *) ls.pub.host_table->data)[expert] = v;
+    mc->tbl_mirror[ls.tbl_off + expert] = v;
+    mc->tbl_dirty = true;
+}
+
+// uploads the queued slices: mmap -> pinned staging -> the upload backend's own stream, then marks them done
+void hot_adapt_worker(moe_cache * mc) {
+    std::vector<upload_job> batch;
+    struct staged { ggml_tensor * dst; size_t off; size_t size; size_t stage_off; };
+    std::vector<staged> st;
+    for (;;) {
+        {
+            std::unique_lock<std::mutex> lk(mc->wmtx);
+            mc->wcv.wait(lk, [mc]() { return mc->stop || !mc->todo.empty(); });
+            if (mc->stop) {
+                return;
+            }
+            batch.assign(mc->todo.begin(), mc->todo.end());
+            mc->todo.clear();
+        }
+        size_t used = 0;
+        auto flush = [&]() {
+            for (const auto & x : st) {
+                ggml_backend_tensor_set_async(mc->up_backend, x.dst, mc->stage_ptr + x.stage_off, x.off, x.size);
+            }
+            ggml_backend_synchronize(mc->up_backend);
+            st.clear();
+            used = 0;
+        };
+        for (const auto & j : batch) {
+            layer_state & ls = mc->layers[j.layer_idx];
+            ggml_tensor *       dsts[3] = { ls.pub.up_c,   ls.pub.gate_c,   ls.pub.down_c   };
+            const ggml_tensor * srcs[3] = { ls.pub.up_src, ls.pub.gate_src, ls.pub.down_src };
+            for (int k = 0; k < 3; ++k) {
+                const size_t sz = srcs[k]->nb[2];
+                if (sz > mc->stage_size) {
+                    upload_slice(dsts[k], srcs[k], j.expert, j.slot);
+                    continue;
+                }
+                if (used + sz > mc->stage_size) {
+                    flush();
+                }
+                memcpy(mc->stage_ptr + used, (const char *) srcs[k]->data + (size_t) j.expert*sz, sz);
+                st.push_back({ dsts[k], (size_t) j.slot*dsts[k]->nb[2], sz, used });
+                used += sz;
+            }
+        }
+        flush();
+        std::lock_guard<std::mutex> lk(mc->wmtx);
+        for (auto j : batch) {
+            j.done = true;
+            mc->done.push_back(j);
+        }
+    }
+}
+
+// LLAMA_MOE_HOT_VERIFY: one resident slot read back and compared with its source bytes
+void hot_adapt_verify(moe_cache * mc) {
+    static uint64_t pick = 0;
+    for (size_t tries = 0; tries < mc->layers.size(); ++tries) {
+        layer_state & ls = mc->layers[(pick++) % mc->layers.size()];
+        if (ls.pub.n_slots == 0) {
+            continue;
+        }
+        const int32_t s = (int32_t) ((pick*2654435761u) % (uint64_t) ls.pub.n_slots);
+        const int32_t e = ls.slot_expert[s];
+        if (e < 0 || ls.slot_in_flight[s]) {
+            continue;
+        }
+        ggml_tensor *       dsts[3] = { ls.pub.up_c,   ls.pub.gate_c,   ls.pub.down_c   };
+        const ggml_tensor * srcs[3] = { ls.pub.up_src, ls.pub.gate_src, ls.pub.down_src };
+        std::vector<uint8_t> buf;
+        bool same = true;
+        for (int k = 0; k < 3 && same; ++k) {
+            const size_t sz = srcs[k]->nb[2];
+            buf.resize(sz);
+            ggml_backend_tensor_get(dsts[k], buf.data(), (size_t) s*dsts[k]->nb[2], sz);
+            same = memcmp(buf.data(), (const char *) srcs[k]->data + (size_t) e*sz, sz) == 0;
+        }
+        if (!same) {
+            mc->ad_bad++;
+            LLAMA_LOG_ERROR("moe-hot: VERIFY MISMATCH blk.%d slot %d expert %d - evicted, the CPU computes it again\n",
+                    ls.pub.il, s, e);
+            ls.expert_slot[e] = -1;
+            ls.slot_expert[s] = -1;
+            hot_adapt_set_entry(mc, ls, e, ls.pub.n_slots);
+        }
+        return;
+    }
+}
+
+// the owning context's step boundary, after its compute has been synchronized: publish finished uploads, roll the
+// windows, then evict and queue new uploads (byte-capped). Nothing here runs while a graph of this context runs.
+void hot_adapt_step(moe_cache * mc) {
+    {
+        std::lock_guard<std::mutex> lk(mc->wmtx);
+        for (const auto & j : mc->done) {
+            layer_state & ls = mc->layers[j.layer_idx];
+            ls.slot_expert[j.slot]        = j.expert;
+            ls.expert_slot[j.expert]      = j.slot;
+            ls.slot_in_flight[j.slot]     = false;
+            ls.expert_in_flight[j.expert] = false;
+            hot_adapt_set_entry(mc, ls, j.expert, j.slot);
+            mc->ad_admitted++;
+        }
+        mc->done.clear();
+    }
+
+    bool any = false;
+    for (const auto & ls : mc->layers) {
+        any = any || !ls.cur_ids.empty();
+    }
+    if (any) {
+        mc->ad_steps++;
+        const int pos = mc->ad_pos;
+        mc->ad_pos = (mc->ad_pos + 1) % mc->ad_win;
+        for (auto & ls : mc->layers) {
+            auto & slot = ls.win_ring[pos];
+            for (const int32_t e : slot) {
+                if (ls.win_cnt[e] > 0) {
+                    ls.win_cnt[e]--;
+                }
+            }
+            slot.swap(ls.cur_ids);
+            ls.cur_ids.clear();
+            for (const int32_t e : slot) {
+                ls.win_cnt[e]++;
+                ls.cur_seen[e] = 0;
+            }
+        }
+
+        struct cand { int li; int32_t e; uint16_t c; };
+        std::vector<cand> cands;
+        for (int li = 0; li < (int) mc->layers.size(); ++li) {
+            const layer_state & ls = mc->layers[li];
+            if (ls.pub.n_slots == 0) {
+                continue;
+            }
+            for (const int32_t e : ls.win_ring[pos]) {
+                if (ls.expert_slot[e] < 0 && !ls.expert_in_flight[e] && ls.win_cnt[e] >= mc->ad_min) {
+                    cands.push_back({ li, e, ls.win_cnt[e] });
+                }
+            }
+        }
+        std::stable_sort(cands.begin(), cands.end(), [](const cand & a, const cand & b) { return a.c > b.c; });
+
+        size_t bytes = 0;
+        bool queued = false;
+        for (const auto & c : cands) {
+            layer_state & ls = mc->layers[c.li];
+            const size_t b = ls.pub.up_src->nb[2] + ls.pub.gate_src->nb[2] + ls.pub.down_src->nb[2];
+            if (bytes + b > mc->ad_bytes) {
+                break;
+            }
+            // victim: the resident slot with the fewest recent sightings, then the lowest static count
+            int32_t  vs = -1;
+            uint16_t vc = 0;
+            double   vp = 0.0;
+            for (int32_t s = 0; s < ls.pub.n_slots; ++s) {
+                if (ls.slot_in_flight[s]) {
+                    continue;
+                }
+                const int32_t  ve = ls.slot_expert[s];
+                const uint16_t cc = ve >= 0 ? ls.win_cnt[ve] : 0;
+                const double   pp = ve >= 0 ? ls.prof[ve] : -1.0;
+                if (vs < 0 || cc < vc || (cc == vc && pp < vp)) {
+                    vs = s;
+                    vc = cc;
+                    vp = pp;
+                }
+            }
+            if (vs < 0 || (int) c.c <= (int) vc + mc->ad_hyst) {
+                continue;
+            }
+            // evict first: the victim leaves both tables now, so no later graph reads the slot being overwritten
+            const int32_t ve = ls.slot_expert[vs];
+            if (ve >= 0) {
+                ls.expert_slot[ve] = -1;
+                hot_adapt_set_entry(mc, ls, ve, ls.pub.n_slots);
+            }
+            ls.slot_expert[vs]      = -1;
+            ls.slot_in_flight[vs]   = true;
+            ls.expert_in_flight[c.e] = true;
+            {
+                std::lock_guard<std::mutex> lk(mc->wmtx);
+                upload_job j;
+                j.layer_idx = (size_t) c.li;
+                j.expert    = c.e;
+                j.slot      = vs;
+                mc->todo.push_back(j);
+            }
+            bytes += b;
+            queued = true;
+        }
+        if (queued) {
+            mc->wcv.notify_one();
+        }
+
+        if (mc->ad_verify > 0 && mc->ad_steps % (uint64_t) mc->ad_verify == 0) {
+            hot_adapt_verify(mc);
+        }
+    }
+
+    // every table change of this step reaches the device in one copy, before the next graph is launched
+    if (mc->tbl_dirty) {
+        ggml_backend_tensor_set(mc->tbl_all, mc->tbl_mirror.data(), 0, mc->tbl_mirror.size()*sizeof(int32_t));
+        mc->tbl_dirty = false;
+    }
+}
+
+void hot_adapt_init(moe_cache * mc, const void * owner, ggml_backend_dev_t dev) {
+    if (!owner || !dev || !mc->tbl_all) {
+        LLAMA_LOG_WARN("moe-hot: LLAMA_MOE_HOT_ADAPT needs one device and equal expert counts - static hot set only\n");
+        return;
+    }
+    if (const char * e = getenv("LLAMA_MOE_HOT_ADMIT")) { // N/W
+        int n = 0, w = 0;
+        if (sscanf(e, "%d/%d", &n, &w) == 2 && n >= 1 && w >= n && w <= 256) {
+            mc->ad_min = n;
+            mc->ad_win = w;
+        }
+    }
+    if (const char * e = getenv("LLAMA_MOE_HOT_ADAPT_MIB")) {
+        mc->ad_bytes = (size_t) std::max(1, atoi(e)) << 20;
+    }
+    if (const char * e = getenv("LLAMA_MOE_HOT_HYST")) {
+        mc->ad_hyst = std::max(0, atoi(e));
+    }
+    if (const char * e = getenv("LLAMA_MOE_HOT_VERIFY")) {
+        mc->ad_verify = std::max(0, atoi(e));
+    }
+
+    mc->up_backend = ggml_backend_dev_init(dev, nullptr);
+    if (!mc->up_backend) {
+        LLAMA_LOG_WARN("moe-hot: no upload backend - static hot set only\n");
+        return;
+    }
+    mc->stage_size = std::max<size_t>(mc->ad_bytes, 16u << 20);
+    if (ggml_backend_buffer_type_t hb = ggml_backend_dev_host_buffer_type(dev)) {
+        mc->staging = ggml_backend_buft_alloc_buffer(hb, mc->stage_size);
+    }
+    if (mc->staging) {
+        mc->stage_ptr = (uint8_t *) ggml_backend_buffer_get_base(mc->staging);
+    } else {
+        mc->stage_buf.resize(mc->stage_size); // pageable: correct, but the copies stage through the driver
+        mc->stage_ptr = mc->stage_buf.data();
+    }
+
+    const int64_t n_exp = mc->tbl_all->ne[1];
+    mc->tbl_mirror.assign((size_t) ggml_nelements(mc->tbl_all), 0);
+    ggml_backend_tensor_get(mc->tbl_all, mc->tbl_mirror.data(), 0, mc->tbl_mirror.size()*sizeof(int32_t));
+    for (auto & ls : mc->layers) {
+        ls.win_cnt.assign(n_exp, 0);
+        ls.win_ring.assign(mc->ad_win, {});
+        ls.cur_seen.assign(n_exp, 0);
+        ls.cur_ids.clear();
+    }
+    mc->owner = owner;
+    mc->adapt = true;
+    mc->worker = std::thread(hot_adapt_worker, mc);
+    LLAMA_LOG_INFO("moe-hot: adaptive: admit after %d sightings in %d steps, hysteresis %d, <= %zu MiB uploads per step, "
+            "%s staging, verify every %d steps\n", mc->ad_min, mc->ad_win, mc->ad_hyst, mc->ad_bytes >> 20,
+            mc->staging ? "pinned" : "pageable", mc->ad_verify);
+}
+
+} // namespace
+
+int llama_moe_hot_max_t() {
+    const moe_cache * mc = g_cache;
+    return mc && mc->hot ? mc->hot_max_t : 0;
+}
+
+bool llama_moe_hot_init(const llama_model & model, const void * owner) {
+    const char * path = getenv("LLAMA_MOE_HOT_PROFILE");
+    if (!path || !path[0]) {
+        return false;
+    }
+    std::lock_guard<std::mutex> init_lock(g_init_mtx);
+    if (g_init_done) {
+        return false;
+    }
+
+    // host-resident expert layers with a device-resident router (the same rule as the LRU cache). A context of a
+    // model whose weights are not loaded (memory estimation) finds none and leaves the one attempt to a later context.
+    std::vector<int> host_layers;
+    for (size_t il = 0; il < model.layers.size(); ++il) {
+        const auto & l = model.layers[il];
+        if (l.ffn_up_exps && l.ffn_gate_exps && l.ffn_down_exps && l.ffn_gate_inp && !l.ffn_gate_up_exps &&
+                l.ffn_up_exps->data && l.ffn_up_exps->buffer && ggml_backend_buffer_is_host(l.ffn_up_exps->buffer) &&
+                l.ffn_gate_inp->buffer && !ggml_backend_buffer_is_host(l.ffn_gate_inp->buffer)) {
+            host_layers.push_back((int) il);
+        }
+    }
+    if (host_layers.empty()) {
+        LLAMA_LOG_WARN("moe-hot: no host-resident expert layer (all experts on a device?) - hot set off\n");
+        return false;
+    }
+    g_init_done = true; // one attempt per process: on any failure below the model runs without a hot set
+
+    int max_t = 8;
+    if (const char * e = getenv("LLAMA_MOE_HOT_MAX_T")) {
+        max_t = std::max(1, std::min(8, atoi(e)));
+    }
+    std::map<std::string, double> cost = { { "q5_1", 1.3 } };
+    if (const char * e = getenv("LLAMA_MOE_HOT_COST")) {
+        std::stringstream ss(e);
+        std::string kv;
+        while (std::getline(ss, kv, ',')) {
+            const size_t eq = kv.find('=');
+            if (eq != std::string::npos) {
+                cost[kv.substr(0, eq)] = atof(kv.c_str() + eq + 1);
+            }
+        }
+    }
+    const char * sec_env = getenv("LLAMA_MOE_HOT_SECTION");
+    std::map<int, std::vector<double>> prof;
+    std::string sec_used;
+    if (!hot_read_profile(path, sec_env ? sec_env : "decode_union", prof, sec_used)) {
+        return false;
+    }
+
+    struct cand_layer {
+        int il;
+        const llama_layer * l;
+        ggml_backend_buffer_type_t buft;
+        size_t bytes;     // per expert, up + gate + down
+        double cost;      // CPU cost per byte relative to 1.0
+    };
+    std::vector<cand_layer> layers;
+    for (int il : host_layers) {
+        const auto & l = model.layers[il];
+        const auto it = prof.find(il);
+        if (it == prof.end() || (int64_t) it->second.size() != l.ffn_up_exps->ne[2]) {
+            continue;
+        }
+        cand_layer c;
+        c.il    = il;
+        c.l     = &l;
+        c.buft  = ggml_backend_buffer_get_type(l.ffn_gate_inp->buffer);
+        c.bytes = l.ffn_up_exps->nb[2] + l.ffn_gate_exps->nb[2] + l.ffn_down_exps->nb[2];
+        c.cost  = (l.ffn_up_exps->nb[2]  *hot_type_cost(l.ffn_up_exps->type,   cost) +
+                   l.ffn_gate_exps->nb[2]*hot_type_cost(l.ffn_gate_exps->type, cost) +
+                   l.ffn_down_exps->nb[2]*hot_type_cost(l.ffn_down_exps->type, cost)) / (double) c.bytes;
+        layers.push_back(c);
+    }
+    if (layers.empty()) {
+        LLAMA_LOG_WARN("moe-hot: the profile %s has no layer that matches the host-resident experts - hot set off\n", path);
+        return false;
+    }
+
+    // budget
+    size_t budget = 0;
+    const char * mib = getenv("LLAMA_MOE_HOT_MIB");
+    if (mib && strcmp(mib, "auto") == 0) {
+        size_t headroom = 1536;
+        if (const char * e = getenv("LLAMA_MOE_HOT_HEADROOM_MIB")) {
+            headroom = (size_t) std::max(0, atoi(e));
+        }
+        ggml_backend_dev_t dev = ggml_backend_buft_get_device(layers[0].buft);
+        size_t mem_free = 0, mem_total = 0;
+        if (dev) {
+            ggml_backend_dev_memory(dev, &mem_free, &mem_total);
+        }
+        budget = mem_free > (headroom << 20) ? mem_free - (headroom << 20) : 0;
+        // LLAMA_MOE_HOT_CAP_MIB: keep device use (all processes) at or below this, e.g. 28500 on a 32 GB card whose
+        // decode degrades above ~28.5 GB well before it spills
+        if (const char * e = getenv("LLAMA_MOE_HOT_CAP_MIB"); e && atoi(e) > 0) {
+            const size_t cap  = (size_t) atoi(e) << 20;
+            const size_t used = mem_total > mem_free ? mem_total - mem_free : 0;
+            const size_t room = cap > used + (headroom << 20) ? cap - used - (headroom << 20) : 0;
+            budget = std::min(budget, room);
+        }
+        LLAMA_LOG_INFO("moe-hot: auto budget %.0f MiB: %.0f MiB free of %.0f, %zu MiB headroom\n", budget/1048576.0,
+                mem_free/1048576.0, mem_total/1048576.0, headroom);
+    } else if (mib) {
+        budget = (size_t) (std::max(0.0, atof(mib))*1048576.0);
+    }
+    if (budget == 0) {
+        LLAMA_LOG_WARN("moe-hot: LLAMA_MOE_HOT_MIB is unset or 0 - hot set off\n");
+        return false;
+    }
+
+    // greedy by count x cost per byte (all experts of a layer have the same size)
+    struct cand_expert { double value; int li; int e; };
+    std::vector<cand_expert> cands;
+    for (int li = 0; li < (int) layers.size(); ++li) {
+        const auto & v = prof[layers[li].il];
+        for (int e = 0; e < (int) v.size(); ++e) {
+            if (v[e] > 0) {
+                cands.push_back({ v[e]*layers[li].cost, li, e });
+            }
+        }
+    }
+    std::stable_sort(cands.begin(), cands.end(), [](const cand_expert & a, const cand_expert & b) { return a.value > b.value; });
+
+    auto * mc = new moe_cache();
+    mc->hot       = true;
+    mc->hot_max_t = max_t;
+
+    auto free_all = [&]() {
+        for (auto * b : mc->bufs) { ggml_backend_buffer_free(b); }
+        for (auto * c : mc->ctxs) { ggml_free(c); }
+        mc->bufs.clear();
+        mc->ctxs.clear();
+        mc->layers.clear();
+        mc->by_up_src.clear();
+        mc->tbl_all = nullptr;
+    };
+
+    for (int attempt = 0; attempt < 32 && budget > 0; ++attempt) {
+        std::vector<std::vector<int32_t>> hot_ids(layers.size());
+        size_t used = 0;
+        for (const auto & c : cands) {
+            const size_t b = layers[c.li].bytes;
+            if (used + b > budget) {
+                continue;
+            }
+            used += b;
+            hot_ids[c.li].push_back(c.e);
+        }
+        for (auto & v : hot_ids) {
+            std::sort(v.begin(), v.end());
+        }
+
+        free_all();
+
+        // device tensors grouped by the router's buffer type, host tables in one CPU buffer
+        std::map<ggml_backend_buffer_type_t, std::vector<int>> groups;
+        size_t n_hot_layers = 0;
+        for (int li = 0; li < (int) layers.size(); ++li) {
+            if (!hot_ids[li].empty()) {
+                groups[layers[li].buft].push_back(li);
+                n_hot_layers++;
+            }
+        }
+        if (n_hot_layers == 0) {
+            break;
+        }
+        mc->layers.reserve(n_hot_layers); // layer_state addresses must stay stable
+
+        auto new_ctx = [&](size_t n) -> ggml_context * {
+            ggml_init_params ip = { ggml_tensor_overhead()*(n + 8), nullptr, true };
+            ggml_context * ctx = ggml_init(ip);
+            if (ctx) {
+                mc->ctxs.push_back(ctx);
+            }
+            return ctx;
+        };
+        bool ok = true;
+        ggml_context * ctx_h = new_ctx(n_hot_layers);
+        ok = ctx_h != nullptr;
+        std::vector<std::pair<int, size_t>> state_of; // (candidate layer index, mc->layers index)
+        for (auto & g : groups) {
+            if (!ok) {
+                break;
+            }
+            ggml_context * ctx_d = new_ctx(g.second.size()*5 + 1);
+            if (!ctx_d) {
+                ok = false;
+                break;
+            }
+            // [TAG_FN_MOE_HOT_ADAPT] all device tables of a group in one tensor, so the adaptive set rewrites them with
+            // one copy per step; each layer's dev_table is a view of its row
+            const int64_t n_exp_g = layers[g.second[0]].l->ffn_up_exps->ne[2];
+            bool same_n_exp = true;
+            for (int li : g.second) {
+                same_n_exp = same_n_exp && layers[li].l->ffn_up_exps->ne[2] == n_exp_g;
+            }
+            ggml_tensor * tbl_all = same_n_exp ? ggml_new_tensor_3d(ctx_d, GGML_TYPE_I32, 1, n_exp_g, (int64_t) g.second.size()) : nullptr;
+            if (tbl_all) {
+                ggml_format_name(tbl_all, "moe_hot_tbl_all");
+            }
+            int64_t k = 0;
+            for (int li : g.second) {
+                const llama_layer * l = layers[li].l;
+                const int32_t n_hot = (int32_t) hot_ids[li].size();
+                mc->layers.push_back({});
+                layer_state & ls = mc->layers.back();
+                state_of.push_back({ li, mc->layers.size() - 1 });
+                ls.pub.il       = layers[li].il;
+                ls.pub.n_slots  = n_hot;
+                ls.pub.up_src   = l->ffn_up_exps;
+                ls.pub.gate_src = l->ffn_gate_exps;
+                ls.pub.down_src = l->ffn_down_exps;
+                const ggml_tensor * u  = l->ffn_up_exps;
+                const ggml_tensor * gt = l->ffn_gate_exps;
+                const ggml_tensor * d  = l->ffn_down_exps;
+                ls.pub.up_c       = ggml_new_tensor_3d(ctx_d, u->type,  u->ne[0],  u->ne[1],  n_hot + 1);
+                ls.pub.gate_c     = ggml_new_tensor_3d(ctx_d, gt->type, gt->ne[0], gt->ne[1], n_hot + 1);
+                ls.pub.down_c     = ggml_new_tensor_3d(ctx_d, d->type,  d->ne[0],  d->ne[1],  n_hot + 1);
+                if (tbl_all) {
+                    ls.pub.dev_table = ggml_view_2d(ctx_d, tbl_all, 1, n_exp_g, tbl_all->nb[1], k*tbl_all->nb[2]);
+                    ls.tbl_off       = k*n_exp_g;
+                } else {
+                    ls.pub.dev_table = ggml_new_tensor_2d(ctx_d, GGML_TYPE_I32, 1, u->ne[2]);
+                }
+                ls.pub.host_table = ggml_new_tensor_2d(ctx_h, GGML_TYPE_I32, 1, u->ne[2]);
+                ggml_format_name(ls.pub.up_c,       "moe_hot_up.%d",   ls.pub.il);
+                ggml_format_name(ls.pub.gate_c,     "moe_hot_gate.%d", ls.pub.il);
+                ggml_format_name(ls.pub.down_c,     "moe_hot_down.%d", ls.pub.il);
+                ggml_format_name(ls.pub.dev_table,  "moe_hot_tbl.%d",  ls.pub.il);
+                ggml_format_name(ls.pub.host_table, "moe_hot_htbl.%d", ls.pub.il);
+                ++k;
+            }
+            ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx_d, g.first);
+            if (!buf) {
+                ok = false;
+                break;
+            }
+            ggml_backend_buffer_clear(buf, 0); // every slot, so the last one of each tensor is the zero slot
+            mc->bufs.push_back(buf);
+            if (groups.size() == 1) {
+                mc->tbl_all = tbl_all;
+            }
+        }
+        if (ok) {
+            ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx_h, ggml_backend_cpu_buffer_type());
+            ok = buf != nullptr;
+            if (ok) {
+                mc->bufs.push_back(buf);
+            }
+        }
+        if (!ok) {
+            LLAMA_LOG_WARN("moe-hot: allocating %.0f MiB failed, retrying with 90%% of the budget\n", used/1048576.0);
+            budget = (size_t) (budget*0.9);
+            continue;
+        }
+
+        // upload the hot slices from the host (mmap) copy and write both tables
+        size_t vram = 0;
+        const int64_t t0 = ggml_time_us();
+        for (const auto & [li, si] : state_of) {
+            layer_state & ls = mc->layers[si];
+            const auto & ids = hot_ids[li];
+            const int64_t n_exp = ls.pub.up_src->ne[2];
+            std::vector<int32_t> tbl(n_exp, ls.pub.n_slots);
+            for (int32_t s = 0; s < (int32_t) ids.size(); ++s) {
+                upload_slice(ls.pub.up_c,   ls.pub.up_src,   ids[s], s);
+                upload_slice(ls.pub.gate_c, ls.pub.gate_src, ids[s], s);
+                upload_slice(ls.pub.down_c, ls.pub.down_src, ids[s], s);
+                tbl[ids[s]] = s;
+            }
+            ggml_backend_tensor_set(ls.pub.dev_table,  tbl.data(), 0, n_exp*sizeof(int32_t));
+            ggml_backend_tensor_set(ls.pub.host_table, tbl.data(), 0, n_exp*sizeof(int32_t));
+            mc->by_up_src[ls.pub.up_src] = si;
+
+            // [TAG_FN_MOE_HOT_ADAPT] bookkeeping, used only by the adaptive set
+            ls.slot_expert = ids;
+            ls.expert_slot.assign(n_exp, -1);
+            for (int32_t s = 0; s < (int32_t) ids.size(); ++s) {
+                ls.expert_slot[ids[s]] = s;
+            }
+            ls.slot_in_flight.assign(ids.size(), false);
+            ls.expert_in_flight.assign(n_exp, false);
+            ls.prof = prof[ls.pub.il];
+
+            const size_t lb = ggml_nbytes(ls.pub.up_c) + ggml_nbytes(ls.pub.gate_c) + ggml_nbytes(ls.pub.down_c);
+            vram += lb;
+            const auto & v = prof[ls.pub.il];
+            double hit = 0.0, all = 0.0;
+            for (size_t e = 0; e < v.size(); ++e) {
+                all += v[e];
+                hit += tbl[e] != ls.pub.n_slots ? v[e] : 0.0;
+            }
+            LLAMA_LOG_INFO("moe-hot: blk.%-2d n_hot %3d  profile hit %.3f  %7.1f MiB\n", ls.pub.il, ls.pub.n_slots,
+                    all > 0 ? hit/all : 0.0, lb/1048576.0);
+        }
+        LLAMA_LOG_INFO("moe-hot: %zu layers, %.1f MiB device memory (budget %.0f MiB), uploaded in %.1f s, section %s of %s, "
+                "graphs of <= %d tokens\n", mc->layers.size(), vram/1048576.0, budget/1048576.0, (ggml_time_us() - t0)/1e6,
+                sec_used.c_str(), path, max_t);
+
+        if (const char * st = getenv("LLAMA_MOE_HOT_STATS"); st && atoi(st) != 0) {
+            mc->ad_stats = true;
+            g_hot_stats.hit.assign(model.layers.size(), 0);
+            g_hot_stats.tot.assign(model.layers.size(), 0);
+            g_hot_stats.first_il = mc->layers.front().pub.il;
+            for (const auto & ls : mc->layers) {
+                g_hot_stats.first_il = std::min(g_hot_stats.first_il, ls.pub.il);
+            }
+        }
+
+        if (const char * ad = getenv("LLAMA_MOE_HOT_ADAPT"); ad && atoi(ad) != 0) {
+            hot_adapt_init(mc, owner, groups.size() == 1 ? ggml_backend_buft_get_device(groups.begin()->first) : nullptr);
+        }
+
+        if (mc->ad_stats || mc->adapt) {
+            ggml_set_moe_obs_callback(hot_obs_cb, mc);
+        }
+        g_cache = mc;
+        return true;
+    }
+
+    free_all();
+    delete mc;
+    LLAMA_LOG_WARN("moe-hot: no hot set could be allocated - hot set off\n");
+    return false;
+}
+
+const void * llama_moe_hot_adapt_owner() {
+    const moe_cache * mc = g_cache;
+    return mc && mc->adapt ? mc->owner : nullptr;
 }

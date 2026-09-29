@@ -1,6 +1,7 @@
 #include "llama-context.h"
 
 #include "llama-moecache.h"
+#include "llama-moetrace.h" // [TAG_FN_MOE_TRACE]
 
 #include "ggml.h"
 #include "llama-arch.h"
@@ -1192,6 +1193,13 @@ llama_context::llama_context(
         if (graph_reuse_disable) {
             LLAMA_LOG_WARN("%s: graph reuse disabled\n", __func__);
         }
+
+        // [TAG_FN_GRAPH_PER_WIDTH]
+        const char * LLAMA_GRAPH_PER_WIDTH = getenv("LLAMA_GRAPH_PER_WIDTH");
+        graph_per_width = LLAMA_GRAPH_PER_WIDTH && atoi(LLAMA_GRAPH_PER_WIDTH) != 0;
+        if (graph_per_width) {
+            LLAMA_LOG_INFO("%s: one graph per decode width 1..%zu (LLAMA_GRAPH_PER_WIDTH)\n", __func__, gf_res_width.size());
+        }
     }
 
     // ref: https://github.com/ggml-org/llama.cpp/pull/17046#discussion_r2503085732
@@ -1404,6 +1412,13 @@ llama_context::llama_context(
 
         sched_reserve();
 
+        // [TAG_FN_MOE_HOT] sized after the reserve, so LLAMA_MOE_HOT_MIB=auto sees what the KV cache and the compute
+        // buffers left; decode graphs then carry the hot chain, so reserve again with it
+        if (llama_moe_hot_init(model, this)) {
+            sched_need_reserve = true;
+            sched_reserve();
+        }
+
         if (!cparams.flash_attn) {
             if (ggml_is_quantized(params.type_v)) {
                 throw std::runtime_error("quantized V cache was requested, but this requires Flash Attention");
@@ -1425,6 +1440,8 @@ llama_context::llama_context(
 llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
+
+    llama_moe_trace_flush(); // [TAG_FN_MOE_TRACE]
 
     // when training, ggml_opt allocates extra buffers through the scheduler, so the sizes no longer match the expectation
     if (!model.hparams.no_alloc && !opt_ctx) {
@@ -1621,6 +1638,9 @@ void llama_context::sched_reserve() {
     LLAMA_LOG_DEBUG("%s: max_nodes = %zu\n", __func__, max_nodes);
 
     for (auto & res : gf_res_prev) {
+        res.reset();
+    }
+    for (auto & res : gf_res_width) { // [TAG_FN_GRAPH_PER_WIDTH]
         res.reset();
     }
     gf_res_reserve.reset(new llm_graph_result(max_nodes));
@@ -2002,6 +2022,7 @@ bool llama_context::memory_update(bool optimize) {
                 res->reset();
             }
         }
+        gf_res_prev_reset_all(); // [TAG_FN_GRAPH_PER_WIDTH]
         gf_res_prev_active = nullptr;
 
         if (!mctx->apply()) {
@@ -2528,6 +2549,14 @@ bool llama_context::set_adapter_cvec(
 // alone could not say which stage went bad, and every input ablation produced identical results
 // because NaN swamps everything downstream. Debug only, off unless the env is set; it reads every
 // tensor back from the backend, so it is very slow.
+static bool turbo_nan_scan_on() {
+    static const bool on = [] {
+        const char * e = getenv("TURBO_NAN_SCAN");
+        return e && e[0] == '1';
+    }();
+    return on;
+}
+
 static bool turbo_nan_scan_cb(struct ggml_tensor * t, bool ask, void * /*user_data*/) {
     if (ask) {
         return true;   // yes, we want to inspect this one
@@ -2612,7 +2641,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         return nullptr;
     }
 
-    auto * res = get_gf_res_prev();
+    auto * res = get_gf_res_prev(ubatch); // [TAG_FN_GRAPH_PER_WIDTH] same as get_gf_res_prev() unless enabled
     auto * gf  = res->get_gf();
 
     // the new graph parameters
@@ -2633,16 +2662,35 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         n_reused++;
         graph_reused = true;
+    } else if (!graph_reuse_disable && graph_per_width && res->has_build_state() && res->can_reuse(gparams)) {
+        // [TAG_FN_GRAPH_PER_WIDTH] this width's graph still fits, but the scheduler holds another one:
+        // restore the post-build state, then split and allocate again, without model.build_graph
+        gf_res_prev_active = nullptr;
+        ggml_backend_sched_reset(sched.get());
+        if (turbo_nan_scan_on()) {
+            ggml_backend_sched_set_eval_callback(sched.get(), turbo_nan_scan_cb, nullptr);
+        } else {
+            ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+        }
+
+        res->restore_build_state(sched.get());
+        if (!ggml_backend_sched_alloc_graph(sched.get(), res->get_gf())) {
+            LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
+            ret = GGML_STATUS_ALLOC_FAILED;
+            return nullptr;
+        }
+
+        gf_res_prev_active = res;
+        n_width_switch++;
+        if (n_width_switch == 1 || n_width_switch % 1024 == 0) {
+            LLAMA_LOG_INFO("%s: graph per width: %" PRIu64 " switches without a rebuild\n", __func__, n_width_switch);
+        }
     } else {
         gf_res_prev_active = nullptr;
         res->reset();
 
         ggml_backend_sched_reset(sched.get());
-        static const bool nan_scan = [] {
-            const char * e = getenv("TURBO_NAN_SCAN");
-            return e && e[0] == '1';
-        }();
-        if (nan_scan) {
+        if (turbo_nan_scan_on()) {
             ggml_backend_sched_set_eval_callback(sched.get(), turbo_nan_scan_cb, nullptr);
         } else {
             ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
@@ -2658,6 +2706,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             LLAMA_LOG_ERROR("%s: failed to initialize graph\n", __func__);
             ret = GGML_STATUS_FAILED;
             return nullptr;
+        }
+
+        if (graph_per_width && !cparams.pipeline_parallel) {
+            res->save_build_state(sched.get()); // [TAG_FN_GRAPH_PER_WIDTH] before the scheduler rewrites it
         }
 
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
@@ -2692,6 +2744,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
         return nullptr;
+    }
+
+    if (!res->t_moe_ids.empty()) { // [TAG_FN_MOE_TRACE] only built when a trace switch is set
+        llama_moe_trace_collect(sched.get(), res, ubatch, gtype == LLM_GRAPH_TYPE_DECODER_MTP);
     }
 
     ret = GGML_STATUS_SUCCESS;
@@ -3436,7 +3492,11 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     //synchronize();
 
     // apply throttled MoE expert-cache updates between graph executions
-    llama_moe_cache_step();
+    // [TAG_FN_MOE_HOT_ADAPT] an adaptive hot set changes its tables only when no graph of its owner runs
+    if (llama_moe_hot_adapt_owner() == this) {
+        ggml_backend_sched_synchronize(sched.get());
+    }
+    llama_moe_cache_step(this);
 
     return 0;
 }
@@ -3847,6 +3907,27 @@ llm_graph_result * llama_context::get_gf_res_prev() {
     return res.get();
 }
 
+// [TAG_FN_GRAPH_PER_WIDTH] decode widths 1..4 with outputs keep their own graph; everything else shares the two above
+llm_graph_result * llama_context::get_gf_res_prev(const llama_ubatch & ubatch) {
+    if (graph_per_width && !cparams.pipeline_parallel && n_outputs > 0 &&
+            ubatch.n_tokens >= 1 && ubatch.n_tokens <= gf_res_width.size()) {
+        auto & res = gf_res_width[ubatch.n_tokens - 1];
+        if (!res) {
+            res.reset(new llm_graph_result(gf_res_reserve->get_max_nodes()));
+        }
+        return res.get();
+    }
+    return get_gf_res_prev();
+}
+
+void llama_context::gf_res_prev_reset_all() {
+    for (auto & res : gf_res_width) {
+        if (res) {
+            res->reset();
+        }
+    }
+}
+
 // pack sampler outputs into as few sequences as possible before using sequences without samplers
 static void ubatch_prepare_reserve(
               llama_ubatch                            & ubatch,
@@ -3922,6 +4003,7 @@ ggml_cgraph * llama_context::graph_reserve(
             res->reset();
         }
     }
+    gf_res_prev_reset_all(); // [TAG_FN_GRAPH_PER_WIDTH]
     gf_res_prev_active = nullptr;
 
     // store the n_outputs as it is, and restore it afterwards
@@ -5032,6 +5114,7 @@ void llama_context::opt_epoch_iter(
             const auto gparams = graph_params(res, ubatch, mctx.get(), ctx_type_to_graph_type(cparams.ctx_type));
 
             // the optimizer graph is allocated outside sched, so the next decode must rebuild
+            gf_res_prev_reset_all(); // [TAG_FN_GRAPH_PER_WIDTH]
             gf_res_prev_active = nullptr;
             res->reset();
 

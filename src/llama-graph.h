@@ -956,6 +956,14 @@ public:
 
     void set_params(const llm_graph_params & params);
 
+    // [TAG_FN_GRAPH_PER_WIDTH] the scheduler rewrites node sources and sets data pointers when it splits and allocates a
+    // graph, so a graph can be split again only after its post-build state is restored
+    // sched: the backend pins set during the build (sched_reset clears them) and the node order (graph_optimize
+    // reorders the nodes in place) are saved and restored too
+    void save_build_state(ggml_backend_sched_t sched);
+    void restore_build_state(ggml_backend_sched_t sched);
+    bool has_build_state() const;
+
     // important graph nodes
     ggml_tensor * t_inp_tokens  = nullptr;
     ggml_tensor * t_inp_embd    = nullptr; // [n_embd_inp, n_tokens]
@@ -970,6 +978,14 @@ public:
     std::vector<ggml_tensor *> t_sampled_probs;
     std::vector<ggml_tensor *> t_sampled_logits;
     std::vector<ggml_tensor *> t_candidates;
+
+    // [TAG_FN_MOE_TRACE] routing capture per MoE layer, only built when llama_moe_trace_active(); aligned vectors
+    std::vector<int>             t_moe_il;
+    std::vector<int64_t>         t_moe_n_expert;
+    std::vector<ggml_tensor *>   t_moe_ids;       // [n_used, T] i32, output
+    std::vector<ggml_tensor *>   t_moe_w;         // [n_used, T] f32, output
+    std::vector<ggml_tensor *>   t_moe_pred;      // [pred_k, T] i32 or nullptr
+    std::map<int, ggml_tensor *> t_moe_pred_next; // target layer -> its router applied one layer early
 
     std::vector<llm_graph_input_ptr> inputs;
     std::vector<llm_graph_fused_node> fused_nodes;
@@ -991,6 +1007,19 @@ private:
 
     // env: LLAMA_GRAPH_RESULT_DEBUG
     int debug = 0;
+
+    // [TAG_FN_GRAPH_PER_WIDTH]
+    struct tensor_state {
+        ggml_tensor *                t;
+        void *                       data;
+        struct ggml_backend_buffer * buffer;
+        void *                       extra;
+        int32_t                      flags;
+        ggml_tensor *                src[GGML_MAX_SRC];
+    };
+    std::vector<tensor_state> build_state;
+    std::vector<ggml_tensor *> build_nodes;
+    std::vector<std::pair<ggml_tensor *, ggml_backend_t>> build_pins;
 };
 
 using llm_graph_result_ptr = std::unique_ptr<llm_graph_result>;
