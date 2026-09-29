@@ -3268,6 +3268,40 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<int>                i_last;
     std::vector<std::vector<float>> chain_h;
 
+    // [TAG_FN_MTP_ATTN_WINDOW] LLAMA_MTP_ATTN_WINDOW on a qwen4exp MTP context: its draft KV keeps only this many
+    // positions (llama-model.cpp), so prompt rows further back than that from their prompt's end are not decoded
+    int32_t mtp_win = 0;
+
+    // the rows of batch_in to decode; false (rows empty) when every row is needed. A sequence that loses rows starts
+    // its draft KV fresh at its first kept row (a stale window from an earlier turn would leave a position gap).
+    bool mtp_win_rows(const llama_batch & b, llama_memory_t mem_dft, std::vector<int32_t> & rows) const {
+        rows.clear();
+        std::vector<char> lost(n_seq, 0);
+        bool any = false;
+        for (int32_t k = 0; k < b.n_tokens; ++k) {
+            const llama_seq_id s = b.seq_id[k][0];
+            if (s >= 0 && s < (llama_seq_id) n_seq && i_batch_end[s] >= 0) {
+                const int32_t after = prefill_after_for(s);
+                if (after > 0 && (int64_t) b.pos[k] + mtp_win + 64 < (int64_t) b.pos[i_batch_end[s]] + after) {
+                    lost[s] = 1;
+                    any     = true;
+                    continue;
+                }
+            }
+            rows.push_back(k);
+        }
+        if (!any) {
+            rows.clear();
+            return false;
+        }
+        for (llama_seq_id s = 0; s < (llama_seq_id) n_seq; ++s) {
+            if (lost[s] && llama_memory_seq_pos_max(mem_dft, s) >= 0) {
+                llama_memory_seq_rm(mem_dft, s, -1, -1);
+            }
+        }
+        return true;
+    }
+
     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq, params.draft.n_max)
         , params(params.draft)
@@ -3358,6 +3392,20 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         verify_h.assign(n_seq, {});
         verify_h_rows.assign(n_seq, 0);
+
+        // [TAG_FN_MTP_ATTN_WINDOW] the same switch llama-model.cpp reads for the qwen4exp MTP draft cache
+        {
+            const char * e = getenv("LLAMA_MTP_ATTN_WINDOW");
+            const long long w = e ? atoll(e) : 0;
+            char arch[32] = { 0 };
+            if (w > 0 && !is_mem_shared && !chain_heads &&
+                    llama_model_meta_val_str(llama_get_model(ctx_dft), "general.architecture", arch, sizeof(arch)) > 0 &&
+                    strcmp(arch, "qwen4exp") == 0) {
+                mtp_win = (int32_t) std::min<long long>(w, INT32_MAX);
+                LOG_INF("%s: [TAG_FN_MTP_ATTN_WINDOW] MTP drafts attend to the last %d positions; prompt rows before that "
+                        "are not decoded by the draft context\n", __func__, mtp_win);
+            }
+        }
     }
 
     ~common_speculative_impl_draft_mtp() override {
@@ -3451,7 +3499,32 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             const int32_t n_b_max = std::max<int32_t>(1, (int32_t) llama_n_batch(ctx_dft));
 
             bool ok = true;
-            for (int head = 0; head < n_mtp_layers && ok; ++head) {
+
+            // [TAG_FN_MTP_ATTN_WINDOW] with a draft attention window, prompt rows that end up outside it before any draft
+            // reads them are not decoded; the rest go through the same chunks as below
+            std::vector<int32_t> win_rows;
+            const bool win_done = mtp_win > 0 && !chain_heads && mtp_win_rows(batch_in, mem_dft, win_rows);
+            for (size_t off = 0; win_done && off < win_rows.size() && ok; off += (size_t) n_b_max) {
+                const int32_t n_chunk = (int32_t) std::min<size_t>((size_t) n_b_max, win_rows.size() - off);
+
+                common_batch_clear(batch);
+                for (int32_t l = 0; l < n_chunk; ++l) {
+                    const int32_t      k = win_rows[off + l];
+                    const llama_seq_id s = batch_in.seq_id[k][0];
+                    common_batch_add(batch, batch_in.token[k], batch_in.pos[k], { s }, 0);
+                    // the first row of a sequence pairs with the stashed h, every other row with the row before it
+                    const float * h = k == i_batch_beg[s] ? pending_h[s].data() : h_tgt + (size_t) (k - 1)*n_embd;
+                    std::memcpy(batch.embd + (size_t) l*n_embd, h, row_bytes);
+                }
+
+                const int32_t rc = llama_decode(ctx_dft, batch);
+                if (rc != 0) {
+                    SPC_ERR("llama_decode(ctx_dft) windowed failed rc=%d (pos=%d n=%d)\n", (int) rc, (int) batch_in.pos[win_rows[off]], (int) n_chunk);
+                    ok = false;
+                }
+            }
+
+            for (int head = 0; head < n_mtp_layers && ok && !win_done; ++head) {
                 if (chain_heads) {
                     // ref: https://github.com/ggml-org/llama.cpp/pull/24340/changes#r3413498544
                     for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {

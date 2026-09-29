@@ -19,6 +19,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdint>
+#include <cstdlib>
 #include <random>
 #include <regex>
 #include <stdexcept>
@@ -959,6 +960,19 @@ static llama_model_ptr get_model_mtp(struct gguf_context * gguf_ctx, FILE * file
     return model;
 }
 
+// [TAG_FN_MTP_HEAD_IDS] [TAG_FN_MTP_ATTN_WINDOW] the switches are read at model load / context creation
+static void mtp_test_set_env(const char * name, const char * value) {
+#ifdef _WIN32
+    _putenv_s(name, value ? value : "");
+#else
+    if (value) {
+        setenv(name, value, 1);
+    } else {
+        unsetenv(name);
+    }
+#endif
+}
+
 static llama_context_ptr get_ctx_mtp(llama_model * model, const enum llama_context_type ctx_type) {
     llama_context_params ctx_params = llama_context_default_params();
     ctx_params.n_ctx           = 0;
@@ -1147,6 +1161,31 @@ static int test_mtp(const std::string & arch_filter, const size_t seed, const fl
             } else {
                 const double nmse_dev = nmse(logits_mtp_cpu, logits_mtp);
                 check(arch_name, label, "MTP logits vs. CPU", nmse_dev <= 1e-4, nmse_dev);
+            }
+
+            // [TAG_FN_MTP_HEAD_IDS] [TAG_FN_MTP_ATTN_WINDOW] the checks below set their switch themselves; a run with an MTP
+            // head switch already in the environment (fn_switch_tests.ps1) has no plain reference, so it skips them
+            const bool mtp_env_free = !getenv("LLAMA_MTP_HEAD_ROWS") && !getenv("LLAMA_MTP_HEAD_IDS") && !getenv("LLAMA_MTP_ATTN_WINDOW");
+
+            // [TAG_FN_MTP_ATTN_WINDOW] a draft window of 16 positions: rows whose keys all lie inside it are unchanged, the
+            // later rows see fewer keys and change
+            if (mtp_env_free) {
+                const uint32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model.get()));
+                const uint32_t w       = 16;
+                mtp_test_set_env("LLAMA_MTP_ATTN_WINDOW", "16");
+                const std::vector<float> logits_win = get_logits_mtp(model.get(), tokens, h_tgt);
+                mtp_test_set_env("LLAMA_MTP_ATTN_WINDOW", nullptr);
+
+                const size_t split = (size_t) w*n_vocab;
+                const std::vector<float> a_in (logits_mtp.begin(), logits_mtp.begin() + split);
+                const std::vector<float> b_in (logits_win.begin(), logits_win.begin() + split);
+                const std::vector<float> a_out(logits_mtp.begin() + split, logits_mtp.end());
+                const std::vector<float> b_out(logits_win.begin() + split, logits_win.end());
+                const double nmse_in  = nmse(a_in,  b_in);
+                const double nmse_out = nmse(a_out, b_out);
+                check(arch_name, label, "MTP window: rows inside unchanged", nmse_in  <= 1e-10, nmse_in);
+                check(arch_name, label, "MTP window: later rows changed",    nmse_out >  1e-8,  nmse_out);
+                check(arch_name, label, "MTP window: logits finite",         all_finite(logits_win), 0.0);
             }
 
             // round trip through a file: with the head, and with it skipped

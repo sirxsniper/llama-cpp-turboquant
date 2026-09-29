@@ -2741,6 +2741,26 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     } else {
                         GGML_ASSERT(!hparams.is_swa_any());
 
+                        // [TAG_FN_MTP_ATTN_WINDOW] LLAMA_MTP_ATTN_WINDOW=<n> (0/unset = off): the qwen4exp MTP draft
+                        // context keeps a sliding-window cache of n + n_ubatch cells per sequence and its drafts attend
+                        // to the last n positions (qwen4exp keeps the explicit KQ mask, which applies the window).
+                        // Drafts only: the target verifies with its full attention.
+                        uint32_t       kv_size  = cparams.n_ctx_seq;
+                        uint32_t       n_swa    = hparams.n_swa;
+                        llama_swa_type swa_type = hparams.swa_type;
+                        if (arch == LLM_ARCH_QWEN4EXP && params.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
+                            const char * e = getenv("LLAMA_MTP_ATTN_WINDOW");
+                            const long long w = e ? atoll(e) : 0;
+                            if (w > 0 && (uint64_t) w < cparams.n_ctx_seq) {
+                                const uint64_t cells = (uint64_t) w*(cparams.kv_unified ? cparams.n_seq_max : 1) + cparams.n_ubatch;
+                                n_swa    = (uint32_t) w;
+                                swa_type = LLAMA_SWA_TYPE_STANDARD;
+                                kv_size  = (uint32_t) std::min<uint64_t>(cparams.n_ctx_seq, GGML_PAD(cells, 256));
+                                LLAMA_LOG_INFO("%s: [TAG_FN_MTP_ATTN_WINDOW] MTP draft attention window %u, draft KV %u cells instead of %u\n",
+                                        __func__, n_swa, kv_size, cparams.n_ctx_seq);
+                            }
+                        }
+
                         res = new llama_kv_cache(
                                 *this,
                                 hparams,
@@ -2749,11 +2769,11 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                 !cparams.flash_attn,
                                 cparams.offload_kqv,
                                 cparams.kv_unified,
-                                cparams.n_ctx_seq,
+                                kv_size,
                                 cparams.n_seq_max,
                                 1,
-                                hparams.n_swa,
-                                hparams.swa_type,
+                                n_swa,
+                                swa_type,
                                 nullptr,
                                 filter,
                                 nullptr,
