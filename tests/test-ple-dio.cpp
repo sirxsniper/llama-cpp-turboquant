@@ -11,7 +11,10 @@
 //   4. the same calls twice with the LRU on: the second pass must be served from the LRU
 //   5. queue depth 1 (strictly one read at a time)
 //   6. throughput by queue depth (printed, not checked)
-//   7. llama_ple_dio_copy (LLAMA_PLE_DIO_FILE) of ~3.3 MB of rows: rows read from the copy vs the mapping
+//   7. llama_ple_dio_copy (LLAMA_PLE_DIO_FILE) of ~64 MB of rows: rows read from the copy vs the mapping, then the
+//      throughput of the copy by queue depth (printed, not checked)
+//   8. injected read failures: with the mapping as fallback nothing changes; without it the call throws, and the
+//      next calls (no stale completions) still return the mapped rows
 // The mapping is touched only for the tested rows (a few MB of pages). Built, not registered with ctest (needs the file).
 
 #include "llama-ple-dio.h"
@@ -337,7 +340,104 @@ int main(int argc, char ** argv) {
         printf("  stats: %s\n", dio->stats_line().c_str());
     }
 
-    // 6: throughput by queue depth (timing only, not checked): 1024 distinct random rows in one call
+    // 8: failed reads (injected). With the mapping as fallback the values must not change; without it the call throws
+    // only after every read of the call has completed, so the next calls reap no stale completion.
+    if (!probe) {
+        auto open_fail = [&](int every) {
+            llama_ple_dio_params q = p;
+            q.cache_bytes     = 0;
+            q.test_fail_every = every;
+            std::string err;
+            auto d = llama_ple_dio::open(q, err); // the probe read ignores injected failures
+            if (!d) {
+                fprintf(stderr, "llama_ple_dio::open failed: %s\n", err.c_str());
+                exit(1);
+            }
+            return d;
+        };
+        const ggml_to_float_t to_float = ggml_get_type_traits(loc.type)->to_float;
+        auto same_as_map = [&](const std::vector<int32_t> & ids, const std::vector<uint8_t> & got) {
+            int bad = 0;
+            std::vector<float> fa(loc.ne0), fb(loc.ne0);
+            for (size_t i = 0; i < ids.size(); ++i) {
+                const uint8_t * ref = map.addr + loc.offset + (uint64_t) ids[i] * loc.rb;
+                const uint8_t * dd  = got.data() + i * loc.rb;
+                if (memcmp(ref, dd, loc.rb) != 0) {
+                    bad++;
+                    continue;
+                }
+                if (loc.type != GGML_TYPE_F32) {
+                    to_float(dd, fa.data(), loc.ne0);
+                    to_float(ref, fb.data(), loc.ne0);
+                    bad += memcmp(fa.data(), fb.data(), loc.ne0 * sizeof(float)) != 0;
+                }
+            }
+            return bad;
+        };
+        // distinct rows, so every row is one read
+        auto distinct = [&](size_t n) {
+            std::vector<int32_t> ids;
+            while (ids.size() < n) {
+                const int32_t r = (int32_t) any_row(rng);
+                if (std::find(ids.begin(), ids.end(), r) == ids.end()) {
+                    ids.push_back(r);
+                }
+            }
+            return ids;
+        };
+        const uint8_t * fallback = map.addr + loc.offset;
+
+        {
+            auto d = open_fail(3);
+            const std::vector<int32_t> ids = distinct(200);
+            std::vector<uint8_t> got(ids.size() * loc.rb, 0xCD);
+            d->read_rows(ids.data(), (int64_t) ids.size(), got.data(), 1, fallback);
+            const auto s   = d->stats();
+            const int  bad = same_as_map(ids, got);
+            const bool ok  = bad == 0 && s.fallbacks == ids.size() / 3;
+            printf("  %-44s %5zu rows: %s (%d mismatches, %llu fallbacks, expected %zu)\n", "8. every 3rd read fails, fallback",
+                    ids.size(), ok ? "OK" : "FAIL", bad, (unsigned long long) s.fallbacks, ids.size() / 3);
+            g_fail += ok ? 0 : 1;
+        }
+        {
+            // 64 reads in flight at once, the 40th completion fails: the call throws after the other 63 completed
+            auto d = open_fail(40);
+            const std::vector<int32_t> ids1 = distinct(64);
+            std::vector<uint8_t> got(ids1.size() * loc.rb);
+            bool threw = false;
+            try {
+                d->read_rows(ids1.data(), (int64_t) ids1.size(), got.data(), 1, nullptr);
+            } catch (const std::exception & e) {
+                threw = true;
+                printf("  8. no fallback: threw \"%s\"\n", e.what());
+            }
+            // completions 65..74: none fails
+            const std::vector<int32_t> ids2 = distinct(10);
+            got.assign(ids2.size() * loc.rb, 0xCD);
+            bool threw2 = false;
+            try {
+                d->read_rows(ids2.data(), (int64_t) ids2.size(), got.data(), 1, nullptr);
+            } catch (const std::exception &) {
+                threw2 = true;
+            }
+            const int  bad2 = threw2 ? -1 : same_as_map(ids2, got);
+            // completions 75..138: the 80th and the 120th fail and come from the mapping
+            const std::vector<int32_t> ids3 = distinct(64);
+            got.assign(ids3.size() * loc.rb, 0xCD);
+            d->read_rows(ids3.data(), (int64_t) ids3.size(), got.data(), 1, fallback);
+            const int  bad3 = same_as_map(ids3, got);
+            const auto s    = d->stats();
+            const bool ok   = threw && bad2 == 0 && bad3 == 0 && s.fallbacks == 2 && s.reads == 138;
+            printf("  %-44s %5d rows: %s (throw %d, then %d and %d mismatches, %llu fallbacks, %llu reads)\n",
+                    "8. throw without fallback, then clean calls", 138, ok ? "OK" : "FAIL", threw ? 1 : 0, bad2, bad3,
+                    (unsigned long long) s.fallbacks, (unsigned long long) s.reads);
+            g_fail += ok ? 0 : 1;
+        }
+    }
+
+    // 6: throughput by queue depth (timing only, not checked): 1024 distinct random rows in one call. The model file
+    // has a data section here (this test maps it, or read its header buffered moments ago), so Windows serves the
+    // reads one at a time; 7 shows the unmapped copy.
     {
         std::vector<int32_t> ids(1024);
         for (auto & r : ids) {
@@ -354,10 +454,10 @@ int main(int argc, char ** argv) {
         }
     }
 
-    // 7: the copy that LLAMA_PLE_DIO_FILE reads: unaligned start, several 1 MiB chunks, a partial last sector
-    if (!probe) {
+    // 7: the copy that LLAMA_PLE_DIO_FILE reads: unaligned start, several 1 MiB chunks, a partial last sector (~64 MB)
+    {
         const int64_t     r0  = loc.n_rows / 3 + 1;
-        const int64_t     nr  = std::min<int64_t>(loc.n_rows - r0, (int64_t) ((3330000 + loc.rb - 1) / loc.rb));
+        const int64_t     nr  = std::min<int64_t>(loc.n_rows - r0, (int64_t) ((67000000 + loc.rb - 1) / loc.rb));
         const std::string dst = copy_dir + "/test-ple-dio-copy.bin";
         std::string err;
         if (!llama_ple_dio_copy(loc.path, loc.offset + (uint64_t) r0 * loc.rb, (uint64_t) nr * loc.rb, dst, 1 << 20, err, log_line)) {
@@ -381,16 +481,41 @@ int main(int argc, char ** argv) {
                 }
                 std::vector<uint8_t> got(ids.size() * loc.rb);
                 cd->read_rows(ids.data(), (int64_t) ids.size(), got.data(), 1, nullptr);
-                int bad = 0;
-                for (size_t i = 0; i < ids.size(); ++i) {
-                    const uint8_t * ref = map.addr + loc.offset + (uint64_t) (r0 + ids[i]) * loc.rb;
-                    bad += memcmp(ref, got.data() + i * loc.rb, loc.rb) != 0;
+                if (!probe) {
+                    int bad = 0;
+                    for (size_t i = 0; i < ids.size(); ++i) {
+                        const uint8_t * ref = map.addr + loc.offset + (uint64_t) (r0 + ids[i]) * loc.rb;
+                        bad += memcmp(ref, got.data() + i * loc.rb, loc.rb) != 0;
+                    }
+                    printf("  %-44s %5zu rows of a %lld-row copy: %s (%d byte mismatches)\n", "7. unmapped copy vs mapping",
+                            ids.size(), (long long) nr, bad == 0 ? "OK" : "FAIL", bad);
+                    g_fail += bad == 0 ? 0 : 1;
                 }
-                printf("  %-44s %5zu rows of a %lld-row copy: %s (%d byte mismatches)\n", "7. unmapped copy vs mapping",
-                        ids.size(), (long long) nr, bad == 0 ? "OK" : "FAIL", bad);
-                g_fail += bad == 0 ? 0 : 1;
             }
             cd.reset();
+
+            // throughput of the copy (nothing maps it or reads it buffered), timing only
+            std::uniform_int_distribution<int64_t> in_copy(0, nr - 1);
+            std::vector<int32_t> ids(1024);
+            for (auto & r : ids) {
+                r = (int32_t) in_copy(rng);
+            }
+            std::vector<uint8_t> buf(ids.size() * loc.rb);
+            for (const int depth : { 1, 8, 64, 256 }) {
+                llama_ple_dio_params qq = p;
+                qq.path        = dst;
+                qq.offset      = 0;
+                qq.n_rows      = nr;
+                qq.queue_depth = depth;
+                auto d = llama_ple_dio::open(qq, err);
+                if (!d) {
+                    break;
+                }
+                d->read_rows(ids.data(), (int64_t) ids.size(), buf.data(), 64, nullptr);
+                const auto s = d->stats();
+                printf("  7. copy, queue depth %3d: %zu rows in %.1f ms = %.0f reads/s, %.1f us/read\n", depth, ids.size(),
+                        s.call_us/1000.0, s.reads/(s.call_us*1e-6), s.reads ? s.read_us/s.reads : 0.0);
+            }
             std::remove(dst.c_str());
         }
     }

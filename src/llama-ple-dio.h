@@ -10,8 +10,9 @@
 // the CPU GET_ROWS uses, so the values are bit-identical to the mapped path.
 //
 // Windows serves unbuffered reads of a file one at a time while the file has a data section, i.e. while any process
-// maps it (measured: ~10K reads/s at any queue depth vs ~130-170K unmapped). The shard that holds the table is mapped
-// for its other tensors, so LLAMA_PLE_DIO_FILE points the reads at a copy of the table that nothing maps.
+// maps it, and for some seconds after any buffered read of it (measured: ~8-14K reads/s at any queue depth vs
+// ~130-200K otherwise). The shard that holds the table is mapped for its other tensors, so LLAMA_PLE_DIO_FILE points
+// the reads at a copy of the table that nothing maps or reads buffered (this code opens it unbuffered only).
 //
 // This file depends on nothing but the C++ library and the OS, so tests can compile it directly.
 //
@@ -24,6 +25,7 @@
 //   LLAMA_PLE_DIO_QD=64          reads in flight at most (1..1024)
 //   LLAMA_PLE_DIO_STATS=1        one statistics line after 256 ubatches and one when the model is freed;
 //                                N > 1 = a line every N ubatches
+//   LLAMA_PLE_DIO_TEST_FAIL=N    tests only: every Nth read fails, so its row comes from the mapped table
 
 #include <cstddef>
 #include <cstdint>
@@ -38,6 +40,7 @@ struct llama_ple_dio_params {
     size_t      cache_bytes = 0;    // LRU budget for recent rows, 0 = no cache
     int         queue_depth = 64;   // reads in flight at most
     int         stats_every = 0;    // 0 = no statistics, 1 = after 256 ubatches + at close, N > 1 = every N ubatches
+    int         test_fail_every = 0; // tests only: every Nth read completes as failed (exercises the fallback path)
     void     (* log)(const char * line) = nullptr; // one line per call, ends with '\n'; nullptr = stderr
 };
 
@@ -58,14 +61,16 @@ struct llama_ple_dio_stats {
 };
 
 struct llama_ple_dio {
-    // nullptr, with the reason in err, when the file cannot be opened for unbuffered reads or the parameters are bad
+    // nullptr, with the reason in err, when the file cannot be opened for unbuffered reads, a probe read of the first
+    // and last rows fails, or the parameters are bad
     static std::unique_ptr<llama_ple_dio> open(const llama_ple_dio_params & params, std::string & err);
 
     ~llama_ple_dio();
 
     // copy the raw bytes of rows[0..n) into dst (n * row_bytes bytes, in the order given; repeated rows are read once).
     // fallback (may be null) is the same table in memory: a row whose read fails is copied from it (logged once);
-    // without it a failed read throws. n_tokens only feeds the statistics. Thread-safe (serialised).
+    // without it a failed read throws. It returns or throws only when no read is in flight. n_tokens only feeds the
+    // statistics. Thread-safe (serialised).
     void read_rows(const int32_t * rows, int64_t n, uint8_t * dst, int64_t n_tokens, const uint8_t * fallback);
 
     const llama_ple_dio_params & params() const;

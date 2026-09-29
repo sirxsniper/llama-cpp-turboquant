@@ -305,6 +305,12 @@ struct llama_ple_dio::impl {
     row_lru             lru;
     llama_ple_dio_stats st;
     bool                warned_fail = false;
+    uint64_t            n_done      = 0; // completed reads (test_fail_every)
+
+    struct fail_rec {
+        int32_t       u;    // distinct row index
+        unsigned long code; // OS error or NTSTATUS
+    };
 
     // per-call scratch
     std::vector<uint64_t> order;
@@ -312,14 +318,21 @@ struct llama_ple_dio::impl {
     std::vector<uint32_t> upos;
     std::vector<uint8_t>  ubuf;
     std::vector<int32_t>  miss;
+    std::vector<fail_rec> failed; // rows whose read failed; handled once no read is in flight
 
 #if defined(_WIN32)
     struct win_slot {
         OVERLAPPED ov; // first member: the completion hands back &ov
         int32_t    u;
         size_t     skip;
+        bool       busy = false; // a read into this slot is in flight
         dio_clock::time_point t0;
     };
+
+    // the completion port failed: reads may still be in flight, so the slots are never used again and every row
+    // comes from the fallback
+    bool          broken      = false;
+    unsigned long broken_code = 0;
 
     HANDLE h    = INVALID_HANDLE_VALUE;
     HANDLE iocp = nullptr;
@@ -369,19 +382,31 @@ struct llama_ple_dio::impl {
         return { start, (size_t) (end - start), (size_t) (off - start) };
     }
 
-    void fail_row(int32_t u, const uint8_t * fallback, unsigned long code) {
+    // tests only: this completed read counts as failed
+    bool inject_fail() {
+        return p.test_fail_every > 0 && ++n_done % (uint64_t) p.test_fail_every == 0;
+    }
+
+    // only called when no read is in flight: failed rows come from the fallback, or the call throws
+    void apply_failures(const uint8_t * fallback) {
         const size_t rb = p.row_bytes;
-        if (!fallback) {
-            throw std::runtime_error("PLE direct I/O: read of row " + std::to_string(urow[u]) + " failed (error " +
-                                     std::to_string(code) + ") and there is no fallback");
+        for (const fail_rec & f : failed) {
+            if (!fallback) {
+                char msg[160];
+                snprintf(msg, sizeof(msg), "PLE direct I/O: read of row %d failed (error 0x%lx) and there is no fallback",
+                         urow[f.u], f.code);
+                failed.clear();
+                throw std::runtime_error(msg);
+            }
+            if (!warned_fail) {
+                warned_fail = true;
+                emit("%s: [TAG_FN_PLE_DIRECT_IO] warning: read of row %d failed (error 0x%lx); such rows are copied "
+                     "from the mapped table\n", __func__, urow[f.u], f.code);
+            }
+            memcpy(ubuf.data() + (size_t) f.u * rb, fallback + (size_t) urow[f.u] * rb, rb);
+            st.fallbacks++;
         }
-        if (!warned_fail) {
-            warned_fail = true;
-            emit("%s: [TAG_FN_PLE_DIRECT_IO] warning: read of row %d failed (error %lu); such rows are copied from the "
-                 "mapped table\n", __func__, urow[u], code);
-        }
-        memcpy(ubuf.data() + (size_t) u * rb, fallback + (size_t) urow[u] * rb, rb);
-        st.fallbacks++;
+        failed.clear();
     }
 
 #if defined(_WIN32)
@@ -410,14 +435,14 @@ struct llama_ple_dio::impl {
         }
         file_size = (uint64_t) sz.QuadPart;
 
-        // unbuffered I/O wants sector-aligned offsets, lengths and buffers; 4096 covers 512e and 4Kn volumes
+        // unbuffered reads want offsets, lengths and buffers aligned to the logical sector; 4096 covers 512e and 4Kn
+        // volumes (the physical sector only matters for writes)
         A = 4096;
         FILE_STORAGE_INFO si = {};
         if (GetFileInformationByHandleEx(h, FileStorageInfo, &si, sizeof(si))) {
-            for (const ULONG s : { si.LogicalBytesPerSector, si.PhysicalBytesPerSectorForAtomicity }) {
-                if (s > A && s <= 65536 && (s & (s - 1)) == 0) {
-                    A = s;
-                }
+            const ULONG s = si.LogicalBytesPerSector;
+            if (s > A && s <= 65536 && (s & (s - 1)) == 0) {
+                A = s;
             }
         }
 
@@ -446,6 +471,9 @@ struct llama_ple_dio::impl {
     }
 
     void close_all() {
+        if (broken && h != INVALID_HANDLE_VALUE) {
+            CancelIoEx(h, nullptr);
+        }
         if (iocp) {
             CloseHandle(iocp);
             iocp = nullptr;
@@ -455,21 +483,36 @@ struct llama_ple_dio::impl {
             h = INVALID_HANDLE_VALUE;
         }
         if (bufs) {
-            VirtualFree(bufs, 0, MEM_RELEASE);
+            // after a port failure a read may still land in the buffers: leave them allocated
+            if (!broken) {
+                VirtualFree(bufs, 0, MEM_RELEASE);
+            }
             bufs = nullptr;
         }
     }
 
-    // all misses in flight at once (up to queue_depth), completions reaped from the port in any order
+    // all misses in flight at once (up to queue_depth), completions reaped from the port in any order. Returns (or
+    // throws) only when no read is in flight, so a later call never reaps a stale completion.
     void read_misses(const uint8_t * fallback) {
         const size_t rb     = p.row_bytes;
         const int    n_miss = (int) miss.size();
         const int    qd     = p.queue_depth;
 
-        int next     = 0;
-        int inflight = 0;
+        failed.clear();
+        if (broken) {
+            for (const int32_t u : miss) {
+                failed.push_back({ u, broken_code });
+            }
+            apply_failures(fallback);
+            return;
+        }
+
+        int  next      = 0;
+        int  inflight  = 0;
+        int  wait_s    = 0;
+        bool cancelled = false;
         while (next < n_miss || inflight > 0) {
-            while (next < n_miss && inflight < qd) {
+            while (!cancelled && next < n_miss && inflight < qd) {
                 const int32_t   u = miss[next++];
                 const read_span s = span_of(urow[u]);
                 const int       k = free_slots.back();
@@ -488,13 +531,19 @@ struct llama_ple_dio::impl {
                 st.issue_us += dio_us(dio_clock::now() - sl.t0);
                 if (!done && e != ERROR_IO_PENDING) {
                     // no completion packet is queued for a read that failed to start
-                    fail_row(u, fallback, e);
+                    failed.push_back({ u, e });
                     free_slots.push_back(k);
                     continue;
                 }
+                sl.busy = true;
                 st.inline_done += done ? 1 : 0;
                 ++inflight;
                 st.reads++;
+            }
+            if (cancelled) {
+                for (; next < n_miss; ++next) {
+                    failed.push_back({ miss[next], ERROR_OPERATION_ABORTED });
+                }
             }
             if (inflight == 0) {
                 break;
@@ -502,31 +551,58 @@ struct llama_ple_dio::impl {
 
             ULONG got = 0;
             if (!GetQueuedCompletionStatusEx(iocp, ents.data(), (ULONG) std::min<int>(inflight, (int) ents.size()), &got,
-                        10000, FALSE)) {
+                        1000, FALSE)) {
                 const DWORD e = GetLastError();
                 if (e == WAIT_TIMEOUT) {
-                    emit("%s: [TAG_FN_PLE_DIRECT_IO] warning: %d reads still pending after 10 s\n", __func__, inflight);
+                    ++wait_s;
+                    if (wait_s % 10 == 0) {
+                        emit("%s: [TAG_FN_PLE_DIRECT_IO] warning: %d reads still pending after %d s\n", __func__,
+                             inflight, wait_s);
+                    }
+                    if (!cancelled && wait_s >= 30) {
+                        // cancelled reads complete with ERROR_OPERATION_ABORTED: their rows come from the fallback
+                        cancelled = true;
+                        CancelIoEx(h, nullptr);
+                    }
                     continue;
                 }
-                // the buffers stay alive with this object, so reads still in flight land in valid memory
-                throw std::runtime_error("PLE direct I/O: GetQueuedCompletionStatusEx failed: " + win_err(e));
+                // the port is unusable: the reads in flight are never reaped, so their slots are never used again
+                broken      = true;
+                broken_code = e;
+                CancelIoEx(h, nullptr);
+                emit("%s: [TAG_FN_PLE_DIRECT_IO] warning: GetQueuedCompletionStatusEx failed (%s); all rows now come "
+                     "from the mapped table\n", __func__, win_err(e).c_str());
+                for (const win_slot & sl : slots) {
+                    if (sl.busy) {
+                        failed.push_back({ sl.u, e });
+                    }
+                }
+                for (; next < n_miss; ++next) {
+                    failed.push_back({ miss[next], e });
+                }
+                break;
             }
+            wait_s = 0;
             const auto t1 = dio_clock::now();
             for (ULONG j = 0; j < got; ++j) {
                 win_slot * sl = reinterpret_cast<win_slot *>(ents[j].lpOverlapped);
                 const int  k  = (int) (sl - slots.data());
                 const DWORD nb = ents[j].dwNumberOfBytesTransferred;
                 st.read_us += dio_us(t1 - sl->t0);
-                if (sl->ov.Internal == 0 && (size_t) nb >= sl->skip + rb) {
+                // 0xC0000185 = STATUS_IO_DEVICE_ERROR
+                const unsigned long status = inject_fail() ? 0xC0000185ul : (unsigned long) sl->ov.Internal;
+                if (status == 0 && (size_t) nb >= sl->skip + rb) {
                     memcpy(ubuf.data() + (size_t) sl->u * rb, bufs + (size_t) k * slot_bytes + sl->skip, rb);
                     st.bytes += nb;
                 } else {
-                    fail_row(sl->u, fallback, (unsigned long) sl->ov.Internal);
+                    failed.push_back({ sl->u, status ? status : (unsigned long) ERROR_HANDLE_EOF });
                 }
+                sl->busy = false;
                 free_slots.push_back(k);
                 --inflight;
             }
         }
+        apply_failures(fallback);
     }
 #else
     bool open_file(std::string & err) {
@@ -559,10 +635,26 @@ struct llama_ple_dio::impl {
             return false;
         }
         file_size = (uint64_t) sb.st_size;
+        // covers 512 B and 4 KiB logical blocks; st_blksize is only a preferred size. A volume that wants more fails
+        // the probe read in open(), which then reads with pread + DONTNEED.
         A = 4096;
-        if (sb.st_blksize > (blksize_t) A && sb.st_blksize <= 65536 && (sb.st_blksize & (sb.st_blksize - 1)) == 0) {
-            A = (size_t) sb.st_blksize;
+        return true;
+    }
+
+    // O_DIRECT can open and then refuse the reads (alignment, file system): read with pread + DONTNEED instead
+    bool reopen_buffered(std::string & err) {
+        int flags = O_RDONLY;
+#ifdef O_CLOEXEC
+        flags |= O_CLOEXEC;
+#endif
+        const int nfd = ::open(p.path.c_str(), flags);
+        if (nfd < 0) {
+            err = std::string("open failed: ") + strerror(errno);
+            return false;
         }
+        ::close(fd);
+        fd        = nfd;
+        is_direct = false;
         return true;
     }
 
@@ -644,11 +736,16 @@ struct llama_ple_dio::impl {
             st.bytes   += a.bytes;
             st.read_us += a.us;
         }
+        failed.clear();
         for (int i = 0; i < n_miss; ++i) {
+            if (err_of[i] == 0 && inject_fail()) {
+                err_of[i] = EIO;
+            }
             if (err_of[i] != 0) {
-                fail_row(miss[i], fallback, (unsigned long) err_of[i]);
+                failed.push_back({ miss[i], (unsigned long) err_of[i] });
             }
         }
+        apply_failures(fallback);
     }
 #endif
 };
@@ -680,15 +777,48 @@ std::unique_ptr<llama_ple_dio> llama_ple_dio::open(const llama_ple_dio_params & 
         d->close_all();
         return nullptr;
     }
-    d->lru.init(params.cache_bytes, params.row_bytes);
-    return std::unique_ptr<llama_ple_dio>(new llama_ple_dio(std::move(d)));
+
+    // probe the first and last rows (the last read may end past the end of the file) with no LRU and no injected
+    // failures; the probe does not count in the statistics
+    d->p.test_fail_every = 0;
+    std::unique_ptr<llama_ple_dio> dio(new llama_ple_dio(std::move(d)));
+    auto probe = [&](std::string & perr) {
+        const int32_t rows[2] = { 0, (int32_t) (params.n_rows - 1) };
+        std::vector<uint8_t> buf(2 * params.row_bytes);
+        bool ok = true;
+        try {
+            dio->read_rows(rows, 2, buf.data(), 0, nullptr);
+        } catch (const std::exception & e) {
+            perr = e.what();
+            ok   = false;
+        }
+        dio->reset_stats();
+        return ok;
+    };
+    std::string perr;
+    if (!probe(perr)) {
+#if !defined(_WIN32)
+        std::string rerr;
+        if (dio->pimpl->is_direct && dio->pimpl->reopen_buffered(rerr) && probe(perr)) {
+            // served by pread + DONTNEED
+        } else
+#endif
+        {
+            err = "probe read failed: " + perr;
+            return nullptr;
+        }
+    }
+    dio->pimpl->p.test_fail_every = params.test_fail_every;
+    dio->pimpl->lru.init(params.cache_bytes, params.row_bytes);
+    return dio;
 }
 
 llama_ple_dio::~llama_ple_dio() {
     if (pimpl->p.stats_every > 0 && pimpl->st.calls > 0) {
         pimpl->emit("%s: [TAG_FN_PLE_DIRECT_IO] final: %s\n", __func__, pimpl->line().c_str());
     }
-    // no read is in flight between calls, and idle POSIX workers never touch the buffers
+    // no read is in flight between calls (except after a port failure, see close_all), and idle POSIX workers never
+    // touch the buffers
     pimpl->close_all();
 }
 
@@ -897,8 +1027,14 @@ bool llama_ple_dio_copy(const std::string & src, uint64_t offset, uint64_t size,
         ov.Offset     = (DWORD) (rs & 0xffffffffu);
         ov.OffsetHigh = (DWORD) (rs >> 32);
         DWORD got = 0;
-        if (!ReadFile(hs, rbuf, (DWORD) rlen, &got, &ov) || got < skip + n) {
+        if (!ReadFile(hs, rbuf, (DWORD) rlen, &got, &ov)) {
             err = "read of " + src + " at " + std::to_string(rs) + " failed: " + dio_win_err(GetLastError());
+            ok = false;
+            break;
+        }
+        if (got < skip + n) {
+            err = "short read of " + src + " at " + std::to_string(rs) + ": " + std::to_string(got) + " of " +
+                  std::to_string(skip + n) + " bytes";
             ok = false;
             break;
         }
@@ -984,7 +1120,11 @@ bool llama_ple_dio_copy(const std::string & src, uint64_t offset, uint64_t size,
             done += (size_t) r;
         }
         // keep both files out of the page cache (dirty pages must reach the disk before they can be dropped)
+#if defined(__APPLE__)
+        if (ok && fsync(fd) != 0) {
+#else
         if (ok && fdatasync(fd) != 0) {
+#endif
             err = "fdatasync of " + tmp + " failed: " + strerror(errno);
             ok = false;
         }

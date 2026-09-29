@@ -21,29 +21,48 @@ static void qwen4exp_require_nonzero(const llama_model_loader & ml, llm_kv kid, 
 // then stays mapped, as without the switch). The loader was asked (TENSOR_READ_DIRECT) to keep the table lazy in any
 // load mode and never to read, validate, prefetch or lock it.
 static void qwen4exp_dio_log(const char * line) {
-    LLAMA_LOG_INFO("%s", line);
+    if (strstr(line, "warning:") != nullptr) {
+        LLAMA_LOG_WARN("%s", line);
+    } else {
+        LLAMA_LOG_INFO("%s", line);
+    }
 }
 
-// 32 rows spread over the table (first and last included) read from both files must match
-static bool qwen4exp_ple_copy_matches(llama_ple_dio & copy, const llama_ple_dio_params & shard) {
+// 512 rows (256 spread over the table with the first and last, 256 scattered) read from both files must match.
+// Both readers are unbuffered, with no LRU and no injected failures; the mapping is not touched.
+static bool qwen4exp_ple_copy_matches(const std::string & copy_path, const llama_ple_dio_params & shard) {
     llama_ple_dio_params q = shard;
-    q.cache_bytes = 0;
-    q.stats_every = 0;
+    q.cache_bytes     = 0;
+    q.stats_every     = 0;
+    q.test_fail_every = 0;
     std::string err;
     auto ref = llama_ple_dio::open(q, err);
     if (!ref) {
         LLAMA_LOG_WARN("%s: [TAG_FN_PLE_DIRECT_IO] cannot read the model file to check the copy: %s\n", __func__, err.c_str());
         return false;
     }
-    const int n = 32;
+    q.path   = copy_path;
+    q.offset = 0;
+    auto copy = llama_ple_dio::open(q, err);
+    if (!copy) {
+        LLAMA_LOG_WARN("%s: [TAG_FN_PLE_DIRECT_IO] cannot read %s: %s\n", __func__, copy_path.c_str(), err.c_str());
+        return false;
+    }
+    const int n = 512;
     std::vector<int32_t> rows(n);
+    uint64_t x = 0x9E3779B97F4A7C15ull;
     for (int i = 0; i < n; ++i) {
-        rows[i] = (int32_t) ((shard.n_rows - 1) * i / (n - 1));
+        if (i < n/2) {
+            rows[i] = (int32_t) ((shard.n_rows - 1) * i / (n/2 - 1));
+        } else {
+            x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+            rows[i] = (int32_t) (x % (uint64_t) shard.n_rows);
+        }
     }
     std::vector<uint8_t> a(n * shard.row_bytes);
     std::vector<uint8_t> b(n * shard.row_bytes);
     try {
-        copy.read_rows(rows.data(), n, a.data(), 0, nullptr);
+        copy->read_rows(rows.data(), n, a.data(), 0, nullptr);
         ref->read_rows(rows.data(), n, b.data(), 0, nullptr);
     } catch (const std::exception & e) {
         LLAMA_LOG_WARN("%s: [TAG_FN_PLE_DIRECT_IO] check read failed: %s\n", __func__, e.what());
@@ -58,7 +77,7 @@ static std::unique_ptr<llama_ple_dio> qwen4exp_open_ple_copy(const llama_ple_dio
     for (int attempt = 0; attempt < 2; ++attempt) {
         const int64_t have = llama_ple_dio_file_size(path);
         if (attempt > 0 || have != (int64_t) bytes) {
-            if (have >= 0) {
+            if (have >= 0 && have != (int64_t) bytes) {
                 LLAMA_LOG_WARN("%s: [TAG_FN_PLE_DIRECT_IO] %s (%lld bytes) is not a copy of this table (%llu bytes): making it again\n",
                         __func__, path.c_str(), (long long) have, (unsigned long long) bytes);
             }
@@ -70,17 +89,15 @@ static std::unique_ptr<llama_ple_dio> qwen4exp_open_ple_copy(const llama_ple_dio
                 return nullptr;
             }
         }
-        llama_ple_dio_params q = shard;
-        q.path   = path;
-        q.offset = 0;
-        std::string err;
-        auto dio = llama_ple_dio::open(q, err);
-        if (!dio) {
-            LLAMA_LOG_WARN("%s: [TAG_FN_PLE_DIRECT_IO] cannot open %s: %s\n", __func__, path.c_str(), err.c_str());
-            return nullptr;
-        }
-        if (qwen4exp_ple_copy_matches(*dio, shard)) {
-            dio->reset_stats(); // the check rows are not model reads
+        if (qwen4exp_ple_copy_matches(path, shard)) {
+            llama_ple_dio_params q = shard;
+            q.path   = path;
+            q.offset = 0;
+            std::string err;
+            auto dio = llama_ple_dio::open(q, err);
+            if (!dio) {
+                LLAMA_LOG_WARN("%s: [TAG_FN_PLE_DIRECT_IO] cannot open %s: %s\n", __func__, path.c_str(), err.c_str());
+            }
             return dio;
         }
         LLAMA_LOG_WARN("%s: [TAG_FN_PLE_DIRECT_IO] %s does not match the table in the model file\n", __func__, path.c_str());
@@ -126,6 +143,8 @@ static std::shared_ptr<llama_ple_dio> qwen4exp_open_ple_dio(const llama_model_lo
     p.queue_depth = (int) std::max(1LL, std::min(1024LL, env_ll("LLAMA_PLE_DIO_QD", 64)));
     p.stats_every = (int) std::max(0LL, std::min((long long) INT32_MAX, env_ll("LLAMA_PLE_DIO_STATS", 0)));
     p.log         = qwen4exp_dio_log;
+    // tests only: every Nth read fails, so its row comes from the mapped table (must not change any value)
+    p.test_fail_every = (int) std::max(0LL, std::min((long long) INT32_MAX, env_ll("LLAMA_PLE_DIO_TEST_FAIL", 0)));
 
     // LLAMA_PLE_DIO_FILE: read a copy that nothing maps (Windows serves unbuffered reads of a mapped file one at a time)
     std::unique_ptr<llama_ple_dio> dio;
@@ -146,13 +165,14 @@ static std::shared_ptr<llama_ple_dio> qwen4exp_open_ple_dio(const llama_model_lo
     }
     const auto & dp = dio->params();
     LLAMA_LOG_INFO("%s: [TAG_FN_PLE_DIRECT_IO] %s: rows read %s from %s @ %llu (%lld rows x %zu B, %zu B aligned, "
-            "%d in flight, LRU %zu MiB%s)\n", __func__, name, dio->direct() ? "unbuffered" : "with pread + DONTNEED",
+            "%d in flight, LRU %zu MiB%s%s)\n", __func__, name, dio->direct() ? "unbuffered" : "with pread + DONTNEED",
             dp.path.c_str(), (unsigned long long) dp.offset, (long long) dp.n_rows, dp.row_bytes, dio->align(),
-            dp.queue_depth, dp.cache_bytes >> 20, dp.stats_every ? ", stats on" : "");
+            dp.queue_depth, dp.cache_bytes >> 20, dp.stats_every ? ", stats on" : "",
+            dp.test_fail_every ? ", TEST: injected read failures" : "");
 #if defined(_WIN32)
     if (dp.path == p.path) {
-        LLAMA_LOG_INFO("%s: [TAG_FN_PLE_DIRECT_IO] note: this file is also mapped, so Windows serves these reads one at a "
-                "time (~10K/s); LLAMA_PLE_DIO_FILE=<path> reads an unmapped copy of the table\n", __func__);
+        LLAMA_LOG_WARN("%s: [TAG_FN_PLE_DIRECT_IO] warning: this file is also mapped, so Windows serves these reads one "
+                "at a time (~10K/s, slow prefill); LLAMA_PLE_DIO_FILE=<path> reads an unmapped copy of the table\n", __func__);
     }
 #endif
     return std::shared_ptr<llama_ple_dio>(std::move(dio));
