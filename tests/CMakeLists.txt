@@ -327,6 +327,12 @@ endif()
 # CPU only. llama_kv_resolve and the turbot plan parser are exported with LLAMA_API, so it links in shared builds too.
 llama_build_and_test(test-kv-resolve.cpp)
 
+# [TAG_FN_QSA_FUSED] the fused qwen4exp QSA indexer ops against the unfused graph, CPU only. It calls the CPU backend
+# directly (ggml-cpu.h), which links only without dynamic backend loading.
+if (NOT GGML_BACKEND_DL AND GGML_CPU)
+    llama_build_and_test(test-qsa-fused.cpp)
+endif()
+
 # [TAG_MOE_DMA_SHARE] [TAG_MOE_PREFETCH] [TAG_FN_PREFILL_STREAM] the gen5 paths (DMA share, prefetch, prefill stream) on the
 # CPU backend: plan/fence/gate/release logic and tables, bitwise against the plain MUL_MAT_ID chain. The gen5 entry
 # points are exported with LLAMA_API; the graphs run on the CPU backend directly, so not with dynamic backends.

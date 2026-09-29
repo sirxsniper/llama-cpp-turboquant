@@ -12873,3 +12873,193 @@ void ggml_compute_forward_lightning_indexer(
         }
     }
 }
+
+// ggml_compute_forward_qsa_score [TAG_FN_QSA_FUSED]
+//
+// Reference of the fused qwen4exp QSA block score. Per key block the steps of the unfused graph (models/qwen4exp.cpp
+// build_qsa_top_k): the r member rows summed in member order and scaled by 1/r, rms_norm (double sum, as
+// ggml_compute_forward_rms_norm), times norm_w, rope_multi (the ggml_mrope_cache_init angles), then per query the relu
+// of each head dot, summed in head order, plus the block bias.
+
+void ggml_compute_forward_qsa_score(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * k         = dst->src[0];
+    const ggml_tensor * blk_cells = dst->src[1];
+    const ggml_tensor * blk_pos   = dst->src[2];
+    const ggml_tensor * norm_w    = dst->src[3];
+    const ggml_tensor * q         = dst->src[4];
+    const ggml_tensor * bias      = dst->src[5];
+
+    const int32_t * op = (const int32_t *) dst->op_params;
+
+    const int r          = op[0];
+    const int n_dims     = op[2];
+    const int mode       = op[3];
+    const int n_ctx_orig = op[4];
+
+    float eps, freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow;
+    int   sections[4];
+    memcpy(&eps,         op +  1, sizeof(float));
+    memcpy(&freq_base,   op +  5, sizeof(float));
+    memcpy(&freq_scale,  op +  6, sizeof(float));
+    memcpy(&ext_factor,  op +  7, sizeof(float));
+    memcpy(&attn_factor, op +  8, sizeof(float));
+    memcpy(&beta_fast,   op +  9, sizeof(float));
+    memcpy(&beta_slow,   op + 10, sizeof(float));
+    memcpy(sections,     op + 11, sizeof(int)*4);
+
+    const int64_t D        = k->ne[0];
+    const int64_t n_stream = k->ne[2];
+    const int64_t n_blocks = dst->ne[0];
+    const int64_t n_tps    = dst->ne[1];
+    const int64_t n_head   = q->ne[1];
+
+    GGML_ASSERT(D <= 256 && n_dims <= D);
+
+    const float theta_scale = powf(freq_base, -2.0f/n_dims);
+    float corr_dims[2];
+    ggml_rope_yarn_corr_dims(n_dims, n_ctx_orig, freq_base, beta_fast, beta_slow, corr_dims);
+    const bool is_imrope = mode == GGML_ROPE_TYPE_IMROPE;
+
+    const ggml_to_float_t to_float = k->type == GGML_TYPE_F32 ? nullptr : ggml_get_type_traits(k->type)->to_float;
+    GGML_ASSERT(k->type == GGML_TYPE_F32 || to_float != nullptr);
+
+    const float   * w   = (const float   *) norm_w->data;
+    const int32_t * pos = (const int32_t *) blk_pos->data;
+
+    const int64_t ne2    = n_blocks*n_stream;
+    const int64_t n_work = n_blocks*n_stream;
+    const int64_t w0     = n_work*params->ith/params->nth;
+    const int64_t w1     = n_work*(params->ith + 1)/params->nth;
+
+    float key[256];
+    float row[256];
+    float cache[256];
+
+    for (int64_t iw = w0; iw < w1; ++iw) {
+        const int64_t s = iw / n_blocks;
+        const int64_t b = iw % n_blocks;
+
+        const int32_t * cells = (const int32_t *) ((const char *) blk_cells->data + s*blk_cells->nb[1]) + (int64_t) r*b;
+
+        for (int i = 0; i < r; ++i) {
+            const char * src = (const char *) k->data + s*k->nb[2] + (int64_t) cells[i]*k->nb[1];
+            float * out = i == 0 ? key : row;
+            if (to_float) {
+                to_float(src, out, D);
+            } else {
+                memcpy(out, src, D*sizeof(float));
+            }
+            if (i > 0) {
+                for (int64_t e = 0; e < D; ++e) {
+                    key[e] = key[e] + row[e];
+                }
+            }
+        }
+        const float inv_r = 1.0f/(float) r;
+        for (int64_t e = 0; e < D; ++e) {
+            key[e] = key[e]*inv_r;
+        }
+
+        ggml_float sum = 0.0;
+        for (int64_t e = 0; e < D; ++e) {
+            sum += (ggml_float) (key[e]*key[e]);
+        }
+        const float mean  = sum/D;
+        const float scale = 1.0f/sqrtf(mean + eps);
+        for (int64_t e = 0; e < D; ++e) {
+            key[e] = key[e]*scale;
+        }
+        for (int64_t e = 0; e < D; ++e) {
+            key[e] = key[e]*w[e];
+        }
+
+        const int64_t i2 = s*n_blocks + b;
+        ggml_mrope_cache_init(pos[i2], pos[i2 + ne2], pos[i2 + 2*ne2], pos[i2 + 3*ne2], sections, is_imrope, false,
+                freq_scale, nullptr, corr_dims, D, ext_factor, attn_factor, cache, 1.0f, theta_scale);
+        for (int64_t i0 = 0; i0 < n_dims; i0 += 2) {
+            const int64_t ic = i0/2;
+            const float x0 = key[ic];
+            const float x1 = key[ic + n_dims/2];
+            key[ic]            = x0*cache[i0 + 0] - x1*cache[i0 + 1];
+            key[ic + n_dims/2] = x0*cache[i0 + 1] + x1*cache[i0 + 0];
+        }
+
+        for (int64_t t = 0; t < n_tps; ++t) {
+            float summed = 0.0f;
+            for (int64_t h = 0; h < n_head; ++h) {
+                const float * qh = (const float *) ((const char *) q->data + (s*n_tps + t)*q->nb[2] + h*q->nb[1]);
+                float d = 0.0f;
+                ggml_vec_dot_f32((int) D, &d, 0, qh, 0, key, 0, 1);
+                d = MAX(d, 0.0f);
+                summed = h == 0 ? d : summed + d;
+            }
+            if (bias) {
+                summed += *(const float *) ((const char *) bias->data + b*bias->nb[0] + t*bias->nb[1] + s*bias->nb[2]);
+            }
+            *(float *) ((char *) dst->data + b*dst->nb[0] + t*dst->nb[1] + s*dst->nb[2]) = summed;
+        }
+    }
+}
+
+// ggml_compute_forward_qsa_topk [TAG_FN_QSA_FUSED]
+//
+// Reference of the fused qwen4exp QSA top-k: v[c] = score[cell_blk[c]] + mask[c], the k cells with the largest v, ties
+// on the k-th value to the lowest cells. Values compare through the order-preserving key the CUDA radix select uses, so
+// both backends define the same set (-0.0 below +0.0). Written in ascending cell order.
+
+static inline uint32_t ggml_qsa_topk_key(const float f) {
+    uint32_t u;
+    memcpy(&u, &f, sizeof(u));
+    return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+}
+
+void ggml_compute_forward_qsa_topk(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * score    = dst->src[0];
+    const ggml_tensor * cell_blk = dst->src[1];
+    const ggml_tensor * mask     = dst->src[2];
+
+    const int64_t k        = dst->ne[0];
+    const int64_t n_tps    = dst->ne[1];
+    const int64_t n_stream = dst->ne[2];
+    const int64_t n_kv     = cell_blk->ne[0];
+    const int64_t n_blocks = score->ne[0];
+
+    const bool mask_f16 = mask->type == GGML_TYPE_F16;
+
+    std::vector<uint32_t> keys(n_kv);
+    std::vector<int32_t>  idx(n_kv);
+
+    const int64_t n_rows = n_tps*n_stream;
+    for (int64_t ir = params->ith; ir < n_rows; ir += params->nth) {
+        const int64_t s = ir / n_tps;
+        const int64_t t = ir % n_tps;
+
+        const int32_t * cb = (const int32_t *) ((const char *) cell_blk->data + s*cell_blk->nb[1]);
+        const float   * sc = (const float   *) ((const char *) score->data + t*score->nb[1] + s*score->nb[2]);
+        const char    * mr = mask_f16 ? (const char *) mask->data + t*mask->nb[1] + s*mask->nb[3]
+                                      : (const char *) mask->data + t*mask->nb[1] + s*mask->nb[2];
+
+        for (int64_t c = 0; c < n_kv; ++c) {
+            const int32_t blk = cb[c];
+            GGML_ASSERT(blk >= 0 && blk < n_blocks);
+            const float m = mask_f16 ? GGML_CPU_FP16_TO_FP32(((const ggml_fp16_t *) mr)[c]) : ((const float *) mr)[c];
+            keys[c] = ggml_qsa_topk_key(sc[blk] + m);
+            idx[c]  = (int32_t) c;
+        }
+
+        const auto before = [&](const int32_t a, const int32_t b) {
+            return keys[a] > keys[b] || (keys[a] == keys[b] && a < b);
+        };
+        std::nth_element(idx.begin(), idx.begin() + (k - 1), idx.end(), before);
+        std::sort(idx.begin(), idx.begin() + k);
+
+        int32_t * out = (int32_t *) ((char *) dst->data + t*dst->nb[1] + s*dst->nb[2]);
+        for (int64_t i = 0; i < k; ++i) {
+            out[i] = idx[i];
+        }
+    }
+}

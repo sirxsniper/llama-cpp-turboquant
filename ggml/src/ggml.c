@@ -1220,9 +1220,12 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
 
     "MOE_HOST_POST",
     "MOE_HOST_WAIT",
+
+    "QSA_SCORE",
+    "QSA_TOPK",
 };
 
-static_assert(GGML_OP_COUNT == 106, "GGML_OP_COUNT != 106");  // +1 GGML_OP_TURBO_WHT (TurboQuant fork), +1 GGML_OP_LIGHTNING_INDEXER, +1 GGML_OP_TURBOT_SET_ROWS [TAG_TURBOT], +1 GGML_OP_GATED_DELTA_NET_REPLAY [TAG_4C_GDN_REPLAY], +2 GGML_OP_MOE_HOST_POST/WAIT [TAG_MOE_BRIDGE]
+static_assert(GGML_OP_COUNT == 108, "GGML_OP_COUNT != 108");  // +1 GGML_OP_TURBO_WHT (TurboQuant fork), +1 GGML_OP_LIGHTNING_INDEXER, +1 GGML_OP_TURBOT_SET_ROWS [TAG_TURBOT], +1 GGML_OP_GATED_DELTA_NET_REPLAY [TAG_4C_GDN_REPLAY], +2 GGML_OP_MOE_HOST_POST/WAIT [TAG_MOE_BRIDGE], +2 GGML_OP_QSA_SCORE/TOPK [TAG_FN_QSA_FUSED]
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1343,9 +1346,12 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
 
     "moe_host_post(x, ids, w)",
     "moe_host_wait(ticket, dep)",
+
+    "qsa_score(k, blk_cells, blk_pos, norm_w, q, bias)",
+    "qsa_topk(score, cell_blk, mask)",
 };
 
-static_assert(GGML_OP_COUNT == 106, "GGML_OP_COUNT != 106");  // +1 GGML_OP_TURBO_WHT (TurboQuant fork), +1 GGML_OP_LIGHTNING_INDEXER, +1 GGML_OP_TURBOT_SET_ROWS [TAG_TURBOT], +1 GGML_OP_GATED_DELTA_NET_REPLAY [TAG_4C_GDN_REPLAY], +2 GGML_OP_MOE_HOST_POST/WAIT [TAG_MOE_BRIDGE]
+static_assert(GGML_OP_COUNT == 108, "GGML_OP_COUNT != 108");  // +1 GGML_OP_TURBO_WHT (TurboQuant fork), +1 GGML_OP_LIGHTNING_INDEXER, +1 GGML_OP_TURBOT_SET_ROWS [TAG_TURBOT], +1 GGML_OP_GATED_DELTA_NET_REPLAY [TAG_4C_GDN_REPLAY], +2 GGML_OP_MOE_HOST_POST/WAIT [TAG_MOE_BRIDGE], +2 GGML_OP_QSA_SCORE/TOPK [TAG_FN_QSA_FUSED]
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6817,6 +6823,110 @@ struct ggml_tensor * ggml_moe_host_wait(
     result->op     = GGML_OP_MOE_HOST_WAIT;
     result->src[0] = ticket;
     result->src[1] = dep;
+
+    return result;
+}
+
+// ggml_qsa_score / ggml_qsa_topk [TAG_FN_QSA_FUSED]
+
+struct ggml_tensor * ggml_qsa_score(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * blk_cells,
+        struct ggml_tensor  * blk_pos,
+        struct ggml_tensor  * norm_w,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * bias,
+        int                   r,
+        float                 eps,
+        int                   n_dims,
+        int                   sections[GGML_MROPE_SECTIONS],
+        int                   mode,
+        int                   n_ctx_orig,
+        float                 freq_base,
+        float                 freq_scale,
+        float                 ext_factor,
+        float                 attn_factor,
+        float                 beta_fast,
+        float                 beta_slow) {
+    const int64_t D        = k->ne[0];
+    const int64_t n_stream = k->ne[2];
+
+    GGML_ASSERT(k->type == GGML_TYPE_F32 || k->type == GGML_TYPE_F16 || k->type == GGML_TYPE_BF16 || k->type == GGML_TYPE_Q8_0);
+    GGML_ASSERT(D % 32 == 0 && D <= 256 && k->ne[3] == 1);
+    GGML_ASSERT(r > 0 && r <= 64);
+    GGML_ASSERT(blk_cells->type == GGML_TYPE_I32 && blk_cells->ne[0] % r == 0 && blk_cells->ne[1] == n_stream);
+    GGML_ASSERT(ggml_is_contiguous(blk_cells) && ggml_is_contiguous(blk_pos));
+
+    const int64_t n_blocks = blk_cells->ne[0] / r;
+
+    GGML_ASSERT(blk_pos->type == GGML_TYPE_I32 && ggml_nelements(blk_pos) == 4*n_blocks*n_stream);
+    GGML_ASSERT(norm_w->type == GGML_TYPE_F32 && ggml_nelements(norm_w) == D && ggml_is_contiguous(norm_w));
+    GGML_ASSERT(q->type == GGML_TYPE_F32 && q->ne[0] == D && q->ne[3] == 1 && q->ne[2] % n_stream == 0);
+    GGML_ASSERT(q->nb[0] == sizeof(float));
+    GGML_ASSERT(n_dims > 0 && n_dims % 2 == 0 && n_dims <= D && (mode & GGML_ROPE_TYPE_MROPE) && mode != GGML_ROPE_TYPE_VISION);
+
+    const int64_t n_tps = q->ne[2] / n_stream;
+
+    if (bias) {
+        GGML_ASSERT(bias->type == GGML_TYPE_F32 && bias->ne[0] == n_blocks && bias->ne[1] == n_tps && bias->ne[2] == n_stream);
+        GGML_ASSERT(bias->nb[0] == sizeof(float));
+    }
+
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_blocks, n_tps, n_stream);
+
+    int32_t params[15] = { r, 0, n_dims, mode, n_ctx_orig };
+    memcpy(params +  1, &eps,         sizeof(float));
+    memcpy(params +  5, &freq_base,   sizeof(float));
+    memcpy(params +  6, &freq_scale,  sizeof(float));
+    memcpy(params +  7, &ext_factor,  sizeof(float));
+    memcpy(params +  8, &attn_factor, sizeof(float));
+    memcpy(params +  9, &beta_fast,   sizeof(float));
+    memcpy(params + 10, &beta_slow,   sizeof(float));
+    memcpy(params + 11, sections,     sizeof(int32_t)*GGML_MROPE_SECTIONS);
+    ggml_set_op_params(result, params, sizeof(params));
+
+    result->op     = GGML_OP_QSA_SCORE;
+    result->src[0] = k;
+    result->src[1] = blk_cells;
+    result->src[2] = blk_pos;
+    result->src[3] = norm_w;
+    result->src[4] = q;
+    result->src[5] = bias;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_qsa_topk(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * score,
+        struct ggml_tensor  * cell_blk,
+        struct ggml_tensor  * mask,
+        int                   k) {
+    GGML_ASSERT(score->type == GGML_TYPE_F32 && score->nb[0] == sizeof(float) && score->ne[3] == 1);
+
+    const int64_t n_blocks = score->ne[0];
+    const int64_t n_tps    = score->ne[1];
+    const int64_t n_stream = score->ne[2];
+
+    GGML_ASSERT(cell_blk->type == GGML_TYPE_I32 && cell_blk->ne[1] == n_stream && ggml_is_contiguous(cell_blk));
+
+    const int64_t n_kv = cell_blk->ne[0];
+
+    GGML_ASSERT(k > 0 && k <= n_kv && n_blocks > 0);
+    GGML_ASSERT(mask->nb[0] == ggml_type_size(mask->type) && mask->ne[0] == n_kv && mask->ne[1] == n_tps);
+    if (mask->type == GGML_TYPE_F16) {
+        GGML_ASSERT(mask->ne[2] == 1 && mask->ne[3] == n_stream);
+    } else {
+        GGML_ASSERT(mask->type == GGML_TYPE_F32 && mask->ne[2] == n_stream && mask->ne[3] == 1);
+    }
+
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, k, n_tps, n_stream);
+
+    result->op     = GGML_OP_QSA_TOPK;
+    result->src[0] = score;
+    result->src[1] = cell_blk;
+    result->src[2] = mask;
 
     return result;
 }

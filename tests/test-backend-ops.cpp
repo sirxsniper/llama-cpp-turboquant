@@ -7547,6 +7547,196 @@ struct test_topk_qsa : public test_case {
     }
 };
 
+// [TAG_FN_QSA_FUSED] GGML_OP_QSA_SCORE: the fused qwen4exp indexer block score, the pooled keys built from the raw key
+// cache inside the op (Flash-Next: D 128, 4 query heads, r 4, imrope sections 11/11/10 over 64 dims, base 1e7). The
+// positions stay below 256: past that the CPU (iterated) and CUDA (powf) rope angles drift apart by float ulps of a
+// large angle, which the two backends' own rope ops share.
+struct test_qsa_score : public test_case {
+    const ggml_type type_k;
+    const int64_t   D;
+    const int64_t   n_blocks;
+    const int64_t   n_head;
+    const int64_t   n_tps;
+    const int64_t   n_stream;
+    const bool      bias;
+    const int       mode;
+    const int64_t   r = 4;
+
+    std::string vars() override {
+        return VARS_TO_STR8(type_k, D, n_blocks, n_head, n_tps, n_stream, bias, mode);
+    }
+
+    double max_nmse_err() override { return 1e-6; }
+
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return 2 * D * n_head * n_tps * n_blocks * n_stream;
+    }
+
+    test_qsa_score(ggml_type type_k = GGML_TYPE_Q8_0, int64_t D = 128, int64_t n_blocks = 1024, int64_t n_head = 4,
+                   int64_t n_tps = 1, int64_t n_stream = 1, bool bias = true, int mode = GGML_ROPE_TYPE_IMROPE)
+        : type_k(type_k), D(D), n_blocks(n_blocks), n_head(n_head), n_tps(n_tps), n_stream(n_stream), bias(bias), mode(mode) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t n_kv = r*n_blocks + 7;
+
+        ggml_tensor * k = ggml_new_tensor_3d(ctx, type_k, D, n_kv, n_stream);
+        ggml_set_name(k, "k");
+        ggml_tensor * blk_cells = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, r*n_blocks, n_stream);
+        ggml_set_name(blk_cells, "blk_cells");
+        ggml_tensor * blk_pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 4*n_blocks*n_stream);
+        ggml_set_name(blk_pos, "blk_pos");
+        ggml_tensor * norm_w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, D);
+        ggml_set_name(norm_w, "norm_w");
+        ggml_tensor * q = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, D, n_head, n_tps*n_stream);
+        ggml_set_name(q, "q");
+        ggml_tensor * b = nullptr;
+        if (bias) {
+            b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_blocks, n_tps, n_stream);
+            ggml_set_name(b, "bias");
+        }
+
+        int sections[4] = { 11, 11, 10, 0 };
+        if (mode != GGML_ROPE_TYPE_IMROPE) {
+            sections[0] = 16; sections[1] = 8; sections[2] = 8;
+        }
+        ggml_tensor * out = ggml_qsa_score(ctx, k, blk_cells, blk_pos, norm_w, q, b, (int) r, 1e-6f,
+                64, sections, mode, 262144, 1e7f, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 rng(1234 + (uint32_t) (n_blocks*7 + n_tps*13 + n_stream));
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->op != GGML_OP_NONE) {
+                continue;
+            }
+            if (strcmp(t->name, "blk_cells") == 0) {
+                const int64_t n_kv = r*n_blocks + 7;
+                std::vector<int32_t> v(ggml_nelements(t));
+                std::uniform_int_distribution<int32_t> d(0, (int32_t) n_kv - 1);
+                for (auto & x : v) { x = d(rng); }
+                ggml_backend_tensor_set(t, v.data(), 0, v.size()*sizeof(int32_t));
+            } else if (strcmp(t->name, "blk_pos") == 0) {
+                std::vector<int32_t> v(ggml_nelements(t));
+                std::uniform_int_distribution<int32_t> d(0, 255);
+                for (auto & x : v) { x = d(rng); }
+                ggml_backend_tensor_set(t, v.data(), 0, v.size()*sizeof(int32_t));
+            } else if (strcmp(t->name, "norm_w") == 0) {
+                init_tensor_uniform(t, 0.5f, 1.5f);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
+// [TAG_FN_QSA_FUSED] GGML_OP_QSA_TOPK: v = score[cell_blk] + mask, top k, ties on the k-th value to the lowest cells. Both
+// backends compute v with the same float add and order it by the same key, so the sets must match exactly.
+//   scores 0: uniform, 1: small integers (ties at the cut), 2: most cells masked (fewer finite cells than k)
+struct test_qsa_topk : public test_case {
+    const int64_t n_kv;
+    const int64_t n_tps;
+    const int64_t n_stream;
+    const int     k;
+    const bool    mask_f16;
+    const int     scores;
+    const int64_t n_blocks;
+
+    std::string vars() override {
+        return VARS_TO_STR6(n_kv, n_tps, n_stream, k, mask_f16, scores);
+    }
+
+    double max_err() override { return 0.0; }
+
+    test_qsa_topk(int64_t n_kv = 16384, int64_t n_tps = 1, int64_t n_stream = 1, int k = 2051, bool mask_f16 = true, int scores = 0)
+        : n_kv(n_kv), n_tps(n_tps), n_stream(n_stream), k(k), mask_f16(mask_f16), scores(scores), n_blocks(n_kv/4 + 1) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * score = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_blocks, n_tps, n_stream);
+        ggml_set_name(score, "score");
+        ggml_tensor * cell_blk = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_kv, n_stream);
+        ggml_set_name(cell_blk, "cell_blk");
+        ggml_tensor * mask = mask_f16 ? ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_kv, n_tps, 1, n_stream)
+                                      : ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_kv, n_tps, n_stream);
+        ggml_set_name(mask, "mask");
+        ggml_tensor * out = ggml_qsa_topk(ctx, score, cell_blk, mask, k);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 rng(4321 + (uint32_t) (n_kv + n_tps*7 + scores*101));
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->op != GGML_OP_NONE) {
+                continue;
+            }
+            if (strcmp(t->name, "cell_blk") == 0) {
+                // stream 0: blocks of 4 consecutive cells, the last partial block on the spare block n_blocks - 1 (the
+                // unpooled tail); other streams: a random map
+                std::vector<int32_t> v(ggml_nelements(t));
+                std::uniform_int_distribution<int32_t> d(0, (int32_t) n_blocks - 1);
+                for (int64_t s = 0; s < n_stream; ++s) {
+                    for (int64_t c = 0; c < n_kv; ++c) {
+                        int32_t b = (int32_t) (c/4);
+                        if (b >= n_blocks - 1 || c >= (n_kv/4)*4 - 2) {
+                            b = (int32_t) n_blocks - 1;
+                        }
+                        v[s*n_kv + c] = s == 0 ? b : d(rng);
+                    }
+                }
+                ggml_backend_tensor_set(t, v.data(), 0, v.size()*sizeof(int32_t));
+            } else if (strcmp(t->name, "score") == 0) {
+                std::vector<float> v(ggml_nelements(t));
+                std::uniform_real_distribution<float> du(0.0f, 30.0f);
+                std::uniform_int_distribution<int>    di(0, 15);
+                for (auto & x : v) { x = scores == 1 ? (float) di(rng) : du(rng); }
+                ggml_backend_tensor_set(t, v.data(), 0, v.size()*sizeof(float));
+            } else if (strcmp(t->name, "mask") == 0) {
+                // f16: the attention mask, 0 or -inf; f32: the per-cell bias of build_qsa_top_k, 0, 1e9 or -inf
+                const float p_inf = scores == 2 ? 0.995f : 0.3f;
+                std::uniform_real_distribution<float> du(0.0f, 1.0f);
+                const int64_t n = ggml_nelements(t);
+                std::vector<float> v(n);
+                for (auto & x : v) {
+                    const float u = du(rng);
+                    x = u < p_inf ? -INFINITY : (!mask_f16 && u > 0.99f ? 1e9f : 0.0f);
+                }
+                if (mask_f16) {
+                    std::vector<ggml_fp16_t> h(n);
+                    ggml_fp32_to_fp16_row(v.data(), h.data(), n);
+                    ggml_backend_tensor_set(t, h.data(), 0, h.size()*sizeof(ggml_fp16_t));
+                } else {
+                    ggml_backend_tensor_set(t, v.data(), 0, v.size()*sizeof(float));
+                }
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+
+    // any order: compare each row as a sorted set
+    double err(const float * a, const float * b, size_t n) override {
+        GGML_ASSERT(n % (size_t) k == 0);
+        double diff = 0.0;
+        std::vector<int32_t> ra(k), rb(k);
+        for (size_t r0 = 0; r0 < n; r0 += (size_t) k) {
+            for (int i = 0; i < k; ++i) {
+                ra[i] = (int32_t) a[r0 + i];
+                rb[i] = (int32_t) b[r0 + i];
+                diff += std::fabs(a[r0 + i] - ra[i]) + std::fabs(b[r0 + i] - rb[i]);
+            }
+            std::sort(ra.begin(), ra.end());
+            std::sort(rb.begin(), rb.end());
+            for (int i = 0; i < k; ++i) {
+                diff += ra[i] != rb[i] ? 1.0 : 0.0;
+            }
+        }
+        return diff;
+    }
+};
+
 enum MoeGatingFunc {
     GATING_FUNC_SOFTMAX,
     GATING_FUNC_SIGMOID,
@@ -13274,6 +13464,39 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_topk_qsa(256,  2048,  4, 2, 2000));
     test_cases.emplace_back(new test_topk_qsa(64,   256,   2, 1, 200));  // small k: unfused fallback
 
+    // [TAG_FN_QSA_FUSED] the fused qwen4exp indexer ops; 65536 blocks / 262144 cells are the deployed 262K shapes
+    for (ggml_type type_k : { GGML_TYPE_Q8_0, GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_BF16 }) {
+        test_cases.emplace_back(new test_qsa_score(type_k, 128, 1024, 4, 3, 1, true));
+    }
+    for (int64_t n_tps : { 1, 2, 3, 4, 16, 17, 64, 100 }) {
+        test_cases.emplace_back(new test_qsa_score(GGML_TYPE_Q8_0, 128, 1024, 4, n_tps, 1, true));
+    }
+    test_cases.emplace_back(new test_qsa_score(GGML_TYPE_Q8_0, 128, 1024, 4, 5, 1, false));
+    test_cases.emplace_back(new test_qsa_score(GGML_TYPE_Q8_0, 128, 1000, 4, 3, 2, true));
+    test_cases.emplace_back(new test_qsa_score(GGML_TYPE_Q8_0, 128, 1024, 4, 3, 1, true, GGML_ROPE_TYPE_MROPE));
+    test_cases.emplace_back(new test_qsa_score(GGML_TYPE_F16,  256,  512, 8, 5, 1, true));
+    test_cases.emplace_back(new test_qsa_score(GGML_TYPE_Q8_0, 128,   37, 4, 2, 1, true));
+    for (int64_t n_tps : { 1, 3, 64 }) {
+        test_cases.emplace_back(new test_qsa_score(GGML_TYPE_Q8_0, 128, 65536, 4, n_tps, 1, true));
+    }
+    for (int scores : { 0, 1, 2 }) {
+        for (bool mask_f16 : { true, false }) {
+            test_cases.emplace_back(new test_qsa_topk(16384, 3, 1, 2051, mask_f16, scores));
+            test_cases.emplace_back(new test_qsa_topk(4100,  2, 2, 2051, mask_f16, scores));
+        }
+    }
+    test_cases.emplace_back(new test_qsa_topk(2051, 1, 1, 2051, true, 0));   // k = n_kv: every cell
+    test_cases.emplace_back(new test_qsa_topk(1030, 4, 1,  511, true, 1));   // n_kv not a multiple of 4: scalar path
+    test_cases.emplace_back(new test_qsa_topk(8192, 64, 1, 2051, true, 0));
+    // the split select (one block per chunk of >= 4k cells, then a merge): 3, 4 and 6 chunks, aligned and not
+    test_cases.emplace_back(new test_qsa_topk(32768, 2, 1, 2051, true,  1));
+    test_cases.emplace_back(new test_qsa_topk(40000, 3, 2, 2051, false, 0));
+    test_cases.emplace_back(new test_qsa_topk(50001, 2, 1, 2051, true,  2));
+    for (int64_t n_tps : { 1, 2, 3, 4 }) {
+        test_cases.emplace_back(new test_qsa_topk(262144, n_tps, 1, 2051, true, 0));
+    }
+    test_cases.emplace_back(new test_qsa_topk(262144, 3, 1, 2051, true, 1));
+
     // exhaustive top_k tests
     //for (int i = 1; i < 9999; ++i) {
     //    test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {i, 2, 1, 3}, rand() % i + 1));
@@ -14564,6 +14787,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     for (int64_t kv : { 32768, 131072, 262144 }) {
         for (int64_t nb : { 1, 3, 512 }) {
             test_cases.emplace_back(new test_flash_attn_ext_turbot(TURBOT_TW_NR2_Q8, kv, nb, TURBOT_MIX_BAND64K, 3, false, 0.0f, true, 256, 2, 24));
+        }
+    }
+    // [TAG_FN_QSA_FUSED] the fused indexer at the qwen4exp shapes (per QSA layer): block scores and top-k at 32K / 131K /
+    // 262K cells, nb 1 / 3 and a 64-query chunk. The unfused graph's cost is the TOPK_QSA / TOP_K / GET_ROWS cases above.
+    //   test-backend-ops perf -b CUDA0 -o "QSA_SCORE|QSA_TOPK"
+    for (int64_t kv : { 32768, 131072, 262144 }) {
+        for (int64_t nb : { 1, 3, 64 }) {
+            test_cases.emplace_back(new test_qsa_score(GGML_TYPE_Q8_0, 128, kv/4, 4, nb, 1, true));
+            test_cases.emplace_back(new test_qsa_topk(kv, nb, 1, 2051, true, 0));
         }
     }
     test_cases.emplace_back(new test_turbot_set_rows(TURBOT_TW_NR2_Q8, 2048, GGML_TYPE_I64, 1, false, true, 256, 2, 24));

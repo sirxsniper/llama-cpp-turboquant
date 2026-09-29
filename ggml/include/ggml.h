@@ -659,6 +659,9 @@ extern "C" {
         GGML_OP_MOE_HOST_POST, // [TAG_MOE_BRIDGE] appended last so that no existing op value moves
         GGML_OP_MOE_HOST_WAIT, // [TAG_MOE_BRIDGE]
 
+        GGML_OP_QSA_SCORE, // [TAG_FN_QSA_FUSED] appended last so that no existing op value moves
+        GGML_OP_QSA_TOPK,  // [TAG_FN_QSA_FUSED]
+
         GGML_OP_COUNT,
     };
 
@@ -2836,6 +2839,54 @@ extern "C" {
             int64_t               n_tokens,
             int32_t               bridge,
             int32_t               chan);
+
+    // [TAG_FN_QSA_FUSED] qwen4exp QSA indexer (models/qwen4exp.cpp build_qsa_top_k) in two fused ops. Neither builds the
+    // [n_kv, n_tokens] score tensor of the unfused graph.
+    //
+    // qsa_score: the score of every key block for every query, the pooled keys built on the fly from the raw key cache:
+    //   key[b]    = rope(rms_norm(mean_i k[:, blk_cells[r*b + i]]) * norm_w, block b's 4 positions in blk_pos)
+    //   res[b, t] = sum_h relu(q[:, h, t] . key[b]) + (bias ? bias[b, t] : 0)
+    // k:         [D, n_kv, n_stream]          f32, f16, bf16 or q8_0 (the raw keys, one head)
+    // blk_cells: [r*n_blocks, n_stream]       i32
+    // blk_pos:   [4*n_blocks*n_stream]        i32 (section p of block b of stream s at p*n_blocks*n_stream + s*n_blocks + b)
+    // norm_w:    [D]                          f32
+    // q:         [D, n_head, n_tps*n_stream]  f32, normed and roped (stream s owns tokens [s*n_tps, (s+1)*n_tps))
+    // bias:      [n_blocks, n_tps, n_stream]  f32, or NULL
+    // res:       [n_blocks, n_tps, n_stream]  f32
+    // The rope arguments are those of ggml_rope_multi; D % 32 == 0, D <= 256, n_dims <= D.
+    GGML_API struct ggml_tensor * ggml_qsa_score(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * blk_cells,
+            struct ggml_tensor  * blk_pos,
+            struct ggml_tensor  * norm_w,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * bias,
+            int                   r,
+            float                 eps,
+            int                   n_dims,
+            int                   sections[GGML_MROPE_SECTIONS],
+            int                   mode,
+            int                   n_ctx_orig,
+            float                 freq_base,
+            float                 freq_scale,
+            float                 ext_factor,
+            float                 attn_factor,
+            float                 beta_fast,
+            float                 beta_slow);
+
+    // qsa_topk: the k cells with the largest v[c, t] = score[cell_blk[c], t] + mask[c, t] per query (the cell expand, the
+    // mask add and the top-k of the unfused graph). Any order; ties on the k-th value keep the lowest cells.
+    // score:    [n_blocks, n_tps, n_stream]        f32
+    // cell_blk: [n_kv, n_stream]                   i32
+    // mask:     [n_kv, n_tps, 1, n_stream] f16 (the attention mask) or [n_kv, n_tps, n_stream] f32 (a per-cell bias)
+    // res:      [k, n_tps, n_stream]               i32
+    GGML_API struct ggml_tensor * ggml_qsa_topk(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * score,
+            struct ggml_tensor  * cell_blk,
+            struct ggml_tensor  * mask,
+            int                   k);
 
     // DSA lightning indexer
     //

@@ -107,6 +107,8 @@ void ggml_compute_forward_gla(const struct ggml_compute_params * params, struct 
 void ggml_compute_forward_gated_delta_net(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_gated_delta_net_replay(const struct ggml_compute_params * params, struct ggml_tensor * dst); // [TAG_4C_GDN_REPLAY]
 void ggml_compute_forward_lightning_indexer(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+void ggml_compute_forward_qsa_score(const struct ggml_compute_params * params, struct ggml_tensor * dst); // [TAG_FN_QSA_FUSED]
+void ggml_compute_forward_qsa_topk(const struct ggml_compute_params * params, struct ggml_tensor * dst);  // [TAG_FN_QSA_FUSED]
 void ggml_compute_forward_dsv4_hc_comb(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_dsv4_hc_pre(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_dsv4_hc_post(const struct ggml_compute_params * params, struct ggml_tensor * dst);
