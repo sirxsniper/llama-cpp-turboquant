@@ -125,9 +125,11 @@ void pfs_run(pfs_state * s) {
                 return;
             }
             job = s->queue.front();
-            const pfs_bank & b0 = s->banks[s->layers[job.pos].bank];
+            pfs_bank & b0 = s->banks[s->layers[job.pos].bank];
             if (b0.holds == job.pos && b0.complete) {
-                s->queue.pop_front(); // the bank has this layer already (weights never change)
+                // the bank has this layer already (weights never change): keep it until the layer's release
+                b0.consumed = false;
+                s->queue.pop_front();
                 s->cv_done.notify_all();
                 continue;
             }

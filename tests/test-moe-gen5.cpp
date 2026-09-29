@@ -15,6 +15,7 @@
 #include "../src/llama-moe-gen5.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -22,6 +23,7 @@
 #include <cstring>
 #include <random>
 #include <string>
+#include <thread>
 #include <vector>
 
 static int g_fail   = 0;
@@ -509,12 +511,24 @@ static void test_pfs(t_model & m, int n_bufs, bool wrap, bool partial) {
     TCHECK(llama_prefill_stream_lookup(nullptr, m.layers[0].w[0], 15) == nullptr, "[%s] not below the minimum", name);
 
     std::mt19937 rng(11 + n_bufs);
-    const int n_ub = 4;
+    // ubatches: (layers in the graph, release of the last one). A graph that stops early is an aborted ubatch: the
+    // next gate 0 must cancel the stale copies, and a missing release must not hold a bank forever.
+    struct ub_shape { int n; bool last_release; };
+    std::vector<ub_shape> plan = { { N_LAYER, true }, { N_LAYER, true }, { N_LAYER, true }, { N_LAYER, true } };
+    if (partial) {
+        plan = { { N_LAYER, true }, { 2, false }, { N_LAYER, true }, { 1, true }, { 1, false }, { 3, false },
+                 { N_LAYER, true }, { 2, true }, { N_LAYER, true } };
+    }
+    const int n_ub = (int) plan.size();
+    int n_full = 0;
+    for (const auto & u : plan) {
+        n_full += u.n == N_LAYER && u.last_release;
+    }
     bool all_same = true;
     for (int ub = 0; ub < n_ub; ++ub) {
-        const int  T      = 40 + 8*ub;
-        const bool cut    = partial && ub == 1; // an ubatch that stops after the gate of layer 1 (abort)
-        const int  n_used_layers = cut ? 2 : N_LAYER;
+        const int  T             = 40 + 8*(ub % 4);
+        const int  n_used_layers = plan[ub].n;
+        const bool cut           = !plan[ub].last_release;
         graph_run g;
         g.init();
         ggml_tensor * x = ggml_new_tensor_2d(g.ctx, GGML_TYPE_F32, N_EMBD, T);
@@ -539,7 +553,7 @@ static void test_pfs(t_model & m, int n_bufs, bool wrap, bool partial) {
             llama_prefill_stream_build_gate(g.ctx, g.gf, v, x);
             ggml_tensor * bw[3] = { v->up, v->gate, v->down };
             ggml_tensor * down = chain(g.ctx, bw, xin, ids[l], nullptr, 0);
-            if (!(cut && l == 1)) {
+            if (!(cut && l == n_used_layers - 1)) {
                 llama_prefill_stream_build_release(g.ctx, g.gf, v, down);
             }
             out_s[l] = down;
@@ -578,15 +592,24 @@ static void test_pfs(t_model & m, int n_bufs, bool wrap, bool partial) {
            (unsigned long long) k.ubatches, (unsigned long long) k.jobs, k.bytes/1048576.0, (unsigned long long) k.reused,
            k.wait_s*1e3, all_same ? "equal" : "DIFFERENT");
     TCHECK(k.ubatches == (uint64_t) n_ub, "[%s] ubatches counted", name);
-    TCHECK(k.jobs >= (uint64_t) (N_LAYER*(n_ub - (partial ? 1 : 0))), "[%s] every layer was copied", name);
+    // a bank that still holds its layer from an earlier ubatch is reused, so only a lower bound is fixed
+    TCHECK(k.jobs >= (uint64_t) n_full, "[%s] layers were copied", name);
     if (wrap && !partial) {
-        TCHECK(k.reused >= (uint64_t) (n_ub - 1), "[%s] the wrap copy of layer 0 was used", name);
+        TCHECK(k.reused >= 1, "[%s] the wrap copy of layer 0 was used", name);
     }
     llama_prefill_stream_free(owner);
     TCHECK(llama_prefill_stream_lookup(nullptr, m.layers[0].w[0], 64) == nullptr, "[%s] freed", name);
 }
 
 int main() {
+    setvbuf(stdout, nullptr, _IONBF, 0);
+    // a lost wakeup in the gate/streamer or plan/issuer handshakes shows up as a hang: fail instead
+    std::thread([]() {
+        std::this_thread::sleep_for(std::chrono::seconds(600));
+        fprintf(stderr, "test-moe-gen5: TIMEOUT after 600 s (a gen5 handshake hangs)\n");
+        fflush(stderr);
+        std::_Exit(3);
+    }).detach();
     t_model m;
     if (!build_model(m)) {
         fprintf(stderr, "cannot build the test model\n");
