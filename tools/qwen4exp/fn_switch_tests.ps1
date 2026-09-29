@@ -1,6 +1,6 @@
 # [TAG_FN_SP0] Unit-level checks of the Flash-Next speed switches (flashnext/speed), no real model. GPU: after SIX_DONE only.
 #
-#   powershell -File tools/qwen4exp/fn_switch_tests.ps1 [-Bin D:\Projects\LocalAI\source-build\wt-fn\build-fn\bin]
+#   powershell -File tools/qwen4exp/fn_switch_tests.ps1 [-Bin D:\Projects\LocalAI\source-build\wt-flash\build-flash\bin]
 #
 # 1. test-backend-ops -b CUDA0 on the new op shapes: the hot chain (remap + zero slot, T 1..8), the QSA-chunk top-k /
 #    concat / cast shapes, and the MTP head-rows shapes
@@ -10,7 +10,7 @@
 # 3. python tools/moe-trace/route_sim.py --selftest
 # Refuses beside any llama/ggml/test process; stops at the first failure.
 param(
-  [string]$Bin = "D:\Projects\LocalAI\source-build\wt-fn\build-fn\bin",
+  [string]$Bin = "D:\Projects\LocalAI\source-build\wt-flash\build-flash\bin",  # [TAG_FN_MERGE] the merged branch
   [string]$Out = "E:\turbot-gates\flashnext\switch_tests"
 )
 $ErrorActionPreference = "Stop"
@@ -68,9 +68,11 @@ if (Test-Path $tla) {
 # LLAMA_MTP_ATTN_WINDOW by itself whenever no MTP head switch is set ([TAG_FN_MTP_HEAD_IDS] [TAG_FN_MTP_ATTN_WINDOW])
 $tmc = Join-Path $Bin "test-mtp-cost.exe"
 if (Test-Path $tmc) { Run "mtp_cost" $tmc @() @{} }
-& python "D:\Projects\LocalAI\source-build\wt-fn\tools\moe-trace\route_sim.py" --selftest
+# [TAG_FN_MERGE] the tools of this checkout, not of the round-1 worktree
+$mt = Join-Path $PSScriptRoot "..\moe-trace"
+& python (Join-Path $mt "route_sim.py") --selftest
 if ($LASTEXITCODE -ne 0) { "route_sim selftest FAILED"; exit 1 }
 if (Test-Path (Join-Path $Out "archs.moet")) {
-  & python "D:\Projects\LocalAI\source-build\wt-fn\tools\moe-trace\make_profile.py" --trace (Join-Path $Out "archs.moet") --out (Join-Path $Out "archs_from_trace.moeprof")
+  & python (Join-Path $mt "make_profile.py") --trace (Join-Path $Out "archs.moet") --out (Join-Path $Out "archs_from_trace.moeprof")
 }
 "ALL SWITCH TESTS PASSED"

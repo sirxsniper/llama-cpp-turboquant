@@ -12,7 +12,9 @@
 #
 # Pass, single stall (--every 0):
 #   - exactly 1 "wait timeout" (or "host job failed") line and at least 1 "re-armed" line in the server log
-#   - exactly 1 request fails with a clean error; every other request returns the same text (sha1) as the others
+#   - exactly 1 request fails with a clean error; the request right after it succeeds (its first ~15 steps run while
+#     the bridge pauses, on the CPU chain, whose summation order may flip a greedy near-tie, so its text is not
+#     compared); every other request returns the same text (sha1). Needs --requests >= 4.
 #   - no CUDA error / illegal memory access / GGML_ASSERT, the server is still healthy after the last request
 # Pass, repeated stalls (--every N):
 #   - exactly 3 error lines, then "3 errors, the bridge stays off for this context"; 1..3 requests fail
@@ -45,7 +47,7 @@ def main():
     ap.add_argument("--env", action="append", default=[], help="K=V for the server (repeatable)")
     ap.add_argument("--stall-ms", type=int, default=100)
     ap.add_argument("--every", type=int, default=0, help="also stall every N jobs after the first (0 = once)")
-    ap.add_argument("--requests", type=int, default=6)
+    ap.add_argument("--requests", type=int, default=6, help=">= 4 for the single-stall text check")
     ap.add_argument("--n", type=int, default=256)
     ap.add_argument("--out", default="E:/turbot-gates/flashnext/r2/gpu")
     ap.add_argument("--tag", default="bridge_stall")
@@ -103,12 +105,19 @@ def main():
     failed = [r for r in results if not r["ok"]]
     good = [r for r in results if r["ok"]]
     shas = {r["sha"] for r in good}
+    # [TAG_MOE_BRIDGE] the request after the failed one runs its first steps while the bridge pauses (CPU chain): only
+    # its success counts; the fully bridged requests before and after it must give one text
+    i_fail = failed[0]["i"] if len(failed) == 1 else -1
+    after = next((r for r in results if r["i"] == i_fail + 1), None) if i_fail >= 0 else None
+    bridged = [r for r in good if i_fail >= 0 and r["i"] != i_fail + 1]
+    shas_bridged = {r["sha"] for r in bridged}
 
     checks = [("bridge enabled", enabled), ("no fatal message", not fatal), ("server healthy at the end", healthy)]
     if a.every <= 0:
         checks += [("exactly 1 stall error line", n_err_lines == 1), ("re-armed after it", n_rearm >= 1),
                    ("exactly 1 failed request", len(failed) == 1),
-                   ("every other request the same text", len(good) == a.requests - 1 and len(shas) == 1)]
+                   ("the request after it succeeds", after is not None and after["ok"]),
+                   ("the bridged requests the same text", len(bridged) >= 2 and len(shas_bridged) == 1)]
     else:
         checks += [("exactly 3 stall error lines", n_err_lines == 3), ("bridge off after 3 errors", off),
                    ("1..3 failed requests", 1 <= len(failed) <= 3),
@@ -116,8 +125,8 @@ def main():
     ok = all(c[1] for c in checks)
     for name, c in checks:
         print("  %-36s %s" % (name, "ok" if c else "FAIL"))
-    print("stall lines %d, re-armed %d, off %s, failed requests %d, distinct texts %d%s" % (
-        n_err_lines, n_rearm, off, len(failed), len(shas), ("  fatal: " + fatal.group(0)) if fatal else ""))
+    print("stall lines %d, re-armed %d, off %s, failed requests %d, distinct texts %d (bridged %d)%s" % (
+        n_err_lines, n_rearm, off, len(failed), len(shas), len(shas_bridged), ("  fatal: " + fatal.group(0)) if fatal else ""))
     print("BRIDGE STALL TEST %s (log %s)" % ("PASS" if ok else "FAIL", log_path))
     return 0 if ok else 1
 
