@@ -11,6 +11,11 @@
 #                   100 %
 #   DMA share       -ub 1..4 (the MTP verify widths), LLAMA_MOE_DMA_SHARE=1 / auto, LLAMA_MOE_PREFETCH=1, with and
 #                   without the hot set: every expert runs on the CPU or the GPU, so KLD <= 1e-3 and same-top >= 99 %
+#                   [TAG_FN_MERGE] relative to the synthetic model's placement band (fn_synth_check.band_ref: every
+#                   expert on the GPU against the all-CPU base): KLD <= min(1e-3, 2 x band), same-top >= band -
+#                   max(2, 3 x SE), because the near-uniform synthetic logits put same-top below 99 % from CPU-vs-GPU
+#                   arithmetic alone (fn_synth_check.limits).
+#                   --no-band restores the absolute rule.
 # Each log must show the path enabled and no fatal message.
 from __future__ import annotations
 
@@ -34,6 +39,7 @@ def main():
     ap.add_argument("--experts", type=int, default=64)
     ap.add_argument("--layers", type=int, default=8)
     ap.add_argument("--max-commit-gb", type=int, default=50)
+    ap.add_argument("--no-band", action="store_true", help="[TAG_FN_MERGE] absolute rule for the DMA cases")
     a = ap.parse_args()
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     errs = fb.preflight(a.max_commit_gb)
@@ -58,8 +64,9 @@ def main():
               "--chunks", "4", "-ngl", "99", "--n-cpu-moe", str(a.layers), "-fit", "off", "-fa", "on", "-t", "8"]
     fatal_re = re.compile(r"CUDA error|illegal memory access|GGML_ASSERT|ggml_abort|outlived")
     ok_all = True
+    bands = {}  # [TAG_FN_MERGE] ub -> (KLD, same-top, its SE) of the all-GPU placement against the base
 
-    def case(tag, ub, env, want_log, max_kld, min_top):
+    def case(tag, ub, env, want_log, max_kld, min_top, banded=False):
         nonlocal ok_all
         base = os.path.join(a.dir, "gen5_base_ub%d.sparse" % ub)
         if not os.path.exists(base):
@@ -69,17 +76,30 @@ def main():
                 fb.log("ub=%d base run failed (rc %d)" % (ub, rc))
                 ok_all = False
                 return
+        band = None
+        if banded and not a.no_band:  # [TAG_FN_MERGE]
+            if ub not in bands:
+                bands[ub] = fs.band_ref(common, ub, base, a.dir, a.layers)
+            band = bands[ub]
+            if band is None:
+                fb.log("ub=%d band run failed" % ub)
+                ok_all = False
+                return
         rc, txt = fs.run(common + ["-ub", str(ub), "--kl-divergence-base", base, "--kl-divergence"], env,
                          os.path.join(a.dir, "gen5_%s.log" % tag))
         kld = re.search(r"Mean\s+KLD:\s*([0-9.eE+-]+)", txt)
         top = re.search(r"Same top p:\s*([0-9.]+)", txt)
         on = re.search(want_log, txt)
         fatal = fatal_re.search(txt)
+        if band is not None:  # [TAG_FN_MERGE]
+            st = fs.same_top(txt)
+            max_kld, min_top = fs.limits(band, max_kld, min_top, st[1] if st else 0.0)
         ok = (rc == 0 and kld and top and on and not fatal and float(kld.group(1)) <= max_kld and
               float(top.group(1)) >= min_top)
         ok_all = ok_all and bool(ok)
-        print("%-28s ub %d  %s  KLD %s  same-top %s  -> %s" % (tag, ub, "on" if on else "NOT ENABLED",
-              kld.group(1) if kld else "-", top.group(1) if top else "-", "PASS" if ok else "FAIL"))
+        print("%-28s ub %d  %s  KLD %s  same-top %s  (limits KLD <= %.3g, same-top >= %.2f)  -> %s" % (
+              tag, ub, "on" if on else "NOT ENABLED", kld.group(1) if kld else "-", top.group(1) if top else "-",
+              max_kld, min_top, "PASS" if ok else "FAIL"))
 
     for bufs in (1, 2, 3):
         case("pfs_bufs%d" % bufs, 64,
@@ -89,12 +109,12 @@ def main():
     dma = {"LLAMA_MOE_DMA_SHARE": "1", "LLAMA_MOE_PREFETCH": "1", "LLAMA_MOE_DMA_STATS": "1",
            "LLAMA_MOE_DMA_RING_MIB": "64", "LLAMA_MOE_DMA_ADMIT": "1/8"}
     for T in (1, 2, 3, 4):
-        case("dma_prefetch_ub%d" % T, T, dma, r"moe-dma: \d+ host expert layers", 1e-3, 99.0)
+        case("dma_prefetch_ub%d" % T, T, dma, r"moe-dma: \d+ host expert layers", 1e-3, 99.0, True)
         case("dma_auto_hot_ub%d" % T, T,
              dict(dma, LLAMA_MOE_DMA_SHARE="auto", LLAMA_MOE_HOT_PROFILE=prof, LLAMA_MOE_HOT_MIB="%.1f" % (hot_mib / 2)),
-             r"moe-dma: \d+ host expert layers", 1e-3, 99.0)
+             r"moe-dma: \d+ host expert layers", 1e-3, 99.0, True)
     case("dma_sync_inline_ub3", 3, dict(dma, LLAMA_MOE_DMA_SYNC="1", LLAMA_MOE_DMA_INLINE="1"),
-         r"moe-dma: \d+ host expert layers", 1e-3, 99.0)
+         r"moe-dma: \d+ host expert layers", 1e-3, 99.0, True)
     case("all_gen5_ub64", 64, dict(dma, LLAMA_PREFILL_STREAM="1"), r"prefill-stream: \d+ host expert layers", 1e-9, 100.0)
     print("GEN5 SYNTH CHECK %s" % ("PASS" if ok_all else "FAIL"))
     return 0 if ok_all else 1
