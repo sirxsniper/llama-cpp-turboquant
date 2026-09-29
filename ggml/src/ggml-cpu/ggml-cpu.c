@@ -2811,6 +2811,11 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_gated_delta_net_replay(params, tensor);
             } break;
+        case GGML_OP_MOE_HOST_POST: // [TAG_MOE_BRIDGE] device backends only; the CPU supports_op is false
+        case GGML_OP_MOE_HOST_WAIT:
+            {
+                GGML_ABORT("%s runs on a device backend only", ggml_op_name(tensor->op));
+            }
         case GGML_OP_MAP_CUSTOM1:
             {
                 ggml_compute_forward_map_custom1(params, tensor);
@@ -3159,6 +3164,8 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_WIN_PART:
         case GGML_OP_WIN_UNPART:
         case GGML_OP_GET_REL_POS:
+        case GGML_OP_MOE_HOST_POST: // [TAG_MOE_BRIDGE]
+        case GGML_OP_MOE_HOST_WAIT:
             {
                 n_tasks = 1;
             } break;

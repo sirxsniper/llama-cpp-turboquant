@@ -2,6 +2,7 @@
 
 #include "ggml.h"
 #include "ggml-backend.h"
+#include "ggml-moe-bridge.h" // [TAG_MOE_BRIDGE]
 
 #ifdef  __cplusplus
 extern "C" {
@@ -104,6 +105,17 @@ GGML_BACKEND_API void triattention_gpu_upload_cells(
 GGML_BACKEND_API float * triattention_gpu_alloc_scores(uint32_t n_cells, void * stream);
 GGML_BACKEND_API void    triattention_gpu_free_dev(void * ptr);
 GGML_BACKEND_API void    triattention_gpu_free(triattention_gpu_state * state);
+
+// [TAG_MOE_BRIDGE] MoE host doorbell, see ggml-moe-bridge.h (also returned by get_proc_address as ggml_backend_moe_bridge_*)
+GGML_BACKEND_API struct ggml_moe_bridge * ggml_backend_cuda_moe_bridge_new(const struct ggml_moe_bridge_params * params);
+GGML_BACKEND_API void     ggml_backend_cuda_moe_bridge_free(struct ggml_moe_bridge * bridge);
+GGML_BACKEND_API int32_t  ggml_backend_cuda_moe_bridge_id(const struct ggml_moe_bridge * bridge);
+GGML_BACKEND_API void     ggml_backend_cuda_moe_bridge_set_runner(struct ggml_moe_bridge * bridge, ggml_moe_bridge_runner_t runner, void * user_data);
+GGML_BACKEND_API bool     ggml_backend_cuda_moe_bridge_poll(struct ggml_moe_bridge * bridge, struct ggml_moe_bridge_job * job);
+GGML_BACKEND_API void     ggml_backend_cuda_moe_bridge_complete(struct ggml_moe_bridge * bridge, const struct ggml_moe_bridge_job * job, bool ok);
+GGML_BACKEND_API uint32_t ggml_backend_cuda_moe_bridge_error(const struct ggml_moe_bridge * bridge);
+GGML_BACKEND_API bool     ggml_backend_cuda_moe_bridge_reset(struct ggml_moe_bridge * bridge);
+GGML_BACKEND_API void     ggml_backend_cuda_moe_bridge_get_stats(const struct ggml_moe_bridge * bridge, struct ggml_moe_bridge_stats * stats);
 
 #ifdef  __cplusplus
 }

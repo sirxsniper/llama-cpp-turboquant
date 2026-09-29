@@ -560,6 +560,9 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
             return ggml_is_contiguous(op->src[0]);
         case GGML_OP_SSM_SCAN:
             return ggml_get_op_params_i32(op, 0) == 1 || op->src[3]->ne[0] == 1;
+        case GGML_OP_MOE_HOST_POST: // [TAG_MOE_BRIDGE] device backends only
+        case GGML_OP_MOE_HOST_WAIT:
+            return false;
         default:
             return true;
     }
@@ -777,6 +780,16 @@ static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const ch
     }
     if (strcmp(name, "ggml_cpu_moe_run") == 0) {
         return (void *)ggml_cpu_moe_run;
+    }
+    // [TAG_MOE_BRIDGE]
+    if (strcmp(name, "ggml_cpu_moe_pool_park") == 0) {
+        return (void *)ggml_cpu_moe_pool_park;
+    }
+    if (strcmp(name, "ggml_cpu_moe_pool_wake") == 0) {
+        return (void *)ggml_cpu_moe_pool_wake;
+    }
+    if (strcmp(name, "ggml_cpu_moe_layer_supported") == 0) {
+        return (void *)ggml_cpu_moe_layer_supported;
     }
     if (strcmp(name, "ggml_cpu_fn_moe_fused_calls") == 0) {
         return (void *)ggml_cpu_fn_moe_fused_calls;

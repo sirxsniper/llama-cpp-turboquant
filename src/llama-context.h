@@ -400,6 +400,9 @@ private:
     std::array<llm_graph_result_ptr, 4> gf_res_width;
     uint64_t n_width_switch = 0;
 
+    // [TAG_MOE_BRIDGE] LLAMA_MOE_BRIDGE=1: the host doorbell of the host-resident expert layers (llama-moe-bridge.h)
+    struct llama_moe_bridge * moe_bridge = nullptr;
+
     llm_graph_result * get_gf_res_prev(const llama_ubatch & ubatch);
     void gf_res_prev_reset_all();
 

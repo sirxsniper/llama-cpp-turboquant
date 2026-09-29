@@ -20,12 +20,14 @@
 #include "ggml-backend.h"
 #include "ggml-cpp.h"
 #include "ggml-cpu.h" // [TAG_FN_CPU_MMID_MR] enum ggml_cpu_fn_switch
+#include "ggml-moe-bridge.h" // [TAG_MOE_BRIDGE]
 #include "ggml-turbot.h"
 
 #include <algorithm>
 #include <atomic>
 #include <array>
 #include <cfloat>
+#include <chrono> // [TAG_MOE_BRIDGE]
 #include <cinttypes>
 #include <cstdarg>
 #include <cstdint>
@@ -15782,6 +15784,10 @@ static bool run_cpu_fn_moe_fuse(ggml_backend_t backend, ggml_backend_t backend_r
     if (!get_sw || !set_sw || !calls || !pp_def || !pool_new || !pool_free || !pool_run) {
         return true;
     }
+    // [TAG_MOE_BRIDGE] optional: park / wake, and the pinned-caller pool of the MoE host bridge
+    using pool_park_t = void (*)(ggml_cpu_moe_pool *);
+    auto pool_park = (pool_park_t) ggml_backend_reg_get_proc_address(reg, "ggml_cpu_moe_pool_park");
+    auto pool_wake = (pool_park_t) ggml_backend_reg_get_proc_address(reg, "ggml_cpu_moe_pool_wake");
     const int saved_fuse = get_sw(GGML_CPU_FN_MOE_FUSE);
     const int saved_mr   = get_sw(GGML_CPU_FN_MMID_MR);
 
@@ -15877,6 +15883,33 @@ static bool run_cpu_fn_moe_fuse(ggml_backend_t backend, ggml_backend_t backend_r
                     job.w   = w.data();
                     job.out = out_w.data();
                     const bool ran_w = pool && pool_run(pool, &job) == GGML_STATUS_SUCCESS;
+
+                    // [TAG_MOE_BRIDGE] a parked pool still runs the next job, and a pool made on its own thread with
+                    // pin_caller + skip_first_core (the bridge executor's settings) gives the same values
+                    const bool bridge_opts = pool_park && pool_wake;
+                    std::vector<float> out_k((size_t) c.n_embd * T, 12345.0f);
+                    std::vector<float> out_q((size_t) c.n_embd * T, 12345.0f);
+                    bool ran_k = false;
+                    bool ran_q = false;
+                    if (bridge_opts && pool) {
+                        pool_park(pool);
+                        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                        job.out = out_k.data();
+                        ran_k = pool_run(pool, &job) == GGML_STATUS_SUCCESS;
+                        pool_wake(pool);
+                        std::thread th([&]() {
+                            ggml_cpu_moe_pool_params pq = pp_def(4);
+                            pq.spin_us         = 50;
+                            pq.pin_caller      = true;
+                            pq.skip_first_core = true;
+                            ggml_cpu_moe_pool * pool_q = pool_new(&pq);
+                            ggml_cpu_moe_job job_q = job;
+                            job_q.out = out_q.data();
+                            ran_q = pool_q && pool_run(pool_q, &job_q) == GGML_STATUS_SUCCESS;
+                            pool_free(pool_q);
+                        });
+                        th.join();
+                    }
                     pool_free(pool);
 
                     // the weighted sum of the reference rows, in slot order, skipped slots left out
@@ -15906,6 +15939,19 @@ static bool run_cpu_fn_moe_fuse(ggml_backend_t backend, ggml_backend_t backend_r
                                (int) ran_p, (int) ran_w, nd_p, err_p, nd_w, err_w);
                     }
                     n_fail += (ok_p ? 0 : 1) + (ok_w ? 0 : 1);
+
+                    if (bridge_opts) { // [TAG_MOE_BRIDGE]
+                        size_t nd_k = 0, nd_q = 0;
+                        double err_k = 0.0, err_q = 0.0;
+                        const bool ok_k = ran_k && !ref.empty() && cpu_fn_same(out_k, exp_w, &nd_k, &err_k);
+                        const bool ok_q = ran_q && !ref.empty() && cpu_fn_same(out_q, exp_w, &nd_q, &err_q);
+                        n_run += 2;
+                        if (!ok_k || !ok_q) {
+                            printf("  FAIL moe pool %s/%s/%s T=%" PRId64 " table=%d: parked pool ran %d (%zu differ), pinned-caller pool ran %d (%zu differ)\n",
+                                   ggml_type_name(c.tu), ggml_type_name(c.tg), ggml_type_name(c.td), T, with_tbl, (int) ran_k, nd_k, (int) ran_q, nd_q);
+                        }
+                        n_fail += (ok_k ? 0 : 1) + (ok_q ? 0 : 1);
+                    }
                 }
             }
         }
@@ -15915,6 +15961,307 @@ static bool run_cpu_fn_moe_fuse(ggml_backend_t backend, ggml_backend_t backend_r
 
     printf("  fused MoE split and CPU MoE pool vs the unfused reference: %d cases run, %d failed\n", n_run, n_fail);
 
+    return n_fail == 0;
+}
+
+// [TAG_MOE_BRIDGE] GGML_OP_MOE_HOST_POST / GGML_OP_MOE_HOST_WAIT on a device backend that provides the MoE host bridge
+// (ggml-moe-bridge.h; CUDA). x / ids / w are posted from device tensors (ids a strided view, as the argsort top-k is),
+// a host job computes the weighted sum on the CPU MoE pool, and the wait returns it. Compared with the unfused CPU chain
+// of backend_ref, weighted and summed in slot order (bitwise, or NMSE <= 1e-10). Spin waits (a test executor thread)
+// and hostfunc waits, T = 1..8, with and without the skip table, 3 runs of each graph (the CUDA graph path), a stall
+// that must time out (zeros, the error set, reset refused while the host owes the job, then recovery), and a failed
+// host job (zeros, the error set, recovery).
+struct moe_bridge_test_runner {
+    ggml_status (*pool_run)(ggml_cpu_moe_pool *, const ggml_cpu_moe_job *) = nullptr;
+    ggml_cpu_moe_pool * pool = nullptr;
+    ggml_cpu_moe_layer  layer     = {};
+    ggml_cpu_moe_layer  layer_tbl = {};
+    std::atomic<bool>   fail_next{false};
+    std::atomic<int>    slow_next_ms{0};
+};
+
+static bool moe_bridge_test_run(const ggml_moe_bridge_job * j, void * ud) {
+    auto * r = (moe_bridge_test_runner *) ud;
+    if (r->fail_next.exchange(false)) {
+        return false;
+    }
+    if (const int ms = r->slow_next_ms.exchange(0); ms > 0) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(ms)); // a slow job: taken, so its wait allows job_max_ms
+    }
+    const ggml_cpu_moe_job job = { (j->flags & GGML_MOE_BRIDGE_JOB_TABLE) ? &r->layer_tbl : &r->layer,
+                                   j->n_tokens, j->n_used, j->x, j->ids, j->w, j->out };
+    return r->pool_run(r->pool, &job) == GGML_STATUS_SUCCESS;
+}
+
+static bool run_moe_bridge(ggml_backend_t backend, ggml_backend_t backend_ref, const char * op_names_filter) {
+    if (backend_is_cpu(backend) ||
+        (!op_names_filter_selects(op_names_filter, "MOE_HOST_POST") && !op_names_filter_selects(op_names_filter, "MOE_HOST_WAIT"))) {
+        return true;
+    }
+    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    auto br_new      = (ggml_backend_moe_bridge_new_t)        ggml_backend_reg_get_proc_address(reg, "ggml_backend_moe_bridge_new");
+    auto br_free     = (ggml_backend_moe_bridge_free_t)       ggml_backend_reg_get_proc_address(reg, "ggml_backend_moe_bridge_free");
+    auto br_id       = (ggml_backend_moe_bridge_id_t)         ggml_backend_reg_get_proc_address(reg, "ggml_backend_moe_bridge_id");
+    auto br_runner   = (ggml_backend_moe_bridge_set_runner_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_moe_bridge_set_runner");
+    auto br_poll     = (ggml_backend_moe_bridge_poll_t)       ggml_backend_reg_get_proc_address(reg, "ggml_backend_moe_bridge_poll");
+    auto br_complete = (ggml_backend_moe_bridge_complete_t)   ggml_backend_reg_get_proc_address(reg, "ggml_backend_moe_bridge_complete");
+    auto br_error    = (ggml_backend_moe_bridge_error_t)      ggml_backend_reg_get_proc_address(reg, "ggml_backend_moe_bridge_error");
+    auto br_reset    = (ggml_backend_moe_bridge_reset_t)      ggml_backend_reg_get_proc_address(reg, "ggml_backend_moe_bridge_reset");
+    auto br_stats    = (ggml_backend_moe_bridge_get_stats_t)  ggml_backend_reg_get_proc_address(reg, "ggml_backend_moe_bridge_get_stats");
+    if (!br_new || !br_free || !br_id || !br_runner || !br_poll || !br_complete || !br_error || !br_reset || !br_stats) {
+        return true; // this backend has no host bridge
+    }
+    ggml_backend_reg_t creg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_ref));
+    using pp_def_t    = ggml_cpu_moe_pool_params (*)(int);
+    using pool_new_t  = ggml_cpu_moe_pool * (*)(const ggml_cpu_moe_pool_params *);
+    using pool_free_t = void (*)(ggml_cpu_moe_pool *);
+    using pool_run_t  = ggml_status (*)(ggml_cpu_moe_pool *, const ggml_cpu_moe_job *);
+    auto pp_def    = (pp_def_t)    ggml_backend_reg_get_proc_address(creg, "ggml_cpu_moe_pool_params_default");
+    auto pool_new  = (pool_new_t)  ggml_backend_reg_get_proc_address(creg, "ggml_cpu_moe_pool_new");
+    auto pool_free = (pool_free_t) ggml_backend_reg_get_proc_address(creg, "ggml_cpu_moe_pool_free");
+    auto pool_run  = (pool_run_t)  ggml_backend_reg_get_proc_address(creg, "ggml_cpu_moe_run");
+    if (!pp_def || !pool_new || !pool_free || !pool_run) {
+        printf("  FAIL moe bridge: the CPU backend has no MoE pool\n");
+        return false;
+    }
+    int dev_index = -1;
+    for (size_t i = 0; i < ggml_backend_reg_dev_count(reg); i++) {
+        if (ggml_backend_reg_dev_get(reg, i) == dev) {
+            dev_index = (int) i;
+        }
+    }
+
+    const cpu_fn_moe_case cases[] = {
+        { GGML_TYPE_Q4_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_1, 512, 128, 16, 4 }, // UD-Q4_K_XL
+        { GGML_TYPE_Q4_K, GGML_TYPE_Q4_K, GGML_TYPE_Q8_0, 256,  64, 12, 3 },
+    };
+
+    std::default_random_engine gen(4321);
+    std::uniform_real_distribution<float> uni(-1.0f, 1.0f);
+    auto nhalf = [](ggml_type t) { return t == GGML_TYPE_Q8_0 || t == GGML_TYPE_IQ4_NL ? 1 : 2; };
+
+    int n_run  = 0;
+    int n_fail = 0;
+    for (const cpu_fn_moe_case & c : cases) {
+        const std::vector<uint8_t> wu = cpu_fn_raw_blocks(c.tu, (size_t) (c.n_embd / ggml_blck_size(c.tu)) * c.n_ff * c.n_exp, nhalf(c.tu), gen);
+        const std::vector<uint8_t> wg = cpu_fn_raw_blocks(c.tg, (size_t) (c.n_embd / ggml_blck_size(c.tg)) * c.n_ff * c.n_exp, nhalf(c.tg), gen);
+        const std::vector<uint8_t> wd = cpu_fn_raw_blocks(c.td, (size_t) (c.n_ff / ggml_blck_size(c.td)) * c.n_embd * c.n_exp, nhalf(c.td), gen);
+        std::vector<int32_t> tbl(c.n_exp);
+        for (int e = 0; e < c.n_exp; e++) {
+            tbl[e] = e % 3 == 1 ? e / 3 : c.n_exp;
+        }
+
+        ggml_init_params wparams = { ggml_tensor_overhead()*4, NULL, true };
+        ggml_context_ptr wctx(ggml_init(wparams));
+        ggml_tensor * a_u = ggml_new_tensor_3d(wctx.get(), c.tu, c.n_embd, c.n_ff, c.n_exp);
+        ggml_tensor * a_g = ggml_new_tensor_3d(wctx.get(), c.tg, c.n_embd, c.n_ff, c.n_exp);
+        ggml_tensor * a_d = ggml_new_tensor_3d(wctx.get(), c.td, c.n_ff, c.n_embd, c.n_exp);
+        a_u->data = (void *) wu.data();
+        a_g->data = (void *) wg.data();
+        a_d->data = (void *) wd.data();
+
+        for (int mode : { (int) GGML_MOE_BRIDGE_WAIT_SPIN, (int) GGML_MOE_BRIDGE_WAIT_HOSTFUNC }) {
+            const char * mname = mode == GGML_MOE_BRIDGE_WAIT_SPIN ? "spin" : "hostfunc";
+            ggml_moe_bridge_params bp = {};
+            bp.device     = dev_index;
+            bp.n_chan     = 2;
+            bp.n_embd     = c.n_embd;
+            bp.n_used     = c.n_used;
+            bp.max_tokens = 8;
+            bp.wait_mode  = mode;
+            bp.timeout_ms = 100;
+            bp.job_max_ms = 1000;
+            bp.stats      = true;
+            ggml_moe_bridge * br = dev_index >= 0 ? br_new(&bp) : nullptr;
+            n_run++;
+            if (br == nullptr) {
+                printf("  FAIL moe bridge %s: the backend could not create a bridge\n", mname);
+                n_fail++;
+                continue;
+            }
+            const int32_t bid = br_id(br);
+
+            moe_bridge_test_runner run;
+            run.pool_run  = pool_run;
+            ggml_cpu_moe_pool_params pp = pp_def(4);
+            pp.spin_us = 50;
+            run.pool      = pool_new(&pp);
+            run.layer     = { a_u, a_g, a_d, nullptr, 0 };
+            run.layer_tbl = { a_u, a_g, a_d, tbl.data(), c.n_exp };
+
+            std::atomic<bool> stop{false};
+            std::atomic<bool> paused{false};
+            std::thread exec;
+            if (mode == GGML_MOE_BRIDGE_WAIT_SPIN) {
+                exec = std::thread([&]() {
+                    while (!stop.load()) {
+                        ggml_moe_bridge_job job;
+                        if (!paused.load() && br_poll(br, &job)) {
+                            br_complete(br, &job, moe_bridge_test_run(&job, &run));
+                        } else {
+                            std::this_thread::yield();
+                        }
+                    }
+                });
+            } else {
+                br_runner(br, moe_bridge_test_run, &run);
+            }
+
+            // one device graph: post, device work in between, wait after it
+            auto run_case = [&](int64_t T, bool with_tbl, int reps, bool expect_ok, const char * what) -> bool {
+                ggml_init_params params = { ggml_tensor_overhead()*16 + ggml_graph_overhead(), NULL, true };
+                ggml_context_ptr ctx(ggml_init(params));
+                ggml_tensor * x        = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, c.n_embd, T);
+                ggml_tensor * ids_full = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, c.n_used + 3, T);
+                ggml_tensor * w        = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, c.n_used, T);
+                ggml_tensor * ids      = ggml_view_2d(ctx.get(), ids_full, c.n_used, T, ids_full->nb[1], 0);
+                ggml_tensor * ticket   = ggml_moe_host_post(ctx.get(), x, ids, w, bid, (int32_t) (T % 2), with_tbl ? GGML_MOE_BRIDGE_JOB_TABLE : 0);
+                ggml_tensor * dep      = ggml_scale(ctx.get(), ggml_sqr(ctx.get(), x), 0.25f);
+                ggml_tensor * out      = ggml_moe_host_wait(ctx.get(), ticket, dep, c.n_embd, T, bid, (int32_t) (T % 2));
+                if (!ggml_backend_supports_op(backend, ticket) || !ggml_backend_supports_op(backend, out) ||
+                    ggml_backend_supports_op(backend_ref, ticket) || ggml_backend_supports_op(backend_ref, out)) {
+                    printf("  FAIL moe bridge %s T=%" PRId64 ": supports_op must hold on the device only\n", mname, T);
+                    return false;
+                }
+                ggml_backend_buffer_ptr buf(ggml_backend_alloc_ctx_tensors(ctx.get(), backend));
+                if (buf == nullptr) {
+                    return false;
+                }
+                ggml_cgraph * gf = ggml_new_graph(ctx.get());
+                ggml_build_forward_expand(gf, out);
+
+                bool ok = true;
+                for (int r = 0; r < reps && ok; r++) {
+                    std::vector<float> xv((size_t) c.n_embd * T);
+                    for (float & v : xv) {
+                        v = uni(gen);
+                    }
+                    std::vector<int32_t> ids_v;
+                    std::vector<int32_t> ids_fv((size_t) (c.n_used + 3) * T, -5);
+                    std::vector<int32_t> experts(c.n_exp);
+                    for (int i = 0; i < c.n_exp; i++) {
+                        experts[i] = i;
+                    }
+                    for (int64_t t = 0; t < T; t++) {
+                        std::shuffle(experts.begin(), experts.end(), gen);
+                        ids_v.insert(ids_v.end(), experts.begin(), experts.begin() + c.n_used);
+                        std::copy(experts.begin(), experts.begin() + c.n_used, ids_fv.begin() + t * (c.n_used + 3));
+                    }
+                    std::vector<float> wv((size_t) c.n_used * T);
+                    for (float & v : wv) {
+                        v = 0.5f + 0.5f * uni(gen);
+                    }
+                    ggml_backend_tensor_set(x, xv.data(), 0, xv.size() * sizeof(float));
+                    ggml_backend_tensor_set(ids_full, ids_fv.data(), 0, ids_fv.size() * sizeof(int32_t));
+                    ggml_backend_tensor_set(w, wv.data(), 0, wv.size() * sizeof(float));
+                    if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) {
+                        printf("  FAIL moe bridge %s T=%" PRId64 ": graph compute failed\n", mname, T);
+                        return false;
+                    }
+                    std::vector<float> got((size_t) c.n_embd * T);
+                    ggml_backend_tensor_get(out, got.data(), 0, got.size() * sizeof(float));
+
+                    std::vector<float> expect((size_t) c.n_embd * T, 0.0f);
+                    if (expect_ok) {
+                        const std::vector<float> ref = cpu_fn_moe_graph(backend_ref, c, T, wu, wg, wd, xv, ids_v, with_tbl ? &tbl : nullptr, c.n_exp);
+                        if (ref.empty()) {
+                            return false;
+                        }
+                        for (int64_t t = 0; t < T; t++) {
+                            for (int64_t row = 0; row < c.n_embd; row++) {
+                                float sum = 0.0f;
+                                for (int slot = 0; slot < c.n_used; slot++) {
+                                    if (with_tbl && tbl[ids_v[t * c.n_used + slot]] != c.n_exp) {
+                                        continue;
+                                    }
+                                    sum += wv[slot + (size_t) c.n_used * t] * ref[((size_t) t * c.n_used + slot) * c.n_embd + row];
+                                }
+                                expect[(size_t) t * c.n_embd + row] = sum;
+                            }
+                        }
+                    }
+                    size_t n_diff = 0;
+                    for (size_t i = 0; i < got.size(); i++) {
+                        n_diff += memcmp(&got[i], &expect[i], sizeof(float)) != 0;
+                    }
+                    const double err = expect_ok ? nmse(expect.data(), got.data(), got.size()) : (n_diff ? 1.0 : 0.0);
+                    ok = n_diff == 0 || err <= 1e-10;
+                    if (!ok || n_diff > 0) {
+                        printf("  %s moe bridge %s %s/%s/%s T=%" PRId64 " table=%d %s run %d: %zu values differ, NMSE %g\n",
+                               ok ? "note:" : "FAIL", mname, ggml_type_name(c.tu), ggml_type_name(c.tg), ggml_type_name(c.td),
+                               T, (int) with_tbl, what, r, n_diff, err);
+                    }
+                }
+                return ok;
+            };
+
+            for (int64_t T = 1; T <= 8; T++) {
+                for (int with_tbl = 0; with_tbl < 2; with_tbl++) {
+                    n_run++;
+                    const bool ok = run_case(T, with_tbl != 0, 3, true, "") && br_error(br) == GGML_MOE_BRIDGE_ERR_NONE;
+                    n_fail += ok ? 0 : 1;
+                }
+            }
+
+            // failure paths: the result is zeros, the error is set and sticky, and a reset recovers
+            n_run++;
+            bool fok = true;
+            if (mode == GGML_MOE_BRIDGE_WAIT_SPIN) {
+                // a job the host has taken may take longer than timeout_ms (up to job_max_ms): exact result, no error
+                run.slow_next_ms = 250;
+                const bool slow_ok = run_case(4, true, 1, true, "(slow job)") && br_error(br) == GGML_MOE_BRIDGE_ERR_NONE;
+                if (!slow_ok) {
+                    printf("  FAIL moe bridge spin slow job: error %u\n", br_error(br));
+                }
+                // a job nobody takes times out after timeout_ms
+                paused = true;
+                const auto t0 = std::chrono::steady_clock::now();
+                fok = slow_ok && run_case(2, false, 1, false, "(stall)");
+                const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+                const bool timed_out = br_error(br) == GGML_MOE_BRIDGE_ERR_TIMEOUT;
+                const bool refused   = !br_reset(br);
+                paused = false;
+                bool reset_ok = false;
+                for (int k = 0; k < 1000 && !reset_ok; k++) {
+                    reset_ok = br_reset(br);
+                    if (!reset_ok) {
+                        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                    }
+                }
+                fok = fok && timed_out && refused && reset_ok && ms >= 90.0;
+                if (!fok) {
+                    printf("  FAIL moe bridge spin stall: %.0f ms, timeout error %d, reset refused while owed %d, reset %d\n",
+                           ms, (int) timed_out, (int) refused, (int) reset_ok);
+                }
+            } else {
+                run.fail_next = true;
+                fok = run_case(2, false, 1, false, "(failed job)") && br_error(br) == GGML_MOE_BRIDGE_ERR_RUNNER && br_reset(br);
+                if (!fok) {
+                    printf("  FAIL moe bridge hostfunc failed job: error %u\n", br_error(br));
+                }
+            }
+            fok = fok && run_case(3, true, 2, true, "(after reset)") && br_error(br) == GGML_MOE_BRIDGE_ERR_NONE;
+            n_fail += fok ? 0 : 1;
+
+            ggml_moe_bridge_stats st;
+            br_stats(br, &st);
+            if (st.completed == 0 || st.waits == 0) {
+                printf("  FAIL moe bridge %s: statistics empty (completed %" PRIu64 ", waits %" PRIu64 ")\n", mname, st.completed, st.waits);
+                n_fail++;
+            }
+
+            ggml_backend_synchronize(backend);
+            stop = true;
+            if (exec.joinable()) {
+                exec.join();
+            }
+            br_free(br);
+            pool_free(run.pool);
+        }
+    }
+
+    printf("  MoE host bridge (post / wait) vs the CPU MUL_MAT_ID chain: %d cases run, %d failed\n", n_run, n_fail);
     return n_fail == 0;
 }
 
@@ -16065,7 +16412,9 @@ static bool test_backend(ggml_backend_t backend, ggml_backend_dev_t dev, test_mo
 
         const bool fn_moe_fuse_ok = run_cpu_fn_moe_fuse(backend, backend_cpu.get(), op_names_filter); // [TAG_FN_CPU_MOE_FUSE]
 
-        return n_ok == tests_run && slice_ok && q2_0_repack_ok && fn_repack_skip_ok && fn_mmid_mr_ok && fn_moe_fuse_ok;
+        const bool moe_bridge_ok = run_moe_bridge(backend, backend_cpu.get(), op_names_filter); // [TAG_MOE_BRIDGE]
+
+        return n_ok == tests_run && slice_ok && q2_0_repack_ok && fn_repack_skip_ok && fn_mmid_mr_ok && fn_moe_fuse_ok && moe_bridge_ok;
     }
 
     if (mode == MODE_GRAD) {

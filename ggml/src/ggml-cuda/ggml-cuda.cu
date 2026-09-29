@@ -34,6 +34,7 @@
 #include "ggml-cuda/mmf.cuh"
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/mmsb.cuh"   // [TAG_MMSB] [TAG_SMALLB]
+#include "ggml-cuda/moe-bridge.cuh" // [TAG_MOE_BRIDGE]
 #include "ggml-cuda/mmqsn.cuh"  // [TAG_MMQSN]
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
@@ -2470,6 +2471,12 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_GATED_DELTA_NET_REPLAY: // [TAG_4C_GDN_REPLAY]
             ggml_cuda_op_gated_delta_net_replay(ctx, dst, nullptr);
+            break;
+        case GGML_OP_MOE_HOST_POST: // [TAG_MOE_BRIDGE]
+            ggml_cuda_op_moe_host_post(ctx, dst);
+            break;
+        case GGML_OP_MOE_HOST_WAIT: // [TAG_MOE_BRIDGE]
+            ggml_cuda_op_moe_host_wait(ctx, dst);
             break;
         case GGML_OP_DSV4_HC_COMB:
             ggml_cuda_op_dsv4_hc_comb(ctx, dst);
@@ -6245,6 +6252,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
 #else
             return ggml_cuda_gdn_replay_supported(op);
 #endif // GGML_USE_MUSA
+        case GGML_OP_MOE_HOST_POST: // [TAG_MOE_BRIDGE] only for a bridge registered on this device
+        case GGML_OP_MOE_HOST_WAIT:
+            return ggml_cuda_moe_bridge_supports_op(dev_ctx->device, op);
         case GGML_OP_DSV4_HC_COMB:
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                 op->src[2]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
@@ -6460,6 +6470,34 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_turbot_supports_geometry") == 0) {   // [TAG_TURBOT_ANY_RESOLVE]
         return (void *)ggml_backend_cuda_turbot_supports_geometry;
+    }
+    // [TAG_MOE_BRIDGE] ggml-moe-bridge.h
+    if (strcmp(name, "ggml_backend_moe_bridge_new") == 0) {
+        return (void *)ggml_backend_cuda_moe_bridge_new;
+    }
+    if (strcmp(name, "ggml_backend_moe_bridge_free") == 0) {
+        return (void *)ggml_backend_cuda_moe_bridge_free;
+    }
+    if (strcmp(name, "ggml_backend_moe_bridge_id") == 0) {
+        return (void *)ggml_backend_cuda_moe_bridge_id;
+    }
+    if (strcmp(name, "ggml_backend_moe_bridge_set_runner") == 0) {
+        return (void *)ggml_backend_cuda_moe_bridge_set_runner;
+    }
+    if (strcmp(name, "ggml_backend_moe_bridge_poll") == 0) {
+        return (void *)ggml_backend_cuda_moe_bridge_poll;
+    }
+    if (strcmp(name, "ggml_backend_moe_bridge_complete") == 0) {
+        return (void *)ggml_backend_cuda_moe_bridge_complete;
+    }
+    if (strcmp(name, "ggml_backend_moe_bridge_error") == 0) {
+        return (void *)ggml_backend_cuda_moe_bridge_error;
+    }
+    if (strcmp(name, "ggml_backend_moe_bridge_reset") == 0) {
+        return (void *)ggml_backend_cuda_moe_bridge_reset;
+    }
+    if (strcmp(name, "ggml_backend_moe_bridge_get_stats") == 0) {
+        return (void *)ggml_backend_cuda_moe_bridge_get_stats;
     }
     return nullptr;
 }

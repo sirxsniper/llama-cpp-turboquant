@@ -177,6 +177,10 @@ extern "C" {
                                              // k-th physical core (SMT siblings skipped); the caller keeps its affinity
         int  prio;                           // enum ggml_sched_priority
         int  spin_us;                        // idle workers spin this long, then sleep until the next job
+        bool pin_caller;                     // [TAG_MOE_BRIDGE] also pin the calling thread (worker 0) to the first CPU
+                                             // of the list, with prio; create the pool on the thread that runs the jobs
+        bool skip_first_core;                // [TAG_MOE_BRIDGE] leave the first CPU of the list free (the main thread
+                                             // of a ggml threadpool sits there) and use at most the rest, one thread each
     };
 
     struct ggml_cpu_moe_pool;
@@ -187,6 +191,13 @@ extern "C" {
     // blocking; one job at a time per pool. GGML_STATUS_FAILED for a job the fused kernel does not take (types,
     // shapes, n_tokens > 16): the caller then runs the layer another way
     GGML_BACKEND_API enum ggml_status               ggml_cpu_moe_run      (struct ggml_cpu_moe_pool * pool, const struct ggml_cpu_moe_job * job);
+
+    // [TAG_MOE_BRIDGE] park: idle workers sleep now instead of spinning (other CPU work is about to run on their
+    // cores); wake: sleeping workers spin again for spin_us (a job is about to come). A job un-parks the pool.
+    GGML_BACKEND_API void                           ggml_cpu_moe_pool_park(struct ggml_cpu_moe_pool * pool);
+    GGML_BACKEND_API void                           ggml_cpu_moe_pool_wake(struct ggml_cpu_moe_pool * pool);
+    // [TAG_MOE_BRIDGE] true if ggml_cpu_moe_run takes jobs of this layer (weight types and shapes)
+    GGML_BACKEND_API bool                           ggml_cpu_moe_layer_supported(const struct ggml_cpu_moe_layer * layer);
 
     // [TAG_FN_CPU_MOE_FUSE] test / benchmark hook: how many fused MoE graph ops have run in this process
     GGML_BACKEND_API uint64_t ggml_cpu_fn_moe_fused_calls(void);
