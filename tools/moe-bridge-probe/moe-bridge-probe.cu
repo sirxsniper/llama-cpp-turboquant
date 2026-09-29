@@ -11,6 +11,8 @@
 //
 //   moe-bridge-probe [--log E:/turbot-gates/flashnext/probe.log] [--pinned-mib 4096] [--stream-mib 8192]
 //                    [--threads 16] [--mask 0x55555555] [--quick] [--only rt|hostfn|memops|bw|bwcpu]
+//   moe-bridge-probe --selftest [--threads 8] [--experts 64] [--reps 4] [--quick]
+//                    [TAG_MOE_BRIDGE] the ggml bridge ops against the CPU MUL_MAT_ID chain (moe-bridge-selftest.cpp)
 
 #include <cuda.h>
 #include <cuda_runtime.h>
@@ -572,7 +574,14 @@ static void test_bw(size_t pinned_mib, size_t stream_mib, int n_threads, uint64_
     CK(cudaFreeHost(h));
 }
 
+int moe_bridge_selftest(int argc, char ** argv); // [TAG_MOE_BRIDGE] moe-bridge-selftest.cpp
+
 int main(int argc, char ** argv) {
+    for (int i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "--selftest") == 0) {
+            return moe_bridge_selftest(argc, argv);
+        }
+    }
     std::string log_path = "E:/turbot-gates/flashnext/probe.log";
     size_t pinned_mib = 4096;
     size_t stream_mib = 8192;

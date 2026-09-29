@@ -10,6 +10,10 @@
 #    experts on the CPU (--n-cpu-moe 8) writes a sparse base with the hot set OFF, then runs again with it ON
 #    (LLAMA_MOE_HOT_PROFILE, half of the expert bytes resident) against that base
 # 3. pass: mean KLD <= 1e-3, same top >= 99 %, the log shows the hot set and its hit statistics, no fatal message
+#
+# [TAG_MOE_BRIDGE] --mode bridge: the candidate runs with the MoE host bridge instead (LLAMA_MOE_BRIDGE=1, one device
+# graph per ubatch, the experts on the CPU pool); --mode bridge-hot: bridge and hot set together. --wait hostfunc
+# selects the host-function wait. The log must show the bridge and no bridge timeout.
 from __future__ import annotations
 
 import argparse
@@ -45,6 +49,8 @@ def main():
     ap.add_argument("--layers", type=int, default=8)
     ap.add_argument("--hot-mib", type=float, default=0, help="hot budget (default: half of the expert bytes)")
     ap.add_argument("--max-commit-gb", type=int, default=50)
+    ap.add_argument("--mode", choices=["hot", "bridge", "bridge-hot"], default="hot")  # [TAG_MOE_BRIDGE]
+    ap.add_argument("--wait", choices=["spin", "hostfunc"], default="spin")
     a = ap.parse_args()
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     errs = fb.preflight(a.max_commit_gb)
@@ -80,18 +86,24 @@ def main():
             fb.log("T=%d base run failed (rc %d)" % (T, rc))
             ok_all = False
             continue
-        env = {"LLAMA_MOE_HOT_PROFILE": prof, "LLAMA_MOE_HOT_MIB": "%.1f" % hot_mib, "LLAMA_MOE_HOT_STATS": "1"}
+        env = {}
+        if a.mode in ("hot", "bridge-hot"):
+            env.update({"LLAMA_MOE_HOT_PROFILE": prof, "LLAMA_MOE_HOT_MIB": "%.1f" % hot_mib, "LLAMA_MOE_HOT_STATS": "1"})
+        if a.mode in ("bridge", "bridge-hot"):  # [TAG_MOE_BRIDGE]
+            env.update({"LLAMA_MOE_BRIDGE": "1", "LLAMA_MOE_BRIDGE_STATS": "1", "LLAMA_MOE_BRIDGE_WAIT": a.wait})
         rc, txt = run(common + ["-ub", str(T), "--kl-divergence-base", base, "--kl-divergence"], env,
-                      os.path.join(a.dir, "hot_ub%d.log" % T))
+                      os.path.join(a.dir, "%s_ub%d.log" % (a.mode, T)))
         kld = re.search(r"Mean\s+KLD:\s*([0-9.eE+-]+)", txt)
         top = re.search(r"Same top p:\s*([0-9.]+)", txt)
-        hot = re.search(r"moe-hot: (\d+) layers, ([0-9.]+) MiB", txt)
-        fatal = re.search(r"CUDA error|illegal memory access|GGML_ASSERT|ggml_abort", txt)
+        hot = re.search(r"moe-hot: (\d+) layers, ([0-9.]+) MiB", txt) if a.mode != "bridge" else re.search(r"MoE bridge \d+ on \S+: (\d+) host expert layers", txt)
+        if hot and a.mode == "bridge-hot" and not re.search(r"MoE bridge \d+ on \S+: (\d+) host expert layers", txt):
+            hot = None
+        fatal = re.search(r"CUDA error|illegal memory access|GGML_ASSERT|ggml_abort|wait timeout|host job failed", txt)
         ok = rc == 0 and kld and top and hot and not fatal and float(kld.group(1)) <= 1e-3 and float(top.group(1)) >= 99.0
         ok_all = ok_all and bool(ok)
         print("T=%d  hot %s  KLD %s  same-top %s  -> %s" % (T, hot.group(0) if hot else "NOT ENABLED",
               kld.group(1) if kld else "-", top.group(1) if top else "-", "PASS" if ok else "FAIL"))
-    print("SYNTH HOT CHECK %s" % ("PASS" if ok_all else "FAIL"))
+    print("SYNTH %s CHECK %s" % (a.mode.upper(), "PASS" if ok_all else "FAIL"))
     return 0 if ok_all else 1
 
 
