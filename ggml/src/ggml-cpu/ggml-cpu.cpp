@@ -560,6 +560,9 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
             return ggml_is_contiguous(op->src[0]);
         case GGML_OP_SSM_SCAN:
             return ggml_get_op_params_i32(op, 0) == 1 || op->src[3]->ne[0] == 1;
+        case GGML_OP_MOE_HOST_POST: // [TAG_MOE_BRIDGE] device backends only
+        case GGML_OP_MOE_HOST_WAIT:
+            return false;
         default:
             return true;
     }
