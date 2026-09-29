@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <iterator>
@@ -330,6 +331,31 @@ void llama_memory_hybrid_idx::set_input_qsa(
     GGML_ASSERT(n_tokens % n_ns == 0);
     const int64_t n_tps = n_tokens/n_ns;             // tokens per stream
 
+    // [TAG_FN_QSA_INPUT_FAST] TURBO_MASK_PROBE=1 also times this fill (it runs on the inference thread before every graph
+    // compute, like the KQ mask fill the probe already times)
+    static const bool qsa_probe = [] {
+        const char * e = getenv("TURBO_MASK_PROBE");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    struct qsa_probe_timer {
+        bool    on;
+        int64_t n_kv;
+        int64_t t0;
+        ~qsa_probe_timer() {
+            if (!on) {
+                return;
+            }
+            static int64_t acc_us = 0, acc_cells = 0, calls = 0, max_kv = 0;
+            acc_us    += ggml_time_us() - t0;
+            acc_cells += n_kv;
+            max_kv     = std::max<int64_t>(max_kv, n_kv);
+            if (++calls % 512 == 0) {
+                fprintf(stderr, "turbo-probe: qsa input fill %lld calls  avg %.3f ms/call  %.2f ns/cell  max n_kv %lld\n",
+                        (long long) calls, acc_us / 1000.0 / calls, acc_cells ? 1000.0 * acc_us / acc_cells : 0.0, (long long) max_kv);
+            }
+        }
+    } probe_timer = { qsa_probe, n_kv, qsa_probe ? ggml_time_us() : 0 };
+
     int32_t * dst_cell_blk  = (int32_t *) cell_blk->data;
     int32_t * dst_blk_cells = (int32_t *) blk_cells->data;
     int32_t * dst_blk_pos   = (int32_t *) blk_pos->data;
@@ -382,6 +408,32 @@ void llama_memory_hybrid_idx::set_input_qsa(
         }
 
         const bool one_seq = n_seq_present <= 1;
+
+        // [TAG_FN_QSA_INPUT_FAST] TURBO_QSA_INPUT_FAST=1: a single-sequence stream takes the two-pass path below, which
+        // writes the same tensors (at 262144 cells the general path costs several ms per ubatch on the inference thread).
+        // =2 runs both and aborts on any difference (a check for test runs). Default off.
+        static const int input_fast = [] {
+            const char * e = getenv("TURBO_QSA_INPUT_FAST");
+            return e ? atoi(e) : 0;
+        }();
+        std::vector<int32_t> chk_cell_blk;
+        std::vector<int32_t> chk_blk_cells;
+        std::vector<int32_t> chk_blk_pos;
+        std::vector<float>   chk_bias;
+        bool chk = false;
+        if (input_fast > 0 && one_seq && blk_bias && !ubatch->is_pos_2d()) {
+            if (input_fast == 2) {
+                chk_cell_blk .assign(n_kv, 0);
+                chk_blk_cells.assign(r*n_blocks, 0);
+                chk_blk_pos  .assign(dst_blk_pos, dst_blk_pos + 4*n_blocks*n_ns);
+                chk_bias     .assign(dst_bias, dst_bias + n_tokens*n_blocks);
+                chk = set_input_qsa_one_seq(cells, s, n_kv, n_ns, n_blocks, r, n_tps, ubatch, chk_cell_blk.data(),
+                        chk_blk_cells.data(), chk_blk_pos.data(), chk_bias.data());
+            } else if (set_input_qsa_one_seq(cells, s, n_kv, n_ns, n_blocks, r, n_tps, ubatch, cur_cell_blk, cur_blk_cells,
+                           dst_blk_pos, dst_bias)) {
+                continue;
+            }
+        }
 
         // a cell no block covers needs its own -inf, which a per-block bias cannot carry
         // every cache path keeps the position below the cell window, so this stays false
@@ -623,7 +675,119 @@ void llama_memory_hybrid_idx::set_input_qsa(
                 cur_bias[j] = v;
             }
         }
+
+        // [TAG_FN_QSA_INPUT_FAST] TURBO_QSA_INPUT_FAST=2: the fast path must have written exactly these tensors
+        if (chk) {
+            const bool same_cell_blk  = memcmp(chk_cell_blk.data(),  cur_cell_blk,  n_kv*sizeof(int32_t)) == 0;
+            const bool same_blk_cells = memcmp(chk_blk_cells.data(), cur_blk_cells, r*n_blocks*sizeof(int32_t)) == 0;
+            const bool same_blk_pos   = memcmp(chk_blk_pos.data(),   dst_blk_pos,   4*n_blocks*n_ns*sizeof(int32_t)) == 0;
+            const bool same_bias      = memcmp(chk_bias.data(),      dst_bias,      n_tokens*n_blocks*sizeof(float)) == 0;
+            if (!same_cell_blk || !same_blk_cells || !same_blk_pos || !same_bias) {
+                LLAMA_LOG_ERROR("%s: fast path differs (stream %d, n_kv %d): cell_blk %d blk_cells %d blk_pos %d bias %d\n", __func__,
+                        (int) s, (int) n_kv, same_cell_blk, same_blk_cells, same_blk_pos, same_bias);
+                GGML_ABORT("qsa: TURBO_QSA_INPUT_FAST check failed");
+            }
+        }
     }
+}
+
+// [TAG_FN_QSA_INPUT_FAST] One stream, one sequence, block bias, 1-D positions. The general path above with its group lists
+// reduced to what one sequence leaves of them: a group is a position bucket pb = pos / r, its bid is its rank among the
+// full buckets, its first cell the lowest cell of the bucket. Pass 1 fills the bucket bitmasks, pass 2 writes cell_blk and
+// blk_cells; the bias rows are the general path's loop. Nothing is written before both refusals are ruled out.
+bool llama_memory_hybrid_idx::set_input_qsa_one_seq(
+        const llama_kv_cells & cells,
+        int64_t s,
+        int64_t n_kv,
+        int64_t n_ns,
+        int64_t n_blocks,
+        int64_t r,
+        int64_t n_tps,
+        const llama_ubatch * ubatch,
+        int32_t * cur_cell_blk,
+        int32_t * cur_blk_cells,
+        int32_t * dst_blk_pos,
+        float   * dst_bias) const {
+    const uint64_t slots_full = r == 64 ? ~uint64_t(0) : ((uint64_t(1) << r) - 1);
+
+    qsa_slots.assign(n_blocks, 0);
+    qsa_first.assign(n_blocks, -1);
+
+    for (int64_t j = 0; j < n_kv; ++j) {
+        if (cells.is_empty(j)) {
+            continue;
+        }
+        const int64_t idx = cells.pos_get(j);
+        const int64_t pb  = idx/r;
+        if (pb >= n_blocks) {
+            return false;   // oor
+        }
+        const uint64_t bit = uint64_t(1) << (idx%r);
+        if (qsa_slots[pb] & bit) {
+            return false;   // dup
+        }
+        qsa_slots[pb] |= bit;
+        if (qsa_first[pb] < 0) {
+            qsa_first[pb] = (int32_t) j;
+        }
+    }
+
+    qsa_bid.assign(n_blocks, -1);
+    qsa_bid_idx.clear();
+    qsa_bid_cell.clear();
+    int32_t n_bid = 0;
+    for (int64_t pb = 0; pb < n_blocks; ++pb) {
+        if (qsa_slots[pb] != slots_full) {
+            continue;
+        }
+        qsa_bid[pb] = n_bid++;
+        qsa_bid_idx .push_back((int32_t) (pb*r));
+        qsa_bid_cell.push_back(qsa_first[pb]);
+    }
+
+    for (int32_t b = 0; b < n_bid; ++b) {
+        for (int64_t sec = 0; sec < 4; ++sec) {
+            dst_blk_pos[sec*(n_blocks*n_ns) + s*n_blocks + b] = qsa_bid_idx[b];
+        }
+    }
+
+    const bool    have_dead = n_bid < n_blocks;
+    const int32_t dead_bid  = have_dead ? n_bid : (int32_t) n_blocks - 1;
+
+    std::fill(cur_blk_cells, cur_blk_cells + r*n_blocks, 0);
+    for (int64_t j = 0; j < n_kv; ++j) {
+        int32_t b = -1;
+        if (!cells.is_empty(j)) {
+            const int64_t idx = cells.pos_get(j);
+            b = qsa_bid[idx/r];
+            if (b >= 0) {
+                cur_blk_cells[b*r + idx%r] = (int32_t) j;
+            }
+        }
+        cur_cell_blk[j] = b < 0 ? dead_bid : b;
+    }
+
+    for (int64_t ii = 0; ii < n_tps; ++ii) {
+        const int64_t      i      = s*n_tps + ii;
+        const llama_seq_id seq_id = ubatch->seq_id[i][0];
+
+        const int64_t q          = ubatch->pos[i];
+        const int64_t tail_start = (q + 1)/r*r;
+
+        float * cur_blk_bias = dst_bias + i*n_blocks;
+        for (int64_t b = 0; b < n_blocks; ++b) {
+            if (b >= n_bid || !cells.seq_has((uint32_t) qsa_bid_cell[b], seq_id)) {
+                cur_blk_bias[b] = -INFINITY;
+                continue;
+            }
+            cur_blk_bias[b] = qsa_bid_idx[b] >= tail_start ? 1e9f : 0.0f;
+        }
+        if (have_dead) {
+            cur_blk_bias[dead_bid] = 1e9f;
+        }
+    }
+
+    return true;
 }
 
 //

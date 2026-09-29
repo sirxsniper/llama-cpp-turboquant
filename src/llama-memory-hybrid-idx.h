@@ -92,6 +92,20 @@ private:
     // seq_id < 0 drops the whole context, as the caches themselves do on a failed restore
     void state_drop(llama_seq_id seq_id);
 
+    // [TAG_FN_QSA_INPUT_FAST] set_input_qsa for one stream holding a single sequence, block bias form, no 2-D positions:
+    // the same tensors as the general path in two passes over the cells, no per-call allocation. false (nothing written)
+    // when the stream needs the general path: a repeated position slot or a cell past the block window.
+    bool set_input_qsa_one_seq(const llama_kv_cells & cells, int64_t s, int64_t n_kv, int64_t n_ns, int64_t n_blocks,
+                               int64_t r, int64_t n_tps, const llama_ubatch * ubatch, int32_t * cur_cell_blk,
+                               int32_t * cur_blk_cells, int32_t * dst_blk_pos, float * dst_bias) const;
+
+    // scratch of set_input_qsa_one_seq, kept across ubatches (the inference thread is the only caller)
+    mutable std::vector<uint64_t> qsa_slots;
+    mutable std::vector<int32_t>  qsa_first;
+    mutable std::vector<int32_t>  qsa_bid;
+    mutable std::vector<int32_t>  qsa_bid_idx;
+    mutable std::vector<int32_t>  qsa_bid_cell;
+
     // the indexer cache holds one key head per layer, so it needs its own hparams:
     // llama_kv_cache keeps a reference to what it is given
     llama_hparams hparams_idx;
