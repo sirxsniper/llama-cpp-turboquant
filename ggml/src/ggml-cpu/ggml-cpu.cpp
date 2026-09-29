@@ -781,6 +781,16 @@ static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const ch
     if (strcmp(name, "ggml_cpu_moe_run") == 0) {
         return (void *)ggml_cpu_moe_run;
     }
+    // [TAG_MOE_BRIDGE]
+    if (strcmp(name, "ggml_cpu_moe_pool_park") == 0) {
+        return (void *)ggml_cpu_moe_pool_park;
+    }
+    if (strcmp(name, "ggml_cpu_moe_pool_wake") == 0) {
+        return (void *)ggml_cpu_moe_pool_wake;
+    }
+    if (strcmp(name, "ggml_cpu_moe_layer_supported") == 0) {
+        return (void *)ggml_cpu_moe_layer_supported;
+    }
     if (strcmp(name, "ggml_cpu_fn_moe_fused_calls") == 0) {
         return (void *)ggml_cpu_fn_moe_fused_calls;
     }

@@ -195,6 +195,8 @@ struct ggml_cpu_moe_pool {
     alignas(64) std::atomic<int>      bar_gen{0};
     std::atomic<int>  n_sleeping{0};
     std::atomic<bool> stop{false};
+    std::atomic<bool> parked{false};                 // [TAG_MOE_BRIDGE] idle workers sleep at once
+    alignas(64) std::atomic<uint32_t> wake_gen{0};   // [TAG_MOE_BRIDGE] bumped by ggml_cpu_moe_pool_wake
 
     std::mutex              mtx;
     std::condition_variable cv;
@@ -228,20 +230,35 @@ static void moe_pool_worker(ggml_cpu_moe_pool * p, int ith) {
         uint32_t s = p->seq.load(std::memory_order_acquire);
         if (s == last && !p->stop.load(std::memory_order_acquire)) {
             // spin for spin_us, then sleep until the caller publishes a job
-            const auto t0 = std::chrono::steady_clock::now();
+            auto t0 = std::chrono::steady_clock::now();
+            uint32_t wg_seen = p->wake_gen.load(std::memory_order_relaxed);
             for (uint32_t k = 1; ; k++) {
                 s = p->seq.load(std::memory_order_acquire);
                 if (s != last || p->stop.load(std::memory_order_acquire)) {
                     break;
                 }
                 moe_pool_relax();
-                if ((k & 255) == 0 && std::chrono::steady_clock::now() - t0 >= std::chrono::microseconds(p->spin_us)) {
+                if ((k & 255) == 0) {
+                    // [TAG_MOE_BRIDGE] a wake restarts the spin window; a park ends it
+                    const uint32_t wg = p->wake_gen.load(std::memory_order_relaxed);
+                    if (wg != wg_seen) {
+                        wg_seen = wg;
+                        t0 = std::chrono::steady_clock::now();
+                    }
+                    if (!p->parked.load(std::memory_order_relaxed) &&
+                        std::chrono::steady_clock::now() - t0 < std::chrono::microseconds(p->spin_us)) {
+                        continue;
+                    }
                     std::unique_lock<std::mutex> lk(p->mtx);
+                    const uint32_t wg_sleep = p->wake_gen.load(std::memory_order_seq_cst);
                     p->n_sleeping.fetch_add(1, std::memory_order_seq_cst);
                     p->cv.wait(lk, [&] {
-                        return p->seq.load(std::memory_order_seq_cst) != last || p->stop.load(std::memory_order_seq_cst);
+                        return p->seq.load(std::memory_order_seq_cst) != last || p->stop.load(std::memory_order_seq_cst) ||
+                               p->wake_gen.load(std::memory_order_seq_cst) != wg_sleep;
                     });
                     p->n_sleeping.fetch_sub(1, std::memory_order_relaxed);
+                    wg_seen = p->wake_gen.load(std::memory_order_relaxed);
+                    t0 = std::chrono::steady_clock::now();
                 }
             }
         }
@@ -285,6 +302,11 @@ struct ggml_cpu_moe_pool * ggml_cpu_moe_pool_new(const struct ggml_cpu_moe_pool_
     if (list.empty()) {
         list = physical_core_cpus();
     }
+    // [TAG_MOE_BRIDGE]
+    if (pp->skip_first_core && list.size() > 1) {
+        list.erase(list.begin());
+        p->n_threads = std::min<int>(p->n_threads, (int) list.size());
+    }
     // worker 0 is the caller: if it is pinned to one CPU of the list now (the ggml threadpool of a GGML_OPENMP=OFF build
     // pins the main thread to the last CPU of its mask), that CPU moves to the front so no worker shares it
     const int caller_cpu = current_thread_single_cpu();
@@ -297,6 +319,12 @@ struct ggml_cpu_moe_pool * ggml_cpu_moe_pool_new(const struct ggml_cpu_moe_pool_
     p->cpus.assign(p->n_threads, -1);
     for (int k = 1; k < p->n_threads; k++) {
         p->cpus[k] = k < (int) list.size() ? list[k] : -1;
+    }
+    // [TAG_MOE_BRIDGE] a dedicated executor thread runs the jobs: it takes the first CPU of the list itself
+    if (pp->pin_caller && !list.empty()) {
+        p->cpus[0] = list[0];
+        pin_current_thread(list[0]);
+        set_current_thread_prio(p->prio);
     }
     for (int k = 1; k < p->n_threads; k++) {
         p->workers.emplace_back(moe_pool_worker, p, k);
@@ -317,6 +345,31 @@ void ggml_cpu_moe_pool_free(struct ggml_cpu_moe_pool * p) {
         t.join();
     }
     delete p;
+}
+
+void ggml_cpu_moe_pool_park(struct ggml_cpu_moe_pool * p) {
+    if (p) {
+        p->parked.store(true, std::memory_order_relaxed);
+    }
+}
+
+void ggml_cpu_moe_pool_wake(struct ggml_cpu_moe_pool * p) {
+    if (p == nullptr) {
+        return;
+    }
+    p->parked.store(false, std::memory_order_relaxed);
+    p->wake_gen.fetch_add(1, std::memory_order_seq_cst);
+    if (p->n_sleeping.load(std::memory_order_seq_cst) > 0) {
+        {
+            std::lock_guard<std::mutex> lk(p->mtx);
+        }
+        p->cv.notify_all();
+    }
+}
+
+bool ggml_cpu_moe_layer_supported(const struct ggml_cpu_moe_layer * l) {
+    ggml_cpu_init();
+    return l != nullptr && ggml_fn_moe_supported(l->up, l->gate, l->down);
 }
 
 enum ggml_status ggml_cpu_moe_run(struct ggml_cpu_moe_pool * p, const struct ggml_cpu_moe_job * job) {
@@ -362,6 +415,7 @@ enum ggml_status ggml_cpu_moe_run(struct ggml_cpu_moe_pool * p, const struct ggm
     a.wdata = p->work.data();
 
     p->n_done.store(0, std::memory_order_relaxed);
+    p->parked.store(false, std::memory_order_relaxed); // [TAG_MOE_BRIDGE]
     p->seq.fetch_add(1, std::memory_order_seq_cst);
     if (p->n_sleeping.load(std::memory_order_seq_cst) > 0) {
         {
