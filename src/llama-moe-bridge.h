@@ -43,4 +43,6 @@ bool llama_moe_bridge_layer (const llama_moe_bridge * br, const ggml_tensor * up
 // runtime, on the owning context's thread
 void llama_moe_bridge_step (llama_moe_bridge * br);            // before the graph parameters: re-arm after a pause
 void llama_moe_bridge_begin(llama_moe_bridge * br, bool used); // before the graph runs: wake the executor, or park it
-bool llama_moe_bridge_end  (llama_moe_bridge * br);            // after the graph completed: false = its output is invalid
+// after a graph with used = true completed (also a failed one): false = its output is invalid. Jobs that come after it
+// (their wait timed out) are stale: they return zeros without running and without the routing observer.
+bool llama_moe_bridge_end  (llama_moe_bridge * br);

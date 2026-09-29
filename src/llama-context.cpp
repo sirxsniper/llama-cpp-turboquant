@@ -1427,6 +1427,22 @@ llama_context::llama_context(
         // [TAG_FN_MERGE] with a host bridge the DMA share / prefetch stay off (they need the CPU split the bridge removes)
         llama_moe_gen5_init(model, this, backend_ptrs, moe_bridge != nullptr);
 
+        // [TAG_MOE_BRIDGE] [TAG_FN_PREFILL_STREAM] a throw below (a reserve whose compute buffers do not fit) leaves the
+        // constructor without the destructor: free the bridge (executor thread, pinned channels) and the gen5 state
+        // (pinned rings, VRAM banks, an owner pointer a later context could match) on the way out
+        struct moe_host_guard {
+            llama_moe_bridge *& br;
+            const void *        owner;
+            bool                armed;
+            ~moe_host_guard() {
+                if (armed) {
+                    llama_moe_bridge_free(br);
+                    br = nullptr;
+                    llama_moe_gen5_free(owner);
+                }
+            }
+        } moe_guard { moe_bridge, this, true };
+
         sched_reserve();
 
         // [TAG_FN_MOE_HOT] sized after the reserve, so LLAMA_MOE_HOT_MIB=auto sees what the KV cache and the compute
@@ -1441,6 +1457,8 @@ llama_context::llama_context(
                 throw std::runtime_error("quantized V cache was requested, but this requires Flash Attention");
             }
         }
+
+        moe_guard.armed = false; // [TAG_MOE_BRIDGE]
     }
 
     // Initialize the full vocabulary token ids for backend samplers.
@@ -2769,6 +2787,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
+        if (moe_bridge_used) { // [TAG_MOE_BRIDGE] close the bridged graph: its late host jobs are stale now
+            ggml_backend_sched_synchronize(sched.get());
+            llama_moe_bridge_end(moe_bridge);
+        }
         ret = status;
         return nullptr;
     }

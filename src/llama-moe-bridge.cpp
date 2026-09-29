@@ -109,6 +109,11 @@ struct llama_moe_bridge {
     alignas(64) std::atomic<uint32_t> wake_gen{0};
     bool                    ready = false; // guarded by mtx
 
+    // the owner's bridged graph runs (begin .. end). A job that comes later is stale: its wait gave up, the owner has
+    // moved on and may run the moe-cache step or a CPU split that calls the same routing observer. [TAG_MOE_BRIDGE]
+    std::mutex graph_mtx;
+    bool       in_graph = false; // guarded by graph_mtx
+
     // state, owning context's thread
     bool     active     = true;
     bool     disabled   = false;
@@ -151,8 +156,13 @@ static bool br_run(const ggml_moe_bridge_job * j, void * ud) {
         layer = &c.layer_tbl;
     }
 
-    // routing observation, as the CPU MUL_MAT_ID of ffn_gate_exps reports it (moe-cache LRU and hot statistics)
+    // routing observation, as the CPU MUL_MAT_ID of ffn_gate_exps reports it (moe-cache LRU and hot statistics). Under
+    // graph_mtx: end() takes it too, so no observer call of this job runs once the owner's graph is closed.
     {
+        std::lock_guard<std::mutex> lk(br->graph_mtx);
+        if (!br->in_graph) {
+            return false; // stale: zeros and no observer call; the bridge error of its wait is already set
+        }
         void * obs_ud = nullptr;
         ggml_moe_obs_cb_t obs = ggml_get_moe_obs_callback(&obs_ud);
         if (obs) {
@@ -206,6 +216,7 @@ static void br_exec_main(llama_moe_bridge * br) {
     const auto spin = std::chrono::microseconds(br->spin_us);
     auto     last    = std::chrono::steady_clock::now();
     uint32_t wg_seen = br->wake_gen.load(std::memory_order_relaxed);
+    uint64_t n_stalled = 0; // job count of the last test stall (a stale job does not count, so n can repeat)
     for (uint32_t k = 1; ; ++k) {
         ggml_moe_bridge_job job;
         if (br->fn_poll(br->gb, &job)) {
@@ -214,7 +225,8 @@ static void br_exec_main(llama_moe_bridge * br) {
             last = std::chrono::steady_clock::now();
             // test: stall before the next job is taken, so its wait runs into timeout_ms
             const uint64_t n = br->n_jobs.load(std::memory_order_relaxed);
-            if (br->stall_ms > 0 && (n == 199 || (br->stall_every > 0 && n > 199 && (n - 199) % br->stall_every == 0))) {
+            if (br->stall_ms > 0 && n != n_stalled && (n == 199 || (br->stall_every > 0 && n > 199 && (n - 199) % br->stall_every == 0))) {
+                n_stalled = n;
                 LLAMA_LOG_WARN("%s: LLAMA_MOE_BRIDGE_TEST_STALL: the executor sleeps %d ms after job %" PRIu64 "\n", __func__, br->stall_ms, n);
                 std::this_thread::sleep_for(std::chrono::milliseconds(br->stall_ms));
             }
@@ -311,8 +323,14 @@ llama_moe_bridge * llama_moe_bridge_create(const llama_model & model, int n_thre
     const auto & hparams = model.hparams;
     ggml_backend_dev_t dev = nullptr;
     int n_skipped = 0;
+    // nextn (MTP) layers run in an MTP context's graphs only, never in this one's (as the KV filter of create_memory)
+    // [TAG_MOE_BRIDGE]
+    const bool nextn_split = hparams.n_layer_nextn > 0 && hparams.n_layer() > 0 && hparams.router_layer < 0;
     for (size_t il = 0; il < model.layers.size(); ++il) {
         const auto & l = model.layers[il];
+        if (nextn_split && il >= hparams.n_layer()) {
+            continue;
+        }
         if (!l.ffn_up_exps || !l.ffn_gate_exps || !l.ffn_down_exps || !l.ffn_gate_inp || l.ffn_gate_up_exps) {
             continue;
         }
@@ -504,6 +522,10 @@ void llama_moe_bridge_begin(llama_moe_bridge * br, bool used) {
         return;
     }
     if (used) {
+        {
+            std::lock_guard<std::mutex> lk(br->graph_mtx);
+            br->in_graph = true;
+        }
         br->parked.store(false, std::memory_order_relaxed);
         br->wake_gen.fetch_add(1, std::memory_order_seq_cst);
         if (br->n_sleeping.load(std::memory_order_seq_cst) > 0) {
@@ -523,6 +545,10 @@ void llama_moe_bridge_begin(llama_moe_bridge * br, bool used) {
 bool llama_moe_bridge_end(llama_moe_bridge * br) {
     if (br == nullptr) {
         return true;
+    }
+    {
+        std::lock_guard<std::mutex> lk(br->graph_mtx); // waits for an observer call in progress
+        br->in_graph = false;
     }
     br->n_graphs++;
     const uint32_t err = br->fn_error(br->gb);
