@@ -306,6 +306,9 @@ struct common_mtp_cost {
     // P_prev * a: probability that the new token and every earlier one of this sequence are accepted; E: the expected
     // tokens of every drafting sequence so far; R: verify rows so far; d: draft decodes so far; n: draft batch width
     bool keep(double p_new, double E, int R, int d, int n) const {
+        if (R + 1 > R_MAX) {
+            return false; // no cost past R_MAX rows (V = 1e30 on both sides would make every token look free)
+        }
         const double t  = V(R) + d*t_d(n);
         const double dv = V(R + 1) - V(R);
         return p_new*t >= E*dv;
@@ -313,6 +316,9 @@ struct common_mtp_cost {
 
     // one more draft decode: P = cumulative acceptance of the sequence's kept tokens, a_hi = acc_hi of the next position
     bool more(double P, double a_hi, double E, int R, int d, int n) const {
+        if (R + 1 > R_MAX) {
+            return false;
+        }
         const double t  = V(R) + d*t_d(n);
         const double dv = V(R + 1) - V(R);
         return P*a_hi*t >= E*(dv + t_d(n));

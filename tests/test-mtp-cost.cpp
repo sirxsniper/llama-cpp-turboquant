@@ -84,6 +84,12 @@ static void test_pieces() {
     TCHECK(!v.add_step(1, 10.0*truth(1)), "outlier dropped");
     TCHECK(std::fabs(v.V(1)/truth(1) - 1.0) < 0.08, "V(1) unchanged by the outlier");
     TCHECK(v.V(common_mtp_cost::R_MAX + 1) > 1e20, "past R_MAX is never chosen");
+    // [TAG_FN_MTP_COST] more drafting sequences than R_MAX rows (or R_MAX rows already): no row can be priced, so nothing
+    // is kept (before the guard, R > R_MAX priced every row at 0 and kept every token)
+    for (int R : { common_mtp_cost::R_MAX, common_mtp_cost::R_MAX + 1, common_mtp_cost::R_MAX + 8 }) {
+        TCHECK(!v.keep(1.0, 1.0, R, 1, 1),       "keep at R = %d must refuse", R);
+        TCHECK(!v.more(1.0, 1.0, 1.0, R, 0, 1),  "more at R = %d must refuse", R);
+    }
 
     // keep: the second verify row costs 0.8*0.55 = 44 % of a one-row step here, the third ~20 % of a two-row step
     const double E1 = 1.0 + 0.95; // one kept token at 0.95
