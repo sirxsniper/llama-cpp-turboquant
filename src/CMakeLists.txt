@@ -39,6 +39,7 @@ set(LLAMA_CORE_SOURCES
     llama-model.cpp
     llama-moecache.cpp       # [TAG_SYNC_CORE_SOURCES] fork-only
     llama-moetrace.cpp       # [TAG_FN_MOE_TRACE] fork-only
+    llama-ple-dio.cpp        # [TAG_FN_PLE_DIRECT_IO] fork-only
     llama-quant.cpp
     llama-sampler.cpp
     llama-triattention.cpp   # [TAG_SYNC_CORE_SOURCES] fork-only

@@ -3,6 +3,7 @@
 #include "llama-memory-hybrid-idx.h"
 #include "llama-memory-recurrent.h"
 #include "llama-moetrace.h" // [TAG_FN_MOE_TRACE]
+#include "llama-ple-dio.h"   // [TAG_FN_PLE_DIRECT_IO]
 
 #include <algorithm>
 #include <cinttypes>
@@ -14,6 +15,146 @@ static void qwen4exp_require_nonzero(const llama_model_loader & ml, llm_kv kid, 
     if (value == 0) {
         throw std::runtime_error(format("%s must be greater than zero, got %u", ml.llm_kv(kid).c_str(), value));
     }
+}
+
+// [TAG_FN_PLE_DIRECT_IO] LLAMA_PLE_DIRECT_IO=1: open the unbuffered row reader for the PLE table, or nullptr (the table
+// then stays mapped, as without the switch). The loader was asked (TENSOR_READ_DIRECT) to keep the table lazy in any
+// load mode and never to read, validate, prefetch or lock it.
+static void qwen4exp_dio_log(const char * line) {
+    LLAMA_LOG_INFO("%s", line);
+}
+
+// 32 rows spread over the table (first and last included) read from both files must match
+static bool qwen4exp_ple_copy_matches(llama_ple_dio & copy, const llama_ple_dio_params & shard) {
+    llama_ple_dio_params q = shard;
+    q.cache_bytes = 0;
+    q.stats_every = 0;
+    std::string err;
+    auto ref = llama_ple_dio::open(q, err);
+    if (!ref) {
+        LLAMA_LOG_WARN("%s: [TAG_FN_PLE_DIRECT_IO] cannot read the model file to check the copy: %s\n", __func__, err.c_str());
+        return false;
+    }
+    const int n = 32;
+    std::vector<int32_t> rows(n);
+    for (int i = 0; i < n; ++i) {
+        rows[i] = (int32_t) ((shard.n_rows - 1) * i / (n - 1));
+    }
+    std::vector<uint8_t> a(n * shard.row_bytes);
+    std::vector<uint8_t> b(n * shard.row_bytes);
+    try {
+        copy.read_rows(rows.data(), n, a.data(), 0, nullptr);
+        ref->read_rows(rows.data(), n, b.data(), 0, nullptr);
+    } catch (const std::exception & e) {
+        LLAMA_LOG_WARN("%s: [TAG_FN_PLE_DIRECT_IO] check read failed: %s\n", __func__, e.what());
+        return false;
+    }
+    return a == b;
+}
+
+// LLAMA_PLE_DIO_FILE: the table's rows in a file of their own, made here when missing or wrong. nullptr on failure.
+static std::unique_ptr<llama_ple_dio> qwen4exp_open_ple_copy(const llama_ple_dio_params & shard, const std::string & path) {
+    const uint64_t bytes = (uint64_t) shard.n_rows * shard.row_bytes;
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        const int64_t have = llama_ple_dio_file_size(path);
+        if (attempt > 0 || have != (int64_t) bytes) {
+            if (have >= 0) {
+                LLAMA_LOG_WARN("%s: [TAG_FN_PLE_DIRECT_IO] %s (%lld bytes) is not a copy of this table (%llu bytes): making it again\n",
+                        __func__, path.c_str(), (long long) have, (unsigned long long) bytes);
+            }
+            LLAMA_LOG_INFO("%s: [TAG_FN_PLE_DIRECT_IO] copying the PLE table (%.2f GiB) to %s with unbuffered I/O (once)\n",
+                    __func__, bytes / 1073741824.0, path.c_str());
+            std::string err;
+            if (!llama_ple_dio_copy(shard.path, shard.offset, bytes, path, (size_t) 8 << 20, err, qwen4exp_dio_log)) {
+                LLAMA_LOG_WARN("%s: [TAG_FN_PLE_DIRECT_IO] copy failed: %s\n", __func__, err.c_str());
+                return nullptr;
+            }
+        }
+        llama_ple_dio_params q = shard;
+        q.path   = path;
+        q.offset = 0;
+        std::string err;
+        auto dio = llama_ple_dio::open(q, err);
+        if (!dio) {
+            LLAMA_LOG_WARN("%s: [TAG_FN_PLE_DIRECT_IO] cannot open %s: %s\n", __func__, path.c_str(), err.c_str());
+            return nullptr;
+        }
+        if (qwen4exp_ple_copy_matches(*dio, shard)) {
+            return dio;
+        }
+        LLAMA_LOG_WARN("%s: [TAG_FN_PLE_DIRECT_IO] %s does not match the table in the model file\n", __func__, path.c_str());
+    }
+    return nullptr;
+}
+
+static std::shared_ptr<llama_ple_dio> qwen4exp_open_ple_dio(const llama_model_loader & ml, const ggml_tensor * t) {
+    const char * name = ggml_get_name(t);
+    auto off = [&](const std::string & why) {
+        LLAMA_LOG_WARN("%s: [TAG_FN_PLE_DIRECT_IO] LLAMA_PLE_DIRECT_IO is set, but %s; %s is read through the mapping\n",
+                __func__, why.c_str(), name);
+        return std::shared_ptr<llama_ple_dio>();
+    };
+    if (!ml.lazy.has(t)) {
+        return off("the tensor is not lazily mapped (no mmap support)");
+    }
+    if (t->type != GGML_TYPE_F32 && ggml_get_type_traits(t->type)->to_float == nullptr) {
+        return off(std::string("type ") + ggml_type_name(t->type) + " has no to_float");
+    }
+    if (t->ne[2] != 1 || t->ne[3] != 1 || (size_t) t->nb[1] != ggml_row_size(t->type, t->ne[0])) {
+        return off("the table is not a plain 2-D row array");
+    }
+    const auto * w = ml.get_weight(name);
+    if (w == nullptr) {
+        return off("its file position is unknown");
+    }
+    if (w->idx >= ml.files_paths.size() || ml.files_paths[w->idx].empty()) {
+        return off("the model was not loaded from a file path");
+    }
+
+    auto env_ll = [](const char * key, long long def) {
+        const char * e = getenv(key);
+        return e != nullptr && *e != '\0' ? atoll(e) : def;
+    };
+
+    llama_ple_dio_params p;
+    p.path        = ml.files_paths[w->idx];
+    p.offset      = w->offs;
+    p.row_bytes   = t->nb[1];
+    p.n_rows      = t->ne[1];
+    p.cache_bytes = (size_t) std::max(0LL, env_ll("LLAMA_PLE_DIO_CACHE_MB", 64)) << 20;
+    p.queue_depth = (int) std::max(1LL, std::min(1024LL, env_ll("LLAMA_PLE_DIO_QD", 64)));
+    p.stats_every = (int) std::max(0LL, std::min((long long) INT32_MAX, env_ll("LLAMA_PLE_DIO_STATS", 0)));
+    p.log         = qwen4exp_dio_log;
+
+    // LLAMA_PLE_DIO_FILE: read a copy that nothing maps (Windows serves unbuffered reads of a mapped file one at a time)
+    std::unique_ptr<llama_ple_dio> dio;
+    const char * copy_path = getenv("LLAMA_PLE_DIO_FILE");
+    if (copy_path != nullptr && *copy_path != '\0') {
+        dio = qwen4exp_open_ple_copy(p, copy_path);
+        if (!dio) {
+            LLAMA_LOG_WARN("%s: [TAG_FN_PLE_DIRECT_IO] LLAMA_PLE_DIO_FILE=%s is not usable; reading the model file instead\n",
+                    __func__, copy_path);
+        }
+    }
+    if (!dio) {
+        std::string err;
+        dio = llama_ple_dio::open(p, err);
+        if (!dio) {
+            return off("the file cannot be read unbuffered (" + err + ")");
+        }
+    }
+    const auto & dp = dio->params();
+    LLAMA_LOG_INFO("%s: [TAG_FN_PLE_DIRECT_IO] %s: rows read %s from %s @ %llu (%lld rows x %zu B, %zu B aligned, "
+            "%d in flight, LRU %zu MiB%s)\n", __func__, name, dio->direct() ? "unbuffered" : "with pread + DONTNEED",
+            dp.path.c_str(), (unsigned long long) dp.offset, (long long) dp.n_rows, dp.row_bytes, dio->align(),
+            dp.queue_depth, dp.cache_bytes >> 20, dp.stats_every ? ", stats on" : "");
+#if defined(_WIN32)
+    if (dp.path == p.path) {
+        LLAMA_LOG_INFO("%s: [TAG_FN_PLE_DIRECT_IO] note: this file is also mapped, so Windows serves these reads one at a "
+                "time (~10K/s); LLAMA_PLE_DIO_FILE=<path> reads an unmapped copy of the table\n", __func__);
+    }
+#endif
+    return std::shared_ptr<llama_ple_dio>(std::move(dio));
 }
 
 // get_arr() copies a short array as-is, leaving a zero tail the n-gram hash silently drops
@@ -201,8 +342,14 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
             ple_rows = ple_w->tensor->ne[1];
         }
 
+        // [TAG_FN_PLE_DIRECT_IO] LLAMA_PLE_DIRECT_IO=1: the table is never mapped in; its rows are read from the file
+        const bool ple_direct = llama_ple_dio_requested();
         per_layer_tok_embd = create_tensor(tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight"),
-                                           { hparams.ple_head_dim, ple_rows }, TENSOR_READ_LAZY | trunk_flags);
+                                           { hparams.ple_head_dim, ple_rows },
+                                           TENSOR_READ_LAZY | (ple_direct ? llama_model_loader::TENSOR_READ_DIRECT : 0) | trunk_flags);
+        if (ple_direct && per_layer_tok_embd != nullptr && !ml.no_alloc) {
+            ple_dio = qwen4exp_open_ple_dio(ml, per_layer_tok_embd);
+        }
     }
 
     auto load_block = [&](int il, int flags) {
@@ -1227,6 +1374,25 @@ static void qwen4exp_rows_to_float(const ggml_tensor * table, const int32_t * ro
     }
 }
 
+// [TAG_FN_PLE_DIRECT_IO] the same rows read from the file (unbuffered, all at once) into raw, then the same to_float:
+// bit-identical to qwen4exp_rows_to_float. The mapped table is only the fallback for a failed read.
+static void qwen4exp_rows_to_float_dio(llama_ple_dio & dio, const ggml_tensor * table, const int32_t * rows, int64_t n_rows,
+        int64_t n_tokens, std::vector<uint8_t> & raw, float * dst) {
+    const int64_t n  = table->ne[0];
+    const size_t  rb = table->nb[1];
+    raw.resize((size_t) n_rows*rb);
+    dio.read_rows(rows, n_rows, raw.data(), n_tokens, (const uint8_t *) table->data);
+    const ggml_to_float_t to_float = ggml_get_type_traits(table->type)->to_float;
+    for (int64_t r = 0; r < n_rows; ++r) {
+        const char * src = (const char *) raw.data() + (size_t) r*rb;
+        if (table->type == GGML_TYPE_F32) {
+            memcpy(dst + r*n, src, n*sizeof(float));
+        } else {
+            to_float(src, dst + r*n, n);
+        }
+    }
+}
+
 // [TAG_FN_PLE_HOST_GATHER] token rows as an f32 input; h is the MTP driver's hidden state input (nullptr in the trunk)
 class llm_graph_input_embd_host : public llm_graph_input_i {
 public:
@@ -1296,6 +1462,7 @@ public:
     // [TAG_FN_PLE_HOST_GATHER] with host gather: F32 [ple_head_dim * ple_n_heads, n_tokens] instead of rows
     ggml_tensor * emb_host = nullptr;
     std::vector<float> emb_buf;
+    std::vector<uint8_t> dio_raw; // [TAG_FN_PLE_DIRECT_IO] raw rows from the file
 
     const llama_model_qwen4exp & pmodel;
 
@@ -1369,7 +1536,12 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
     if (emb_host) { // [TAG_FN_PLE_HOST_GATHER] same rows, dequantized here instead of by a CPU GET_ROWS
         emb_buf.resize(ggml_nelements(emb_host));
         GGML_ASSERT((int64_t) emb_buf.size() == pmodel.per_layer_tok_embd->ne[0]*n_heads*n_tokens);
-        qwen4exp_rows_to_float(pmodel.per_layer_tok_embd, idx.data(), n_heads*n_tokens, emb_buf.data());
+        if (pmodel.ple_dio) { // [TAG_FN_PLE_DIRECT_IO] the same bytes, read from the file instead of the mapping
+            qwen4exp_rows_to_float_dio(*pmodel.ple_dio, pmodel.per_layer_tok_embd, idx.data(), n_heads*n_tokens, n_tokens,
+                    dio_raw, emb_buf.data());
+        } else {
+            qwen4exp_rows_to_float(pmodel.per_layer_tok_embd, idx.data(), n_heads*n_tokens, emb_buf.data());
+        }
         ggml_backend_tensor_set(emb_host, emb_buf.data(), 0, emb_buf.size()*sizeof(float));
         return;
     }
@@ -1442,7 +1614,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_inp_ple(
             static_cast<const llama_model_qwen4exp &>(model), mctx_hyb->get_attn());
 
     // [TAG_FN_PLE_HOST_GATHER] the table rows arrive as an f32 input: no CPU GET_ROWS split
-    if (qwen4exp_host_gather_ok(model.per_layer_tok_embd)) {
+    // [TAG_FN_PLE_DIRECT_IO] always so with direct I/O: a GET_ROWS would read the rows through the mapping
+    if (static_cast<const llama_model_qwen4exp &>(model).ple_dio || qwen4exp_host_gather_ok(model.per_layer_tok_embd)) {
         ple_inp->emb_host = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.ple_head_dim * n_heads, n_tokens);
         ggml_set_input(ple_inp->emb_host);
         ggml_tensor * emb = ple_inp->emb_host;

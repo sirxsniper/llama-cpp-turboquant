@@ -327,6 +327,12 @@ endif()
 # CPU only. llama_kv_resolve and the turbot plan parser are exported with LLAMA_API, so it links in shared builds too.
 llama_build_and_test(test-kv-resolve.cpp)
 
+# [TAG_FN_PLE_DIRECT_IO] unbuffered PLE row reads (src/llama-ple-dio.cpp) against the mapped rows of a real GGUF, CPU and
+# disk only. Built, not registered with ctest: it needs the model file. The reader is compiled in (libllama does not
+# export it).
+llama_build(test-ple-dio.cpp ${CMAKE_CURRENT_SOURCE_DIR}/../src/llama-ple-dio.cpp)
+target_include_directories(test-ple-dio PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model")
 llama_build_and_test(test-autorelease.cpp       LABEL "model")
 llama_build_and_test(test-backend-sampler.cpp   LABEL "model")

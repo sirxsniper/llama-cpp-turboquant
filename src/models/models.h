@@ -9,6 +9,7 @@
 #include <map>
 
 class llama_memory_hybrid_idx_context;
+struct llama_ple_dio; // [TAG_FN_PLE_DIRECT_IO] llama-ple-dio.h
 
 // [TAG_FN_MTP_HEAD_ROWS] ids >= head_rows that a head-rows view keeps draftable: control and user-defined tokens,
 // punctuation-only pieces, and the ids in the file at path (may be null); sorted, at most 4096 (dflash.cpp)
@@ -2404,6 +2405,10 @@ struct llama_model_qwen4exp : public llama_model_base {
     // [TAG_FN_MTP_HEAD_ROWS] LLAMA_MTP_HEAD_ROWS=N: the MTP draft head reads rows [0, N) of the LM head plus these ids
     int64_t              mtp_head_rows = 0;
     std::vector<int32_t> mtp_head_extra;
+
+    // [TAG_FN_PLE_DIRECT_IO] LLAMA_PLE_DIRECT_IO=1: per_layer_tok_embd rows come from the file with unbuffered reads
+    // (llama-ple-dio.h); nullptr = the mapped table (default). shared_ptr: the type stays incomplete here.
+    std::shared_ptr<llama_ple_dio> ple_dio;
 
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
