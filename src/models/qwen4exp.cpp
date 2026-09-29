@@ -5,10 +5,14 @@
 #include "llama-moetrace.h" // [TAG_FN_MOE_TRACE]
 #include "llama-moe-gen5.h" // [TAG_MOE_PREFETCH]
 
+#include "ggml-alloc.h"   // [TAG_FN_MTP_HEAD_IDS]
+#include "ggml-backend.h"
+
 #include <algorithm>
 #include <cinttypes>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 
 // bad metadata must be catchable: GGML_ASSERT aborts the whole process
 static void qwen4exp_require_nonzero(const llama_model_loader & ml, llm_kv kid, uint32_t value) {
@@ -25,6 +29,38 @@ static void qwen4exp_require_arr_len(llama_model_loader & ml, llm_kv kid, uint32
         throw std::runtime_error(format("%s has %u entries, but at least %u are required",
                                         ml.llm_kv(kid).c_str(), n_arr, n_min));
     }
+}
+
+// [TAG_FN_MTP_HEAD_IDS] token ids in [0, n_vocab) from a text file: separated by spaces, commas or new lines, '#' starts
+// a comment (the LLAMA_DFLASH_HEAD_EXTRA format). Empty when the file cannot be read.
+static std::vector<int32_t> qwen4exp_read_ids(const char * path, int64_t n_vocab) {
+    std::vector<int32_t> ids;
+    std::ifstream f(path);
+    if (!f) {
+        LLAMA_LOG_WARN("%s: [TAG_FN_MTP_HEAD_IDS] cannot read '%s'\n", __func__, path);
+        return ids;
+    }
+    std::string line;
+    while (std::getline(f, line)) {
+        line = line.substr(0, line.find('#'));
+        std::replace(line.begin(), line.end(), ',', ' ');
+        size_t pos = 0;
+        while (pos < line.size()) {
+            const size_t beg = line.find_first_not_of(" \t\r", pos);
+            if (beg == std::string::npos) {
+                break;
+            }
+            const size_t  end = line.find_first_of(" \t\r", beg);
+            const int64_t id  = atoll(line.substr(beg, end - beg).c_str());
+            if (id >= 0 && id < n_vocab) {
+                ids.push_back((int32_t) id);
+            }
+            pos = end;
+        }
+    }
+    std::sort(ids.begin(), ids.end());
+    ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+    return ids;
 }
 
 void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
@@ -308,6 +344,37 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
             mtp_head_extra = llama_head_extra_rows(vocab, rows, n_vocab, getenv("LLAMA_MTP_HEAD_EXTRA"));
             LLAMA_LOG_INFO("%s: [TAG_FN_MTP_HEAD_ROWS] MTP drafts read LM head rows [0, %lld) plus %zu more rows (%.1f%% of the head)\n",
                     __func__, (long long) rows, mtp_head_extra.size(), 100.0*(rows + (int64_t) mtp_head_extra.size())/n_vocab);
+        }
+    }
+
+    // [TAG_FN_MTP_HEAD_IDS] LLAMA_MTP_HEAD_IDS=<file> (unset = off): the MTP drafts score only a calibrated draft
+    // vocabulary (e.g. scripts/dflash-draft-vocab.py ids), plus every control and user-defined token. Only drafts
+    // change: verify uses the full head. It replaces LLAMA_MTP_HEAD_ROWS when both are set.
+    if (ml.load_mtp && n_layer_all > n_layer) {
+        const char * path = getenv("LLAMA_MTP_HEAD_IDS");
+        if (path && path[0]) {
+            std::vector<int32_t> ids = qwen4exp_read_ids(path, n_vocab);
+            const size_t n_file = ids.size();
+            for (int64_t id = 0; id < (int64_t) n_vocab; ++id) {
+                if (vocab.token_get_attr((llama_token) id) & (LLAMA_TOKEN_ATTR_CONTROL | LLAMA_TOKEN_ATTR_USER_DEFINED)) {
+                    ids.push_back((int32_t) id);
+                }
+            }
+            std::sort(ids.begin(), ids.end());
+            ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+            if (n_file == 0 || ids.size() >= (size_t) n_vocab) {
+                LLAMA_LOG_WARN("%s: [TAG_FN_MTP_HEAD_IDS] '%s' gives %zu ids of %u: MTP drafts use the full head\n",
+                        __func__, path, n_file, (uint32_t) n_vocab);
+            } else {
+                mtp_head_ids = std::move(ids);
+                if (mtp_head_rows > 0) {
+                    LLAMA_LOG_WARN("%s: [TAG_FN_MTP_HEAD_IDS] LLAMA_MTP_HEAD_IDS replaces LLAMA_MTP_HEAD_ROWS\n", __func__);
+                    mtp_head_rows = 0;
+                    mtp_head_extra.clear();
+                }
+                LLAMA_LOG_INFO("%s: [TAG_FN_MTP_HEAD_IDS] MTP drafts score %zu ids (%zu from '%s', the rest control tokens), "
+                        "%.1f%% of the head\n", __func__, mtp_head_ids.size(), n_file, path, 100.0*mtp_head_ids.size()/n_vocab);
+            }
         }
     }
 
@@ -1587,6 +1654,85 @@ public:
     const std::vector<int32_t> & v;
 };
 
+// [TAG_FN_MTP_HEAD_IDS] the compact draft head
+llama_model_qwen4exp::mtp_head_compact::~mtp_head_compact() {
+    if (buf) {
+        ggml_backend_buffer_free(buf);
+    }
+    if (ctx) {
+        ggml_free(ctx);
+    }
+}
+
+const llama_model_qwen4exp::mtp_head_compact * llama_model_qwen4exp::mtp_head_get(const ggml_tensor * head_w) const {
+    std::lock_guard<std::mutex> lock(mtp_head_mutex);
+    if (mtp_head_tried || mtp_head_ids.empty()) {
+        return mtp_head_c.get();
+    }
+    // a model loaded without tensor data (a memory-fit probe) has nothing to copy yet: ask again next graph
+    if (head_w == nullptr || head_w->buffer == nullptr || head_w->data == nullptr) {
+        return nullptr;
+    }
+    mtp_head_tried = true;
+
+    const int64_t n_ids     = (int64_t) mtp_head_ids.size();
+    const size_t  row_bytes = ggml_row_size(head_w->type, head_w->ne[0]);
+    ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(head_w->buffer);
+    ggml_backend_dev_t         dev  = ggml_backend_buft_get_device(buft);
+
+    // rows must be plain bytes: a device's own buffer type or the CPU one (not a repacked or split layout)
+    const bool plain = buft == ggml_backend_cpu_buffer_type() || (dev != nullptr && ggml_backend_dev_buffer_type(dev) == buft);
+    if (!plain || head_w->nb[1] != row_bytes || !ggml_is_contiguous(head_w) ||
+            split_mode() == LLAMA_SPLIT_MODE_ROW || split_mode() == LLAMA_SPLIT_MODE_TENSOR ||
+            mtp_head_ids.back() >= head_w->ne[1]) {
+        LLAMA_LOG_WARN("%s: [TAG_FN_MTP_HEAD_IDS] head in '%s' (%lld rows) cannot be copied row by row: full head\n",
+                __func__, ggml_backend_buft_name(buft), (long long) head_w->ne[1]);
+        return nullptr;
+    }
+
+    // gather the rows through a bounded host window; the ids are sorted, so the head is read once
+    std::vector<uint8_t> rows((size_t) n_ids*row_bytes);
+    {
+        const int64_t win = std::max<int64_t>(1, (int64_t) ((64u << 20)/row_bytes));
+        std::vector<uint8_t> chunk((size_t) std::min<int64_t>(win, head_w->ne[1])*row_bytes);
+        int64_t k = 0;
+        for (int64_t r0 = 0; r0 < head_w->ne[1] && k < n_ids; r0 += win) {
+            const int64_t r1 = std::min<int64_t>(head_w->ne[1], r0 + win);
+            if (mtp_head_ids[k] >= r1) {
+                continue;
+            }
+            ggml_backend_tensor_get(head_w, chunk.data(), (size_t) r0*row_bytes, (size_t) (r1 - r0)*row_bytes);
+            for (; k < n_ids && mtp_head_ids[k] < r1; ++k) {
+                memcpy(rows.data() + (size_t) k*row_bytes, chunk.data() + (size_t) (mtp_head_ids[k] - r0)*row_bytes, row_bytes);
+            }
+        }
+        GGML_ASSERT(k == n_ids);
+    }
+
+    auto c = std::make_unique<mtp_head_compact>();
+    ggml_init_params ip = { 2*ggml_tensor_overhead(), nullptr, true };
+    c->ctx = ggml_init(ip);
+    c->w   = ggml_new_tensor_2d(c->ctx, head_w->type, head_w->ne[0], n_ids);
+    c->ids = ggml_new_tensor_1d(c->ctx, GGML_TYPE_I32, n_ids);
+    ggml_set_name(c->w,   "mtp_head_compact.weight");
+    ggml_set_name(c->ids, "mtp_head_compact.ids");
+    c->buf = ggml_backend_alloc_ctx_tensors_from_buft(c->ctx, buft);
+    if (c->buf == nullptr) {
+        LLAMA_LOG_WARN("%s: [TAG_FN_MTP_HEAD_IDS] cannot allocate %.1f MiB in '%s': full head\n",
+                __func__, rows.size()/1048576.0, ggml_backend_buft_name(buft));
+        return nullptr;
+    }
+    ggml_backend_buffer_set_usage(c->buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    ggml_backend_tensor_set(c->w,   rows.data(),         0, rows.size());
+    ggml_backend_tensor_set(c->ids, mtp_head_ids.data(), 0, (size_t) n_ids*sizeof(int32_t));
+
+    LLAMA_LOG_INFO("%s: [TAG_FN_MTP_HEAD_IDS] compact MTP draft head: %lld of %lld rows, %.1f MiB %s in '%s'\n",
+            __func__, (long long) n_ids, (long long) head_w->ne[1], ggml_backend_buffer_get_size(c->buf)/1048576.0,
+            ggml_type_name(head_w->type), ggml_backend_buft_name(buft));
+    mtp_head_c = std::move(c);
+    return mtp_head_c.get();
+}
+
 // [TAG_QWEN4EXP_MTP] The nextn block, run as the draft context of an MTP decode step. Structurally
 // deepseek4::graph_mtp with the qwen4exp hyper-connection helpers: both keep a wide residual of hc parallel streams,
 // so eh_proj is applied per stream and the state stays [n_embd, hc, T] until the block's own output mixer.
@@ -1713,7 +1859,31 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     // the logits keep the full vocabulary width, so the draft driver and backend sampling are unchanged
     const auto & pm = static_cast<const llama_model_qwen4exp &>(model);
     const int64_t n_vocab_head = head_w->ne[1];
-    if (pm.mtp_head_rows > 0 && pm.mtp_head_rows < n_vocab_head && head_s == nullptr && loras->empty() &&
+
+    // [TAG_FN_MTP_HEAD_IDS] a per-tensor head scale (one value) multiplies any subset of rows the same way
+    const bool head_s_scalar = head_s == nullptr || ggml_nelements(head_s) == 1;
+
+    // [TAG_FN_MTP_HEAD_IDS] the calibrated draft vocabulary: its byte-copied rows, scattered into a -inf row of the full
+    // width (the draft driver and backend sampling see the usual logits)
+    const llama_model_qwen4exp::mtp_head_compact * head_c = nullptr;
+    if (!pm.mtp_head_ids.empty() && head_s_scalar && loras->empty() && n_vocab_head == (int64_t) model.vocab.n_tokens()) {
+        head_c = pm.mtp_head_get(head_w);
+    }
+
+    if (head_c != nullptr) {
+        const int64_t n_ids = head_c->w->ne[1];
+        const int64_t n_out = cur->ne[1];
+
+        ggml_tensor * draft = ggml_mul_mat(ctx0, head_c->w, cur);
+        if (head_s) {
+            draft = ggml_mul(ctx0, draft, head_s);
+        }
+        cur = ggml_fill(ctx0, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 1, n_vocab_head, n_out), -INFINITY);
+        cur = ggml_set_rows(ctx0, cur,
+                ggml_reshape_3d(ctx0, draft, 1, n_ids, n_out),
+                ggml_reshape_2d(ctx0, head_c->ids, n_ids, 1));
+        cur = ggml_reshape_2d(ctx0, cur, n_vocab_head, n_out);
+    } else if (pm.mtp_head_rows > 0 && pm.mtp_head_rows < n_vocab_head && head_s_scalar && loras->empty() &&
             n_vocab_head == (int64_t) model.vocab.n_tokens()) {
         const int64_t n_rows  = pm.mtp_head_rows;
         const int64_t n_extra = (int64_t) pm.mtp_head_extra.size();
@@ -1721,6 +1891,9 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
         ggml_tensor * normed  = cur;
 
         cur = ggml_mul_mat(ctx0, ggml_view_2d(ctx0, head_w, head_w->ne[0], n_rows, head_w->nb[1], 0), normed);
+        if (head_s) {
+            cur = ggml_mul(ctx0, cur, head_s); // [TAG_FN_MTP_HEAD_IDS] the per-tensor scale, as build_lora_mm applies it
+        }
         cur = ggml_concat(ctx0, cur,
                 ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_vocab_head - n_rows, n_out), -INFINITY), 0);
         if (n_extra > 0) {
@@ -1729,6 +1902,9 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
             ggml_set_input(inp_ids->ids);
 
             ggml_tensor * extra = ggml_mul_mat(ctx0, ggml_get_rows(ctx0, head_w, inp_ids->ids), normed);
+            if (head_s) {
+                extra = ggml_mul(ctx0, extra, head_s);
+            }
             cur = ggml_set_rows(ctx0, ggml_reshape_3d(ctx0, cur, 1, n_vocab_head, n_out),
                     ggml_reshape_3d(ctx0, extra, 1, n_extra, n_out),
                     ggml_reshape_2d(ctx0, inp_ids->ids, n_extra, 1));
@@ -1737,13 +1913,13 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
             res->add_input(std::move(inp_ids));
         }
     } else {
-        if (pm.mtp_head_rows > 0) {
-            // [TAG_FN_MTP_HEAD_ROWS] say so once, so a head-rows measurement arm is not read as "no effect"
+        if ((pm.mtp_head_rows > 0 || !pm.mtp_head_ids.empty()) && head_w->buffer != nullptr) {
+            // [TAG_FN_MTP_HEAD_ROWS] [TAG_FN_MTP_HEAD_IDS] say so once, so a draft-vocabulary arm is not read as "no effect"
             static bool warned = false;
             if (!warned) {
                 warned = true;
-                LLAMA_LOG_WARN("%s: [TAG_FN_MTP_HEAD_ROWS] not used: head %lld rows vs vocab %u, scale %s, %zu LoRA - full head\n",
-                        __func__, (long long) n_vocab_head, model.vocab.n_tokens(), head_s ? "present" : "none", loras->size());
+                LLAMA_LOG_WARN("%s: [TAG_FN_MTP_HEAD_ROWS] draft vocabulary not used: head %lld rows vs vocab %u, scale %s, %zu LoRA - full head\n",
+                        __func__, (long long) n_vocab_head, model.vocab.n_tokens(), head_s ? (head_s_scalar ? "scalar" : "per row") : "none", loras->size());
             }
         }
         cur = build_lora_mm(head_w, cur, head_s);

@@ -11617,6 +11617,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, GGML_TYPE_F32, GGML_TYPE_I32, { 1, 8, 1, 3 }, { 1, 1 }, 2, false));
     test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, GGML_TYPE_Q8_0, GGML_TYPE_I32, { 256, 5, 1, 3 }, { 1, 1, }, 1, false));
 
+    // [TAG_FN_MTP_HEAD_IDS] the qwen4exp MTP draft-vocabulary scatter: one f32 logit per row into [1, n_vocab, T], one id
+    // list shared by the T draft rows (compact head: 40960 ids; head-rows extra ids: up to 4096)
+    for (int T : {1, 3}) {
+        test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, GGML_TYPE_F32, GGML_TYPE_I32, { 1, 248320, 1, 1 }, { T, 1 }, 40960, false));
+        test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, GGML_TYPE_F32, GGML_TYPE_I32, { 1, 248320, 1, 1 }, { T, 1 }, 4096, false));
+    }
+
     // [TAG_TURBO_SET_ROWS_PARITY] SET_ROWS is the only op that exercises the turbo
     // WRITER. Every other turbo test populates K/V on the host with ggml_quantize_chunk,
     // so both backends receive identical bytes and both dequantize them identically -

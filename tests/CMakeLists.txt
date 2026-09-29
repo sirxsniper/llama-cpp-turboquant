@@ -334,6 +334,9 @@ if (NOT GGML_BACKEND_DL AND GGML_CPU)
     llama_build_and_test(test-moe-gen5.cpp)
 endif()
 
+# [TAG_FN_MTP_COST] cost-aware MTP draft length (common/speculative-mtp-cost.h): pieces and a step simulation, CPU only
+llama_build_and_test(test-mtp-cost.cpp)
+
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model")
 llama_build_and_test(test-autorelease.cpp       LABEL "model")
 llama_build_and_test(test-backend-sampler.cpp   LABEL "model")
