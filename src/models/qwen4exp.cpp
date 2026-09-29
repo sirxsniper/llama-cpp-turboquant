@@ -1712,6 +1712,15 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
             res->add_input(std::move(inp_ids));
         }
     } else {
+        if (pm.mtp_head_rows > 0) {
+            // [TAG_FN_MTP_HEAD_ROWS] say so once, so a head-rows measurement arm is not read as "no effect"
+            static bool warned = false;
+            if (!warned) {
+                warned = true;
+                LLAMA_LOG_WARN("%s: [TAG_FN_MTP_HEAD_ROWS] not used: head %lld rows vs vocab %u, scale %s, %zu LoRA - full head\n",
+                        __func__, (long long) n_vocab_head, model.vocab.n_tokens(), head_s ? "present" : "none", loras->size());
+            }
+        }
         cur = build_lora_mm(head_w, cur, head_s);
     }
     cb(cur, "result_output", -1);
