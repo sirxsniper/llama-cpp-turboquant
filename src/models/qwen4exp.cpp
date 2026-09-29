@@ -3,6 +3,7 @@
 #include "llama-memory-hybrid-idx.h"
 #include "llama-memory-recurrent.h"
 #include "llama-moetrace.h" // [TAG_FN_MOE_TRACE]
+#include "llama-moe-gen5.h" // [TAG_MOE_PREFETCH]
 
 #include <algorithm>
 #include <cinttypes>
@@ -1138,11 +1139,16 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
     GGML_ASSERT(model.layers[il].ffn_gate_inp != nullptr);
 
     // [TAG_FN_MOE_TRACE] LLAMA_MOE_TRACE_PRED: the next layer's router on this layer's FFN input (prefetch study)
-    if (const int pred_k = llama_moe_trace_pred_k(); pred_k > 0 && il + 1 < n_layer && model.layers[il + 1].ffn_gate_inp) {
+    // [TAG_MOE_PREFETCH] the same lookahead feeds the DMA prefetch in decode graphs (LLAMA_MOE_PREFETCH)
+    const int trace_k = llama_moe_trace_pred_k();
+    const int pred_k  = trace_k > 0 ? trace_k : (n_tokens <= LLAMA_MOE_DMA_MAX_T ? llama_moe_dma_pred_k() : 0);
+    if (pred_k > 0 && il + 1 < n_layer && model.layers[il + 1].ffn_gate_inp) {
         ggml_tensor * lg = build_lora_mm(model.layers[il + 1].ffn_gate_inp, cur);
         ggml_tensor * pr = ggml_cont(ctx0, ggml_argsort_top_k(ctx0, lg, std::min<int>(pred_k, (int) n_expert)));
         ggml_format_name(pr, "moe_trace_pred-%d", il + 1);
-        ggml_set_output(pr);
+        if (trace_k > 0) {
+            ggml_set_output(pr);
+        }
         ggml_build_forward_expand(gf, pr);
         res->t_moe_pred_next[il + 1] = pr;
     }

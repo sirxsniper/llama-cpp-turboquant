@@ -2,6 +2,7 @@
 
 #include "llama-moecache.h"
 #include "llama-moetrace.h" // [TAG_FN_MOE_TRACE]
+#include "llama-moe-gen5.h" // [TAG_MOE_DMA_SHARE] [TAG_FN_PREFILL_STREAM]
 
 #include "ggml.h"
 #include "llama-arch.h"
@@ -1418,6 +1419,9 @@ llama_context::llama_context(
             LLAMA_LOG_INFO("%s: pipeline parallelism enabled\n", __func__);
         }
 
+        // [TAG_MOE_DMA_SHARE] [TAG_FN_PREFILL_STREAM] before the reserve: the graphs it builds use the gen5 banks
+        llama_moe_gen5_init(model, this, backend_ptrs);
+
         sched_reserve();
 
         // [TAG_FN_MOE_HOT] sized after the reserve, so LLAMA_MOE_HOT_MIB=auto sees what the KV cache and the compute
@@ -1448,6 +1452,8 @@ llama_context::llama_context(
 llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
+
+    llama_moe_gen5_free(this); // [TAG_MOE_DMA_SHARE] [TAG_FN_PREFILL_STREAM]
 
     llama_moe_trace_flush(); // [TAG_FN_MOE_TRACE]
 
@@ -3505,6 +3511,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         ggml_backend_sched_synchronize(sched.get());
     }
     llama_moe_cache_step(this);
+    llama_moe_gen5_step(this); // [TAG_MOE_DMA_SHARE] ring admission and stats, owner only
 
     return 0;
 }
