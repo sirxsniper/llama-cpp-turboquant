@@ -1147,6 +1147,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
         res->t_moe_pred_next[il + 1] = pr;
     }
 
+    // [TAG_MOE_BRIDGE] with the host bridge, build_moe_ffn posts the host experts and returns a placeholder; the wait
+    // comes after the shared expert (build_moe_bridge_finish below), so the device computes it while the host works
+    moe_bridge_defer = true;
     ggml_tensor * moe_out =
         build_moe_ffn(cur,
             model.layers[il].ffn_gate_inp,
@@ -1162,7 +1165,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
             model.layers[il].ffn_up_exps_s,
             model.layers[il].ffn_gate_exps_s,
             model.layers[il].ffn_down_exps_s);
-    cb(moe_out, "ffn_moe_out", il);
+    moe_bridge_defer = false;
 
     // shared experts, as in the Qwen3Next reference
     if (model.layers[il].ffn_up_shexp != nullptr) {
@@ -1185,9 +1188,14 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
         ffn_shexp = ggml_mul(ctx0, ffn_shexp, shared_gate);
         cb(ffn_shexp, "ffn_shexp_gated", il);
 
+        moe_out = build_moe_bridge_finish(moe_out, il, ffn_shexp); // [TAG_MOE_BRIDGE] unchanged without a post
+        cb(moe_out, "ffn_moe_out", il);
+
         cur = ggml_add(ctx0, moe_out, ffn_shexp);
         cb(cur, "ffn_out", il);
     } else {
+        moe_out = build_moe_bridge_finish(moe_out, il, nullptr); // [TAG_MOE_BRIDGE]
+        cb(moe_out, "ffn_moe_out", il);
         cur = moe_out;
     }
 

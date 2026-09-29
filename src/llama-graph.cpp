@@ -3,6 +3,8 @@
 
 #include "llama-moecache.h"
 #include "llama-moetrace.h" // [TAG_FN_MOE_TRACE]
+#include "llama-moe-bridge.h" // [TAG_MOE_BRIDGE]
+#include "ggml-moe-bridge.h"  // [TAG_MOE_BRIDGE]
 
 #include "llama-impl.h"
 #include "llama-model.h"
@@ -1507,6 +1509,8 @@ void llm_graph_result::reset() {
     build_nodes.clear();
     build_pins.clear();
 
+    n_moe_bridge = 0; // [TAG_MOE_BRIDGE]
+
     t_moe_il.clear(); // [TAG_FN_MOE_TRACE]
     t_moe_n_expert.clear();
     t_moe_ids.clear();
@@ -1727,7 +1731,8 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     cb_func          (params.cb),
     res              (params.res),
     ctx0             (res->get_ctx()),
-    gf               (res->get_gf()) {
+    gf               (res->get_gf()),
+    moe_bridge       (params.moe_bridge) { // [TAG_MOE_BRIDGE]
         res->set_params(params);
     }
 
@@ -2421,6 +2426,26 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         type_op == LLM_FFN_SILU && !weight_before_ffn && loras->empty()) {
         mcache = llama_moe_cache_lookup(up_exps);
     }
+
+    // [TAG_MOE_BRIDGE] host-resident experts through the host bridge: post x / ids / w right after the router, so the
+    // host starts while the device builds the hot chain and the caller's shared expert; build_moe_bridge_finish waits
+    int32_t br_id   = -1;
+    int32_t br_chan = -1;
+    ggml_tensor * br_ticket = nullptr;
+    if (moe_bridge && il >= 0 && n_tokens >= 1 && n_tokens <= llama_moe_bridge_max_t(moe_bridge) &&
+        n_expert_used <= llama_moe_bridge_n_used(moe_bridge) &&
+        !gate_up_exps && gate_exps && down_exps && !up_exps_b && !gate_exps_b && !down_exps_b &&
+        !up_exps_s && !gate_exps_s && !down_exps_s && type_op == LLM_FFN_SILU && !weight_before_ffn &&
+        loras->empty() && !(hparams.swiglu_clamp_exp[il] > 1e-6f) &&
+        llama_moe_bridge_layer(moe_bridge, up_exps, &br_id, &br_chan)) {
+        ggml_tensor * w2 = ggml_is_contiguous(weights) ? weights : ggml_cont(ctx0, weights);
+        w2 = ggml_reshape_2d(ctx0, w2, n_expert_used, n_tokens);
+        br_ticket = ggml_moe_host_post(ctx0, cur, selected_experts, w2, br_id, br_chan, mcache ? GGML_MOE_BRIDGE_JOB_TABLE : 0);
+        cb(br_ticket, "ffn_moe_bridge_post", il);
+        ggml_build_forward_expand(gf, br_ticket);
+        res->n_moe_bridge++;
+    }
+
     if (mcache && hot_max_t == 0) {
         mc_slot_ids = ggml_get_rows(ctx0, mcache->dev_table, selected_experts); // [1, n_expert_used, 1]
         mc_slot_ids = ggml_reshape_2d(ctx0, mc_slot_ids, n_expert_used, 1);
@@ -2473,6 +2498,31 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     if (mcache && hot_max_t > 0) {
         hot_down = build_cache_chain();
         ggml_build_forward_expand(gf, hot_down);
+    }
+
+    // [TAG_MOE_BRIDGE] the device part is the hot chain only, weighted and summed here; no CPU chain in this graph
+    if (br_ticket) {
+        ggml_tensor * hot = nullptr;
+        if (mcache) {
+            ggml_tensor * hw = ggml_mul(ctx0, hot_down ? hot_down : build_cache_chain(), weights); // [n_embd, n_expert_used, n_tokens]
+            cb(hw, "ffn_moe_bridge_hot_weighted", il);
+            const uint32_t n_used_il = hparams.n_expert_used(il);
+            for (uint32_t i = 0; i < n_used_il; ++i) {
+                ggml_tensor * v = ggml_view_2d(ctx0, hw, n_embd, n_tokens, hw->nb[2], i*hw->nb[1]);
+                ggml_build_forward_expand(gf, v);
+                hot = hot ? ggml_add(ctx0, hot, v) : v;
+            }
+            if (n_used_il == 1) {
+                hot = ggml_cont(ctx0, hot);
+            }
+            cb(hot, "ffn_moe_bridge_hot", il);
+            ggml_build_forward_expand(gf, hot);
+        }
+        moe_bridge_posts[il] = { br_ticket, hot, n_embd, n_tokens, br_id, br_chan };
+        if (moe_bridge_defer) {
+            return br_ticket; // placeholder: the caller passes it to build_moe_bridge_finish
+        }
+        return build_moe_bridge_finish(br_ticket, il, nullptr);
     }
 
     if (weight_before_ffn) {
@@ -2695,6 +2745,27 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     cb(moe_out, "ffn_moe_out", il);
 
     return moe_out;
+}
+
+// [TAG_MOE_BRIDGE]
+ggml_tensor * llm_graph_context::build_moe_bridge_finish(ggml_tensor * cur, int il, ggml_tensor * dep) const {
+    const auto it = moe_bridge_posts.find(il);
+    if (it == moe_bridge_posts.end()) {
+        return cur;
+    }
+    const moe_bridge_post p = it->second;
+    moe_bridge_posts.erase(it);
+    GGML_ASSERT(cur == p.ticket && "build_moe_bridge_finish expects the placeholder that build_moe_ffn returned");
+
+    // dep (or the hot chain) goes into the graph before the wait, so the device runs it while the host works
+    ggml_tensor * out = ggml_moe_host_wait(ctx0, p.ticket, dep ? dep : p.hot, p.n_embd, p.n_tokens, p.id, p.chan);
+    cb(out, "ffn_moe_bridge_wait", il);
+    if (p.hot) {
+        out = ggml_add(ctx0, p.hot, out);
+        cb(out, "ffn_moe_bridge_sum", il);
+    }
+    ggml_build_forward_expand(gf, out);
+    return out;
 }
 
 // input embeddings with optional lora

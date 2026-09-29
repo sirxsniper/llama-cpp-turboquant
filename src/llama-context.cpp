@@ -2,6 +2,7 @@
 
 #include "llama-moecache.h"
 #include "llama-moetrace.h" // [TAG_FN_MOE_TRACE]
+#include "llama-moe-bridge.h" // [TAG_MOE_BRIDGE]
 
 #include "ggml.h"
 #include "llama-arch.h"
@@ -1418,6 +1419,9 @@ llama_context::llama_context(
             LLAMA_LOG_INFO("%s: pipeline parallelism enabled\n", __func__);
         }
 
+        // [TAG_MOE_BRIDGE] LLAMA_MOE_BRIDGE=1: before the reserve, so decode graphs are reserved with the bridge ops
+        moe_bridge = llama_moe_bridge_create(model, (int) cparams.n_threads);
+
         sched_reserve();
 
         // [TAG_FN_MOE_HOT] sized after the reserve, so LLAMA_MOE_HOT_MIB=auto sees what the KV cache and the compute
@@ -1448,6 +1452,9 @@ llama_context::llama_context(
 llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
+
+    llama_moe_bridge_free(moe_bridge); // [TAG_MOE_BRIDGE] no graph runs now
+    moe_bridge = nullptr;
 
     llama_moe_trace_flush(); // [TAG_FN_MOE_TRACE]
 
@@ -2649,6 +2656,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         return nullptr;
     }
 
+    llama_moe_bridge_step(moe_bridge); // [TAG_MOE_BRIDGE] re-arm a paused bridge before the graph parameters are taken
+
     auto * res = get_gf_res_prev(ubatch); // [TAG_FN_GRAPH_PER_WIDTH] same as get_gf_res_prev() unless enabled
     auto * gf  = res->get_gf();
 
@@ -2739,6 +2748,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
+    // [TAG_MOE_BRIDGE] wake the host executor for a graph that posts to it, or park it (a CPU split may run)
+    const bool moe_bridge_used = res->n_moe_bridge > 0;
+    llama_moe_bridge_begin(moe_bridge, moe_bridge_used);
+
     const bool    gap_probe = llama_host_gap_probe_enabled(); // [TAG_HOST_GAP_PROBE]
     const int64_t t_gap_c0  = gap_probe ? ggml_time_us() : 0;
 
@@ -2752,6 +2765,16 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
         return nullptr;
+    }
+
+    // [TAG_MOE_BRIDGE] a bridge wait that timed out (or a host job that failed) left zeros in this ubatch: fail it, so
+    // the memory rollback of decode() runs and nothing wrong reaches the caller. The bridge pauses, then re-arms.
+    if (moe_bridge_used) {
+        ggml_backend_sched_synchronize(sched.get());
+        if (!llama_moe_bridge_end(moe_bridge)) {
+            ret = GGML_STATUS_FAILED;
+            return nullptr;
+        }
     }
 
     if (!res->t_moe_ids.empty()) { // [TAG_FN_MOE_TRACE] only built when a trace switch is set
@@ -4080,6 +4103,7 @@ llm_graph_params llama_context::graph_params(
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
+        /*.moe_bridge  =*/ llama_moe_bridge_active(moe_bridge) ? moe_bridge : nullptr, // [TAG_MOE_BRIDGE]
     };
 }
 
