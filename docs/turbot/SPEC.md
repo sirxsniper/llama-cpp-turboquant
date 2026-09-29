@@ -1839,6 +1839,88 @@ K shift (`seq_add` / `seq_div`) stays unsupported on every geometry (9.3).
 
 ---
 
+## 15. turbot on Qwen3.8-Flash-Next (qwen4exp) (`[TAG_FN_TURBOT_*]`, 2026-09-28)
+
+Owner's bar (2026-09-28): turbot must run on Flash-Next, with no q4 or other low-bit KV: q8_0-level quality (KLD and same-top within the f16 floor). turbo5p512 is only the comparison baseline.
+
+### 15.1 Model
+
+- arch `qwen4exp`: 48 blocks, n_embd 2560; full attention on layers 3, 7, ..., 47 (12), GDN on the others.
+- 24 query heads, 2 KV heads x 256: NR 2, 512-value rows, flags 1, GQA 12. IMRoPE on 64 of 256 dims. No sinks, softcap, ALiBi or SWA.
+- Every attention layer runs QSA (`models/qwen4exp.cpp` `build_attn_qsa`): an indexer (4 query heads x 128, 1 key head x 128, top-k 2048 cells in blocks of 4) picks cells, and one FA runs over the whole cache under a mask that is -inf outside the picked blocks and the unpooled tail.
+- Caches of a context: A attention K/V (turbot), B indexer keys (15.3), C GDN state (f32, per sequence), D the MTP draft context over layer 48 (15.5).
+
+### 15.2 Graph (`[TAG_FN_TURBOT_QSA]`)
+
+- `build_attn_qsa` writes a turbot cache with `turbot_cpy_k/v` (base code, young rows of young granules, center fills) and reads through `build_attn_mha_kv`: the forward WHT-128 on Q for turbo and turbot K, the young pool (src[7]), the granule table (src[8]) and the op params. `build_attn_mha_kv` takes `n_kv_max` (default 0), so f16 keeps its sparse gather. f16 and q8_0 get the same nodes as before.
+- turbot has no sparse gather: the FA reads every cell and the mask hides the unpicked ones (`ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse` is false for turbot, and the turbot kernel ignores op-params slot 4). This is correct; its cost is S1 in 15.8. q8_0 is dense too.
+- The indexer never reads the attention K, so the attention KV type does not change which cells top-k picks. turbot never moves cells and the indexer mirrors the attention slot layout, so a picked cell names the same token in both caches and in the granule table.
+- Hyper-connections, the output gate, the PLE table and the indexer's read-time norm and RoPE do not touch the attention KV. K is cached after IMRoPE, as on the 27B.
+- `llama_kv_resolve_turbo_graph` no longer refuses turbo or turbot for qwen4exp.
+
+### 15.3 Indexer key cache (`[TAG_FN_TURBOT_IDX]`)
+
+- `llama-memory-hybrid-idx.cpp` gives the indexer its own type: f32, f16, bf16 and q8_0 are kept; every other attention type (turbot, the turbo types, q4_0, ...) gives q8_0. `LLAMA_QSA_IDX_TYPE=f16|bf16|f32|q8_0` overrides it (the A/B of gate F3).
+- Before, the indexer inherited the attention type: turbot threw "shared cells and MLA caches are unsupported", turbo5p512 threw on 128-value rows, and turbo4 would have fed WHT-rotated keys to `get_rows`.
+- Size at 262144 cells: q8_0 408 MiB, f16 768 MiB.
+
+### 15.4 Plan: the quality plan (`[TAG_FN_TURBOT_PLAN]`)
+
+- `llama_turbot_plan_quality_text(shape)`:
+  - old width 6 and young width 8 on every run of every layer (Y lines);
+  - CAP 65536: the newest 64K cells of each sequence are young; when POOL is the whole cache (it costs the q8_0 bytes then), CAP is max(65536, kv_size), so no cell goes old while the pool has room (review fix: `-np 4 --kv-unified` at 262144 used to keep a long sequence at 64K young and 6 bits beyond, at the q8_0 bytes);
+  - POOL: the POOL auto rule for that CAP (per stream ceil(n_seq_max / n_stream) x (CAP + 128) + 2112 cells in whole granules, times n_stream), at most the cache, a multiple of 64 x n_stream;
+  - uncalibrated; the text starts `# turbot quality plan v1` and has a size line against q8_0. `tools/turbot/turbot_plan.py quality` prints the same text and hash.
+- Chooser (14.6): step 4 makes the quality plan instead of the byte-budget automatic plan when `shape.quality` is set (llama_context sets it for the qwen4exp main context) or with `LLAMA_TURBOT_AUTO_PLAN=quality`. `--kv-tier-plan quality` / `LLAMA_TURBOT_PLAN=quality` force it (step 1). A verified sidecar (step 2) still wins, so a calibrated Flash-Next plan replaces it without a code change. `LLAMA_TURBOT_AUTO_PLAN=0` turns it off (and then 15.5 gives q8_0).
+- One INFO line, e.g. `turbot: no verified plan names this model's 12 attention layers; quality plan (the q8-level default of this model): old width 6, young 8 on every run, POOL 67776, CAP 65536, 2623.38 MiB (q8_0 3264.00 MiB), uncalibrated, hash 0xcc97a64e9786d761`. `LLAMA_TURBOT_AUTO_PLAN_DUMP=<file>` writes the text.
+- Attention K+V of Flash-Next, MiB:
+
+| Cells | Quality plan | q8_0 | turbo5p512 (baseline) | f16 |
+|---|---|---|---|---|
+| 32768, 1 sequence | 408.00 (all young) | 408 | 252 | 768 |
+| 131072, 1 sequence | 1423.38 | 1632 | 1008 | 3072 |
+| 262144, 1 sequence | 2623.38 | 3264 | 2016 | 6144 |
+| 262144, -np 4 unified | 3264.00 (all young, CAP 262144) | 3264 | 2016 | 6144 |
+
+- Why these widths (a proxy; gate F2-F4 in TESTING.md 13 decides):
+  - per value (test-turbot-geom (i), 2000 rows of 2 x 256): young y 8 has 1.38x the q8_0 squared error on Gaussian rows (nMSE 3.9e-5 against 2.9e-5) and 0.54x on K-like rows with 8 outlier channels, which the WHT flattens;
+  - old b 6 is 6.2e-4 / 6.0e-4 nMSE (21x / 9x q8_0), about 4x below turbo5p's 5 bits;
+  - on the 27B a uniform 7-bit cache measured at the f16 floor (S3 fq_t7), and the accepted default plan has only 16K cells at 7 bits over a ~4.3-bit old tier;
+  - QSA can put all attention mass on old cells, so the old tier is 6 bits and the band 64K. If the old tier fails the gate, the fallback is a sidecar with CAP = the cache (all young, q8_0 bytes).
+- Speed note: the default build compiles young loaders only for y = 7; y = 8 runs the runtime young loader. `-DGGML_CUDA_TURBOT_YOUNG_CT_EXT=ON` compiles it (TESTING.md 12.3); gate F6 measures both.
+
+### 15.5 Fallback and the draft cache (`[TAG_FN_TURBOT_HQ]`, `[TAG_FN_TURBOT_MTP]`)
+
+- `llama_kv_resolve_input::hq_fallback` (qwen4exp; `LLAMA_KV_HQ_FALLBACK=0` clears it, `=1` sets it for every model): the chain walk passes over every turbo type that was not asked for. The WARN line says `turbo5p, turbo4: not a fallback for this model (its KV bar is q8_0; LLAMA_KV_HQ_FALLBACK=0 allows it)`. A refused turbot goes to q8_0, then f16. A turbo type that was asked for is kept (turbo5p runs as turbo5p512 on 512-value rows). The `LLAMA_TURBOT=0` kill switch follows the same bar: q8_0 on qwen4exp, turbo5p elsewhere.
+- The MTP draft context (`--spec-type draft-mtp --spec-draft-model mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf`) never uses turbot (9.1). For a qwen4exp target (general.architecture read from the GGUF header) common's swap now gives q8_0 instead of turbo5p, which became turbo5p512. +104 MiB at 262144 cells; it changes draft acceptance only.
+
+### 15.6 Expected types on Flash-Next
+
+| Request | Attention K/V | Indexer | MTP draft |
+|---|---|---|---|
+| `-ctk turbot -ctv turbot`, FA on, KV on CUDA, main context | turbot, quality plan (or a verified sidecar) | q8_0 | q8_0 |
+| the same, turbot refused for any reason | q8_0 (WARN: why, and the skipped turbo types) | q8_0 | q8_0 |
+| `-ctk q8_0 -ctv q8_0` | q8_0 | q8_0 | q8_0 |
+| `-ctk f16 -ctv f16` | f16 | f16 | f16 |
+| `-ctk turbo5p -ctv turbo5p` (asked) | turbo5p512 | q8_0 | turbo5p512 |
+| `-ctk q4_0 -ctv q4_0` (asked) | q4_0 | q8_0 | q4_0 |
+
+Every other model: unchanged (the flags are set for qwen4exp only).
+
+### 15.7 Tests
+
+- `test-kv-resolve` `test_flash_next`; `test-turbot` [8c']; `test-turbot-geom` (g) D 256 NR 2 GQA 12 with the quality widths and a QSA-shaped mask, and (i) the quality widths against q8_0.
+- `test-backend-ops` (GPU): FA at `d=256,hkv=2,hq=24` for `nr2q` (the quality widths), `nr2a`, `nr2b` and `nr2l`, mask modes 1, 2 and 3 (3 = a QSA mask with n_kv_max set as `build_attn_qsa` sets it), kv 96..65536, nb 1..1280; the writer at `nr2q`; perf `nr2q` against turbo5p512 and q8_0 at kv 32K / 131K / 262K.
+- GPU gates F0-F8: TESTING.md section 13.
+
+### 15.8 Open
+
+- S1: turbot has no sparse gather, so QSA reads every cell of the 12 layers (dense masked FA, as q8_0 does); only f16 gathers the ~2051 picked cells. Measure (F6) before building a turbot gather.
+- The quality plan is uncalibrated. A calibrated per-head plan needs a Flash-Next K/V dump (the S1/S2 method of the 27B) and ships as a verified sidecar.
+- GQA 12 has never run on the GPU (F1).
+
+---
+
 ## Review log (2026-09-15)
 
 Each review issue was checked against the code or reproduced on CPU (`scratchpad/turbot_review_mc.py`, `scratchpad/turbot_review_indep.py`, and the a_lloyd convergence probe).

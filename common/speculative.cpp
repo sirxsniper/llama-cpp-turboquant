@@ -22,6 +22,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <iomanip>
 #include <map>
 #include <mutex>
@@ -4477,6 +4478,37 @@ const std::vector<double> & common_speculative_get_synth_probs(const common_spec
     return spec->synth_probs;
 }
 
+// [TAG_FN_TURBOT_MTP] general.architecture of a GGUF file (header only, cached per path), "" when it cannot be read
+static std::string common_spec_gguf_arch(const std::string & path) {
+    static std::mutex                         mutex;
+    static std::map<std::string, std::string> cache;
+
+    std::lock_guard<std::mutex> lock(mutex);
+    const auto it = cache.find(path);
+    if (it != cache.end()) {
+        return it->second;
+    }
+
+    std::string arch;
+    std::error_code ec;
+    if (!path.empty() && std::filesystem::is_regular_file(std::filesystem::path(path), ec)) {
+        struct gguf_init_params gguf_params = {
+            /* .no_alloc = */ true,
+            /* .ctx      = */ nullptr,
+        };
+        gguf_context_ptr gguf_ctx(gguf_init_from_file(path.c_str(), gguf_params));
+        if (gguf_ctx) {
+            const int64_t id = gguf_find_key(gguf_ctx.get(), "general.architecture");
+            if (id >= 0 && gguf_get_kv_type(gguf_ctx.get(), id) == GGUF_TYPE_STRING) {
+                arch = gguf_get_val_str(gguf_ctx.get(), id);
+            }
+        }
+    }
+
+    cache[path] = arch;
+    return arch;
+}
+
 common_params common_base_params_to_speculative(const common_params & params) {
     const bool has_draft = params.speculative.has_dft();
 
@@ -4518,15 +4550,26 @@ common_params common_base_params_to_speculative(const common_params & params) {
     if (result.cache_type_k == GGML_TYPE_TURBOT_S8 || result.cache_type_v == GGML_TYPE_TURBOT_S8) {
         const bool asked = (params_spec.cache_type_k_set && params_spec.cache_type_k == GGML_TYPE_TURBOT_S8) ||
                            (params_spec.cache_type_v_set && params_spec.cache_type_v == GGML_TYPE_TURBOT_S8);
+        // [TAG_FN_TURBOT_MTP] Qwen3.8-Flash-Next (qwen4exp, its MTP head) keeps its KV at q8_0 or better: q8_0 for the
+        // draft cache, not turbo5p (turbo5p512 on its 512-value rows). +104 MiB at 262144 cells; it changes only the
+        // draft acceptance, never the output. LLAMA_KV_HQ_FALLBACK=0 restores turbo5p, as in llama_context.
+        const char * hq_env = getenv("LLAMA_KV_HQ_FALLBACK");
+        const bool   hq     = !(hq_env != nullptr && strcmp(hq_env, "0") == 0) &&
+                              ((hq_env != nullptr && strcmp(hq_env, "1") == 0) || common_spec_gguf_arch(params.model.path) == "qwen4exp");
+        const ggml_type swap = hq ? GGML_TYPE_Q8_0 : GGML_TYPE_TURBO5P_0;
         if (result.cache_type_k == GGML_TYPE_TURBOT_S8) {
-            result.cache_type_k = GGML_TYPE_TURBO5P_0;
+            result.cache_type_k = swap;
         }
         if (result.cache_type_v == GGML_TYPE_TURBOT_S8) {
-            result.cache_type_v = GGML_TYPE_TURBO5P_0;
+            result.cache_type_v = swap;
         }
         static std::atomic<bool> warned{false};
-        if (asked && !warned.exchange(true)) {
-            LOG_WRN("%s: the draft KV cache does not support turbot, using turbo5p for it\n", __func__);
+        if ((asked || hq) && !warned.exchange(true)) {
+            if (asked) {
+                LOG_WRN("%s: the draft KV cache does not support turbot, using %s for it\n", __func__, ggml_type_name(swap));
+            } else {
+                LOG_INF("%s: the draft KV cache does not support turbot; this model keeps q8-level KV, using q8_0 for it\n", __func__);
+            }
         }
     }
 

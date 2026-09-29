@@ -70,6 +70,7 @@ llama_turbot_switches llama_turbot_read_switches() {
     if (!sw.any) {
         sw.auto_plan           = false;
         sw.auto_all            = false;
+        sw.auto_quality        = false;
         sw.auto_budget_turbo5p = false;
         sw.sidecar             = false;
         sw.iswa                = false;
@@ -80,6 +81,7 @@ llama_turbot_switches llama_turbot_read_switches() {
 
     sw.auto_plan           = !llama_turbot_env_is("LLAMA_TURBOT_AUTO_PLAN", "0");
     sw.auto_all            =  llama_turbot_env_is("LLAMA_TURBOT_AUTO_PLAN", "all");
+    sw.auto_quality        =  llama_turbot_env_is("LLAMA_TURBOT_AUTO_PLAN", "quality");   // [TAG_FN_TURBOT_PLAN]
     sw.auto_budget_turbo5p =  llama_turbot_env_is("LLAMA_TURBOT_AUTO_BUDGET", "turbo5p");
     sw.sidecar             = !llama_turbot_env_is("LLAMA_TURBOT_SIDECAR", "0");
     sw.iswa                = !llama_turbot_env_is("LLAMA_TURBOT_ISWA", "0");
@@ -574,6 +576,11 @@ llama_turbot_plan_source llama_turbot_plan_get_source() {
         src.origin = LLAMA_TURBOT_PLAN_AUTO_FORCED;
         src.name   = LLAMA_TURBOT_PLAN_AUTO_NAME;
         src.set_by = set_by;
+    } else if (value == LLAMA_TURBOT_PLAN_KEYWORD_QUALITY && llama_turbot_read_switches().any) {
+        // [TAG_FN_TURBOT_PLAN] the quality plan of the cache shape; with LLAMA_TURBOT_ANY=0 "quality" names a file
+        src.origin = LLAMA_TURBOT_PLAN_QUALITY_FORCED;
+        src.name   = LLAMA_TURBOT_PLAN_QUALITY_NAME;
+        src.set_by = set_by;
     } else {
         src.origin = LLAMA_TURBOT_PLAN_FILE;
         src.path   = value;
@@ -614,6 +621,13 @@ bool llama_turbot_plan_read(const llama_turbot_plan_source & src, std::string & 
         text.clear();
         err = format("turbot: plan %s: an automatic plan is generated from the cache shape (llama_turbot_plan_auto_text)",
                 LLAMA_TURBOT_PLAN_AUTO_NAME);
+        return false;
+    }
+
+    if (src.origin == LLAMA_TURBOT_PLAN_QUALITY_FORCED) {   // [TAG_FN_TURBOT_PLAN]
+        text.clear();
+        err = format("turbot: plan %s: the quality plan is generated from the cache shape (llama_turbot_plan_quality_text)",
+                LLAMA_TURBOT_PLAN_QUALITY_NAME);
         return false;
     }
 
@@ -858,6 +872,116 @@ bool llama_turbot_plan_auto_text(const llama_turbot_cache_shape & shape, std::st
     return llama_turbot_auto_impl(shape, llama_turbot_read_switches(), text, why);
 }
 
+//
+// [TAG_FN_TURBOT_PLAN] quality plan (tools/turbot/turbot_plan.py quality_plan mirrors this, text and hash)
+//
+
+// q8_0 bytes of one cell of every layer-side of geoms (the size line of the quality plan)
+static uint64_t llama_turbot_q8_cell_bytes(const std::map<int32_t, llama_turbot_shape_geom> & geoms) {
+    uint64_t b = 0;
+    for (const auto & it : geoms) {
+        b += 2*(uint64_t) ggml_row_size(GGML_TYPE_Q8_0, ggml_turbot_geom_row_elems((unsigned) it.second.flags));
+    }
+    return b;
+}
+
+static bool llama_turbot_quality_impl(const llama_turbot_cache_shape & shape, const llama_turbot_switches & sw, std::string & text,
+        std::string & why) {
+    std::map<int32_t, llama_turbot_shape_geom> geoms;
+    if (!llama_turbot_shape_geoms(shape, sw.any, geoms, why)) {
+        return false;
+    }
+    if (geoms.empty()) {
+        why = "the cache holds no attention layers";
+        return false;
+    }
+    if (shape.kv_size == 0 || shape.kv_size % GGML_TURBOT_GRANULE != 0) {
+        why = format("kv_size %u is not a positive multiple of %d", shape.kv_size, GGML_TURBOT_GRANULE);
+        return false;
+    }
+
+    const uint64_t n_stream = std::max<uint32_t>(1, shape.n_stream);
+    const uint64_t n_seq    = std::max<uint32_t>(1, shape.n_seq_max);
+    const uint64_t kv_cells = llama_turbot_shape_cells(shape);
+    const uint64_t gran     = GGML_TURBOT_GRANULE;
+    const uint64_t step     = gran*n_stream;
+    uint64_t       cap      = LLAMA_TURBOT_QUALITY_CAP;
+    const uint64_t slack    = gran*GGML_TURBOT_QUOTA_SLACK_GRANULES;
+    const int      b        = LLAMA_TURBOT_QUALITY_B;
+    const int      y        = LLAMA_TURBOT_QUALITY_Y;
+
+    // the POOL auto rule ([TAG_TURBOT_POOL_AUTO]) for this CAP, at most the cache, in whole granules per stream
+    const uint64_t need = (n_seq + n_stream - 1)/n_stream*(cap + slack) + 33*gran;
+    uint64_t pool = n_stream*((need + gran - 1)/gran*gran);
+    pool = std::min(pool, kv_cells/gran*gran);
+    pool = pool/step*step;
+
+    // a pool of the whole cache costs the q8_0 bytes anyway: no per-sequence cap then, so no cell goes old while young
+    // room is free (-np 4 unified at 262144: one long sequence stays at 8 bits, not 64K at 8 and the rest at 6)
+    if (pool >= kv_cells) {
+        cap = std::max<uint64_t>(cap, shape.kv_size);
+    }
+
+    uint64_t base  = 0;
+    uint64_t young = 0;
+    for (const auto & it : geoms) {
+        const uint64_t nr = (uint64_t) it.second.nr;
+        base  += 2*(32*(uint64_t) b*nr + 16);
+        young += 2*(32*(uint64_t) (y - b)*nr + 16);
+    }
+    const uint64_t bytes = kv_cells*base + pool*young;
+    const uint64_t q8    = kv_cells*llama_turbot_q8_cell_bytes(geoms);
+
+    // the geometries in order of first appearance by il, "<count> x <KV heads>x<head dim>" (as the automatic plan)
+    std::vector<std::pair<std::pair<int, int>, int>> groups;
+    for (const auto & it : geoms) {
+        const std::pair<int, int> key((int) it.second.n_head_kv, (int) it.second.head_dim);
+        auto g = std::find_if(groups.begin(), groups.end(), [&](const auto & e) { return e.first == key; });
+        if (g == groups.end()) {
+            groups.push_back({ key, 1 });
+        } else {
+            g->second++;
+        }
+    }
+    std::string geo;
+    for (size_t i = 0; i < groups.size(); ++i) {
+        geo += format("%s%d x %dx%d", i ? ", " : "", groups[i].second, groups[i].first.first, groups[i].first.second);
+    }
+
+    const auto widths = [](int w, int nr) {
+        std::string s;
+        for (int r = 0; r < nr; ++r) {
+            s += format(" %d", w);
+        }
+        return s;
+    };
+
+    text  = "# turbot quality plan v1\n";
+    text += format("# shape: %d attention layers: %s (KV heads x head dim); kv_size %u, n_stream %u, n_seq_max %u\n",
+            (int) geoms.size(), geo.c_str(), shape.kv_size, (unsigned) n_stream, (unsigned) n_seq);
+    text += format("# widths: old %d, young %d on every run; the newest %llu cells of each sequence are young; uncalibrated\n",
+            b, y, (unsigned long long) cap);
+    text += format("# size: %.2f MiB (q8_0 %.2f MiB)\n", bytes/LLAMA_TURBOT_MIB, q8/LLAMA_TURBOT_MIB);
+    for (const auto & it : geoms) {
+        const int nr = it.second.nr;
+        text += format("L %d K%s V%s\n", it.first, widths(b, nr).c_str(), widths(b, nr).c_str());
+    }
+    for (const auto & it : geoms) {
+        const int nr = it.second.nr;
+        text += format("Y %d K%s V%s\n", it.first, widths(y, nr).c_str(), widths(y, nr).c_str());
+    }
+    text += format("POOL %llu\n", (unsigned long long) pool);
+    text += format("CAP %llu\n",  (unsigned long long) cap);
+
+    why.clear();
+
+    return true;
+}
+
+bool llama_turbot_plan_quality_text(const llama_turbot_cache_shape & shape, std::string & text, std::string & why) {
+    return llama_turbot_quality_impl(shape, llama_turbot_read_switches(), text, why);
+}
+
 // may step 4 give shape an automatic plan? (the validated geometries, LLAMA_TURBOT_AUTO_PLAN=all for every supported
 // one, LLAMA_TURBOT_AUTO_BUDGET=turbo5p for the one-run geometries)
 static bool llama_turbot_auto_allowed(const llama_turbot_cache_shape & shape, const llama_turbot_switches & sw, std::string & why) {
@@ -1038,6 +1162,22 @@ bool llama_turbot_plan_choose(const llama_turbot_cache_shape & shape, llama_turb
         why.clear();
         return true;
     }
+    if (src.origin == LLAMA_TURBOT_PLAN_QUALITY_FORCED) {   // [TAG_FN_TURBOT_PLAN]
+        std::string msg;
+        if (!llama_turbot_quality_impl(shape, sw, text, msg)) {
+            why = format("turbot: plan %s (%s " LLAMA_TURBOT_PLAN_KEYWORD_QUALITY "): %s", LLAMA_TURBOT_PLAN_QUALITY_NAME,
+                    src.set_by == "LLAMA_TURBOT_PLAN" ? "LLAMA_TURBOT_PLAN=" : "--kv-tier-plan", msg.c_str());
+            return false;
+        }
+        if (!llama_turbot_plan_parse_impl(text, LLAMA_TURBOT_PLAN_QUALITY_NAME, shape, plan, why, /*quiet =*/ true)) {
+            return false;
+        }
+        choice.kind = LLAMA_TURBOT_PLAN_KIND_QUALITY;
+        choice.text = text;
+        choice.name = LLAMA_TURBOT_PLAN_QUALITY_NAME;
+        why.clear();
+        return true;
+    }
 
     // 2. a verified sidecar of this model
     std::string why_sidecar;
@@ -1075,13 +1215,27 @@ bool llama_turbot_plan_choose(const llama_turbot_cache_shape & shape, llama_turb
         return true;
     }
 
-    // 4. the automatic plan
+    // 4. the automatic plan; [TAG_FN_TURBOT_PLAN] the quality plan for a model whose KV bar is q8_0 (shape.quality) or with
+    // LLAMA_TURBOT_AUTO_PLAN=quality, never the byte-budget plan there
     std::string why_auto;
     if (sw.any) {
         if (!shape.auto_ok) {
             why_auto = "an automatic plan is only made for the main context";
         } else if (!sw.auto_plan) {
             why_auto = "LLAMA_TURBOT_AUTO_PLAN=0";
+        } else if (shape.quality || sw.auto_quality) {
+            std::string msg;
+            if (llama_turbot_quality_impl(shape, sw, text, msg)) {
+                if (llama_turbot_plan_parse_impl(text, LLAMA_TURBOT_PLAN_QUALITY_NAME, shape, plan, why_auto, /*quiet =*/ true)) {
+                    choice.kind = LLAMA_TURBOT_PLAN_KIND_QUALITY;
+                    choice.text = text;
+                    choice.name = LLAMA_TURBOT_PLAN_QUALITY_NAME;
+                    why.clear();
+                    return true;
+                }
+            } else {
+                why_auto = "the quality plan: " + msg;
+            }
         } else if (llama_turbot_auto_allowed(shape, sw, why_auto)) {
             std::string msg;
             if (llama_turbot_auto_impl(shape, sw, text, msg)) {
@@ -1178,6 +1332,41 @@ static void llama_turbot_log_auto(const char * func, const llama_turbot_cache_sh
     }
 }
 
+// [TAG_FN_TURBOT_PLAN] the INFO line of the quality plan, and LLAMA_TURBOT_AUTO_PLAN_DUMP
+static void llama_turbot_log_quality(const char * func, const llama_turbot_cache_shape & shape, const llama_turbot_plan & plan,
+        const std::string & text, const llama_turbot_plan_source & src) {
+    std::map<int32_t, llama_turbot_shape_geom> geoms;
+    std::string msg;
+    llama_turbot_shape_geoms(shape, llama_turbot_read_switches().any, geoms, msg);
+
+    const uint64_t kv_cells = llama_turbot_shape_cells(shape);
+
+    std::string head;
+    if (src.origin == LLAMA_TURBOT_PLAN_QUALITY_FORCED) {
+        head = format("%s: quality plan", src.set_by == "LLAMA_TURBOT_PLAN" ? "LLAMA_TURBOT_PLAN=" LLAMA_TURBOT_PLAN_KEYWORD_QUALITY
+                                                                            : "--kv-tier-plan " LLAMA_TURBOT_PLAN_KEYWORD_QUALITY);
+    } else {
+        head = format("no verified plan names this model's %d attention layers; quality plan (%s)", (int) plan.layers.size(),
+                shape.quality ? "the q8-level default of this model" : "LLAMA_TURBOT_AUTO_PLAN=quality");
+    }
+
+    LLAMA_LOG_INFO("%s: turbot: %s: old width %d, young %d on every run, POOL %u, CAP %u, %.2f MiB (q8_0 %.2f MiB), uncalibrated, hash 0x%016llx\n",
+            func, head.c_str(), LLAMA_TURBOT_QUALITY_B, LLAMA_TURBOT_QUALITY_Y, plan.pool_cells, plan.cap_cells,
+            llama_turbot_plan_bytes(plan, kv_cells)/LLAMA_TURBOT_MIB, kv_cells*llama_turbot_q8_cell_bytes(geoms)/LLAMA_TURBOT_MIB,
+            (unsigned long long) plan.hash);
+
+    const char * dump = getenv("LLAMA_TURBOT_AUTO_PLAN_DUMP");
+    if (dump != nullptr && dump[0] != '\0') {
+        std::ofstream f(dump, std::ios::binary);
+        f << text;
+        if (!f) {
+            LLAMA_LOG_WARN("%s: turbot: LLAMA_TURBOT_AUTO_PLAN_DUMP: cannot write %s\n", func, dump);
+        } else {
+            LLAMA_LOG_INFO("%s: turbot: quality plan written to %s (LLAMA_TURBOT_AUTO_PLAN_DUMP)\n", func, dump);
+        }
+    }
+}
+
 // [TAG_TURBOT_ANY_SIDECAR] a sidecar that was set but not used says why, once per path
 static void llama_turbot_log_sidecar_unused(const char * func, const llama_turbot_cache_shape & shape, llama_turbot_plan_kind used,
         bool scoped) {
@@ -1199,7 +1388,8 @@ static void llama_turbot_log_sidecar_unused(const char * func, const llama_turbo
 
     std::string why;
     const llama_turbot_plan_source src = llama_turbot_plan_get_source();
-    if (src.origin == LLAMA_TURBOT_PLAN_FILE || src.origin == LLAMA_TURBOT_PLAN_BUILTIN_FORCED || src.origin == LLAMA_TURBOT_PLAN_AUTO_FORCED) {
+    if (src.origin == LLAMA_TURBOT_PLAN_FILE || src.origin == LLAMA_TURBOT_PLAN_BUILTIN_FORCED || src.origin == LLAMA_TURBOT_PLAN_AUTO_FORCED ||
+            src.origin == LLAMA_TURBOT_PLAN_QUALITY_FORCED) {
         why = format("%s is given", src.set_by.c_str());
     } else if (!scoped) {
         why = "without a plan chosen by llama_context (LLAMA_KV_RESOLVE=0) only --kv-tier-plan, LLAMA_TURBOT_PLAN and the built-in plan are used";
@@ -1250,6 +1440,15 @@ bool llama_turbot_plan_load(const llama_turbot_cache_shape & shape, llama_turbot
                 llama_turbot_log_auto(__func__, shape, res, scope->text, src);
                 llama_turbot_log_fingerprint(__func__, shape);
                 break;
+            case LLAMA_TURBOT_PLAN_KIND_QUALITY:   // [TAG_FN_TURBOT_PLAN]
+                {
+                    // the chooser's shape carried quality; the constructor's own shape does not, so ask the source
+                    llama_turbot_cache_shape s = shape;
+                    s.quality = src.origin != LLAMA_TURBOT_PLAN_QUALITY_FORCED && !llama_turbot_read_switches().auto_quality;
+                    llama_turbot_log_quality(__func__, s, res, scope->text, src);
+                    llama_turbot_log_fingerprint(__func__, shape);
+                }
+                break;
             case LLAMA_TURBOT_PLAN_KIND_FILE:
                 llama_turbot_log_fingerprint(__func__, shape);
                 break;
@@ -1280,6 +1479,29 @@ bool llama_turbot_plan_load(const llama_turbot_cache_shape & shape, llama_turbot
         llama_turbot_log_auto(__func__, shape, res, text, src);
         llama_turbot_log_fingerprint(__func__, shape);
         llama_turbot_log_sidecar_unused(__func__, shape, LLAMA_TURBOT_PLAN_KIND_AUTO, false);
+
+        plan = std::move(res);
+
+        return true;
+    }
+
+    // [TAG_FN_TURBOT_PLAN] "quality" without a scope, the same way
+    if (src.origin == LLAMA_TURBOT_PLAN_QUALITY_FORCED) {
+        std::string text;
+        std::string msg;
+        if (!llama_turbot_quality_impl(shape, llama_turbot_read_switches(), text, msg)) {
+            err = format("turbot: plan %s (%s " LLAMA_TURBOT_PLAN_KEYWORD_QUALITY "): %s", LLAMA_TURBOT_PLAN_QUALITY_NAME,
+                    src.set_by == "LLAMA_TURBOT_PLAN" ? "LLAMA_TURBOT_PLAN=" : "--kv-tier-plan", msg.c_str());
+            return false;
+        }
+        if (!llama_turbot_plan_parse_impl(text, LLAMA_TURBOT_PLAN_QUALITY_NAME, shape, res, err)) {
+            return false;
+        }
+        res.path = LLAMA_TURBOT_PLAN_QUALITY_NAME;
+
+        llama_turbot_log_quality(__func__, shape, res, text, src);
+        llama_turbot_log_fingerprint(__func__, shape);
+        llama_turbot_log_sidecar_unused(__func__, shape, LLAMA_TURBOT_PLAN_KIND_QUALITY, false);
 
         plan = std::move(res);
 

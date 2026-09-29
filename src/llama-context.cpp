@@ -311,6 +311,7 @@ llama_turbot_cache_shape llama_kv_resolve_turbot_shape_of(const llama_kv_resolve
     shape.n_stream  = in.n_stream;
     shape.n_seq_max = in.n_seq_max;
     shape.auto_ok   = in.ctx_default;
+    shape.quality   = in.turbot_quality;   // [TAG_FN_TURBOT_PLAN]
     shape.model     = nullptr;
     return shape;
 }
@@ -454,6 +455,11 @@ static ggml_type llama_kv_resolve_walk(const llama_kv_resolve_input & in, const 
         ggml_type req_k, ggml_type req_v, llama_kv_resolve_notes & notes) {
     for (size_t i = 0; i < chain.size(); ++i) {
         const ggml_type t = chain[i];
+        // [TAG_FN_TURBOT_HQ] a model with a q8_0 KV bar passes over the turbo types it did not ask for, and says so
+        if (in.hq_fallback && llama_kv_resolve_is_turbo(t) && t != req_k && t != req_v && i + 1 < chain.size()) {
+            notes.add(t, "not a fallback for this model (its KV bar is q8_0; LLAMA_KV_HQ_FALLBACK=0 allows it)");
+            continue;
+        }
         std::string why;
         if (ggml_turbot_is_type(t)) {
             why = llama_kv_resolve_turbot_refusal(in,
@@ -675,6 +681,8 @@ static bool llama_kv_resolve_attn_layer(const llama_model & model, llama_context
 // [TAG_KV_RESOLVE] archs whose attention input has no turbo query rotation (llama-graph.cpp: build_attn for
 // llm_graph_input_attn_k_dsa / k_dsa_iswa / k_iswa): a turbo cache there would be read without the rotation
 static bool llama_kv_resolve_turbo_graph(const llama_model & model, llama_context_type ctx_type) {
+    GGML_UNUSED(ctx_type);   // [TAG_FN_TURBOT_QSA] no arch keys on it any more (qwen4exp did)
+
     switch (model.arch) {
         case LLM_ARCH_DEEPSEEK32:
         case LLM_ARCH_GLM_DSA:
@@ -686,25 +694,10 @@ static bool llama_kv_resolve_turbo_graph(const llama_model & model, llama_contex
         case LLM_ARCH_MINIMAX_M3:
             return false;
         case LLM_ARCH_QWEN4EXP:
-            {
-                // [TAG_KV_RESOLVE] the QSA layers (compress ratio > 0 with the indexer cache, models/qwen4exp.cpp
-                // build_attn_qsa) call build_attn_mha without the forward WHT on Q; dense-only checkpoints are fine
-                const auto & hp = model.hparams;
-                if (hp.indexer_head_size == 0) {
-                    return true;
-                }
-                // [TAG_QWEN4EXP_MTP] an MTP context holds only the nextn block, and graph_mtp runs it through the
-                // dense build_attn (no indexer cache there), which applies the rotation
-                if (ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
-                    return true;
-                }
-                for (uint32_t il = 0; il < hp.n_layer_all && il < LLAMA_MAX_LAYERS; ++il) {
-                    if (hp.dsv4_compress_ratios[il] > 0) {
-                        return false;
-                    }
-                }
-                return true;
-            }
+            // [TAG_FN_TURBOT_QSA] the QSA layers (models/qwen4exp.cpp build_attn_qsa) read through build_attn_mha_kv like
+            // the dense path: forward WHT on Q, turbot writer, young pool and granule table. The indexer cache takes its
+            // own type (llama-memory-hybrid-idx.cpp [TAG_FN_TURBOT_IDX]). The MTP context runs the dense build_attn.
+            return true;
         case LLM_ARCH_DFLASH:
             return model.hparams.dsv4_hc_mult == 0;   // the DeepSeek V4 DSpark stages use k_iswa
         default:
@@ -806,6 +799,15 @@ static std::string llama_kv_resolve_turbot_kernel_refusal(uint32_t il, ggml_back
     return "";
 }
 
+// [TAG_FN_TURBOT_HQ] Qwen3.8-Flash-Next (qwen4exp): the owner's KV bar is q8_0, so a refused or disabled turbot steps to
+// q8_0, never to turbo5p512 or turbo4. LLAMA_KV_HQ_FALLBACK=0 restores the turbo steps, =1 applies the rule to every model.
+static bool llama_kv_hq_fallback(const llama_model & model) {
+    const char * e   = getenv("LLAMA_KV_HQ_FALLBACK");
+    const bool   on  = e != nullptr && strcmp(e, "1") == 0;
+    const bool   off = e != nullptr && strcmp(e, "0") == 0;
+    return on || (!off && model.arch == LLM_ARCH_QWEN4EXP);
+}
+
 // [TAG_KV_RESOLVE] the resolver input for model and params, without the plan check. turbot_refused: the turbot cache
 // constructor refused anyway (the llama_context constructor's fallback), so turbot is out.
 static llama_kv_resolve_input llama_kv_resolve_make_input(const llama_model & model, const llama_context_params & params,
@@ -831,6 +833,12 @@ static llama_kv_resolve_input llama_kv_resolve_make_input(const llama_model & mo
     // [TAG_TURBOT_ANY_RESOLVE] only the main context may get an automatic plan: not an MTP context, not a draft model
     // (common also swaps turbot out of every draft context, [TAG_TURBOT] in common/speculative.cpp)
     in.ctx_default    = params.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && model.arch != LLM_ARCH_DFLASH;
+
+    in.hq_fallback = llama_kv_hq_fallback(model);   // [TAG_FN_TURBOT_HQ]
+
+    // [TAG_FN_TURBOT_PLAN] and turbot takes the quality plan there (old 6 / young 8 bits) when no verified sidecar is given,
+    // instead of the turbo5p512-budget automatic plan, which is not validated on 2 KV heads x 256 anyway
+    in.turbot_quality = model.arch == LLM_ARCH_QWEN4EXP;
 
     const bool want_turbot = ggml_turbot_is_type(params.type_k) || ggml_turbot_is_type(params.type_v);
     if (want_turbot) {
@@ -5297,9 +5305,12 @@ llama_context * llama_init_from_model(
     if (ggml_turbot_is_type(params.type_k) || ggml_turbot_is_type(params.type_v)) {
         const char * LLAMA_TURBOT = getenv("LLAMA_TURBOT");
         if (LLAMA_TURBOT && strcmp(LLAMA_TURBOT, "0") == 0) {
-            LLAMA_LOG_WARN("%s: LLAMA_TURBOT=0: turbot disabled, using turbo5p\n", __func__);
-            params.type_k = GGML_TYPE_TURBO5P_0;
-            params.type_v = GGML_TYPE_TURBO5P_0;
+            // [TAG_FN_TURBOT_HQ] a model whose KV bar is q8_0 gets q8_0 here too, not turbo5p
+            const bool hq = llama_kv_hq_fallback(*model);
+            LLAMA_LOG_WARN("%s: LLAMA_TURBOT=0: turbot disabled, using %s\n", __func__,
+                    hq ? "q8_0 (this model's KV bar is q8_0; LLAMA_KV_HQ_FALLBACK=0 gives turbo5p)" : "turbo5p");
+            params.type_k = hq ? GGML_TYPE_Q8_0 : GGML_TYPE_TURBO5P_0;
+            params.type_v = hq ? GGML_TYPE_Q8_0 : GGML_TYPE_TURBO5P_0;
         }
     }
 

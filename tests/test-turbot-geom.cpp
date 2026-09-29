@@ -13,6 +13,8 @@
 //   (g) CPU flash attention reference over turbot K/V at D 128 NR 4 (GQA 4 and 7), D 256 NR 2 (GQA 8) and the other
 //       geometries, against dense attention over the decoded K/V; supports_op follows the op-params geometry
 //   (h) CPU writer op (GGML_OP_TURBOT_SET_ROWS) at NR 1, 2 and 4, fill entries included, against the header coder
+//   (i) [TAG_FN_TURBOT_TESTS] the quality plan's widths (old 6, young 8) against q8_0 on 2 x 256 rows; (g) also runs
+//       D 256 NR 2 GQA 12 (Qwen3.8-Flash-Next) with those widths and a QSA-shaped mask
 //
 // (g) and (h) call the CPU backend directly (ggml-cpu.h), which links only without GGML_BACKEND_DL: tests/CMakeLists.txt
 // defines TURBOT_GEOM_CPU_OPS in that case, and the two parts print SKIPPED otherwise.
@@ -707,6 +709,74 @@ static void test_op_params() {
     }
 }
 
+// ---------------------------------------------------------------------------------------------------------------
+// (i) [TAG_FN_TURBOT_TESTS] the quality plan's widths against q8_0, the KV bar of Qwen3.8-Flash-Next
+// ---------------------------------------------------------------------------------------------------------------
+
+// the widths of the quality plan (llama_turbot_plan_quality_text)
+static const uint8_t QUALITY_B[4] = { 6, 6, 6, 6 };
+static const uint8_t QUALITY_Y[4] = { 8, 8, 8, 8 };
+
+// nMSE (sum of squared error over sum of squares) of the young (y 8) and old (b 6) decode of 2 x 256 rows against the q8_0
+// round trip of the same rows: Gaussian rows, and K-like rows with 8 channels 6x larger. A proxy for the q8-level claim
+// of the plan (the real gate is KLD against f16 on the GPU): the young tier must stay within 2.5x of q8_0 (8-bit Lloyd-Max
+// has 1.38x the q8_0 error on the Gaussian rows here, 0.54x on the K-like rows, which the WHT flattens), the old tier
+// below 1e-3 (6.2e-4 / 6.0e-4 measured; turbo5p's 5 bits are about 2.5e-3).
+static void test_quality_widths() {
+    printf("[i] quality plan widths (old 6, young 8) against q8_0, 2 x 256 rows\n");
+
+    const int flags = ggml_turbot_geom_flags(256, 2);
+    ggml_turbot_layer l;
+    TCHECK(flags >= 0 && ggml_turbot_layer_init_geom(&l, QUALITY_B, QUALITY_B, QUALITY_Y, QUALITY_Y, (unsigned) flags), "quality layer");
+    if (flags < 0) {
+        return;
+    }
+    const int row = ggml_turbot_geom_row_elems((unsigned) flags);
+
+    const ggml_type_traits * tq = ggml_get_type_traits(GGML_TYPE_Q8_0);
+
+    std::mt19937 gen(2028);
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+
+    for (int kind = 0; kind < 2; ++kind) {
+        std::vector<float>   x(row), xr(row), dy(row), dold(row), dq(row);
+        std::vector<uint8_t> base(l.k.base_row_bytes), young(l.pool_row_bytes), q8(ggml_row_size(GGML_TYPE_Q8_0, row));
+        double e_y = 0.0, e_o = 0.0, e_q = 0.0, e_x = 0.0;
+        for (int n = 0; n < 2000; ++n) {
+            for (auto & v : x) {
+                v = nd(gen);
+            }
+            if (kind == 1) {
+                for (int c = 0; c < 8; ++c) {
+                    x[(n*37 + c*61) % row] *= 6.0f;
+                }
+            }
+            ggml_turbot_encode_side(x.data(), &l.k, base.data(), young.data());
+            ggml_turbot_decode_side(base.data(), young.data(), &l.k, dy.data());
+            ggml_turbot_decode_side(base.data(), nullptr, &l.k, dold.data());
+            ggml_quantize_chunk(GGML_TYPE_Q8_0, x.data(), q8.data(), 0, 1, row, nullptr);
+            tq->to_float(q8.data(), dq.data(), row);
+            // turbot decodes to the WHT-128 domain (FA rotates Q the same way); the WHT is orthonormal, so compare there
+            xr = x;
+            for (int g = 0; g < row/128; ++g) {
+                ggml_turbot_fwht128(xr.data() + 128*g);
+            }
+            for (int i = 0; i < row; ++i) {
+                e_y += (double) (dy[i]   - xr[i]) * (dy[i]   - xr[i]);
+                e_o += (double) (dold[i] - xr[i]) * (dold[i] - xr[i]);
+                e_q += (double) (dq[i]   - x[i]) * (dq[i]   - x[i]);
+                e_x += (double) x[i] * x[i];
+            }
+        }
+        const double n_y = e_y/e_x, n_o = e_o/e_x, n_q = e_q/e_x;
+        printf("    %-9s rows: young y8 nMSE %.3g (%.2fx q8_0), old b6 %.3g (%.1fx q8_0), q8_0 %.3g\n", kind ? "K-like" : "Gaussian",
+               n_y, n_y/n_q, n_o, n_o/n_q, n_q);
+        TCHECK(n_y <= 2.5*n_q, "%s rows: young nMSE %.3g above 2.5x q8_0 %.3g", kind ? "K-like" : "Gaussian", n_y, n_q);
+        TCHECK(n_o <= 1e-3, "%s rows: old nMSE %.3g above 1e-3", kind ? "K-like" : "Gaussian", n_o);
+        TCHECK(n_y < n_o, "%s rows: young %.3g not below old %.3g", kind ? "K-like" : "Gaussian", n_y, n_o);
+    }
+}
+
 #ifdef TURBOT_GEOM_CPU_OPS
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -722,7 +792,20 @@ struct fa_case {
     int   n_q;
     bool  mask;
     float softcap;
+    int   widths    = 0;   // [TAG_FN_TURBOT_TESTS] 0: MIX_*, 1: the quality plan (old 6, young 8 on every run)
+    int   mask_kind = 0;   // [TAG_FN_TURBOT_TESTS] 0: a stripe per query, 1: QSA shape (whole blocks of 4 cells, the tail)
 };
+
+// [TAG_FN_TURBOT_TESTS] a QSA mask row (models/qwen4exp.cpp build_attn_qsa): cells in whole blocks of 4 that top-k picked
+// (about one block in 3, a different set per query) and the last 3 cells (the unpooled tail), -inf everywhere else
+static bool qsa_visible(int i, int iq, int n_kv) {
+    if (i >= n_kv - 3) {
+        return true;
+    }
+    const uint32_t blk = (uint32_t) (i / 4);
+    const uint32_t h   = (blk * 2654435761u) ^ ((uint32_t) iq * 40503u);
+    return (h >> 7) % 3 == 0;
+}
 
 static void test_fa() {
     printf("[g] CPU flash attention over turbot K/V vs dense attention over the decoded rows\n");
@@ -735,6 +818,11 @@ static void test_fa() {
         { "D128 NR2 GQA4",          128, 4,  4, 192, 2, false, 0.0f  },
         { "D128 NR1 GQA16",         128, 2, 16, 150, 2, true,  0.0f  },
         { "D256 NR4 GQA6 (Qwen)",   256, 4,  6, 192, 2, true,  0.0f  },
+        // [TAG_FN_TURBOT_TESTS] Qwen3.8-Flash-Next: 2 x 256, GQA 12 (24 query heads), the quality widths, a stripe mask and
+        // the QSA mask; the MIX widths under the QSA mask as well
+        { "D256 NR2 GQA12 quality",    256, 2, 12, 192, 3, true, 0.0f, 1, 0 },
+        { "D256 NR2 GQA12 quality QSA", 256, 2, 12, 192, 5, true, 0.0f, 1, 1 },
+        { "D256 NR2 GQA12 mix QSA",    256, 2, 12, 176, 2, true, 0.0f, 0, 1 },
     };
 
     ggml_backend_t cpu = ggml_backend_cpu_init();
@@ -755,7 +843,11 @@ static void test_fa() {
         const int n_gran    = (c.n_kv + 63) / 64;
 
         ggml_turbot_layer l;
-        TCHECK(ggml_turbot_layer_init_geom(&l, MIX_BK, MIX_BV, MIX_YK, MIX_YV, (unsigned) flags), "%s: layer", c.name);
+        if (c.widths == 1) {
+            TCHECK(ggml_turbot_layer_init_geom(&l, QUALITY_B, QUALITY_B, QUALITY_Y, QUALITY_Y, (unsigned) flags), "%s: layer", c.name);
+        } else {
+            TCHECK(ggml_turbot_layer_init_geom(&l, MIX_BK, MIX_BV, MIX_YK, MIX_YV, (unsigned) flags), "%s: layer", c.name);
+        }
 
         // granule tier pattern: granule 0 old, then young slots 1, 0, 1, ... (the last partial granule included)
         std::vector<int32_t> gtab(n_gran);
@@ -803,8 +895,8 @@ static void test_fa() {
             ggml_fp16_t * mp = (ggml_fp16_t *) m->data;
             for (int iq = 0; iq < c.n_q; ++iq) {
                 for (int i = 0; i < c.n_kv; ++i) {
-                    // hide a stripe of cells per query, keep at least cell 0 visible
-                    const bool hidden = i > 0 && ((i + 5 * iq) % 7 == 0);
+                    // hide a stripe of cells per query, keep at least cell 0 visible ([TAG_FN_TURBOT_TESTS] or the QSA shape)
+                    const bool hidden = c.mask_kind == 1 ? !qsa_visible(i, iq, c.n_kv) : (i > 0 && ((i + 5 * iq) % 7 == 0));
                     const float v = hidden ? -INFINITY : 0.0f;
                     md[(size_t) iq * c.n_kv + i] = v;
                     mp[(size_t) iq * c.n_kv + i] = ggml_fp32_to_fp16(v);
@@ -1000,6 +1092,7 @@ int main(int argc, char ** argv) {
     test_hash();
     test_types();
     test_op_params();
+    test_quality_widths();   // [TAG_FN_TURBOT_TESTS]
 #ifdef TURBOT_GEOM_CPU_OPS
     test_fa();
     test_writer();
