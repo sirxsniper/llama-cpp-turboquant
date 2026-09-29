@@ -60,6 +60,10 @@ if (Test-Path $tla) {
   # tests/CMakeLists.txt builds test-llama-archs only when NOT (WIN32 and BUILD_SHARED_LIBS); use fn_synth_check.py
   "test-llama-archs.exe not built (Windows shared build): run tools\qwen4exp\fn_synth_check.py for the qwen4exp graphs"
 }
+# [TAG_FN_MTP_COST] the MTP draft-length policy (CPU only). test-llama-archs --mtp above also checks LLAMA_MTP_HEAD_IDS and
+# LLAMA_MTP_ATTN_WINDOW by itself whenever no MTP head switch is set ([TAG_FN_MTP_HEAD_IDS] [TAG_FN_MTP_ATTN_WINDOW])
+$tmc = Join-Path $Bin "test-mtp-cost.exe"
+if (Test-Path $tmc) { Run "mtp_cost" $tmc @() @{} }
 & python "D:\Projects\LocalAI\source-build\wt-fn\tools\moe-trace\route_sim.py" --selftest
 if ($LASTEXITCODE -ne 0) { "route_sim selftest FAILED"; exit 1 }
 if (Test-Path (Join-Path $Out "archs.moet")) {

@@ -327,6 +327,9 @@ endif()
 # CPU only. llama_kv_resolve and the turbot plan parser are exported with LLAMA_API, so it links in shared builds too.
 llama_build_and_test(test-kv-resolve.cpp)
 
+# [TAG_FN_MTP_COST] cost-aware MTP draft length (common/speculative-mtp-cost.h): pieces and a step simulation, CPU only
+llama_build_and_test(test-mtp-cost.cpp)
+
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model")
 llama_build_and_test(test-autorelease.cpp       LABEL "model")
 llama_build_and_test(test-backend-sampler.cpp   LABEL "model")
