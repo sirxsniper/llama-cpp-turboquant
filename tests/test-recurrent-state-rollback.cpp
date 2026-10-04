@@ -175,11 +175,13 @@ static test_status test_multi_seq_split_replay(const common_params & params, lla
 
     // both contexts decode the identical [0, p0) prefill; only ctx_roll decodes
     // the tail, which is then rolled back so its restore is pending at replay
+    // [TAG_GDN_NW_CAP] [TAG_SYNC_1004] a ubatch of T tokens keeps T - 1 of them rollback-able (a verify step never
+    // rejects its first token), so ctx_roll starts its tail one token early: the rollback is the last 3 of 4
     for (uint32_t s = 0; s < n_seqs && ok; ++s) {
-        ok = ok && decode_range(ctx_roll.get(), s, 0, (llama_pos) p0);
+        ok = ok && decode_range(ctx_roll.get(), s, 0, (llama_pos) p0 - 1);
         ok = ok && decode_range(ctx_ref.get(),  s, 0, (llama_pos) p0);
 
-        ok = ok && decode_range(ctx_roll.get(), s, (llama_pos) p0, (llama_pos) n_prompt);
+        ok = ok && decode_range(ctx_roll.get(), s, (llama_pos) p0 - 1, (llama_pos) n_prompt);
 
         ok = ok && llama_memory_seq_rm(llama_get_memory(ctx_roll.get()), (llama_seq_id) s, p0, -1);
 
