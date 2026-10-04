@@ -563,6 +563,9 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
             return ggml_is_contiguous(op->src[0]);
         case GGML_OP_SSM_SCAN:
             return ggml_get_op_params_i32(op, 0) == 1 || op->src[3]->ne[0] == 1;
+        case GGML_OP_MOE_HOST_POST: // [TAG_MOE_BRIDGE] device backends only
+        case GGML_OP_MOE_HOST_WAIT:
+            return false;
         default:
             return true;
     }
@@ -760,6 +763,39 @@ static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const ch
     }
     if (strcmp(name, "ggml_backend_cpu_set_use_ref") == 0) {
         return (void *)ggml_backend_cpu_set_use_ref;
+    }
+    // [TAG_FN_CPU_SWITCHES] the CPU expert path switches, for tests and benchmarks that load backends dynamically
+    if (strcmp(name, "ggml_cpu_fn_get_switch") == 0) {
+        return (void *)ggml_cpu_fn_get_switch;
+    }
+    if (strcmp(name, "ggml_cpu_fn_set_switch") == 0) {
+        return (void *)ggml_cpu_fn_set_switch;
+    }
+    // [TAG_FN_CPU_MOE_FUSE] the CPU MoE worker pool and the fused-op counter
+    if (strcmp(name, "ggml_cpu_moe_pool_params_default") == 0) {
+        return (void *)ggml_cpu_moe_pool_params_default;
+    }
+    if (strcmp(name, "ggml_cpu_moe_pool_new") == 0) {
+        return (void *)ggml_cpu_moe_pool_new;
+    }
+    if (strcmp(name, "ggml_cpu_moe_pool_free") == 0) {
+        return (void *)ggml_cpu_moe_pool_free;
+    }
+    if (strcmp(name, "ggml_cpu_moe_run") == 0) {
+        return (void *)ggml_cpu_moe_run;
+    }
+    // [TAG_MOE_BRIDGE]
+    if (strcmp(name, "ggml_cpu_moe_pool_park") == 0) {
+        return (void *)ggml_cpu_moe_pool_park;
+    }
+    if (strcmp(name, "ggml_cpu_moe_pool_wake") == 0) {
+        return (void *)ggml_cpu_moe_pool_wake;
+    }
+    if (strcmp(name, "ggml_cpu_moe_layer_supported") == 0) {
+        return (void *)ggml_cpu_moe_layer_supported;
+    }
+    if (strcmp(name, "ggml_cpu_fn_moe_fused_calls") == 0) {
+        return (void *)ggml_cpu_fn_moe_fused_calls;
     }
 
     // threadpool - TODO:  move to ggml-base

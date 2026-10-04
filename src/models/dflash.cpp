@@ -39,19 +39,18 @@ static bool dfl_head_extra_token(const llama_vocab & vocab, llama_token id) {
 
 // [TAG_DFL_HEAD] the extra rows: the tokens above, plus the ids in the file LLAMA_DFLASH_HEAD_EXTRA names (separated by
 // spaces, commas or new lines, '#' starts a comment), e.g. from scripts/dflash-draft-vocab.py
-static void dfl_head_init_extra(llama_model_dflash & m, int64_t n_vocab) {
-    std::vector<int32_t> & extra = m.dfl_head_extra;
-    extra.clear();
-    for (int64_t id = m.dfl_head_rows; id < n_vocab; ++id) {
-        if (dfl_head_extra_token(m.vocab, (llama_token) id)) {
+// [TAG_FN_MTP_HEAD_ROWS] shared with the qwen4exp MTP head (declared in models.h), same rules for both
+std::vector<int32_t> llama_head_extra_rows(const llama_vocab & vocab, int64_t head_rows, int64_t n_vocab, const char * path) {
+    std::vector<int32_t> extra;
+    for (int64_t id = head_rows; id < n_vocab; ++id) {
+        if (dfl_head_extra_token(vocab, (llama_token) id)) {
             extra.push_back((int32_t) id);
         }
     }
-    const char * path = getenv("LLAMA_DFLASH_HEAD_EXTRA");
     if (path && path[0]) {
         std::ifstream f(path);
         if (!f) {
-            LLAMA_LOG_WARN("%s: [TAG_DFL_HEAD] cannot read LLAMA_DFLASH_HEAD_EXTRA '%s'\n", __func__, path);
+            LLAMA_LOG_WARN("%s: [TAG_DFL_HEAD] cannot read the head extra-rows file '%s'\n", __func__, path);
         }
         std::string line;
         while (std::getline(f, line)) {
@@ -65,7 +64,7 @@ static void dfl_head_init_extra(llama_model_dflash & m, int64_t n_vocab) {
                 }
                 const size_t end = line.find_first_of(" \t\r", beg);
                 const int64_t id = atoll(line.substr(beg, end - beg).c_str());
-                if (id >= m.dfl_head_rows && id < n_vocab) {
+                if (id >= head_rows && id < n_vocab) {
                     extra.push_back((int32_t) id);
                 }
                 pos = end;
@@ -80,10 +79,15 @@ static void dfl_head_init_extra(llama_model_dflash & m, int64_t n_vocab) {
         LLAMA_LOG_WARN("%s: [TAG_DFL_HEAD] %zu extra rows, keeping the first %zu\n", __func__, extra.size(), max_extra);
         extra.resize(max_extra);
     }
+    return extra;
+}
+
+static void dfl_head_init_extra(llama_model_dflash & m, int64_t n_vocab) {
+    m.dfl_head_extra = llama_head_extra_rows(m.vocab, m.dfl_head_rows, n_vocab, getenv("LLAMA_DFLASH_HEAD_EXTRA"));
     // the same ids as f32 for the id map; token ids < 2^24 convert exactly
     m.dfl_head_extra_f.clear();
-    m.dfl_head_extra_f.reserve(extra.size());
-    for (const int32_t id : extra) {
+    m.dfl_head_extra_f.reserve(m.dfl_head_extra.size());
+    for (const int32_t id : m.dfl_head_extra) {
         m.dfl_head_extra_f.push_back((float) id);
     }
 }

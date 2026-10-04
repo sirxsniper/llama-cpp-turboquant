@@ -158,6 +158,8 @@ def main() -> int:
     ap.add_argument("--type", choices=["q8_0", "q4_0", "f16"], default="q8_0", help="type of the large matrices")
     ap.add_argument("--sigma", type=float, default=0.02, help="std of the random matrices")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--hot-profile-out", default="", help="[TAG_FN_MOE_HOT] also write a random moeprof v1 profile "
+                    "for LLAMA_MOE_HOT_PROFILE (Zipf-skewed counts per trunk layer)")
     args = ap.parse_args()
 
     meta = load_meta(args.meta) if args.meta else default_meta(DEFAULTS)
@@ -412,6 +414,16 @@ def main() -> int:
         w.write_tensor_data(make(ne, kind, q))
     w.close()
     print(f"wrote {out}")
+    if args.hot_profile_out:
+        # [TAG_FN_MOE_HOT] a skewed random profile: tools/qwen4exp/fn_synth_check.py runs hot on / off against it
+        prng = np.random.default_rng(args.seed + 1)
+        zipf = 1.0 / np.arange(1, n_expert + 1) ** 0.9
+        lines = [f"moeprof v1 n_layer={n_trunk} n_expert={n_expert} steps=1000 source=synth_gguf"]
+        for il in range(n_trunk):
+            counts = (zipf[prng.permutation(n_expert)] * 1000).astype(np.int64) + 1
+            lines.append("decode_union %d %s" % (il, " ".join(str(int(c)) for c in counts)))
+        Path(args.hot_profile_out).write_text("\n".join(lines) + "\n", encoding="utf-8")
+        print(f"wrote {args.hot_profile_out}")
     return 0
 
 

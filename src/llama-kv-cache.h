@@ -168,6 +168,9 @@ public:
     uint32_t get_n_seq_max() const;
     uint32_t get_n_stream() const;
 
+    // [TAG_FN_MTP_ATTN_WINDOW] the sliding window this cache applies, 0 for none
+    uint32_t get_swa_window() const { return swa_type == LLAMA_SWA_TYPE_NONE ? 0 : n_swa; }
+
     bool get_has_shift() const;
 
     ggml_type type_k() const;

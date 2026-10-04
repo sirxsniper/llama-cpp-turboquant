@@ -57,5 +57,29 @@ void llama_moe_cache_init(const llama_model & model, int32_t n_slots, int32_t ma
 // nullptr when the cache is disabled or this tensor has no cached layer
 const llama_moe_cache_layer * llama_moe_cache_lookup(const ggml_tensor * up_exps);
 
-// apply throttled LRU updates; call between graph executions only
-void llama_moe_cache_step();
+// apply throttled LRU updates; call between graph executions only. ctx: the calling llama_context
+// ([TAG_FN_MOE_HOT_ADAPT] only the owner of an adaptive hot set updates it)
+void llama_moe_cache_step(const void * ctx);
+
+// [TAG_FN_MOE_HOT] static per-expert hot set, chosen once from a routing profile (tools/moe-trace, LLAMA_MOE_PROFILE):
+//   LLAMA_MOE_HOT_PROFILE=<file.moeprof>  enables it (the LRU cache above is then not built)
+//   LLAMA_MOE_HOT_MIB=<n>|auto            VRAM budget; auto = free VRAM after the reserve minus LLAMA_MOE_HOT_HEADROOM_MIB (1536)
+//   LLAMA_MOE_HOT_CAP_MIB=<n>             with auto: keep device use (all processes) at or below n MiB
+//   LLAMA_MOE_HOT_MAX_T=<n>               graphs of up to n tokens (MTP verify, 2 streams) use it, 1..8, default 8
+//   LLAMA_MOE_HOT_SECTION=<name>          profile section, default decode_union
+//   LLAMA_MOE_HOT_COST=<type=f,...>       relative CPU cost per byte by type, default q5_1=1.3
+//   LLAMA_MOE_HOT_STATS=1                 hit rate per layer every 256 decode steps
+// The same companion-tensor + two-table mechanism as the LRU cache, with a variable slot count per layer; the tables
+// are written once at init, and there is no worker and no step, so nothing races with a running graph (the CPU
+// observer is set only for LLAMA_MOE_HOT_STATS, and only counts).
+// Returns true when this call enabled it (the caller then reserves the scheduler again). Once per process.
+bool llama_moe_hot_init(const llama_model & model, const void * owner);
+
+// [TAG_FN_MOE_HOT_ADAPT] LLAMA_MOE_HOT_ADAPT=1: windowed-frequency admission into the hot slots, evict first, publish
+// after the upload has landed (LLAMA_MOE_HOT_ADMIT=N/W default 3/16, LLAMA_MOE_HOT_HYST=1, LLAMA_MOE_HOT_ADAPT_MIB=64 per
+// step, LLAMA_MOE_HOT_VERIFY=<steps> compares one resident slot with its source). The owner context must synchronize
+// its compute before llama_moe_cache_step; this returns that context, or nullptr when no adaptive set exists.
+const void * llama_moe_hot_adapt_owner();
+
+// max graph width for the hot chain, 0 when hot mode is off
+int llama_moe_hot_max_t();

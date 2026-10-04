@@ -94,6 +94,7 @@ static const char * kind_name(llama_turbot_plan_kind k) {
         case LLAMA_TURBOT_PLAN_KIND_BUILTIN: return "built-in";
         case LLAMA_TURBOT_PLAN_KIND_SIDECAR: return "sidecar";
         case LLAMA_TURBOT_PLAN_KIND_AUTO:    return "auto";
+        case LLAMA_TURBOT_PLAN_KIND_QUALITY: return "quality";   // [TAG_FN_TURBOT_TESTS]
     }
     return "?";
 }
@@ -252,6 +253,19 @@ static llama_kv_resolve_input nemotron_h(ggml_type tk, ggml_type tv) {
 // Granite 4.2 8B: 40 layers, 8 x 128 (1024-element rows)
 static llama_kv_resolve_input granite(ggml_type tk, ggml_type tv) {
     return make_model(tk, tv, 40, 8, 128);
+}
+
+// [TAG_FN_TURBOT_TESTS] Qwen3.8-Flash-Next: qwen4exp hybrid, 48 layers, full attention 3, 7, ..., 47 (12) with 2 x 256
+// (512-value rows, GQA 12), GDN elsewhere. The main GGUF has no nextn layer; the MTP head (mtp-*.gguf, 49 blocks) runs in
+// an MTP context over layer 48. llama_context sets hq_fallback and turbot_quality for this arch, and turbo_graph is true
+// since [TAG_FN_TURBOT_QSA].
+static llama_kv_resolve_input flash_next(ggml_type tk, ggml_type tv, bool mtp = false) {
+    llama_kv_resolve_input in = make_model(tk, tv, mtp ? 49 : 48, 2, 256,
+            [mtp](uint32_t il) { return mtp ? il == 48 : every_4th(il); });
+    in.ctx_default    = !mtp;
+    in.hq_fallback    = true;
+    in.turbot_quality = true;
+    return in;
 }
 
 //
@@ -715,6 +729,137 @@ static void test_granite() {
     reset_env();
 }
 
+// [TAG_FN_TURBOT_TESTS] Qwen3.8-Flash-Next: turbot with the quality plan; every refusal steps to q8_0, never to a turbo type
+static void test_flash_next() {
+    reset_env();
+
+    // the shape the plan chooser sees: 12 layers of 2 x 256, the quality flag
+    {
+        const llama_turbot_cache_shape s = llama_kv_resolve_turbot_shape_of(flash_next(T_TURBOT, T_TURBOT));
+        TCHECK(s.layers.size() == 12 && s.layers.front().il == 3 && s.layers.back().il == 47, "Flash-Next shape: %zu layers", s.layers.size());
+        TCHECK(s.layers.front().head_dim == 256 && s.layers.front().n_head_kv == 2 && s.auto_ok && s.quality, "Flash-Next shape fields");
+        TCHECK(!llama_kv_resolve_turbot_shape_of(ornith_35b(T_TURBOT, T_TURBOT)).quality, "Ornith-35B shape: quality set");
+    }
+
+    // turbot is kept with the quality plan (no sidecar: the chooser has no model here)
+    {
+        const auto r = resolve("Flash-Next turbot (12 layers, 2 x 256)", flash_next(T_TURBOT, T_TURBOT));
+        TCHECK(is_pair(r, T_TURBOT, T_TURBOT) && r.steps.empty(), "Flash-Next: %s/%s", tn(r.type_k), tn(r.type_v));
+        TCHECK(g_plan_chosen > 0 && g_plan_kind == LLAMA_TURBOT_PLAN_KIND_QUALITY, "Flash-Next plan: %s", kind_name(g_plan_kind));
+        TCHECK(r.n_turbot_layers == 12, "Flash-Next turbot layers %u", r.n_turbot_layers);
+    }
+    // 131072 cells, 4 sequences unified: still the quality plan
+    {
+        llama_kv_resolve_input in = flash_next(T_TURBOT, T_TURBOT);
+        in.kv_size   = 131072;
+        in.n_seq_max = 4;
+        const auto r = resolve("Flash-Next turbot, 131072 cells, 4 sequences unified", in);
+        TCHECK(is_pair(r, T_TURBOT, T_TURBOT) && g_plan_kind == LLAMA_TURBOT_PLAN_KIND_QUALITY, "Flash-Next np 4: %s/%s", tn(r.type_k), tn(r.type_v));
+    }
+
+    // every refusal of turbot steps to q8_0 and says why it passed over turbo5p and turbo4
+    {
+        set_env("LLAMA_TURBOT_AUTO_PLAN", "0");
+        const auto r = resolve("Flash-Next turbot, AUTO_PLAN=0", flash_next(T_TURBOT, T_TURBOT));
+        TCHECK(is_pair(r, T_Q8, T_Q8) && r.steps.size() == 1, "Flash-Next AUTO_PLAN=0: %s/%s", tn(r.type_k), tn(r.type_v));
+        TCHECK(has_step(r, 'B', T_TURBOT, T_Q8, "LLAMA_TURBOT_AUTO_PLAN=0") && has_step(r, 'B', T_TURBOT, T_Q8, "turbo5p, turbo4: not a fallback"),
+               "Flash-Next AUTO_PLAN=0: step");
+
+        // the old chain without the q8_0 bar (LLAMA_KV_HQ_FALLBACK=0): turbo5p, run as turbo5p512 on 512-value rows
+        llama_kv_resolve_input in = flash_next(T_TURBOT, T_TURBOT);
+        in.hq_fallback = false;
+        const auto r2 = resolve("Flash-Next turbot, AUTO_PLAN=0, no q8_0 bar", in);
+        TCHECK(is_pair(r2, T_5P512, T_5P512) && has_step(r2, 'B', T_TURBOT, T_5P, "LLAMA_TURBOT_AUTO_PLAN=0"),
+               "Flash-Next without the bar: %s/%s", tn(r2.type_k), tn(r2.type_v));
+        reset_env();
+    }
+    {
+        llama_kv_resolve_input in = flash_next(T_TURBOT, T_TURBOT);
+        in.env_refusal = "TURBO_INNERQ is incompatible";
+        const auto r = resolve("Flash-Next turbot, TURBO_INNERQ=1", in);
+        TCHECK(is_pair(r, T_Q8, T_Q8) && has_step(r, 'B', T_TURBOT, T_Q8, "TURBO_INNERQ"), "Flash-Next env refusal: %s/%s", tn(r.type_k), tn(r.type_v));
+    }
+    {
+        llama_kv_resolve_input in = flash_next(T_TURBOT, T_TURBOT);
+        for (auto & L : in.layers) {
+            if (L.il == 23) {
+                L.dev_refusal = "attention KV must be on a CUDA device (layer 23: CPU)";
+            }
+        }
+        const auto r = resolve("Flash-Next turbot, layer 23 on CPU", in);
+        TCHECK(is_pair(r, T_Q8, T_Q8) && has_step(r, 'B', T_TURBOT, T_Q8, "layer 23"), "Flash-Next device refusal: %s/%s", tn(r.type_k), tn(r.type_v));
+    }
+    {
+        llama_kv_resolve_input in = flash_next(T_TURBOT, T_TURBOT);
+        in.turbot_refused = "turbot: plan <quality> line 3: something the constructor refused";
+        const auto r = llama_kv_resolve(in);
+        TCHECK(is_pair(r, T_Q8, T_Q8), "Flash-Next constructor refusal: %s/%s", tn(r.type_k), tn(r.type_v));
+    }
+    {
+        llama_kv_resolve_input in = flash_next(T_TURBOT, T_TURBOT);
+        in.flash_attn = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+        const auto r = resolve("Flash-Next turbot, -fa off", in);
+        TCHECK(is_pair(r, T_Q8, T_F16), "Flash-Next fa off: %s/%s", tn(r.type_k), tn(r.type_v));
+        TCHECK(has_step(r, 'K', T_TURBOT, T_Q8, "needs flash attention") && has_step(r, 'V', T_TURBOT, T_F16, "quantized V cache"),
+               "Flash-Next fa off: steps");
+    }
+    {
+        const auto r = resolve("Flash-Next -ctk turbot -ctv q8_0", flash_next(T_TURBOT, T_Q8));
+        TCHECK(is_pair(r, T_Q8, T_Q8) && has_step(r, 'K', T_TURBOT, T_Q8, "together"), "Flash-Next one-sided turbot: %s/%s",
+               tn(r.type_k), tn(r.type_v));
+    }
+    {
+        set_env("LLAMA_TURBOT_ANY", "0");
+        llama_kv_resolve_input in = flash_next(T_TURBOT, T_TURBOT);
+        in.plan_check = plan_check_legacy();
+        const auto r = resolve("Flash-Next turbot, ANY=0", in);
+        TCHECK(is_pair(r, T_Q8, T_Q8) && has_step(r, 'B', T_TURBOT, T_Q8, "unsupported head geometry"), "Flash-Next ANY=0: %s/%s",
+               tn(r.type_k), tn(r.type_v));
+        reset_env();
+    }
+
+    // a turbo type that is asked for is kept (turbo5p runs as turbo5p512 on 512-value rows), and so are the upstream types
+    {
+        const auto r = llama_kv_resolve(flash_next(T_5P, T_5P));
+        TCHECK(is_pair(r, T_5P512, T_5P512) && r.steps.empty(), "Flash-Next turbo5p: %s/%s", tn(r.type_k), tn(r.type_v));
+        const auto r2 = llama_kv_resolve(flash_next(T_4, T_4));
+        TCHECK(is_pair(r2, T_4, T_4) && r2.steps.empty(), "Flash-Next turbo4: %s/%s", tn(r2.type_k), tn(r2.type_v));
+        for (ggml_type t : { T_Q8, T_F16 }) {
+            const auto r3 = llama_kv_resolve(flash_next(t, t));
+            TCHECK(is_pair(r3, t, t) && r3.steps.empty(), "Flash-Next %s changed to %s/%s", tn(t), tn(r3.type_k), tn(r3.type_v));
+        }
+    }
+
+    // the MTP context over layer 48: common hands it q8_0 ([TAG_FN_TURBOT_MTP]); turbot there gets no plan and steps to q8_0
+    {
+        const auto r = llama_kv_resolve(flash_next(T_Q8, T_Q8, true));
+        TCHECK(is_pair(r, T_Q8, T_Q8) && r.steps.empty(), "Flash-Next MTP q8_0: %s/%s", tn(r.type_k), tn(r.type_v));
+        const auto r2 = resolve("Flash-Next turbot, MTP context", flash_next(T_TURBOT, T_TURBOT, true));
+        TCHECK(is_pair(r2, T_Q8, T_Q8) && has_step(r2, 'B', T_TURBOT, T_Q8, "main context") && g_plan_chosen == 0,
+               "Flash-Next MTP turbot: %s/%s", tn(r2.type_k), tn(r2.type_v));
+    }
+
+    // the quality plan on other models only when asked: LLAMA_TURBOT_AUTO_PLAN=quality, or the keyword
+    {
+        set_env("LLAMA_TURBOT_AUTO_PLAN", "quality");
+        const auto r = resolve("Ornith-1.5-35B turbot, AUTO_PLAN=quality", ornith_35b(T_TURBOT, T_TURBOT));
+        TCHECK(is_pair(r, T_TURBOT, T_TURBOT) && r.steps.empty() && g_plan_kind == LLAMA_TURBOT_PLAN_KIND_QUALITY,
+               "Ornith-35B AUTO_PLAN=quality: %s/%s plan %s", tn(r.type_k), tn(r.type_v), kind_name(g_plan_kind));
+        const auto r2 = resolve("Qwen3.8-27B turbot, AUTO_PLAN=quality", qwen38(T_TURBOT, T_TURBOT));
+        TCHECK(is_pair(r2, T_TURBOT, T_TURBOT) && g_plan_kind == LLAMA_TURBOT_PLAN_KIND_BUILTIN, "Qwen AUTO_PLAN=quality: the built-in plan still wins");
+        reset_env();
+
+        set_env("LLAMA_TURBOT_PLAN", "quality");
+        const auto r3 = resolve("Qwen3.8-27B turbot, LLAMA_TURBOT_PLAN=quality", qwen38(T_TURBOT, T_TURBOT));
+        TCHECK(is_pair(r3, T_TURBOT, T_TURBOT) && g_plan_kind == LLAMA_TURBOT_PLAN_KIND_QUALITY, "Qwen LLAMA_TURBOT_PLAN=quality: plan %s",
+               kind_name(g_plan_kind));
+        const auto r4 = resolve("Ornith-1.5-9B turbot, MTP context, LLAMA_TURBOT_PLAN=quality", ornith_9b(T_TURBOT, T_TURBOT, true));
+        TCHECK(is_pair(r4, T_TURBOT, T_TURBOT) && g_plan_kind == LLAMA_TURBOT_PLAN_KIND_QUALITY, "keyword without auto_ok: %s/%s",
+               tn(r4.type_k), tn(r4.type_v));
+        reset_env();
+    }
+}
+
 // [TAG_TURBOT_ANY_ISWA] an all-SWA model: an iSWA cache whose base child holds no layer
 static void test_all_swa() {
     reset_env();
@@ -1027,6 +1172,7 @@ int main() {
     test_muse_glimmer();
     test_nemotron_h();
     test_granite();
+    test_flash_next();   // [TAG_FN_TURBOT_TESTS]
     test_all_swa();
     test_plan_file();
     test_head64();

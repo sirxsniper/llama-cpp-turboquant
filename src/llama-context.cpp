@@ -1,6 +1,9 @@
 #include "llama-context.h"
 
 #include "llama-moecache.h"
+#include "llama-moetrace.h" // [TAG_FN_MOE_TRACE]
+#include "llama-moe-bridge.h" // [TAG_MOE_BRIDGE]
+#include "llama-moe-gen5.h" // [TAG_MOE_DMA_SHARE] [TAG_FN_PREFILL_STREAM]
 
 #include "ggml.h"
 #include "llama-arch.h"
@@ -310,6 +313,7 @@ llama_turbot_cache_shape llama_kv_resolve_turbot_shape_of(const llama_kv_resolve
     shape.n_stream  = in.n_stream;
     shape.n_seq_max = in.n_seq_max;
     shape.auto_ok   = in.ctx_default;
+    shape.quality   = in.turbot_quality;   // [TAG_FN_TURBOT_PLAN]
     shape.model     = nullptr;
     return shape;
 }
@@ -453,6 +457,11 @@ static ggml_type llama_kv_resolve_walk(const llama_kv_resolve_input & in, const 
         ggml_type req_k, ggml_type req_v, llama_kv_resolve_notes & notes) {
     for (size_t i = 0; i < chain.size(); ++i) {
         const ggml_type t = chain[i];
+        // [TAG_FN_TURBOT_HQ] a model with a q8_0 KV bar passes over the turbo types it did not ask for, and says so
+        if (in.hq_fallback && llama_kv_resolve_is_turbo(t) && t != req_k && t != req_v && i + 1 < chain.size()) {
+            notes.add(t, "not a fallback for this model (its KV bar is q8_0; LLAMA_KV_HQ_FALLBACK=0 allows it)");
+            continue;
+        }
         std::string why;
         if (ggml_turbot_is_type(t)) {
             why = llama_kv_resolve_turbot_refusal(in,
@@ -680,6 +689,8 @@ static bool llama_kv_resolve_attn_layer(const llama_model & model, llama_context
 // [TAG_KV_RESOLVE] archs whose attention input has no turbo query rotation (llama-graph.cpp: build_attn for
 // llm_graph_input_attn_k_dsa / k_dsa_iswa / k_iswa): a turbo cache there would be read without the rotation
 static bool llama_kv_resolve_turbo_graph(const llama_model & model, llama_context_type ctx_type) {
+    GGML_UNUSED(ctx_type);   // [TAG_FN_TURBOT_QSA] no arch keys on it any more (qwen4exp did)
+
     switch (model.arch) {
         case LLM_ARCH_DEEPSEEK32:
         case LLM_ARCH_GLM_DSA:
@@ -691,24 +702,12 @@ static bool llama_kv_resolve_turbo_graph(const llama_model & model, llama_contex
         case LLM_ARCH_MINIMAX_M3:
             return false;
         case LLM_ARCH_QWEN4EXP:
-            {
-                // [TAG_KV_RESOLVE] the QSA layers (compress ratio > 0 with the indexer cache, models/qwen4exp.cpp
-                // build_attn_qsa) call build_attn_mha without the forward WHT on Q; dense-only checkpoints are fine
-                const auto & hp = model.hparams;
-                if (hp.indexer_head_size == 0) {
-                    return true;
-                }
-                // [TAG_QWEN4EXP_MTP] [TAG_SYNC_1004] an MTP context holds only the nextn block, which upstream #29761
-                // runs as a QSA layer when its compress ratio is set (no forward WHT on Q there either)
-                const bool     mtp = ctx_type == LLAMA_CONTEXT_TYPE_MTP;
-                const uint32_t il0 = mtp ? hp.n_layer()   : 0;
-                for (uint32_t il = il0; il < hp.n_layer_all && il < LLAMA_MAX_LAYERS; ++il) {
-                    if (hp.dsv4_compress_ratios[il] > 0) {
-                        return false;
-                    }
-                }
-                return true;
-            }
+            // [TAG_FN_TURBOT_QSA] the QSA layers (models/qwen4exp.cpp build_attn_qsa) read through build_attn_mha_kv like
+            // the dense path: forward WHT on Q, turbot writer, young pool and granule table. The indexer cache takes its
+            // own type (llama-memory-hybrid-idx.cpp [TAG_FN_TURBOT_IDX]). [TAG_SYNC_1004] The MTP context runs its block
+            // through the same build_layer_attn: build_attn_qsa when the block has a compress ratio, the dense build_attn
+            // (which rotates too) when it has none, so no context type is refused here.
+            return true;
         case LLM_ARCH_DFLASH:
             return model.hparams.dsv4_hc_mult == 0;   // the DeepSeek V4 DSpark stages use k_iswa
         default:
@@ -810,6 +809,15 @@ static std::string llama_kv_resolve_turbot_kernel_refusal(uint32_t il, ggml_back
     return "";
 }
 
+// [TAG_FN_TURBOT_HQ] Qwen3.8-Flash-Next (qwen4exp): the owner's KV bar is q8_0, so a refused or disabled turbot steps to
+// q8_0, never to turbo5p512 or turbo4. LLAMA_KV_HQ_FALLBACK=0 restores the turbo steps, =1 applies the rule to every model.
+static bool llama_kv_hq_fallback(const llama_model & model) {
+    const char * e   = getenv("LLAMA_KV_HQ_FALLBACK");
+    const bool   on  = e != nullptr && strcmp(e, "1") == 0;
+    const bool   off = e != nullptr && strcmp(e, "0") == 0;
+    return on || (!off && model.arch == LLM_ARCH_QWEN4EXP);
+}
+
 // [TAG_KV_RESOLVE] the resolver input for model and params, without the plan check. turbot_refused: the turbot cache
 // constructor refused anyway (the llama_context constructor's fallback), so turbot is out.
 static llama_kv_resolve_input llama_kv_resolve_make_input(const llama_model & model, const llama_context_params & params,
@@ -835,6 +843,12 @@ static llama_kv_resolve_input llama_kv_resolve_make_input(const llama_model & mo
     // [TAG_TURBOT_ANY_RESOLVE] only the main context may get an automatic plan: not an MTP context, not a draft model
     // (common also swaps turbot out of every draft context, [TAG_TURBOT] in common/speculative.cpp)
     in.ctx_default    = params.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && model.arch != LLM_ARCH_DFLASH;
+
+    in.hq_fallback = llama_kv_hq_fallback(model);   // [TAG_FN_TURBOT_HQ]
+
+    // [TAG_FN_TURBOT_PLAN] and turbot takes the quality plan there (old 6 / young 8 bits) when no verified sidecar is given,
+    // instead of the turbo5p512-budget automatic plan, which is not validated on 2 KV heads x 256 anyway
+    in.turbot_quality = model.arch == LLM_ARCH_QWEN4EXP;
 
     const bool want_turbot = ggml_turbot_is_type(params.type_k) || ggml_turbot_is_type(params.type_v);
     if (want_turbot) {
@@ -1198,6 +1212,13 @@ llama_context::llama_context(
         if (graph_reuse_disable) {
             LLAMA_LOG_WARN("%s: graph reuse disabled\n", __func__);
         }
+
+        // [TAG_FN_GRAPH_PER_WIDTH]
+        const char * LLAMA_GRAPH_PER_WIDTH = getenv("LLAMA_GRAPH_PER_WIDTH");
+        graph_per_width = LLAMA_GRAPH_PER_WIDTH && atoi(LLAMA_GRAPH_PER_WIDTH) != 0;
+        if (graph_per_width) {
+            LLAMA_LOG_INFO("%s: one graph per decode width 1..%zu (LLAMA_GRAPH_PER_WIDTH)\n", __func__, gf_res_width.size());
+        }
     }
 
     // ref: https://github.com/ggml-org/llama.cpp/pull/17046#discussion_r2503085732
@@ -1408,13 +1429,45 @@ llama_context::llama_context(
             LLAMA_LOG_INFO("%s: pipeline parallelism enabled\n", __func__);
         }
 
+        // [TAG_MOE_BRIDGE] LLAMA_MOE_BRIDGE=1: before the reserve, so decode graphs are reserved with the bridge ops
+        moe_bridge = llama_moe_bridge_create(model, (int) cparams.n_threads);
+
+        // [TAG_MOE_DMA_SHARE] [TAG_FN_PREFILL_STREAM] before the reserve: the graphs it builds use the gen5 banks
+        // [TAG_FN_MERGE] with a host bridge the DMA share / prefetch stay off (they need the CPU split the bridge removes)
+        llama_moe_gen5_init(model, this, backend_ptrs, moe_bridge != nullptr);
+
+        // [TAG_MOE_BRIDGE] [TAG_FN_PREFILL_STREAM] a throw below (a reserve whose compute buffers do not fit) leaves the
+        // constructor without the destructor: free the bridge (executor thread, pinned channels) and the gen5 state
+        // (pinned rings, VRAM banks, an owner pointer a later context could match) on the way out
+        struct moe_host_guard {
+            llama_moe_bridge *& br;
+            const void *        owner;
+            bool                armed;
+            ~moe_host_guard() {
+                if (armed) {
+                    llama_moe_bridge_free(br);
+                    br = nullptr;
+                    llama_moe_gen5_free(owner);
+                }
+            }
+        } moe_guard { moe_bridge, this, true };
+
         sched_reserve();
+
+        // [TAG_FN_MOE_HOT] sized after the reserve, so LLAMA_MOE_HOT_MIB=auto sees what the KV cache and the compute
+        // buffers left; decode graphs then carry the hot chain, so reserve again with it
+        if (llama_moe_hot_init(model, this)) {
+            sched_need_reserve = true;
+            sched_reserve();
+        }
 
         if (!cparams.flash_attn) {
             if (ggml_is_quantized(params.type_v)) {
                 throw std::runtime_error("quantized V cache was requested, but this requires Flash Attention");
             }
         }
+
+        moe_guard.armed = false; // [TAG_MOE_BRIDGE]
     }
 
     // Initialize the full vocabulary token ids for backend samplers.
@@ -1431,6 +1484,12 @@ llama_context::llama_context(
 llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
+
+    llama_moe_bridge_free(moe_bridge); // [TAG_MOE_BRIDGE] no graph runs now
+    moe_bridge = nullptr;
+    llama_moe_gen5_free(this); // [TAG_MOE_DMA_SHARE] [TAG_FN_PREFILL_STREAM]
+
+    llama_moe_trace_flush(); // [TAG_FN_MOE_TRACE]
 
     // when training, ggml_opt allocates extra buffers through the scheduler, so the sizes no longer match the expectation
     if (!model.hparams.no_alloc && !opt_ctx) {
@@ -1624,6 +1683,9 @@ void llama_context::sched_reserve() {
     LLAMA_LOG_DEBUG("%s: max_nodes = %zu\n", __func__, max_nodes);
 
     for (auto & res : gf_res_prev) {
+        res.reset();
+    }
+    for (auto & res : gf_res_width) { // [TAG_FN_GRAPH_PER_WIDTH]
         res.reset();
     }
     gf_res_reserve.reset(new llm_graph_result(max_nodes));
@@ -2009,6 +2071,7 @@ bool llama_context::memory_update(bool optimize) {
                 res->reset();
             }
         }
+        gf_res_prev_reset_all(); // [TAG_FN_GRAPH_PER_WIDTH]
         gf_res_prev_active = nullptr;
 
         if (!mctx->apply()) {
@@ -2553,6 +2616,14 @@ bool llama_context::set_adapter_cvec(
 // alone could not say which stage went bad, and every input ablation produced identical results
 // because NaN swamps everything downstream. Debug only, off unless the env is set; it reads every
 // tensor back from the backend, so it is very slow.
+static bool turbo_nan_scan_on() {
+    static const bool on = [] {
+        const char * e = getenv("TURBO_NAN_SCAN");
+        return e && e[0] == '1';
+    }();
+    return on;
+}
+
 static bool turbo_nan_scan_cb(struct ggml_tensor * t, bool ask, void * /*user_data*/) {
     if (ask) {
         return true;   // yes, we want to inspect this one
@@ -2637,7 +2708,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         return nullptr;
     }
 
-    auto * res = get_gf_res_prev();
+    llama_moe_bridge_step(moe_bridge); // [TAG_MOE_BRIDGE] re-arm a paused bridge before the graph parameters are taken
+
+    auto * res = get_gf_res_prev(ubatch); // [TAG_FN_GRAPH_PER_WIDTH] same as get_gf_res_prev() unless enabled
     auto * gf  = res->get_gf();
 
     // the new graph parameters
@@ -2658,16 +2731,35 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         n_reused++;
         graph_reused = true;
+    } else if (!graph_reuse_disable && graph_per_width && res->has_build_state() && res->can_reuse(gparams)) {
+        // [TAG_FN_GRAPH_PER_WIDTH] this width's graph still fits, but the scheduler holds another one:
+        // restore the post-build state, then split and allocate again, without model.build_graph
+        gf_res_prev_active = nullptr;
+        ggml_backend_sched_reset(sched.get());
+        if (turbo_nan_scan_on()) {
+            ggml_backend_sched_set_eval_callback(sched.get(), turbo_nan_scan_cb, nullptr);
+        } else {
+            ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+        }
+
+        res->restore_build_state(sched.get());
+        if (!ggml_backend_sched_alloc_graph(sched.get(), res->get_gf())) {
+            LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
+            ret = GGML_STATUS_ALLOC_FAILED;
+            return nullptr;
+        }
+
+        gf_res_prev_active = res;
+        n_width_switch++;
+        if (n_width_switch == 1 || n_width_switch % 1024 == 0) {
+            LLAMA_LOG_INFO("%s: graph per width: %" PRIu64 " switches without a rebuild\n", __func__, n_width_switch);
+        }
     } else {
         gf_res_prev_active = nullptr;
         res->reset();
 
         ggml_backend_sched_reset(sched.get());
-        static const bool nan_scan = [] {
-            const char * e = getenv("TURBO_NAN_SCAN");
-            return e && e[0] == '1';
-        }();
-        if (nan_scan) {
+        if (turbo_nan_scan_on()) {
             ggml_backend_sched_set_eval_callback(sched.get(), turbo_nan_scan_cb, nullptr);
         } else {
             ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
@@ -2683,6 +2775,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             LLAMA_LOG_ERROR("%s: failed to initialize graph\n", __func__);
             ret = GGML_STATUS_FAILED;
             return nullptr;
+        }
+
+        if (graph_per_width && !cparams.pipeline_parallel) {
+            res->save_build_state(sched.get()); // [TAG_FN_GRAPH_PER_WIDTH] before the scheduler rewrites it
         }
 
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
@@ -2704,6 +2800,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
+    // [TAG_MOE_BRIDGE] wake the host executor for a graph that posts to it, or park it (a CPU split may run)
+    const bool moe_bridge_used = res->n_moe_bridge > 0;
+    llama_moe_bridge_begin(moe_bridge, moe_bridge_used);
+
     const bool    gap_probe = llama_host_gap_probe_enabled(); // [TAG_HOST_GAP_PROBE]
     const int64_t t_gap_c0  = gap_probe ? ggml_time_us() : 0;
 
@@ -2715,8 +2815,26 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
+        if (moe_bridge_used) { // [TAG_MOE_BRIDGE] close the bridged graph: its late host jobs are stale now
+            ggml_backend_sched_synchronize(sched.get());
+            llama_moe_bridge_end(moe_bridge);
+        }
         ret = status;
         return nullptr;
+    }
+
+    // [TAG_MOE_BRIDGE] a bridge wait that timed out (or a host job that failed) left zeros in this ubatch: fail it, so
+    // the memory rollback of decode() runs and nothing wrong reaches the caller. The bridge pauses, then re-arms.
+    if (moe_bridge_used) {
+        ggml_backend_sched_synchronize(sched.get());
+        if (!llama_moe_bridge_end(moe_bridge)) {
+            ret = GGML_STATUS_FAILED;
+            return nullptr;
+        }
+    }
+
+    if (!res->t_moe_ids.empty()) { // [TAG_FN_MOE_TRACE] only built when a trace switch is set
+        llama_moe_trace_collect(sched.get(), res, ubatch, gtype == LLM_GRAPH_TYPE_DECODER_MTP);
     }
 
     ret = GGML_STATUS_SUCCESS;
@@ -3476,7 +3594,12 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     //synchronize();
 
     // apply throttled MoE expert-cache updates between graph executions
-    llama_moe_cache_step();
+    // [TAG_FN_MOE_HOT_ADAPT] an adaptive hot set changes its tables only when no graph of its owner runs
+    if (llama_moe_hot_adapt_owner() == this) {
+        ggml_backend_sched_synchronize(sched.get());
+    }
+    llama_moe_cache_step(this);
+    llama_moe_gen5_step(this); // [TAG_MOE_DMA_SHARE] ring admission and stats, owner only
 
     return 0;
 }
@@ -3935,6 +4058,27 @@ llm_graph_result * llama_context::get_gf_res_prev() {
     return res.get();
 }
 
+// [TAG_FN_GRAPH_PER_WIDTH] decode widths 1..4 with outputs keep their own graph; everything else shares the two above
+llm_graph_result * llama_context::get_gf_res_prev(const llama_ubatch & ubatch) {
+    if (graph_per_width && !cparams.pipeline_parallel && n_outputs > 0 &&
+            ubatch.n_tokens >= 1 && ubatch.n_tokens <= gf_res_width.size()) {
+        auto & res = gf_res_width[ubatch.n_tokens - 1];
+        if (!res) {
+            res.reset(new llm_graph_result(gf_res_reserve->get_max_nodes()));
+        }
+        return res.get();
+    }
+    return get_gf_res_prev();
+}
+
+void llama_context::gf_res_prev_reset_all() {
+    for (auto & res : gf_res_width) {
+        if (res) {
+            res->reset();
+        }
+    }
+}
+
 // pack sampler outputs into as few sequences as possible before using sequences without samplers
 static void ubatch_prepare_reserve(
               llama_ubatch                            & ubatch,
@@ -4010,6 +4154,7 @@ ggml_cgraph * llama_context::graph_reserve(
             res->reset();
         }
     }
+    gf_res_prev_reset_all(); // [TAG_FN_GRAPH_PER_WIDTH]
     gf_res_prev_active = nullptr;
 
     // store the n_outputs as it is, and restore it afterwards
@@ -4079,6 +4224,7 @@ llm_graph_params llama_context::graph_params(
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
+        /*.moe_bridge  =*/ llama_moe_bridge_active(moe_bridge) ? moe_bridge : nullptr, // [TAG_MOE_BRIDGE]
     };
 }
 
@@ -5139,6 +5285,7 @@ void llama_context::opt_epoch_iter(
             const auto gparams = graph_params(res, ubatch, mctx.get(), ctx_type_to_graph_type(cparams.ctx_type));
 
             // the optimizer graph is allocated outside sched, so the next decode must rebuild
+            gf_res_prev_reset_all(); // [TAG_FN_GRAPH_PER_WIDTH]
             gf_res_prev_active = nullptr;
             res->reset();
 
@@ -5321,9 +5468,12 @@ llama_context * llama_init_from_model(
     if (ggml_turbot_is_type(params.type_k) || ggml_turbot_is_type(params.type_v)) {
         const char * LLAMA_TURBOT = getenv("LLAMA_TURBOT");
         if (LLAMA_TURBOT && strcmp(LLAMA_TURBOT, "0") == 0) {
-            LLAMA_LOG_WARN("%s: LLAMA_TURBOT=0: turbot disabled, using turbo5p\n", __func__);
-            params.type_k = GGML_TYPE_TURBO5P_0;
-            params.type_v = GGML_TYPE_TURBO5P_0;
+            // [TAG_FN_TURBOT_HQ] a model whose KV bar is q8_0 gets q8_0 here too, not turbo5p
+            const bool hq = llama_kv_hq_fallback(*model);
+            LLAMA_LOG_WARN("%s: LLAMA_TURBOT=0: turbot disabled, using %s\n", __func__,
+                    hq ? "q8_0 (this model's KV bar is q8_0; LLAMA_KV_HQ_FALLBACK=0 gives turbo5p)" : "turbo5p");
+            params.type_k = hq ? GGML_TYPE_Q8_0 : GGML_TYPE_TURBO5P_0;
+            params.type_v = hq ? GGML_TYPE_Q8_0 : GGML_TYPE_TURBO5P_0;
         }
     }
 
@@ -6222,4 +6372,15 @@ int32_t llama_memory_attn_n_free_ext(llama_context * ctx, llama_seq_id seq_id) {
     }
     const llama_kv_cells & cells = kv->get_cells(seq_id);
     return (int32_t) (cells.size() - cells.get_used());
+}
+
+uint32_t llama_memory_attn_swa_ext(llama_context * ctx) {
+    llama_memory_i * mem = ctx ? ctx->get_memory() : nullptr;
+    llama_kv_cache * kv  = dynamic_cast<llama_kv_cache *>(mem);
+    if (kv == nullptr) {
+        if (auto * hyb = dynamic_cast<llama_memory_hybrid *>(mem)) {
+            kv = hyb->get_mem_attn();
+        }
+    }
+    return kv ? kv->get_swa_window() : 0;
 }

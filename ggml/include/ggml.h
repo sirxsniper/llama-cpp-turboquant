@@ -656,6 +656,9 @@ extern "C" {
 
         GGML_OP_GATED_DELTA_NET_REPLAY, // [TAG_4C_GDN_REPLAY] appended last so that no existing op value moves
 
+        GGML_OP_MOE_HOST_POST, // [TAG_MOE_BRIDGE] appended last so that no existing op value moves
+        GGML_OP_MOE_HOST_WAIT, // [TAG_MOE_BRIDGE]
+
         GGML_OP_COUNT,
     };
 
@@ -2807,6 +2810,32 @@ extern "C" {
     // [TAG_GDN_NW_CAP] keep at most n_w of the new tokens in the ring (and commit the state before them); 0 = min(n_tokens,
     // n_ring). The ring capacity and layout stay n_ring slots.
     GGML_API void ggml_gated_delta_net_replay_set_n_w(struct ggml_tensor * t, int32_t n_w);
+
+    // [TAG_MOE_BRIDGE] hand the routed experts of one MoE layer to a host executor and take its result back, inside one
+    // device graph (no split, no host sync). Backend-specific: only the CUDA backend runs them (ggml-moe-bridge.h).
+    //
+    // post: x [n_embd, T] f32, ids [n_used, T] i32, w (n_used*T contiguous) f32 -> ticket i32 [1]
+    //       bridge: the id of a registered bridge, chan: its channel (one per MoE layer)
+    //       flags:  GGML_MOE_BRIDGE_JOB_* (ggml-moe-bridge.h)
+    // wait: ticket (from post), dep (or NULL; only orders the wait after it) -> f32 [n_embd, T], the executor's weighted
+    //       sum over the experts it computed
+    GGML_API struct ggml_tensor * ggml_moe_host_post(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * ids,
+            struct ggml_tensor  * w,
+            int32_t               bridge,
+            int32_t               chan,
+            int32_t               flags);
+
+    GGML_API struct ggml_tensor * ggml_moe_host_wait(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * ticket,
+            struct ggml_tensor  * dep,
+            int64_t               n_embd,
+            int64_t               n_tokens,
+            int32_t               bridge,
+            int32_t               chan);
 
     // DSA lightning indexer
     //

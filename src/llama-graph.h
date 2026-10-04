@@ -23,6 +23,7 @@ struct llama_layer;
 struct llama_prec_policy;
 
 struct llama_memory_context_i;
+struct llama_moe_bridge; // [TAG_MOE_BRIDGE] llama-moe-bridge.h
 
 class llama_kv_cache_context;
 class llama_kv_cache_dsa_context;
@@ -840,6 +841,8 @@ struct llm_graph_params {
 
     llm_graph_result * res;
 
+    const llama_moe_bridge * moe_bridge = nullptr; // [TAG_MOE_BRIDGE] the context's bridge while it is active
+
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
     bool allow_reuse(const llm_graph_params & other) const {
@@ -910,7 +913,8 @@ struct llm_graph_params {
             gtype == other.gtype &&
             cvec  == other.cvec  &&
             loras == other.loras &&
-            cross == other.cross;
+            cross == other.cross &&
+            moe_bridge == other.moe_bridge; // [TAG_MOE_BRIDGE] a paused bridge rebuilds without its ops
     }
 };
 
@@ -959,6 +963,14 @@ public:
 
     void set_params(const llm_graph_params & params);
 
+    // [TAG_FN_GRAPH_PER_WIDTH] the scheduler rewrites node sources and sets data pointers when it splits and allocates a
+    // graph, so a graph can be split again only after its post-build state is restored
+    // sched: the backend pins set during the build (sched_reset clears them) and the node order (graph_optimize
+    // reorders the nodes in place) are saved and restored too
+    void save_build_state(ggml_backend_sched_t sched);
+    void restore_build_state(ggml_backend_sched_t sched);
+    bool has_build_state() const;
+
     // important graph nodes
     ggml_tensor * t_inp_tokens  = nullptr;
     ggml_tensor * t_inp_embd    = nullptr; // [n_embd_inp, n_tokens]
@@ -973,6 +985,17 @@ public:
     std::vector<ggml_tensor *> t_sampled_probs;
     std::vector<ggml_tensor *> t_sampled_logits;
     std::vector<ggml_tensor *> t_candidates;
+
+    // [TAG_FN_MOE_TRACE] routing capture per MoE layer, only built when llama_moe_trace_active(); aligned vectors
+    std::vector<int>             t_moe_il;
+    std::vector<int64_t>         t_moe_n_expert;
+    std::vector<ggml_tensor *>   t_moe_ids;       // [n_used, T] i32, output
+    std::vector<ggml_tensor *>   t_moe_w;         // [n_used, T] f32, output
+    std::vector<ggml_tensor *>   t_moe_pred;      // [pred_k, T] i32 or nullptr
+    std::map<int, ggml_tensor *> t_moe_pred_next; // target layer -> its router applied one layer early
+
+    // [TAG_MOE_BRIDGE] MoE layers of this graph that post to the host bridge
+    int n_moe_bridge = 0;
 
     std::vector<llm_graph_input_ptr> inputs;
     std::vector<llm_graph_fused_node> fused_nodes;
@@ -994,6 +1017,19 @@ private:
 
     // env: LLAMA_GRAPH_RESULT_DEBUG
     int debug = 0;
+
+    // [TAG_FN_GRAPH_PER_WIDTH]
+    struct tensor_state {
+        ggml_tensor *                t;
+        void *                       data;
+        struct ggml_backend_buffer * buffer;
+        void *                       extra;
+        int32_t                      flags;
+        ggml_tensor *                src[GGML_MAX_SRC];
+    };
+    std::vector<tensor_state> build_state;
+    std::vector<ggml_tensor *> build_nodes;
+    std::vector<std::pair<ggml_tensor *, ggml_backend_t>> build_pins;
 };
 
 using llm_graph_result_ptr = std::unique_ptr<llm_graph_result>;
@@ -1067,6 +1103,20 @@ struct llm_graph_context {
 
     ggml_context * ctx0 = nullptr;
     ggml_cgraph  * gf   = nullptr;
+
+    // [TAG_MOE_BRIDGE] set by an arch that calls build_moe_bridge_finish itself (after its shared expert); posts of
+    // build_moe_ffn wait here until then
+    const llama_moe_bridge * moe_bridge = nullptr;
+    mutable bool moe_bridge_defer = false;
+    struct moe_bridge_post {
+        ggml_tensor * ticket;
+        ggml_tensor * hot;      // the device part, weighted and summed [n_embd, T], or nullptr
+        int64_t       n_embd;
+        int64_t       n_tokens;
+        int32_t       id;
+        int32_t       chan;
+    };
+    mutable std::map<int, moe_bridge_post> moe_bridge_posts;
 
     llm_graph_context(const llm_graph_params & params);
     virtual ~llm_graph_context() = default;
@@ -1189,6 +1239,11 @@ struct llm_graph_context {
              ggml_tensor * down_exps_s = nullptr,
              ggml_tensor * selected_experts_in = nullptr) const;
 
+    // [TAG_MOE_BRIDGE] the wait for layer il's host experts, after dep (so dep's work overlaps the host), plus the device
+    // part. Returns cur when layer il has no pending post (the unchanged path). With moe_bridge_defer, build_moe_ffn
+    // returns the pending post's ticket as a placeholder and the caller passes it here as cur.
+    ggml_tensor * build_moe_bridge_finish(ggml_tensor * cur, int il, ggml_tensor * dep) const;
+
     //
     // inputs
     //
@@ -1242,7 +1297,8 @@ struct llm_graph_context {
                     int   il,
             ggml_tensor * kv_pos,
             ggml_tensor * q_pos,
-            ggml_tensor * turbot_gtab) const;
+            ggml_tensor * turbot_gtab,
+                int64_t   n_kv_max = 0) const;   // [TAG_FN_TURBOT_QSA] the sparse-attention budget (build_attn_mha)
 
     llm_graph_input_attn_no_cache * build_attn_inp_no_cache() const;
 

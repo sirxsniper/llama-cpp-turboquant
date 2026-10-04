@@ -403,6 +403,18 @@ private:
 
     llm_graph_result * gf_res_prev_active = nullptr;
 
+    // [TAG_FN_GRAPH_PER_WIDTH] LLAMA_GRAPH_PER_WIDTH=1: one graph per decode width 1..4 (with outputs), so MTP verify
+    // widths that alternate 1/2/3 switch graphs with a scheduler re-split instead of a full rebuild
+    bool graph_per_width = false;
+    std::array<llm_graph_result_ptr, 4> gf_res_width;
+    uint64_t n_width_switch = 0;
+
+    // [TAG_MOE_BRIDGE] LLAMA_MOE_BRIDGE=1: the host doorbell of the host-resident expert layers (llama-moe-bridge.h)
+    struct llama_moe_bridge * moe_bridge = nullptr;
+
+    llm_graph_result * get_gf_res_prev(const llama_ubatch & ubatch);
+    void gf_res_prev_reset_all();
+
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;
 

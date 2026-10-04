@@ -9,16 +9,46 @@
 #include "llama-io.h"
 #include "llama-model.h"
 
+#include "ggml-turbot.h"   // [TAG_FN_TURBOT_IDX] ggml_turbot_is_type
 
 #include <algorithm>
 #include <cassert>
 #include <cmath>
+#include <cstdlib>
+#include <cstring>
 #include <iterator>
 #include <stdexcept>
 
 //
 // llama_memory_hybrid_idx
 //
+
+// [TAG_FN_TURBOT_IDX] K type of the indexer key cache. The indexer reads its keys with get_rows (raw, before norm and
+// RoPE), so a turbo or turbot type cannot hold them, and top-k selection must not get a low-bit key. Rule:
+//   - env LLAMA_QSA_IDX_TYPE = f32, f16, bf16 or q8_0: that type (the A/B switch for the top-k agreement gate)
+//   - the attention type when it is f32, f16, bf16 or q8_0 (unchanged from before)
+//   - else q8_0: turbot, the turbo types and every other quantized type (never below q8_0)
+static ggml_type llama_qsa_idx_type(ggml_type type_attn) {
+    static const ggml_type ok[] = { GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q8_0 };
+
+    const char * env = getenv("LLAMA_QSA_IDX_TYPE");
+    if (env != nullptr && env[0] != '\0') {
+        for (const ggml_type t : ok) {
+            if (strcmp(env, ggml_type_name(t)) == 0) {
+                return t;
+            }
+        }
+        LLAMA_LOG_WARN("%s: LLAMA_QSA_IDX_TYPE=%s is not f32, f16, bf16 or q8_0, ignored\n", __func__, env);
+    }
+
+    for (const ggml_type t : ok) {
+        if (type_attn == t) {
+            return t;
+        }
+    }
+
+    return GGML_TYPE_Q8_0;
+}
 
 llama_memory_hybrid_idx::llama_memory_hybrid_idx(
         const llama_model & model,
@@ -65,10 +95,18 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
         hparams_idx.n_embd_head_k_mla_impl = model.hparams.indexer_head_size;
         hparams_idx.n_embd_head_v_mla_impl = model.hparams.indexer_head_size;
 
-        LLAMA_LOG_INFO("%s: creating indexer KV cache, size = %u cells\n", __func__, kv_size);
+        // [TAG_FN_TURBOT_IDX] its own K type; V is never cached (MLA fake above), so it takes the same type
+        const ggml_type type_idx = llama_qsa_idx_type(type_k);
+
+        if (type_idx == type_k) {
+            LLAMA_LOG_INFO("%s: creating indexer KV cache, size = %u cells\n", __func__, kv_size);
+        } else {
+            LLAMA_LOG_INFO("%s: creating indexer KV cache, size = %u cells, K type %s (attention cache %s; the indexer keys stay at q8_0 or better)\n",
+                    __func__, kv_size, ggml_type_name(type_idx), ggml_turbot_is_type(type_k) ? "turbot" : ggml_type_name(type_k));
+        }
 
         return new llama_kv_cache(
-            model, hparams_idx, type_k, type_v, v_trans, offload, unified,
+            model, hparams_idx, type_idx, type_idx, v_trans, offload, unified,
             kv_size, n_seq_max, n_pad, n_swa, swa_type,
             nullptr, filter_idx, nullptr, nullptr, "idx_");
     }()) {}

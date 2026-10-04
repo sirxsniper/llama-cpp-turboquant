@@ -1,0 +1,48 @@
+#pragma once
+
+// [TAG_MOE_BRIDGE] per-context MoE host bridge (E:/turbot-gates/flashnext/PLAN.md SP-5, ggml-moe-bridge.h).
+//
+// With LLAMA_MOE_BRIDGE=1, a decode graph (T <= LLAMA_MOE_BRIDGE_MAX_T) no longer splits at the host-resident expert
+// layers: each such layer posts x / ids / w to a mapped pinned channel, the device goes on with the hot experts and
+// the shared expert, and a host executor computes the cold experts on the CPU MoE pool (ggml_cpu_moe_run, weighted
+// sum) meanwhile; the device then waits (bounded) and adds. One device graph per step, no host sync per layer.
+//
+// Switches (all off / default unless set):
+//   LLAMA_MOE_BRIDGE=1                    enable (one bridge per process: the first context with host expert layers)
+//   LLAMA_MOE_BRIDGE_WAIT=spin|hostfunc   device spin on a mapped flag + executor thread (default), or a host function
+//                                         node that runs the job on the driver thread
+//   LLAMA_MOE_BRIDGE_SPIN_US=2000         executor and pool workers spin this long after a job, then sleep
+//   LLAMA_MOE_BRIDGE_TIMEOUT_MS=50        a device wait gives up after this long if the host has not taken the job
+//   LLAMA_MOE_BRIDGE_JOB_MAX_MS=1000        ... or after this long once it has (slow job); either way the ubatch fails
+//                                         (decode returns an error, its memory is rolled back) and the bridge pauses
+//   LLAMA_MOE_BRIDGE_MAX_T=8              largest graph width that uses it (1..16)
+//   LLAMA_MOE_BRIDGE_THREADS=<n>          pool threads including the executor (default: the context's n_threads)
+//   LLAMA_MOE_BRIDGE_CPUMASK=<hex>        pool CPUs (default: one per physical core, except the first core)
+//   LLAMA_MOE_BRIDGE_PRIO=<0..3>          pool thread priority (default 2, high)
+//   LLAMA_MOE_BRIDGE_STATS=1              job and wait statistics every 256 bridged graphs
+//   LLAMA_MOE_BRIDGE_TEST_STALL=<ms>      test (spin): the executor sleeps this long after job 199 (and every
+//   LLAMA_MOE_BRIDGE_TEST_STALL_EVERY=<n>   n jobs after it) before it takes the next, to exercise the timeout path
+
+#include <cstdint>
+
+struct llama_model;
+struct ggml_tensor;
+struct llama_moe_bridge;
+
+// nullptr when disabled or not possible here (the reason is logged)
+llama_moe_bridge * llama_moe_bridge_create(const llama_model & model, int n_threads);
+void               llama_moe_bridge_free(llama_moe_bridge * br);
+
+// graph side. active: graphs built now may use it (not paused after an error, not disabled)
+bool llama_moe_bridge_active(const llama_moe_bridge * br);
+int  llama_moe_bridge_max_t (const llama_moe_bridge * br);
+int  llama_moe_bridge_n_used(const llama_moe_bridge * br);
+// the bridge id and channel for this layer's up_exps, false if the layer is not bridged
+bool llama_moe_bridge_layer (const llama_moe_bridge * br, const ggml_tensor * up_exps, int32_t * id, int32_t * chan);
+
+// runtime, on the owning context's thread
+void llama_moe_bridge_step (llama_moe_bridge * br);            // before the graph parameters: re-arm after a pause
+void llama_moe_bridge_begin(llama_moe_bridge * br, bool used); // before the graph runs: wake the executor, or park it
+// after a graph with used = true completed (also a failed one): false = its output is invalid. Jobs that come after it
+// (their wait timed out) are stale: they return zeros without running and without the routing observer.
+bool llama_moe_bridge_end  (llama_moe_bridge * br);

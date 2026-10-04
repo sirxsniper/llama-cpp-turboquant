@@ -1217,10 +1217,12 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "TURBOT_SET_ROWS",
 
     "GATED_DELTA_NET_REPLAY",
+
+    "MOE_HOST_POST",
+    "MOE_HOST_WAIT",
 };
 
-static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
-static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");  // +1 GGML_OP_TURBO_WHT (TurboQuant fork), +1 GGML_OP_LIGHTNING_INDEXER, +1 GGML_OP_TURBOT_SET_ROWS [TAG_TURBOT], +1 GGML_OP_GATED_DELTA_NET_REPLAY [TAG_4C_GDN_REPLAY]
+static_assert(GGML_OP_COUNT == 106, "GGML_OP_COUNT != 106");  // +1 GGML_OP_TURBO_WHT (TurboQuant fork), +1 GGML_OP_LIGHTNING_INDEXER, +1 GGML_OP_TURBOT_SET_ROWS [TAG_TURBOT], +1 GGML_OP_GATED_DELTA_NET_REPLAY [TAG_4C_GDN_REPLAY], +2 GGML_OP_MOE_HOST_POST/WAIT [TAG_MOE_BRIDGE]
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1338,10 +1340,12 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "turbot_set_rows(x)",
 
     "gated_delta_net_replay(q, k, v, g, beta, s, ring, ring_n)",
+
+    "moe_host_post(x, ids, w)",
+    "moe_host_wait(ticket, dep)",
 };
 
-static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
-static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");  // +1 GGML_OP_TURBO_WHT (TurboQuant fork), +1 GGML_OP_LIGHTNING_INDEXER, +1 GGML_OP_TURBOT_SET_ROWS [TAG_TURBOT], +1 GGML_OP_GATED_DELTA_NET_REPLAY [TAG_4C_GDN_REPLAY]
+static_assert(GGML_OP_COUNT == 106, "GGML_OP_COUNT != 106");  // +1 GGML_OP_TURBO_WHT (TurboQuant fork), +1 GGML_OP_LIGHTNING_INDEXER, +1 GGML_OP_TURBOT_SET_ROWS [TAG_TURBOT], +1 GGML_OP_GATED_DELTA_NET_REPLAY [TAG_4C_GDN_REPLAY], +2 GGML_OP_MOE_HOST_POST/WAIT [TAG_MOE_BRIDGE]
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6769,6 +6773,61 @@ void ggml_gated_delta_net_replay_set_n_w(struct ggml_tensor * t, int32_t n_w) {
     GGML_ASSERT(t->op == GGML_OP_GATED_DELTA_NET_REPLAY);
     GGML_ASSERT(n_w >= 0 && n_w <= ggml_get_op_params_i32(t, 0));
     ggml_set_op_params_i32(t, 1, n_w);
+}
+
+// ggml_moe_host_post / ggml_moe_host_wait [TAG_MOE_BRIDGE]
+
+struct ggml_tensor * ggml_moe_host_post(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * ids,
+        struct ggml_tensor  * w,
+        int32_t               bridge,
+        int32_t               chan,
+        int32_t               flags) {
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && ids->type == GGML_TYPE_I32 && w->type == GGML_TYPE_F32);
+    GGML_ASSERT(x->nb[0] == sizeof(float) && ids->nb[0] == sizeof(int32_t));
+    GGML_ASSERT(x->ne[2] == 1 && x->ne[3] == 1);
+    const int64_t n_tokens = x->ne[1];
+    GGML_ASSERT(ids->ne[1] == n_tokens && ids->ne[2] == 1 && ids->ne[3] == 1);
+    GGML_ASSERT(ggml_is_contiguous(w) && ggml_nelements(w) == ids->ne[0]*n_tokens);
+    GGML_ASSERT(bridge >= 0 && chan >= 0);
+
+    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+
+    ggml_set_op_params_i32(result, 0, bridge);
+    ggml_set_op_params_i32(result, 1, chan);
+    ggml_set_op_params_i32(result, 2, flags);
+
+    result->op     = GGML_OP_MOE_HOST_POST;
+    result->src[0] = x;
+    result->src[1] = ids;
+    result->src[2] = w;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_moe_host_wait(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * ticket,
+        struct ggml_tensor  * dep,
+        int64_t               n_embd,
+        int64_t               n_tokens,
+        int32_t               bridge,
+        int32_t               chan) {
+    GGML_ASSERT(ticket->type == GGML_TYPE_I32 && ggml_nelements(ticket) == 1);
+    GGML_ASSERT(n_embd > 0 && n_tokens > 0 && bridge >= 0 && chan >= 0);
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+
+    ggml_set_op_params_i32(result, 0, bridge);
+    ggml_set_op_params_i32(result, 1, chan);
+
+    result->op     = GGML_OP_MOE_HOST_WAIT;
+    result->src[0] = ticket;
+    result->src[1] = dep;
+
+    return result;
 }
 
 // ggml_lightning_indexer

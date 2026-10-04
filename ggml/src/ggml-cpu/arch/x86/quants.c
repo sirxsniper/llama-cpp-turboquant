@@ -1366,7 +1366,8 @@ void ggml_vec_dot_q5_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
 #endif
 }
 
-void ggml_vec_dot_q5_1_q8_1(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+// [TAG_FN_CPU_Q5_1_AVX512] the unswitched body; ggml_vec_dot_q5_1_q8_1 (end of file) selects between it and the AVX-512 one
+void ggml_vec_dot_q5_1_q8_1_base(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     const int qk = QK8_1;
     const int nb = n / qk;
 
@@ -4253,3 +4254,712 @@ void ggml_vec_dot_iq4_xs_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const v
     ggml_vec_dot_iq4_xs_q8_K_generic(n, s, bs, vx, bx, vy, by, nrc);
 #endif
 }
+
+//===================================== CPU expert path kernels (Flash-Next WP-CPU) =====================================
+//
+// [TAG_FN_CPU_Q5_1_AVX512] [TAG_FN_CPU_MMID_MR]
+// Row kernels that take one weight row and up to 4 columns (tokens). Every value they produce is bitwise equal to the
+// AVX2 ggml_vec_dot_<type> above on the same row and column, as long as the compiler does not contract a*b + c
+// differently in the two functions (MSVC never contracts):
+// - integer parts: the same int32 lane sums. The lanes cover the same bytes (4i..4i+3 of each 32 byte block), integer
+//   adds are exact in any order, and for these types no maddubs pair reaches the int16 limit, so VNNI dpbusd gives the
+//   same sums as maddubs + madd.
+// - float parts: the same operations in the same order. Per block (or super-block) the same scale product and one
+//   fmadd into a per-column accumulator, in block order, then the same horizontal sums and scalar additions.
+// The 512-bit bodies do the integer work of two blocks at once and split the result into its two 256-bit halves for
+// the float steps, so they keep that order too.
+
+#if defined(GGML_CPU_FN_X86)
+
+#if defined(_MSC_VER)
+#define GGML_FN_INLINE __forceinline
+#else
+#define GGML_FN_INLINE inline __attribute__((always_inline))
+#endif
+
+// one block of the AVX2 ggml_vec_dot_q5_1_q8_1 loop for one column; qx (the unpacked weight block), dx and fm (its
+// scale and min) and ib come from the caller
+#define GGML_FN_Q5_1_COL(acc, summs, y) do {                                             \
+        (summs) += fm * GGML_CPU_FP16_TO_FP32((y)[ib].s);                                \
+        const __m256  dy_ = _mm256_set1_ps(GGML_CPU_FP16_TO_FP32((y)[ib].d));            \
+        const __m256i qy_ = _mm256_loadu_si256((const __m256i *) (y)[ib].qs);            \
+        const __m256  q_  = mul_sum_us8_pairs_float(qx, qy_);                            \
+        (acc) = _mm256_fmadd_ps(q_, _mm256_mul_ps(dx, dy_), (acc));                      \
+    } while (0)
+
+// one q5_1 row against nc (1..4, a constant after inlining) q8_1 columns: s[c*bs] = dot(x, yc)
+static GGML_FN_INLINE void ggml_fn_q5_1_row_avx2(const int nb, const block_q5_1 * GGML_RESTRICT x,
+        const block_q8_1 * y0, const block_q8_1 * y1, const block_q8_1 * y2, const block_q8_1 * y3,
+        const int nc, float * GGML_RESTRICT s, const size_t bs) {
+    __m256 acc0 = _mm256_setzero_ps();
+    __m256 acc1 = acc0;
+    __m256 acc2 = acc0;
+    __m256 acc3 = acc0;
+    float summs0 = 0.0f;
+    float summs1 = 0.0f;
+    float summs2 = 0.0f;
+    float summs3 = 0.0f;
+
+    for (int ib = 0; ib < nb; ++ib) {
+        const __m256 dx = _mm256_set1_ps(GGML_CPU_FP16_TO_FP32(x[ib].d));
+        const float  fm = GGML_CPU_FP16_TO_FP32(x[ib].m);
+
+        __m256i qx = bytes_from_nibbles_32(x[ib].qs);
+        __m256i bxhi = bytes_from_bits_32(x[ib].qh);
+        bxhi = _mm256_and_si256(bxhi, _mm256_set1_epi8(0x10));
+        qx = _mm256_or_si256(qx, bxhi);
+
+        GGML_FN_Q5_1_COL(acc0, summs0, y0);
+        if (nc > 1) { GGML_FN_Q5_1_COL(acc1, summs1, y1); }
+        if (nc > 2) { GGML_FN_Q5_1_COL(acc2, summs2, y2); }
+        if (nc > 3) { GGML_FN_Q5_1_COL(acc3, summs3, y3); }
+    }
+
+    s[0] = hsum_float_8(acc0) + summs0;
+    if (nc > 1) { s[1*bs] = hsum_float_8(acc1) + summs1; }
+    if (nc > 2) { s[2*bs] = hsum_float_8(acc2) + summs2; }
+    if (nc > 3) { s[3*bs] = hsum_float_8(acc3) + summs3; }
+}
+
+#if defined(GGML_CPU_FN_X86_AVX512)
+
+// unsigned x bytes times signed y bytes, summed in groups of 4 into 16 int32 lanes (maddubs + madd, or VNNI dpbusd,
+// which is the same for inputs whose byte pairs stay inside int16)
+static inline __m512i ggml_fn_dot_us8_512(const __m512i ax, const __m512i sy) {
+#if defined(__AVX512VNNI__)
+    return _mm512_dpbusd_epi32(_mm512_setzero_si512(), ax, sy);
+#else
+    return _mm512_madd_epi16(_mm512_maddubs_epi16(ax, sy), _mm512_set1_epi16(1));
+#endif
+}
+
+// 32 bytes at p0 in the low half, 32 bytes at p1 in the high half
+static inline __m512i ggml_fn_load_2x32(const void * p0, const void * p1) {
+    return _mm512_inserti64x4(_mm512_castsi256_si512(_mm256_loadu_si256((const __m256i *) p0)),
+                              _mm256_loadu_si256((const __m256i *) p1), 1);
+}
+
+// the 32 nibbles of each of two 16 byte blocks, as two bytes_from_nibbles_32: 128-bit lanes [low nibbles of q0,
+// high nibbles of q0, low nibbles of q1, high nibbles of q1]
+// [TAG_FN_CPU_MMID_MR] built with broadcast loads: MSVC compiles _mm512_castsi256_si512 of a register as a 32-byte store
+// and a 64-byte reload, a store-forwarding stall that made the 512-bit bodies ~3x slower than the 256-bit ones
+static inline __m512i ggml_fn_nibbles_2x32(const uint8_t * q0, const uint8_t * q1) {
+    const __m512i t = _mm512_mask_broadcast_i32x4(_mm512_broadcast_i32x4(_mm_loadu_si128((const __m128i *) q0)),
+                                                  (__mmask16) 0xFF00, _mm_loadu_si128((const __m128i *) q1)); // [q0, q0, q1, q1]
+    // shift the 16-bit words of lanes 1 and 3 (words 8..15 and 24..31) to bring the high nibbles down
+    return _mm512_and_si512(_mm512_mask_srli_epi16(t, (__mmask32) 0xFF00FF00u, t, 4), _mm512_set1_epi8(0x0F));
+}
+
+// blocks ib and ib + 1 of the AVX2 ggml_vec_dot_q5_1_q8_1 loop for one column, from one 512-bit integer dot; qx, dx0,
+// dx1, fm0, fm1 and ib come from the caller
+#define GGML_FN_Q5_1_COL2(acc, summs, y) do {                                                               \
+        const __m512 q_ = _mm512_cvtepi32_ps(ggml_fn_dot_us8_512(qx, ggml_fn_load_2x32((y)[ib].qs, (y)[ib + 1].qs))); \
+        (summs) += fm0 * GGML_CPU_FP16_TO_FP32((y)[ib].s);                                                   \
+        (acc) = _mm256_fmadd_ps(_mm512_castps512_ps256(q_),                                                  \
+                    _mm256_mul_ps(dx0, _mm256_set1_ps(GGML_CPU_FP16_TO_FP32((y)[ib].d))), (acc));            \
+        (summs) += fm1 * GGML_CPU_FP16_TO_FP32((y)[ib + 1].s);                                               \
+        (acc) = _mm256_fmadd_ps(_mm512_extractf32x8_ps(q_, 1),                                               \
+                    _mm256_mul_ps(dx1, _mm256_set1_ps(GGML_CPU_FP16_TO_FP32((y)[ib + 1].d))), (acc));        \
+    } while (0)
+
+// as ggml_fn_q5_1_row_avx2, two blocks per step: the high bits come from a 64-bit mask (a masked add of 0x10 to the
+// nibbles is the same as or-ing bytes_from_bits_32 & 0x10), the four byte products per lane from one 512-bit dot
+static GGML_FN_INLINE void ggml_fn_q5_1_row_avx512(const int nb, const block_q5_1 * GGML_RESTRICT x,
+        const block_q8_1 * y0, const block_q8_1 * y1, const block_q8_1 * y2, const block_q8_1 * y3,
+        const int nc, float * GGML_RESTRICT s, const size_t bs) {
+    __m256 acc0 = _mm256_setzero_ps();
+    __m256 acc1 = acc0;
+    __m256 acc2 = acc0;
+    __m256 acc3 = acc0;
+    float summs0 = 0.0f;
+    float summs1 = 0.0f;
+    float summs2 = 0.0f;
+    float summs3 = 0.0f;
+
+    const __m512i m10 = _mm512_set1_epi8(0x10);
+
+    int ib = 0;
+    for (; ib + 1 < nb; ib += 2) {
+        const __m256 dx0 = _mm256_set1_ps(GGML_CPU_FP16_TO_FP32(x[ib + 0].d));
+        const __m256 dx1 = _mm256_set1_ps(GGML_CPU_FP16_TO_FP32(x[ib + 1].d));
+        const float  fm0 = GGML_CPU_FP16_TO_FP32(x[ib + 0].m);
+        const float  fm1 = GGML_CPU_FP16_TO_FP32(x[ib + 1].m);
+
+        uint32_t qh0;
+        uint32_t qh1;
+        memcpy(&qh0, x[ib + 0].qh, sizeof(qh0));
+        memcpy(&qh1, x[ib + 1].qh, sizeof(qh1));
+
+        __m512i qx = ggml_fn_nibbles_2x32(x[ib + 0].qs, x[ib + 1].qs);
+        qx = _mm512_mask_add_epi8(qx, (__mmask64) ((uint64_t) qh0 | ((uint64_t) qh1 << 32)), qx, m10);
+
+        GGML_FN_Q5_1_COL2(acc0, summs0, y0);
+        if (nc > 1) { GGML_FN_Q5_1_COL2(acc1, summs1, y1); }
+        if (nc > 2) { GGML_FN_Q5_1_COL2(acc2, summs2, y2); }
+        if (nc > 3) { GGML_FN_Q5_1_COL2(acc3, summs3, y3); }
+    }
+    for (; ib < nb; ++ib) {
+        // an odd last block: the 256-bit step
+        const __m256 dx = _mm256_set1_ps(GGML_CPU_FP16_TO_FP32(x[ib].d));
+        const float  fm = GGML_CPU_FP16_TO_FP32(x[ib].m);
+
+        __m256i qx = bytes_from_nibbles_32(x[ib].qs);
+        __m256i bxhi = bytes_from_bits_32(x[ib].qh);
+        bxhi = _mm256_and_si256(bxhi, _mm256_set1_epi8(0x10));
+        qx = _mm256_or_si256(qx, bxhi);
+
+        GGML_FN_Q5_1_COL(acc0, summs0, y0);
+        if (nc > 1) { GGML_FN_Q5_1_COL(acc1, summs1, y1); }
+        if (nc > 2) { GGML_FN_Q5_1_COL(acc2, summs2, y2); }
+        if (nc > 3) { GGML_FN_Q5_1_COL(acc3, summs3, y3); }
+    }
+
+    s[0] = hsum_float_8(acc0) + summs0;
+    if (nc > 1) { s[1*bs] = hsum_float_8(acc1) + summs1; }
+    if (nc > 2) { s[2*bs] = hsum_float_8(acc2) + summs2; }
+    if (nc > 3) { s[3*bs] = hsum_float_8(acc3) + summs3; }
+}
+
+#endif // GGML_CPU_FN_X86_AVX512
+
+#endif // GGML_CPU_FN_X86
+
+// [TAG_FN_CPU_Q5_1_AVX512] GGML_CPU_Q5_1_AVX512=1 on an AVX512F/BW/DQ build: the 512-bit body, bitwise equal to the
+// AVX2 one (see above); otherwise ggml_vec_dot_q5_1_q8_1_base
+void ggml_vec_dot_q5_1_q8_1(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+#if defined(GGML_CPU_FN_X86_AVX512)
+    if (ggml_cpu_fn_sw[GGML_CPU_FN_Q5_1_AVX512]) {
+        assert(n % QK5_1 == 0);
+        assert(nrc == 1);
+        const block_q8_1 * y = (const block_q8_1 *) vy;
+        ggml_fn_q5_1_row_avx512(n / QK5_1, (const block_q5_1 *) vx, y, y, y, y, 1, s, 0);
+        return;
+    }
+#endif
+    ggml_vec_dot_q5_1_q8_1_base(n, s, bs, vx, bx, vy, by, nrc);
+}
+
+// [TAG_FN_CPU_MMID_MR] multi-row x multi-token dot products for the CPU MUL_MAT_ID (GGML_CPU_MMID_MR=1/2)
+//
+// ggml_vec_dot_<type>_mr(n, s, bs, vx, bx, nr, vy, nc): s[c*bs + r] = dot(row r of vx (row stride bx), column vy[c])
+// for r < nr and c < nc <= 4, the columns in the type's vec_dot_type. MUL_MAT_ID passes all the tokens routed to one
+// expert (up to 4 per call), so every weight block is unpacked once per row for all of them, where the plain path
+// calls vec_dot once per (row, token). Values: bitwise equal to the AVX2 vec_dot (see the header of this section).
+// GGML_CPU_MMID_MR=1 uses the 512-bit bodies where this build has them (q4_K, q5_1, iq4_nl), =2 only 256-bit ones.
+
+#if defined(GGML_CPU_FN_X86)
+
+// ---- q4_K x q8_K and q5_K x q8_K ----
+
+// the scales (16-bit elements 0..7) and mins (8..15) of a q4_K / q5_K super-block, unpacked as the AVX2 dot products do
+static inline __m256i ggml_fn_k4_mins_and_scales(const uint8_t * GGML_RESTRICT scales) {
+    const uint32_t kmask1 = 0x3f3f3f3f;
+    const uint32_t kmask2 = 0x0f0f0f0f;
+    const uint32_t kmask3 = 0x03030303;
+
+    uint32_t utmp[4];
+    memcpy(utmp, scales, 12);
+    utmp[3] = ((utmp[2] >> 4) & kmask2) | (((utmp[1] >> 6) & kmask3) << 4);
+    const uint32_t uaux = utmp[1] & kmask1;
+    utmp[1] = (utmp[2] & kmask2) | (((utmp[0] >> 6) & kmask3) << 4);
+    utmp[2] = uaux;
+    utmp[0] &= kmask1;
+
+    return _mm256_cvtepu8_epi16(_mm_set_epi32(utmp[3], utmp[2], utmp[1], utmp[0]));
+}
+
+// the per super-block float steps of the AVX2 ggml_vec_dot_q4_K_q8_K for one column: the mins term into accm, the
+// scaled integer sum into acc; xd, xdmin, mins and i come from the caller
+#define GGML_FN_Q4_K_FIN(acc, accm, sumi, y) do {                                                           \
+        const float   d_      =  (y)[i].d * xd;                                                             \
+        const float   dmin_   = -(y)[i].d * xdmin;                                                          \
+        const __m256i q8sums_ = _mm256_loadu_si256((const __m256i *) (y)[i].bsums);                         \
+        const __m128i q8s_    = _mm_hadd_epi16(_mm256_extracti128_si256(q8sums_, 0), _mm256_extracti128_si256(q8sums_, 1)); \
+        const __m128i prod_   = _mm_madd_epi16(mins, q8s_);                                                 \
+        (accm) = _mm_fmadd_ps(_mm_set1_ps(dmin_), _mm_cvtepi32_ps(prod_), (accm));                          \
+        (acc)  = _mm256_fmadd_ps(_mm256_set1_ps(d_), _mm256_cvtepi32_ps(sumi), (acc));                      \
+    } while (0)
+
+// the final sums of the AVX2 ggml_vec_dot_q4_K_q8_K
+#define GGML_FN_Q4_K_OUT(dst, acc, accm) do {                                    \
+        __m128 am_ = (accm);                                                     \
+        am_ = _mm_add_ps(am_, _mm_movehl_ps(am_, am_));                          \
+        am_ = _mm_add_ss(am_, _mm_movehdup_ps(am_));                             \
+        (dst) = hsum_float_8(acc) + _mm_cvtss_f32(am_);                          \
+    } while (0)
+
+// one 64-value step j of the AVX2 ggml_vec_dot_q4_K_q8_K for one column; q4l, q4h, scale_l, scale_h, i and j come
+// from the caller
+#define GGML_FN_Q4_K_COL(sumi, y) do {                                                                  \
+        const int8_t * q8_ = (y)[i].qs + 64*j;                                                          \
+        __m256i p16l_ = _mm256_maddubs_epi16(q4l, _mm256_loadu_si256((const __m256i *) q8_));           \
+        p16l_ = _mm256_madd_epi16(scale_l, p16l_);                                                      \
+        __m256i p16h_ = _mm256_maddubs_epi16(q4h, _mm256_loadu_si256((const __m256i *) (q8_ + 32)));    \
+        p16h_ = _mm256_madd_epi16(scale_h, p16h_);                                                      \
+        (sumi) = _mm256_add_epi32((sumi), _mm256_add_epi32(p16l_, p16h_));                              \
+    } while (0)
+
+static GGML_FN_INLINE void ggml_fn_q4_K_row_avx2(const int nb, const block_q4_K * GGML_RESTRICT x,
+        const block_q8_K * y0, const block_q8_K * y1, const block_q8_K * y2, const block_q8_K * y3,
+        const int nc, float * GGML_RESTRICT s, const size_t bs) {
+    const __m256i m4 = _mm256_set1_epi8(0xF);
+
+    __m256 acc0 = _mm256_setzero_ps();
+    __m256 acc1 = acc0;
+    __m256 acc2 = acc0;
+    __m256 acc3 = acc0;
+    __m128 accm0 = _mm_setzero_ps();
+    __m128 accm1 = accm0;
+    __m128 accm2 = accm0;
+    __m128 accm3 = accm0;
+
+    for (int i = 0; i < nb; ++i) {
+        const float xd    = GGML_CPU_FP16_TO_FP32(x[i].d);
+        const float xdmin = GGML_CPU_FP16_TO_FP32(x[i].dmin);
+
+        const __m256i mins_and_scales = ggml_fn_k4_mins_and_scales(x[i].scales);
+        const __m128i mins   = _mm256_extracti128_si256(mins_and_scales, 1);
+        const __m128i sc128  = _mm256_extracti128_si256(mins_and_scales, 0);
+        const __m256i scales = MM256_SET_M128I(sc128, sc128);
+
+        __m256i sumi0 = _mm256_setzero_si256();
+        __m256i sumi1 = sumi0;
+        __m256i sumi2 = sumi0;
+        __m256i sumi3 = sumi0;
+
+        const uint8_t * GGML_RESTRICT q4 = x[i].qs;
+        for (int j = 0; j < QK_K/64; ++j) {
+            const __m256i scale_l = _mm256_shuffle_epi8(scales, get_scale_shuffle_k4(2*j+0));
+            const __m256i scale_h = _mm256_shuffle_epi8(scales, get_scale_shuffle_k4(2*j+1));
+
+            const __m256i q4bits = _mm256_loadu_si256((const __m256i *) (q4 + 32*j));
+            const __m256i q4l = _mm256_and_si256(q4bits, m4);
+            const __m256i q4h = _mm256_and_si256(_mm256_srli_epi16(q4bits, 4), m4);
+
+            GGML_FN_Q4_K_COL(sumi0, y0);
+            if (nc > 1) { GGML_FN_Q4_K_COL(sumi1, y1); }
+            if (nc > 2) { GGML_FN_Q4_K_COL(sumi2, y2); }
+            if (nc > 3) { GGML_FN_Q4_K_COL(sumi3, y3); }
+        }
+
+        GGML_FN_Q4_K_FIN(acc0, accm0, sumi0, y0);
+        if (nc > 1) { GGML_FN_Q4_K_FIN(acc1, accm1, sumi1, y1); }
+        if (nc > 2) { GGML_FN_Q4_K_FIN(acc2, accm2, sumi2, y2); }
+        if (nc > 3) { GGML_FN_Q4_K_FIN(acc3, accm3, sumi3, y3); }
+    }
+
+    GGML_FN_Q4_K_OUT(s[0], acc0, accm0);
+    if (nc > 1) { GGML_FN_Q4_K_OUT(s[1*bs], acc1, accm1); }
+    if (nc > 2) { GGML_FN_Q4_K_OUT(s[2*bs], acc2, accm2); }
+    if (nc > 3) { GGML_FN_Q4_K_OUT(s[3*bs], acc3, accm3); }
+}
+
+#if defined(GGML_CPU_FN_X86_AVX512)
+
+// the whole super-block for one column: w0..w3 are the weights of q8 bytes 0..63, 64..127, 128..191, 192..255 as
+// [low nibbles | high nibbles] (= [q4l_j | q4h_j] of the AVX2 step j), sc0..sc3 the matching [scale_l_j | scale_h_j].
+// Lane k of the low half sums the q4l products of all four steps, lane k of the high half the q4h ones, so their sum
+// is lane k of the AVX2 sumi.
+#define GGML_FN_Q4_K_COL512(acc, accm, y) do {                                                                          \
+        const int8_t * q8_ = (y)[i].qs;                                                                                 \
+        __m512i p_ =                    _mm512_madd_epi16(sc0, _mm512_maddubs_epi16(w0, _mm512_loadu_si512(q8_)));       \
+        p_ = _mm512_add_epi32(p_, _mm512_madd_epi16(sc1, _mm512_maddubs_epi16(w1, _mm512_loadu_si512(q8_ +  64))));     \
+        p_ = _mm512_add_epi32(p_, _mm512_madd_epi16(sc2, _mm512_maddubs_epi16(w2, _mm512_loadu_si512(q8_ + 128))));     \
+        p_ = _mm512_add_epi32(p_, _mm512_madd_epi16(sc3, _mm512_maddubs_epi16(w3, _mm512_loadu_si512(q8_ + 192))));     \
+        const __m256i sumi_ = _mm256_add_epi32(_mm512_castsi512_si256(p_), _mm512_extracti64x4_epi64(p_, 1));            \
+        GGML_FN_Q4_K_FIN(acc, accm, sumi_, y);                                                                          \
+    } while (0)
+
+// 16-bit element k in the low 256 bits and k + 1 in the high 256 bits (indices for _mm512_permutexvar_epi16)
+static inline __m512i ggml_fn_bcast16_pair_idx(const int k) {
+    return _mm512_mask_blend_epi32((__mmask16) 0xFF00, _mm512_set1_epi16((short) k), _mm512_set1_epi16((short) (k + 1)));
+}
+
+static GGML_FN_INLINE void ggml_fn_q4_K_row_avx512(const int nb, const block_q4_K * GGML_RESTRICT x,
+        const block_q8_K * y0, const block_q8_K * y1, const block_q8_K * y2, const block_q8_K * y3,
+        const int nc, float * GGML_RESTRICT s, const size_t bs) {
+    const __m512i m4 = _mm512_set1_epi8(0xF);
+    const __m512i si0 = ggml_fn_bcast16_pair_idx(0);
+    const __m512i si1 = ggml_fn_bcast16_pair_idx(2);
+    const __m512i si2 = ggml_fn_bcast16_pair_idx(4);
+    const __m512i si3 = ggml_fn_bcast16_pair_idx(6);
+
+    __m256 acc0 = _mm256_setzero_ps();
+    __m256 acc1 = acc0;
+    __m256 acc2 = acc0;
+    __m256 acc3 = acc0;
+    __m128 accm0 = _mm_setzero_ps();
+    __m128 accm1 = accm0;
+    __m128 accm2 = accm0;
+    __m128 accm3 = accm0;
+
+    for (int i = 0; i < nb; ++i) {
+        const float xd    = GGML_CPU_FP16_TO_FP32(x[i].d);
+        const float xdmin = GGML_CPU_FP16_TO_FP32(x[i].dmin);
+
+        const __m256i mins_and_scales = ggml_fn_k4_mins_and_scales(x[i].scales);
+        const __m128i mins = _mm256_extracti128_si256(mins_and_scales, 1);
+        // 16-bit elements 0..7: the scales (no widening cast, see ggml_fn_nibbles_2x32)
+        const __m512i sc   = _mm512_inserti64x4(_mm512_setzero_si512(), mins_and_scales, 0);
+        const __m512i sc0  = _mm512_permutexvar_epi16(si0, sc);
+        const __m512i sc1  = _mm512_permutexvar_epi16(si1, sc);
+        const __m512i sc2  = _mm512_permutexvar_epi16(si2, sc);
+        const __m512i sc3  = _mm512_permutexvar_epi16(si3, sc);
+
+        const __m512i b01 = _mm512_loadu_si512(x[i].qs);      // 32 bytes of step 0 | 32 bytes of step 1
+        const __m512i b23 = _mm512_loadu_si512(x[i].qs + 64); // steps 2 | 3
+        const __m512i l01 = _mm512_and_si512(b01, m4);
+        const __m512i h01 = _mm512_and_si512(_mm512_srli_epi16(b01, 4), m4);
+        const __m512i l23 = _mm512_and_si512(b23, m4);
+        const __m512i h23 = _mm512_and_si512(_mm512_srli_epi16(b23, 4), m4);
+        const __m512i w0  = _mm512_shuffle_i64x2(l01, h01, _MM_SHUFFLE(1, 0, 1, 0)); // [q4l_0 | q4h_0]
+        const __m512i w1  = _mm512_shuffle_i64x2(l01, h01, _MM_SHUFFLE(3, 2, 3, 2)); // [q4l_1 | q4h_1]
+        const __m512i w2  = _mm512_shuffle_i64x2(l23, h23, _MM_SHUFFLE(1, 0, 1, 0)); // [q4l_2 | q4h_2]
+        const __m512i w3  = _mm512_shuffle_i64x2(l23, h23, _MM_SHUFFLE(3, 2, 3, 2)); // [q4l_3 | q4h_3]
+
+        GGML_FN_Q4_K_COL512(acc0, accm0, y0);
+        if (nc > 1) { GGML_FN_Q4_K_COL512(acc1, accm1, y1); }
+        if (nc > 2) { GGML_FN_Q4_K_COL512(acc2, accm2, y2); }
+        if (nc > 3) { GGML_FN_Q4_K_COL512(acc3, accm3, y3); }
+    }
+
+    GGML_FN_Q4_K_OUT(s[0], acc0, accm0);
+    if (nc > 1) { GGML_FN_Q4_K_OUT(s[1*bs], acc1, accm1); }
+    if (nc > 2) { GGML_FN_Q4_K_OUT(s[2*bs], acc2, accm2); }
+    if (nc > 3) { GGML_FN_Q4_K_OUT(s[3*bs], acc3, accm3); }
+}
+
+#endif // GGML_CPU_FN_X86_AVX512
+
+// the per super-block float steps of the AVX2 ggml_vec_dot_q5_K_q8_K for one column; xd, xdmin, mins, mzero and i
+// come from the caller
+#define GGML_FN_Q5_K_FIN(acc, summs, sumi, y) do {                                                          \
+        const float   d_      =  (y)[i].d * xd;                                                             \
+        const float   dmin_   = -(y)[i].d * xdmin;                                                          \
+        const __m256i q8sums_ = _mm256_loadu_si256((const __m256i *) (y)[i].bsums);                         \
+        const __m128i q8s_    = _mm_hadd_epi16(_mm256_extracti128_si256(q8sums_, 0), _mm256_extracti128_si256(q8sums_, 1)); \
+        const __m128i prod_   = _mm_madd_epi16(mins, q8s_);                                                 \
+        const __m128i hsum_   = _mm_hadd_epi32(_mm_hadd_epi32(prod_, mzero), mzero);                        \
+        (summs) += dmin_ * _mm_extract_epi32(hsum_, 0);                                                     \
+        (acc) = _mm256_fmadd_ps(_mm256_set1_ps(d_), _mm256_cvtepi32_ps(sumi), (acc));                       \
+    } while (0)
+
+// one 64-value step j of the AVX2 ggml_vec_dot_q5_K_q8_K for one column; q5_0, q5_1, scale_0, scale_1, i and j come
+// from the caller
+#define GGML_FN_Q5_K_COL(sumi, y) do {                                                                  \
+        const int8_t * q8_ = (y)[i].qs + 64*j;                                                          \
+        __m256i p16_0_ = _mm256_maddubs_epi16(q5_0, _mm256_loadu_si256((const __m256i *) q8_));         \
+        __m256i p16_1_ = _mm256_maddubs_epi16(q5_1, _mm256_loadu_si256((const __m256i *) (q8_ + 32)));  \
+        p16_0_ = _mm256_madd_epi16(scale_0, p16_0_);                                                    \
+        p16_1_ = _mm256_madd_epi16(scale_1, p16_1_);                                                    \
+        (sumi) = _mm256_add_epi32((sumi), _mm256_add_epi32(p16_0_, p16_1_));                            \
+    } while (0)
+
+static GGML_FN_INLINE void ggml_fn_q5_K_row_avx2(const int nb, const block_q5_K * GGML_RESTRICT x,
+        const block_q8_K * y0, const block_q8_K * y1, const block_q8_K * y2, const block_q8_K * y3,
+        const int nc, float * GGML_RESTRICT s, const size_t bs) {
+    const __m256i m4    = _mm256_set1_epi8(0xF);
+    const __m128i mzero = _mm_setzero_si128();
+    const __m256i mone  = _mm256_set1_epi8(1);
+
+    __m256 acc0 = _mm256_setzero_ps();
+    __m256 acc1 = acc0;
+    __m256 acc2 = acc0;
+    __m256 acc3 = acc0;
+    float summs0 = 0.0f;
+    float summs1 = 0.0f;
+    float summs2 = 0.0f;
+    float summs3 = 0.0f;
+
+    for (int i = 0; i < nb; ++i) {
+        const float xd    = GGML_CPU_FP16_TO_FP32(x[i].d);
+        const float xdmin = GGML_CPU_FP16_TO_FP32(x[i].dmin);
+
+        const __m256i mins_and_scales = ggml_fn_k4_mins_and_scales(x[i].scales);
+        const __m128i mins   = _mm256_extracti128_si256(mins_and_scales, 1);
+        const __m128i sc128  = _mm256_extracti128_si256(mins_and_scales, 0);
+        const __m256i scales = MM256_SET_M128I(sc128, sc128);
+
+        const __m256i hbits = _mm256_loadu_si256((const __m256i *) x[i].qh);
+        __m256i hmask = mone;
+
+        __m256i sumi0 = _mm256_setzero_si256();
+        __m256i sumi1 = sumi0;
+        __m256i sumi2 = sumi0;
+        __m256i sumi3 = sumi0;
+
+        const uint8_t * GGML_RESTRICT q5 = x[i].qs;
+        int bit = 0;
+        for (int j = 0; j < QK_K/64; ++j) {
+            const __m256i scale_0 = _mm256_shuffle_epi8(scales, get_scale_shuffle_k4(2*j+0));
+            const __m256i scale_1 = _mm256_shuffle_epi8(scales, get_scale_shuffle_k4(2*j+1));
+
+            const __m256i q5bits = _mm256_loadu_si256((const __m256i *) (q5 + 32*j));
+
+            const __m256i q5l_0 = _mm256_and_si256(q5bits, m4);
+            const __m256i q5h_0 = _mm256_slli_epi16(_mm256_srli_epi16(_mm256_and_si256(hbits, hmask), bit++), 4);
+            const __m256i q5_0  = _mm256_add_epi8(q5l_0, q5h_0);
+            hmask = _mm256_slli_epi16(hmask, 1);
+
+            const __m256i q5l_1 = _mm256_and_si256(_mm256_srli_epi16(q5bits, 4), m4);
+            const __m256i q5h_1 = _mm256_slli_epi16(_mm256_srli_epi16(_mm256_and_si256(hbits, hmask), bit++), 4);
+            const __m256i q5_1  = _mm256_add_epi8(q5l_1, q5h_1);
+            hmask = _mm256_slli_epi16(hmask, 1);
+
+            GGML_FN_Q5_K_COL(sumi0, y0);
+            if (nc > 1) { GGML_FN_Q5_K_COL(sumi1, y1); }
+            if (nc > 2) { GGML_FN_Q5_K_COL(sumi2, y2); }
+            if (nc > 3) { GGML_FN_Q5_K_COL(sumi3, y3); }
+        }
+
+        GGML_FN_Q5_K_FIN(acc0, summs0, sumi0, y0);
+        if (nc > 1) { GGML_FN_Q5_K_FIN(acc1, summs1, sumi1, y1); }
+        if (nc > 2) { GGML_FN_Q5_K_FIN(acc2, summs2, sumi2, y2); }
+        if (nc > 3) { GGML_FN_Q5_K_FIN(acc3, summs3, sumi3, y3); }
+    }
+
+    s[0] = hsum_float_8(acc0) + summs0;
+    if (nc > 1) { s[1*bs] = hsum_float_8(acc1) + summs1; }
+    if (nc > 2) { s[2*bs] = hsum_float_8(acc2) + summs2; }
+    if (nc > 3) { s[3*bs] = hsum_float_8(acc3) + summs3; }
+}
+
+// ---- q8_0 x q8_0 ----
+
+// one block of the AVX2 ggml_vec_dot_q8_0_q8_0 loop for one column; qx, fx and ib come from the caller
+#define GGML_FN_Q8_0_COL(acc, y) do {                                                                   \
+        const __m256 d_ = _mm256_set1_ps(fx * GGML_CPU_FP16_TO_FP32((y)[ib].d));                        \
+        const __m256 q_ = mul_sum_i8_pairs_float(qx, _mm256_loadu_si256((const __m256i *) (y)[ib].qs)); \
+        (acc) = _mm256_fmadd_ps(d_, q_, (acc));                                                         \
+    } while (0)
+
+static GGML_FN_INLINE void ggml_fn_q8_0_row_avx2(const int nb, const block_q8_0 * GGML_RESTRICT x,
+        const block_q8_0 * y0, const block_q8_0 * y1, const block_q8_0 * y2, const block_q8_0 * y3,
+        const int nc, float * GGML_RESTRICT s, const size_t bs) {
+    __m256 acc0 = _mm256_setzero_ps();
+    __m256 acc1 = acc0;
+    __m256 acc2 = acc0;
+    __m256 acc3 = acc0;
+
+    for (int ib = 0; ib < nb; ++ib) {
+        const float   fx = GGML_CPU_FP16_TO_FP32(x[ib].d);
+        const __m256i qx = _mm256_loadu_si256((const __m256i *) x[ib].qs);
+
+        GGML_FN_Q8_0_COL(acc0, y0);
+        if (nc > 1) { GGML_FN_Q8_0_COL(acc1, y1); }
+        if (nc > 2) { GGML_FN_Q8_0_COL(acc2, y2); }
+        if (nc > 3) { GGML_FN_Q8_0_COL(acc3, y3); }
+    }
+
+    s[0] = hsum_float_8(acc0);
+    if (nc > 1) { s[1*bs] = hsum_float_8(acc1); }
+    if (nc > 2) { s[2*bs] = hsum_float_8(acc2); }
+    if (nc > 3) { s[3*bs] = hsum_float_8(acc3); }
+}
+
+// ---- iq4_nl x q8_0 ----
+
+// blocks ib and ib + 1 of the AVX2 ggml_vec_dot_iq4_nl_q8_0 loop for one column (accumulators a1 for the even block,
+// a2 for the odd one); q4b_1, q4b_2, fx1, fx2, mone and ib come from the caller
+#define GGML_FN_IQ4_NL_COL(a1, a2, y) do {                                                                      \
+        const __m256i p16_1_ = mul_add_epi8(q4b_1, _mm256_loadu_si256((const __m256i *) (y)[ib + 0].qs));        \
+        const __m256i p16_2_ = mul_add_epi8(q4b_2, _mm256_loadu_si256((const __m256i *) (y)[ib + 1].qs));        \
+        const __m256i p_1_ = _mm256_madd_epi16(p16_1_, mone);                                                   \
+        const __m256i p_2_ = _mm256_madd_epi16(p16_2_, mone);                                                   \
+        (a1) = _mm256_fmadd_ps(_mm256_set1_ps(GGML_CPU_FP16_TO_FP32((y)[ib + 0].d)*fx1), _mm256_cvtepi32_ps(p_1_), (a1)); \
+        (a2) = _mm256_fmadd_ps(_mm256_set1_ps(GGML_CPU_FP16_TO_FP32((y)[ib + 1].d)*fx2), _mm256_cvtepi32_ps(p_2_), (a2)); \
+    } while (0)
+
+// the scalar tail of the AVX2 ggml_vec_dot_iq4_nl_q8_0 (an odd last block) for one column
+static inline float ggml_fn_iq4_nl_tail(float sumf, const block_iq4_nl * GGML_RESTRICT x, const block_q8_0 * GGML_RESTRICT y) {
+    const float d = GGML_CPU_FP16_TO_FP32(y->d)*GGML_CPU_FP16_TO_FP32(x->d);
+    int sumi1 = 0, sumi2 = 0;
+    for (int j = 0; j < QK4_NL/2; ++j) {
+        sumi1 += y->qs[j+       0] * kvalues_iq4nl[x->qs[j] & 0xf];
+        sumi2 += y->qs[j+QK4_NL/2] * kvalues_iq4nl[x->qs[j] >>  4];
+    }
+    sumf += d * (sumi1 + sumi2);
+    return sumf;
+}
+
+#define GGML_FN_IQ4_NL_OUT(dst, a1, a2, y) do {                                  \
+        float sumf_ = hsum_float_8(_mm256_add_ps((a1), (a2)));                   \
+        if (ib < nb) {                                                           \
+            sumf_ = ggml_fn_iq4_nl_tail(sumf_, &x[ib], &(y)[ib]);                \
+        }                                                                        \
+        (dst) = sumf_;                                                           \
+    } while (0)
+
+static GGML_FN_INLINE void ggml_fn_iq4_nl_row_avx2(const int nb, const block_iq4_nl * GGML_RESTRICT x,
+        const block_q8_0 * y0, const block_q8_0 * y1, const block_q8_0 * y2, const block_q8_0 * y3,
+        const int nc, float * GGML_RESTRICT s, const size_t bs) {
+    const __m128i values128 = _mm_loadu_si128((const __m128i *) kvalues_iq4nl);
+    const __m128i m4b  = _mm_set1_epi8(0x0f);
+    const __m256i mone = _mm256_set1_epi16(1);
+
+    __m256 a1_0 = _mm256_setzero_ps();
+    __m256 a1_1 = a1_0;
+    __m256 a1_2 = a1_0;
+    __m256 a1_3 = a1_0;
+    __m256 a2_0 = a1_0;
+    __m256 a2_1 = a1_0;
+    __m256 a2_2 = a1_0;
+    __m256 a2_3 = a1_0;
+
+    int ib = 0;
+    for (; ib + 1 < nb; ib += 2) {
+        const __m128i q4bits_1 = _mm_loadu_si128((const __m128i *) x[ib + 0].qs);
+        const __m128i q4bits_2 = _mm_loadu_si128((const __m128i *) x[ib + 1].qs);
+        const __m256i q4b_1 = MM256_SET_M128I(_mm_shuffle_epi8(values128, _mm_and_si128(_mm_srli_epi16(q4bits_1, 4), m4b)),
+                                              _mm_shuffle_epi8(values128, _mm_and_si128(q4bits_1, m4b)));
+        const __m256i q4b_2 = MM256_SET_M128I(_mm_shuffle_epi8(values128, _mm_and_si128(_mm_srli_epi16(q4bits_2, 4), m4b)),
+                                              _mm_shuffle_epi8(values128, _mm_and_si128(q4bits_2, m4b)));
+        const float fx1 = GGML_CPU_FP16_TO_FP32(x[ib + 0].d);
+        const float fx2 = GGML_CPU_FP16_TO_FP32(x[ib + 1].d);
+
+        GGML_FN_IQ4_NL_COL(a1_0, a2_0, y0);
+        if (nc > 1) { GGML_FN_IQ4_NL_COL(a1_1, a2_1, y1); }
+        if (nc > 2) { GGML_FN_IQ4_NL_COL(a1_2, a2_2, y2); }
+        if (nc > 3) { GGML_FN_IQ4_NL_COL(a1_3, a2_3, y3); }
+    }
+
+    GGML_FN_IQ4_NL_OUT(s[0], a1_0, a2_0, y0);
+    if (nc > 1) { GGML_FN_IQ4_NL_OUT(s[1*bs], a1_1, a2_1, y1); }
+    if (nc > 2) { GGML_FN_IQ4_NL_OUT(s[2*bs], a1_2, a2_2, y2); }
+    if (nc > 3) { GGML_FN_IQ4_NL_OUT(s[3*bs], a1_3, a2_3, y3); }
+}
+
+#if defined(GGML_CPU_FN_X86_AVX512)
+
+// blocks ib and ib + 1 for one column from one 512-bit dot: |x| times y with the sign of x (the AVX2 mul_add_epi8:
+// where x is 0 the product is 0 either way), then the same float steps into a1 and a2; ax, xneg, fx1, fx2 and ib come
+// from the caller
+#define GGML_FN_IQ4_NL_COL512(a1, a2, y) do {                                                                   \
+        const __m512i q8b_ = ggml_fn_load_2x32((y)[ib + 0].qs, (y)[ib + 1].qs);                                 \
+        const __m512i sy_  = _mm512_mask_sub_epi8(q8b_, xneg, _mm512_setzero_si512(), q8b_);                    \
+        const __m512  p_   = _mm512_cvtepi32_ps(ggml_fn_dot_us8_512(ax, sy_));                                  \
+        (a1) = _mm256_fmadd_ps(_mm256_set1_ps(GGML_CPU_FP16_TO_FP32((y)[ib + 0].d)*fx1), _mm512_castps512_ps256(p_), (a1));   \
+        (a2) = _mm256_fmadd_ps(_mm256_set1_ps(GGML_CPU_FP16_TO_FP32((y)[ib + 1].d)*fx2), _mm512_extractf32x8_ps(p_, 1), (a2)); \
+    } while (0)
+
+static GGML_FN_INLINE void ggml_fn_iq4_nl_row_avx512(const int nb, const block_iq4_nl * GGML_RESTRICT x,
+        const block_q8_0 * y0, const block_q8_0 * y1, const block_q8_0 * y2, const block_q8_0 * y3,
+        const int nc, float * GGML_RESTRICT s, const size_t bs) {
+    const __m512i values = _mm512_broadcast_i32x4(_mm_loadu_si128((const __m128i *) kvalues_iq4nl));
+
+    __m256 a1_0 = _mm256_setzero_ps();
+    __m256 a1_1 = a1_0;
+    __m256 a1_2 = a1_0;
+    __m256 a1_3 = a1_0;
+    __m256 a2_0 = a1_0;
+    __m256 a2_1 = a1_0;
+    __m256 a2_2 = a1_0;
+    __m256 a2_3 = a1_0;
+
+    int ib = 0;
+    for (; ib + 1 < nb; ib += 2) {
+        // [q4b_1 | q4b_2] of the AVX2 step: per block the low nibble values, then the high nibble values
+        const __m512i q4b  = _mm512_shuffle_epi8(values, ggml_fn_nibbles_2x32(x[ib + 0].qs, x[ib + 1].qs));
+        const __m512i ax   = _mm512_abs_epi8(q4b);
+        const __mmask64 xneg = _mm512_movepi8_mask(q4b);
+        const float fx1 = GGML_CPU_FP16_TO_FP32(x[ib + 0].d);
+        const float fx2 = GGML_CPU_FP16_TO_FP32(x[ib + 1].d);
+
+        GGML_FN_IQ4_NL_COL512(a1_0, a2_0, y0);
+        if (nc > 1) { GGML_FN_IQ4_NL_COL512(a1_1, a2_1, y1); }
+        if (nc > 2) { GGML_FN_IQ4_NL_COL512(a1_2, a2_2, y2); }
+        if (nc > 3) { GGML_FN_IQ4_NL_COL512(a1_3, a2_3, y3); }
+    }
+
+    GGML_FN_IQ4_NL_OUT(s[0], a1_0, a2_0, y0);
+    if (nc > 1) { GGML_FN_IQ4_NL_OUT(s[1*bs], a1_1, a2_1, y1); }
+    if (nc > 2) { GGML_FN_IQ4_NL_OUT(s[2*bs], a1_2, a2_2, y2); }
+    if (nc > 3) { GGML_FN_IQ4_NL_OUT(s[3*bs], a1_3, a2_3, y3); }
+}
+
+#endif // GGML_CPU_FN_X86_AVX512
+
+// ---- entry points ----
+
+// row r of every call gets its own s + r; the column count is a literal in each case, so the inlined body keeps only
+// the columns it has
+#define GGML_FN_MR_ROWS(TX, TY, QK, ROW) do {                                                       \
+        const int nb = n / (QK);                                                                    \
+        const TY * y0 = (const TY *) vy[0];                                                         \
+        const TY * y1 = nc > 1 ? (const TY *) vy[1] : y0;                                           \
+        const TY * y2 = nc > 2 ? (const TY *) vy[2] : y0;                                           \
+        const TY * y3 = nc > 3 ? (const TY *) vy[3] : y0;                                           \
+        for (int r = 0; r < nr; ++r) {                                                              \
+            const TX * x = (const TX *) ((const char *) vx + r*bx);                                 \
+            switch (nc) {                                                                           \
+                case 1:  ROW(nb, x, y0, y1, y2, y3, 1, s + r, bs); break;                           \
+                case 2:  ROW(nb, x, y0, y1, y2, y3, 2, s + r, bs); break;                           \
+                case 3:  ROW(nb, x, y0, y1, y2, y3, 3, s + r, bs); break;                           \
+                default: ROW(nb, x, y0, y1, y2, y3, 4, s + r, bs); break;                           \
+            }                                                                                       \
+        }                                                                                           \
+    } while (0)
+
+// GGML_CPU_MMID_MR=2 keeps the 256-bit bodies
+static inline bool ggml_fn_mr_wide(void) {
+#if defined(GGML_CPU_FN_X86_AVX512)
+    return ggml_cpu_fn_sw[GGML_CPU_FN_MMID_MR] != 2;
+#else
+    return false;
+#endif
+}
+
+void ggml_vec_dot_q4_K_q8_K_mr(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, int nr,
+                               const void * const * GGML_RESTRICT vy, int nc) {
+    assert(n % QK_K == 0);
+    assert(nc >= 1 && nc <= GGML_CPU_FN_MR_MAX_NC);
+#if defined(GGML_CPU_FN_X86_AVX512)
+    if (ggml_fn_mr_wide()) {
+        GGML_FN_MR_ROWS(block_q4_K, block_q8_K, QK_K, ggml_fn_q4_K_row_avx512);
+        return;
+    }
+#endif
+    GGML_FN_MR_ROWS(block_q4_K, block_q8_K, QK_K, ggml_fn_q4_K_row_avx2);
+}
+
+void ggml_vec_dot_q5_K_q8_K_mr(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, int nr,
+                               const void * const * GGML_RESTRICT vy, int nc) {
+    assert(n % QK_K == 0);
+    assert(nc >= 1 && nc <= GGML_CPU_FN_MR_MAX_NC);
+    GGML_FN_MR_ROWS(block_q5_K, block_q8_K, QK_K, ggml_fn_q5_K_row_avx2);
+}
+
+void ggml_vec_dot_q5_1_q8_1_mr(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, int nr,
+                               const void * const * GGML_RESTRICT vy, int nc) {
+    assert(n % QK5_1 == 0);
+    assert(nc >= 1 && nc <= GGML_CPU_FN_MR_MAX_NC);
+#if defined(GGML_CPU_FN_X86_AVX512)
+    if (ggml_fn_mr_wide()) {
+        GGML_FN_MR_ROWS(block_q5_1, block_q8_1, QK5_1, ggml_fn_q5_1_row_avx512);
+        return;
+    }
+#endif
+    GGML_FN_MR_ROWS(block_q5_1, block_q8_1, QK5_1, ggml_fn_q5_1_row_avx2);
+}
+
+void ggml_vec_dot_q8_0_q8_0_mr(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, int nr,
+                               const void * const * GGML_RESTRICT vy, int nc) {
+    assert(n % QK8_0 == 0);
+    assert(nc >= 1 && nc <= GGML_CPU_FN_MR_MAX_NC);
+    GGML_FN_MR_ROWS(block_q8_0, block_q8_0, QK8_0, ggml_fn_q8_0_row_avx2);
+}
+
+void ggml_vec_dot_iq4_nl_q8_0_mr(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, int nr,
+                                 const void * const * GGML_RESTRICT vy, int nc) {
+    assert(n % QK4_NL == 0);
+    assert(nc >= 1 && nc <= GGML_CPU_FN_MR_MAX_NC);
+#if defined(GGML_CPU_FN_X86_AVX512)
+    if (ggml_fn_mr_wide()) {
+        GGML_FN_MR_ROWS(block_iq4_nl, block_q8_0, QK4_NL, ggml_fn_iq4_nl_row_avx512);
+        return;
+    }
+#endif
+    GGML_FN_MR_ROWS(block_iq4_nl, block_q8_0, QK4_NL, ggml_fn_iq4_nl_row_avx2);
+}
+
+#endif // GGML_CPU_FN_X86

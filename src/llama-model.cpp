@@ -2355,6 +2355,16 @@ ggml_tensor * llama_model::get_rope_factors(const llama_cparams & cparams, int i
     return layers[il].rope_short;
 }
 
+// [TAG_QWEN4EXP_MTP] whether the qwen4exp MTP block runs QSA (a compress ratio > 0 on a layer past n_layer)
+static bool llama_model_qwen4exp_mtp_qsa(const llama_hparams & hparams) {
+    for (uint32_t il = hparams.n_layer(); il < hparams.n_layer_all && il < LLAMA_MAX_LAYERS; ++il) {
+        if (hparams.dsv4_compress_ratios[il] > 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 llama_memory_i * llama_model::create_memory(const llama_memory_params & params, const llama_cparams & cparams) const {
     llama_memory_i * res;
 
@@ -2752,16 +2762,51 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* attn_type_k_swa   */ params.type_k_swa,    // [TAG_TURBOT_ANY_ISWA]
                             /* attn_type_v_swa   */ params.type_v_swa);
                     } else if (needs_mem_idx) {
+                        uint32_t       kv_size_attn = cparams.n_ctx_seq;
+                        uint32_t       n_swa_attn   = hparams.n_swa;
+                        llama_swa_type swa_attn     = hparams.swa_type;
+
+                        if (arch == LLM_ARCH_QWEN4EXP && params.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
+                            const bool mtp_qsa = llama_model_qwen4exp_mtp_qsa(hparams);
+
+                            // [TAG_QWEN4EXP_MTP] [TAG_SYNC_1004] a dense MTP block (compress ratio 0, as in the unsloth
+                            // MTP files) never reads the indexer cache, so the draft context makes none
+                            if (!mtp_qsa) {
+                                filter_idx = nullptr;
+                            }
+
+                            // [TAG_FN_MTP_ATTN_WINDOW] LLAMA_MTP_ATTN_WINDOW=<n> (0/unset = off): the qwen4exp MTP draft
+                            // context keeps a sliding-window cache of n + n_ubatch cells per sequence and its drafts attend
+                            // to the last n positions (qwen4exp keeps the explicit KQ mask, which applies the window).
+                            // Drafts only: the target verifies with its full attention. A QSA MTP block pools whole
+                            // sequences in cache order, which an evicting window would regroup, so it keeps the full cache.
+                            const char * e = getenv("LLAMA_MTP_ATTN_WINDOW");
+                            const long long w = e ? atoll(e) : 0;
+                            if (w > 0 && (uint64_t) w < cparams.n_ctx_seq) {
+                                if (mtp_qsa) {
+                                    LLAMA_LOG_WARN("%s: [TAG_FN_MTP_ATTN_WINDOW] the MTP block is a QSA layer (compress ratio > 0): "
+                                            "LLAMA_MTP_ATTN_WINDOW ignored, the draft KV keeps %u cells\n", __func__, cparams.n_ctx_seq);
+                                } else {
+                                    const uint64_t cells = (uint64_t) w*(cparams.kv_unified ? cparams.n_seq_max : 1) + cparams.n_ubatch;
+                                    n_swa_attn   = (uint32_t) w;
+                                    swa_attn     = LLAMA_SWA_TYPE_STANDARD;
+                                    kv_size_attn = (uint32_t) std::min<uint64_t>(cparams.n_ctx_seq, GGML_PAD(cells, 256));
+                                    LLAMA_LOG_INFO("%s: [TAG_FN_MTP_ATTN_WINDOW] MTP draft attention window %u, draft KV %u cells instead of %u\n",
+                                            __func__, n_swa_attn, kv_size_attn, cparams.n_ctx_seq);
+                                }
+                            }
+                        }
+
                         // sparse attention over a per-token indexer cache, in its own memory type
                         res = new llama_memory_hybrid_idx(
                             /* model             */ *this,
                             /* attn_type_k       */ params.type_k,
                             /* attn_type_v       */ params.type_v,
                             /* attn_v_trans      */ !cparams.flash_attn,
-                            /* attn_kv_size      */ cparams.n_ctx_seq,
+                            /* attn_kv_size      */ kv_size_attn,
                             /* attn_n_pad        */ 1,
-                            /* attn_n_swa        */ hparams.n_swa,
-                            /* attn_swa_type     */ hparams.swa_type,
+                            /* attn_n_swa        */ n_swa_attn,
+                            /* attn_swa_type     */ swa_attn,
                             /* recurrent_type_k  */ GGML_TYPE_F32,
                             /* recurrent_type_v  */ GGML_TYPE_F32,
                             /* recurrent_kv_size */ std::max((uint32_t) 1, cparams.n_seq_max),

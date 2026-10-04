@@ -34,6 +34,7 @@
 #include "ggml-cuda/mmf.cuh"
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/mmsb.cuh"   // [TAG_MMSB] [TAG_SMALLB]
+#include "ggml-cuda/moe-bridge.cuh" // [TAG_MOE_BRIDGE]
 #include "ggml-cuda/mmqsn.cuh"  // [TAG_MMQSN]
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
@@ -2522,6 +2523,12 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_GATED_DELTA_NET_REPLAY: // [TAG_4C_GDN_REPLAY]
             ggml_cuda_op_gated_delta_net_replay(ctx, dst, nullptr);
             break;
+        case GGML_OP_MOE_HOST_POST: // [TAG_MOE_BRIDGE]
+            ggml_cuda_op_moe_host_post(ctx, dst);
+            break;
+        case GGML_OP_MOE_HOST_WAIT: // [TAG_MOE_BRIDGE]
+            ggml_cuda_op_moe_host_wait(ctx, dst);
+            break;
         case GGML_OP_DSV4_HC_COMB:
             ggml_cuda_op_dsv4_hc_comb(ctx, dst);
             break;
@@ -2787,8 +2794,14 @@ static bool ggml_cuda_graph_key_memo_enabled() {
     return on;
 }
 
+// [TAG_FN_GRAPH_KEY_MEMO] 4-way set lookup by uid: O(1) per call with 256 entries (uids are consecutive per graph split)
+static constexpr int GGML_CUDA_GRAPH_KEY_MEMO_WAYS = 4;
+
 static ggml_cuda_graph_key_memo * ggml_cuda_graph_key_memo_find(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph) {
-    for (ggml_cuda_graph_key_memo & m : cuda_ctx->graph_key_memo) {
+    constexpr int n_memo = ggml_backend_cuda_context::GRAPH_KEY_MEMO_N;
+    const int base = (int) (cgraph->uid % n_memo);
+    for (int w = 0; w < GGML_CUDA_GRAPH_KEY_MEMO_WAYS; ++w) {
+        ggml_cuda_graph_key_memo & m = cuda_ctx->graph_key_memo[(base + w) % n_memo];
         if (m.uid == cgraph->uid && m.cgraph == cgraph && m.n_nodes == cgraph->n_nodes && m.key != nullptr) {
             return &m;
         }
@@ -2807,9 +2820,21 @@ static const void * ggml_cuda_graph_get_key(ggml_backend_cuda_context * cuda_ctx
 
     const void * key = ggml_cuda_graph_get_key_hash(cgraph);
 
-    constexpr int n_memo = (int) (sizeof(ggml_backend_cuda_context::graph_key_memo) / sizeof(ggml_cuda_graph_key_memo));
-    ggml_cuda_graph_key_memo & m = cuda_ctx->graph_key_memo[cuda_ctx->graph_key_memo_next];
-    cuda_ctx->graph_key_memo_next = (cuda_ctx->graph_key_memo_next + 1) % n_memo;
+    // [TAG_FN_GRAPH_KEY_MEMO] replace an empty way, else the oldest (smallest uid) of the set
+    constexpr int n_memo = ggml_backend_cuda_context::GRAPH_KEY_MEMO_N;
+    const int base = (int) (cgraph->uid % n_memo);
+    int victim = base;
+    for (int w = 0; w < GGML_CUDA_GRAPH_KEY_MEMO_WAYS; ++w) {
+        const int i = (base + w) % n_memo;
+        if (cuda_ctx->graph_key_memo[i].key == nullptr) {
+            victim = i;
+            break;
+        }
+        if (cuda_ctx->graph_key_memo[i].uid < cuda_ctx->graph_key_memo[victim].uid) {
+            victim = i;
+        }
+    }
+    ggml_cuda_graph_key_memo & m = cuda_ctx->graph_key_memo[victim];
     m.uid     = cgraph->uid;
     m.cgraph  = cgraph;
     m.n_nodes = cgraph->n_nodes;
@@ -6352,6 +6377,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
 #else
             return ggml_cuda_gdn_replay_supported(op);
 #endif // GGML_USE_MUSA
+        case GGML_OP_MOE_HOST_POST: // [TAG_MOE_BRIDGE] only for a bridge registered on this device
+        case GGML_OP_MOE_HOST_WAIT:
+            return ggml_cuda_moe_bridge_supports_op(dev_ctx->device, op);
         case GGML_OP_DSV4_HC_COMB:
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                 op->src[2]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
@@ -6567,6 +6595,34 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_turbot_supports_geometry") == 0) {   // [TAG_TURBOT_ANY_RESOLVE]
         return (void *)ggml_backend_cuda_turbot_supports_geometry;
+    }
+    // [TAG_MOE_BRIDGE] ggml-moe-bridge.h
+    if (strcmp(name, "ggml_backend_moe_bridge_new") == 0) {
+        return (void *)ggml_backend_cuda_moe_bridge_new;
+    }
+    if (strcmp(name, "ggml_backend_moe_bridge_free") == 0) {
+        return (void *)ggml_backend_cuda_moe_bridge_free;
+    }
+    if (strcmp(name, "ggml_backend_moe_bridge_id") == 0) {
+        return (void *)ggml_backend_cuda_moe_bridge_id;
+    }
+    if (strcmp(name, "ggml_backend_moe_bridge_set_runner") == 0) {
+        return (void *)ggml_backend_cuda_moe_bridge_set_runner;
+    }
+    if (strcmp(name, "ggml_backend_moe_bridge_poll") == 0) {
+        return (void *)ggml_backend_cuda_moe_bridge_poll;
+    }
+    if (strcmp(name, "ggml_backend_moe_bridge_complete") == 0) {
+        return (void *)ggml_backend_cuda_moe_bridge_complete;
+    }
+    if (strcmp(name, "ggml_backend_moe_bridge_error") == 0) {
+        return (void *)ggml_backend_cuda_moe_bridge_error;
+    }
+    if (strcmp(name, "ggml_backend_moe_bridge_reset") == 0) {
+        return (void *)ggml_backend_cuda_moe_bridge_reset;
+    }
+    if (strcmp(name, "ggml_backend_moe_bridge_get_stats") == 0) {
+        return (void *)ggml_backend_cuda_moe_bridge_get_stats;
     }
     return nullptr;
 }

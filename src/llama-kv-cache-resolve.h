@@ -196,6 +196,15 @@ struct llama_kv_resolve_input {
     // get an automatic plan (llama_turbot_cache_shape::auto_ok). MTP and draft contexts never do.
     bool ctx_default = false;
 
+    // [TAG_FN_TURBOT_HQ] the KV quality bar of this model is q8_0: a step down the chain never takes a turbo type that
+    // was not asked for (turbot -> q8_0 -> f16, not turbot -> turbo5p -> turbo4). llama_context sets it for qwen4exp;
+    // env LLAMA_KV_HQ_FALLBACK=0 clears it, =1 sets it for every model.
+    bool hq_fallback = false;
+
+    // [TAG_FN_TURBOT_PLAN] the plan chooser's step 4 makes the quality plan for this cache (llama_turbot_cache_shape::quality):
+    // llama_context sets it for qwen4exp, whose KV bar is q8_0
+    bool turbot_quality = false;
+
     std::string env_refusal;     // llama_turbot_env_refusal() of the process
     std::string turbot_refused;  // non-empty: turbot is refused with this reason (the constructor threw it anyway)
 
@@ -235,8 +244,8 @@ struct llama_kv_resolve_result {
 LLAMA_API llama_kv_resolve_result llama_kv_resolve(const llama_kv_resolve_input & in);
 
 // [TAG_TURBOT_ANY_RESOLVE] the plan shape of the turbot cache in would build: its layers (attn, minus the SWA ones of an
-// iSWA split) with their geometry, kv_size, n_stream, n_seq_max and auto_ok = in.ctx_default; model = nullptr
-// (llama-context.cpp). llama_kv_resolve hands exactly this shape to in.plan_check.
+// iSWA split) with their geometry, kv_size, n_stream, n_seq_max, auto_ok = in.ctx_default and [TAG_FN_TURBOT_PLAN]
+// quality = in.turbot_quality; model = nullptr (llama-context.cpp). llama_kv_resolve hands exactly this shape to in.plan_check.
 LLAMA_API llama_turbot_cache_shape llama_kv_resolve_turbot_shape_of(const llama_kv_resolve_input & in);
 
 // "turbot" for the turbot types, ggml_type_name() otherwise

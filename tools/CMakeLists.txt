@@ -36,10 +36,14 @@ else()
         # these tools use backends directly (no dynamic loading) and depend on CPU backend symbols
         add_subdirectory(cvector-generator)
         add_subdirectory(export-lora)
+        add_subdirectory(moe-cpu-bench) # [TAG_FN_CPU_MOE_BENCH]
     endif()
     add_subdirectory(fit-params)
     if (GGML_METAL)
         add_subdirectory(tuning)
     endif()
     add_subdirectory(results)
+    if (GGML_CUDA)
+        add_subdirectory(moe-bridge-probe) # [TAG_FN_BRIDGE_PROBE]
+    endif()
 endif()

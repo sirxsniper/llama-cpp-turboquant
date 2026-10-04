@@ -299,6 +299,17 @@ endif()
 llama_build_and_test(test-kv-resolve.cpp)
 
 llama_build_and_test(test-tiled-mulmat.cpp)
+
+# [TAG_MOE_DMA_SHARE] [TAG_MOE_PREFETCH] [TAG_FN_PREFILL_STREAM] the gen5 paths (DMA share, prefetch, prefill stream) on the
+# CPU backend: plan/fence/gate/release logic and tables, bitwise against the plain MUL_MAT_ID chain. The gen5 entry
+# points are exported with LLAMA_API; the graphs run on the CPU backend directly, so not with dynamic backends.
+if (NOT GGML_BACKEND_DL AND GGML_CPU)
+    llama_build_and_test(test-moe-gen5.cpp)
+endif()
+
+# [TAG_FN_MTP_COST] cost-aware MTP draft length (common/speculative-mtp-cost.h): pieces and a step simulation, CPU only
+llama_build_and_test(test-mtp-cost.cpp)
+
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model")
 llama_build_and_test(test-autorelease.cpp       LABEL "model")
 llama_build_and_test(test-backend-sampler.cpp   LABEL "model")

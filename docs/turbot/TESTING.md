@@ -921,3 +921,26 @@ the full-vocabulary KLD: compare arms only on the same sparse base, never with 3
 16K chunk, full-row and sparse base of the same f16 run, the same turbot arm read against both: mean difference < 2e-6.
 The full-row base stores uint16 log-probs, so its nll_base and top-1 differ slightly from the sparse base's floats.
 
+
+## 13. Qwen3.8-Flash-Next (qwen4exp) gates (`[TAG_FN_TURBOT_*]`, SPEC 15, 2026-09-28)
+
+The owner's bar is q8_0-level quality (KLD and same-top within the f16 floor), no q4 or low-bit KV; turbo5p512 is only the
+baseline in reports. The exact commands, the runner scripts (`fn_kld.ps1`, `fn_srv.py`, `fn_memcheck.py`, `fn_paired.py` =
+a frozen `tq8_paired.py`) and the gate plan files live in `E:\turbot-gates\flashnext\turbot` (`gpu_plan.md`). Section 0
+rules apply to every GPU step; every KLD base is a sparse top-256 base (12.5), never a dense 248K-vocab base.
+
+| Gate | What | Pass |
+|---|---|---|
+| F0 | build-fnkv; `test-kv-resolve` (test_flash_next), `test-turbot` [8c'], `test-turbot-geom` (g) GQA 12 + QSA mask and (i) | all OK; `turbot_plan.py quality --gguf <shard 1> -c 262144` prints hash 0xcc97a64e9786d761 |
+| F1 | memcheck, then `test-backend-ops -o FLASH_ATTN_EXT,TURBOT_SET_ROWS -p "turbot=[a-z0-9]+,d=256,hkv=2,hq=24"` (GQA 12, mask modes 1/2/3), then `validate.ps1` | 0 memcheck errors, N/N passed, GATE PASSED |
+| F2 | server smoke, q8_0 and turbot arms | no `KV cache type for` line; `turbot plan <quality>` and the quality-plan INFO line; indexer q8_0; correct probes; 16K needle |
+| F3 | 32K x 8 chunks, second half scored: f16 repeat, f16 `-ub 1024` floor, q8_0, turbot, turbot CAP 4096 (old tier), turbot with an f16 indexer, turbo5p512 | turbot and turbot CAP 4096 q8-level against q8_0 and the floor (`fn_paired.py --refs`), the indexer arm not worse |
+| F4 | 131K x 4 chunks, last 4096 positions scored (`LLAMA_PPL_SCORE_FIRST=126975`): f16 floor, q8_0, turbot, turbo5p512 | turbot q8-level; else the all-young plan arm |
+| F5 | needles 131K (3 + 1) and 245,760 (3), q8_0 and turbot | turbot passes every run q8_0 passes |
+| F6 | FA perf `turbot_perf=nr2q,d=256,hkv=2,hq=24` against `turbot_ref=q8_0` / `turbo5p512`, default and `GGML_CUDA_TURBOT_YOUNG_CT_EXT=ON`; llama-bench tg64/pp512 at d 0 / 32K / 131K | turbot tg >= q8_0 - 1%, pp >= q8_0 - 3% |
+| F7 | MTP head, draft KV q8_0 (default) vs turbo5p512 | report acceptance only |
+| F8 | Qwen3.8-27B unchanged (validate.ps1 smoke; optional 16 x 32K KLD on the existing bases) | identical |
+
+Outcomes: an old-tier failure (F3 CAP 4096 or F4) moves the default to the all-young plan (q8_0 bytes) as a verified
+sidecar; a worse q8_0 indexer moves the indexer to f16 (+360 MiB at 262K); a noisy MoE floor is reported with the default
+delta and a floor-scaled delta side by side for the owner to decide.

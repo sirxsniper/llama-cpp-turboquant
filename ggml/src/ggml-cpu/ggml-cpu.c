@@ -581,7 +581,7 @@ struct ggml_compute_state {
 static inline void ggml_thread_cpu_relax(void) {
     __asm__ volatile("yield" ::: "memory");
 }
-#elif defined(__x86_64__)
+#elif defined(__x86_64__) || defined(_M_X64) // [TAG_FN_CPU_RELAX_MSVC] MSVC defines _M_X64 only, so its spin loops had no pause
 static inline void ggml_thread_cpu_relax(void) {
     _mm_pause();
 }
@@ -1223,12 +1223,83 @@ void ggml_set_f32_nd(const struct ggml_tensor * tensor, int i0, int i1, int i2, 
 // [TAG_Q2_0_CPU] SIMD Q2_0 dot product on x86, off by default; initialized once in ggml_cpu_init(), read-only afterwards
 bool ggml_cpu_q2_0_simd = false;
 
+// [TAG_FN_CPU_SWITCHES] the switches of enum ggml_cpu_fn_switch: environment variable names and values (0 = off)
+static const char * const ggml_cpu_fn_sw_env[] = {
+    /* GGML_CPU_FN_APPLY_ONCE */ "GGML_CPU_APPLY_ONCE",
+    /* GGML_CPU_FN_Q5_1_AVX512 */ "GGML_CPU_Q5_1_AVX512",
+    /* GGML_CPU_FN_MMID_MR     */ "GGML_CPU_MMID_MR",
+    /* GGML_CPU_FN_MOE_FUSE    */ "GGML_CPU_MOE_FUSE",
+};
+static_assert(sizeof(ggml_cpu_fn_sw_env)/sizeof(ggml_cpu_fn_sw_env[0]) == GGML_CPU_FN_SWITCH_COUNT, "one name per switch");
+
+int ggml_cpu_fn_sw[GGML_CPU_FN_SWITCH_COUNT] = { 0 };
+
+static void ggml_cpu_fn_switches_init(void) {
+    for (int i = 0; i < GGML_CPU_FN_SWITCH_COUNT; i++) {
+        const char * env = getenv(ggml_cpu_fn_sw_env[i]);
+        ggml_cpu_fn_sw[i] = env != NULL ? atoi(env) : 0;
+        if (ggml_cpu_fn_sw[i] != 0) {
+            GGML_LOG_INFO("%s: %s=%d\n", __func__, ggml_cpu_fn_sw_env[i], ggml_cpu_fn_sw[i]);
+        }
+    }
+}
+
+int ggml_cpu_fn_get_switch(enum ggml_cpu_fn_switch sw) {
+    ggml_cpu_init();
+    GGML_ASSERT((int) sw >= 0 && (int) sw < GGML_CPU_FN_SWITCH_COUNT);
+    return ggml_cpu_fn_sw[sw];
+}
+
+void ggml_cpu_fn_set_switch(enum ggml_cpu_fn_switch sw, int value) {
+    ggml_cpu_init(); // so that a later first ggml_cpu_init() cannot overwrite the value with the environment's
+    GGML_ASSERT((int) sw >= 0 && (int) sw < GGML_CPU_FN_SWITCH_COUNT);
+    ggml_cpu_fn_sw[sw] = value;
+}
+
+const char * ggml_cpu_fn_switch_env(enum ggml_cpu_fn_switch sw) {
+    GGML_ASSERT((int) sw >= 0 && (int) sw < GGML_CPU_FN_SWITCH_COUNT);
+    return ggml_cpu_fn_sw_env[sw];
+}
+
+// [TAG_FN_CPU_MMID_MR] the multi-row x multi-token dot product of a weight type, or NULL
+static ggml_vec_dot_mr_t ggml_cpu_fn_mr_kernel(enum ggml_type type) {
+#if defined(GGML_CPU_FN_X86)
+    switch (type) {
+        case GGML_TYPE_Q4_K:   return ggml_vec_dot_q4_K_q8_K_mr;
+        case GGML_TYPE_Q5_K:   return ggml_vec_dot_q5_K_q8_K_mr;
+        case GGML_TYPE_Q5_1:   return ggml_vec_dot_q5_1_q8_1_mr;
+        case GGML_TYPE_Q8_0:   return ggml_vec_dot_q8_0_q8_0_mr;
+        case GGML_TYPE_IQ4_NL: return ggml_vec_dot_iq4_nl_q8_0_mr;
+        default:               break;
+    }
+#endif
+    GGML_UNUSED(type);
+    return NULL;
+}
+
+bool ggml_cpu_fn_vec_dot_mr(enum ggml_type type, int n, float * s, size_t bs, const void * vx, size_t bx,
+                            int nr, const void * const * vy, int nc) {
+    ggml_cpu_init();
+    const ggml_vec_dot_mr_t mr = ggml_cpu_fn_mr_kernel(type);
+    if (mr == NULL || nc < 1 || nc > GGML_CPU_FN_MR_MAX_NC || nr < 1) {
+        return false;
+    }
+    mr(n, s, bs, vx, bx, nr, vy, nc);
+    return true;
+}
+
 // [TAG_Q2_0_CPU] the use_ref backend (the reference of test-backend-ops -b CPU) runs the scalar Q2_0 dot product, so the
 // SIMD one is compared against it
 static inline ggml_vec_dot_t ggml_cpu_mul_mat_vec_dot(enum ggml_type type, bool use_ref) {
     if (use_ref && type == GGML_TYPE_Q2_0) {
         return ggml_vec_dot_q2_0_q8_0_generic;
     }
+#if defined(GGML_CPU_FN_X86_ARCH)
+    // [TAG_FN_CPU_Q5_1_AVX512] the reference keeps the AVX2 q5_1 dot product whatever GGML_CPU_Q5_1_AVX512 says
+    if (use_ref && type == GGML_TYPE_Q5_1) {
+        return ggml_vec_dot_q5_1_q8_1_base;
+    }
+#endif
     return type_traits_cpu[type].vec_dot;
 }
 
@@ -1567,7 +1638,8 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
     const size_t row_size,
     const bool src1_cont,
     const void * wdata,
-    const bool use_ref) {
+    const bool use_ref,
+    const ggml_vec_dot_mr_t vec_dot_mr) {
 
     GGML_TENSOR_BINARY_OP_LOCALS
 
@@ -1578,6 +1650,41 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
 
     const int64_t blck_0 = 16;
     const int64_t blck_1 = 16;
+
+    if (vec_dot_mr != NULL) {
+        // [TAG_FN_CPU_MMID_MR] rows in blocks of 16, the tokens of this expert in groups of up to 4: every weight row is
+        // unpacked once per group instead of once per token. Same values as the per-(row, token) vec_dot calls below.
+        float tmp_mr[GGML_CPU_FN_MR_MAX_NC*16];
+        for (int64_t iir0 = ir0_start; iir0 < ir0_end; iir0 += blck_0) {
+            const int64_t nr = MIN(iir0 + blck_0, ir0_end) - iir0;
+            for (int64_t ir1 = ir1_start; ir1 < ir1_end; ir1 += GGML_CPU_FN_MR_MAX_NC) {
+                const int nc = (int) MIN(GGML_CPU_FN_MR_MAX_NC, ir1_end - ir1);
+
+                const void * cols[GGML_CPU_FN_MR_MAX_NC];
+                float      * dst_cols[GGML_CPU_FN_MR_MAX_NC];
+                for (int c = 0; c < nc; ++c) {
+                    const struct mmid_row_mapping row_mapping = MMID_MATRIX_ROW(cur_a, ir1 + c);
+
+                    const int     id  = row_mapping.i1; // expert slot of the token
+                    const int64_t i11 = id % ne11;
+                    const int64_t i12 = row_mapping.i2; // token
+
+                    cols[c] = (const char *) wdata +
+                        (src1_cont || src1->type != vec_dot_type
+                        ? (i11      + i12*ne11)*row_size
+                        : (i11*nb11 + i12*nb12));
+                    dst_cols[c] = (float *) ((char *) dst->data + (id*nb1 + i12*nb2));
+                }
+
+                vec_dot_mr((int) ne00, tmp_mr, 16, src0_cur + iir0*nb01, nb01, (int) nr, cols, nc);
+
+                for (int c = 0; c < nc; ++c) {
+                    memcpy(&dst_cols[c][iir0], tmp_mr + c*16, nr*sizeof(float));
+                }
+            }
+        }
+        return;
+    }
 
     float tmp[16];
 
@@ -1646,6 +1753,48 @@ static inline void ggml_moe_log_unlock(FILE * f) {
 #endif
 }
 
+// MoE routing observation for the llama expert cache, and GGML_MOE_LOG. Called by thread 0 of a MUL_MAT_ID (and of the
+// fused MoE op [TAG_FN_CPU_MOE_FUSE]) once the routing is known.
+static void ggml_compute_mmid_observe(const struct ggml_tensor * src0, const struct ggml_tensor * ids) {
+    const int n_ids = ids->ne[0]; // n_expert_used
+
+    // MoE routing observation for the llama expert cache
+    {
+        void * moe_obs_ud = NULL;
+        ggml_moe_obs_cb_t moe_obs_cb = ggml_get_moe_obs_callback(&moe_obs_ud);
+        if (moe_obs_cb && strstr(src0->name, "ffn_gate_exps")) {
+            moe_obs_cb(src0->name, ids, moe_obs_ud);
+        }
+    }
+
+    // GGML_MOE_LOG: append the routed expert ids of every ffn_gate_exps
+    // mul_mat_id to the file named by the env var. Diagnostic only; the
+    // whole block is inert unless GGML_MOE_LOG is set at first use.
+    {
+        static FILE * moe_log_file  = NULL;
+        static int    moe_log_state = -1;
+        if (moe_log_state == -1) {
+            const char * moe_log_path = getenv("GGML_MOE_LOG");
+            if (moe_log_path && moe_log_path[0]) {
+                moe_log_file = fopen(moe_log_path, "a");
+            }
+            moe_log_state = moe_log_file ? 1 : 0;
+        }
+        if (moe_log_state == 1 && strstr(src0->name, "ffn_gate_exps")) {
+            ggml_moe_log_lock(moe_log_file);
+            for (int64_t iid1 = 0; iid1 < ids->ne[1]; ++iid1) {
+                fprintf(moe_log_file, "%s", src0->name);
+                for (int id = 0; id < n_ids; ++id) {
+                    const int32_t i02 = *(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]);
+                    fprintf(moe_log_file, " %d", i02);
+                }
+                fputc('\n', moe_log_file);
+            }
+            ggml_moe_log_unlock(moe_log_file);
+        }
+    }
+}
+
 static void ggml_compute_forward_mul_mat_id(
         const struct ggml_compute_params * params,
               struct ggml_tensor * dst) {
@@ -1698,6 +1847,10 @@ static void ggml_compute_forward_mul_mat_id(
     // Tiled matmul (see tiled.h); per-thread work buffers, 0 bytes when disabled. The
     // reservation is unconditional, the per expert eligibility is decided at dispatch time
     char * tiled_scratch = incr_ptr_aligned(&wdata_cur, ggml_tiled_wdata_size(nth, dst), 64);
+
+    // [TAG_FN_CPU_MMID_MR] GGML_CPU_MMID_MR: several tokens per decoded weight row; the use_ref reference keeps the
+    // per-(row, token) vec_dot path. An expert the tiled path takes (see above) never reaches it.
+    const ggml_vec_dot_mr_t vec_dot_mr = ggml_cpu_fn_sw[GGML_CPU_FN_MMID_MR] && !params->use_ref ? ggml_cpu_fn_mr_kernel(type) : NULL;
 
     GGML_ASSERT(params->wsize >= (size_t)((char *) wdata_cur - (char *) params->wdata));
 
@@ -1770,41 +1923,7 @@ static void ggml_compute_forward_mul_mat_id(
             }
         }
 
-        // MoE routing observation for the llama expert cache
-        {
-            void * moe_obs_ud = NULL;
-            ggml_moe_obs_cb_t moe_obs_cb = ggml_get_moe_obs_callback(&moe_obs_ud);
-            if (moe_obs_cb && strstr(src0->name, "ffn_gate_exps")) {
-                moe_obs_cb(src0->name, ids, moe_obs_ud);
-            }
-        }
-
-        // GGML_MOE_LOG: append the routed expert ids of every ffn_gate_exps
-        // mul_mat_id to the file named by the env var. Diagnostic only; the
-        // whole block is inert unless GGML_MOE_LOG is set at first use.
-        {
-            static FILE * moe_log_file  = NULL;
-            static int    moe_log_state = -1;
-            if (moe_log_state == -1) {
-                const char * moe_log_path = getenv("GGML_MOE_LOG");
-                if (moe_log_path && moe_log_path[0]) {
-                    moe_log_file = fopen(moe_log_path, "a");
-                }
-                moe_log_state = moe_log_file ? 1 : 0;
-            }
-            if (moe_log_state == 1 && strstr(src0->name, "ffn_gate_exps")) {
-                ggml_moe_log_lock(moe_log_file);
-                for (int64_t iid1 = 0; iid1 < ids->ne[1]; ++iid1) {
-                    fprintf(moe_log_file, "%s", src0->name);
-                    for (int id = 0; id < n_ids; ++id) {
-                        const int32_t i02 = *(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]);
-                        fprintf(moe_log_file, " %d", i02);
-                    }
-                    fputc('\n', moe_log_file);
-                }
-                ggml_moe_log_unlock(moe_log_file);
-            }
-        }
+        ggml_compute_mmid_observe(src0, ids); // [TAG_FN_CPU_MOE_FUSE] moved into a helper, unchanged
     }
 
     // reset current_chunk
@@ -1870,7 +1989,7 @@ static void ggml_compute_forward_mul_mat_id(
             ggml_compute_forward_mul_mat_id_one_chunk(
                 dst, src0, src1, ids, cur_a,
                 ir0_start, ir0_end, ir1_start, ir1_end,
-                src0_cur, matrix_rows, row_size, src1_cont, wdata, params->use_ref
+                src0_cur, matrix_rows, row_size, src1_cont, wdata, params->use_ref, vec_dot_mr
             );
 
             if (nth >= nchunk0 * nchunk1) {
@@ -1880,6 +1999,489 @@ static void ggml_compute_forward_mul_mat_id(
             current_chunk = atomic_fetch_add_explicit(current_chunk_ctr, 1, memory_order_relaxed);
         }
     }
+}
+
+
+// ---- [TAG_FN_CPU_MOE_FUSE] the MoE split up / gate / swiglu / down as one op ----
+//
+// Unfused, the CPU split of a host-expert layer is 4 nodes with 7 barriers (one after each node and one inside each
+// MUL_MAT_ID after the input quantization). Fused: every thread quantizes the few input rows and builds the routing
+// itself, computes pieces of GGML_FN_MOE_PR rows of gate and up for all tokens of an expert, applies swiglu and
+// quantizes the result straight into the input format of the down projection; one barrier; then pieces of
+// GGML_FN_MOE_PD rows of down. Rows are split evenly over the threads (expert-major), so every thread streams long
+// contiguous runs. Values are bitwise equal to the unfused nodes: the same dot kernels on the same quantized inputs,
+// ggml_vec_swiglu_f32 works per element (pieces are multiples of 16 elements, so each element takes the same SIMD or
+// tail path as in the full row), and the q8 quantizations work block by block.
+
+#define GGML_FN_MOE_PR 32 // gate/up rows per piece (raised to the block size of the down input type)
+#define GGML_FN_MOE_PD 64 // down rows per piece
+
+// debug / test counter: fused ops run (thread 0 counts)
+static atomic_int ggml_fn_moe_fused_n = 0;
+
+uint64_t ggml_cpu_fn_moe_fused_calls(void) {
+    return (uint64_t) atomic_load_explicit(&ggml_fn_moe_fused_n, memory_order_relaxed);
+}
+
+bool ggml_fn_moe_supported(const struct ggml_tensor * up, const struct ggml_tensor * gate, const struct ggml_tensor * down) {
+    if (!up || !gate || !down || !up->data || !gate->data || !down->data) {
+        return false;
+    }
+    if (up->ne[0] != gate->ne[0] || up->ne[1] != gate->ne[1] || up->ne[2] != gate->ne[2] ||
+        down->ne[0] != up->ne[1] || down->ne[1] != up->ne[0] || down->ne[2] != up->ne[2]) {
+        return false;
+    }
+    const struct ggml_tensor * w[3] = { up, gate, down };
+    for (int i = 0; i < 3; ++i) {
+        const enum ggml_type t = w[i]->type;
+        const enum ggml_type vt = type_traits_cpu[t].vec_dot_type;
+        if (type_traits_cpu[t].vec_dot == NULL || type_traits_cpu[vt].from_float == NULL || type_traits_cpu[t].nrows != 1) {
+            return false;
+        }
+        if (w[i]->ne[3] != 1 || w[i]->nb[0] != ggml_type_size(t) || w[i]->nb[1] != ggml_row_size(t, w[i]->ne[0])) {
+            return false;
+        }
+        if (w[i]->ne[0] % ggml_blck_size(vt) != 0) {
+            return false;
+        }
+    }
+    // one piece of h must hold whole blocks of the down input type
+    const int64_t bk_d = ggml_blck_size(type_traits_cpu[down->type].vec_dot_type);
+    return bk_d <= 256 && 256 % bk_d == 0 && up->ne[1] % bk_d == 0;
+}
+
+static int64_t ggml_fn_moe_pr(const struct ggml_tensor * down) {
+    return MAX(GGML_FN_MOE_PR, ggml_blck_size(type_traits_cpu[down->type].vec_dot_type));
+}
+
+static size_t ggml_fn_moe_thread_bytes(const struct ggml_tensor * up, const struct ggml_tensor * gate, int n_used, int n_tokens) {
+    const enum ggml_type vt_u = type_traits_cpu[up->type].vec_dot_type;
+    const enum ggml_type vt_g = type_traits_cpu[gate->type].vec_dot_type;
+    size_t b = GGML_PAD((size_t) n_tokens*ggml_row_size(vt_u, up->ne[0]), 64);
+    if (vt_g != vt_u) {
+        b += GGML_PAD((size_t) n_tokens*ggml_row_size(vt_g, gate->ne[0]), 64);
+    }
+    b += GGML_PAD(sizeof(int32_t)*(size_t) (up->ne[2] + 1), 64); // counts / cursors per expert
+    b += GGML_PAD(sizeof(int32_t)*(size_t) n_used*n_tokens, 64); // entries (slot + n_used*t), grouped by expert
+    b += GGML_PAD(sizeof(int32_t)*3*(size_t) n_used*n_tokens, 64); // active experts: expert, first entry, entries
+    return b;
+}
+
+// the weighted-sum scratch is only reserved for the pool (w != NULL)
+static size_t ggml_fn_moe_work_size_ext(const struct ggml_tensor * up, const struct ggml_tensor * gate, const struct ggml_tensor * down,
+                                        int n_used, int n_tokens, int nth, bool weighted) {
+    const enum ggml_type vt_d = type_traits_cpu[down->type].vec_dot_type;
+    size_t b = 64; // alignment of the base
+    b += GGML_PAD((size_t) n_used*n_tokens*ggml_row_size(vt_d, down->ne[0]), 64);
+    if (weighted) {
+        b += GGML_PAD(sizeof(float)*(size_t) down->ne[1]*n_used*n_tokens, 64);
+    }
+    b += (size_t) nth*ggml_fn_moe_thread_bytes(up, gate, n_used, n_tokens);
+    return b;
+}
+
+size_t ggml_fn_moe_work_size(const struct ggml_tensor * up, const struct ggml_tensor * gate, const struct ggml_tensor * down,
+                             int n_used, int n_tokens, int nth) {
+    return ggml_fn_moe_work_size_ext(up, gate, down, n_used, n_tokens, nth, true);
+}
+
+// s[c*bs + r] for r < nr, c < nc: the multi-row x multi-token kernel when there is one, else vec_dot per (row, column);
+// the two give the same values
+static void ggml_fn_moe_dots(ggml_vec_dot_t dot, ggml_vec_dot_mr_t mr, int64_t n, float * s, size_t bs,
+                             const char * vx, size_t bx, int64_t nr, const void * const * cols, int nc) {
+    if (mr) {
+        mr((int) n, s, bs, vx, bx, (int) nr, cols, nc);
+        return;
+    }
+    for (int c = 0; c < nc; ++c) {
+        for (int64_t r = 0; r < nr; ++r) {
+            dot((int) n, s + c*bs + r, 0, vx + r*bx, 0, cols[c], 0, 1);
+        }
+    }
+}
+
+void ggml_fn_moe_compute(const struct ggml_fn_moe_args * a, int ith, int nth, void (*barrier)(void *), void * barrier_ctx) {
+    const struct ggml_tensor * wu = a->up;
+    const struct ggml_tensor * wg = a->gate;
+    const struct ggml_tensor * wd = a->down;
+
+    const int64_t n_embd = wu->ne[0];
+    const int64_t n_ff   = wu->ne[1];
+    const int     n_exp  = (int) wu->ne[2];
+    const int     T      = a->n_tokens;
+    const int     n_used = a->n_used;
+
+    const enum ggml_type vt_u = type_traits_cpu[wu->type].vec_dot_type;
+    const enum ggml_type vt_g = type_traits_cpu[wg->type].vec_dot_type;
+    const enum ggml_type vt_d = type_traits_cpu[wd->type].vec_dot_type;
+    const size_t  rs_u = ggml_row_size(vt_u, n_embd);
+    const size_t  rs_g = ggml_row_size(vt_g, n_embd);
+    const size_t  rs_d = ggml_row_size(vt_d, n_ff);
+    const int64_t bk_d = ggml_blck_size(vt_d);
+    const size_t  ts_d = ggml_type_size(vt_d);
+
+    ggml_vec_dot_t const dot_u = type_traits_cpu[wu->type].vec_dot;
+    ggml_vec_dot_t const dot_g = type_traits_cpu[wg->type].vec_dot;
+    ggml_vec_dot_t const dot_d = type_traits_cpu[wd->type].vec_dot;
+    const bool mr_on = ggml_cpu_fn_sw[GGML_CPU_FN_MMID_MR] != 0;
+    ggml_vec_dot_mr_t const mr_u = mr_on ? ggml_cpu_fn_mr_kernel(wu->type) : NULL;
+    ggml_vec_dot_mr_t const mr_g = mr_on ? ggml_cpu_fn_mr_kernel(wg->type) : NULL;
+    ggml_vec_dot_mr_t const mr_d = mr_on ? ggml_cpu_fn_mr_kernel(wd->type) : NULL;
+
+    // work: [h rows in the down input type, shared] [weighted-sum scratch, shared] [per thread: x rows, routing]
+    char * base = (char *) GGML_PAD((uintptr_t) a->wdata, 64);
+    char * hq   = base;
+    size_t off  = GGML_PAD((size_t) n_used*T*rs_d, 64);
+    float * dscr = NULL;
+    if (a->w) {
+        dscr = (float *) (base + off);
+        off += GGML_PAD(sizeof(float)*(size_t) n_embd*n_used*T, 64);
+    }
+    char * my = base + off + (size_t) ith*ggml_fn_moe_thread_bytes(wu, wg, n_used, T);
+    char * qxu = my;
+    my += GGML_PAD((size_t) T*rs_u, 64);
+    char * qxg = qxu;
+    if (vt_g != vt_u) {
+        qxg = my;
+        my += GGML_PAD((size_t) T*rs_g, 64);
+    }
+    int32_t * cnt = (int32_t *) my;
+    my += GGML_PAD(sizeof(int32_t)*(size_t) (n_exp + 1), 64);
+    int32_t * ent = (int32_t *) my;
+    my += GGML_PAD(sizeof(int32_t)*(size_t) n_used*T, 64);
+    int32_t * act = (int32_t *) my;
+
+    // down rows go to the graph layout in out, or to the scratch for the weighted sum
+    char * orow = a->w ? (char *) dscr : a->out;
+    const size_t o_nb1 = a->w ? (size_t) n_embd*sizeof(float) : a->out_nb1;
+    const size_t o_nb2 = a->w ? (size_t) n_embd*n_used*sizeof(float) : a->out_nb2;
+
+#define GGML_FN_MOE_ID(slot, t) (*(const int32_t *) (a->ids + (size_t) (slot)*a->ids_nb0 + (size_t) (t)*a->ids_nb1))
+#define GGML_FN_MOE_SKIP(e)     (a->table != NULL && a->table[e] != a->table_miss)
+
+    // 1. the input rows in the dot types of up and gate: every thread makes its own copy, so no barrier
+    for (int t = 0; t < T; ++t) {
+        const float * xt = (const float *) (a->x + (size_t) t*a->x_nb);
+        type_traits_cpu[vt_u].from_float(xt, qxu + (size_t) t*rs_u, n_embd);
+        if (vt_g != vt_u) {
+            type_traits_cpu[vt_g].from_float(xt, qxg + (size_t) t*rs_g, n_embd);
+        }
+    }
+
+    // 2. routing: the (slot, token) entries computed here, grouped by expert in expert order (counting sort)
+    memset(cnt, 0, sizeof(int32_t)*(size_t) (n_exp + 1));
+    for (int t = 0; t < T; ++t) {
+        for (int slot = 0; slot < n_used; ++slot) {
+            const int32_t e = GGML_FN_MOE_ID(slot, t);
+            GGML_ASSERT(e >= 0 && e < n_exp);
+            if (!GGML_FN_MOE_SKIP(e)) {
+                cnt[e + 1]++;
+            }
+        }
+    }
+    int n_act = 0;
+    for (int e = 0; e < n_exp; ++e) {
+        if (cnt[e + 1] > 0) {
+            act[3*n_act + 0] = e;
+            act[3*n_act + 1] = cnt[e];
+            act[3*n_act + 2] = cnt[e + 1];
+            n_act++;
+        }
+        cnt[e + 1] += cnt[e];
+    }
+    for (int t = 0; t < T; ++t) {
+        for (int slot = 0; slot < n_used; ++slot) {
+            const int32_t e = GGML_FN_MOE_ID(slot, t);
+            if (!GGML_FN_MOE_SKIP(e)) {
+                ent[cnt[e]++] = slot + n_used*t;
+            }
+        }
+    }
+
+    // 3. gate + up + swiglu + quantized h, in pieces of pr rows, rows split evenly over the threads
+    {
+        const int64_t pr   = ggml_fn_moe_pr(wd);
+        const int64_t np_e = (n_ff + pr - 1)/pr;
+        const int64_t np   = (int64_t) n_act*np_e;
+        float gv[GGML_CPU_FN_MR_MAX_NC*256];
+        float uv[GGML_CPU_FN_MR_MAX_NC*256];
+        float hv[256];
+        GGML_ASSERT(pr <= 256);
+        for (int64_t p = np*ith/nth; p < np*(ith + 1)/nth; ++p) {
+            const int32_t * ak = act + 3*(p/np_e);
+            const int64_t r0 = (p % np_e)*pr;
+            const int64_t nr = MIN(pr, n_ff - r0);
+            const char * wu_e = (const char *) wu->data + (size_t) ak[0]*wu->nb[2] + (size_t) r0*wu->nb[1];
+            const char * wg_e = (const char *) wg->data + (size_t) ak[0]*wg->nb[2] + (size_t) r0*wg->nb[1];
+            for (int j = 0; j < ak[2]; j += GGML_CPU_FN_MR_MAX_NC) {
+                const int nc = MIN(GGML_CPU_FN_MR_MAX_NC, ak[2] - j);
+                const void * cu[GGML_CPU_FN_MR_MAX_NC];
+                const void * cg[GGML_CPU_FN_MR_MAX_NC];
+                int32_t sl[GGML_CPU_FN_MR_MAX_NC];
+                for (int c = 0; c < nc; ++c) {
+                    sl[c] = ent[ak[1] + j + c];
+                    const int t = sl[c]/n_used;
+                    cu[c] = qxu + (size_t) t*rs_u;
+                    cg[c] = qxg + (size_t) t*rs_g;
+                }
+                ggml_fn_moe_dots(dot_g, mr_g, n_embd, gv, (size_t) pr, wg_e, wg->nb[1], nr, cg, nc);
+                ggml_fn_moe_dots(dot_u, mr_u, n_embd, uv, (size_t) pr, wu_e, wu->nb[1], nr, cu, nc);
+                for (int c = 0; c < nc; ++c) {
+                    ggml_vec_swiglu_f32((int) nr, hv, gv + c*pr, uv + c*pr);
+                    char * hrow = hq + (size_t) sl[c]*rs_d; // sl = slot + n_used*t: the row of (slot, t)
+                    type_traits_cpu[vt_d].from_float(hv, hrow + (size_t) (r0/bk_d)*ts_d, nr);
+                }
+            }
+        }
+    }
+
+    barrier(barrier_ctx);
+
+    // 4. down, in pieces of GGML_FN_MOE_PD rows of n_embd
+    {
+        const int64_t pd   = GGML_FN_MOE_PD;
+        const int64_t np_e = (n_embd + pd - 1)/pd;
+        const int64_t np   = (int64_t) n_act*np_e;
+        float dv[GGML_CPU_FN_MR_MAX_NC*GGML_FN_MOE_PD];
+        for (int64_t p = np*ith/nth; p < np*(ith + 1)/nth; ++p) {
+            const int32_t * ak = act + 3*(p/np_e);
+            const int64_t r0 = (p % np_e)*pd;
+            const int64_t nr = MIN(pd, n_embd - r0);
+            const char * wd_e = (const char *) wd->data + (size_t) ak[0]*wd->nb[2] + (size_t) r0*wd->nb[1];
+            for (int j = 0; j < ak[2]; j += GGML_CPU_FN_MR_MAX_NC) {
+                const int nc = MIN(GGML_CPU_FN_MR_MAX_NC, ak[2] - j);
+                const void * cd[GGML_CPU_FN_MR_MAX_NC];
+                int32_t sl[GGML_CPU_FN_MR_MAX_NC];
+                for (int c = 0; c < nc; ++c) {
+                    sl[c] = ent[ak[1] + j + c];
+                    cd[c] = hq + (size_t) sl[c]*rs_d;
+                }
+                ggml_fn_moe_dots(dot_d, mr_d, n_ff, dv, (size_t) pd, wd_e, wd->nb[1], nr, cd, nc);
+                for (int c = 0; c < nc; ++c) {
+                    const int slot = sl[c] % n_used;
+                    const int t    = sl[c]/n_used;
+                    memcpy(orow + (size_t) slot*o_nb1 + (size_t) t*o_nb2 + (size_t) r0*sizeof(float), dv + c*pd, (size_t) nr*sizeof(float));
+                }
+            }
+        }
+        // graph layout: the rows of the slots computed elsewhere are zero, as the unfused op leaves them
+        if (a->table && !a->w) {
+            for (int i = ith; i < n_used*T; i += nth) {
+                const int slot = i % n_used;
+                const int t    = i/n_used;
+                if (GGML_FN_MOE_SKIP(GGML_FN_MOE_ID(slot, t))) {
+                    memset(orow + (size_t) slot*o_nb1 + (size_t) t*o_nb2, 0, (size_t) n_embd*sizeof(float));
+                }
+            }
+        }
+    }
+
+    // 5. weighted sum over the slots computed here, in slot order
+    if (a->w) {
+        barrier(barrier_ctx);
+        const int64_t r_begin = n_embd*ith/nth;
+        const int64_t r_end   = n_embd*(ith + 1)/nth;
+        for (int t = 0; t < T; ++t) {
+            float * dst = a->out_sum + (size_t) t*n_embd;
+            for (int64_t r = r_begin; r < r_end; ++r) {
+                float sum = 0.0f;
+                for (int slot = 0; slot < n_used; ++slot) {
+                    if (GGML_FN_MOE_SKIP(GGML_FN_MOE_ID(slot, t))) {
+                        continue;
+                    }
+                    sum += a->w[slot + (size_t) n_used*t]*dscr[((size_t) t*n_used + slot)*n_embd + r];
+                }
+                dst[r] = sum;
+            }
+        }
+    }
+
+#undef GGML_FN_MOE_ID
+#undef GGML_FN_MOE_SKIP
+}
+
+// the graph pattern: two MUL_MAT_ID on the same input and ids (up and gate, either order), GLU swiglu split(gate, up),
+// MUL_MAT_ID down on its result with the same ids; view nodes may sit in between; up, gate and the GLU result are used
+// by nothing else
+struct ggml_fn_moe_match {
+    int idx[4];
+    const struct ggml_tensor * up;
+    const struct ggml_tensor * gate;
+    const struct ggml_tensor * down;
+};
+
+// GGML_CPU_TILED_MM_FORCE=1 makes the tiled path take every expert it supports (tiled.cpp, test/bench only)
+static bool ggml_fn_tiled_forced(void) {
+    static int forced = -1;
+    if (forced < 0) {
+        const char * e = getenv("GGML_CPU_TILED_MM_FORCE");
+        forced = e != NULL && atoi(e) == 1;
+    }
+    return forced == 1;
+}
+
+static bool ggml_fn_moe_match_at(const struct ggml_cgraph * cgraph, int i, struct ggml_fn_moe_match * m) {
+    int idx[4];
+    int n = 0;
+    for (int j = i; j < cgraph->n_nodes && j < i + 16 && n < 4; ++j) {
+        if (j > i && ggml_op_is_empty(cgraph->nodes[j]->op)) {
+            continue;
+        }
+        idx[n++] = j;
+    }
+    if (n < 4) {
+        return false;
+    }
+    const struct ggml_tensor * a0   = cgraph->nodes[idx[0]];
+    const struct ggml_tensor * a1   = cgraph->nodes[idx[1]];
+    const struct ggml_tensor * glu  = cgraph->nodes[idx[2]];
+    const struct ggml_tensor * down = cgraph->nodes[idx[3]];
+    if (a0->op != GGML_OP_MUL_MAT_ID || a1->op != GGML_OP_MUL_MAT_ID || glu->op != GGML_OP_GLU || down->op != GGML_OP_MUL_MAT_ID) {
+        return false;
+    }
+    if (ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU || glu->src[1] == NULL || ggml_get_op_params_i32(glu, 1) != 0 ||
+        glu->type != GGML_TYPE_F32) {
+        return false;
+    }
+    const struct ggml_tensor * gate = glu->src[0];
+    const struct ggml_tensor * up   = glu->src[1];
+    if (!((gate == a0 && up == a1) || (gate == a1 && up == a0))) {
+        return false;
+    }
+    const struct ggml_tensor * x   = up->src[1];
+    const struct ggml_tensor * ids = up->src[2];
+    if (gate->src[1] != x || gate->src[2] != ids || down->src[1] != glu || down->src[2] != ids) {
+        return false;
+    }
+    if (x->type != GGML_TYPE_F32 || x->ne[1] != 1 || x->ne[3] != 1 || x->nb[0] != sizeof(float) || ids->type != GGML_TYPE_I32) {
+        return false;
+    }
+    const int64_t T = ids->ne[1];
+    if (T < 1 || T > GGML_FN_MOE_MAX_T || x->ne[2] != T || x->ne[0] != up->src[0]->ne[0]) {
+        return false;
+    }
+    if (up->type != GGML_TYPE_F32 || gate->type != GGML_TYPE_F32 || down->type != GGML_TYPE_F32 || down->nb[0] != sizeof(float) ||
+        down->ne[1] != ids->ne[0] || down->ne[2] != T) {
+        return false;
+    }
+    // the expert skip table: the same on all three, or none
+    if (up->src[3] != gate->src[3] || up->src[3] != down->src[3]) {
+        return false;
+    }
+    if (up->src[3] && (up->src[3]->type != GGML_TYPE_I32 ||
+                       ggml_get_op_params_i32(up, 0) != ggml_get_op_params_i32(gate, 0) ||
+                       ggml_get_op_params_i32(up, 0) != ggml_get_op_params_i32(down, 0))) {
+        return false;
+    }
+    // weights in plain host memory (no extra buffer type takes the nodes); [TAG_SYNC_1004] the tiled k-quant path, which
+    // replaced the IQ panel path, is tested on the routing at compute time (ggml_fn_moe_tiled_idle)
+    const struct ggml_tensor * mm[3] = { up, gate, down };
+    for (int k = 0; k < 3; ++k) {
+        size_t extra = 0;
+        if (ggml_cpu_extra_work_size(1, mm[k], &extra)) {
+            return false;
+        }
+    }
+    if (!ggml_fn_moe_supported(up->src[0], gate->src[0], down->src[0])) {
+        return false;
+    }
+    const enum ggml_op ops[4] = { GGML_OP_MUL_MAT_ID, GGML_OP_MUL_MAT_ID, GGML_OP_GLU, GGML_OP_MUL_MAT_ID };
+    const int outputs[1] = { idx[3] };
+    if (!ggml_can_fuse_subgraph_ext(cgraph, idx, 4, ops, outputs, 1)) {
+        return false;
+    }
+    memcpy(m->idx, idx, sizeof(idx));
+    m->up   = up;
+    m->gate = gate;
+    m->down = down;
+    return true;
+}
+
+// [TAG_FN_CPU_MOE_FUSE] [TAG_SYNC_1004] the unfused MUL_MAT_IDs give an expert of >= 8 rows to the tiled k-quant path
+// (#27851; every expert with GGML_CPU_TILED_MM_FORCE=1), while the fused op computes every expert with the vec_dot
+// kernels: fuse only when tiled would take no expert of this layer, so the values stay those of the unfused nodes. Reads
+// the routing (and the skip table, whose experts the CPU ops do not count), so every thread decides the same.
+static bool ggml_fn_moe_tiled_idle(const struct ggml_fn_moe_match * m) {
+    const struct ggml_tensor * mm[3] = { m->up, m->gate, m->down };
+    bool tiled = false;
+    for (int k = 0; k < 3; ++k) {
+        tiled = tiled || ggml_tiled_wdata_size(1, (struct ggml_tensor *) mm[k]) > 0;
+    }
+    if (!tiled) {
+        return true;
+    }
+    if (ggml_fn_tiled_forced()) {
+        return false;
+    }
+    const struct ggml_tensor * ids = m->up->src[2];
+    const int64_t n_used = ids->ne[0];
+    const int64_t T      = ids->ne[1];
+    if (T < 8) {
+        return true; // an expert gets at most one row per token
+    }
+    enum { FN_MOE_MAX_AS = 4096 };
+    const int64_t n_as = m->up->src[0]->ne[2];
+    if (n_as > FN_MOE_MAX_AS || ids->data == NULL) {
+        return false;
+    }
+    uint8_t rows[FN_MOE_MAX_AS];
+    memset(rows, 0, (size_t) n_as);
+    const int32_t * tbl   = m->up->src[3] ? (const int32_t *) m->up->src[3]->data : NULL;
+    const int32_t   dummy = tbl ? ggml_get_op_params_i32(m->up, 0) : 0;
+    for (int64_t t = 0; t < T; ++t) {
+        for (int64_t j = 0; j < n_used; ++j) {
+            const int32_t e = *(const int32_t *) ((const char *) ids->data + t*ids->nb[1] + j*ids->nb[0]);
+            if (e < 0 || e >= n_as) {
+                return false;
+            }
+            if (tbl && tbl[e] != dummy) {
+                continue;
+            }
+            if (++rows[e] >= 8) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+static void ggml_fn_moe_barrier_tp(void * tp) {
+    ggml_barrier((struct ggml_threadpool *) tp);
+}
+
+static void ggml_compute_forward_moe_fused(const struct ggml_compute_params * params, const struct ggml_fn_moe_match * m) {
+    const struct ggml_tensor * x   = m->up->src[1];
+    const struct ggml_tensor * ids = m->up->src[2];
+
+    struct ggml_fn_moe_args a;
+    memset(&a, 0, sizeof(a));
+    a.up   = m->up->src[0];
+    a.gate = m->gate->src[0];
+    a.down = m->down->src[0];
+    if (m->up->src[3]) {
+        a.table      = (const int32_t *) m->up->src[3]->data;
+        a.table_miss = ggml_get_op_params_i32(m->up, 0);
+    }
+    a.n_tokens = (int) ids->ne[1];
+    a.n_used   = (int) ids->ne[0];
+    a.x        = (const char *) x->data;
+    a.x_nb     = x->nb[2];
+    a.ids      = (const char *) ids->data;
+    a.ids_nb0  = ids->nb[0];
+    a.ids_nb1  = ids->nb[1];
+    a.out      = (char *) m->down->data;
+    a.out_nb1  = m->down->nb[1];
+    a.out_nb2  = m->down->nb[2];
+    a.wdata    = params->wdata;
+
+    GGML_ASSERT(params->wsize >= ggml_fn_moe_work_size_ext(a.up, a.gate, a.down, a.n_used, a.n_tokens, params->nth, false));
+
+    if (params->ith == 0) {
+        ggml_compute_mmid_observe(a.gate, ids);
+        atomic_fetch_add_explicit(&ggml_fn_moe_fused_n, 1, memory_order_relaxed);
+    }
+
+    ggml_fn_moe_compute(&a, params->ith, params->nth, ggml_fn_moe_barrier_tp, params->threadpool);
 }
 
 /////////////////////////////////
@@ -2264,6 +2866,11 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_gated_delta_net_replay(params, tensor);
             } break;
+        case GGML_OP_MOE_HOST_POST: // [TAG_MOE_BRIDGE] device backends only; the CPU supports_op is false
+        case GGML_OP_MOE_HOST_WAIT:
+            {
+                GGML_ABORT("%s runs on a device backend only", ggml_op_name(tensor->op));
+            }
         case GGML_OP_MAP_CUSTOM1:
             {
                 ggml_compute_forward_map_custom1(params, tensor);
@@ -2612,6 +3219,8 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_WIN_PART:
         case GGML_OP_WIN_UNPART:
         case GGML_OP_GET_REL_POS:
+        case GGML_OP_MOE_HOST_POST: // [TAG_MOE_BRIDGE]
+        case GGML_OP_MOE_HOST_WAIT:
             {
                 n_tasks = 1;
             } break;
@@ -2877,6 +3486,46 @@ static bool ggml_thread_apply_priority(int32_t prio) {
 }
 
 #endif
+
+// [TAG_FN_CPU_APPLY_ONCE] GGML_CPU_APPLY_ONCE=1. With OpenMP every graph compute (one per CPU split of the scheduler)
+// opens a parallel region in which each thread re-applies the priority and the affinity mask: on Windows that is
+// SetThreadInformation + SetThreadPriority + SetThreadAffinityMask per thread per split, about 2N regions per token
+// with N CPU expert layers. The OS keeps both per thread, so each thread remembers what it applied last and skips the
+// calls when nothing changed. Only successful calls are remembered (a failed one is retried by the next region), and
+// clear_numa_thread_affinity() forgets the mask it resets. The OpenMP runtime keeps its worker threads, so after the
+// first region the calls are skipped until the requested priority or mask changes.
+#ifdef GGML_USE_OPENMP
+#if defined(_MSC_VER)
+#define GGML_CPU_FN_TLS __declspec(thread)
+#else
+#define GGML_CPU_FN_TLS _Thread_local
+#endif
+
+static GGML_CPU_FN_TLS bool    ggml_fn_prio_known   = false;
+static GGML_CPU_FN_TLS int32_t ggml_fn_prio_applied = 0;
+static GGML_CPU_FN_TLS bool    ggml_fn_mask_known   = false;
+static GGML_CPU_FN_TLS bool    ggml_fn_mask_applied[GGML_MAX_N_THREADS];
+
+static void ggml_thread_apply_priority_once(int32_t prio) {
+    if (ggml_fn_prio_known && ggml_fn_prio_applied == prio) {
+        return;
+    }
+    ggml_fn_prio_known = ggml_thread_apply_priority(prio);
+    ggml_fn_prio_applied = prio;
+}
+
+static void ggml_thread_apply_affinity_once(bool * mask) {
+    if (ggml_fn_mask_known && memcmp(ggml_fn_mask_applied, mask, GGML_MAX_N_THREADS) == 0) {
+        return;
+    }
+    ggml_fn_mask_known = ggml_thread_apply_affinity(mask);
+    memcpy(ggml_fn_mask_applied, mask, GGML_MAX_N_THREADS);
+}
+
+static void ggml_thread_apply_forget_mask(void) {
+    ggml_fn_mask_known = false;
+}
+#endif // GGML_USE_OPENMP
 
 static bool ggml_thread_cpumask_is_valid(const bool * mask) {
     for (int i = 0; i < GGML_MAX_N_THREADS; i++) {
@@ -3229,6 +3878,15 @@ struct ggml_cplan ggml_graph_plan(
         }
 
         work_size = MAX(work_size, cur);
+
+        // [TAG_FN_CPU_MOE_FUSE] the fused MoE op starting at this node
+        if (node->op == GGML_OP_MUL_MAT_ID && ggml_cpu_fn_sw[GGML_CPU_FN_MOE_FUSE]) {
+            struct ggml_fn_moe_match m;
+            if (ggml_fn_moe_match_at(cgraph, i, &m)) {
+                work_size = MAX(work_size, ggml_fn_moe_work_size_ext(m.up->src[0], m.gate->src[0], m.down->src[0],
+                    (int) m.up->src[2]->ne[0], (int) m.up->src[2]->ne[1], n_threads, false));
+            }
+        }
     }
 
     if (work_size > 0) {
@@ -3259,6 +3917,15 @@ static int ggml_cpu_try_fuse_ops(
     }
 
     struct ggml_tensor * node = cgraph->nodes[node_n];
+
+    // [TAG_FN_CPU_MOE_FUSE]
+    if (node->op == GGML_OP_MUL_MAT_ID && ggml_cpu_fn_sw[GGML_CPU_FN_MOE_FUSE]) {
+        struct ggml_fn_moe_match m;
+        if (ggml_fn_moe_match_at(cgraph, node_n, &m) && ggml_fn_moe_tiled_idle(&m)) {
+            ggml_compute_forward_moe_fused(params, &m);
+            return m.idx[3] - node_n;
+        }
+    }
 
     if (node->op == GGML_OP_RMS_NORM) {
         // RMS_NORM + MUL fusion
@@ -3614,9 +4281,17 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
             // Apply thread CPU mask and priority
             int ith = omp_get_thread_num();
 
-            ggml_thread_apply_priority(threadpool->prio);
-            if (ggml_thread_cpumask_is_valid(threadpool->workers[ith].cpumask)) {
-                ggml_thread_apply_affinity(threadpool->workers[ith].cpumask);
+            if (ggml_cpu_fn_sw[GGML_CPU_FN_APPLY_ONCE]) {
+                // [TAG_FN_CPU_APPLY_ONCE] same settings, applied only when they differ from this thread's last ones
+                ggml_thread_apply_priority_once(threadpool->prio);
+                if (ggml_thread_cpumask_is_valid(threadpool->workers[ith].cpumask)) {
+                    ggml_thread_apply_affinity_once(threadpool->workers[ith].cpumask);
+                }
+            } else {
+                ggml_thread_apply_priority(threadpool->prio);
+                if (ggml_thread_cpumask_is_valid(threadpool->workers[ith].cpumask)) {
+                    ggml_thread_apply_affinity(threadpool->workers[ith].cpumask);
+                }
             }
             ggml_graph_compute_thread(&threadpool->workers[ith]);
         }
@@ -3639,6 +4314,11 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
 
     // don't leave affinity set on the main thread
     clear_numa_thread_affinity();
+#ifdef GGML_USE_OPENMP
+    if (ggml_is_numa()) {
+        ggml_thread_apply_forget_mask(); // [TAG_FN_CPU_APPLY_ONCE] the mask was just reset
+    }
+#endif
 
     enum ggml_status ret = threadpool->ec;
 
@@ -4241,6 +4921,8 @@ void ggml_cpu_init(void) {
             const char * env = getenv("GGML_CPU_Q2_0_SIMD");
             ggml_cpu_q2_0_simd = (env != NULL && atoi(env) == 1);
         }
+
+        ggml_cpu_fn_switches_init(); // [TAG_FN_CPU_SWITCHES]
 
         is_first_call = false;
     }

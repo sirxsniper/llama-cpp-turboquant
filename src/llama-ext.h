@@ -166,6 +166,11 @@ LLAMA_API void llama_sampler_chain_backend_detach(struct llama_sampler * smpl);
 // places every ubatch row in any empty cell of the stream. -1 for any other memory type.
 LLAMA_API int32_t llama_memory_attn_n_free_ext(struct llama_context * ctx, llama_seq_id seq_id);
 
+// [TAG_FN_MTP_ATTN_WINDOW] The sliding window of the context's attention cache (llama_kv_cache, or the attention half of
+// llama_memory_hybrid), 0 for none or for any other memory type. A qwen4exp MTP draft context gets one from
+// LLAMA_MTP_ATTN_WINDOW (llama-model.cpp).
+LLAMA_API uint32_t llama_memory_attn_swa_ext(struct llama_context * ctx);
+
 // [TAG_TURBOT] Process-wide turbot plan path; takes precedence over env LLAMA_TURBOT_PLAN. nullptr or "" clears it.
 // [TAG_TURBOT_EMBED_PLAN] "default" selects the built-in plan; with neither set, the built-in plan is used when it fits.
 LLAMA_API void llama_turbot_set_plan_path(const char * path);
