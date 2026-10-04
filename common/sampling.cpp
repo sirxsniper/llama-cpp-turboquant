@@ -979,6 +979,8 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(
     std::vector<llama_token> result;
     result.reserve(idxs.size());
 
+    const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx));
+
     std::uniform_real_distribution<float> uniform(0.0f, 1.0f);
     size_t i = 0;
     for (; i < draft.size(); ++i) {
@@ -1010,6 +1012,11 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(
         if (q_draft > 0.0f && uniform(gsmpl->rng) * q_draft <= p_draft) {
             common_sampler_accept(gsmpl, draft[i], true);
             result.push_back(draft[i]);
+            // [TAG_SYNC_1004] upstream #29638's stop, as in the greedy overload: no draft token is accepted after an
+            // EOG - it would not be output but would stay in the context
+            if (llama_vocab_is_eog(vocab, draft[i]) && i + 1 < draft.size()) {
+                break;
+            }
             // [TAG_BS_LAZY_GRAMMAR] same stop as the greedy overload: the rows after this token went through the
             // backend sampler without the constraint this token just activated
             if (bs_row_on_backend(ctx, idxs[i + 1]) && !common_sampler_backend_ok(gsmpl)) {
@@ -1091,6 +1098,8 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct com
 
     std::vector<llama_token_data> cand; // candidate array masked by the grammar, if there is one
 
+    const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx));
+
     size_t i = 0;
     for (; i < draft.size(); i++) {
         // leaves the target distribution in the candidate array
@@ -1139,6 +1148,10 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct com
         if (q_x > 0.0f && (p_x >= q_x || uni(gsmpl->rng) < p_x / q_x)) {
             common_sampler_accept(gsmpl, draft[i], true);
             result.push_back(draft[i]);
+            // [TAG_SYNC_1004] upstream #29638's stop, as in the greedy overload: no draft token after an accepted EOG
+            if (llama_vocab_is_eog(vocab, draft[i]) && i + 1 < draft.size()) {
+                break;
+            }
             // [TAG_BS_LAZY_GRAMMAR] same stop as the other accept loops: the rows after this token went through the
             // backend sampler without the constraint this token just activated
             if (bs_row_on_backend(ctx, idxs[i + 1]) && !common_sampler_backend_ok(gsmpl)) {
