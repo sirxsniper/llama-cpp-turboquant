@@ -2471,15 +2471,20 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     int32_t br_id   = -1;
     int32_t br_chan = -1;
     ggml_tensor * br_ticket = nullptr;
+    const llama_moe_dma_view * br_dma = nullptr; // [TAG_FN_R4_BRIDGE_DMA] the layer's bank when the graph fetches a share
     if (moe_bridge && il >= 0 && n_tokens >= 1 && n_tokens <= llama_moe_bridge_max_t(moe_bridge) &&
         n_expert_used <= llama_moe_bridge_n_used(moe_bridge) &&
         !gate_up_exps && gate_exps && down_exps && !up_exps_b && !gate_exps_b && !down_exps_b &&
         !up_exps_s && !gate_exps_s && !down_exps_s && type_op == LLM_FFN_SILU && !weight_before_ffn &&
         loras->empty() && !(hparams.swiglu_clamp_exp[il] > 1e-6f) &&
         llama_moe_bridge_layer(moe_bridge, up_exps, &br_id, &br_chan)) {
+        if (llama_moe_bridge_dma(moe_bridge) && !pfs) {
+            br_dma = llama_moe_dma_bridge_lookup(up_exps, n_tokens);
+        }
         ggml_tensor * w2 = ggml_is_contiguous(weights) ? weights : ggml_cont(ctx0, weights);
         w2 = ggml_reshape_2d(ctx0, w2, n_expert_used, n_tokens);
-        br_ticket = ggml_moe_host_post(ctx0, cur, selected_experts, w2, br_id, br_chan, mcache ? GGML_MOE_BRIDGE_JOB_TABLE : 0);
+        const int32_t br_flags = (mcache ? GGML_MOE_BRIDGE_JOB_TABLE : 0) | (br_dma ? GGML_MOE_BRIDGE_JOB_DMA : 0);
+        br_ticket = ggml_moe_host_post(ctx0, cur, selected_experts, w2, br_id, br_chan, br_flags);
         cb(br_ticket, "ffn_moe_bridge_post", il);
         ggml_build_forward_expand(gf, br_ticket);
         res->n_moe_bridge++;
@@ -2584,6 +2589,38 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                 hot = ggml_cont(ctx0, hot);
             }
             cb(hot, "ffn_moe_bridge_hot", il);
+            ggml_build_forward_expand(gf, hot);
+        }
+        // [TAG_FN_R4_BRIDGE_DMA] the PCIe share: the fetch waits for the host's plan and copies the planned experts into
+        // the bank (after the hot chain, so the device computes the hits while the copies' plan forms), then the bank
+        // chain computes them (zero slot for the rest), weighted and summed like the hot chain. A bank serves every
+        // other layer: the fetch waits for the last reader of its bank (dep), so a copy never overwrites a slot that an
+        // earlier layer's chain still reads.
+        if (br_dma) {
+            ggml_tensor * dep = nullptr;
+            const auto it_dep = moe_dma_bank_last.find(br_dma->up);
+            if (it_dep != moe_dma_bank_last.end()) {
+                dep = it_dep->second;
+            }
+            ggml_tensor * dma_ids = ggml_moe_host_fetch(ctx0, br_ticket, br_dma->up, br_dma->gate, br_dma->down, dep,
+                    n_expert_used, n_tokens, br_id, br_chan);
+            cb(dma_ids, "ffn_moe_bridge_fetch", il);
+            ggml_tensor * dma_down = build_slot_chain(br_dma->up, br_dma->gate, br_dma->down, dma_ids, true);
+            moe_dma_bank_last[br_dma->up] = dma_down;
+            ggml_tensor * dw = ggml_mul(ctx0, dma_down, weights); // [n_embd, n_expert_used, n_tokens]
+            cb(dw, "ffn_moe_bridge_dma_weighted", il);
+            ggml_tensor * dsum = nullptr;
+            const uint32_t n_used_il = hparams.n_expert_used(il);
+            for (uint32_t i = 0; i < n_used_il; ++i) {
+                ggml_tensor * v = ggml_view_2d(ctx0, dw, n_embd, n_tokens, dw->nb[2], i*dw->nb[1]);
+                ggml_build_forward_expand(gf, v);
+                dsum = dsum ? ggml_add(ctx0, dsum, v) : v;
+            }
+            if (n_used_il == 1) {
+                dsum = ggml_cont(ctx0, dsum);
+            }
+            cb(dsum, "ffn_moe_bridge_dma", il);
+            hot = hot ? ggml_add(ctx0, hot, dsum) : dsum;
             ggml_build_forward_expand(gf, hot);
         }
         moe_bridge_posts[il] = { br_ticket, hot, n_embd, n_tokens, br_id, br_chan };
@@ -3427,12 +3464,15 @@ static void build_turbot_inputs(ggml_context * ctx0, const llama_kv_cache_contex
     }
 }
 
+// [TAG_FN_R4_QSA_POS] indexer_pos: the model builds its sparse-attention masks from the positional vectors itself
+// (qwen4exp under LLAMA_QSA_POS_MASK, ggml_qsa_mask), so its indexer no longer needs the explicit mask
 static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
            ggml_context * ctx0,
      const llama_ubatch & ubatch,
     const llama_hparams & hparams,
     const llama_cparams & cparams,
-    const llama_kv_cache_context * mctx_cur) {
+    const llama_kv_cache_context * mctx_cur,
+    bool indexer_pos = false) {
 
     auto inp = std::make_unique<llm_graph_input_attn_kv>(hparams, cparams, mctx_cur);
 
@@ -3499,7 +3539,7 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
             ubatch.n_seqs_unq <= 32 && (ubatch.token != nullptr || !ubatch.is_pos_2d());
         const bool use_pos_mask = pos_mask_env && cparams.flash_attn && cparams.causal_attn &&
             hparams.f_max_alibi_bias == 0.0f && (ubatch.n_seqs_unq == 1 || pos_mask_ms) &&
-            !has_sparse_attn_indexer;
+            (!has_sparse_attn_indexer || indexer_pos);
         if (use_pos_mask) {
             const auto n_kv = mctx_cur->get_n_kv();
             if (ubatch.n_seqs_unq == 1) {
@@ -4531,8 +4571,13 @@ ggml_tensor * llm_graph_context::build_rwkv_token_shift_store(
 llm_graph_input_mem_hybrid * llm_graph_context::build_inp_mem_hybrid() const {
     const auto * mctx_cur = static_cast<const llama_memory_hybrid_context *>(mctx);
 
+    // [TAG_FN_R4_QSA_POS] qwen4exp under LLAMA_QSA_POS_MASK: the positional vectors instead of the explicit mask; its
+    // QSA layers make their masks with ggml_qsa_mask and a dense layer (the nextn block) reads the vectors in FA. Not
+    // with a windowed cache (the LLAMA_MTP_ATTN_WINDOW draft cache): the positional test has no window.
+    const bool indexer_pos = arch == LLM_ARCH_QWEN4EXP && cparams.qsa_pos_mask && mctx_cur->get_attn()->get_swa_window() == 0;
+
     auto inp_rs   = build_rs_inp_impl     (ctx0, ubatch, mctx_cur->get_recr());
-    auto inp_attn = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur->get_attn());
+    auto inp_attn = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur->get_attn(), indexer_pos);
 
     auto inp = std::make_unique<llm_graph_input_mem_hybrid>(cparams, std::move(inp_attn), std::move(inp_rs), mctx_cur);
 

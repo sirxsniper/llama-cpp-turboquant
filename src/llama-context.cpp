@@ -1206,6 +1206,18 @@ llama_context::llama_context(
     cparams.pipeline_parallel = false;
     cparams.training = false;
 
+    // [TAG_FN_R4_QSA_POS] read per context, so a test can set the switches before it creates one
+    if (model.arch == LLM_ARCH_QWEN4EXP) {
+        const char * e = getenv("LLAMA_QSA_POS_MASK");
+        cparams.qsa_pos_mask = e && atoi(e) != 0;
+        const char * c = getenv("LLAMA_QSA_POS_CHUNK");
+        cparams.qsa_pos_chunk = c ? (uint32_t) std::max(0, atoi(c)) : 0;
+        if (cparams.qsa_pos_mask) {
+            LLAMA_LOG_INFO("%s: [TAG_FN_R4_QSA_POS] QSA masks from positions (ggml_qsa_mask)%s\n", __func__,
+                    cparams.qsa_pos_chunk > 0 ? format(", %u queries per mask", cparams.qsa_pos_chunk).c_str() : "");
+        }
+    }
+
     {
         const char * LLAMA_GRAPH_REUSE_DISABLE = getenv("LLAMA_GRAPH_REUSE_DISABLE");
         graph_reuse_disable = LLAMA_GRAPH_REUSE_DISABLE ? (atoi(LLAMA_GRAPH_REUSE_DISABLE) != 0) : graph_reuse_disable;
@@ -1437,6 +1449,10 @@ llama_context::llama_context(
         // [TAG_FN_MERGE] with a host bridge the DMA share / prefetch stay off (they need the CPU split the bridge removes)
         llama_moe_gen5_init(model, this, backend_ptrs, moe_bridge != nullptr);
 
+        // [TAG_FN_R4_BRIDGE_DMA] LLAMA_MOE_BRIDGE_DMA=1: the DMA share inside the bridged graphs (the gen5 state above is in
+        // bridge mode then); before the reserve, so decode graphs are reserved with the fetch ops
+        llama_moe_bridge_attach_dma(moe_bridge, this);
+
         // [TAG_MOE_BRIDGE] [TAG_FN_PREFILL_STREAM] a throw below (a reserve whose compute buffers do not fit) leaves the
         // constructor without the destructor: free the bridge (executor thread, pinned channels) and the gen5 state
         // (pinned rings, VRAM banks, an owner pointer a later context could match) on the way out
@@ -1501,6 +1517,7 @@ llama_context::~llama_context() {
 
     llama_fn_ctx_remove(model, this); // [TAG_FN_VRAM_FIT]
 
+    llama_moe_hot_save_now(this);      // [TAG_FN_R4_ADAPT_DECAY] LLAMA_MOE_HOT_SAVE: the learned hot set, owner only
     llama_moe_bridge_free(moe_bridge); // [TAG_MOE_BRIDGE] no graph runs now
     moe_bridge = nullptr;
     llama_moe_gen5_free(this); // [TAG_MOE_DMA_SHARE] [TAG_FN_PREFILL_STREAM]

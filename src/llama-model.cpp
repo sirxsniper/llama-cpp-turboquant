@@ -2783,7 +2783,13 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             // to the last n positions (qwen4exp keeps the explicit KQ mask, which applies the window).
                             // Drafts only: the target verifies with its full attention. A QSA MTP block pools whole
                             // sequences in cache order, which an evicting window would regroup, so it keeps the full cache.
+                            // [TAG_FN_R4_MTP_WINDOW] LLAMA_MTP_WINDOW=<n> is the same switch under Strata's name (32768
+                            // there); LLAMA_MTP_ATTN_WINDOW wins when both are set. With LLAMA_QSA_POS_MASK the windowed
+                            // draft cache keeps the explicit mask (the positional test has no window, llama-graph.cpp).
                             const char * e = getenv("LLAMA_MTP_ATTN_WINDOW");
+                            if (!e || !e[0]) {
+                                e = getenv("LLAMA_MTP_WINDOW");
+                            }
                             const long long w = e ? atoll(e) : 0;
                             if (w > 0 && (uint64_t) w < cparams.n_ctx_seq) {
                                 if (mtp_qsa) {

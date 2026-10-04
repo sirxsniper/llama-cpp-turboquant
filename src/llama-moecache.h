@@ -100,5 +100,13 @@ size_t llama_moe_hot_device_bytes();
 // its compute before llama_moe_cache_step; this returns that context, or nullptr when no adaptive set exists.
 const void * llama_moe_hot_adapt_owner();
 
+// [TAG_FN_R4_ADAPT_DECAY] LLAMA_MOE_HOT_DECAY=<0..1> (e.g. 0.92): the decayed-count policy instead of the window
+// (llama-moe-decay.h: every LLAMA_MOE_HOT_DECAY_EVERY=2 steps one pass, admit at LLAMA_MOE_HOT_DECAY_ADMIT=2 and over
+// LLAMA_MOE_HOT_DECAY_RATIO=1.2 x / LLAMA_MOE_HOT_DECAY_HYST=0.5 + the victim, LLAMA_MOE_HOT_DECAY_MIB per pass, by default
+// LLAMA_MOE_HOT_ADAPT_MIB x every: the window's bytes per step), with the
+// prompt's routing x LLAMA_MOE_HOT_SEED=0.03 folded in (0 = off). LLAMA_MOE_HOT_SAVE=<file>: the learned set as a moeprof
+// v1 profile every LLAMA_MOE_HOT_SAVE_EVERY=1024 decode steps and at llama_moe_hot_save_now (the owner's destructor).
+void llama_moe_hot_save_now(const void * owner);
+
 // max graph width for the hot chain, 0 when hot mode is off
 int llama_moe_hot_max_t();

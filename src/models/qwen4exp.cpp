@@ -1198,15 +1198,16 @@ llama_model_qwen4exp::llm_graph_input_kpool * llama_model_qwen4exp::graph::build
 
 // QSA attends to the top blocks of compress_ratio cells plus the incomplete tail, like the glm5-next k-pool indexer
 // a block is scored by one pooled key: the mean of its raw indexer keys, normed and rotated to its first member
-ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
+llama_model_qwen4exp::graph::qsa_sel llama_model_qwen4exp::graph::build_qsa_sel(
         const llama_memory_hybrid_idx_context * mctx_hyb,
         llm_graph_input_kpool *                 inp_kpool,
         ggml_tensor *                           cur,
         ggml_tensor *                           inp_pos,
-        ggml_tensor *                           kq_mask,
+        llm_graph_input_attn_kv *               inp,
         int *                                   sections,
         int                                     il) {
     const llama_kv_cache_context * mctx_idx = mctx_hyb->get_idx();
+    ggml_tensor * kq_mask = inp->get_kq_mask(); // [TAG_FN_R4_QSA_POS] nullptr with the positional vectors
 
     const int64_t idx_dim = hparams.indexer_head_size;
     const int64_t n_idx_h = hparams.indexer_n_head;
@@ -1335,6 +1336,20 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
 
     ggml_build_forward_expand(gf, sel_idx);
 
+    // [TAG_FN_R4_QSA_POS] the positional vectors: no explicit mask to add; ggml_qsa_mask builds the mask next to the
+    // attention from the selection, the picked scores (a picked pool is live when its score is not -inf, the rule below)
+    // and the positions. Its values are the ones the scatter below gives.
+    if (kq_mask == nullptr) {
+        GGML_ASSERT(inp->get_kv_pos() != nullptr && inp->get_q_pos() != nullptr);
+        qsa_sel qs;
+        qs.sel_idx = sel_idx;
+        qs.live    = ggml_reshape_2d(ctx0, top_score, n_top_pool, n_tokens);
+        qs.group   = kpool;
+        qs.n_sel   = n_sel;
+        cb(qs.live, "indexer_top_score", il);
+        return qs;
+    }
+
     // TODO: figure out to reduce the large copmute buffer that this creates
 
     // scatter zeros for the selected cells into an all -inf row, each dead slot into its own dump row n_kv + slot
@@ -1378,7 +1393,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
     sel = ggml_add(ctx0, sel, kq_mask);
     cb(sel, "indexer_sel", il);
 
-    return sel;
+    qsa_sel qs;
+    qs.mask  = sel;
+    qs.group = kpool;
+    qs.n_sel = n_sel;
+    return qs;
 }
 
 // Dense GQA self-attention over the cells that the QSA mask keeps.
@@ -1387,10 +1406,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
         ggml_tensor *             q_cur,
         ggml_tensor *             k_cur,
         ggml_tensor *             v_cur,
-        ggml_tensor *             sel,
-        int64_t                   n_sel,
+        const qsa_sel &           qs,
         float                     kq_scale,
         int                       il) {
+    const int64_t n_sel = qs.n_sel;
     // rotate q/k/v before they reach a quantized cache, as the dense path does. the indexer
     // has already scored with its own query in build_qsa_sel, so the selection is unaffected.
     if (inp->self_k_rot) {
@@ -1428,9 +1447,12 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
     }
 
     // the selection mask already carries the causal mask
-    ggml_tensor * kq_mask = inp->get_kq_mask();
-    ggml_tensor * mask    = ggml_reshape_4d(ctx0, sel, kq_mask->ne[0], kq_mask->ne[1], kq_mask->ne[2], kq_mask->ne[3]);
-    cb(mask, "kq_mask_qsa", il);
+    ggml_tensor * mask = nullptr;
+    if (qs.mask) {
+        ggml_tensor * kq_mask = inp->get_kq_mask();
+        mask = ggml_reshape_4d(ctx0, qs.mask, kq_mask->ne[0], kq_mask->ne[1], kq_mask->ne[2], kq_mask->ne[3]);
+        cb(mask, "kq_mask_qsa", il);
+    }
 
     ggml_tensor * q = q_cur;
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
@@ -1447,8 +1469,35 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
         return e && e[0] == '1';
     }();
     const int64_t n_kv_max = !mctx_cur->is_turbot() || qsa_sparse_turbot ? n_sel : 0;
-    ggml_tensor * cur = build_attn_mha_kv(mctx_cur, q, k, v, nullptr, mask, nullptr, nullptr, kq_scale, il,
-            nullptr, nullptr, inp->self_turbot_gtab, n_kv_max);
+    ggml_tensor * cur = nullptr;
+    if (mask) {
+        cur = build_attn_mha_kv(mctx_cur, q, k, v, nullptr, mask, nullptr, nullptr, kq_scale, il,
+                nullptr, nullptr, inp->self_turbot_gtab, n_kv_max);
+    } else {
+        // [TAG_FN_R4_QSA_POS] the mask from the positional vectors, the selection and the picked scores: one f16 [n_kv, n]
+        // buffer instead of the explicit KQ mask input, the -inf fill, the scatter and the sum (each about n_kv x n_ubatch).
+        // LLAMA_QSA_POS_CHUNK=<n>: the mask and the attention per n queries (the outputs are concatenated in query order),
+        // so the buffer is [n_kv, n]; every chunk reads the whole cache again.
+        ggml_tensor * kv_pos = inp->get_kv_pos();
+        ggml_tensor * q_pos  = inp->get_q_pos();
+        GGML_ASSERT(kv_pos && q_pos && qs.sel_idx && qs.live);
+        const int64_t n_q   = q->ne[2];
+        const int64_t chunk = cparams.qsa_pos_chunk > 0 ? (int64_t) cparams.qsa_pos_chunk : n_q;
+        for (int64_t c0 = 0; c0 < n_q; c0 += chunk) {
+            const int64_t nc = std::min(chunk, n_q - c0);
+            ggml_tensor * q_c  = nc == n_q ? q : ggml_view_3d(ctx0, q, q->ne[0], q->ne[1], nc, q->nb[1], q->nb[2], c0*q->nb[2]);
+            ggml_tensor * qp_c = nc == n_q ? q_pos : ggml_view_2d(ctx0, q_pos, nc, q_pos->ne[1], q_pos->nb[1], c0*q_pos->nb[0]);
+            ggml_tensor * sl_c = nc == n_q ? qs.sel_idx :
+                ggml_view_2d(ctx0, qs.sel_idx, qs.sel_idx->ne[0], nc, qs.sel_idx->nb[1], c0*qs.sel_idx->nb[1]);
+            ggml_tensor * lv_c = nc == n_q ? qs.live :
+                ggml_view_2d(ctx0, qs.live, qs.live->ne[0], nc, qs.live->nb[1], c0*qs.live->nb[1]);
+            ggml_tensor * mask_c = ggml_qsa_mask(ctx0, kv_pos, qp_c, sl_c, lv_c, (int32_t) qs.group);
+            cb(mask_c, "kq_mask_qsa", il);
+            ggml_tensor * out_c = build_attn_mha_kv(mctx_cur, q_c, k, v, nullptr, mask_c, nullptr, nullptr, kq_scale, il,
+                    nullptr, nullptr, inp->self_turbot_gtab, n_kv_max);
+            cur = cur ? ggml_concat(ctx0, cur, out_c, 1) : out_c;
+        }
+    }
     cb(cur, "kqv_out", il);
 
     // the rotation is its own inverse, so undo it on the value side of the output
@@ -1473,7 +1522,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
     // indexer reads the same block input as q/k/v; no cache or no ratio means dense
     const bool qsa = inp_kpool != nullptr && hparams.dsv4_compress_ratios[il] > 0;
 
-    ggml_tensor * sel = qsa ? build_qsa_sel(mctx_hyb, inp_kpool, cur, inp_pos, inp->get_kq_mask(), sections, il) : nullptr;
+    qsa_sel qs;
+    if (qsa) {
+        qs = build_qsa_sel(mctx_hyb, inp_kpool, cur, inp_pos, inp, sections, il);
+    }
 
     // Qwen3Next uses a single Q projection that outputs query + gate
     ggml_tensor * Qcur_full = build_lora_mm(model.layers[il].wq, cur, model.layers[il].wq_s); // [ (n_embd_head * 2) * n_head, n_tokens ]
@@ -1525,8 +1577,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
 
     const float kq_scale = hparams.f_attention_scale == 0.0f ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
 
-    if (sel) {
-        cur = build_attn_qsa(inp, Qcur, Kcur, Vcur, sel, inp_kpool->n_sel, kq_scale, il);
+    if (qsa) {
+        cur = build_attn_qsa(inp, Qcur, Kcur, Vcur, qs, kq_scale, il);
     } else {
         cur = build_attn(inp,
                     nullptr, nullptr, nullptr,

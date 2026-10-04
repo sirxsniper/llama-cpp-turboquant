@@ -520,6 +520,9 @@ public:
 
     uint32_t get_n_kv() const;
 
+    // [TAG_FN_R4_QSA_POS] the sliding window the cache applies (llama_kv_cache::get_swa_window), 0 for none
+    uint32_t get_swa_window() const;
+
     ggml_type type_k() const;
     ggml_type type_v() const;
 

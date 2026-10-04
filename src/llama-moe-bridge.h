@@ -22,6 +22,10 @@
 //   LLAMA_MOE_BRIDGE_STATS=1              job and wait statistics every 256 bridged graphs
 //   LLAMA_MOE_BRIDGE_TEST_STALL=<ms>      test (spin): the executor sleeps this long after job 199 (and every
 //   LLAMA_MOE_BRIDGE_TEST_STALL_EVERY=<n>   n jobs after it) before it takes the next, to exercise the timeout path
+//   LLAMA_MOE_BRIDGE_DMA=1                [TAG_FN_R4_BRIDGE_DMA] with LLAMA_MOE_DMA_SHARE=<0..1>|auto (llama-moe-gen5.h):
+//                                         the DMA share inside the bridged graphs - the GPU computes its hot experts, then
+//                                         the fetched ones (copied from the pinned ring by SM loads) when they land, the CPU
+//                                         pool the rest; share = auto moves the split by the measured rates
 
 #include <cstdint>
 
@@ -32,6 +36,12 @@ struct llama_moe_bridge;
 // nullptr when disabled or not possible here (the reason is logged)
 llama_moe_bridge * llama_moe_bridge_create(const llama_model & model, int n_threads);
 void               llama_moe_bridge_free(llama_moe_bridge * br);
+
+// [TAG_FN_R4_BRIDGE_DMA] LLAMA_MOE_BRIDGE_DMA=1 (with LLAMA_MOE_DMA_SHARE=<share>|auto): after llama_moe_gen5_init (bridge
+// mode) and before the reserve, register the DMA ring with the device side; the bridged graphs then fetch a share of
+// each job's experts over PCIe (GGML_OP_MOE_HOST_FETCH) while the CPU computes the rest. false: no DMA share (logged).
+bool               llama_moe_bridge_attach_dma(llama_moe_bridge * br, const void * owner);
+bool               llama_moe_bridge_dma(const llama_moe_bridge * br);
 
 // graph side. active: graphs built now may use it (not paused after an error, not disabled)
 bool llama_moe_bridge_active(const llama_moe_bridge * br);

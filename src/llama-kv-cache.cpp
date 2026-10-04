@@ -4288,6 +4288,11 @@ uint32_t llama_kv_cache_context::get_n_kv() const {
     return n_kv;
 }
 
+// [TAG_FN_R4_QSA_POS]
+uint32_t llama_kv_cache_context::get_swa_window() const {
+    return kv ? kv->get_swa_window() : 0;
+}
+
 ggml_type llama_kv_cache_context::type_k() const {
     return kv->type_k();
 }

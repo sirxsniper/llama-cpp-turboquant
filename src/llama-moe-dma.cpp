@@ -14,6 +14,16 @@
 //             and hot results before the weights are applied.
 // The ring changes only at step boundaries (admission) and at fences (urgent fills, into slots no copy of this step
 // reads). All copies of a step are finished at the step boundary (copy stream synchronized).
+//
+// [TAG_FN_R4_BRIDGE_DMA] Bridge mode (LLAMA_MOE_BRIDGE=1 with LLAMA_MOE_BRIDGE_DMA=1 and a share): the same ring, banks,
+// admission and warm start, but no plan / fence nodes, no issuer thread and no copy stream. The bridge's host executor
+// plans each bridged job (llama_moe_dma_bridge_plan: D = routed cold experts that sit ready in the ring, most tokens
+// first, up to share x the job's cold experts and the bank), the device fetch (GGML_OP_MOE_HOST_FETCH) copies D from
+// the ring through its device mapping into the bank with SM loads, and the CPU pool skips D. The ring is read only by
+// fetches of the running graph, which the owner synchronizes before the step boundary, so admission stays at the step
+// boundary as above. share = auto moves the share by measured rates (llama_moe_dma_bridge_feedback): the CPU's time per
+// expert against the fetch's, and whether the device waited for the host's part (the CPU is the long pole: more to the
+// GPU) or not (the GPU is: less).
 
 #include "llama-moe-gen5.h"
 #include "llama-moe-gen5-impl.h"
@@ -143,6 +153,18 @@ struct dma_state {
     int    K           = 8;
     double share       = 0.0;
     bool   share_auto  = false;
+    bool   bridge      = false; // [TAG_FN_R4_BRIDGE_DMA] bridge mode: the bridge's executor plans, the device fetches
+
+    // [TAG_FN_R4_BRIDGE_DMA] the share the executor reads (the owner's thread moves it between graphs)
+    std::atomic<double> br_share{0.0};
+    double br_cpu_us   = 0.0;   // EMA: CPU pool time per expert of a job (the whole pool)
+    double br_fetch_us = 0.0;   // EMA: fetch time per fetched expert
+    double br_wait_hi  = 20.0;  // the device waited more than this per layer (us): the CPU is the long pole
+    double br_wait_lo  = 3.0;   // ... less than this: the GPU is
+    double br_step     = 0.02;  // share change per graph
+    double br_max      = 1.0;   // share cap
+    uint64_t br_graphs = 0;
+    double br_wait_sum = 0.0;   // per-layer device wait, summed over the graphs (stats)
     bool   prefetch    = false;
     int    pf_slots    = 4;
     int    pf_fill     = 2;
@@ -273,6 +295,9 @@ void dma_wait_seq(dma_state * s, uint64_t seq) {
 }
 
 void dma_wait_issuer_idle(dma_state * s) {
+    if (s->bridge) {
+        return; // [TAG_FN_R4_BRIDGE_DMA] no issuer
+    }
     std::unique_lock<std::mutex> lk(s->imtx);
     s->icv_done.wait(lk, [&]() { return s->stop || (s->itasks.empty() && !s->ibusy); });
 }
@@ -653,9 +678,12 @@ bool dma_read_profile(const char * path, std::map<int, std::vector<double>> & ou
 }
 
 // step boundary of the owner: every copy of the step is done; roll the windows, admit into the ring, warm start
+// [TAG_FN_R4_BRIDGE_DMA] in bridge mode the fetches ran in the owner's bridged graphs, which it synchronized
 void dma_step_impl(dma_state * s) {
     dma_wait_issuer_idle(s);
-    ggml_backend_synchronize(s->copy);
+    if (s->copy) {
+        ggml_backend_synchronize(s->copy);
+    }
     s->step++;
     s->ctr.steps++;
 
@@ -745,7 +773,14 @@ void dma_step_impl(dma_state * s) {
     }
     s->fcv.notify_all();
 
-    if (s->stats && s->ctr.steps % 256 == 0) {
+    if (s->stats && s->ctr.steps % 256 == 0 && s->bridge) { // [TAG_FN_R4_BRIDGE_DMA]
+        const auto & c = s->ctr;
+        const double ls = c.layer_steps ? (double) c.layer_steps : 1.0;
+        LLAMA_LOG_INFO("moe-dma (bridge): %" PRIu64 " steps: per layer-step %.2f cold, %.2f ring-ready, %.2f fetched; fills %" PRIu64
+                "; share %.3f%s; CPU %.1f us/expert, fetch %.1f us/expert, device wait %.1f us/layer\n",
+                c.steps, c.cold/ls, c.ring_ready/ls, c.dma_on_demand/ls, c.fills, s->br_share.load(),
+                s->share_auto ? " (auto)" : "", s->br_cpu_us, s->br_fetch_us, s->br_graphs ? s->br_wait_sum/s->br_graphs : 0.0);
+    } else if (s->stats && s->ctr.steps % 256 == 0) {
         const auto & c = s->ctr;
         const double ls = c.layer_steps ? (double) c.layer_steps : 1.0;
         LLAMA_LOG_INFO("moe-dma: %" PRIu64 " steps: per layer-step %.2f cold, %.2f ring-ready, %.2f to the GPU (%.2f prefetched), "
@@ -804,7 +839,8 @@ bool dma_requested() {
 }
 } // namespace gen5
 
-bool llama_moe_dma_init_layers(const std::vector<llama_moe_gen5_layer_desc> & layers, const llama_moe_gen5_device & d, const void * owner) {
+bool llama_moe_dma_init_layers(const std::vector<llama_moe_gen5_layer_desc> & layers, const llama_moe_gen5_device & d, const void * owner,
+        bool bridge) {
     std::lock_guard<std::mutex> init_lock(g_dma_init);
     if (g_dma || layers.empty() || !d.compute || !d.buft || !gen5::dma_requested()) {
         return false;
@@ -813,6 +849,7 @@ bool llama_moe_dma_init_layers(const std::vector<llama_moe_gen5_layer_desc> & la
     s->owner   = owner;
     s->dev     = d.dev;
     s->compute = d.compute;
+    s->bridge  = bridge; // [TAG_FN_R4_BRIDGE_DMA]
 
     const char * sh = getenv("LLAMA_MOE_DMA_SHARE");
     if (sh && strcmp(sh, "auto") == 0) {
@@ -823,6 +860,23 @@ bool llama_moe_dma_init_layers(const std::vector<llama_moe_gen5_layer_desc> & la
     }
     s->prefetch     = gen5::env_flag("LLAMA_MOE_PREFETCH");
     s->K            = gen5::env_int("LLAMA_MOE_DMA_SLOTS", 8, 1, 64);
+    if (s->bridge) {
+        // [TAG_FN_R4_BRIDGE_DMA] the prefetch needs the fences of the CPU split; a fetch copies at most
+        // GGML_MOE_BRIDGE_MAX_FETCH (32) experts; share = auto starts low (Strata: 0-0.3 for Q4 on a 5090)
+        if (s->prefetch) {
+            LLAMA_LOG_WARN("moe-dma: LLAMA_MOE_PREFETCH is off with the bridge (it needs the CPU split's fences)\n");
+        }
+        s->prefetch = false;
+        s->K = std::min(s->K, 32);
+        if (s->share_auto) {
+            s->share = gen5::env_int("LLAMA_MOE_DMA_SHARE_START_PCT", 25, 0, 100) / 100.0;
+        }
+        s->br_wait_hi = gen5::env_int("LLAMA_MOE_DMA_WAIT_HI_US", 20, 0, 100000);
+        s->br_wait_lo = gen5::env_int("LLAMA_MOE_DMA_WAIT_LO_US", 3, 0, 100000);
+        s->br_step    = gen5::env_int("LLAMA_MOE_DMA_STEP_PCT10", 20, 1, 1000) / 1000.0;
+        s->br_max     = gen5::env_int("LLAMA_MOE_DMA_SHARE_MAX_PCT", 100, 0, 100) / 100.0;
+        s->br_share.store(s->share);
+    }
     s->pf_slots     = gen5::env_int("LLAMA_MOE_PREFETCH_SLOTS", 4, 1, 64);
     s->pf_fill      = gen5::env_int("LLAMA_MOE_PREFETCH_FILL", 2, 0, 64);
     s->pf_k         = gen5::env_int("LLAMA_MOE_PREFETCH_K", 12, 1, 64);
@@ -952,13 +1006,15 @@ bool llama_moe_dma_init_layers(const std::vector<llama_moe_gen5_layer_desc> & la
     s->rs.reset(new ring_slot[s->n_ring]);
 
     const bool cpu_dev = !d.dev || ggml_backend_dev_type(d.dev) == GGML_BACKEND_DEVICE_TYPE_CPU;
-    if (!cpu_dev) {
+    if (s->bridge) {
+        s->copy = nullptr; // [TAG_FN_R4_BRIDGE_DMA] the device fetch copies: no copy stream, no host CUDA call
+    } else if (!cpu_dev) {
         s->copy = ggml_backend_dev_init(d.dev, nullptr);
         s->own_copy = s->copy != nullptr;
     } else {
         s->copy = d.compute;
     }
-    if (!s->copy) {
+    if (!s->copy && !s->bridge) {
         return fail("no copy backend");
     }
 
@@ -995,7 +1051,7 @@ bool llama_moe_dma_init_layers(const std::vector<llama_moe_gen5_layer_desc> & la
         s->warm_done = true;
     }
 
-    if (!s->inline_issue) {
+    if (!s->inline_issue && !s->bridge) {
         s->issuer = std::thread(dma_issuer_run, s);
     }
     for (int i = 0; i < n_fill; ++i) {
@@ -1004,6 +1060,9 @@ bool llama_moe_dma_init_layers(const std::vector<llama_moe_gen5_layer_desc> & la
     s->ctr.share = s->share;
     g_dma = s;
 
+    if (s->bridge) {
+        LLAMA_LOG_INFO("moe-dma: [TAG_FN_R4_BRIDGE_DMA] bridge mode: the bridge's executor plans the share, the device fetches it\n");
+    }
     LLAMA_LOG_INFO("moe-dma: %zu host expert layers, %zu banks x %d slots (%.1f MiB VRAM), %s ring %d x %.2f MiB, share %s%.2f, "
             "prefetch %s (%d slots, %d fills, top %d), admit %d/%d, %.0f MiB fills per step%s\n",
             s->layers.size(), s->banks.size(), s->K, vram/1048576.0, s->ring.pinned ? "pinned" : "plain", s->n_ring,
@@ -1033,8 +1092,8 @@ void llama_moe_dma_step(const void * owner) {
 
 const llama_moe_dma_view * llama_moe_dma_lookup(ggml_backend_sched_t sched, const ggml_tensor * up_exps, int64_t n_tokens) {
     dma_state * s = g_dma;
-    if (!s || n_tokens < 1 || n_tokens > LLAMA_MOE_DMA_MAX_T || !gen5::sched_has(sched, s->compute)) {
-        return nullptr;
+    if (!s || s->bridge || n_tokens < 1 || n_tokens > LLAMA_MOE_DMA_MAX_T || !gen5::sched_has(sched, s->compute)) {
+        return nullptr; // [TAG_FN_R4_BRIDGE_DMA] bridge mode has no plan / fence path
     }
     auto it = s->by_up.find(up_exps);
     return it != s->by_up.end() ? &s->layers[it->second].view : nullptr;
@@ -1076,6 +1135,160 @@ llama_moe_dma_counters llama_moe_dma_get_counters() {
     c.fills       = s->ctr.fills;
     c.fill_urgent = s->ctr.fill_urgent;
     return c;
+}
+
+// ---- [TAG_FN_R4_BRIDGE_DMA] bridge mode ------------------------------------------------------------------------------
+
+bool llama_moe_dma_bridge_mode() {
+    dma_state * s = g_dma;
+    return s && s->bridge;
+}
+
+const llama_moe_dma_view * llama_moe_dma_bridge_lookup(const ggml_tensor * up_exps, int64_t n_tokens) {
+    dma_state * s = g_dma;
+    if (!s || !s->bridge || n_tokens < 1 || n_tokens > LLAMA_MOE_DMA_MAX_T) {
+        return nullptr;
+    }
+    auto it = s->by_up.find(up_exps);
+    return it != s->by_up.end() ? &s->layers[it->second].view : nullptr;
+}
+
+bool llama_moe_dma_bridge_ring(const void * owner, void ** ptr, size_t * size, int * max_fetch) {
+    dma_state * s = g_dma;
+    if (!s || !s->bridge || s->owner != owner || !s->ring.ptr) {
+        return false; // pinned or plain (CPU device): the device side checks that it can read it
+    }
+    *ptr       = s->ring.ptr;
+    *size      = (size_t) s->n_ring*s->slot_size;
+    *max_fetch = s->K;
+    return true;
+}
+
+int llama_moe_dma_bridge_plan(void * handle, const int32_t * ids, int n_used, int n_tokens, const int32_t * hot_tbl,
+        int32_t hot_miss, int max_copy, uint64_t * off, int32_t * slot, int32_t * slot_ids, int32_t * d_experts) {
+    dma_state * s = g_dma;
+    dma_layer * L = (dma_layer *) handle;
+    if (!s || !s->bridge || !L || L->pos < 0 || L->pos >= (int) s->layers.size() || &s->layers[L->pos] != L) {
+        return -1;
+    }
+    const dma_bank & B = s->banks[L->bank];
+    const int64_t n_exp = L->n_expert;
+    auto is_hot = [&](int32_t e) { return hot_tbl && hot_tbl[e] != hot_miss; };
+
+    // unique routed experts and tokens per expert, in routing order; the cold ones feed the ring admission
+    auto & tok    = L->s_tok;
+    auto & uniq   = L->s_uniq;
+    auto & cold   = L->s_cold;
+    auto & d_slot = L->s_dslot;
+    uniq.clear();
+    cold.clear();
+    for (int t = 0; t < n_tokens; ++t) {
+        for (int i = 0; i < n_used; ++i) {
+            const int32_t e = ids[(size_t) t*n_used + i];
+            if (e < 0 || e >= n_exp) {
+                continue;
+            }
+            if (tok[e]++ == 0) {
+                uniq.push_back(e);
+            }
+        }
+    }
+    for (int32_t e : uniq) {
+        if (is_hot(e)) {
+            continue;
+        }
+        cold.push_back(e);
+        if (!L->cur_seen[e]) {
+            L->cur_seen[e] = 1;
+            L->cur_ids.push_back(e);
+        }
+    }
+
+    // D: ring-ready cold experts, most tokens first, up to share x cold, the bank and the fetch budget
+    const double share = s->br_share.load(std::memory_order_relaxed);
+    const int cap = std::min({ max_copy, B.n_slots, (int) std::lround(share*(double) cold.size()) });
+    int n = 0;
+    uint64_t n_ready = 0;
+    if (cap > 0) {
+        std::vector<std::pair<int32_t, int32_t>> cand; // (expert, ring slot)
+        std::lock_guard<std::mutex> lk(s->ring_mtx);
+        for (int32_t e : cold) {
+            const int32_t r = L->ring_slot[e];
+            if (r >= 0 && s->rs[r].state.load(std::memory_order_acquire) == RING_READY) {
+                cand.push_back({ e, r });
+            }
+        }
+        n_ready = cand.size();
+        std::stable_sort(cand.begin(), cand.end(), [&](const std::pair<int32_t, int32_t> & a, const std::pair<int32_t, int32_t> & b) {
+            return tok[a.first] != tok[b.first] ? tok[a.first] > tok[b.first] : a.first < b.first;
+        });
+        for (const auto & c : cand) {
+            if (n >= cap) {
+                break;
+            }
+            d_slot[c.first]       = n;
+            off[n]                = (uint64_t) c.second*s->slot_size;
+            slot[n]               = n;
+            d_experts[n]          = c.first;
+            s->rs[c.second].last_use = s->step;
+            n++;
+        }
+    }
+
+    // the bank slot of every routed (slot, token): its D slot, else the zero slot
+    for (int t = 0; t < n_tokens; ++t) {
+        for (int i = 0; i < n_used; ++i) {
+            const int32_t e = ids[(size_t) t*n_used + i];
+            slot_ids[(size_t) t*n_used + i] = e >= 0 && e < n_exp && d_slot[e] >= 0 ? d_slot[e] : B.n_slots;
+        }
+    }
+    for (int32_t e : uniq) {
+        tok[e]    = 0;
+        d_slot[e] = -1;
+    }
+
+    s->ctr.layer_steps++;
+    s->ctr.cold          += cold.size();
+    s->ctr.dma_on_demand += n;
+    s->ctr.ring_ready    += n_ready;
+    return n;
+}
+
+void llama_moe_dma_bridge_feedback(const llama_moe_dma_bridge_step & st) {
+    dma_state * s = g_dma;
+    if (!s || !s->bridge || st.n_layers <= 0) {
+        return;
+    }
+    const double a = 0.1; // EMA weight of a graph
+    if (st.n_cpu > 0) {
+        const double c = st.cpu_us/(double) st.n_cpu;
+        s->br_cpu_us = s->br_cpu_us > 0.0 ? (1.0 - a)*s->br_cpu_us + a*c : c;
+    }
+    if (st.n_fetch > 0) {
+        const double f = st.fetch_us/(double) st.n_fetch;
+        s->br_fetch_us = s->br_fetch_us > 0.0 ? (1.0 - a)*s->br_fetch_us + a*f : f;
+    }
+    const double wait = st.gpu_wait_us/(double) st.n_layers;
+    s->br_graphs++;
+    s->br_wait_sum += wait;
+    if (!s->share_auto) {
+        return;
+    }
+    // the rate balance: the share at which the fetched experts take as long as the CPU's (both measured per expert);
+    // the share never goes past 1.5x of it
+    double cap = s->br_max;
+    if (s->br_cpu_us > 0.0 && s->br_fetch_us > 0.0) {
+        cap = std::min(cap, 1.5*s->br_cpu_us/(s->br_cpu_us + s->br_fetch_us));
+    }
+    double share = s->br_share.load(std::memory_order_relaxed);
+    if (wait > s->br_wait_hi) {
+        share += s->br_step;        // the device idled waiting for the CPU part: more to the GPU
+    } else if (wait < s->br_wait_lo) {
+        share -= s->br_step;        // the CPU part was ready: the GPU is the long pole
+    }
+    share = std::max(0.0, std::min(cap, share));
+    s->br_share.store(share, std::memory_order_relaxed);
+    s->share = share;
 }
 
 void llama_moe_dma_wait_idle() {

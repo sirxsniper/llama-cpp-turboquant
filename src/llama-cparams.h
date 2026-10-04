@@ -55,6 +55,13 @@ struct llama_cparams {
     bool pipeline_parallel;
     bool training;           // set by llama_opt_init()
 
+    // [TAG_FN_R4_QSA_POS] LLAMA_QSA_POS_MASK=1 (qwen4exp only, default off): the attention input carries the positional
+    // vectors instead of the explicit [n_kv, n_tokens] KQ mask; the QSA layers build their mask from them with
+    // ggml_qsa_mask and a dense layer (the nextn block) reads them in FA. LLAMA_QSA_POS_CHUNK=<n> (0 = off): the QSA mask
+    // and its FA run per n queries, so the mask buffer is [n_kv, n] instead of [n_kv, n_ubatch].
+    bool     qsa_pos_mask  = false;
+    uint32_t qsa_pos_chunk = 0;
+
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
 
     enum llama_context_type ctx_type;

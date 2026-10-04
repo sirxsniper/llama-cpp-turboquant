@@ -1118,6 +1118,9 @@ struct llm_graph_context {
     };
     mutable std::map<int, moe_bridge_post> moe_bridge_posts;
 
+    // [TAG_FN_R4_BRIDGE_DMA] per DMA bank (its up tensor): the last chain that read it in this graph
+    mutable std::map<const ggml_tensor *, ggml_tensor *> moe_dma_bank_last;
+
     llm_graph_context(const llm_graph_params & params);
     virtual ~llm_graph_context() = default;
 

@@ -23,10 +23,19 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <stdexcept>
 #include <vector>
+
+#if defined(_WIN32) // [TAG_FN_R4_ECOQOS]
+#    define WIN32_LEAN_AND_MEAN
+#    ifndef NOMINMAX
+#        define NOMINMAX
+#    endif
+#    include <windows.h>
+#endif
 
 #if defined(_MSC_VER)
 #pragma warning(disable: 4244 4267) // possible loss of data
@@ -120,8 +129,31 @@ const char * llama_version(void) {
     return LLAMA_VERSION;
 }
 
+// [TAG_FN_R4_ECOQOS] LLAMA_NO_ECOQOS=1 (Windows): opt the process out of EcoQoS / power throttling, which Windows may
+// apply to a background-launched or minimized process (Strata #691: -20% decode on a hybrid CPU). Only this process's
+// own scheduling hint changes; nothing else on the machine.
+static void llama_ecoqos_opt_out(void) {
+#if defined(_WIN32) && defined(PROCESS_POWER_THROTTLING_CURRENT_VERSION)
+    const char * e = getenv("LLAMA_NO_ECOQOS");
+    if (!e || atoi(e) == 0) {
+        return;
+    }
+    PROCESS_POWER_THROTTLING_STATE st;
+    memset(&st, 0, sizeof(st));
+    st.Version     = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
+    st.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED;
+    st.StateMask   = 0; // execution speed throttling off
+    if (!SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &st, sizeof(st))) {
+        LLAMA_LOG_WARN("%s: LLAMA_NO_ECOQOS: SetProcessInformation failed (%lu)\n", __func__, (unsigned long) GetLastError());
+    } else {
+        LLAMA_LOG_INFO("%s: LLAMA_NO_ECOQOS: power throttling (EcoQoS) off for this process\n", __func__);
+    }
+#endif
+}
+
 void llama_backend_init(void) {
     ggml_time_init();
+    llama_ecoqos_opt_out(); // [TAG_FN_R4_ECOQOS]
 
     // needed to initialize f16 tables
     {

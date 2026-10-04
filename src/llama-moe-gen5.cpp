@@ -268,9 +268,11 @@ void llama_moe_gen5_init(const llama_model & model, const void * owner, const st
     const bool want_pfs = gen5::env_flag("LLAMA_PREFILL_STREAM");
     // [TAG_FN_MERGE] the bridge computes the cold experts on its host executor inside one device graph: there is no CPU
     // split for the plan and fence nodes. The two are exclusive; the bridge wins (its graphs never build a DMA plan).
-    if (want_dma && host_bridge) {
+    // [TAG_FN_R4_BRIDGE_DMA] LLAMA_MOE_BRIDGE_DMA=1: the share runs inside the bridged graphs (bridge mode)
+    const bool dma_bridge = want_dma && host_bridge && gen5::env_flag("LLAMA_MOE_BRIDGE_DMA");
+    if (want_dma && host_bridge && !dma_bridge) {
         LLAMA_LOG_WARN("gen5: LLAMA_MOE_DMA_SHARE / LLAMA_MOE_PREFETCH are off in this context: LLAMA_MOE_BRIDGE owns the "
-                       "host experts of its decode graphs (unset LLAMA_MOE_BRIDGE to use them)\n");
+                       "host experts of its decode graphs (LLAMA_MOE_BRIDGE_DMA=1 runs the share inside them)\n");
         want_dma = false;
     }
     if (!want_dma && !want_pfs) {
@@ -299,7 +301,7 @@ void llama_moe_gen5_init(const llama_model & model, const void * owner, const st
         llama_prefill_stream_init_layers(layers, d, owner);
     }
     if (want_dma) {
-        llama_moe_dma_init_layers(layers, d, owner);
+        llama_moe_dma_init_layers(layers, d, owner, dma_bridge);
     }
 }
 

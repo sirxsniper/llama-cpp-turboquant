@@ -78,6 +78,7 @@ struct llama_pfs_view {
 // host_bridge: the owner has an active MoE host bridge (LLAMA_MOE_BRIDGE, llama-moe-bridge.h). Its decode graphs have no
 // CPU split for the DMA plan / fence nodes, so the DMA share and the prefetch stay off; the prefill stream (graphs of
 // >= LLAMA_PREFILL_STREAM_MIN tokens, never bridged) is unaffected. [TAG_FN_MERGE]
+// [TAG_FN_R4_BRIDGE_DMA] with LLAMA_MOE_BRIDGE_DMA=1 the DMA share runs in bridge mode instead (see below).
 void llama_moe_gen5_init(const llama_model & model, const void * owner, const std::vector<ggml_backend_t> & backends,
         bool host_bridge = false);
 void llama_moe_gen5_step(const void * owner); // end of the owner's decode()
@@ -87,8 +88,9 @@ void llama_moe_gen5_free(const void * owner); // owner destructor
 
 constexpr int LLAMA_MOE_DMA_MAX_T = 8; // one zero slot per bank: MMVQ widths only
 
-// explicit init (tests): returns true when enabled
-LLAMA_API bool llama_moe_dma_init_layers(const std::vector<llama_moe_gen5_layer_desc> & layers, const llama_moe_gen5_device & d, const void * owner);
+// explicit init (tests): returns true when enabled. bridge: [TAG_FN_R4_BRIDGE_DMA] bridge mode (see below)
+LLAMA_API bool llama_moe_dma_init_layers(const std::vector<llama_moe_gen5_layer_desc> & layers, const llama_moe_gen5_device & d, const void * owner,
+        bool bridge = false);
 LLAMA_API void llama_moe_dma_free(const void * owner);
 LLAMA_API void llama_moe_dma_step(const void * owner);
 
@@ -124,6 +126,37 @@ struct llama_moe_dma_counters {
 LLAMA_API llama_moe_dma_counters llama_moe_dma_get_counters();
 // tests: wait until the filler has no queued or running job
 LLAMA_API void llama_moe_dma_wait_idle();
+
+// --- [TAG_FN_R4_BRIDGE_DMA] the DMA share inside bridged graphs (LLAMA_MOE_BRIDGE=1, LLAMA_MOE_BRIDGE_DMA=1, a share) ---
+//
+// The bridge's host executor plans the share of each job, the device fetch op copies it from the ring (mapped) into the
+// layer's bank, a bank chain computes it on the GPU, and the CPU pool skips it: the GPU computes its hot experts, then
+// the fetched ones when they land, while the CPU computes the rest. No plan / fence node, issuer thread or copy stream.
+
+LLAMA_API bool llama_moe_dma_bridge_mode();
+// the bank view of a bridged layer (nullptr: not a DMA layer, or not bridge mode)
+LLAMA_API const llama_moe_dma_view * llama_moe_dma_bridge_lookup(const ggml_tensor * up_exps, int64_t n_tokens);
+// the pinned ring the device reads (host pointer and size) and the bank size (experts per fetch); false: not available
+LLAMA_API bool llama_moe_dma_bridge_ring(const void * owner, void ** ptr, size_t * size, int * max_fetch);
+// one job's plan (the bridge's executor thread; one job of a layer at a time): returns the experts to fetch (n, -1 on a
+// bad handle) and writes their ring byte offsets, bank slots and expert ids (off, slot, d_experts: n entries,
+// max_copy capacity) and the bank slot of every routed (slot, token) (slot_ids [n_used, n_tokens], the zero slot
+// where not fetched). hot_tbl/hot_miss: the hot set's host table and its "not hot" value (or nullptr): hot experts are
+// never fetched.
+LLAMA_API int  llama_moe_dma_bridge_plan(void * handle, const int32_t * ids, int n_used, int n_tokens, const int32_t * hot_tbl,
+        int32_t hot_miss, int max_copy, uint64_t * off, int32_t * slot, int32_t * slot_ids, int32_t * d_experts);
+
+// what one bridged graph measured (sums over its bridged layers)
+struct llama_moe_dma_bridge_step {
+    int      n_layers    = 0;
+    double   gpu_wait_us = 0.0; // device waits for the host's results
+    double   cpu_us      = 0.0; // host pool time of the jobs
+    uint64_t n_cpu       = 0;   // experts the host computed
+    double   fetch_us    = 0.0; // device fetch time
+    uint64_t n_fetch     = 0;   // experts fetched
+};
+// the owner's thread, after a bridged graph: rates and, with share = auto, the next share
+LLAMA_API void llama_moe_dma_bridge_feedback(const llama_moe_dma_bridge_step & st);
 
 // --- [TAG_FN_PREFILL_STREAM] ---
 

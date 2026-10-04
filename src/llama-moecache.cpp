@@ -1,6 +1,7 @@
 #include "llama-moecache.h"
 
 #include "llama-fn-auto.h" // [TAG_FN_AUTO]
+#include "llama-moe-decay.h" // [TAG_FN_R4_ADAPT_DECAY]
 #include "llama-impl.h"
 #include "llama-model.h"
 
@@ -49,6 +50,12 @@ struct layer_state {
     std::vector<uint8_t>              cur_seen;  // [n_expert]
     std::vector<double>               prof;      // static profile counts (eviction tie-break)
     int64_t                           tbl_off = 0; // row offset in the group's table tensor
+
+    // [TAG_FN_R4_ADAPT_DECAY] the decayed policy (LLAMA_MOE_HOT_DECAY): routing counts, and the prompt's counts not yet
+    // folded in (the observer fills both; the owner's step reads them, never while a graph of the owner runs)
+    std::vector<float>                dcnt;      // [n_expert]
+    std::vector<float>                dseed;     // [n_expert]
+    bool                              dseed_any = false;
 };
 
 struct upload_job {
@@ -93,6 +100,16 @@ struct moe_cache {
     uint64_t      ad_admitted = 0;
     uint64_t      ad_bad      = 0;
     bool          ad_stats    = false;
+
+    // [TAG_FN_R4_ADAPT_DECAY] the decayed policy instead of the window (llama-moe-decay.h), and the learned set saved
+    // as a routing profile (LLAMA_MOE_HOT_SAVE=<file>, every LLAMA_MOE_HOT_SAVE_EVERY decode steps and at the owner's end)
+    bool                   dc_on      = false;
+    llama_moe_decay_params dc;
+    size_t                 dc_bytes   = 0;     // upload budget per pass (LLAMA_MOE_HOT_DECAY_MIB, else ADAPT_MIB x every)
+    uint64_t               dc_swaps   = 0;
+    uint64_t               dc_passes  = 0;
+    std::string            save_path;
+    uint64_t               save_every = 0;
     ggml_backend_t        up_backend = nullptr;
     ggml_backend_buffer_t staging    = nullptr;
     uint8_t *             stage_ptr  = nullptr;
@@ -496,7 +513,25 @@ void hot_obs_cb(const char * name, const struct ggml_tensor * ids, void * ud) {
     const int64_t n_used   = ids->ne[0];
     const int64_t n_tokens = ids->ne[1];
     if (n_tokens > mc->hot_max_t) {
-        return; // prefill: not counted, and the adaptive set stays frozen
+        // [TAG_FN_R4_ADAPT_DECAY] prefill: the prompt's routing x LLAMA_MOE_HOT_SEED warms the decayed counts at the next
+        // step; otherwise not counted, and the adaptive set stays frozen
+        if (mc->adapt && mc->dc_on && mc->dc.seed > 0.0f) {
+            const int il = parse_layer_from_name(name);
+            for (auto & l : mc->layers) {
+                if (l.pub.il != il || l.dseed.empty()) {
+                    continue;
+                }
+                for (int64_t t = 0; t < n_tokens; ++t) {
+                    for (int64_t i = 0; i < n_used; ++i) {
+                        const int32_t e = *(const int32_t *) ((const char *) ids->data + t*ids->nb[1] + i*ids->nb[0]);
+                        llama_moe_decay_count(l.dseed, &e, 1);
+                    }
+                }
+                l.dseed_any = true;
+                break;
+            }
+        }
+        return;
     }
     const int il = parse_layer_from_name(name);
     layer_state * ls = nullptr;
@@ -546,7 +581,8 @@ void hot_obs_cb(const char * name, const struct ggml_tensor * ids, void * ud) {
     LLAMA_LOG_INFO("moe-hot: %" PRIu64 " decode steps, hit rate %.3f (host layers only; layer min %.3f max %.3f)%s\n",
             mc->hot_steps, t ? (double) h / t : 0.0, lo, hi, mc->adapt ? " adaptive" : "");
     if (mc->adapt) {
-        LLAMA_LOG_INFO("moe-hot: adaptive: %" PRIu64 " experts admitted, %" PRIu64 " verify mismatches\n", mc->ad_admitted, mc->ad_bad);
+        LLAMA_LOG_INFO("moe-hot: adaptive: %" PRIu64 " experts admitted, %" PRIu64 " verify mismatches%s\n", mc->ad_admitted, mc->ad_bad,
+                mc->dc_on ? format(", %" PRIu64 " decay passes, %" PRIu64 " swaps queued", mc->dc_passes, mc->dc_swaps).c_str() : "");
     }
 }
 
@@ -694,6 +730,116 @@ void hot_adapt_verify(moe_cache * mc) {
     }
 }
 
+// [TAG_FN_R4_ADAPT_DECAY] the learned set as a moeprof v1 routing profile: resident experts first (1e9 + count), then
+// the routing counts (decayed counts, or the window's), the static profile breaking ties. LLAMA_MOE_HOT_PROFILE=<it>
+// starts the next run from it.
+void hot_adapt_save(moe_cache * mc) {
+    if (mc->save_path.empty() || mc->layers.empty()) {
+        return;
+    }
+    const std::string tmp = mc->save_path + ".tmp";
+    FILE * f = fopen(tmp.c_str(), "w");
+    if (!f) {
+        LLAMA_LOG_WARN("moe-hot: cannot write %s\n", tmp.c_str());
+        return;
+    }
+    int max_il = 0;
+    for (const auto & ls : mc->layers) {
+        max_il = std::max(max_il, ls.pub.il);
+    }
+    const int64_t n_exp = mc->layers.front().pub.host_table->ne[1];
+    fprintf(f, "moeprof v1 n_layer=%d n_expert=%lld tokens=%llu source=moe-hot-save policy=%s\n", max_il + 1,
+            (long long) n_exp, (unsigned long long) mc->ad_steps, mc->dc_on ? "decay" : "window");
+    for (const auto & ls : mc->layers) {
+        fprintf(f, "decode_union %d", ls.pub.il);
+        for (int64_t e = 0; e < n_exp; ++e) {
+            double v = mc->dc_on && !ls.dcnt.empty() ? ls.dcnt[e] : (!ls.win_cnt.empty() ? ls.win_cnt[e] : 0.0);
+            if (e < (int64_t) ls.expert_slot.size() && ls.expert_slot[e] >= 0) {
+                v += 1e9;
+            }
+            if (e < (int64_t) ls.prof.size()) {
+                v += 1e-6*ls.prof[e];
+            }
+            fprintf(f, " %.6g", v);
+        }
+        fprintf(f, "\n");
+    }
+    const bool ok = fclose(f) == 0;
+    std::remove(mc->save_path.c_str());
+    if (!ok || std::rename(tmp.c_str(), mc->save_path.c_str()) != 0) {
+        LLAMA_LOG_WARN("moe-hot: cannot replace %s\n", mc->save_path.c_str());
+    }
+}
+
+// [TAG_FN_R4_ADAPT_DECAY] the decayed policy's part of the step: fold the prompt seeds, then every `every` decode steps
+// one pass (llama_moe_decay_pairs over all layers, best gain first, under the upload budget) and the decay
+void hot_adapt_decay(moe_cache * mc, bool decode_step) {
+    for (auto & ls : mc->layers) {
+        if (ls.dseed_any) {
+            llama_moe_decay_fold_seed(ls.dcnt, ls.dseed, mc->dc.seed);
+            ls.dseed_any = false;
+        }
+    }
+    if (!decode_step || mc->ad_steps % (uint64_t) std::max(1, mc->dc.every) != 0) {
+        return;
+    }
+    mc->dc_passes++;
+    std::vector<llama_moe_decay_swap> swaps;
+    std::vector<uint8_t> slot_busy;
+    std::vector<uint8_t> expert_busy;
+    for (int li = 0; li < (int) mc->layers.size(); ++li) {
+        const layer_state & ls = mc->layers[li];
+        if (ls.pub.n_slots == 0 || ls.dcnt.empty()) {
+            continue;
+        }
+        slot_busy.assign(ls.pub.n_slots, 0);
+        for (int32_t s = 0; s < ls.pub.n_slots; ++s) {
+            slot_busy[s] = ls.slot_in_flight[s] ? 1 : 0;
+        }
+        expert_busy.assign(ls.dcnt.size(), 0);
+        for (size_t e = 0; e < ls.dcnt.size(); ++e) {
+            expert_busy[e] = ls.expert_slot[e] >= 0 || ls.expert_in_flight[e] ? 1 : 0;
+        }
+        llama_moe_decay_pairs(li, ls.dcnt, ls.slot_expert, slot_busy, expert_busy, mc->dc, swaps);
+    }
+    llama_moe_decay_order(swaps);
+
+    size_t bytes = 0;
+    bool queued = false;
+    for (const auto & w : swaps) {
+        layer_state & ls = mc->layers[w.layer];
+        const size_t b = ls.pub.up_src->nb[2] + ls.pub.gate_src->nb[2] + ls.pub.down_src->nb[2];
+        if (bytes + b > mc->dc_bytes) {
+            break;
+        }
+        // evict first: the victim leaves both tables now, so no later graph reads the slot being overwritten
+        if (w.victim >= 0) {
+            ls.expert_slot[w.victim] = -1;
+            hot_adapt_set_entry(mc, ls, w.victim, ls.pub.n_slots);
+        }
+        ls.slot_expert[w.slot]       = -1;
+        ls.slot_in_flight[w.slot]    = true;
+        ls.expert_in_flight[w.expert] = true;
+        {
+            std::lock_guard<std::mutex> lk(mc->wmtx);
+            upload_job j;
+            j.layer_idx = (size_t) w.layer;
+            j.expert    = w.expert;
+            j.slot      = w.slot;
+            mc->todo.push_back(j);
+        }
+        bytes += b;
+        queued = true;
+        mc->dc_swaps++;
+    }
+    if (queued) {
+        mc->wcv.notify_one();
+    }
+    for (auto & ls : mc->layers) {
+        llama_moe_decay_apply(ls.dcnt, mc->dc.decay);
+    }
+}
+
 // the owning context's step boundary, after its compute has been synchronized: publish finished uploads, roll the
 // windows, then evict and queue new uploads (byte-capped). Nothing here runs while a graph of this context runs.
 void hot_adapt_step(moe_cache * mc) {
@@ -714,6 +860,33 @@ void hot_adapt_step(moe_cache * mc) {
     bool any = false;
     for (const auto & ls : mc->layers) {
         any = any || !ls.cur_ids.empty();
+    }
+    // [TAG_FN_R4_ADAPT_DECAY] the decayed policy replaces the window: every expert a decode step routed counts once (the
+    // unit of the r1 trace replay, E:/turbot-gates/flashnext/test/r4/route_decay), then the pass
+    if (mc->dc_on) {
+        if (any) {
+            mc->ad_steps++;
+            for (auto & ls : mc->layers) {
+                if (!ls.dcnt.empty()) {
+                    llama_moe_decay_count(ls.dcnt, ls.cur_ids.data(), (int64_t) ls.cur_ids.size());
+                }
+                for (const int32_t e : ls.cur_ids) {
+                    ls.cur_seen[e] = 0;
+                }
+                ls.cur_ids.clear();
+            }
+        }
+        hot_adapt_decay(mc, any);
+        if (any && mc->ad_verify > 0 && mc->ad_steps % (uint64_t) mc->ad_verify == 0) {
+            hot_adapt_verify(mc);
+        }
+        if (any && mc->save_every > 0 && mc->ad_steps % mc->save_every == 0) {
+            hot_adapt_save(mc);
+        }
+        any = false; // the window part below is skipped
+    }
+    if (any && mc->save_every > 0 && (mc->ad_steps + 1) % mc->save_every == 0) {
+        hot_adapt_save(mc); // [TAG_FN_R4_ADAPT_DECAY] the window policy's learned set
     }
     if (any) {
         mc->ad_steps++;
@@ -860,12 +1033,59 @@ void hot_adapt_init(moe_cache * mc, const llama_model & model, const void * owne
         ls.cur_seen.assign(n_exp, 0);
         ls.cur_ids.clear();
     }
+    // [TAG_FN_R4_ADAPT_DECAY] LLAMA_MOE_HOT_DECAY=<0..1> (unset / 0 = the window policy above)
+    if (const char * e = llama_fn_env(model, "LLAMA_MOE_HOT_DECAY")) {
+        const float d = (float) atof(e);
+        if (d > 0.0f && d < 1.0f) {
+            mc->dc_on    = true;
+            mc->dc.decay = d;
+            if (const char * v = llama_fn_env(model, "LLAMA_MOE_HOT_DECAY_EVERY")) { mc->dc.every = std::max(1, atoi(v)); }
+            if (const char * v = llama_fn_env(model, "LLAMA_MOE_HOT_DECAY_ADMIT")) { mc->dc.admit = std::max(0.0f, (float) atof(v)); }
+            if (const char * v = llama_fn_env(model, "LLAMA_MOE_HOT_DECAY_RATIO")) { mc->dc.ratio = std::max(1.0f, (float) atof(v)); }
+            if (const char * v = llama_fn_env(model, "LLAMA_MOE_HOT_DECAY_HYST"))  { mc->dc.hyst  = std::max(0.0f, (float) atof(v)); }
+            if (const char * v = llama_fn_env(model, "LLAMA_MOE_HOT_SEED"))        { mc->dc.seed  = std::max(0.0f, (float) atof(v)); }
+            // the same upload bytes per decode step as the window policy: a pass every `every` steps moves every x the
+            // step budget (the r1 trace replay: 128 MiB per 2-step pass beat the window at 64 MiB per step on code,
+            // prose and chat, E:/turbot-gates/flashnext/test/r4/route_decay)
+            mc->dc_bytes = mc->ad_bytes*(size_t) mc->dc.every;
+            if (const char * v = llama_fn_env(model, "LLAMA_MOE_HOT_DECAY_MIB")) { mc->dc_bytes = (size_t) std::max(1, atoi(v)) << 20; }
+            for (auto & ls : mc->layers) {
+                ls.dcnt.assign(n_exp, 0.0f);
+                ls.dseed.assign(n_exp, 0.0f);
+                // the starting set counts as known: its static profile rank keeps it until the routing says otherwise
+                for (int64_t x = 0; x < n_exp && x < (int64_t) ls.expert_slot.size(); ++x) {
+                    if (ls.expert_slot[x] >= 0) {
+                        ls.dcnt[x] = mc->dc.admit;
+                    }
+                }
+            }
+        } else if (d != 0.0f) {
+            LLAMA_LOG_WARN("moe-hot: LLAMA_MOE_HOT_DECAY=%s is not in (0, 1) - the window policy\n", e);
+        }
+    }
+    if (const char * e = llama_fn_env(model, "LLAMA_MOE_HOT_SAVE"); e && e[0]) {
+        mc->save_path  = e;
+        mc->save_every = 1024;
+        if (const char * v = llama_fn_env(model, "LLAMA_MOE_HOT_SAVE_EVERY")) {
+            mc->save_every = (uint64_t) std::max(0, atoi(v));
+        }
+    }
+
     mc->owner = owner;
     mc->adapt = true;
     mc->worker = std::thread(hot_adapt_worker, mc);
-    LLAMA_LOG_INFO("moe-hot: adaptive: admit after %d sightings in %d steps, hysteresis %d, <= %zu MiB uploads per step, "
-            "%s staging, verify every %d steps\n", mc->ad_min, mc->ad_win, mc->ad_hyst, mc->ad_bytes >> 20,
-            mc->staging ? "pinned" : "pageable", mc->ad_verify);
+    if (mc->dc_on) {
+        LLAMA_LOG_INFO("moe-hot: adaptive [TAG_FN_R4_ADAPT_DECAY]: decayed counts x %.2f every %d steps, admit at %.2f and "
+                "> %.2fx / +%.2f over the victim, prompt seed x %.3f, <= %zu MiB uploads per pass, %s staging, verify every "
+                "%d steps%s%s\n", mc->dc.decay, mc->dc.every, mc->dc.admit, mc->dc.ratio, mc->dc.hyst, mc->dc.seed,
+                mc->dc_bytes >> 20, mc->staging ? "pinned" : "pageable", mc->ad_verify,
+                mc->save_path.empty() ? "" : ", saved to ", mc->save_path.c_str());
+    } else {
+        LLAMA_LOG_INFO("moe-hot: adaptive: admit after %d sightings in %d steps, hysteresis %d, <= %zu MiB uploads per step, "
+                "%s staging, verify every %d steps%s%s\n", mc->ad_min, mc->ad_win, mc->ad_hyst, mc->ad_bytes >> 20,
+                mc->staging ? "pinned" : "pageable", mc->ad_verify, mc->save_path.empty() ? "" : ", saved to ",
+                mc->save_path.c_str());
+    }
 }
 
 } // namespace
@@ -1307,4 +1527,12 @@ bool llama_moe_hot_init(const llama_model & model, const void * owner, size_t bu
 const void * llama_moe_hot_adapt_owner() {
     const moe_cache * mc = g_cache;
     return mc && mc->adapt ? mc->owner : nullptr;
+}
+
+// [TAG_FN_R4_ADAPT_DECAY]
+void llama_moe_hot_save_now(const void * owner) {
+    moe_cache * mc = g_cache;
+    if (mc && mc->adapt && mc->owner == owner) {
+        hot_adapt_save(mc);
+    }
 }
