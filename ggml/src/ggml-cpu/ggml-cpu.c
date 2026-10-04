@@ -1229,18 +1229,65 @@ static const char * const ggml_cpu_fn_sw_env[] = {
     /* GGML_CPU_FN_Q5_1_AVX512 */ "GGML_CPU_Q5_1_AVX512",
     /* GGML_CPU_FN_MMID_MR     */ "GGML_CPU_MMID_MR",
     /* GGML_CPU_FN_MOE_FUSE    */ "GGML_CPU_MOE_FUSE",
+    /* GGML_CPU_FN_VNNI        */ "GGML_CPU_VNNI",       // [TAG_FN_R4_VNNI]
 };
 static_assert(sizeof(ggml_cpu_fn_sw_env)/sizeof(ggml_cpu_fn_sw_env[0]) == GGML_CPU_FN_SWITCH_COUNT, "one name per switch");
 
 int ggml_cpu_fn_sw[GGML_CPU_FN_SWITCH_COUNT] = { 0 };
 
+// [TAG_FN_R4_VNNI] AVX512-VNNI at run time: CPUID.(EAX=7, ECX=0):ECX bit 11. Only asked on a build with the AVX-512
+// bodies (which already needs the OS to keep the ZMM state).
+bool ggml_cpu_fn_vnni_cpu = false;
+
+#if defined(GGML_CPU_FN_X86_AVX512) && !defined(_MSC_VER) && (defined(__GNUC__) || defined(__clang__))
+#include <cpuid.h>
+#endif
+
+static bool ggml_cpu_fn_detect_vnni(void) {
+#if defined(GGML_CPU_FN_X86_AVX512)
+#if defined(_MSC_VER)
+    int r[4];
+    __cpuidex(r, 0, 0);
+    if (r[0] < 7) {
+        return false;
+    }
+    __cpuidex(r, 7, 0);
+    return ((r[2] >> 11) & 1) != 0;
+#elif defined(__GNUC__) || defined(__clang__)
+    unsigned int a = 0, b = 0, c = 0, d = 0;
+    if (!__get_cpuid_count(7, 0, &a, &b, &c, &d)) {
+        return false;
+    }
+    return ((c >> 11) & 1) != 0;
+#else
+    return false;
+#endif
+#else
+    return false;
+#endif
+}
+
+bool ggml_cpu_fn_vnni_available(void) {
+    ggml_cpu_init();
+    return ggml_cpu_fn_vnni_cpu;
+}
+
 static void ggml_cpu_fn_switches_init(void) {
+    ggml_cpu_fn_vnni_cpu = ggml_cpu_fn_detect_vnni();
     for (int i = 0; i < GGML_CPU_FN_SWITCH_COUNT; i++) {
         const char * env = getenv(ggml_cpu_fn_sw_env[i]);
         ggml_cpu_fn_sw[i] = env != NULL ? atoi(env) : 0;
         if (ggml_cpu_fn_sw[i] != 0) {
             GGML_LOG_INFO("%s: %s=%d\n", __func__, ggml_cpu_fn_sw_env[i], ggml_cpu_fn_sw[i]);
         }
+    }
+    if (ggml_cpu_fn_sw[GGML_CPU_FN_VNNI] && !ggml_cpu_fn_vnni_cpu) {
+#if defined(GGML_CPU_FN_X86_AVX512)
+        const char * why = "this CPU has no AVX512-VNNI";
+#else
+        const char * why = "this build has no AVX-512 bodies";
+#endif
+        GGML_LOG_WARN("%s: GGML_CPU_VNNI is set, but %s: the multi-row kernels keep their maddubs bodies\n", __func__, why);
     }
 }
 
@@ -1850,7 +1897,9 @@ static void ggml_compute_forward_mul_mat_id(
 
     // [TAG_FN_CPU_MMID_MR] GGML_CPU_MMID_MR: several tokens per decoded weight row; the use_ref reference keeps the
     // per-(row, token) vec_dot path. An expert the tiled path takes (see above) never reaches it.
-    const ggml_vec_dot_mr_t vec_dot_mr = ggml_cpu_fn_sw[GGML_CPU_FN_MMID_MR] && !params->use_ref ? ggml_cpu_fn_mr_kernel(type) : NULL;
+    // [TAG_FN_R4_VNNI] GGML_CPU_VNNI turns the multi-row path on too (its bodies live there)
+    const ggml_vec_dot_mr_t vec_dot_mr = (ggml_cpu_fn_sw[GGML_CPU_FN_MMID_MR] || ggml_cpu_fn_sw[GGML_CPU_FN_VNNI]) && !params->use_ref ?
+        ggml_cpu_fn_mr_kernel(type) : NULL;
 
     GGML_ASSERT(params->wsize >= (size_t)((char *) wdata_cur - (char *) params->wdata));
 
@@ -2123,7 +2172,7 @@ void ggml_fn_moe_compute(const struct ggml_fn_moe_args * a, int ith, int nth, vo
     ggml_vec_dot_t const dot_u = type_traits_cpu[wu->type].vec_dot;
     ggml_vec_dot_t const dot_g = type_traits_cpu[wg->type].vec_dot;
     ggml_vec_dot_t const dot_d = type_traits_cpu[wd->type].vec_dot;
-    const bool mr_on = ggml_cpu_fn_sw[GGML_CPU_FN_MMID_MR] != 0;
+    const bool mr_on = ggml_cpu_fn_sw[GGML_CPU_FN_MMID_MR] != 0 || ggml_cpu_fn_sw[GGML_CPU_FN_VNNI] != 0; // [TAG_FN_R4_VNNI]
     ggml_vec_dot_mr_t const mr_u = mr_on ? ggml_cpu_fn_mr_kernel(wu->type) : NULL;
     ggml_vec_dot_mr_t const mr_g = mr_on ? ggml_cpu_fn_mr_kernel(wg->type) : NULL;
     ggml_vec_dot_mr_t const mr_d = mr_on ? ggml_cpu_fn_mr_kernel(wd->type) : NULL;
@@ -2866,8 +2915,13 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_gated_delta_net_replay(params, tensor);
             } break;
+        case GGML_OP_QSA_MASK: // [TAG_FN_R4_QSA_POS]
+            {
+                ggml_compute_forward_qsa_mask(params, tensor);
+            } break;
         case GGML_OP_MOE_HOST_POST: // [TAG_MOE_BRIDGE] device backends only; the CPU supports_op is false
         case GGML_OP_MOE_HOST_WAIT:
+        case GGML_OP_MOE_HOST_FETCH: // [TAG_FN_R4_BRIDGE_DMA]
             {
                 GGML_ABORT("%s runs on a device backend only", ggml_op_name(tensor->op));
             }
@@ -3221,8 +3275,13 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_GET_REL_POS:
         case GGML_OP_MOE_HOST_POST: // [TAG_MOE_BRIDGE]
         case GGML_OP_MOE_HOST_WAIT:
+        case GGML_OP_MOE_HOST_FETCH: // [TAG_FN_R4_BRIDGE_DMA]
             {
                 n_tasks = 1;
+            } break;
+        case GGML_OP_QSA_MASK: // [TAG_FN_R4_QSA_POS] rows split over the threads
+            {
+                n_tasks = MIN(n_threads, (int) node->ne[1]);
             } break;
         case GGML_OP_MAP_CUSTOM1:
             {

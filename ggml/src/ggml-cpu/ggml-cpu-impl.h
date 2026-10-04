@@ -33,6 +33,9 @@ struct ggml_compute_params {
 // ggml_cpu_init() from the environment and afterwards only by ggml_cpu_fn_set_switch() while no graph is computing
 extern int ggml_cpu_fn_sw[];
 
+// [TAG_FN_R4_VNNI] the CPU runs AVX512-VNNI (CPUID, set once in ggml_cpu_init())
+extern bool ggml_cpu_fn_vnni_cpu;
+
 // [TAG_FN_CPU_MOE_FUSE] the fused CPU MoE split (ggml-cpu.c), shared by the graph op and the worker pool (moe-pool.cpp)
 #define GGML_FN_MOE_MAX_T 16
 

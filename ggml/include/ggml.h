@@ -659,6 +659,9 @@ extern "C" {
         GGML_OP_MOE_HOST_POST, // [TAG_MOE_BRIDGE] appended last so that no existing op value moves
         GGML_OP_MOE_HOST_WAIT, // [TAG_MOE_BRIDGE]
 
+        GGML_OP_QSA_MASK,       // [TAG_FN_R4_QSA_POS] appended last so that no existing op value moves
+        GGML_OP_MOE_HOST_FETCH, // [TAG_FN_R4_BRIDGE_DMA]
+
         GGML_OP_COUNT,
     };
 
@@ -2836,6 +2839,42 @@ extern "C" {
             int64_t               n_tokens,
             int32_t               bridge,
             int32_t               chan);
+
+    // [TAG_FN_R4_BRIDGE_DMA] the PCIe share of a bridged MoE layer (the host plans it when the post carries
+    // GGML_MOE_BRIDGE_JOB_DMA): wait (bounded) for the host's plan of the job of ticket, copy the planned experts from
+    // the bridge's pinned ring (read through its device mapping) into bank slots, and return the bank slot of every
+    // routed (slot, token): I32 [n_used, n_tokens], the bank's zero slot (n_slots) for the experts not in the bank.
+    // bank_up / bank_gate / bank_down: [ne0, ne1, n_slots + 1] device tensors of the layer's types, written in place.
+    // dep (or NULL): only orders the copy after it (the last reader of the same bank).
+    // A wait that gives up sets the bridge error, copies nothing and returns the zero slot everywhere.
+    GGML_API struct ggml_tensor * ggml_moe_host_fetch(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * ticket,
+            struct ggml_tensor  * bank_up,
+            struct ggml_tensor  * bank_gate,
+            struct ggml_tensor  * bank_down,
+            struct ggml_tensor  * dep,
+            int64_t               n_used,
+            int64_t               n_tokens,
+            int32_t               bridge,
+            int32_t               chan);
+
+    // [TAG_FN_R4_QSA_POS] the attention mask of a sparse-attention (QSA) layer from the positional mask vectors and the
+    // indexer's selection, instead of an explicit [n_kv, n_q] KQ mask, a -INF fill and a scatter:
+    //   kv_pos: I32 [n_kv] or [n_kv, 2], q_pos: I32 [n_q] or [n_q, 2]: the vectors of ggml_flash_attn_ext_set_pos
+    //           (row 1: the cell's sequence set and the query's sequence bit); a cell is visible from a query iff
+    //           0 <= kv_pos <= q_pos (and kv_seq & q_seq != 0)
+    //   sel:    I32 [n_sel, n_q]: the cells each query selected; an entry outside [0, n_kv) selects nothing
+    //   live:   F32 [n_live, n_q] or NULL: slot s < n_live*group of query q selects only if live[s/group, q] > -INF
+    //           (the picked pools' scores: an invisible pool scores -INF); the slots from n_live*group on always select
+    // result: F16 [n_kv, n_q], 0 where a selecting slot names a cell visible from the query, -INF elsewhere
+    GGML_API struct ggml_tensor * ggml_qsa_mask(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * kv_pos,
+            struct ggml_tensor  * q_pos,
+            struct ggml_tensor  * sel,
+            struct ggml_tensor  * live,
+            int32_t               group);
 
     // DSA lightning indexer
     //

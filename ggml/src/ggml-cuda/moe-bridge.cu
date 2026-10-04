@@ -16,6 +16,15 @@
 // Bounded: a wait gives up after timeout_ms if the host has not taken the job, or after job_max_ms if it has (a slow
 // job, e.g. page faults on cold experts), sets the sticky error and writes zeros. Later posts of the graph then skip and
 // later waits return zeros at once, so a stalled host costs one timeout per graph and never a driver watchdog reset.
+//
+// [TAG_FN_R4_BRIDGE_DMA] The PCIe share: a job posted with GGML_MOE_BRIDGE_JOB_DMA carries a plan area (mapped). The
+// host writes the plan (ring offsets and bank slots of the experts the GPU takes, and the bank slot of every routed
+// (slot, token)) and publishes it (hdr.plan, a release store) before it computes the rest. GGML_OP_MOE_HOST_FETCH waits
+// (bounded, as a wait) for the plan, copies it into device memory, and SM copy blocks read the experts from the pinned
+// ring through its device mapping (ld.global.cv: a refilled ring slot is never served from a stale L2 line) into the
+// bank slots. The host makes no CUDA call inside a running graph (the Strata #31 driver deadlock: a host copy issued
+// while the GPU spins on a mapped flag). The device writes its wait and fetch times per channel into the mapped header,
+// for the host's DMA/CPU split. glob.release (host memory) makes every wait and fetch give up at once (exit paths).
 
 #include "moe-bridge.cuh"
 
@@ -25,6 +34,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cinttypes>
+#include <cstddef>
 #include <cstring>
 #include <mutex>
 #include <vector>
@@ -53,10 +63,15 @@ struct alignas(64) mb_chan_hdr {
     int32_t  n_tokens;
     int32_t  n_used;
     int32_t  flags;
-    uint32_t pad0[12];
+    unsigned long long wait_ns;  // [TAG_FN_R4_BRIDGE_DMA] device: the last wait for the host's result
+    unsigned long long fetch_ns; // [TAG_FN_R4_BRIDGE_DMA] device: the last fetch, plan to last copied byte
+    uint32_t n_fetch;            // [TAG_FN_R4_BRIDGE_DMA] device: experts the last fetch copied
+    uint32_t times_seq;          // [TAG_FN_R4_BRIDGE_DMA] device: the job of these times
+    uint32_t pad0[6];
     uint32_t done;  // host: the answered job
     uint32_t taken; // host: the job being computed (a wait then allows job_max_ns instead of timeout_ns)
-    uint32_t pad1[14];
+    uint32_t plan;  // [TAG_FN_R4_BRIDGE_DMA] host: the job whose plan is published
+    uint32_t pad1[13];
 };
 
 struct alignas(64) mb_glob {
@@ -64,7 +79,8 @@ struct alignas(64) mb_glob {
     int32_t  err_chan;
     uint32_t err_seq;
     uint32_t posted; // device: the last ring stamp (spin mode)
-    uint32_t pad0[12];
+    uint32_t release; // [TAG_FN_R4_BRIDGE_DMA] host: nonzero = every wait and fetch gives up at once
+    uint32_t pad0[11];
     unsigned long long waits;
     unsigned long long waits_ready;
     unsigned long long wait_ns;
@@ -74,6 +90,17 @@ struct alignas(64) mb_glob {
 static_assert(sizeof(mb_ring_entry) == 64,  "mb_ring_entry size");
 static_assert(sizeof(mb_chan_hdr)   == 128, "mb_chan_hdr size");
 static_assert(sizeof(mb_glob)       == 128, "mb_glob size");
+
+// [TAG_FN_R4_BRIDGE_DMA] the plan of a channel's last fetch, in device memory (the copy blocks read it there)
+struct mb_fetch_dev {
+    int32_t            n_copy;
+    uint32_t           done_blocks; // copy blocks finished (the last one writes the times)
+    uint32_t           seq;
+    uint32_t           pad;
+    unsigned long long t0;          // device time the plan was taken
+    unsigned long long off [GGML_MOE_BRIDGE_MAX_FETCH];
+    int32_t            slot[GGML_MOE_BRIDGE_MAX_FETCH];
+};
 
 // the device view, passed by value to the kernels
 struct mb_dev {
@@ -85,6 +112,11 @@ struct mb_dev {
     size_t          off_ids;
     size_t          off_w;
     size_t          off_out;
+    size_t          off_plan;  // [TAG_FN_R4_BRIDGE_DMA] the channel's plan area (0 without fetches)
+    mb_fetch_dev  * fetch;     // [TAG_FN_R4_BRIDGE_DMA] device memory, one per channel (nullptr without fetches)
+    const char    * dma_ring;  // [TAG_FN_R4_BRIDGE_DMA] the registered DMA ring, device view (nullptr: none)
+    unsigned long long dma_ring_size;
+    int             max_fetch;
     uint32_t      * state; // device memory: [0] ring counter, [1] sticky error, [2 + chan] channel sequence
     int             n_chan;
     int             mode;
@@ -113,6 +145,8 @@ struct ggml_moe_bridge {
 
     uint32_t * state = nullptr; // device memory
     mb_dev     dev   = {};
+
+    mb_fetch_dev * fetch = nullptr; // [TAG_FN_R4_BRIDGE_DMA] device memory, n_chan entries
 
     cudaStream_t aux = nullptr; // reset, and the host function nodes of hostfunc mode
     std::vector<cudaEvent_t> ev_post;
@@ -247,12 +281,13 @@ static __global__ void k_mb_wait(const mb_dev v, const int chan, const int32_t *
             const volatile uint32_t * err   = &v.state[1];
             const unsigned long long t0 = mb_now_ns();
             bool ready = true;
+            const volatile uint32_t * rel = &v.glob->release; // [TAG_FN_R4_BRIDGE_DMA]
             for (;;) {
                 if ((int32_t) (*done - want) >= 0) {
                     ok = 1;
                     break;
                 }
-                if (*err != 0) {
+                if (*err != 0 || *rel != 0) {
                     break;
                 }
                 const unsigned long long el = mb_now_ns() - t0;
@@ -269,11 +304,17 @@ static __global__ void k_mb_wait(const mb_dev v, const int chan, const int32_t *
                 ready = false;
                 mb_sleep();
             }
+            const unsigned long long dt = mb_now_ns() - t0;
             if (v.stats && blockIdx.x == 0) {
                 volatile mb_glob * g = v.glob;
                 g->waits       = g->waits + 1;
                 g->waits_ready = g->waits_ready + (ready && ok ? 1 : 0);
-                g->wait_ns     = g->wait_ns + (mb_now_ns() - t0);
+                g->wait_ns     = g->wait_ns + dt;
+            }
+            if (blockIdx.x == 0) { // [TAG_FN_R4_BRIDGE_DMA] the host's DMA/CPU split reads this
+                volatile mb_chan_hdr * h = v.hdr + chan;
+                h->wait_ns   = ready ? 0ull : dt;
+                h->times_seq = want;
             }
         }
         // acquire: the host wrote out before done. The fence is in the thread that read done and comes before the
@@ -301,6 +342,132 @@ static __global__ void k_mb_wait(const mb_dev v, const int chan, const int32_t *
     }
 }
 
+// [TAG_FN_R4_BRIDGE_DMA] thread 0: wait (bounded, as k_mb_wait) for the plan of the ticket's job and check it; then the
+// block copies it into the device scratch and the slot ids into dst. A plan that never comes, or does not fit the
+// ring, the banks or the budget, sets the error and makes every slot id the zero slot (nothing is copied).
+static __global__ void k_mb_fetch_plan(const mb_dev v, const int chan, const int32_t * __restrict__ ticket,
+        int32_t * __restrict__ dst, const int n_ids, const int zero_slot, const unsigned long long expert_bytes) {
+    __shared__ int s_ok;
+    __shared__ int s_n;
+    mb_fetch_dev * f = v.fetch + chan;
+    const ggml_moe_bridge_plan * pl = (const ggml_moe_bridge_plan *) (v.data + (size_t) chan*v.chan_bytes + v.off_plan);
+    if (threadIdx.x == 0) {
+        const uint32_t want = (uint32_t) ticket[0];
+        int ok = 0;
+        int n  = 0;
+        if (want != 0) {
+            const volatile uint32_t * plan  = &v.hdr[chan].plan;
+            const volatile uint32_t * taken = &v.hdr[chan].taken;
+            const volatile uint32_t * err   = &v.state[1];
+            const volatile uint32_t * rel   = &v.glob->release;
+            const unsigned long long t0 = mb_now_ns();
+            for (;;) {
+                if ((int32_t) (*plan - want) >= 0) {
+                    ok = 1;
+                    break;
+                }
+                if (*err != 0 || *rel != 0) {
+                    break;
+                }
+                const unsigned long long el = mb_now_ns() - t0;
+                if (el > v.timeout_ns && ((int32_t) (*taken - want) < 0 || el > v.job_max_ns)) {
+                    if (atomicCAS(&v.state[1], 0u, (unsigned int) GGML_MOE_BRIDGE_ERR_TIMEOUT) == 0u) {
+                        *(volatile int32_t  *) &v.glob->err_chan = chan;
+                        *(volatile uint32_t *) &v.glob->err_seq  = want;
+                        __threadfence_system();
+                        *(volatile uint32_t *) &v.glob->err = GGML_MOE_BRIDGE_ERR_TIMEOUT;
+                        __threadfence_system();
+                    }
+                    break;
+                }
+                mb_sleep();
+            }
+            __threadfence_system(); // acquire: the host wrote the plan before plan
+            if (ok) {
+                n = __ldcv(&pl->n_copy);
+                bool good = n >= 0 && n <= v.max_fetch && v.dma_ring != nullptr;
+                for (int i = 0; good && i < n; ++i) {
+                    const unsigned long long off  = __ldcv((const unsigned long long *) &pl->off[i]);
+                    const int32_t            slot = __ldcv(&pl->slot[i]);
+                    good = off + expert_bytes <= v.dma_ring_size && slot >= 0 && slot < zero_slot;
+                    f->off[i]  = off;
+                    f->slot[i] = slot;
+                }
+                if (!good) {
+                    ok = 0;
+                    n  = 0;
+                    if (atomicCAS(&v.state[1], 0u, (unsigned int) GGML_MOE_BRIDGE_ERR_RUNNER) == 0u) {
+                        *(volatile int32_t  *) &v.glob->err_chan = chan;
+                        *(volatile uint32_t *) &v.glob->err_seq  = want;
+                        __threadfence_system();
+                        *(volatile uint32_t *) &v.glob->err = GGML_MOE_BRIDGE_ERR_RUNNER;
+                        __threadfence_system();
+                    }
+                }
+            }
+        }
+        f->n_copy      = n;
+        f->done_blocks = 0;
+        f->seq         = want;
+        f->t0          = mb_now_ns();
+        s_ok = ok;
+        s_n  = n;
+    }
+    __syncthreads();
+    for (int i = threadIdx.x; i < n_ids; i += blockDim.x) {
+        int32_t sl = zero_slot;
+        if (s_ok) {
+            sl = __ldcv(&pl->slot_ids[i]);
+            sl = sl >= 0 && sl <= zero_slot ? sl : zero_slot;
+        }
+        dst[i] = sl;
+    }
+    GGML_UNUSED(s_n);
+}
+
+// [TAG_FN_R4_BRIDGE_DMA] blockIdx.z: the plan's expert, blockIdx.y: its part (up, gate, down); the blocks of x stride
+// over the part's 16-byte words. The ring holds each expert as up | gate | down, packed. The last block to finish
+// writes the fetch time and count into the mapped header.
+static __global__ void k_mb_fetch_copy(const mb_dev v, const int chan,
+        char * __restrict__ d0, const long long nb0, const long long sz0,
+        char * __restrict__ d1, const long long nb1, const long long sz1,
+        char * __restrict__ d2, const long long nb2, const long long sz2) {
+    mb_fetch_dev * f = v.fetch + chan;
+    const int e = blockIdx.z;
+    const int n = f->n_copy;
+    if (e < n) {
+        const int part = blockIdx.y;
+        const long long sz  = part == 0 ? sz0 : part == 1 ? sz1 : sz2;
+        const long long po  = part == 0 ? 0   : part == 1 ? sz0 : sz0 + sz1;
+        const char * src = v.dma_ring + f->off[e] + po;
+        char       * dst = (part == 0 ? d0 + f->slot[e]*nb0 : part == 1 ? d1 + f->slot[e]*nb1 : d2 + f->slot[e]*nb2);
+        const long long stride = (long long) gridDim.x*blockDim.x;
+        const long long i0     = (long long) blockIdx.x*blockDim.x + threadIdx.x;
+        if ((((uintptr_t) src | (uintptr_t) dst | (uintptr_t) sz) & 15) == 0) {
+            const uint4 * s4 = (const uint4 *) src;
+            uint4       * t4 = (uint4 *) dst;
+            for (long long i = i0; i < sz/16; i += stride) {
+                t4[i] = __ldcv(s4 + i);
+            }
+        } else {
+            for (long long i = i0; i < sz; i += stride) {
+                dst[i] = __ldcv(src + i);
+            }
+        }
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        __threadfence();
+        const unsigned int total = gridDim.x*gridDim.y*gridDim.z;
+        if (atomicAdd(&f->done_blocks, 1u) == total - 1u) {
+            volatile mb_chan_hdr * h = v.hdr + chan;
+            h->fetch_ns = n > 0 ? mb_now_ns() - f->t0 : 0ull;
+            h->n_fetch  = (uint32_t) n;
+            __threadfence_system();
+        }
+    }
+}
+
 static void mb_make_job(const ggml_moe_bridge * b, int32_t chan, uint32_t seq, ggml_moe_bridge_job * job) {
     const mb_chan_hdr * h = b->hdr + chan;
     char * p = b->data + (size_t) chan*b->dev.chan_bytes;
@@ -314,6 +481,9 @@ static void mb_make_job(const ggml_moe_bridge * b, int32_t chan, uint32_t seq, g
     job->ids      = (const int32_t *) (p + b->dev.off_ids);
     job->w        = (const float *)   (p + b->dev.off_w);
     job->out      = (float *)         (p + b->dev.off_out);
+    // [TAG_FN_R4_BRIDGE_DMA] the plan area of a job the graph fetches for
+    job->plan     = b->params.max_fetch > 0 && (job->flags & GGML_MOE_BRIDGE_JOB_DMA) ?
+                    (ggml_moe_bridge_plan *) (p + b->dev.off_plan) : nullptr;
 }
 
 // the host has started this job: its wait now allows job_max_ns
@@ -355,6 +525,11 @@ static void mb_destroy(ggml_moe_bridge * b) {
         std::lock_guard<std::mutex> lk(g_mb_mtx);
         g_mb[b->id].store(nullptr, std::memory_order_release);
     }
+    if (b->glob) {
+        // [TAG_FN_R4_BRIDGE_DMA] no device wait or fetch of this bridge spins past this point
+        *(volatile uint32_t *) &b->glob->release = 1;
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+    }
     ggml_cuda_set_device(b->params.device);
     if (b->aux) {
         (void) cudaStreamSynchronize(b->aux);
@@ -375,6 +550,9 @@ static void mb_destroy(ggml_moe_bridge * b) {
     if (b->state) {
         (void) cudaFree(b->state);
     }
+    if (b->fetch) {
+        (void) cudaFree(b->fetch);
+    }
     if (b->host) {
         (void) cudaFreeHost(b->host);
     }
@@ -389,7 +567,7 @@ ggml_moe_bridge * ggml_backend_cuda_moe_bridge_new(const ggml_moe_bridge_params 
 #else
     if (p == nullptr || p->device < 0 || p->device >= ggml_backend_cuda_get_device_count() ||
         p->n_chan < 1 || p->n_chan > 4096 || p->n_embd < 1 || p->n_embd > (1 << 20) || p->n_used < 1 || p->n_used > 256 ||
-        p->max_tokens < 1 || p->max_tokens > 64 ||
+        p->max_tokens < 1 || p->max_tokens > 64 || p->max_fetch < 0 || p->max_fetch > GGML_MOE_BRIDGE_MAX_FETCH ||
         (p->wait_mode != GGML_MOE_BRIDGE_WAIT_SPIN && p->wait_mode != GGML_MOE_BRIDGE_WAIT_HOSTFUNC)) {
         GGML_LOG_ERROR("%s: invalid parameters\n", __func__);
         return nullptr;
@@ -414,7 +592,10 @@ ggml_moe_bridge * ggml_backend_cuda_moe_bridge_new(const ggml_moe_bridge_params 
     const int     max_t  = p->max_tokens;
     const size_t  sx     = mb_pad((size_t) n_embd*max_t*sizeof(float));
     const size_t  si     = mb_pad((size_t) p->n_used*max_t*sizeof(int32_t));
-    const size_t  chan_bytes = sx + si + si + sx;
+    // [TAG_FN_R4_BRIDGE_DMA] the plan area: the fixed part and the slot ids of [n_used, max_t]
+    const size_t  sp = p->max_fetch > 0 ?
+        mb_pad(offsetof(ggml_moe_bridge_plan, slot_ids) + (size_t) p->n_used*max_t*sizeof(int32_t)) : 0;
+    const size_t  chan_bytes = sx + si + si + sx + sp;
 
     const size_t off_ring = mb_pad(sizeof(mb_glob));
     const size_t off_hdr  = off_ring + (size_t) MB_RING*sizeof(mb_ring_entry);
@@ -448,6 +629,13 @@ ggml_moe_bridge * ggml_backend_cuda_moe_bridge_new(const ggml_moe_bridge_params 
     if (rc != cudaSuccess) {
         b->state = nullptr;
         return fail("cudaMalloc", rc);
+    }
+    if (p->max_fetch > 0) { // [TAG_FN_R4_BRIDGE_DMA]
+        rc = cudaMalloc((void **) &b->fetch, (size_t) p->n_chan*sizeof(mb_fetch_dev));
+        if (rc != cudaSuccess) {
+            b->fetch = nullptr;
+            return fail("cudaMalloc (fetch)", rc);
+        }
     }
     rc = cudaStreamCreateWithFlags(&b->aux, cudaStreamNonBlocking);
     if (rc != cudaSuccess) {
@@ -487,6 +675,11 @@ ggml_moe_bridge * ggml_backend_cuda_moe_bridge_new(const ggml_moe_bridge_params 
     b->dev.off_ids    = sx;
     b->dev.off_w      = sx + si;
     b->dev.off_out    = sx + si + si;
+    b->dev.off_plan   = sx + si + si + sx; // [TAG_FN_R4_BRIDGE_DMA]
+    b->dev.fetch      = b->fetch;
+    b->dev.dma_ring      = nullptr;
+    b->dev.dma_ring_size = 0;
+    b->dev.max_fetch  = p->max_fetch;
     b->dev.state      = b->state;
     b->dev.n_chan     = p->n_chan;
     b->dev.mode       = p->wait_mode;
@@ -508,9 +701,10 @@ ggml_moe_bridge * ggml_backend_cuda_moe_bridge_new(const ggml_moe_bridge_params 
         return fail("registering (too many bridges)", cudaSuccess);
     }
 
-    GGML_LOG_INFO("%s: bridge %d on device %d: %d channels, n_embd %" PRId64 ", n_used %d, T <= %d, %s wait, timeout %d ms (%d ms once taken), %.2f MiB mapped\n",
+    GGML_LOG_INFO("%s: bridge %d on device %d: %d channels, n_embd %" PRId64 ", n_used %d, T <= %d, %s wait, timeout %d ms (%d ms once taken), %.2f MiB mapped, fetch <= %d experts\n",
             __func__, b->id, p->device, p->n_chan, n_embd, p->n_used, max_t,
-            p->wait_mode == GGML_MOE_BRIDGE_WAIT_SPIN ? "spin" : "hostfunc", b->params.timeout_ms, b->params.job_max_ms, total/1024.0/1024.0);
+            p->wait_mode == GGML_MOE_BRIDGE_WAIT_SPIN ? "spin" : "hostfunc", b->params.timeout_ms, b->params.job_max_ms, total/1024.0/1024.0,
+            p->max_fetch);
     return b;
 #endif
 }
@@ -635,6 +829,58 @@ void ggml_backend_cuda_moe_bridge_get_stats(const ggml_moe_bridge * b, ggml_moe_
     s->error_chan  = g->err_chan;
 }
 
+// [TAG_FN_R4_BRIDGE_DMA]
+bool ggml_backend_cuda_moe_bridge_set_ring(ggml_moe_bridge * b, void * host_ptr, size_t size) {
+#ifdef GGML_MOE_BRIDGE_DISABLED
+    GGML_UNUSED(b);
+    GGML_UNUSED(host_ptr);
+    GGML_UNUSED(size);
+    return false;
+#else
+    if (b == nullptr || b->params.max_fetch <= 0 || b->fetch == nullptr || host_ptr == nullptr || size == 0) {
+        return false;
+    }
+    ggml_cuda_set_device(b->params.device);
+    void * dptr = nullptr;
+    const cudaError_t rc = cudaHostGetDevicePointer(&dptr, host_ptr, 0);
+    if (rc != cudaSuccess || dptr == nullptr) {
+        GGML_LOG_WARN("%s: bridge %d: the ring is not readable by device %d: %s\n", __func__, b->id, b->params.device,
+                cudaGetErrorString(rc));
+        (void) cudaGetLastError();
+        return false;
+    }
+    b->dev.dma_ring      = (const char *) dptr;
+    b->dev.dma_ring_size = (unsigned long long) size;
+    GGML_LOG_INFO("%s: bridge %d: fetches read a %.0f MiB pinned ring\n", __func__, b->id, size/1048576.0);
+    return true;
+#endif
+}
+
+void ggml_backend_cuda_moe_bridge_publish_plan(ggml_moe_bridge * b, const ggml_moe_bridge_job * job) {
+    std::atomic_thread_fence(std::memory_order_release);
+    *(volatile uint32_t *) &b->hdr[job->chan].plan = job->seq;
+}
+
+void ggml_backend_cuda_moe_bridge_chan_times(const ggml_moe_bridge * b, int32_t chan, ggml_moe_bridge_chan_times * t) {
+    memset(t, 0, sizeof(*t));
+    if (b == nullptr || chan < 0 || chan >= b->params.n_chan) {
+        return;
+    }
+    const volatile mb_chan_hdr * h = b->hdr + chan;
+    t->seq      = h->times_seq;
+    std::atomic_thread_fence(std::memory_order_acquire);
+    t->wait_ns  = h->wait_ns;
+    t->fetch_ns = h->fetch_ns;
+    t->n_fetch  = h->n_fetch;
+}
+
+void ggml_backend_cuda_moe_bridge_release(ggml_moe_bridge * b) {
+    if (b && b->glob) {
+        *(volatile uint32_t *) &b->glob->release = 1;
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+    }
+}
+
 // ---- ops ------------------------------------------------------------------------------------------------------------
 
 bool ggml_cuda_moe_bridge_supports_op(int device, const ggml_tensor * op) {
@@ -660,6 +906,11 @@ bool ggml_cuda_moe_bridge_supports_op(int device, const ggml_tensor * op) {
     if (op->op == GGML_OP_MOE_HOST_WAIT) {
         return op->type == GGML_TYPE_F32 && op->ne[0] == p.n_embd && op->ne[1] >= 1 && op->ne[1] <= p.max_tokens &&
             ggml_is_contiguous(op);
+    }
+    if (op->op == GGML_OP_MOE_HOST_FETCH) { // [TAG_FN_R4_BRIDGE_DMA]
+        return p.max_fetch > 0 && b->dev.dma_ring != nullptr && op->type == GGML_TYPE_I32 && ggml_is_contiguous(op) &&
+            op->ne[0] >= 1 && op->ne[0] <= p.n_used && op->ne[1] >= 1 && op->ne[1] <= p.max_tokens &&
+            op->src[1] && op->src[2] && op->src[3] && op->src[1]->ne[2] >= 2 && op->src[1]->ne[2] - 1 <= INT32_MAX;
     }
     return false;
 #endif
@@ -715,6 +966,39 @@ void ggml_cuda_op_moe_host_wait(ggml_backend_cuda_context & ctx, ggml_tensor * d
     const int n_vec  = (n & 3) == 0 ? n/4 : n;
     const int blocks = std::min(MB_WAIT_MAX_BLOCKS, std::max(1, (n_vec + MB_WAIT_THREADS - 1)/MB_WAIT_THREADS));
     k_mb_wait<<<blocks, MB_WAIT_THREADS, 0, stream>>>(b->dev, chan, (const int32_t *) dst->src[0]->data, (float *) dst->data, n);
+    CUDA_CHECK(cudaGetLastError());
+#endif
+}
+
+// [TAG_FN_R4_BRIDGE_DMA] the plan, then the copies; both on the compute stream, so the bank chain after it sees the bytes
+void ggml_cuda_op_moe_host_fetch(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+#ifdef GGML_MOE_BRIDGE_DISABLED
+    GGML_UNUSED(ctx);
+    GGML_UNUSED(dst);
+    GGML_ABORT("MOE_HOST_FETCH is not supported on this backend");
+#else
+    ggml_moe_bridge * b = mb_get(ggml_get_op_params_i32(dst, 0));
+    GGML_ASSERT(b != nullptr && b->params.device == ctx.device && b->fetch != nullptr && b->dev.dma_ring != nullptr);
+    const int32_t chan = ggml_get_op_params_i32(dst, 1);
+
+    const ggml_tensor * up   = dst->src[1];
+    const ggml_tensor * gate = dst->src[2];
+    const ggml_tensor * down = dst->src[3];
+
+    const int zero_slot = (int) up->ne[2] - 1;
+    const unsigned long long expert_bytes = (unsigned long long) (up->nb[2] + gate->nb[2] + down->nb[2]);
+
+    cudaStream_t stream = ctx.stream();
+    k_mb_fetch_plan<<<1, 128, 0, stream>>>(b->dev, chan, (const int32_t *) dst->src[0]->data, (int32_t *) dst->data,
+            (int) ggml_nelements(dst), zero_slot, expert_bytes);
+    CUDA_CHECK(cudaGetLastError());
+
+    // 48 blocks per part: about 20 KiB per block for a 1 MB q4_K part, enough loads in flight to fill a Gen5 link
+    const dim3 grid(48, 3, (unsigned) b->params.max_fetch);
+    k_mb_fetch_copy<<<grid, 256, 0, stream>>>(b->dev, chan,
+            (char *) up->data,   (long long) up->nb[2],   (long long) up->nb[2],
+            (char *) gate->data, (long long) gate->nb[2], (long long) gate->nb[2],
+            (char *) down->data, (long long) down->nb[2], (long long) down->nb[2]);
     CUDA_CHECK(cudaGetLastError());
 #endif
 }

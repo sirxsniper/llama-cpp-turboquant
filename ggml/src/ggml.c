@@ -1220,9 +1220,12 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
 
     "MOE_HOST_POST",
     "MOE_HOST_WAIT",
+
+    "QSA_MASK",
+    "MOE_HOST_FETCH",
 };
 
-static_assert(GGML_OP_COUNT == 106, "GGML_OP_COUNT != 106");  // +1 GGML_OP_TURBO_WHT (TurboQuant fork), +1 GGML_OP_LIGHTNING_INDEXER, +1 GGML_OP_TURBOT_SET_ROWS [TAG_TURBOT], +1 GGML_OP_GATED_DELTA_NET_REPLAY [TAG_4C_GDN_REPLAY], +2 GGML_OP_MOE_HOST_POST/WAIT [TAG_MOE_BRIDGE]
+static_assert(GGML_OP_COUNT == 108, "GGML_OP_COUNT != 108");  // +1 GGML_OP_TURBO_WHT (TurboQuant fork), +1 GGML_OP_LIGHTNING_INDEXER, +1 GGML_OP_TURBOT_SET_ROWS [TAG_TURBOT], +1 GGML_OP_GATED_DELTA_NET_REPLAY [TAG_4C_GDN_REPLAY], +2 GGML_OP_MOE_HOST_POST/WAIT [TAG_MOE_BRIDGE], +1 GGML_OP_QSA_MASK [TAG_FN_R4_QSA_POS], +1 GGML_OP_MOE_HOST_FETCH [TAG_FN_R4_BRIDGE_DMA]
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1343,9 +1346,12 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
 
     "moe_host_post(x, ids, w)",
     "moe_host_wait(ticket, dep)",
+
+    "qsa_mask(kv_pos, q_pos, sel, live)",
+    "moe_host_fetch(ticket, up, gate, down, dep)",
 };
 
-static_assert(GGML_OP_COUNT == 106, "GGML_OP_COUNT != 106");  // +1 GGML_OP_TURBO_WHT (TurboQuant fork), +1 GGML_OP_LIGHTNING_INDEXER, +1 GGML_OP_TURBOT_SET_ROWS [TAG_TURBOT], +1 GGML_OP_GATED_DELTA_NET_REPLAY [TAG_4C_GDN_REPLAY], +2 GGML_OP_MOE_HOST_POST/WAIT [TAG_MOE_BRIDGE]
+static_assert(GGML_OP_COUNT == 108, "GGML_OP_COUNT != 108");  // +1 GGML_OP_TURBO_WHT (TurboQuant fork), +1 GGML_OP_LIGHTNING_INDEXER, +1 GGML_OP_TURBOT_SET_ROWS [TAG_TURBOT], +1 GGML_OP_GATED_DELTA_NET_REPLAY [TAG_4C_GDN_REPLAY], +2 GGML_OP_MOE_HOST_POST/WAIT [TAG_MOE_BRIDGE], +1 GGML_OP_QSA_MASK [TAG_FN_R4_QSA_POS], +1 GGML_OP_MOE_HOST_FETCH [TAG_FN_R4_BRIDGE_DMA]
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6826,6 +6832,76 @@ struct ggml_tensor * ggml_moe_host_wait(
     result->op     = GGML_OP_MOE_HOST_WAIT;
     result->src[0] = ticket;
     result->src[1] = dep;
+
+    return result;
+}
+
+// [TAG_FN_R4_BRIDGE_DMA]
+struct ggml_tensor * ggml_moe_host_fetch(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * ticket,
+        struct ggml_tensor  * bank_up,
+        struct ggml_tensor  * bank_gate,
+        struct ggml_tensor  * bank_down,
+        struct ggml_tensor  * dep,
+        int64_t               n_used,
+        int64_t               n_tokens,
+        int32_t               bridge,
+        int32_t               chan) {
+    GGML_ASSERT(ticket->type == GGML_TYPE_I32 && ggml_nelements(ticket) == 1);
+    GGML_ASSERT(n_used > 0 && n_tokens > 0 && bridge >= 0 && chan >= 0);
+    const struct ggml_tensor * b[3] = { bank_up, bank_gate, bank_down };
+    for (int i = 0; i < 3; ++i) {
+        GGML_ASSERT(b[i] != NULL && b[i]->ne[3] == 1 && b[i]->ne[2] >= 2 && b[i]->ne[2] == bank_up->ne[2]);
+        GGML_ASSERT(b[i]->nb[1] == ggml_row_size(b[i]->type, b[i]->ne[0]) && b[i]->nb[2] == b[i]->nb[1]*b[i]->ne[1]);
+    }
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, n_tokens);
+
+    ggml_set_op_params_i32(result, 0, bridge);
+    ggml_set_op_params_i32(result, 1, chan);
+
+    result->op     = GGML_OP_MOE_HOST_FETCH;
+    result->src[0] = ticket;
+    result->src[1] = bank_up;
+    result->src[2] = bank_gate;
+    result->src[3] = bank_down;
+    result->src[4] = dep;
+
+    return result;
+}
+
+// [TAG_FN_R4_QSA_POS]
+struct ggml_tensor * ggml_qsa_mask(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * kv_pos,
+        struct ggml_tensor  * q_pos,
+        struct ggml_tensor  * sel,
+        struct ggml_tensor  * live,
+        int32_t               group) {
+    GGML_ASSERT(kv_pos->type == GGML_TYPE_I32 && q_pos->type == GGML_TYPE_I32 && sel->type == GGML_TYPE_I32);
+    // one row (positions) or two (positions, then sequence sets / bits), the same for both, as ggml_flash_attn_ext_set_pos
+    GGML_ASSERT(kv_pos->ne[1] == q_pos->ne[1] && (kv_pos->ne[1] == 1 || kv_pos->ne[1] == 2));
+    GGML_ASSERT(kv_pos->ne[2] == 1 && kv_pos->ne[3] == 1 && q_pos->ne[2] == 1 && q_pos->ne[3] == 1);
+    GGML_ASSERT(kv_pos->nb[0] == sizeof(int32_t) && q_pos->nb[0] == sizeof(int32_t) && sel->nb[0] == sizeof(int32_t));
+    const int64_t n_kv = kv_pos->ne[0];
+    const int64_t n_q  = q_pos->ne[0];
+    GGML_ASSERT(sel->ne[1] == n_q && sel->ne[2] == 1 && sel->ne[3] == 1);
+    if (live) {
+        GGML_ASSERT(live->type == GGML_TYPE_F32 && live->nb[0] == sizeof(float));
+        GGML_ASSERT(live->ne[1] == n_q && live->ne[2] == 1 && live->ne[3] == 1);
+        GGML_ASSERT(group >= 1 && live->ne[0]*group <= sel->ne[0]);
+    }
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n_kv, n_q);
+
+    ggml_set_op_params_i32(result, 0, live ? group : 0);
+
+    result->op     = GGML_OP_QSA_MASK;
+    result->src[0] = kv_pos;
+    result->src[1] = q_pos;
+    result->src[2] = sel;
+    result->src[3] = live;
 
     return result;
 }

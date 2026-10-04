@@ -13124,3 +13124,64 @@ void ggml_compute_forward_lightning_indexer(
         }
     }
 }
+
+// [TAG_FN_R4_QSA_POS] ggml_qsa_mask: the attention mask of a QSA layer from the positional vectors and the selection.
+// The same values as the explicit path of qwen4exp (an all -INF row, zeros scattered at the selected cells of the live
+// slots, plus the KQ mask): 0 where a live slot names the cell and the cell is visible from the query, -INF elsewhere.
+// Rows are split over the threads; each row is filled with -INF first, then its selected cells are set to 0.
+void ggml_compute_forward_qsa_mask(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * kv_pos = dst->src[0];
+    const ggml_tensor * q_pos  = dst->src[1];
+    const ggml_tensor * sel    = dst->src[2];
+    const ggml_tensor * live   = dst->src[3];
+
+    GGML_ASSERT(dst->type == GGML_TYPE_F16 && kv_pos->type == GGML_TYPE_I32 && q_pos->type == GGML_TYPE_I32 && sel->type == GGML_TYPE_I32);
+
+    const int64_t n_kv   = dst->ne[0];
+    const int64_t n_q    = dst->ne[1];
+    const int64_t n_sel  = sel->ne[0];
+    const int32_t group  = ggml_get_op_params_i32(dst, 0);
+    const int64_t n_lsel = live ? live->ne[0]*group : 0; // the slots that depend on a picked score
+
+    const bool ms = kv_pos->ne[1] == 2;
+
+    const int32_t * kvp = (const int32_t *) kv_pos->data;
+    const int32_t * kvs = ms ? (const int32_t *) ((const char *) kv_pos->data + kv_pos->nb[1]) : nullptr;
+
+    const ggml_fp16_t ninf = GGML_CPU_FP32_TO_FP16(-INFINITY);
+    const ggml_fp16_t zero = GGML_CPU_FP32_TO_FP16(0.0f);
+
+    for (int64_t iq = params->ith; iq < n_q; iq += params->nth) {
+        ggml_fp16_t * row = (ggml_fp16_t *) ((char *) dst->data + iq*dst->nb[1]);
+        for (int64_t c = 0; c < n_kv; ++c) {
+            row[c] = ninf;
+        }
+
+        const int32_t  qp = *(const int32_t *) ((const char *) q_pos->data + iq*q_pos->nb[0]);
+        const uint32_t qs = ms ? *(const uint32_t *) ((const char *) q_pos->data + q_pos->nb[1] + iq*q_pos->nb[0]) : 0;
+
+        const char * srow = (const char *) sel->data + iq*sel->nb[1];
+        const char * lrow = live ? (const char *) live->data + iq*live->nb[1] : nullptr;
+
+        for (int64_t s = 0; s < n_sel; ++s) {
+            const int32_t c = *(const int32_t *) (srow + s*sel->nb[0]);
+            if (c < 0 || c >= n_kv) {
+                continue; // a padded block or a missing tail cell
+            }
+            if (s < n_lsel) {
+                const float l = *(const float *) (lrow + (s/group)*live->nb[0]);
+                if (!(l > -INFINITY)) {
+                    continue; // a pool the indexer could not see (score -INF), picked only to fill the top-k
+                }
+            }
+            const int32_t kp = kvp[c];
+            if (kp < 0 || kp > qp) {
+                continue;
+            }
+            if (ms && (((uint32_t) kvs[c]) & qs) == 0) {
+                continue;
+            }
+            row[c] = zero;
+        }
+    }
+}

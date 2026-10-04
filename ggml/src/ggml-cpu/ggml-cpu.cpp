@@ -565,7 +565,11 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
             return ggml_get_op_params_i32(op, 0) == 1 || op->src[3]->ne[0] == 1;
         case GGML_OP_MOE_HOST_POST: // [TAG_MOE_BRIDGE] device backends only
         case GGML_OP_MOE_HOST_WAIT:
+        case GGML_OP_MOE_HOST_FETCH: // [TAG_FN_R4_BRIDGE_DMA]
             return false;
+        case GGML_OP_QSA_MASK: // [TAG_FN_R4_QSA_POS]
+            return op->type == GGML_TYPE_F16 && op->src[0]->type == GGML_TYPE_I32 && op->src[1]->type == GGML_TYPE_I32 &&
+                op->src[2]->type == GGML_TYPE_I32 && (op->src[3] == nullptr || op->src[3]->type == GGML_TYPE_F32);
         default:
             return true;
     }

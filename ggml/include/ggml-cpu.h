@@ -135,10 +135,16 @@ extern "C" {
                                     //   (bitwise equal); =2: the same with the 256-bit bodies only
         GGML_CPU_FN_MOE_FUSE,       // GGML_CPU_MOE_FUSE=1: the MoE split up / gate / swiglu / down as one op with one
                                     //   barrier, for up to 16 tokens (bitwise equal to the unfused nodes)
+        GGML_CPU_FN_VNNI,           // [TAG_FN_R4_VNNI] GGML_CPU_VNNI=1: the 512-bit multi-row bodies of q4_K, q5_1 and
+                                    //   iq4_nl use AVX512-VNNI (vpdpwssd / vpdpbusd) when the CPU has it, also in a build
+                                    //   that was not compiled for it (MSVC: no /arch flag defines __AVX512VNNI__); it turns
+                                    //   the multi-row path on as GGML_CPU_MMID_MR=1 does (bitwise equal to the AVX2 dots)
         GGML_CPU_FN_SWITCH_COUNT,
     };
 
     GGML_BACKEND_API int          ggml_cpu_fn_get_switch(enum ggml_cpu_fn_switch sw);
+    // [TAG_FN_R4_VNNI] true if this build has the VNNI bodies and the CPU runs AVX512-VNNI (GGML_CPU_VNNI can act)
+    GGML_BACKEND_API bool         ggml_cpu_fn_vnni_available(void);
     GGML_BACKEND_API void         ggml_cpu_fn_set_switch(enum ggml_cpu_fn_switch sw, int value);
     GGML_BACKEND_API const char * ggml_cpu_fn_switch_env(enum ggml_cpu_fn_switch sw); // environment variable name
 

@@ -33,6 +33,24 @@ enum ggml_moe_bridge_error {
 
 // job flags (the post op's flags, handed to the host)
 #define GGML_MOE_BRIDGE_JOB_TABLE 1 // the graph serves the hot experts of the layer's table on the device: skip them
+#define GGML_MOE_BRIDGE_JOB_DMA   2 // [TAG_FN_R4_BRIDGE_DMA] the graph fetches a PCIe share of the job's experts
+                                    // (GGML_OP_MOE_HOST_FETCH): the host must publish a plan (job->plan) before it
+                                    // computes, and skip the planned experts
+
+// [TAG_FN_R4_BRIDGE_DMA] the largest PCIe share of one job, in experts
+#define GGML_MOE_BRIDGE_MAX_FETCH 32
+
+// [TAG_FN_R4_BRIDGE_DMA] the PCIe share of one job, in mapped memory: the host writes it, then publishes it
+// (ggml_backend_moe_bridge_publish_plan); the device fetch reads it, copies the experts from the registered ring into
+// the bank slots and hands slot_ids to the bank chain
+struct ggml_moe_bridge_plan {
+    int32_t  n_copy;                              // experts to copy, <= params.max_fetch
+    int32_t  pad0;
+    uint64_t off [GGML_MOE_BRIDGE_MAX_FETCH];     // byte offset of each expert in the ring: up | gate | down, packed
+    int32_t  slot[GGML_MOE_BRIDGE_MAX_FETCH];     // its bank slot
+    int32_t  slot_ids[1];                         // [n_used, n_tokens]: the bank slot of every routed (slot, token),
+                                                  // the zero slot (n_slots) where the expert is not in the bank
+};
 
 struct ggml_moe_bridge_params {
     int     device;      // backend device index
@@ -45,6 +63,7 @@ struct ggml_moe_bridge_params {
     int     job_max_ms;  // ... or after this long once it has (a slow job: page faults); <= 0: max(timeout_ms, 1000).
                          // Both are clamped to 1500 ms, below the ~2 s driver watchdog.
     bool    stats;       // keep device wait statistics
+    int     max_fetch;   // [TAG_FN_R4_BRIDGE_DMA] experts per job a fetch may copy (0: no fetch, <= GGML_MOE_BRIDGE_MAX_FETCH)
 };
 
 // one posted job; the pointers stay valid until it is completed
@@ -59,6 +78,15 @@ struct ggml_moe_bridge_job {
     const int32_t * ids;     // [n_used, n_tokens]
     const float   * w;       // [n_used, n_tokens]
     float         * out;     // [n_embd, n_tokens], written by the host
+    struct ggml_moe_bridge_plan * plan; // [TAG_FN_R4_BRIDGE_DMA] the job's plan area (mapped), NULL without a fetch
+};
+
+// [TAG_FN_R4_BRIDGE_DMA] what the device measured for the last job of a channel (mapped memory, written by the device)
+struct ggml_moe_bridge_chan_times {
+    uint64_t wait_ns;    // the wait for the host's result (0: ready at the first look)
+    uint64_t fetch_ns;   // the fetch: from its plan to the last copied byte (0: no fetch, or nothing copied)
+    uint32_t n_fetch;    // experts the fetch copied
+    uint32_t seq;        // the job these belong to
 };
 
 struct ggml_moe_bridge_stats {
@@ -95,6 +123,19 @@ typedef uint32_t (*ggml_backend_moe_bridge_error_t)(const struct ggml_moe_bridge
 typedef bool     (*ggml_backend_moe_bridge_reset_t)(struct ggml_moe_bridge * bridge);
 // "ggml_backend_moe_bridge_get_stats"
 typedef void     (*ggml_backend_moe_bridge_get_stats_t)(const struct ggml_moe_bridge * bridge, struct ggml_moe_bridge_stats * stats);
+
+// [TAG_FN_R4_BRIDGE_DMA]
+// "ggml_backend_moe_bridge_set_ring": the pinned host ring the fetches copy from (the gen5 DMA ring: host memory of the
+//                                     device's host buffer type); false when the device cannot read it (no fetch then).
+//                                     Only when no graph that uses the bridge runs.
+typedef bool     (*ggml_backend_moe_bridge_set_ring_t)(struct ggml_moe_bridge * bridge, void * host_ptr, size_t size);
+// "ggml_backend_moe_bridge_publish_plan": job->plan is written: let the device fetch go (a release store, no CUDA call)
+typedef void     (*ggml_backend_moe_bridge_publish_plan_t)(struct ggml_moe_bridge * bridge, const struct ggml_moe_bridge_job * job);
+// "ggml_backend_moe_bridge_chan_times": the device's times of the last job of a channel
+typedef void     (*ggml_backend_moe_bridge_chan_times_t)(const struct ggml_moe_bridge * bridge, int32_t chan, struct ggml_moe_bridge_chan_times * t);
+// "ggml_backend_moe_bridge_release": make every device wait and fetch of this bridge give up at once (exit and crash
+//                                     paths: no kernel keeps spinning on a flag nobody will raise); host memory only
+typedef void     (*ggml_backend_moe_bridge_release_t)(struct ggml_moe_bridge * bridge);
 
 #ifdef __cplusplus
 }

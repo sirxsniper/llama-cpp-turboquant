@@ -35,6 +35,7 @@
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/mmsb.cuh"   // [TAG_MMSB] [TAG_SMALLB]
 #include "ggml-cuda/moe-bridge.cuh" // [TAG_MOE_BRIDGE]
+#include "ggml-cuda/qsa-mask.cuh"   // [TAG_FN_R4_QSA_POS]
 #include "ggml-cuda/mmqsn.cuh"  // [TAG_MMQSN]
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
@@ -2529,6 +2530,12 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_MOE_HOST_WAIT: // [TAG_MOE_BRIDGE]
             ggml_cuda_op_moe_host_wait(ctx, dst);
             break;
+        case GGML_OP_MOE_HOST_FETCH: // [TAG_FN_R4_BRIDGE_DMA]
+            ggml_cuda_op_moe_host_fetch(ctx, dst);
+            break;
+        case GGML_OP_QSA_MASK: // [TAG_FN_R4_QSA_POS]
+            ggml_cuda_op_qsa_mask(ctx, dst);
+            break;
         case GGML_OP_DSV4_HC_COMB:
             ggml_cuda_op_dsv4_hc_comb(ctx, dst);
             break;
@@ -5014,6 +5021,22 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         }
         // Launch graph
         CUDA_CHECK(cudaGraphLaunch(graph->instance, cuda_ctx->stream()));
+        // [TAG_FN_R4_POKE] GGML_CUDA_GRAPH_POKE=1: one stream query right after the launch flushes WDDM's batched
+        // submission, so the GPU starts the graph now rather than at the next driver call, and host work that should
+        // overlap it (a CPU split, the MoE bridge's executor) does. Strata R4.2d measured 17 of 10,562 layers overlapped
+        // without it and 9,190 with it. The query changes no result; "not ready" is its normal answer here.
+        static const bool graph_poke = [] {
+            const char * e = getenv("GGML_CUDA_GRAPH_POKE");
+            return e != nullptr && atoi(e) != 0;
+        }();
+        if (graph_poke) {
+            const cudaError_t q = cudaStreamQuery(cuda_ctx->stream());
+            if (q == cudaErrorNotReady) {
+                (void) cudaGetLastError(); // not an error: clear it, as torch's stream query does
+            } else if (q != cudaSuccess) {
+                CUDA_CHECK(q);
+            }
+        }
 #else
         GGML_UNUSED(graph_key);
         graph_evaluated_or_captured = true;
@@ -6379,7 +6402,10 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
 #endif // GGML_USE_MUSA
         case GGML_OP_MOE_HOST_POST: // [TAG_MOE_BRIDGE] only for a bridge registered on this device
         case GGML_OP_MOE_HOST_WAIT:
+        case GGML_OP_MOE_HOST_FETCH: // [TAG_FN_R4_BRIDGE_DMA]
             return ggml_cuda_moe_bridge_supports_op(dev_ctx->device, op);
+        case GGML_OP_QSA_MASK: // [TAG_FN_R4_QSA_POS]
+            return ggml_cuda_qsa_mask_supported(op);
         case GGML_OP_DSV4_HC_COMB:
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                 op->src[2]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
@@ -6623,6 +6649,19 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_moe_bridge_get_stats") == 0) {
         return (void *)ggml_backend_cuda_moe_bridge_get_stats;
+    }
+    // [TAG_FN_R4_BRIDGE_DMA]
+    if (strcmp(name, "ggml_backend_moe_bridge_set_ring") == 0) {
+        return (void *)ggml_backend_cuda_moe_bridge_set_ring;
+    }
+    if (strcmp(name, "ggml_backend_moe_bridge_publish_plan") == 0) {
+        return (void *)ggml_backend_cuda_moe_bridge_publish_plan;
+    }
+    if (strcmp(name, "ggml_backend_moe_bridge_chan_times") == 0) {
+        return (void *)ggml_backend_cuda_moe_bridge_chan_times;
+    }
+    if (strcmp(name, "ggml_backend_moe_bridge_release") == 0) {
+        return (void *)ggml_backend_cuda_moe_bridge_release;
     }
     return nullptr;
 }

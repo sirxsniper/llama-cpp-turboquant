@@ -4879,6 +4879,208 @@ static GGML_FN_INLINE void ggml_fn_iq4_nl_row_avx512(const int nb, const block_i
 
 #endif // GGML_CPU_FN_X86_AVX512
 
+// ---- [TAG_FN_R4_VNNI] AVX512-VNNI bodies, picked at run time (GGML_CPU_VNNI=1 on a CPU with AVX512-VNNI) ----
+//
+// MSVC compiles any intrinsic whatever /arch says, so an AVX-512 build always has these bodies; GCC and clang get the
+// target attribute on every function that uses them (the row bodies are always_inline into entry functions with the
+// same attribute), and the rest of the file stays free of VNNI instructions. Values: the same int32 lane sums as the
+// maddubs bodies - vpdpwssd is the scale madd plus the add, both exact in int32, and vpdpbusd equals maddubs + madd for
+// these types, whose byte pairs never reach the int16 limit (see the header of this section) - then the same float
+// steps in the same order, so every value is bitwise equal to the AVX2 vec_dot.
+
+#if defined(GGML_CPU_FN_X86_AVX512)
+#if defined(__AVX512VNNI__) || (defined(_MSC_VER) && !defined(__clang__))
+#define GGML_FN_VNNI_TARGET
+#define GGML_FN_HAVE_VNNI 1
+#elif defined(__GNUC__) || defined(__clang__)
+#define GGML_FN_VNNI_TARGET __attribute__((target("avx512vnni")))
+#define GGML_FN_HAVE_VNNI 1
+#endif
+#endif
+
+#if defined(GGML_FN_HAVE_VNNI)
+
+// q4_K: GGML_FN_Q4_K_COL512 with each scale madd and its add fused into one vpdpwssd
+#define GGML_FN_Q4_K_COL512_VNNI(acc, accm, y) do {                                                                     \
+        const int8_t * q8_ = (y)[i].qs;                                                                                 \
+        __m512i p_ = _mm512_dpwssd_epi32(_mm512_setzero_si512(), sc0, _mm512_maddubs_epi16(w0, _mm512_loadu_si512(q8_)));       \
+        p_ = _mm512_dpwssd_epi32(p_, sc1, _mm512_maddubs_epi16(w1, _mm512_loadu_si512(q8_ +  64)));                     \
+        p_ = _mm512_dpwssd_epi32(p_, sc2, _mm512_maddubs_epi16(w2, _mm512_loadu_si512(q8_ + 128)));                     \
+        p_ = _mm512_dpwssd_epi32(p_, sc3, _mm512_maddubs_epi16(w3, _mm512_loadu_si512(q8_ + 192)));                     \
+        const __m256i sumi_ = _mm256_add_epi32(_mm512_castsi512_si256(p_), _mm512_extracti64x4_epi64(p_, 1));            \
+        GGML_FN_Q4_K_FIN(acc, accm, sumi_, y);                                                                          \
+    } while (0)
+
+static GGML_FN_INLINE GGML_FN_VNNI_TARGET void ggml_fn_q4_K_row_avx512_vnni(const int nb, const block_q4_K * GGML_RESTRICT x,
+        const block_q8_K * y0, const block_q8_K * y1, const block_q8_K * y2, const block_q8_K * y3,
+        const int nc, float * GGML_RESTRICT s, const size_t bs) {
+    const __m512i m4 = _mm512_set1_epi8(0xF);
+    const __m512i si0 = ggml_fn_bcast16_pair_idx(0);
+    const __m512i si1 = ggml_fn_bcast16_pair_idx(2);
+    const __m512i si2 = ggml_fn_bcast16_pair_idx(4);
+    const __m512i si3 = ggml_fn_bcast16_pair_idx(6);
+
+    __m256 acc0 = _mm256_setzero_ps();
+    __m256 acc1 = acc0;
+    __m256 acc2 = acc0;
+    __m256 acc3 = acc0;
+    __m128 accm0 = _mm_setzero_ps();
+    __m128 accm1 = accm0;
+    __m128 accm2 = accm0;
+    __m128 accm3 = accm0;
+
+    for (int i = 0; i < nb; ++i) {
+        const float xd    = GGML_CPU_FP16_TO_FP32(x[i].d);
+        const float xdmin = GGML_CPU_FP16_TO_FP32(x[i].dmin);
+
+        const __m256i mins_and_scales = ggml_fn_k4_mins_and_scales(x[i].scales);
+        const __m128i mins = _mm256_extracti128_si256(mins_and_scales, 1);
+        const __m512i sc   = _mm512_inserti64x4(_mm512_setzero_si512(), mins_and_scales, 0);
+        const __m512i sc0  = _mm512_permutexvar_epi16(si0, sc);
+        const __m512i sc1  = _mm512_permutexvar_epi16(si1, sc);
+        const __m512i sc2  = _mm512_permutexvar_epi16(si2, sc);
+        const __m512i sc3  = _mm512_permutexvar_epi16(si3, sc);
+
+        const __m512i b01 = _mm512_loadu_si512(x[i].qs);
+        const __m512i b23 = _mm512_loadu_si512(x[i].qs + 64);
+        const __m512i l01 = _mm512_and_si512(b01, m4);
+        const __m512i h01 = _mm512_and_si512(_mm512_srli_epi16(b01, 4), m4);
+        const __m512i l23 = _mm512_and_si512(b23, m4);
+        const __m512i h23 = _mm512_and_si512(_mm512_srli_epi16(b23, 4), m4);
+        const __m512i w0  = _mm512_shuffle_i64x2(l01, h01, _MM_SHUFFLE(1, 0, 1, 0));
+        const __m512i w1  = _mm512_shuffle_i64x2(l01, h01, _MM_SHUFFLE(3, 2, 3, 2));
+        const __m512i w2  = _mm512_shuffle_i64x2(l23, h23, _MM_SHUFFLE(1, 0, 1, 0));
+        const __m512i w3  = _mm512_shuffle_i64x2(l23, h23, _MM_SHUFFLE(3, 2, 3, 2));
+
+        GGML_FN_Q4_K_COL512_VNNI(acc0, accm0, y0);
+        if (nc > 1) { GGML_FN_Q4_K_COL512_VNNI(acc1, accm1, y1); }
+        if (nc > 2) { GGML_FN_Q4_K_COL512_VNNI(acc2, accm2, y2); }
+        if (nc > 3) { GGML_FN_Q4_K_COL512_VNNI(acc3, accm3, y3); }
+    }
+
+    GGML_FN_Q4_K_OUT(s[0], acc0, accm0);
+    if (nc > 1) { GGML_FN_Q4_K_OUT(s[1*bs], acc1, accm1); }
+    if (nc > 2) { GGML_FN_Q4_K_OUT(s[2*bs], acc2, accm2); }
+    if (nc > 3) { GGML_FN_Q4_K_OUT(s[3*bs], acc3, accm3); }
+}
+
+// unsigned x bytes times signed y bytes, summed in groups of 4 into 16 int32 lanes
+static inline GGML_FN_VNNI_TARGET __m512i ggml_fn_dot_us8_512_vnni(const __m512i ax, const __m512i sy) {
+    return _mm512_dpbusd_epi32(_mm512_setzero_si512(), ax, sy);
+}
+
+// q5_1: GGML_FN_Q5_1_COL2 with vpdpbusd
+#define GGML_FN_Q5_1_COL2_VNNI(acc, summs, y) do {                                                              \
+        const __m512 q_ = _mm512_cvtepi32_ps(ggml_fn_dot_us8_512_vnni(qx, ggml_fn_load_2x32((y)[ib].qs, (y)[ib + 1].qs))); \
+        (summs) += fm0 * GGML_CPU_FP16_TO_FP32((y)[ib].s);                                                       \
+        (acc) = _mm256_fmadd_ps(_mm512_castps512_ps256(q_),                                                      \
+                    _mm256_mul_ps(dx0, _mm256_set1_ps(GGML_CPU_FP16_TO_FP32((y)[ib].d))), (acc));                \
+        (summs) += fm1 * GGML_CPU_FP16_TO_FP32((y)[ib + 1].s);                                                   \
+        (acc) = _mm256_fmadd_ps(_mm512_extractf32x8_ps(q_, 1),                                                   \
+                    _mm256_mul_ps(dx1, _mm256_set1_ps(GGML_CPU_FP16_TO_FP32((y)[ib + 1].d))), (acc));            \
+    } while (0)
+
+static GGML_FN_INLINE GGML_FN_VNNI_TARGET void ggml_fn_q5_1_row_avx512_vnni(const int nb, const block_q5_1 * GGML_RESTRICT x,
+        const block_q8_1 * y0, const block_q8_1 * y1, const block_q8_1 * y2, const block_q8_1 * y3,
+        const int nc, float * GGML_RESTRICT s, const size_t bs) {
+    __m256 acc0 = _mm256_setzero_ps();
+    __m256 acc1 = acc0;
+    __m256 acc2 = acc0;
+    __m256 acc3 = acc0;
+    float summs0 = 0.0f;
+    float summs1 = 0.0f;
+    float summs2 = 0.0f;
+    float summs3 = 0.0f;
+
+    const __m512i m10 = _mm512_set1_epi8(0x10);
+
+    int ib = 0;
+    for (; ib + 1 < nb; ib += 2) {
+        const __m256 dx0 = _mm256_set1_ps(GGML_CPU_FP16_TO_FP32(x[ib + 0].d));
+        const __m256 dx1 = _mm256_set1_ps(GGML_CPU_FP16_TO_FP32(x[ib + 1].d));
+        const float  fm0 = GGML_CPU_FP16_TO_FP32(x[ib + 0].m);
+        const float  fm1 = GGML_CPU_FP16_TO_FP32(x[ib + 1].m);
+
+        uint32_t qh0;
+        uint32_t qh1;
+        memcpy(&qh0, x[ib + 0].qh, sizeof(qh0));
+        memcpy(&qh1, x[ib + 1].qh, sizeof(qh1));
+
+        __m512i qx = ggml_fn_nibbles_2x32(x[ib + 0].qs, x[ib + 1].qs);
+        qx = _mm512_mask_add_epi8(qx, (__mmask64) ((uint64_t) qh0 | ((uint64_t) qh1 << 32)), qx, m10);
+
+        GGML_FN_Q5_1_COL2_VNNI(acc0, summs0, y0);
+        if (nc > 1) { GGML_FN_Q5_1_COL2_VNNI(acc1, summs1, y1); }
+        if (nc > 2) { GGML_FN_Q5_1_COL2_VNNI(acc2, summs2, y2); }
+        if (nc > 3) { GGML_FN_Q5_1_COL2_VNNI(acc3, summs3, y3); }
+    }
+    for (; ib < nb; ++ib) {
+        // an odd last block: the 256-bit step of the AVX2 body
+        const __m256 dx = _mm256_set1_ps(GGML_CPU_FP16_TO_FP32(x[ib].d));
+        const float  fm = GGML_CPU_FP16_TO_FP32(x[ib].m);
+
+        __m256i qx = bytes_from_nibbles_32(x[ib].qs);
+        __m256i bxhi = bytes_from_bits_32(x[ib].qh);
+        bxhi = _mm256_and_si256(bxhi, _mm256_set1_epi8(0x10));
+        qx = _mm256_or_si256(qx, bxhi);
+
+        GGML_FN_Q5_1_COL(acc0, summs0, y0);
+        if (nc > 1) { GGML_FN_Q5_1_COL(acc1, summs1, y1); }
+        if (nc > 2) { GGML_FN_Q5_1_COL(acc2, summs2, y2); }
+        if (nc > 3) { GGML_FN_Q5_1_COL(acc3, summs3, y3); }
+    }
+
+    s[0] = hsum_float_8(acc0) + summs0;
+    if (nc > 1) { s[1*bs] = hsum_float_8(acc1) + summs1; }
+    if (nc > 2) { s[2*bs] = hsum_float_8(acc2) + summs2; }
+    if (nc > 3) { s[3*bs] = hsum_float_8(acc3) + summs3; }
+}
+
+// iq4_nl: GGML_FN_IQ4_NL_COL512 with vpdpbusd
+#define GGML_FN_IQ4_NL_COL512_VNNI(a1, a2, y) do {                                                              \
+        const __m512i q8b_ = ggml_fn_load_2x32((y)[ib + 0].qs, (y)[ib + 1].qs);                                 \
+        const __m512i sy_  = _mm512_mask_sub_epi8(q8b_, xneg, _mm512_setzero_si512(), q8b_);                    \
+        const __m512  p_   = _mm512_cvtepi32_ps(ggml_fn_dot_us8_512_vnni(ax, sy_));                             \
+        (a1) = _mm256_fmadd_ps(_mm256_set1_ps(GGML_CPU_FP16_TO_FP32((y)[ib + 0].d)*fx1), _mm512_castps512_ps256(p_), (a1));   \
+        (a2) = _mm256_fmadd_ps(_mm256_set1_ps(GGML_CPU_FP16_TO_FP32((y)[ib + 1].d)*fx2), _mm512_extractf32x8_ps(p_, 1), (a2)); \
+    } while (0)
+
+static GGML_FN_INLINE GGML_FN_VNNI_TARGET void ggml_fn_iq4_nl_row_avx512_vnni(const int nb, const block_iq4_nl * GGML_RESTRICT x,
+        const block_q8_0 * y0, const block_q8_0 * y1, const block_q8_0 * y2, const block_q8_0 * y3,
+        const int nc, float * GGML_RESTRICT s, const size_t bs) {
+    const __m512i values = _mm512_broadcast_i32x4(_mm_loadu_si128((const __m128i *) kvalues_iq4nl));
+
+    __m256 a1_0 = _mm256_setzero_ps();
+    __m256 a1_1 = a1_0;
+    __m256 a1_2 = a1_0;
+    __m256 a1_3 = a1_0;
+    __m256 a2_0 = a1_0;
+    __m256 a2_1 = a1_0;
+    __m256 a2_2 = a1_0;
+    __m256 a2_3 = a1_0;
+
+    int ib = 0;
+    for (; ib + 1 < nb; ib += 2) {
+        const __m512i q4b  = _mm512_shuffle_epi8(values, ggml_fn_nibbles_2x32(x[ib + 0].qs, x[ib + 1].qs));
+        const __m512i ax   = _mm512_abs_epi8(q4b);
+        const __mmask64 xneg = _mm512_movepi8_mask(q4b);
+        const float fx1 = GGML_CPU_FP16_TO_FP32(x[ib + 0].d);
+        const float fx2 = GGML_CPU_FP16_TO_FP32(x[ib + 1].d);
+
+        GGML_FN_IQ4_NL_COL512_VNNI(a1_0, a2_0, y0);
+        if (nc > 1) { GGML_FN_IQ4_NL_COL512_VNNI(a1_1, a2_1, y1); }
+        if (nc > 2) { GGML_FN_IQ4_NL_COL512_VNNI(a1_2, a2_2, y2); }
+        if (nc > 3) { GGML_FN_IQ4_NL_COL512_VNNI(a1_3, a2_3, y3); }
+    }
+
+    GGML_FN_IQ4_NL_OUT(s[0], a1_0, a2_0, y0);
+    if (nc > 1) { GGML_FN_IQ4_NL_OUT(s[1*bs], a1_1, a2_1, y1); }
+    if (nc > 2) { GGML_FN_IQ4_NL_OUT(s[2*bs], a1_2, a2_2, y2); }
+    if (nc > 3) { GGML_FN_IQ4_NL_OUT(s[3*bs], a1_3, a2_3, y3); }
+}
+
+#endif // GGML_FN_HAVE_VNNI
+
 // ---- entry points ----
 
 // row r of every call gets its own s + r; the column count is a literal in each case, so the inlined body keeps only
@@ -4909,10 +5111,38 @@ static inline bool ggml_fn_mr_wide(void) {
 #endif
 }
 
+#if defined(GGML_FN_HAVE_VNNI)
+// [TAG_FN_R4_VNNI] GGML_CPU_VNNI=1 on a VNNI CPU, unless GGML_CPU_MMID_MR=2 asked for the 256-bit bodies
+static inline bool ggml_fn_mr_vnni(void) {
+    return ggml_cpu_fn_sw[GGML_CPU_FN_VNNI] != 0 && ggml_cpu_fn_vnni_cpu && ggml_fn_mr_wide();
+}
+
+static GGML_FN_VNNI_TARGET void ggml_fn_q4_K_mr_vnni(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx,
+                                                     int nr, const void * const * GGML_RESTRICT vy, int nc) {
+    GGML_FN_MR_ROWS(block_q4_K, block_q8_K, QK_K, ggml_fn_q4_K_row_avx512_vnni);
+}
+
+static GGML_FN_VNNI_TARGET void ggml_fn_q5_1_mr_vnni(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx,
+                                                     int nr, const void * const * GGML_RESTRICT vy, int nc) {
+    GGML_FN_MR_ROWS(block_q5_1, block_q8_1, QK5_1, ggml_fn_q5_1_row_avx512_vnni);
+}
+
+static GGML_FN_VNNI_TARGET void ggml_fn_iq4_nl_mr_vnni(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx,
+                                                       int nr, const void * const * GGML_RESTRICT vy, int nc) {
+    GGML_FN_MR_ROWS(block_iq4_nl, block_q8_0, QK4_NL, ggml_fn_iq4_nl_row_avx512_vnni);
+}
+#endif
+
 void ggml_vec_dot_q4_K_q8_K_mr(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, int nr,
                                const void * const * GGML_RESTRICT vy, int nc) {
     assert(n % QK_K == 0);
     assert(nc >= 1 && nc <= GGML_CPU_FN_MR_MAX_NC);
+#if defined(GGML_FN_HAVE_VNNI)
+    if (ggml_fn_mr_vnni()) { // [TAG_FN_R4_VNNI]
+        ggml_fn_q4_K_mr_vnni(n, s, bs, vx, bx, nr, vy, nc);
+        return;
+    }
+#endif
 #if defined(GGML_CPU_FN_X86_AVX512)
     if (ggml_fn_mr_wide()) {
         GGML_FN_MR_ROWS(block_q4_K, block_q8_K, QK_K, ggml_fn_q4_K_row_avx512);
@@ -4933,6 +5163,12 @@ void ggml_vec_dot_q5_1_q8_1_mr(int n, float * GGML_RESTRICT s, size_t bs, const 
                                const void * const * GGML_RESTRICT vy, int nc) {
     assert(n % QK5_1 == 0);
     assert(nc >= 1 && nc <= GGML_CPU_FN_MR_MAX_NC);
+#if defined(GGML_FN_HAVE_VNNI)
+    if (ggml_fn_mr_vnni()) { // [TAG_FN_R4_VNNI]
+        ggml_fn_q5_1_mr_vnni(n, s, bs, vx, bx, nr, vy, nc);
+        return;
+    }
+#endif
 #if defined(GGML_CPU_FN_X86_AVX512)
     if (ggml_fn_mr_wide()) {
         GGML_FN_MR_ROWS(block_q5_1, block_q8_1, QK5_1, ggml_fn_q5_1_row_avx512);
@@ -4953,6 +5189,12 @@ void ggml_vec_dot_iq4_nl_q8_0_mr(int n, float * GGML_RESTRICT s, size_t bs, cons
                                  const void * const * GGML_RESTRICT vy, int nc) {
     assert(n % QK4_NL == 0);
     assert(nc >= 1 && nc <= GGML_CPU_FN_MR_MAX_NC);
+#if defined(GGML_FN_HAVE_VNNI)
+    if (ggml_fn_mr_vnni()) { // [TAG_FN_R4_VNNI]
+        ggml_fn_iq4_nl_mr_vnni(n, s, bs, vx, bx, nr, vy, nc);
+        return;
+    }
+#endif
 #if defined(GGML_CPU_FN_X86_AVX512)
     if (ggml_fn_mr_wide()) {
         GGML_FN_MR_ROWS(block_iq4_nl, block_q8_0, QK4_NL, ggml_fn_iq4_nl_row_avx512);
