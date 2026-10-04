@@ -2365,6 +2365,13 @@ void llama_context::set_embeddings(bool value) {
 void llama_context::set_embeddings_nextn(bool value, bool masked) {
     LLAMA_LOG_DEBUG("%s: value = %d, masked = %d\n", __func__, value, masked);
 
+    // [TAG_SYNC_1004] the graphs read these flags (e.g. qwen4exp graph_mtp expands h_nextn before the logits, with or
+    // without the out_ids gather): a change can keep the node and leaf counts but reorder them, and ggml-alloc then
+    // reuses the reserved assignments by index. Re-reserve on a change, as set_embeddings_layer_inp() does.
+    if (cparams.embeddings_nextn != value || cparams.embeddings_nextn_masked != masked) {
+        sched_need_reserve = true;
+    }
+
     cparams.embeddings_nextn        = value;
     cparams.embeddings_nextn_masked = masked;
 }
