@@ -19,7 +19,7 @@ param(
   [string]$Env = "",
   [string]$ExtraArgs = "",
   [string]$Model = "D:\Projects\LocalAI\models\Qwen3.8-Flash-Next-UD-Q4_K_XL-MTP-00001-of-00005.gguf",
-  [string]$Bin = "D:\Projects\LocalAI\source-build\wt-flash\build-flash\bin",
+  [string]$Bin = "D:\Projects\LocalAI\source-build\wt-fsync\build-fsync\bin",  # [TAG_SYNC_1004] flashnext/synced
   [string]$Kv = "turbot",  # [TAG_FN_MERGE] Flash-Next KV is turbot (owner 2026-09-28: never q4 / turbo4 KV)
   [string]$Out = "E:\turbot-gates\flashnext\kld"
 )

@@ -15,12 +15,12 @@ param(
   [int]$Tokens = 20480,
   [string]$Agentic = "",
   [string]$Model = "D:\Projects\LocalAI\models\Qwen3.8-Flash-Next-UD-Q4_K_XL-MTP-00001-of-00005.gguf",
-  [string]$Bin = "D:\Projects\LocalAI\source-build\wt-fn\build-fn\bin",
+  [string]$Bin = "D:\Projects\LocalAI\source-build\wt-fsync\build-fsync\bin",  # [TAG_SYNC_1004] flashnext/synced
   [string]$Out = "E:\turbot-gates\flashnext\route",
   [string]$Budgets = "14300,16000"
 )
 $ErrorActionPreference = "Stop"
-$Tree = "D:\Projects\LocalAI\source-build\wt-fn"
+$Tree = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path   # [TAG_SYNC_1004] the tools of this checkout
 if (-not (Test-Path "E:\turbot-gates\imp\SIX_DONE")) { "REFUSED: E:\turbot-gates\imp\SIX_DONE missing"; exit 2 }
 if (Test-Path "E:\turbot-gates\STOP_GPU") { "REFUSED: STOP_GPU exists"; exit 2 }
 New-Item -ItemType Directory -Force $Out | Out-Null

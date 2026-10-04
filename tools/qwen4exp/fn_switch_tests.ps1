@@ -1,6 +1,6 @@
 # [TAG_FN_SP0] Unit-level checks of the Flash-Next speed switches (flashnext/speed), no real model. GPU: after SIX_DONE only.
 #
-#   powershell -File tools/qwen4exp/fn_switch_tests.ps1 [-Bin D:\Projects\LocalAI\source-build\wt-flash\build-flash\bin]
+#   powershell -File tools/qwen4exp/fn_switch_tests.ps1 [-Bin D:\Projects\LocalAI\source-build\wt-fsync\build-fsync\bin]
 #
 # 1. test-backend-ops -b CUDA0 on the new op shapes: the hot chain (remap + zero slot, T 1..8), the QSA-chunk top-k /
 #    concat / cast shapes, and the MTP head-rows shapes
@@ -10,7 +10,7 @@
 # 3. python tools/moe-trace/route_sim.py --selftest
 # Refuses beside any llama/ggml/test process; stops at the first failure.
 param(
-  [string]$Bin = "D:\Projects\LocalAI\source-build\wt-flash\build-flash\bin",  # [TAG_FN_MERGE] the merged branch
+  [string]$Bin = "D:\Projects\LocalAI\source-build\wt-fsync\build-fsync\bin",  # [TAG_SYNC_1004] the synced branch (flashnext/synced)
   [string]$Out = "E:\turbot-gates\flashnext\switch_tests"
 )
 $ErrorActionPreference = "Stop"

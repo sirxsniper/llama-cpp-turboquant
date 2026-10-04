@@ -2,7 +2,7 @@
 # [TAG_FN_MOE_HOT] Hot set on vs off on a synthetic qwen4exp model (no 100 GB model needed). GPU: same preflight as
 # fn_bench.py (SIX_DONE, ONE-process check, commit, no nvlddmkm events).
 #
-#   python tools/qwen4exp/fn_synth_check.py [--bin build-fn/bin] [--dir E:/synth/fnhot]
+#   python tools/qwen4exp/fn_synth_check.py [--bin <build>/bin, default fn_bench.BIN] [--dir E:/synth/fnhot]
 #
 # 1. writes E:/synth/fnhot/q4x-hot.gguf with synth_gguf.py (8 layers, 64 experts, the real tokenizer from shard 1 of the
 #    downloaded split, no MTP) and a Zipf-skewed random profile, if they are missing (CPU and disk only)

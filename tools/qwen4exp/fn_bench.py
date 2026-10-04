@@ -37,7 +37,7 @@ ROOT = "E:/turbot-gates"
 PORT = 8091
 M = "D:/Projects/LocalAI/models/"
 MODEL_A = M + "Qwen3.8-Flash-Next-UD-Q4_K_XL-MTP-00001-of-00005.gguf"
-BIN = "D:/Projects/LocalAI/source-build/wt-flash/build-flash/bin"  # [TAG_FN_MERGE] the merged branch (flashnext/all)
+BIN = "D:/Projects/LocalAI/source-build/wt-fsync/build-fsync/bin"  # [TAG_SYNC_1004] the synced branch (flashnext/synced)
 
 # [TAG_FN_MERGE] turbot KV only on Flash-Next (owner, 2026-09-28: no q4 / turbo4 KV); ncmoe 39 = the F0 fit (32K, MTP on)
 BASE_131K = ("-c 131072 -ngl 99 --n-cpu-moe 39 -fit off -fa on -ctk turbot -ctv turbot -b 2048 -ub 512 -t 16 "
