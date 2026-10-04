@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <cfloat>
 #include <cmath>
+#include <type_traits>
 #include <vector>
 
 extern "C" { GGML_API int turbo3_cpu_wht_group_size; }
@@ -476,6 +477,10 @@ static void ggml_compute_forward_dup_bytes(
     }
 }
 
+// [TAG_CPU_DUP_Q_HALF] dst_t = float writes the dequantized block straight into dst; F16/BF16 dequantize the
+// block to F32 first and narrow it (the turbo4p/turbo5p -> F16 CPY tests aborted the CPU backend here,
+// which reports quantized -> F16 CPY as supported).
+template <typename dst_t>
 static void ggml_compute_forward_dup_from_q(
         const ggml_compute_params * params,
               ggml_tensor * dst) {
@@ -505,6 +510,8 @@ static void ggml_compute_forward_dup_from_q(
     const int ir0 = dr*ith;
     const int ir1 = MIN(ir0 + dr, nr);
 
+    std::vector<float> tmp(std::is_same_v<dst_t, float> ? 0 : qk);
+
     for (int64_t ir = ir0; ir < ir1; ++ir) {
 
         uint32_t i = ir * qk;
@@ -521,9 +528,17 @@ static void ggml_compute_forward_dup_from_q(
         const int64_t i10 = i - i13*ne10*ne11*ne12 - i12*ne10*ne11 - i11*ne10;
         const int64_t dst_offset = i10*nb10 + i11*nb11 + i12*nb12 + i13*nb13;
 
-        dequantize_row_q(
-                (const void *) ((char *) src0->data + x_offset),
-                     (float *) ((char *)  dst->data + dst_offset), qk);
+        if constexpr (std::is_same_v<dst_t, float>) {
+            dequantize_row_q(
+                    (const void *) ((char *) src0->data + x_offset),
+                         (float *) ((char *)  dst->data + dst_offset), qk);
+        } else {
+            dequantize_row_q((const void *) ((char *) src0->data + x_offset), tmp.data(), qk);
+            dst_t * y = (dst_t *) ((char *) dst->data + dst_offset);
+            for (size_t k = 0; k < qk; ++k) {
+                y[k] = type_conversion_table<dst_t>::from_f32(tmp[k]);
+            }
+        }
     }
 }
 
@@ -569,7 +584,15 @@ void ggml_compute_forward_dup(
         default:
             {
                 if (ggml_is_quantized(src0->type) && dst->type == GGML_TYPE_F32) {
-                    ggml_compute_forward_dup_from_q(params, dst);
+                    ggml_compute_forward_dup_from_q<float>(params, dst);
+                    break;
+                }
+                if (ggml_is_quantized(src0->type) && dst->type == GGML_TYPE_F16) { // [TAG_CPU_DUP_Q_HALF]
+                    ggml_compute_forward_dup_from_q<ggml_fp16_t>(params, dst);
+                    break;
+                }
+                if (ggml_is_quantized(src0->type) && dst->type == GGML_TYPE_BF16) {
+                    ggml_compute_forward_dup_from_q<ggml_bf16_t>(params, dst);
                     break;
                 }
                 GGML_ABORT("fatal error");
