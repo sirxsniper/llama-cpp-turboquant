@@ -34,6 +34,11 @@ function Run([string]$name, [string]$exe, [string[]]$argv, [hashtable]$envs) {
 }
 
 $tbo = Join-Path $Bin "test-backend-ops.exe"
+# [TAG_FN_R4_QSA_POS] [TAG_FN_R4_BRIDGE_DMA] round 4: the QSA mask from positions (kv 4096 .. 262144) and the bridge's
+# fetch (PCIe share: copy, slot ids, bank chain, timeout and refused-plan paths). Their first GPU run belongs under
+# compute-sanitizer memcheck (fn_switch_tests runs them plain).
+Run "tbo_qsa_mask"    $tbo @("-b", "CUDA0", "-o", "QSA_MASK") @{}
+Run "tbo_moe_fetch"   $tbo @("-b", "CUDA0", "-o", "MOE_HOST_FETCH") @{}
 Run "tbo_hot_chain"   $tbo @("-b", "CUDA0", "-o", "MUL_MAT_ID", "-p", "n_hot=") @{}
 Run "tbo_topk"        $tbo @("-b", "CUDA0", "-o", "TOP_K", "-p", "k=2051") @{}
 Run "tbo_concat"      $tbo @("-b", "CUDA0", "-o", "CONCAT") @{}
@@ -43,6 +48,13 @@ Run "tbo_mul_mat"     $tbo @("-b", "CUDA0", "-o", "MUL_MAT", "-p", "m=98304") @{
 # tools/qwen4exp/fn_gen5_check.py
 $g5 = Join-Path $Bin "test-moe-gen5.exe"
 if (Test-Path $g5) { Run "moe_gen5_cpu" $g5 @("--cpu") @{ CUDA_VISIBLE_DEVICES = "-1" } }
+# [TAG_FN_R4_QSA_POS] [TAG_FN_R4_ADAPT_DECAY] [TAG_FN_R4_VNNI] CPU-only round-4 tests
+foreach ($t in @("test-qsa-pos", "test-moe-decay")) {
+  $exe = Join-Path $Bin "$t.exe"
+  if (Test-Path $exe) { Run $t $exe @() @{ CUDA_VISIBLE_DEVICES = "-1" } }
+}
+$tqf = Join-Path $Bin "test-quantize-fns.exe"
+if (Test-Path $tqf) { Run "quantize_fns_vnni" $tqf @() @{ CUDA_VISIBLE_DEVICES = "-1"; GGML_CPU_VNNI = "1" } }
 
 $tla = Join-Path $Bin "test-llama-archs.exe"
 $switches = [ordered]@{
@@ -52,8 +64,12 @@ $switches = [ordered]@{
   "per_width"   = @{ LLAMA_GRAPH_PER_WIDTH = "1" }
   "qsa_chunk"   = @{ TURBO_QSA_CHUNK = "2" }
   "head_rows"   = @{ LLAMA_MTP_HEAD_ROWS = "64" }
+  "qsa_pos"     = @{ LLAMA_QSA_POS_MASK = "1" }                              # [TAG_FN_R4_QSA_POS]
+  "qsa_pos_ch"  = @{ LLAMA_QSA_POS_MASK = "1"; LLAMA_QSA_POS_CHUNK = "16" }  # [TAG_FN_R4_QSA_POS]
+  "mtp_window"  = @{ LLAMA_MTP_WINDOW = "16" }                               # [TAG_FN_R4_MTP_WINDOW]
   "trace"       = @{ LLAMA_MOE_PROFILE = (Join-Path $Out "archs.moeprof"); LLAMA_MOE_TRACE = (Join-Path $Out "archs.moet"); LLAMA_MOE_TRACE_PRED = "1" }
-  "all"         = @{ GGML_SCHED_SPLIT_ASYNC = "1"; LLAMA_PLE_HOST_GATHER = "1"; LLAMA_GRAPH_PER_WIDTH = "1"; TURBO_QSA_CHUNK = "2"; LLAMA_MTP_HEAD_ROWS = "64" }
+  "all"         = @{ GGML_SCHED_SPLIT_ASYNC = "1"; LLAMA_PLE_HOST_GATHER = "1"; LLAMA_GRAPH_PER_WIDTH = "1"; TURBO_QSA_CHUNK = "2"; LLAMA_MTP_HEAD_ROWS = "64";
+                    LLAMA_QSA_POS_MASK = "1"; LLAMA_QSA_POS_CHUNK = "16"; GGML_CUDA_GRAPH_POKE = "1" }
 }
 if (Test-Path $tla) {
   foreach ($s in $switches.Keys) {

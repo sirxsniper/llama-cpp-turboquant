@@ -15,6 +15,10 @@
 #   wlfu     windowed LFU (SP-4): starts from static; admits an expert seen >= N times in the last W steps when it beats
 #            the coldest resident by more than the hysteresis; at most --admit-mib per step; the copy lands next step
 #   belady   optimal replacement with unit sizes (upper bound; --no-belady to skip)
+#   decay    [TAG_FN_R4_ADAPT_DECAY] the decayed-count policy of LLAMA_MOE_HOT_DECAY (src/llama-moe-decay.h): every step
+#            adds 1 per sighting, every --decay-every steps one pass pairs the best non-residents with the weakest
+#            residents (admit >= --decay-admit, > --decay-ratio x and > --decay-hyst + the victim) under --admit-mib, then
+#            all counts x --decay (Strata #407: long memory 31-38% fewer misses than short windows); --decay 0 skips it
 from __future__ import annotations
 
 import argparse
@@ -174,6 +178,58 @@ def sim_wlfu(steps, kb, budget, start_mask, W, N, hyst, admit_bytes):
     return hit / tot if tot else 0.0, upl / max(1, len(steps))
 
 
+def sim_decay(steps, kb, budget, start_mask, decay, every, admit, ratio, hyst, admit_bytes):
+    """[TAG_FN_R4_ADAPT_DECAY] the LLAMA_MOE_HOT_DECAY policy on one global byte budget (the real set has per-layer slots;
+    the budget is spread the same way by the starting mask). Copies land at the next step."""
+    res = start_mask.copy()
+    used = kb[res].sum()
+    cnt = np.zeros(len(kb))
+    cnt[res] = admit
+    hit = tot = upl = 0.0
+    pending = np.zeros(0, dtype=np.int64)
+    busy = np.zeros(len(kb), dtype=bool)
+    for i, s in enumerate(steps):
+        res[pending] = True
+        busy[pending] = False
+        b = kb[s]
+        tot += b.sum()
+        hit += b[res[s]].sum()
+        cnt[s] += 1.0
+        pend = []
+        if (i + 1) % every == 0:
+            cand = np.nonzero((~res) & (~busy) & (cnt >= admit))[0]
+            cand = cand[np.argsort(-cnt[cand], kind="stable")]
+            res_idx = np.nonzero(res)[0]
+            vict = res_idx[np.argsort(cnt[res_idx], kind="stable")]
+            vi, left = 0, admit_bytes
+            for key in cand.tolist():
+                bk = kb[key]
+                if bk > left:
+                    break
+                ok = True
+                while used + bk > budget:
+                    if vi >= len(vict):
+                        ok = False
+                        break
+                    v = vict[vi]
+                    if not (cnt[key] > ratio * cnt[v] and cnt[key] > cnt[v] + hyst):
+                        ok = False
+                        break
+                    res[v] = False
+                    used -= kb[v]
+                    vi += 1
+                if not ok:
+                    break
+                used += bk
+                left -= bk
+                upl += bk
+                busy[key] = True
+                pend.append(key)
+            cnt *= decay
+        pending = np.array(pend, dtype=np.int64)
+    return hit / tot if tot else 0.0, upl / max(1, len(steps))
+
+
 def sim_belady(steps, kb, budget):
     cap = int(budget // np.mean(kb[kb > 0]))
     seq = np.concatenate(steps).tolist() if steps else []
@@ -216,9 +272,11 @@ def selftest():
     hs = eval_mask(steps[300:], m, kb)
     hl, _ = sim_lru(steps[300:], kb, budget)
     hw, _ = sim_wlfu(steps[300:], kb, budget, m, 16, 3, 1, 64 * 2**20)
+    hd, _ = sim_decay(steps[300:], kb, budget, m, 0.92, 2, 2.0, 1.2, 0.5, 64 * 2**20)  # [TAG_FN_R4_ADAPT_DECAY]
     hb = sim_belady(steps[300:], kb, budget)
-    ok = 0.3 < hs <= hb + 1e-9 and hw <= hb + 1e-9 and hl <= hb + 1e-9 and m.sum() == int(budget // 3072000)
-    print("selftest static %.3f lru %.3f wlfu %.3f belady %.3f -> %s" % (hs, hl, hw, hb, "OK" if ok else "FAIL"))
+    ok = 0.3 < hs <= hb + 1e-9 and hw <= hb + 1e-9 and hl <= hb + 1e-9 and hd <= hb + 1e-9 and hd > 0.3 and \
+        m.sum() == int(budget // 3072000)
+    print("selftest static %.3f lru %.3f wlfu %.3f decay %.3f belady %.3f -> %s" % (hs, hl, hw, hd, hb, "OK" if ok else "FAIL"))
     return 0 if ok else 1
 
 
@@ -235,6 +293,12 @@ def main():
     ap.add_argument("--admit-n", type=int, default=3)
     ap.add_argument("--hyst", type=int, default=1)
     ap.add_argument("--admit-mib", type=float, default=64)
+    # [TAG_FN_R4_ADAPT_DECAY] the decayed policy (0 = skip)
+    ap.add_argument("--decay", type=float, default=0.92)
+    ap.add_argument("--decay-every", type=int, default=2)
+    ap.add_argument("--decay-admit", type=float, default=2.0)
+    ap.add_argument("--decay-ratio", type=float, default=1.2)
+    ap.add_argument("--decay-hyst", type=float, default=0.5)
     ap.add_argument("--no-belady", action="store_true")
     ap.add_argument("--out", default="")
     ap.add_argument("--selftest", action="store_true")
@@ -275,9 +339,13 @@ def main():
             row["lru_upload_mib_per_step"] = up / 2**20
             row["wlfu"], up = sim_wlfu(test, kb, budget, m, a.window, a.admit_n, a.hyst, a.admit_mib * 2**20)
             row["wlfu_upload_mib_per_step"] = up / 2**20
+            if a.decay > 0:  # [TAG_FN_R4_ADAPT_DECAY]
+                row["decay"], up = sim_decay(test, kb, budget, m, a.decay, a.decay_every, a.decay_admit, a.decay_ratio,
+                                             a.decay_hyst, a.admit_mib * 2**20)
+                row["decay_upload_mib_per_step"] = up / 2**20
             if not a.no_belady:
                 row["belady"] = sim_belady(test, kb, budget)
-            for k in ("static", "lru", "wlfu", "belady"):
+            for k in ("static", "lru", "wlfu", "decay", "belady"):
                 if k in row and 0 < row[k] < 1 and 0 < f < 1:
                     row["alpha_" + k] = math.log(row[k]) / math.log(f)
             hits = tot = 0
@@ -288,9 +356,11 @@ def main():
                     hits += len(np.intersect1d(miss, pred[t]))
             row["pred_recall_nonhot_misses"] = hits / tot if tot else None
             d["policies"][str(int(B))] = row
-            print("%-8s %6.0f MiB (f %.3f): static %.3f lru %.3f (+%.1f MiB/step) wlfu %.3f (+%.1f)%s alpha_static %s"
+            print("%-8s %6.0f MiB (f %.3f): static %.3f lru %.3f (+%.1f MiB/step) wlfu %.3f (+%.1f)%s%s alpha_static %s"
                   " nonhot-recall %s" % (dom, B, f, row["static"], row["lru"], row["lru_upload_mib_per_step"], row["wlfu"],
                                          row["wlfu_upload_mib_per_step"],
+                                         (" decay %.3f (+%.1f)" % (row["decay"], row["decay_upload_mib_per_step"]))
+                                         if "decay" in row else "",
                                          (" belady %.3f" % row["belady"]) if "belady" in row else "",
                                          ("%.3f" % row["alpha_static"]) if "alpha_static" in row else "-",
                                          ("%.3f" % row["pred_recall_nonhot_misses"]) if row["pred_recall_nonhot_misses"] is not None else "-"))
