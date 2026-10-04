@@ -28,7 +28,8 @@
 # [TAG_FN_AUTO] every run pins LLAMA_FLASHNEXT_PROFILE=off unless its mode sets it: the synthetic model is qwen4exp with
 # host experts, so the automatic profile would otherwise change the base and band runs. --mode auto: the candidate runs
 # the default profile (safe) with --n-cpu-moe 1, so the automatic placement must move every layer's experts to the host,
-# and the hot set is the even, adaptive one sized by the VRAM fit at the first decode. --mode auto-fast: the fast profile.
+# and the hot set is the even, adaptive one sized by the VRAM fit at the first decode. --mode auto-trial: the trial profile
+# (every built lever that is not measured yet; "fast" holds only measured winners).
 # The log must show the fn-auto placement line, the VRAM fit and the adaptive hot set.
 from __future__ import annotations
 
@@ -98,7 +99,7 @@ def main():
     ap.add_argument("--layers", type=int, default=8)
     ap.add_argument("--hot-mib", type=float, default=0, help="hot budget (default: half of the expert bytes)")
     ap.add_argument("--max-commit-gb", type=int, default=50)
-    ap.add_argument("--mode", choices=["hot", "bridge", "bridge-hot", "auto", "auto-fast"], default="hot")  # [TAG_MOE_BRIDGE] [TAG_FN_AUTO]
+    ap.add_argument("--mode", choices=["hot", "bridge", "bridge-hot", "auto", "auto-trial"], default="hot")  # [TAG_MOE_BRIDGE] [TAG_FN_AUTO]
     ap.add_argument("--wait", choices=["spin", "hostfunc"], default="spin")
     ap.add_argument("--no-band", action="store_true", help="[TAG_FN_MERGE] absolute rule (KLD <= 1e-3, same-top >= 99)")
     a = ap.parse_args()
@@ -149,8 +150,8 @@ def main():
         if a.mode in ("bridge", "bridge-hot"):  # [TAG_MOE_BRIDGE]
             env.update({"LLAMA_MOE_BRIDGE": "1", "LLAMA_MOE_BRIDGE_STATS": "1", "LLAMA_MOE_BRIDGE_WAIT": a.wait})
         cand = list(common)
-        if a.mode in ("auto", "auto-fast"):  # [TAG_FN_AUTO]
-            env.update({"LLAMA_FLASHNEXT_PROFILE": "safe" if a.mode == "auto" else "fast", "LLAMA_MOE_HOT_STATS": "1"})
+        if a.mode in ("auto", "auto-trial"):  # [TAG_FN_AUTO]
+            env.update({"LLAMA_FLASHNEXT_PROFILE": "safe" if a.mode == "auto" else "trial", "LLAMA_MOE_HOT_STATS": "1"})
             cand[cand.index("--n-cpu-moe") + 1] = "1"
         rc, txt = run(cand + ["-ub", str(T), "--kl-divergence-base", base, "--kl-divergence"], env,
                       os.path.join(a.dir, "%s_ub%d.log" % (a.mode, T)))
@@ -159,7 +160,7 @@ def main():
         hot = re.search(r"moe-hot: (\d+) layers, ([0-9.]+) MiB", txt) if a.mode != "bridge" else re.search(r"MoE bridge \d+ on \S+: (\d+) host expert layers", txt)
         if hot and a.mode == "bridge-hot" and not re.search(r"MoE bridge \d+ on \S+: (\d+) host expert layers", txt):
             hot = None
-        if hot and a.mode in ("auto", "auto-fast") and not (  # [TAG_FN_AUTO]
+        if hot and a.mode in ("auto", "auto-trial") and not (  # [TAG_FN_AUTO]
                 re.search(r"fn-auto:   placement: the routed experts of all %d trunk layers" % a.layers, txt) and
                 re.search(r"moe-hot: VRAM fit on ", txt) and re.search(r"moe-hot: adaptive: admit after", txt)):
             hot = None

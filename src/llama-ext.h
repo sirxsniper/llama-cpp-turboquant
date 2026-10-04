@@ -184,7 +184,7 @@ LLAMA_API void llama_turbot_set_sidecar_path(const char * path);
 // [TAG_FN_AUTO] getenv(name), else the automatic value of this model (LLAMA_FLASHNEXT_PROFILE on qwen4exp with host
 // experts, src/llama-fn-auto.h), else nullptr. model may be nullptr (then plain getenv).
 LLAMA_API const char * llama_model_fn_env(const struct llama_model * model, const char * name);
-// [TAG_FN_AUTO] "safe", "fast" or "fast-dma" while the automatic defaults are active for this model, else nullptr
+// [TAG_FN_AUTO] "safe", "fast", "trial" or "trial-dma" while the automatic defaults are active for this model, else nullptr
 LLAMA_API const char * llama_model_fn_profile(const struct llama_model * model);
 
 // [TAG_FN_RAM_FIT] host memory plan for a model bigger than RAM (mmap): when the host-resident model bytes, the host

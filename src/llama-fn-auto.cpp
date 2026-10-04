@@ -21,11 +21,12 @@
 namespace {
 
 enum : int {
-    P_SAFE = 1 << LLAMA_FN_PROFILE_SAFE,
-    P_FAST = 1 << LLAMA_FN_PROFILE_FAST,
-    P_FDMA = 1 << LLAMA_FN_PROFILE_FAST_DMA,
-    P_ALL  = P_SAFE | P_FAST | P_FDMA,
-    P_LEV  = P_FAST | P_FDMA,
+    P_SAFE  = 1 << LLAMA_FN_PROFILE_SAFE,
+    P_FAST  = 1 << LLAMA_FN_PROFILE_FAST,
+    P_TRIAL = 1 << LLAMA_FN_PROFILE_TRIAL,
+    P_TDMA  = 1 << LLAMA_FN_PROFILE_TRIAL_DMA,
+    P_ALL   = P_SAFE | P_FAST | P_TRIAL | P_TDMA,
+    P_TRY   = P_TRIAL | P_TDMA,
 };
 
 struct fn_item {
@@ -34,9 +35,11 @@ struct fn_item {
     int          profiles;
 };
 
-// safe = the measured winners: speed/r1 hot48ad against F0 (ncmoe 39), 3 interleaved rounds at 32K with turbot KV and MTP:
-// +35.4% greedy code, +45.1% temp-1 prose, KLD on the pure-placement band (r2/TEST_PLAN.md 0.4)
-// fast = built and unit tested, not yet measured on the GPU; the GPU results decide what moves up to safe
+// safe: speed/r1 hot48ad against F0 (ncmoe 39), 3 interleaved rounds at 32K with turbot KV and MTP: +35.4% greedy code,
+// +45.1% temp-1 prose, KLD on the pure-placement band (r2/TEST_PLAN.md 0.4). That run started the hot set from a routing
+// profile (fn_r1_all.moeprof); "even" (no <model>.moeprof sidecar) is not measured yet.
+// fast: safe + the measured winners. A lever moves from P_TRY to P_FAST only with its A/B result (speed/history.md).
+// trial / trial-dma: built and unit tested, NOT measured on the GPU; for A/B runs only.
 const fn_item k_items[] = {
     { "LLAMA_FN_PLACEMENT",     "auto",  P_ALL  }, // every trunk layer's routed experts on the host
     { "LLAMA_MOE_HOT_PROFILE",  "",      P_ALL  }, // set at load: <model>.moeprof if present, else "even"
@@ -46,19 +49,21 @@ const fn_item k_items[] = {
     { "LLAMA_MOE_HOT_ADMIT",    "2/32",  P_ALL  },
     { "LLAMA_RAM_FIT",          "1",     P_ALL  }, // [TAG_FN_RAM_FIT]
 
-    { "LLAMA_MOE_BRIDGE",       "1",     P_FAST },
-    { "LLAMA_MOE_DMA_SHARE",    "auto",  P_FDMA }, // exclusive with the bridge
-    { "GGML_CPU_APPLY_ONCE",    "1",     P_LEV  },
-    { "GGML_CPU_Q5_1_AVX512",   "1",     P_LEV  },
-    { "GGML_CPU_MMID_MR",       "1",     P_LEV  },
-    { "GGML_CPU_MOE_FUSE",      "1",     P_LEV  },
-    { "GGML_SCHED_SPLIT_ASYNC", "1",     P_LEV  },
-    { "LLAMA_PLE_HOST_GATHER",  "1",     P_LEV  },
-    { "LLAMA_PLE_DIRECT_IO",    "1",     P_LEV  }, // flashnext/ple-dio; no effect before that branch is merged
-    { "LLAMA_GRAPH_PER_WIDTH",  "1",     P_LEV  },
-    { "TURBO_QSA_CHUNK",        "64",    P_LEV  },
-    { "SPEC_MTP_COST",          "1",     P_LEV  },
-    { "LLAMA_MTP_ATTN_WINDOW",  "32768", P_LEV  },
+    // P_FAST levers (measured winners) go here
+
+    { "LLAMA_MOE_BRIDGE",       "1",     P_TRIAL },
+    { "LLAMA_MOE_DMA_SHARE",    "auto",  P_TDMA  }, // exclusive with the bridge
+    { "GGML_CPU_APPLY_ONCE",    "1",     P_TRY   },
+    { "GGML_CPU_Q5_1_AVX512",   "1",     P_TRY   },
+    { "GGML_CPU_MMID_MR",       "1",     P_TRY   },
+    { "GGML_CPU_MOE_FUSE",      "1",     P_TRY   },
+    { "GGML_SCHED_SPLIT_ASYNC", "1",     P_TRY   },
+    { "LLAMA_PLE_HOST_GATHER",  "1",     P_TRY   },
+    { "LLAMA_PLE_DIRECT_IO",    "1",     P_TRY   }, // flashnext/ple-dio; no effect before that branch is merged
+    { "LLAMA_GRAPH_PER_WIDTH",  "1",     P_TRY   },
+    { "TURBO_QSA_CHUNK",        "64",    P_TRY   },
+    { "SPEC_MTP_COST",          "1",     P_TRY   },
+    { "LLAMA_MTP_ATTN_WINDOW",  "32768", P_TRY   },
 };
 
 // names the fn-auto aware code reads through llama_fn_env(): never put into the environment
@@ -154,8 +159,11 @@ llama_fn_profile llama_fn_profile_parse(const char * s, bool * ok) {
     if (v == "fast" || v == "2") {
         return LLAMA_FN_PROFILE_FAST;
     }
-    if (v == "fast-dma" || v == "fast_dma" || v == "fastdma") {
-        return LLAMA_FN_PROFILE_FAST_DMA;
+    if (v == "trial") {
+        return LLAMA_FN_PROFILE_TRIAL;
+    }
+    if (v == "trial-dma" || v == "trial_dma") {
+        return LLAMA_FN_PROFILE_TRIAL_DMA;
     }
     if (ok) {
         *ok = false;
@@ -165,12 +173,21 @@ llama_fn_profile llama_fn_profile_parse(const char * s, bool * ok) {
 
 const char * llama_fn_profile_name(llama_fn_profile p) {
     switch (p) {
-        case LLAMA_FN_PROFILE_OFF:      return "off";
-        case LLAMA_FN_PROFILE_SAFE:     return "safe";
-        case LLAMA_FN_PROFILE_FAST:     return "fast";
-        case LLAMA_FN_PROFILE_FAST_DMA: return "fast-dma";
+        case LLAMA_FN_PROFILE_OFF:       return "off";
+        case LLAMA_FN_PROFILE_SAFE:      return "safe";
+        case LLAMA_FN_PROFILE_FAST:      return "fast";
+        case LLAMA_FN_PROFILE_TRIAL:     return "trial";
+        case LLAMA_FN_PROFILE_TRIAL_DMA: return "trial-dma";
     }
     return "?";
+}
+
+int llama_fn_fast_lever_count() {
+    int n = 0;
+    for (const auto & it : k_items) {
+        n += (it.profiles & P_FAST) && !(it.profiles & P_SAFE) ? 1 : 0;
+    }
+    return n;
 }
 
 bool llama_fn_parse_opt_list(const char * s, std::vector<std::pair<std::string, std::string>> & out) {
@@ -207,14 +224,14 @@ std::vector<llama_fn_opt> llama_fn_profile_opts(llama_fn_profile p, const char *
         return out;
     }
     std::vector<std::pair<std::string, std::string>> custom;
-    const bool use_custom = p == LLAMA_FN_PROFILE_FAST && fast_list && fast_list[0] && llama_fn_parse_opt_list(fast_list, custom);
+    const bool use_custom = p != LLAMA_FN_PROFILE_SAFE && fast_list && fast_list[0] && llama_fn_parse_opt_list(fast_list, custom);
     const int bit = 1 << p;
     for (const auto & it : k_items) {
         if (!(it.profiles & bit)) {
             continue;
         }
         if (use_custom && !(it.profiles & P_SAFE)) {
-            continue; // LLAMA_FLASHNEXT_FAST replaces the built-in fast levers
+            continue; // LLAMA_FLASHNEXT_FAST replaces the built-in levers
         }
         llama_fn_opt o;
         o.name   = it.name;
@@ -360,14 +377,16 @@ int32_t llama_fn_even_slots(const std::vector<size_t> & bytes_per_expert, size_t
     if (sum == 0 || n_expert <= 0) {
         return 0;
     }
-    return (int32_t) std::min<size_t>((size_t) n_expert, budget / sum);
+    const size_t rows = budget / sum; // slot rows incl. the zero slot of every layer
+    return rows > 1 ? (int32_t) std::min<size_t>((size_t) n_expert, rows - 1) : 0;
 }
 
 // [TAG_FN_VRAM_FIT] -----------------------------------------------------------------------------------------------
 
 size_t llama_fn_vram_ceiling_default(size_t total) {
     const size_t keep = std::max<size_t>((size_t) 1536 << 20, total / 8);
-    return total > keep ? total - keep : 0;
+    const size_t step = (size_t) 256 << 20;
+    return total > keep ? (total - keep) / step * step : 0;
 }
 
 size_t llama_fn_vram_fit_budget(size_t total, size_t free, size_t ceiling, size_t margin) {
@@ -442,7 +461,7 @@ void llama_fn_auto_on_load(llama_model & model, llama_model_loader & ml, const s
     bool ok = true;
     const llama_fn_profile prof = llama_fn_profile_parse(pe, &ok);
     if (!ok) {
-        LLAMA_LOG_WARN("fn-auto: LLAMA_FLASHNEXT_PROFILE=%s is not off, safe, fast or fast-dma - using safe\n", pe);
+        LLAMA_LOG_WARN("fn-auto: LLAMA_FLASHNEXT_PROFILE=%s is not off, safe, fast, trial or trial-dma - using safe\n", pe);
     }
     if (prof == LLAMA_FN_PROFILE_OFF) {
         LLAMA_LOG_INFO("fn-auto: qwen4exp with host experts, LLAMA_FLASHNEXT_PROFILE=off: no automatic defaults\n");
@@ -451,8 +470,10 @@ void llama_fn_auto_on_load(llama_model & model, llama_model_loader & ml, const s
     const char * fast_list = getenv("LLAMA_FLASHNEXT_FAST");
     if (fast_list && fast_list[0]) {
         std::vector<std::pair<std::string, std::string>> tmp;
-        if (!llama_fn_parse_opt_list(fast_list, tmp)) {
-            LLAMA_LOG_WARN("fn-auto: LLAMA_FLASHNEXT_FAST=%s is not NAME=VALUE,... - the built-in fast list is used\n", fast_list);
+        if (prof == LLAMA_FN_PROFILE_SAFE) {
+            LLAMA_LOG_WARN("fn-auto: LLAMA_FLASHNEXT_FAST is ignored by the safe profile (it sets the levers of fast and trial)\n");
+        } else if (!llama_fn_parse_opt_list(fast_list, tmp)) {
+            LLAMA_LOG_WARN("fn-auto: LLAMA_FLASHNEXT_FAST=%s is not NAME=VALUE,... - the built-in lever list is used\n", fast_list);
         }
     }
 
@@ -481,10 +502,20 @@ void llama_fn_auto_on_load(llama_model & model, llama_model_loader & ml, const s
     llama_fn_state_inject(*st);
 
     LLAMA_LOG_INFO("fn-auto: qwen4exp with the routed experts of %d of %d trunk layers on the host: LLAMA_FLASHNEXT_PROFILE=%s%s "
-            "(off|safe|fast|fast-dma)\n", n_host_user, n_layer, llama_fn_profile_name(prof), pe ? "" : " (default)");
+            "(off|safe|fast|trial|trial-dma)\n", n_host_user, n_layer, llama_fn_profile_name(prof), pe ? "" : " (default)");
+    if (prof == LLAMA_FN_PROFILE_TRIAL || prof == LLAMA_FN_PROFILE_TRIAL_DMA) {
+        LLAMA_LOG_WARN("fn-auto: the %s profile turns on levers that are NOT measured yet - for A/B runs only\n", llama_fn_profile_name(prof));
+    }
+    if (prof == LLAMA_FN_PROFILE_FAST && llama_fn_fast_lever_count() == 0 && !(fast_list && fast_list[0])) {
+        LLAMA_LOG_INFO("fn-auto:   fast: no lever has won a measured A/B yet, so fast is the same as safe\n");
+    }
     if (st->promote) {
         LLAMA_LOG_INFO("fn-auto:   placement: the routed experts of all %d trunk layers stay on the host and the hot set holds "
                 "the hot ones in VRAM (LLAMA_FN_PLACEMENT=user keeps the overrides as given)\n", n_layer);
+    }
+    if (const char * hp = llama_fn_env(model, "LLAMA_MOE_HOT_PROFILE"); hp && strcmp(hp, "even") == 0 && !getenv("LLAMA_MOE_HOT_PROFILE")) {
+        LLAMA_LOG_INFO("fn-auto:   hot set: no %s.moeprof routing profile, so every layer gets the same number of empty slots that "
+                "the adaptive set fills (the measured r1 win started from a routing profile)\n", fname.c_str());
     }
     std::string own, env, injected;
     for (const auto & o : st->opts) {

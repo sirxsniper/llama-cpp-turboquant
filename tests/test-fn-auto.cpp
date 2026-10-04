@@ -64,10 +64,13 @@ static void test_profile_names() {
     TCHECK(llama_fn_profile_parse("0", &ok) == LLAMA_FN_PROFILE_OFF && ok, "0");
     TCHECK(llama_fn_profile_parse(" Safe ", &ok) == LLAMA_FN_PROFILE_SAFE && ok, "safe, case and spaces");
     TCHECK(llama_fn_profile_parse("FAST", &ok) == LLAMA_FN_PROFILE_FAST && ok, "fast");
-    TCHECK(llama_fn_profile_parse("fast-dma", &ok) == LLAMA_FN_PROFILE_FAST_DMA && ok, "fast-dma");
-    TCHECK(llama_fn_profile_parse("fast_dma", &ok) == LLAMA_FN_PROFILE_FAST_DMA && ok, "fast_dma");
+    TCHECK(llama_fn_profile_parse("trial", &ok) == LLAMA_FN_PROFILE_TRIAL && ok, "trial");
+    TCHECK(llama_fn_profile_parse("trial-dma", &ok) == LLAMA_FN_PROFILE_TRIAL_DMA && ok, "trial-dma");
+    TCHECK(llama_fn_profile_parse("trial_dma", &ok) == LLAMA_FN_PROFILE_TRIAL_DMA && ok, "trial_dma");
+    TCHECK(llama_fn_profile_parse("fast-dma", &ok) == LLAMA_FN_PROFILE_SAFE && !ok, "fast-dma is gone (trial-dma), not ok");
     TCHECK(llama_fn_profile_parse("turbo", &ok) == LLAMA_FN_PROFILE_SAFE && !ok, "unknown = safe, not ok");
-    TCHECK(strcmp(llama_fn_profile_name(LLAMA_FN_PROFILE_FAST_DMA), "fast-dma") == 0, "name");
+    TCHECK(strcmp(llama_fn_profile_name(LLAMA_FN_PROFILE_TRIAL_DMA), "trial-dma") == 0, "name");
+    TCHECK(strcmp(llama_fn_profile_name(LLAMA_FN_PROFILE_TRIAL), "trial") == 0, "name trial");
 
     std::vector<std::pair<std::string, std::string>> l;
     TCHECK(llama_fn_parse_opt_list(" A=1, B = x/y ,,C=", l) && l.size() == 3, "list parse");
@@ -93,34 +96,50 @@ static void test_profile_opts() {
     TCHECK(find_opt(safe, "LLAMA_MOE_HOT_ADAPT")->value == "1", "adaptive");
     TCHECK(find_opt(safe, "LLAMA_MOE_BRIDGE") == nullptr, "no bridge in safe");
 
+    // fast = safe + the levers that won a measured A/B: none yet
     const auto fast = llama_fn_profile_opts(LLAMA_FN_PROFILE_FAST, nullptr);
-    TCHECK(fast.size() > safe.size(), "fast adds levers");
+    TCHECK(llama_fn_fast_lever_count() == 0, "no measured lever in fast yet (%d)", llama_fn_fast_lever_count());
+    TCHECK(fast.size() == safe.size() + (size_t) llama_fn_fast_lever_count(), "fast = safe + the measured levers");
     for (const char * n : safe_names) {
         TCHECK(find_opt(fast, n) != nullptr, "fast keeps safe %s", n);
     }
-    const char * fast_names[] = { "LLAMA_MOE_BRIDGE", "GGML_CPU_APPLY_ONCE", "GGML_CPU_Q5_1_AVX512", "GGML_CPU_MMID_MR",
-                                  "GGML_CPU_MOE_FUSE", "GGML_SCHED_SPLIT_ASYNC", "LLAMA_PLE_HOST_GATHER", "LLAMA_PLE_DIRECT_IO",
-                                  "LLAMA_GRAPH_PER_WIDTH", "TURBO_QSA_CHUNK", "SPEC_MTP_COST", "LLAMA_MTP_ATTN_WINDOW" };
-    for (const char * n : fast_names) {
-        const llama_fn_opt * o = find_opt(fast, n);
-        TCHECK(o && o->inject, "fast %s present and put into the environment", n);
+
+    // trial = safe + every built lever that is not measured yet
+    const auto trial = llama_fn_profile_opts(LLAMA_FN_PROFILE_TRIAL, nullptr);
+    TCHECK(trial.size() > safe.size(), "trial adds levers");
+    for (const char * n : safe_names) {
+        TCHECK(find_opt(trial, n) != nullptr, "trial keeps safe %s", n);
     }
-    TCHECK(find_opt(fast, "LLAMA_MOE_DMA_SHARE") == nullptr, "fast uses the bridge, not the DMA share");
+    const char * trial_names[] = { "LLAMA_MOE_BRIDGE", "GGML_CPU_APPLY_ONCE", "GGML_CPU_Q5_1_AVX512", "GGML_CPU_MMID_MR",
+                                   "GGML_CPU_MOE_FUSE", "GGML_SCHED_SPLIT_ASYNC", "LLAMA_PLE_HOST_GATHER", "LLAMA_PLE_DIRECT_IO",
+                                   "LLAMA_GRAPH_PER_WIDTH", "TURBO_QSA_CHUNK", "SPEC_MTP_COST", "LLAMA_MTP_ATTN_WINDOW" };
+    for (const char * n : trial_names) {
+        const llama_fn_opt * o = find_opt(trial, n);
+        TCHECK(o && o->inject, "trial %s present and put into the environment", n);
+        TCHECK(find_opt(fast, n) == nullptr, "fast has no unmeasured %s", n);
+    }
+    TCHECK(find_opt(trial, "LLAMA_MOE_DMA_SHARE") == nullptr, "trial uses the bridge, not the DMA share");
 
-    const auto fdma = llama_fn_profile_opts(LLAMA_FN_PROFILE_FAST_DMA, nullptr);
-    TCHECK(find_opt(fdma, "LLAMA_MOE_BRIDGE") == nullptr, "fast-dma has no bridge (exclusive)");
-    TCHECK(find_opt(fdma, "LLAMA_MOE_DMA_SHARE") && find_opt(fdma, "LLAMA_MOE_DMA_SHARE")->value == "auto", "fast-dma DMA share");
-    TCHECK(find_opt(fdma, "GGML_CPU_MOE_FUSE") != nullptr, "fast-dma keeps the CPU levers");
+    const auto tdma = llama_fn_profile_opts(LLAMA_FN_PROFILE_TRIAL_DMA, nullptr);
+    TCHECK(find_opt(tdma, "LLAMA_MOE_BRIDGE") == nullptr, "trial-dma has no bridge (exclusive)");
+    TCHECK(find_opt(tdma, "LLAMA_MOE_DMA_SHARE") && find_opt(tdma, "LLAMA_MOE_DMA_SHARE")->value == "auto", "trial-dma DMA share");
+    TCHECK(find_opt(tdma, "GGML_CPU_MOE_FUSE") != nullptr, "trial-dma keeps the CPU levers");
 
-    // LLAMA_FLASHNEXT_FAST replaces the fast levers of "fast", may change a safe value, and knows lookup names
-    const auto cust = llama_fn_profile_opts(LLAMA_FN_PROFILE_FAST, "GGML_CPU_MOE_FUSE=1, LLAMA_MOE_HOT_ADMIT=3/16, LLAMA_MOE_HOT_ADAPT_MIB=128");
+    // safe ignores LLAMA_FLASHNEXT_FAST
+    const auto safe_c = llama_fn_profile_opts(LLAMA_FN_PROFILE_SAFE, "GGML_CPU_MOE_FUSE=1");
+    TCHECK(find_opt(safe_c, "GGML_CPU_MOE_FUSE") == nullptr && safe_c.size() == safe.size(), "safe ignores a lever list");
+
+    // LLAMA_FLASHNEXT_FAST replaces the levers of fast / trial / trial-dma, may change a safe value, and knows lookup names
+    const auto cust = llama_fn_profile_opts(LLAMA_FN_PROFILE_TRIAL, "GGML_CPU_MOE_FUSE=1, LLAMA_MOE_HOT_ADMIT=3/16, LLAMA_MOE_HOT_ADAPT_MIB=128");
     TCHECK(find_opt(cust, "LLAMA_MOE_BRIDGE") == nullptr, "custom list drops the built-in bridge");
     TCHECK(find_opt(cust, "GGML_CPU_MOE_FUSE") && find_opt(cust, "GGML_CPU_MOE_FUSE")->inject, "custom lever injected");
     TCHECK(find_opt(cust, "LLAMA_MOE_HOT_ADMIT")->value == "3/16", "custom list changes a safe value");
     TCHECK(find_opt(cust, "LLAMA_MOE_HOT_ADAPT_MIB") && !find_opt(cust, "LLAMA_MOE_HOT_ADAPT_MIB")->inject, "hot names stay lookups");
     TCHECK(find_opt(cust, "LLAMA_FN_PLACEMENT") != nullptr, "custom list keeps the safe items");
-    const auto bad = llama_fn_profile_opts(LLAMA_FN_PROFILE_FAST, "noequals");
-    TCHECK(find_opt(bad, "LLAMA_MOE_BRIDGE") != nullptr, "a bad custom list leaves the built-in fast list");
+    const auto bad = llama_fn_profile_opts(LLAMA_FN_PROFILE_TRIAL, "noequals");
+    TCHECK(find_opt(bad, "LLAMA_MOE_BRIDGE") != nullptr, "a bad custom list leaves the built-in lever list");
+    const auto cust_fast = llama_fn_profile_opts(LLAMA_FN_PROFILE_FAST, "GGML_CPU_MOE_FUSE=1");
+    TCHECK(find_opt(cust_fast, "GGML_CPU_MOE_FUSE") && find_opt(cust_fast, "GGML_CPU_MOE_FUSE")->inject, "fast takes a lever list too");
 }
 
 static void test_host_expert_layers() {
@@ -219,11 +238,12 @@ static std::vector<size_t> flash_next_expert_bytes() {
 }
 
 static void test_vram_fit() {
-    // RTX 5090: cudaMemGetInfo total 32607 MiB -> ceiling 28531.1 MiB ("<= ~28.5 GB")
+    // RTX 5090: cudaMemGetInfo total 32607 MiB -> total - total/8 = 28531.1 MiB, rounded down to 256 MiB: 28416 MiB
+    // (under the 28500 MiB the card is run at)
     const size_t t5090 = (size_t) 32607 * MiB;
     const size_t c5090 = llama_fn_vram_ceiling_default(t5090);
-    TCHECK(c5090 == t5090 - t5090/8, "5090 ceiling is total - total/8");
-    TCHECK(c5090 / MiB == 28531, "5090 ceiling %zu MiB", c5090 / MiB);
+    TCHECK(c5090 == (t5090 - t5090/8) / (256 * MiB) * (256 * MiB), "5090 ceiling is total - total/8, on 256 MiB steps");
+    TCHECK(c5090 / MiB == 28416, "5090 ceiling %zu MiB", c5090 / MiB);
     TCHECK(llama_fn_vram_ceiling_default((size_t) 8192 * MiB) == (size_t) (8192 - 1536) * MiB, "8 GB card keeps 1536 MiB");
     TCHECK(llama_fn_vram_ceiling_default((size_t) 1024 * MiB) == 0, "tiny card: no room");
 
@@ -231,12 +251,12 @@ static void test_vram_fit() {
     const size_t used = (size_t) 15607 * MiB;
     const size_t b = llama_fn_vram_fit_budget(t5090, t5090 - used, c5090, 768 * MiB);
     TCHECK(b == c5090 - used - 768 * MiB, "budget = ceiling - used - margin");
-    TCHECK(b / MiB == 12156, "262K budget %zu MiB", b / MiB);
+    TCHECK(b / MiB == 12041, "262K budget %zu MiB", b / MiB);
     TCHECK(llama_fn_vram_fit_budget(t5090, (size_t) 1000 * MiB, t5090, 768 * MiB) == 232 * MiB, "free - margin when the ceiling is the card");
     TCHECK(llama_fn_vram_fit_budget(t5090, (size_t) 3000 * MiB, c5090, 768 * MiB) == 0, "used above the ceiling: 0");
     TCHECK(llama_fn_vram_fit_budget(t5090, (size_t) 500 * MiB, t5090, 768 * MiB) == 0, "free below the margin: 0");
     TCHECK(llama_fn_vram_fit_budget(t5090, t5090 - used, c5090, 0) == c5090 - used, "no margin");
-    TCHECK(llama_fn_even_slots(flash_next_expert_bytes(), b, 512) == 84, "262K budget as even slots: 84 per layer");
+    TCHECK(llama_fn_even_slots(flash_next_expert_bytes(), b, 512) == 83, "262K budget as even slots: 83 per layer + the zero slot");
 }
 
 // [TAG_FN_AUTO] even slots at Flash-Next UD-Q4_K_XL
@@ -245,12 +265,18 @@ static void test_even_slots() {
     // even slots at Flash-Next UD-Q4_K_XL: 43 layers q4_K/q4_K/q5_1 (3,072,000 B), 5 layers with q8_0 down (3,584,000 B)
     const std::vector<size_t> bytes = flash_next_expert_bytes();
     const int32_t n = llama_fn_even_slots(bytes, b, 512);
-    TCHECK(n == 84, "262K even slots per layer %d", n);
+    TCHECK(n == 83, "262K even slots per layer %d", n);
     size_t total = 0;
     for (size_t x : bytes) {
-        total += x * (size_t) n;
+        total += x * (size_t) (n + 1); // every layer also holds its zero slot
     }
-    TCHECK(total <= b, "even slots fit the budget");
+    TCHECK(total <= b, "even slots and the zero slots fit the budget");
+    size_t sum = 0;
+    for (size_t x : bytes) {
+        sum += x;
+    }
+    TCHECK(llama_fn_even_slots(bytes, sum, 512) == 0, "a budget of one row per layer is the zero slot alone: 0");
+    TCHECK(llama_fn_even_slots(bytes, 2*sum, 512) == 1, "two rows per layer: one slot");
     TCHECK(llama_fn_even_slots(bytes, (size_t) 1 << 50, 512) == 512, "at most every expert");
     TCHECK(llama_fn_even_slots(bytes, 100 * MiB, 512) == 0, "a budget below one expert per layer gives 0");
     TCHECK(llama_fn_even_slots({}, b, 512) == 0, "no layers");

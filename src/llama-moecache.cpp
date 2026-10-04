@@ -210,7 +210,8 @@ void llama_moe_cache_init(const llama_model & model, int32_t n_slots, int32_t ma
     }
     [&]() {
         if (n_slots <= 0) {
-            g_init_done = true;
+            // [TAG_FN_AUTO] no attempt: a -fit memory probe context comes here first and must not block the hot set of
+            // the loaded model (its profile values are not visible on the probe model)
             return;
         }
 

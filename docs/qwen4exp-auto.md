@@ -6,18 +6,20 @@ qwen4exp with all experts on the GPU, runs exactly as before. Code: `src/llama-f
 
 ## The switch
 
-`LLAMA_FLASHNEXT_PROFILE=off|safe|fast|fast-dma` (unset = `safe`).
+`LLAMA_FLASHNEXT_PROFILE=off|safe|fast|trial|trial-dma` (unset = `safe`).
 
 | Profile | What it turns on |
 |---|---|
 | `off` | nothing automatic; every switch works as a separate environment variable, as before |
 | `safe` (default) | the measured winners only: all trunk experts on the host plus the adaptive VRAM hot set (speed/r1 `hot48ad`: +35 % greedy code, +45 % temp-1 prose at 32K), the VRAM fit and the RAM fit |
-| `fast` | `safe` plus the built but not yet GPU-measured levers: `LLAMA_MOE_BRIDGE=1`, `GGML_CPU_APPLY_ONCE=1`, `GGML_CPU_Q5_1_AVX512=1`, `GGML_CPU_MMID_MR=1`, `GGML_CPU_MOE_FUSE=1`, `GGML_SCHED_SPLIT_ASYNC=1`, `LLAMA_PLE_HOST_GATHER=1`, `LLAMA_PLE_DIRECT_IO=1`, `LLAMA_GRAPH_PER_WIDTH=1`, `TURBO_QSA_CHUNK=64`, `SPEC_MTP_COST=1`, `LLAMA_MTP_ATTN_WINDOW=32768` |
-| `fast-dma` | `fast` with `LLAMA_MOE_DMA_SHARE=auto` instead of the bridge (the two are exclusive) |
+| `fast` | `safe` plus the levers that won a measured A/B (`P_FAST` in `k_items`, each with its evidence in `speed/history.md`). None yet, so today `fast` is `safe` |
+| `trial` | `safe` plus every built lever that is not measured yet, for A/B runs only: `LLAMA_MOE_BRIDGE=1`, `GGML_CPU_APPLY_ONCE=1`, `GGML_CPU_Q5_1_AVX512=1`, `GGML_CPU_MMID_MR=1`, `GGML_CPU_MOE_FUSE=1`, `GGML_SCHED_SPLIT_ASYNC=1`, `LLAMA_PLE_HOST_GATHER=1`, `LLAMA_PLE_DIRECT_IO=1`, `LLAMA_GRAPH_PER_WIDTH=1`, `TURBO_QSA_CHUNK=64`, `SPEC_MTP_COST=1`, `LLAMA_MTP_ATTN_WINDOW=32768` |
+| `trial-dma` | `trial` with `LLAMA_MOE_DMA_SHARE=auto` instead of the bridge (the two are exclusive) |
 
 - A variable that is set in the environment always wins over the profile (also `0` to turn one lever off).
-- `LLAMA_FLASHNEXT_FAST=NAME=VALUE,...` replaces the fast levers of `fast` (for tests; the safe items stay).
-- The safe items are read only by the code that owns them. The fast levers are read elsewhere with `getenv`, so while the
+- `LLAMA_FLASHNEXT_FAST=NAME=VALUE,...` replaces the levers of `fast`, `trial` and `trial-dma` (one lever per A/B arm; the
+  safe items stay, and `safe` ignores it).
+- The safe items are read only by the code that owns them. The other levers are read elsewhere with `getenv`, so while the
   model is loaded the profile puts them into the process environment (the `GGML_CPU_*` ones through
   `ggml_cpu_fn_set_switch`) and removes them when the model is freed. Switches that latch on first use keep their value.
 - The load log shows the decision: lines starting with `fn-auto:`.
@@ -27,7 +29,7 @@ qwen4exp with all experts on the GPU, runs exactly as before. Code: `src/llama-f
 | Variable | Profile value | Meaning |
 |---|---|---|
 | `LLAMA_FN_PLACEMENT` | `auto` | the routed experts of every trunk layer stay on the host; `user` keeps the overrides as given |
-| `LLAMA_MOE_HOT_PROFILE` | `<model>.moeprof` if that file exists, else `even` | `even`: no routing profile, the same number of slots in every layer, empty at start, filled by the adaptive set; `off` = no hot set |
+| `LLAMA_MOE_HOT_PROFILE` | `<model>.moeprof` if that file exists, else `even` | `even`: no routing profile, the same number of slots in every layer (the budget also holds each layer's zero slot), empty at start, filled by the adaptive set; `off` = no hot set |
 | `LLAMA_MOE_HOT_MIB` | `auto` | budget from free VRAM |
 | `LLAMA_MOE_HOT_FIT` | `1` | the VRAM fit below |
 | `LLAMA_MOE_HOT_ADAPT` | `1` | adaptive admission |
@@ -41,7 +43,8 @@ context is created after it; without MTP at the first decode, at the latest at t
 caches (turbot pool, indexer cache), the compute buffers (the QSA temporaries grow with `-ub`) and the draft context are
 allocated. Budget = min(free - margin, ceiling - used - margin):
 
-- ceiling: `LLAMA_MOE_HOT_CAP_MIB`, default total - max(1536 MiB, total / 8) = 28,531 MiB on a 32 GB card;
+- ceiling: `LLAMA_MOE_HOT_CAP_MIB`, default total - max(1536 MiB, total / 8), rounded down to 256 MiB: 28,416 MiB on a
+  32 GB card (under the 28,500 MiB the 5090 is run at);
 - margin: `LLAMA_MOE_HOT_HEADROOM_MIB`, default 768 MiB (CUDA graphs, pool growth, lazily loaded kernels).
 
 The log prints the breakdown (`moe-hot: VRAM fit ...`). Works at any `-c`, including 262144. `LLAMA_MOE_HOT_FIT=1`
