@@ -191,15 +191,19 @@ static size_t slot_file_ckpt_keep() {
     return n;
 }
 
+// [TAG_FN_RAM_FIT] the RAM fit's checkpoint budget per slot in bytes (0 = not set), used while
+// LLAMA_CTX_CHECKPOINT_BUDGET_MIB is not set
+static std::atomic<size_t> g_ckpt_budget_ram_fit{0};
+
 // the byte budget of the checkpoint ring: the same variable and default as [TAG_CKPT_BYTE_BUDGET] in
 // create_checkpoint(), 0 = no byte bound (count only)
 static size_t slot_file_ckpt_budget_bytes() {
-    static const size_t n = [] {
-        const char * e = getenv("LLAMA_CTX_CHECKPOINT_BUDGET_MIB");
-        const size_t mib = e ? (size_t) strtoull(e, nullptr, 10) : 2048;
-        return mib * 1024 * 1024;
-    }();
-    return n;
+    static const char * const e = getenv("LLAMA_CTX_CHECKPOINT_BUDGET_MIB");
+    if (e) {
+        return (size_t) strtoull(e, nullptr, 10) * 1024 * 1024;
+    }
+    const size_t fit = g_ckpt_budget_ram_fit.load();
+    return fit ? fit : (size_t) 2048 * 1024 * 1024;
 }
 
 static constexpr uint32_t SLOT_FILE_CKPT_MAGIC      = 0x4b43534cu; // "LSCK" in the file
@@ -2151,6 +2155,89 @@ private:
         return true;
     }
 
+    // [TAG_FN_RAM_FIT] a model bigger than RAM (mmap): when the host-resident model bytes, the host buffers, the prompt
+    // cache and the context checkpoints need more than 85% of physical RAM, lower the checkpoint budget (not below 512 MiB
+    // per slot) and then the prompt cache, so the mapped expert pages stay in the page cache. On by default for the
+    // qwen4exp automatic profile (LLAMA_FLASHNEXT_PROFILE); LLAMA_RAM_FIT=1 turns it on for any model, =0 off.
+    // --cache-ram, --ctx-checkpoints and LLAMA_CTX_CHECKPOINT_BUDGET_MIB given by the user are kept.
+    // LLAMA_RAM_FIT_PCT=<percent of RAM> (85), LLAMA_RAM_FIT_CKPT_MIB=<minimum checkpoint MiB per slot> (512).
+    void ram_fit_apply() {
+        g_ckpt_budget_ram_fit = 0; // a resumed server plans again
+        const char * rf = llama_model_fn_env(model_tgt, "LLAMA_RAM_FIT");
+        if (!rf || atoi(rf) == 0) {
+            return;
+        }
+        ggml_backend_dev_t cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+        size_t ram_free  = 0;
+        size_t ram_total = 0;
+        if (cpu) {
+            ggml_backend_dev_memory(cpu, &ram_free, &ram_total);
+        }
+        if (ram_total == 0) {
+            SRV_WRN("%s", "RAM fit: the physical RAM size is unknown, nothing is capped\n");
+            return;
+        }
+
+        llama_ram_fit_in in;
+        in.ram_total = ram_total;
+        auto add_ctx = [&](llama_context * c, bool count_model) {
+            if (!c) {
+                return;
+            }
+            for (const auto & [buft, mb] : llama_get_memory_breakdown(c)) {
+                if (!buft || !ggml_backend_buft_is_host(buft)) {
+                    continue;
+                }
+                if (count_model) {
+                    in.model_host += mb.model;
+                }
+                in.host_buffers += mb.context + mb.compute;
+            }
+        };
+        add_ctx(ctx_tgt, true);
+        add_ctx(ctx_dft, model_dft != nullptr && model_dft != model_tgt);
+
+        const char * cb = getenv("LLAMA_CTX_CHECKPOINT_BUDGET_MIB");
+        in.cache_ram_mib = params_base.cache_ram_mib;
+        in.cache_ram_set = params_base.cache_ram_mib_set;
+        in.ckpt_mib      = params_base.n_ctx_checkpoints > 0 ? (cb ? (int64_t) strtoll(cb, nullptr, 10) : 2048) : 0;
+        in.ckpt_set      = params_base.n_ctx_checkpoints_set || cb != nullptr;
+        in.n_slots       = std::max(1, params_base.n_parallel);
+        if (const char * e = getenv("LLAMA_RAM_FIT_PCT"); e && atof(e) > 0) {
+            in.frac = atof(e) / 100.0;
+        }
+        if (const char * e = getenv("LLAMA_RAM_FIT_CKPT_MIB"); e && atoi(e) > 0) {
+            in.ckpt_min_mib = atoi(e);
+        }
+
+        const llama_ram_fit_out out = llama_ram_fit_plan(in);
+        const double GiB = 1024.0 * 1024.0 * 1024.0;
+        const std::string cache_s = in.cache_ram_mib < 0 ? std::string("unlimited") : std::to_string(in.cache_ram_mib) + " MiB";
+        if (!out.over) {
+            SRV_INF("RAM fit: host-resident model %.1f GiB + host buffers %.1f GiB + prompt cache %s + checkpoints %lld MiB x %d "
+                    "fit in %.0f%% of %.1f GiB RAM\n", in.model_host / GiB, in.host_buffers / GiB, cache_s.c_str(),
+                    (long long) in.ckpt_mib, in.n_slots, in.frac * 100.0, in.ram_total / GiB);
+            return;
+        }
+        SRV_WRN("RAM fit: host-resident model %.1f GiB + host buffers %.1f GiB + prompt cache %s + checkpoints %lld MiB x %d "
+                "= %.1f GiB, more than %.0f%% of %.1f GiB RAM: mapped expert pages would be evicted\n", in.model_host / GiB,
+                in.host_buffers / GiB, cache_s.c_str(), (long long) in.ckpt_mib, in.n_slots, out.need / GiB, in.frac * 100.0,
+                in.ram_total / GiB);
+        if (out.cache_ram_mib != in.cache_ram_mib) {
+            SRV_WRN("RAM fit: prompt cache %s -> %lld MiB (--cache-ram sets it)\n", cache_s.c_str(), (long long) out.cache_ram_mib);
+            params_base.cache_ram_mib = (int32_t) out.cache_ram_mib;
+        } else if (in.cache_ram_set && in.cache_ram_mib != 0) {
+            SRV_WRN("RAM fit: prompt cache %s kept (--cache-ram given)\n", cache_s.c_str());
+        }
+        if (out.ckpt_mib != in.ckpt_mib) {
+            SRV_WRN("RAM fit: context checkpoints %lld -> %lld MiB per slot (LLAMA_CTX_CHECKPOINT_BUDGET_MIB or --ctx-checkpoints set them)\n",
+                    (long long) in.ckpt_mib, (long long) out.ckpt_mib);
+            g_ckpt_budget_ram_fit = (size_t) std::max<int64_t>(1, out.ckpt_mib) * 1024 * 1024;
+        } else if (in.ckpt_set && in.ckpt_mib != 0) {
+            SRV_WRN("%s", "RAM fit: context checkpoints kept (--ctx-checkpoints or LLAMA_CTX_CHECKPOINT_BUDGET_MIB given)\n");
+        }
+    }
+
     // load the model and initialize llama_context
     // this may also be called to resume from sleeping state
     bool load_model(common_params & params) {
@@ -2563,6 +2650,8 @@ private:
             const int32_t n_embd  = llama_model_n_embd_inp(model_tgt);
             batch.init(ctx_tgt, std::max(n_batch, params_base.n_parallel), n_embd);
         }
+
+        ram_fit_apply(); // [TAG_FN_RAM_FIT] before the prompt cache is created
 
         if (params_base.cache_ram_mib != 0) {
             if (params_base.cache_ram_mib < 0) {
@@ -4617,13 +4706,10 @@ private:
         size_t n_ckpt_max = (size_t) params_base.n_ctx_checkpoints;
 
         if (!slot.prompt.checkpoints.empty()) {
-            static const size_t budget_bytes = [] {
-                const char * e = getenv("LLAMA_CTX_CHECKPOINT_BUDGET_MIB");
-                // Default 2048 MiB. On this model that is 13 checkpoints instead of 32,
-                // which is still twice the depth reached in real coding sessions.
-                const size_t mib = e ? (size_t) strtoull(e, nullptr, 10) : 2048;
-                return mib * 1024 * 1024;
-            }();
+            // Default 2048 MiB. On this model that is 13 checkpoints instead of 32,
+            // which is still twice the depth reached in real coding sessions.
+            // [TAG_FN_RAM_FIT] lower when the RAM fit capped it at load
+            const size_t budget_bytes = slot_file_ckpt_budget_bytes();
 
             const size_t one = slot.prompt.checkpoints.back().size();
 

@@ -412,6 +412,12 @@ private:
     // [TAG_MOE_BRIDGE] LLAMA_MOE_BRIDGE=1: the host doorbell of the host-resident expert layers (llama-moe-bridge.h)
     struct llama_moe_bridge * moe_bridge = nullptr;
 
+    // [TAG_FN_VRAM_FIT] the hot set waits for the first decode after every context of the model exists (the MTP draft
+    // context is created after this one), then takes what the model, KV, compute buffers and draft context left
+    bool     moe_hot_pending = false;
+    uint32_t moe_hot_waits   = 0;
+    void     moe_hot_fit_try();
+
     llm_graph_result * get_gf_res_prev(const llama_ubatch & ubatch);
     void gf_res_prev_reset_all();
 

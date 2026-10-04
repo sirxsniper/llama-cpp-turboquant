@@ -1,5 +1,6 @@
 #include "llama-moecache.h"
 
+#include "llama-fn-auto.h" // [TAG_FN_AUTO]
 #include "llama-impl.h"
 #include "llama-model.h"
 
@@ -200,9 +201,10 @@ void llama_moe_cache_init(const llama_model & model, int32_t n_slots, int32_t ma
         return;
     }
     // [TAG_FN_MOE_HOT] a hot profile replaces the LRU cache; llama_moe_hot_init builds it after the scheduler reserve
-    if (const char * hp = getenv("LLAMA_MOE_HOT_PROFILE"); hp && hp[0]) {
+    // [TAG_FN_AUTO] from the environment or the model's automatic profile
+    if (llama_moe_hot_wanted(model)) {
         if (n_slots > 0) {
-            LLAMA_LOG_WARN("%s: LLAMA_MOE_HOT_PROFILE is set, --moe-expert-cache %d is ignored\n", __func__, n_slots);
+            LLAMA_LOG_WARN("%s: a MoE hot set is configured, --moe-expert-cache %d is ignored\n", __func__, n_slots);
         }
         return;
     }
@@ -810,25 +812,25 @@ void hot_adapt_step(moe_cache * mc) {
     }
 }
 
-void hot_adapt_init(moe_cache * mc, const void * owner, ggml_backend_dev_t dev) {
+void hot_adapt_init(moe_cache * mc, const llama_model & model, const void * owner, ggml_backend_dev_t dev) {
     if (!owner || !dev || !mc->tbl_all) {
         LLAMA_LOG_WARN("moe-hot: LLAMA_MOE_HOT_ADAPT needs one device and equal expert counts - static hot set only\n");
         return;
     }
-    if (const char * e = getenv("LLAMA_MOE_HOT_ADMIT")) { // N/W
+    if (const char * e = llama_fn_env(model, "LLAMA_MOE_HOT_ADMIT")) { // N/W
         int n = 0, w = 0;
         if (sscanf(e, "%d/%d", &n, &w) == 2 && n >= 1 && w >= n && w <= 256) {
             mc->ad_min = n;
             mc->ad_win = w;
         }
     }
-    if (const char * e = getenv("LLAMA_MOE_HOT_ADAPT_MIB")) {
+    if (const char * e = llama_fn_env(model, "LLAMA_MOE_HOT_ADAPT_MIB")) {
         mc->ad_bytes = (size_t) std::max(1, atoi(e)) << 20;
     }
-    if (const char * e = getenv("LLAMA_MOE_HOT_HYST")) {
+    if (const char * e = llama_fn_env(model, "LLAMA_MOE_HOT_HYST")) {
         mc->ad_hyst = std::max(0, atoi(e));
     }
-    if (const char * e = getenv("LLAMA_MOE_HOT_VERIFY")) {
+    if (const char * e = llama_fn_env(model, "LLAMA_MOE_HOT_VERIFY")) {
         mc->ad_verify = std::max(0, atoi(e));
     }
 
@@ -872,9 +874,67 @@ int llama_moe_hot_max_t() {
     return mc && mc->hot ? mc->hot_max_t : 0;
 }
 
-bool llama_moe_hot_init(const llama_model & model, const void * owner) {
-    const char * path = getenv("LLAMA_MOE_HOT_PROFILE");
-    if (!path || !path[0]) {
+namespace {
+
+// host-resident expert layers with a device-resident router (the same rule as the LRU cache). A context of a model
+// whose weights are not loaded (memory estimation) finds none.
+std::vector<int> hot_host_layers(const llama_model & model) {
+    std::vector<int> out;
+    for (size_t il = 0; il < model.layers.size(); ++il) {
+        const auto & l = model.layers[il];
+        if (l.ffn_up_exps && l.ffn_gate_exps && l.ffn_down_exps && l.ffn_gate_inp && !l.ffn_gate_up_exps &&
+                l.ffn_up_exps->data && l.ffn_up_exps->buffer && ggml_backend_buffer_is_host(l.ffn_up_exps->buffer) &&
+                l.ffn_gate_inp->buffer && !ggml_backend_buffer_is_host(l.ffn_gate_inp->buffer)) {
+            out.push_back((int) il);
+        }
+    }
+    return out;
+}
+
+// [TAG_FN_AUTO] LLAMA_MOE_HOT_PROFILE unset, empty, off, 0 or none: no hot set
+bool hot_profile_off(const char * p) {
+    return !p || !p[0] || strcmp(p, "off") == 0 || strcmp(p, "0") == 0 || strcmp(p, "none") == 0;
+}
+
+} // namespace
+
+bool llama_moe_hot_wanted(const llama_model & model) {
+    return !hot_profile_off(llama_fn_env(model, "LLAMA_MOE_HOT_PROFILE"));
+}
+
+bool llama_moe_hot_fit_wanted(const llama_model & model) {
+    if (!llama_moe_hot_wanted(model)) {
+        return false;
+    }
+    const char * mib = llama_fn_env(model, "LLAMA_MOE_HOT_MIB");
+    const char * fit = llama_fn_env(model, "LLAMA_MOE_HOT_FIT");
+    return mib && strcmp(mib, "auto") == 0 && fit && atoi(fit) != 0;
+}
+
+ggml_backend_dev_t llama_moe_hot_device(const llama_model & model) {
+    const std::vector<int> hl = hot_host_layers(model);
+    if (hl.empty()) {
+        return nullptr;
+    }
+    return ggml_backend_buft_get_device(ggml_backend_buffer_get_type(model.layers[hl[0]].ffn_gate_inp->buffer));
+}
+
+size_t llama_moe_hot_device_bytes() {
+    const moe_cache * mc = g_cache;
+    if (!mc || !mc->hot) {
+        return 0;
+    }
+    size_t b = 0;
+    for (const auto & ls : mc->layers) {
+        b += ggml_nbytes(ls.pub.up_c) + ggml_nbytes(ls.pub.gate_c) + ggml_nbytes(ls.pub.down_c);
+    }
+    return b;
+}
+
+bool llama_moe_hot_init(const llama_model & model, const void * owner, size_t budget_bytes) {
+    // [TAG_FN_AUTO] every variable through llama_fn_env(): the environment, else the model's automatic profile
+    const char * path = llama_fn_env(model, "LLAMA_MOE_HOT_PROFILE");
+    if (hot_profile_off(path)) {
         return false;
     }
     std::lock_guard<std::mutex> init_lock(g_init_mtx);
@@ -882,17 +942,7 @@ bool llama_moe_hot_init(const llama_model & model, const void * owner) {
         return false;
     }
 
-    // host-resident expert layers with a device-resident router (the same rule as the LRU cache). A context of a
-    // model whose weights are not loaded (memory estimation) finds none and leaves the one attempt to a later context.
-    std::vector<int> host_layers;
-    for (size_t il = 0; il < model.layers.size(); ++il) {
-        const auto & l = model.layers[il];
-        if (l.ffn_up_exps && l.ffn_gate_exps && l.ffn_down_exps && l.ffn_gate_inp && !l.ffn_gate_up_exps &&
-                l.ffn_up_exps->data && l.ffn_up_exps->buffer && ggml_backend_buffer_is_host(l.ffn_up_exps->buffer) &&
-                l.ffn_gate_inp->buffer && !ggml_backend_buffer_is_host(l.ffn_gate_inp->buffer)) {
-            host_layers.push_back((int) il);
-        }
-    }
+    const std::vector<int> host_layers = hot_host_layers(model);
     if (host_layers.empty()) {
         LLAMA_LOG_WARN("moe-hot: no host-resident expert layer (all experts on a device?) - hot set off\n");
         return false;
@@ -900,11 +950,11 @@ bool llama_moe_hot_init(const llama_model & model, const void * owner) {
     g_init_done = true; // one attempt per process: on any failure below the model runs without a hot set
 
     int max_t = 8;
-    if (const char * e = getenv("LLAMA_MOE_HOT_MAX_T")) {
+    if (const char * e = llama_fn_env(model, "LLAMA_MOE_HOT_MAX_T")) {
         max_t = std::max(1, std::min(8, atoi(e)));
     }
     std::map<std::string, double> cost = { { "q5_1", 1.3 } };
-    if (const char * e = getenv("LLAMA_MOE_HOT_COST")) {
+    if (const char * e = llama_fn_env(model, "LLAMA_MOE_HOT_COST")) {
         std::stringstream ss(e);
         std::string kv;
         while (std::getline(ss, kv, ',')) {
@@ -914,11 +964,33 @@ bool llama_moe_hot_init(const llama_model & model, const void * owner) {
             }
         }
     }
-    const char * sec_env = getenv("LLAMA_MOE_HOT_SECTION");
+    const bool adapt_req = [&]() {
+        const char * ad = llama_fn_env(model, "LLAMA_MOE_HOT_ADAPT");
+        return ad && atoi(ad) != 0;
+    }();
+
+    // [TAG_FN_AUTO] "even": no routing profile; equal slot counts, empty at start, filled by the adaptive set
+    bool even = strcmp(path, "even") == 0;
+    const char * sec_env = llama_fn_env(model, "LLAMA_MOE_HOT_SECTION");
     std::map<int, std::vector<double>> prof;
     std::string sec_used;
-    if (!hot_read_profile(path, sec_env ? sec_env : "decode_union", prof, sec_used)) {
+    if (!even && !hot_read_profile(path, sec_env ? sec_env : "decode_union", prof, sec_used)) {
+        if (!adapt_req) {
+            return false;
+        }
+        LLAMA_LOG_WARN("moe-hot: the profile %s cannot be used - even slots, filled by the adaptive set\n", path);
+        even = true;
+        prof.clear();
+    }
+    if (even && !adapt_req) {
+        LLAMA_LOG_WARN("moe-hot: LLAMA_MOE_HOT_PROFILE=even needs LLAMA_MOE_HOT_ADAPT=1 (only the adaptive set fills the slots) - hot set off\n");
         return false;
+    }
+    if (even) {
+        sec_used = "none (even slots)";
+        for (int il : host_layers) {
+            prof[il] = std::vector<double>((size_t) model.layers[il].ffn_up_exps->ne[2], 0.0);
+        }
     }
 
     struct cand_layer {
@@ -951,41 +1023,43 @@ bool llama_moe_hot_init(const llama_model & model, const void * owner) {
     }
 
     // budget
-    size_t budget = 0;
-    const char * mib = getenv("LLAMA_MOE_HOT_MIB");
-    if (mib && strcmp(mib, "auto") == 0) {
-        size_t headroom = 1536;
-        if (const char * e = getenv("LLAMA_MOE_HOT_HEADROOM_MIB")) {
-            headroom = (size_t) std::max(0, atoi(e));
+    size_t budget = budget_bytes; // [TAG_FN_VRAM_FIT] the caller's fit, logged there
+    if (budget == 0) {
+        const char * mib = llama_fn_env(model, "LLAMA_MOE_HOT_MIB");
+        if (mib && strcmp(mib, "auto") == 0) {
+            size_t headroom = 1536;
+            if (const char * e = llama_fn_env(model, "LLAMA_MOE_HOT_HEADROOM_MIB")) {
+                headroom = (size_t) std::max(0, atoi(e));
+            }
+            ggml_backend_dev_t dev = ggml_backend_buft_get_device(layers[0].buft);
+            size_t mem_free = 0, mem_total = 0;
+            if (dev) {
+                ggml_backend_dev_memory(dev, &mem_free, &mem_total);
+            }
+            budget = mem_free > (headroom << 20) ? mem_free - (headroom << 20) : 0;
+            // LLAMA_MOE_HOT_CAP_MIB: keep device use (all processes) at or below this, e.g. 28500 on a 32 GB card whose
+            // decode degrades above ~28.5 GB well before it spills
+            if (const char * e = llama_fn_env(model, "LLAMA_MOE_HOT_CAP_MIB"); e && atoi(e) > 0) {
+                const size_t cap  = (size_t) atoi(e) << 20;
+                const size_t used = mem_total > mem_free ? mem_total - mem_free : 0;
+                const size_t room = cap > used + (headroom << 20) ? cap - used - (headroom << 20) : 0;
+                budget = std::min(budget, room);
+            }
+            LLAMA_LOG_INFO("moe-hot: auto budget %.0f MiB: %.0f MiB free of %.0f, %zu MiB headroom\n", budget/1048576.0,
+                    mem_free/1048576.0, mem_total/1048576.0, headroom);
+        } else if (mib) {
+            budget = (size_t) (std::max(0.0, atof(mib))*1048576.0);
         }
-        ggml_backend_dev_t dev = ggml_backend_buft_get_device(layers[0].buft);
-        size_t mem_free = 0, mem_total = 0;
-        if (dev) {
-            ggml_backend_dev_memory(dev, &mem_free, &mem_total);
-        }
-        budget = mem_free > (headroom << 20) ? mem_free - (headroom << 20) : 0;
-        // LLAMA_MOE_HOT_CAP_MIB: keep device use (all processes) at or below this, e.g. 28500 on a 32 GB card whose
-        // decode degrades above ~28.5 GB well before it spills
-        if (const char * e = getenv("LLAMA_MOE_HOT_CAP_MIB"); e && atoi(e) > 0) {
-            const size_t cap  = (size_t) atoi(e) << 20;
-            const size_t used = mem_total > mem_free ? mem_total - mem_free : 0;
-            const size_t room = cap > used + (headroom << 20) ? cap - used - (headroom << 20) : 0;
-            budget = std::min(budget, room);
-        }
-        LLAMA_LOG_INFO("moe-hot: auto budget %.0f MiB: %.0f MiB free of %.0f, %zu MiB headroom\n", budget/1048576.0,
-                mem_free/1048576.0, mem_total/1048576.0, headroom);
-    } else if (mib) {
-        budget = (size_t) (std::max(0.0, atof(mib))*1048576.0);
     }
     if (budget == 0) {
-        LLAMA_LOG_WARN("moe-hot: LLAMA_MOE_HOT_MIB is unset or 0 - hot set off\n");
+        LLAMA_LOG_WARN("moe-hot: the budget is 0 (LLAMA_MOE_HOT_MIB unset or 0, or no VRAM left) - hot set off\n");
         return false;
     }
 
     // greedy by count x cost per byte (all experts of a layer have the same size)
     struct cand_expert { double value; int li; int e; };
     std::vector<cand_expert> cands;
-    for (int li = 0; li < (int) layers.size(); ++li) {
+    for (int li = 0; li < (int) layers.size() && !even; ++li) {
         const auto & v = prof[layers[li].il];
         for (int e = 0; e < (int) v.size(); ++e) {
             if (v[e] > 0) {
@@ -1011,17 +1085,34 @@ bool llama_moe_hot_init(const llama_model & model, const void * owner) {
 
     for (int attempt = 0; attempt < 32 && budget > 0; ++attempt) {
         std::vector<std::vector<int32_t>> hot_ids(layers.size());
+        std::vector<int32_t>              n_slots_of(layers.size(), 0);
         size_t used = 0;
-        for (const auto & c : cands) {
-            const size_t b = layers[c.li].bytes;
-            if (used + b > budget) {
-                continue;
+        if (even) {
+            // [TAG_FN_AUTO] the same slot count in every host layer
+            std::vector<size_t> bytes;
+            int32_t n_exp_min = INT32_MAX;
+            for (const auto & c : layers) {
+                bytes.push_back(c.bytes);
+                n_exp_min = std::min<int32_t>(n_exp_min, (int32_t) c.l->ffn_up_exps->ne[2]);
             }
-            used += b;
-            hot_ids[c.li].push_back(c.e);
-        }
-        for (auto & v : hot_ids) {
-            std::sort(v.begin(), v.end());
+            const int32_t n = llama_fn_even_slots(bytes, budget, n_exp_min);
+            for (size_t li = 0; li < layers.size(); ++li) {
+                n_slots_of[li] = n;
+                used += (size_t) n*layers[li].bytes;
+            }
+        } else {
+            for (const auto & c : cands) {
+                const size_t b = layers[c.li].bytes;
+                if (used + b > budget) {
+                    continue;
+                }
+                used += b;
+                hot_ids[c.li].push_back(c.e);
+            }
+            for (size_t li = 0; li < layers.size(); ++li) {
+                std::sort(hot_ids[li].begin(), hot_ids[li].end());
+                n_slots_of[li] = (int32_t) hot_ids[li].size();
+            }
         }
 
         free_all();
@@ -1030,7 +1121,7 @@ bool llama_moe_hot_init(const llama_model & model, const void * owner) {
         std::map<ggml_backend_buffer_type_t, std::vector<int>> groups;
         size_t n_hot_layers = 0;
         for (int li = 0; li < (int) layers.size(); ++li) {
-            if (!hot_ids[li].empty()) {
+            if (n_slots_of[li] > 0) {
                 groups[layers[li].buft].push_back(li);
                 n_hot_layers++;
             }
@@ -1075,7 +1166,7 @@ bool llama_moe_hot_init(const llama_model & model, const void * owner) {
             int64_t k = 0;
             for (int li : g.second) {
                 const llama_layer * l = layers[li].l;
-                const int32_t n_hot = (int32_t) hot_ids[li].size();
+                const int32_t n_hot = n_slots_of[li];
                 mc->layers.push_back({});
                 layer_state & ls = mc->layers.back();
                 state_of.push_back({ li, mc->layers.size() - 1 });
@@ -1146,18 +1237,23 @@ bool llama_moe_hot_init(const llama_model & model, const void * owner) {
             ggml_backend_tensor_set(ls.pub.host_table, tbl.data(), 0, n_exp*sizeof(int32_t));
             mc->by_up_src[ls.pub.up_src] = si;
 
-            // [TAG_FN_MOE_HOT_ADAPT] bookkeeping, used only by the adaptive set
-            ls.slot_expert = ids;
+            // [TAG_FN_MOE_HOT_ADAPT] bookkeeping, used only by the adaptive set; [TAG_FN_AUTO] slots past ids stay empty
+            ls.slot_expert.assign(ls.pub.n_slots, -1);
             ls.expert_slot.assign(n_exp, -1);
             for (int32_t s = 0; s < (int32_t) ids.size(); ++s) {
+                ls.slot_expert[s]      = ids[s];
                 ls.expert_slot[ids[s]] = s;
             }
-            ls.slot_in_flight.assign(ids.size(), false);
+            ls.slot_in_flight.assign(ls.pub.n_slots, false);
             ls.expert_in_flight.assign(n_exp, false);
             ls.prof = prof[ls.pub.il];
 
             const size_t lb = ggml_nbytes(ls.pub.up_c) + ggml_nbytes(ls.pub.gate_c) + ggml_nbytes(ls.pub.down_c);
             vram += lb;
+            if (even) {
+                LLAMA_LOG_DEBUG("moe-hot: blk.%-2d n_hot %3d  empty  %7.1f MiB\n", ls.pub.il, ls.pub.n_slots, lb/1048576.0);
+                continue;
+            }
             const auto & v = prof[ls.pub.il];
             double hit = 0.0, all = 0.0;
             for (size_t e = 0; e < v.size(); ++e) {
@@ -1167,11 +1263,15 @@ bool llama_moe_hot_init(const llama_model & model, const void * owner) {
             LLAMA_LOG_INFO("moe-hot: blk.%-2d n_hot %3d  profile hit %.3f  %7.1f MiB\n", ls.pub.il, ls.pub.n_slots,
                     all > 0 ? hit/all : 0.0, lb/1048576.0);
         }
+        if (even) {
+            LLAMA_LOG_INFO("moe-hot: %zu layers x %d empty slots, the adaptive set fills them from the routing\n",
+                    mc->layers.size(), mc->layers.front().pub.n_slots);
+        }
         LLAMA_LOG_INFO("moe-hot: %zu layers, %.1f MiB device memory (budget %.0f MiB), uploaded in %.1f s, section %s of %s, "
                 "graphs of <= %d tokens\n", mc->layers.size(), vram/1048576.0, budget/1048576.0, (ggml_time_us() - t0)/1e6,
                 sec_used.c_str(), path, max_t);
 
-        if (const char * st = getenv("LLAMA_MOE_HOT_STATS"); st && atoi(st) != 0) {
+        if (const char * st = llama_fn_env(model, "LLAMA_MOE_HOT_STATS"); st && atoi(st) != 0) {
             mc->ad_stats = true;
             g_hot_stats.hit.assign(model.layers.size(), 0);
             g_hot_stats.tot.assign(model.layers.size(), 0);
@@ -1181,8 +1281,13 @@ bool llama_moe_hot_init(const llama_model & model, const void * owner) {
             }
         }
 
-        if (const char * ad = getenv("LLAMA_MOE_HOT_ADAPT"); ad && atoi(ad) != 0) {
-            hot_adapt_init(mc, owner, groups.size() == 1 ? ggml_backend_buft_get_device(groups.begin()->first) : nullptr);
+        if (adapt_req) {
+            hot_adapt_init(mc, model, owner, groups.size() == 1 ? ggml_backend_buft_get_device(groups.begin()->first) : nullptr);
+        }
+        if (even && !mc->adapt) {
+            // [TAG_FN_AUTO] nothing would ever fill the empty slots
+            LLAMA_LOG_WARN("moe-hot: the adaptive set could not start, so the even slots would stay empty - hot set off\n");
+            break;
         }
 
         if (mc->ad_stats || mc->adapt) {

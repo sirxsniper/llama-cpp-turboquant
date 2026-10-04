@@ -632,6 +632,8 @@ struct llama_prec_policy {
     void load(llama_model_loader & ml, const llama_model & model);
 };
 
+struct llama_fn_auto_state; // [TAG_FN_AUTO] src/llama-fn-auto.h
+
 struct llama_model {
     llm_type type = LLM_TYPE_UNKNOWN;
     llm_arch arch = LLM_ARCH_UNKNOWN;
@@ -747,6 +749,9 @@ struct llama_model {
 
     int64_t t_load_us  = 0;
     int64_t t_start_us = 0;
+
+    // [TAG_FN_AUTO] automatic qwen4exp defaults (LLAMA_FLASHNEXT_PROFILE), nullptr for every other model
+    std::shared_ptr<llama_fn_auto_state> fn_auto;
 
     explicit llama_model(const llama_model_params & params);
     virtual ~llama_model();

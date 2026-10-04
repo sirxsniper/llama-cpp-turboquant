@@ -8207,9 +8207,14 @@ struct test_moe_hot_chain : public test_case {
     const int       n_hot;
     const int       n_used;
     const int       n_tokens;
+    const int       n_resident; // [TAG_FN_AUTO] slots the table maps to (-1: all n_hot); 0 = the empty start of even slots
 
     std::string vars() override {
-        return VARS_TO_STR7(type_a, k, m, n_expert, n_hot, n_used, n_tokens);
+        std::string v = VARS_TO_STR7(type_a, k, m, n_expert, n_hot, n_used, n_tokens);
+        if (n_resident >= 0) {
+            v += "," + VAR_TO_STR(n_resident);
+        }
+        return v;
     }
 
     double max_nmse_err() override {
@@ -8217,8 +8222,9 @@ struct test_moe_hot_chain : public test_case {
     }
 
     test_moe_hot_chain(ggml_type type_a = GGML_TYPE_Q4_K, int64_t k = 2560, int64_t m = 640,
-            int n_expert = 512, int n_hot = 96, int n_used = 10, int n_tokens = 3)
-        : type_a(type_a), k(k), m(m), n_expert(n_expert), n_hot(n_hot), n_used(n_used), n_tokens(n_tokens) {}
+            int n_expert = 512, int n_hot = 96, int n_used = 10, int n_tokens = 3, int n_resident = -1)
+        : type_a(type_a), k(k), m(m), n_expert(n_expert), n_hot(n_hot), n_used(n_used), n_tokens(n_tokens),
+          n_resident(n_resident) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * slots = ggml_new_tensor_3d(ctx, type_a, k, m, n_hot + 1);
@@ -8249,11 +8255,13 @@ struct test_moe_hot_chain : public test_case {
                 ggml_backend_tensor_set(t, zero.data(), (size_t) n_hot*t->nb[2], t->nb[2]);
             } else if (name == "table") {
                 // n_hot experts get a slot, all others the zero slot n_hot
+                // [TAG_FN_AUTO] n_resident >= 0: only that many slots hold an expert, the rest stay empty
                 std::vector<int32_t> perm(n_expert);
                 std::iota(perm.begin(), perm.end(), 0);
                 std::shuffle(perm.begin(), perm.end(), rng);
                 std::vector<int32_t> tbl(n_expert, n_hot);
-                for (int s = 0; s < n_hot; ++s) {
+                const int n_res = n_resident >= 0 ? std::min(n_resident, n_hot) : n_hot;
+                for (int s = 0; s < n_res; ++s) {
                     tbl[perm[s]] = s;
                 }
                 ggml_backend_tensor_set(t, tbl.data(), 0, tbl.size()*sizeof(int32_t));
@@ -14346,9 +14354,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_moe_hot_chain(GGML_TYPE_Q8_0, 640, 2560, 512, 8, 10, t));
     }
 
+    // [TAG_FN_AUTO] [TAG_FN_VRAM_FIT] the hot chain of the automatic profile at -c 262144 on a 32 GB card: the VRAM fit
+    // leaves about 12.1 GB, which even slots spread as 84 per layer (tests/test-fn-auto.cpp); gate/up q4_K, down q5_1 and
+    // q8_0; the adaptive set starts empty (every id to the zero slot), then fills
+    for (int t : {1, 2, 3}) {
+        for (int n_res : {0, 42, -1}) {
+            test_cases.emplace_back(new test_moe_hot_chain(GGML_TYPE_Q4_K, 2560, 640, 512, 84, 10, t, n_res));
+            test_cases.emplace_back(new test_moe_hot_chain(GGML_TYPE_Q5_1, 640, 2560, 512, 84, 10, t, n_res));
+            test_cases.emplace_back(new test_moe_hot_chain(GGML_TYPE_Q8_0, 640, 2560, 512, 84, 10, t, n_res));
+        }
+    }
+    test_cases.emplace_back(new test_moe_hot_chain(GGML_TYPE_Q4_K, 2560, 640, 512, 84, 10, 8, 0)); // 2 streams, empty
+
     // [TAG_FN_QSA_CHUNK] TURBO_QSA_CHUNK=64: indexer top-k of a 64-query chunk over n_kv cells, the chunks' indices
     // concatenated along the query axis (i32), and the chunk's mask rows cast to f32
-    for (int64_t n_kv : {4096, 16384, 65536}) {
+    // [TAG_FN_AUTO] 262144 = the fast profile at the owner's -c 262144
+    for (int64_t n_kv : {4096, 16384, 65536, 262144}) {
         test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {n_kv, 64, 1, 1}, 2051));
         test_cases.emplace_back(new test_cpy(GGML_TYPE_F16, GGML_TYPE_F32, {n_kv, 64, 1, 1}));
     }

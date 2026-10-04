@@ -677,6 +677,8 @@ struct common_params {
     int32_t kv_unified_per_slot = 0;     // max context per parallel slot; 0 = unset
     int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
+    bool    cache_ram_mib_set     = false; // [TAG_FN_RAM_FIT] --cache-ram was given: the RAM fit keeps it
+    bool    n_ctx_checkpoints_set = false; // [TAG_FN_RAM_FIT] --ctx-checkpoints was given: the RAM fit keeps the checkpoints
 
     std::string public_path   = "";                                                                         // NOLINT
     std::string api_prefix    = "";                                                                         // NOLINT

@@ -316,6 +316,10 @@ llama_build_and_test(test-mtp-cost.cpp)
 llama_build(test-ple-dio.cpp ${CMAKE_CURRENT_SOURCE_DIR}/../src/llama-ple-dio.cpp)
 target_include_directories(test-ple-dio PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
 
+# [TAG_FN_AUTO] [TAG_FN_VRAM_FIT] [TAG_FN_RAM_FIT] the automatic qwen4exp defaults (src/llama-fn-auto.h): profiles, option
+# lookup and environment handling, expert placement detection, VRAM fit and RAM fit plans. CPU only, no model.
+llama_build_and_test(test-fn-auto.cpp)
+
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model")
 llama_build_and_test(test-autorelease.cpp       LABEL "model")
 llama_build_and_test(test-backend-sampler.cpp   LABEL "model")

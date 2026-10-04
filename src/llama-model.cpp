@@ -7,6 +7,7 @@
 #include "llama-mmap.h"
 #include "llama-cparams.h"
 #include "llama-model-loader.h"
+#include "llama-fn-auto.h" // [TAG_FN_AUTO]
 
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
@@ -1287,6 +1288,7 @@ llama_model::llama_model(const llama_model_params & params) : params(params), pi
 }
 
 llama_model::~llama_model() {
+    llama_fn_auto_on_free(*this); // [TAG_FN_AUTO] takes back what the profile put into the environment
     for (auto * lora : loras) {
         delete lora;
     }

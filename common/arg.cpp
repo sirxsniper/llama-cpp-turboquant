@@ -1767,6 +1767,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             "[(more info)](https://github.com/ggml-org/llama.cpp/pull/15293)", params.n_ctx_checkpoints),
         [](common_params & params, int value) {
             params.n_ctx_checkpoints = value;
+            params.n_ctx_checkpoints_set = true; // [TAG_FN_RAM_FIT]
         }
     ).set_env("LLAMA_ARG_CTX_CHECKPOINTS").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
@@ -1785,6 +1786,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             "[(more info)](https://github.com/ggml-org/llama.cpp/pull/16391)", params.cache_ram_mib),
         [](common_params & params, int value) {
             params.cache_ram_mib = value;
+            params.cache_ram_mib_set = true; // [TAG_FN_RAM_FIT]
         }
     ).set_env("LLAMA_ARG_CACHE_RAM").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
