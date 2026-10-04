@@ -51,6 +51,9 @@ struct common_speculative_output_limits {
 common_speculative_output_limits common_speculative_get_output_limits(
         int32_t n_batch, int32_t n_parallel, int32_t n_draft);
 
+// return true if the target and draft models have compatible vocabs
+bool common_speculative_are_compatible(const llama_model * model_tgt, const llama_model * model_dft);
+
 common_speculative * common_speculative_init(common_params_speculative & params, uint32_t n_seq);
 
 void common_speculative_free(common_speculative * spec);
@@ -75,10 +78,16 @@ struct common_speculative_draft_params {
     // the generated draft from the last _draft() call
     llama_tokens * result;
 
-    // optional sparse proposal distributions, one per draft token
+    // optional sparse proposal distributions, one per draft token: the drafters that sample their own proposal
+    // (DFlash2, draft-mtp with TURBO_MTP_DISTS) fill it at temp > 0 and the server verifies by maximal coupling
     std::vector<common_speculative_token_dist> * dists = nullptr;
 
-    float temperature = 0.0f;
+    // upstream #27694: candidate distribution per drafted token; set it to make draft-simple and draft-mtp sample
+    // (--spec-draft-sampling probabilistic), the server then verifies by rejection sampling
+    std::vector<std::vector<llama_token_data>> * result_q = nullptr;
+
+    // the target's temp and seed ([TAG_SYNC_1004] the fork's `temperature` and upstream's `temp` are one field)
+    float    temp = 1.0f;
     uint32_t seed = LLAMA_DEFAULT_SEED;
 
     // [TAG_DFL_QTRUNC] the request's truncation, for drafters that sample their own proposal (0 / 1 / 0 = none)
@@ -93,7 +102,7 @@ common_speculative_draft_params & common_speculative_get_draft_params(common_spe
 void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, const llama_tokens & prompt);
 
 // process the batch and update the internal state of the speculative context
-bool common_speculative_process(common_speculative * spec, const llama_batch & batch);
+bool common_speculative_process(common_speculative * spec, const common_batch & batch);
 
 // tell the speculative context how many prompt tokens still follow the ubatch that is
 // about to be passed to common_speculative_process(); 0 during generation. Lets a
@@ -111,7 +120,7 @@ void common_speculative_set_prefill_after_seq(common_speculative * spec, llama_s
 // per-layer inputs (llama_get_embeddings_layer_inp) for this batch, so the caller may disable
 // their extraction for the target decode of this batch. Ask AFTER publishing the per-sequence
 // prefill_after values above.
-bool common_speculative_prefill_will_skip(const common_speculative * spec, const llama_batch & batch);
+bool common_speculative_prefill_will_skip(const common_speculative * spec, const common_batch & batch);
 
 // true if any registered implementation actually reads dparams.prompt. Only the n-gram
 // drafters do; the model-based ones (dflash, mtp, eagle3, simple) never look at it, so the

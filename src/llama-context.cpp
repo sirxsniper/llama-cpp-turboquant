@@ -637,10 +637,11 @@ static bool llama_kv_resolve_attn_layer(const llama_model & model, llama_context
     const bool     mtp  = ctx_type == LLAMA_CONTEXT_TYPE_MTP;
 
     // dense MTP heads of hybrid models get a plain attention cache over the nextn layers
+    // [TAG_QWEN4EXP_MTP] [TAG_SYNC_1004] qwen4exp's MTP context keeps the hybrid indexer memory (upstream #29761),
+    // filtered to the nextn layers: see the QWEN4EXP case below
     const bool mtp_on_hybrid = mtp &&
         (arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE ||
-         arch == LLM_ARCH_BAILINGMOE3 || arch == LLM_ARCH_NEMOTRON_H_MOE ||
-         arch == LLM_ARCH_QWEN4EXP);   // [TAG_QWEN4EXP_MTP]
+         arch == LLM_ARCH_BAILINGMOE3 || arch == LLM_ARCH_NEMOTRON_H_MOE);
 
     if (llm_arch_is_hybrid(arch) && !mtp_on_hybrid) {
         switch (arch) {
@@ -649,10 +650,15 @@ static bool llama_kv_resolve_attn_layer(const llama_model & model, llama_context
             case LLM_ARCH_NEMOTRON_H:
             case LLM_ARCH_NEMOTRON_H_MOE:
                 return !hp.is_recr(il) && hp.n_ff(il) == 0;
+            case LLM_ARCH_QWEN4EXP:
+                // the MTP draft context holds the MTP block alone (create_memory, upstream #29761)
+                if (mtp) {
+                    return il >= hp.n_layer();
+                }
+                return il < hp.n_layer() && !hp.is_recr(il);
             case LLM_ARCH_QWEN3NEXT:
             case LLM_ARCH_QWEN35:
             case LLM_ARCH_QWEN35MOE:
-            case LLM_ARCH_QWEN4EXP:
             case LLM_ARCH_MINIMAX_01:
                 return il < hp.n_layer() && !hp.is_recr(il);
             default:
@@ -692,12 +698,11 @@ static bool llama_kv_resolve_turbo_graph(const llama_model & model, llama_contex
                 if (hp.indexer_head_size == 0) {
                     return true;
                 }
-                // [TAG_QWEN4EXP_MTP] an MTP context holds only the nextn block, and graph_mtp runs it through the
-                // dense build_attn (no indexer cache there), which applies the rotation
-                if (ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
-                    return true;
-                }
-                for (uint32_t il = 0; il < hp.n_layer_all && il < LLAMA_MAX_LAYERS; ++il) {
+                // [TAG_QWEN4EXP_MTP] [TAG_SYNC_1004] an MTP context holds only the nextn block, which upstream #29761
+                // runs as a QSA layer when its compress ratio is set (no forward WHT on Q there either)
+                const bool     mtp = ctx_type == LLAMA_CONTEXT_TYPE_MTP;
+                const uint32_t il0 = mtp ? hp.n_layer()   : 0;
+                for (uint32_t il = il0; il < hp.n_layer_all && il < LLAMA_MAX_LAYERS; ++il) {
                     if (hp.dsv4_compress_ratios[il] > 0) {
                         return false;
                     }
@@ -1184,6 +1189,7 @@ llama_context::llama_context(
 
     // initialized later
     cparams.pipeline_parallel = false;
+    cparams.training = false;
 
     {
         const char * LLAMA_GRAPH_REUSE_DISABLE = getenv("LLAMA_GRAPH_REUSE_DISABLE");
@@ -1542,10 +1548,7 @@ static int llama_graph_n_input_tensors(ggml_cgraph * gf) {
     }
 
     for (const auto & [tensor, nodes] : users) {
-        if (tensor->op != GGML_OP_NONE) {
-            LLAMA_LOG_WARN("%s: input tensor '%32s' has op %s, expected GGML_OP_NONE\n",
-                    __func__, tensor->name, ggml_op_name(tensor->op));
-        }
+        GGML_ASSERT(tensor->op == GGML_OP_NONE);
         for (const ggml_tensor * node : nodes) {
             LLAMA_LOG_DEBUG("%s: input tensor '%32s' [%s, ne = { %5" PRId64 ", %5" PRId64 ", %5" PRId64 ", %5" PRId64 " }] is used by node '%s' (%s)\n",
                     __func__, tensor->name, ggml_type_name(tensor->type),
@@ -1705,7 +1708,11 @@ void llama_context::sched_reserve() {
     }
 
     // reserve with tg (token generation) graph to get the number of splits and nodes
-    {
+    if (cparams.training) {
+        // no tg graph for training
+        n_splits_tg = n_splits_pp;
+        n_nodes_tg  = n_nodes_pp;
+    } else {
         auto * gf = graph_reserve(n_seqs, n_seqs, n_seqs, mctx.get(), model.hparams.no_alloc);
         if (!gf) {
             throw std::runtime_error("failed to allocate compute tg buffers");
@@ -2390,7 +2397,18 @@ void llama_context::set_causal_attn(bool value) {
 
     cparams.causal_attn = value;
 
-    sched_need_reserve = true;
+    // no scheduler reserve needed because graph shapes must not depend on causal_attn, a flip only rebuilds the graph
+    // [TAG_FA_POS_MASK] [TAG_SYNC_1004] Here they can: causal flash attention over one stream takes the positional
+    // mask (two I32 rows) instead of the [n_kv, n_tokens] F16 one, so with flash attention a flip re-reserves as it did
+    // before upstream ed7ac35e1. The DFlash drafter flips its context to non-causal right after creating it, and its
+    // reserve ([TAG_4C_DFT_RESERVE]) must size the graph it really runs instead of growing on the first decode.
+    if (cparams.flash_attn) {
+        sched_need_reserve = true;
+    }
+}
+
+bool llama_context::get_causal_attn() const {
+    return cparams.causal_attn;
 }
 
 void llama_context::set_warmup(bool value) {
@@ -3103,6 +3121,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     n_queued_tokens += n_tokens_all;
 
     output_swaps.clear();
+    embd_batch_idxs.clear();
 
     sched_reserve();
 
@@ -3332,7 +3351,11 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             }
         }
 
-        extract_layer_inputs(res, n_tokens_prev, ubatch);
+        // [TAG_EXTRACT_TARGET_EMBEDDINGS] [TAG_LAYER_INP_SCATTER] token-indexed rows (layer inputs, unmasked nextn)
+        // are written straight to their batch index when inp_scatter, else copied as one block and permuted back
+        // to batch order in output_reorder() (upstream #29019)
+        const bool inp_scatter = layer_inp_scatter();
+        bool extract_all_idxs = extract_layer_inputs(res, n_tokens_prev, ubatch, inp_scatter);
 
         // extract nextn embeddings before
         // only meaningful in LLAMA_POOLING_TYPE_NONE (per-token); other pooling modes are ignored.
@@ -3357,9 +3380,19 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                     // [TAG_LAYER_INP_SCATTER] token-indexed ("indexed by raw token position", see
                     // get_embeddings_nextn_ith), so it takes the same batch-order write as the layer inputs
                     tensor_get_rows_batch_order(backend_h, t_h_nextn, embd_nextn.data, embd_nextn.size,
-                            n_embd, (size_t) n_tokens_prev, ubatch);
+                            n_embd, (size_t) n_tokens_prev, ubatch, inp_scatter);
+                    extract_all_idxs = true;
                 }
             }
+        }
+
+        // rows scattered to their batch index are already in place: only block copies record their batch
+        // indices for the permutation in output_reorder()
+        if (extract_all_idxs && !inp_scatter) {
+            GGML_ASSERT(ubatch.data && ubatch.data->batch_idxs.size() == ubatch.n_tokens);
+            GGML_ASSERT(embd_batch_idxs.size() == (size_t) n_tokens_prev);
+            const auto & batch_idxs = ubatch.data->batch_idxs;
+            embd_batch_idxs.insert(embd_batch_idxs.end(), batch_idxs.begin(), batch_idxs.end());
         }
 
         if (has_samplers) {
@@ -3616,15 +3649,23 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
 // the same batch. Output stayed exact, because the target verifies every draft, so it showed only
 // as acceptance quietly collapsing on those slots in multi-agent use.
 // Rows are copied in runs of consecutive batch indices, so the identity case (one sequence, or a
-// split that kept batch order) is still exactly one copy. LLAMA_LAYER_INP_SCATTER=0 restores the
-// old block copy for A/B.
-void llama_context::tensor_get_rows_batch_order(ggml_backend_t backend, ggml_tensor * t,
-        float * dst, size_t dst_floats, size_t row_floats, size_t token_offset, const llama_ubatch & ubatch) {
-    static const bool scatter = [] {
+// split that kept batch order) is still exactly one copy.
+// [TAG_EXTRACT_TARGET_EMBEDDINGS] Upstream #29019 fixed the same ordering another way: each ubatch is copied
+// as one block and output_reorder() permutes the rows back to batch order on the host. That path is used
+// where the scatter cannot run - a tensor-split (meta) backend asserts a zero source offset in
+// get_tensor_async - and with LLAMA_LAYER_INP_SCATTER=0 (A/B of the two correct paths). Everywhere else
+// the rows land at their batch index directly and output_reorder() has nothing to permute, which also
+// spares multi-slot prefill a host pass over every captured row. [TAG_SYNC_1004]
+bool llama_context::layer_inp_scatter() const {
+    static const bool env_on = [] {
         const char * e = getenv("LLAMA_LAYER_INP_SCATTER");
         return e == nullptr || atoi(e) != 0;
     }();
+    return env_on && model.split_mode() != LLAMA_SPLIT_MODE_TENSOR;
+}
 
+void llama_context::tensor_get_rows_batch_order(ggml_backend_t backend, ggml_tensor * t,
+        float * dst, size_t dst_floats, size_t row_floats, size_t token_offset, const llama_ubatch & ubatch, bool scatter) {
     const size_t n_tokens = ubatch.n_tokens;
 
     const std::vector<int32_t> * ids = nullptr;
@@ -3638,6 +3679,7 @@ void llama_context::tensor_get_rows_batch_order(ggml_backend_t backend, ggml_ten
     }
 
     if (ids == nullptr) {
+        // one block at the ubatch's running offset: the identity case, or the block copy output_reorder() permutes
         GGML_ASSERT((token_offset + n_tokens) * row_floats <= dst_floats);
         ggml_backend_tensor_get_async(backend, t, dst + token_offset * row_floats, 0, n_tokens * row_floats * sizeof(float));
         return;
@@ -3656,14 +3698,15 @@ void llama_context::tensor_get_rows_batch_order(ggml_backend_t backend, ggml_ten
     }
 }
 
-void llama_context::extract_layer_inputs(const llm_graph_result * res, size_t token_offset, const llama_ubatch & ubatch) {
+bool llama_context::extract_layer_inputs(const llm_graph_result * res, size_t token_offset, const llama_ubatch & ubatch, bool scatter) {
     const size_t n_tokens = ubatch.n_tokens;
 
     // [TAG_SPEC_PREFILL_TAIL_EXTRACT] the caller knows nobody will read these for this batch
     if (!layer_inp_extract) {
-        return;
+        return false;
     }
 
+    bool extracted = false;
     for (uint32_t il = 0; il < cparams.embeddings_layer_inp.size(); ++il) {
         if (!cparams.embeddings_layer_inp[il]) {
             continue;
@@ -3682,16 +3725,23 @@ void llama_context::extract_layer_inputs(const llm_graph_result * res, size_t to
         GGML_ASSERT(nfloats % n_tokens == 0);
 
         const size_t row_floats = nfloats / n_tokens;
+        if (!scatter) {
+            // output_reorder() permutes these rows n_embd floats at a time
+            GGML_ASSERT(row_floats == model.hparams.n_embd);
+        }
 
         ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched.get(), t);
         GGML_ASSERT(backend != nullptr);
         tensor_get_rows_batch_order(backend, t, embd_layer_inp[il].data, embd_layer_inp[il].size,
-                row_floats, token_offset, ubatch);
+                row_floats, token_offset, ubatch, scatter);
+        extracted = true;
     }
+    return extracted;
 }
 
 void llama_context::output_reorder() {
     const uint64_t n_vocab     = model.vocab.n_tokens();
+    const uint64_t n_embd      = model.hparams.n_embd;
     const uint64_t n_embd_out  = model.hparams.n_embd_out();
 
     for (size_t s = 0; s < output_swaps.size(); ++s) {
@@ -3726,6 +3776,8 @@ void llama_context::output_reorder() {
         // where only some tokens carry logits - the two index spaces are unrelated, so
         // this quietly scrambled the hidden states the drafter is seeded with. It fails
         // silently as reduced acceptance rather than as an error.
+        // (upstream #29019 dropped the same two swaps; [TAG_EXTRACT_TARGET_EMBEDDINGS] below restores batch
+        // order for block-copied token-indexed rows instead)
         if (embd_nextn.size > 0 && cparams.embeddings_nextn_masked) {
             for (uint64_t k = 0; k < n_embd_out; k++) {
                 std::swap(embd_nextn.data[i0*n_embd_out + k], embd_nextn.data[i1*n_embd_out + k]);
@@ -3761,6 +3813,29 @@ void llama_context::output_reorder() {
     }
 
     output_swaps.clear();
+
+    // [TAG_EXTRACT_TARGET_EMBEDDINGS]
+    // Layer inputs and unmasked NextN embeddings contain all token rows, independent of logits selection.
+    for (size_t i = 0; i < embd_batch_idxs.size(); ++i) {
+        while (embd_batch_idxs[i] != (int32_t) i) {
+            const int32_t j = embd_batch_idxs[i];
+            GGML_ASSERT(j >= 0 && (size_t) j < embd_batch_idxs.size());
+            if (embd_nextn.has_data() && !cparams.embeddings_nextn_masked) {
+                for (size_t k = 0; k < n_embd_out; ++k) {
+                    std::swap(embd_nextn.data[i*n_embd_out + k], embd_nextn.data[j*n_embd_out + k]);
+                }
+            }
+            for (auto & layer : embd_layer_inp) {
+                if (layer.has_data()) {
+                    for (size_t k = 0; k < n_embd; ++k) {
+                        std::swap(layer.data[i*n_embd + k], layer.data[j*n_embd + k]);
+                    }
+                }
+            }
+            std::swap(embd_batch_idxs[i], embd_batch_idxs[j]);
+        }
+    }
+    embd_batch_idxs.clear();
 }
 
 //
@@ -3769,7 +3844,7 @@ void llama_context::output_reorder() {
 
 uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
     uint32_t res;
-    if (model.arch == LLM_ARCH_KIMI_K3) {
+    if (model.arch == LLM_ARCH_KIMI_K3 || model.arch == LLM_ARCH_GLM5_NEXT) {
         // the n_tokens*40 budget below is exhausted at ubatch 3840
         res = std::max<uint32_t>(n_tokens * 160, 64u * model.n_tensors());
     } else if (model.arch == LLM_ARCH_HRM_TEXT) {
@@ -3780,6 +3855,7 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
         model.arch == LLM_ARCH_BAILINGMOE3 ||
         model.arch == LLM_ARCH_QWEN35 ||
         model.arch == LLM_ARCH_QWEN35MOE ||
+        model.arch == LLM_ARCH_CLEF ||
         model.arch == LLM_ARCH_QWEN4EXP ||
         model.arch == LLM_ARCH_DEEPSEEK4 ||
         (model.arch == LLM_ARCH_DFLASH && model.hparams.dsv4_hc_mult > 0) ||
@@ -3832,6 +3908,11 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
     if (n_sampling_outputs_max > 1) {
         res += (n_sampling_outputs_max - 1) * n_sampling_nodes_max;
     }
+
+    if (cparams.training) {
+        res *= 4;
+    }
+
     return res;
 }
 
@@ -3986,6 +4067,7 @@ llm_graph_params llama_context::graph_params(
         /*.loras       =*/ loras.get(),
         /*.mctx        =*/ mctx,
         /*.cross       =*/ &cross,
+        /*.prec_policy =*/ &model.prec_policy,
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
@@ -4167,6 +4249,10 @@ public:
         ptr += size;
         size_read += size;
         buf_size -= size;
+    }
+
+    void discard() override {
+        rinfos.clear();
     }
 
     size_t n_bytes() override {
@@ -4519,6 +4605,11 @@ public:
         rinfos.push_back({tensor, ptr, size, offset});
     }
 
+    void discard() override {
+        rinfos.clear();
+        buf_size = 0;
+    }
+
     size_t n_bytes() override {
         return size_read;
     }
@@ -4565,6 +4656,7 @@ size_t llama_context::state_set_data(const uint8_t * src, size_t size) {
         return state_read_data(io);
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: error loading state: %s\n", __func__, err.what());
+        io.discard();
         return 0;
     }
 }
@@ -4638,6 +4730,7 @@ size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * sr
         return state_seq_read_data(*io, seq_id, flags);
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: error loading state: %s\n", __func__, err.what());
+        io->discard();
         return 0;
     }
 }
@@ -4920,11 +5013,18 @@ void llama_context::opt_init(struct llama_model * model, struct llama_opt_params
     if (cparams.flash_attn) {
         LLAMA_LOG_INFO("%s: disabling flash attention, FLASH_ATTN_EXT has no backward pass\n", __func__);
         cparams.flash_attn = false;
-
-        // the graph changes without flash attention, need to reserve again
-        sched_need_reserve = true;
-        sched_reserve();
     }
+
+    // gradients cannot flow through the KV cache, so the attention reads the K and V of the current ubatch directly
+    if (n_ubatch == cparams.n_ctx) {
+        cparams.training = true;
+    } else {
+        LLAMA_LOG_WARN("%s: n_ubatch (%u) != n_ctx (%u), the K and V projections will not receive gradients\n", __func__, n_ubatch, cparams.n_ctx);
+    }
+
+    // the training graph is different, need to reserve again
+    sched_need_reserve = true;
+    sched_reserve();
 
     ggml_opt_params opt_params = ggml_opt_default_params(sched.get(), GGML_OPT_LOSS_TYPE_CROSS_ENTROPY);
     opt_params.opt_period      = n_batch / n_ubatch;
@@ -5493,6 +5593,10 @@ void llama_set_embeddings(llama_context * ctx, bool embeddings) {
 
 void llama_set_causal_attn(llama_context * ctx, bool causal_attn) {
     ctx->set_causal_attn(causal_attn);
+}
+
+bool llama_get_causal_attn(const llama_context * ctx) {
+    return ctx->get_causal_attn();
 }
 
 void llama_set_warmup(llama_context * ctx, bool warmup) {

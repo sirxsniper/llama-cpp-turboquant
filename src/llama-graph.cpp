@@ -302,7 +302,7 @@ void llm_graph_input_cls::set_input(const llama_ubatch * ubatch) {
 
         const bool last = (
              cparams.pooling_type == LLAMA_POOLING_TYPE_LAST ||
-            (cparams.pooling_type == LLAMA_POOLING_TYPE_RANK && (arch == LLM_ARCH_QWEN3 || arch == LLM_ARCH_QWEN3VL)) // qwen3 reranking & embedding models use last token
+            (cparams.pooling_type == LLAMA_POOLING_TYPE_RANK && cparams.causal_attn)
         );
 
         for (int i = 0; i < n_tokens; ++i) {
@@ -411,8 +411,7 @@ bool llm_graph_input_rs::can_reuse(const llm_graph_params & params) {
 
     res &= s_copy->ne[0] == mctx->get_n_rs();
 
-    res &= s_copy_main->ne[0]  == params.ubatch.n_seqs;
-    res &= s_copy_extra->ne[0] == mctx->get_n_rs() - params.ubatch.n_seqs;
+    res &= s_copy_main->ne[0] == params.ubatch.n_seqs;
 
     res &= head == mctx->get_head();
     res &= rs_z == mctx->get_rs_z();
@@ -556,8 +555,13 @@ static bool can_reuse_turbot(const llm_graph_input_attn_kv * inp, const llama_kv
 }
 
 void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
-    mctx->set_input_k_idxs(self_k_idxs, ubatch);
-    mctx->set_input_v_idxs(self_v_idxs, ubatch);
+    // the idxs are left unallocated when the KV cache is bypassed during training
+    if (self_k_idxs && self_k_idxs->buffer) {
+        mctx->set_input_k_idxs(self_k_idxs, ubatch);
+    }
+    if (self_v_idxs && self_v_idxs->buffer) {
+        mctx->set_input_v_idxs(self_v_idxs, ubatch);
+    }
 
     if (self_turbot_gtab) {   // [TAG_TURBOT]
         mctx->set_input_turbot(self_turbot_gtab, self_turbot_young, self_turbot_fill);
@@ -1270,8 +1274,7 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
 
     res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
 
-    res &= inp_rs->s_copy_main->ne[0]  == params.ubatch.n_seqs;
-    res &= inp_rs->s_copy_extra->ne[0] == mctx->get_recr()->get_n_rs() - params.ubatch.n_seqs;
+    res &= inp_rs->s_copy_main->ne[0] == params.ubatch.n_seqs;
 
     res &= inp_rs->head == mctx->get_recr()->get_head();
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
@@ -1320,8 +1323,7 @@ bool llm_graph_input_mem_hybrid_k::can_reuse(const llm_graph_params & params) {
 
     res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
 
-    res &= inp_rs->s_copy_main->ne[0]  == params.ubatch.n_seqs;
-    res &= inp_rs->s_copy_extra->ne[0] == mctx->get_recr()->get_n_rs() - params.ubatch.n_seqs;
+    res &= inp_rs->s_copy_main->ne[0] == params.ubatch.n_seqs;
 
     res &= inp_rs->head == mctx->get_recr()->get_head();
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
@@ -1423,8 +1425,7 @@ bool llm_graph_input_mem_hybrid_iswa::can_reuse(const llm_graph_params & params)
 
     res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
 
-    res &= inp_rs->s_copy_main->ne[0]  == params.ubatch.n_seqs;
-    res &= inp_rs->s_copy_extra->ne[0] == mctx->get_recr()->get_n_rs() - params.ubatch.n_seqs;
+    res &= inp_rs->s_copy_main->ne[0] == params.ubatch.n_seqs;
 
     res &= inp_rs->head == mctx->get_recr()->get_head();
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
@@ -1655,6 +1656,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     loras            (params.loras),
     mctx             (params.mctx),
     cross            (params.cross),
+    prec_policy      (params.prec_policy),
     samplers         (params.samplers),
     cb_func          (params.cb),
     res              (params.res),
@@ -1682,6 +1684,14 @@ ggml_tensor * llm_graph_context::build_lora_mm(
           ggml_tensor * cur,
           ggml_tensor * w_s) const {
     ggml_tensor * res = ggml_mul_mat(ctx0, w, cur);
+
+    if (prec_policy) {
+        prec_policy->apply(res);
+    }
+
+    if (w->type == GGML_TYPE_NVFP4) {
+        ggml_prec_set_acc(res, GGML_PREC_BF16);
+    }
 
     if (w_s) {
         res = ggml_mul(ctx0, res, w_s);
@@ -1714,6 +1724,14 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
           ggml_tensor * ids,
           ggml_tensor * w_s) const {
     ggml_tensor * res = ggml_mul_mat_id(ctx0, w, cur, ids);
+
+    if (prec_policy) {
+        prec_policy->apply(res);
+    }
+
+    if (w->type == GGML_TYPE_NVFP4) {
+        ggml_prec_set_acc(res, GGML_PREC_BF16);
+    }
 
     if (w_s) {
         const int64_t n_expert = w_s->ne[0];
@@ -1997,7 +2015,7 @@ ggml_tensor * llm_graph_context::build_ffn(
                     const float limit = hparams.swiglu_clamp_shexp[il];
                     constexpr float eps = 1e-6f;
                     if (limit > eps) {
-                        if (arch == LLM_ARCH_DEEPSEEK4 || (arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0)) {
+                        if (arch == LLM_ARCH_DEEPSEEK4 || arch == LLM_ARCH_GLM5_NEXT || (arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0)) {
                             cur = ggml_swiglu_clamp(ctx0, cur, tmp, limit);
                         } else {
                             tmp = ggml_clamp(ctx0, tmp, -limit, limit);
@@ -2421,7 +2439,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                     const float limit = hparams.swiglu_clamp_exp[il];
                     constexpr float eps = 1e-6f;
                     if (limit > eps) {
-                        if (arch == LLM_ARCH_MAPLE || arch == LLM_ARCH_DEEPSEEK4 || (arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0) || arch == LLM_ARCH_HY_V4) {
+                        if (arch == LLM_ARCH_MAPLE || arch == LLM_ARCH_DEEPSEEK4 || arch == LLM_ARCH_GLM5_NEXT || (arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0) || arch == LLM_ARCH_HY_V4) {
                             cur = ggml_swiglu_clamp(ctx0, cur, up, limit);
                         } else {
                             up = ggml_clamp(ctx0, up, -limit, limit);
@@ -2858,7 +2876,10 @@ ggml_tensor * llm_graph_context::build_attn_mha(
     GGML_ASSERT((kv_pos == nullptr || kv_pos->ne[1] == 1 || (n_stream == 1 && cparams.flash_attn && kq_b == nullptr)) &&
                 "multi-sequence positional mask: one KV stream and flash attention only");
 
-    q = ggml_view_4d(ctx0, q, q->ne[0], q->ne[1], q->ne[2]/n_stream, n_stream, q->nb[1], q->nb[2], q->nb[3]/n_stream, 0);
+    // the stream dim steps over one stream's worth of dim-2 (tokens): (ne[2]/n_stream) rows of stride nb[2].
+    // q->nb[3]/n_stream only equals that for a contiguous q; nope-only MLA (glm5-next) passes a permuted
+    // q_absorbed where nb[3] != ne[2]*nb[2], so using nb[3] read another head's queries for streams s >= 1.
+    q = ggml_view_4d(ctx0, q, q->ne[0], q->ne[1], q->ne[2]/n_stream, n_stream, q->nb[1], q->nb[2], q->nb[2]*(q->ne[2]/n_stream), 0);
 
     q = ggml_permute(ctx0, q, 0, 2, 1, 3);
     k = ggml_permute(ctx0, k, 0, 2, 1, 3);
@@ -3355,27 +3376,38 @@ ggml_tensor * llm_graph_context::build_attn(
 
     const auto * mctx_cur = inp->mctx;
 
-    // store to KV cache
-    {
-        const auto & k_idxs = inp->get_k_idxs();
-        const auto & v_idxs = inp->get_v_idxs();
+    ggml_tensor * q = q_cur;
+    ggml_tensor * k;
+    ggml_tensor * v;
 
-        if (mctx_cur->is_turbot()) {
-            // [TAG_TURBOT] one writer op per layer-side: base code always, refinement for rows of young granules,
-            // center fills of the ubatch first (SPEC 10.2)
-            ggml_build_forward_expand(gf, mctx_cur->turbot_cpy_k(ctx0, k_cur, k_idxs, inp->self_turbot_young, inp->self_turbot_fill, il));
-            ggml_build_forward_expand(gf, mctx_cur->turbot_cpy_v(ctx0, v_cur, v_idxs, inp->self_turbot_young, inp->self_turbot_fill, il));
-        } else {
-            ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
-            ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
+    if (cparams.training) {
+        GGML_ASSERT(mctx_cur->get_n_kv() == n_tokens);
+        GGML_ASSERT(!mctx_cur->is_turbot() && "turbot: training reads K/V of the ubatch, not a turbot cache");
+
+        k = k_cur;
+        v = v_cur;
+    } else {
+        // store to KV cache
+        {
+            const auto & k_idxs = inp->get_k_idxs();
+            const auto & v_idxs = inp->get_v_idxs();
+
+            if (mctx_cur->is_turbot()) {
+                // [TAG_TURBOT] one writer op per layer-side: base code always, refinement for rows of young granules,
+                // center fills of the ubatch first (SPEC 10.2)
+                ggml_build_forward_expand(gf, mctx_cur->turbot_cpy_k(ctx0, k_cur, k_idxs, inp->self_turbot_young, inp->self_turbot_fill, il));
+                ggml_build_forward_expand(gf, mctx_cur->turbot_cpy_v(ctx0, v_cur, v_idxs, inp->self_turbot_young, inp->self_turbot_fill, il));
+            } else {
+                ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
+                ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
+            }
         }
+
+        k = mctx_cur->get_k(ctx0, il);
+        v = mctx_cur->get_v(ctx0, il);
     }
 
     ggml_tensor * kq_mask = inp->get_kq_mask();
-
-    ggml_tensor * q = q_cur;
-    ggml_tensor * k = mctx_cur->get_k(ctx0, il);
-    ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
     // [TAG_TURBOT_ANY_ISWA] the Q rotation and the FA, shared with the iSWA build_attn (the same nodes as before)
     ggml_tensor * cur = build_attn_mha_kv(mctx_cur, q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il,
@@ -3679,8 +3711,17 @@ ggml_tensor * llm_graph_context::build_attn(
     const bool turbot = mctx_cur->is_turbot();
     GGML_ASSERT(!(turbot && is_swa) && "turbot: the SWA child of an iSWA cache cannot be turbot");
 
+    // whole seq fits into batch in training mode
+    const bool use_kv_cur = cparams.training && k_cur && v_cur;
+    if (use_kv_cur) {
+        GGML_ASSERT(mctx_cur->get_n_kv() == n_tokens);
+        GGML_ASSERT(!turbot && "turbot: training reads K/V of the ubatch, not a turbot cache");
+    }
+
+    const bool store_kv = !use_kv_cur || hparams.n_layer_kv_from_start >= 0;
+
     // optionally store to KV cache
-    if (k_cur) {
+    if (store_kv && k_cur) {
         const auto & k_idxs = is_swa ? inp->get_k_idxs_swa() : inp->get_k_idxs();
 
         if (turbot) {
@@ -3691,7 +3732,7 @@ ggml_tensor * llm_graph_context::build_attn(
         }
     }
 
-    if (v_cur) {
+    if (store_kv && v_cur) {
         const auto & v_idxs = is_swa ? inp->get_v_idxs_swa() : inp->get_v_idxs();
 
         if (turbot) {
@@ -3704,8 +3745,8 @@ ggml_tensor * llm_graph_context::build_attn(
     const auto & kq_mask = is_swa ? inp->get_kq_mask_swa() : inp->get_kq_mask();
 
     ggml_tensor * q = q_cur;
-    ggml_tensor * k = mctx_cur->get_k(ctx0, il);
-    ggml_tensor * v = mctx_cur->get_v(ctx0, il);
+    ggml_tensor * k = use_kv_cur ? k_cur : mctx_cur->get_k(ctx0, il);
+    ggml_tensor * v = use_kv_cur ? v_cur : mctx_cur->get_v(ctx0, il);
 
     // TurboQuant: pre-rotate Q for ISWA attention (pad to 128-aligned if needed); [TAG_TURBOT_ANY_ISWA] the turbot
     // rotation and the FA with the young pool and the granule table of a turbot base child, shared with the kv overload
@@ -4058,8 +4099,8 @@ llm_graph_input_dsv4 * llm_graph_context::build_inp_dsv4() const {
 
 ggml_tensor * llm_graph_context::build_rs(
         ggml_tensor * s,
+        ggml_tensor * state_copy,
         ggml_tensor * state_copy_main,
-        ggml_tensor * state_copy_extra,
             int32_t   state_size,
             int32_t   n_seqs,
            uint32_t   n_rs,
@@ -4078,12 +4119,19 @@ ggml_tensor * llm_graph_context::build_rs(
 
     // copy states
     // NOTE: assuming the copy destinations are ALL contained between rs_head and rs_head + n_rs
-    // {state_size, rs_size} -> {state_size, n_seqs}
-    ggml_tensor * output_states = get_state_rows(ctx0, states, state_copy_main);
+    // one gather of the states i0..n_rs (ubatch states then extra states), sized by n_rs so the reserve covers every split
+    // {state_size, rs_size} -> {state_size, n_rs - i0}
+    const int64_t i0 = n_rs - state_copy->ne[0];
+
+    ggml_tensor * states_all = ggml_get_rows(ctx0, states, state_copy);
+
+    ggml_tensor * output_states = get_state_rows ?
+        get_state_rows(ctx0, states, state_copy_main) :
+        ggml_view_2d(ctx0, states_all, state_size, n_seqs, states_all->nb[1], 0);
     ggml_build_forward_expand(gf, output_states);
 
     // copy extra states which won't be changed further (between n_seqs and n_rs)
-    ggml_tensor * states_extra = ggml_get_rows(ctx0, states, state_copy_extra);
+    ggml_tensor * states_extra = ggml_view_2d(ctx0, states_all, state_size, n_rs - n_seqs, states_all->nb[1], (n_seqs - i0)*states_all->nb[1]);
     ggml_build_forward_expand(gf,
         ggml_cpy(ctx0,
             states_extra,
@@ -4106,8 +4154,8 @@ static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
     ggml_set_input(inp->s_copy);
     ggml_set_name(inp->s_copy, "rs_s_copy");
 
-    inp->s_copy_main  = ggml_view_1d(ctx0, inp->s_copy, n_seqs, 0);
-    inp->s_copy_extra = ggml_view_1d(ctx0, inp->s_copy, n_rs - n_seqs, n_seqs * inp->s_copy->nb[0]);
+    inp->s_copy_main = ggml_view_1d(ctx0, inp->s_copy, n_seqs, 0);
+    inp->s_copy_tail = ggml_view_1d(ctx0, inp->s_copy, n_rs - 1, inp->s_copy->nb[0]);
 
     // [TAG_XSEQ_PLANES]
     if (rs_planes_needed(mctx_cur, (uint32_t) n_seqs)) {
@@ -4122,8 +4170,8 @@ static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
         ggml_set_input(inp->s_copy_r);
         ggml_set_name(inp->s_copy_r, "rs_s_copy_r");
 
-        inp->s_copy_r_main  = ggml_view_1d(ctx0, inp->s_copy_r, n_seqs, 0);
-        inp->s_copy_r_extra = ggml_view_1d(ctx0, inp->s_copy_r, n_rs - n_seqs, n_seqs * inp->s_copy_r->nb[0]);
+        inp->s_copy_r_main = ggml_view_1d(ctx0, inp->s_copy_r, n_seqs, 0);
+        inp->s_copy_r_tail = ggml_view_1d(ctx0, inp->s_copy_r, n_rs - 1, inp->s_copy_r->nb[0]);
 
         inp->ring_n = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_seqs);
         ggml_set_input(inp->ring_n);
@@ -4154,13 +4202,19 @@ ggml_tensor * llm_graph_context::build_rs(
 
     // [TAG_4C_GDN_REPLAY] a tensor with one row per cell (committed state, ring) under the replay layout: group-0
     //   sources, and no snapshot groups to move. The conv rows keep their groups and the path below.
+    //   [TAG_SYNC_1004] one gather of the replay sources as upstream #29856 does for s_copy (s_copy_r, or its tail
+    //   with a custom getter)
     if (inp->s_copy_r != nullptr && ggml_nelements(s) == (int64_t) state_size*kv_state->get_size()) {
-        return build_rs(s, inp->s_copy_r_main, inp->s_copy_r_extra, state_size, n_seqs,
+        return build_rs(s, get_state_rows ? inp->s_copy_r_tail : inp->s_copy_r, inp->s_copy_r_main, state_size, n_seqs,
                 kv_state->get_n_rs(), kv_state->get_head(), kv_state->get_size(), kv_state->get_rs_z(),
                 get_state_rows);
     }
 
-    ggml_tensor * output_states = build_rs(s, inp->s_copy_main, inp->s_copy_extra, state_size, n_seqs,
+    // a custom getter reads the states of the ubatch straight from the cache, so the gather skips the first
+    // state: it still holds the n_rs - n_seqs extra states and copies no state of a single sequence ubatch
+    ggml_tensor * state_copy = get_state_rows ? inp->s_copy_tail : inp->s_copy;
+
+    ggml_tensor * output_states = build_rs(s, state_copy, inp->s_copy_main, state_size, n_seqs,
                     kv_state->get_n_rs(), kv_state->get_head(), kv_state->get_size(), kv_state->get_rs_z(),
                     get_state_rows);
 
@@ -4355,8 +4409,8 @@ void llm_graph_context::build_pooling(
             } break;
         case LLAMA_POOLING_TYPE_RANK:
             {
-                if (arch == LLM_ARCH_MODERN_BERT) {
-                    // modern bert gte reranker builds mean first then applies prediction head and classifier
+                if (hparams.pooling_type_cls == LLAMA_POOLING_TYPE_MEAN) {
+                    // modern bert with classifier_pooling = "mean" builds mean first then applies prediction head and classifier
                     // https://github.com/huggingface/transformers/blob/main/src/transformers/models/modernbert/modular_modernbert.py#L1404-1411
                     ggml_tensor * inp_mean = build_inp_mean();
                     cur = ggml_mul_mat(ctx0, ggml_cont(ctx0, ggml_transpose(ctx0, inp)), inp_mean);

@@ -142,6 +142,9 @@ static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_co
 }
 
 static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_config_volta(const int DKQ, const int DV, const int ncols) {
+    GGML_CUDA_FATTN_MMA_CONFIG_CASE(320, 256, 32, 128, 2,  32, 128, 128,  64, 1, false);
+    GGML_CUDA_FATTN_MMA_CONFIG_CASE(320, 256, 64, 256, 1,  32, 128, 128,  64, 1, false);
+
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(512, 512,  8,  64, 4,  32, 256, 256,  64, 1, false);
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(512, 512, 16,  64, 4,  32, 256, 256,  64, 1, false);
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(512, 512, 32, 128, 2,  32, 128, 128,  64, 1, false);
@@ -2496,7 +2499,7 @@ static __global__ void flash_attn_ext_f16(
 #endif // defined(AMD_WMMA_AVAILABLE)
 
 #if defined(AMD_MFMA_AVAILABLE)
-    if (ncols1*ncols2 < 16 || DKQ > 256) {
+    if (ncols1*ncols2 < 16 || (DKQ > 256 && ncols1*ncols2 < 32)) {
         NO_DEVICE_CODE;
         return;
     }
@@ -2888,27 +2891,23 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
         }
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 
-#if !defined(GGML_USE_MUSA)
         // Keyed on turbo_mode and use_sparse as well: each variant is a different kernel and each needs
-        // its own shared-memory limit raised.
+        // its own shared-memory limit raised. [TAG_SYNC_1004] no MUSA guard: upstream f9af9be21 raises it on MUSA too.
         static bool shared_memory_limit_raised[GGML_CUDA_MAX_DEVICES][FATTN_MMA_TURBO_MODE_COUNT][2] = {{{false}}};   // [TAG_TURBO5P] one slot per turbo mode
         if (!shared_memory_limit_raised[id][turbo_mode][use_sparse]) {
             CUDA_CHECK(cudaFuncSetAttribute(reinterpret_cast<fattn_kernel_ptr_t>(fattn_kernel), cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes_shared_total));
             shared_memory_limit_raised[id][turbo_mode][use_sparse] = true;
         }
-#endif // !defined(GGML_USE_MUSA)
     } else {
         constexpr bool use_logit_softcap = true;
         constexpr bool use_sparse_kernel = false;
         fattn_kernel = ggml_cuda_fattn_mma_f16_select_kernel<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, use_sparse_kernel>(turbo_mode);   // [TAG_TURBO5P512_MMA]
 
-#if !defined(GGML_USE_MUSA)
         static bool shared_memory_limit_raised[GGML_CUDA_MAX_DEVICES][FATTN_MMA_TURBO_MODE_COUNT] = {{false}};   // [TAG_TURBOT] was [3], indexed up to 4
         if (!shared_memory_limit_raised[id][turbo_mode]) {
             CUDA_CHECK(cudaFuncSetAttribute(reinterpret_cast<fattn_kernel_ptr_t>(fattn_kernel), cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes_shared_total));
             shared_memory_limit_raised[id][turbo_mode] = true;
         }
-#endif // !defined(GGML_USE_MUSA)
     }
 
     // When reading the cache natively there is nothing to convert: tell launch_fattn not

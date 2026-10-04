@@ -106,6 +106,8 @@ struct llama_context {
     const llama_token * get_sampled_candidates_ith(int32_t idx);
     size_t get_sampled_candidates_count(int32_t idx);
 
+    bool get_causal_attn() const;
+
     void attach_threadpool(
             ggml_threadpool_t threadpool,
             ggml_threadpool_t threadpool_batch);
@@ -239,13 +241,19 @@ private:
     int64_t output_resolve_row(int32_t i) const;
 
     // async-copy enabled layer-input tensors (per cparams.output_layer_inp)
-    // from backend into host-side embd_layer_inp buffers, each row at its batch index
-    void extract_layer_inputs(const llm_graph_result * res, size_t token_offset, const llama_ubatch & ubatch);
+    // from backend into host-side embd_layer_inp buffers, each row at its batch index (scatter) or as one
+    // block whose rows output_reorder() permutes into batch order; returns true if anything was copied
+    bool extract_layer_inputs(const llm_graph_result * res, size_t token_offset, const llama_ubatch & ubatch, bool scatter);
 
     // [TAG_LAYER_INP_SCATTER] async-copy a token-indexed [row_floats, n_tokens] tensor so that ubatch
-    // row r lands at host row ubatch.data->idx_batch[r] (runs of consecutive indices are one copy)
+    // row r lands at host row ubatch.data->idx_batch[r] (runs of consecutive indices are one copy);
+    // without scatter the tensor is copied as one block at token_offset
     void tensor_get_rows_batch_order(ggml_backend_t backend, ggml_tensor * t, float * dst, size_t dst_floats,
-            size_t row_floats, size_t token_offset, const llama_ubatch & ubatch);
+            size_t row_floats, size_t token_offset, const llama_ubatch & ubatch, bool scatter);
+
+    // [TAG_LAYER_INP_SCATTER] [TAG_EXTRACT_TARGET_EMBEDDINGS] write token-indexed rows at their batch index
+    // (false: block copies + output_reorder() permutation, for tensor split or LLAMA_LAYER_INP_SCATTER=0)
+    bool layer_inp_scatter() const;
 
     //
     // graph
@@ -318,6 +326,7 @@ private:
     // host buffers for output layer input embeddings, per layer
     // populated when cparams.output_layer_inp[il] is true
     std::vector<buffer_view<float>> embd_layer_inp;
+    std::vector<int32_t> embd_batch_idxs; // extracted index -> original batch index
 
     struct sampling_info {
         // !samplers.empty() to check if any samplers are active

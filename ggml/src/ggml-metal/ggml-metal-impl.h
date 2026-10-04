@@ -120,17 +120,26 @@
 #define FC_TOPK_MOE                    1800
 #define FC_MOE_REDUCE                  1900
 #define FC_DSV4_HC                     2000
-#define FC_TURBO_WHT                   2100 // [TAG_SYNC_METAL_FC] was 1700, which upstream now uses for FC_NORM
+#define FC_PAD                         2100
+#define FC_FLASH_ATTN_EXT_TENSOR       2200
+#define FC_LIGHTNING_INDEXER           2200
+// [TAG_SYNC_METAL_FC] fork-only constant moved far from upstream's sequential ids: 1700 went to FC_NORM, then
+// 2100 to FC_PAD (upstream #29561). [TAG_SYNC_1004]
+#define FC_TURBO_WHT                   9100
 
 // op-specific constants
 #define OP_FLASH_ATTN_EXT_NQPSG 8
 #define OP_FLASH_ATTN_EXT_NCPSG 64
 
+#define OP_FLASH_ATTN_EXT_TENSOR_NQPSG       32
+#define OP_FLASH_ATTN_EXT_TENSOR_NQPSG_LARGE 16
+#define OP_FLASH_ATTN_EXT_TENSOR_NCPSG       64
+#define OP_FLASH_ATTN_EXT_TENSOR_NSG         8
+
 #define OP_FLASH_ATTN_EXT_VEC_NQPSG 1
 #define OP_FLASH_ATTN_EXT_VEC_NCPSG 32
 
 #define OP_LIGHTNING_INDEXER_DK    128
-#define OP_LIGHTNING_INDEXER_NH     64
 #define OP_LIGHTNING_INDEXER_NHPTG   8
 #define OP_LIGHTNING_INDEXER_NKPSG   8
 #define OP_LIGHTNING_INDEXER_NSG     8
@@ -1126,6 +1135,10 @@ typedef struct {
     uint64_t nb1;
     uint64_t nb2;
     uint64_t nb3;
+    int32_t  lp0;
+    int32_t  lp1;
+    int32_t  lp2;
+    int32_t  lp3;
 } ggml_metal_kargs_pad;
 
 typedef struct {
@@ -1240,6 +1253,11 @@ typedef struct {
     uint64_t nb03;
     int32_t  top_k;  // k
 } ggml_metal_kargs_top_k;
+
+// widths at or above this use the threadgroup FWHT kernel, one row per threadgroup
+// with GGML_METAL_FWHT_TG_NT threads, instead of one row per simdgroup
+#define GGML_METAL_FWHT_TG_MIN_N 512
+#define GGML_METAL_FWHT_TG_NT    256
 
 typedef struct {
     int32_t  ne01;      // n_tokens

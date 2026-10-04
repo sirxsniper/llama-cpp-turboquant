@@ -129,14 +129,17 @@ struct common_sampler {
 
     llama_token_data_array cur_p;
 
+    // the verifier's random stream, for the fork's maximal coupling and upstream #27694's rejection sampling alike;
+    // independent of the draft, or the target distribution is not preserved. Reseeded from speculative_seed on
+    // reset() so a request is reproducible. [TAG_SYNC_1004] the fork's speculative_rng and upstream's rng are one
     uint32_t speculative_seed;
-    std::mt19937 speculative_rng;
+    std::mt19937 rng;
 
     void reset() {
         prev.clear();
 
         llama_sampler_reset(chain);
-        speculative_rng.seed(speculative_seed);
+        rng.seed(speculative_seed);
     }
 
     void set_logits(struct llama_context * ctx, int idx) {
@@ -322,7 +325,7 @@ struct common_sampler * common_sampler_init(
 #ifdef LLAMA_USE_LLGUIDANCE
         grmr = llama_sampler_init_llg(vocab, "lark", grammar_str.c_str());
 #else
-        GGML_ABORT("llguidance (cmake -DLLAMA_LLGUIDANCE=ON) is not enabled");
+        throw std::runtime_error("failed to parse grammar: llguidance is not enabled");
 #endif // LLAMA_USE_LLGUIDANCE
     } else {
         std::vector<std::string> trigger_patterns;
@@ -564,7 +567,7 @@ struct common_sampler * common_sampler_init(
         /* .cur     = */ {},
         /* .cur_p   = */ {},
         /* .speculative_seed = */ speculative_seed,
-        /* .speculative_rng  = */ std::mt19937(speculative_seed),
+        /* .rng     = */ std::mt19937(speculative_seed),
     };
 
     return result;
@@ -655,7 +658,7 @@ struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
         /* .cur     = */ gsmpl->cur,
         /* .cur_p   = */ gsmpl->cur_p,
         /* .speculative_seed = */ gsmpl->speculative_seed,
-        /* .speculative_rng  = */ gsmpl->speculative_rng,
+        /* .rng     = */ gsmpl->rng,
     };
 
     res->cur_p.data = gsmpl->cur_p.data ? res->cur.data() : nullptr; // re-point to the clone's buffer
@@ -681,7 +684,7 @@ void common_sampler_copy(const common_sampler * src, common_sampler * dst) {
     dst->cur_p      = src->cur_p;
     dst->cur_p.data = src->cur_p.data ? dst->cur.data() : nullptr; // re-point to dst's buffer
     dst->speculative_seed = src->speculative_seed;
-    dst->speculative_rng  = src->speculative_rng;
+    dst->rng        = src->rng;
     dst->t_total_us = src->t_total_us;
 }
 
@@ -917,11 +920,18 @@ static bool bs_row_on_backend(struct llama_context * ctx, int idx) {
            llama_get_sampled_probs_ith (ctx, idx) != nullptr;
 }
 
+// [TAG_BS_LAZY_GRAMMAR] see sampling.h
+bool common_sampler_backend_row_stale(const struct common_sampler * gsmpl, struct llama_context * ctx, int idx) {
+    return bs_row_on_backend(ctx, idx) && !common_sampler_backend_ok(gsmpl);
+}
+
 std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, bool grammar_first) {
     GGML_ASSERT(idxs.size() == draft.size() + 1 && "idxs.size() must be draft.size() + 1");
 
     std::vector<llama_token> result;
     result.reserve(idxs.size());
+
+    const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx));
 
     size_t i = 0;
     for (; i < draft.size(); i++) {
@@ -931,7 +941,9 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
 
         result.push_back(id);
 
-        if (draft[i] != id) {
+        // do not accept draft tokens after an EOG - they are not output but would stay in the context
+        // on replay the last token is from the target and can be EOG, so a trailing EOG is still accepted
+        if (draft[i] != id || (llama_vocab_is_eog(vocab, id) && i + 1 < draft.size())) {
             break;
         }
 
@@ -995,7 +1007,7 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(
             }
         }
 
-        if (q_draft > 0.0f && uniform(gsmpl->speculative_rng) * q_draft <= p_draft) {
+        if (q_draft > 0.0f && uniform(gsmpl->rng) * q_draft <= p_draft) {
             common_sampler_accept(gsmpl, draft[i], true);
             result.push_back(draft[i]);
             // [TAG_BS_LAZY_GRAMMAR] same stop as the greedy overload: the rows after this token went through the
@@ -1017,7 +1029,7 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(
         size_t       id_idx = SIZE_MAX;   // [TAG_SAMPLER_CLONE_CURP] which branch produced `id`
         if (residual_sum > 0.0f) {
             std::discrete_distribution<size_t> sample(residual.begin(), residual.end());
-            id_idx = sample(gsmpl->speculative_rng);
+            id_idx = sample(gsmpl->rng);
             id = p->data[id_idx].id;
         }
 
@@ -1047,6 +1059,129 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(
     if (i == draft.size()) {
         const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
         common_sampler_accept(gsmpl, id, true);
+        result.push_back(id);
+    }
+
+    return result;
+}
+
+static float prob_of(const llama_token_data * data, size_t n, llama_token id) {
+    for (size_t k = 0; k < n; ++k) {
+        if (data[k].id == id) {
+            return data[k].p;
+        }
+    }
+    return 0.0f;
+}
+
+// Accept a drafted token with probability min(1, p/q), else draw from norm(max(0, p - q)).
+// Preserves the target distribution exactly, and accepts more often than matching does when the
+// draft samples instead of taking its argmax.
+std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, const std::vector<std::vector<llama_token_data>> & draft_q, bool grammar_first) {
+    GGML_ASSERT(idxs.size()    == draft.size() + 1 && "idxs.size() must be draft.size() + 1");
+    GGML_ASSERT(draft_q.size() == draft.size() && "draft_q must have one entry per draft token");
+
+    std::vector<llama_token> result;
+    result.reserve(idxs.size());
+
+    // draws come from the sampler's own stream, so they stay independent of what was drafted
+    std::uniform_real_distribution<float> uni(0.0f, 1.0f);
+
+    std::vector<llama_token_data> residual;
+
+    std::vector<llama_token_data> cand; // candidate array masked by the grammar, if there is one
+
+    size_t i = 0;
+    for (; i < draft.size(); i++) {
+        // leaves the target distribution in the candidate array
+        const llama_token id_tgt = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
+
+        const auto * cur_p = common_sampler_get_candidates(gsmpl, true);
+        const auto & q     = draft_q[i];
+
+        const bool masked = !grammar_first && grammar_should_apply(gsmpl);
+        if (masked) {
+            cand.assign(cur_p->data, cur_p->data + cur_p->size);
+            llama_token_data_array arr = { cand.data(), cand.size(), -1, false };
+            llama_sampler_apply(gsmpl->grmr, &arr);
+        }
+
+        // a candidate the grammar rejects carries no probability, whatever the target thinks
+        auto p_raw = [&](size_t k) {
+            return masked && cand[k].logit == -INFINITY ? 0.0f : cur_p->data[k].p;
+        };
+
+        // masking drops probability mass, so rescale what is left or the residual is over-weighted
+        float p_sum = 0.0f;
+        if (masked) {
+            for (size_t k = 0; k < cur_p->size; ++k) {
+                p_sum += p_raw(k);
+            }
+        }
+
+        const float p_norm = masked && p_sum > 0.0f ? 1.0f/p_sum : 1.0f;
+
+        auto p_of = [&](size_t k) {
+            return p_raw(k)*p_norm;
+        };
+
+        // q_x is never 0 for a token the draft produced, but guard the divide
+        const float q_x = prob_of(q.data(), q.size(), draft[i]);
+
+        float p_x = 0.0f;
+        for (size_t k = 0; k < cur_p->size; ++k) {
+            if (cur_p->data[k].id == draft[i]) {
+                p_x = p_of(k);
+                break;
+            }
+        }
+
+        if (q_x > 0.0f && (p_x >= q_x || uni(gsmpl->rng) < p_x / q_x)) {
+            common_sampler_accept(gsmpl, draft[i], true);
+            result.push_back(draft[i]);
+            // [TAG_BS_LAZY_GRAMMAR] same stop as the other accept loops: the rows after this token went through the
+            // backend sampler without the constraint this token just activated
+            if (bs_row_on_backend(ctx, idxs[i + 1]) && !common_sampler_backend_ok(gsmpl)) {
+                break;
+            }
+            continue;
+        }
+
+        // rejected: tokens outside q's support keep all of p
+        residual.clear();
+        float sum = 0.0f;
+        for (size_t k = 0; k < cur_p->size; ++k) {
+            const float r = p_of(k) - prob_of(q.data(), q.size(), cur_p->data[k].id);
+            if (r > 0.0f) {
+                residual.push_back({ cur_p->data[k].id, 0.0f, r });
+                sum += r;
+            }
+        }
+
+        llama_token id = id_tgt;
+        if (sum > 0.0f) {
+            float u = uni(gsmpl->rng) * sum;
+            id = residual.back().id;
+            for (const auto & e : residual) {
+                u -= e.p;
+                if (u <= 0.0f) {
+                    id = e.id;
+                    break;
+                }
+            }
+        }
+
+        common_sampler_accept(gsmpl, id, true);
+        result.push_back(id);
+
+        break;
+    }
+
+    if (i == draft.size()) {
+        const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
+
+        common_sampler_accept(gsmpl, id, true);
+
         result.push_back(id);
     }
 

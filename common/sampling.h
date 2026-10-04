@@ -103,6 +103,9 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(
         const std::vector<common_speculative_token_dist> & dists,
         bool grammar_first = false);
 
+// upstream #27694: verifies by rejection sampling; draft_q holds the draft's candidates per token
+std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, const std::vector<std::vector<llama_token_data>> & draft_q, bool grammar_first = false);
+
 // assume idxs == [ 0, 1, 2, ..., draft.size() ]
 std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const llama_tokens & draft, bool grammar_first = false);
 
@@ -120,6 +123,10 @@ bool common_sampler_backend_ok(const struct common_sampler * gsmpl);
 // clears the chain's offload state, without which the CPU chain keeps skipping the samplers the backend used to run
 // and selects nothing. Do not offload the same sampler again afterwards.
 void common_sampler_backend_detach(struct common_sampler * gsmpl, struct llama_context * ctx, llama_seq_id seq_id);
+
+// [TAG_BS_LAZY_GRAMMAR] true when output row idx went through the backend sampler although this sampler's grammar or
+// reasoning budget is active now: the row was prepared without that constraint, so an accept loop must stop before it
+bool common_sampler_backend_row_stale(const struct common_sampler * gsmpl, struct llama_context * ctx, int idx);
 
 // helpers
 
