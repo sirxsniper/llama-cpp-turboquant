@@ -357,6 +357,7 @@ static __global__ void k_mb_fetch_plan(const mb_dev v, const int chan, const int
         int n  = 0;
         if (want != 0) {
             const volatile uint32_t * plan  = &v.hdr[chan].plan;
+            const volatile uint32_t * done  = &v.hdr[chan].done;
             const volatile uint32_t * taken = &v.hdr[chan].taken;
             const volatile uint32_t * err   = &v.state[1];
             const volatile uint32_t * rel   = &v.glob->release;
@@ -364,6 +365,13 @@ static __global__ void k_mb_fetch_plan(const mb_dev v, const int chan, const int
             for (;;) {
                 if ((int32_t) (*plan - want) >= 0) {
                     ok = 1;
+                    break;
+                }
+                if ((int32_t) (*done - want) >= 0) {
+                    // the host answered the job: a plan it published before done is visible after this fence; none
+                    // means a failed job (its error is the host's, raised by complete): nothing to fetch
+                    __threadfence_system();
+                    ok = (int32_t) (*plan - want) >= 0 ? 1 : 0;
                     break;
                 }
                 if (*err != 0 || *rel != 0) {
@@ -389,7 +397,8 @@ static __global__ void k_mb_fetch_plan(const mb_dev v, const int chan, const int
                 for (int i = 0; good && i < n; ++i) {
                     const unsigned long long off  = __ldcv((const unsigned long long *) &pl->off[i]);
                     const int32_t            slot = __ldcv(&pl->slot[i]);
-                    good = off + expert_bytes <= v.dma_ring_size && slot >= 0 && slot < zero_slot;
+                    good = expert_bytes <= v.dma_ring_size && off <= v.dma_ring_size - expert_bytes &&
+                           slot >= 0 && slot < zero_slot;
                     f->off[i]  = off;
                     f->slot[i] = slot;
                 }
