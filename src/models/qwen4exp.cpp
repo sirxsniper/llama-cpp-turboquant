@@ -301,6 +301,27 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
         nextn.hc_head_down = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_DOWN, "weight", il), { hc_dim, hc_lr }, mtp_flags);
         nextn.hc_head_up   = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_UP,   "weight", il), { hc_lr, hc_dim }, mtp_flags);
     }
+
+    // [TAG_QWEN4EXP_MTP] [TAG_SYNC_1004] without MTP the block above is skipped, and the generic scale pass of
+    // load_tensors keys on the loaded weights, so it never asks for the block's optional ".scale" / ".input_scale"
+    // tensors (NVFP4, or any file the saver wrote): skip them here too, or the tensor count of such a file fails.
+    // Absent ones are ignored. (e20efe765, kept over upstream's loader)
+    if (!ml.load_mtp) {
+        const int skip = TENSOR_NOT_REQUIRED | TENSOR_SKIP;
+        for (int il = n_layer; il < n_layer_all; ++il) {
+            for (const char * suffix : { "scale", "input_scale" }) {
+                for (const llm_tensor t : { LLM_TENSOR_ATTN_Q, LLM_TENSOR_ATTN_K, LLM_TENSOR_ATTN_V, LLM_TENSOR_ATTN_OUT,
+                        LLM_TENSOR_ATTN_QKV, LLM_TENSOR_ATTN_GATE, LLM_TENSOR_FFN_GATE_SHEXP, LLM_TENSOR_FFN_DOWN_SHEXP,
+                        LLM_TENSOR_FFN_UP_SHEXP, LLM_TENSOR_SSM_OUT, LLM_TENSOR_SSM_ALPHA, LLM_TENSOR_SSM_BETA,
+                        LLM_TENSOR_NEXTN_EH_PROJ, LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD }) {
+                    create_tensor(tn(t, suffix, il), { 1 }, skip);
+                }
+                for (const llm_tensor t : { LLM_TENSOR_FFN_GATE_EXPS, LLM_TENSOR_FFN_DOWN_EXPS, LLM_TENSOR_FFN_UP_EXPS }) {
+                    create_tensor(tn(t, suffix, il), { n_expert }, skip);
+                }
+            }
+        }
+    }
 }
 
 std::unique_ptr<llm_graph_context> llama_model_qwen4exp::build_arch_graph(const llm_graph_params & params) const {
@@ -569,8 +590,11 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     // the draft memory has no recurrent layer, but its input still has to be allocated
     ggml_build_forward_expand(gf, inp_hyb->get_recr()->s_copy);
 
+    // [TAG_QWEN4EXP_MTP] [TAG_SYNC_1004] the indexer inputs only for a QSA block: an MTP block with compress ratio 0 runs
+    // dense (build_layer_attn), and an input no node reads is never allocated, so its set_input would assert. The
+    // unsloth Qwen3.8-Flash-Next MTP files carry ratio 0 for the nextn block.
     llm_graph_input_kpool * inp_kpool = nullptr;
-    if (mctx_hyb->get_idx() && hparams.indexer_kpool > 0) {
+    if (mctx_hyb->get_idx() && hparams.indexer_kpool > 0 && hparams.dsv4_compress_ratios[il] > 0) {
         GGML_ASSERT(mctx_hyb->get_idx()->get_n_kv() == mctx_hyb->get_attn()->get_n_kv() &&
                 "the indexer cache must track the attention cache cell for cell");
         inp_kpool = build_inp_kpool(mctx_hyb);
