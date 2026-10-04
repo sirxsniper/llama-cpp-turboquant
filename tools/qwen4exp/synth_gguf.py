@@ -154,6 +154,8 @@ def main() -> int:
                     "work depends only on the used count)")
     ap.add_argument("--ple-rows", type=int, default=65536, help="PLE table rows per head (the real table is ~40M)")
     ap.add_argument("--no-mtp", action="store_true", help="no nextn block")
+    ap.add_argument("--mtp-ratio", type=int, default=0, help="[TAG_SYNC_1004] compress ratio of the nextn block: 0 = dense "
+                    "(as the Unsloth head and file A), the trunk ratio = a QSA block (upstream #29761's layout)")
     ap.add_argument("--no-output", action="store_true", help="tie output to token_embd (saves ~0.7 GB)")
     ap.add_argument("--type", choices=["q8_0", "q4_0", "f16"], default="q8_0", help="type of the large matrices")
     ap.add_argument("--sigma", type=float, default=0.02, help="std of the random matrices")
@@ -235,7 +237,11 @@ def main() -> int:
 
     put(k("block_count"),  n_all, VT.UINT32)
     put(k("expert_count"), n_expert, VT.UINT32)
-    put(k("attention.compress_ratios"), ratios + [0] * (n_all - n_trunk), VT.ARRAY, VT.INT32)   # the MTP block is dense
+    # the MTP block is dense unless --mtp-ratio makes it a QSA layer; QSA layers share one ratio
+    if args.mtp_ratio not in (0, ratio_full):
+        print(f"--mtp-ratio must be 0 or the trunk ratio {ratio_full}", file=sys.stderr)
+        return 1
+    put(k("attention.compress_ratios"), ratios + [args.mtp_ratio] * (n_all - n_trunk), VT.ARRAY, VT.INT32)
     if recr_src is not None:
         put(k("attention.recurrent_layers"), recr + [False] * (n_all - n_trunk), VT.ARRAY, VT.BOOL)
     if mtp:
