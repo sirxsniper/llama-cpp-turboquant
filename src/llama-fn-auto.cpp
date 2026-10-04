@@ -240,7 +240,9 @@ std::vector<llama_fn_opt> llama_fn_profile_opts(llama_fn_profile p, const char *
         out.push_back(o);
     }
     for (const auto & [name, value] : custom) {
-        auto it = std::find_if(out.begin(), out.end(), [&](const llama_fn_opt & o) { return o.name == name; });
+        // a lambda may capture a structured binding only from C++20 on (clang before 16 rejects it)
+        const std::string & key = name;
+        auto it = std::find_if(out.begin(), out.end(), [&key](const llama_fn_opt & o) { return o.name == key; });
         if (it != out.end()) {
             it->value = value;
         } else {
