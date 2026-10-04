@@ -669,6 +669,7 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
 
     // [per-seq] deferred boundary state
     std::vector<std::vector<float>> pending_g_last;
+    std::vector<std::vector<float>> bridge_g; // [TAG_SYNC_1004] stable copy of pending_g_last for process()'s bridge row
     std::vector<llama_pos>          pending_pos_last;
 
     // [per-seq] snapshot of the most recent process()'s encoder output
@@ -750,6 +751,7 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
         llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ true);
 
         pending_g_last.assign(n_seq, std::vector<float>(n_embd_dec, 0.0f));
+        bridge_g.assign(n_seq, std::vector<float>(n_embd_dec, 0.0f));
         pending_pos_last.assign(n_seq, -1);
 
         verify_g.assign(n_seq, std::vector<float>());
@@ -923,7 +925,10 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
                         return false;
                     }
                     const int32_t idx = batch.add(batch_in.tokens[beg].id, pending_pos, seq_id, /*output=*/ false);
-                    batch.set_embd(idx, { pending_g_last[seq_id].data(), 1, (size_t) n_embd_dec });
+                    // [TAG_SYNC_1004] set_embd keeps a view that is only read when the batch is decoded, and pending_g_last
+                    // is overwritten with this ubatch's last row below, before that: decode the bridge from a copy
+                    bridge_g[seq_id] = pending_g_last[seq_id];
+                    batch.set_embd(idx, { bridge_g[seq_id].data(), 1, (size_t) n_embd_dec });
                 }
             }
 
