@@ -3577,8 +3577,9 @@ ggml_tensor * llm_graph_context::build_attn_mha_kv(
         mctx_cur->get_turbot_op_params(il, GGML_TURBOT_SIDE_BOTH, turbot_params);
     }
 
-    // [TAG_FN_TURBOT_QSA] n_kv_max > 0 only from a sparse-attention caller. A turbot FA has no sparse gather and reads
-    // every cell under the mask (ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse is false for turbot).
+    // [TAG_FN_TURBOT_QSA] n_kv_max > 0 only from a sparse-attention caller. [TAG_FN_TURBOT_SPARSE] On a turbot FA it
+    // selects the CUDA gather over the cells the mask rows select (fattn.cu ggml_cuda_fattn_turbot_sparse_ncols1);
+    // with n_kv_max 0 the turbot FA reads every cell under the mask.
     return build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, n_kv_max, kq_scale, il, kv_pos, q_pos,
             turbot ? mctx_cur->get_turbot_pool(il) : nullptr,
             turbot ? turbot_gtab                   : nullptr,

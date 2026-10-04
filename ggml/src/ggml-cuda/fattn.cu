@@ -134,8 +134,11 @@ void ggml_cuda_flash_attn_ext_compact_mask(
     const dim3 block_dim(256, 1, 1);
     const ggml_cuda_kernel_launch_params launch_params(blocks_num, block_dim, 0, stream);
     // the last group of queries is partial only if ncols1 does not divide n_queries
-    GGML_ASSERT(ncols1 == 1 || ncols1 == 8);
-    const auto kernel = ncols1 == 1       ? flash_attn_mask_to_sparse_indices<1, false> :
+    // [TAG_FN_TURBOT_SPARSE] 4: the sparse turbot FA at Q <= 4 (<4, 8>)
+    GGML_ASSERT(ncols1 == 1 || ncols1 == 4 || ncols1 == 8);
+    const auto kernel = ncols1 == 1        ? flash_attn_mask_to_sparse_indices<1, false> :
+                        ncols1 == 4        ? (n_queries % 4 != 0 ? flash_attn_mask_to_sparse_indices<4, true> :
+                                                                   flash_attn_mask_to_sparse_indices<4, false>) :
                         n_queries % 8 != 0 ? flash_attn_mask_to_sparse_indices<8, true>  :
                                              flash_attn_mask_to_sparse_indices<8, false>;
     ggml_cuda_kernel_launch(kernel, launch_params,
@@ -163,14 +166,57 @@ bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(const int cc, const ggml_
     // the dense kernel handles up to 64/ncols2 queries per K/V pass, the single-query gather has to beat that
     const int64_t n_gather = (ncols1 == 1 ? std::min<int64_t>(Q->ne[1], 64/ncols2) : ncols1) * (int64_t) n_kv_max;
 
-    // [TAG_SYNC_SPARSE_TURBOT] a turbot K/V has its own kernel with no sparse gather, and the sparse branch in
-    // ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1 calls the f16 case directly (past the turbot dispatch). Keep this
-    // test: [TAG_FN_TURBOT_QSA] the qwen4exp QSA layers set n_kv_max > 0 on a turbot FA, which must run dense under the mask.
+    // [TAG_SYNC_SPARSE_TURBOT] the sparse branch in ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1 calls the f16 case
+    // directly (past the turbot dispatch), so a turbot K/V must never take it. Keep this test: a turbot FA with
+    // n_kv_max > 0 takes its own gather ([TAG_FN_TURBOT_SPARSE], ggml_cuda_fattn_turbot_sparse_ncols1) or runs dense.
     return GGML_CUDA_CC_IS_NVIDIA(cc) && turing_mma_available(cc) && !ggml_turbot_is_type(K->type) &&
         mask != nullptr && n_kv_max > 0 && max_bias == 0.0f && logit_softcap == 0.0f &&
         mask->ne[0] == K->ne[1] && mask->ne[1] >= Q->ne[1] && mask->ne[2] == 1 &&
         K->ne[1] >= std::max<int64_t>(4096, 2*n_gather);
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+}
+
+// [TAG_FN_TURBOT_SPARSE] The query-tile width of the sparse turbot FA for dst, or 0 for the dense turbot FA. A turbot FA
+// goes sparse when the graph set n_kv_max (models/qwen4exp.cpp build_attn_qsa does, under TURBO_QSA_SPARSE) and the
+// gather beats a dense walk: D 256, GQA > 4 (ncols2 8), an explicit mask, no ALiBi and no softcap, and at least twice
+// the cells a query tile can gather. <4, 8> takes Q <= 4, <8, 8> the rest. GGML_CUDA_TURBOT_SPARSE=0 keeps every
+// turbot FA dense (A/B on one binary).
+static int ggml_cuda_fattn_turbot_sparse_ncols1(const int cc, const ggml_tensor * dst) {
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+    GGML_UNUSED_VARS(cc, dst);
+    return 0;
+#else
+    static const bool enabled = [] {
+        const char * e = getenv("GGML_CUDA_TURBOT_SPARSE");
+        return !(e && e[0] == '0');
+    }();
+
+    const ggml_tensor * Q    = dst->src[0];
+    const ggml_tensor * K    = dst->src[1];
+    const ggml_tensor * V    = dst->src[2];
+    const ggml_tensor * mask = dst->src[3];
+
+    const int32_t n_kv_max = ggml_get_op_params_i32(dst, 4);
+    if (!enabled || n_kv_max <= 0 || !ggml_turbot_is_type(K->type) || !ggml_turbot_is_type(V->type)) {
+        return 0;
+    }
+
+    float max_bias      = 0.0f;
+    float logit_softcap = 0.0f;
+    memcpy(&max_bias,      (const float *) dst->op_params + 1, sizeof(float));
+    memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
+
+    if (!GGML_CUDA_CC_IS_NVIDIA(cc) || !turing_mma_available(cc) || mask == nullptr || dst->src[5] != nullptr ||
+            max_bias != 0.0f || logit_softcap != 0.0f || Q->ne[0] != 256 || K->ne[0] != 256 || V->ne[0] != 256 ||
+            Q->ne[3] != 1 || mask->ne[2] != 1 || mask->ne[3] != 1 || mask->ne[0] != K->ne[1] || mask->ne[1] < Q->ne[1] ||
+            Q->ne[2] % K->ne[2] != 0 || Q->ne[2]/K->ne[2] <= 4) {
+        return 0;
+    }
+
+    const int     ncols1   = Q->ne[1] <= 4 ? 4 : 8;
+    const int64_t n_gather = std::min<int64_t>(Q->ne[1], ncols1) * (int64_t) n_kv_max;
+    return K->ne[1] >= std::max<int64_t>(4096, 2*n_gather) ? ncols1 : 0;
+#endif // defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
 }
 
 // [TAG_TURBOT_Q2_ROUTE] kill switch for the Q <= 2 turbot route below: TURBOT_Q2_ROUTE=0 sends Q = 2 back to the <2,8>
@@ -462,6 +508,13 @@ static void ggml_cuda_flash_attn_ext_mma_f16(ggml_backend_cuda_context & ctx, gg
     const ggml_tensor * V    = dst->src[2];
     const ggml_tensor * mask = dst->src[3];   // [TAG_FA_POS_MASK] a positional mask counts as a mask for routing
     const bool has_mask = mask != nullptr || dst->src[5] != nullptr;
+
+    // [TAG_FN_TURBOT_SPARSE] a turbot FA with an n_kv_max budget reads only the cells its mask rows select
+    switch (ggml_cuda_fattn_turbot_sparse_ncols1(cc, dst)) {
+        case 4: ggml_cuda_flash_attn_ext_turbot_sparse_case<256, 256, 4, 8>(ctx, dst); return;
+        case 8: ggml_cuda_flash_attn_ext_turbot_sparse_case<256, 256, 8, 8>(ctx, dst); return;
+        default: break;
+    }
 
     switch (Q->ne[0]) {
         case 64:

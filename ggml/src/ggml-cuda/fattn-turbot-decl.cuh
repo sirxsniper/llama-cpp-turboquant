@@ -57,6 +57,18 @@ extern DECL_FATTN_TURBOT_CASE( 64, 2);
 extern DECL_FATTN_TURBOT_CASE( 32, 4);
 extern DECL_FATTN_TURBOT_CASE( 16, 8);
 
+// [TAG_FN_TURBOT_SPARSE] Sparse turbot FA (the qwen4exp QSA layers): the kernel reads only the cells of one index list
+// per query tile (the union of the tile's mask rows). D = 256, ncols2 8; <4, 8> for Q <= 4 (decode and MTP verify),
+// <8, 8> above. One instance file per pair in template-instances/fattn-mma-turbot-sparse-instance-ncols1_<n1>-ncols2_8.cu.
+template <int DKQ, int DV, int ncols1, int ncols2>
+void ggml_cuda_flash_attn_ext_turbot_sparse_case(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+
+#define DECL_FATTN_TURBOT_SPARSE_CASE(ncols1, ncols2) \
+    template void ggml_cuda_flash_attn_ext_turbot_sparse_case<256, 256, ncols1, ncols2>(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
+
+extern DECL_FATTN_TURBOT_SPARSE_CASE(4, 8);
+extern DECL_FATTN_TURBOT_SPARSE_CASE(8, 8);
+
 #if GGML_CUDA_FA_TURBOT_D128
 // [TAG_TURBOT_ANY_D128] Exactly the pairs ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<128, 128, ncols2> can select for
 // ncols2 in {1, 2, 4, 8}: ncols 8, 16, 32, 64 (the [TAG_FA_NCOLS_128] tier and the Q <= 2 routes are D = 256 only).
