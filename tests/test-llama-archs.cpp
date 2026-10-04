@@ -1262,7 +1262,8 @@ static int test_mtp(const std::string & arch_filter, const size_t seed, const fl
 
             // [TAG_FN_MTP_HEAD_IDS] [TAG_FN_MTP_ATTN_WINDOW] the checks below set their switch themselves; a run with an MTP
             // head switch already in the environment (fn_switch_tests.ps1) has no plain reference, so it skips them
-            const bool mtp_env_free = !getenv("LLAMA_MTP_HEAD_ROWS") && !getenv("LLAMA_MTP_HEAD_IDS") && !getenv("LLAMA_MTP_ATTN_WINDOW");
+            const bool mtp_env_free = !getenv("LLAMA_MTP_HEAD_ROWS") && !getenv("LLAMA_MTP_HEAD_IDS") && !getenv("LLAMA_MTP_ATTN_WINDOW") &&
+                                      !getenv("LLAMA_MTP_WINDOW"); // [TAG_FN_R4_MTP_WINDOW]
 
             // [TAG_FN_MTP_HEAD_IDS] a draft vocabulary (every third id): its rows keep the full head's logits, the others
             // are -inf. Control tokens join the list on their own, so they are skipped here.
@@ -1337,6 +1338,19 @@ static int test_mtp(const std::string & arch_filter, const size_t seed, const fl
                 const std::vector<float> logits_win = get_logits_mtp(model.get(), tokens, h_tgt);
                 mtp_test_set_env("LLAMA_MTP_ATTN_WINDOW", nullptr);
 
+                // [TAG_FN_R4_MTP_WINDOW] the same window under Strata's name, and next to the positional QSA masks (the
+                // windowed draft cache keeps its explicit mask): the same logits
+                mtp_test_set_env("LLAMA_MTP_WINDOW", "16");
+                const std::vector<float> logits_win2 = get_logits_mtp(model.get(), tokens, h_tgt);
+                check(arch_name, label, "MTP window: LLAMA_MTP_WINDOW alias", logits_win2 == logits_win, 0.0);
+                if (!getenv("LLAMA_QSA_POS_MASK")) { // a switch-matrix run that sets it keeps it for the checks below
+                    mtp_test_set_env("LLAMA_QSA_POS_MASK", "1");
+                    const std::vector<float> logits_win3 = get_logits_mtp(model.get(), tokens, h_tgt);
+                    mtp_test_set_env("LLAMA_QSA_POS_MASK", nullptr);
+                    check(arch_name, label, "MTP window: with QSA pos mask", logits_win3 == logits_win, 0.0);
+                }
+                mtp_test_set_env("LLAMA_MTP_WINDOW", nullptr);
+
                 const size_t split = (size_t) w*n_vocab;
                 const std::vector<float> a_in (logits_mtp.begin(), logits_mtp.begin() + split);
                 const std::vector<float> b_in (logits_win.begin(), logits_win.begin() + split);
@@ -1350,6 +1364,33 @@ static int test_mtp(const std::string & arch_filter, const size_t seed, const fl
                 // so any change at all is the window
                 check(arch_name, label, "MTP window: later rows changed",    nmse_out >  0.0,   nmse_out);
                 check(arch_name, label, "MTP window: logits finite",         all_finite(logits_win), 0.0);
+            }
+
+            // [TAG_FN_R4_QSA_POS] the QSA masks from the positional vectors (LLAMA_QSA_POS_MASK=1), whole and in query chunks
+            // of 16 (LLAMA_QSA_POS_CHUNK): the trunk's QSA layers get the same mask values, so the target logits stay the
+            // same (bit for bit on the CPU, where FA works per query); the dense nextn block reads the vectors in FA instead
+            // of an explicit mask, so the MTP logits move by rounding at most
+            if (mtp_env_free && !getenv("LLAMA_QSA_POS_MASK") && !getenv("LLAMA_QSA_POS_CHUNK")) {
+                for (const char * chunk : { (const char *) nullptr, "16" }) {
+                    mtp_test_set_env("LLAMA_QSA_POS_MASK", "1");
+                    mtp_test_set_env("LLAMA_QSA_POS_CHUNK", chunk);
+                    std::vector<float> h_pos;
+                    const std::vector<float> logits_pos     = get_logits_tgt(model.get(), tokens, true, false, &h_pos);
+                    const std::vector<float> logits_mtp_pos = get_logits_mtp(model.get(), tokens, h_tgt);
+                    mtp_test_set_env("LLAMA_QSA_POS_MASK", nullptr);
+                    mtp_test_set_env("LLAMA_QSA_POS_CHUNK", nullptr);
+                    const double nmse_t = nmse(logits_unmasked, logits_pos);
+                    const double nmse_h = nmse(h_tgt, h_pos);
+                    const double nmse_m = nmse(logits_mtp, logits_mtp_pos);
+                    const bool   cpu    = label == "CPU";
+                    // chunks of 16 queries take the CPU FA's one-chunk path where 64 take its tiled one: rounding only
+                    check(arch_name, label, chunk ? "QSA pos mask chunk 16: target" : "QSA pos mask: target",
+                          cpu && !chunk ? nmse_t == 0.0 : nmse_t <= 1e-6, nmse_t);
+                    check(arch_name, label, chunk ? "QSA pos mask chunk 16: h_nextn" : "QSA pos mask: h_nextn",
+                          cpu && !chunk ? nmse_h == 0.0 : nmse_h <= 1e-6, nmse_h);
+                    check(arch_name, label, chunk ? "QSA pos mask chunk 16: MTP" : "QSA pos mask: MTP",
+                          all_finite(logits_mtp_pos) && nmse_m <= 1e-6, nmse_m);
+                }
             }
 
             // round trip through a file: with the head, and with it skipped

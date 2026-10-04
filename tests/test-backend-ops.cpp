@@ -9252,6 +9252,120 @@ struct test_flash_attn_ext_pos : public test_case {
     }
 };
 
+// [TAG_FN_R4_QSA_POS] GGML_OP_QSA_MASK: the QSA attention mask from the positional vectors and the indexer's selection.
+// The layout reproduces a qwen4exp ubatch in a --kv-unified pool: the sequence starts `off` cells in (cells before it
+// are -1), every 7th cell inside it is a hole, the queries are its last n_q positions; with ms the pool holds two
+// sequences (row 1 of the vectors: the cell's sequence set, the query's sequence bit) and the queries alternate between
+// them. Each query selects n_pool pools of `group` cells (some of them past the end or padded with n_kv, the n_kv
+// sentinel of the explicit path) plus group - 1 tail cells, and a quarter of the picked pools score -inf (live < 0).
+// The output is 0 / -inf only, so the comparison is exact (err() counts the elements that differ).
+struct test_qsa_mask : public test_case {
+    const int64_t n_kv;
+    const int64_t n_q;
+    const int64_t n_pool;  // picked pools per query
+    const int64_t group;   // cells per pool
+    const int64_t off;     // first cell of the sequence
+    const bool    ms;      // two sequences in the pool (two-row vectors)
+    const bool    live;    // with the picked scores
+
+    std::string vars() override {
+        return VARS_TO_STR7(n_kv, n_q, n_pool, group, off, ms, live);
+    }
+
+    double max_nmse_err() override {
+        return 0.0;
+    }
+
+    double err(const float * a, const float * b, size_t n) override {
+        size_t bad = 0;
+        for (size_t i = 0; i < n; ++i) {
+            bad += !(a[i] == b[i]);
+        }
+        return (double) bad;
+    }
+
+    test_qsa_mask(int64_t n_kv, int64_t n_q, int64_t n_pool, int64_t group, int64_t off, bool ms, bool live)
+        : n_kv(n_kv), n_q(n_q), n_pool(n_pool), group(group), off(off), ms(ms), live(live) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t rows = ms ? 2 : 1;
+        ggml_tensor * kv_pos = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_kv, rows);
+        ggml_set_name(kv_pos, "kv_pos");
+        ggml_tensor * q_pos = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_q, rows);
+        ggml_set_name(q_pos, "q_pos");
+        ggml_tensor * sel = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_pool*group + group - 1, n_q);
+        ggml_set_name(sel, "sel");
+        ggml_tensor * lv = nullptr;
+        if (live) {
+            lv = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_pool, n_q);
+            ggml_set_name(lv, "live");
+        }
+        ggml_tensor * out = ggml_qsa_mask(ctx, kv_pos, q_pos, sel, lv, (int32_t) group);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 rng(1234 + (int) n_kv + 7*(int) n_q + (ms ? 1 : 0));
+        // positions with holes (two interleaved sequences with ms), the newest token last
+        std::vector<int32_t> pos(n_kv, -1);
+        std::vector<int32_t> set(n_kv, 0);
+        int32_t p[2] = { 0, 0 };
+        for (int64_t j = off; j < n_kv; ++j) {
+            if ((j - off) % 7 == 6) {
+                continue;
+            }
+            const int sq = ms ? (int) ((j/3) % 2) : 0;
+            pos[j] = p[sq]++;
+            set[j] = 1 << sq;
+        }
+        std::vector<int32_t> qp(n_q*(ms ? 2 : 1));
+        for (int64_t i = 0; i < n_q; ++i) {
+            const int sq = ms ? (int) (i % 2) : 0;
+            qp[i] = std::max<int32_t>(0, p[sq] - 1 - (int32_t) ((n_q - 1 - i)/(ms ? 2 : 1)));
+            if (ms) {
+                qp[n_q + i] = 1 << sq;
+            }
+        }
+        // per query: n_pool pools of group cells (random block starts, a few past the end or n_kv), then the tail
+        const int64_t n_sel = n_pool*group + group - 1;
+        std::vector<int32_t> sl(n_sel*n_q);
+        std::vector<float>   lv(n_pool*n_q);
+        std::uniform_int_distribution<int64_t> blk(0, n_kv/group);
+        for (int64_t i = 0; i < n_q; ++i) {
+            for (int64_t b = 0; b < n_pool; ++b) {
+                const int64_t b0 = blk(rng)*group;
+                const bool pad = (rng() % 11) == 0;
+                for (int64_t m = 0; m < group; ++m) {
+                    const int64_t c = b0 + m;
+                    sl[i*n_sel + b*group + m] = pad || c >= n_kv ? (int32_t) n_kv : (int32_t) c;
+                }
+                lv[i*n_pool + b] = (rng() % 4) == 0 ? -INFINITY : (float) (rng() % 1000)/100.0f;
+            }
+            for (int64_t m = 0; m < group - 1; ++m) {
+                const int64_t c = (int64_t) (rng() % (uint32_t) (n_kv + 2)) - 1; // -1 .. n_kv
+                sl[i*n_sel + n_pool*group + m] = (int32_t) c;
+            }
+        }
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "kv_pos") == 0) {
+                ggml_backend_tensor_set(t, pos.data(), 0, n_kv*sizeof(int32_t));
+                if (ms) {
+                    ggml_backend_tensor_set(t, set.data(), t->nb[1], n_kv*sizeof(int32_t));
+                }
+            } else if (strcmp(t->name, "q_pos") == 0) {
+                ggml_backend_tensor_set(t, qp.data(), 0, ggml_nbytes(t));
+            } else if (strcmp(t->name, "sel") == 0) {
+                ggml_backend_tensor_set(t, sl.data(), 0, ggml_nbytes(t));
+            } else if (strcmp(t->name, "live") == 0) {
+                ggml_backend_tensor_set(t, lv.data(), 0, ggml_nbytes(t));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // ==== [TAG_TURBO5P512_MMA] split-plane turbo K/V at the real head geometry (begin) ====================================
 // test_flash_attn_ext and test_flash_attn_ext_pos pad the head to the type's block (GGML_PAD(hs, blck)), so their
 // split-plane cases ask for a 512- or 1024-wide head that no FA kernel takes and report "not supported"
@@ -13907,6 +14021,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 1024, 75, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, false));
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 512, 75, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, false));
 
+    // [TAG_FN_R4_QSA_POS] the QSA mask from positions: decode widths, a prefill ubatch, the Flash-Next budget (512 pools
+    // of 4 + 3 tail cells) at kv 65536 and 262144, an odd n_kv (the half2 fill falls back), two sequences, no scores
+    for (int64_t n_kv : { 4096, 65536, 262144 }) {
+        for (int64_t n_q : { 1, 4, 512 }) {
+            if (n_kv == 262144 && n_q == 512) {
+                continue; // 256 MiB of output: the 262144 x 64 case below covers the shape
+            }
+            test_cases.emplace_back(new test_qsa_mask(n_kv, n_q, 512, 4, 1537, false, true));
+        }
+    }
+    test_cases.emplace_back(new test_qsa_mask(262144, 64, 512, 4, 1537, false, true));
+    test_cases.emplace_back(new test_qsa_mask(4097,   7,  64,  4, 100,  false, true));
+    test_cases.emplace_back(new test_qsa_mask(8192,   9,  128, 4, 3000, true,  true));
+    test_cases.emplace_back(new test_qsa_mask(8192,   5,  128, 4, 3000, false, false));
+    test_cases.emplace_back(new test_qsa_mask(1000,   3,  16,  8, 0,    true,  true));
+
     // [TAG_FA_POS_MASK] positional-mask FA in the deployed geometry (head 256, 4 KV heads x 6 query repeats),
     // sequence starting mid-tile inside a unified pool (see test_flash_attn_ext_pos). kv >= 4096 is where the
     // per-tile KV bounds from positions are computed for every query count ([TAG_FA_KVMAX_POS]).
@@ -16700,6 +16830,355 @@ static bool run_moe_bridge(ggml_backend_t backend, ggml_backend_t backend_ref, c
     return n_fail == 0;
 }
 
+// [TAG_FN_R4_BRIDGE_DMA] GGML_OP_MOE_HOST_FETCH: the PCIe share of a bridged MoE layer. A bridge made for fetches gets a
+// pinned ring (the device's host buffer type) holding every expert as up | gate | down; the test executor plans each
+// job (every expert with id % 3 == 0 that the job routes, at most K, ring slot = expert id), publishes the plan and
+// computes the rest on the CPU pool (the planned experts skipped). The graph: post, fetch, the bank chain (MUL_MAT_ID
+// over the bank with the fetched slot ids) and the wait. Checked against the CPU chain of backend_ref: the bank slots
+// hold the ring bytes of the planned experts, the slot ids are the plan's, the bank chain's rows of planned experts
+// match the CPU rows (NMSE <= 5e-4, GPU kernels), its other rows are zero (the zero slot), and the wait's sum is the CPU
+// sum over the other experts. Then the failure paths: a plan that never comes (timeout error, every slot id the zero
+// slot), and a plan whose bank slot is out of range (runner error); a reset recovers each time.
+static bool run_moe_bridge_fetch(ggml_backend_t backend, ggml_backend_t backend_ref, const char * op_names_filter) {
+    if (backend_is_cpu(backend) || !op_names_filter_selects(op_names_filter, "MOE_HOST_FETCH")) {
+        return true;
+    }
+    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    auto br_new      = (ggml_backend_moe_bridge_new_t)          ggml_backend_reg_get_proc_address(reg, "ggml_backend_moe_bridge_new");
+    auto br_free     = (ggml_backend_moe_bridge_free_t)         ggml_backend_reg_get_proc_address(reg, "ggml_backend_moe_bridge_free");
+    auto br_id       = (ggml_backend_moe_bridge_id_t)           ggml_backend_reg_get_proc_address(reg, "ggml_backend_moe_bridge_id");
+    auto br_poll     = (ggml_backend_moe_bridge_poll_t)         ggml_backend_reg_get_proc_address(reg, "ggml_backend_moe_bridge_poll");
+    auto br_complete = (ggml_backend_moe_bridge_complete_t)     ggml_backend_reg_get_proc_address(reg, "ggml_backend_moe_bridge_complete");
+    auto br_error    = (ggml_backend_moe_bridge_error_t)        ggml_backend_reg_get_proc_address(reg, "ggml_backend_moe_bridge_error");
+    auto br_reset    = (ggml_backend_moe_bridge_reset_t)        ggml_backend_reg_get_proc_address(reg, "ggml_backend_moe_bridge_reset");
+    auto br_ring     = (ggml_backend_moe_bridge_set_ring_t)     ggml_backend_reg_get_proc_address(reg, "ggml_backend_moe_bridge_set_ring");
+    auto br_publish  = (ggml_backend_moe_bridge_publish_plan_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_moe_bridge_publish_plan");
+    auto br_times    = (ggml_backend_moe_bridge_chan_times_t)   ggml_backend_reg_get_proc_address(reg, "ggml_backend_moe_bridge_chan_times");
+    if (!br_new || !br_free || !br_id || !br_poll || !br_complete || !br_error || !br_reset || !br_ring || !br_publish || !br_times) {
+        return true; // this backend has no fetch side
+    }
+    ggml_backend_reg_t creg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_ref));
+    using pp_def_t    = ggml_cpu_moe_pool_params (*)(int);
+    using pool_new_t  = ggml_cpu_moe_pool * (*)(const ggml_cpu_moe_pool_params *);
+    using pool_free_t = void (*)(ggml_cpu_moe_pool *);
+    using pool_run_t  = ggml_status (*)(ggml_cpu_moe_pool *, const ggml_cpu_moe_job *);
+    auto pp_def    = (pp_def_t)    ggml_backend_reg_get_proc_address(creg, "ggml_cpu_moe_pool_params_default");
+    auto pool_new  = (pool_new_t)  ggml_backend_reg_get_proc_address(creg, "ggml_cpu_moe_pool_new");
+    auto pool_free = (pool_free_t) ggml_backend_reg_get_proc_address(creg, "ggml_cpu_moe_pool_free");
+    auto pool_run  = (pool_run_t)  ggml_backend_reg_get_proc_address(creg, "ggml_cpu_moe_run");
+    ggml_backend_buffer_type_t host_buft = ggml_backend_dev_host_buffer_type(dev);
+    if (!pp_def || !pool_new || !pool_free || !pool_run || !host_buft) {
+        printf("  FAIL moe fetch: no CPU MoE pool or no host buffer type\n");
+        return false;
+    }
+    int dev_index = -1;
+    for (size_t i = 0; i < ggml_backend_reg_dev_count(reg); i++) {
+        if (ggml_backend_reg_dev_get(reg, i) == dev) {
+            dev_index = (int) i;
+        }
+    }
+
+    const cpu_fn_moe_case c = { GGML_TYPE_Q4_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_1, 512, 128, 24, 6 }; // UD-Q4_K_XL types
+    const int K = 4;
+    std::default_random_engine gen(8765);
+    std::uniform_real_distribution<float> uni(-1.0f, 1.0f);
+    auto nhalf = [](ggml_type t) { return t == GGML_TYPE_Q8_0 || t == GGML_TYPE_IQ4_NL ? 1 : 2; };
+    const std::vector<uint8_t> wu = cpu_fn_raw_blocks(c.tu, (size_t) (c.n_embd / ggml_blck_size(c.tu)) * c.n_ff * c.n_exp, nhalf(c.tu), gen);
+    const std::vector<uint8_t> wg = cpu_fn_raw_blocks(c.tg, (size_t) (c.n_embd / ggml_blck_size(c.tg)) * c.n_ff * c.n_exp, nhalf(c.tg), gen);
+    const std::vector<uint8_t> wd = cpu_fn_raw_blocks(c.td, (size_t) (c.n_ff / ggml_blck_size(c.td)) * c.n_embd * c.n_exp, nhalf(c.td), gen);
+    const size_t eb[3] = { wu.size() / c.n_exp, wg.size() / c.n_exp, wd.size() / c.n_exp };
+    const size_t slot_size = (eb[0] + eb[1] + eb[2] + 4095) & ~(size_t) 4095;
+
+    ggml_backend_buffer_ptr ring_buf(ggml_backend_buft_alloc_buffer(host_buft, slot_size * c.n_exp));
+    if (!ring_buf) {
+        printf("  FAIL moe fetch: no pinned ring\n");
+        return false;
+    }
+    uint8_t * ring = (uint8_t *) ggml_backend_buffer_get_base(ring_buf.get());
+    for (int e = 0; e < c.n_exp; e++) {
+        memcpy(ring + e * slot_size,                 wu.data() + e * eb[0], eb[0]);
+        memcpy(ring + e * slot_size + eb[0],         wg.data() + e * eb[1], eb[1]);
+        memcpy(ring + e * slot_size + eb[0] + eb[1], wd.data() + e * eb[2], eb[2]);
+    }
+
+    ggml_init_params wparams = { ggml_tensor_overhead()*4, NULL, true };
+    ggml_context_ptr wctx(ggml_init(wparams));
+    ggml_tensor * a_u = ggml_new_tensor_3d(wctx.get(), c.tu, c.n_embd, c.n_ff, c.n_exp);
+    ggml_tensor * a_g = ggml_new_tensor_3d(wctx.get(), c.tg, c.n_embd, c.n_ff, c.n_exp);
+    ggml_tensor * a_d = ggml_new_tensor_3d(wctx.get(), c.td, c.n_ff, c.n_embd, c.n_exp);
+    a_u->data = (void *) wu.data();
+    a_g->data = (void *) wg.data();
+    a_d->data = (void *) wd.data();
+
+    ggml_moe_bridge_params bp = {};
+    bp.device     = dev_index;
+    bp.n_chan     = 2;
+    bp.n_embd     = c.n_embd;
+    bp.n_used     = c.n_used;
+    bp.max_tokens = 8;
+    bp.wait_mode  = GGML_MOE_BRIDGE_WAIT_SPIN;
+    bp.timeout_ms = 100;
+    bp.job_max_ms = 1000;
+    bp.stats      = true;
+    bp.max_fetch  = K;
+    ggml_moe_bridge * br = dev_index >= 0 ? br_new(&bp) : nullptr;
+    if (br == nullptr) {
+        printf("  FAIL moe fetch: the backend could not create a bridge with fetches\n");
+        return false;
+    }
+    if (!br_ring(br, ring, slot_size * c.n_exp)) {
+        printf("  FAIL moe fetch: the device cannot read the pinned ring\n");
+        br_free(br);
+        return false;
+    }
+    const int32_t bid = br_id(br);
+
+    ggml_cpu_moe_pool_params pp = pp_def(4);
+    pp.spin_us = 50;
+    ggml_cpu_moe_pool * pool = pool_new(&pp);
+    std::vector<int32_t> skip(c.n_exp, 0);
+
+    // the plan rule and the failure injections of the test executor
+    std::atomic<bool> stop{false};
+    std::atomic<bool> paused{false};
+    std::atomic<int>  bad_slot{0};
+    std::mutex        plan_mtx;
+    std::vector<int32_t> last_plan; // experts of the last plan, slot order
+    std::thread exec([&]() {
+        while (!stop.load()) {
+            ggml_moe_bridge_job job;
+            if (paused.load() || !br_poll(br, &job)) {
+                std::this_thread::yield();
+                continue;
+            }
+            std::fill(skip.begin(), skip.end(), 0);
+            std::vector<int32_t> d;
+            if (job.plan) {
+                for (int a = 0; a < job.n_used * job.n_tokens && (int) d.size() < K; a++) {
+                    const int32_t e = job.ids[a];
+                    if (e % 3 == 0 && std::find(d.begin(), d.end(), e) == d.end()) {
+                        d.push_back(e);
+                    }
+                }
+                for (size_t i = 0; i < d.size(); i++) {
+                    job.plan->off[i]  = (uint64_t) d[i] * slot_size;
+                    job.plan->slot[i] = (int32_t) i;
+                    skip[d[i]] = 1;
+                }
+                if (bad_slot.exchange(0) && !d.empty()) {
+                    job.plan->slot[0] = K + 7; // out of the bank: the device must refuse the plan
+                }
+                job.plan->n_copy = (int32_t) d.size();
+                for (int a = 0; a < job.n_used * job.n_tokens; a++) {
+                    const auto it = std::find(d.begin(), d.end(), job.ids[a]);
+                    job.plan->slot_ids[a] = it != d.end() ? (int32_t) (it - d.begin()) : K;
+                }
+                br_publish(br, &job);
+            }
+            {
+                std::lock_guard<std::mutex> lk(plan_mtx);
+                last_plan = d;
+            }
+            const ggml_cpu_moe_layer layer = { a_u, a_g, a_d, skip.data(), 0 };
+            const ggml_cpu_moe_job cj = { &layer, job.n_tokens, job.n_used, job.x, job.ids, job.w, job.out };
+            br_complete(br, &job, pool_run(pool, &cj) == GGML_STATUS_SUCCESS);
+        }
+    });
+
+    int n_run  = 0;
+    int n_fail = 0;
+    // expect: 0 = the exact result, 1 = a timeout (no plan), 2 = a refused plan
+    auto run_case = [&](int64_t T, int expect, const char * what) -> bool {
+        ggml_init_params params = { ggml_tensor_overhead()*32 + ggml_graph_overhead(), NULL, true };
+        ggml_context_ptr ctx(ggml_init(params));
+        ggml_tensor * x      = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, c.n_embd, T);
+        ggml_tensor * ids    = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, c.n_used, T);
+        ggml_tensor * w      = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, c.n_used, T);
+        ggml_tensor * bu     = ggml_new_tensor_3d(ctx.get(), c.tu, c.n_embd, c.n_ff, K + 1);
+        ggml_tensor * bg     = ggml_new_tensor_3d(ctx.get(), c.tg, c.n_embd, c.n_ff, K + 1);
+        ggml_tensor * bd     = ggml_new_tensor_3d(ctx.get(), c.td, c.n_ff, c.n_embd, K + 1);
+        const int32_t chan   = (int32_t) (T % 2);
+        ggml_tensor * ticket = ggml_moe_host_post(ctx.get(), x, ids, w, bid, chan, GGML_MOE_BRIDGE_JOB_DMA);
+        ggml_tensor * sids   = ggml_moe_host_fetch(ctx.get(), ticket, bu, bg, bd, nullptr, c.n_used, T, bid, chan);
+        ggml_tensor * x3     = ggml_reshape_3d(ctx.get(), x, c.n_embd, 1, T);
+        ggml_tensor * up     = ggml_mul_mat_id(ctx.get(), bu, x3, sids);
+        ggml_tensor * gate   = ggml_mul_mat_id(ctx.get(), bg, x3, sids);
+        ggml_tensor * down   = ggml_mul_mat_id(ctx.get(), bd, ggml_swiglu_split(ctx.get(), gate, up), sids);
+        ggml_tensor * out    = ggml_moe_host_wait(ctx.get(), ticket, down, c.n_embd, T, bid, chan);
+        if (!ggml_backend_supports_op(backend, sids) || ggml_backend_supports_op(backend_ref, sids)) {
+            printf("  FAIL moe fetch T=%" PRId64 ": supports_op must hold on the device only\n", T);
+            return false;
+        }
+        ggml_backend_buffer_ptr buf(ggml_backend_alloc_ctx_tensors(ctx.get(), backend));
+        if (buf == nullptr) {
+            return false;
+        }
+        ggml_backend_buffer_clear(buf.get(), 0); // the zero slots
+        ggml_cgraph * gf = ggml_new_graph(ctx.get());
+        ggml_build_forward_expand(gf, down);
+        ggml_build_forward_expand(gf, out);
+
+        std::vector<float> xv((size_t) c.n_embd * T);
+        for (float & v : xv) {
+            v = uni(gen);
+        }
+        std::vector<int32_t> ids_v;
+        std::vector<int32_t> experts(c.n_exp);
+        for (int i = 0; i < c.n_exp; i++) {
+            experts[i] = i;
+        }
+        for (int64_t t = 0; t < T; t++) {
+            std::shuffle(experts.begin(), experts.end(), gen);
+            ids_v.insert(ids_v.end(), experts.begin(), experts.begin() + c.n_used);
+        }
+        std::vector<float> wv((size_t) c.n_used * T);
+        for (float & v : wv) {
+            v = 0.5f + 0.5f * uni(gen);
+        }
+        ggml_backend_tensor_set(x, xv.data(), 0, xv.size() * sizeof(float));
+        ggml_backend_tensor_set(ids, ids_v.data(), 0, ids_v.size() * sizeof(int32_t));
+        ggml_backend_tensor_set(w, wv.data(), 0, wv.size() * sizeof(float));
+        if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) {
+            printf("  FAIL moe fetch T=%" PRId64 ": graph compute failed\n", T);
+            return false;
+        }
+        std::vector<int32_t> plan;
+        {
+            std::lock_guard<std::mutex> lk(plan_mtx);
+            plan = last_plan;
+        }
+        std::vector<int32_t> sid((size_t) c.n_used * T);
+        ggml_backend_tensor_get(sids, sid.data(), 0, sid.size() * sizeof(int32_t));
+        std::vector<float> dv((size_t) c.n_embd * c.n_used * T);
+        ggml_backend_tensor_get(down, dv.data(), 0, dv.size() * sizeof(float));
+        std::vector<float> ov((size_t) c.n_embd * T);
+        ggml_backend_tensor_get(out, ov.data(), 0, ov.size() * sizeof(float));
+
+        bool ok = true;
+        if (expect != 0) {
+            // every slot id the zero slot, the bank chain zero, the wait zeros, the error set
+            const uint32_t err = br_error(br);
+            ok = err == (expect == 1 ? (uint32_t) GGML_MOE_BRIDGE_ERR_TIMEOUT : (uint32_t) GGML_MOE_BRIDGE_ERR_RUNNER);
+            for (int32_t v : sid) {
+                ok = ok && v == K;
+            }
+            for (float v : dv) {
+                ok = ok && v == 0.0f;
+            }
+            if (!ok) {
+                printf("  FAIL moe fetch %s T=%" PRId64 ": error %u (want %s), slot ids or rows not all zero slot\n", what, T, err,
+                       expect == 1 ? "timeout" : "runner");
+            }
+            return ok;
+        }
+
+        // the slot ids are the plan's
+        for (size_t a = 0; a < sid.size(); a++) {
+            const auto it = std::find(plan.begin(), plan.end(), ids_v[a]);
+            const int32_t want = it != plan.end() ? (int32_t) (it - plan.begin()) : K;
+            if (sid[a] != want) {
+                printf("  FAIL moe fetch T=%" PRId64 ": slot id %zu is %d, the plan says %d\n", T, a, sid[a], want);
+                ok = false;
+                break;
+            }
+        }
+        // the bank slots hold the planned experts' ring bytes
+        for (size_t i = 0; i < plan.size() && ok; i++) {
+            ggml_tensor * bank[3] = { bu, bg, bd };
+            for (int k = 0; k < 3 && ok; k++) {
+                std::vector<uint8_t> got(eb[k]);
+                ggml_backend_tensor_get(bank[k], got.data(), i * bank[k]->nb[2], eb[k]);
+                const uint8_t * src = k == 0 ? wu.data() : k == 1 ? wg.data() : wd.data();
+                if (memcmp(got.data(), src + (size_t) plan[i] * eb[k], eb[k]) != 0) {
+                    printf("  FAIL moe fetch T=%" PRId64 ": bank slot %zu part %d is not expert %d's bytes\n", T, i, k, plan[i]);
+                    ok = false;
+                }
+            }
+        }
+        // the bank chain against the CPU rows; the wait against the CPU sum over the other experts
+        const std::vector<float> ref = cpu_fn_moe_graph(backend_ref, c, T, wu, wg, wd, xv, ids_v, nullptr, 0);
+        if (ref.empty()) {
+            return false;
+        }
+        std::vector<float> want_rows, got_rows;
+        bool zeros_ok = true;
+        std::vector<float> want_sum((size_t) c.n_embd * T, 0.0f);
+        for (int64_t t = 0; t < T; t++) {
+            for (int slot = 0; slot < c.n_used; slot++) {
+                const size_t a = (size_t) t * c.n_used + slot;
+                const float * rr = ref.data() + a * c.n_embd;
+                const float * gr = dv.data() + a * c.n_embd;
+                const bool planned = std::find(plan.begin(), plan.end(), ids_v[a]) != plan.end();
+                for (int64_t row = 0; row < c.n_embd; row++) {
+                    if (planned) {
+                        want_rows.push_back(rr[row]);
+                        got_rows.push_back(gr[row]);
+                    } else {
+                        zeros_ok = zeros_ok && gr[row] == 0.0f;
+                        want_sum[(size_t) t * c.n_embd + row] += wv[a] * rr[row];
+                    }
+                }
+            }
+        }
+        const double err_rows = want_rows.empty() ? 0.0 : nmse(want_rows.data(), got_rows.data(), want_rows.size());
+        const double err_sum  = nmse(want_sum.data(), ov.data(), ov.size());
+        if (!zeros_ok || err_rows > 5e-4 || err_sum > 1e-10 || br_error(br) != GGML_MOE_BRIDGE_ERR_NONE) {
+            printf("  FAIL moe fetch %s T=%" PRId64 ": %zu planned, bank rows NMSE %g, zero rows %d, CPU sum NMSE %g, error %u\n",
+                   what, T, plan.size(), err_rows, (int) zeros_ok, err_sum, br_error(br));
+            ok = false;
+        }
+        ggml_moe_bridge_chan_times tm;
+        br_times(br, chan, &tm);
+        // the count only: the fetch of the test's small experts can take less than one tick of the device timer
+        if (ok && tm.n_fetch != plan.size()) {
+            printf("  FAIL moe fetch T=%" PRId64 ": device times say %u fetched in %llu ns, the plan had %zu\n", T, tm.n_fetch,
+                   (unsigned long long) tm.fetch_ns, plan.size());
+            ok = false;
+        }
+        return ok;
+    };
+
+    for (int rep = 0; rep < 3; rep++) {
+        for (int64_t T = 1; T <= 8; T++) {
+            n_run++;
+            n_fail += run_case(T, 0, "") ? 0 : 1;
+        }
+    }
+    auto recover = [&]() {
+        for (int k = 0; k < 2000; k++) {
+            if (br_reset(br)) {
+                return true;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        return false;
+    };
+    // no plan: the executor does not take the job, the fetch times out
+    n_run++;
+    paused = true;
+    bool fok = run_case(3, 1, "(no plan)");
+    paused = false;
+    fok = recover() && fok;
+    n_fail += fok ? 0 : 1;
+    // a plan with a bank slot out of range
+    n_run++;
+    bad_slot = 1;
+    fok = run_case(4, 2, "(bad plan)");
+    fok = recover() && fok;
+    n_fail += fok ? 0 : 1;
+    n_run++;
+    n_fail += run_case(5, 0, "(after recovery)") ? 0 : 1;
+
+    ggml_backend_synchronize(backend);
+    stop = true;
+    exec.join();
+    br_free(br);
+    pool_free(pool);
+    printf("  MoE bridge fetch (PCIe share) vs the CPU MUL_MAT_ID chain: %d cases run, %d failed\n", n_run, n_fail);
+    return n_fail == 0;
+}
+
 static bool test_backend(ggml_backend_t backend, ggml_backend_dev_t dev, test_mode mode, const char * op_names_filter, const char * params_filter,
                          printer * output_printer, const char * test_file_path, int parallel_workers) {
     auto filter_test_cases = [](std::vector<std::unique_ptr<test_case>> & test_cases, const char * params_filter) {
@@ -16847,7 +17326,8 @@ static bool test_backend(ggml_backend_t backend, ggml_backend_dev_t dev, test_mo
 
         const bool fn_moe_fuse_ok = run_cpu_fn_moe_fuse(backend, backend_cpu.get(), op_names_filter); // [TAG_FN_CPU_MOE_FUSE]
 
-        const bool moe_bridge_ok = run_moe_bridge(backend, backend_cpu.get(), op_names_filter); // [TAG_MOE_BRIDGE]
+        const bool moe_bridge_ok = run_moe_bridge(backend, backend_cpu.get(), op_names_filter) && // [TAG_MOE_BRIDGE]
+                                   run_moe_bridge_fetch(backend, backend_cpu.get(), op_names_filter); // [TAG_FN_R4_BRIDGE_DMA]
 
         return n_ok == tests_run && slice_ok && q2_0_repack_ok && fn_repack_skip_ok && fn_mmid_mr_ok && fn_moe_fuse_ok && moe_bridge_ok;
     }

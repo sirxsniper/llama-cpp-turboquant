@@ -307,6 +307,16 @@ if (NOT GGML_BACKEND_DL AND GGML_CPU)
     llama_build_and_test(test-moe-gen5.cpp)
 endif()
 
+# [TAG_FN_R4_QSA_POS] ggml_qsa_mask (the QSA attention mask from positions) bit for bit against qwen4exp's explicit
+# mask path (fill, scatter, add) on the CPU backend, whole and in query chunks
+if (NOT GGML_BACKEND_DL AND GGML_CPU)
+    llama_build_and_test(test-qsa-pos.cpp)
+endif()
+
+# [TAG_FN_R4_ADAPT_DECAY] the decayed-count admission policy of the adaptive hot set (src/llama-moe-decay.h, header only):
+# pairing rules, prompt seed, and replays (steady experts vs bursts, a shifted working set, a skewed stream). CPU only.
+llama_build_and_test(test-moe-decay.cpp)
+
 # [TAG_FN_MTP_COST] cost-aware MTP draft length (common/speculative-mtp-cost.h): pieces and a step simulation, CPU only
 llama_build_and_test(test-mtp-cost.cpp)
 

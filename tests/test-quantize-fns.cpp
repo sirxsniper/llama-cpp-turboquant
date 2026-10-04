@@ -436,6 +436,7 @@ static int test_fn_mmid_mr(bool verbose) {
 
     const int saved_mr   = ggml_cpu_fn_get_switch(GGML_CPU_FN_MMID_MR);
     const int saved_q5_1 = ggml_cpu_fn_get_switch(GGML_CPU_FN_Q5_1_AVX512);
+    const int saved_vnni = ggml_cpu_fn_get_switch(GGML_CPU_FN_VNNI); // [TAG_FN_R4_VNNI]
     ggml_cpu_fn_set_switch(GGML_CPU_FN_Q5_1_AVX512, 0); // vec_dot = the AVX2 bodies
 
     std::mt19937 rng(4321);
@@ -474,8 +475,11 @@ static int test_fn_mmid_mr(bool verbose) {
                 }
             }
 
-            for (int body : {1, 2}) {
-                ggml_cpu_fn_set_switch(GGML_CPU_FN_MMID_MR, body);
+            // [TAG_FN_R4_VNNI] body 3: GGML_CPU_MMID_MR=1 with GGML_CPU_VNNI=1 (the VNNI bodies of q4_K, q5_1 and iq4_nl on a
+            // VNNI CPU; elsewhere the maddubs bodies run again)
+            for (int body : {1, 2, 3}) {
+                ggml_cpu_fn_set_switch(GGML_CPU_FN_MMID_MR, body == 3 ? 1 : body);
+                ggml_cpu_fn_set_switch(GGML_CPU_FN_VNNI,   body == 3 ? 1 : 0);
                 for (int nr : {1, 3, max_nr}) {
                     for (int nc = 1; nc <= 4; ++nc) {
                         const void * cols[4] = { yq[0].data(), yq[1].data(), yq[2].data(), yq[3].data() };
@@ -518,9 +522,11 @@ static int test_fn_mmid_mr(bool verbose) {
 
     ggml_cpu_fn_set_switch(GGML_CPU_FN_MMID_MR, saved_mr);
     ggml_cpu_fn_set_switch(GGML_CPU_FN_Q5_1_AVX512, saved_q5_1);
+    ggml_cpu_fn_set_switch(GGML_CPU_FN_VNNI, saved_vnni);
 
     if (num_failed || verbose) {
-        printf(" mmid_mr kernels: %d values, %d not bitwise equal to vec_dot\n", n_values, num_failed);
+        printf(" mmid_mr kernels: %d values, %d not bitwise equal to vec_dot (VNNI bodies %s)\n", n_values, num_failed,
+               ggml_cpu_fn_vnni_available() ? "checked" : "not available: body 3 ran the maddubs bodies");
     }
     return num_failed;
 }

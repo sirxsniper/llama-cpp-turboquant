@@ -53,6 +53,8 @@ static void set_env(const char * name, const char * value) {
 }
 
 static const char * k_env[] = {
+    "LLAMA_MOE_DMA_SHARE_START_PCT", "LLAMA_MOE_DMA_WAIT_HI_US", "LLAMA_MOE_DMA_WAIT_LO_US", // [TAG_FN_R4_BRIDGE_DMA]
+    "LLAMA_MOE_DMA_STEP_PCT10", "LLAMA_MOE_DMA_SHARE_MAX_PCT",
     "LLAMA_MOE_DMA_SHARE", "LLAMA_MOE_PREFETCH", "LLAMA_MOE_DMA_SLOTS", "LLAMA_MOE_DMA_ADMIT", "LLAMA_MOE_DMA_FILL_MIB",
     "LLAMA_MOE_DMA_RING_MIB", "LLAMA_MOE_PREFETCH_SLOTS", "LLAMA_MOE_PREFETCH_FILL", "LLAMA_MOE_PREFETCH_K",
     "LLAMA_MOE_DMA_FILL_THREADS", "LLAMA_MOE_DMA_SYNC", "LLAMA_MOE_DMA_INLINE", "LLAMA_MOE_DMA_HYST", "LLAMA_MOE_DMA_PROFILE",
@@ -486,6 +488,237 @@ static void test_dma(t_model & m, const dma_cfg & c, int n_steps) {
 }
 
 //
+// [TAG_FN_R4_BRIDGE_DMA] the DMA share in bridge mode: the bridge's executor plans each job (llama_moe_dma_bridge_plan),
+// the device fetch copies the plan from the ring into the bank, the bank chain computes the fetched experts, the CPU
+// skips them. Here the fetch is a memcpy of the plan's ring bytes into the CPU bank; the sum of the CPU chain (hot and
+// fetched experts skipped), the hot chain and the bank chain must equal the plain chain bit for bit. Checks the plan
+// itself too: only routed, cold, ring-ready experts whose ring bytes are the expert's, at most share x cold, most
+// tokens first, the slot ids, and share = auto against the measured rates.
+//
+
+static void test_dma_bridge(t_model & m, const char * name, const char * share, const char * slots, int n_steps) {
+    reset_env();
+    set_env("LLAMA_MOE_DMA_SHARE", share);
+    set_env("LLAMA_MOE_DMA_SLOTS", slots);
+    set_env("LLAMA_MOE_DMA_ADMIT", "1/8");
+    set_env("LLAMA_MOE_DMA_FILL_MIB", "64");
+    set_env("LLAMA_MOE_DMA_RING_MIB", "2");
+    set_env("LLAMA_MOE_DMA_FILL_THREADS", "2");
+    set_env("LLAMA_MOE_PREFETCH", "1"); // must be turned off in bridge mode
+    static int owner_tag = 0;
+    const void * owner = &owner_tag;
+    const bool ok = llama_moe_dma_init_layers(descs(m), cpu_device(m), owner, /*bridge =*/ true);
+    TCHECK(ok, "[%s] init (bridge mode)", name);
+    if (!ok) {
+        return;
+    }
+    TCHECK(llama_moe_dma_bridge_mode(), "[%s] bridge mode", name);
+    TCHECK(llama_moe_dma_lookup(nullptr, m.layers[0].w[0], 1) == nullptr, "[%s] no plan/fence path in bridge mode", name);
+    TCHECK(llama_moe_dma_pred_k() == 0, "[%s] no prefetch in bridge mode", name);
+    void * ring = nullptr;
+    size_t ring_size = 0;
+    int K = 0;
+    TCHECK(llama_moe_dma_bridge_ring(owner, &ring, &ring_size, &K) && ring && ring_size > 0, "[%s] ring", name);
+    TCHECK(K == atoi(slots), "[%s] bank slots %d", name, K);
+    if (!ring) {
+        llama_moe_dma_free(owner);
+        return;
+    }
+
+    std::mt19937 rng(11);
+    std::vector<std::vector<int32_t>> work(N_LAYER);
+    for (auto & w : work) {
+        for (int i = 0; i < 16; ++i) {
+            w.push_back((int32_t) (rng() % N_EXPERT));
+        }
+    }
+    const double share_v = strcmp(share, "auto") == 0 ? 0.25 : atof(share);
+    bool all_same = true;
+    uint64_t n_fetched = 0;
+    for (int step = 0; step < n_steps; ++step) {
+        const int T = 1 + step % LLAMA_MOE_DMA_MAX_T;
+        if (step % 16 == 15) {
+            for (auto & w : work) {
+                w[rng() % w.size()] = (int32_t) (rng() % N_EXPERT);
+            }
+        }
+        graph_run g;
+        g.init();
+        ggml_tensor * x = ggml_new_tensor_2d(g.ctx, GGML_TYPE_F32, N_EMBD, T);
+        ggml_set_input(x);
+        ggml_tensor * xin = ggml_reshape_3d(g.ctx, x, N_EMBD, 1, T);
+        std::vector<ggml_tensor *> ids(N_LAYER), skip(N_LAYER), bank_ids(N_LAYER), out_ref(N_LAYER), out_br(N_LAYER);
+        for (int l = 0; l < N_LAYER; ++l) {
+            ids[l] = ggml_new_tensor_2d(g.ctx, GGML_TYPE_I32, N_USED, T);
+            ggml_set_input(ids[l]);
+            skip[l] = ggml_new_tensor_2d(g.ctx, GGML_TYPE_I32, 1, N_EXPERT);
+            ggml_set_input(skip[l]);
+            bank_ids[l] = ggml_new_tensor_2d(g.ctx, GGML_TYPE_I32, N_USED, T);
+            ggml_set_input(bank_ids[l]);
+        }
+        std::vector<const llama_moe_dma_view *> views(N_LAYER, nullptr);
+        for (int l = 0; l < N_LAYER; ++l) {
+            t_layer & L = m.layers[l];
+            out_ref[l] = chain(g.ctx, L.w, xin, ids[l], nullptr, 0);
+            ggml_set_output(out_ref[l]);
+            ggml_build_forward_expand(g.gf, out_ref[l]);
+
+            views[l] = llama_moe_dma_bridge_lookup(L.w[0], T);
+            TCHECK(views[l] != nullptr, "[%s] bridge lookup layer %d", name, l);
+            if (!views[l]) {
+                llama_moe_dma_free(owner);
+                return;
+            }
+            ggml_tensor * merged = chain(g.ctx, L.w, xin, ids[l], skip[l], 0);
+            if (L.hot) {
+                merged = ggml_add(g.ctx, merged, chain(g.ctx, L.hw, xin, remap(g.ctx, L.hot_tbl, ids[l]), nullptr, 0));
+            }
+            ggml_tensor * bw[3] = { views[l]->up, views[l]->gate, views[l]->down };
+            merged = ggml_add(g.ctx, merged, chain(g.ctx, bw, xin, bank_ids[l], nullptr, 0));
+            out_br[l] = merged;
+            ggml_set_output(out_br[l]);
+            ggml_build_forward_expand(g.gf, out_br[l]);
+        }
+        if (!g.alloc()) {
+            TCHECK(false, "[%s] graph alloc", name);
+            break;
+        }
+        std::vector<float> xv(N_EMBD*T);
+        std::uniform_real_distribution<float> u(-1.0f, 1.0f);
+        for (auto & v : xv) {
+            v = u(rng);
+        }
+        ggml_backend_tensor_set(x, xv.data(), 0, xv.size()*sizeof(float));
+
+        for (int l = 0; l < N_LAYER; ++l) {
+            t_layer & L = m.layers[l];
+            const std::vector<int32_t> r = route(rng, T, work[l]);
+            set_i32(ids[l], r);
+            const int32_t * hot_tbl = L.hot ? (const int32_t *) L.hot_tbl->data : nullptr;
+
+            // the executor's plan
+            uint64_t off[64];
+            int32_t  slot[64];
+            int32_t  d_exp[64];
+            std::vector<int32_t> sl(N_USED*T, -7);
+            const int n = llama_moe_dma_bridge_plan(views[l]->handle, r.data(), (int) N_USED, T, hot_tbl, N_HOT, K, off, slot,
+                    sl.data(), d_exp);
+            TCHECK(n >= 0 && n <= K, "[%s] plan size %d of %d", name, n, K);
+            if (n < 0) {
+                n_steps = 0;
+                break;
+            }
+            n_fetched += n;
+            std::vector<int> tok(N_EXPERT, 0);
+            int n_cold = 0;
+            for (int32_t e : r) {
+                tok[e]++;
+            }
+            for (int e = 0; e < N_EXPERT; ++e) {
+                n_cold += tok[e] > 0 && !(hot_tbl && hot_tbl[e] != N_HOT);
+            }
+            TCHECK(n <= (int) std::lround(share_v*n_cold) || strcmp(share, "auto") == 0, "[%s] plan %d within share x %d cold", name, n, n_cold);
+            const size_t eb[3] = { ggml_nbytes(L.w[0])/N_EXPERT, ggml_nbytes(L.w[1])/N_EXPERT, ggml_nbytes(L.w[2])/N_EXPERT };
+            for (int i = 0; i < n; ++i) {
+                const int32_t e = d_exp[i];
+                TCHECK(e >= 0 && e < N_EXPERT && tok[e] > 0, "[%s] fetched expert %d is routed", name, e);
+                TCHECK(!(hot_tbl && hot_tbl[e] != N_HOT), "[%s] fetched expert %d is not hot", name, e);
+                TCHECK(slot[i] == i, "[%s] bank slots in plan order", name);
+                TCHECK(i == 0 || tok[d_exp[i - 1]] >= tok[e], "[%s] most tokens first", name);
+                // the ring bytes are the expert's (up | gate | down), the fetch copies them into the bank slot
+                const uint8_t * src = (const uint8_t *) ring + off[i];
+                TCHECK(off[i] + eb[0] + eb[1] + eb[2] <= ring_size, "[%s] ring offset in range", name);
+                size_t o = 0;
+                ggml_tensor * bank[3] = { views[l]->up, views[l]->gate, views[l]->down };
+                for (int k = 0; k < 3; ++k) {
+                    TCHECK(memcmp(src + o, (const uint8_t *) L.w[k]->data + (size_t) e*eb[k], eb[k]) == 0,
+                            "[%s] ring bytes of expert %d part %d", name, e, k);
+                    ggml_backend_tensor_set(bank[k], src + o, (size_t) slot[i]*bank[k]->nb[2], eb[k]);
+                    o += eb[k];
+                }
+            }
+            // slot ids: the fetched expert's slot, the zero slot elsewhere
+            for (int a = 0; a < N_USED*T; ++a) {
+                int want = K;
+                for (int i = 0; i < n; ++i) {
+                    if (d_exp[i] == r[a]) {
+                        want = slot[i];
+                    }
+                }
+                TCHECK(sl[a] == want, "[%s] slot id %d: %d, want %d", name, a, sl[a], want);
+            }
+            set_i32(bank_ids[l], sl);
+            // the CPU's skip table: the hot experts and the fetched ones
+            std::vector<int32_t> sk(N_EXPERT, 0);
+            for (int e = 0; e < N_EXPERT; ++e) {
+                sk[e] = hot_tbl && hot_tbl[e] != N_HOT ? 1 : 0;
+            }
+            for (int i = 0; i < n; ++i) {
+                sk[d_exp[i]] = 1;
+            }
+            set_i32(skip[l], sk);
+        }
+        if (n_steps == 0) {
+            break;
+        }
+        if (ggml_backend_graph_compute(m.cpu, g.gf) != GGML_STATUS_SUCCESS) {
+            TCHECK(false, "[%s] compute", name);
+            break;
+        }
+        for (int l = 0; l < N_LAYER; ++l) {
+            const bool s = same(out_ref[l], out_br[l], name, l);
+            all_same = all_same && s;
+            TCHECK(s, "[%s] step %d T %d layer %d: bridged DMA sum == plain chain", name, step, T, l);
+        }
+        // the zero slot stays zero: the fetches never write it
+        for (int l = 0; l < N_LAYER; ++l) {
+            ggml_tensor * bank = views[l]->down;
+            std::vector<uint8_t> z(bank->nb[2]);
+            ggml_backend_tensor_get(bank, z.data(), (size_t) K*bank->nb[2], z.size());
+            TCHECK(std::all_of(z.begin(), z.end(), [](uint8_t b) { return b == 0; }), "[%s] zero slot of layer %d", name, l);
+        }
+        llama_moe_dma_step(owner);
+        llama_moe_dma_wait_idle();
+    }
+    const llama_moe_dma_counters k = llama_moe_dma_get_counters();
+    printf("  [%s] %llu steps, %llu layer-steps: cold %llu, ring-ready %llu, fetched %llu, fills %llu, bitwise %s\n", name,
+           (unsigned long long) k.steps, (unsigned long long) k.layer_steps, (unsigned long long) k.cold,
+           (unsigned long long) k.ring_ready, (unsigned long long) k.dma_on_demand, (unsigned long long) k.fills,
+           all_same ? "equal" : "DIFFERENT");
+    if (share_v > 0.0) {
+        TCHECK(n_fetched > 0, "[%s] experts were fetched", name);
+    } else {
+        TCHECK(n_fetched == 0, "[%s] share 0 fetches nothing", name);
+    }
+
+    // share = auto: the device waited for the CPU part (more to the GPU), then it did not (less), capped by the rates
+    if (strcmp(share, "auto") == 0) {
+        llama_moe_dma_bridge_step st;
+        st.n_layers = 4;
+        st.cpu_us = 400.0;
+        st.n_cpu = 8;           // 50 us per CPU expert
+        st.fetch_us = 120.0;
+        st.n_fetch = 2;         // 60 us per fetched expert: balance 50/110 = 0.45, cap 0.68
+        st.gpu_wait_us = 4*100.0;
+        const double s0 = llama_moe_dma_get_counters().share;
+        llama_moe_dma_bridge_feedback(st);
+        const double s1 = llama_moe_dma_get_counters().share;
+        TCHECK(s1 > s0, "[%s] auto: the device waited, the share grows (%.3f -> %.3f)", name, s0, s1);
+        for (int i = 0; i < 200; ++i) {
+            llama_moe_dma_bridge_feedback(st);
+        }
+        const double s2 = llama_moe_dma_get_counters().share;
+        TCHECK(s2 <= 1.5*50.0/110.0 + 1e-9 && s2 > 0.5, "[%s] auto: capped by the rates (%.3f)", name, s2);
+        st.gpu_wait_us = 0.0;
+        llama_moe_dma_bridge_feedback(st);
+        const double s3 = llama_moe_dma_get_counters().share;
+        TCHECK(s3 < s2, "[%s] auto: no wait, the share shrinks (%.3f -> %.3f)", name, s2, s3);
+    }
+    llama_moe_dma_free(owner);
+    TCHECK(llama_moe_dma_bridge_lookup(m.layers[0].w[0], 1) == nullptr, "[%s] freed", name);
+}
+
+//
 // prefill stream
 //
 
@@ -629,6 +862,12 @@ int main() {
     for (const auto & c : cfgs) {
         test_dma(m, c, 48);
     }
+
+    printf("test-moe-gen5: DMA share in bridge mode [TAG_FN_R4_BRIDGE_DMA]\n");
+    test_dma_bridge(m, "bridge share 1",          "1",    "4", 48);
+    test_dma_bridge(m, "bridge share 0.5, 2 slots", "0.5", "2", 48);
+    test_dma_bridge(m, "bridge share 0",          "0",    "4", 16);
+    test_dma_bridge(m, "bridge share auto",       "auto", "4", 48);
 
     printf("test-moe-gen5: prefill stream\n");
     for (int nb = 1; nb <= 3; ++nb) {
