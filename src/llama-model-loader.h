@@ -70,6 +70,9 @@ struct llama_model_loader {
     static const int TENSOR_SKIP_IF_VIRTUAL = 1 << 3;
     static const int TENSOR_ALLOW_RESHAPE   = 1 << 4;
     static const int TENSOR_READ_LAZY       = 1 << 5; // read rows on demand instead of loading whole tensor; requires mmap for now
+    // [TAG_FN_PLE_DIRECT_IO] with TENSOR_READ_LAZY: lazy whatever the lazy mode and the size, and never read, validated,
+    // prefetched or locked at load; the model reads the rows itself from the file (files_paths) with unbuffered I/O
+    static const int TENSOR_READ_DIRECT     = 1 << 6;
 
     int n_kv      = 0;
     int n_tensors = 0;
@@ -92,7 +95,8 @@ struct llama_model_loader {
 
         // decide whether this tensor is read lazily
         // pass w to also record it, or nullptr to only ask
-        bool add(const std::string & name, const ggml_tensor * t, const llama_tensor_weight * w);
+        // [TAG_FN_PLE_DIRECT_IO] direct: TENSOR_READ_DIRECT (lazy in any mode, recorded in `direct`)
+        bool add(const std::string & name, const ggml_tensor * t, const llama_tensor_weight * w, bool direct_read = false);
 
         bool any() const {
             return !ranges.empty();
@@ -100,6 +104,18 @@ struct llama_model_loader {
 
         bool has(const ggml_tensor * t) const {
             return tensors.count(ggml_get_name(t)) > 0;
+        }
+
+        // [TAG_FN_PLE_DIRECT_IO] the model reads this tensor's rows from the file itself; the load must not touch it
+        bool is_direct(const ggml_tensor * t) const {
+            return direct.count(ggml_get_name(t)) > 0;
+        }
+
+        // [TAG_FN_PLE_DIRECT_IO] a directly read tensor of file idx starts before offs (a lock from the file start up
+        // to a tensor at offs would lock it)
+        bool direct_before(uint32_t idx, size_t offs) const {
+            const auto it = direct_first.find(idx);
+            return it != direct_first.end() && it->second < offs;
         }
 
         const llama_mmap::ranges & for_file(uint32_t idx) const {
@@ -115,9 +131,12 @@ struct llama_model_loader {
     private:
         std::map<uint32_t, llama_mmap::ranges> ranges;
         std::set<std::string>                  tensors;
+        std::set<std::string>                  direct;       // [TAG_FN_PLE_DIRECT_IO]
+        std::map<uint32_t, size_t>             direct_first; // [TAG_FN_PLE_DIRECT_IO] lowest direct offset per file
     } lazy;
 
     llama_files files;
+    std::vector<std::string> files_paths; // [TAG_FN_PLE_DIRECT_IO] path of files[i] (empty when loaded from a FILE *)
     llama_ftype ftype;
     llama_fver  fver;
 

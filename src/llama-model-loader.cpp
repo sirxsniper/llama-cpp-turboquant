@@ -577,6 +577,7 @@ llama_model_loader::llama_model_loader(
         llm_kv = LLM_KV(llm_arch_from_string(arch_name));
 
         files.emplace_back(new llama_file(fname.c_str(), "rb", use_direct_io));
+        files_paths.push_back(fname);
         contexts.emplace_back(ctx);
 
         // Save tensors data offset of the main file.
@@ -645,6 +646,7 @@ llama_model_loader::llama_model_loader(
                 }
 
                 files.emplace_back(new llama_file(fname_split, "rb", use_direct_io));
+                files_paths.push_back(fname_split);
                 contexts.emplace_back(ctx);
 
                 // Save tensors data offset info of the shard.
@@ -696,6 +698,7 @@ llama_model_loader::llama_model_loader(
         llm_kv = LLM_KV(llm_arch_from_string(arch_name));
 
         files.emplace_back(new llama_file(file));
+        files_paths.emplace_back();
         contexts.emplace_back(ctx);
 
         // Save tensors data offset info of the main file.
@@ -1085,14 +1088,15 @@ ggml_backend_buffer_type_t llama_model_loader::lazy_read::buft() {
     return ggml_backend_dev_buffer_type(cpu_dev);
 }
 
-bool llama_model_loader::lazy_read::add(const std::string & name, const ggml_tensor * t, const llama_tensor_weight * w) {
-    if (mode == LLAMA_LAZY_MODE_OFF) {
+bool llama_model_loader::lazy_read::add(const std::string & name, const ggml_tensor * t, const llama_tensor_weight * w, bool direct_read) {
+    // [TAG_FN_PLE_DIRECT_IO] a directly read tensor is lazy whatever the mode and the size: loading it would read it all
+    if (mode == LLAMA_LAZY_MODE_OFF && !direct_read) {
         return false;
     }
 
     // do not lazy-read small tensors, it has significant overhead and is not worth it
     constexpr size_t auto_min_size = 4ull * 1024 * 1024 * 1024;
-    if (mode != LLAMA_LAZY_MODE_ON && ggml_nbytes(t) <= auto_min_size) {
+    if (mode != LLAMA_LAZY_MODE_ON && !direct_read && ggml_nbytes(t) <= auto_min_size) {
         return false;
     }
 
@@ -1105,9 +1109,14 @@ bool llama_model_loader::lazy_read::add(const std::string & name, const ggml_ten
     if (w) {
         ranges[w->idx].emplace_back(w->offs, w->offs + ggml_nbytes(t));
         tensors.insert(name);
+        if (direct_read) {
+            direct.insert(name);
+            const auto it = direct_first.find(w->idx);
+            direct_first[w->idx] = it == direct_first.end() ? w->offs : std::min(it->second, w->offs);
+        }
 
-        LLAMA_LOG_INFO("%s: tensor %s (size = %zu MiB) lazy read enabled\n",
-                __func__, name.c_str(), ggml_nbytes(t)/1024/1024);
+        LLAMA_LOG_INFO("%s: tensor %s (size = %zu MiB) lazy read enabled%s\n",
+                __func__, name.c_str(), ggml_nbytes(t)/1024/1024, direct_read ? " (rows read from the file, never mapped in)" : "");
     }
 
     return true;
@@ -1341,7 +1350,8 @@ struct ggml_tensor * llama_model_loader::create_tensor(
 
     if (flags & TENSOR_READ_LAZY) {
         // the decision must not depend on the load mode, or the memory-fit pass (no_alloc, no mmap)
-        is_lazy = lazy.add(tn.str(), cur, no_alloc ? nullptr : &require_weight(tn.str().c_str()));
+        is_lazy = lazy.add(tn.str(), cur, no_alloc ? nullptr : &require_weight(tn.str().c_str()),
+                (flags & TENSOR_READ_DIRECT) != 0);
     }
 
     ggml_tensor t_meta = *cur;
@@ -1646,7 +1656,8 @@ bool llama_model_loader::load_all_data(
             }
             uint8_t * data = (uint8_t *) mapping->addr() + weight->offs;
 
-            if (check_tensors) {
+            // [TAG_FN_PLE_DIRECT_IO] validating would read the whole tensor through the mapping
+            if (check_tensors && !lazy.is_direct(cur)) {
                 validation_result.emplace_back(std::async(std::launch::async, [cur, data, n_size] {
                     return std::make_pair(cur, ggml_validate_row_data(cur->type, data, n_size));
                 }));
@@ -1658,8 +1669,16 @@ bool llama_model_loader::load_all_data(
 
                 // locking a lazy tensor would fault all of it in, which is what lazy avoids
                 if (lmlocks && !lazy.has(cur)) {
-                    const auto & lmlock = lmlocks->at(weight->idx);
-                    lmlock->grow_to(weight->offs + n_size);
+                    if (lazy.direct_before(weight->idx, weight->offs)) {
+                        // [TAG_FN_PLE_DIRECT_IO] the file lock grows from the file start and would take a directly
+                        // read table before this tensor with it: lock this tensor's own range instead
+                        lmlocks->emplace_back(new llama_mlock());
+                        lmlocks->back()->init(data);
+                        lmlocks->back()->grow_to(n_size);
+                    } else {
+                        const auto & lmlock = lmlocks->at(weight->idx);
+                        lmlock->grow_to(weight->offs + n_size);
+                    }
                 }
 
                 auto & mmap_used = mmaps_used[weight->idx];

@@ -310,6 +310,12 @@ endif()
 # [TAG_FN_MTP_COST] cost-aware MTP draft length (common/speculative-mtp-cost.h): pieces and a step simulation, CPU only
 llama_build_and_test(test-mtp-cost.cpp)
 
+# [TAG_FN_PLE_DIRECT_IO] unbuffered PLE row reads (src/llama-ple-dio.cpp) against the mapped rows of a real GGUF, CPU and
+# disk only. Built, not registered with ctest: it needs the model file. The reader is compiled in (libllama does not
+# export it).
+llama_build(test-ple-dio.cpp ${CMAKE_CURRENT_SOURCE_DIR}/../src/llama-ple-dio.cpp)
+target_include_directories(test-ple-dio PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model")
 llama_build_and_test(test-autorelease.cpp       LABEL "model")
 llama_build_and_test(test-backend-sampler.cpp   LABEL "model")
