@@ -1161,6 +1161,18 @@ struct common_batch {
     int32_t size() const { return (int32_t) tokens.size(); }
 };
 
+// [TAG_SYNC_1004] llama_batch helpers, kept for the fork code that still fills a llama_batch itself (the DFlash
+// drafter's own decode batches, the KLD tooling in llama-perplexity, tests); upstream #29601 removed them when the
+// rest of the tree moved to common_batch. llama_decode() converts such a batch to llama_batch_ext.
+void common_batch_clear(struct llama_batch & batch);
+
+void common_batch_add(
+                 struct llama_batch & batch,
+                        llama_token   id,
+                          llama_pos   pos,
+    const std::vector<llama_seq_id> & seq_ids,
+                               bool   logits);
+
 // create a single-sequence batch from a list of tokens
 // positions continue from the memory, last token always have output_logits set to true
 common_batch common_batch_get_one(struct llama_context * ctx, const llama_token * tokens, int32_t n_tokens);
