@@ -86,7 +86,7 @@ const fn_item k_items[] = {
     { "TURBO_QSA_CHUNK",              "512",   P_ALL },
     { "TURBO_QSA_SPARSE",             "1",     P_ALL },
     { "TURBO_QSA_TOPK_UNORDERED",     "1",     P_ALL },
-    { "SPEC_MTP_COST",                "2",     P_ALL }, // [TAG_FN_L3_ADOPT] draft length v2 [TAG_FN_L3_MTP_COST2] (1 until round 3)
+    { "SPEC_MTP_COST",                "0",     P_ALL }, // [TAG_FN_L3_ADOPT] the fixed p_min rule (1 until round 3): with no DMA share v1 and v2 (SPEC_MTP_COST=2) shorten the drafts in some server loads (l3/int conf: tau 1.06, -7 %)
     { "LLAMA_MTP_ATTN_WINDOW",        "32768", P_ALL },
     { "LLAMA_MTP_HEAD_ROWS",          "98304", P_ALL },
     { "SPEC_DFT_UBATCH",              "128",   P_ALL }, // the MTP draft context's ubatch (its logits buffer at -ub 8192)

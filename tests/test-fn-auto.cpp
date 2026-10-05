@@ -119,7 +119,7 @@ static void test_profile_opts() {
         { "LLAMA_MOE_BRIDGE_PF", "1" }, { "LLAMA_MOE_BRIDGE_PF_SOLO", "1" }, // [TAG_FN_R2_BRIDGE_PF] r2/ab4
         { "LLAMA_QSA_POS_MASK", "1" }, { "LLAMA_QSA_POS_CHUNK", "512" }, { "TURBO_QSA_CHUNK", "512" },
         { "TURBO_QSA_SPARSE", "1" }, { "LLAMA_MTP_ATTN_WINDOW", "32768" }, { "LLAMA_MTP_HEAD_ROWS", "98304" },
-        { "SPEC_DFT_UBATCH", "128" }, { "SPEC_MTP_COST", "2" }, { "LLAMA_FN_CBUF", "1" }, { "LLAMA_FN_GPU_IDXQ8", "0" }, // [TAG_FN_L3_ADOPT]
+        { "SPEC_DFT_UBATCH", "128" }, { "SPEC_MTP_COST", "0" }, { "LLAMA_FN_CBUF", "1" }, { "LLAMA_FN_GPU_IDXQ8", "0" }, // [TAG_FN_L3_ADOPT]
         { "LLAMA_PREFILL_STREAM_LEND", "1" }, { "LLAMA_PREFILL_STREAM_THREADS", "16" },
     };
     for (const auto & w : want) {
