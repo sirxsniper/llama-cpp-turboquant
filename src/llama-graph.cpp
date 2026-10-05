@@ -6,6 +6,7 @@
 #include "llama-moe-bridge.h" // [TAG_MOE_BRIDGE]
 #include "ggml-moe-bridge.h"  // [TAG_MOE_BRIDGE]
 #include "llama-moe-gen5.h" // [TAG_MOE_DMA_SHARE] [TAG_FN_PREFILL_STREAM]
+#include "ggml-fn-l3.h"     // [TAG_FN_L3_GPU]
 
 #include "llama-impl.h"
 #include "llama-model.h"
@@ -2303,6 +2304,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         logits = build_lora_mm(gate_inp, cur); // [n_expert, n_tokens]
         if (gating_op == LLAMA_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS) {
             ggml_prec_set_acc(logits, GGML_PREC_F32);
+        }
+        // [TAG_FN_L3_GPU_MMV] an arch's mark for its router mat-vec (qwen4exp sets it; 0 for every other model)
+        if (moe_router_mark != 0 && logits->op == GGML_OP_MUL_MAT) {
+            ggml_fn_l3_set(logits, moe_router_mark);
         }
         cb(logits, "ffn_moe_logits", il);
     } else {

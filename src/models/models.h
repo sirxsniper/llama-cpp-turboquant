@@ -2540,7 +2540,7 @@ struct llama_model_qwen4exp : public llama_model_base {
         // the helpers alone, graph_mtp builds its own body
         struct no_build {};
         graph(const llama_model & model, const llm_graph_params & params, no_build) :
-            llm_build_delta_net_base(params), model(model) {}
+            llm_build_delta_net_base(params), l3(l3_read(model)), model(model) {}
 
         // HC replaces every layer norm: residual is [n_embd, hc, n_tokens]
         ggml_tensor * build_hc_mix(
@@ -2557,6 +2557,37 @@ struct llama_model_qwen4exp : public llama_model_base {
                     ggml_tensor * block_out,
                     ggml_tensor * inject,
                             int   il);
+
+        // [TAG_FN_L3_GPU] build_hc_combine in two parts: the scatter weights from the inject, then the combine
+        ggml_tensor * build_hc_combine_w(
+                    ggml_tensor * inject,
+                            int   il);
+
+        ggml_tensor * build_hc_combine_post(
+                    ggml_tensor * residual,
+                    ggml_tensor * block_out,
+                    ggml_tensor * w,
+                            int   il);
+
+        // [TAG_FN_L3_GPU] lever round 3, device time: LLAMA_FN_GPU=1 turns every lever on, LLAMA_FN_GPU_<NAME>=0|1 sets one
+        // (off by default). The marks are the ones of ggml-fn-l3.h; only this graph sets them.
+        struct l3_flags {
+            bool defer   = false; // DEFER:   conv write-back and the ffn combine weights after the bridge post
+            bool convwb  = false; // CONVWB:  conv write-back as direct strided copies (one chained CUDA launch)
+            bool hcfuse  = false; // HCFUSE:  hc scale -> sigmoid -> scale (-> hc post) and scale -> silu in one launch
+            bool compact = false; // COMPACT: QSA sparse-index compaction on many blocks
+            bool topk    = false; // TOPK:    QSA top-k as a chunked two-stage select
+            bool idxq8   = false; // IDXQ8:   the lightning indexer reads the q8_0 pooled keys in place
+            bool mmv     = false; // MMV:     few-row mat-vecs (hc down / inject, GDN alpha / beta, router) with run-ahead loads
+            bool mmvd    = false; // MMVD:    the same for the dense q8_0 projections (GDN qkv / z / out, attention q / k / v / o)
+        };
+        static l3_flags l3_read(const llama_model & model);
+        l3_flags l3;
+
+        // [TAG_FN_L3_GPU_DEFER] nodes the next layer does not read: build_layer_ffn puts them into the graph right after
+        // the bridge post, so the device computes them while the host computes the layer's experts
+        std::vector<ggml_tensor *> l3_deferred;
+        void l3_expand_deferred();
 
         ggml_tensor * build_layer_attn(
               llm_graph_input_attn_kv * inp_attn,

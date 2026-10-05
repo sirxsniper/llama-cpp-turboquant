@@ -1113,6 +1113,8 @@ struct llm_graph_context {
     const llama_moe_bridge * moe_bridge = nullptr;
     const llama_moe_bridge * moe_bridge_sync = nullptr; // [TAG_FN_R2_BRIDGE_SYNC] see llm_graph_params
     mutable bool moe_bridge_defer = false;
+    // [TAG_FN_L3_GPU_MMV] a ggml-fn-l3.h mark build_moe_ffn puts on the router mat-vec (0 = none, every model but qwen4exp)
+    mutable int32_t moe_router_mark = 0;
     struct moe_bridge_post {
         ggml_tensor * ticket;
         ggml_tensor * hot;      // the device part, weighted and summed [n_embd, T], or nullptr

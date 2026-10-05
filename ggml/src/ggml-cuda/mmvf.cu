@@ -873,3 +873,176 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0
             return false;
     }
 }
+
+// [TAG_FN_L3_GPU_MMV] mul_mat_vec_f<float, float, ncols_dst, block_size> without ids, fusion, channels or samples, with
+// the row loop's loads issued four iterations ahead: every thread adds the same products to the same sums in the same
+// order, and the reduction is the original's, so the result has the same bits. Only for the mat-vecs the qwen4exp
+// graph marks (hc inject: 4 rows of 10240, GDN alpha / beta: 48 rows of 2560), where one block per row leaves the loads
+// of a 20-iteration loop latency-bound.
+#include "fn-l3.cuh"
+
+template <int ncols_dst, int block_size>
+static __global__ void mul_mat_vec_f_fn_l3(
+        const float * x, const float * y, float * dst, const int ncols2, const int stride_row, const int stride_col_y2,
+        const int stride_col_dst) {
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+
+    ggml_cuda_pdl_sync();
+
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+
+    x += int64_t(row)*stride_row;
+
+    const float2 * y2 = (const float2 *) y;
+
+    extern __shared__ char data_mmv[];
+    float * buf_iw = (float *) data_mmv;
+
+    if (block_size > warp_size) {
+        if (tid < warp_size) {
+            buf_iw[tid] = 0.0f;
+        }
+        __syncthreads();
+    }
+
+    float sumf[ncols_dst] = {0.0f};
+
+    const float2 * x2 = (const float2 *) x;
+    constexpr int ahead = 4;
+    int col2 = tid;
+    for (; col2 + (ahead - 1)*block_size < ncols2; col2 += ahead*block_size) {
+        float2 tmpx[ahead];
+        float2 tmpy[ahead][ncols_dst];
+#pragma unroll
+        for (int u = 0; u < ahead; ++u) {
+            tmpx[u] = x2[col2 + u*block_size];
+        }
+#pragma unroll
+        for (int u = 0; u < ahead; ++u) {
+#pragma unroll
+            for (int j = 0; j < ncols_dst; ++j) {
+                tmpy[u][j] = y2[j*stride_col_y2 + col2 + u*block_size];
+            }
+        }
+#pragma unroll
+        for (int u = 0; u < ahead; ++u) {
+#pragma unroll
+            for (int j = 0; j < ncols_dst; ++j) {
+                ggml_cuda_mad(sumf[j], tmpx[u].x, tmpy[u][j].x);
+                ggml_cuda_mad(sumf[j], tmpx[u].y, tmpy[u][j].y);
+            }
+        }
+    }
+    for (; col2 < ncols2; col2 += block_size) {
+        const float2 tmpx = x2[col2];
+#pragma unroll
+        for (int j = 0; j < ncols_dst; ++j) {
+            const float2 tmpy = y2[j*stride_col_y2 + col2];
+            ggml_cuda_mad(sumf[j], tmpx.x, tmpy.x);
+            ggml_cuda_mad(sumf[j], tmpx.y, tmpy.y);
+        }
+    }
+
+    ggml_cuda_pdl_lc();
+#pragma unroll
+    for (int j = 0; j < ncols_dst; ++j) {
+        sumf[j] = warp_reduce_sum<warp_size>(sumf[j]);
+
+        if (block_size > warp_size) {
+            buf_iw[tid/warp_size] = sumf[j];
+            __syncthreads();
+            if (tid < warp_size) {
+                sumf[j] = buf_iw[tid];
+                sumf[j] = warp_reduce_sum<warp_size>(sumf[j]);
+            }
+
+            if (j < ncols_dst) {
+                __syncthreads();
+            }
+        }
+    }
+
+    if (tid >= ncols_dst) {
+        return;
+    }
+
+    dst[tid*stride_col_dst + row] = sumf[tid];
+}
+
+template <int ncols_dst>
+static void mul_mat_vec_f_fn_l3_launch(const float * x, const float * y, float * dst, const int64_t ncols, const int64_t nrows,
+        const int64_t stride_row, const int64_t stride_col_y, const int64_t stride_col_dst, cudaStream_t stream) {
+    const int device    = ggml_cuda_get_device();
+    const int warp_size = ggml_cuda_info().devices[device].warp_size;
+
+    // the block size launch_mul_mat_vec_f_cuda picks
+    int64_t block_size_best = warp_size;
+    int64_t niter_best      = (ncols + 2*warp_size - 1) / (2*warp_size);
+    int64_t max_block_size  = 256;
+    if (ggml_cuda_info().devices[device].cc > GGML_CUDA_CC_OFFSET_AMD && ggml_cuda_info().devices[device].cc < GGML_CUDA_CC_RDNA1) {
+        max_block_size = 128;
+    }
+    for (int64_t block_size = 2*warp_size; block_size <= max_block_size; block_size += warp_size) {
+        const int64_t niter = (ncols + 2*block_size - 1) / (2*block_size);
+        if (niter < niter_best) {
+            niter_best      = niter;
+            block_size_best = block_size;
+        }
+    }
+
+    const int nbytes_shared = warp_size*sizeof(float);
+    const ggml_cuda_kernel_launch_params lp(dim3((unsigned) nrows, 1, 1), dim3((unsigned) block_size_best, 1, 1), nbytes_shared, stream);
+    const int ncols2 = (int) (ncols/2);
+    switch (block_size_best) {
+#define FN_L3_MMVF_CASE(bs) case bs: ggml_cuda_kernel_launch(mul_mat_vec_f_fn_l3<ncols_dst, bs>, lp, x, y, dst, ncols2, \
+        (int) stride_row, (int) (stride_col_y/2), (int) stride_col_dst); break;
+        FN_L3_MMVF_CASE(32)
+        FN_L3_MMVF_CASE(64)
+        FN_L3_MMVF_CASE(96)
+        FN_L3_MMVF_CASE(128)
+        FN_L3_MMVF_CASE(160)
+        FN_L3_MMVF_CASE(192)
+        FN_L3_MMVF_CASE(224)
+        FN_L3_MMVF_CASE(256)
+#undef FN_L3_MMVF_CASE
+        default:
+            GGML_ABORT("fatal error");
+    }
+}
+
+bool ggml_cuda_fn_l3_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    if (!ggml_cuda_fn_l3_enabled() || src0->type != GGML_TYPE_F32 || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+        return false;
+    }
+    GGML_TENSOR_BINARY_OP_LOCALS;
+    const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
+    // a plain [K, rows] x [K, T] product: no channels or samples, contiguous rows, even strides for the float2 loads
+    if (ne02 != 1 || ne03 != 1 || ne12 != 1 || ne13 != 1 || ne2 != 1 || ne3 != 1 || ne11 < 1 || ne11 > MMVF_MAX_BATCH_SIZE ||
+            nb00 != sizeof(float) || nb10 != sizeof(float) || nb0 != sizeof(float) || ne00 % 2 != 0 ||
+            (nb01/sizeof(float)) % 2 != 0 || (nb11/sizeof(float)) % 2 != 0 || warp_size != 32 ||
+            ne01 > INT32_MAX || ne00 > INT32_MAX || nb01/sizeof(float) > INT32_MAX || nb11/sizeof(float) > INT32_MAX ||
+            nb1/sizeof(float) > INT32_MAX) {
+        return false;
+    }
+    const float * x = (const float *) src0->data;
+    const float * y = (const float *) src1->data;
+    float       * d = (float *) dst->data;
+    const int64_t s01 = nb01/sizeof(float);
+    const int64_t s11 = nb11/sizeof(float);
+    const int64_t s1  = nb1/sizeof(float);
+    cudaStream_t stream = ctx.stream();
+    switch (ne11) {
+        case 1: mul_mat_vec_f_fn_l3_launch<1>(x, y, d, ne00, ne01, s01, s11, s1, stream); break;
+        case 2: mul_mat_vec_f_fn_l3_launch<2>(x, y, d, ne00, ne01, s01, s11, s1, stream); break;
+        case 3: mul_mat_vec_f_fn_l3_launch<3>(x, y, d, ne00, ne01, s01, s11, s1, stream); break;
+        case 4: mul_mat_vec_f_fn_l3_launch<4>(x, y, d, ne00, ne01, s01, s11, s1, stream); break;
+        case 5: mul_mat_vec_f_fn_l3_launch<5>(x, y, d, ne00, ne01, s01, s11, s1, stream); break;
+        case 6: mul_mat_vec_f_fn_l3_launch<6>(x, y, d, ne00, ne01, s01, s11, s1, stream); break;
+        case 7: mul_mat_vec_f_fn_l3_launch<7>(x, y, d, ne00, ne01, s01, s11, s1, stream); break;
+        case 8: mul_mat_vec_f_fn_l3_launch<8>(x, y, d, ne00, ne01, s01, s11, s1, stream); break;
+        default: return false;
+    }
+    ggml_cuda_fn_l3_note(GGML_CUDA_FN_L3_PATH_MMVF, "MMV: few-row f32 mat-vecs with run-ahead loads");
+    return true;
+}

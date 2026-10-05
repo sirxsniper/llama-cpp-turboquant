@@ -78,6 +78,7 @@
 #include "ggml-cuda/cumsum.cuh"
 #include "ggml-cuda/fill.cuh"
 #include "ggml-cuda/lightning-indexer.cuh"
+#include "ggml-cuda/fn-l3.cuh"            // [TAG_FN_L3_GPU]
 #include "ggml.h"
 
 #include <algorithm>
@@ -1926,6 +1927,22 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
 
     const int cc        = ggml_cuda_info().devices[ctx.device].cc;
     const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
+
+    // [TAG_FN_L3_GPU_MMV] a mat-vec the qwen4exp graph marked: the same sums with the loads issued ahead
+    if (ggml_fn_l3_get(dst) == GGML_FN_L3_MMV) {
+        if (src0->type == GGML_TYPE_F32 && ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, ne11) &&
+                ggml_cuda_fn_l3_mul_mat_vec_f(ctx, src0, src1, dst)) {
+            return;
+        }
+        if (src0->type == GGML_TYPE_Q8_0 && !ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, ne11) &&
+                !ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, ne11, /*mul_mat_id =*/ false) &&
+                ne01 != 1 && !ggml_cuda_should_use_mmsb(src0, src1, dst, cc) &&
+                !ggml_cuda_should_use_mmqsn(src0, src1, dst, cc) &&
+                ggml_cuda_should_use_mmvq(src0->type, cc, ne11, /*ne01 =*/ src0->ne[1]) &&
+                ggml_cuda_fn_l3_mul_mat_vec_q(ctx, src0, src1, dst)) {
+            return;
+        }
+    }
 
     if (ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, ne11)) {
         // The custom F16 vector kernel can be used over batched cuBLAS GEMM.
@@ -3970,6 +3987,69 @@ static bool ggml_cuda_try_rms_norm_scale_fusion(const ggml_cgraph * cgraph, int 
     return ggml_cuda_check_fusion_memory_ranges(cgraph, i, 2, &out_node, 1);
 }
 
+// [TAG_FN_L3_GPU_HCFUSE] at a SCALE node that the qwen4exp graph marked (ggml-fn-l3.h): the hc chains in one launch.
+//   HCLO: scale -> silu;  HCW: scale -> sigmoid -> scale, and with the dsv4_hc_post (no comb) that reads it, that too.
+// Returns the nodes after i that the launch covered (0: none). Same arithmetic as the unfused ops (fn-l3.cu).
+static int ggml_cuda_fn_l3_try_hc(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+    const ggml_tensor * s1   = cgraph->nodes[i];
+    const int32_t       mark = ggml_fn_l3_get(s1);
+    if (s1->op != GGML_OP_SCALE || (mark != GGML_FN_L3_HCW && mark != GGML_FN_L3_HCLO) || !ggml_cuda_fn_l3_enabled()) {
+        return 0;
+    }
+    const ggml_tensor * x = s1->src[0];
+    if (x == nullptr || x->type != GGML_TYPE_F32 || s1->type != GGML_TYPE_F32 || !ggml_is_contiguous(x) ||
+            !ggml_is_contiguous(s1) || ggml_is_empty(s1)) {
+        return 0;
+    }
+    const auto is_unary = [&](int j, ggml_unary_op uop) {
+        return j < cgraph->n_nodes && cgraph->nodes[j]->op == GGML_OP_UNARY && ggml_get_unary_op(cgraph->nodes[j]) == uop &&
+               cgraph->nodes[j]->type == GGML_TYPE_F32 && ggml_is_contiguous(cgraph->nodes[j]);
+    };
+
+    if (mark == GGML_FN_L3_HCLO) {
+        if (!is_unary(i + 1, GGML_UNARY_OP_SILU) || !ggml_can_fuse(cgraph, i, { GGML_OP_SCALE, GGML_OP_UNARY })) {
+            return 0;
+        }
+        const int out = i + 1;
+        if (!ggml_cuda_check_fusion_memory_ranges(cgraph, i, 2, &out, 1)) {
+            return 0;
+        }
+        ggml_cuda_fn_l3_hclo(*cuda_ctx, s1, cgraph->nodes[i + 1]);
+        return 1;
+    }
+
+    if (!is_unary(i + 1, GGML_UNARY_OP_SIGMOID) ||
+            !ggml_can_fuse(cgraph, i, { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE }) ||
+            cgraph->nodes[i + 2]->type != GGML_TYPE_F32 || !ggml_is_contiguous(cgraph->nodes[i + 2])) {
+        return 0;
+    }
+    ggml_tensor * s2 = cgraph->nodes[i + 2];
+
+    // the combine that reads s2 right after it (not when the graph deferred the weights: then s2 is the output)
+    if (i + 3 < cgraph->n_nodes) {
+        ggml_tensor * post = cgraph->nodes[i + 3];
+        const ggml_tensor * xb  = post->src[0];
+        const ggml_tensor * res = post->src[1];
+        if (post->op == GGML_OP_DSV4_HC_POST && (post->flags & GGML_TENSOR_FLAG_COMPUTE) && post->src[2] == s2 &&
+                post->src[3] == nullptr && ggml_node_has_n_uses(cgraph, i + 2, 1) &&
+                xb && res && xb->type == GGML_TYPE_F32 && res->type == GGML_TYPE_F32 && post->type == GGML_TYPE_F32 &&
+                s2->ne[0] == res->ne[1] && s2->ne[1] == xb->ne[1] && s2->ne[2] == 1 && s2->ne[3] == 1) {
+            const int out = i + 3;
+            if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, 4, &out, 1)) {
+                ggml_cuda_fn_l3_hcw4(*cuda_ctx, s1, s2, post);
+                return 3;
+            }
+        }
+    }
+
+    const int out = i + 2;
+    if (!ggml_cuda_check_fusion_memory_ranges(cgraph, i, 3, &out, 1)) {
+        return 0;
+    }
+    ggml_cuda_fn_l3_hcw3(*cuda_ctx, s1, s2);
+    return 2;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
@@ -3978,6 +4058,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     ggml_tensor * node = cgraph->nodes[i];
+
+    // [TAG_FN_L3_GPU_HCFUSE]
+    if (node->op == GGML_OP_SCALE && ggml_fn_l3_get(node) != GGML_FN_L3_NONE) {
+        const int n = ggml_cuda_fn_l3_try_hc(cuda_ctx, cgraph, i);
+        if (n > 0) {
+            return n;
+        }
+    }
 
     // [TAG_GDN_PREP_FUSION] add -> softplus -> mul -> one launch
     if (node->op == GGML_OP_ADD && ggml_cuda_try_gdn_prep_fusion(cgraph, i)) {
@@ -4938,6 +5026,11 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     ggml_cuda_mmvq_q8_cache_note_write(*cuda_ctx, node);
                     cuda_ctx->mmvq_q8.cgraph   = cgraph;
                     cuda_ctx->mmvq_q8.node_idx = i;
+                }
+
+                // [TAG_FN_L3_GPU_IDXQ8] a q8_0 gather that only marked lightning indexers read: they read through it
+                if (node->op == GGML_OP_GET_ROWS && ggml_cuda_fn_l3_idxq8_skip(cgraph, i)) {
+                    continue;
                 }
 
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
