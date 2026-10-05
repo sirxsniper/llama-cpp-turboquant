@@ -2379,7 +2379,8 @@ static void ggml_fn_moe_phase(const struct ggml_fn_moe_ctx * c, int phase, int i
     }
 
     // then the free pieces of the other threads, from the end of their lists (their owners work from the front, where
-    // their prefetched pieces are); every owner walks its whole list, so each piece is computed exactly once
+    // their prefetched pieces are); every owner walks its whole list, so each piece is computed exactly once, and a
+    // thief leaves a list at its first claimed piece: the owner (or a thief before it) is there and takes the rest
     for (int dv = 1; dv < nth; ++dv) {
         const int v = (ith + dv) % nth;
         int64_t n_v = 0;
@@ -2389,7 +2390,8 @@ static void ggml_fn_moe_phase(const struct ggml_fn_moe_ctx * c, int phase, int i
         }
         int32_t * cv = claim + (size_t) v*c->claim_run;
         int64_t jj = n_v;
-        for (int kv = n_act - 1; kv >= 0 && jj > 0; --kv) {
+        bool met = false;
+        for (int kv = n_act - 1; kv >= 0 && jj > 0 && !met; --kv) {
             const int64_t p0 = (v - ggml_fn_moe_owner0(c->act[3*kv], nth) + nth) % nth;
             if (p0 >= np_e) {
                 continue;
@@ -2397,7 +2399,8 @@ static void ggml_fn_moe_phase(const struct ggml_fn_moe_ctx * c, int phase, int i
             for (int64_t pv = p0 + ((np_e - 1 - p0)/nth)*nth; pv >= p0; pv -= nth) {
                 --jj;
                 if (!ggml_fn_moe_claim(cv + jj, a->epoch)) {
-                    continue;
+                    met = true;
+                    break;
                 }
                 acc[0] += ggml_fn_moe_piece(c, phase, kv, pv);
                 acc[1]++;
