@@ -3847,10 +3847,11 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     if (hot_owner) {
         ggml_backend_sched_synchronize(sched.get());
     }
-    if (step_async_want && hot_owner) {
+    if (step_async_want && hot_owner && !llama_moe_hot_has_layer_from((int) model.hparams.n_layer())) {
         // [TAG_FN_L3_HOST_STEP] the same two calls on the helper thread, while the caller samples and drafts; no graph of
         // this context runs until step_join() (next decode / encode / reserve / free), the draft context's graphs
-        // read none of this state, and the bridge's observer and plan run only inside this context's graphs
+        // read none of this state (no MTP block layer in the hot set: checked above, else the step stays inline), and
+        // the bridge's observer and plan run only inside this context's graphs
         if (!step_async) {
             step_async = std::make_unique<step_worker>();
         }

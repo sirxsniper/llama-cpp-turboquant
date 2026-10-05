@@ -100,6 +100,10 @@ size_t llama_moe_hot_device_bytes();
 // its compute before llama_moe_cache_step; this returns that context, or nullptr when no adaptive set exists.
 const void * llama_moe_hot_adapt_owner();
 
+// [TAG_FN_L3_HOST_STEP] true when the hot set holds a layer with index >= il_min (with il_min = n_layer(): an MTP
+// block's host experts, which the draft context's graphs read, so its owner's step may not run beside them)
+bool llama_moe_hot_has_layer_from(int il_min);
+
 // [TAG_FN_R4_ADAPT_DECAY] LLAMA_MOE_HOT_DECAY=<0..1> (e.g. 0.92): the decayed-count policy instead of the window
 // (llama-moe-decay.h: every LLAMA_MOE_HOT_DECAY_EVERY=2 steps one pass, admit at LLAMA_MOE_HOT_DECAY_ADMIT=2 and over
 // LLAMA_MOE_HOT_DECAY_RATIO=1.2 x / LLAMA_MOE_HOT_DECAY_HYST=0.5 + the victim, LLAMA_MOE_HOT_DECAY_MIB per pass, by default

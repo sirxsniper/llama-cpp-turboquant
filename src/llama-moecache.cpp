@@ -1552,6 +1552,20 @@ const void * llama_moe_hot_adapt_owner() {
     return mc && mc->adapt ? mc->owner : nullptr;
 }
 
+// [TAG_FN_L3_HOST_STEP] the layer list is fixed once the set exists (only per-layer state changes in a step)
+bool llama_moe_hot_has_layer_from(int il_min) {
+    const moe_cache * mc = g_cache;
+    if (!mc) {
+        return false;
+    }
+    for (const auto & ls : mc->layers) {
+        if (ls.pub.il >= il_min) {
+            return true;
+        }
+    }
+    return false;
+}
+
 // [TAG_FN_R4_ADAPT_DECAY]
 void llama_moe_hot_save_now(const void * owner) {
     moe_cache * mc = g_cache;
