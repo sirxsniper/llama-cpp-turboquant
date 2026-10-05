@@ -496,7 +496,10 @@ static void test_dma(t_model & m, const dma_cfg & c, int n_steps) {
 // tokens first, the slot ids, and share = auto against the measured rates.
 //
 
-static void test_dma_bridge(t_model & m, const char * name, const char * share, const char * slots, int n_steps) {
+// [TAG_FN_L3_CPU_FILL] fill_mode 1: the ring fills pause while a "pool job" runs (here: the graph compute between
+// llama_moe_dma_bridge_hold(true) and (false)); 2: a hold that is never released (each 256 KiB piece waits 5 ms at most,
+// so the fills still end). The fill threads are pinned to CPUs 0-1. The ring bytes of every fetched expert are checked.
+static void test_dma_bridge(t_model & m, const char * name, const char * share, const char * slots, int n_steps, int fill_mode = 0) {
     reset_env();
     set_env("LLAMA_MOE_DMA_SHARE", share);
     set_env("LLAMA_MOE_DMA_SLOTS", slots);
@@ -523,6 +526,15 @@ static void test_dma_bridge(t_model & m, const char * name, const char * share, 
     if (!ring) {
         llama_moe_dma_free(owner);
         return;
+    }
+    uint64_t held_us0 = 0;
+    uint64_t held_n0  = 0;
+    if (fill_mode > 0) { // [TAG_FN_L3_CPU_FILL]
+        llama_moe_dma_bridge_fill_policy(true, 0x3);
+        llama_moe_dma_bridge_fill_held(&held_us0, &held_n0);
+        if (fill_mode == 2) {
+            llama_moe_dma_bridge_hold(true);
+        }
     }
 
     std::mt19937 rng(11);
@@ -661,7 +673,14 @@ static void test_dma_bridge(t_model & m, const char * name, const char * share, 
         if (n_steps == 0) {
             break;
         }
-        if (ggml_backend_graph_compute(m.cpu, g.gf) != GGML_STATUS_SUCCESS) {
+        if (fill_mode == 1) {
+            llama_moe_dma_bridge_hold(true); // [TAG_FN_L3_CPU_FILL] the "pool job"
+        }
+        const bool computed = ggml_backend_graph_compute(m.cpu, g.gf) == GGML_STATUS_SUCCESS;
+        if (fill_mode == 1) {
+            llama_moe_dma_bridge_hold(false);
+        }
+        if (!computed) {
             TCHECK(false, "[%s] compute", name);
             break;
         }
@@ -685,6 +704,16 @@ static void test_dma_bridge(t_model & m, const char * name, const char * share, 
            (unsigned long long) k.steps, (unsigned long long) k.layer_steps, (unsigned long long) k.cold,
            (unsigned long long) k.ring_ready, (unsigned long long) k.dma_on_demand, (unsigned long long) k.fills,
            all_same ? "equal" : "DIFFERENT");
+    if (fill_mode > 0) { // [TAG_FN_L3_CPU_FILL]
+        uint64_t held_us = 0;
+        uint64_t held_n  = 0;
+        llama_moe_dma_bridge_fill_held(&held_us, &held_n);
+        printf("  [%s] fills held %llu times, %.1f ms\n", name, (unsigned long long) (held_n - held_n0), (held_us - held_us0)/1e3);
+        if (fill_mode == 2) {
+            TCHECK(held_n > held_n0 && k.fills > 0, "[%s] a stuck hold delays the fills but they end", name);
+            llama_moe_dma_bridge_hold(false);
+        }
+    }
     if (share_v > 0.0) {
         TCHECK(n_fetched > 0, "[%s] experts were fetched", name);
     } else {
@@ -868,6 +897,8 @@ int main() {
     test_dma_bridge(m, "bridge share 0.5, 2 slots", "0.5", "2", 48);
     test_dma_bridge(m, "bridge share 0",          "0",    "4", 16);
     test_dma_bridge(m, "bridge share auto",       "auto", "4", 48);
+    test_dma_bridge(m, "bridge share 1, fills between jobs", "1", "4", 48, 1); // [TAG_FN_L3_CPU_FILL]
+    test_dma_bridge(m, "bridge share 1, stuck fill hold",    "1", "4", 6, 2);
 
     printf("test-moe-gen5: prefill stream\n");
     for (int nb = 1; nb <= 3; ++nb) {
