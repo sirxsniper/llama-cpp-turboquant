@@ -31,15 +31,137 @@
 #include <atomic>
 #include <cinttypes>
 #include <cmath>
+#include <condition_variable>
+#include <cstdio>
 #include <cstring>
+#include <functional>
 #include <limits>
+#include <mutex>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <unordered_map>
 
 //
 // llama_context
 //
+
+// [TAG_FN_L3_HOST_STEP] one helper thread that runs one job at a time: post() waits for the previous job first, join()
+// waits until no job runs. A job never throws out of the thread.
+struct llama_context::step_worker {
+    std::thread             th;
+    std::mutex              mtx;
+    std::condition_variable cv;
+    std::function<void()>   job;
+    bool                    busy = false;
+    bool                    stop = false;
+
+    step_worker() {
+        th = std::thread([this]() { run(); });
+    }
+
+    ~step_worker() {
+        {
+            std::lock_guard<std::mutex> lk(mtx);
+            stop = true;
+        }
+        cv.notify_all();
+        th.join();
+    }
+
+    void run() {
+        for (;;) {
+            std::function<void()> j;
+            {
+                std::unique_lock<std::mutex> lk(mtx);
+                cv.wait(lk, [this]() { return stop || busy; });
+                if (!busy) {
+                    return; // stop, nothing left
+                }
+                j = std::move(job);
+            }
+            try {
+                j();
+            } catch (const std::exception & e) {
+                LLAMA_LOG_ERROR("%s: [TAG_FN_L3_HOST_STEP] the step failed: %s\n", __func__, e.what());
+            } catch (...) {
+                LLAMA_LOG_ERROR("%s: [TAG_FN_L3_HOST_STEP] the step failed\n", __func__);
+            }
+            {
+                std::lock_guard<std::mutex> lk(mtx);
+                busy = false;
+                job  = nullptr;
+            }
+            cv.notify_all();
+        }
+    }
+
+    void post(std::function<void()> && f) {
+        std::unique_lock<std::mutex> lk(mtx);
+        cv.wait(lk, [this]() { return !busy; });
+        job  = std::move(f);
+        busy = true;
+        lk.unlock();
+        cv.notify_all();
+    }
+
+    void join() {
+        std::unique_lock<std::mutex> lk(mtx);
+        cv.wait(lk, [this]() { return !busy; });
+    }
+};
+
+void llama_context::step_join() {
+    if (step_async) {
+        step_async->join();
+    }
+}
+
+// [TAG_FN_L3_HOST_LAUNCH2] the layer outputs after which a bridged decode graph is cut (qwen4exp), "" when off:
+//   LLAMA_FN_HOST_LAUNCH2=N       one cut after layer N (0 <= N < n_layer - 1)
+//   LLAMA_FN_HOST_LAUNCH_EVERY=K  a cut after every K layers (layers K-1, 2K-1, ... below n_layer - 1)
+static std::string llama_launch_cuts(const llama_model & model) {
+    const int n = llama_fn_l3_int(model, "LLAMA_FN_HOST_LAUNCH2", -1);
+    const int k = llama_fn_l3_int(model, "LLAMA_FN_HOST_LAUNCH_EVERY", 0);
+    if (n < 0 && k <= 0) {
+        return std::string(); // off (and every model but qwen4exp)
+    }
+    const int n_layer = (int) model.hparams.n_layer();
+    std::vector<bool> cut(std::max(n_layer, 0), false);
+    if (n >= 0 && n < n_layer - 1) {
+        cut[n] = true;
+    }
+    for (int il = k - 1; k > 0 && il < n_layer - 1; il += k) {
+        cut[il] = true;
+    }
+    std::string s;
+    for (int il = 0; il < n_layer - 1; ++il) {
+        if (cut[il]) {
+            s += (s.empty() ? "" : ",") + std::string("l_last-") + std::to_string(il);
+        }
+    }
+    return s;
+}
+
+// [TAG_FN_L3_HOST_LAUNCH2] the scheduler cuts a bridged decode graph after the layers above, so a step is one device graph
+// launch per piece and the device runs a piece while the host launches the next. Set before every graph split of the
+// context (on for bridged decode ubatches, off for everything else, reserves included). True: this graph is cut.
+static bool llama_launch2_apply(const llama_model & model, ggml_backend_sched_t sched, bool decode) {
+    if (sched == nullptr) {
+        return false;
+    }
+    const std::string cuts = llama_launch_cuts(model);
+    if (cuts.empty()) {
+        return false;
+    }
+    ggml_backend_sched_set_split_after(sched, decode ? cuts.c_str() : nullptr);
+    static std::atomic<bool> logged{false};
+    if (decode && !logged.exchange(true)) {
+        LLAMA_LOG_INFO("%s: [TAG_FN_L3_HOST_LAUNCH2] bridged decode graphs are cut after %s: one device graph launch per "
+                "piece\n", __func__, cuts.c_str());
+    }
+    return decode;
+}
 
 static llm_graph_type ctx_type_to_graph_type(llama_context_type ctx_type) {
     switch (ctx_type) {
@@ -1523,6 +1645,13 @@ llama_context::llama_context(
         // bridge mode then); before the reserve, so decode graphs are reserved with the fetch ops
         llama_moe_bridge_attach_dma(moe_bridge, this);
 
+        // [TAG_FN_L3_HOST_STEP] the owner's step goes to a helper thread (the MTP draft context never owns the hot set)
+        step_async_want = cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP && llama_fn_l3_flag(model, "LLAMA_FN_HOST_STEP");
+        if (step_async_want) {
+            LLAMA_LOG_INFO("%s: [TAG_FN_L3_HOST_STEP] the hot set's and the DMA ring's step after a decode run on a helper "
+                    "thread, joined at the next decode of this context\n", __func__);
+        }
+
         // [TAG_MOE_BRIDGE] [TAG_FN_PREFILL_STREAM] a throw below (a reserve whose compute buffers do not fit) leaves the
         // constructor without the destructor: free the bridge (executor thread, pinned channels) and the gen5 state
         // (pinned rings, VRAM banks, an owner pointer a later context could match) on the way out
@@ -1584,6 +1713,9 @@ llama_context::llama_context(
 llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
+
+    step_join();        // [TAG_FN_L3_HOST_STEP] the last step is done before the hot set and the DMA state go
+    step_async.reset();
 
     llama_fn_ctx_remove(model, this); // [TAG_FN_VRAM_FIT]
 
@@ -1775,6 +1907,7 @@ void llama_context::sched_reserve() {
     LLAMA_LOG_INFO("%s: reserving ...\n", __func__);
 
     synchronize();
+    step_join(); // [TAG_FN_L3_HOST_STEP] the moe-cache / DMA step is done before the banks or the hot set move
 
     // [TAG_FN_R1_PFS_LEND] reserve with the prefill stream's banks returned: the reserve graphs keep the op offload
     // copies in the compute buffer, which a prompt that cannot borrow the banks needs
@@ -2827,6 +2960,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     auto * res = get_gf_res_prev(ubatch); // [TAG_FN_GRAPH_PER_WIDTH] same as get_gf_res_prev() unless enabled
     auto * gf  = res->get_gf();
 
+    // [TAG_FN_L3_HOST_LAUNCH2] the split boundary the scheduler uses if it splits this ubatch's graph below
+    // (a paused or turned-off bridge: the graph runs the CPU split and is not cut)
+    const bool launch2_decode = llama_moe_bridge_active(moe_bridge) && (int) ubatch.n_tokens <= llama_moe_bridge_max_t(moe_bridge);
+
     // the new graph parameters
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
@@ -2857,6 +2994,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
 
         res->restore_build_state(sched.get());
+        llama_launch2_apply(model, sched.get(), launch2_decode); // [TAG_FN_L3_HOST_LAUNCH2]
         if (!ggml_backend_sched_alloc_graph(sched.get(), res->get_gf())) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
@@ -2895,10 +3033,18 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             res->save_build_state(sched.get()); // [TAG_FN_GRAPH_PER_WIDTH] before the scheduler rewrites it
         }
 
+        const bool launch_cut = llama_launch2_apply(model, sched.get(), launch2_decode); // [TAG_FN_L3_HOST_LAUNCH2]
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
+        }
+        if (launch_cut) { // [TAG_FN_L3_HOST_LAUNCH2] the proof line: the bridged decode graph's scheduler splits
+            static std::atomic<int> n_logged{0};
+            if (n_logged.fetch_add(1) < 2) {
+                LLAMA_LOG_INFO("%s: [TAG_FN_L3_HOST_LAUNCH2] a decode graph of %u tokens: %d scheduler splits\n", __func__,
+                        ubatch.n_tokens, ggml_backend_sched_get_n_splits(sched.get()));
+            }
         }
 
         gf_res_prev_active = res;
@@ -2962,6 +3108,8 @@ int llama_context::encode(const llama_batch_ext & batch_inp) {
         LLAMA_LOG_ERROR("%s: n_tokens == 0\n", __func__);
         return -1;
     }
+
+    step_join(); // [TAG_FN_L3_HOST_STEP]
 
     const auto & hparams = model.hparams;
 
@@ -3276,6 +3424,8 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     if (llama_host_gap_probe_enabled()) { // [TAG_HOST_GAP_PROBE]
         llama_host_gap_probe_decode(this);
     }
+
+    step_join(); // [TAG_FN_L3_HOST_STEP] the last step's table changes are on the device before this graph
 
     if (batch_inp.tokens.empty()) {
         LLAMA_LOG_ERROR("%s: n_tokens == 0\n", __func__);
@@ -3757,11 +3907,35 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
     // apply throttled MoE expert-cache updates between graph executions
     // [TAG_FN_MOE_HOT_ADAPT] an adaptive hot set changes its tables only when no graph of its owner runs
-    if (llama_moe_hot_adapt_owner() == this) {
+    const bool hot_owner = llama_moe_hot_adapt_owner() == this;
+    if (hot_owner) {
         ggml_backend_sched_synchronize(sched.get());
     }
-    llama_moe_cache_step(this);
-    llama_moe_gen5_step(this); // [TAG_MOE_DMA_SHARE] ring admission and stats, owner only
+    if (step_async_want && hot_owner && !llama_moe_hot_has_layer_from((int) model.hparams.n_layer())) {
+        // [TAG_FN_L3_HOST_STEP] the same two calls on the helper thread, while the caller samples and drafts; no graph of
+        // this context runs until step_join() (next decode / encode / reserve / free), the draft context's graphs
+        // read none of this state (no MTP block layer in the hot set: checked above, else the step stays inline), and
+        // the bridge's observer and plan run only inside this context's graphs
+        if (!step_async) {
+            step_async = std::make_unique<step_worker>();
+        }
+        step_async->post([this]() {
+            const int64_t t0 = ggml_time_us();
+            llama_moe_cache_step(this);
+            llama_moe_gen5_step(this);
+            // the helper's own counters (only this thread touches them)
+            static thread_local uint64_t n_step  = 0;
+            static thread_local double   step_us = 0.0;
+            step_us += (double) (ggml_time_us() - t0);
+            if (++n_step == 1 || n_step % 256 == 0) {
+                LLAMA_LOG_INFO("decode: [TAG_FN_L3_HOST_STEP] %" PRIu64 " steps on the helper thread, %.1f us each (off the "
+                        "caller's path)\n", n_step, step_us / (double) n_step);
+            }
+        });
+    } else {
+        llama_moe_cache_step(this);
+        llama_moe_gen5_step(this); // [TAG_MOE_DMA_SHARE] ring admission and stats, owner only
+    }
 
     return 0;
 }
@@ -4309,6 +4483,7 @@ ggml_cgraph * llama_context::graph_reserve(
     }
 
     ggml_backend_sched_reset(sched.get());
+    llama_launch2_apply(model, sched.get(), false); // [TAG_FN_L3_HOST_LAUNCH2] reserve graphs are never cut
 
     // when the scheduler is reset, we cannot reuse old graphs, so we reset the previous graph results
     for (auto & res : gf_res_prev) {

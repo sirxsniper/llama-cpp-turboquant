@@ -85,3 +85,8 @@ void llama_moe_bridge_begin(llama_moe_bridge * br, bool used); // before the gra
 // after a graph with used = true completed (also a failed one): false = its output is invalid. Jobs that come after it
 // (their wait timed out) are stale: they return zeros without running and without the routing observer.
 bool llama_moe_bridge_end  (llama_moe_bridge * br);
+
+// [TAG_FN_L3_HOST_QUIET] LLAMA_FN_HOST_QUIET=1 (qwen4exp): background host copies (the hot set's uploads, the DMA
+// ring's fills) wait here while a bridged graph runs, so its CPU experts get the DRAM bandwidth, and copy between
+// graphs. Returns at once when no bridge has the switch on; a wait ends after max_ms at the latest.
+void llama_moe_bridge_quiet_wait(int max_ms);

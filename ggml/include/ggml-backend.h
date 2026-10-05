@@ -355,6 +355,18 @@ extern "C" {
     // Set a callback to be called for each resulting node during graph compute
     GGML_API void                 ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backend_sched_eval_callback callback, void * user_data);
 
+    // [TAG_FN_L3_HOST_DIAG] count every backend synchronize, event synchronize and blocking device tensor get / set that
+    // takes at least threshold_us by its call stack, and log the stacks with the most total time every 256 such waits
+    // (process wide; 0 = off, the default). Diagnostic only.
+    GGML_API void                 ggml_backend_sync_trace_set(int threshold_us);
+
+    // [TAG_FN_L3_HOST_LAUNCH2] names: comma-separated node names (at most 64). After each node with one of these names a new
+    // split starts when the next node runs on the same backend, so the device gets one graph launch per piece and runs a
+    // piece while the host launches the next. The graph inputs of the later pieces are copied with the first piece's.
+    // A cut changes no value unless a backend fuses ops across it. NULL or "": off (default). Takes effect at the next
+    // graph split (alloc / reserve).
+    GGML_API void                 ggml_backend_sched_set_split_after(ggml_backend_sched_t sched, const char * names);
+
     //
     // Meta backend
     //

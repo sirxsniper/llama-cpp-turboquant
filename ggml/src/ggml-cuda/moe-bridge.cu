@@ -129,6 +129,11 @@ size_t mb_pad(size_t n) {
     return (n + 63) & ~(size_t) 63;
 }
 
+// [TAG_FN_L3_HOST_EXEC] the ring stamp after s: 0 is skipped (the ring watch marks a taken entry with 0)
+__host__ __device__ inline uint32_t mb_next_stamp(uint32_t s) {
+    return s + 1u != 0u ? s + 1u : 1u;
+}
+
 } // namespace
 
 struct ggml_moe_bridge {
@@ -167,6 +172,7 @@ struct ggml_moe_bridge {
     std::atomic<uint64_t> taken{0};
     std::atomic<uint64_t> completed{0};
     std::atomic<uint32_t> n_lapped{0};
+    bool                  watch = false; // [TAG_FN_L3_HOST_EXEC] poll zeroes the stamps it takes
 };
 
 static std::mutex                       g_mb_mtx;
@@ -255,7 +261,10 @@ static __global__ void k_mb_post(const mb_dev v, const int chan,
         __threadfence_system();
         *(volatile uint32_t *) &h->seq = seq;
         if (v.mode == GGML_MOE_BRIDGE_WAIT_SPIN) {
-            const uint32_t g = atomicAdd(&v.state[0], 1u) + 1u;
+            uint32_t g = atomicAdd(&v.state[0], 1u) + 1u;
+            if (g == 0u) { // [TAG_FN_L3_HOST_EXEC] stamp 0 is never a post (mb_next_stamp)
+                g = atomicAdd(&v.state[0], 1u) + 1u;
+            }
             mb_ring_entry * e = v.ring + (g % MB_RING);
             *(volatile uint32_t *) &e->chan = (uint32_t) chan;
             *(volatile uint32_t *) &e->seq  = seq;
@@ -739,10 +748,13 @@ bool ggml_backend_cuda_moe_bridge_poll(ggml_moe_bridge * b, ggml_moe_bridge_job 
     GGML_UNUSED(job);
     return false;
 #else
-    const uint32_t next = b->served.load(std::memory_order_relaxed) + 1;
-    const mb_ring_entry * e = b->ring + (next % MB_RING);
+    const uint32_t next = mb_next_stamp(b->served.load(std::memory_order_relaxed));
+    mb_ring_entry * e = b->ring + (next % MB_RING);
     const uint32_t st = *(const volatile uint32_t *) &e->stamp;
     if (st != next) {
+        if (b->watch && st == 0) {
+            return false; // [TAG_FN_L3_HOST_EXEC] a zeroed entry is not posted yet, never a lap (whatever next is)
+        }
         if ((int32_t) (st - next) > 0) {
             // the device lapped the ring: the jobs before st are lost and their waits time out; resume at st
             if (b->n_lapped.fetch_add(1, std::memory_order_relaxed) < 8) {
@@ -755,6 +767,10 @@ bool ggml_backend_cuda_moe_bridge_poll(ggml_moe_bridge * b, ggml_moe_bridge_job 
     std::atomic_thread_fence(std::memory_order_acquire);
     const uint32_t chan = *(const volatile uint32_t *) &e->chan;
     const uint32_t seq  = *(const volatile uint32_t *) &e->seq;
+    if (b->watch) {
+        // [TAG_FN_L3_HOST_EXEC] the device writes this entry again only one lap (MB_RING posts) later
+        *(volatile uint32_t *) &e->stamp = 0;
+    }
     if (chan >= (uint32_t) b->params.n_chan) {
         b->served.store(next, std::memory_order_release);
         return false;
@@ -888,6 +904,69 @@ void ggml_backend_cuda_moe_bridge_release(ggml_moe_bridge * b) {
         *(volatile uint32_t *) &b->glob->release = 1;
         std::atomic_thread_fence(std::memory_order_seq_cst);
     }
+}
+
+// [TAG_FN_L3_HOST_EXEC] no graph runs (before the first one): the entries the poll has taken get stamp 0, so from now on
+// every entry ahead of served reads 0 until the device posts there
+void ggml_backend_cuda_moe_bridge_set_watch(ggml_moe_bridge * b, bool on) {
+    if (b == nullptr || b->ring == nullptr || b->params.wait_mode != GGML_MOE_BRIDGE_WAIT_SPIN) {
+        return;
+    }
+    if (on && !b->watch) {
+        const uint32_t served = b->served.load(std::memory_order_acquire);
+        for (int i = 0; i < MB_RING; ++i) {
+            volatile uint32_t * st = &b->ring[i].stamp;
+            if ((int32_t) (*st - served) <= 0) {
+                *st = 0;
+            }
+        }
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+    }
+    b->watch = on;
+}
+
+const volatile int32_t * ggml_backend_cuda_moe_bridge_next_post_word(ggml_moe_bridge * b) {
+    if (b == nullptr || b->ring == nullptr || !b->watch) {
+        return nullptr;
+    }
+    const uint32_t next = mb_next_stamp(b->served.load(std::memory_order_relaxed));
+    return (const volatile int32_t *) &b->ring[next % MB_RING].stamp;
+}
+
+// [TAG_FN_L3_HOST_EXEC] test hook: the ring counter of a spin bridge restarts at g (no graph runs, no job is owed), so a
+// unit test crosses the 2^32 wrap of the stamps in a few posts. Every entry reads as taken (watch: 0, else g).
+bool ggml_backend_cuda_moe_bridge_test_seed(ggml_moe_bridge * b, uint32_t g) {
+#ifdef GGML_MOE_BRIDGE_DISABLED
+    GGML_UNUSED(b);
+    GGML_UNUSED(g);
+    return false;
+#else
+    if (b == nullptr || b->ring == nullptr || b->params.wait_mode != GGML_MOE_BRIDGE_WAIT_SPIN || g == 0) {
+        return false;
+    }
+    const uint32_t posted = *(const volatile uint32_t *) &b->glob->posted;
+    if (posted != b->served.load(std::memory_order_acquire) ||
+        b->completed.load(std::memory_order_acquire) != b->taken.load(std::memory_order_acquire)) {
+        return false; // a job is owed
+    }
+    ggml_cuda_set_device(b->params.device);
+    cudaError_t rc = cudaMemcpyAsync(b->state, &g, sizeof(g), cudaMemcpyHostToDevice, b->aux);
+    if (rc == cudaSuccess) {
+        rc = cudaStreamSynchronize(b->aux);
+    }
+    if (rc != cudaSuccess) {
+        GGML_LOG_WARN("%s: bridge %d: %s\n", __func__, b->id, cudaGetErrorString(rc));
+        (void) cudaGetLastError();
+        return false;
+    }
+    for (int i = 0; i < MB_RING; ++i) {
+        *(volatile uint32_t *) &b->ring[i].stamp = b->watch ? 0u : g;
+    }
+    *(volatile uint32_t *) &b->glob->posted = g;
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    b->served.store(g, std::memory_order_seq_cst);
+    return true;
+#endif
 }
 
 // ---- ops ------------------------------------------------------------------------------------------------------------

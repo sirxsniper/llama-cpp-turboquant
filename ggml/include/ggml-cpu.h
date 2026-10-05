@@ -230,6 +230,14 @@ extern "C" {
     // (not resident)
     GGML_BACKEND_API void             ggml_cpu_moe_prefetch_stats(struct ggml_cpu_moe_pool * pool, uint64_t * jobs,
                                                                   uint64_t * stopped, uint64_t * bytes, uint64_t * experts);
+    // [TAG_FN_L3_HOST_EXEC] the caller's own part of the posted prefetch (not solo): once the workers have the predicted
+    // experts, pull the pieces that the caller (thread 0) computes in a job of them into its own caches. Returns at the
+    // end, or as soon as *stop != 0 (checked while it waits for the list and every 16 KiB). Caller thread only, after
+    // ggml_cpu_moe_prefetch and before the next job. Returns the bytes covered.
+    GGML_BACKEND_API size_t           ggml_cpu_moe_prefetch_caller(struct ggml_cpu_moe_pool * pool, const volatile int32_t * stop);
+    // [TAG_FN_L3_HOST_EXEC] totals: caller prefetches started, stopped before their end, bytes covered
+    GGML_BACKEND_API void             ggml_cpu_moe_prefetch_caller_stats(struct ggml_cpu_moe_pool * pool, uint64_t * calls,
+                                                                         uint64_t * stopped, uint64_t * bytes);
 
     // [TAG_FN_CPU_MOE_FUSE] test / benchmark hook: how many fused MoE graph ops have run in this process
     GGML_BACKEND_API uint64_t ggml_cpu_fn_moe_fused_calls(void);

@@ -27,6 +27,7 @@
 
 #include "llama-moe-gen5.h"
 #include "llama-moe-gen5-impl.h"
+#include "llama-moe-bridge.h" // [TAG_FN_L3_HOST_QUIET]
 
 #include "llama-impl.h"
 
@@ -149,6 +150,8 @@ struct dma_state {
     ggml_backend_t     compute  = nullptr;
     ggml_backend_t     copy     = nullptr;
     bool               own_copy = false;
+    // [TAG_FN_L3_HOST_POKE] flush the copy stream after an issue (a no-op unless LLAMA_FN_HOST_POKE turned it on)
+    void (*poke)(ggml_backend_t) = nullptr;
 
     int    K           = 8;
     double share       = 0.0;
@@ -246,6 +249,9 @@ void dma_issue(dma_state * s, const issue_task & t) {
             ggml_backend_synchronize(s->copy);
         }
     }
+    if (s->poke) {
+        s->poke(s->copy); // [TAG_FN_L3_HOST_POKE] the copies start now, not at this thread's next driver call
+    }
 }
 
 void dma_issuer_run(dma_state * s) {
@@ -320,6 +326,7 @@ void dma_filler_run(dma_state * s) {
             }
             s->f_running++;
         }
+        llama_moe_bridge_quiet_wait(100); // [TAG_FN_L3_HOST_QUIET] the fills are for later steps
         const dma_layer & L = s->layers[j.pos];
         uint8_t * dst = s->ring.ptr + (size_t) j.slot*s->slot_size;
         size_t o = 0;
@@ -1011,6 +1018,9 @@ bool llama_moe_dma_init_layers(const std::vector<llama_moe_gen5_layer_desc> & la
     } else if (!cpu_dev) {
         s->copy = ggml_backend_dev_init(d.dev, nullptr);
         s->own_copy = s->copy != nullptr;
+        if (ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(d.dev)) { // [TAG_FN_L3_HOST_POKE]
+            s->poke = (void (*)(ggml_backend_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_stream_poke");
+        }
     } else {
         s->copy = d.compute;
     }

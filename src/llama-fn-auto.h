@@ -124,6 +124,44 @@ void llama_ecoqos_opt_out(void);
 const char * llama_fn_env(const llama_model & model, const char * name);
 bool         llama_fn_active(const llama_model & model);
 
+// [TAG_FN_L3_HOST] lever round 3, host / WDDM / sync family. Every switch is off unless set, and read for arch qwen4exp
+// only (every other model runs none of this code), through llama_fn_env:
+//   LLAMA_FN_HOST_EXEC=1     [TAG_FN_L3_HOST_EXEC] with LLAMA_MOE_BRIDGE_PF=1 (spin): the bridge's executor computes
+//                            its share of every job (thread 0 of the pool, PF_SOLO off) and pulls that share into its
+//                            own caches between two jobs, until the next job is posted (it watches the next ring word)
+//   LLAMA_FN_HOST_STEP=1     [TAG_FN_L3_HOST_STEP] the hot set's and the DMA ring's step after each decode of their
+//                            owner run on a helper thread, joined at that context's next decode / reserve / free
+//                            (inline while the hot set holds an MTP block layer: the draft context reads those)
+//   LLAMA_FN_HOST_LAUNCH2=N  [TAG_FN_L3_HOST_LAUNCH2] the scheduler cuts a bridged decode graph after layer N's output
+//                            (l_last-N, 0 <= N < n_layer - 1): two device graph launches per step, the first runs while
+//                            the host launches the second
+//   LLAMA_FN_HOST_LAUNCH_EVERY=K  [TAG_FN_L3_HOST_LAUNCH2] a cut after every K layers (l_last-(K-1), l_last-(2K-1), ...):
+//                            one launch per K layers, the device runs a piece while the host launches the next (with
+//                            LAUNCH2 the cuts of both). The graph inputs of all pieces are copied before the first one
+//   LLAMA_FN_HOST_POKE=1     [TAG_FN_L3_HOST_POKE] flush WDDM's batched submission after an eager (non-graph) CUDA
+//                            split and after the prefill stream's / DMA issuer's queued copies
+//   LLAMA_FN_HOST_QOS=1      [TAG_FN_L3_HOST_QOS] Windows: 1 ms timer resolution while the model lives, and the process
+//                            keeps it (and full execution speed) when minimized or occluded
+//   LLAMA_FN_HOST_QUIET=1    [TAG_FN_L3_HOST_QUIET] the hot set's upload worker and the DMA ring's fill threads wait
+//                            while a bridged graph runs (its CPU experts are DRAM bound) and copy between graphs
+//   LLAMA_FN_HOST_DMAOFF=1   [TAG_FN_L3_HOST_DMAOFF] no DMA share at all: the bridge makes no fetch side and no context
+//                            makes a DMA state (LLAMA_MOE_BRIDGE_DMA=0 alone let the MTP draft context make one: 148.5 MiB
+//                            of banks, a 1 GiB pinned ring and fill threads that no graph of it uses)
+//   LLAMA_FN_HOST_REARM=1|N  [TAG_FN_L3_HOST_REARM] a bridge that 3 errors turned off comes back after a cool-down (1: 256
+//                            steps or 30 s, N > 1: N steps or N/8 s, whichever ends first), doubled at every further
+//                            turn-off up to 64x; 65536 clean graphs start the back-off over. Off: off for good (as before)
+//   LLAMA_FN_HOST_DIAG=1|N   [TAG_FN_L3_HOST_DIAG] the bridge's per-graph host timing every N (1: 64) bridged graphs
+//   LLAMA_FN_HOST_SYNC_TRACE=<us>  [TAG_FN_L3_HOST_DIAG] every synchronize / blocking device copy of >= us is counted by
+//                            its call stack (ggml_backend_sync_trace_set), a report every 256 such waits
+//   LLAMA_FN_HOST_KPOOL_PROBE=1  [TAG_FN_L3_HOST_DIAG] host time of the k-pool layout update and of its input arrays per
+//                            ubatch, a line every 64 fills (read with getenv by llama-memory-hybrid-idx.cpp)
+bool llama_fn_l3_flag(const llama_model & model, const char * name);
+int  llama_fn_l3_int (const llama_model & model, const char * name, int def);
+// [TAG_FN_L3_HOST_QOS] [TAG_FN_L3_HOST_POKE] model hooks (load: at the end of llama_fn_auto_on_load, after the profile
+// state exists; free)
+void llama_fn_l3_host_on_load(const llama_model & model);
+void llama_fn_l3_host_on_free(const llama_model & model);
+
 // the contexts of a model (the VRAM fit breakdown, and whether the MTP draft context exists yet)
 void llama_fn_ctx_add   (const llama_model & model, llama_context * ctx, int ctx_type);
 void llama_fn_ctx_remove(const llama_model & model, llama_context * ctx);

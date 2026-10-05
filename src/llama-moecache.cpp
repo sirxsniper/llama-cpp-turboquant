@@ -2,6 +2,7 @@
 
 #include "llama-fn-auto.h" // [TAG_FN_AUTO]
 #include "llama-moe-decay.h" // [TAG_FN_R4_ADAPT_DECAY]
+#include "llama-moe-bridge.h" // [TAG_FN_L3_HOST_QUIET]
 #include "llama-impl.h"
 #include "llama-model.h"
 
@@ -675,6 +676,7 @@ void hot_adapt_worker(moe_cache * mc) {
         }
         size_t used = 0;
         auto flush = [&]() {
+            llama_moe_bridge_quiet_wait(100); // [TAG_FN_L3_HOST_QUIET] the copies read host memory too
             for (const auto & x : st) {
                 ggml_backend_tensor_set_async(mc->up_backend, x.dst, mc->stage_ptr + x.stage_off, x.off, x.size);
             }
@@ -683,6 +685,7 @@ void hot_adapt_worker(moe_cache * mc) {
             used = 0;
         };
         for (const auto & j : batch) {
+            llama_moe_bridge_quiet_wait(100); // [TAG_FN_L3_HOST_QUIET] no expert copy while a bridged graph runs
             layer_state & ls = mc->layers[j.layer_idx];
             ggml_tensor *       dsts[3] = { ls.pub.up_c,   ls.pub.gate_c,   ls.pub.down_c   };
             const ggml_tensor * srcs[3] = { ls.pub.up_src, ls.pub.gate_src, ls.pub.down_src };
@@ -1550,6 +1553,20 @@ bool llama_moe_hot_init(const llama_model & model, const void * owner, size_t bu
 const void * llama_moe_hot_adapt_owner() {
     const moe_cache * mc = g_cache;
     return mc && mc->adapt ? mc->owner : nullptr;
+}
+
+// [TAG_FN_L3_HOST_STEP] the layer list is fixed once the set exists (only per-layer state changes in a step)
+bool llama_moe_hot_has_layer_from(int il_min) {
+    const moe_cache * mc = g_cache;
+    if (!mc) {
+        return false;
+    }
+    for (const auto & ls : mc->layers) {
+        if (ls.pub.il >= il_min) {
+            return true;
+        }
+    }
+    return false;
 }
 
 // [TAG_FN_R4_ADAPT_DECAY]

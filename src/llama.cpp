@@ -26,6 +26,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <mutex>
 #include <stdexcept>
 #include <vector>
 
@@ -149,6 +150,118 @@ void llama_ecoqos_opt_out(void) {
         LLAMA_LOG_INFO("%s: LLAMA_NO_ECOQOS: power throttling (EcoQoS) off for this process\n", __func__);
     }
 #endif
+}
+
+// [TAG_FN_L3_HOST_QOS] [TAG_FN_L3_HOST_POKE] process-wide settings held while a qwen4exp model that asked for them lives
+// (llama-fn-auto.h: LLAMA_FN_HOST_QOS, LLAMA_FN_HOST_POKE)
+namespace {
+
+std::mutex                       g_l3_mtx;
+std::vector<const llama_model *> g_l3_qos_models;
+std::vector<const llama_model *> g_l3_poke_models;
+std::vector<const llama_model *> g_l3_trace_models; // [TAG_FN_L3_HOST_DIAG] LLAMA_FN_HOST_SYNC_TRACE
+
+#if defined(_WIN32)
+#    ifndef PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION
+#        define PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION 0x4
+#    endif
+using l3_time_period_t = unsigned int (WINAPI *)(unsigned int);
+HMODULE          g_l3_winmm       = nullptr;
+l3_time_period_t g_l3_time_begin  = nullptr;
+l3_time_period_t g_l3_time_end    = nullptr;
+bool             g_l3_time_active = false;
+#endif
+
+using l3_set_poke_t = void (*)(int);
+
+l3_set_poke_t l3_cuda_set_poke() {
+    ggml_backend_reg_t reg = ggml_backend_reg_by_name("CUDA");
+    return reg ? (l3_set_poke_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_fn_set_poke") : nullptr;
+}
+
+} // namespace
+
+void llama_fn_l3_host_on_load(const llama_model & model) {
+    std::lock_guard<std::mutex> lk(g_l3_mtx);
+    if (llama_fn_l3_flag(model, "LLAMA_FN_HOST_QOS")) {
+#if defined(_WIN32) && defined(PROCESS_POWER_THROTTLING_CURRENT_VERSION)
+        if (g_l3_qos_models.empty()) {
+            // full execution speed and honoured timer requests also while the process is minimized or occluded
+            PROCESS_POWER_THROTTLING_STATE st;
+            memset(&st, 0, sizeof(st));
+            st.Version     = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
+            st.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED | PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION;
+            st.StateMask   = 0;
+            bool ok_pt = SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &st, sizeof(st)) != 0;
+            if (!ok_pt) { // a Windows without the timer bit
+                st.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED;
+                ok_pt = SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &st, sizeof(st)) != 0;
+            }
+            // timed waits (cv wait_for, sleeps) at 1 ms instead of the 15.6 ms default of a process that asks for nothing
+            if (!g_l3_winmm) {
+                g_l3_winmm = LoadLibraryA("winmm.dll");
+                if (g_l3_winmm) {
+                    g_l3_time_begin = (l3_time_period_t) GetProcAddress(g_l3_winmm, "timeBeginPeriod");
+                    g_l3_time_end   = (l3_time_period_t) GetProcAddress(g_l3_winmm, "timeEndPeriod");
+                }
+            }
+            g_l3_time_active = g_l3_time_begin && g_l3_time_end && g_l3_time_begin(1) == 0;
+            LLAMA_LOG_INFO("%s: [TAG_FN_L3_HOST_QOS] power throttling off (execution speed%s): %s; 1 ms timer resolution: %s\n",
+                    __func__, st.ControlMask & PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION ? ", timer resolution" : "",
+                    ok_pt ? "yes" : "FAILED", g_l3_time_active ? "yes" : "FAILED");
+        }
+        g_l3_qos_models.push_back(&model);
+#else
+        LLAMA_LOG_INFO("%s: [TAG_FN_L3_HOST_QOS] Windows only: nothing to do here\n", __func__);
+#endif
+    }
+    if (llama_fn_l3_flag(model, "LLAMA_FN_HOST_POKE")) {
+        l3_set_poke_t set_poke = l3_cuda_set_poke();
+        if (set_poke == nullptr) {
+            LLAMA_LOG_WARN("%s: [TAG_FN_L3_HOST_POKE] no CUDA backend with the switch: nothing to do\n", __func__);
+        } else {
+            if (g_l3_poke_models.empty()) {
+                set_poke(1);
+            }
+            g_l3_poke_models.push_back(&model);
+            LLAMA_LOG_INFO("%s: [TAG_FN_L3_HOST_POKE] eager CUDA splits end with a stream query (WDDM flush)\n", __func__);
+        }
+    }
+    // [TAG_FN_L3_HOST_DIAG] LLAMA_FN_HOST_SYNC_TRACE=<us>: the call stacks of the waits that take at least that long
+    if (const int us = llama_fn_l3_int(model, "LLAMA_FN_HOST_SYNC_TRACE", 0); us > 0) {
+        ggml_backend_sync_trace_set(us);
+        g_l3_trace_models.push_back(&model);
+        LLAMA_LOG_INFO("%s: [TAG_FN_L3_HOST_DIAG] waits of >= %d us are counted by call stack (a report every 256)\n", __func__, us);
+    }
+}
+
+void llama_fn_l3_host_on_free(const llama_model & model) {
+    std::lock_guard<std::mutex> lk(g_l3_mtx);
+    // true when the model held the setting and was its last holder
+    auto drop = [&model](std::vector<const llama_model *> & v) -> bool {
+        auto it = std::find(v.begin(), v.end(), &model);
+        if (it == v.end()) {
+            return false;
+        }
+        v.erase(it);
+        return v.empty();
+    };
+    if (drop(g_l3_qos_models)) {
+#if defined(_WIN32)
+        if (g_l3_time_active) {
+            g_l3_time_end(1);
+            g_l3_time_active = false;
+        }
+#endif
+    }
+    if (drop(g_l3_poke_models)) {
+        if (l3_set_poke_t set_poke = l3_cuda_set_poke()) {
+            set_poke(0);
+        }
+    }
+    if (drop(g_l3_trace_models)) {
+        ggml_backend_sync_trace_set(0);
+    }
 }
 
 void llama_backend_init(void) {

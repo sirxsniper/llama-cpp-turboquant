@@ -4787,6 +4787,37 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     return 0;
 }
 
+// [TAG_FN_L3_HOST_POKE] llama turns it on for qwen4exp (LLAMA_FN_HOST_POKE): an eager evaluation (no CUDA graph) ends
+// with a stream query too, and helper threads may flush their copy streams (ggml_backend_cuda_stream_poke)
+static std::atomic<int> g_ggml_cuda_fn_poke{0};
+
+static bool ggml_cuda_fn_poke_on() {
+    return g_ggml_cuda_fn_poke.load(std::memory_order_relaxed) != 0;
+}
+
+// one stream query: WDDM submits the stream's batched work now. "Not ready" is its normal answer here.
+static void ggml_cuda_stream_query_flush(cudaStream_t stream) {
+    const cudaError_t q = cudaStreamQuery(stream);
+    if (q == cudaErrorNotReady) {
+        (void) cudaGetLastError();
+    } else if (q != cudaSuccess) {
+        CUDA_CHECK(q);
+    }
+}
+
+void ggml_backend_cuda_fn_set_poke(int on) {
+    g_ggml_cuda_fn_poke.store(on != 0 ? 1 : 0, std::memory_order_relaxed);
+}
+
+void ggml_backend_cuda_stream_poke(ggml_backend_t backend) {
+    if (!ggml_cuda_fn_poke_on() || backend == nullptr || !ggml_backend_is_cuda(backend)) {
+        return;
+    }
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_set_device(cuda_ctx->device);
+    ggml_cuda_stream_query_flush(cuda_ctx->stream());
+}
+
 static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
     bool graph_evaluated_or_captured = false;
 
@@ -5009,6 +5040,11 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         } else {
             graph_evaluated_or_captured = true; // ggml graph has been directly evaluated
         }
+    }
+
+    // [TAG_FN_L3_HOST_POKE] the kernels of an eager evaluation start now, not at the next driver call
+    if (!use_cuda_graph && ggml_cuda_fn_poke_on()) {
+        ggml_cuda_stream_query_flush(cuda_ctx->stream());
     }
 
     if (use_cuda_graph) {
@@ -6662,6 +6698,23 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_moe_bridge_release") == 0) {
         return (void *)ggml_backend_cuda_moe_bridge_release;
+    }
+    // [TAG_FN_L3_HOST_EXEC]
+    if (strcmp(name, "ggml_backend_moe_bridge_set_watch") == 0) {
+        return (void *)ggml_backend_cuda_moe_bridge_set_watch;
+    }
+    if (strcmp(name, "ggml_backend_moe_bridge_next_post_word") == 0) {
+        return (void *)ggml_backend_cuda_moe_bridge_next_post_word;
+    }
+    if (strcmp(name, "ggml_backend_moe_bridge_test_seed") == 0) {
+        return (void *)ggml_backend_cuda_moe_bridge_test_seed;
+    }
+    // [TAG_FN_L3_HOST_POKE]
+    if (strcmp(name, "ggml_backend_cuda_fn_set_poke") == 0) {
+        return (void *)ggml_backend_cuda_fn_set_poke;
+    }
+    if (strcmp(name, "ggml_backend_cuda_stream_poke") == 0) {
+        return (void *)ggml_backend_cuda_stream_poke;
     }
     return nullptr;
 }

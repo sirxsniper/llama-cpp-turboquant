@@ -266,6 +266,17 @@ static bool gen5_model_layers(const llama_model & model, std::vector<llama_moe_g
 void llama_moe_gen5_init(const llama_model & model, const void * owner, const std::vector<ggml_backend_t> & backends,
         bool host_bridge) {
     bool       want_dma = gen5::dma_requested();
+    // [TAG_FN_L3_HOST_DMAOFF] LLAMA_FN_HOST_DMAOFF=1 (qwen4exp): no DMA share in any context of the model. Without it,
+    // LLAMA_MOE_BRIDGE_DMA=0 leaves the share to the next context that asks: the MTP draft context then made a DMA state
+    // of its own (banks, a 1 GiB pinned ring, fill threads, a warm start) that none of its graphs can use
+    if (want_dma && llama_fn_l3_flag(model, "LLAMA_FN_HOST_DMAOFF")) {
+        want_dma = false;
+        static std::atomic<bool> logged{false};
+        if (!logged.exchange(true)) {
+            LLAMA_LOG_INFO("gen5: [TAG_FN_L3_HOST_DMAOFF] no DMA share: no banks, no pinned ring, no fill threads in any context "
+                    "of this model\n");
+        }
+    }
     const bool want_pfs = gen5::env_flag("LLAMA_PREFILL_STREAM");
     // [TAG_FN_MERGE] the bridge computes the cold experts on its host executor inside one device graph: there is no CPU
     // split for the plan and fence nodes. The two are exclusive; the bridge wins (its graphs never build a DMA plan).
