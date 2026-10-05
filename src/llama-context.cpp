@@ -2932,7 +2932,7 @@ static bool turbo_nan_scan_cb(struct ggml_tensor * t, bool ask, void * /*user_da
     static bool noted = false;
     if (n_nan_unread && !noted) {
         noted = true;
-        fprintf(stderr, "[NAN] note: op=%s name='%s' holds %lld NaN in its %lld snapshot elements (not counted here: the unwritten slots are never read, the written ones are checked in the copies that read them)\n",
+        fprintf(stderr, "[nan-scan] note (not a NaN finding): op=%s name='%s' holds %lld NaN in its %lld snapshot elements (not counted here: the unwritten slots are never read, the written ones are checked in the copies that read them)\n",
                 ggml_op_name(t->op), ggml_get_name(t), (long long) n_nan_unread, (long long) (n - n_scan));
         fflush(stderr);
     }
