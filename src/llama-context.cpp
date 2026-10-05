@@ -1720,6 +1720,7 @@ llama_context::~llama_context() {
     llama_fn_ctx_remove(model, this); // [TAG_FN_VRAM_FIT]
 
     llama_moe_hot_save_now(this);      // [TAG_FN_R4_ADAPT_DECAY] LLAMA_MOE_HOT_SAVE: the learned hot set, owner only
+    llama_moe_hot_state_save(this);    // [TAG_FN_L3_POLICY_STATE] LLAMA_MOE_HOT_STATE: counts + residents, owner only
     llama_moe_bridge_free(moe_bridge); // [TAG_MOE_BRIDGE] no graph runs now
     moe_bridge = nullptr;
     llama_moe_gen5_free(this); // [TAG_MOE_DMA_SHARE] [TAG_FN_PREFILL_STREAM]
@@ -5283,6 +5284,8 @@ bool llama_context::state_save_file(const char * filepath, const llama_token * t
     llama_io_write_file io(&file);
     state_write_data(io);
 
+    llama_moe_hot_state_save(this); // [TAG_FN_L3_POLICY_STATE]
+
     return true;
 }
 
@@ -5356,6 +5359,8 @@ size_t llama_context::state_seq_save_file(llama_seq_id seq_id, const char * file
 
     const size_t res = file.tell();
     GGML_ASSERT(res == sizeof(uint32_t) * 3 + sizeof(llama_token) * n_token_count + io.n_bytes());
+
+    llama_moe_hot_state_save(this); // [TAG_FN_L3_POLICY_STATE] a slot save keeps the learned hot set too
 
     return res;
 }

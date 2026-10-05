@@ -94,6 +94,21 @@ struct ggml_backend_device * llama_moe_hot_device(const llama_model & model);
 // [TAG_FN_VRAM_FIT] device bytes the hot set holds, 0 without one
 size_t llama_moe_hot_device_bytes();
 
+// [TAG_FN_L3_POLICY_POOL] LLAMA_MOE_HOT_POOL=1 (qwen4exp, even slots, the decayed adaptive set): the layers of one expert
+// shape class (same types and shapes) share one slot pool, k layers x (n + 1) - 1 slots and one zero slot in the bytes of
+// their k fixed shares, and the decayed policy pairs the candidates and residents of all of them: a layer with a wide
+// working set takes the slots a narrow one does not use. Each layer keeps its own tables; the pool's tensors are its
+// up_c / gate_c / down_c and the pool's size its miss value, so the graph, the bridge and the CPU skip tables are unchanged.
+// [TAG_FN_L3_POLICY_UPLOAD] LLAMA_MOE_HOT_UP_PIPE=1 (qwen4exp, adaptive set): the upload worker stages through two small
+// pinned halves (LLAMA_MOE_HOT_UP_STAGE_MIB each, default 8) - one is filled while the other uploads, so the staging stays
+// in the CPU caches - and LLAMA_MOE_HOT_UP_MIB_STEP=<n> (0 = no limit) caps its bytes per decode step (a token bucket that
+// the owner's step refills, at most two steps' worth), so a large refill spreads over steps instead of taking DRAM and
+// PCIe from one; a pass then queues at most what the bucket gives until the next pass. No host CUDA call waits on the
+// compute stream; the worker waits only for its own copies.
+// [TAG_FN_L3_POLICY_BURST] LLAMA_MOE_HOT_BURST_MIB=<n> (qwen4exp, decayed adaptive set; 0 = off): past the pass budget
+// (LLAMA_MOE_HOT_DECAY_MIB) a pass may queue up to n MiB more for strong pairs only - a free slot, or a candidate whose count
+// is over LLAMA_MOE_HOT_BURST_RATIO (default 2) x its victim's - so a shifted working set (a new request) refills fast while
+// the steady state keeps the small budget. LLAMA_MOE_HOT_STATS adds the step's host time to the adaptive stats line.
 // [TAG_FN_MOE_HOT_ADAPT] LLAMA_MOE_HOT_ADAPT=1: windowed-frequency admission into the hot slots, evict first, publish
 // after the upload has landed (LLAMA_MOE_HOT_ADMIT=N/W default 3/16, LLAMA_MOE_HOT_HYST=1, LLAMA_MOE_HOT_ADAPT_MIB=64 per
 // step, LLAMA_MOE_HOT_VERIFY=<steps> compares one resident slot with its source). The owner context must synchronize
@@ -127,3 +142,22 @@ bool llama_moe_hot_lend(const void * owner, size_t bytes, struct ggml_backend_bu
 // [TAG_FN_R1_PFS_LEND] the lent range is back (the device is idle, nothing writes it any more): the resident experts of
 // the lent layers are uploaded again, their zero slots cleared, and both tables restored. No-op when nothing is lent.
 void llama_moe_hot_unlend(const void * owner);
+
+// [TAG_FN_L3_POLICY_SEED] LLAMA_MOE_HOT_SEED_NODE=1 (qwen4exp, decayed adaptive set, LLAMA_MOE_HOT_SEED > 0): a prompt
+// ubatch (more than LLAMA_MOE_HOT_MAX_T tokens) reports its routing through a CPU graph node after the layer's experts,
+// wherever they ran. Without it the prompt seed sees only prompts the CPU computes: the CPU MUL_MAT_ID observer never runs
+// for ubatches that the prefill stream or the scheduler's op offload put on the GPU (32 tokens or more). The observer then
+// counts decode steps only, so nothing is counted twice. LLAMA_MOE_HOT_SEED_NORM=<steps> (default 0 = the raw prompt counts x
+// LLAMA_MOE_HOT_SEED): the whole prompt folds in once, at its first decode step, as <steps> decode steps x LLAMA_MOE_HOT_SEED
+// of the share of its tokens that route to each expert, so a 100K prompt does not outweigh the decode for hundreds of steps.
+struct ggml_context;
+struct ggml_cgraph;
+bool          llama_moe_hot_seed_node_wanted(const ggml_tensor * up_exps, int64_t n_tokens);
+// ids: [n_expert_used, n_tokens] I32, contiguous. Returns the node (pin it to the CPU backend).
+ggml_tensor * llama_moe_hot_build_seed(ggml_context * ctx, ggml_cgraph * gf, ggml_tensor * ids, int il);
+
+// [TAG_FN_L3_POLICY_STATE] LLAMA_MOE_HOT_STATE=<file>|auto (qwen4exp, decayed adaptive set; auto = <model file>.hotstate):
+// the learned set (decayed counts + residents, best first) is saved on a slot save, at the owner's end and every
+// LLAMA_MOE_HOT_STATE_EVERY decode steps (0 = off), and loaded when the hot set starts: the even slots start filled with
+// the saved residents instead of empty, so a new process does not start cold. LLAMA_MOE_HOT_STATE_LOAD=0 saves only.
+void llama_moe_hot_state_save(const void * owner);
