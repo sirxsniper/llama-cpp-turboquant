@@ -150,6 +150,8 @@ bool         llama_fn_active(const llama_model & model);
 //   LLAMA_FN_HOST_DIAG=1|N   [TAG_FN_L3_HOST_DIAG] the bridge's per-graph host timing every N (1: 64) bridged graphs
 //   LLAMA_FN_HOST_SYNC_TRACE=<us>  [TAG_FN_L3_HOST_DIAG] every synchronize / blocking device copy of >= us is counted by
 //                            its call stack (ggml_backend_sync_trace_set), a report every 256 such waits
+//   LLAMA_FN_HOST_KPOOL_PROBE=1  [TAG_FN_L3_HOST_DIAG] host time of the k-pool layout update and of its input arrays per
+//                            ubatch, a line every 256 ubatches (read with getenv by llama-memory-hybrid-idx.cpp)
 bool llama_fn_l3_flag(const llama_model & model, const char * name);
 int  llama_fn_l3_int (const llama_model & model, const char * name, int def);
 // [TAG_FN_L3_HOST_QOS] [TAG_FN_L3_HOST_POKE] model hooks (load: at the end of llama_fn_auto_on_load, after the profile
