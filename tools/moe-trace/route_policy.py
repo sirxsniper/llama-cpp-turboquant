@@ -574,6 +574,15 @@ def grid_real():
     the paced worker (LLAMA_MOE_HOT_UP_MIB_STEP)"""
     g = collections.OrderedDict()
     g["ship"] = {}
+    # the candidates for the test stage (old-trace replays 2026-10-05): L3P = pool, decay 0.95, 1.5x / +1.0, 64 MiB per pass
+    # plus a 512 MiB burst at 2x; LEAN = the same with decay 0.97 and a 1.5x burst
+    l3p = {"pool": True, "decay": 0.95, "ratio": 1.5, "hyst": 1.0, "up_mib": 64.0, "burst_mib": 512.0, "burst_ratio": 2.0}
+    g["L3P"] = dict(l3p)
+    g["L3P_seed03"] = dict(l3p, seed=0.03)
+    g["L3P_seednorm16"] = dict(l3p, seed=1.0, seed_norm=16.0)
+    g["L3P_pace128"] = dict(l3p, pace=True, up_bw_mib=128.0)
+    g["LEAN"] = dict(l3p, decay=0.97, burst_ratio=1.5)
+    g["L3P_nopool"] = dict(l3p, pool=False)
     for s in (0.01, 0.03, 0.10):
         g["seed%03d" % round(s * 100)] = {"seed": s}
     for n in (8.0, 16.0, 32.0, 64.0):
