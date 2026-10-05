@@ -3395,6 +3395,10 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         // executor), so the ubatch carries zeros and failed. Roll it back exactly as the failure path below does, then
         // compute it once more: the bridge pauses after a failure, so the retry runs the plain graph (the CPU split).
         // Without this the caller got a compute error for a transient stall - llama-server dropped the whole slot.
+        // The rollback needs a memory that can drop the whole ubatch: an attention cache always can, a recurrent state
+        // only the tokens its ring keeps (a 1-token decode, not a 3-token speculative verify ubatch with n_rs_seq 2).
+        // When it refuses (a refused seq_rm changes nothing; the failure path below removes the same ranges again) the
+        // ubatch fails as before.
         if (!res && moe_bridge_failed) {
             if (turbot_kv) {
                 turbot_kv->turbot_abort_ubatch();
@@ -3413,13 +3417,17 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                     rolled = memory->seq_rm(s, pos_min_r[s], -1) && rolled;
                 }
             }
-            n_bridge_retry++;
-            LLAMA_LOG_WARN("%s: [TAG_FN_R1_BRIDGE_RETRY] the bridge failed this ubatch of %u tokens (%s rolled back); "
-                    "computing it again without the bridge (retry %" PRIu64 ")\n", __func__, ubatch.n_tokens,
-                    rolled ? "" : "NOT", n_bridge_retry);
             if (rolled) {
+                n_bridge_retry++;
+                LLAMA_LOG_WARN("%s: [TAG_FN_R1_BRIDGE_RETRY] the bridge failed this ubatch of %u tokens: rolled back, "
+                        "computing it again without the bridge (retry %" PRIu64 ")\n", __func__, ubatch.n_tokens,
+                        n_bridge_retry);
                 gf_res_prev_active = nullptr; // never reuse the bridged graph
                 res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
+            } else {
+                LLAMA_LOG_WARN("%s: [TAG_FN_R1_BRIDGE_RETRY] the bridge failed this ubatch of %u tokens and the memory "
+                        "cannot roll it back (a recurrent state keeps fewer of its tokens), so it fails\n", __func__,
+                        ubatch.n_tokens);
             }
         }
 

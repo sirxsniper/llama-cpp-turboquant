@@ -13,8 +13,10 @@
 //                                         node that runs the job on the driver thread
 //   LLAMA_MOE_BRIDGE_SPIN_US=2000         executor and pool workers spin this long after a job, then sleep
 //   LLAMA_MOE_BRIDGE_TIMEOUT_MS=500       a device wait gives up after this long if the host has not taken the job
-//                                         ([TAG_FN_R1_BRIDGE_RETRY] was 50; the context then computes the ubatch again
-//                                         without the bridge instead of failing it)
+//                                         ([TAG_FN_R1_BRIDGE_RETRY] was 50, and a cold start missed it). The context
+//                                         then rolls the ubatch back and computes it again without the bridge when the
+//                                         memory can drop the whole ubatch (attention caches; a recurrent state only
+//                                         for a 1-token decode), else the ubatch fails as below
 //   LLAMA_MOE_BRIDGE_JOB_MAX_MS=1000        ... or after this long once it has (slow job); either way the ubatch fails
 //                                         (decode returns an error, its memory is rolled back) and the bridge pauses
 //   LLAMA_MOE_BRIDGE_MAX_T=8              largest graph width that uses it (1..16)

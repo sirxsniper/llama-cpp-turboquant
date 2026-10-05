@@ -482,14 +482,15 @@ static void kpool_scan_pools(llama_memory_hybrid_idx::kpool_layout_seq & sq, uin
     sq.j_next = j;
 }
 
-// [TAG_FN_R1_KPOOL_TAIL] LLAMA_KPOOL_TAIL=1 turns the tail path on (default off: every edit rebuilds the sequence's
-// layout, as before); LLAMA_KPOOL_VERIFY=1 rebuilds every updated sequence from scratch as well and aborts on any
-// difference
+// [TAG_FN_R1_KPOOL_TAIL] the tail path is on by default (Flash-Next at 262K, one slot: +5% at 32K, +20% at 131K, +30%
+// at 246K real-use decode, the same layout as a rebuild under LLAMA_KPOOL_VERIFY=1); LLAMA_KPOOL_TAIL=0 rebuilds the
+// sequence's layout on every edit, as before. LLAMA_KPOOL_VERIFY=1 rebuilds every updated sequence from scratch as well
+// and aborts on any difference
 static int kpool_tail_mode() {
     static const int m = [] {
         const char * e = getenv("LLAMA_KPOOL_TAIL");
         const char * v = getenv("LLAMA_KPOOL_VERIFY");
-        const int tail   = e != nullptr && atoi(e) != 0 ? 1 : 0;
+        const int tail   = e != nullptr && atoi(e) == 0 ? 0 : 1;
         const int verify = v != nullptr && atoi(v) != 0 ? 2 : 0;
         return tail | verify;
     }();
