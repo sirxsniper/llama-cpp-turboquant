@@ -28,8 +28,9 @@
 # [TAG_FN_AUTO] every run pins LLAMA_FLASHNEXT_PROFILE=off unless its mode sets it: the synthetic model is qwen4exp with
 # host experts, so the automatic profile would otherwise change the base and band runs. --mode auto: the candidate runs
 # the default profile (safe) with --n-cpu-moe 1, so the automatic placement must move every layer's experts to the host,
-# and the hot set is the even, adaptive one sized by the VRAM fit at the first decode. --mode auto-trial: the trial profile
-# (every built lever that is not measured yet; "fast" holds only measured winners).
+# and the hot set is the even, adaptive one sized by the VRAM fit at the first decode ([TAG_FN_SHIP1] safe also turns on
+# every lever measured in lever round 1: bridge + DMA share, CPU kernels, QSA switches, PLE direct I/O, prefill stream).
+# --mode auto-trial: the trial profile (safe + the levers that are not measured yet; none today, so it equals auto).
 # The log must show the fn-auto placement line, the VRAM fit and the adaptive hot set.
 from __future__ import annotations
 

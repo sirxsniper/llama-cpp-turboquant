@@ -58,6 +58,10 @@ struct llama_moe_gen5_device {
     ggml_backend_dev_t         dev     = nullptr;
     ggml_backend_buffer_type_t buft    = nullptr; // bank memory
     ggml_backend_t             compute = nullptr; // the backend that runs the owner's graphs on dev
+    // [TAG_FN_SHIP1] the DMA share's warm-start routing profile as the model resolves it (LLAMA_MOE_DMA_PROFILE, else
+    // LLAMA_MOE_HOT_PROFILE, both through the qwen4exp profile's lookup, so also its <model>.moeprof sidecar);
+    // nullptr = read the two variables from the environment (tests). Read only inside llama_moe_dma_init_layers.
+    const char *               profile = nullptr;
 };
 
 // graph-building views, valid while the owner lives

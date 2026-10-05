@@ -131,8 +131,8 @@ const char * llama_version(void) {
 
 // [TAG_FN_R4_ECOQOS] LLAMA_NO_ECOQOS=1 (Windows): opt the process out of EcoQoS / power throttling, which Windows may
 // apply to a background-launched or minimized process (Strata #691: -20% decode on a hybrid CPU). Only this process's
-// own scheduling hint changes; nothing else on the machine.
-static void llama_ecoqos_opt_out(void) {
+// own scheduling hint changes; nothing else on the machine. [TAG_FN_SHIP1] also called by the qwen4exp profile (fn-auto).
+void llama_ecoqos_opt_out(void) {
 #if defined(_WIN32) && defined(PROCESS_POWER_THROTTLING_CURRENT_VERSION)
     const char * e = getenv("LLAMA_NO_ECOQOS");
     if (!e || atoi(e) == 0) {

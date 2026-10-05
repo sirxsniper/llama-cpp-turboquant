@@ -26,7 +26,8 @@ enum : int {
     P_TRIAL = 1 << LLAMA_FN_PROFILE_TRIAL,
     P_TDMA  = 1 << LLAMA_FN_PROFILE_TRIAL_DMA,
     P_ALL   = P_SAFE | P_FAST | P_TRIAL | P_TDMA,
-    P_TRY   = P_TRIAL | P_TDMA,
+    P_TRY   = P_TRIAL | P_TDMA,          // levers that are not measured yet (A/B runs only)
+    P_BR    = P_SAFE | P_FAST | P_TRIAL, // [TAG_FN_SHIP1] the host bridge and what runs inside it: not trial-dma
 };
 
 struct fn_item {
@@ -35,40 +36,65 @@ struct fn_item {
     int          profiles;
 };
 
-// safe: speed/r1 hot48ad against F0 (ncmoe 39), 3 interleaved rounds at 32K with turbot KV and MTP: +35.4% greedy code,
-// +45.1% temp-1 prose, KLD on the pure-placement band (r2/TEST_PLAN.md 0.4). That run started the hot set from a routing
-// profile (fn_r1_all.moeprof); "even" (no <model>.moeprof sidecar) is not measured yet.
-// fast: safe + the measured winners. A lever moves from P_TRY to P_FAST only with its A/B result (speed/history.md).
-// trial / trial-dma: built and unit tested, NOT measured on the GPU; for A/B runs only.
+// safe (the default) = the measured winners, all with file A (UD-Q4_K_XL + Q8_0 MTP head), turbot KV and MTP:
+//   - placement auto + the adaptive hot set + the fits: speed/r1 hot48ad against F0 (ncmoe 39), 3 interleaved rounds at
+//     32K: +35.4% greedy code, +45.1% temp-1 prose, KLD on the pure-placement band (r2/TEST_PLAN.md 0.4);
+//   - [TAG_FN_SHIP1] lever round 1 at -c 262144 (E:/turbot-gates/flashnext/test/history.md): ALL-ON (the levers below)
+//     against the hot set alone, same binary, 2 interleaved rounds: real use (temp 1, thinking, 32K / 131K / 246K filled)
+//     +38.6 %, bench code +24.8 %, decode KLD on the placement band (0.0117 vs 0.0121); the bs3 binary search kept every
+//     group (decay, host trims, CPU kernels, PLE direct I/O, -ub 8192); with the fix-r1 code (k-pool tail, wide
+//     compaction, bridge rollback ring) real use 35.3 -> 58.6 t/s (+65.9 %), bench code 51.1 -> 64.8 t/s.
+// fast: safe + levers that won only a narrower A/B (P_FAST). None: every measured lever is in safe.
+// trial: safe + built levers that are NOT measured yet (P_TRY), for A/B runs only. None today.
+// trial-dma: trial without the host bridge, i.e. the gen5 DMA share in its own CPU split (the pre-round-4 exclusive mode).
 const fn_item k_items[] = {
-    { "LLAMA_FN_PLACEMENT",     "auto",  P_ALL  }, // every trunk layer's routed experts on the host
-    { "LLAMA_MOE_HOT_PROFILE",  "",      P_ALL  }, // set at load: <model>.moeprof if present, else "even"
-    { "LLAMA_MOE_HOT_MIB",      "auto",  P_ALL  },
-    { "LLAMA_MOE_HOT_FIT",      "1",     P_ALL  }, // [TAG_FN_VRAM_FIT]
-    { "LLAMA_MOE_HOT_ADAPT",    "1",     P_ALL  },
-    { "LLAMA_MOE_HOT_ADMIT",    "2/32",  P_ALL  },
-    { "LLAMA_RAM_FIT",          "1",     P_ALL  }, // [TAG_FN_RAM_FIT]
+    { "LLAMA_FN_PLACEMENT",           "auto",  P_ALL }, // every trunk layer's routed experts on the host
+    { "LLAMA_MOE_HOT_PROFILE",        "",      P_ALL }, // set at load: <model>.moeprof if present, else "even"
+    { "LLAMA_MOE_HOT_MIB",            "auto",  P_ALL },
+    { "LLAMA_MOE_HOT_FIT",            "1",     P_ALL }, // [TAG_FN_VRAM_FIT]
+    { "LLAMA_MOE_HOT_ADAPT",          "1",     P_ALL },
+    { "LLAMA_MOE_HOT_ADMIT",          "2/32",  P_ALL },
+    { "LLAMA_RAM_FIT",                "1",     P_ALL }, // [TAG_FN_RAM_FIT]
 
-    // P_FAST levers (measured winners) go here
-
-    { "LLAMA_MOE_BRIDGE",       "1",     P_TRIAL },
-    { "LLAMA_MOE_DMA_SHARE",    "auto",  P_TDMA  }, // exclusive with the bridge
-    { "GGML_CPU_APPLY_ONCE",    "1",     P_TRY   },
-    { "GGML_CPU_Q5_1_AVX512",   "1",     P_TRY   },
-    { "GGML_CPU_MMID_MR",       "1",     P_TRY   },
-    { "GGML_CPU_MOE_FUSE",      "1",     P_TRY   },
-    { "GGML_SCHED_SPLIT_ASYNC", "1",     P_TRY   },
-    { "LLAMA_PLE_HOST_GATHER",  "1",     P_TRY   },
-    { "LLAMA_PLE_DIRECT_IO",    "1",     P_TRY   }, // flashnext/ple-dio; no effect before that branch is merged
-    { "LLAMA_GRAPH_PER_WIDTH",  "1",     P_TRY   },
-    { "TURBO_QSA_CHUNK",        "64",    P_TRY   },
-    { "SPEC_MTP_COST",          "1",     P_TRY   },
-    { "LLAMA_MTP_ATTN_WINDOW",  "32768", P_TRY   },
+    // [TAG_FN_SHIP1] lever round 1 (see above). Lookups (llama_fn_env), never put into the environment:
+    { "LLAMA_MOE_HOT_HEADROOM_MIB",   "1280",  P_ALL }, // the 768 default went over 28,500 MiB at depth (28,622)
+    { "LLAMA_MOE_HOT_DECAY",          "0.92",  P_ALL }, // decayed hot set (bs3: without it -2.5 % code, -3.4 % prose)
+    { "LLAMA_MOE_HOT_SEED",           "0.03",  P_ALL },
+    { "LLAMA_PLE_DIO_FILE",           "",      P_ALL }, // set at load: <model>.ple (the unmapped PLE table copy)
+    // read with getenv() elsewhere, so they are in the environment while the model is loaded:
+    { "LLAMA_MOE_BRIDGE",             "1",     P_BR  }, // the host bridge (+ its rollback ring, [TAG_FN_R1_BRIDGE_RB])
+    { "LLAMA_MOE_BRIDGE_DMA",         "1",     P_BR  }, // the DMA share inside the bridged graphs ([TAG_FN_R4_BRIDGE_DMA])
+    { "LLAMA_MOE_DMA_SHARE",          "auto",  P_ALL },
+    { "GGML_CPU_APPLY_ONCE",          "1",     P_ALL },
+    { "GGML_CPU_Q5_1_AVX512",         "1",     P_ALL },
+    { "GGML_CPU_MMID_MR",             "1",     P_ALL },
+    { "GGML_CPU_MOE_FUSE",            "1",     P_ALL },
+    { "GGML_CPU_VNNI",                "1",     P_ALL }, // acts only on a CPU with AVX512-VNNI
+    { "GGML_SCHED_SPLIT_ASYNC",       "1",     P_ALL },
+    { "GGML_CUDA_GRAPH_POKE",         "1",     P_ALL },
+    { "LLAMA_NO_ECOQOS",              "1",     P_ALL }, // applied at load: llama_backend_init() read it before
+    { "LLAMA_GRAPH_PER_WIDTH",        "1",     P_ALL },
+    { "LLAMA_PLE_HOST_GATHER",        "1",     P_ALL },
+    { "LLAMA_PLE_DIRECT_IO",          "1",     P_ALL },
+    { "LLAMA_QSA_POS_MASK",           "1",     P_ALL },
+    { "LLAMA_QSA_POS_CHUNK",          "512",   P_ALL },
+    { "TURBO_QSA_CHUNK",              "512",   P_ALL },
+    { "TURBO_QSA_SPARSE",             "1",     P_ALL },
+    { "TURBO_QSA_TOPK_UNORDERED",     "1",     P_ALL },
+    { "SPEC_MTP_COST",                "1",     P_ALL },
+    { "LLAMA_MTP_ATTN_WINDOW",        "32768", P_ALL },
+    { "LLAMA_MTP_HEAD_ROWS",          "98304", P_ALL },
+    { "SPEC_DFT_UBATCH",              "128",   P_ALL }, // the MTP draft context's ubatch (its logits buffer at -ub 8192)
+    { "LLAMA_PREFILL_STREAM",         "1",     P_ALL },
+    { "LLAMA_PREFILL_STREAM_LEND",    "1",     P_ALL },
+    { "LLAMA_PREFILL_STREAM_THREADS", "16",    P_ALL },
 };
 
 // names the fn-auto aware code reads through llama_fn_env(): never put into the environment
+// [TAG_FN_SHIP1] LLAMA_PLE_DIO_FILE as well: qwen4exp's loader tells the profile's default copy from the user's path
 bool fn_is_lookup_name(const std::string & n) {
-    return n.rfind("LLAMA_MOE_HOT_", 0) == 0 || n.rfind("LLAMA_FN_", 0) == 0 || n == "LLAMA_RAM_FIT";
+    return n.rfind("LLAMA_MOE_HOT_", 0) == 0 || n.rfind("LLAMA_FN_", 0) == 0 || n == "LLAMA_RAM_FIT" ||
+           n == "LLAMA_PLE_DIO_FILE";
 }
 
 std::string fn_trim(const std::string & s) {
@@ -113,6 +139,7 @@ const fn_cpu_sw k_cpu_sw[] = {
     { "GGML_CPU_Q5_1_AVX512", GGML_CPU_FN_Q5_1_AVX512 },
     { "GGML_CPU_MMID_MR",     GGML_CPU_FN_MMID_MR     },
     { "GGML_CPU_MOE_FUSE",    GGML_CPU_FN_MOE_FUSE    },
+    { "GGML_CPU_VNNI",        GGML_CPU_FN_VNNI        }, // [TAG_FN_SHIP1]
 };
 
 const fn_cpu_sw * fn_cpu_switch(const std::string & name) {
@@ -509,6 +536,11 @@ void llama_fn_auto_on_load(llama_model & model, llama_model_loader & ml, const s
             const std::string sidecar = fname.empty() ? "" : fname + ".moeprof";
             o.value = !sidecar.empty() && fn_file_exists(sidecar) ? sidecar : "even";
         }
+        // [TAG_FN_SHIP1] the unmapped copy of the PLE table that LLAMA_PLE_DIRECT_IO reads, next to the model: made on the
+        // first load when its volume has room to spare, else the table is read through the mapping (qwen4exp.cpp)
+        if (o.name == "LLAMA_PLE_DIO_FILE" && o.value.empty() && !fname.empty()) {
+            o.value = fname + ".ple";
+        }
     }
     model.fn_auto = st;
 
@@ -519,14 +551,19 @@ void llama_fn_auto_on_load(llama_model & model, llama_model_loader & ml, const s
     }
 
     llama_fn_state_inject(*st);
+    // [TAG_FN_SHIP1] llama_backend_init() read LLAMA_NO_ECOQOS before any model existed: apply the profile's value now
+    if (std::find(st->injected.begin(), st->injected.end(), "LLAMA_NO_ECOQOS") != st->injected.end()) {
+        llama_ecoqos_opt_out();
+    }
 
     LLAMA_LOG_INFO("fn-auto: qwen4exp with the routed experts of %d of %d trunk layers on the host: LLAMA_FLASHNEXT_PROFILE=%s%s "
             "(off|safe|fast|trial|trial-dma)\n", n_host_user, n_layer, llama_fn_profile_name(prof), pe ? "" : " (default)");
     if (prof == LLAMA_FN_PROFILE_TRIAL || prof == LLAMA_FN_PROFILE_TRIAL_DMA) {
-        LLAMA_LOG_WARN("fn-auto: the %s profile turns on levers that are NOT measured yet - for A/B runs only\n", llama_fn_profile_name(prof));
+        LLAMA_LOG_WARN("fn-auto: the %s profile is for A/B runs only (trial: safe + the levers not measured yet; trial-dma: "
+                "trial without the host bridge)\n", llama_fn_profile_name(prof));
     }
     if (prof == LLAMA_FN_PROFILE_FAST && llama_fn_fast_lever_count() == 0 && !(fast_list && fast_list[0])) {
-        LLAMA_LOG_INFO("fn-auto:   fast: no lever has won a measured A/B yet, so fast is the same as safe\n");
+        LLAMA_LOG_INFO("fn-auto:   fast: every measured lever is in safe, so fast is the same as safe\n");
     }
     if (st->promote) {
         LLAMA_LOG_INFO("fn-auto:   placement: the routed experts of all %d trunk layers stay on the host and the hot set holds "

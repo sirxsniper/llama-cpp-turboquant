@@ -2,22 +2,26 @@
 
 // [TAG_FN_AUTO] automatic Flash-Next (qwen4exp) defaults behind ONE switch, LLAMA_FLASHNEXT_PROFILE:
 //   off        nothing automatic (the switch-by-switch behaviour of flashnext/all)
-//   safe       default: every trunk layer's routed experts on the host, the adaptive per-expert VRAM hot set sized by the
-//              VRAM fit (speed/r1 hot48ad, +35% code / +45% prose at 32K), and the RAM fit
-//   fast       safe + the levers that won a measured A/B (k_items, P_FAST). None yet, so today fast == safe. A lever goes
-//              in only with its A/B evidence (speed/history.md) next to it
-//   trial      safe + every built lever that is NOT measured yet (host bridge, CPU MoE switches, split trims, QSA chunk,
-//              PLE direct I/O, MTP cost). For A/B runs and synthetic tests only, never a default
-//   trial-dma  trial with the gen5 DMA share instead of the host bridge (the two are exclusive)
-// LLAMA_FLASHNEXT_FAST=<NAME=VALUE,...> replaces the lever list of fast / trial / trial-dma (one lever per A/B arm).
+//   safe       default: the measured winners (k_items, each with its A/B evidence next to it): every trunk layer's
+//              routed experts on the host, the adaptive decayed per-expert VRAM hot set sized by the VRAM fit, the RAM
+//              fit, and [TAG_FN_SHIP1] lever round 1's set at -c 262144: the host bridge with the DMA share inside it,
+//              the CPU expert kernels, host trims, PLE direct I/O from an unmapped copy, the positional QSA mask, sparse
+//              turbot FA and unordered top-k, the MTP cost / window / head rows / draft ubatch, the prefill stream with
+//              lend (real use +65.9 % at 262K vs the round's start, E:/turbot-gates/flashnext/test/history.md)
+//   fast       safe + levers that won only a narrower A/B (k_items, P_FAST). None: every measured lever is in safe
+//   trial      safe + every built lever that is NOT measured yet. None today, so trial == safe. For A/B runs only
+//   trial-dma  trial without the host bridge: the gen5 DMA share in its own CPU split (the pre-round-4 exclusive mode)
+// LLAMA_FLASHNEXT_FAST=<NAME=VALUE,...> replaces the levers of fast / trial / trial-dma that are not in safe (none today)
+// and adds or changes options (one lever per A/B arm); safe ignores it.
 // Active only for arch qwen4exp whose routed experts the tensor overrides (--n-cpu-moe, --cpu-moe, -ot, -fit) put on
 // the host, with the weights loaded (not the -fit memory probes). Every other model is unchanged. A variable that is
 // set in the environment always wins over the profile.
 //
-// The safe items are read through llama_fn_env() by the code that owns them (placement, hot set, VRAM fit, RAM fit),
-// so they never leave the model. The levers are read by getenv() deep in other code, so while the model is loaded the
-// profile puts them into the process environment (GGML_CPU_* through ggml_cpu_fn_set_switch) and takes them out again
-// when the model is freed.
+// The lookup items (LLAMA_MOE_HOT_*, LLAMA_FN_*, LLAMA_RAM_FIT, LLAMA_PLE_DIO_FILE) are read through llama_fn_env() by
+// the code that owns them (placement, hot set, VRAM fit, RAM fit, the PLE copy), so they never leave the model. The other
+// levers are read by getenv() deep in other code, so while the model is loaded the profile puts them into the process
+// environment (GGML_CPU_* through ggml_cpu_fn_set_switch) and takes them out again when the model is freed. Switches that
+// latch on first use (a static in the code that reads them) keep their value for the process.
 
 #include "llama.h"
 #include "llama-ext.h"
@@ -73,6 +77,7 @@ LLAMA_API const char *     llama_fn_profile_name(llama_fn_profile p);
 LLAMA_API bool llama_fn_parse_opt_list(const char * s, std::vector<std::pair<std::string, std::string>> & out);
 
 // the options of a profile; fast_list (LLAMA_FLASHNEXT_FAST) replaces the built-in levers of fast / trial / trial-dma
+// that are not in safe and adds or changes options ([TAG_FN_SHIP1] every built-in lever is in safe today)
 LLAMA_API std::vector<llama_fn_opt> llama_fn_profile_opts(llama_fn_profile p, const char * fast_list);
 
 // the built-in levers of fast (the measured winners) beyond safe; 0 today
@@ -110,6 +115,10 @@ void llama_fn_auto_on_load(llama_model & model, llama_model_loader & ml, const s
 void llama_fn_auto_after_load(llama_model & model);
 // the model is being freed
 void llama_fn_auto_on_free(llama_model & model);
+
+// [TAG_FN_SHIP1] src/llama.cpp: LLAMA_NO_ECOQOS=1 opts the process out of EcoQoS (power throttling). llama_backend_init()
+// calls it before any model exists; the qwen4exp profile calls it again after it set the variable.
+void llama_ecoqos_opt_out(void);
 
 // getenv(name), else this model's automatic value, else nullptr
 const char * llama_fn_env(const llama_model & model, const char * name);

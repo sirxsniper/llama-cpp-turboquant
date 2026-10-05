@@ -83,63 +83,94 @@ static void test_profile_names() {
 static void test_profile_opts() {
     TCHECK(llama_fn_profile_opts(LLAMA_FN_PROFILE_OFF, nullptr).empty(), "off has no options");
 
+    // [TAG_FN_SHIP1] safe = every measured winner: the hot-set items (lookups) and the lever-round-1 set at 262K
     const auto safe = llama_fn_profile_opts(LLAMA_FN_PROFILE_SAFE, nullptr);
-    const char * safe_names[] = { "LLAMA_FN_PLACEMENT", "LLAMA_MOE_HOT_PROFILE", "LLAMA_MOE_HOT_MIB", "LLAMA_MOE_HOT_FIT",
-                                  "LLAMA_MOE_HOT_ADAPT", "LLAMA_MOE_HOT_ADMIT", "LLAMA_RAM_FIT" };
-    TCHECK(safe.size() == sizeof(safe_names)/sizeof(safe_names[0]), "safe = the measured winners only (%zu)", safe.size());
-    for (const char * n : safe_names) {
+    const char * lookup_names[] = { "LLAMA_FN_PLACEMENT", "LLAMA_MOE_HOT_PROFILE", "LLAMA_MOE_HOT_MIB", "LLAMA_MOE_HOT_FIT",
+                                    "LLAMA_MOE_HOT_ADAPT", "LLAMA_MOE_HOT_ADMIT", "LLAMA_RAM_FIT",
+                                    "LLAMA_MOE_HOT_HEADROOM_MIB", "LLAMA_MOE_HOT_DECAY", "LLAMA_MOE_HOT_SEED",
+                                    "LLAMA_PLE_DIO_FILE" };
+    const char * lever_names[] = { "LLAMA_MOE_BRIDGE", "LLAMA_MOE_BRIDGE_DMA", "LLAMA_MOE_DMA_SHARE", "GGML_CPU_APPLY_ONCE",
+                                   "GGML_CPU_Q5_1_AVX512", "GGML_CPU_MMID_MR", "GGML_CPU_MOE_FUSE", "GGML_CPU_VNNI",
+                                   "GGML_SCHED_SPLIT_ASYNC", "GGML_CUDA_GRAPH_POKE", "LLAMA_NO_ECOQOS",
+                                   "LLAMA_GRAPH_PER_WIDTH", "LLAMA_PLE_HOST_GATHER", "LLAMA_PLE_DIRECT_IO",
+                                   "LLAMA_QSA_POS_MASK", "LLAMA_QSA_POS_CHUNK", "TURBO_QSA_CHUNK", "TURBO_QSA_SPARSE",
+                                   "TURBO_QSA_TOPK_UNORDERED", "SPEC_MTP_COST", "LLAMA_MTP_ATTN_WINDOW",
+                                   "LLAMA_MTP_HEAD_ROWS", "SPEC_DFT_UBATCH", "LLAMA_PREFILL_STREAM",
+                                   "LLAMA_PREFILL_STREAM_LEND", "LLAMA_PREFILL_STREAM_THREADS" };
+    const size_t n_lookup = sizeof(lookup_names)/sizeof(lookup_names[0]);
+    const size_t n_lever  = sizeof(lever_names)/sizeof(lever_names[0]);
+    TCHECK(safe.size() == n_lookup + n_lever, "safe = the measured winners (%zu, want %zu)", safe.size(), n_lookup + n_lever);
+    for (const char * n : lookup_names) {
         const llama_fn_opt * o = find_opt(safe, n);
         TCHECK(o && !o->inject, "safe %s present and read through the lookup, never the environment", n);
     }
-    TCHECK(find_opt(safe, "LLAMA_MOE_HOT_ADMIT")->value == "2/32", "measured admission 2/32");
-    TCHECK(find_opt(safe, "LLAMA_MOE_HOT_MIB")->value == "auto", "budget auto");
-    TCHECK(find_opt(safe, "LLAMA_MOE_HOT_ADAPT")->value == "1", "adaptive");
-    TCHECK(find_opt(safe, "LLAMA_MOE_BRIDGE") == nullptr, "no bridge in safe");
+    for (const char * n : lever_names) {
+        const llama_fn_opt * o = find_opt(safe, n);
+        TCHECK(o && o->inject, "safe lever %s present and put into the environment", n);
+    }
+    // the values the lever-round-1 A/B measured (E:/turbot-gates/flashnext/test/BEST.json)
+    struct { const char * name; const char * value; } want[] = {
+        { "LLAMA_MOE_HOT_ADMIT", "2/32" }, { "LLAMA_MOE_HOT_MIB", "auto" }, { "LLAMA_MOE_HOT_ADAPT", "1" },
+        { "LLAMA_MOE_HOT_HEADROOM_MIB", "1280" }, { "LLAMA_MOE_HOT_DECAY", "0.92" }, { "LLAMA_MOE_HOT_SEED", "0.03" },
+        { "LLAMA_MOE_BRIDGE", "1" }, { "LLAMA_MOE_BRIDGE_DMA", "1" }, { "LLAMA_MOE_DMA_SHARE", "auto" },
+        { "LLAMA_QSA_POS_MASK", "1" }, { "LLAMA_QSA_POS_CHUNK", "512" }, { "TURBO_QSA_CHUNK", "512" },
+        { "TURBO_QSA_SPARSE", "1" }, { "LLAMA_MTP_ATTN_WINDOW", "32768" }, { "LLAMA_MTP_HEAD_ROWS", "98304" },
+        { "SPEC_DFT_UBATCH", "128" }, { "LLAMA_PREFILL_STREAM_LEND", "1" }, { "LLAMA_PREFILL_STREAM_THREADS", "16" },
+    };
+    for (const auto & w : want) {
+        const llama_fn_opt * o = find_opt(safe, w.name);
+        TCHECK(o && o->value == w.value, "safe %s = %s", w.name, w.value);
+    }
+    const llama_fn_opt * hp  = find_opt(safe, "LLAMA_MOE_HOT_PROFILE");
+    const llama_fn_opt * ple = find_opt(safe, "LLAMA_PLE_DIO_FILE");
+    TCHECK(hp && hp->value.empty() && ple && ple->value.empty(), "the sidecar paths are set at load");
+    TCHECK(find_opt(safe, "LLAMA_MOE_HOT_STATS") == nullptr && find_opt(safe, "LLAMA_MOE_BRIDGE_STATS") == nullptr &&
+           find_opt(safe, "LLAMA_FLASHNEXT_PROFILE") == nullptr, "no stats switch and no profile switch in a profile");
 
-    // fast = safe + the levers that won a measured A/B: none yet
+    // fast = safe: every measured lever is in safe
     const auto fast = llama_fn_profile_opts(LLAMA_FN_PROFILE_FAST, nullptr);
-    TCHECK(llama_fn_fast_lever_count() == 0, "no measured lever in fast yet (%d)", llama_fn_fast_lever_count());
-    TCHECK(fast.size() == safe.size() + (size_t) llama_fn_fast_lever_count(), "fast = safe + the measured levers");
-    for (const char * n : safe_names) {
-        TCHECK(find_opt(fast, n) != nullptr, "fast keeps safe %s", n);
-    }
+    TCHECK(llama_fn_fast_lever_count() == 0, "no lever only in fast (%d)", llama_fn_fast_lever_count());
+    TCHECK(fast.size() == safe.size(), "fast = safe");
 
-    // trial = safe + every built lever that is not measured yet
+    // trial = safe + the levers that are not measured yet: none today
     const auto trial = llama_fn_profile_opts(LLAMA_FN_PROFILE_TRIAL, nullptr);
-    TCHECK(trial.size() > safe.size(), "trial adds levers");
-    for (const char * n : safe_names) {
-        TCHECK(find_opt(trial, n) != nullptr, "trial keeps safe %s", n);
+    TCHECK(trial.size() == safe.size(), "trial = safe today (%zu vs %zu)", trial.size(), safe.size());
+    for (const auto & o : safe) {
+        TCHECK(find_opt(fast, o.name.c_str()) && find_opt(trial, o.name.c_str()), "fast and trial keep %s", o.name.c_str());
     }
-    const char * trial_names[] = { "LLAMA_MOE_BRIDGE", "GGML_CPU_APPLY_ONCE", "GGML_CPU_Q5_1_AVX512", "GGML_CPU_MMID_MR",
-                                   "GGML_CPU_MOE_FUSE", "GGML_SCHED_SPLIT_ASYNC", "LLAMA_PLE_HOST_GATHER", "LLAMA_PLE_DIRECT_IO",
-                                   "LLAMA_GRAPH_PER_WIDTH", "TURBO_QSA_CHUNK", "SPEC_MTP_COST", "LLAMA_MTP_ATTN_WINDOW" };
-    for (const char * n : trial_names) {
-        const llama_fn_opt * o = find_opt(trial, n);
-        TCHECK(o && o->inject, "trial %s present and put into the environment", n);
-        TCHECK(find_opt(fast, n) == nullptr, "fast has no unmeasured %s", n);
-    }
-    TCHECK(find_opt(trial, "LLAMA_MOE_DMA_SHARE") == nullptr, "trial uses the bridge, not the DMA share");
 
+    // trial-dma = trial without the host bridge: the gen5 DMA share in its own CPU split
     const auto tdma = llama_fn_profile_opts(LLAMA_FN_PROFILE_TRIAL_DMA, nullptr);
-    TCHECK(find_opt(tdma, "LLAMA_MOE_BRIDGE") == nullptr, "trial-dma has no bridge (exclusive)");
+    TCHECK(find_opt(tdma, "LLAMA_MOE_BRIDGE") == nullptr && find_opt(tdma, "LLAMA_MOE_BRIDGE_DMA") == nullptr,
+           "trial-dma has no bridge");
     TCHECK(find_opt(tdma, "LLAMA_MOE_DMA_SHARE") && find_opt(tdma, "LLAMA_MOE_DMA_SHARE")->value == "auto", "trial-dma DMA share");
-    TCHECK(find_opt(tdma, "GGML_CPU_MOE_FUSE") != nullptr, "trial-dma keeps the CPU levers");
+    TCHECK(find_opt(tdma, "GGML_CPU_MOE_FUSE") != nullptr && tdma.size() == safe.size() - 2, "trial-dma keeps the rest");
 
     // safe ignores LLAMA_FLASHNEXT_FAST
-    const auto safe_c = llama_fn_profile_opts(LLAMA_FN_PROFILE_SAFE, "GGML_CPU_MOE_FUSE=1");
-    TCHECK(find_opt(safe_c, "GGML_CPU_MOE_FUSE") == nullptr && safe_c.size() == safe.size(), "safe ignores a lever list");
+    const auto safe_c = llama_fn_profile_opts(LLAMA_FN_PROFILE_SAFE, "GGML_CPU_MOE_FUSE=0,LLAMA_FN_TEST_X=1");
+    const llama_fn_opt * fuse = find_opt(safe_c, "GGML_CPU_MOE_FUSE");
+    TCHECK(fuse && fuse->value == "1" && find_opt(safe_c, "LLAMA_FN_TEST_X") == nullptr && safe_c.size() == safe.size(),
+           "safe ignores a lever list");
 
-    // LLAMA_FLASHNEXT_FAST replaces the levers of fast / trial / trial-dma, may change a safe value, and knows lookup names
-    const auto cust = llama_fn_profile_opts(LLAMA_FN_PROFILE_TRIAL, "GGML_CPU_MOE_FUSE=1, LLAMA_MOE_HOT_ADMIT=3/16, LLAMA_MOE_HOT_ADAPT_MIB=128");
-    TCHECK(find_opt(cust, "LLAMA_MOE_BRIDGE") == nullptr, "custom list drops the built-in bridge");
-    TCHECK(find_opt(cust, "GGML_CPU_MOE_FUSE") && find_opt(cust, "GGML_CPU_MOE_FUSE")->inject, "custom lever injected");
-    TCHECK(find_opt(cust, "LLAMA_MOE_HOT_ADMIT")->value == "3/16", "custom list changes a safe value");
-    TCHECK(find_opt(cust, "LLAMA_MOE_HOT_ADAPT_MIB") && !find_opt(cust, "LLAMA_MOE_HOT_ADAPT_MIB")->inject, "hot names stay lookups");
-    TCHECK(find_opt(cust, "LLAMA_FN_PLACEMENT") != nullptr, "custom list keeps the safe items");
+    // LLAMA_FLASHNEXT_FAST in fast / trial / trial-dma changes a value, adds a name and knows the lookup names; the safe
+    // levers stay (only levers outside safe are replaced, none today)
+    const auto cust = llama_fn_profile_opts(LLAMA_FN_PROFILE_TRIAL,
+            "GGML_CPU_MOE_FUSE=0, LLAMA_MOE_HOT_ADMIT=3/16, LLAMA_MOE_HOT_ADAPT_MIB=128, LLAMA_FN_TEST_X=1");
+    const llama_fn_opt * cf = find_opt(cust, "GGML_CPU_MOE_FUSE");
+    const llama_fn_opt * ca = find_opt(cust, "LLAMA_MOE_HOT_ADMIT");
+    const llama_fn_opt * cm = find_opt(cust, "LLAMA_MOE_HOT_ADAPT_MIB");
+    const llama_fn_opt * cx = find_opt(cust, "LLAMA_FN_TEST_X");
+    TCHECK(find_opt(cust, "LLAMA_MOE_BRIDGE") != nullptr, "a custom list keeps the safe bridge");
+    TCHECK(cf && cf->value == "0" && cf->inject, "custom list changes a lever");
+    TCHECK(ca && ca->value == "3/16", "custom list changes a safe value");
+    TCHECK(cm && !cm->inject, "hot names stay lookups");
+    TCHECK(cx && !cx->inject, "LLAMA_FN_ names stay lookups");
+    TCHECK(cust.size() == safe.size() + 2, "two names added (%zu)", cust.size());
     const auto bad = llama_fn_profile_opts(LLAMA_FN_PROFILE_TRIAL, "noequals");
-    TCHECK(find_opt(bad, "LLAMA_MOE_BRIDGE") != nullptr, "a bad custom list leaves the built-in lever list");
-    const auto cust_fast = llama_fn_profile_opts(LLAMA_FN_PROFILE_FAST, "GGML_CPU_MOE_FUSE=1");
-    TCHECK(find_opt(cust_fast, "GGML_CPU_MOE_FUSE") && find_opt(cust_fast, "GGML_CPU_MOE_FUSE")->inject, "fast takes a lever list too");
+    TCHECK(bad.size() == trial.size() && find_opt(bad, "LLAMA_MOE_BRIDGE") != nullptr, "a bad custom list leaves the built-in list");
+    const auto cust_fast = llama_fn_profile_opts(LLAMA_FN_PROFILE_FAST, "TURBO_QSA_CHUNK=0");
+    const llama_fn_opt * cq = find_opt(cust_fast, "TURBO_QSA_CHUNK");
+    TCHECK(cq && cq->value == "0" && cq->inject, "fast takes a lever list too");
 }
 
 static void test_host_expert_layers() {
@@ -241,6 +272,17 @@ static void test_inject() {
     TCHECK(c.cpu_set.size() == 1, "CPU switch recorded");
     llama_fn_state_undo(c);
     TCHECK(get(GGML_CPU_FN_MMID_MR) == 0 && before == 0, "CPU switch back to off");
+
+    // [TAG_FN_SHIP1] GGML_CPU_VNNI goes the same way (the switch; its kernels act only on a CPU with AVX512-VNNI)
+    if (!getenv("GGML_CPU_VNNI")) {
+        llama_fn_auto_state v;
+        v.active = true;
+        v.opts.push_back({ "GGML_CPU_VNNI", "1", true });
+        llama_fn_state_inject(v);
+        TCHECK(get(GGML_CPU_FN_VNNI) == 1 && getenv("GGML_CPU_VNNI") == nullptr, "VNNI switch set through the CPU backend");
+        llama_fn_state_undo(v);
+        TCHECK(get(GGML_CPU_FN_VNNI) == 0, "VNNI switch back to off");
+    }
 }
 
 // bytes per expert (up + gate + down) of the 48 trunk layers: q4_K/q4_K/q5_1, and q8_0 down on layers 2, 4, 30, 46, 47

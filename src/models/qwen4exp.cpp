@@ -5,6 +5,7 @@
 #include "llama-moetrace.h" // [TAG_FN_MOE_TRACE]
 #include "llama-moe-gen5.h" // [TAG_MOE_PREFETCH]
 #include "llama-ple-dio.h"  // [TAG_FN_PLE_DIRECT_IO]
+#include "llama-ext.h"      // [TAG_FN_SHIP1] llama_model_fn_env
 
 #include "ggml-alloc.h"   // [TAG_FN_MTP_HEAD_IDS]
 #include "ggml-backend.h"
@@ -13,6 +14,7 @@
 #include <cinttypes>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>     // [TAG_FN_SHIP1]
 #include <fstream>
 
 // bad metadata must be catchable: GGML_ASSERT aborts the whole process
@@ -110,7 +112,35 @@ static std::unique_ptr<llama_ple_dio> qwen4exp_open_ple_copy(const llama_ple_dio
     return nullptr;
 }
 
-static std::shared_ptr<llama_ple_dio> qwen4exp_open_ple_dio(const llama_model_loader & ml, const ggml_tensor * t) {
+// [TAG_FN_SHIP1] room for the profile's automatic copy: its size plus 16 GiB must stay free on the copy's volume (a copy
+// of the right size that exists needs none), so a default never fills a disk
+static bool qwen4exp_ple_auto_room(const llama_ple_dio_params & shard, const std::string & path, std::string & why) {
+    const uint64_t bytes = (uint64_t) shard.n_rows * shard.row_bytes;
+    if (llama_ple_dio_file_size(path) == (int64_t) bytes) {
+        return true;
+    }
+    std::error_code ec;
+    std::filesystem::path dir = std::filesystem::u8path(path).parent_path();
+    if (dir.empty()) {
+        dir = std::filesystem::current_path(ec);
+    }
+    const std::filesystem::space_info sp = std::filesystem::space(dir, ec);
+    if (ec) {
+        why = "the free space of its volume is unknown (" + ec.message() + ")";
+        return false;
+    }
+    const uint64_t need = bytes + (16ull << 30);
+    if (sp.available < need) {
+        why = format("its volume has %.1f GiB free, the copy needs %.1f GiB plus 16 GiB to spare",
+                sp.available / 1073741824.0, bytes / 1073741824.0);
+        return false;
+    }
+    return true;
+}
+
+// copy_path: the user's LLAMA_PLE_DIO_FILE, else the qwen4exp profile's <model>.ple (copy_auto), else nullptr
+static std::shared_ptr<llama_ple_dio> qwen4exp_open_ple_dio(const llama_model_loader & ml, const ggml_tensor * t,
+        const char * copy_path, bool copy_auto) {
     const char * name = ggml_get_name(t);
     auto off = [&](const std::string & why) {
         LLAMA_LOG_WARN("%s: [TAG_FN_PLE_DIRECT_IO] LLAMA_PLE_DIRECT_IO is set, but %s; %s is read through the mapping\n",
@@ -152,10 +182,23 @@ static std::shared_ptr<llama_ple_dio> qwen4exp_open_ple_dio(const llama_model_lo
     p.test_fail_every = (int) std::max(0LL, std::min((long long) INT32_MAX, env_ll("LLAMA_PLE_DIO_TEST_FAIL", 0)));
 
     // LLAMA_PLE_DIO_FILE: read a copy that nothing maps (Windows serves unbuffered reads of a mapped file one at a time)
+    // [TAG_FN_SHIP1] the profile's automatic copy (copy_auto) is made only with room to spare on its volume; when it
+    // cannot be made or opened, the table is read through the mapping (as without the lever), not from the mapped model
+    // file one read at a time
     std::unique_ptr<llama_ple_dio> dio;
-    const char * copy_path = getenv("LLAMA_PLE_DIO_FILE");
     if (copy_path != nullptr && *copy_path != '\0') {
+        if (copy_auto) {
+            std::string why;
+            if (!qwen4exp_ple_auto_room(p, copy_path, why)) {
+                return off(std::string("no automatic copy at ") + copy_path + ": " + why +
+                           " (LLAMA_PLE_DIO_FILE=<path> puts it elsewhere)");
+            }
+        }
         dio = qwen4exp_open_ple_copy(p, copy_path);
+        if (!dio && copy_auto) {
+            return off(std::string("the automatic copy ") + copy_path +
+                       " could not be made or opened (LLAMA_PLE_DIO_FILE=<path> puts it elsewhere)");
+        }
         if (!dio) {
             LLAMA_LOG_WARN("%s: [TAG_FN_PLE_DIRECT_IO] LLAMA_PLE_DIO_FILE=%s is not usable; reading the model file instead\n",
                     __func__, copy_path);
@@ -419,7 +462,11 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
                                            { hparams.ple_head_dim, ple_rows },
                                            TENSOR_READ_LAZY | (ple_direct ? llama_model_loader::TENSOR_READ_DIRECT : 0));
         if (ple_direct && per_layer_tok_embd != nullptr && !ml.no_alloc) {
-            ple_dio = qwen4exp_open_ple_dio(ml, per_layer_tok_embd);
+            // [TAG_FN_SHIP1] the user's LLAMA_PLE_DIO_FILE, else the qwen4exp profile's <model>.ple
+            const char * user_copy = getenv("LLAMA_PLE_DIO_FILE");
+            const char * copy      = llama_model_fn_env(this, "LLAMA_PLE_DIO_FILE");
+            const bool   copy_auto = !(user_copy && user_copy[0]) && copy && copy[0];
+            ple_dio = qwen4exp_open_ple_dio(ml, per_layer_tok_embd, copy, copy_auto);
         }
     }
 

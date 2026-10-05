@@ -6,6 +6,7 @@
 
 #include "llama-impl.h"
 #include "llama-model.h"
+#include "llama-fn-auto.h" // [TAG_FN_SHIP1] llama_fn_env
 
 #include <algorithm>
 #include <atomic>
@@ -301,6 +302,13 @@ void llama_moe_gen5_init(const llama_model & model, const void * owner, const st
         llama_prefill_stream_init_layers(layers, d, owner);
     }
     if (want_dma) {
+        // [TAG_FN_SHIP1] the warm start reads the same routing profile as the hot set: the environment first, then the
+        // qwen4exp profile's value (its <model>.moeprof sidecar), not the environment alone
+        const char * prof = llama_fn_env(model, "LLAMA_MOE_DMA_PROFILE");
+        if (!prof || !prof[0]) {
+            prof = llama_fn_env(model, "LLAMA_MOE_HOT_PROFILE");
+        }
+        d.profile = prof ? prof : "";
         llama_moe_dma_init_layers(layers, d, owner, dma_bridge);
     }
 }

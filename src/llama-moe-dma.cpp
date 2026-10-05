@@ -1019,10 +1019,14 @@ bool llama_moe_dma_init_layers(const std::vector<llama_moe_gen5_layer_desc> & la
     }
 
     // profile for the warm start
+    // [TAG_FN_SHIP1] d.profile: resolved by llama_moe_gen5_init through the model's lookup; nullptr = the environment
     std::map<int, std::vector<double>> prof;
-    const char * pp = getenv("LLAMA_MOE_DMA_PROFILE");
-    if (!pp || !pp[0]) {
-        pp = getenv("LLAMA_MOE_HOT_PROFILE");
+    const char * pp = d.profile;
+    if (!pp) {
+        pp = getenv("LLAMA_MOE_DMA_PROFILE");
+        if (!pp || !pp[0]) {
+            pp = getenv("LLAMA_MOE_HOT_PROFILE");
+        }
     }
     const bool have_prof = pp && pp[0] && dma_read_profile(pp, prof);
 
