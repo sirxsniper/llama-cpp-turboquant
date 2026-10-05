@@ -1394,6 +1394,9 @@ llama_model_qwen4exp::graph::qsa_sel llama_model_qwen4exp::graph::build_qsa_sel(
         // write before the pool gather
         ggml_build_forward_expand(gf, kpool_cache.scatter_pooled(pooled_new, inp_kpool->new_pool_rep));
         pooled = kpool_cache.gather_pooled(inp_kpool->pool_cells);
+        if (l3.idxq8 && pooled->op == GGML_OP_GET_ROWS) {
+            ggml_fn_l3_set(pooled, GGML_FN_L3_IDXQ8); // [TAG_FN_L3_GPU_IDXQ8] the gather the marked indexers read through
+        }
     } else {
         // shared cells re-pool every pool, in layout order
         GGML_ASSERT(n_new < n_pool);

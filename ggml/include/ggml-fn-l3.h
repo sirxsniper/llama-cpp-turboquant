@@ -14,7 +14,7 @@ extern "C" {
 #endif
 
 // int32 op_params slot 15 (bytes 60..63): free in SCALE, UNARY, MUL, MUL_MAT, TOP_K, LIGHTNING_INDEXER, FLASH_ATTN_EXT
-// (turbot uses bytes 24..47), DSV4_HC_PRE, DSV4_HC_POST and RESHAPE (only ROPE uses slot 15)
+// (turbot uses bytes 24..47), DSV4_HC_PRE, DSV4_HC_POST, GET_ROWS and RESHAPE (only ROPE uses slot 15)
 #define GGML_FN_L3_SLOT 15
 
 enum ggml_fn_l3_mark {
@@ -23,7 +23,8 @@ enum ggml_fn_l3_mark {
     GGML_FN_L3_HCLO    = 0x4C334702, // SCALE -> SILU: the low-rank activation of an hc mixer
     GGML_FN_L3_COMPACT = 0x4C334703, // FLASH_ATTN_EXT: the sparse-index compaction runs on many blocks
     GGML_FN_L3_TOPK    = 0x4C334704, // TOP_K (unordered): chunked two-stage select for a large k
-    GGML_FN_L3_IDXQ8   = 0x4C334705, // LIGHTNING_INDEXER: reads its keys through the GET_ROWS that feeds it
+    GGML_FN_L3_IDXQ8   = 0x4C334705, // LIGHTNING_INDEXER: reads its keys through the GET_ROWS that feeds it; on that
+                                     // GET_ROWS: not computed when only marked indexers read it
     GGML_FN_L3_MMV     = 0x4C334706, // MUL_MAT with few rows and a long row: the mat-vec loads run ahead (same sums)
     GGML_FN_L3_Q8OUT   = 0x4C334707, // MUL of an RMS_NORM, SILU of an HCLO chain, DSV4_HC_PRE: also writes the q8_1 copy
                                      // of its output for the MUL_MAT that reads it (the MMVQ reuse cache, same bytes)

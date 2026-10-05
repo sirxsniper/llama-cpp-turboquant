@@ -412,7 +412,9 @@ const ggml_tensor * ggml_cuda_fn_l3_idxq8_gather(const ggml_tensor * indexer) {
 
 bool ggml_cuda_fn_l3_idxq8_skip(const ggml_cgraph * cgraph, int i) {
     const ggml_tensor * g = cgraph->nodes[i];
-    if (g->op != GGML_OP_GET_ROWS || !ggml_cuda_fn_l3_enabled() || (g->flags & GGML_TENSOR_FLAG_OUTPUT) ||
+    // only a gather the qwen4exp graph marked
+    if (g->op != GGML_OP_GET_ROWS || ggml_fn_l3_get(g) != GGML_FN_L3_IDXQ8 || !ggml_cuda_fn_l3_enabled() ||
+            (g->flags & GGML_TENSOR_FLAG_OUTPUT) ||
             g->type != GGML_TYPE_F32 || g->src[0] == nullptr || g->src[0]->type != GGML_TYPE_Q8_0) {
         return false;
     }

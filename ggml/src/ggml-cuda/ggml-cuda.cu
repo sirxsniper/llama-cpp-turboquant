@@ -4839,8 +4839,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     // [TAG_FN_L3_GPU_Q8F] a MUL the qwen4exp graph marked (the hc norm): the same kernel, plus the q8_1 copy of its output
-    if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL }, {}) &&
-            ggml_fn_l3_get(cgraph->nodes[i + 1]) == GGML_FN_L3_Q8OUT &&
+    if (node->op == GGML_OP_RMS_NORM && i + 1 < cgraph->n_nodes && ggml_fn_l3_get(cgraph->nodes[i + 1]) == GGML_FN_L3_Q8OUT &&
+            ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL }, {}) &&
             ggml_cuda_fn_l3_rms_norm_mul_q8(*cuda_ctx, node, cgraph->nodes[i + 1])) {
         return 1;
     }

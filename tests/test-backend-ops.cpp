@@ -12053,7 +12053,11 @@ struct test_fn_l3_idxq8 : public test_case {
         ggml_set_name(m, "mask");
 
         ggml_tensor * pooled = ggml_view_2d(ctx, cache, 128, n_cells, cache->nb[1], ggml_row_size(GGML_TYPE_Q8_0, 128));
-        ggml_tensor * k = ggml_reshape_3d(ctx, ggml_get_rows(ctx, pooled, cells), 128, 1, n_pool);
+        ggml_tensor * gathered = ggml_get_rows(ctx, pooled, cells);
+        if (marked) {
+            ggml_fn_l3_set(gathered, GGML_FN_L3_IDXQ8); // the gather the indexer reads through (not computed)
+        }
+        ggml_tensor * k = ggml_reshape_3d(ctx, gathered, 128, 1, n_pool);
         ggml_tensor * out = ggml_lightning_indexer(ctx, q, k, w, m);
         if (marked) {
             ggml_fn_l3_set(out, GGML_FN_L3_IDXQ8);
