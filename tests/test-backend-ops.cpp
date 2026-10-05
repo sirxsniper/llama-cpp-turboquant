@@ -17533,10 +17533,11 @@ static bool run_moe_bridge_fetch(ggml_backend_t backend, ggml_backend_t backend_
     return n_fail == 0;
 }
 
-// [TAG_FN_L3_HOST_LAUNCH2] ggml_backend_sched_set_split_after: a scheduler over {backend, CPU} splits the device part of
-// a small chain after the named node (two splits instead of one), and a graph input first used after the cut is copied
-// with the first split's inputs. Two computes of one allocation with new input values each time: the cut graph gives the
-// values of the uncut graph bit for bit, and both match the host formula (so the moved input was copied every time).
+// [TAG_FN_L3_HOST_LAUNCH2] ggml_backend_sched_set_split_after: a scheduler over {backend, CPU} cuts the device part of a
+// small chain after the named nodes (no cut, one cut, two cuts given with spaces and an empty entry), and the graph inputs
+// first used after a cut are copied with the first split's inputs. Two computes of one allocation with new input values
+// each time: every cut graph gives the values of the uncut graph bit for bit, and all match the host formula (so the
+// moved inputs were copied every time).
 static bool run_sched_split_after(ggml_backend_t backend, ggml_backend_t backend_ref, const char * op_names_filter) {
     if (!op_names_filter_selects(op_names_filter, "SCHED_SPLIT_AFTER")) {
         return true;
@@ -17555,71 +17556,83 @@ static bool run_sched_split_after(ggml_backend_t backend, ggml_backend_t backend
     backends.push_back(cpu.get());
 
     const int64_t n = 4096;
-    std::default_random_engine gen(1234);
     std::uniform_real_distribution<float> uni(-1.0f, 1.0f);
+
+    // the cut lists and the device splits each one gives
+    const char * cut_list[3] = { nullptr, "l_last-0", " l_last-0 ,, l_last-1 " };
+    const int    want_split[3] = { 1, 2, 3 };
 
     int n_run  = 0;
     int n_fail = 0;
-    std::vector<std::vector<float>> outs[2]; // [cut][run]
-    for (int cut = 0; cut < 2; cut++) {
+    std::vector<std::vector<float>> outs[3]; // [cut mode][run]
+    for (int cut = 0; cut < 3; cut++) {
         ggml_init_params params = { ggml_tensor_overhead()*16 + ggml_graph_overhead(), NULL, true };
         ggml_context_ptr ctx(ggml_init(params));
         ggml_tensor * a = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, n);
         ggml_tensor * b = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, n);
+        ggml_tensor * c = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, n);
         ggml_set_name(a, "a");
         ggml_set_name(b, "b");
+        ggml_set_name(c, "c");
         ggml_set_input(a);
         ggml_set_input(b);
-        // ops no backend fuses across the cut (scale | add), so cut and uncut graphs run the same kernels
+        ggml_set_input(c);
+        // ops no backend fuses across a cut (scale | add, sqr | mul), so cut and uncut graphs run the same kernels
         ggml_tensor * x1 = ggml_sqr(ctx.get(), a);
         ggml_set_name(x1, "x1");
         ggml_tensor * x2 = ggml_scale(ctx.get(), x1, 0.5f);
         ggml_set_name(x2, "l_last-0");
-        ggml_tensor * x3 = ggml_add(ctx.get(), x2, b); // b: first used after the cut
+        ggml_tensor * x3 = ggml_add(ctx.get(), x2, b); // b: first used after the first cut
         ggml_set_name(x3, "x3");
         ggml_tensor * x4 = ggml_sqr(ctx.get(), x3);
-        ggml_set_name(x4, "x4");
-        ggml_set_output(x4);
+        ggml_set_name(x4, "l_last-1");
+        ggml_tensor * x5 = ggml_mul(ctx.get(), x4, c); // c: first used after the second cut
+        ggml_set_name(x5, "x5");
+        ggml_tensor * x6 = ggml_scale(ctx.get(), x5, 0.25f);
+        ggml_set_name(x6, "x6");
+        ggml_set_output(x6);
         ggml_cgraph * gf = ggml_new_graph(ctx.get());
-        ggml_build_forward_expand(gf, x4);
+        ggml_build_forward_expand(gf, x6);
 
         ggml_backend_sched_ptr sched(ggml_backend_sched_new(backends.data(), nullptr, (int) backends.size(), 64, false, false));
         if (!is_cpu) {
             // the chain runs on the device (no weights pull it there); the inputs stay on the CPU, so they are split inputs
-            for (ggml_tensor * t : { x1, x2, x3, x4 }) {
+            for (ggml_tensor * t : { x1, x2, x3, x4, x5, x6 }) {
                 ggml_backend_sched_set_tensor_backend(sched.get(), t, backend);
             }
         }
-        ggml_backend_sched_set_split_after(sched.get(), cut ? "l_last-0" : nullptr);
+        ggml_backend_sched_set_split_after(sched.get(), cut_list[cut]);
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
             printf("  FAIL sched split after: alloc failed (cut %d)\n", cut);
             return false;
         }
         const int n_splits = ggml_backend_sched_get_n_splits(sched.get());
         n_run++;
-        if (n_splits != (cut ? 2 : 1)) {
-            printf("  FAIL sched split after %s cut %d: %d splits\n", ggml_backend_name(backend), cut, n_splits);
+        if (n_splits != want_split[cut]) {
+            printf("  FAIL sched split after %s cut %d: %d splits, want %d\n", ggml_backend_name(backend), cut, n_splits, want_split[cut]);
             n_fail++;
         }
         std::default_random_engine gen_run(99);
         for (int r = 0; r < 2; r++) {
-            std::vector<float> av(n), bv(n);
+            std::vector<float> av(n), bv(n), cv(n);
             for (int64_t i = 0; i < n; i++) {
                 av[i] = uni(gen_run);
                 bv[i] = uni(gen_run) + (float) r;
+                cv[i] = uni(gen_run) - (float) r;
             }
             ggml_backend_tensor_set(a, av.data(), 0, n*sizeof(float));
             ggml_backend_tensor_set(b, bv.data(), 0, n*sizeof(float));
+            ggml_backend_tensor_set(c, cv.data(), 0, n*sizeof(float));
             if (ggml_backend_sched_graph_compute(sched.get(), gf) != GGML_STATUS_SUCCESS) {
                 printf("  FAIL sched split after: compute failed (cut %d run %d)\n", cut, r);
                 return false;
             }
             std::vector<float> got(n);
-            ggml_backend_tensor_get(x4, got.data(), 0, n*sizeof(float));
+            ggml_backend_tensor_get(x6, got.data(), 0, n*sizeof(float));
             double err = 0.0;
             for (int64_t i = 0; i < n; i++) {
                 const double s   = 0.5*(double) av[i]*av[i] + bv[i];
-                const double ref = s*s;
+                const double ref = 0.25*(s*s*cv[i]);
                 err = std::max(err, std::fabs(ref - got[i]));
             }
             n_run++;
@@ -17630,15 +17643,16 @@ static bool run_sched_split_after(ggml_backend_t backend, ggml_backend_t backend
             outs[cut].push_back(std::move(got));
         }
     }
-    for (size_t r = 0; r < outs[0].size() && r < outs[1].size(); r++) {
-        n_run++;
-        if (memcmp(outs[0][r].data(), outs[1][r].data(), n*sizeof(float)) != 0) {
-            printf("  FAIL sched split after %s run %zu: the cut graph's values differ from the uncut graph's\n", ggml_backend_name(backend), r);
-            n_fail++;
+    for (int cut = 1; cut < 3; cut++) {
+        for (size_t r = 0; r < outs[0].size() && r < outs[cut].size(); r++) {
+            n_run++;
+            if (memcmp(outs[0][r].data(), outs[cut][r].data(), n*sizeof(float)) != 0) {
+                printf("  FAIL sched split after %s cut %d run %zu: the cut graph's values differ from the uncut graph's\n", ggml_backend_name(backend), cut, r);
+                n_fail++;
+            }
         }
     }
-    GGML_UNUSED(gen);
-    printf("  scheduler split after a named node (%s): %d checks, %d failed\n", ggml_backend_name(backend), n_run, n_fail);
+    printf("  scheduler split after named nodes (%s): %d checks, %d failed\n", ggml_backend_name(backend), n_run, n_fail);
     return n_fail == 0;
 }
 

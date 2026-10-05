@@ -1081,6 +1081,9 @@ static bool ggml_is_view_op(enum ggml_op op) {
 #define GGML_SCHED_MAX_COPIES 4
 #endif
 
+// [TAG_FN_L3_HOST_LAUNCH2] ggml_backend_sched_set_split_after takes at most this many node names
+#define GGML_SCHED_MAX_CUTS 64
+
 struct ggml_backend_sched_split {
     int backend_id;
     int i_start;
@@ -1148,14 +1151,38 @@ struct ggml_backend_sched {
     int debug_graph_size;
     int debug_prev_graph_size;
 
-    // [TAG_FN_L3_HOST_LAUNCH2] ggml_backend_sched_set_split_after; empty = off
-    char split_after[GGML_MAX_NAME];
+    // [TAG_FN_L3_HOST_LAUNCH2] ggml_backend_sched_set_split_after: the cut node names, sorted by hash; 0 = off
+    int      n_split_after;
+    uint64_t split_after_hash[GGML_SCHED_MAX_CUTS];
+    char     split_after[GGML_SCHED_MAX_CUTS][GGML_MAX_NAME];
 };
 
 #define hash_id(tensor) ggml_hash_find_or_insert(&sched->hash_set, tensor)
 #define tensor_backend_id(tensor) sched->hv_tensor_backend_ids[hash_id(tensor)]
 #define tensor_id_copy(id, backend_id, copy_id) sched->hv_tensor_copies[(id) * sched->n_backends * sched->n_copies + (backend_id) * sched->n_copies + (copy_id)]
 #define tensor_copy(tensor, backend_id, copy_id) tensor_id_copy(hash_id(tensor), backend_id, copy_id)
+
+// [TAG_FN_L3_HOST_LAUNCH2] FNV-1a of a node name
+static uint64_t ggml_backend_sched_name_hash(const char * s) {
+    uint64_t h = 1469598103934665603ull;
+    for (; *s; ++s) {
+        h = (h ^ (uint8_t) *s) * 1099511628211ull;
+    }
+    return h;
+}
+
+// [TAG_FN_L3_HOST_LAUNCH2] true if a node with this name ends a split (binary search on the hashes, then the names)
+static bool ggml_backend_sched_is_split_after(const ggml_backend_sched * sched, const char * name) {
+    const uint64_t h = ggml_backend_sched_name_hash(name);
+    const uint64_t * b = sched->split_after_hash;
+    const uint64_t * e = b + sched->n_split_after;
+    for (const uint64_t * it = std::lower_bound(b, e, h); it != e && *it == h; ++it) {
+        if (strcmp(sched->split_after[it - b], name) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
 
 static void ggml_backend_sched_split_inputs_grow(struct ggml_backend_sched_split * split) {
     int new_cap = GGML_SCHED_MAX_SPLIT_INPUTS;
@@ -1622,12 +1649,11 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         split->i_start = 0;
         split->n_inputs = 0;
         int cur_backend_id = split->backend_id;
-        // [TAG_FN_L3_HOST_LAUNCH2] cut_next: the previous node was the split_after node; cut_parent: the split the cut ended,
-        // while the split after it runs: its graph inputs are copied with the parent's, so it starts without a copy
-        // (and without the synchronize that would wait for the parent)
-        bool cut_next   = false;
-        bool cut_done   = sched->split_after[0] == '\0';
-        int  cut_parent = -1;
+        // [TAG_FN_L3_HOST_LAUNCH2] cut_next: the previous node is a split_after node. cut_root: the first split of a run of
+        // cut splits on one backend; the graph inputs of the later splits of the run are copied with the root's, so they
+        // start without a copy and without the synchronize that would wait for the split before them
+        bool cut_next = false;
+        int  cut_root = -1;
         for (; i < graph->n_nodes; i++) {
             struct ggml_tensor * node = graph->nodes[i];
 
@@ -1647,8 +1673,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                 cut_here       = node_backend_id == cur_backend_id;
                 need_new_split = cut_here;
             }
-            if (!cut_done && strcmp(node->name, sched->split_after) == 0) {
-                cut_done = true;
+            if (sched->n_split_after > 0 && ggml_backend_sched_is_split_after(sched, node->name)) {
                 cut_next = true;
             }
             if (node_backend_id == cur_backend_id && split->n_inputs > 0) {
@@ -1687,7 +1712,11 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                 split->i_start = i;
                 split->n_inputs = 0;
                 cur_backend_id = node_backend_id;
-                cut_parent = cut_here ? i_split - 1 : -1; // [TAG_FN_L3_HOST_LAUNCH2]
+                if (!cut_here) { // [TAG_FN_L3_HOST_LAUNCH2]
+                    cut_root = -1;
+                } else if (cut_root < 0) {
+                    cut_root = i_split - 1;
+                }
             }
 
             // find inputs that are not on the same backend
@@ -1715,10 +1744,10 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                             tensor_id_copy(src_id, cur_backend_id, c) = tensor_copy;
                             SET_CAUSE(tensor_copy, "4.cpy");
                         }
-                        // [TAG_FN_L3_HOST_LAUNCH2] a graph input of the cut's second split is copied with the first's
-                        // (same backend, nothing runs between them); other inputs stay where they are needed
+                        // [TAG_FN_L3_HOST_LAUNCH2] a graph input of a later split of a cut run is copied with the run's
+                        // first split (same backend, nothing runs between them); other inputs stay where they are needed
                         struct ggml_backend_sched_split * in_split =
-                            cut_parent >= 0 && (src->flags & GGML_TENSOR_FLAG_INPUT) ? &sched->splits[cut_parent] : split;
+                            cut_root >= 0 && (src->flags & GGML_TENSOR_FLAG_INPUT) ? &sched->splits[cut_root] : split;
                         int n_inputs = in_split->n_inputs++;
                         if (n_inputs >= in_split->inputs_capacity) {
                             ggml_backend_sched_split_inputs_grow(in_split);
@@ -2509,10 +2538,45 @@ void ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backe
     sched->callback_eval_user_data = user_data;
 }
 
-// [TAG_FN_L3_HOST_LAUNCH2]
-void ggml_backend_sched_set_split_after(ggml_backend_sched_t sched, const char * name) {
+// [TAG_FN_L3_HOST_LAUNCH2] names: comma-separated node names, NULL or "" = off
+void ggml_backend_sched_set_split_after(ggml_backend_sched_t sched, const char * names) {
     GGML_ASSERT(sched);
-    snprintf(sched->split_after, sizeof(sched->split_after), "%s", name ? name : "");
+    char     tmp_name[GGML_SCHED_MAX_CUTS][GGML_MAX_NAME];
+    uint64_t tmp_hash[GGML_SCHED_MAX_CUTS];
+    int n = 0;
+    for (const char * p = names ? names : ""; *p != '\0';) {
+        while (*p == ',' || *p == ' ') {
+            ++p;
+        }
+        const char * q = p;
+        while (*q != '\0' && *q != ',') {
+            ++q;
+        }
+        size_t len = (size_t) (q - p);
+        while (len > 0 && p[len - 1] == ' ') {
+            --len;
+        }
+        if (len > 0) {
+            if (n == GGML_SCHED_MAX_CUTS) {
+                GGML_LOG_WARN("%s: more than %d names, the rest is ignored\n", __func__, GGML_SCHED_MAX_CUTS);
+                break;
+            }
+            snprintf(tmp_name[n], GGML_MAX_NAME, "%.*s", (int) std::min<size_t>(len, GGML_MAX_NAME - 1), p);
+            tmp_hash[n] = ggml_backend_sched_name_hash(tmp_name[n]);
+            n++;
+        }
+        p = q;
+    }
+    int order[GGML_SCHED_MAX_CUTS];
+    for (int i = 0; i < n; i++) {
+        order[i] = i;
+    }
+    std::sort(order, order + n, [&](int a, int b) { return tmp_hash[a] < tmp_hash[b]; });
+    for (int i = 0; i < n; i++) {
+        sched->split_after_hash[i] = tmp_hash[order[i]];
+        memcpy(sched->split_after[i], tmp_name[order[i]], GGML_MAX_NAME);
+    }
+    sched->n_split_after = n;
 }
 
 int ggml_backend_sched_get_n_splits(ggml_backend_sched_t sched) {

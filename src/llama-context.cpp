@@ -115,27 +115,47 @@ void llama_context::step_join() {
     }
 }
 
-// [TAG_FN_L3_HOST_LAUNCH2] LLAMA_FN_HOST_LAUNCH2=N (qwen4exp): a bridged decode graph gets a second device split after
-// layer N's output, so a step is two graph launches and the first one runs while the host launches the second. Set before
-// every graph split of the context (on for bridged decode ubatches, off for everything else), so a prompt graph keeps
-// its splits.
-static void llama_launch2_apply(const llama_model & model, ggml_backend_sched_t sched, bool decode) {
+// [TAG_FN_L3_HOST_LAUNCH2] the layer outputs after which a bridged decode graph is cut (qwen4exp), "" when off:
+//   LLAMA_FN_HOST_LAUNCH2=N       one cut after layer N (0 <= N < n_layer - 1)
+//   LLAMA_FN_HOST_LAUNCH_EVERY=K  a cut after every K layers (layers K-1, 2K-1, ... below n_layer - 1)
+static std::string llama_launch_cuts(const llama_model & model) {
+    const int n_layer = (int) model.hparams.n_layer();
+    std::vector<bool> cut(std::max(n_layer, 0), false);
     const int n = llama_fn_l3_int(model, "LLAMA_FN_HOST_LAUNCH2", -1);
-    if (n < 0 || n >= (int) model.hparams.n_layer() - 1 || sched == nullptr) {
-        return;
+    if (n >= 0 && n < n_layer - 1) {
+        cut[n] = true;
     }
-    if (!decode) {
-        ggml_backend_sched_set_split_after(sched, nullptr);
-        return;
+    const int k = llama_fn_l3_int(model, "LLAMA_FN_HOST_LAUNCH_EVERY", 0);
+    for (int il = k - 1; k > 0 && il < n_layer - 1; il += k) {
+        cut[il] = true;
     }
-    char name[GGML_MAX_NAME];
-    snprintf(name, sizeof(name), "l_last-%d", n);
-    ggml_backend_sched_set_split_after(sched, name);
+    std::string s;
+    for (int il = 0; il < n_layer - 1; ++il) {
+        if (cut[il]) {
+            s += (s.empty() ? "" : ",") + std::string("l_last-") + std::to_string(il);
+        }
+    }
+    return s;
+}
+
+// [TAG_FN_L3_HOST_LAUNCH2] the scheduler cuts a bridged decode graph after the layers above, so a step is one device graph
+// launch per piece and the device runs a piece while the host launches the next. Set before every graph split of the
+// context (on for bridged decode ubatches, off for everything else, reserves included). True: this graph is cut.
+static bool llama_launch2_apply(const llama_model & model, ggml_backend_sched_t sched, bool decode) {
+    if (sched == nullptr) {
+        return false;
+    }
+    const std::string cuts = llama_launch_cuts(model);
+    if (cuts.empty()) {
+        return false;
+    }
+    ggml_backend_sched_set_split_after(sched, decode ? cuts.c_str() : nullptr);
     static std::atomic<bool> logged{false};
-    if (!logged.exchange(true)) {
-        LLAMA_LOG_INFO("%s: [TAG_FN_L3_HOST_LAUNCH2] bridged decode graphs split after %s: two device graph launches per "
-                "step\n", __func__, name);
+    if (decode && !logged.exchange(true)) {
+        LLAMA_LOG_INFO("%s: [TAG_FN_L3_HOST_LAUNCH2] bridged decode graphs are cut after %s: one device graph launch per "
+                "piece\n", __func__, cuts.c_str());
     }
+    return decode;
 }
 
 static llm_graph_type ctx_type_to_graph_type(llama_context_type ctx_type) {
@@ -2969,13 +2989,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             res->save_build_state(sched.get()); // [TAG_FN_GRAPH_PER_WIDTH] before the scheduler rewrites it
         }
 
-        llama_launch2_apply(model, sched.get(), launch2_decode); // [TAG_FN_L3_HOST_LAUNCH2]
+        const bool launch_cut = llama_launch2_apply(model, sched.get(), launch2_decode); // [TAG_FN_L3_HOST_LAUNCH2]
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
         }
-        if (launch2_decode && llama_fn_l3_int(model, "LLAMA_FN_HOST_LAUNCH2", -1) >= 0) { // [TAG_FN_L3_HOST_LAUNCH2]
+        if (launch_cut) { // [TAG_FN_L3_HOST_LAUNCH2] the proof line: the bridged decode graph's scheduler splits
             static std::atomic<int> n_logged{0};
             if (n_logged.fetch_add(1) < 2) {
                 LLAMA_LOG_INFO("%s: [TAG_FN_L3_HOST_LAUNCH2] a decode graph of %u tokens: %d scheduler splits\n", __func__,
@@ -4419,6 +4439,7 @@ ggml_cgraph * llama_context::graph_reserve(
     }
 
     ggml_backend_sched_reset(sched.get());
+    llama_launch2_apply(model, sched.get(), false); // [TAG_FN_L3_HOST_LAUNCH2] reserve graphs are never cut
 
     // when the scheduler is reset, we cannot reuse old graphs, so we reset the previous graph results
     for (auto & res : gf_res_prev) {

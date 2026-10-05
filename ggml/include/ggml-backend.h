@@ -360,11 +360,12 @@ extern "C" {
     // (process wide; 0 = off, the default). Diagnostic only.
     GGML_API void                 ggml_backend_sync_trace_set(int threshold_us);
 
-    // [TAG_FN_L3_HOST_LAUNCH2] start a new split after the first node with this name when the next node runs on the same
-    // backend: the device gets two graph launches, and the first one runs while the second is launched. The split
-    // boundary changes no value unless a backend fuses ops across it. NULL or "": off (default). Takes effect at the next
+    // [TAG_FN_L3_HOST_LAUNCH2] names: comma-separated node names (at most 64). After each node with one of these names a new
+    // split starts when the next node runs on the same backend, so the device gets one graph launch per piece and runs a
+    // piece while the host launches the next. The graph inputs of the later pieces are copied with the first piece's.
+    // A cut changes no value unless a backend fuses ops across it. NULL or "": off (default). Takes effect at the next
     // graph split (alloc / reserve).
-    GGML_API void                 ggml_backend_sched_set_split_after(ggml_backend_sched_t sched, const char * name);
+    GGML_API void                 ggml_backend_sched_set_split_after(ggml_backend_sched_t sched, const char * names);
 
     //
     // Meta backend
