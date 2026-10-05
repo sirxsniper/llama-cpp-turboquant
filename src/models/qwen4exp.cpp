@@ -656,7 +656,10 @@ llama_model_qwen4exp::graph::l3_flags llama_model_qwen4exp::graph::l3_read(const
     const int mask = (f.defer ? 1 : 0) | (f.convwb ? 2 : 0) | (f.hcfuse ? 4 : 0) | (f.compact ? 8 : 0) |
                      (f.topk ? 16 : 0) | (f.idxq8 ? 32 : 0) | (f.mmv ? 64 : 0) | (f.mmvd ? 128 : 0) | (f.q8f ? 256 : 0) |
                      (f.zskip ? 512 : 0) | (f.gdnab ? 1024 : 0);
-    static std::atomic<int> logged{-1};
+    // once per model and mask (a process-wide flag would be spent by the fit probe, which logs at DEBUG)
+    static std::atomic<int> logged_other{-1};
+    const auto * qm = dynamic_cast<const llama_model_qwen4exp *>(&model);
+    std::atomic<int> & logged = qm ? qm->l3_logged : logged_other;
     if (logged.exchange(mask) != mask) {
         LLAMA_LOG_INFO("qwen4exp: [TAG_FN_L3_GPU] device levers:%s%s%s%s%s%s%s%s%s%s%s%s\n",
                 f.defer ? " DEFER" : "", f.convwb ? " CONVWB" : "", f.hcfuse ? " HCFUSE" : "", f.compact ? " COMPACT" : "",

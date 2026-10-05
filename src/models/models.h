@@ -8,6 +8,7 @@
 #include <cmath>
 #include <map>
 #include <mutex> // [TAG_FN_MTP_HEAD_IDS]
+#include <atomic> // [TAG_FN_L3_GPU]
 
 class llama_memory_hybrid_idx_context;
 struct llama_ple_dio; // [TAG_FN_PLE_DIRECT_IO] llama-ple-dio.h
@@ -2530,6 +2531,9 @@ struct llama_model_qwen4exp : public llama_model_base {
     // [TAG_FN_PLE_DIRECT_IO] LLAMA_PLE_DIRECT_IO=1: per_layer_tok_embd rows come from the file with unbuffered reads
     // (llama-ple-dio.h); nullptr = the mapped table (default). shared_ptr: the type stays incomplete here.
     std::shared_ptr<llama_ple_dio> ple_dio;
+    // [TAG_FN_L3_GPU] the lever mask this model last logged (-1: none yet). Per model: the fit probe builds its graphs on
+    // a model of its own while the log level is demoted, so the real model still logs its line at INFO.
+    mutable std::atomic<int> l3_logged{-1};
 
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
