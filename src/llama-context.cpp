@@ -119,13 +119,16 @@ void llama_context::step_join() {
 //   LLAMA_FN_HOST_LAUNCH2=N       one cut after layer N (0 <= N < n_layer - 1)
 //   LLAMA_FN_HOST_LAUNCH_EVERY=K  a cut after every K layers (layers K-1, 2K-1, ... below n_layer - 1)
 static std::string llama_launch_cuts(const llama_model & model) {
+    const int n = llama_fn_l3_int(model, "LLAMA_FN_HOST_LAUNCH2", -1);
+    const int k = llama_fn_l3_int(model, "LLAMA_FN_HOST_LAUNCH_EVERY", 0);
+    if (n < 0 && k <= 0) {
+        return std::string(); // off (and every model but qwen4exp)
+    }
     const int n_layer = (int) model.hparams.n_layer();
     std::vector<bool> cut(std::max(n_layer, 0), false);
-    const int n = llama_fn_l3_int(model, "LLAMA_FN_HOST_LAUNCH2", -1);
     if (n >= 0 && n < n_layer - 1) {
         cut[n] = true;
     }
-    const int k = llama_fn_l3_int(model, "LLAMA_FN_HOST_LAUNCH_EVERY", 0);
     for (int il = k - 1; k > 0 && il < n_layer - 1; il += k) {
         cut[il] = true;
     }
