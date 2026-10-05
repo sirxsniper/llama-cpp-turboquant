@@ -2353,14 +2353,22 @@ void ggml_fn_moe_compute(const struct ggml_fn_moe_args * a, int ith, int nth, vo
 // mode 0: one real load per 64-byte line - it waits for its line, and the sequential lines start the hardware stream
 // prefetcher; mode 1: software prefetches, which never wait (r2 pfid: 25 MiB "done" before the next job in 99 % of the
 // gaps, faster than DRAM can deliver it - the core drops what it cannot queue), and never fault.
-static inline void ggml_fn_prefetch_bytes(const char * a, size_t len, int mode) {
+// Mode 0 checks *stop every 16 KiB (at a worker's share of DRAM bandwidth a 92 KiB gate + up piece takes ~18 us, which
+// the next job would otherwise wait for); returns false once stopped.
+static inline bool ggml_fn_prefetch_bytes(const char * a, size_t len, int mode, const volatile int32_t * stop) {
     const char * end = a + len;
     const char * c   = (const char *) ((uintptr_t) a & ~(uintptr_t) 63);
     if (mode == 0) {
-        for (; c < end; c += 64) {
-            (void) *(const volatile char *) c;
+        while (c < end) {
+            if (*stop) {
+                return false;
+            }
+            const char * e = c + 16384 < end ? c + 16384 : end;
+            for (; c < e; c += 64) {
+                (void) *(const volatile char *) c;
+            }
         }
-        return;
+        return true;
     }
     for (; c < end; c += 64) {
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
@@ -2371,6 +2379,7 @@ static inline void ggml_fn_prefetch_bytes(const char * a, size_t len, int mode) 
         GGML_UNUSED(c);
 #endif
     }
+    return true;
 }
 
 // [TAG_FN_R2_BRIDGE_PF] the weights thread ith of nth reads in ggml_fn_moe_compute for a job whose active experts are
@@ -2395,8 +2404,10 @@ size_t ggml_fn_moe_prefetch(const struct ggml_tensor * up, const struct ggml_ten
             const int32_t e  = list[p/np_e];
             const int64_t r0 = (p % np_e)*pr;
             const int64_t nr = MIN(pr, n_ff - r0);
-            ggml_fn_prefetch_bytes((const char *) gate->data + (size_t) e*gate->nb[2] + (size_t) r0*gate->nb[1], (size_t) nr*gate->nb[1], mode);
-            ggml_fn_prefetch_bytes((const char *) up->data   + (size_t) e*up->nb[2]   + (size_t) r0*up->nb[1],   (size_t) nr*up->nb[1], mode);
+            if (!ggml_fn_prefetch_bytes((const char *) gate->data + (size_t) e*gate->nb[2] + (size_t) r0*gate->nb[1], (size_t) nr*gate->nb[1], mode, stop) ||
+                !ggml_fn_prefetch_bytes((const char *) up->data   + (size_t) e*up->nb[2]   + (size_t) r0*up->nb[1],   (size_t) nr*up->nb[1], mode, stop)) {
+                return bytes;
+            }
             bytes += (size_t) nr*(gate->nb[1] + up->nb[1]);
         }
     }
@@ -2411,7 +2422,9 @@ size_t ggml_fn_moe_prefetch(const struct ggml_tensor * up, const struct ggml_ten
             const int32_t e  = list[p/np_e];
             const int64_t r0 = (p % np_e)*pd;
             const int64_t nr = MIN(pd, n_embd - r0);
-            ggml_fn_prefetch_bytes((const char *) down->data + (size_t) e*down->nb[2] + (size_t) r0*down->nb[1], (size_t) nr*down->nb[1], mode);
+            if (!ggml_fn_prefetch_bytes((const char *) down->data + (size_t) e*down->nb[2] + (size_t) r0*down->nb[1], (size_t) nr*down->nb[1], mode, stop)) {
+                return bytes;
+            }
             bytes += (size_t) nr*down->nb[1];
         }
     }
