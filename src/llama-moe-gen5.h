@@ -197,3 +197,6 @@ LLAMA_API llama_pfs_counters llama_prefill_stream_get_counters();
 // before each ubatch's graph; sched: its scheduler (synchronized here before a lend or a return).
 // Returns true when the banks were borrowed or returned (graphs built before must not be reused).
 LLAMA_API bool llama_prefill_stream_before_ubatch(const void * owner, ggml_backend_sched_t sched, int64_t n_tokens);
+
+// [TAG_FN_L3_VRAM_CBUF] the bytes a lending stream of this owner borrows from the hot set per prompt (0: none)
+LLAMA_API size_t llama_prefill_stream_lend_bytes(const void * owner);

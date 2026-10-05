@@ -105,6 +105,19 @@ LLAMA_API size_t llama_fn_vram_ceiling_default(size_t total);
 // hot-set budget: min(free - margin, ceiling - (total - free) - margin), 0 when negative
 LLAMA_API size_t llama_fn_vram_fit_budget(size_t total, size_t free, size_t ceiling, size_t margin);
 
+// [TAG_FN_L3_VRAM_CBUF] the compute-buffer lend (LLAMA_FN_CBUF):
+// the widest graph the SMALL reserve serves: at least 8 (the hot chain's widest graph) and below the op-offload minimum
+// (a graph that wide copies host experts into the compute buffer), a multiple of n_seqs (the reserve rounds up to one)
+LLAMA_API uint32_t llama_fn_cbuf_small_t(uint32_t requested, int op_offload_min, uint32_t n_seqs);
+// the tail the hot set keeps: the FULL - SMALL reserve difference plus pool_extra, rounded up to the granularity; 0 when
+// FULL is not at least min_gain larger than SMALL
+LLAMA_API size_t   llama_fn_cbuf_tail(size_t full, size_t small, size_t pool_extra, size_t gran, size_t min_gain);
+// the first layer of the tail: whole layers from the top (layer_bytes in buffer order) until they hold tail_bytes; -1 when
+// that needs every layer (one must stay below the tail) or tail_bytes is 0
+LLAMA_API int      llama_fn_cbuf_first_tail_layer(const std::vector<size_t> & layer_bytes, size_t tail_bytes);
+// the budget holds the tail, the prefill stream's lend range and about one layer (budget / 32) between them, plus slack
+LLAMA_API bool     llama_fn_cbuf_fits(size_t budget, size_t tail, size_t stream_lend);
+
 //
 // model hooks (src/llama.cpp) and lookups
 //
