@@ -84,6 +84,7 @@ struct llama_moe_bridge {
 
     int     mode       = GGML_MOE_BRIDGE_WAIT_SPIN;
     int     max_t      = 8;
+    bool    sync_on    = true; // [TAG_FN_R2_BRIDGE_SYNC] LLAMA_MOE_BRIDGE_SYNC
     int     n_used     = 0;
     int64_t n_embd     = 0;
     int     spin_us    = 2000;
@@ -533,6 +534,7 @@ llama_moe_bridge * llama_moe_bridge_create(const llama_model & model, int n_thre
     const char * wm = getenv("LLAMA_MOE_BRIDGE_WAIT");
     br->mode       = wm && strcmp(wm, "hostfunc") == 0 ? GGML_MOE_BRIDGE_WAIT_HOSTFUNC : GGML_MOE_BRIDGE_WAIT_SPIN;
     br->max_t      = std::min(16, std::max(1, env_int("LLAMA_MOE_BRIDGE_MAX_T", 8)));
+    br->sync_on    = env_int("LLAMA_MOE_BRIDGE_SYNC", 1) > 0; // [TAG_FN_R2_BRIDGE_SYNC]
     if (max_t_cap > 0 && br->max_t > max_t_cap) {
         // [TAG_FN_R1_BRIDGE_RB] wider graphs (a prompt's last few tokens) run the plain CPU split
         br->max_t = max_t_cap;
@@ -679,6 +681,11 @@ bool llama_moe_bridge_dma(const llama_moe_bridge * br) {
 
 bool llama_moe_bridge_active(const llama_moe_bridge * br) {
     return br != nullptr && br->active && !br->disabled;
+}
+
+// [TAG_FN_R2_BRIDGE_SYNC]
+bool llama_moe_bridge_sync(const llama_moe_bridge * br) {
+    return br != nullptr && br->sync_on && !llama_moe_bridge_active(br);
 }
 
 int llama_moe_bridge_max_t(const llama_moe_bridge * br) {

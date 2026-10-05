@@ -11,6 +11,8 @@
 #include <string>
 #include <vector>
 
+extern "C" bool ggml_cpu_moe_host_sum_supported(const struct ggml_tensor * op); // [TAG_FN_R2_BRIDGE_SYNC] ggml-cpu.c
+
 #ifdef GGML_USE_CPU_HBM
 #    include "hbm.h"
 #endif
@@ -567,6 +569,15 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
         case GGML_OP_MOE_HOST_WAIT:
         case GGML_OP_MOE_HOST_FETCH: // [TAG_FN_R4_BRIDGE_DMA]
             return false;
+        case GGML_OP_MOE_HOST_SUM: // [TAG_FN_R2_BRIDGE_SYNC] the fused kernel reads the experts in plain host memory
+            for (int k = 3; k <= 5; ++k) {
+                const ggml_tensor * t = op->src[k];
+                if (t == nullptr || (t->buffer && (!ggml_backend_buffer_is_host(t->buffer) ||
+                                                   ggml_backend_cpu_is_extra_buffer_type(t->buffer->buft)))) {
+                    return false;
+                }
+            }
+            return ggml_cpu_moe_host_sum_supported(op);
         case GGML_OP_QSA_MASK: // [TAG_FN_R4_QSA_POS]
             return op->type == GGML_TYPE_F16 && op->src[0]->type == GGML_TYPE_I32 && op->src[1]->type == GGML_TYPE_I32 &&
                 op->src[2]->type == GGML_TYPE_I32 && (op->src[3] == nullptr || op->src[3]->type == GGML_TYPE_F32);

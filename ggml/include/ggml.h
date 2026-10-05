@@ -662,6 +662,8 @@ extern "C" {
         GGML_OP_QSA_MASK,       // [TAG_FN_R4_QSA_POS] appended last so that no existing op value moves
         GGML_OP_MOE_HOST_FETCH, // [TAG_FN_R4_BRIDGE_DMA]
 
+        GGML_OP_MOE_HOST_SUM,   // [TAG_FN_R2_BRIDGE_SYNC] appended last so that no existing op value moves
+
         GGML_OP_COUNT,
     };
 
@@ -2839,6 +2841,26 @@ extern "C" {
             int64_t               n_tokens,
             int32_t               bridge,
             int32_t               chan);
+
+    // [TAG_FN_R2_BRIDGE_SYNC] the host side of a bridged MoE layer as a CPU graph op (CPU backend only), for the graphs
+    // that run while the bridge is paused or off: for every token t,
+    //   out[:, t] = sum, in slot order, over the slots s whose expert e = ids[s, t] passes the table (table == NULL or
+    //               table[e] == table_miss), of w[s, t] * down_e(swiglu(gate_e(x[:, t]), up_e(x[:, t])))
+    // with the kernel of the CPU MoE pool (ggml_cpu_moe_run with w, the bridge's host job): the same values bit for bit,
+    // so a graph that runs this op in place of post + wait computes what the bridged graph computes.
+    //   x [n_embd, n_tokens] f32, ids [n_used, n_tokens] i32, w [n_used, n_tokens] f32 contiguous,
+    //   up_exps / gate_exps [n_embd, n_ff, n_expert], down_exps [n_ff, n_embd, n_expert] in plain host memory,
+    //   table [n_expert] i32 or NULL -> f32 [n_embd, n_tokens]
+    GGML_API struct ggml_tensor * ggml_moe_host_sum(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * ids,
+            struct ggml_tensor  * w,
+            struct ggml_tensor  * up_exps,
+            struct ggml_tensor  * gate_exps,
+            struct ggml_tensor  * down_exps,
+            struct ggml_tensor  * table,
+            int32_t               table_miss);
 
     // [TAG_FN_R4_BRIDGE_DMA] the PCIe share of a bridged MoE layer (the host plans it when the post carries
     // GGML_MOE_BRIDGE_JOB_DMA): wait (bounded) for the host's plan of the job of ticket, copy the planned experts from

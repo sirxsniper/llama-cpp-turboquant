@@ -842,6 +842,9 @@ struct llm_graph_params {
     llm_graph_result * res;
 
     const llama_moe_bridge * moe_bridge = nullptr; // [TAG_MOE_BRIDGE] the context's bridge while it is active
+    // [TAG_FN_R2_BRIDGE_SYNC] the context's bridge while it is paused or off: the layers it would take run its host job
+    // as a CPU op (ggml_moe_host_sum) and sum like the bridged graph, so a retried ubatch gets the bridged values
+    const llama_moe_bridge * moe_bridge_sync = nullptr;
 
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
@@ -914,7 +917,8 @@ struct llm_graph_params {
             cvec  == other.cvec  &&
             loras == other.loras &&
             cross == other.cross &&
-            moe_bridge == other.moe_bridge; // [TAG_MOE_BRIDGE] a paused bridge rebuilds without its ops
+            moe_bridge == other.moe_bridge &&       // [TAG_MOE_BRIDGE] a paused bridge rebuilds without its ops
+            moe_bridge_sync == other.moe_bridge_sync; // [TAG_FN_R2_BRIDGE_SYNC]
     }
 };
 
@@ -1107,6 +1111,7 @@ struct llm_graph_context {
     // [TAG_MOE_BRIDGE] set by an arch that calls build_moe_bridge_finish itself (after its shared expert); posts of
     // build_moe_ffn wait here until then
     const llama_moe_bridge * moe_bridge = nullptr;
+    const llama_moe_bridge * moe_bridge_sync = nullptr; // [TAG_FN_R2_BRIDGE_SYNC] see llm_graph_params
     mutable bool moe_bridge_defer = false;
     struct moe_bridge_post {
         ggml_tensor * ticket;
@@ -1115,6 +1120,7 @@ struct llm_graph_context {
         int64_t       n_tokens;
         int32_t       id;
         int32_t       chan;
+        bool          sync;     // [TAG_FN_R2_BRIDGE_SYNC] ticket is the ggml_moe_host_sum result: no wait
     };
     mutable std::map<int, moe_bridge_post> moe_bridge_posts;
 

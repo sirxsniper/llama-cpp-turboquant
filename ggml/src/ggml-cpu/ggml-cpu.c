@@ -2533,6 +2533,60 @@ static void ggml_compute_forward_moe_fused(const struct ggml_compute_params * pa
     ggml_fn_moe_compute(&a, params->ith, params->nth, ggml_fn_moe_barrier_tp, params->threadpool);
 }
 
+// [TAG_FN_R2_BRIDGE_SYNC] GGML_OP_MOE_HOST_SUM: the host job of a bridged MoE layer (the CPU MoE pool's weighted mode,
+// ggml_cpu_moe_run with w) on the graph's threads. ggml_fn_moe_compute gives the same values for any thread count (rows
+// and pieces each have one owner, the weighted sum runs per row in slot order), so this equals the bridge's answer.
+// The weights must be in plain host memory; the caller (ggml-cpu.cpp) has ruled out the extra buffer types.
+bool ggml_cpu_moe_host_sum_supported(const struct ggml_tensor * op) {
+    const struct ggml_tensor * x   = op->src[0];
+    const struct ggml_tensor * ids = op->src[1];
+    const struct ggml_tensor * w   = op->src[2];
+    const struct ggml_tensor * tbl = op->src[6];
+    if (op->type != GGML_TYPE_F32 || !ggml_is_contiguous(op) || x == NULL || ids == NULL || w == NULL ||
+        x->type != GGML_TYPE_F32 || x->nb[0] != sizeof(float) || ids->type != GGML_TYPE_I32 ||
+        w->type != GGML_TYPE_F32 || !ggml_is_contiguous(w) || ids->ne[1] < 1 || ids->ne[1] > GGML_FN_MOE_MAX_T ||
+        (tbl != NULL && tbl->type != GGML_TYPE_I32)) {
+        return false;
+    }
+    return ggml_fn_moe_supported(op->src[3], op->src[4], op->src[5]);
+}
+
+static void ggml_compute_forward_moe_host_sum(const struct ggml_compute_params * params, struct ggml_tensor * dst) {
+    const struct ggml_tensor * x   = dst->src[0];
+    const struct ggml_tensor * ids = dst->src[1];
+    const struct ggml_tensor * w   = dst->src[2];
+    const struct ggml_tensor * tbl = dst->src[6];
+
+    struct ggml_fn_moe_args a;
+    memset(&a, 0, sizeof(a));
+    a.up   = dst->src[3];
+    a.gate = dst->src[4];
+    a.down = dst->src[5];
+    if (tbl) {
+        a.table      = (const int32_t *) tbl->data;
+        a.table_miss = ggml_get_op_params_i32(dst, 0);
+    }
+    a.n_tokens = (int) ids->ne[1];
+    a.n_used   = (int) ids->ne[0];
+    a.x        = (const char *) x->data;
+    a.x_nb     = x->nb[1];
+    a.ids      = (const char *) ids->data;
+    a.ids_nb0  = ids->nb[0];
+    a.ids_nb1  = ids->nb[1];
+    a.w        = (const float *) w->data;
+    a.out_sum  = (float *) dst->data;
+    a.wdata    = params->wdata;
+
+    GGML_ASSERT(a.n_tokens >= 1 && a.n_tokens <= GGML_FN_MOE_MAX_T);
+    GGML_ASSERT(params->wsize >= ggml_fn_moe_work_size(a.up, a.gate, a.down, a.n_used, a.n_tokens, params->nth));
+
+    if (params->ith == 0) {
+        ggml_compute_mmid_observe(a.gate, ids); // the routing observation the bridge's job makes
+    }
+
+    ggml_fn_moe_compute(&a, params->ith, params->nth, ggml_fn_moe_barrier_tp, params->threadpool);
+}
+
 /////////////////////////////////
 
 static void ggml_compute_forward(struct ggml_compute_params * params, struct ggml_tensor * tensor) {
@@ -2925,6 +2979,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 GGML_ABORT("%s runs on a device backend only", ggml_op_name(tensor->op));
             }
+        case GGML_OP_MOE_HOST_SUM: // [TAG_FN_R2_BRIDGE_SYNC]
+            {
+                ggml_compute_forward_moe_host_sum(params, tensor);
+            } break;
         case GGML_OP_MAP_CUSTOM1:
             {
                 ggml_compute_forward_map_custom1(params, tensor);
@@ -3282,6 +3340,10 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_QSA_MASK: // [TAG_FN_R4_QSA_POS] rows split over the threads
             {
                 n_tasks = MIN(n_threads, (int) node->ne[1]);
+            } break;
+        case GGML_OP_MOE_HOST_SUM: // [TAG_FN_R2_BRIDGE_SYNC] every thread, as the fused MoE op
+            {
+                n_tasks = n_threads;
             } break;
         case GGML_OP_MAP_CUSTOM1:
             {
@@ -3920,6 +3982,11 @@ struct ggml_cplan ggml_graph_plan(
                 case GGML_OP_TURBOT_SET_ROWS:
                     {
                         cur = 0;  // [TAG_TURBOT] the CPU reference coder works on the stack
+                    } break;
+                case GGML_OP_MOE_HOST_SUM: // [TAG_FN_R2_BRIDGE_SYNC] the fused MoE work area with the weighted-sum scratch
+                    {
+                        cur = ggml_fn_moe_work_size(node->src[3], node->src[4], node->src[5], (int) node->src[1]->ne[0],
+                                (int) node->src[1]->ne[1], n_tasks);
                     } break;
                 case GGML_OP_COUNT:
                     {

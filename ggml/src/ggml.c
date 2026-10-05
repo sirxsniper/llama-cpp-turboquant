@@ -1223,9 +1223,11 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
 
     "QSA_MASK",
     "MOE_HOST_FETCH",
+
+    "MOE_HOST_SUM",
 };
 
-static_assert(GGML_OP_COUNT == 108, "GGML_OP_COUNT != 108");  // +1 GGML_OP_TURBO_WHT (TurboQuant fork), +1 GGML_OP_LIGHTNING_INDEXER, +1 GGML_OP_TURBOT_SET_ROWS [TAG_TURBOT], +1 GGML_OP_GATED_DELTA_NET_REPLAY [TAG_4C_GDN_REPLAY], +2 GGML_OP_MOE_HOST_POST/WAIT [TAG_MOE_BRIDGE], +1 GGML_OP_QSA_MASK [TAG_FN_R4_QSA_POS], +1 GGML_OP_MOE_HOST_FETCH [TAG_FN_R4_BRIDGE_DMA]
+static_assert(GGML_OP_COUNT == 109, "GGML_OP_COUNT != 109");  // +1 GGML_OP_TURBO_WHT (TurboQuant fork), +1 GGML_OP_LIGHTNING_INDEXER, +1 GGML_OP_TURBOT_SET_ROWS [TAG_TURBOT], +1 GGML_OP_GATED_DELTA_NET_REPLAY [TAG_4C_GDN_REPLAY], +2 GGML_OP_MOE_HOST_POST/WAIT [TAG_MOE_BRIDGE], +1 GGML_OP_QSA_MASK [TAG_FN_R4_QSA_POS], +1 GGML_OP_MOE_HOST_FETCH [TAG_FN_R4_BRIDGE_DMA], +1 GGML_OP_MOE_HOST_SUM [TAG_FN_R2_BRIDGE_SYNC]
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1349,9 +1351,11 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
 
     "qsa_mask(kv_pos, q_pos, sel, live)",
     "moe_host_fetch(ticket, up, gate, down, dep)",
+
+    "moe_host_sum(x, ids, w, up, gate, down, table)",
 };
 
-static_assert(GGML_OP_COUNT == 108, "GGML_OP_COUNT != 108");  // +1 GGML_OP_TURBO_WHT (TurboQuant fork), +1 GGML_OP_LIGHTNING_INDEXER, +1 GGML_OP_TURBOT_SET_ROWS [TAG_TURBOT], +1 GGML_OP_GATED_DELTA_NET_REPLAY [TAG_4C_GDN_REPLAY], +2 GGML_OP_MOE_HOST_POST/WAIT [TAG_MOE_BRIDGE], +1 GGML_OP_QSA_MASK [TAG_FN_R4_QSA_POS], +1 GGML_OP_MOE_HOST_FETCH [TAG_FN_R4_BRIDGE_DMA]
+static_assert(GGML_OP_COUNT == 109, "GGML_OP_COUNT != 109");  // +1 GGML_OP_TURBO_WHT (TurboQuant fork), +1 GGML_OP_LIGHTNING_INDEXER, +1 GGML_OP_TURBOT_SET_ROWS [TAG_TURBOT], +1 GGML_OP_GATED_DELTA_NET_REPLAY [TAG_4C_GDN_REPLAY], +2 GGML_OP_MOE_HOST_POST/WAIT [TAG_MOE_BRIDGE], +1 GGML_OP_QSA_MASK [TAG_FN_R4_QSA_POS], +1 GGML_OP_MOE_HOST_FETCH [TAG_FN_R4_BRIDGE_DMA], +1 GGML_OP_MOE_HOST_SUM [TAG_FN_R2_BRIDGE_SYNC]
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6867,6 +6871,43 @@ struct ggml_tensor * ggml_moe_host_fetch(
     result->src[2] = bank_gate;
     result->src[3] = bank_down;
     result->src[4] = dep;
+
+    return result;
+}
+
+// [TAG_FN_R2_BRIDGE_SYNC]
+struct ggml_tensor * ggml_moe_host_sum(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * ids,
+        struct ggml_tensor  * w,
+        struct ggml_tensor  * up_exps,
+        struct ggml_tensor  * gate_exps,
+        struct ggml_tensor  * down_exps,
+        struct ggml_tensor  * table,
+        int32_t               table_miss) {
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && ids->type == GGML_TYPE_I32 && w->type == GGML_TYPE_F32);
+    GGML_ASSERT(x->nb[0] == sizeof(float) && ids->nb[0] == sizeof(int32_t));
+    GGML_ASSERT(x->ne[2] == 1 && x->ne[3] == 1);
+    const int64_t n_tokens = x->ne[1];
+    GGML_ASSERT(ids->ne[1] == n_tokens && ids->ne[2] == 1 && ids->ne[3] == 1);
+    GGML_ASSERT(ggml_is_contiguous(w) && ggml_nelements(w) == ids->ne[0]*n_tokens);
+    GGML_ASSERT(up_exps->ne[0] == x->ne[0] && gate_exps->ne[0] == x->ne[0] && down_exps->ne[1] == x->ne[0]);
+    GGML_ASSERT(up_exps->ne[2] == gate_exps->ne[2] && up_exps->ne[2] == down_exps->ne[2] && ids->ne[0] <= up_exps->ne[2]);
+    GGML_ASSERT(table == NULL || (table->type == GGML_TYPE_I32 && ggml_is_contiguous(table) && ggml_nelements(table) >= up_exps->ne[2]));
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, x->ne[0], n_tokens);
+
+    ggml_set_op_params_i32(result, 0, table_miss);
+
+    result->op     = GGML_OP_MOE_HOST_SUM;
+    result->src[0] = x;
+    result->src[1] = ids;
+    result->src[2] = w;
+    result->src[3] = up_exps;
+    result->src[4] = gate_exps;
+    result->src[5] = down_exps;
+    result->src[6] = table;
 
     return result;
 }

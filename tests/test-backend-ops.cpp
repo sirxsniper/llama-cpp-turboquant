@@ -16431,6 +16431,69 @@ static std::vector<float> cpu_fn_moe_graph(ggml_backend_t be, const cpu_fn_moe_c
     return r;
 }
 
+// [TAG_FN_R2_BRIDGE_SYNC] GGML_OP_MOE_HOST_SUM on be with n_threads (0: leave the backend's count): x [n_embd, T], ids as
+// a strided view of [n_used + 2, T] (as the argsort top-k is), w [n_used, T], the optional skip table [1, n_exp]
+static std::vector<float> cpu_fn_moe_host_sum_graph(ggml_backend_t be, const cpu_fn_moe_case & c, int64_t T,
+                                                    const std::vector<uint8_t> & wu, const std::vector<uint8_t> & wg, const std::vector<uint8_t> & wd,
+                                                    const std::vector<float> & x, const std::vector<int32_t> & ids, const std::vector<float> & w,
+                                                    const std::vector<int32_t> * tbl, int32_t miss, int n_threads, int n_threads_restore) {
+    ggml_init_params params = {
+        /* .mem_size = */ ggml_tensor_overhead()*16 + ggml_graph_overhead(),
+        /* .mem_base = */ NULL,
+        /* .no_alloc = */ true,
+    };
+    ggml_context_ptr ctx(ggml_init(params));
+
+    ggml_tensor * a_u   = ggml_new_tensor_3d(ctx.get(), c.tu, c.n_embd, c.n_ff, c.n_exp);
+    ggml_tensor * a_g   = ggml_new_tensor_3d(ctx.get(), c.tg, c.n_embd, c.n_ff, c.n_exp);
+    ggml_tensor * a_d   = ggml_new_tensor_3d(ctx.get(), c.td, c.n_ff, c.n_embd, c.n_exp);
+    ggml_tensor * tx    = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, c.n_embd, T);
+    ggml_tensor * tidsf = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, c.n_used + 2, T);
+    ggml_tensor * tids  = ggml_view_2d(ctx.get(), tidsf, c.n_used, T, tidsf->nb[1], sizeof(int32_t));
+    ggml_tensor * tw    = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, c.n_used, T);
+    ggml_tensor * ttbl  = tbl ? ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, 1, c.n_exp) : nullptr;
+
+    ggml_tensor * out = ggml_moe_host_sum(ctx.get(), tx, tids, tw, a_u, a_g, a_d, ttbl, miss);
+
+    ggml_backend_buffer_ptr buf(ggml_backend_alloc_ctx_tensors(ctx.get(), be));
+    if (buf == nullptr || !ggml_backend_supports_op(be, out)) { // supports_op reads the weights' data pointers
+        return {};
+    }
+    ggml_backend_tensor_set(a_u, wu.data(), 0, wu.size());
+    ggml_backend_tensor_set(a_g, wg.data(), 0, wg.size());
+    ggml_backend_tensor_set(a_d, wd.data(), 0, wd.size());
+    ggml_backend_tensor_set(tx, x.data(), 0, x.size() * sizeof(float));
+    std::vector<int32_t> idsf((size_t) (c.n_used + 2) * T, -1); // the padding entries are never read
+    for (int64_t t = 0; t < T; t++) {
+        for (int k = 0; k < c.n_used; k++) {
+            idsf[(size_t) t * (c.n_used + 2) + 1 + k] = ids[(size_t) t * c.n_used + k];
+        }
+    }
+    ggml_backend_tensor_set(tidsf, idsf.data(), 0, idsf.size() * sizeof(int32_t));
+    ggml_backend_tensor_set(tw, w.data(), 0, w.size() * sizeof(float));
+    if (ttbl) {
+        ggml_backend_tensor_set(ttbl, tbl->data(), 0, tbl->size() * sizeof(int32_t));
+    }
+
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(be));
+    auto set_threads = (ggml_backend_set_n_threads_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_n_threads");
+    if (n_threads > 0 && set_threads) {
+        set_threads(be, n_threads);
+    }
+    ggml_cgraph * gf = ggml_new_graph(ctx.get());
+    ggml_build_forward_expand(gf, out);
+    const ggml_status st = ggml_backend_graph_compute(be, gf);
+    if (n_threads > 0 && set_threads) {
+        set_threads(be, n_threads_restore);
+    }
+    if (st != GGML_STATUS_SUCCESS) {
+        return {};
+    }
+    std::vector<float> r(ggml_nelements(out));
+    ggml_backend_tensor_get(out, r.data(), 0, ggml_nbytes(out));
+    return r;
+}
+
 static bool cpu_fn_same(const std::vector<float> & a, const std::vector<float> & b, size_t * n_diff, double * err) {
     *n_diff = 0;
     for (size_t i = 0; i < a.size(); i++) {
@@ -16445,7 +16508,8 @@ static bool cpu_fn_same(const std::vector<float> & a, const std::vector<float> &
 // the use_ref CPU backend: bitwise equal (q2_0_cpu_max_nmse(), 0 on MSVC). Q4K-MTP style type mixes, a mixed q8_K /
 // q8_0 input pair, 1..16 tokens, with and without the skip table. The fused-op counter proves the fusion ran.
 static bool run_cpu_fn_moe_fuse(ggml_backend_t backend, ggml_backend_t backend_ref, const char * op_names_filter) {
-    if (!backend_is_cpu(backend) || !op_names_filter_selects(op_names_filter, "MUL_MAT_ID")) {
+    if (!backend_is_cpu(backend) || (!op_names_filter_selects(op_names_filter, "MUL_MAT_ID") &&
+                                    !op_names_filter_selects(op_names_filter, "MOE_HOST_SUM"))) {
         return true;
     }
     ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
@@ -16632,6 +16696,28 @@ static bool run_cpu_fn_moe_fuse(ggml_backend_t backend, ggml_backend_t backend_r
                                (int) ran_p, (int) ran_w, nd_p, err_p, nd_w, err_w);
                     }
                     n_fail += (ok_p ? 0 : 1) + (ok_w ? 0 : 1);
+
+                    // [TAG_FN_R2_BRIDGE_SYNC] GGML_OP_MOE_HOST_SUM, the bridge's host job as a CPU graph op, on 1, 3 and the
+                    // default threads: bitwise equal to the pool's weighted sum (the bridge's answer), no NMSE allowance
+                    if (ran_w) {
+                        const int nt_default = std::max<int>(1, (int) N_THREADS / 2);
+                        for (int nt : { 1, 3, 0 }) {
+                            const std::vector<float> out_s = cpu_fn_moe_host_sum_graph(backend, c, T, wu, wg, wd, x, ids, w, tp, c.n_exp, nt, nt_default);
+                            size_t nd_s = out_s.size() == out_w.size() ? 0 : out_w.size();
+                            for (size_t i = 0; i < out_s.size() && i < out_w.size(); i++) {
+                                nd_s += memcmp(&out_s[i], &out_w[i], sizeof(float)) != 0;
+                            }
+                            const bool ok_s = !out_s.empty() && nd_s == 0;
+                            n_run++;
+                            if (!ok_s) {
+                                printf("  FAIL moe host sum %s/%s/%s T=%" PRId64 " table=%d threads=%d: %s, %zu values differ from the pool's weighted sum
+",
+                                       ggml_type_name(c.tu), ggml_type_name(c.tg), ggml_type_name(c.td), T, with_tbl, nt,
+                                       out_s.empty() ? "did not run" : "ran", nd_s);
+                            }
+                            n_fail += ok_s ? 0 : 1;
+                        }
+                    }
 
                     if (bridge_opts) { // [TAG_MOE_BRIDGE]
                         size_t nd_k = 0, nd_q = 0;

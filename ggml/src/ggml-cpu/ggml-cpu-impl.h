@@ -66,6 +66,8 @@ size_t ggml_fn_moe_work_size(const struct ggml_tensor * up, const struct ggml_te
                              int n_used, int n_tokens, int nth);
 // every one of the nth threads calls it with its ith; barrier(barrier_ctx) must synchronize all of them
 void   ggml_fn_moe_compute(const struct ggml_fn_moe_args * a, int ith, int nth, void (*barrier)(void *), void * barrier_ctx);
+// [TAG_FN_R2_BRIDGE_SYNC] GGML_OP_MOE_HOST_SUM on the CPU: types, shapes and the fused kernel (ggml-cpu.c)
+bool   ggml_cpu_moe_host_sum_supported(const struct ggml_tensor * op);
 
 
 #if defined(_MSC_VER)

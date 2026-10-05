@@ -1735,7 +1735,8 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     res              (params.res),
     ctx0             (res->get_ctx()),
     gf               (res->get_gf()),
-    moe_bridge       (params.moe_bridge) { // [TAG_MOE_BRIDGE]
+    moe_bridge       (params.moe_bridge),        // [TAG_MOE_BRIDGE]
+    moe_bridge_sync  (params.moe_bridge_sync) {  // [TAG_FN_R2_BRIDGE_SYNC]
         res->set_params(params);
     }
 
@@ -2472,22 +2473,35 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     int32_t br_chan = -1;
     ggml_tensor * br_ticket = nullptr;
     const llama_moe_dma_view * br_dma = nullptr; // [TAG_FN_R4_BRIDGE_DMA] the layer's bank when the graph fetches a share
-    if (moe_bridge && il >= 0 && n_tokens >= 1 && n_tokens <= llama_moe_bridge_max_t(moe_bridge) &&
-        n_expert_used <= llama_moe_bridge_n_used(moe_bridge) &&
+    // [TAG_FN_R2_BRIDGE_SYNC] while the bridge is paused or off (a retried ubatch, the steps after a deadline miss), the
+    // layers it would take run its host job as a CPU op and sum exactly like the bridged graph: the same values, so a
+    // stall never changes the output (the CPU split below sums the slots in another order)
+    const llama_moe_bridge * br_any = moe_bridge ? moe_bridge : moe_bridge_sync;
+    bool br_sync = false;
+    if (br_any && il >= 0 && n_tokens >= 1 && n_tokens <= llama_moe_bridge_max_t(br_any) &&
+        n_expert_used <= llama_moe_bridge_n_used(br_any) &&
         !gate_up_exps && gate_exps && down_exps && !up_exps_b && !gate_exps_b && !down_exps_b &&
         !up_exps_s && !gate_exps_s && !down_exps_s && type_op == LLM_FFN_SILU && !weight_before_ffn &&
         loras->empty() && !(hparams.swiglu_clamp_exp[il] > 1e-6f) &&
-        llama_moe_bridge_layer(moe_bridge, up_exps, &br_id, &br_chan)) {
-        if (llama_moe_bridge_dma(moe_bridge) && !pfs) {
+        llama_moe_bridge_layer(br_any, up_exps, &br_id, &br_chan)) {
+        if (moe_bridge && llama_moe_bridge_dma(moe_bridge) && !pfs) {
             br_dma = llama_moe_dma_bridge_lookup(up_exps, n_tokens);
         }
         ggml_tensor * w2 = ggml_is_contiguous(weights) ? weights : ggml_cont(ctx0, weights);
         w2 = ggml_reshape_2d(ctx0, w2, n_expert_used, n_tokens);
-        const int32_t br_flags = (mcache ? GGML_MOE_BRIDGE_JOB_TABLE : 0) | (br_dma ? GGML_MOE_BRIDGE_JOB_DMA : 0);
-        br_ticket = ggml_moe_host_post(ctx0, cur, selected_experts, w2, br_id, br_chan, br_flags);
-        cb(br_ticket, "ffn_moe_bridge_post", il);
+        if (moe_bridge) {
+            const int32_t br_flags = (mcache ? GGML_MOE_BRIDGE_JOB_TABLE : 0) | (br_dma ? GGML_MOE_BRIDGE_JOB_DMA : 0);
+            br_ticket = ggml_moe_host_post(ctx0, cur, selected_experts, w2, br_id, br_chan, br_flags);
+            cb(br_ticket, "ffn_moe_bridge_post", il);
+            res->n_moe_bridge++;
+        } else {
+            // the job's table: the hot set's, as the bridge's job takes it (GGML_MOE_BRIDGE_JOB_TABLE); no DMA share
+            br_ticket = ggml_moe_host_sum(ctx0, cur, selected_experts, w2, up_exps, gate_exps, down_exps,
+                    mcache ? mcache->host_table : nullptr, mcache ? mcache->n_slots : 0);
+            cb(br_ticket, "ffn_moe_bridge_sync", il);
+            br_sync = true;
+        }
         ggml_build_forward_expand(gf, br_ticket);
-        res->n_moe_bridge++;
     }
 
     // [TAG_MOE_DMA_SHARE] [TAG_MOE_PREFETCH] a CPU plan node picks the cold experts that go over PCIe to a VRAM bank; its
@@ -2623,7 +2637,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             hot = hot ? ggml_add(ctx0, hot, dsum) : dsum;
             ggml_build_forward_expand(gf, hot);
         }
-        moe_bridge_posts[il] = { br_ticket, hot, n_embd, n_tokens, br_id, br_chan };
+        moe_bridge_posts[il] = { br_ticket, hot, n_embd, n_tokens, br_id, br_chan, br_sync };
         if (moe_bridge_defer) {
             return br_ticket; // placeholder: the caller passes it to build_moe_bridge_finish
         }
@@ -2875,8 +2889,12 @@ ggml_tensor * llm_graph_context::build_moe_bridge_finish(ggml_tensor * cur, int 
     GGML_ASSERT(cur == p.ticket && "build_moe_bridge_finish expects the placeholder that build_moe_ffn returned");
 
     // dep (or the hot chain) goes into the graph before the wait, so the device runs it while the host works
-    ggml_tensor * out = ggml_moe_host_wait(ctx0, p.ticket, dep ? dep : p.hot, p.n_embd, p.n_tokens, p.id, p.chan);
-    cb(out, "ffn_moe_bridge_wait", il);
+    // [TAG_FN_R2_BRIDGE_SYNC] a paused bridge's layer: the ticket is the CPU op's sum itself
+    ggml_tensor * out = p.ticket;
+    if (!p.sync) {
+        out = ggml_moe_host_wait(ctx0, p.ticket, dep ? dep : p.hot, p.n_embd, p.n_tokens, p.id, p.chan);
+        cb(out, "ffn_moe_bridge_wait", il);
+    }
     if (p.hot) {
         out = ggml_add(ctx0, p.hot, out);
         cb(out, "ffn_moe_bridge_sum", il);

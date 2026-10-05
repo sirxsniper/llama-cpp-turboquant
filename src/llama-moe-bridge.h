@@ -20,6 +20,11 @@
 //   LLAMA_MOE_BRIDGE_RB=0                 [TAG_FN_R1_BRIDGE_RB] (on by default with speculative decoding on a hybrid
 //                                         model) off: no extra ring token, the bridge keeps graphs up to MAX_T, and a
 //                                         failed bridged verify ubatch fails (its recurrent state cannot roll back)
+//   LLAMA_MOE_BRIDGE_SYNC=1               [TAG_FN_R2_BRIDGE_SYNC] (default) while the bridge is paused or off (the
+//                                         retried ubatch, the 16 steps after a deadline miss, after 3 errors), the
+//                                         layers it takes run its host job as a CPU graph op (ggml_moe_host_sum) and
+//                                         sum like the bridged graph: the same values, so a stall never changes the
+//                                         output. 0: the plain CPU split (the slots summed in another float order)
 //   LLAMA_MOE_BRIDGE_RB_TOKENS=1          [TAG_FN_R2_BRIDGE_NOSPEC] a hybrid model without speculative decoding has no
 //                                         ring at all: the context gets a ring of this many tokens (1..8) and the bridge
 //                                         takes graphs of at most that many tokens, so every bridged ubatch rolls back
@@ -50,6 +55,8 @@ llama_moe_bridge * llama_moe_bridge_create(const llama_model & model, int n_thre
 void               llama_moe_bridge_free(llama_moe_bridge * br);
 // [TAG_FN_R2_BRIDGE_NOSPEC] LLAMA_MOE_BRIDGE=1 and the model has a layer the bridge could take (cheap, no pool, no device)
 bool               llama_moe_bridge_wanted(const llama_model & model);
+// [TAG_FN_R2_BRIDGE_SYNC] the bridge exists, is paused or off, and LLAMA_MOE_BRIDGE_SYNC is on
+bool               llama_moe_bridge_sync(const llama_moe_bridge * br);
 
 // [TAG_FN_R4_BRIDGE_DMA] LLAMA_MOE_BRIDGE_DMA=1 (with LLAMA_MOE_DMA_SHARE=<share>|auto): after llama_moe_gen5_init (bridge
 // mode) and before the reserve, register the DMA ring with the device side; the bridged graphs then fetch a share of

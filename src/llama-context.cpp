@@ -4352,6 +4352,7 @@ llm_graph_params llama_context::graph_params(
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
         /*.moe_bridge  =*/ llama_moe_bridge_active(moe_bridge) ? moe_bridge : nullptr, // [TAG_MOE_BRIDGE]
+        /*.moe_bridge_sync =*/ llama_moe_bridge_sync(moe_bridge) ? moe_bridge : nullptr, // [TAG_FN_R2_BRIDGE_SYNC]
     };
 }
 
