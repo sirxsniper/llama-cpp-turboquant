@@ -8281,6 +8281,110 @@ struct test_moe_hot_chain : public test_case {
     }
 };
 
+// [TAG_FN_TEST_S1] the hot-set chain of build_moe_ffn next to the shared expert: the 6-node pattern of upstream #29184
+// (ggml_cuda_match_shared_expert). Gate and up MUL_MAT_ID over the VRAM slot tensors (the routed ids remapped through the
+// expert -> slot table by GET_ROWS, the last slot all zeros), GLU, then the shared expert's gate and up MUL_MAT and GLU on
+// the same input. CUDA fuses the six nodes into one MMVQ launch when the routed and the shared gate/up have one type and
+// shape: Flash-Next's trunk (routed q4_K, shared q8_0) never matches, its MTP block (all q8_0) and uniform-type quants do.
+// Both outputs (routed and shared) are compared against the CPU. -o MOE_HOT_CHAIN_SHARED
+struct test_moe_hot_chain_shared : public test_case {
+    const ggml_type type_a;     // routed gate/up (the slot tensors)
+    const ggml_type type_s;     // shared gate/up
+    const int64_t   k;
+    const int64_t   m;
+    const int       n_expert;
+    const int       n_hot;
+    const int       n_used;
+    const int       n_tokens;
+    const int       n_resident; // slots the table maps to (-1: all n_hot, 0: the empty start of even slots)
+    ggml_tensor *   routed = nullptr;
+    ggml_tensor *   shared = nullptr;
+
+    std::string vars() override {
+        return VARS_TO_STR9(type_a, type_s, k, m, n_expert, n_hot, n_used, n_tokens, n_resident);
+    }
+
+    std::string op_desc(ggml_tensor *) override { return "MOE_HOT_CHAIN_SHARED"; }
+    bool run_whole_graph() override { return true; }
+    double max_nmse_err() override { return 5e-4; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return { routed, shared }; }
+
+    test_moe_hot_chain_shared(ggml_type type_a = GGML_TYPE_Q8_0, ggml_type type_s = GGML_TYPE_Q8_0, int64_t k = 2560,
+            int64_t m = 640, int n_expert = 512, int n_hot = 84, int n_used = 10, int n_tokens = 1, int n_resident = -1)
+        : type_a(type_a), type_s(type_s), k(k), m(m), n_expert(n_expert), n_hot(n_hot), n_used(n_used),
+          n_tokens(n_tokens), n_resident(n_resident) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n_tokens);
+        ggml_set_name(x, "x");
+        ggml_tensor * x3 = ggml_reshape_3d(ctx, x, k, 1, n_tokens);
+
+        ggml_tensor * gate_slots = ggml_new_tensor_3d(ctx, type_a, k, m, n_hot + 1);
+        ggml_set_name(gate_slots, "gate_slots");
+        ggml_tensor * up_slots = ggml_new_tensor_3d(ctx, type_a, k, m, n_hot + 1);
+        ggml_set_name(up_slots, "up_slots");
+        ggml_tensor * table = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1, n_expert);
+        ggml_set_name(table, "table");
+        // the routed ids arrive as the first n_used of a wider top-k row, like ggml_argsort_top_k's view
+        ggml_tensor * sel_all = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used + 6, n_tokens);
+        ggml_set_name(sel_all, "sel_all");
+        ggml_tensor * sel = ggml_view_2d(ctx, sel_all, n_used, n_tokens, sel_all->nb[1], 0);
+        ggml_tensor * ids_flat = ggml_reshape_1d(ctx, ggml_cont(ctx, sel), n_used*n_tokens);
+        ggml_tensor * slot_ids = ggml_reshape_2d(ctx, ggml_get_rows(ctx, table, ids_flat), n_used, n_tokens);
+
+        ggml_tensor * shared_gate = ggml_new_tensor_2d(ctx, type_s, k, m);
+        ggml_set_name(shared_gate, "shared_gate");
+        ggml_tensor * shared_up = ggml_new_tensor_2d(ctx, type_s, k, m);
+        ggml_set_name(shared_up, "shared_up");
+
+        ggml_tensor * g = ggml_mul_mat_id(ctx, gate_slots, x3, slot_ids);
+        ggml_tensor * u = ggml_mul_mat_id(ctx, up_slots, x3, slot_ids);
+        routed = ggml_swiglu_split(ctx, g, u);
+        ggml_set_name(routed, "routed");
+        shared = ggml_swiglu_split(ctx, ggml_mul_mat(ctx, shared_gate, x), ggml_mul_mat(ctx, shared_up, x));
+        ggml_set_name(shared, "shared");
+        ggml_tensor * out = ggml_add(ctx, routed, ggml_reshape_3d(ctx, shared, m, 1, n_tokens));
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 rng(4321);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            const std::string name = ggml_get_name(t);
+            if (name == "gate_slots" || name == "up_slots") {
+                init_tensor_uniform(t);
+                std::vector<uint8_t> zero(t->nb[2], 0);
+                ggml_backend_tensor_set(t, zero.data(), (size_t) n_hot*t->nb[2], t->nb[2]);
+            } else if (name == "table") {
+                // n_res experts get a slot, all others the zero slot n_hot
+                std::vector<int32_t> perm(n_expert);
+                std::iota(perm.begin(), perm.end(), 0);
+                std::shuffle(perm.begin(), perm.end(), rng);
+                std::vector<int32_t> tbl(n_expert, n_hot);
+                const int n_res = n_resident >= 0 ? std::min(n_resident, n_hot) : n_hot;
+                for (int s = 0; s < n_res; ++s) {
+                    tbl[perm[s]] = s;
+                }
+                ggml_backend_tensor_set(t, tbl.data(), 0, tbl.size()*sizeof(int32_t));
+            } else if (name == "sel_all") {
+                std::vector<int32_t> ids(t->ne[0]*t->ne[1]);
+                for (int64_t r = 0; r < t->ne[1]; ++r) {
+                    std::vector<int32_t> perm(n_expert);
+                    std::iota(perm.begin(), perm.end(), 0);
+                    std::shuffle(perm.begin(), perm.end(), rng);
+                    std::copy(perm.begin(), perm.begin() + t->ne[0], ids.begin() + r*t->ne[0]);
+                }
+                ggml_backend_tensor_set(t, ids.data(), 0, ids.size()*sizeof(int32_t));
+            } else if (name == "shared_gate" || name == "shared_up") {
+                init_tensor_uniform(t);
+            } else if (t->type == GGML_TYPE_F32 && !ggml_is_view_op(t->op)) {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // [TAG_DFL_LEAN] the DFlash2 drafter conv of LLAMA_DFLASH_LEAN=1 (src/models/dflash.cpp build_dflash2_conv_lean), at
 // Qwen3.8-27B's DFlash2 shapes: the coefficients read through a strided 4-D view and repeated, the shifted tap as a left
 // pad of a strided view, and MUL with a strided src0. Every op is shipped; these strided shapes are new on the backends.
@@ -14521,6 +14625,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     test_cases.emplace_back(new test_moe_hot_chain(GGML_TYPE_Q4_K, 2560, 640, 512, 84, 10, 8, 0)); // 2 streams, empty
 
+    // [TAG_FN_TEST_S1] the hot chain next to the shared expert (upstream #29184's fusion, ggml_cuda_match_shared_expert):
+    // q8_0 / q8_0 (fuses: Flash-Next's MTP block, uniform-type quants), q4_K / q4_K (fuses) and q4_K / q8_0 (Flash-Next's
+    // trunk: never fuses); a full, a half-full and an empty slot table (84 even slots at -c 262144); widths 1..3
+    for (const auto & ts : std::vector<std::pair<ggml_type, ggml_type>>{ { GGML_TYPE_Q8_0, GGML_TYPE_Q8_0 },
+                                                                         { GGML_TYPE_Q4_K, GGML_TYPE_Q4_K },
+                                                                         { GGML_TYPE_Q4_K, GGML_TYPE_Q8_0 } }) {
+        for (int t : {1, 2, 3}) {
+            for (int n_res : {-1, 42, 0}) {
+                test_cases.emplace_back(new test_moe_hot_chain_shared(ts.first, ts.second, 2560, 640, 512, 84, 10, t, n_res));
+            }
+        }
+    }
+
     // [TAG_FN_QSA_CHUNK] TURBO_QSA_CHUNK=64: indexer top-k of a 64-query chunk over n_kv cells, the chunks' indices
     // concatenated along the query axis (i32), and the chunk's mask rows cast to f32
     // [TAG_FN_AUTO] 262144 = the fast profile at the owner's -c 262144
@@ -14760,6 +14877,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int kv : { 1, 7, 8, 63, 64, 65 }) {
         for (ggml_type type_K : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q8_0, GGML_TYPE_Q5_1, GGML_TYPE_Q5_0, GGML_TYPE_Q4_1, GGML_TYPE_Q4_0}) {
             test_cases.emplace_back(new test_lightning_indexer(128, 64, kv, 32, 4, 1, type_K));
+        }
+    }
+
+    // [TAG_FN_TEST_S1] the lightning indexer at Qwen3.8-Flash-Next's shapes: 4 heads x 128, one pooled key per 4 cells
+    // (compress ratio 4), so 16384 / 65536 keys at -c 65536 / 262144; keys q8_0 (the indexer cache beside a turbot
+    // attention cache) and f16 (LLAMA_QSA_IDX_TYPE=f16); decode (1), MTP verify (3) and a prefill ubatch (512)
+    for (int kv : { 16384, 65536 }) {
+        for (int bs : { 1, 3, 512 }) {
+            for (ggml_type type_K : { GGML_TYPE_Q8_0, GGML_TYPE_F16 }) {
+                test_cases.emplace_back(new test_lightning_indexer(128, 4, kv, bs, 1, 1, type_K));
+            }
         }
     }
 

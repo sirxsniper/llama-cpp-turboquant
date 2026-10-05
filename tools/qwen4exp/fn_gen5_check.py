@@ -61,7 +61,9 @@ def main():
             return 1
     hot_mib = (a.layers * a.experts * 3 * 2560 * 640 * 34 / 32 / 2**20) / 2
     common = [os.path.join(a.bin, "llama-perplexity.exe"), "-m", model, "-f", fs.CORPUS, "-c", "64", "-b", "128",
-              "--chunks", "4", "-ngl", "99", "--n-cpu-moe", str(a.layers), "-fit", "off", "-fa", "on", "-t", "8"]
+              "--chunks", "4", "-ngl", "99", "--n-cpu-moe", str(a.layers), "-fit", "off", "-fa", "on", "-t", "8",
+              "-lv", "4"]  # [TAG_FN_TEST_S1] the path lines (moe-hot, MoE bridge, moe-dma, prefill-stream, fn-auto) are INFO: since the
+              # upstream sync the default verbosity hides them, and the check would read every enabled path as "NOT ENABLED"
     fatal_re = re.compile(r"CUDA error|illegal memory access|GGML_ASSERT|ggml_abort|outlived")
     ok_all = True
     bands = {}  # [TAG_FN_MERGE] ub -> (KLD, same-top, its SE) of the all-GPU placement against the base
