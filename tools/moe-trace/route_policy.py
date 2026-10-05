@@ -240,7 +240,7 @@ class Geo:
 
 DEF = dict(decay=0.92, every=2, admit=2.0, ratio=1.2, hyst=0.5, up_mib=128.0, up_n=0, up_bw_mib=256.0, seed=0.0,
            count="union", alloc="even", pool=False, value="count", start="empty", lat=0, token_w=0.0, fold="add",
-           prof=None, admit_free=None, seed_norm=0.0)
+           prof=None, admit_free=None, seed_norm=0.0, pace=False)
 
 
 def sim_policy(tr, geo, budget, cfg, state=None, collect_answers=True):
@@ -398,12 +398,17 @@ def sim_policy(tr, geo, budget, cfg, state=None, collect_answers=True):
             swaps.sort(key=lambda x: (-x[0], x[1]))
             bytes_q = 0.0
             n_q = 0
+            budget_q = up_budget
+            if c["pace"]:
+                # [TAG_FN_L3_POLICY_UPLOAD] LLAMA_MOE_HOT_UP_MIB_STEP: at most what the worker moves until the next pass,
+                # minus the queued bytes (hot_adapt_decay's cap)
+                budget_q = min(up_budget, max(0.0, up_bw * c["every"] - sum(q[1] for q in queue)))
             for g, _, pi, k, v in swaps:
                 bk = pool_bytes[pi]
                 if up_n > 0:
                     if n_q >= up_n:
                         break
-                elif bytes_q + bk > up_budget:
+                elif bytes_q + bk > budget_q:
                     break
                 if v >= 0:
                     res[v] = False  # evict first: the slot is busy until the new expert has landed
@@ -455,45 +460,67 @@ def sim_static(tr, geo, n_slots, prof):
     return hit / tot if tot else 0.0, tot - hit
 
 
-def sim_belady(tr, geo, n_slots):
-    """per layer, optimal replacement (furthest next use, instant free uploads): the bound for per-layer slots"""
+def _belady_hits(seq, cap):
+    """optimal replacement with bypass over one access sequence (keys of one cache): a miss is admitted only when its next
+    use comes before the furthest next use among the residents (then that one is evicted). Instant free uploads."""
+    if cap <= 0 or not seq:
+        return 0
+    nxt = [0] * len(seq)
+    last = {}
+    for i in range(len(seq) - 1, -1, -1):
+        nxt[i] = last.get(seq[i], math.inf)
+        last[seq[i]] = i
+    resd, heap, cur = set(), [], {}
+    hits = 0
+    for i, k in enumerate(seq):
+        if k in resd:
+            hits += 1
+        elif len(resd) >= cap:
+            # the resident with the furthest next use (lazy heap: skip stale entries)
+            while heap and not (heap[0][1] in resd and cur.get(heap[0][1]) == -heap[0][0]):
+                heapq.heappop(heap)
+            if nxt[i] >= -heap[0][0]:
+                continue  # bypass: k is needed later than every resident
+            resd.discard(heapq.heappop(heap)[1])
+            resd.add(k)
+        else:
+            resd.add(k)
+        cur[k] = nxt[i]
+        heapq.heappush(heap, (-nxt[i], k))
+    return hits
+
+
+def sim_belady(tr, geo, n_slots, pools=None, pool_slots=None):
+    """optimal replacement with bypass (furthest next use, instant free uploads): the bound for the given slots. pools:
+    lists of layer indices that share one cache of pool_slots[i] slots (the shape-class pools); default one per layer"""
     L, E = geo.L, geo.E
-    seqs = [[] for _ in range(L)]
+    if pools is None:
+        pools = [[li] for li in range(L)]
+        pool_slots = [int(n_slots[li]) for li in range(L)]
+    pool_of = {}
+    for pi, p in enumerate(pools):
+        for li in p:
+            pool_of[li] = pi
+    seqs = [[] for _ in pools]
     for s in tr.steps:
         li = s // E
         for l, k in zip(li.tolist(), s.tolist()):
-            seqs[l].append(k)
+            seqs[pool_of[l]].append(k)
     hit_b = tot_b = 0.0
-    for l in range(L):
-        seq = seqs[l]
-        cap = int(n_slots[l])
-        bl = geo.bytes[l]
+    for pi, p in enumerate(pools):
+        seq = seqs[pi]
+        bl = geo.bytes[p[0]]  # a pool holds one size class
         tot_b += bl * len(seq)
-        if cap <= 0 or not seq:
-            continue
-        nxt = [0] * len(seq)
-        last = {}
-        for i in range(len(seq) - 1, -1, -1):
-            nxt[i] = last.get(seq[i], math.inf)
-            last[seq[i]] = i
-        resd, heap, cur = set(), [], {}
-        hits = 0
-        for i, k in enumerate(seq):
-            if k in resd:
-                hits += 1
-            elif len(resd) >= cap:
-                while heap:
-                    negn, kk = heapq.heappop(heap)
-                    if kk in resd and cur.get(kk) == -negn:
-                        resd.discard(kk)
-                        break
-                resd.add(k)
-            else:
-                resd.add(k)
-            cur[k] = nxt[i]
-            heapq.heappush(heap, (-nxt[i], k))
-        hit_b += hits * bl
+        hit_b += _belady_hits(seq, int(pool_slots[pi])) * bl
     return hit_b / tot_b if tot_b else 0.0, tot_b - hit_b
+
+
+def pool_layout(geo, n_slots):
+    """the shape-class pools of llama_moe_hot_init (LLAMA_MOE_HOT_POOL=1): k layers x (n + 1) - 1 slots, a class of one
+    keeps its n slots"""
+    pools = geo.classes()
+    slots = [int(n_slots[p].sum()) + (len(p) - 1 if len(p) > 1 and n_slots[p].min() > 0 else 0) for p in pools]
+    return pools, slots
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -529,6 +556,29 @@ def grid_default():
     g["count_mix05"] = {"count": "mix", "token_w": 0.5}
     g["pool"] = {"pool": True}
     g["pool_up256"] = {"pool": True, "up_mib": 256.0}
+    return g
+
+
+def grid_real():
+    """[TAG_FN_L3_POLICY_SIM] the arms for the real-use traces (prompts + answers): the shipped policy, the prompt seed
+    (LLAMA_MOE_HOT_SEED_NODE, raw x seed or LLAMA_MOE_HOT_SEED_NORM), the pools, longer memory with fewer uploads, and
+    the paced worker (LLAMA_MOE_HOT_UP_MIB_STEP)"""
+    g = collections.OrderedDict()
+    g["ship"] = {}
+    for s in (0.01, 0.03, 0.10):
+        g["seed%03d" % round(s * 100)] = {"seed": s}
+    for n in (8.0, 16.0, 32.0, 64.0):
+        g["seednorm%d" % n] = {"seed": 1.0, "seed_norm": n}
+    g["pool"] = {"pool": True}
+    g["pool_seed03"] = {"pool": True, "seed": 0.03}
+    g["pool_seednorm16"] = {"pool": True, "seed": 1.0, "seed_norm": 16.0}
+    for d in (0.95, 0.97, 0.98):
+        g["d%d_r15h10" % round(d * 100)] = {"decay": d, "ratio": 1.5, "hyst": 1.0}
+        g["pool_d%d_r15h10" % round(d * 100)] = {"pool": True, "decay": d, "ratio": 1.5, "hyst": 1.0}
+    g["pool_d95_u256"] = {"pool": True, "decay": 0.95, "up_mib": 256.0}
+    g["strata_tuned"] = {"admit": 2.0, "ratio": 1.0, "hyst": 1.5, "up_n": 192, "up_mib": 1e9}
+    for bw in (32.0, 64.0, 96.0):
+        g["pool_pace%d" % bw] = {"pool": True, "pace": True, "up_bw_mib": bw}
     return g
 
 
@@ -611,10 +661,12 @@ def selftest():
     rs = sim_policy(tr, geo, budget, dict(base, seed=0.03))
     rp = sim_policy(tr, geo, budget, dict(base, pool=True))
     hb, _ = sim_belady(tr, geo, n_even)
+    hbp, _ = sim_belady(tr, geo, n_even, *pool_layout(geo, n_even))
     hs, _ = sim_static(tr, geo, n_even, union_counts(tr))
-    print("selftest: decay %.3f  +seed %.3f (warm %.3f vs %.3f)  pool %.3f  static-oracle %.3f  belady %.3f" %
-          (r0["hit"], rs["hit"], rs["hit_warm64"], r0["hit_warm64"], rp["hit"], hs, hb))
+    print("selftest: decay %.3f  +seed %.3f (warm %.3f vs %.3f)  pool %.3f  static-oracle %.3f  belady %.3f (pooled %.3f)" %
+          (r0["hit"], rs["hit"], rs["hit_warm64"], r0["hit_warm64"], rp["hit"], hs, hb, hbp))
     ok &= 0.3 < r0["hit"] <= hb + 1e-9 and rs["hit"] <= hb + 1e-9 and hs <= hb + 1e-9
+    ok &= rp["hit"] <= hbp + 1e-9 and hb <= hbp + 1e-9  # one pool of 4 x 17 - 1 slots holds what 4 x 16 hold
     ok &= rs["hit_warm64"] > r0["hit_warm64"]  # the seed warms a shifted working set faster
     ok &= r0["up_mib_step"] <= 64.0 + 1e-9  # the worker's rate limit holds
     # the even rule of llama_fn_even_slots: rows = budget / sum(bytes), n = rows - 1
@@ -640,7 +692,7 @@ def main():
     ap.add_argument("--types", default="E:/turbot-gates/flashnext/recipe/types_A.json")
     ap.add_argument("--host-layers", default="0-47")
     ap.add_argument("--budget-mib", default="10300,14300")
-    ap.add_argument("--grid", default="default", help="default | wide | none")
+    ap.add_argument("--grid", default="default", help="default | wide | real | none")
     ap.add_argument("--top", type=int, default=0, help="print only the best N arms per trace and budget (by eff2), plus ship")
     ap.add_argument("--set", action="append", default=[], help="extra arm: name=key:val,key:val")
     ap.add_argument("--no-belady", action="store_true")
@@ -672,13 +724,13 @@ def main():
     any_tr = next(iter(traces.values()))
     geo = Geo(types, any_tr.host, any_tr.n_expert)
     budgets = [float(x) * 2**20 for x in a.budget_mib.split(",") if x]
-    grid = grid_default() if a.grid == "default" else (grid_wide() if a.grid == "wide" else collections.OrderedDict())
+    grid = {"default": grid_default, "wide": grid_wide, "real": grid_real}.get(a.grid, collections.OrderedDict)()
     for s in a.set:
         name, kv = s.split("=", 1)
         d = {}
         for item in kv.split(","):
             k, v = item.split(":", 1)
-            d[k] = v if k in ("count", "alloc", "start", "fold") else (v == "1" if k == "pool" else float(v))
+            d[k] = v if k in ("count", "alloc", "start", "fold") else (v == "1" if k in ("pool", "pace") else float(v))
         grid[name] = d
     summary = {"budgets_mib": [b / 2**20 for b in budgets], "traces": {}, "geo": {"bytes_sum": float(geo.bytes.sum())}}
     counts = {n: union_counts(t) for n, t in traces.items()}
@@ -691,8 +743,11 @@ def main():
             row["static_oracle"] = hs
             if not a.no_belady:
                 row["belady_even"], _ = sim_belady(tr, geo, n_even)
+                pl, ps = pool_layout(geo, n_even)
+                row["belady_pool"], _ = sim_belady(tr, geo, n_even, pl, ps)
             line = "%-10s %6.0f MiB even %d slots: static-oracle %.4f%s" % (
-                name, B / 2**20, n_even[0], hs, (" belady %.4f" % row["belady_even"]) if "belady_even" in row else "")
+                name, B / 2**20, n_even[0], hs, (" belady %.4f (pools %.4f)" % (row["belady_even"], row["belady_pool"]))
+                if "belady_even" in row else "")
             print(line)
             for arm, cfg in grid.items():
                 t0 = time.time()
