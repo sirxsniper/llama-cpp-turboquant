@@ -709,11 +709,13 @@ void hot_adapt_worker(moe_cache * mc) {
             if (mc->stop) {
                 return;
             }
-            // [TAG_FN_L3_VRAM_CBUF] at most 512 MiB per batch, so a long queue (the tail's refill) is published as it
-            // lands; an admission pass (<= LLAMA_MOE_HOT_DECAY_MIB, 128 MiB) stays one batch
+            // [TAG_FN_L3_VRAM_CBUF] with a tail (the lend on): at most 512 MiB per batch, so a long queue (the tail's
+            // refill) is published as it lands; an admission pass (<= LLAMA_MOE_HOT_DECAY_MIB, 128 MiB) stays one batch.
+            // Without a tail the whole queue, as before (cb_buf is set before this thread starts and never changes)
+            const size_t cap = mc->cb_buf ? ((size_t) 512 << 20) : SIZE_MAX;
             size_t take  = 0;
             size_t bytes = 0;
-            while (take < mc->todo.size() && (take == 0 || bytes < ((size_t) 512 << 20))) {
+            while (take < mc->todo.size() && (take == 0 || bytes < cap)) {
                 const layer_state & ls = mc->layers[mc->todo[take].layer_idx];
                 bytes += ls.pub.up_src->nb[2] + ls.pub.gate_src->nb[2] + ls.pub.down_src->nb[2];
                 take++;
@@ -1263,7 +1265,8 @@ size_t hot_round_up(size_t x, size_t g) {
 }
 
 // the group's tensors (layers li0.. of mc->layers) on reserved virtual memory in creation order (the tables, then each
-// layer's up / gate / down), the first tail layer moved up to a granule boundary. The tail is whole layers from the top,
+// layer's up / gate / down), the first tail layer moved up to a granule boundary plus a guard granule (and one more after
+// the end). The tail is whole layers from the top,
 // at least tail_bytes, and leaves one layer or more below it. The base and the tail are mapped apart, so the tail can give
 // its VRAM back alone. Returns the buffer, cleared; nullptr leaves nothing allocated (the tensors may point into a freed
 // buffer then: the caller frees their contexts).
@@ -1295,13 +1298,16 @@ ggml_backend_buffer_t hot_vmm_place(moe_cache * mc, ggml_context * ctx_d, ggml_b
             continue;
         }
         if (t == first_tail) {
-            off = hot_round_up(off, gran);
+            // one granule of guard below the tail (mapped with the base): a kernel that reads a little past the last
+            // base layer's slots never reaches the tail's addresses, which have no memory while the tail is out
+            off = hot_round_up(off, gran) + gran;
             lo  = off;
         }
         place.push_back({ t, off });
         off += tsize(t);
     }
-    const size_t total = hot_round_up(off, gran);
+    // and one past the last tail layer (mapped with the tail), as a cudaMalloc buffer's 2 MiB pages leave room after it
+    const size_t total = hot_round_up(off, gran) + gran;
     if (lo == 0 || lo >= total) {
         return nullptr;
     }
@@ -1574,8 +1580,9 @@ bool llama_moe_hot_init(const llama_model & model, const void * owner, size_t bu
         std::vector<std::vector<int32_t>> hot_ids(layers.size());
         std::vector<int32_t>              n_slots_of(layers.size(), 0);
         size_t used = 0;
-        // [TAG_FN_L3_VRAM_CBUF] the virtual-memory layout pads the tail start and the end to granules
-        const size_t budget_slots = tail_bytes > 0 ? (budget > 3*vmm_gran ? budget - 3*vmm_gran : 0) : budget;
+        // [TAG_FN_L3_VRAM_CBUF] the virtual-memory layout pads the tail start and the end to granules and adds a guard
+        // granule below the tail and after it
+        const size_t budget_slots = tail_bytes > 0 ? (budget > 5*vmm_gran ? budget - 5*vmm_gran : 0) : budget;
         if (even) {
             // [TAG_FN_AUTO] the same slot count in every host layer
             std::vector<size_t> bytes;
