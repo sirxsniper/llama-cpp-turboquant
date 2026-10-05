@@ -499,7 +499,13 @@ void llama_fn_auto_on_load(llama_model & model, llama_model_loader & ml, const s
     // profile sets counts as well as one from the environment
     struct l3_host_hook {
         llama_model & m;
-        ~l3_host_hook() { llama_fn_l3_host_on_load(m); }
+        ~l3_host_hook() {
+            try {
+                llama_fn_l3_host_on_load(m);
+            } catch (...) {
+                // never out of a destructor (it may run while an exception unwinds the load)
+            }
+        }
     } l3_hook { model };
 
     const int n_layer = (int) model.hparams.n_layer();
