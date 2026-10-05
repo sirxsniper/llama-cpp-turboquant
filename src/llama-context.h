@@ -452,6 +452,7 @@ private:
     bool     vram_acc_on   = false;
     size_t   vram_acc_last = 0;
     bool     vram_acc_wide = false; // the last batch was wider than 31 tokens (a prompt)
+    size_t   vram_acc_stack = 0;    // the CUDA stack limit last printed
     uint32_t vram_acc_n    = 0;
     void     vram_account(const char * stage);
 

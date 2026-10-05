@@ -135,6 +135,9 @@ GGML_BACKEND_API size_t                ggml_backend_cuda_vmm_buffer_mapped(ggml_
 GGML_BACKEND_API void   ggml_backend_cuda_pool_stats(ggml_backend_t backend, size_t * reserved, size_t * hwm);
 GGML_BACKEND_API size_t ggml_backend_cuda_pool_trim(ggml_backend_t backend, size_t keep);
 
+// [TAG_FN_L3_VRAM_ACCOUNT] per-thread stack limit, device malloc heap, printf FIFO and resident threads of the device
+GGML_BACKEND_API void   ggml_backend_cuda_limits(ggml_backend_t backend, size_t * stack, size_t * heap, size_t * fifo, size_t * threads);
+
 #ifdef  __cplusplus
 }
 #endif

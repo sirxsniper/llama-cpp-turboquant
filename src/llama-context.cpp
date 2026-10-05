@@ -5762,6 +5762,29 @@ void llama_context::vram_account(const char * stage) {
             llama_moe_hot_cbuf_out() ? " (tail out)" : "");
     vram_acc_last = used;
 
+    // the CUDA context's local memory: the driver sizes it to the largest per-thread stack a launched kernel needed, for
+    // every resident thread of the device, and keeps it (printed when the stack limit changes)
+    for (auto & backend : backends) {
+        ggml_backend_dev_t d = ggml_backend_get_device(backend.get());
+        if (d != dev) {
+            continue;
+        }
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(d);
+        auto * lim = reg ? (void (*)(ggml_backend_t, size_t *, size_t *, size_t *, size_t *)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_limits") : nullptr;
+        if (!lim) {
+            break;
+        }
+        size_t stack = 0, heap = 0, fifo = 0, threads = 0;
+        lim(backend.get(), &stack, &heap, &fifo, &threads);
+        if (stack != vram_acc_stack) {
+            vram_acc_stack = stack;
+            LLAMA_LOG_INFO("vram-account [TAG_FN_L3_VRAM_ACCOUNT] ctx %p %-12s: CUDA stack limit %zu B per thread (local memory up "
+                    "to %.1f MiB for %zu resident threads), malloc heap %.1f MiB, printf FIFO %.1f MiB\n", (const void *) this,
+                    stage, stack, (double) stack*threads/MiB, threads, heap/MiB, fifo/MiB);
+        }
+        break;
+    }
+
     // the model's tensors on this device by kind, once per process
     static std::atomic<bool> model_done{false};
     if (model_done.exchange(true)) {

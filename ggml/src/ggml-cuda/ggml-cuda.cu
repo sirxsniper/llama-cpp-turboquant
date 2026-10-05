@@ -5965,6 +5965,27 @@ size_t ggml_backend_cuda_pool_trim(ggml_backend_t backend, size_t keep) {
     return freed;
 }
 
+// [TAG_FN_L3_VRAM_ACCOUNT] the context's per-thread stack limit (the driver grows the local memory to it for every
+// resident thread and keeps it), the device-side malloc heap and the printf FIFO, and the resident threads of the device
+void ggml_backend_cuda_limits(ggml_backend_t backend, size_t * stack, size_t * heap, size_t * fifo, size_t * threads) {
+    size_t s = 0, h = 0, f = 0, t = 0;
+    if (ggml_backend_is_cuda(backend)) {
+        const int device = ((ggml_backend_cuda_context *) backend->context)->device;
+        ggml_cuda_set_device(device);
+        CUDA_CHECK(cudaDeviceGetLimit(&s, cudaLimitStackSize));
+        CUDA_CHECK(cudaDeviceGetLimit(&h, cudaLimitMallocHeapSize));
+        CUDA_CHECK(cudaDeviceGetLimit(&f, cudaLimitPrintfFifoSize));
+        int n_sm = 0, n_thr = 0;
+        CUDA_CHECK(cudaDeviceGetAttribute(&n_sm,  cudaDevAttrMultiProcessorCount, device));
+        CUDA_CHECK(cudaDeviceGetAttribute(&n_thr, cudaDevAttrMaxThreadsPerMultiProcessor, device));
+        t = (size_t) n_sm * (size_t) n_thr;
+    }
+    if (stack)   { *stack   = s; }
+    if (heap)    { *heap    = h; }
+    if (fifo)    { *fifo    = f; }
+    if (threads) { *threads = t; }
+}
+
 int ggml_backend_cuda_get_device_count() {
     return ggml_cuda_info().device_count;
 }
@@ -6999,6 +7020,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_pool_trim") == 0) {
         return (void *)ggml_backend_cuda_pool_trim;
+    }
+    if (strcmp(name, "ggml_backend_cuda_limits") == 0) { // [TAG_FN_L3_VRAM_ACCOUNT]
+        return (void *)ggml_backend_cuda_limits;
     }
     return nullptr;
 }
