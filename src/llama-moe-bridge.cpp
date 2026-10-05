@@ -28,6 +28,19 @@
 #    include <immintrin.h>
 #endif
 
+#if defined(_WIN32)
+#    ifndef WIN32_LEAN_AND_MEAN
+#        define WIN32_LEAN_AND_MEAN
+#    endif
+#    ifndef NOMINMAX
+#        define NOMINMAX
+#    endif
+#    include <windows.h>
+#    include <psapi.h>
+#else
+#    include <sys/resource.h>
+#endif
+
 namespace {
 
 using pool_params_default_t = ggml_cpu_moe_pool_params (*)(int);
@@ -40,6 +53,7 @@ using pool_pf_t             = ggml_status (*)(ggml_cpu_moe_pool *, const ggml_cp
 using pool_pf_stop_t        = void (*)(ggml_cpu_moe_pool *);
 using pool_pf_stats_t       = void (*)(ggml_cpu_moe_pool *, uint64_t *, uint64_t *, uint64_t *, uint64_t *);
 using pool_set_solo_t       = void (*)(ggml_cpu_moe_pool *, bool);
+using pool_get_stats_t      = void (*)(ggml_cpu_moe_pool *, ggml_cpu_moe_pool_stats *, bool); // [TAG_FN_L3_CPU_STATS]
 
 inline void br_relax() {
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
@@ -55,6 +69,20 @@ int env_int(const char * name, int def) {
 }
 
 std::atomic<bool> g_bridge_owned{false};
+
+// [TAG_FN_L3_CPU_STATS] page faults of this process so far (soft and hard)
+uint64_t br_page_faults() {
+#if defined(_WIN32)
+    PROCESS_MEMORY_COUNTERS pmc;
+    memset(&pmc, 0, sizeof(pmc));
+    pmc.cb = sizeof(pmc);
+    return GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc)) ? (uint64_t) pmc.PageFaultCount : 0;
+#else
+    struct rusage ru;
+    memset(&ru, 0, sizeof(ru));
+    return getrusage(RUSAGE_SELF, &ru) == 0 ? (uint64_t) ru.ru_minflt + (uint64_t) ru.ru_majflt : 0;
+#endif
+}
 
 } // namespace
 
@@ -96,6 +124,25 @@ struct llama_moe_bridge {
     pool_set_solo_t                       pool_set_solo = nullptr;
     std::vector<int>                      pf_next;   // per channel: the channel of layer il + 1, or -1
     std::vector<std::vector<ggml_fp16_t>> pf_router; // per channel: its router rows in f16 ([n_expert][n_embd]) if predicted
+
+    // lever round 3, qwen4exp only ([TAG_FN_L3_CPU_*])
+    bool                                pool_stats   = false; // LLAMA_MOE_POOL_STATS
+    int                                 pool_split   = 0;     // LLAMA_MOE_POOL_SPLIT
+    int                                 pool_swpf    = 0;     // LLAMA_MOE_POOL_SWPF
+    bool                                pf_rank      = false; // LLAMA_MOE_BRIDGE_PF_RANK
+    int                                 exec_cpu     = -1;    // [TAG_FN_L3_CPU_PLACE] LLAMA_MOE_POOL_EXEC_CPU
+    bool                                fill_gap     = false; // [TAG_FN_L3_CPU_FILL] LLAMA_MOE_DMA_FILL_GAP (with the DMA share)
+    uint64_t                            fill_mask    = 0;     // [TAG_FN_L3_CPU_FILL] LLAMA_MOE_DMA_FILL_CPUS
+    int                                 hint_k       = 0;     // [TAG_FN_L3_CPU_DEVPRED] LLAMA_MOE_BRIDGE_PF_DEV: ids per token
+    int                                 hint_wait_us = 50;
+    ggml_backend_moe_bridge_read_hint_t fn_read_hint = nullptr;
+    pool_get_stats_t                    pool_get_stats = nullptr;
+    std::atomic<uint64_t>               disp_ns{0};        // [TAG_FN_L3_CPU_STATS] executor: job taken -> pool run
+    std::atomic<uint64_t>               n_disp{0};
+    std::atomic<uint64_t>               n_hint_ok{0};
+    std::atomic<uint64_t>               n_hint_miss{0};
+    uint64_t                            st_faults = 0;     // owner thread: page faults and jobs at the last stats line
+    uint64_t                            st_jobs   = 0;
 
     ggml_moe_bridge * gb  = nullptr;
     int32_t           bid = -1;
@@ -173,6 +220,7 @@ struct llama_moe_bridge {
 // the job on the CPU MoE pool: runs on the executor thread (spin) or the driver's callback thread (hostfunc)
 static bool br_run(const ggml_moe_bridge_job * j, void * ud) {
     auto * br = (llama_moe_bridge *) ud;
+    const auto t_take = std::chrono::steady_clock::now();
     if (j->chan < 0 || j->chan >= (int) br->chans.size() || j->n_embd != br->n_embd) {
         return false;
     }
@@ -267,8 +315,19 @@ static bool br_run(const ggml_moe_bridge_job * j, void * ud) {
     }
 
     const auto t0 = std::chrono::steady_clock::now();
+    if (br->pool_stats) { // [TAG_FN_L3_CPU_STATS] observer + plan, the work before the pool starts
+        br->disp_ns.fetch_add((uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(t0 - t_take).count(), std::memory_order_relaxed);
+        br->n_disp.fetch_add(1, std::memory_order_relaxed);
+    }
     const ggml_cpu_moe_job job = { layer, j->n_tokens, j->n_used, j->x, j->ids, j->w, j->out };
+    const bool hold = br->fill_gap && br->dma_on; // [TAG_FN_L3_CPU_FILL] the ring fills wait while the pool reads DRAM
+    if (hold) {
+        llama_moe_dma_bridge_hold(true);
+    }
     const bool ok = br->pool_run(br->pool, &job) == GGML_STATUS_SUCCESS;
+    if (hold) {
+        llama_moe_dma_bridge_hold(false);
+    }
     const uint64_t ns = (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
     if (br->stats) {
         br->job_ns.fetch_add(ns, std::memory_order_relaxed);
@@ -317,7 +376,7 @@ static void br_prefetch_next(llama_moe_bridge * br, ggml_cpu_moe_pool * pool, co
         return;
     }
     const int nc = br->pf_next[j.chan];
-    if (nc < 0 || br->pf_router[nc].empty()) {
+    if (nc < 0 || (br->hint_k <= 0 && br->pf_router[nc].empty())) {
         return;
     }
     {
@@ -329,7 +388,38 @@ static void br_prefetch_next(llama_moe_bridge * br, ggml_cpu_moe_pool * pool, co
     auto & cn = br->chans[nc];
     // the table the next job takes: the hot set's when its layer has one (br_run sets it up at the layer's first job)
     const ggml_cpu_moe_layer * lay = cn.tbl_ok ? &cn.layer_tbl : &cn.layer;
-    const ggml_cpu_moe_prefetch_job pj = { lay, br->pf_router[nc].data(), j.n_tokens, j.x, br->pf_k, br->pf_mode };
+    if (br->hint_k > 0) {
+        // [TAG_FN_L3_CPU_DEVPRED] the device's top-k of the next router, written right after this job's post; a job
+        // that took less time than the hint kernel waits for it a little
+        if (!(j.flags & GGML_MOE_BRIDGE_JOB_HINT)) {
+            return;
+        }
+        int32_t ids[GGML_MOE_BRIDGE_MAX_HINT_K*16];
+        int k = 0;
+        int t = 0;
+        bool ok = br->fn_read_hint(br->gb, j.chan, j.seq, ids, (int) (sizeof(ids)/sizeof(ids[0])), &k, &t);
+        if (!ok && br->hint_wait_us > 0) {
+            const auto t0 = std::chrono::steady_clock::now();
+            while (!ok && std::chrono::steady_clock::now() - t0 < std::chrono::microseconds(br->hint_wait_us)) {
+                br_relax();
+                ok = br->fn_read_hint(br->gb, j.chan, j.seq, ids, (int) (sizeof(ids)/sizeof(ids[0])), &k, &t);
+            }
+        }
+        if (!ok || t != j.n_tokens) {
+            br->n_hint_miss.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        br->n_hint_ok.fetch_add(1, std::memory_order_relaxed);
+        ggml_cpu_moe_prefetch_job pj = {};
+        pj.layer    = lay;
+        pj.n_tokens = t;
+        pj.k        = k;
+        pj.mode     = br->pf_mode;
+        pj.list     = ids;
+        br->pool_pf(pool, &pj);
+        return;
+    }
+    const ggml_cpu_moe_prefetch_job pj = { lay, br->pf_router[nc].data(), j.n_tokens, j.x, br->pf_k, br->pf_mode, nullptr };
     br->pool_pf(pool, &pj);
 }
 
@@ -594,10 +684,54 @@ llama_moe_bridge * llama_moe_bridge_create(const llama_model & model, int n_thre
     br->stall_ms    = std::max(0, env_int("LLAMA_MOE_BRIDGE_TEST_STALL", 0));
     br->stall_every = std::max(0, env_int("LLAMA_MOE_BRIDGE_TEST_STALL_EVERY", 0));
 
+    // lever round 3, CPU side [TAG_FN_L3_CPU_*]: qwen4exp only
+    {
+        const char * sp = getenv("LLAMA_MOE_POOL_SPLIT");
+        int split = 0;
+        if (sp && sp[0]) {
+            split = strcmp(sp, "steal") == 0 ? 2 : strcmp(sp, "stable") == 0 ? 1 : strcmp(sp, "range") == 0 ? 0 : atoi(sp);
+        }
+        split = std::min(2, std::max(0, split));
+        const bool stats = env_int("LLAMA_MOE_POOL_STATS", 0) > 0;
+        const int  swpf  = std::min(64, std::max(0, env_int("LLAMA_MOE_POOL_SWPF", 0)));
+        const bool rank  = env_int("LLAMA_MOE_BRIDGE_PF_RANK", 0) > 0;
+        const bool dev   = env_int("LLAMA_MOE_BRIDGE_PF_DEV", 0) > 0;
+        const int  exec  = env_int("LLAMA_MOE_POOL_EXEC_CPU", -1);
+        const bool fgap  = env_int("LLAMA_MOE_DMA_FILL_GAP", 0) > 0;
+        const char * fm  = getenv("LLAMA_MOE_DMA_FILL_CPUS");
+        if (model.arch == LLM_ARCH_QWEN4EXP) {
+            br->pool_split = split;
+            br->pool_swpf  = swpf;
+            br->pool_stats = stats;
+            br->pf_rank    = rank;
+            br->hint_k     = dev ? 1 : 0; // the count is set with the prefetch below
+            br->exec_cpu   = exec >= 0 && exec < GGML_MAX_N_THREADS ? exec : -1;
+            br->fill_gap   = fgap;
+            br->fill_mask  = fm && fm[0] ? strtoull(fm, nullptr, 16) : 0;
+        } else if (split != 0 || swpf != 0 || stats || rank || dev || exec >= 0 || fgap || (fm && fm[0])) {
+            LLAMA_LOG_WARN("%s: LLAMA_MOE_POOL_SPLIT / _SWPF / _STATS / _EXEC_CPU, LLAMA_MOE_BRIDGE_PF_RANK / _PF_DEV and "
+                    "LLAMA_MOE_DMA_FILL_GAP / _CPUS act on qwen4exp only: ignored\n", __func__);
+        }
+        br->hint_wait_us = std::min(1000, std::max(0, env_int("LLAMA_MOE_BRIDGE_PF_DEV_WAIT_US", 50)));
+    }
+
     const int n_pool = std::max(1, env_int("LLAMA_MOE_BRIDGE_THREADS", n_threads > 0 ? n_threads : 1));
     br->pool_params = br->pool_params_default(std::min(n_pool, GGML_MAX_N_THREADS));
     br->pool_params.prio    = std::min(3, std::max(0, env_int("LLAMA_MOE_BRIDGE_PRIO", GGML_SCHED_PRIO_HIGH)));
     br->pool_params.spin_us = br->spin_us;
+    br->pool_params.split   = br->pool_split; // [TAG_FN_L3_CPU_SPLIT]
+    br->pool_params.swpf    = br->pool_swpf;  // [TAG_FN_L3_CPU_SWPF]
+    br->pool_params.stats   = br->pool_stats; // [TAG_FN_L3_CPU_STATS]
+    br->pool_params.pf_rank = br->pf_rank;    // [TAG_FN_L3_CPU_PFRANK]
+    br->pool_params.caller_cpu1 = br->exec_cpu + 1; // [TAG_FN_L3_CPU_PLACE] 0: the first CPU of the list, as before
+    if (br->pool_stats) {
+        br->pool_get_stats = (pool_get_stats_t) ggml_backend_reg_get_proc_address(cpu_reg, "ggml_cpu_moe_pool_get_stats");
+        if (br->pool_get_stats == nullptr) {
+            LLAMA_LOG_WARN("%s: LLAMA_MOE_POOL_STATS: the CPU backend has no pool statistics\n", __func__);
+            br->pool_stats = false;
+            br->pool_params.stats = false;
+        }
+    }
     // default: one thread per physical core except the first, where the ggml threadpool pins the main thread (it spins
     // in the device synchronize while the step runs; a pool thread there would share its core)
     br->pool_params.skip_first_core = true;
@@ -638,6 +772,17 @@ llama_moe_bridge * llama_moe_bridge_create(const llama_model & model, int n_thre
         }
     }
     bp.max_fetch = br->max_fetch;
+    // [TAG_FN_L3_CPU_DEVPRED] hints need the next-layer prefetch (spin mode) and a device side that reads them back
+    if (br->hint_k > 0) {
+        br->fn_read_hint = (ggml_backend_moe_bridge_read_hint_t) proc("ggml_backend_moe_bridge_read_hint");
+        if (env_int("LLAMA_MOE_BRIDGE_PF", 0) <= 0 || br->mode != GGML_MOE_BRIDGE_WAIT_SPIN || br->fn_read_hint == nullptr) {
+            LLAMA_LOG_WARN("%s: LLAMA_MOE_BRIDGE_PF_DEV needs LLAMA_MOE_BRIDGE_PF=1, spin waits and device hints: off\n", __func__);
+            br->hint_k = 0;
+        } else {
+            br->hint_k = std::min(GGML_MOE_BRIDGE_MAX_HINT_K, std::max(1, std::min(64, env_int("LLAMA_MOE_BRIDGE_PF_K", 12))));
+        }
+    }
+    bp.hint_k = br->hint_k;
     br->gb = br->fn_new(&bp);
     if (br->gb == nullptr) {
         return give_up("the device could not create the bridge");
@@ -678,7 +823,7 @@ llama_moe_bridge * llama_moe_bridge_create(const llama_model & model, int n_thre
                     r->ne[3] != 1 || !ggml_is_contiguous(r)) {
                     continue;
                 }
-                if (br->pf_router[nc].empty()) {
+                if (br->pf_router[nc].empty() && br->hint_k <= 0) { // [TAG_FN_L3_CPU_DEVPRED] no host router with hints
                     const ggml_type_traits * tt = ggml_get_type_traits(r->type);
                     if (r->type != GGML_TYPE_F32 && (tt == nullptr || tt->to_float == nullptr)) {
                         continue;
@@ -703,7 +848,17 @@ llama_moe_bridge * llama_moe_bridge_create(const llama_model & model, int n_thre
                     "(top-%d per token, the cold ones pulled into the CPU caches between two jobs by %s%s), router copies "
                     "%.1f MiB\n", __func__, n_pf, br->chans.size(), br->pf_k, br->pf_mode == 0 ? "real loads" : "software prefetches",
                     br->pf_solo ? "; solo: the workers compute, the executor dispatches" : "", n_bytes/1048576.0);
+            if (br->pool_split > 0 || br->pf_rank || br->hint_k > 0) {
+                LLAMA_LOG_INFO("%s: [TAG_FN_L3_CPU] pool split %s, prefetch order %s, prediction %s\n", __func__,
+                        br->pool_split == 2 ? "steal" : br->pool_split == 1 ? "stable" : "range",
+                        br->pf_rank || br->hint_k > 0 ? "by rank" : "by expert id",
+                        br->hint_k > 0 ? "on the device (hints)" : "host router");
+            }
         }
+    }
+
+    if (!br->pf_on && br->hint_k > 0) {
+        br->hint_k = 0; // [TAG_FN_L3_CPU_DEVPRED] the graphs then build no hint (the device areas stay unused)
     }
 
     if (br->mode == GGML_MOE_BRIDGE_WAIT_HOSTFUNC) {
@@ -726,6 +881,14 @@ llama_moe_bridge * llama_moe_bridge_create(const llama_model & model, int n_thre
             "taken), spin %d us, up to %d pool threads, prio %d\n", __func__, br->bid, ggml_backend_dev_name(dev), br->chans.size(),
             n_skipped, br->max_t, br->mode == GGML_MOE_BRIDGE_WAIT_SPIN ? "spin" : "hostfunc", br->timeout_ms, br->job_max_ms,
             br->spin_us, br->pool_params.n_threads, br->pool_params.prio);
+    if (br->pool_stats) {
+        br->st_faults = br_page_faults();
+        LLAMA_LOG_INFO("%s: [TAG_FN_L3_CPU_STATS] pool statistics every 256 bridged graphs\n", __func__);
+    }
+    if (br->exec_cpu >= 0) {
+        LLAMA_LOG_INFO("%s: [TAG_FN_L3_CPU_PLACE] the executor runs on CPU %d, the pool's workers on the rest of its list\n",
+                __func__, br->exec_cpu);
+    }
     return br;
 }
 
@@ -782,6 +945,9 @@ bool llama_moe_bridge_attach_dma(llama_moe_bridge * br, const void * owner) {
     br->dma_on = true;
     LLAMA_LOG_INFO("%s: MoE bridge %d: DMA share inside the bridged graphs on %d of %zu layers (fetch <= %d experts)\n",
             __func__, br->bid, n, br->chans.size(), max_fetch);
+    if (br->fill_gap || br->fill_mask != 0) {
+        llama_moe_dma_bridge_fill_policy(br->fill_gap, br->fill_mask); // [TAG_FN_L3_CPU_FILL]
+    }
     return br->dma_on;
 }
 
@@ -796,6 +962,11 @@ bool llama_moe_bridge_active(const llama_moe_bridge * br) {
 // [TAG_FN_R2_BRIDGE_SYNC]
 bool llama_moe_bridge_sync(const llama_moe_bridge * br) {
     return br != nullptr && br->sync_on && !llama_moe_bridge_active(br);
+}
+
+// [TAG_FN_L3_CPU_DEVPRED]
+int llama_moe_bridge_hint_k(const llama_moe_bridge * br) {
+    return br != nullptr && br->pf_on ? br->hint_k : 0;
 }
 
 int llama_moe_bridge_max_t(const llama_moe_bridge * br) {
@@ -917,6 +1088,62 @@ bool llama_moe_bridge_end(llama_moe_bridge * br) {
                     "%.2f predicted cold experts and %.2f MiB per prefetch\n", __func__, br->bid, pj, pj ? 100.0*ps/pj : 0.0,
                     pj ? (double) pe/pj : 0.0, pj ? pb/1048576.0/pj : 0.0);
         }
+    }
+    if (br->pool_stats && br->pool && br->n_graphs % 256 == 0) {
+        // [TAG_FN_L3_CPU_STATS] the window since the last line (the pool resets with the read)
+        ggml_cpu_moe_pool_stats ps;
+        br->pool_get_stats(br->pool, &ps, true);
+        const uint64_t nj     = br->n_jobs.load();
+        const uint64_t faults = br_page_faults();
+        const uint64_t dj     = nj > br->st_jobs ? nj - br->st_jobs : 0;
+        const double   f_job  = dj ? (double) (faults - br->st_faults)/dj : 0.0;
+        br->st_faults = faults;
+        br->st_jobs   = nj;
+        const uint64_t nd = br->n_disp.exchange(0);
+        const double   disp_us = nd ? br->disp_ns.exchange(0)/1e3/nd : 0.0;
+        LLAMA_LOG_INFO("%s: MoE bridge %d: [TAG_FN_L3_CPU_STATS] %" PRIu64 " jobs: %.1f us, %.2f MiB = %.1f GB/s, %.2f experts; "
+                "dispatch %.1f us, start lag %.1f us, gate/up %.1f + wait %.1f us (spread %.1f), down %.1f + wait %.1f us "
+                "(spread %.1f), sum %.1f us; taken %.2f pieces, prefetched-and-computed %.2f MiB; %.1f page faults per job\n",
+                __func__, br->bid, ps.jobs, ps.job_us, ps.mib, ps.job_us > 0.0 ? ps.mib*1.048576/ps.job_us*1e3 : 0.0, ps.experts,
+                disp_us, ps.lag_us, ps.p3_us, ps.w3_us, ps.spread3_us, ps.p4_us, ps.w4_us, ps.spread4_us, ps.p5_us, ps.taken,
+                ps.pf_hit_mib, f_job);
+        std::string doms;
+        for (int d = 0; d < ps.n_dom; ++d) {
+            char tmp[96];
+            snprintf(tmp, sizeof(tmp), "%sL3 %d: %d threads x %.1f GB/s", d ? ", " : "", d, ps.dom_threads[d], ps.dom_gbs[d]);
+            doms += tmp;
+        }
+        LLAMA_LOG_INFO("%s: MoE bridge %d: [TAG_FN_L3_CPU_STATS] per domain (busy time) %s; prefetch: %" PRIu64 " posts, window "
+                "%.1f us (host router %.1f us), %.2f MiB and %.2f experts each, %.1f%% stopped (the job waited %.1f us, max %.1f); "
+                "hints %" PRIu64 " read, %" PRIu64 " missing\n",
+                __func__, br->bid, doms.c_str(), ps.pf_jobs, ps.pf_us, ps.pf_router_us, ps.pf_mib, ps.pf_experts,
+                100.0*ps.pf_stopped, ps.pf_stop_us, ps.pf_stop_max_us, br->n_hint_ok.exchange(0), br->n_hint_miss.exchange(0));
+        // the workers by their rate over the window: the slowest gate every barrier
+        std::vector<int> ord;
+        for (int k = 0; k < ps.n_thr; ++k) {
+            if (ps.thr_busy_us[k] > 0.0) {
+                ord.push_back(k);
+            }
+        }
+        std::sort(ord.begin(), ord.end(), [&ps](int a, int b) { return ps.thr_gbs[a] < ps.thr_gbs[b]; });
+        std::string wl;
+        for (size_t i = 0; i < ord.size(); ++i) {
+            if (i >= 4 && i + 2 < ord.size()) {
+                continue; // the 4 slowest and the 2 fastest
+            }
+            char tmp[80];
+            snprintf(tmp, sizeof(tmp), "%scpu %d %.1f GB/s %.0f us", wl.empty() ? "" : ", ", ps.thr_cpu[ord[i]], ps.thr_gbs[ord[i]],
+                    ps.thr_busy_us[ord[i]]);
+            wl += tmp;
+        }
+        uint64_t held_us = 0;
+        uint64_t held_n  = 0;
+        if (br->fill_gap && br->dma_on) {
+            llama_moe_dma_bridge_fill_held(&held_us, &held_n);
+        }
+        LLAMA_LOG_INFO("%s: MoE bridge %d: [TAG_FN_L3_CPU_STATS] workers slowest first: %s; slowest job %.1f us, %" PRIu64 " jobs "
+                "over 1 ms; fills held %" PRIu64 " times, %.1f ms in all\n", __func__, br->bid, wl.c_str(), ps.job_max_us,
+                ps.jobs_slow, held_n, held_us/1e3);
     }
     if (err == GGML_MOE_BRIDGE_ERR_NONE) {
         return true;

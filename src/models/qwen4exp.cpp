@@ -6,6 +6,7 @@
 #include "llama-moe-gen5.h" // [TAG_MOE_PREFETCH]
 #include "llama-ple-dio.h"  // [TAG_FN_PLE_DIRECT_IO]
 #include "llama-ext.h"      // [TAG_FN_SHIP1] llama_model_fn_env
+#include "llama-moe-bridge.h" // [TAG_FN_L3_CPU_DEVPRED]
 
 #include "ggml-alloc.h"   // [TAG_FN_MTP_HEAD_IDS]
 #include "ggml-backend.h"
@@ -1788,6 +1789,17 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
         }
         ggml_build_forward_expand(gf, pr);
         res->t_moe_pred_next[il + 1] = pr;
+    }
+
+    // [TAG_FN_L3_CPU_DEVPRED] a bridged layer whose successor is bridged too hands the host its prediction of the
+    // successor's experts (the next router on this input) after the post; build_moe_ffn takes the router
+    if (moe_bridge && llama_moe_bridge_hint_k(moe_bridge) > 0 && il + 1 < n_layer && model.layers[il + 1].ffn_gate_inp &&
+        model.layers[il + 1].ffn_up_exps) {
+        int32_t hid = -1;
+        int32_t hch = -1;
+        if (llama_moe_bridge_layer(moe_bridge, model.layers[il + 1].ffn_up_exps, &hid, &hch)) {
+            moe_bridge_hint_router = model.layers[il + 1].ffn_gate_inp;
+        }
     }
 
     // [TAG_MOE_BRIDGE] with the host bridge, build_moe_ffn posts the host experts and returns a placeholder; the wait

@@ -166,6 +166,14 @@ struct llama_moe_dma_bridge_step {
 // the owner's thread, after a bridged graph: rates and, with share = auto, the next share
 LLAMA_API void llama_moe_dma_bridge_feedback(const llama_moe_dma_bridge_step & st);
 
+// [TAG_FN_L3_CPU_FILL] the ring fills against the bridge's CPU pool (the bridge sets it, qwen4exp only): gap = a fill
+// pauses between its 256 KiB pieces while a pool job runs (llama_moe_dma_bridge_hold from the executor around each
+// job); cpu_mask != 0 = the fill threads run on these CPUs (bits 0..63)
+LLAMA_API void llama_moe_dma_bridge_fill_policy(bool gap, uint64_t cpu_mask);
+LLAMA_API void llama_moe_dma_bridge_hold(bool hold);
+// the time the fills waited for pool jobs so far: microseconds and pauses
+LLAMA_API void llama_moe_dma_bridge_fill_held(uint64_t * us, uint64_t * n);
+
 // --- [TAG_FN_PREFILL_STREAM] ---
 
 LLAMA_API bool llama_prefill_stream_init_layers(const std::vector<llama_moe_gen5_layer_desc> & layers, const llama_moe_gen5_device & d, const void * owner);

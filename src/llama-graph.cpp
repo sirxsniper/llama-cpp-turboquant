@@ -2277,6 +2277,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     const int64_t n_embd   = cur->ne[0];
     const int64_t n_tokens = cur->ne[1];
     const bool weight_before_ffn = arch == LLM_ARCH_LLAMA4; // for llama4, we apply the sigmoid-ed weights before the FFN
+    ggml_tensor * const hint_router = moe_bridge_hint_router; // [TAG_FN_L3_CPU_DEVPRED] for this call only
+    moe_bridge_hint_router = nullptr;
 
     // [TAG_FN_PREFILL_STREAM] large ubatches read this layer's host experts from a VRAM bank the streamer fills; the gate
     // node waits for the bank before the router runs
@@ -2490,10 +2492,21 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         ggml_tensor * w2 = ggml_is_contiguous(weights) ? weights : ggml_cont(ctx0, weights);
         w2 = ggml_reshape_2d(ctx0, w2, n_expert_used, n_tokens);
         if (moe_bridge) {
-            const int32_t br_flags = (mcache ? GGML_MOE_BRIDGE_JOB_TABLE : 0) | (br_dma ? GGML_MOE_BRIDGE_JOB_DMA : 0);
+            // [TAG_FN_L3_CPU_DEVPRED] the next layer's router on this input, top hint_k per token, right after the post
+            const int hint_k = hint_router ? llama_moe_bridge_hint_k(moe_bridge) : 0;
+            const bool hint  = hint_k > 0 && hint_router->ne[0] == cur->ne[0] && hint_router->ne[1] >= hint_k;
+            const int32_t br_flags = (mcache ? GGML_MOE_BRIDGE_JOB_TABLE : 0) | (br_dma ? GGML_MOE_BRIDGE_JOB_DMA : 0) |
+                                     (hint ? GGML_MOE_BRIDGE_JOB_HINT : 0);
             br_ticket = ggml_moe_host_post(ctx0, cur, selected_experts, w2, br_id, br_chan, br_flags);
             cb(br_ticket, "ffn_moe_bridge_post", il);
             res->n_moe_bridge++;
+            if (hint) {
+                ggml_tensor * lg = build_lora_mm(hint_router, cur); // [n_expert of il + 1, n_tokens]
+                ggml_tensor * pr = ggml_argsort_top_k(ctx0, lg, hint_k);       // [hint_k, n_tokens] by rank
+                ggml_tensor * hn = ggml_moe_host_hint(ctx0, br_ticket, pr, br_id, br_chan);
+                cb(hn, "ffn_moe_bridge_hint", il);
+                ggml_build_forward_expand(gf, hn);
+            }
         } else {
             // the job's table: the hot set's, as the bridge's job takes it (GGML_MOE_BRIDGE_JOB_TABLE); no DMA share
             br_ticket = ggml_moe_host_sum(ctx0, cur, selected_experts, w2, up_exps, gate_exps, down_exps,

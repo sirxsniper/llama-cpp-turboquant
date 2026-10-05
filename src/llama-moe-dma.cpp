@@ -32,6 +32,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cinttypes>
 #include <cmath>
 #include <condition_variable>
@@ -48,6 +49,23 @@
 #include <thread>
 #include <tuple>
 #include <vector>
+
+#if defined(_WIN32)
+#    ifndef WIN32_LEAN_AND_MEAN
+#        define WIN32_LEAN_AND_MEAN
+#    endif
+#    ifndef NOMINMAX
+#        define NOMINMAX
+#    endif
+#    include <windows.h>
+#elif defined(__linux__)
+#    include <pthread.h>
+#    include <sched.h>
+#endif
+
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+#    include <immintrin.h>
+#endif
 
 namespace {
 
@@ -207,6 +225,15 @@ struct dma_state {
     std::deque<fill_job>     fq;
     int                      f_running = 0;
 
+    // [TAG_FN_L3_CPU_FILL] bridge mode, set by the bridge (qwen4exp): fill_gap = the fills pause while a CPU pool job runs
+    // (fill_hold, the bridge's executor); fill_mask != 0 = the fill threads run on these CPUs only
+    std::atomic<bool>              fill_gap{false};
+    alignas(64) std::atomic<int>   fill_hold{0};
+    std::atomic<uint64_t>          fill_mask{0};
+    std::atomic<uint32_t>          fill_mask_gen{0};
+    std::atomic<uint64_t>          fill_held_us{0};  // time the fills waited for a job to end
+    std::atomic<uint64_t>          fill_held_n{0};
+
     bool stop = false;
 
     // decided by plan(L), applied and released by fence(L)
@@ -302,7 +329,50 @@ void dma_wait_issuer_idle(dma_state * s) {
     s->icv_done.wait(lk, [&]() { return s->stop || (s->itasks.empty() && !s->ibusy); });
 }
 
+// [TAG_FN_L3_CPU_FILL] the calling thread on the CPUs of mask (bits 0..63)
+void dma_pin_mask(uint64_t mask) {
+    if (mask == 0) {
+        return;
+    }
+#if defined(_WIN32)
+    SetThreadAffinityMask(GetCurrentThread(), (DWORD_PTR) mask);
+#elif defined(__linux__)
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    for (int c = 0; c < 64; ++c) {
+        if ((mask >> c) & 1) {
+            CPU_SET(c, &set);
+        }
+    }
+    pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
+#endif
+}
+
+// [TAG_FN_L3_CPU_FILL] copy n bytes in 256 KiB pieces, each after the bridge's CPU pool job (if one runs) has ended; a
+// hold that lasts longer than 5 ms is not waited for (a stuck executor never stops the fills)
+void dma_fill_copy_gap(dma_state * s, uint8_t * dst, const uint8_t * src, size_t n) {
+    const size_t piece = 256u << 10;
+    for (size_t o = 0; o < n; o += piece) {
+        if (s->fill_hold.load(std::memory_order_acquire) != 0) {
+            const auto t0 = std::chrono::steady_clock::now();
+            auto t = t0;
+            while (s->fill_hold.load(std::memory_order_acquire) != 0 && t - t0 < std::chrono::milliseconds(5)) {
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+                _mm_pause();
+#else
+                std::this_thread::yield();
+#endif
+                t = std::chrono::steady_clock::now();
+            }
+            s->fill_held_us.fetch_add((uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(t - t0).count(), std::memory_order_relaxed);
+            s->fill_held_n.fetch_add(1, std::memory_order_relaxed);
+        }
+        memcpy(dst + o, src + o, std::min(piece, n - o));
+    }
+}
+
 void dma_filler_run(dma_state * s) {
+    uint32_t mask_gen = 0; // [TAG_FN_L3_CPU_FILL]
     for (;;) {
         fill_job j;
         {
@@ -320,11 +390,20 @@ void dma_filler_run(dma_state * s) {
             }
             s->f_running++;
         }
+        if (const uint32_t mg = s->fill_mask_gen.load(std::memory_order_acquire); mg != mask_gen) { // [TAG_FN_L3_CPU_FILL]
+            mask_gen = mg;
+            dma_pin_mask(s->fill_mask.load(std::memory_order_relaxed));
+        }
+        const bool gap = s->fill_gap.load(std::memory_order_relaxed);
         const dma_layer & L = s->layers[j.pos];
         uint8_t * dst = s->ring.ptr + (size_t) j.slot*s->slot_size;
         size_t o = 0;
         for (int k = 0; k < 3; ++k) {
-            memcpy(dst + o, (const uint8_t *) L.src[k]->data + (size_t) j.expert*L.bytes[k], L.bytes[k]);
+            if (gap) {
+                dma_fill_copy_gap(s, dst + o, (const uint8_t *) L.src[k]->data + (size_t) j.expert*L.bytes[k], L.bytes[k]);
+            } else {
+                memcpy(dst + o, (const uint8_t *) L.src[k]->data + (size_t) j.expert*L.bytes[k], L.bytes[k]);
+            }
             o += L.bytes[k];
         }
         s->rs[j.slot].state.store(RING_READY, std::memory_order_release);
@@ -1311,4 +1390,34 @@ void llama_moe_dma_wait_idle() {
     dma_wait_issuer_idle(s);
     std::unique_lock<std::mutex> lk(s->fmtx);
     s->fcv_idle.wait(lk, [&]() { return s->stop || (s->fq.empty() && s->fq_urgent.empty() && s->f_running == 0); });
+}
+
+// [TAG_FN_L3_CPU_FILL]
+void llama_moe_dma_bridge_fill_policy(bool gap, uint64_t cpu_mask) {
+    dma_state * s = g_dma;
+    if (!s || !s->bridge) {
+        return;
+    }
+    s->fill_gap.store(gap, std::memory_order_relaxed);
+    s->fill_mask.store(cpu_mask, std::memory_order_relaxed);
+    s->fill_mask_gen.fetch_add(1, std::memory_order_release); // each fill thread pins itself at its next fill
+    LLAMA_LOG_INFO("moe-dma: [TAG_FN_L3_CPU_FILL] ring fills %s, fill threads %s (mask 0x%" PRIx64 ")\n",
+            gap ? "pause while a CPU pool job runs" : "run beside the pool jobs", cpu_mask ? "pinned" : "not pinned", cpu_mask);
+}
+
+void llama_moe_dma_bridge_hold(bool hold) {
+    dma_state * s = g_dma;
+    if (s) {
+        s->fill_hold.store(hold ? 1 : 0, std::memory_order_release);
+    }
+}
+
+void llama_moe_dma_bridge_fill_held(uint64_t * us, uint64_t * n) {
+    dma_state * s = g_dma;
+    if (us) {
+        *us = s ? s->fill_held_us.load(std::memory_order_relaxed) : 0;
+    }
+    if (n) {
+        *n = s ? s->fill_held_n.load(std::memory_order_relaxed) : 0;
+    }
 }
