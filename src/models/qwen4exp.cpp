@@ -6,6 +6,7 @@
 #include "llama-moe-gen5.h" // [TAG_MOE_PREFETCH]
 #include "llama-ple-dio.h"  // [TAG_FN_PLE_DIRECT_IO]
 #include "llama-ext.h"      // [TAG_FN_SHIP1] llama_model_fn_env
+#include "llama-moe-bridge.h" // [TAG_FN_L3_CPU_DEVPRED]
 
 #include "ggml-alloc.h"   // [TAG_FN_MTP_HEAD_IDS]
 #include "ggml-backend.h"
@@ -902,6 +903,30 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
     // make sure hc_init is in the same graph split as the first layer (-sm tensor)
     ggml_build_forward_expand(gf, res_hc);
 
+    // [TAG_FN_L3_CPU_DEVPRED] LLAMA_MOE_BRIDGE_PF_DEV=2: the next layer's own FFN mixer (grouped RMSNorm with its gamma,
+    // its stream gates) on this layer's residual is the input of the next layer's router in the prefetch hint. Built
+    // here, the hint puts it into the graph after this layer's post (off the device's critical path). No fused node and
+    // no 1/hc on the stream mean: a positive scale does not change a linear router's top-k.
+    const bool hint_mix = moe_bridge && llama_moe_bridge_hint_mode(moe_bridge) == 2;
+    auto build_hint_mix = [&](ggml_tensor * x, int jl) -> ggml_tensor * {
+        const auto & L = model.layers[jl];
+        if (!L.hc_ffn_norm || !L.hc_ffn_down || !L.hc_ffn_up) {
+            return nullptr;
+        }
+        const int64_t nt = x->ne[2];
+        ggml_tensor * xn = ggml_mul(ctx0, ggml_rms_norm(ctx0, x, hparams.f_norm_rms_eps), L.hc_ffn_norm);
+        xn = ggml_reshape_2d(ctx0, xn, hc * n_embd, nt);
+        ggml_tensor * lo = ggml_silu(ctx0, ggml_scale(ctx0, build_lora_mm(L.hc_ffn_down, xn), 1.0f / (float) hc));
+        ggml_tensor * gated = ggml_mul(ctx0, xn, ggml_sigmoid(ctx0, build_lora_mm(L.hc_ffn_up, lo)));
+        gated = ggml_reshape_3d(ctx0, gated, n_embd, hc, nt);
+        const size_t rs = ggml_row_size(gated->type, n_embd);
+        ggml_tensor * mixed = ggml_cont(ctx0, ggml_view_2d(ctx0, gated, n_embd, nt, rs*hc, 0));
+        for (int64_t c = 1; c < hc; ++c) {
+            mixed = ggml_add(ctx0, mixed, ggml_view_2d(ctx0, gated, n_embd, nt, rs*hc, rs*c));
+        }
+        return mixed;
+    };
+
     for (int il = 0; il < n_layer; ++il) {
         res->t_layer_inp[il] = res_hc;
 
@@ -952,6 +977,9 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
             l3_deferred.push_back(w_ffn);
         }
 
+        if (hint_mix && il + 1 < n_layer) {
+            moe_bridge_hint_input = build_hint_mix(res_hc, il + 1); // [TAG_FN_L3_CPU_DEVPRED] build_moe_ffn takes it
+        }
         cur = build_layer_ffn(cur, il);
         cb(cur, "ffn_out", il);
 
@@ -2057,6 +2085,17 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
         }
         ggml_build_forward_expand(gf, pr);
         res->t_moe_pred_next[il + 1] = pr;
+    }
+
+    // [TAG_FN_L3_CPU_DEVPRED] a bridged layer whose successor is bridged too hands the host its prediction of the
+    // successor's experts (the next router on this input) after the post; build_moe_ffn takes the router
+    if (moe_bridge && llama_moe_bridge_hint_k(moe_bridge) > 0 && il + 1 < n_layer && model.layers[il + 1].ffn_gate_inp &&
+        model.layers[il + 1].ffn_up_exps) {
+        int32_t hid = -1;
+        int32_t hch = -1;
+        if (llama_moe_bridge_layer(moe_bridge, model.layers[il + 1].ffn_up_exps, &hid, &hch)) {
+            moe_bridge_hint_router = model.layers[il + 1].ffn_gate_inp;
+        }
     }
 
     // [TAG_MOE_BRIDGE] with the host bridge, build_moe_ffn posts the host experts and returns a placeholder; the wait

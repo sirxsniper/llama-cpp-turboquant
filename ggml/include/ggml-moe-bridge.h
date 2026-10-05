@@ -36,9 +36,14 @@ enum ggml_moe_bridge_error {
 #define GGML_MOE_BRIDGE_JOB_DMA   2 // [TAG_FN_R4_BRIDGE_DMA] the graph fetches a PCIe share of the job's experts
                                     // (GGML_OP_MOE_HOST_FETCH): the host must publish a plan (job->plan) before it
                                     // computes, and skip the planned experts
+#define GGML_MOE_BRIDGE_JOB_HINT  4 // [TAG_FN_L3_CPU_DEVPRED] a hint (ggml_moe_host_hint) follows the post: the predicted
+                                    // experts of the next layer arrive in the channel's hint area
 
 // [TAG_FN_R4_BRIDGE_DMA] the largest PCIe share of one job, in experts
 #define GGML_MOE_BRIDGE_MAX_FETCH 32
+
+// [TAG_FN_L3_CPU_DEVPRED] the most predicted experts per token a hint carries (ggml_moe_host_hint)
+#define GGML_MOE_BRIDGE_MAX_HINT_K 32
 
 // [TAG_FN_R4_BRIDGE_DMA] the PCIe share of one job, in mapped memory: the host writes it, then publishes it
 // (ggml_backend_moe_bridge_publish_plan); the device fetch reads it, copies the experts from the registered ring into
@@ -64,6 +69,8 @@ struct ggml_moe_bridge_params {
                          // Both are clamped to 1500 ms, below the ~2 s driver watchdog.
     bool    stats;       // keep device wait statistics
     int     max_fetch;   // [TAG_FN_R4_BRIDGE_DMA] experts per job a fetch may copy (0: no fetch, <= GGML_MOE_BRIDGE_MAX_FETCH)
+    int     hint_k;      // [TAG_FN_L3_CPU_DEVPRED] predicted experts per token a hint may carry (0: no hints,
+                         // <= GGML_MOE_BRIDGE_MAX_HINT_K)
 };
 
 // one posted job; the pointers stay valid until it is completed
@@ -147,6 +154,13 @@ typedef const volatile int32_t * (*ggml_backend_moe_bridge_next_post_word_t)(str
 // "ggml_backend_moe_bridge_test_seed": test hook, spin mode, no graph running and no job owed: the ring counter restarts
 //                                      at g (nonzero), so a test crosses the 2^32 wrap of the ring stamps in a few posts
 typedef bool     (*ggml_backend_moe_bridge_test_seed_t)(struct ggml_moe_bridge * bridge, uint32_t g);
+
+// [TAG_FN_L3_CPU_DEVPRED]
+// "ggml_backend_moe_bridge_read_hint": the predicted ids the graph wrote after the post of job seq of chan
+//                                      (ggml_moe_host_hint): ids [n_tokens][k] by rank; false if that job's hint is not
+//                                      (or no longer) there, or does not fit max_ids. Host memory only, no CUDA call.
+typedef bool     (*ggml_backend_moe_bridge_read_hint_t)(const struct ggml_moe_bridge * bridge, int32_t chan, uint32_t seq,
+                                                        int32_t * ids, int max_ids, int * k, int * n_tokens);
 
 #ifdef __cplusplus
 }

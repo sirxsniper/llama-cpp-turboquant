@@ -17575,6 +17575,317 @@ static bool run_cpu_fn_moe_fuse(ggml_backend_t backend, ggml_backend_t backend_r
     return n_fail == 0;
 }
 
+// [TAG_FN_L3_CPU_SPLIT] [TAG_FN_L3_CPU_PFRANK] [TAG_FN_L3_CPU_DEVPRED] [TAG_FN_L3_CPU_STATS] the CPU MoE pool's lever-round-3
+// modes against today's pool (split RANGE, no statistics) and the unfused reference, bit for bit: the stable split and
+// the stealing split, on 2 .. 7 threads, with and without solo, with statistics, after a host-router prefetch (in
+// expert order or by rank) and after a given list (finished, so every piece is prefetched by its own worker: the
+// prefetched-and-computed bytes must equal the job's bytes in the stable split; and stopped), T = 1..16, with and without
+// the skip table, a layer with fewer pieces per expert than threads, and many jobs of alternating widths (the claim
+// words of the stealing split across epochs and buffer growth).
+static bool run_cpu_fn_moe_pool_l3(ggml_backend_t backend, ggml_backend_t backend_ref, const char * op_names_filter) {
+    if (!backend_is_cpu(backend) || (!op_names_filter_selects(op_names_filter, "MUL_MAT_ID") &&
+                                    !op_names_filter_selects(op_names_filter, "MOE_HOST_SUM") &&
+                                    !op_names_filter_selects(op_names_filter, "MOE_POOL"))) {
+        return true;
+    }
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+    using pp_def_t      = ggml_cpu_moe_pool_params (*)(int);
+    using pool_new_t    = ggml_cpu_moe_pool * (*)(const ggml_cpu_moe_pool_params *);
+    using pool_free_t   = void (*)(ggml_cpu_moe_pool *);
+    using pool_run_t    = ggml_status (*)(ggml_cpu_moe_pool *, const ggml_cpu_moe_job *);
+    using pool_pf_t     = ggml_status (*)(ggml_cpu_moe_pool *, const ggml_cpu_moe_prefetch_job *);
+    using pool_pfst_t   = void (*)(ggml_cpu_moe_pool *, uint64_t *, uint64_t *, uint64_t *, uint64_t *);
+    using pool_solo_t   = void (*)(ggml_cpu_moe_pool *, bool);
+    using pool_stats_t  = void (*)(ggml_cpu_moe_pool *, ggml_cpu_moe_pool_stats *, bool);
+    auto pp_def     = (pp_def_t)     ggml_backend_reg_get_proc_address(reg, "ggml_cpu_moe_pool_params_default");
+    auto pool_new   = (pool_new_t)   ggml_backend_reg_get_proc_address(reg, "ggml_cpu_moe_pool_new");
+    auto pool_free  = (pool_free_t)  ggml_backend_reg_get_proc_address(reg, "ggml_cpu_moe_pool_free");
+    auto pool_run   = (pool_run_t)   ggml_backend_reg_get_proc_address(reg, "ggml_cpu_moe_run");
+    auto pool_pf    = (pool_pf_t)    ggml_backend_reg_get_proc_address(reg, "ggml_cpu_moe_prefetch");
+    auto pool_pfst  = (pool_pfst_t)  ggml_backend_reg_get_proc_address(reg, "ggml_cpu_moe_prefetch_stats");
+    auto pool_solo  = (pool_solo_t)  ggml_backend_reg_get_proc_address(reg, "ggml_cpu_moe_pool_set_solo");
+    auto pool_stats = (pool_stats_t) ggml_backend_reg_get_proc_address(reg, "ggml_cpu_moe_pool_get_stats");
+    if (!pp_def || !pool_new || !pool_free || !pool_run || !pool_pf || !pool_pfst || !pool_solo || !pool_stats) {
+        printf("  FAIL moe pool l3: the CPU backend lacks a pool function\n");
+        return false;
+    }
+
+    const cpu_fn_moe_case cases[] = {
+        { GGML_TYPE_Q4_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_1, 512, 128, 16, 4 }, // UD-Q4_K_XL
+        { GGML_TYPE_Q4_K, GGML_TYPE_Q4_K, GGML_TYPE_Q8_0, 512, 128, 16, 4 },
+        { GGML_TYPE_Q5_K, GGML_TYPE_Q5_K, GGML_TYPE_Q5_1, 256,  64, 12, 3 }, // 2 gate / up and 4 down pieces per expert
+    };
+
+    std::default_random_engine gen(1234);
+    std::uniform_real_distribution<float> uni(-1.0f, 1.0f);
+    auto nhalf = [](ggml_type t) { return t == GGML_TYPE_Q8_0 || t == GGML_TYPE_IQ4_NL ? 1 : 2; };
+
+    int n_run  = 0;
+    int n_fail = 0;
+    auto same = [](const std::vector<float> & a, const std::vector<float> & b) -> size_t {
+        size_t nd = a.size() == b.size() ? 0 : a.size() + 1;
+        for (size_t i = 0; i < a.size() && i < b.size(); i++) {
+            nd += memcmp(&a[i], &b[i], sizeof(float)) != 0;
+        }
+        return nd;
+    };
+
+    for (const cpu_fn_moe_case & c : cases) {
+        const std::vector<uint8_t> wu = cpu_fn_raw_blocks(c.tu, (size_t) (c.n_embd / ggml_blck_size(c.tu)) * c.n_ff * c.n_exp, nhalf(c.tu), gen);
+        const std::vector<uint8_t> wg = cpu_fn_raw_blocks(c.tg, (size_t) (c.n_embd / ggml_blck_size(c.tg)) * c.n_ff * c.n_exp, nhalf(c.tg), gen);
+        const std::vector<uint8_t> wd = cpu_fn_raw_blocks(c.td, (size_t) (c.n_ff / ggml_blck_size(c.td)) * c.n_embd * c.n_exp, nhalf(c.td), gen);
+
+        ggml_init_params params = { ggml_tensor_overhead()*4, NULL, true };
+        ggml_context_ptr ctx(ggml_init(params));
+        ggml_tensor * a_u = ggml_new_tensor_3d(ctx.get(), c.tu, c.n_embd, c.n_ff, c.n_exp);
+        ggml_tensor * a_g = ggml_new_tensor_3d(ctx.get(), c.tg, c.n_embd, c.n_ff, c.n_exp);
+        ggml_tensor * a_d = ggml_new_tensor_3d(ctx.get(), c.td, c.n_ff, c.n_embd, c.n_exp);
+        a_u->data = (void *) wu.data();
+        a_g->data = (void *) wg.data();
+        a_d->data = (void *) wd.data();
+
+        std::vector<int32_t> tbl(c.n_exp);
+        for (int e = 0; e < c.n_exp; e++) {
+            tbl[e] = e % 3 == 1 ? e / 3 : c.n_exp;
+        }
+        std::vector<ggml_fp16_t> router((size_t) c.n_exp * c.n_embd);
+        for (ggml_fp16_t & v : router) {
+            v = ggml_fp32_to_fp16(uni(gen));
+        }
+
+        // today's pool: the reference of every mode below
+        ggml_cpu_moe_pool_params p0 = pp_def(4);
+        p0.spin_us = 50;
+        ggml_cpu_moe_pool * pool0 = pool_new(&p0);
+
+        for (int64_t T : {1, 2, 3, 4, 5, 8, 16}) {
+            std::vector<float> x((size_t) c.n_embd * T);
+            for (float & v : x) {
+                v = uni(gen);
+            }
+            std::vector<int32_t> ids;
+            std::vector<int32_t> experts(c.n_exp);
+            for (int i = 0; i < c.n_exp; i++) {
+                experts[i] = i;
+            }
+            for (int64_t t = 0; t < T; t++) {
+                std::shuffle(experts.begin(), experts.end(), gen);
+                ids.insert(ids.end(), experts.begin(), experts.begin() + c.n_used);
+            }
+            std::vector<float> w((size_t) c.n_used * T);
+            for (float & v : w) {
+                v = 0.5f + 0.5f * uni(gen);
+            }
+            // a given prediction [T][k]: each token's own experts first (a perfect predictor), then two random ones
+            const int kp = c.n_used + 2;
+            std::vector<int32_t> pred((size_t) kp * T);
+            for (int64_t t = 0; t < T; t++) {
+                for (int i = 0; i < c.n_used; i++) {
+                    pred[t * kp + i] = ids[t * c.n_used + i];
+                }
+                pred[t * kp + c.n_used]     = (int32_t) (gen() % c.n_exp);
+                pred[t * kp + c.n_used + 1] = (int32_t) (gen() % c.n_exp);
+            }
+
+            for (int with_tbl = 0; with_tbl < 2; with_tbl++) {
+                const std::vector<int32_t> * tp = with_tbl ? &tbl : nullptr;
+                const std::vector<float> ref = cpu_fn_moe_graph(backend_ref, c, T, wu, wg, wd, x, ids, tp, c.n_exp);
+                ggml_cpu_moe_layer layer = { a_u, a_g, a_d, with_tbl ? tbl.data() : nullptr, c.n_exp };
+
+                std::vector<float> out0((size_t) c.n_embd * T, 12345.0f);
+                ggml_cpu_moe_job job0 = { &layer, (int32_t) T, c.n_used, x.data(), ids.data(), w.data(), out0.data() };
+                const bool ran0 = pool0 && pool_run(pool0, &job0) == GGML_STATUS_SUCCESS;
+                std::vector<float> outp0(ref.size(), 12345.0f);
+                job0.w   = nullptr;
+                job0.out = outp0.data();
+                const bool ranp0 = pool0 && pool_run(pool0, &job0) == GGML_STATUS_SUCCESS;
+                n_run++;
+                if (!ran0 || !ranp0 || ref.empty() || same(outp0, ref) != 0) {
+                    printf("  FAIL moe pool l3 %s/%s/%s T=%" PRId64 " table=%d: today's pool did not reproduce the reference\n",
+                           ggml_type_name(c.tu), ggml_type_name(c.tg), ggml_type_name(c.td), T, with_tbl);
+                    n_fail++;
+                    continue;
+                }
+
+                for (int split : {0, 1, 2}) { // range only with the software prefetch (else it is pool0)
+                    for (int nt : {2, 4, 7}) {
+                        for (int solo = 0; solo < 2; solo++) {
+                            const int variant = (int) (T + with_tbl + split + nt + solo) % 2; // alternate stats / rank / swpf
+                            ggml_cpu_moe_pool_params pp = pp_def(nt);
+                            pp.spin_us = 50;
+                            pp.split   = split;
+                            pp.stats   = variant == 0;
+                            pp.pf_rank = variant == 1;
+                            pp.swpf    = split == 0 || variant == 1 ? 2 : 0; // [TAG_FN_L3_CPU_SWPF]
+                            pp.pf_streams = 1 + 3 * (int) ((T + nt) % 2);       // [TAG_FN_L3_CPU_PFSTREAMS]
+                            ggml_cpu_moe_pool * pool = pool_new(&pp);
+                            if (pool == nullptr) {
+                                printf("  FAIL moe pool l3: no pool (split %d, %d threads)\n", split, nt);
+                                n_fail++;
+                                continue;
+                            }
+                            if (solo) {
+                                pool_solo(pool, true);
+                            }
+                            const char * tag = split == 2 ? "steal" : split == 1 ? "stable" : "range+swpf";
+                            auto check = [&](const std::vector<float> & got, const std::vector<float> & want, const char * what) {
+                                n_run++;
+                                const size_t nd = same(got, want);
+                                if (nd != 0) {
+                                    printf("  FAIL moe pool l3 %s %s/%s/%s T=%" PRId64 " table=%d threads=%d solo=%d %s: %zu values differ\n",
+                                           tag, ggml_type_name(c.tu), ggml_type_name(c.tg), ggml_type_name(c.td), T, with_tbl, nt, solo, what, nd);
+                                    n_fail++;
+                                }
+                            };
+
+                            // plain jobs: weighted and graph layout
+                            std::vector<float> o1(out0.size(), 12345.0f);
+                            ggml_cpu_moe_job job = { &layer, (int32_t) T, c.n_used, x.data(), ids.data(), w.data(), o1.data() };
+                            pool_run(pool, &job);
+                            check(o1, out0, "weighted");
+                            std::vector<float> o2(ref.size(), 12345.0f);
+                            job.w   = nullptr;
+                            job.out = o2.data();
+                            pool_run(pool, &job);
+                            check(o2, ref, "graph layout");
+                            job.w = w.data();
+
+                            // after a host-router prefetch that runs to its end, and after one the job stops
+                            if (nt >= 2) {
+                                const ggml_cpu_moe_prefetch_job pr = { &layer, router.data(), (int32_t) T, x.data(), 4, (int32_t) (T % 2), nullptr };
+                                std::vector<float> o3(out0.size(), 12345.0f);
+                                job.out = o3.data();
+                                pool_pf(pool, &pr);
+                                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                                pool_run(pool, &job);
+                                check(o3, out0, "after a router prefetch");
+                                std::vector<float> o4(out0.size(), 12345.0f);
+                                job.out = o4.data();
+                                pool_pf(pool, &pr);
+                                pool_run(pool, &job);
+                                check(o4, out0, "after a stopped router prefetch");
+
+                                // a given list (the device's hint): finished, then stopped
+                                ggml_cpu_moe_pool_stats st0;
+                                ggml_cpu_moe_prefetch_job pg = {};
+                                pg.layer    = &layer;
+                                pg.n_tokens = (int32_t) T;
+                                pg.k        = kp;
+                                pg.mode     = 0;
+                                pg.list     = pred.data();
+                                std::vector<float> o5(out0.size(), 12345.0f);
+                                job.out = o5.data();
+                                pool_pf(pool, &pg);
+                                pool_stats(pool, nullptr, true); // the post summed the last job: a new window from here
+                                std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                                pool_run(pool, &job);
+                                check(o5, out0, "after a given list");
+                                // the pool sums a job's records when the next job (or prefetch) starts: one more job
+                                std::vector<float> o5b(out0.size(), 12345.0f);
+                                job.out = o5b.data();
+                                pool_run(pool, &job);
+                                check(o5b, out0, "after a given list, the next job");
+                                pool_stats(pool, &st0, true);
+                                if (pp.stats && split >= 1 && !(solo && nt == 2)) { // one compute thread: the job splits by range
+                                    n_run++;
+                                    // stable + solo: every piece the job computes was pulled by its own worker. Without solo the
+                                    // caller (compute thread 0) takes no part in a prefetch, so its pieces are never prefetched;
+                                    // stealing moves pieces to other threads
+                                    const bool hit_ok = split == 2 || !solo ? st0.pf_hit_mib <= st0.mib + 1e-9 && st0.pf_hit_mib > 0.0 :
+                                                                              std::fabs(st0.pf_hit_mib - st0.mib) < 1e-9;
+                                    // [TAG_FN_L3_CPU_STATS] the list holds every routed expert: recall 1, precision <= 1
+                                    const bool pred_ok = st0.pred_jobs == 1 && std::fabs(st0.pf_recall - 1.0) < 1e-9 &&
+                                                         st0.pf_precision > 0.0 && st0.pf_precision <= 1.0 + 1e-9;
+                                    if (st0.jobs != 1 || st0.mib <= 0.0 || st0.pf_jobs != 1 || !hit_ok || !pred_ok || st0.job_us <= 0.0) {
+                                        printf("  FAIL moe pool l3 %s T=%" PRId64 " table=%d threads=%d solo=%d: statistics jobs %" PRIu64 ", %.4f MiB, "
+                                               "prefetched-and-computed %.4f MiB, %" PRIu64 " prefetches, job %.1f us, prediction %" PRIu64 " jobs "
+                                               "precision %.3f recall %.3f\n", tag, T, with_tbl, nt, solo, st0.jobs, st0.mib, st0.pf_hit_mib,
+                                               st0.pf_jobs, st0.job_us, st0.pred_jobs, st0.pf_precision, st0.pf_recall);
+                                        n_fail++;
+                                    }
+                                }
+                                std::vector<float> o6(out0.size(), 12345.0f);
+                                job.out = o6.data();
+                                pool_pf(pool, &pg);
+                                pool_run(pool, &job);
+                                check(o6, out0, "after a stopped given list");
+
+                                // many jobs of alternating widths (stealing: epochs and claim buffer growth)
+                                for (int r = 0; r < 6; r++) {
+                                    const int64_t Tr = r % 2 ? 1 : T;
+                                    std::vector<float> o7((size_t) c.n_embd * Tr, 12345.0f);
+                                    ggml_cpu_moe_job jr = { &layer, (int32_t) Tr, c.n_used, x.data(), ids.data(), w.data(), o7.data() };
+                                    pool_run(pool, &jr);
+                                    if (Tr == T) {
+                                        check(o7, out0, "repeated");
+                                    }
+                                }
+                            }
+                            uint64_t pj = 0;
+                            pool_pfst(pool, &pj, nullptr, nullptr, nullptr);
+                            n_run++;
+                            if (pj != 4) {
+                                printf("  FAIL moe pool l3 %s T=%" PRId64 ": %" PRIu64 " prefetches counted, 4 posted\n", tag, T, pj);
+                                n_fail++;
+                            }
+                            pool_free(pool);
+                        }
+                    }
+                }
+
+                // [TAG_FN_L3_CPU_PLACE] worker 0 on a chosen CPU (CPU 1) and out of the workers' list, with the stealing split
+                // and statistics: the values stay today's pool's. On a thread of its own, since the pin stays with the thread.
+                if (T == 3 && with_tbl == 1) {
+                    std::vector<float> o8(out0.size(), 12345.0f);
+                    ggml_cpu_moe_pool_stats st8;
+                    memset(&st8, 0, sizeof(st8));
+                    bool made = false;
+                    std::thread th([&]() {
+                        ggml_cpu_moe_pool_params pp = pp_def(3);
+                        pp.spin_us     = 50;
+                        pp.split       = 2;
+                        pp.stats       = true;
+                        pp.pin_caller  = true;
+                        pp.caller_cpu1 = 1 + 1;
+                        ggml_cpu_moe_pool * pool = pool_new(&pp);
+                        if (pool == nullptr) {
+                            return;
+                        }
+                        made = true;
+                        ggml_cpu_moe_job job = { &layer, (int32_t) T, c.n_used, x.data(), ids.data(), w.data(), o8.data() };
+                        pool_run(pool, &job);
+                        pool_run(pool, &job); // the pool sums a job's records when the next job starts
+                        pool_stats(pool, &st8, true);
+                        pool_free(pool);
+                    });
+                    th.join();
+                    n_run++;
+                    const size_t nd = same(o8, out0);
+                    bool   st_ok   = st8.n_thr == 3 && st8.thr_cpu[0] == 1 && st8.thr_cpu[1] != 1 && st8.thr_cpu[2] != 1 && st8.jobs == 1;
+                    double sum_gbs = 0.0;
+                    for (int k = 0; k < st8.n_thr && k < 3; k++) {
+                        st_ok    = st_ok && st8.thr_busy_us[k] > 0.0 && std::isfinite(st8.thr_gbs[k]) && st8.thr_gbs[k] >= 0.0;
+                        sum_gbs += st8.thr_gbs[k];
+                    }
+                    st_ok = st_ok && sum_gbs > 0.0 && st8.job_max_us > 0.0;
+                    if (!made || nd != 0 || !st_ok) {
+                        printf("  FAIL moe pool l3 placement %s/%s/%s T=%" PRId64 ": made %d, %zu values differ, statistics: %d threads, "
+                               "cpus %d %d %d, %" PRIu64 " jobs, %.1f GB/s summed\n", ggml_type_name(c.tu), ggml_type_name(c.tg),
+                               ggml_type_name(c.td), T, (int) made, nd, st8.n_thr, st8.thr_cpu[0], st8.thr_cpu[1], st8.thr_cpu[2],
+                               st8.jobs, sum_gbs);
+                        n_fail++;
+                    }
+                }
+            }
+        }
+        pool_free(pool0);
+    }
+
+    printf("  CPU MoE pool, stable / stealing split, ranked and given prefetch lists, statistics, vs today's pool: %d cases run, %d failed\n",
+           n_run, n_fail);
+    return n_fail == 0;
+}
+
 // [TAG_MOE_BRIDGE] GGML_OP_MOE_HOST_POST / GGML_OP_MOE_HOST_WAIT on a device backend that provides the MoE host bridge
 // (ggml-moe-bridge.h; CUDA). x / ids / w are posted from device tensors (ids a strided view, as the argsort top-k is),
 // a host job computes the weighted sum on the CPU MoE pool, and the wait returns it. Compared with the unfused CPU chain
@@ -18129,6 +18440,290 @@ static bool run_moe_bridge(ggml_backend_t backend, ggml_backend_t backend_ref, c
     }
 
     printf("  MoE host bridge (post / wait) vs the CPU MUL_MAT_ID chain: %d cases run, %d failed\n", n_run, n_fail);
+    return n_fail == 0;
+}
+
+// [TAG_FN_L3_CPU_DEVPRED] the hint of a bridged post (ggml_moe_host_hint): a bridge made with hint_k gets, after each post,
+// the graph's predicted ids [k, T] (a strided view, as the argsort top-k is) in the channel's hint area under the post's
+// ticket; ggml_backend_moe_bridge_read_hint returns exactly them for that job and nothing for another job, the post's
+// result is unchanged (the bridge's weighted sum, checked against the CPU chain), a bridge without hints does not take
+// the node, and a skipped post (sticky error) leaves no hint. Spin waits, T = 1..8, 3 runs per graph.
+static bool run_moe_bridge_hint(ggml_backend_t backend, ggml_backend_t backend_ref, const char * op_names_filter) {
+    if (backend_is_cpu(backend) || (!op_names_filter_selects(op_names_filter, "MOE_HOST_POST") &&
+                                    !op_names_filter_selects(op_names_filter, "MOE_HOST_HINT"))) {
+        return true;
+    }
+    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    auto br_new      = (ggml_backend_moe_bridge_new_t)       ggml_backend_reg_get_proc_address(reg, "ggml_backend_moe_bridge_new");
+    auto br_free     = (ggml_backend_moe_bridge_free_t)      ggml_backend_reg_get_proc_address(reg, "ggml_backend_moe_bridge_free");
+    auto br_id       = (ggml_backend_moe_bridge_id_t)        ggml_backend_reg_get_proc_address(reg, "ggml_backend_moe_bridge_id");
+    auto br_poll     = (ggml_backend_moe_bridge_poll_t)      ggml_backend_reg_get_proc_address(reg, "ggml_backend_moe_bridge_poll");
+    auto br_complete = (ggml_backend_moe_bridge_complete_t)  ggml_backend_reg_get_proc_address(reg, "ggml_backend_moe_bridge_complete");
+    auto br_error    = (ggml_backend_moe_bridge_error_t)     ggml_backend_reg_get_proc_address(reg, "ggml_backend_moe_bridge_error");
+    auto br_reset    = (ggml_backend_moe_bridge_reset_t)     ggml_backend_reg_get_proc_address(reg, "ggml_backend_moe_bridge_reset");
+    auto br_hint     = (ggml_backend_moe_bridge_read_hint_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_moe_bridge_read_hint");
+    if (!br_new || !br_free || !br_id || !br_poll || !br_complete || !br_error || !br_reset) {
+        return true; // this backend has no host bridge
+    }
+    if (!br_hint) {
+        printf("  FAIL moe bridge hint: the backend has a bridge but no ggml_backend_moe_bridge_read_hint\n");
+        return false;
+    }
+    ggml_backend_reg_t creg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_ref));
+    using pp_def_t    = ggml_cpu_moe_pool_params (*)(int);
+    using pool_new_t  = ggml_cpu_moe_pool * (*)(const ggml_cpu_moe_pool_params *);
+    using pool_free_t = void (*)(ggml_cpu_moe_pool *);
+    using pool_run_t  = ggml_status (*)(ggml_cpu_moe_pool *, const ggml_cpu_moe_job *);
+    auto pp_def    = (pp_def_t)    ggml_backend_reg_get_proc_address(creg, "ggml_cpu_moe_pool_params_default");
+    auto pool_new  = (pool_new_t)  ggml_backend_reg_get_proc_address(creg, "ggml_cpu_moe_pool_new");
+    auto pool_free = (pool_free_t) ggml_backend_reg_get_proc_address(creg, "ggml_cpu_moe_pool_free");
+    auto pool_run  = (pool_run_t)  ggml_backend_reg_get_proc_address(creg, "ggml_cpu_moe_run");
+    if (!pp_def || !pool_new || !pool_free || !pool_run) {
+        printf("  FAIL moe bridge hint: the CPU backend has no MoE pool\n");
+        return false;
+    }
+    int dev_index = -1;
+    for (size_t i = 0; i < ggml_backend_reg_dev_count(reg); i++) {
+        if (ggml_backend_reg_dev_get(reg, i) == dev) {
+            dev_index = (int) i;
+        }
+    }
+
+    const cpu_fn_moe_case c = { GGML_TYPE_Q4_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_1, 512, 128, 16, 4 };
+    const int hint_k = 12;
+    std::default_random_engine gen(777);
+    std::uniform_real_distribution<float> uni(-1.0f, 1.0f);
+    const std::vector<uint8_t> wu = cpu_fn_raw_blocks(c.tu, (size_t) (c.n_embd / ggml_blck_size(c.tu)) * c.n_ff * c.n_exp, 2, gen);
+    const std::vector<uint8_t> wg = cpu_fn_raw_blocks(c.tg, (size_t) (c.n_embd / ggml_blck_size(c.tg)) * c.n_ff * c.n_exp, 2, gen);
+    const std::vector<uint8_t> wd = cpu_fn_raw_blocks(c.td, (size_t) (c.n_ff / ggml_blck_size(c.td)) * c.n_embd * c.n_exp, 2, gen);
+    ggml_init_params wparams = { ggml_tensor_overhead()*4, NULL, true };
+    ggml_context_ptr wctx(ggml_init(wparams));
+    ggml_tensor * a_u = ggml_new_tensor_3d(wctx.get(), c.tu, c.n_embd, c.n_ff, c.n_exp);
+    ggml_tensor * a_g = ggml_new_tensor_3d(wctx.get(), c.tg, c.n_embd, c.n_ff, c.n_exp);
+    ggml_tensor * a_d = ggml_new_tensor_3d(wctx.get(), c.td, c.n_ff, c.n_embd, c.n_exp);
+    a_u->data = (void *) wu.data();
+    a_g->data = (void *) wg.data();
+    a_d->data = (void *) wd.data();
+
+    int n_run  = 0;
+    int n_fail = 0;
+
+    // a bridge without hints must not take a hint node
+    {
+        ggml_moe_bridge_params bp = {};
+        bp.device = dev_index; bp.n_chan = 2; bp.n_embd = c.n_embd; bp.n_used = c.n_used; bp.max_tokens = 8;
+        bp.wait_mode = GGML_MOE_BRIDGE_WAIT_SPIN; bp.timeout_ms = 100; bp.job_max_ms = 1000;
+        ggml_moe_bridge * br0 = dev_index >= 0 ? br_new(&bp) : nullptr;
+        n_run++;
+        if (br0 == nullptr) {
+            printf("  FAIL moe bridge hint: no bridge\n");
+            return false;
+        }
+        ggml_init_params params = { ggml_tensor_overhead()*8, NULL, true };
+        ggml_context_ptr ctx(ggml_init(params));
+        ggml_tensor * x      = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, c.n_embd, 2);
+        ggml_tensor * ids    = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, c.n_used, 2);
+        ggml_tensor * w      = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, c.n_used, 2);
+        ggml_tensor * pred   = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, hint_k, 2);
+        ggml_tensor * ticket = ggml_moe_host_post(ctx.get(), x, ids, w, br_id(br0), 0, 0);
+        ggml_tensor * hn     = ggml_moe_host_hint(ctx.get(), ticket, pred, br_id(br0), 0);
+        if (ggml_backend_supports_op(backend, hn) || ggml_backend_supports_op(backend_ref, hn) || !ggml_backend_supports_op(backend, ticket)) {
+            printf("  FAIL moe bridge hint: a bridge without hints took a hint node (or the post was refused)\n");
+            n_fail++;
+        }
+        br_free(br0);
+    }
+
+    ggml_moe_bridge_params bp = {};
+    bp.device     = dev_index;
+    bp.n_chan     = 2;
+    bp.n_embd     = c.n_embd;
+    bp.n_used     = c.n_used;
+    bp.max_tokens = 8;
+    bp.wait_mode  = GGML_MOE_BRIDGE_WAIT_SPIN;
+    bp.timeout_ms = 100;
+    bp.job_max_ms = 1000;
+    bp.hint_k     = hint_k;
+    ggml_moe_bridge * br = dev_index >= 0 ? br_new(&bp) : nullptr;
+    n_run++;
+    if (br == nullptr) {
+        printf("  FAIL moe bridge hint: the backend could not create a bridge with hints\n");
+        return false;
+    }
+    const int32_t bid = br_id(br);
+
+    moe_bridge_test_runner run;
+    run.pool_run  = pool_run;
+    ggml_cpu_moe_pool_params pp = pp_def(4);
+    pp.spin_us = 50;
+    run.pool      = pool_new(&pp);
+    run.layer     = { a_u, a_g, a_d, nullptr, 0 };
+    run.layer_tbl = run.layer;
+
+    std::atomic<bool>     stop{false};
+    std::atomic<bool>     paused{false};
+    std::atomic<uint32_t> last_seq[2];
+    std::atomic<int32_t>  last_flags[2];
+    last_seq[0] = last_seq[1] = 0;
+    last_flags[0] = last_flags[1] = 0;
+    std::thread exec([&]() {
+        while (!stop.load()) {
+            ggml_moe_bridge_job job;
+            if (!paused.load() && br_poll(br, &job)) {
+                const bool ok = moe_bridge_test_run(&job, &run);
+                last_seq[job.chan & 1]   = job.seq;
+                last_flags[job.chan & 1] = job.flags;
+                br_complete(br, &job, ok);
+            } else {
+                std::this_thread::yield();
+            }
+        }
+    });
+
+    auto run_case = [&](int64_t T, int reps, bool expect_ok) -> bool {
+        const int32_t chan = (int32_t) (T % 2);
+        ggml_init_params params = { ggml_tensor_overhead()*16 + ggml_graph_overhead(), NULL, true };
+        ggml_context_ptr ctx(ggml_init(params));
+        ggml_tensor * x         = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, c.n_embd, T);
+        ggml_tensor * ids       = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, c.n_used, T);
+        ggml_tensor * w         = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, c.n_used, T);
+        ggml_tensor * pred_full = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, hint_k + 3, T);
+        ggml_tensor * pred      = ggml_view_2d(ctx.get(), pred_full, hint_k, T, pred_full->nb[1], 0);
+        ggml_tensor * ticket    = ggml_moe_host_post(ctx.get(), x, ids, w, bid, chan, GGML_MOE_BRIDGE_JOB_HINT);
+        ggml_tensor * hn        = ggml_moe_host_hint(ctx.get(), ticket, pred, bid, chan);
+        ggml_tensor * dep       = ggml_scale(ctx.get(), ggml_sqr(ctx.get(), x), 0.25f);
+        ggml_tensor * out       = ggml_moe_host_wait(ctx.get(), ticket, dep, c.n_embd, T, bid, chan);
+        if (!ggml_backend_supports_op(backend, hn) || ggml_backend_supports_op(backend_ref, hn)) {
+            printf("  FAIL moe bridge hint T=%" PRId64 ": supports_op must hold on the device only\n", T);
+            return false;
+        }
+        ggml_backend_buffer_ptr buf(ggml_backend_alloc_ctx_tensors(ctx.get(), backend));
+        if (buf == nullptr) {
+            return false;
+        }
+        ggml_cgraph * gf = ggml_new_graph(ctx.get());
+        ggml_build_forward_expand(gf, ticket);
+        ggml_build_forward_expand(gf, hn);
+        ggml_build_forward_expand(gf, out);
+
+        bool ok = true;
+        for (int r = 0; r < reps && ok; r++) {
+            std::vector<float> xv((size_t) c.n_embd * T);
+            for (float & v : xv) {
+                v = uni(gen);
+            }
+            std::vector<int32_t> ids_v;
+            std::vector<int32_t> experts(c.n_exp);
+            for (int i = 0; i < c.n_exp; i++) {
+                experts[i] = i;
+            }
+            for (int64_t t = 0; t < T; t++) {
+                std::shuffle(experts.begin(), experts.end(), gen);
+                ids_v.insert(ids_v.end(), experts.begin(), experts.begin() + c.n_used);
+            }
+            std::vector<float> wv((size_t) c.n_used * T);
+            for (float & v : wv) {
+                v = 0.5f + 0.5f * uni(gen);
+            }
+            std::vector<int32_t> pv((size_t) (hint_k + 3) * T, -9);
+            for (int64_t t = 0; t < T; t++) {
+                for (int i = 0; i < hint_k; i++) {
+                    pv[t * (hint_k + 3) + i] = (int32_t) (gen() % c.n_exp);
+                }
+            }
+            ggml_backend_tensor_set(x, xv.data(), 0, xv.size() * sizeof(float));
+            ggml_backend_tensor_set(ids, ids_v.data(), 0, ids_v.size() * sizeof(int32_t));
+            ggml_backend_tensor_set(w, wv.data(), 0, wv.size() * sizeof(float));
+            ggml_backend_tensor_set(pred_full, pv.data(), 0, pv.size() * sizeof(int32_t));
+            if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) {
+                printf("  FAIL moe bridge hint T=%" PRId64 ": graph compute failed\n", T);
+                return false;
+            }
+            ggml_backend_synchronize(backend);
+            std::vector<float> got((size_t) c.n_embd * T);
+            ggml_backend_tensor_get(out, got.data(), 0, got.size() * sizeof(float));
+
+            const uint32_t seq = last_seq[chan].load();
+            int32_t hid[GGML_MOE_BRIDGE_MAX_HINT_K * 8];
+            int hk = 0;
+            int ht = 0;
+            const bool have = br_hint(br, chan, seq, hid, (int) (sizeof(hid)/sizeof(hid[0])), &hk, &ht);
+            if (!expect_ok) {
+                ok = !have;
+                if (!ok) {
+                    printf("  FAIL moe bridge hint T=%" PRId64 ": a skipped post left a hint\n", T);
+                }
+                continue;
+            }
+            bool hint_ok = have && hk == hint_k && ht == (int) T && (last_flags[chan].load() & GGML_MOE_BRIDGE_JOB_HINT);
+            for (int64_t t = 0; hint_ok && t < T; t++) {
+                for (int i = 0; i < hint_k; i++) {
+                    hint_ok = hint_ok && hid[t * hint_k + i] == pv[t * (hint_k + 3) + i];
+                }
+            }
+            int32_t tmp[GGML_MOE_BRIDGE_MAX_HINT_K * 8];
+            int tk = 0;
+            int tt = 0;
+            const bool other = br_hint(br, chan, seq + 1, tmp, (int) (sizeof(tmp)/sizeof(tmp[0])), &tk, &tt) ||
+                               br_hint(br, chan, seq, tmp, hint_k * (int) T - 1, &tk, &tt);
+            const std::vector<float> ref = cpu_fn_moe_graph(backend_ref, c, T, wu, wg, wd, xv, ids_v, nullptr, c.n_exp);
+            std::vector<float> expect((size_t) c.n_embd * T, 0.0f);
+            for (int64_t t = 0; t < T && !ref.empty(); t++) {
+                for (int64_t row = 0; row < c.n_embd; row++) {
+                    float sum = 0.0f;
+                    for (int slot = 0; slot < c.n_used; slot++) {
+                        sum += wv[slot + (size_t) c.n_used * t] * ref[((size_t) t * c.n_used + slot) * c.n_embd + row];
+                    }
+                    expect[(size_t) t * c.n_embd + row] = sum;
+                }
+            }
+            size_t n_diff = ref.empty() ? got.size() : 0;
+            for (size_t i = 0; i < got.size() && !ref.empty(); i++) {
+                n_diff += memcmp(&got[i], &expect[i], sizeof(float)) != 0;
+            }
+            const double err = ref.empty() ? 1.0 : nmse(expect.data(), got.data(), got.size());
+            ok = hint_ok && !other && (n_diff == 0 || err <= 1e-10) && br_error(br) == GGML_MOE_BRIDGE_ERR_NONE;
+            if (!ok) {
+                printf("  FAIL moe bridge hint T=%" PRId64 " run %d: hint read %d (k %d, T %d, ids %s), another job's / a short read %s, "
+                       "%zu values differ (NMSE %g), error %u\n", T, r, (int) have, hk, ht, hint_ok ? "equal" : "DIFFER",
+                       other ? "ACCEPTED" : "refused", n_diff, err, br_error(br));
+            }
+        }
+        return ok;
+    };
+
+    for (int64_t T = 1; T <= 8; T++) {
+        n_run++;
+        n_fail += run_case(T, 3, true) ? 0 : 1;
+    }
+
+    // a post skipped by the sticky error leaves no hint: stall the executor so the wait times out, then run again
+    n_run++;
+    paused = true;
+    run_case(2, 1, false); // times out: the error is set
+    bool skipped_ok = br_error(br) == GGML_MOE_BRIDGE_ERR_TIMEOUT && run_case(3, 1, false); // posted while the error is set
+    paused = false;
+    bool reset_ok = false;
+    for (int k = 0; k < 1000 && !reset_ok; k++) {
+        reset_ok = br_reset(br);
+        if (!reset_ok) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    }
+    skipped_ok = skipped_ok && reset_ok && run_case(4, 2, true);
+    if (!skipped_ok) {
+        printf("  FAIL moe bridge hint: the skipped-post path (error %u, reset %d)\n", br_error(br), (int) reset_ok);
+    }
+    n_fail += skipped_ok ? 0 : 1;
+
+    ggml_backend_synchronize(backend);
+    stop = true;
+    exec.join();
+    br_free(br);
+    pool_free(run.pool);
+
+    printf("  MoE host bridge hints (device-predicted ids after a post): %d cases run, %d failed\n", n_run, n_fail);
     return n_fail == 0;
 }
 
@@ -18750,16 +19345,18 @@ static bool test_backend(ggml_backend_t backend, ggml_backend_dev_t dev, test_mo
         const bool fn_mmid_mr_ok = run_cpu_fn_mmid_mr(backend, backend_cpu.get(), op_names_filter); // [TAG_FN_CPU_MMID_MR]
 
         const bool fn_moe_fuse_ok = run_cpu_fn_moe_fuse(backend, backend_cpu.get(), op_names_filter); // [TAG_FN_CPU_MOE_FUSE]
+        const bool fn_pool_l3_ok = run_cpu_fn_moe_pool_l3(backend, backend_cpu.get(), op_names_filter); // [TAG_FN_L3_CPU_SPLIT]
 
         const bool moe_bridge_ok = run_moe_bridge(backend, backend_cpu.get(), op_names_filter) && // [TAG_MOE_BRIDGE]
-                                   run_moe_bridge_fetch(backend, backend_cpu.get(), op_names_filter); // [TAG_FN_R4_BRIDGE_DMA]
+                                   run_moe_bridge_fetch(backend, backend_cpu.get(), op_names_filter) && // [TAG_FN_R4_BRIDGE_DMA]
+                                   run_moe_bridge_hint(backend, backend_cpu.get(), op_names_filter); // [TAG_FN_L3_CPU_DEVPRED]
 
         const bool split_after_ok = run_sched_split_after(backend, backend_cpu.get(), op_names_filter); // [TAG_FN_L3_HOST_LAUNCH2]
 
         const bool fn_l3_gpu_ok = run_fn_l3_gpu(backend, backend_cpu.get(), op_names_filter); // [TAG_FN_L3_GPU]
 
-        return n_ok == tests_run && slice_ok && q2_0_repack_ok && fn_repack_skip_ok && fn_mmid_mr_ok && fn_moe_fuse_ok && moe_bridge_ok &&
-               split_after_ok && fn_l3_gpu_ok;
+        return n_ok == tests_run && slice_ok && q2_0_repack_ok && fn_repack_skip_ok && fn_mmid_mr_ok && fn_moe_fuse_ok && fn_pool_l3_ok &&
+               moe_bridge_ok && split_after_ok && fn_l3_gpu_ok;
     }
 
     if (mode == MODE_GRAD) {

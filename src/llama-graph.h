@@ -1119,6 +1119,11 @@ struct llm_graph_context {
     mutable int32_t moe_q8in_mark = 0;
     // [TAG_FN_L3_GPU_ZSKIP] a ggml-fn-l3.h mark build_moe_ffn puts on the slot ids of the device expert chains (0 = none)
     mutable int32_t moe_zskip_mark = 0;
+    // [TAG_FN_L3_CPU_DEVPRED] set by an arch before build_moe_ffn, which takes and clears it: the next layer's router,
+    // whose top-k on this layer's input a bridged post hands to the host as that layer's prefetch hint; and, if set, the
+    // router's input instead of this layer's FFN input ([n_embd, n_tokens], put into the graph after the post)
+    mutable ggml_tensor * moe_bridge_hint_router = nullptr;
+    mutable ggml_tensor * moe_bridge_hint_input  = nullptr;
     struct moe_bridge_post {
         ggml_tensor * ticket;
         ggml_tensor * hot;      // the device part, weighted and summed [n_embd, T], or nullptr

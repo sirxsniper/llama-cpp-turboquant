@@ -148,6 +148,10 @@ GGML_BACKEND_API size_t ggml_backend_cuda_pool_trim(ggml_backend_t backend, size
 // [TAG_FN_L3_VRAM_ACCOUNT] per-thread stack limit, device malloc heap, printf FIFO and resident threads of the device
 GGML_BACKEND_API void   ggml_backend_cuda_limits(ggml_backend_t backend, size_t * stack, size_t * heap, size_t * fifo, size_t * threads);
 
+// [TAG_FN_L3_CPU_DEVPRED]
+GGML_BACKEND_API bool     ggml_backend_cuda_moe_bridge_read_hint(const struct ggml_moe_bridge * bridge, int32_t chan, uint32_t seq,
+                                                                 int32_t * ids, int max_ids, int * k, int * n_tokens);
+
 #ifdef  __cplusplus
 }
 #endif

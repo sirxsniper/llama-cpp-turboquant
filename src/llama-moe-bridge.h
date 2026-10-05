@@ -50,6 +50,38 @@
 //                                         the DMA share inside the bridged graphs - the GPU computes its hot experts, then
 //                                         the fetched ones (copied from the pinned ring by SM loads) when they land, the CPU
 //                                         pool the rest; share = auto moves the split by the measured rates
+//
+// Lever round 3, CPU side (qwen4exp only; off by default; every one leaves the values bit for bit as they are):
+//   LLAMA_MOE_POOL_STATS=1                [TAG_FN_L3_CPU_STATS] the pool's job anatomy every 256 bridged graphs: bytes,
+//                                         GB/s, start lag, gate/up and down time per thread, barrier waits and spread,
+//                                         per-L3-domain GB/s, the prefetch's window and bytes, page faults per job, the
+//                                         slowest workers (CPU, GB/s), the slowest job, the wait for a stopped prefetch
+//   LLAMA_MOE_POOL_EXEC_CPU=<cpu>         [TAG_FN_L3_CPU_PLACE] (default: the first core of the pool) the executor's CPU,
+//                                         e.g. 1 = the SMT sibling of core 0 (the main thread): every pool core computes
+//   LLAMA_MOE_POOL_PF_STREAMS=<n>         [TAG_FN_L3_CPU_PFSTREAMS] (default 1; with split stable / steal) each worker pulls
+//                                         n regions of an expert at once, one line of each in turn (more misses in flight)
+//   LLAMA_MOE_DMA_FILL_GAP=1              [TAG_FN_L3_CPU_FILL] (with the DMA share) the ring fills pause while a pool job
+//                                         reads DRAM and run between the jobs (placement noise: the ring-ready set moves)
+//   LLAMA_MOE_DMA_FILL_CPUS=<hex mask>    [TAG_FN_L3_CPU_FILL] the ring fill threads on these CPUs only (e.g. 0xA = 1, 3:
+//                                         the SMT siblings of the main thread's and the executor's cores)
+//   LLAMA_MOE_POOL_SPLIT=range|stable|steal [TAG_FN_L3_CPU_SPLIT] (default range) stable: piece p of expert e goes to
+//                                         worker (h(e) + p) mod n in the job and in the prefetch, and the prefetched
+//                                         experts go first, so each core computes what it pulled; steal: stable, then
+//                                         idle workers take free pieces from the end of the others' lists
+//   LLAMA_MOE_POOL_SWPF=<lines>           [TAG_FN_L3_CPU_SWPF] (default 0) each worker software-prefetches this many cache
+//                                         lines at every 4 KiB page of its next piece before it computes the current one
+//                                         (the hardware stream prefetcher stops at every page of the file mapping)
+//   LLAMA_MOE_BRIDGE_PF_RANK=1            [TAG_FN_L3_CPU_PFRANK] the host-router prefetch pulls by rank (every token's
+//                                         most likely expert first) instead of in expert order, so a stopped prefetch
+//                                         holds the likeliest experts
+//   LLAMA_MOE_BRIDGE_PF_DEV=1|2           [TAG_FN_L3_CPU_DEVPRED] (with LLAMA_MOE_BRIDGE_PF=1) the device predicts: after
+//                                         each post the graph applies the next layer's router to this layer's input
+//                                         (top LLAMA_MOE_BRIDGE_PF_K per token) and writes the ids to the channel; the
+//                                         executor prefetches from them (by rank) with no router on the host and no
+//                                         f16 router copies (-117 MiB RAM); LLAMA_MOE_BRIDGE_PF_DEV_WAIT_US=50 bounds the
+//                                         wait for a hint that is late. 2: the router's input is the next layer's own FFN
+//                                         mixer (hyper-connection norm and gates) applied to this layer's residual, a
+//                                         closer stand-in for that layer's input (a few more small kernels after the post)
 
 #include <cstdint>
 
@@ -65,6 +97,10 @@ void               llama_moe_bridge_free(llama_moe_bridge * br);
 bool               llama_moe_bridge_wanted(const llama_model & model);
 // [TAG_FN_R2_BRIDGE_SYNC] the bridge exists, is paused or off, and LLAMA_MOE_BRIDGE_SYNC is on
 bool               llama_moe_bridge_sync(const llama_moe_bridge * br);
+// [TAG_FN_L3_CPU_DEVPRED] predicted ids per token a graph writes after each post (0: no hints), and the input of the
+// prediction: 1 = this layer's FFN input, 2 = the next layer's FFN mixer on this layer's residual (0: no hints)
+int                llama_moe_bridge_hint_k(const llama_moe_bridge * br);
+int                llama_moe_bridge_hint_mode(const llama_moe_bridge * br);
 
 // [TAG_FN_R4_BRIDGE_DMA] LLAMA_MOE_BRIDGE_DMA=1 (with LLAMA_MOE_DMA_SHARE=<share>|auto): after llama_moe_gen5_init (bridge
 // mode) and before the reserve, register the DMA ring with the device side; the bridged graphs then fetch a share of

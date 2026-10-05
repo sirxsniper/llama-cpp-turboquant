@@ -6840,6 +6840,31 @@ struct ggml_tensor * ggml_moe_host_wait(
     return result;
 }
 
+// [TAG_FN_L3_CPU_DEVPRED]
+struct ggml_tensor * ggml_moe_host_hint(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * ticket,
+        struct ggml_tensor  * ids,
+        int32_t               bridge,
+        int32_t               chan) {
+    GGML_ASSERT(ticket->type == GGML_TYPE_I32 && ggml_nelements(ticket) == 1);
+    GGML_ASSERT(ids->type == GGML_TYPE_I32 && ids->nb[0] == sizeof(int32_t) && ids->ne[2] == 1 && ids->ne[3] == 1);
+    GGML_ASSERT(bridge >= 0 && chan >= 0);
+
+    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+
+    ggml_set_op_params_i32(result, 0, bridge);
+    ggml_set_op_params_i32(result, 1, chan);
+    ggml_set_op_params_i32(result, 2, 0);
+    ggml_set_op_params_i32(result, 3, 1); // a hint, not a job
+
+    result->op     = GGML_OP_MOE_HOST_POST;
+    result->src[0] = ticket;
+    result->src[1] = ids;
+
+    return result;
+}
+
 // [TAG_FN_R4_BRIDGE_DMA]
 struct ggml_tensor * ggml_moe_host_fetch(
         struct ggml_context * ctx,

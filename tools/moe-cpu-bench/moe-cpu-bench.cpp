@@ -18,6 +18,10 @@
 // paired, alternating rounds of the current switches (A) and the same plus NAME=V (B). --pool N also runs the split
 // through the persistent CPU MoE worker pool (ggml_cpu_moe_run, N workers including the caller), as the GPU/CPU
 // doorbell would, and --check then compares it with the graph too.
+// [TAG_FN_L3_CPU_STATS] --pool-split / --pool-solo / --pool-stats / --pool-cpumask / --pool-skip-first run the pool as the
+// bridge does (and print its job anatomy); --pf-window-us W posts a prefetch of the job's experts (--pf-precision of
+// them correct, the rest random) W us before each pool job, as the bridge does during the device's attention;
+// --roofline-only prints the streaming-read roofline of the threads (and of the pool's CPUs) and stops.
 // CPU only: it links ggml-base and ggml-cpu, never a GPU backend.
 
 #include "ggml.h"
@@ -77,6 +81,19 @@ struct bench_params {
     int              max_layers   = 0;   // --gguf: layers per type group (0 = all)
     int              pool_spin_us = 1000;
     std::vector<std::pair<int, int>> ab; // switch, value
+    // [TAG_FN_L3_CPU_STATS]
+    int              pool_split   = 0;
+    int              pool_swpf    = 0;
+    bool             pool_solo    = false;
+    bool             pool_stats   = false;
+    uint64_t         pool_cpumask = 0;      // 0: --cpumask
+    bool             pool_skip_first = false;
+    int              pf_window_us = 0;      // 0: no prefetch before a pool job
+    double           pf_precision = 1.0;
+    int              pf_k         = 0;      // ids per token of the prediction (0: n_used + 2)
+    bool             roofline_only = false;
+    int              pool_exec_cpu = -1;    // [TAG_FN_L3_CPU_PLACE] -1: the caller keeps its affinity
+    int              pf_streams    = 1;     // [TAG_FN_L3_CPU_PFSTREAMS]
 };
 
 // the fp16 scale fields at the start of a block (all of them must hold normal numbers in random blocks)
@@ -157,6 +174,18 @@ void usage(const char * argv0) {
     printf("  --rounds N             rounds for --ab (default 6)\n");
     printf("  --pool N               also run the split on the CPU MoE worker pool with N workers (mask from --cpumask)\n");
     printf("  --pool-spin-us N       pool workers spin this long before sleeping (default 1000)\n");
+    printf("  --pool-split N         0 range, 1 stable, 2 steal (LLAMA_MOE_POOL_SPLIT)\n");
+    printf("  --pool-swpf N          software-prefetch N lines per 4 KiB page of the next piece (LLAMA_MOE_POOL_SWPF)\n");
+    printf("  --pool-solo            the caller only dispatches (LLAMA_MOE_BRIDGE_PF_SOLO)\n");
+    printf("  --pool-stats           print the pool's job anatomy per token count\n");
+    printf("  --pool-cpumask HEX     the pool's CPUs (default: --cpumask)\n");
+    printf("  --pool-skip-first      leave the pool's first CPU free, as the bridge does\n");
+    printf("  --pf-window-us W       before each pool job: post a prefetch of its experts, wait W us\n");
+    printf("  --pf-precision F       share of the job's experts in that prediction (default 1), the rest random\n");
+    printf("  --pf-k K               predicted ids per token (default n_used + 2)\n");
+    printf("  --roofline-only        print the read rooflines and stop\n");
+    printf("  --pool-exec-cpu N      pin the pool's caller (worker 0) to CPU N; the workers take the rest of the mask\n");
+    printf("  --pf-streams N         a split >= 1 prefetch pulls N regions at once (LLAMA_MOE_POOL_PF_STREAMS)\n");
     printf("switches (environment variables, read at start): ");
     for (int i = 0; i < GGML_CPU_FN_SWITCH_COUNT; i++) {
         printf("%s%s", i ? ", " : "", ggml_cpu_fn_switch_env((ggml_cpu_fn_switch) i));
@@ -225,6 +254,30 @@ bench_params parse_args(int argc, char ** argv) {
             p.pool_threads = atoi(next());
         } else if (a == "--pool-spin-us") {
             p.pool_spin_us = atoi(next());
+        } else if (a == "--pool-split") {
+            p.pool_split = atoi(next());
+        } else if (a == "--pool-swpf") {
+            p.pool_swpf = atoi(next());
+        } else if (a == "--pool-solo") {
+            p.pool_solo = true;
+        } else if (a == "--pool-stats") {
+            p.pool_stats = true;
+        } else if (a == "--pool-cpumask") {
+            p.pool_cpumask = strtoull(next(), nullptr, 16);
+        } else if (a == "--pool-skip-first") {
+            p.pool_skip_first = true;
+        } else if (a == "--pf-window-us") {
+            p.pf_window_us = atoi(next());
+        } else if (a == "--pf-precision") {
+            p.pf_precision = atof(next());
+        } else if (a == "--pf-k") {
+            p.pf_k = atoi(next());
+        } else if (a == "--roofline-only") {
+            p.roofline_only = true;
+        } else if (a == "--pool-exec-cpu") {
+            p.pool_exec_cpu = atoi(next());
+        } else if (a == "--pf-streams") {
+            p.pf_streams = atoi(next());
         } else if (a == "--ab") {
             std::string list = next();
             size_t pos = 0;
@@ -649,10 +702,35 @@ struct split_graphs {
         pool_out.assign((size_t) ws.n_embd * n_used * T, 0.0f);
     }
 
-    // the split on the worker pool; fixed: every expert skipped through the table
-    double run_pool(ggml_cpu_moe_pool * pool, int n_expert, int n_used, bool fixed) {
+    // the split on the worker pool; fixed: every expert skipped through the table. [TAG_FN_L3_CPU_STATS] pf_window_us > 0:
+    // first a prefetch of a prediction of this job's experts (precision: the share of the true ones; the rest random),
+    // then a wait of pf_window_us (the device's attention in the bridge), then the job, timed alone
+    double run_pool(ggml_cpu_moe_pool * pool, int n_expert, int n_used, bool fixed, int pf_window_us = 0, double precision = 1.0,
+                    int pf_k = 0, std::mt19937 * rng = nullptr) {
         ggml_cpu_moe_layer layer = { w_up, w_gate, w_down, fixed ? (const int32_t *) tbl->data : nullptr, n_expert };
         ggml_cpu_moe_job job = { &layer, T, n_used, (const float *) x->data, (const int32_t *) ids->data, nullptr, pool_out.data() };
+        if (pf_window_us > 0 && rng) {
+            const int k = pf_k > 0 ? pf_k : n_used + 2;
+            std::vector<int32_t> pred((size_t) T*k);
+            std::uniform_real_distribution<double> u01(0.0, 1.0);
+            std::uniform_int_distribution<int> pick(0, n_expert - 1);
+            const int32_t * d = (const int32_t *) ids->data;
+            for (int t = 0; t < T; t++) {
+                for (int i = 0; i < k; i++) {
+                    pred[(size_t) t*k + i] = i < n_used && u01(*rng) < precision ? d[t*n_used + i] : pick(*rng);
+                }
+            }
+            ggml_cpu_moe_prefetch_job pj = {};
+            pj.layer    = &layer;
+            pj.n_tokens = T;
+            pj.k        = k;
+            pj.mode     = 0;
+            pj.list     = pred.data();
+            ggml_cpu_moe_prefetch(pool, &pj);
+            const int64_t tw = ggml_time_us();
+            while (ggml_time_us() - tw < pf_window_us) {
+            }
+        }
         const int64_t t0 = ggml_time_us();
         if (ggml_cpu_moe_run(pool, &job) != GGML_STATUS_SUCCESS) {
             fprintf(stderr, "ggml_cpu_moe_run refused the job (types %s/%s/%s)\n", ggml_type_name(w_up->type), ggml_type_name(w_gate->type), ggml_type_name(w_down->type));
@@ -723,7 +801,8 @@ stat_acc measure(run_ctx & rc, split_graphs & sg, const weight_set & ws, which w
         sg.set_layer(ws.layers[layer_rr++ % ws.layers.size()]);
         const int nd = sg.set_random_ids(rng, ws.n_expert, rc.p.n_used);
         const double t = w == which::pool || w == which::pool_fixed
-            ? sg.run_pool(rc.pool, ws.n_expert, rc.p.n_used, w == which::pool_fixed)
+            ? sg.run_pool(rc.pool, ws.n_expert, rc.p.n_used, w == which::pool_fixed, w == which::pool ? rc.p.pf_window_us : 0,
+                          rc.p.pf_precision, rc.p.pf_k, &rng)
             : rc.compute(g);
         double b = 0.0;
         switch (w) {
@@ -859,6 +938,9 @@ void run_set(run_ctx & rc, const weight_set & ws, int & n_bad) {
            expert_bytes(ws.down_t, ws.n_ff, ws.n_embd) / 1024.0);
 
     printf("   read roofline (same threads): %.1f GiB/s\n", read_roofline(rc, ws, 2));
+    if (rc.p.roofline_only) {
+        return;
+    }
 
     std::mt19937 rng(42);
     size_t layer_rr = 0;
@@ -906,11 +988,39 @@ void run_set(run_ctx & rc, const weight_set & ws, int & n_bad) {
         if (rc.pool) {
             // the pool's workers spin: the ggml threadpool (GGML_OPENMP=OFF builds poll after each graph) must sleep
             ggml_threadpool_pause(rc.tp);
+            ggml_cpu_moe_pool_get_stats(rc.pool, nullptr, true);
             const stat_acc s_pool  = measure(rc, sg, ws, which::pool,       rc.p.iters, rc.p.warmup, rng, layer_rr);
+            ggml_cpu_moe_pool_stats pst;
+            ggml_cpu_moe_pool_get_stats(rc.pool, &pst, true);
             const stat_acc s_pfix  = measure(rc, sg, ws, which::pool_fixed, rc.p.iters, rc.p.warmup, rng, layer_rr);
             ggml_threadpool_resume(rc.tp);
             printf("        pool (%d workers): %8.1f us median %8.1f mean %8.1f p90 %8.1f max  %6.1f GiB/s   fixed (all experts skipped): %6.1f us\n",
                    rc.p.pool_threads, s_pool.median(), s_pool.mean(), s_pool.pct(0.9), s_pool.pct(1.0), s_pool.gibs(), s_pfix.median());
+            if (rc.p.pool_stats && pst.jobs > 0) { // [TAG_FN_L3_CPU_STATS] (warm-up jobs included)
+                printf("        pool anatomy: %.1f us, %.2f MiB, %.2f experts; lag %.1f, gate/up %.1f + wait %.1f (spread %.1f), down %.1f + wait %.1f "
+                       "(spread %.1f), sum %.1f us; taken %.2f; prefetched-and-computed %.2f MiB\n", pst.job_us, pst.mib, pst.experts,
+                       pst.lag_us, pst.p3_us, pst.w3_us, pst.spread3_us, pst.p4_us, pst.w4_us, pst.spread4_us, pst.p5_us, pst.taken,
+                       pst.pf_hit_mib);
+                printf("        per L3 domain:");
+                for (int d = 0; d < pst.n_dom; d++) {
+                    printf(" [%d: %d threads x %.1f GB/s busy]", d, pst.dom_threads[d], pst.dom_gbs[d]);
+                }
+                if (pst.pf_jobs > 0) {
+                    printf("; prefetch %.1f us window, %.2f MiB, %.2f experts, %.0f%% stopped (stop wait %.1f us, max %.1f)", pst.pf_us,
+                           pst.pf_mib, pst.pf_experts, 100.0 * pst.pf_stopped, pst.pf_stop_us, pst.pf_stop_max_us);
+                }
+                printf("\n        workers (cpu: GB/s busy us):");
+                for (int k = 0; k < pst.n_thr; k++) {
+                    if (pst.thr_busy_us[k] > 0.0) {
+                        printf(" [%d: %.1f %.0f]", pst.thr_cpu[k], pst.thr_gbs[k], pst.thr_busy_us[k]);
+                    }
+                }
+                printf("; slowest job %.1f us, %" PRIu64 " over 1 ms\n", pst.job_max_us, pst.jobs_slow);
+                if (pst.pred_jobs > 0) {
+                    printf("        prediction over %" PRIu64 " jobs: precision %.2f (first 4: %.2f), recall %.2f\n", pst.pred_jobs,
+                           pst.pf_precision, pst.pf_prec_top4, pst.pf_recall);
+                }
+            }
         }
         if (rc.p.per_op) {
             const stat_acc s_up   = measure(rc, sg, ws, which::up,   rc.p.iters, rc.p.warmup, rng, layer_rr);
@@ -951,16 +1061,32 @@ int main(int argc, char ** argv) {
 
     if (p.pool_threads > 0) {
         ggml_cpu_moe_pool_params pp = ggml_cpu_moe_pool_params_default(p.pool_threads);
+        const uint64_t pmask = p.pool_cpumask ? p.pool_cpumask : p.cpumask;
         for (int i = 0; i < 64 && i < GGML_MAX_N_THREADS; i++) {
-            pp.cpumask[i] = (p.cpumask >> i) & 1;
+            pp.cpumask[i] = (pmask >> i) & 1;
         }
-        pp.prio    = p.prio;
-        pp.spin_us = p.pool_spin_us;
+        pp.prio            = p.prio;
+        pp.spin_us         = p.pool_spin_us;
+        pp.split           = p.pool_split;      // [TAG_FN_L3_CPU_SPLIT]
+        pp.swpf            = p.pool_swpf;       // [TAG_FN_L3_CPU_SWPF]
+        pp.stats           = p.pool_stats;      // [TAG_FN_L3_CPU_STATS]
+        pp.skip_first_core = p.pool_skip_first;
+        pp.pf_streams      = p.pf_streams; // [TAG_FN_L3_CPU_PFSTREAMS]
+        if (p.pool_exec_cpu >= 0) { // [TAG_FN_L3_CPU_PLACE]
+            pp.pin_caller  = true;
+            pp.caller_cpu1 = p.pool_exec_cpu + 1;
+        }
         rc.pool = ggml_cpu_moe_pool_new(&pp);
         if (!rc.pool) {
             fprintf(stderr, "failed to create the CPU MoE pool\n");
             return 1;
         }
+        if (p.pool_solo) {
+            ggml_cpu_moe_pool_set_solo(rc.pool, true);
+        }
+        printf("pool: %d threads, cpumask 0x%" PRIx64 "%s, split %d, swpf %d%s%s, prefetch window %d us (precision %.2f)\n", p.pool_threads,
+               pmask, p.pool_skip_first ? " (first CPU left free)" : "", p.pool_split, p.pool_swpf, p.pool_solo ? ", solo" : "",
+               p.pool_stats ? ", stats" : "", p.pf_window_us, p.pf_precision);
     }
 
     printf("moe-cpu-bench: threads %d, cpumask 0x%" PRIx64 ", strict %d, poll %d, prio %d, pool %d, avx512 %d, avx512_vnni %d, avx512_bf16 %d\n",

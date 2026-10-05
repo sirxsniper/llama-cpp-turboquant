@@ -2113,6 +2113,7 @@ static size_t ggml_fn_moe_thread_bytes(const struct ggml_tensor * up, const stru
     b += GGML_PAD(sizeof(int32_t)*(size_t) (up->ne[2] + 1), 64); // counts / cursors per expert
     b += GGML_PAD(sizeof(int32_t)*(size_t) n_used*n_tokens, 64); // entries (slot + n_used*t), grouped by expert
     b += GGML_PAD(sizeof(int32_t)*3*(size_t) n_used*n_tokens, 64); // active experts: expert, first entry, entries
+    b += GGML_PAD(sizeof(int32_t)*3*(size_t) n_used*n_tokens, 64); // [TAG_FN_L3_CPU_SPLIT] the same in prio order
     return b;
 }
 
@@ -2149,10 +2150,274 @@ static void ggml_fn_moe_dots(ggml_vec_dot_t dot, ggml_vec_dot_mr_t mr, int64_t n
     }
 }
 
+// [TAG_FN_L3_CPU_SPLIT] [TAG_FN_L3_CPU_STATS]
+uint64_t ggml_fn_moe_tick(void) {
+#if defined(_MSC_VER) && !defined(__clang__) && (defined(_M_X64) || defined(_M_IX86))
+    return (uint64_t) __rdtsc();
+#elif (defined(__GNUC__) || defined(__clang__)) && (defined(__x86_64__) || defined(__i386__))
+    return (uint64_t) __builtin_ia32_rdtsc();
+#else
+    return (uint64_t) ggml_time_us();
+#endif
+}
+
+int64_t ggml_fn_moe_np_max(const struct ggml_tensor * up, const struct ggml_tensor * down) {
+    const int64_t pr  = ggml_fn_moe_pr(down);
+    const int64_t np3 = (up->ne[1] + pr - 1)/pr;
+    const int64_t np4 = (up->ne[0] + GGML_FN_MOE_PD - 1)/GGML_FN_MOE_PD;
+    return MAX(np3, np4);
+}
+
+// [TAG_FN_L3_CPU_SPLIT] claim a piece for this job: true if this call moved the word to epoch (no other thread did)
+static inline bool ggml_fn_moe_claim(int32_t * w, int32_t epoch) {
+#if defined(_MSC_VER) && !defined(__clang__)
+    const LONG v = *(volatile LONG *) w;
+    return v != (LONG) epoch && InterlockedCompareExchange((volatile LONG *) w, (LONG) epoch, v) == v;
+#else
+    int32_t v = __atomic_load_n(w, __ATOMIC_RELAXED);
+    return v != epoch && __atomic_compare_exchange_n(w, &v, epoch, false, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED);
+#endif
+}
+
+// what every piece of one thread reads and writes
+struct ggml_fn_moe_ctx {
+    const struct ggml_fn_moe_args * a;
+    const struct ggml_tensor * wu;
+    const struct ggml_tensor * wg;
+    const struct ggml_tensor * wd;
+    int64_t           n_embd;
+    int64_t           n_ff;
+    int               n_used;
+    enum ggml_type    vt_d;
+    size_t            rs_u;
+    size_t            rs_g;
+    size_t            rs_d;
+    size_t            ts_d;
+    int64_t           bk_d;
+    int64_t           pr;        // gate / up rows per piece
+    ggml_vec_dot_t    dot_u;
+    ggml_vec_dot_t    dot_g;
+    ggml_vec_dot_t    dot_d;
+    ggml_vec_dot_mr_t mr_u;
+    ggml_vec_dot_mr_t mr_g;
+    ggml_vec_dot_mr_t mr_d;
+    char *            hq;
+    const char *      qxu;
+    const char *      qxg;
+    const int32_t *   ent;
+    const int32_t *   act;       // [n_act][3]: expert, first entry, entries
+    int               n_act;
+    char *            orow;
+    size_t            o_nb1;
+    size_t            o_nb2;
+    int64_t           claim_run; // split 2: claim words per thread and phase
+};
+
+// gate + up + swiglu + quantized h, rows [pp*pr, pp*pr + nr) of active expert kk for all its entries; returns the weight
+// bytes read
+static size_t ggml_fn_moe_piece_gu(const struct ggml_fn_moe_ctx * c, int kk, int64_t pp) {
+    const int32_t * ak = c->act + 3*kk;
+    const int64_t r0 = pp*c->pr;
+    const int64_t nr = MIN(c->pr, c->n_ff - r0);
+    const char * wu_e = (const char *) c->wu->data + (size_t) ak[0]*c->wu->nb[2] + (size_t) r0*c->wu->nb[1];
+    const char * wg_e = (const char *) c->wg->data + (size_t) ak[0]*c->wg->nb[2] + (size_t) r0*c->wg->nb[1];
+    float gv[GGML_CPU_FN_MR_MAX_NC*256];
+    float uv[GGML_CPU_FN_MR_MAX_NC*256];
+    float hv[256];
+    for (int j = 0; j < ak[2]; j += GGML_CPU_FN_MR_MAX_NC) {
+        const int nc = MIN(GGML_CPU_FN_MR_MAX_NC, ak[2] - j);
+        const void * cu[GGML_CPU_FN_MR_MAX_NC];
+        const void * cg[GGML_CPU_FN_MR_MAX_NC];
+        int32_t sl[GGML_CPU_FN_MR_MAX_NC];
+        for (int q = 0; q < nc; ++q) {
+            sl[q] = c->ent[ak[1] + j + q];
+            const int t = sl[q]/c->n_used;
+            cu[q] = c->qxu + (size_t) t*c->rs_u;
+            cg[q] = c->qxg + (size_t) t*c->rs_g;
+        }
+        ggml_fn_moe_dots(c->dot_g, c->mr_g, c->n_embd, gv, (size_t) c->pr, wg_e, c->wg->nb[1], nr, cg, nc);
+        ggml_fn_moe_dots(c->dot_u, c->mr_u, c->n_embd, uv, (size_t) c->pr, wu_e, c->wu->nb[1], nr, cu, nc);
+        for (int q = 0; q < nc; ++q) {
+            ggml_vec_swiglu_f32((int) nr, hv, gv + q*c->pr, uv + q*c->pr);
+            char * hrow = c->hq + (size_t) sl[q]*c->rs_d; // sl = slot + n_used*t: the row of (slot, t)
+            type_traits_cpu[c->vt_d].from_float(hv, hrow + (size_t) (r0/c->bk_d)*c->ts_d, nr);
+        }
+    }
+    return (size_t) nr*(c->wg->nb[1] + c->wu->nb[1]);
+}
+
+// down, rows [pp*GGML_FN_MOE_PD, + nr) of n_embd for active expert kk; returns the weight bytes read
+static size_t ggml_fn_moe_piece_down(const struct ggml_fn_moe_ctx * c, int kk, int64_t pp) {
+    const int32_t * ak = c->act + 3*kk;
+    const int64_t pd = GGML_FN_MOE_PD;
+    const int64_t r0 = pp*pd;
+    const int64_t nr = MIN(pd, c->n_embd - r0);
+    const char * wd_e = (const char *) c->wd->data + (size_t) ak[0]*c->wd->nb[2] + (size_t) r0*c->wd->nb[1];
+    float dv[GGML_CPU_FN_MR_MAX_NC*GGML_FN_MOE_PD];
+    for (int j = 0; j < ak[2]; j += GGML_CPU_FN_MR_MAX_NC) {
+        const int nc = MIN(GGML_CPU_FN_MR_MAX_NC, ak[2] - j);
+        const void * cd[GGML_CPU_FN_MR_MAX_NC];
+        int32_t sl[GGML_CPU_FN_MR_MAX_NC];
+        for (int q = 0; q < nc; ++q) {
+            sl[q] = c->ent[ak[1] + j + q];
+            cd[q] = c->hq + (size_t) sl[q]*c->rs_d;
+        }
+        ggml_fn_moe_dots(c->dot_d, c->mr_d, c->n_ff, dv, (size_t) pd, wd_e, c->wd->nb[1], nr, cd, nc);
+        for (int q = 0; q < nc; ++q) {
+            const int slot = sl[q] % c->n_used;
+            const int t    = sl[q]/c->n_used;
+            memcpy(c->orow + (size_t) slot*c->o_nb1 + (size_t) t*c->o_nb2 + (size_t) r0*sizeof(float), dv + q*pd, (size_t) nr*sizeof(float));
+        }
+    }
+    return (size_t) nr*c->wd->nb[1];
+}
+
+static inline size_t ggml_fn_moe_piece(const struct ggml_fn_moe_ctx * c, int phase, int kk, int64_t pp) {
+    return phase == 0 ? ggml_fn_moe_piece_gu(c, kk, pp) : ggml_fn_moe_piece_down(c, kk, pp);
+}
+
+// [TAG_FN_L3_CPU_SWPF] software prefetches of `lines` cache lines at the start of the range and at every 4 KiB page in it:
+// the page walks and the first misses of each page start early, where the hardware stream prefetcher stops at a page
+static void ggml_fn_moe_pf_pages(const char * p, size_t len, int lines) {
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+    const char * end = p + len;
+    const char * q   = (const char *) ((uintptr_t) p & ~(uintptr_t) 63);
+    while (q < end) {
+        for (int l = 0; l < lines && q + 64*l < end; ++l) {
+            _mm_prefetch(q + 64*l, _MM_HINT_T0);
+        }
+        q = (const char *) (((uintptr_t) q & ~(uintptr_t) 4095) + 4096);
+    }
+#else
+    GGML_UNUSED(p);
+    GGML_UNUSED(len);
+    GGML_UNUSED(lines);
+#endif
+}
+
+static void ggml_fn_moe_piece_pf(const struct ggml_fn_moe_ctx * c, int phase, int kk, int64_t pp, int lines) {
+    const int32_t e = c->act[3*kk];
+    if (phase == 0) {
+        const int64_t r0 = pp*c->pr;
+        const int64_t nr = MIN(c->pr, c->n_ff - r0);
+        ggml_fn_moe_pf_pages((const char *) c->wg->data + (size_t) e*c->wg->nb[2] + (size_t) r0*c->wg->nb[1], (size_t) nr*c->wg->nb[1], lines);
+        ggml_fn_moe_pf_pages((const char *) c->wu->data + (size_t) e*c->wu->nb[2] + (size_t) r0*c->wu->nb[1], (size_t) nr*c->wu->nb[1], lines);
+    } else {
+        const int64_t r0 = pp*GGML_FN_MOE_PD;
+        const int64_t nr = MIN(GGML_FN_MOE_PD, c->n_embd - r0);
+        ggml_fn_moe_pf_pages((const char *) c->wd->data + (size_t) e*c->wd->nb[2] + (size_t) r0*c->wd->nb[1], (size_t) nr*c->wd->nb[1], lines);
+    }
+}
+
+// [TAG_FN_L3_CPU_SPLIT] the own piece of thread ith after (kk, pp) in its order (experts in act order, pieces ascending);
+// kk = -1 starts at the first. false at the end
+static bool ggml_fn_moe_next_own(const struct ggml_fn_moe_ctx * c, int64_t np_e, int ith, int nth, int * kk, int64_t * pp) {
+    if (*kk >= 0 && *pp + nth < np_e) {
+        *pp += nth;
+        return true;
+    }
+    for (int k = *kk + 1; k < c->n_act; ++k) {
+        const int64_t p0 = (ith - ggml_fn_moe_owner0(c->act[3*k], nth) + nth) % nth;
+        if (p0 < np_e) {
+            *kk = k;
+            *pp = p0;
+            return true;
+        }
+    }
+    return false;
+}
+
+// [TAG_FN_L3_CPU_SPLIT] the pieces of one phase (0: gate / up, 1: down) that thread ith computes. acc: [0] weight bytes,
+// [1] pieces taken from other threads, [2] bytes of experts this thread's stable prefetch covered
+static void ggml_fn_moe_phase(const struct ggml_fn_moe_ctx * c, int phase, int ith, int nth, uint64_t * acc) {
+    const struct ggml_fn_moe_args * a = c->a;
+    const int64_t np_e  = phase == 0 ? (c->n_ff + c->pr - 1)/c->pr : (c->n_embd + GGML_FN_MOE_PD - 1)/GGML_FN_MOE_PD;
+    const int     n_act = c->n_act;
+
+    if (a->split <= 0) {
+        // contiguous ranges of the expert-major piece list
+        const int64_t np = (int64_t) n_act*np_e;
+        const int64_t p1 = np*(ith + 1)/nth;
+        for (int64_t p = np*ith/nth; p < p1; ++p) {
+            if (a->swpf > 0 && p + 1 < p1) { // [TAG_FN_L3_CPU_SWPF]
+                ggml_fn_moe_piece_pf(c, phase, (int) ((p + 1)/np_e), (p + 1) % np_e, a->swpf);
+            }
+            acc[0] += ggml_fn_moe_piece(c, phase, (int) (p/np_e), p % np_e);
+        }
+        return;
+    }
+
+    // own pieces: piece pp of expert e belongs to thread (owner0(e) + pp) mod nth, the stable prefetch's owner
+    int32_t * claim = a->split >= 2 && a->claim ? a->claim + (size_t) phase*nth*c->claim_run : NULL;
+    const uint8_t * pfd = a->pf_done ? a->pf_done + (size_t) ith*c->wu->ne[2] : NULL;
+    int64_t j  = 0;
+    int     kk = -1;
+    int64_t pp = 0;
+    bool    more = ggml_fn_moe_next_own(c, np_e, ith, nth, &kk, &pp);
+    while (more) {
+        int     kn = kk;
+        int64_t pn = pp;
+        const bool has_next = ggml_fn_moe_next_own(c, np_e, ith, nth, &kn, &pn);
+        if (claim == NULL || ggml_fn_moe_claim(claim + (size_t) ith*c->claim_run + j, a->epoch)) { // else another thread took it
+            if (a->swpf > 0 && has_next) { // [TAG_FN_L3_CPU_SWPF]
+                ggml_fn_moe_piece_pf(c, phase, kn, pn, a->swpf);
+            }
+            const int32_t e = c->act[3*kk];
+            const size_t  b = ggml_fn_moe_piece(c, phase, kk, pp);
+            acc[0] += b;
+            if (pfd && pfd[e]) {
+                acc[2] += b;
+            }
+        }
+        j++;
+        kk   = kn;
+        pp   = pn;
+        more = has_next;
+    }
+    if (claim == NULL) {
+        return;
+    }
+
+    // then the free pieces of the other threads, from the end of their lists (their owners work from the front, where
+    // their prefetched pieces are); every owner walks its whole list, so each piece is computed exactly once, and a
+    // thief leaves a list at its first claimed piece: the owner (or a thief before it) is there and takes the rest
+    for (int dv = 1; dv < nth; ++dv) {
+        const int v = (ith + dv) % nth;
+        int64_t n_v = 0;
+        for (int kv = 0; kv < n_act; ++kv) {
+            const int64_t p0 = (v - ggml_fn_moe_owner0(c->act[3*kv], nth) + nth) % nth;
+            n_v += p0 < np_e ? (np_e - 1 - p0)/nth + 1 : 0;
+        }
+        int32_t * cv = claim + (size_t) v*c->claim_run;
+        int64_t jj = n_v;
+        bool met = false;
+        for (int kv = n_act - 1; kv >= 0 && jj > 0 && !met; --kv) {
+            const int64_t p0 = (v - ggml_fn_moe_owner0(c->act[3*kv], nth) + nth) % nth;
+            if (p0 >= np_e) {
+                continue;
+            }
+            for (int64_t pv = p0 + ((np_e - 1 - p0)/nth)*nth; pv >= p0; pv -= nth) {
+                --jj;
+                if (!ggml_fn_moe_claim(cv + jj, a->epoch)) {
+                    met = true;
+                    break;
+                }
+                acc[0] += ggml_fn_moe_piece(c, phase, kv, pv);
+                acc[1]++;
+            }
+        }
+    }
+}
+
 void ggml_fn_moe_compute(const struct ggml_fn_moe_args * a, int ith, int nth, void (*barrier)(void *), void * barrier_ctx) {
     const struct ggml_tensor * wu = a->up;
     const struct ggml_tensor * wg = a->gate;
     const struct ggml_tensor * wd = a->down;
+
+    uint64_t * ts = a->ts ? a->ts + (size_t) ith*GGML_FN_MOE_TS_N : NULL; // [TAG_FN_L3_CPU_STATS]
+    if (ts) {
+        ts[GGML_FN_MOE_TS_START] = ggml_fn_moe_tick();
+    }
 
     const int64_t n_embd = wu->ne[0];
     const int64_t n_ff   = wu->ne[1];
@@ -2166,16 +2431,8 @@ void ggml_fn_moe_compute(const struct ggml_fn_moe_args * a, int ith, int nth, vo
     const size_t  rs_u = ggml_row_size(vt_u, n_embd);
     const size_t  rs_g = ggml_row_size(vt_g, n_embd);
     const size_t  rs_d = ggml_row_size(vt_d, n_ff);
-    const int64_t bk_d = ggml_blck_size(vt_d);
-    const size_t  ts_d = ggml_type_size(vt_d);
 
-    ggml_vec_dot_t const dot_u = type_traits_cpu[wu->type].vec_dot;
-    ggml_vec_dot_t const dot_g = type_traits_cpu[wg->type].vec_dot;
-    ggml_vec_dot_t const dot_d = type_traits_cpu[wd->type].vec_dot;
     const bool mr_on = ggml_cpu_fn_sw[GGML_CPU_FN_MMID_MR] != 0 || ggml_cpu_fn_sw[GGML_CPU_FN_VNNI] != 0; // [TAG_FN_R4_VNNI]
-    ggml_vec_dot_mr_t const mr_u = mr_on ? ggml_cpu_fn_mr_kernel(wu->type) : NULL;
-    ggml_vec_dot_mr_t const mr_g = mr_on ? ggml_cpu_fn_mr_kernel(wg->type) : NULL;
-    ggml_vec_dot_mr_t const mr_d = mr_on ? ggml_cpu_fn_mr_kernel(wd->type) : NULL;
 
     // work: [h rows in the down input type, shared] [weighted-sum scratch, shared] [per thread: x rows, routing]
     char * base = (char *) GGML_PAD((uintptr_t) a->wdata, 64);
@@ -2199,6 +2456,8 @@ void ggml_fn_moe_compute(const struct ggml_fn_moe_args * a, int ith, int nth, vo
     int32_t * ent = (int32_t *) my;
     my += GGML_PAD(sizeof(int32_t)*(size_t) n_used*T, 64);
     int32_t * act = (int32_t *) my;
+    my += GGML_PAD(sizeof(int32_t)*3*(size_t) n_used*T, 64);
+    int32_t * act2 = (int32_t *) my; // [TAG_FN_L3_CPU_SPLIT] act in the order of a->prio
 
     // down rows go to the graph layout in out, or to the scratch for the weighted sum
     char * orow = a->w ? (char *) dscr : a->out;
@@ -2247,87 +2506,105 @@ void ggml_fn_moe_compute(const struct ggml_fn_moe_args * a, int ith, int nth, vo
         }
     }
 
-    // 3. gate + up + swiglu + quantized h, in pieces of pr rows, rows split evenly over the threads
-    {
-        const int64_t pr   = ggml_fn_moe_pr(wd);
-        const int64_t np_e = (n_ff + pr - 1)/pr;
-        const int64_t np   = (int64_t) n_act*np_e;
-        float gv[GGML_CPU_FN_MR_MAX_NC*256];
-        float uv[GGML_CPU_FN_MR_MAX_NC*256];
-        float hv[256];
-        GGML_ASSERT(pr <= 256);
-        for (int64_t p = np*ith/nth; p < np*(ith + 1)/nth; ++p) {
-            const int32_t * ak = act + 3*(p/np_e);
-            const int64_t r0 = (p % np_e)*pr;
-            const int64_t nr = MIN(pr, n_ff - r0);
-            const char * wu_e = (const char *) wu->data + (size_t) ak[0]*wu->nb[2] + (size_t) r0*wu->nb[1];
-            const char * wg_e = (const char *) wg->data + (size_t) ak[0]*wg->nb[2] + (size_t) r0*wg->nb[1];
-            for (int j = 0; j < ak[2]; j += GGML_CPU_FN_MR_MAX_NC) {
-                const int nc = MIN(GGML_CPU_FN_MR_MAX_NC, ak[2] - j);
-                const void * cu[GGML_CPU_FN_MR_MAX_NC];
-                const void * cg[GGML_CPU_FN_MR_MAX_NC];
-                int32_t sl[GGML_CPU_FN_MR_MAX_NC];
-                for (int c = 0; c < nc; ++c) {
-                    sl[c] = ent[ak[1] + j + c];
-                    const int t = sl[c]/n_used;
-                    cu[c] = qxu + (size_t) t*rs_u;
-                    cg[c] = qxg + (size_t) t*rs_g;
-                }
-                ggml_fn_moe_dots(dot_g, mr_g, n_embd, gv, (size_t) pr, wg_e, wg->nb[1], nr, cg, nc);
-                ggml_fn_moe_dots(dot_u, mr_u, n_embd, uv, (size_t) pr, wu_e, wu->nb[1], nr, cu, nc);
-                for (int c = 0; c < nc; ++c) {
-                    ggml_vec_swiglu_f32((int) nr, hv, gv + c*pr, uv + c*pr);
-                    char * hrow = hq + (size_t) sl[c]*rs_d; // sl = slot + n_used*t: the row of (slot, t)
-                    type_traits_cpu[vt_d].from_float(hv, hrow + (size_t) (r0/bk_d)*ts_d, nr);
-                }
+    // [TAG_FN_L3_CPU_SPLIT] the experts of a->prio first, in its order (the prefetch pulled them in that order), the rest
+    // after them in expert order; only the order of the work changes, never a value. cnt is free scratch from here on.
+    if (a->split >= 1 && a->prio && a->n_prio > 0 && n_act > 1) {
+        int32_t * pos = cnt;
+        for (int e = 0; e < n_exp; ++e) {
+            pos[e] = -1;
+        }
+        for (int kk = 0; kk < n_act; ++kk) {
+            pos[act[3*kk]] = kk;
+        }
+        int m = 0;
+        for (int i = 0; i < a->n_prio; ++i) {
+            const int32_t e = a->prio[i];
+            if (e < 0 || e >= n_exp || pos[e] < 0) {
+                continue;
+            }
+            memcpy(act2 + 3*m, act + 3*pos[e], 3*sizeof(int32_t));
+            pos[e] = -1;
+            m++;
+        }
+        for (int kk = 0; kk < n_act; ++kk) {
+            if (pos[act[3*kk]] >= 0) {
+                memcpy(act2 + 3*m, act + 3*kk, 3*sizeof(int32_t));
+                m++;
             }
         }
+        GGML_ASSERT(m == n_act);
+        act = act2;
+    }
+
+    struct ggml_fn_moe_ctx c;
+    c.a      = a;
+    c.wu     = wu;
+    c.wg     = wg;
+    c.wd     = wd;
+    c.n_embd = n_embd;
+    c.n_ff   = n_ff;
+    c.n_used = n_used;
+    c.vt_d   = vt_d;
+    c.rs_u   = rs_u;
+    c.rs_g   = rs_g;
+    c.rs_d   = rs_d;
+    c.ts_d   = ggml_type_size(vt_d);
+    c.bk_d   = ggml_blck_size(vt_d);
+    c.pr     = ggml_fn_moe_pr(wd);
+    c.dot_u  = type_traits_cpu[wu->type].vec_dot;
+    c.dot_g  = type_traits_cpu[wg->type].vec_dot;
+    c.dot_d  = type_traits_cpu[wd->type].vec_dot;
+    c.mr_u   = mr_on ? ggml_cpu_fn_mr_kernel(wu->type) : NULL;
+    c.mr_g   = mr_on ? ggml_cpu_fn_mr_kernel(wg->type) : NULL;
+    c.mr_d   = mr_on ? ggml_cpu_fn_mr_kernel(wd->type) : NULL;
+    c.hq     = hq;
+    c.qxu    = qxu;
+    c.qxg    = qxg;
+    c.ent    = ent;
+    c.act    = act;
+    c.n_act  = n_act;
+    c.orow   = orow;
+    c.o_nb1  = o_nb1;
+    c.o_nb2  = o_nb2;
+    c.claim_run = a->split >= 2 ? GGML_FN_MOE_CLAIM_RUN(n_used*T, ggml_fn_moe_np_max(wu, wd), nth) : 0;
+    GGML_ASSERT(c.pr <= 256);
+
+    uint64_t acc[3] = { 0, 0, 0 };
+
+    // 3. gate + up + swiglu + quantized h, in pieces of pr rows
+    ggml_fn_moe_phase(&c, 0, ith, nth, acc);
+    if (ts) {
+        ts[GGML_FN_MOE_TS_P3] = ggml_fn_moe_tick();
     }
 
     barrier(barrier_ctx);
+    if (ts) {
+        ts[GGML_FN_MOE_TS_B1] = ggml_fn_moe_tick();
+    }
 
     // 4. down, in pieces of GGML_FN_MOE_PD rows of n_embd
-    {
-        const int64_t pd   = GGML_FN_MOE_PD;
-        const int64_t np_e = (n_embd + pd - 1)/pd;
-        const int64_t np   = (int64_t) n_act*np_e;
-        float dv[GGML_CPU_FN_MR_MAX_NC*GGML_FN_MOE_PD];
-        for (int64_t p = np*ith/nth; p < np*(ith + 1)/nth; ++p) {
-            const int32_t * ak = act + 3*(p/np_e);
-            const int64_t r0 = (p % np_e)*pd;
-            const int64_t nr = MIN(pd, n_embd - r0);
-            const char * wd_e = (const char *) wd->data + (size_t) ak[0]*wd->nb[2] + (size_t) r0*wd->nb[1];
-            for (int j = 0; j < ak[2]; j += GGML_CPU_FN_MR_MAX_NC) {
-                const int nc = MIN(GGML_CPU_FN_MR_MAX_NC, ak[2] - j);
-                const void * cd[GGML_CPU_FN_MR_MAX_NC];
-                int32_t sl[GGML_CPU_FN_MR_MAX_NC];
-                for (int c = 0; c < nc; ++c) {
-                    sl[c] = ent[ak[1] + j + c];
-                    cd[c] = hq + (size_t) sl[c]*rs_d;
-                }
-                ggml_fn_moe_dots(dot_d, mr_d, n_ff, dv, (size_t) pd, wd_e, wd->nb[1], nr, cd, nc);
-                for (int c = 0; c < nc; ++c) {
-                    const int slot = sl[c] % n_used;
-                    const int t    = sl[c]/n_used;
-                    memcpy(orow + (size_t) slot*o_nb1 + (size_t) t*o_nb2 + (size_t) r0*sizeof(float), dv + c*pd, (size_t) nr*sizeof(float));
-                }
+    ggml_fn_moe_phase(&c, 1, ith, nth, acc);
+    // graph layout: the rows of the slots computed elsewhere are zero, as the unfused op leaves them
+    if (a->table && !a->w) {
+        for (int i = ith; i < n_used*T; i += nth) {
+            const int slot = i % n_used;
+            const int t    = i/n_used;
+            if (GGML_FN_MOE_SKIP(GGML_FN_MOE_ID(slot, t))) {
+                memset(orow + (size_t) slot*o_nb1 + (size_t) t*o_nb2, 0, (size_t) n_embd*sizeof(float));
             }
         }
-        // graph layout: the rows of the slots computed elsewhere are zero, as the unfused op leaves them
-        if (a->table && !a->w) {
-            for (int i = ith; i < n_used*T; i += nth) {
-                const int slot = i % n_used;
-                const int t    = i/n_used;
-                if (GGML_FN_MOE_SKIP(GGML_FN_MOE_ID(slot, t))) {
-                    memset(orow + (size_t) slot*o_nb1 + (size_t) t*o_nb2, 0, (size_t) n_embd*sizeof(float));
-                }
-            }
-        }
+    }
+    if (ts) {
+        ts[GGML_FN_MOE_TS_P4] = ggml_fn_moe_tick();
+        ts[GGML_FN_MOE_TS_B2] = ts[GGML_FN_MOE_TS_P4];
     }
 
     // 5. weighted sum over the slots computed here, in slot order
     if (a->w) {
         barrier(barrier_ctx);
+        if (ts) {
+            ts[GGML_FN_MOE_TS_B2] = ggml_fn_moe_tick();
+        }
         const int64_t r_begin = n_embd*ith/nth;
         const int64_t r_end   = n_embd*(ith + 1)/nth;
         for (int t = 0; t < T; ++t) {
@@ -2343,6 +2620,14 @@ void ggml_fn_moe_compute(const struct ggml_fn_moe_args * a, int ith, int nth, vo
                 dst[r] = sum;
             }
         }
+    }
+
+    if (ts) {
+        ts[GGML_FN_MOE_TS_BYTES] = acc[0];
+        ts[GGML_FN_MOE_TS_TAKEN] = acc[1];
+        ts[GGML_FN_MOE_TS_PFHIT] = acc[2];
+        ts[GGML_FN_MOE_TS_NACT]  = (uint64_t) n_act;
+        ts[GGML_FN_MOE_TS_END]   = ggml_fn_moe_tick();
     }
 
 #undef GGML_FN_MOE_ID
@@ -2426,6 +2711,160 @@ size_t ggml_fn_moe_prefetch(const struct ggml_tensor * up, const struct ggml_ten
                 return bytes;
             }
             bytes += (size_t) nr*down->nb[1];
+        }
+    }
+    return bytes;
+}
+
+// [TAG_FN_L3_CPU_SPLIT] ggml_fn_prefetch_bytes with a stop check every 4 KiB page of real loads: the next job waits for
+// the slowest worker to leave the prefetch, so the stop must land fast
+static inline bool ggml_fn_prefetch_bytes_fine(const char * a, size_t len, int mode, const volatile int32_t * stop) {
+    if (mode != 0) {
+        return ggml_fn_prefetch_bytes(a, len, mode, stop);
+    }
+    const char * end = a + len;
+    const char * c   = (const char *) ((uintptr_t) a & ~(uintptr_t) 63);
+    while (c < end) {
+        if (*stop) {
+            return false;
+        }
+        const char * e = c + 4096 < end ? c + 4096 : end;
+        for (; c < e; c += 64) {
+            (void) *(const volatile char *) c;
+        }
+    }
+    return true;
+}
+
+// [TAG_FN_L3_CPU_PFSTREAMS] real loads of up to GGML_FN_PF_MAX_STREAMS regions at once, one line of each in turn: as many
+// independent streams (page walks, stream prefetcher restarts at every page) instead of one
+#define GGML_FN_PF_MAX_STREAMS 8
+
+struct ggml_fn_pf_group {
+    const char * a[GGML_FN_PF_MAX_STREAMS];
+    size_t       len[GGML_FN_PF_MAX_STREAMS];
+    int          k;
+    int          ns;
+};
+
+// pull the group's regions; false (and nothing more pulled) once *stop != 0, checked every 4 KiB of each region
+static bool ggml_fn_pf_group_pull(struct ggml_fn_pf_group * g, const volatile int32_t * stop, size_t * bytes) {
+    const char * c[GGML_FN_PF_MAX_STREAMS];
+    const char * end[GGML_FN_PF_MAX_STREAMS];
+    size_t span = 0;
+    for (int r = 0; r < g->k; ++r) {
+        c[r]   = (const char *) ((uintptr_t) g->a[r] & ~(uintptr_t) 63);
+        end[r] = g->a[r] + g->len[r];
+        span   = MAX(span, (size_t) (end[r] - c[r]));
+    }
+    for (size_t o = 0; o < span; o += 64) {
+        if ((o & 4095) == 0 && *stop) {
+            g->k = 0;
+            return false;
+        }
+        for (int r = 0; r < g->k; ++r) {
+            if (c[r] + o < end[r]) {
+                (void) *(const volatile char *) (c[r] + o);
+            }
+        }
+    }
+    for (int r = 0; r < g->k; ++r) {
+        *bytes += g->len[r];
+    }
+    g->k = 0;
+    return true;
+}
+
+static bool ggml_fn_pf_group_add(struct ggml_fn_pf_group * g, const char * a, size_t len, const volatile int32_t * stop, size_t * bytes) {
+    g->a[g->k]   = a;
+    g->len[g->k] = len;
+    g->k++;
+    return g->k < g->ns || ggml_fn_pf_group_pull(g, stop, bytes);
+}
+
+// [TAG_FN_L3_CPU_SPLIT] the stable split's prefetch: thread ith's own pieces (owner0(e) + pp mod nth, as in a split >= 1
+// job) of the experts list[0..n) in list order, each expert's gate + up pieces then its down pieces, so a stopped
+// prefetch has covered the first (most likely) experts. done[e] = 1 once all its pieces of this thread are pulled.
+// [TAG_FN_L3_CPU_PFSTREAMS] streams > 1 (real loads): an expert's regions are pulled that many at a time, interleaved.
+size_t ggml_fn_moe_prefetch_stable(const struct ggml_tensor * up, const struct ggml_tensor * gate, const struct ggml_tensor * down,
+                                   const int32_t * list, int n, int ith, int nth, const volatile int32_t * stop, int mode,
+                                   uint8_t * done, int streams) {
+    if (n <= 0 || nth <= 0 || ith < 0 || ith >= nth) {
+        return 0;
+    }
+    const int64_t n_embd = up->ne[0];
+    const int64_t n_ff   = up->ne[1];
+    const int64_t n_exp  = up->ne[2];
+    const int64_t pr     = ggml_fn_moe_pr(down);
+    const int64_t np3    = (n_ff + pr - 1)/pr;
+    const int64_t pd     = GGML_FN_MOE_PD;
+    const int64_t np4    = (n_embd + pd - 1)/pd;
+    size_t bytes = 0;
+    if (streams > 1 && mode == 0) {
+        struct ggml_fn_pf_group g;
+        g.k  = 0;
+        g.ns = MIN(streams, GGML_FN_PF_MAX_STREAMS);
+        for (int i = 0; i < n; ++i) {
+            const int32_t e = list[i];
+            if (e < 0 || e >= n_exp) {
+                continue;
+            }
+            const int64_t p0 = (ith - ggml_fn_moe_owner0(e, nth) + nth) % nth;
+            for (int64_t pp = p0; pp < np3; pp += nth) {
+                const int64_t r0 = pp*pr;
+                const int64_t nr = MIN(pr, n_ff - r0);
+                if (!ggml_fn_pf_group_add(&g, (const char *) gate->data + (size_t) e*gate->nb[2] + (size_t) r0*gate->nb[1], (size_t) nr*gate->nb[1], stop, &bytes) ||
+                    !ggml_fn_pf_group_add(&g, (const char *) up->data   + (size_t) e*up->nb[2]   + (size_t) r0*up->nb[1],   (size_t) nr*up->nb[1], stop, &bytes)) {
+                    return bytes;
+                }
+            }
+            for (int64_t pp = p0; pp < np4; pp += nth) {
+                const int64_t r0 = pp*pd;
+                const int64_t nr = MIN(pd, n_embd - r0);
+                if (!ggml_fn_pf_group_add(&g, (const char *) down->data + (size_t) e*down->nb[2] + (size_t) r0*down->nb[1], (size_t) nr*down->nb[1], stop, &bytes)) {
+                    return bytes;
+                }
+            }
+            if (g.k > 0 && !ggml_fn_pf_group_pull(&g, stop, &bytes)) {
+                return bytes;
+            }
+            if (done) {
+                done[e] = 1;
+            }
+        }
+        return bytes;
+    }
+    for (int i = 0; i < n; ++i) {
+        const int32_t e = list[i];
+        if (e < 0 || e >= n_exp) {
+            continue;
+        }
+        const int64_t p0 = (ith - ggml_fn_moe_owner0(e, nth) + nth) % nth;
+        for (int64_t pp = p0; pp < np3; pp += nth) {
+            if (*stop) {
+                return bytes;
+            }
+            const int64_t r0 = pp*pr;
+            const int64_t nr = MIN(pr, n_ff - r0);
+            if (!ggml_fn_prefetch_bytes_fine((const char *) gate->data + (size_t) e*gate->nb[2] + (size_t) r0*gate->nb[1], (size_t) nr*gate->nb[1], mode, stop) ||
+                !ggml_fn_prefetch_bytes_fine((const char *) up->data   + (size_t) e*up->nb[2]   + (size_t) r0*up->nb[1],   (size_t) nr*up->nb[1], mode, stop)) {
+                return bytes;
+            }
+            bytes += (size_t) nr*(gate->nb[1] + up->nb[1]);
+        }
+        for (int64_t pp = p0; pp < np4; pp += nth) {
+            if (*stop) {
+                return bytes;
+            }
+            const int64_t r0 = pp*pd;
+            const int64_t nr = MIN(pd, n_embd - r0);
+            if (!ggml_fn_prefetch_bytes_fine((const char *) down->data + (size_t) e*down->nb[2] + (size_t) r0*down->nb[1], (size_t) nr*down->nb[1], mode, stop)) {
+                return bytes;
+            }
+            bytes += (size_t) nr*down->nb[1];
+        }
+        if (done) {
+            done[e] = 1;
         }
     }
     return bytes;
