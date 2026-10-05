@@ -2923,7 +2923,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     auto * gf  = res->get_gf();
 
     // [TAG_FN_L3_HOST_LAUNCH2] the split boundary the scheduler uses if it splits this ubatch's graph below
-    const bool launch2_decode = moe_bridge != nullptr && (int) ubatch.n_tokens <= llama_moe_bridge_max_t(moe_bridge);
+    // (a paused or turned-off bridge: the graph runs the CPU split and is not cut)
+    const bool launch2_decode = llama_moe_bridge_active(moe_bridge) && (int) ubatch.n_tokens <= llama_moe_bridge_max_t(moe_bridge);
 
     // the new graph parameters
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
