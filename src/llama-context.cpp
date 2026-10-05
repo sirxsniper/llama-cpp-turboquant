@@ -1055,6 +1055,18 @@ llama_context::llama_context(
             LLAMA_LOG_INFO("%s: [TAG_FN_R1_BRIDGE_RB] MoE bridge on: the recurrent ring keeps whole ubatches of up to %u "
                     "tokens (n_rs_seq + 1), so a failed bridged ubatch is rolled back and computed again\n", __func__,
                     cparams.n_rs_seq);
+        } else if (cparams.n_rs_seq == 0 && params.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && !(er && er[0] == '0') &&
+                llm_arch_supports_rs_rollback(model.arch) && llama_moe_bridge_wanted(model)) {
+            // [TAG_FN_R2_BRIDGE_NOSPEC] no speculative decoding, so no ring: a failed bridged ubatch could not roll back and
+            // the decode failed (llama-perplexity -ub 3, a prompt tail, 1-token decodes after page-ins). Give the context a
+            // small ring; the bridge then takes only graphs the ring can roll back whole.
+            const char * et = getenv("LLAMA_MOE_BRIDGE_RB_TOKENS");
+            cparams.n_rs_seq = (uint32_t) std::min(8, std::max(1, et && et[0] ? atoi(et) : 1));
+            llama_rs_set_nw_full(true);
+            bridge_rb = true;
+            LLAMA_LOG_INFO("%s: [TAG_FN_R2_BRIDGE_NOSPEC] MoE bridge on without speculative decoding: the recurrent ring "
+                    "keeps whole ubatches of up to %u tokens, so a failed bridged ubatch is rolled back and computed again\n",
+                    __func__, cparams.n_rs_seq);
         }
     }
 

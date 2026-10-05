@@ -383,6 +383,34 @@ static void br_destroy(llama_moe_bridge * br) {
     g_bridge_owned.store(false);
 }
 
+// [TAG_FN_R2_BRIDGE_NOSPEC] the layer test of llama_moe_bridge_create without the CPU pool: routed experts in host memory,
+// the router on a device
+bool llama_moe_bridge_wanted(const llama_model & model) {
+    if (env_int("LLAMA_MOE_BRIDGE", 0) <= 0) {
+        return false;
+    }
+    const auto & hparams = model.hparams;
+    const bool nextn_split = hparams.n_layer_nextn > 0 && hparams.n_layer() > 0 && hparams.router_layer < 0;
+    for (size_t il = 0; il < model.layers.size(); ++il) {
+        const auto & l = model.layers[il];
+        if (nextn_split && il >= hparams.n_layer()) {
+            continue;
+        }
+        if (!l.ffn_up_exps || !l.ffn_gate_exps || !l.ffn_down_exps || !l.ffn_gate_inp || l.ffn_gate_up_exps) {
+            continue;
+        }
+        const ggml_tensor * ws[3] = { l.ffn_up_exps, l.ffn_gate_exps, l.ffn_down_exps };
+        bool host = true;
+        for (const ggml_tensor * w : ws) {
+            host = host && w->data && w->buffer && ggml_backend_buffer_is_host(w->buffer) && w->extra == nullptr;
+        }
+        if (host && l.ffn_gate_inp->buffer && !ggml_backend_buffer_is_host(l.ffn_gate_inp->buffer)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 llama_moe_bridge * llama_moe_bridge_create(const llama_model & model, int n_threads, int max_t_cap) {
     if (env_int("LLAMA_MOE_BRIDGE", 0) <= 0) {
         return nullptr;
