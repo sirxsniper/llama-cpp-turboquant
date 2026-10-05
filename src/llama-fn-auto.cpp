@@ -64,6 +64,11 @@ const fn_item k_items[] = {
     // read with getenv() elsewhere, so they are in the environment while the model is loaded:
     { "LLAMA_MOE_BRIDGE",             "1",     P_BR  }, // the host bridge (+ its rollback ring, [TAG_FN_R1_BRIDGE_RB])
     { "LLAMA_MOE_BRIDGE_DMA",         "1",     P_BR  }, // the DMA share inside the bridged graphs ([TAG_FN_R4_BRIDGE_DMA])
+    // [TAG_FN_R2_BRIDGE_PF] lever round 2 (r2/ab4, 2 interleaved rounds vs the round-1 default, 262K, MTP): the next-layer
+    // prefetch by real loads with the executor out of the compute - bench code +6.5 %, prose +5.8 %, real use +1.8 %;
+    // exact (greedy identity, values never touched)
+    { "LLAMA_MOE_BRIDGE_PF",          "1",     P_BR  },
+    { "LLAMA_MOE_BRIDGE_PF_SOLO",     "1",     P_BR  },
     { "LLAMA_MOE_DMA_SHARE",          "auto",  P_ALL },
     { "GGML_CPU_APPLY_ONCE",          "1",     P_ALL },
     { "GGML_CPU_Q5_1_AVX512",         "1",     P_ALL },

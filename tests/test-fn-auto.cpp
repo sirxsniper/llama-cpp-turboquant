@@ -89,7 +89,8 @@ static void test_profile_opts() {
                                     "LLAMA_MOE_HOT_ADAPT", "LLAMA_MOE_HOT_ADMIT", "LLAMA_RAM_FIT",
                                     "LLAMA_MOE_HOT_HEADROOM_MIB", "LLAMA_MOE_HOT_DECAY", "LLAMA_MOE_HOT_SEED",
                                     "LLAMA_PLE_DIO_FILE" };
-    const char * lever_names[] = { "LLAMA_MOE_BRIDGE", "LLAMA_MOE_BRIDGE_DMA", "LLAMA_MOE_DMA_SHARE", "GGML_CPU_APPLY_ONCE",
+    const char * lever_names[] = { "LLAMA_MOE_BRIDGE", "LLAMA_MOE_BRIDGE_DMA", "LLAMA_MOE_BRIDGE_PF", "LLAMA_MOE_BRIDGE_PF_SOLO",
+                                   "LLAMA_MOE_DMA_SHARE", "GGML_CPU_APPLY_ONCE",
                                    "GGML_CPU_Q5_1_AVX512", "GGML_CPU_MMID_MR", "GGML_CPU_MOE_FUSE", "GGML_CPU_VNNI",
                                    "GGML_SCHED_SPLIT_ASYNC", "GGML_CUDA_GRAPH_POKE", "LLAMA_NO_ECOQOS",
                                    "LLAMA_GRAPH_PER_WIDTH", "LLAMA_PLE_HOST_GATHER", "LLAMA_PLE_DIRECT_IO",
@@ -113,6 +114,7 @@ static void test_profile_opts() {
         { "LLAMA_MOE_HOT_ADMIT", "2/32" }, { "LLAMA_MOE_HOT_MIB", "auto" }, { "LLAMA_MOE_HOT_ADAPT", "1" },
         { "LLAMA_MOE_HOT_HEADROOM_MIB", "1280" }, { "LLAMA_MOE_HOT_DECAY", "0.92" }, { "LLAMA_MOE_HOT_SEED", "0.03" },
         { "LLAMA_MOE_BRIDGE", "1" }, { "LLAMA_MOE_BRIDGE_DMA", "1" }, { "LLAMA_MOE_DMA_SHARE", "auto" },
+        { "LLAMA_MOE_BRIDGE_PF", "1" }, { "LLAMA_MOE_BRIDGE_PF_SOLO", "1" }, // [TAG_FN_R2_BRIDGE_PF] r2/ab4
         { "LLAMA_QSA_POS_MASK", "1" }, { "LLAMA_QSA_POS_CHUNK", "512" }, { "TURBO_QSA_CHUNK", "512" },
         { "TURBO_QSA_SPARSE", "1" }, { "LLAMA_MTP_ATTN_WINDOW", "32768" }, { "LLAMA_MTP_HEAD_ROWS", "98304" },
         { "SPEC_DFT_UBATCH", "128" }, { "LLAMA_PREFILL_STREAM_LEND", "1" }, { "LLAMA_PREFILL_STREAM_THREADS", "16" },
@@ -141,10 +143,11 @@ static void test_profile_opts() {
 
     // trial-dma = trial without the host bridge: the gen5 DMA share in its own CPU split
     const auto tdma = llama_fn_profile_opts(LLAMA_FN_PROFILE_TRIAL_DMA, nullptr);
-    TCHECK(find_opt(tdma, "LLAMA_MOE_BRIDGE") == nullptr && find_opt(tdma, "LLAMA_MOE_BRIDGE_DMA") == nullptr,
-           "trial-dma has no bridge");
+    TCHECK(find_opt(tdma, "LLAMA_MOE_BRIDGE") == nullptr && find_opt(tdma, "LLAMA_MOE_BRIDGE_DMA") == nullptr &&
+           find_opt(tdma, "LLAMA_MOE_BRIDGE_PF") == nullptr && find_opt(tdma, "LLAMA_MOE_BRIDGE_PF_SOLO") == nullptr,
+           "trial-dma has no bridge (and none of its switches)");
     TCHECK(find_opt(tdma, "LLAMA_MOE_DMA_SHARE") && find_opt(tdma, "LLAMA_MOE_DMA_SHARE")->value == "auto", "trial-dma DMA share");
-    TCHECK(find_opt(tdma, "GGML_CPU_MOE_FUSE") != nullptr && tdma.size() == safe.size() - 2, "trial-dma keeps the rest");
+    TCHECK(find_opt(tdma, "GGML_CPU_MOE_FUSE") != nullptr && tdma.size() == safe.size() - 4, "trial-dma keeps the rest");
 
     // safe ignores LLAMA_FLASHNEXT_FAST
     const auto safe_c = llama_fn_profile_opts(LLAMA_FN_PROFILE_SAFE, "GGML_CPU_MOE_FUSE=0,LLAMA_FN_TEST_X=1");
