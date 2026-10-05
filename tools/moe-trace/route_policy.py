@@ -146,6 +146,10 @@ def load_trace(spec, host_layers, prefill_as_decode=0):
         with open(ans_path, encoding="utf-8") as f:
             meta = json.load(f)
         gen = [a.get("predicted_n") for a in meta.get("answers", [])]
+        # the server's warm-up decode (one step before the first request) shows up as an answer of its own: one token
+        lead = len(tr.answers) - len(gen)
+        if 0 < lead <= 2 and all(a[1] <= 2 for a in tr.answers[:lead]):
+            gen = [a[1] for a in tr.answers[:lead]] + gen
         if len(gen) == len(tr.answers):
             for a, g in zip(tr.answers, gen):
                 a[2] = g
