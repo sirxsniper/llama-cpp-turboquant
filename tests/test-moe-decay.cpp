@@ -8,6 +8,7 @@
 
 #include "../src/llama-moe-decay.h"
 
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <random>
@@ -465,6 +466,51 @@ static void test_select() {
     TCHECK(sel.empty(), "no budget: nothing (%s)", ids().c_str());
 }
 
+// [TAG_FN_L3_POLICY_POOL] the pass at Flash-Next's sizes (43 pooled layers x 512 experts, 3052 slots; steady-state counts
+// of a skewed routing), printed only: it runs between two decode graphs, so its time adds to the step
+static void test_pool_timing() {
+    const int n_layer = 43, n_exp = 512, n_slots = 43*71 - 1;
+    std::mt19937 rng(77);
+    std::vector<std::vector<float>>   cnt(n_layer, std::vector<float>(n_exp, 0.0f));
+    std::vector<std::vector<uint8_t>> busy(n_layer, std::vector<uint8_t>(n_exp, 0));
+    std::exponential_distribution<float> ex(0.35f);
+    for (auto & c : cnt) {
+        for (auto & x : c) {
+            x = ex(rng);
+        }
+    }
+    std::vector<int32_t> sl(n_slots), se(n_slots);
+    std::vector<uint8_t> sb(n_slots, 0);
+    for (int s = 0; s < n_slots; ++s) {
+        sl[s] = s % n_layer;
+        se[s] = (s / n_layer) * 7 % n_exp;
+        busy[sl[s]][se[s]] = 1;
+    }
+    std::vector<const std::vector<float> *>   pc;
+    std::vector<const std::vector<uint8_t> *> pb;
+    for (int l = 0; l < n_layer; ++l) {
+        pc.push_back(&cnt[l]);
+        pb.push_back(&busy[l]);
+    }
+    llama_moe_decay_params p;
+    const int reps = 50;
+    std::vector<llama_moe_decay_swap> sw;
+    std::vector<std::pair<size_t, bool>> sel;
+    const auto t0 = std::chrono::steady_clock::now();
+    size_t n_sw = 0;
+    for (int r = 0; r < reps; ++r) {
+        sw.clear();
+        llama_moe_decay_pairs_pool(pc, pb, sl, se, sb, p, sw);
+        llama_moe_decay_order(sw);
+        llama_moe_decay_select(sw, (size_t) 64 << 20, (size_t) 576 << 20, [](const llama_moe_decay_swap &) { return (size_t) 3072000; },
+                [](const llama_moe_decay_swap &) { return true; }, sel);
+        n_sw += sw.size();
+    }
+    const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count()/reps;
+    printf("  pool pass at Flash-Next size: %.0f us (%zu pairs, %zu selected)\n", us, n_sw/reps, sel.size());
+    TCHECK(us < 20000.0, "the pool pass takes %.0f us", us);
+}
+
 int main() {
     printf("test-moe-decay: [TAG_FN_R4_ADAPT_DECAY]\n");
     test_pairs();
@@ -476,6 +522,7 @@ int main() {
     test_pool_pairs();
     test_pool_vs_fixed();
     test_select();
+    test_pool_timing();
     printf("test-moe-decay: %d checks, %d errors%s\n", g_checks, g_fail, g_fail ? "" : " - PASSED");
     return g_fail == 0 ? 0 : 1;
 }
