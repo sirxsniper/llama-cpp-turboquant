@@ -14979,6 +14979,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_fn_l3_mmv(GGML_TYPE_F32, 10240, 4, t, true));
         test_cases.emplace_back(new test_fn_l3_mmv(GGML_TYPE_F32, 2560, 48, t, true));
         test_cases.emplace_back(new test_fn_l3_mmv(GGML_TYPE_Q8_0, 10240, 320, t, true));
+        test_cases.emplace_back(new test_fn_l3_mmv(GGML_TYPE_Q8_0, 2560, 6144, t, true)); // [TAG_FN_L3_GPU_MMV] RA (K <= 4096)
+        test_cases.emplace_back(new test_fn_l3_mmv(GGML_TYPE_Q8_0, 320, 10240, t, true)); // [TAG_FN_L3_GPU_MMV] SMK (K <= 1024)
         test_cases.emplace_back(new test_fn_l3_convwb(t, 3, 10240, 4, true));
         test_cases.emplace_back(new test_fn_l3_convwb(t, 9, 10240, 4, true));
         test_cases.emplace_back(new test_fn_l3_idxq8(8192*4 + 3, 8192, t, true));

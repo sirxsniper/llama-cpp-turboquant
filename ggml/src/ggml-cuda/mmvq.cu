@@ -2060,8 +2060,9 @@ void ggml_cuda_op_mul_mat_vec_q(
 // [TAG_FN_L3_GPU_MMV] mul_mat_vec_q<GGML_TYPE_Q8_0, ncols_dst, false> for a plain 2-D product (no ids, fusion, channels
 // or samples) with the K loop taken four iterations per pass, so a thread's loads of four iterations are in flight together. A
 // thread computes the same vec_dot terms and adds them to tmp in the same order, and the reduction is the original's, so
-// the result has the same bits. Only for the mat-vecs the qwen4exp graph marks (the hc mixers' down projections: 320
-// rows of 10240, 160 blocks of 4 warps that each walk a 10-iteration K loop one load at a time).
+// the result has the same bits. Only for the mat-vecs the qwen4exp graph marks, and only where one pass covers the row
+// (K <= 4096 at 1..4 columns: the K 2560 projections and the router; see ggml_cuda_fn_l3_mul_mat_vec_q).
+#define FN_L3_MMVQ_AHEAD 4
 template <int ncols_dst>
 __launch_bounds__(calc_nwarps(GGML_TYPE_Q8_0, ncols_dst, get_device_table_id())*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q_fn_l3(
@@ -2091,7 +2092,7 @@ static __global__ void mul_mat_vec_q_fn_l3(
     const int kbx_offset = row0*stride_row_x;
 
     // four iterations per pass, each guarded, so their loads can issue together; kbx still runs in the original order
-    constexpr int ahead = 4;
+    constexpr int ahead = FN_L3_MMVQ_AHEAD;
     const int kqs = vdr * (tid % (qi/vdr));
     for (int kbx0 = tid / (qi/vdr); kbx0 < blocks_per_row_x; kbx0 += ahead*blocks_per_iter) {
 #pragma unroll
@@ -2259,6 +2260,13 @@ bool ggml_cuda_fn_l3_mul_mat_vec_q(ggml_backend_cuda_context & ctx, const ggml_t
     const bool use_smk = ne11 >= 2 && ne11 <= 4 &&
         ne00/QK8_0 <= calc_nwarps(GGML_TYPE_Q8_0, (int) ne11, MMVQ_PARAMETERS_GENERIC)*blocks_per_iter_1warp;
     if (use_smk ? !ggml_cuda_fn_l3_smk_enabled() : !ggml_cuda_fn_l3_ra_enabled()) {
+        return false;
+    }
+    // RA only where one pass of FN_L3_MMVQ_AHEAD iterations covers the row (K <= 4096 at 1..4 columns): the longer rows
+    // ran slower at one column (test-backend-ops perf, K 10240 x 320 and K 6144 x 2560: +28 %) and no faster at three
+    // (l3/gpu/gpu/l3gpu_perf_fnl3.txt), so the hc down and the K 6144 projections keep mul_mat_vec_q
+    if (!use_smk && ne00/QK8_0 > FN_L3_MMVQ_AHEAD*calc_nwarps(GGML_TYPE_Q8_0, (int) ne11, MMVQ_PARAMETERS_GENERIC)*
+            blocks_per_iter_1warp) {
         return false;
     }
 
