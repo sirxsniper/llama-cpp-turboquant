@@ -733,6 +733,9 @@ void hot_adapt_verify(moe_cache * mc) {
 // [TAG_FN_R4_ADAPT_DECAY] the learned set as a moeprof v1 routing profile: resident experts first (1e9 + count), then
 // the routing counts (decayed counts, or the window's), the static profile breaking ties. LLAMA_MOE_HOT_PROFILE=<it>
 // starts the next run from it.
+// [TAG_FN_R4_REVIEW] Printed with 17 significant digits: "%.6g" wrote every resident expert as 1e+09, so the order among
+// them (and the 1e-6 tie-break) was lost, and a next run with fewer slots took its residents by layer order - the greedy
+// pick of hot_init runs over all layers - instead of by count.
 void hot_adapt_save(moe_cache * mc) {
     if (mc->save_path.empty() || mc->layers.empty()) {
         return;
@@ -760,7 +763,7 @@ void hot_adapt_save(moe_cache * mc) {
             if (e < (int64_t) ls.prof.size()) {
                 v += 1e-6*ls.prof[e];
             }
-            fprintf(f, " %.6g", v);
+            fprintf(f, " %.17g", v);
         }
         fprintf(f, "\n");
     }

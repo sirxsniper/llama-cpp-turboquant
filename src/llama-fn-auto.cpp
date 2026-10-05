@@ -143,6 +143,19 @@ bool fn_file_exists(const std::string & path) {
     return f.good();
 }
 
+// [TAG_FN_R4_REVIEW] the user's value of an item under another name: LLAMA_MTP_WINDOW is LLAMA_MTP_ATTN_WINDOW under
+// Strata's name (llama-model.cpp reads it when LLAMA_MTP_ATTN_WINDOW is unset), so an injected default must not hide it
+const char * fn_alias_value(const std::string & name, const char ** alias) {
+    if (name == "LLAMA_MTP_ATTN_WINDOW") {
+        const char * v = getenv("LLAMA_MTP_WINDOW");
+        if (v && v[0]) {
+            *alias = "LLAMA_MTP_WINDOW";
+            return v;
+        }
+    }
+    return nullptr;
+}
+
 } // namespace
 
 llama_fn_profile llama_fn_profile_parse(const char * s, bool * ok) {
@@ -341,6 +354,10 @@ void llama_fn_state_inject(llama_fn_auto_state & st) {
         if (getenv(o.name.c_str())) {
             continue; // the user's value wins
         }
+        const char * alias = nullptr;
+        if (fn_alias_value(o.name, &alias)) {
+            continue; // [TAG_FN_R4_REVIEW] the user's value under the alias wins as well
+        }
         fn_setenv(o.name.c_str(), o.value.c_str());
         g_env_ref[o.name] = 1;
         st.injected.push_back(o.name);
@@ -524,11 +541,15 @@ void llama_fn_auto_on_load(llama_model & model, llama_model_loader & ml, const s
         const bool ours = std::find(st->injected.begin(), st->injected.end(), o.name) != st->injected.end() ||
                           std::find(st->cpu_set.begin(),  st->cpu_set.end(),  o.name) != st->cpu_set.end();
         const char * e = getenv(o.name.c_str());
+        const char * alias = nullptr;
+        if (!e && !ours) {
+            e = fn_alias_value(o.name, &alias); // [TAG_FN_R4_REVIEW]
+        }
         std::string & dst = o.inject ? (ours ? injected : env) : (e ? env : own);
         if (o.inject && !ours && !e && fn_cpu_switch(o.name)) {
             continue; // no CPU setter: warned above
         }
-        dst += " " + o.name + "=" + (e && !ours ? std::string(e) : o.value);
+        dst += " " + std::string(alias ? alias : o.name.c_str()) + "=" + (e && !ours ? std::string(e) : o.value);
     }
     if (!own.empty()) {
         LLAMA_LOG_INFO("fn-auto:   profile:%s\n", own.c_str());

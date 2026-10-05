@@ -207,6 +207,22 @@ static void test_inject() {
     TCHECK(strcmp(getenv("LLAMA_FN_TEST_USER"), "mine") == 0, "user value survives the undo");
     set_env("LLAMA_FN_TEST_USER", nullptr);
 
+    // [TAG_FN_R4_REVIEW] LLAMA_MTP_WINDOW (Strata's name) is the user's LLAMA_MTP_ATTN_WINDOW: the trial default stays out
+    if (!getenv("LLAMA_MTP_ATTN_WINDOW") && !getenv("LLAMA_MTP_WINDOW")) {
+        llama_fn_auto_state w;
+        w.active = true;
+        w.opts.push_back({ "LLAMA_MTP_ATTN_WINDOW", "32768", true });
+        set_env("LLAMA_MTP_WINDOW", "16384");
+        llama_fn_state_inject(w);
+        TCHECK(getenv("LLAMA_MTP_ATTN_WINDOW") == nullptr && w.injected.empty(), "the alias LLAMA_MTP_WINDOW keeps the default out");
+        llama_fn_state_undo(w);
+        set_env("LLAMA_MTP_WINDOW", nullptr);
+        llama_fn_state_inject(w);
+        TCHECK(getenv("LLAMA_MTP_ATTN_WINDOW") && strcmp(getenv("LLAMA_MTP_ATTN_WINDOW"), "32768") == 0, "without the alias the default goes in");
+        llama_fn_state_undo(w);
+        TCHECK(getenv("LLAMA_MTP_ATTN_WINDOW") == nullptr, "and comes out with the state");
+    }
+
     // GGML_CPU_* switches go through ggml_cpu_fn_set_switch (ggml_cpu_init read the environment long before)
     ggml_backend_reg_t reg = ggml_backend_reg_by_name("CPU");
     using get_t = int (*)(enum ggml_cpu_fn_switch);
