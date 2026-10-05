@@ -378,10 +378,14 @@ void pfs_gate_op(ggml_tensor * dst, int ith, int nth, void * ud) {
 }
 
 void pfs_release_op(ggml_tensor * dst, int ith, int nth, void * ud) {
-    GGML_UNUSED(dst);
     GGML_UNUSED(nth);
     if (ith != 0) {
         return;
+    }
+    // [TAG_NAN_SCAN] the one-element output carries no value (an ordering node): written, so the NaN scan never reads
+    // whatever bytes its buffer held (seen as a [NAN] line with the l3-cpu switches at -c 262144)
+    if (dst->data != nullptr && dst->type == GGML_TYPE_F32) {
+        *(float *) dst->data = 0.0f;
     }
     pfs_state * s = g_pfs;
     pfs_layer * L = (pfs_layer *) ud;
