@@ -6,6 +6,7 @@
 #   define NOMINMAX
 #endif
 #include <windows.h>
+#include <dbghelp.h> // [TAG_FN_L3_HOST_DIAG] types only: dbghelp.dll is loaded at run time
 #endif
 
 #include "ggml-backend.h"
@@ -20,8 +21,15 @@
 #include <stdlib.h>
 #include <string.h>
 #include <algorithm>
+#include <atomic>
+#include <cinttypes>
+#include <mutex>
 #include <unordered_map>
 #include <vector>
+
+// [TAG_FN_L3_HOST_DIAG] the wait tracer (see ggml_backend_sync_trace_set below)
+static int  ggml_sync_trace_threshold_us();
+static void ggml_sync_trace_record(const char * what, double us);
 
 #ifdef __APPLE__
 #include <sys/types.h>
@@ -484,7 +492,17 @@ void ggml_backend_tensor_set(struct ggml_tensor * tensor, const void * data, siz
     GGML_ASSERT(tensor->data != NULL && "tensor not allocated");
     GGML_ASSERT(offset + size <= ggml_nbytes(tensor) && "tensor write out of bounds");
 
+    const int trace_us = ggml_sync_trace_threshold_us(); // [TAG_FN_L3_HOST_DIAG]
+    if (trace_us <= 0 || ggml_backend_buffer_is_host(buf)) {
+        buf->iface.set_tensor(buf, tensor, data, offset, size);
+        return;
+    }
+    const int64_t t0 = ggml_time_us();
     buf->iface.set_tensor(buf, tensor, data, offset, size);
+    const int64_t dt = ggml_time_us() - t0;
+    if (dt >= trace_us) {
+        ggml_sync_trace_record("tensor_set", (double) dt);
+    }
 }
 
 void ggml_backend_tensor_get(const struct ggml_tensor * tensor, void * data, size_t offset, size_t size) {
@@ -499,7 +517,17 @@ void ggml_backend_tensor_get(const struct ggml_tensor * tensor, void * data, siz
     GGML_ASSERT(tensor->data != NULL && "tensor not allocated");
     GGML_ASSERT(offset + size <= ggml_nbytes(tensor) && "tensor read out of bounds");
 
+    const int trace_us = ggml_sync_trace_threshold_us(); // [TAG_FN_L3_HOST_DIAG]
+    if (trace_us <= 0 || ggml_backend_buffer_is_host(buf)) {
+        buf->iface.get_tensor(buf, tensor, data, offset, size);
+        return;
+    }
+    const int64_t t0 = ggml_time_us();
     buf->iface.get_tensor(buf, tensor, data, offset, size);
+    const int64_t dt = ggml_time_us() - t0;
+    if (dt >= trace_us) {
+        ggml_sync_trace_record("tensor_get", (double) dt);
+    }
 }
 
 void ggml_backend_tensor_set_2d(struct ggml_tensor * tensor, const void * data, size_t offset, size_t size,
@@ -562,13 +590,137 @@ void ggml_backend_tensor_memset(struct ggml_tensor * tensor, uint8_t value, size
     buf->iface.memset_tensor(buf, tensor, value, offset, size);
 }
 
+// [TAG_FN_L3_HOST_DIAG] ggml_backend_sync_trace_set: every backend synchronize, event synchronize and blocking tensor
+// get / set that takes at least threshold_us is counted under its call stack, and every 1024 such waits the stacks with
+// the most total time are printed. Windows: frames symbolized by dbghelp, which reads the export tables when there is
+// no PDB, so a large displacement means an unexported function of that module. Diagnostic only; 0 (default) costs one
+// relaxed load per call.
+static std::atomic<int> g_sync_trace_us{0};
+
+struct ggml_sync_trace_entry {
+    const char * what     = "";
+    uint64_t     n        = 0;
+    double       us       = 0.0;
+    int          n_frames = 0;
+    void *       frames[12] = {};
+};
+
+static std::mutex                                         g_sync_trace_mtx;
+static std::unordered_map<uint64_t, ggml_sync_trace_entry> g_sync_trace;
+static uint64_t                                           g_sync_trace_n = 0;
+
+static int ggml_sync_trace_threshold_us() {
+    return g_sync_trace_us.load(std::memory_order_relaxed);
+}
+
+// under g_sync_trace_mtx
+static void ggml_sync_trace_report() {
+    std::vector<const ggml_sync_trace_entry *> v;
+    for (const auto & it : g_sync_trace) {
+        v.push_back(&it.second);
+    }
+    std::sort(v.begin(), v.end(), [](const ggml_sync_trace_entry * a, const ggml_sync_trace_entry * b) { return a->us > b->us; });
+#ifdef _WIN32
+    using sym_init_t = BOOL (WINAPI *)(HANDLE, PCSTR, BOOL);
+    using sym_opts_t = DWORD (WINAPI *)(DWORD);
+    using sym_addr_t = BOOL (WINAPI *)(HANDLE, DWORD64, PDWORD64, PSYMBOL_INFO);
+    static sym_addr_t sym_from_addr = nullptr;
+    static bool       sym_tried     = false;
+    if (!sym_tried) {
+        sym_tried = true;
+        if (HMODULE dbg = LoadLibraryA("dbghelp.dll")) {
+            auto sym_init = (sym_init_t) GetProcAddress(dbg, "SymInitialize");
+            auto sym_opts = (sym_opts_t) GetProcAddress(dbg, "SymSetOptions");
+            sym_from_addr = (sym_addr_t) GetProcAddress(dbg, "SymFromAddr");
+            if (sym_opts) {
+                sym_opts(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS);
+            }
+            if (!sym_init || !sym_init(GetCurrentProcess(), nullptr, TRUE)) {
+                sym_from_addr = nullptr;
+            }
+        }
+    }
+#endif
+    GGML_LOG_INFO("sync-trace: %" PRIu64 " waits traced, %zu call stacks; the most total time first:\n", g_sync_trace_n, v.size());
+    for (size_t i = 0; i < v.size() && i < 8; ++i) {
+        const ggml_sync_trace_entry & e = *v[i];
+        GGML_LOG_INFO("sync-trace: #%zu %s: %" PRIu64 " waits, %.1f us total, %.1f us each\n", i, e.what, e.n, e.us, e.us/e.n);
+        for (int f = 0; f < e.n_frames; ++f) {
+            char line[512];
+            snprintf(line, sizeof(line), "%p", e.frames[f]);
+#ifdef _WIN32
+            HMODULE mod = nullptr;
+            char    mod_path[MAX_PATH] = "?";
+            if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                        (LPCSTR) e.frames[f], &mod) && mod) {
+                GetModuleFileNameA(mod, mod_path, sizeof(mod_path));
+            }
+            const char * base = strrchr(mod_path, '\\');
+            base = base ? base + 1 : mod_path;
+            const uintptr_t off = mod ? (uintptr_t) e.frames[f] - (uintptr_t) mod : 0;
+            alignas(SYMBOL_INFO) char sbuf[sizeof(SYMBOL_INFO) + 256];
+            SYMBOL_INFO * si = (SYMBOL_INFO *) sbuf;
+            memset(sbuf, 0, sizeof(sbuf));
+            si->SizeOfStruct = sizeof(SYMBOL_INFO);
+            si->MaxNameLen   = 255;
+            DWORD64 disp = 0;
+            if (sym_from_addr && sym_from_addr(GetCurrentProcess(), (DWORD64) (uintptr_t) e.frames[f], &disp, si)) {
+                snprintf(line, sizeof(line), "%s+0x%zx  %s+0x%llx", base, (size_t) off, si->Name, (unsigned long long) disp);
+            } else {
+                snprintf(line, sizeof(line), "%s+0x%zx", base, (size_t) off);
+            }
+#endif
+            GGML_LOG_INFO("sync-trace:      %s\n", line);
+        }
+    }
+}
+
+static void ggml_sync_trace_record(const char * what, double us) {
+    void * frames[12] = {};
+    int    n_frames   = 0;
+#ifdef _WIN32
+    n_frames = (int) CaptureStackBackTrace(2, 12, frames, nullptr);
+#endif
+    uint64_t h = 1469598103934665603ull;
+    h = (h ^ (uint64_t) (uintptr_t) what) * 1099511628211ull;
+    for (int f = 0; f < n_frames; ++f) {
+        h = (h ^ (uint64_t) (uintptr_t) frames[f]) * 1099511628211ull;
+    }
+    std::lock_guard<std::mutex> lk(g_sync_trace_mtx);
+    ggml_sync_trace_entry & e = g_sync_trace[h];
+    if (e.n == 0) {
+        e.what     = what;
+        e.n_frames = n_frames;
+        memcpy(e.frames, frames, sizeof(frames));
+    }
+    e.n++;
+    e.us += us;
+    if (++g_sync_trace_n % 1024 == 0) {
+        ggml_sync_trace_report();
+    }
+}
+
+void ggml_backend_sync_trace_set(int threshold_us) {
+    g_sync_trace_us.store(threshold_us > 0 ? threshold_us : 0, std::memory_order_relaxed);
+}
+
 void ggml_backend_synchronize(ggml_backend_t backend) {
     GGML_ASSERT(backend);
     if (backend->iface.synchronize == NULL) {
         return;
     }
 
+    const int trace_us = g_sync_trace_us.load(std::memory_order_relaxed); // [TAG_FN_L3_HOST_DIAG]
+    if (trace_us <= 0) {
+        backend->iface.synchronize(backend);
+        return;
+    }
+    const int64_t t0 = ggml_time_us();
     backend->iface.synchronize(backend);
+    const int64_t dt = ggml_time_us() - t0;
+    if (dt >= trace_us) {
+        ggml_sync_trace_record(ggml_backend_name(backend), (double) dt);
+    }
 }
 
 ggml_backend_graph_plan_t ggml_backend_graph_plan_create(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
@@ -697,7 +849,17 @@ void ggml_backend_event_synchronize(ggml_backend_event_t event) {
     GGML_ASSERT(event);
     GGML_ASSERT(event->device->iface.event_synchronize);
 
+    const int trace_us = g_sync_trace_us.load(std::memory_order_relaxed); // [TAG_FN_L3_HOST_DIAG]
+    if (trace_us <= 0) {
+        event->device->iface.event_synchronize(event->device, event);
+        return;
+    }
+    const int64_t t0 = ggml_time_us();
     event->device->iface.event_synchronize(event->device, event);
+    const int64_t dt = ggml_time_us() - t0;
+    if (dt >= trace_us) {
+        ggml_sync_trace_record("event", (double) dt);
+    }
 }
 
 void ggml_backend_event_wait(ggml_backend_t backend, ggml_backend_event_t event) {
@@ -978,6 +1140,9 @@ struct ggml_backend_sched {
     int debug_realloc;
     int debug_graph_size;
     int debug_prev_graph_size;
+
+    // [TAG_FN_L3_HOST_LAUNCH2] ggml_backend_sched_set_split_after; empty = off
+    char split_after[GGML_MAX_NAME];
 };
 
 #define hash_id(tensor) ggml_hash_find_or_insert(&sched->hash_set, tensor)
@@ -1450,6 +1615,12 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         split->i_start = 0;
         split->n_inputs = 0;
         int cur_backend_id = split->backend_id;
+        // [TAG_FN_L3_HOST_LAUNCH2] cut_next: the previous node was the split_after node; cut_parent: the split the cut ended,
+        // while the split after it runs: its graph inputs are copied with the parent's, so it starts without a copy
+        // (and without the synchronize that would wait for the parent)
+        bool cut_next   = false;
+        bool cut_done   = sched->split_after[0] == '\0';
+        int  cut_parent = -1;
         for (; i < graph->n_nodes; i++) {
             struct ggml_tensor * node = graph->nodes[i];
 
@@ -1463,6 +1634,16 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
 
             // check if we should start a new split based on the sources of the current node
             bool need_new_split = false;
+            bool cut_here       = false;
+            if (cut_next) { // [TAG_FN_L3_HOST_LAUNCH2]
+                cut_next       = false;
+                cut_here       = node_backend_id == cur_backend_id;
+                need_new_split = cut_here;
+            }
+            if (!cut_done && strcmp(node->name, sched->split_after) == 0) {
+                cut_done = true;
+                cut_next = true;
+            }
             if (node_backend_id == cur_backend_id && split->n_inputs > 0) {
                 for (int j = 0; j < GGML_MAX_SRC; j++) {
                     struct ggml_tensor * src = node->src[j];
@@ -1499,6 +1680,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                 split->i_start = i;
                 split->n_inputs = 0;
                 cur_backend_id = node_backend_id;
+                cut_parent = cut_here ? i_split - 1 : -1; // [TAG_FN_L3_HOST_LAUNCH2]
             }
 
             // find inputs that are not on the same backend
@@ -1526,11 +1708,15 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                             tensor_id_copy(src_id, cur_backend_id, c) = tensor_copy;
                             SET_CAUSE(tensor_copy, "4.cpy");
                         }
-                        int n_inputs = split->n_inputs++;
-                        if (n_inputs >= split->inputs_capacity) {
-                            ggml_backend_sched_split_inputs_grow(split);
+                        // [TAG_FN_L3_HOST_LAUNCH2] a graph input of the cut's second split is copied with the first's
+                        // (same backend, nothing runs between them); other inputs stay where they are needed
+                        struct ggml_backend_sched_split * in_split =
+                            cut_parent >= 0 && (src->flags & GGML_TENSOR_FLAG_INPUT) ? &sched->splits[cut_parent] : split;
+                        int n_inputs = in_split->n_inputs++;
+                        if (n_inputs >= in_split->inputs_capacity) {
+                            ggml_backend_sched_split_inputs_grow(in_split);
                         }
-                        split->inputs[n_inputs] = src;
+                        in_split->inputs[n_inputs] = src;
                     }
                     node->src[j] = tensor_id_copy(src_id, cur_backend_id, sched->cur_copy);
                 }
@@ -2314,6 +2500,12 @@ void ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backe
     GGML_ASSERT(sched);
     sched->callback_eval = callback;
     sched->callback_eval_user_data = user_data;
+}
+
+// [TAG_FN_L3_HOST_LAUNCH2]
+void ggml_backend_sched_set_split_after(ggml_backend_sched_t sched, const char * name) {
+    GGML_ASSERT(sched);
+    snprintf(sched->split_after, sizeof(sched->split_after), "%s", name ? name : "");
 }
 
 int ggml_backend_sched_get_n_splits(ggml_backend_sched_t sched) {

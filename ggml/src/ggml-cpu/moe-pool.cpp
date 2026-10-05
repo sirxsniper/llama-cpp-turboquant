@@ -223,6 +223,14 @@ struct ggml_cpu_moe_pool {
     std::atomic<uint64_t>     pf_stopped{0};
     std::atomic<uint64_t>     pf_bytes{0};
     std::atomic<uint64_t>     pf_experts{0};
+
+    // [TAG_FN_L3_HOST_EXEC] the caller's part of a prefetch: pf_gen numbers the posted prefetches (caller side),
+    // worker 1 stores it in pf_list_gen once pf_list / pf_n hold that prefetch's prediction
+    uint32_t                     pf_gen = 0;
+    alignas(64) std::atomic<uint32_t> pf_list_gen{0};
+    std::atomic<uint64_t>        pfc_calls{0};
+    std::atomic<uint64_t>        pfc_stopped{0};
+    std::atomic<uint64_t>        pfc_bytes{0};
 };
 
 static void moe_pool_barrier(void * ctx) {
@@ -314,6 +322,7 @@ static void moe_pool_prefetch_part(ggml_cpu_moe_pool * p, int ith) {
         }
         p->pf_n = n;
         p->pf_experts.fetch_add((uint64_t) n, std::memory_order_relaxed);
+        p->pf_list_gen.store(p->pf_gen, std::memory_order_release); // [TAG_FN_L3_HOST_EXEC] the caller may read the list
     }
     moe_pool_pf_barrier(p, nw);
 
@@ -591,6 +600,7 @@ enum ggml_status ggml_cpu_moe_prefetch(struct ggml_cpu_moe_pool * p, const struc
     p->pf_mark.resize((size_t) n_exp);
     p->pf_n    = 0;
     p->pf_stop = 0;
+    p->pf_gen++; // [TAG_FN_L3_HOST_EXEC] published to the workers by the seq increment below
     p->pf_jobs.fetch_add(1, std::memory_order_relaxed);
 
     p->kind.store(1, std::memory_order_relaxed);
@@ -617,6 +627,47 @@ void ggml_cpu_moe_pool_set_solo(struct ggml_cpu_moe_pool * p, bool solo) {
     if (p) {
         moe_pool_prefetch_finish(p);
         p->solo = solo && p->n_threads >= 2;
+    }
+}
+
+// [TAG_FN_L3_HOST_EXEC] the caller computes as thread 0 of n_threads (not solo), so it pulls its own pieces: the
+// workers pull theirs in moe_pool_prefetch_part with the same split. The list is the one worker 1 published for the
+// prefetch posted last; nothing writes it until the caller posts the next prefetch or job (it returns before both).
+size_t ggml_cpu_moe_prefetch_caller(struct ggml_cpu_moe_pool * p, const volatile int32_t * stop) {
+    if (p == nullptr || stop == nullptr || !p->pf_inflight || p->solo || p->n_threads < 2) {
+        return 0;
+    }
+    p->pfc_calls.fetch_add(1, std::memory_order_relaxed);
+    const uint32_t gen = p->pf_gen;
+    while (p->pf_list_gen.load(std::memory_order_acquire) != gen) {
+        if (*stop) {
+            p->pfc_stopped.fetch_add(1, std::memory_order_relaxed);
+            return 0;
+        }
+        moe_pool_relax();
+    }
+    const ggml_cpu_moe_layer * L = p->pf.layer;
+    const int n = p->pf_n;
+    size_t b = 0;
+    if (n > 0 && L != nullptr && !*stop) {
+        b = ggml_fn_moe_prefetch(L->up, L->gate, L->down, p->pf_list.data(), n, 0, p->n_threads, stop, p->pf.mode);
+    }
+    if (*stop) {
+        p->pfc_stopped.fetch_add(1, std::memory_order_relaxed);
+    }
+    p->pfc_bytes.fetch_add((uint64_t) b, std::memory_order_relaxed);
+    return b;
+}
+
+void ggml_cpu_moe_prefetch_caller_stats(struct ggml_cpu_moe_pool * p, uint64_t * calls, uint64_t * stopped, uint64_t * bytes) {
+    if (calls) {
+        *calls = p ? p->pfc_calls.load() : 0;
+    }
+    if (stopped) {
+        *stopped = p ? p->pfc_stopped.load() : 0;
+    }
+    if (bytes) {
+        *bytes = p ? p->pfc_bytes.load() : 0;
     }
 }
 

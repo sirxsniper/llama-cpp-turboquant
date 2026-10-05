@@ -137,6 +137,14 @@ typedef void     (*ggml_backend_moe_bridge_chan_times_t)(const struct ggml_moe_b
 //                                     paths: no kernel keeps spinning on a flag nobody will raise); host memory only
 typedef void     (*ggml_backend_moe_bridge_release_t)(struct ggml_moe_bridge * bridge);
 
+// [TAG_FN_L3_HOST_EXEC]
+// "ggml_backend_moe_bridge_set_watch": spin mode. on: poll zeroes the stamp of every ring entry it takes, so the word of
+//                                      the next entry reads 0 until the device posts there. Before the first graph.
+typedef void     (*ggml_backend_moe_bridge_set_watch_t)(struct ggml_moe_bridge * bridge, bool on);
+// "ggml_backend_moe_bridge_next_post_word": with watch on, a host word that turns nonzero when the next job is posted
+//                                           (no CUDA call to read it); valid until the next poll. Executor thread only.
+typedef const volatile int32_t * (*ggml_backend_moe_bridge_next_post_word_t)(struct ggml_moe_bridge * bridge);
+
 #ifdef __cplusplus
 }
 #endif

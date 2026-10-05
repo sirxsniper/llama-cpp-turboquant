@@ -167,6 +167,7 @@ struct ggml_moe_bridge {
     std::atomic<uint64_t> taken{0};
     std::atomic<uint64_t> completed{0};
     std::atomic<uint32_t> n_lapped{0};
+    bool                  watch = false; // [TAG_FN_L3_HOST_EXEC] poll zeroes the stamps it takes
 };
 
 static std::mutex                       g_mb_mtx;
@@ -740,9 +741,10 @@ bool ggml_backend_cuda_moe_bridge_poll(ggml_moe_bridge * b, ggml_moe_bridge_job 
     return false;
 #else
     const uint32_t next = b->served.load(std::memory_order_relaxed) + 1;
-    const mb_ring_entry * e = b->ring + (next % MB_RING);
+    mb_ring_entry * e = b->ring + (next % MB_RING);
     const uint32_t st = *(const volatile uint32_t *) &e->stamp;
     if (st != next) {
+        // [TAG_FN_L3_HOST_EXEC] a zeroed entry (watch on) reads as not posted: (0 - next) is negative, not a lap
         if ((int32_t) (st - next) > 0) {
             // the device lapped the ring: the jobs before st are lost and their waits time out; resume at st
             if (b->n_lapped.fetch_add(1, std::memory_order_relaxed) < 8) {
@@ -755,6 +757,10 @@ bool ggml_backend_cuda_moe_bridge_poll(ggml_moe_bridge * b, ggml_moe_bridge_job 
     std::atomic_thread_fence(std::memory_order_acquire);
     const uint32_t chan = *(const volatile uint32_t *) &e->chan;
     const uint32_t seq  = *(const volatile uint32_t *) &e->seq;
+    if (b->watch) {
+        // [TAG_FN_L3_HOST_EXEC] the device writes this entry again only one lap (MB_RING posts) later
+        *(volatile uint32_t *) &e->stamp = 0;
+    }
     if (chan >= (uint32_t) b->params.n_chan) {
         b->served.store(next, std::memory_order_release);
         return false;
@@ -888,6 +894,33 @@ void ggml_backend_cuda_moe_bridge_release(ggml_moe_bridge * b) {
         *(volatile uint32_t *) &b->glob->release = 1;
         std::atomic_thread_fence(std::memory_order_seq_cst);
     }
+}
+
+// [TAG_FN_L3_HOST_EXEC] no graph runs (before the first one): the entries the poll has taken get stamp 0, so from now on
+// every entry ahead of served reads 0 until the device posts there
+void ggml_backend_cuda_moe_bridge_set_watch(ggml_moe_bridge * b, bool on) {
+    if (b == nullptr || b->ring == nullptr || b->params.wait_mode != GGML_MOE_BRIDGE_WAIT_SPIN) {
+        return;
+    }
+    if (on && !b->watch) {
+        const uint32_t served = b->served.load(std::memory_order_acquire);
+        for (int i = 0; i < MB_RING; ++i) {
+            volatile uint32_t * st = &b->ring[i].stamp;
+            if ((int32_t) (*st - served) <= 0) {
+                *st = 0;
+            }
+        }
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+    }
+    b->watch = on;
+}
+
+const volatile int32_t * ggml_backend_cuda_moe_bridge_next_post_word(ggml_moe_bridge * b) {
+    if (b == nullptr || b->ring == nullptr || !b->watch) {
+        return nullptr;
+    }
+    const uint32_t next = b->served.load(std::memory_order_relaxed) + 1;
+    return (const volatile int32_t *) &b->ring[next % MB_RING].stamp;
 }
 
 // ---- ops ------------------------------------------------------------------------------------------------------------
