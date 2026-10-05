@@ -6820,6 +6820,7 @@ private:
             slot.i_batch = -1;
 
             common_sampler_accept(slot.smpl.get(), id, true);
+            common_sampler_eog_trace(slot.smpl.get(), slot.ctx_tgt, id, "single", -1.0f); // [TAG_FN_R2_EOG_TRACE]
 
             // [TAG_BS_LAZY_GRAMMAR] the lazy grammar just triggered (or the reasoning budget started forcing):
             // this slot samples on the CPU, grammar applied, from the next decode on

@@ -940,6 +940,7 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
         common_sampler_accept(gsmpl, id, true);
 
         result.push_back(id);
+        common_sampler_eog_trace(gsmpl, ctx, id, draft[i] == id ? "match" : "target", -1.0f); // [TAG_FN_R2_EOG_TRACE]
 
         // do not accept draft tokens after an EOG - they are not output but would stay in the context
         // on replay the last token is from the target and can be EOG, so a trailing EOG is still accepted
@@ -961,6 +962,7 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
         common_sampler_accept(gsmpl, id, true);
 
         result.push_back(id);
+        common_sampler_eog_trace(gsmpl, ctx, id, "bonus", -1.0f); // [TAG_FN_R2_EOG_TRACE]
     }
 
     return result;
@@ -1012,6 +1014,7 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(
         if (q_draft > 0.0f && uniform(gsmpl->rng) * q_draft <= p_draft) {
             common_sampler_accept(gsmpl, draft[i], true);
             result.push_back(draft[i]);
+            common_sampler_eog_trace(gsmpl, ctx, draft[i], "couple-accept", q_draft); // [TAG_FN_R2_EOG_TRACE]
             // [TAG_SYNC_1004] upstream #29638's stop, as in the greedy overload: no draft token is accepted after an
             // EOG - it would not be output but would stay in the context
             if (llama_vocab_is_eog(vocab, draft[i]) && i + 1 < draft.size()) {
@@ -1060,6 +1063,7 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(
 
         common_sampler_accept(gsmpl, id, true);
         result.push_back(id);
+        common_sampler_eog_trace(gsmpl, ctx, id, id_idx == SIZE_MAX ? "couple-fallback" : "couple-residual", q_prob(id)); // [TAG_FN_R2_EOG_TRACE]
         break;
     }
 
@@ -1067,6 +1071,7 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(
         const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
         common_sampler_accept(gsmpl, id, true);
         result.push_back(id);
+        common_sampler_eog_trace(gsmpl, ctx, id, "bonus", -1.0f); // [TAG_FN_R2_EOG_TRACE]
     }
 
     return result;
@@ -1079,6 +1084,36 @@ static float prob_of(const llama_token_data * data, size_t n, llama_token id) {
         }
     }
     return 0.0f;
+}
+
+// [TAG_FN_R2_EOG_TRACE] LLAMA_EOG_TRACE=1: one log line per end-of-generation token a sampler emits - how it was chosen,
+// its probability in the target's candidate array (cur_p after the chain), the draft's probability, the top candidates
+void common_sampler_eog_trace(const struct common_sampler * gsmpl, const struct llama_context * ctx, llama_token id,
+        const char * path, float q_x) {
+    static const bool on = [] {
+        const char * e = getenv("LLAMA_EOG_TRACE");
+        return e && e[0] == '1';
+    }();
+    if (!on || gsmpl == nullptr) {
+        return;
+    }
+    const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx));
+    if (!llama_vocab_is_eog(vocab, id)) {
+        return;
+    }
+    const auto & cp = gsmpl->cur_p;
+    std::vector<llama_token_data> top(cp.data, cp.data + cp.size);
+    std::sort(top.begin(), top.end(), [](const llama_token_data & a, const llama_token_data & b) { return a.p > b.p; });
+    std::string s;
+    for (size_t k = 0; k < top.size() && k < 8; ++k) {
+        s += string_format("%s%d:%.4f", k ? " " : "", top[k].id, top[k].p);
+    }
+    float p_sum = 0.0f;
+    for (const auto & e : top) {
+        p_sum += e.p;
+    }
+    LOG_WRN("[TAG_FN_R2_EOG_TRACE] EOG %d via %s: p_target %.6f q_draft %.6f, %zu candidates (p sum %.4f), top: %s\n",
+            id, path, prob_of(cp.data, cp.size, id), q_x, (size_t) cp.size, p_sum, s.c_str());
 }
 
 // Accept a drafted token with probability min(1, p/q), else draw from norm(max(0, p - q)).
@@ -1148,6 +1183,7 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct com
         if (q_x > 0.0f && (p_x >= q_x || uni(gsmpl->rng) < p_x / q_x)) {
             common_sampler_accept(gsmpl, draft[i], true);
             result.push_back(draft[i]);
+            common_sampler_eog_trace(gsmpl, ctx, draft[i], "reject-accept", q_x); // [TAG_FN_R2_EOG_TRACE]
             // [TAG_SYNC_1004] upstream #29638's stop, as in the greedy overload: no draft token after an accepted EOG
             if (llama_vocab_is_eog(vocab, draft[i]) && i + 1 < draft.size()) {
                 break;
@@ -1186,6 +1222,8 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct com
 
         common_sampler_accept(gsmpl, id, true);
         result.push_back(id);
+        common_sampler_eog_trace(gsmpl, ctx, id, sum > 0.0f ? "reject-residual" : "reject-fallback",
+                prob_of(q.data(), q.size(), id)); // [TAG_FN_R2_EOG_TRACE]
 
         break;
     }
@@ -1196,6 +1234,7 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct com
         common_sampler_accept(gsmpl, id, true);
 
         result.push_back(id);
+        common_sampler_eog_trace(gsmpl, ctx, id, "bonus", -1.0f); // [TAG_FN_R2_EOG_TRACE]
     }
 
     return result;

@@ -111,6 +111,9 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
 
 uint32_t common_sampler_get_seed(const struct common_sampler * gsmpl);
 
+// [TAG_FN_R2_EOG_TRACE] LLAMA_EOG_TRACE=1: log an emitted end-of-generation token with its path and probabilities
+void common_sampler_eog_trace(const struct common_sampler * gsmpl, const struct llama_context * ctx, llama_token id, const char * path, float q_x);
+
 // force the reasoning budget sampler (if any) to begin forcing its end sequence now.
 bool common_sampler_reasoning_budget_force(struct common_sampler * gsmpl);
 
