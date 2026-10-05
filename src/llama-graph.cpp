@@ -2287,6 +2287,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         }
     };
     const llama_pfs_view * pfs = nullptr;
+    ggml_tensor * const up_exps_host = up_exps; // [TAG_FN_L3_POLICY_SEED] the hot set knows the layer by its host tensor
     if (!gate_up_exps && gate_exps && down_exps && loras->empty()) {
         pfs = llama_prefill_stream_lookup(sched, up_exps, n_tokens);
     }
@@ -2400,6 +2401,14 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     ggml_tensor * weights = ggml_get_rows(ctx0, probs, selected_experts); // [1, n_expert_used, n_tokens]
     cb(weights, "ffn_moe_weights", il);
+
+    // [TAG_FN_L3_POLICY_SEED] a prompt ubatch copies its ids here (device, next to the router) for the seed node below
+    ggml_tensor * seed_ids = nullptr;
+    if (arch == LLM_ARCH_QWEN4EXP && il >= 0 && llama_moe_hot_seed_node_wanted(up_exps_host, n_tokens)) {
+        seed_ids = ggml_cont(ctx0, selected_experts);
+        ggml_format_name(seed_ids, "moe_hot_seed_ids-%d", il);
+        ggml_build_forward_expand(gf, seed_ids);
+    }
 
 
     if (gating_op == LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX_WEIGHT) {
@@ -2803,6 +2812,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // [TAG_FN_PREFILL_STREAM] the bank of this layer may be refilled once its down projection is done
     if (pfs) {
         pin_cpu(llama_prefill_stream_build_release(ctx0, gf, pfs, experts));
+    }
+    // [TAG_FN_L3_POLICY_SEED] right after the release, so both CPU nodes share one split
+    if (seed_ids) {
+        pin_cpu(llama_moe_hot_build_seed(ctx0, gf, seed_ids, il));
     }
 
     set_skip(experts);

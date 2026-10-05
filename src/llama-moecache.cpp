@@ -9,7 +9,9 @@
 #include "ggml-backend.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cinttypes>
+#include <cmath>
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
@@ -56,10 +58,25 @@ struct layer_state {
     std::vector<float>                dcnt;      // [n_expert]
     std::vector<float>                dseed;     // [n_expert]
     bool                              dseed_any = false;
+    float                             dseed_tok = 0.0f; // [TAG_FN_L3_POLICY_SEED] prompt tokens in dseed (LLAMA_MOE_HOT_SEED_NORM)
 
     // [TAG_FN_R1_PFS_LEND] the slots of this layer lie in the range the prefill stream borrowed: both tables say "not
     // hot" for every expert, nothing uploads into it, and llama_moe_hot_unlend refills it from slot_expert
     bool                              lent = false;
+
+    // [TAG_FN_L3_POLICY_POOL] the layer's slots are those of a pool shared by its expert shape class: slot_expert and
+    // slot_in_flight are pool sized and hold only this layer's entries (resident / upload into it in flight)
+    int                               pool   = -1;
+    int                               pool_k = -1; // the layer's index inside its pool
+};
+
+// [TAG_FN_L3_POLICY_POOL] one dynamic slot pool per expert shape class (LLAMA_MOE_HOT_POOL=1): any layer of the class can
+// take any slot of it. The class tensors (n_slots + 1 slots, the last one zero) are every member layer's up_c/gate_c/down_c
+// and n_slots is every member's miss value, so the graph, the bridge and the CPU skip tables work unchanged.
+struct hot_pool {
+    std::vector<size_t>  layers;     // mc->layers indices, pool_k order
+    std::vector<int32_t> slot_layer; // the mc->layers index that holds or receives a slot, -1 = free
+    int32_t              n_slots = 0;
 };
 
 struct upload_job {
@@ -67,6 +84,7 @@ struct upload_job {
     int32_t expert;
     int32_t slot;
     bool    done = false;
+    bool    failed = false; // [TAG_FN_L3_POLICY_UPLOAD] not uploaded (a slice out of range): the slot comes back empty
 };
 
 struct moe_cache {
@@ -141,11 +159,45 @@ struct moe_cache {
     uint64_t                 n_lend      = 0;
     double                   unlend_ms   = 0.0;
     size_t                   unlend_b    = 0;
+
+    // [TAG_FN_L3_POLICY_POOL]
+    std::vector<hot_pool> pools;
+
+    // [TAG_FN_L3_POLICY_SEED] prompt routing from the graph node instead of the CPU MUL_MAT_ID observer
+    bool                  sd_node   = false;
+    float                 sd_norm   = 0.0f; // LLAMA_MOE_HOT_SEED_NORM: the prompt folds in as this many decode steps of its mix
+    std::atomic<uint64_t> sd_tokens { 0 }; // prompt tokens counted by the node (owner's graphs only; stats)
+
+    // [TAG_FN_L3_POLICY_STATE] the learned set saved and loaded per model
+    std::string st_path;
+    std::string st_model;     // the model's name (general.name): a state of another model is not loaded
+    uint64_t    st_every  = 0;
+    uint64_t    st_saves  = 0;
+    bool        st_load   = true;
+
+    // [TAG_FN_L3_POLICY_UPLOAD] two small pinned halves (one fills while the other uploads) and a per-step byte bucket
+    bool                  up_pipe     = false;
+    size_t                up_half     = 8u << 20;
+    ggml_backend_buffer_t up_stage    = nullptr;
+    uint8_t *             up_stage_p  = nullptr;
+    ggml_backend_event_t  up_ev[2]    = { nullptr, nullptr };
+    bool                  up_ev_rec[2] = { false, false };
+    size_t                up_rate     = 0;     // bytes per decode step, 0 = no limit
+    size_t                up_cap      = 0;     // bucket size: two steps' worth, at least the largest slice
+    size_t                up_bucket   = 0;     // guarded by wmtx
+    bool                  up_drain    = false; // guarded by wmtx: a lend waits for the worker, so the bucket is ignored
+    std::atomic<uint64_t> up_bytes    { 0 };   // written by the worker, read by the stats line
+    std::atomic<uint64_t> up_waits    { 0 };   // times the bucket made the worker wait
+    uint64_t              up_batches  = 0;     // worker only
+    uint64_t              sd_folded   = 0;     // [TAG_FN_L3_POLICY_SEED] prompt tokens folded so far (owner's step)
+    uint64_t              sd_folds    = 0;
 };
 
 moe_cache * g_cache = nullptr;
 
 void hot_adapt_step(moe_cache * mc); // [TAG_FN_MOE_HOT_ADAPT]
+void hot_state_save(moe_cache * mc); // [TAG_FN_L3_POLICY_STATE]
+void hot_state_load(moe_cache * mc);
 std::mutex g_init_mtx;
 bool g_init_done = false;
 
@@ -528,7 +580,8 @@ void hot_obs_cb(const char * name, const struct ggml_tensor * ids, void * ud) {
     if (n_tokens > mc->hot_max_t) {
         // [TAG_FN_R4_ADAPT_DECAY] prefill: the prompt's routing x LLAMA_MOE_HOT_SEED warms the decayed counts at the next
         // step; otherwise not counted, and the adaptive set stays frozen
-        if (mc->adapt && mc->dc_on && mc->dc.seed > 0.0f) {
+        // [TAG_FN_L3_POLICY_SEED] with the seed node the graph reports every prompt ubatch, so the observer does not
+        if (mc->adapt && mc->dc_on && mc->dc.seed > 0.0f && !mc->sd_node) {
             const int il = parse_layer_from_name(name);
             for (auto & l : mc->layers) {
                 if (l.pub.il != il || l.dseed.empty()) {
@@ -541,6 +594,7 @@ void hot_obs_cb(const char * name, const struct ggml_tensor * ids, void * ud) {
                     }
                 }
                 l.dseed_any = true;
+                l.dseed_tok += (float) n_tokens;
                 break;
             }
         }
@@ -594,8 +648,10 @@ void hot_obs_cb(const char * name, const struct ggml_tensor * ids, void * ud) {
     LLAMA_LOG_INFO("moe-hot: %" PRIu64 " decode steps, hit rate %.3f (host layers only; layer min %.3f max %.3f)%s\n",
             mc->hot_steps, t ? (double) h / t : 0.0, lo, hi, mc->adapt ? " adaptive" : "");
     if (mc->adapt) {
-        LLAMA_LOG_INFO("moe-hot: adaptive: %" PRIu64 " experts admitted, %" PRIu64 " verify mismatches%s\n", mc->ad_admitted, mc->ad_bad,
-                mc->dc_on ? format(", %" PRIu64 " decay passes, %" PRIu64 " swaps queued", mc->dc_passes, mc->dc_swaps).c_str() : "");
+        LLAMA_LOG_INFO("moe-hot: adaptive: %" PRIu64 " experts admitted, %" PRIu64 " verify mismatches%s%s\n", mc->ad_admitted, mc->ad_bad,
+                mc->dc_on ? format(", %" PRIu64 " decay passes, %" PRIu64 " swaps queued", mc->dc_passes, mc->dc_swaps).c_str() : "",
+                mc->up_pipe || mc->up_rate > 0 || mc->sd_node ? format(" [TAG_FN_L3_POLICY] uploaded %.0f MiB, %" PRIu64 " bucket waits, "
+                        "%" PRIu64 " prompt tokens seeded", mc->up_bytes.load()/1048576.0, mc->up_waits.load(), mc->sd_tokens.load()).c_str() : "");
     }
 }
 
@@ -657,11 +713,148 @@ void hot_adapt_set_entry(moe_cache * mc, layer_state & ls, int32_t expert, int32
     mc->tbl_dirty = true;
 }
 
+// [TAG_FN_L3_POLICY_UPLOAD] the per-step byte bucket: takes `bytes`, waiting until it holds them when `wait` (else false
+// without taking anything); a lend that waits for the worker (and the process stop) lets it through, so the bucket never
+// holds a batch the prompt path waits for
+bool hot_rate_take(moe_cache * mc, size_t bytes, bool wait = true) {
+    if (mc->up_rate == 0) {
+        return true;
+    }
+    std::unique_lock<std::mutex> lk(mc->wmtx);
+    if (mc->up_bucket < bytes && !mc->up_drain && !mc->stop) {
+        if (!wait) {
+            return false;
+        }
+        mc->up_waits.fetch_add(1, std::memory_order_relaxed);
+        mc->wcv.wait(lk, [&]() { return mc->up_bucket >= bytes || mc->up_drain || mc->stop; });
+    }
+    mc->up_bucket = mc->up_bucket > bytes ? mc->up_bucket - bytes : 0;
+    return true;
+}
+
+// a slice's source and destination are inside their tensors (upload_slice's check)
+bool hot_slice_ok(const ggml_tensor * dst_c, const ggml_tensor * src, int32_t expert, int32_t slot) {
+    const size_t sz = src->nb[2];
+    if (slot < 0 || expert < 0 || (size_t) slot*dst_c->nb[2] + sz > ggml_nbytes(dst_c) || (size_t) expert*sz + sz > ggml_nbytes(src)) {
+        LLAMA_LOG_ERROR("moe-hot: bad upload %s <- %s expert=%d slot=%d - skipped\n", dst_c->name, src->name, expert, slot);
+        return false;
+    }
+    return true;
+}
+
+// [TAG_FN_L3_POLICY_UPLOAD] LLAMA_MOE_HOT_UP_PIPE: the batch through two small pinned halves - the copy threads fill one
+// while the upload stream reads the other (an event per half orders the reuse) - so the staging stays cache resident and
+// the memcpy overlaps the DMA. Returns after every copy of the batch has landed.
+void hot_upload_pipe(moe_cache * mc, std::vector<upload_job> & batch) {
+    struct staged { ggml_tensor * dst; size_t off; size_t size; size_t stage_off; };
+    std::vector<staged> st;
+    int    h    = 0;
+    size_t used = 0;
+    auto half = [&](int i) { return mc->up_stage_p + (size_t) i*mc->up_half; };
+    auto wait_half = [&](int i) {
+        if (mc->up_ev_rec[i]) {
+            ggml_backend_event_synchronize(mc->up_ev[i]); // the copies of its previous content have read it
+            mc->up_ev_rec[i] = false;
+        }
+    };
+    auto flush = [&]() {
+        if (st.empty()) {
+            return;
+        }
+        for (const auto & x : st) {
+            ggml_backend_tensor_set_async(mc->up_backend, x.dst, half(h) + x.stage_off, x.off, x.size);
+        }
+        ggml_backend_event_record(mc->up_ev[h], mc->up_backend);
+        mc->up_ev_rec[h] = true;
+        st.clear();
+        used = 0;
+        h ^= 1;
+        wait_half(h);
+    };
+    wait_half(h);
+    const int64_t t0 = ggml_time_us();
+    size_t batch_bytes = 0;
+    for (auto & j : batch) {
+        layer_state & ls = mc->layers[j.layer_idx];
+        ggml_tensor *       dsts[3] = { ls.pub.up_c,   ls.pub.gate_c,   ls.pub.down_c   };
+        const ggml_tensor * srcs[3] = { ls.pub.up_src, ls.pub.gate_src, ls.pub.down_src };
+        for (int k = 0; k < 3 && !j.failed; ++k) {
+            j.failed = !hot_slice_ok(dsts[k], srcs[k], j.expert, j.slot);
+        }
+        if (j.failed) {
+            continue;
+        }
+        for (int k = 0; k < 3; ++k) {
+            const size_t sz = srcs[k]->nb[2];
+            batch_bytes += sz;
+            if (!hot_rate_take(mc, sz, false)) {
+                flush(); // what is staged uploads while the bucket refills
+                hot_rate_take(mc, sz, true);
+            }
+            if (sz > mc->up_half) {
+                flush();
+                upload_slice(dsts[k], srcs[k], j.expert, j.slot);
+                mc->up_bytes.fetch_add(sz, std::memory_order_relaxed);
+                continue;
+            }
+            if (used + sz > mc->up_half) {
+                flush();
+            }
+            memcpy(half(h) + used, (const char *) srcs[k]->data + (size_t) j.expert*sz, sz);
+            st.push_back({ dsts[k], (size_t) j.slot*dsts[k]->nb[2], sz, used });
+            used += sz;
+            mc->up_bytes.fetch_add(sz, std::memory_order_relaxed);
+        }
+    }
+    flush();
+    ggml_backend_synchronize(mc->up_backend); // every copy of the batch has landed
+    if (mc->up_batches++ < 2) {
+        const double ms = (ggml_time_us() - t0)/1000.0;
+        LLAMA_LOG_INFO("moe-hot: [TAG_FN_L3_POLICY_UPLOAD] batch %llu: %zu experts, %.1f MiB through the pinned halves in %.1f ms "
+                "(%.1f GiB/s, incl. bucket waits)\n", (unsigned long long) mc->up_batches, batch.size(), batch_bytes/1048576.0, ms,
+                ms > 0 ? batch_bytes/1073741824.0/(ms/1000.0) : 0.0);
+    }
+}
+
+// the batch through the one large pinned staging buffer: fill it, upload, wait, repeat
+void hot_upload_staged(moe_cache * mc, const std::vector<upload_job> & batch) {
+    struct staged { ggml_tensor * dst; size_t off; size_t size; size_t stage_off; };
+    std::vector<staged> st;
+    size_t used = 0;
+    auto flush = [&]() {
+        for (const auto & x : st) {
+            ggml_backend_tensor_set_async(mc->up_backend, x.dst, mc->stage_ptr + x.stage_off, x.off, x.size);
+        }
+        ggml_backend_synchronize(mc->up_backend);
+        st.clear();
+        used = 0;
+    };
+    for (const auto & j : batch) {
+        layer_state & ls = mc->layers[j.layer_idx];
+        ggml_tensor *       dsts[3] = { ls.pub.up_c,   ls.pub.gate_c,   ls.pub.down_c   };
+        const ggml_tensor * srcs[3] = { ls.pub.up_src, ls.pub.gate_src, ls.pub.down_src };
+        for (int k = 0; k < 3; ++k) {
+            const size_t sz = srcs[k]->nb[2];
+            hot_rate_take(mc, sz); // [TAG_FN_L3_POLICY_UPLOAD] a no-op without LLAMA_MOE_HOT_UP_MIB_STEP
+            mc->up_bytes.fetch_add(sz, std::memory_order_relaxed);
+            if (sz > mc->stage_size) {
+                upload_slice(dsts[k], srcs[k], j.expert, j.slot);
+                continue;
+            }
+            if (used + sz > mc->stage_size) {
+                flush();
+            }
+            memcpy(mc->stage_ptr + used, (const char *) srcs[k]->data + (size_t) j.expert*sz, sz);
+            st.push_back({ dsts[k], (size_t) j.slot*dsts[k]->nb[2], sz, used });
+            used += sz;
+        }
+    }
+    flush();
+}
+
 // uploads the queued slices: mmap -> pinned staging -> the upload backend's own stream, then marks them done
 void hot_adapt_worker(moe_cache * mc) {
     std::vector<upload_job> batch;
-    struct staged { ggml_tensor * dst; size_t off; size_t size; size_t stage_off; };
-    std::vector<staged> st;
     for (;;) {
         {
             std::unique_lock<std::mutex> lk(mc->wmtx);
@@ -669,38 +862,31 @@ void hot_adapt_worker(moe_cache * mc) {
             if (mc->stop) {
                 return;
             }
-            batch.assign(mc->todo.begin(), mc->todo.end());
-            mc->todo.clear();
+            size_t n = mc->todo.size();
+            if (mc->up_rate > 0 && !mc->up_drain) {
+                // [TAG_FN_L3_POLICY_UPLOAD] only what the bucket holds now (at least one expert): each part is published
+                // as soon as it has landed, instead of the whole pass at the end
+                size_t b = 0;
+                n = 0;
+                for (const auto & j : mc->todo) {
+                    const layer_state & ls = mc->layers[j.layer_idx];
+                    const size_t jb = ls.pub.up_src->nb[2] + ls.pub.gate_src->nb[2] + ls.pub.down_src->nb[2];
+                    if (n > 0 && b + jb > mc->up_bucket) {
+                        break;
+                    }
+                    b += jb;
+                    n++;
+                }
+            }
+            batch.assign(mc->todo.begin(), mc->todo.begin() + (std::ptrdiff_t) n);
+            mc->todo.erase(mc->todo.begin(), mc->todo.begin() + (std::ptrdiff_t) n);
             mc->worker_busy = true; // [TAG_FN_R1_PFS_LEND]
         }
-        size_t used = 0;
-        auto flush = [&]() {
-            for (const auto & x : st) {
-                ggml_backend_tensor_set_async(mc->up_backend, x.dst, mc->stage_ptr + x.stage_off, x.off, x.size);
-            }
-            ggml_backend_synchronize(mc->up_backend);
-            st.clear();
-            used = 0;
-        };
-        for (const auto & j : batch) {
-            layer_state & ls = mc->layers[j.layer_idx];
-            ggml_tensor *       dsts[3] = { ls.pub.up_c,   ls.pub.gate_c,   ls.pub.down_c   };
-            const ggml_tensor * srcs[3] = { ls.pub.up_src, ls.pub.gate_src, ls.pub.down_src };
-            for (int k = 0; k < 3; ++k) {
-                const size_t sz = srcs[k]->nb[2];
-                if (sz > mc->stage_size) {
-                    upload_slice(dsts[k], srcs[k], j.expert, j.slot);
-                    continue;
-                }
-                if (used + sz > mc->stage_size) {
-                    flush();
-                }
-                memcpy(mc->stage_ptr + used, (const char *) srcs[k]->data + (size_t) j.expert*sz, sz);
-                st.push_back({ dsts[k], (size_t) j.slot*dsts[k]->nb[2], sz, used });
-                used += sz;
-            }
+        if (mc->up_pipe) {
+            hot_upload_pipe(mc, batch); // [TAG_FN_L3_POLICY_UPLOAD]
+        } else {
+            hot_upload_staged(mc, batch);
         }
-        flush();
         std::lock_guard<std::mutex> lk(mc->wmtx);
         for (auto j : batch) {
             j.done = true;
@@ -715,11 +901,19 @@ void hot_adapt_worker(moe_cache * mc) {
 void hot_adapt_verify(moe_cache * mc) {
     static uint64_t pick = 0;
     for (size_t tries = 0; tries < mc->layers.size(); ++tries) {
-        layer_state & ls = mc->layers[(pick++) % mc->layers.size()];
-        if (ls.pub.n_slots == 0 || ls.lent) { // [TAG_FN_R1_PFS_LEND] a lent layer's slots hold the stream's bytes
+        layer_state * lp = &mc->layers[(pick++) % mc->layers.size()];
+        if (lp->pub.n_slots == 0 || lp->lent) { // [TAG_FN_R1_PFS_LEND] a lent layer's slots hold the stream's bytes
             continue;
         }
-        const int32_t s = (int32_t) ((pick*2654435761u) % (uint64_t) ls.pub.n_slots);
+        const int32_t s = (int32_t) ((pick*2654435761u) % (uint64_t) lp->pub.n_slots);
+        if (lp->pool >= 0) { // [TAG_FN_L3_POLICY_POOL] the layer that holds this pool slot
+            const int32_t o = mc->pools[lp->pool].slot_layer[s];
+            if (o < 0) {
+                continue;
+            }
+            lp = &mc->layers[o];
+        }
+        layer_state & ls = *lp;
         const int32_t e = ls.slot_expert[s];
         if (e < 0 || ls.slot_in_flight[s]) {
             continue;
@@ -741,6 +935,9 @@ void hot_adapt_verify(moe_cache * mc) {
             ls.expert_slot[e] = -1;
             ls.slot_expert[s] = -1;
             hot_adapt_set_entry(mc, ls, e, ls.pub.n_slots);
+            if (ls.pool >= 0) {
+                mc->pools[ls.pool].slot_layer[s] = -1; // [TAG_FN_L3_POLICY_POOL]
+            }
         }
         return;
     }
@@ -793,11 +990,34 @@ void hot_adapt_save(moe_cache * mc) {
 // [TAG_FN_R4_ADAPT_DECAY] the decayed policy's part of the step: fold the prompt seeds, then every `every` decode steps
 // one pass (llama_moe_decay_pairs over all layers, best gain first, under the upload budget) and the decay
 void hot_adapt_decay(moe_cache * mc, bool decode_step) {
+    bool folded = false;
     for (auto & ls : mc->layers) {
-        if (ls.dseed_any) {
-            llama_moe_decay_fold_seed(ls.dcnt, ls.dseed, mc->dc.seed);
-            ls.dseed_any = false;
+        if (!ls.dseed_any) {
+            continue;
         }
+        if (mc->sd_norm > 0.0f) {
+            // [TAG_FN_L3_POLICY_SEED] LLAMA_MOE_HOT_SEED_NORM: the whole prompt (all its ubatches) at its first decode step,
+            // as sd_norm decode steps of the share of its tokens that route to each expert, whatever its length
+            if (!decode_step) {
+                continue;
+            }
+            llama_moe_decay_fold_seed(ls.dcnt, ls.dseed, ls.dseed_tok > 0.0f ? mc->dc.seed*mc->sd_norm/ls.dseed_tok : 0.0f);
+        } else {
+            llama_moe_decay_fold_seed(ls.dcnt, ls.dseed, mc->dc.seed);
+        }
+        ls.dseed_any = false;
+        ls.dseed_tok = 0.0f;
+        folded = true;
+    }
+    // [TAG_FN_L3_POLICY_SEED] the node's prompt tokens, logged for the first folds
+    const uint64_t sd_now = mc->sd_tokens.load(std::memory_order_relaxed);
+    if (folded && mc->sd_node && sd_now > mc->sd_folded) {
+        if (mc->sd_folds++ < 3 || mc->sd_folds % 64 == 0) {
+            LLAMA_LOG_INFO("moe-hot: [TAG_FN_L3_POLICY_SEED] the routing of %llu prompt tokens (graph node) folded into the "
+                    "counts x %.3f (fold %llu, %llu tokens so far)\n", (unsigned long long) (sd_now - mc->sd_folded),
+                    mc->dc.seed, (unsigned long long) mc->sd_folds, (unsigned long long) sd_now);
+        }
+        mc->sd_folded = sd_now;
     }
     if (!decode_step || mc->ad_steps % (uint64_t) std::max(1, mc->dc.every) != 0) {
         return;
@@ -811,6 +1031,9 @@ void hot_adapt_decay(moe_cache * mc, bool decode_step) {
         if (ls.pub.n_slots == 0 || ls.dcnt.empty() || ls.lent) { // [TAG_FN_R1_PFS_LEND] no upload into a lent layer
             continue;
         }
+        if (ls.pool >= 0) {
+            continue; // [TAG_FN_L3_POLICY_POOL] below, per pool
+        }
         slot_busy.assign(ls.pub.n_slots, 0);
         for (int32_t s = 0; s < ls.pub.n_slots; ++s) {
             slot_busy[s] = ls.slot_in_flight[s] ? 1 : 0;
@@ -821,24 +1044,86 @@ void hot_adapt_decay(moe_cache * mc, bool decode_step) {
         }
         llama_moe_decay_pairs(li, ls.dcnt, ls.slot_expert, slot_busy, expert_busy, mc->dc, swaps);
     }
+    // [TAG_FN_L3_POLICY_POOL] the candidates and residents of all layers of a pool compete for its slots
+    for (const auto & P : mc->pools) {
+        std::vector<const std::vector<float> *>   cnts;
+        std::vector<std::vector<uint8_t>>         busy_own(P.layers.size());
+        std::vector<const std::vector<uint8_t> *> busy;
+        bool skip = false;
+        for (size_t k = 0; k < P.layers.size() && !skip; ++k) {
+            const layer_state & ls = mc->layers[P.layers[k]];
+            skip = ls.lent || ls.dcnt.empty();
+            busy_own[k].assign(ls.dcnt.size(), 0);
+            for (size_t e = 0; e < ls.dcnt.size(); ++e) {
+                busy_own[k][e] = ls.expert_slot[e] >= 0 || ls.expert_in_flight[e] ? 1 : 0;
+            }
+            cnts.push_back(&ls.dcnt);
+            busy.push_back(&busy_own[k]);
+        }
+        if (skip) {
+            continue;
+        }
+        std::vector<int32_t> sl(P.n_slots, -1);
+        std::vector<int32_t> se(P.n_slots, -1);
+        std::vector<uint8_t> sb(P.n_slots, 0);
+        for (int32_t s = 0; s < P.n_slots; ++s) {
+            const int32_t o = P.slot_layer[s];
+            if (o < 0) {
+                continue;
+            }
+            const layer_state & ow = mc->layers[o];
+            sl[s] = ow.pool_k;
+            se[s] = ow.slot_expert[s];
+            sb[s] = ow.slot_in_flight[s] ? 1 : 0;
+        }
+        std::vector<llama_moe_decay_swap> ps;
+        llama_moe_decay_pairs_pool(cnts, busy, sl, se, sb, mc->dc, ps);
+        for (auto w : ps) {
+            w.layer        = (int) P.layers[w.layer];
+            w.victim_layer = w.victim_layer >= 0 ? (int) P.layers[w.victim_layer] : -1;
+            swaps.push_back(w);
+        }
+    }
     llama_moe_decay_order(swaps);
+
+    // [TAG_FN_L3_POLICY_UPLOAD] with a rate limit a pass queues at most what the bucket gives the worker until the next
+    // pass, minus what is still queued: evicted slots must not wait empty behind a growing queue
+    size_t pass_bytes = mc->dc_bytes;
+    if (mc->up_rate > 0) {
+        size_t queued_b = 0;
+        {
+            std::lock_guard<std::mutex> lk(mc->wmtx);
+            for (const auto & j : mc->todo) {
+                const layer_state & ls = mc->layers[j.layer_idx];
+                queued_b += ls.pub.up_src->nb[2] + ls.pub.gate_src->nb[2] + ls.pub.down_src->nb[2];
+            }
+        }
+        const size_t cap = mc->up_rate*(size_t) std::max(1, mc->dc.every);
+        pass_bytes = std::min(pass_bytes, cap > queued_b ? cap - queued_b : 0);
+    }
 
     size_t bytes = 0;
     bool queued = false;
     for (const auto & w : swaps) {
         layer_state & ls = mc->layers[w.layer];
         const size_t b = ls.pub.up_src->nb[2] + ls.pub.gate_src->nb[2] + ls.pub.down_src->nb[2];
-        if (bytes + b > mc->dc_bytes) {
+        if (bytes + b > pass_bytes) {
             break;
         }
         // evict first: the victim leaves both tables now, so no later graph reads the slot being overwritten
+        // [TAG_FN_L3_POLICY_POOL] in a pool the victim may belong to another layer of the class
+        layer_state & vs = w.victim_layer >= 0 ? mc->layers[w.victim_layer] : ls;
         if (w.victim >= 0) {
-            ls.expert_slot[w.victim] = -1;
-            hot_adapt_set_entry(mc, ls, w.victim, ls.pub.n_slots);
+            vs.expert_slot[w.victim] = -1;
+            vs.slot_expert[w.slot]   = -1;
+            hot_adapt_set_entry(mc, vs, w.victim, vs.pub.n_slots);
         }
         ls.slot_expert[w.slot]       = -1;
         ls.slot_in_flight[w.slot]    = true;
         ls.expert_in_flight[w.expert] = true;
+        if (ls.pool >= 0) {
+            mc->pools[ls.pool].slot_layer[w.slot] = w.layer;
+        }
         {
             std::lock_guard<std::mutex> lk(mc->wmtx);
             upload_job j;
@@ -865,6 +1150,14 @@ void hot_adapt_publish(moe_cache * mc) {
     std::lock_guard<std::mutex> lk(mc->wmtx);
     for (const auto & j : mc->done) {
         layer_state & ls = mc->layers[j.layer_idx];
+        if (j.failed) { // [TAG_FN_L3_POLICY_UPLOAD] nothing was copied: the slot is free again, the expert stays cold
+            ls.slot_in_flight[j.slot]     = false;
+            ls.expert_in_flight[j.expert] = false;
+            if (ls.pool >= 0) {
+                mc->pools[ls.pool].slot_layer[j.slot] = -1;
+            }
+            continue;
+        }
         ls.slot_expert[j.slot]        = j.expert;
         ls.expert_slot[j.expert]      = j.slot;
         ls.slot_in_flight[j.slot]     = false;
@@ -883,6 +1176,12 @@ void hot_adapt_step(moe_cache * mc) {
     bool any = false;
     for (const auto & ls : mc->layers) {
         any = any || !ls.cur_ids.empty();
+    }
+    // [TAG_FN_L3_POLICY_UPLOAD] every decode step gives the upload worker its bytes (at most two steps' worth kept)
+    if (any && mc->up_rate > 0) {
+        std::lock_guard<std::mutex> lk(mc->wmtx);
+        mc->up_bucket = std::min(mc->up_cap, mc->up_bucket + mc->up_rate);
+        mc->wcv.notify_one();
     }
     // [TAG_FN_R4_ADAPT_DECAY] the decayed policy replaces the window: every expert a decode step routed counts once (the
     // unit of the r1 trace replay, E:/turbot-gates/flashnext/test/r4/route_decay), then the pass
@@ -905,6 +1204,9 @@ void hot_adapt_step(moe_cache * mc) {
         }
         if (any && mc->save_every > 0 && mc->ad_steps % mc->save_every == 0) {
             hot_adapt_save(mc);
+        }
+        if (any && mc->st_every > 0 && mc->ad_steps % mc->st_every == 0) {
+            hot_state_save(mc); // [TAG_FN_L3_POLICY_STATE]
         }
         any = false; // the window part below is skipped
     }
@@ -934,7 +1236,7 @@ void hot_adapt_step(moe_cache * mc) {
         std::vector<cand> cands;
         for (int li = 0; li < (int) mc->layers.size(); ++li) {
             const layer_state & ls = mc->layers[li];
-            if (ls.pub.n_slots == 0 || ls.lent) { // [TAG_FN_R1_PFS_LEND] no upload into a lent layer
+            if (ls.pub.n_slots == 0 || ls.lent || ls.pool >= 0) { // [TAG_FN_R1_PFS_LEND] no upload into a lent layer
                 continue;
             }
             for (const int32_t e : ls.win_ring[pos]) {
@@ -1031,20 +1333,67 @@ void hot_adapt_init(moe_cache * mc, const llama_model & model, const void * owne
         mc->ad_verify = std::max(0, atoi(e));
     }
 
+    // [TAG_FN_L3_POLICY_*] the switches of lever round 3 act for qwen4exp only; every other model keeps the code above
+    const bool l3 = model.arch == LLM_ARCH_QWEN4EXP;
+    if (l3) { // [TAG_FN_L3_POLICY_UPLOAD]
+        if (const char * e = llama_fn_env(model, "LLAMA_MOE_HOT_UP_PIPE")) {
+            mc->up_pipe = atoi(e) != 0;
+        }
+        if (const char * e = llama_fn_env(model, "LLAMA_MOE_HOT_UP_STAGE_MIB")) {
+            mc->up_half = (size_t) std::max(2, std::min(256, atoi(e))) << 20;
+        }
+        if (const char * e = llama_fn_env(model, "LLAMA_MOE_HOT_UP_MIB_STEP")) {
+            mc->up_rate = (size_t) std::max(0, atoi(e)) << 20;
+        }
+    }
+
     mc->up_backend = ggml_backend_dev_init(dev, nullptr);
     if (!mc->up_backend) {
         LLAMA_LOG_WARN("moe-hot: no upload backend - static hot set only\n");
         return;
     }
-    mc->stage_size = std::max<size_t>(mc->ad_bytes, 16u << 20);
-    if (ggml_backend_buffer_type_t hb = ggml_backend_dev_host_buffer_type(dev)) {
-        mc->staging = ggml_backend_buft_alloc_buffer(hb, mc->stage_size);
+    if (mc->up_pipe) { // [TAG_FN_L3_POLICY_UPLOAD] two small pinned halves instead of the one large staging buffer
+        if (ggml_backend_buffer_type_t hb = ggml_backend_dev_host_buffer_type(dev)) {
+            mc->up_stage = ggml_backend_buft_alloc_buffer(hb, 2*mc->up_half);
+        }
+        mc->up_ev[0] = mc->up_stage ? ggml_backend_event_new(dev) : nullptr;
+        mc->up_ev[1] = mc->up_stage ? ggml_backend_event_new(dev) : nullptr;
+        if (!mc->up_stage || !mc->up_ev[0] || !mc->up_ev[1]) {
+            LLAMA_LOG_WARN("moe-hot: [TAG_FN_L3_POLICY_UPLOAD] no pinned halves or events - the one staging buffer\n");
+            for (auto & ev : mc->up_ev) {
+                if (ev) {
+                    ggml_backend_event_free(ev);
+                    ev = nullptr;
+                }
+            }
+            if (mc->up_stage) {
+                ggml_backend_buffer_free(mc->up_stage);
+                mc->up_stage = nullptr;
+            }
+            mc->up_pipe = false;
+        } else {
+            mc->up_stage_p = (uint8_t *) ggml_backend_buffer_get_base(mc->up_stage);
+        }
     }
-    if (mc->staging) {
-        mc->stage_ptr = (uint8_t *) ggml_backend_buffer_get_base(mc->staging);
-    } else {
-        mc->stage_buf.resize(mc->stage_size); // pageable: correct, but the copies stage through the driver
-        mc->stage_ptr = mc->stage_buf.data();
+    if (!mc->up_pipe) {
+        mc->stage_size = std::max<size_t>(mc->ad_bytes, 16u << 20);
+        if (ggml_backend_buffer_type_t hb = ggml_backend_dev_host_buffer_type(dev)) {
+            mc->staging = ggml_backend_buft_alloc_buffer(hb, mc->stage_size);
+        }
+        if (mc->staging) {
+            mc->stage_ptr = (uint8_t *) ggml_backend_buffer_get_base(mc->staging);
+        } else {
+            mc->stage_buf.resize(mc->stage_size); // pageable: correct, but the copies stage through the driver
+            mc->stage_ptr = mc->stage_buf.data();
+        }
+    }
+    if (mc->up_rate > 0) { // [TAG_FN_L3_POLICY_UPLOAD] two steps' worth, and never less than the largest slice
+        size_t max_slice = 0;
+        for (const auto & ls : mc->layers) {
+            max_slice = std::max({ max_slice, ls.pub.up_src->nb[2], ls.pub.gate_src->nb[2], ls.pub.down_src->nb[2] });
+        }
+        mc->up_cap    = std::max(2*mc->up_rate, max_slice);
+        mc->up_bucket = mc->up_cap;
     }
 
     const int64_t n_exp = mc->tbl_all->ne[1];
@@ -1093,15 +1442,54 @@ void hot_adapt_init(moe_cache * mc, const llama_model & model, const void * owne
             mc->save_every = (uint64_t) std::max(0, atoi(v));
         }
     }
+    // [TAG_FN_L3_POLICY_SEED] the prompt's routing from the graph node (llama_moe_hot_build_seed)
+    if (l3 && mc->dc_on && mc->dc.seed > 0.0f) {
+        if (const char * e = llama_fn_env(model, "LLAMA_MOE_HOT_SEED_NODE")) {
+            mc->sd_node = atoi(e) != 0;
+        }
+        if (const char * e = llama_fn_env(model, "LLAMA_MOE_HOT_SEED_NORM")) {
+            mc->sd_norm = std::max(0.0f, (float) atof(e));
+        }
+    }
+    // [TAG_FN_L3_POLICY_STATE] the learned set per model: saved on a slot save, at the end and every N steps, loaded at
+    // the start (llama_moe_hot_init)
+    if (l3 && mc->dc_on) {
+        const char * e = llama_fn_env(model, "LLAMA_MOE_HOT_STATE");
+        if (e && e[0] && strcmp(e, "0") != 0 && strcmp(e, "off") != 0) {
+            const std::string mpath = model.fn_auto ? model.fn_auto->model_path : std::string();
+            mc->st_path = strcmp(e, "auto") == 0 ? (mpath.empty() ? std::string() : mpath + ".hotstate") : std::string(e);
+            if (mc->st_path.empty()) {
+                LLAMA_LOG_WARN("moe-hot: [TAG_FN_L3_POLICY_STATE] LLAMA_MOE_HOT_STATE=auto needs the model path (the qwen4exp "
+                        "profile keeps it) - no saved state; give a file name\n");
+            }
+            mc->st_model = llama_moe_hotstate_name(model.name);
+            if (const char * v = llama_fn_env(model, "LLAMA_MOE_HOT_STATE_EVERY")) {
+                mc->st_every = (uint64_t) std::max(0, atoi(v));
+            }
+            if (const char * v = llama_fn_env(model, "LLAMA_MOE_HOT_STATE_LOAD")) {
+                mc->st_load = atoi(v) != 0;
+            }
+        }
+    }
 
     mc->owner = owner;
     mc->adapt = true;
     mc->worker = std::thread(hot_adapt_worker, mc);
+    if (mc->sd_node || mc->sd_norm > 0.0f || mc->up_pipe || mc->up_rate > 0 || !mc->st_path.empty()) {
+        const std::string up = mc->up_pipe ? format("2 x %zu MiB pinned halves", mc->up_half >> 20) : std::string("one staging buffer");
+        const std::string rt = mc->up_rate > 0 ? format("<= %zu MiB per decode step (bucket %zu MiB)", mc->up_rate >> 20, mc->up_cap >> 20) :
+                                                 std::string("no step limit");
+        const std::string st = mc->st_path.empty() ? std::string("off") :
+                format("%s (load %s, every %llu steps)", mc->st_path.c_str(), mc->st_load ? "on" : "off", (unsigned long long) mc->st_every);
+        LLAMA_LOG_INFO("moe-hot: [TAG_FN_L3_POLICY] prompt seed from the graph node: %s%s; uploads: %s, %s; saved state: %s\n",
+                mc->sd_node ? "on" : "off", mc->sd_norm > 0.0f ? format(" (a prompt counts as %.0f decode steps x %.3f)", mc->sd_norm, mc->dc.seed).c_str() : "",
+                up.c_str(), rt.c_str(), st.c_str());
+    }
     if (mc->dc_on) {
         LLAMA_LOG_INFO("moe-hot: adaptive [TAG_FN_R4_ADAPT_DECAY]: decayed counts x %.2f every %d steps, admit at %.2f and "
                 "> %.2fx / +%.2f over the victim, prompt seed x %.3f, <= %zu MiB uploads per pass, %s staging, verify every "
                 "%d steps%s%s\n", mc->dc.decay, mc->dc.every, mc->dc.admit, mc->dc.ratio, mc->dc.hyst, mc->dc.seed,
-                mc->dc_bytes >> 20, mc->staging ? "pinned" : "pageable", mc->ad_verify,
+                mc->dc_bytes >> 20, mc->up_pipe ? "pipe" : (mc->staging ? "pinned" : "pageable"), mc->ad_verify,
                 mc->save_path.empty() ? "" : ", saved to ", mc->save_path.c_str());
     } else {
         LLAMA_LOG_INFO("moe-hot: adaptive: admit after %d sightings in %d steps, hysteresis %d, <= %zu MiB uploads per step, "
@@ -1169,8 +1557,14 @@ size_t llama_moe_hot_device_bytes() {
         return 0;
     }
     size_t b = 0;
+    std::vector<const ggml_tensor *> seen; // [TAG_FN_L3_POLICY_POOL] the layers of a pool share their tensors
     for (const auto & ls : mc->layers) {
-        b += ggml_nbytes(ls.pub.up_c) + ggml_nbytes(ls.pub.gate_c) + ggml_nbytes(ls.pub.down_c);
+        for (const ggml_tensor * t : { ls.pub.up_c, ls.pub.gate_c, ls.pub.down_c }) {
+            if (std::find(seen.begin(), seen.end(), t) == seen.end()) {
+                seen.push_back(t);
+                b += ggml_nbytes(t);
+            }
+        }
     }
     return b;
 }
@@ -1236,6 +1630,14 @@ bool llama_moe_hot_init(const llama_model & model, const void * owner, size_t bu
             prof[il] = std::vector<double>((size_t) model.layers[il].ffn_up_exps->ne[2], 0.0);
         }
     }
+    // [TAG_FN_L3_POLICY_POOL] LLAMA_MOE_HOT_POOL=1 (qwen4exp, even slots, the decayed adaptive set): the layers of one
+    // expert shape class share one slot pool instead of a fixed share each
+    const bool pool_req = [&]() {
+        const char * pe = llama_fn_env(model, "LLAMA_MOE_HOT_POOL");
+        const char * de = llama_fn_env(model, "LLAMA_MOE_HOT_DECAY");
+        const float  d  = de ? (float) atof(de) : 0.0f;
+        return model.arch == LLM_ARCH_QWEN4EXP && even && adapt_req && pe && atoi(pe) != 0 && d > 0.0f && d < 1.0f;
+    }();
 
     struct cand_layer {
         int il;
@@ -1325,6 +1727,7 @@ bool llama_moe_hot_init(const llama_model & model, const void * owner, size_t bu
         mc->layers.clear();
         mc->by_up_src.clear();
         mc->tbl_all = nullptr;
+        mc->pools.clear(); // [TAG_FN_L3_POLICY_POOL]
     };
 
     for (int attempt = 0; attempt < 32 && budget > 0; ++attempt) {
@@ -1407,6 +1810,53 @@ bool llama_moe_hot_init(const llama_model & model, const void * owner, size_t bu
             if (tbl_all) {
                 ggml_format_name(tbl_all, "moe_hot_tbl_all");
             }
+            // [TAG_FN_L3_POLICY_POOL] the layers of one shape class (types, shapes, slot count) share one tensor set of their
+            // slot rows: k layers x (n slots + their zero slot) = one pool of k*(n + 1) - 1 slots and one zero slot
+            struct pool_class {
+                std::vector<int> lis;
+                ggml_tensor *    t[3]    = { nullptr, nullptr, nullptr };
+                int32_t          n_slots = 0;
+                int              pool    = -1;
+            };
+            std::vector<pool_class> classes;
+            std::map<int, size_t>   class_of;
+            if (pool_req) {
+                std::map<std::vector<int64_t>, size_t> by_key;
+                for (int li : g.second) {
+                    const llama_layer * l = layers[li].l;
+                    std::vector<int64_t> key;
+                    for (const ggml_tensor * t : { l->ffn_up_exps, l->ffn_gate_exps, l->ffn_down_exps }) {
+                        key.insert(key.end(), { (int64_t) t->type, t->ne[0], t->ne[1], t->ne[2] });
+                    }
+                    key.push_back(n_slots_of[li]);
+                    auto it = by_key.find(key);
+                    if (it == by_key.end()) {
+                        it = by_key.emplace(key, classes.size()).first;
+                        classes.emplace_back();
+                    }
+                    classes[it->second].lis.push_back(li);
+                }
+                for (size_t c = 0; c < classes.size(); ++c) {
+                    pool_class & C = classes[c];
+                    if (C.lis.size() < 2) {
+                        continue; // a class of one keeps its own slots
+                    }
+                    C.n_slots = (int32_t) C.lis.size()*(n_slots_of[C.lis[0]] + 1) - 1;
+                    const llama_layer * l = layers[C.lis[0]].l;
+                    const ggml_tensor * src[3] = { l->ffn_up_exps, l->ffn_gate_exps, l->ffn_down_exps };
+                    static const char * nm[3] = { "up", "gate", "down" };
+                    for (int w = 0; w < 3; ++w) {
+                        C.t[w] = ggml_new_tensor_3d(ctx_d, src[w]->type, src[w]->ne[0], src[w]->ne[1], C.n_slots + 1);
+                        ggml_format_name(C.t[w], "moe_hot_pool%zu_%s", mc->pools.size(), nm[w]);
+                    }
+                    C.pool = (int) mc->pools.size();
+                    mc->pools.emplace_back();
+                    mc->pools.back().n_slots = C.n_slots;
+                    for (int li : C.lis) {
+                        class_of[li] = c;
+                    }
+                }
+            }
             int64_t k = 0;
             for (int li : g.second) {
                 const llama_layer * l = layers[li].l;
@@ -1422,9 +1872,25 @@ bool llama_moe_hot_init(const llama_model & model, const void * owner, size_t bu
                 const ggml_tensor * u  = l->ffn_up_exps;
                 const ggml_tensor * gt = l->ffn_gate_exps;
                 const ggml_tensor * d  = l->ffn_down_exps;
-                ls.pub.up_c       = ggml_new_tensor_3d(ctx_d, u->type,  u->ne[0],  u->ne[1],  n_hot + 1);
-                ls.pub.gate_c     = ggml_new_tensor_3d(ctx_d, gt->type, gt->ne[0], gt->ne[1], n_hot + 1);
-                ls.pub.down_c     = ggml_new_tensor_3d(ctx_d, d->type,  d->ne[0],  d->ne[1],  n_hot + 1);
+                const auto cit = class_of.find(li);
+                if (cit != class_of.end()) {
+                    const pool_class & C = classes[cit->second];
+                    hot_pool & P = mc->pools[C.pool];
+                    ls.pub.n_slots = C.n_slots;
+                    ls.pub.up_c    = C.t[0];
+                    ls.pub.gate_c  = C.t[1];
+                    ls.pub.down_c  = C.t[2];
+                    ls.pool        = C.pool;
+                    ls.pool_k      = (int) P.layers.size();
+                    P.layers.push_back(mc->layers.size() - 1);
+                } else {
+                    ls.pub.up_c   = ggml_new_tensor_3d(ctx_d, u->type,  u->ne[0],  u->ne[1],  n_hot + 1);
+                    ls.pub.gate_c = ggml_new_tensor_3d(ctx_d, gt->type, gt->ne[0], gt->ne[1], n_hot + 1);
+                    ls.pub.down_c = ggml_new_tensor_3d(ctx_d, d->type,  d->ne[0],  d->ne[1],  n_hot + 1);
+                    ggml_format_name(ls.pub.up_c,   "moe_hot_up.%d",   ls.pub.il);
+                    ggml_format_name(ls.pub.gate_c, "moe_hot_gate.%d", ls.pub.il);
+                    ggml_format_name(ls.pub.down_c, "moe_hot_down.%d", ls.pub.il);
+                }
                 if (tbl_all) {
                     ls.pub.dev_table = ggml_view_2d(ctx_d, tbl_all, 1, n_exp_g, tbl_all->nb[1], k*tbl_all->nb[2]);
                     ls.tbl_off       = k*n_exp_g;
@@ -1432,9 +1898,6 @@ bool llama_moe_hot_init(const llama_model & model, const void * owner, size_t bu
                     ls.pub.dev_table = ggml_new_tensor_2d(ctx_d, GGML_TYPE_I32, 1, u->ne[2]);
                 }
                 ls.pub.host_table = ggml_new_tensor_2d(ctx_h, GGML_TYPE_I32, 1, u->ne[2]);
-                ggml_format_name(ls.pub.up_c,       "moe_hot_up.%d",   ls.pub.il);
-                ggml_format_name(ls.pub.gate_c,     "moe_hot_gate.%d", ls.pub.il);
-                ggml_format_name(ls.pub.down_c,     "moe_hot_down.%d", ls.pub.il);
                 ggml_format_name(ls.pub.dev_table,  "moe_hot_tbl.%d",  ls.pub.il);
                 ggml_format_name(ls.pub.host_table, "moe_hot_htbl.%d", ls.pub.il);
                 ++k;
@@ -1493,7 +1956,9 @@ bool llama_moe_hot_init(const llama_model & model, const void * owner, size_t bu
             ls.prof = prof[ls.pub.il];
 
             const size_t lb = ggml_nbytes(ls.pub.up_c) + ggml_nbytes(ls.pub.gate_c) + ggml_nbytes(ls.pub.down_c);
-            vram += lb;
+            if (ls.pool < 0 || ls.pool_k == 0) {
+                vram += lb; // [TAG_FN_L3_POLICY_POOL] a pool's tensors once
+            }
             if (even) {
                 LLAMA_LOG_DEBUG("moe-hot: blk.%-2d n_hot %3d  empty  %7.1f MiB\n", ls.pub.il, ls.pub.n_slots, lb/1048576.0);
                 continue;
@@ -1507,9 +1972,22 @@ bool llama_moe_hot_init(const llama_model & model, const void * owner, size_t bu
             LLAMA_LOG_INFO("moe-hot: blk.%-2d n_hot %3d  profile hit %.3f  %7.1f MiB\n", ls.pub.il, ls.pub.n_slots,
                     all > 0 ? hit/all : 0.0, lb/1048576.0);
         }
-        if (even) {
+        for (auto & P : mc->pools) {
+            P.slot_layer.assign(P.n_slots, -1); // [TAG_FN_L3_POLICY_POOL] every slot free
+        }
+        if (even && mc->pools.empty()) {
             LLAMA_LOG_INFO("moe-hot: %zu layers x %d empty slots, the adaptive set fills them from the routing\n",
                     mc->layers.size(), mc->layers.front().pub.n_slots);
+        } else if (even) {
+            std::string pl;
+            size_t n_pooled = 0;
+            for (const auto & P : mc->pools) {
+                pl += format(" %zu layers x %d slots (blk.%d ...),", P.layers.size(), P.n_slots, mc->layers[P.layers[0]].pub.il);
+                n_pooled += P.layers.size();
+            }
+            LLAMA_LOG_INFO("moe-hot: [TAG_FN_L3_POLICY_POOL] %zu slot pools:%s %zu layers with their own %d slots; the adaptive "
+                    "set fills them from the routing, any layer of a pool can take any of its slots\n", mc->pools.size(),
+                    pl.c_str(), mc->layers.size() - n_pooled, n_slots_of.empty() ? 0 : n_slots_of[0]);
         }
         LLAMA_LOG_INFO("moe-hot: %zu layers, %.1f MiB device memory (budget %.0f MiB), uploaded in %.1f s, section %s of %s, "
                 "graphs of <= %d tokens\n", mc->layers.size(), vram/1048576.0, budget/1048576.0, (ggml_time_us() - t0)/1e6,
@@ -1527,6 +2005,9 @@ bool llama_moe_hot_init(const llama_model & model, const void * owner, size_t bu
 
         if (adapt_req) {
             hot_adapt_init(mc, model, owner, groups.size() == 1 ? ggml_backend_buft_get_device(groups.begin()->first) : nullptr);
+            if (mc->adapt) {
+                hot_state_load(mc); // [TAG_FN_L3_POLICY_STATE] LLAMA_MOE_HOT_STATE: the saved residents into the empty slots
+            }
         }
         if (even && !mc->adapt) {
             // [TAG_FN_AUTO] nothing would ever fill the empty slots
@@ -1558,6 +2039,67 @@ void llama_moe_hot_save_now(const void * owner) {
     if (mc && mc->adapt && mc->owner == owner) {
         hot_adapt_save(mc);
     }
+}
+
+// [TAG_FN_L3_POLICY_SEED] ----------------------------------------------------------------------------------------------
+
+namespace {
+
+// the CPU node after a prompt ubatch's experts: its ids (copied to the host by the scheduler) into the layer's prompt
+// counts, which the owner's next step folds into the decayed counts x LLAMA_MOE_HOT_SEED. Runs inside the owner's graph,
+// never beside its step (the step runs after the owner has synchronized its compute)
+void hot_seed_op(ggml_tensor * dst, int ith, int nth, void * userdata) {
+    GGML_UNUSED(nth);
+    if (ith != 0) {
+        return;
+    }
+    moe_cache * mc = g_cache;
+    const ggml_tensor * ids = dst->src[0];
+    const int il = (int) (intptr_t) userdata;
+    if (!mc || !mc->adapt || !mc->dc_on || !mc->sd_node || !ids || ids->type != GGML_TYPE_I32) {
+        return;
+    }
+    for (auto & ls : mc->layers) {
+        if (ls.pub.il != il) {
+            continue;
+        }
+        if (ls.dseed.empty()) {
+            return;
+        }
+        const int32_t n_exp = (int32_t) ls.dseed.size();
+        for (int64_t t = 0; t < ids->ne[1]; ++t) {
+            for (int64_t i = 0; i < ids->ne[0]; ++i) {
+                const int32_t e = *(const int32_t *) ((const char *) ids->data + t*ids->nb[1] + i*ids->nb[0]);
+                if (e >= 0 && e < n_exp) {
+                    ls.dseed[e] += 1.0f;
+                }
+            }
+        }
+        ls.dseed_any = true;
+        ls.dseed_tok += (float) ids->ne[1];
+        if (&ls == &mc->layers.front()) {
+            mc->sd_tokens.fetch_add((uint64_t) ids->ne[1], std::memory_order_relaxed);
+        }
+        return;
+    }
+}
+
+} // namespace
+
+bool llama_moe_hot_seed_node_wanted(const ggml_tensor * up_exps, int64_t n_tokens) {
+    const moe_cache * mc = g_cache;
+    if (!mc || !mc->hot || !mc->adapt || !mc->dc_on || !mc->sd_node || mc->dc.seed <= 0.0f || n_tokens <= mc->hot_max_t) {
+        return false;
+    }
+    return mc->by_up_src.find(up_exps) != mc->by_up_src.end();
+}
+
+ggml_tensor * llama_moe_hot_build_seed(ggml_context * ctx, ggml_cgraph * gf, ggml_tensor * ids, int il) {
+    ggml_tensor * args[1] = { ids };
+    ggml_tensor * t = ggml_custom_4d(ctx, GGML_TYPE_F32, 1, 1, 1, 1, args, 1, hot_seed_op, 1, (void *) (intptr_t) il);
+    ggml_format_name(t, "moe_hot_seed-%d", il);
+    ggml_build_forward_expand(gf, t);
+    return t;
 }
 
 // [TAG_FN_R1_PFS_LEND] ---------------------------------------------------------------------------------------------
@@ -1763,12 +2305,21 @@ bool llama_moe_hot_lend(const void * owner, size_t bytes, ggml_backend_buffer_t 
             if (ls.lent) {
                 ls.slot_in_flight[it->slot]     = false;
                 ls.expert_in_flight[it->expert] = false;
+                if (ls.pool >= 0) {
+                    mc->pools[ls.pool].slot_layer[it->slot] = -1; // [TAG_FN_L3_POLICY_POOL]
+                }
                 it = mc->todo.erase(it);
             } else {
                 ++it;
             }
         }
-        mc->wcv_idle.wait(lk, [mc]() { return !mc->worker_busy; });
+        // [TAG_FN_L3_POLICY_UPLOAD] no decode step refills the bucket during a prompt: the worker ignores it now, and with
+        // a rate limit the lend also waits for the rest of the queue (the bucket may have left jobs in it), so no upload
+        // runs beside the stream
+        mc->up_drain = true;
+        mc->wcv.notify_all();
+        mc->wcv_idle.wait(lk, [mc]() { return !mc->worker_busy && (mc->up_rate == 0 || mc->todo.empty()); });
+        mc->up_drain = false;
     }
     if (mc->adapt) {
         hot_adapt_publish(mc); // the batch the worker just finished: slot_expert knows it, the tables stay "not hot"
@@ -1828,6 +2379,7 @@ void llama_moe_hot_unlend(const void * owner) {
         }
     }
     const size_t bytes = hot_refill(mc, jobs);
+    std::vector<const ggml_tensor *> zeroed; // [TAG_FN_L3_POLICY_POOL] the layers of a pool share their tensors
     for (auto & ls : mc->layers) {
         if (!ls.lent) {
             continue;
@@ -1835,6 +2387,10 @@ void llama_moe_hot_unlend(const void * owner) {
         // the zero slot every miss reads, and the alloc-size tail after it (kernels may read padded rows there)
         ggml_tensor * ts[3] = { ls.pub.up_c, ls.pub.gate_c, ls.pub.down_c };
         for (ggml_tensor * t : ts) {
+            if (std::find(zeroed.begin(), zeroed.end(), t) != zeroed.end()) {
+                continue;
+            }
+            zeroed.push_back(t);
             ggml_backend_tensor_memset(t, 0, (size_t) ls.pub.n_slots*t->nb[2], t->nb[2]);
             uint8_t * tail_lo = std::max((uint8_t *) t->data + ggml_nbytes(t), g_lend.lo);
             uint8_t * tail_hi = (uint8_t *) t->data + ggml_backend_buft_get_alloc_size(buft, t);
@@ -1852,5 +2408,188 @@ void llama_moe_hot_unlend(const void * owner) {
     if (mc->n_lend <= 2 || mc->n_lend % 16 == 0) {
         LLAMA_LOG_INFO("moe-hot: [TAG_FN_R1_PFS_LEND] lend %" PRIu64 ": %.2f GiB of resident experts refilled in %.1f ms "
                 "(%.1f GiB/s)\n", mc->n_lend, bytes/1073741824.0, ms, ms > 0 ? bytes/1073741824.0/(ms/1000.0) : 0.0);
+    }
+}
+
+// [TAG_FN_L3_POLICY_STATE] ---------------------------------------------------------------------------------------------
+
+namespace {
+
+size_t hot_layer_bytes(const layer_state & ls) {
+    return ls.pub.up_src->nb[2] + ls.pub.gate_src->nb[2] + ls.pub.down_src->nb[2];
+}
+
+// the file format is llama_moe_hotstate_format / _parse (llama-moe-decay.h, tests/test-moe-decay.cpp)
+void hot_state_save(moe_cache * mc) {
+    if (mc->st_path.empty() || mc->layers.empty() || !mc->dc_on) {
+        return;
+    }
+    const int64_t n_exp = mc->layers.front().pub.host_table->ne[1];
+    std::vector<llama_moe_hotstate_layer> out;
+    size_t n_res = 0;
+    for (const auto & ls : mc->layers) {
+        llama_moe_hotstate_layer l;
+        l.il    = ls.pub.il;
+        l.bytes = hot_layer_bytes(ls);
+        l.cnt   = ls.dcnt;
+        for (int32_t s = 0; s < ls.pub.n_slots; ++s) {
+            if (ls.slot_expert[s] >= 0) {
+                l.res.push_back(ls.slot_expert[s]);
+            }
+        }
+        std::stable_sort(l.res.begin(), l.res.end(), [&](int32_t a, int32_t b) { return ls.dcnt[a] > ls.dcnt[b]; });
+        n_res += l.res.size();
+        out.push_back(std::move(l));
+    }
+    const std::string text = llama_moe_hotstate_format(n_exp, mc->ad_steps, mc->st_model, out);
+    const std::string tmp  = mc->st_path + ".tmp";
+    FILE * f = fopen(tmp.c_str(), "wb");
+    if (!f) {
+        LLAMA_LOG_WARN("moe-hot: [TAG_FN_L3_POLICY_STATE] cannot write %s\n", tmp.c_str());
+        return;
+    }
+    const bool ok = fwrite(text.data(), 1, text.size(), f) == text.size() && fclose(f) == 0;
+    if (!ok) {
+        std::remove(tmp.c_str());
+        LLAMA_LOG_WARN("moe-hot: [TAG_FN_L3_POLICY_STATE] cannot write %s\n", tmp.c_str());
+        return;
+    }
+    std::remove(mc->st_path.c_str());
+    if (std::rename(tmp.c_str(), mc->st_path.c_str()) != 0) {
+        LLAMA_LOG_WARN("moe-hot: [TAG_FN_L3_POLICY_STATE] cannot replace %s\n", mc->st_path.c_str());
+        return;
+    }
+    if (mc->st_saves++ < 3) {
+        LLAMA_LOG_INFO("moe-hot: [TAG_FN_L3_POLICY_STATE] saved %zu residents of %zu layers and the counts of %llu decode "
+                "steps to %s\n", n_res, mc->layers.size(), (unsigned long long) mc->ad_steps, mc->st_path.c_str());
+    }
+}
+
+// at the start of the adaptive set (no graph of the owner runs): the saved residents of every layer go into its empty
+// slots, best first, as many as fit, and the counts come back with them. A state of another model, expert count or expert
+// size is not used. Every slice has landed before a table names its slot.
+void hot_state_load(moe_cache * mc) {
+    if (mc->st_path.empty() || !mc->st_load || !mc->dc_on || mc->layers.empty() || !mc->tbl_all) {
+        return;
+    }
+    std::ifstream f(mc->st_path);
+    if (!f) {
+        LLAMA_LOG_INFO("moe-hot: [TAG_FN_L3_POLICY_STATE] no saved state %s yet - the set starts empty\n", mc->st_path.c_str());
+        return;
+    }
+    const int64_t t0    = ggml_time_us();
+    const int64_t n_exp = mc->layers.front().pub.host_table->ne[1];
+    std::vector<llama_moe_hotstate_layer> saved;
+    uint64_t steps = 0;
+    std::string why;
+    size_t n_bad = 0;
+    if (!llama_moe_hotstate_parse(f, n_exp, mc->st_model, saved, steps, why, &n_bad)) {
+        LLAMA_LOG_WARN("moe-hot: [TAG_FN_L3_POLICY_STATE] %s not used: %s\n", mc->st_path.c_str(), why.c_str());
+        return;
+    }
+    std::vector<refill_job> jobs;
+    size_t n_layers = 0;
+    size_t n_res    = 0;
+    size_t n_skip   = n_bad;
+    // [TAG_FN_L3_POLICY_POOL] (count, layer index, expert) of the saved residents of every pool
+    struct pool_cand { float c; size_t li; int32_t e; };
+    std::vector<std::vector<pool_cand>> pool_cands(mc->pools.size());
+    auto add_jobs = [&](layer_state & ls, int32_t e, int32_t s) -> bool {
+        ggml_tensor *       dsts[3] = { ls.pub.up_c,   ls.pub.gate_c,   ls.pub.down_c   };
+        const ggml_tensor * srcs[3] = { ls.pub.up_src, ls.pub.gate_src, ls.pub.down_src };
+        for (int k = 0; k < 3; ++k) {
+            if (!hot_slice_ok(dsts[k], srcs[k], e, s)) {
+                return false;
+            }
+        }
+        for (int k = 0; k < 3; ++k) {
+            const size_t sz = srcs[k]->nb[2];
+            jobs.push_back({ dsts[k], (size_t) s*dsts[k]->nb[2], (const char *) srcs[k]->data + (size_t) e*sz, sz });
+        }
+        ls.slot_expert[s] = e;
+        ls.expert_slot[e] = s;
+        return true;
+    };
+    for (const auto & l : saved) {
+        layer_state * ls = nullptr;
+        for (auto & x : mc->layers) {
+            if (x.pub.il == l.il) {
+                ls = &x;
+                break;
+            }
+        }
+        if (!ls || ls->dcnt.size() != l.cnt.size() || hot_layer_bytes(*ls) != l.bytes || ls->lent) {
+            n_skip++;
+            continue;
+        }
+        ls->dcnt = l.cnt;
+        if (ls->pool >= 0) {
+            for (const int32_t e : l.res) {
+                pool_cands[ls->pool].push_back({ l.cnt[e], (size_t) (ls - mc->layers.data()), e });
+            }
+            n_layers++;
+            continue;
+        }
+        int32_t s = 0;
+        for (const int32_t e : l.res) {
+            while (s < ls->pub.n_slots && (ls->slot_expert[s] >= 0 || ls->slot_in_flight[s])) {
+                s++;
+            }
+            if (s >= ls->pub.n_slots) {
+                break;
+            }
+            if (ls->expert_slot[e] >= 0 || ls->expert_in_flight[e] || !add_jobs(*ls, e, s)) {
+                continue;
+            }
+            n_res++;
+            s++;
+        }
+        n_layers++;
+    }
+    for (size_t pi = 0; pi < mc->pools.size(); ++pi) {
+        hot_pool & P = mc->pools[pi];
+        auto & cand = pool_cands[pi];
+        std::stable_sort(cand.begin(), cand.end(), [](const pool_cand & a, const pool_cand & b) { return a.c > b.c; });
+        int32_t s = 0;
+        for (const auto & c : cand) {
+            while (s < P.n_slots && P.slot_layer[s] >= 0) {
+                s++;
+            }
+            if (s >= P.n_slots) {
+                break;
+            }
+            layer_state & ls = mc->layers[c.li];
+            if (ls.expert_slot[c.e] >= 0 || ls.expert_in_flight[c.e] || !add_jobs(ls, c.e, s)) {
+                continue;
+            }
+            P.slot_layer[s] = (int32_t) c.li;
+            n_res++;
+            s++;
+        }
+    }
+    const size_t bytes = hot_refill(mc, jobs);
+    for (auto & ls : mc->layers) {
+        for (int32_t s = 0; s < ls.pub.n_slots; ++s) {
+            if (ls.slot_expert[s] >= 0) {
+                hot_adapt_set_entry(mc, ls, ls.slot_expert[s], s);
+            }
+        }
+    }
+    if (mc->tbl_dirty) {
+        ggml_backend_tensor_set(mc->tbl_all, mc->tbl_mirror.data(), 0, mc->tbl_mirror.size()*sizeof(int32_t));
+        mc->tbl_dirty = false;
+    }
+    LLAMA_LOG_INFO("moe-hot: [TAG_FN_L3_POLICY_STATE] loaded %s: %zu residents in %zu layers (%.2f GiB in %.0f ms), the "
+            "counts of %llu decode steps%s\n", mc->st_path.c_str(), n_res, n_layers, bytes/1073741824.0,
+            (ggml_time_us() - t0)/1000.0, (unsigned long long) steps,
+            n_skip ? format(", %zu layer lines not used", n_skip).c_str() : "");
+}
+
+} // namespace
+
+void llama_moe_hot_state_save(const void * owner) {
+    moe_cache * mc = g_cache;
+    if (mc && mc->adapt && mc->owner == owner) {
+        hot_state_save(mc);
     }
 }

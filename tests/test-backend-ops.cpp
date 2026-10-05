@@ -8281,6 +8281,112 @@ struct test_moe_hot_chain : public test_case {
     }
 };
 
+// [TAG_FN_L3_POLICY_POOL] the hot chain over a slot pool shared by the layers of one expert shape class
+// (LLAMA_MOE_HOT_POOL=1): Flash-Next's 43 q4_K/q4_K/q5_1 layers x (70 + 1) - 1 = 3052 slots and one zero slot in one
+// tensor, so the routed ids of a layer map to slots anywhere in it. Smaller rows than the model keep the case cheap; the
+// slot index range is the model's. -o MOE_HOT_POOL
+struct test_moe_hot_pool : public test_moe_hot_chain {
+    using test_moe_hot_chain::test_moe_hot_chain;
+
+    std::string op_desc(ggml_tensor *) override { return "MOE_HOT_POOL"; }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_moe_hot_chain::initialize_tensors(ctx);
+        // the layer's resident experts in random slots of the whole pool (the base maps them to the first slots)
+        std::mt19937 rng(9876);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (std::string(ggml_get_name(t)) != "table") {
+                continue;
+            }
+            std::vector<int32_t> perm(n_expert);
+            std::iota(perm.begin(), perm.end(), 0);
+            std::shuffle(perm.begin(), perm.end(), rng);
+            std::vector<int32_t> slots(n_hot);
+            std::iota(slots.begin(), slots.end(), 0);
+            std::shuffle(slots.begin(), slots.end(), rng);
+            std::vector<int32_t> tbl(n_expert, n_hot);
+            const int n_res = std::min({ n_resident >= 0 ? n_resident : n_expert, n_hot, n_expert });
+            for (int i = 0; i < n_res; ++i) {
+                tbl[perm[i]] = slots[i];
+            }
+            ggml_backend_tensor_set(t, tbl.data(), 0, tbl.size()*sizeof(int32_t));
+        }
+    }
+};
+
+// [TAG_FN_L3_POLICY_POOL] the pool at the model's row sizes (q4_K up 2560 x 640: 3052 slots = 2.8 GB; q5_1 down
+// 640 x 2560 at the +4 GB budget: 4084 slots = 5.0 GB), so resident slots lie past 2 GiB and 4 GiB of one tensor. Only the
+// slots the table names (the top 16 among them) and the zero slot hold data: a full random init would not fit in memory.
+struct test_moe_hot_pool_big : public test_moe_hot_chain {
+    using test_moe_hot_chain::test_moe_hot_chain;
+
+    std::string op_desc(ggml_tensor *) override { return "MOE_HOT_POOL"; }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 rng(4321);
+        // the resident slots: the top 16 of the pool, then random others
+        std::vector<int32_t> res_slots;
+        for (int s = n_hot - 1; s >= 0 && s >= n_hot - 16; --s) {
+            res_slots.push_back(s);
+        }
+        {
+            std::vector<int32_t> rest(std::max(0, n_hot - 16));
+            std::iota(rest.begin(), rest.end(), 0);
+            std::shuffle(rest.begin(), rest.end(), rng);
+            res_slots.insert(res_slots.end(), rest.begin(), rest.end());
+        }
+        const int n_res = std::min({ n_resident >= 0 ? n_resident : n_expert, n_hot, n_expert });
+        res_slots.resize(n_res);
+        // expert perm[i] lives in res_slots[i]: perm[0..15] in the top slots
+        std::vector<int32_t> perm(n_expert);
+        std::iota(perm.begin(), perm.end(), 0);
+        std::shuffle(perm.begin(), perm.end(), rng);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            const std::string name = ggml_get_name(t);
+            if (name == "slots") {
+                // one quantized random slice per resident slot, zeros in the zero slot
+                std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+                std::vector<float>   f((size_t) t->ne[0]*t->ne[1]);
+                std::vector<uint8_t> q(t->nb[2]);
+                for (const int32_t s : res_slots) {
+                    for (float & x : f) {
+                        x = dist(rng);
+                    }
+                    ggml_quantize_chunk(t->type, f.data(), q.data(), 0, t->ne[1], t->ne[0], nullptr);
+                    ggml_backend_tensor_set(t, q.data(), (size_t) s*t->nb[2], t->nb[2]);
+                }
+                std::fill(q.begin(), q.end(), 0);
+                ggml_backend_tensor_set(t, q.data(), (size_t) n_hot*t->nb[2], t->nb[2]);
+            } else if (name == "table") {
+                std::vector<int32_t> tbl(n_expert, n_hot);
+                for (int i = 0; i < n_res; ++i) {
+                    tbl[perm[i]] = res_slots[i];
+                }
+                ggml_backend_tensor_set(t, tbl.data(), 0, tbl.size()*sizeof(int32_t));
+            } else if (name == "sel_all") {
+                // per token: 4 of the top-slot experts (all 16 over 4 tokens), then distinct others, resident or not
+                const int n_top = std::min(16, n_res);
+                std::vector<int32_t> ids(t->ne[0]*t->ne[1]);
+                for (int64_t r = 0; r < t->ne[1]; ++r) {
+                    std::vector<int32_t> row;
+                    for (int j = 0; j < 4 && j < n_top && (int64_t) row.size() < t->ne[0]; ++j) {
+                        row.push_back(perm[(r*4 + j) % n_top]);
+                    }
+                    std::vector<int32_t> other(perm.begin() + n_top, perm.end());
+                    std::shuffle(other.begin(), other.end(), rng);
+                    for (size_t j = 0; (int64_t) row.size() < t->ne[0] && j < other.size(); ++j) {
+                        row.push_back(other[j]);
+                    }
+                    std::copy(row.begin(), row.end(), ids.begin() + r*t->ne[0]);
+                }
+                ggml_backend_tensor_set(t, ids.data(), 0, ids.size()*sizeof(int32_t));
+            } else if (t->type == GGML_TYPE_F32 && !ggml_is_view_op(t->op)) {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // [TAG_FN_TEST_S1] the hot-set chain of build_moe_ffn next to the shared expert: the 6-node pattern of upstream #29184
 // (ggml_cuda_match_shared_expert). Gate and up MUL_MAT_ID over the VRAM slot tensors (the routed ids remapped through the
 // expert -> slot table by GET_ROWS, the last slot all zeros), GLU, then the shared expert's gate and up MUL_MAT and GLU on
@@ -14624,6 +14730,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
     test_cases.emplace_back(new test_moe_hot_chain(GGML_TYPE_Q4_K, 2560, 640, 512, 84, 10, 8, 0)); // 2 streams, empty
+
+    // [TAG_FN_L3_POLICY_POOL] the shared slot pool: 3052 slots (43 layers of q4_K/q4_K/q5_1) and 283 (4 layers with q8_0
+    // down); a layer's experts anywhere in the pool, half or all of a layer's 512 resident, widths 1 and 3
+    for (int t : {1, 3, 8}) {
+        for (int n_res : {256, 512}) {
+            test_cases.emplace_back(new test_moe_hot_pool(GGML_TYPE_Q4_K, 2560, 64, 512, 3052, 10, t, n_res));
+            test_cases.emplace_back(new test_moe_hot_pool(GGML_TYPE_Q5_1, 640, 256, 512, 3052, 10, t, n_res));
+        }
+        test_cases.emplace_back(new test_moe_hot_pool(GGML_TYPE_Q8_0, 640, 256, 512, 283, 10, t, 140));
+    }
+    // the model's row sizes: slots past 2 GiB (q4_K up, 3052 slots) and past 4 GiB (q5_1 down, 4084 slots) of one tensor
+    test_cases.emplace_back(new test_moe_hot_pool_big(GGML_TYPE_Q4_K, 2560, 640, 512, 3052, 10, 3, 64));
+    test_cases.emplace_back(new test_moe_hot_pool_big(GGML_TYPE_Q5_1, 640, 2560, 512, 4084, 10, 3, 64));
 
     // [TAG_FN_TEST_S1] the hot chain next to the shared expert (upstream #29184's fusion, ggml_cuda_match_shared_expert):
     // q8_0 / q8_0 (fuses: Flash-Next's MTP block, uniform-type quants), q4_K / q4_K (fuses) and q4_K / q8_0 (Flash-Next's
