@@ -23,8 +23,35 @@ enum ggml_cuda_fn_l3_path {
     GGML_CUDA_FN_L3_PATH_IDXQ8_SKIP,
     GGML_CUDA_FN_L3_PATH_MMVF,
     GGML_CUDA_FN_L3_PATH_MMVQ,
+    GGML_CUDA_FN_L3_PATH_MMVQ_SMK,
+    GGML_CUDA_FN_L3_PATH_Q8F_NORM,
+    GGML_CUDA_FN_L3_PATH_Q8F_HCLO,
+    GGML_CUDA_FN_L3_PATH_Q8F_HCPRE,
+    GGML_CUDA_FN_L3_PATH_Q8F_MMID,
     GGML_CUDA_FN_L3_PATH_COUNT,
 };
+
+// [TAG_FN_L3_GPU_Q8F] where a producer kernel writes the q8_1 copy of its output: the MMVQ reuse cache's buffer, laid
+// out as quantize_row_q8_1_cuda lays out the src1 that reads it (nrows rows of bpr blocks, the last bpr - ne10/32 of them
+// padding)
+struct ggml_cuda_fn_l3_q8_dst {
+    block_q8_1 * y     = nullptr;
+    int64_t      ne10  = 0;
+    int64_t      bpr   = 0;
+    int64_t      nrows = 0;
+};
+
+// mmvq.cu: finds the MUL_MAT that reads `producer` next and points the reuse cache at its src1 (false: no copy). The
+// caller must then write the whole copy: padding_ok = it also writes the zero blocks of rows padded to MATRIX_ROW_PADDING.
+bool ggml_cuda_mmvq_q8_produce(ggml_backend_cuda_context & ctx, const ggml_tensor * producer, ggml_cuda_fn_l3_q8_dst & out,
+        bool padding_ok);
+
+// [TAG_FN_L3_GPU_Q8F] the producers: each computes its output as the unmarked op does and also its q8_1 copy, bit for bit
+// what quantize_q8_1 makes of that output. false: not taken (nothing launched, the caller runs the op as usual).
+//   rms_norm_mul: the fused RMS_NORM -> MUL (MUL marked Q8OUT)
+//   hc_pre:       DSV4_HC_PRE (gated, marked Q8OUT)
+bool ggml_cuda_fn_l3_rms_norm_mul_q8(ggml_backend_cuda_context & ctx, ggml_tensor * rms_norm, ggml_tensor * mul);
+bool ggml_cuda_fn_l3_hc_pre_q8(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
 // [TAG_FN_L3_GPU_HCFUSE] the hc chains in one launch (ggml-cuda.cu matches the marked nodes):
 //   hcw3: s1 = scale(x), sigmoid, s2 = scale -> writes s2

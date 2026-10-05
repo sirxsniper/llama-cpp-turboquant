@@ -2580,6 +2580,8 @@ struct llama_model_qwen4exp : public llama_model_base {
             bool idxq8   = false; // IDXQ8:   the lightning indexer reads the q8_0 pooled keys in place
             bool mmv     = false; // MMV:     few-row mat-vecs (hc down / inject, GDN alpha / beta, router) with run-ahead loads
             bool mmvd    = false; // MMVD:    the same for the dense q8_0 projections (GDN qkv / z / out, attention q / k / v / o)
+            bool q8f     = false; // Q8F:     the hc norm, low rank (with HCFUSE) and hc_pre write the q8_1 copy of their output
+                                  //          for the mat-vecs that read it; the expert MUL_MAT_IDs read that copy too
         };
         static l3_flags l3_read(const llama_model & model);
         l3_flags l3;

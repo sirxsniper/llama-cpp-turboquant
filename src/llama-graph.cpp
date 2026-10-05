@@ -2538,6 +2538,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
     ggml_tensor * mc_inp = cur;
+    // [TAG_FN_L3_GPU_Q8F] an arch's mark for the expert chains' input (qwen4exp: read the q8_1 copy its producer made)
+    if (moe_q8in_mark != 0 && mc_inp->op == GGML_OP_RESHAPE) {
+        ggml_fn_l3_set(mc_inp, moe_q8in_mark);
+    }
 
     // device-side chain over the cached experts, mirroring the LLM_FFN_SILU activation below (the only type_op the
     // cache path is enabled for); uncached ids map to the zero slot

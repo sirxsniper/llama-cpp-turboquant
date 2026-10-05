@@ -12134,6 +12134,116 @@ struct test_fn_l3_convwb : public test_case {
     }
 };
 
+// [TAG_FN_L3_GPU_Q8F] the producers that write the q8_1 copy of their output for the mat-vecs that read it, at Flash-Next
+// shapes (n_embd 2560, hc 4, low rank 320); marked = Q8OUT on the producer (and Q8IN on the expert input):
+//   mode 0: xn = rms_norm(x) * w -> [10240, T] -> q8_0 down (320 rows) and the f32 inject (4 rows)
+//   mode 1: scale 1/hc -> silu (HCLO) -> q8_0 up (10240 rows of 320: padded rows)
+//   mode 2: hc_pre (gated) -> q8_0 qkv (10240 rows) and z (6144 rows)
+//   mode 3: hc_pre -> q4_K expert MUL_MAT_ID (k of 16 per token) on a reshape, then the q8_0 shared expert
+struct test_fn_l3_q8f : public test_case {
+    const int     mode;
+    const int64_t n_tokens;
+    const bool    marked;
+
+    std::string op_desc(ggml_tensor *) override { return "FN_L3_GPU"; }
+    std::string vars() override { return "q8f," + VARS_TO_STR3(mode, n_tokens, marked); }
+    bool run_whole_graph() override { return true; }
+    double max_nmse_err() override { return 5e-4; }
+
+    test_fn_l3_q8f(int mode = 0, int64_t n_tokens = 3, bool marked = true) : mode(mode), n_tokens(n_tokens), marked(marked) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t n_embd = 2560;
+        const int64_t hc     = 4;
+        const int64_t T      = n_tokens;
+        if (mode == 0) {
+            ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, T);
+            ggml_set_name(x, "x");
+            ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, hc);
+            ggml_set_name(w, "w");
+            ggml_tensor * xn = ggml_mul(ctx, ggml_rms_norm(ctx, x, 1e-6f), w);
+            if (marked) {
+                ggml_fn_l3_set(xn, GGML_FN_L3_Q8OUT);
+            }
+            xn = ggml_reshape_2d(ctx, xn, n_embd*hc, T);
+            ggml_tensor * wd = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, n_embd*hc, 320);
+            ggml_set_name(wd, "w_down");
+            ggml_tensor * wi = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd*hc, hc);
+            ggml_set_name(wi, "w_inject");
+            ggml_tensor * out = ggml_concat(ctx, ggml_mul_mat(ctx, wd, xn), ggml_mul_mat(ctx, wi, xn), 0);
+            ggml_set_name(out, "out");
+            return out;
+        }
+        if (mode == 1) {
+            ggml_tensor * lo = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 320, T);
+            ggml_set_name(lo, "lo");
+            ggml_tensor * s = ggml_scale(ctx, lo, 1.0f/(float) hc);
+            if (marked) {
+                ggml_fn_l3_set(s, GGML_FN_L3_HCLO);
+            }
+            ggml_tensor * a = ggml_silu(ctx, s);
+            if (marked) {
+                ggml_fn_l3_set(a, GGML_FN_L3_Q8OUT);
+            }
+            ggml_tensor * wu = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, 320, n_embd*hc);
+            ggml_set_name(wu, "w_up");
+            ggml_tensor * out = ggml_concat(ctx, ggml_mul_mat(ctx, wu, a), a, 0);
+            ggml_set_name(out, "out");
+            return out;
+        }
+        ggml_tensor * xn3 = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, T);
+        ggml_set_name(xn3, "xn");
+        ggml_tensor * gate = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, T);
+        ggml_set_name(gate, "gate");
+        ggml_tensor * mixed = ggml_dsv4_hc_pre_gated(ctx, xn3, gate, 1.0f/(float) hc);
+        if (marked) {
+            ggml_fn_l3_set(mixed, GGML_FN_L3_Q8OUT);
+        }
+        if (mode == 2) {
+            ggml_tensor * wqkv = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, n_embd, 10240);
+            ggml_set_name(wqkv, "w_qkv");
+            ggml_tensor * wz = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, n_embd, 6144);
+            ggml_set_name(wz, "w_z");
+            ggml_tensor * out = ggml_concat(ctx, ggml_mul_mat(ctx, wqkv, mixed), ggml_concat(ctx, ggml_mul_mat(ctx, wz, mixed), mixed, 0), 0);
+            ggml_set_name(out, "out");
+            return out;
+        }
+        const int64_t n_exp  = 16;
+        const int64_t n_used = 4;
+        ggml_tensor * as = ggml_new_tensor_3d(ctx, GGML_TYPE_Q4_K, n_embd, 640, n_exp);
+        ggml_set_name(as, "experts");
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, T);
+        ggml_set_name(ids, "ids");
+        ggml_tensor * mc = ggml_reshape_3d(ctx, mixed, n_embd, 1, T);
+        if (marked) {
+            ggml_fn_l3_set(mc, GGML_FN_L3_Q8IN);
+        }
+        ggml_tensor * routed = ggml_mul_mat_id(ctx, as, mc, ids); // [640, n_used, T]
+        ggml_tensor * ws = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, n_embd, 640);
+        ggml_set_name(ws, "w_shexp");
+        ggml_tensor * shared = ggml_mul_mat(ctx, ws, mixed); // [640, T]
+        ggml_tensor * out = ggml_concat(ctx, ggml_reshape_2d(ctx, routed, 640, n_used*T), shared, 1);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->view_src != nullptr || t->op != GGML_OP_NONE) {
+                continue;
+            }
+            const std::string name = ggml_get_name(t);
+            if (name == "ids") {
+                init_mul_mat_id_ids(ctx, 16);
+            } else if (name == "lo" || name == "gate") {
+                init_tensor_uniform(t, -4.0f, 4.0f);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
     std::default_random_engine rng(0);
@@ -14685,6 +14795,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_fn_l3_idxq8(8192*4 + 3, 8192, t, true));
         test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, { 61440, t, 1, 1 }, 512, false, true, true));
         test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, { 8192, t, 1, 1 }, 512, true, true, true));
+        for (int mode : { 0, 1, 2, 3 }) {
+            test_cases.emplace_back(new test_fn_l3_q8f(mode, t, true)); // [TAG_FN_L3_GPU_Q8F]
+        }
     }
     for (int64_t nb : { 1, 3 }) {
         test_cases.emplace_back(new test_flash_attn_ext_turbot(TURBOT_TW_NR2_Q8, 32768, nb, TURBOT_MIX_BAND64K, 3, false, 0.0f, false,
@@ -15426,7 +15539,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             test_cases.emplace_back(new test_fn_l3_mmv(GGML_TYPE_F32, 10240, 4, t, m));
             test_cases.emplace_back(new test_fn_l3_mmv(GGML_TYPE_F32, 2560, 48, t, m));
             test_cases.emplace_back(new test_fn_l3_mmv(GGML_TYPE_Q8_0, 10240, 320, t, m));
+            test_cases.emplace_back(new test_fn_l3_mmv(GGML_TYPE_Q8_0, 320, 10240, t, m)); // [TAG_FN_L3_GPU_MMV] hc up
+            test_cases.emplace_back(new test_fn_l3_mmv(GGML_TYPE_Q8_0, 640, 2560, t, m));  // shared expert down
+            // MMVD: GDN qkv / z / out, attention q / o
+            static const int64_t dense_km[][2] = { { 2560, 10240 }, { 2560, 6144 }, { 6144, 2560 }, { 2560, 12288 } };
+            for (const auto & km : dense_km) {
+                test_cases.emplace_back(new test_fn_l3_mmv(GGML_TYPE_Q8_0, km[0], km[1], t, m));
+            }
             test_cases.emplace_back(new test_fn_l3_convwb(t, 3, 10240, 4, m));
+            for (int mode : { 0, 1, 2, 3 }) {
+                test_cases.emplace_back(new test_fn_l3_q8f(mode, t, m)); // [TAG_FN_L3_GPU_Q8F]
+            }
             for (int64_t np : { 8192, 32768, 61440 }) {
                 test_cases.emplace_back(new test_fn_l3_idxq8(np*4 + 3, np, t, m));
                 test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, { np, t, 1, 1 }, 512, false, true, m));
@@ -17204,6 +17327,13 @@ static bool run_fn_l3_gpu(ggml_backend_t backend, ggml_backend_t backend_ref, co
             cases.push_back({ [=](bool m) { return std::unique_ptr<test_case>(new test_fn_l3_mmv(GGML_TYPE_Q8_0, 10240, 320, t, m)); }, false });
             cases.push_back({ [=](bool m) { return std::unique_ptr<test_case>(new test_fn_l3_mmv(GGML_TYPE_Q8_0, 2560, 1000, t, m)); }, false });
             cases.push_back({ [=](bool m) { return std::unique_ptr<test_case>(new test_fn_l3_mmv(GGML_TYPE_Q8_0, 1088, 33, t, m)); }, false });
+            // [TAG_FN_L3_GPU_MMV] rows of at most 32 q8_0 blocks: hc up (K 320), shared expert down (K 640), K 1024, K 96
+            static const int64_t smk_km[][2] = { { 320, 10240 }, { 640, 2560 }, { 1024, 512 }, { 96, 64 } };
+            for (const auto & km : smk_km) {
+                const int64_t kk = km[0];
+                const int64_t mm = km[1];
+                cases.push_back({ [=](bool m) { return std::unique_ptr<test_case>(new test_fn_l3_mmv(GGML_TYPE_Q8_0, kk, mm, t, m)); }, false });
+            }
             // [TAG_FN_L3_GPU_MMV] MMVD: the dense projections (GDN qkv / z / out, attention q / k / v / o)
             static const int64_t dense_km[][2] = { { 2560, 10240 }, { 2560, 6144 }, { 6144, 2560 }, { 2560, 12288 }, { 2560, 512 } };
             for (const auto & km : dense_km) {
@@ -17216,6 +17346,10 @@ static bool run_fn_l3_gpu(ggml_backend_t backend, ggml_backend_t backend_ref, co
             cases.push_back({ [=](bool m) { return std::unique_ptr<test_case>(new test_fn_l3_convwb(t, sc, 10240, 4, m)); }, false });
         }
         cases.push_back({ [=](bool m) { return std::unique_ptr<test_case>(new test_fn_l3_convwb(t, 3, 10240, 1, m)); }, false });
+        // [TAG_FN_L3_GPU_Q8F] the q8_1 copies of the producers against the MMVQ / MMID own quantization
+        for (int mode : { 0, 1, 2, 3 }) {
+            cases.push_back({ [=](bool m) { return std::unique_ptr<test_case>(new test_fn_l3_q8f(mode, t, m)); }, false });
+        }
     }
     for (int64_t t : { 1, 3, 4 }) {
         if (cpu) {

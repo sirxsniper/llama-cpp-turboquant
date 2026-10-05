@@ -649,15 +649,16 @@ llama_model_qwen4exp::graph::l3_flags llama_model_qwen4exp::graph::l3_read(const
     f.idxq8   = on("LLAMA_FN_GPU_IDXQ8");
     f.mmv     = on("LLAMA_FN_GPU_MMV");
     f.mmvd    = on("LLAMA_FN_GPU_MMVD");
+    f.q8f     = on("LLAMA_FN_GPU_Q8F");
 
     const int mask = (f.defer ? 1 : 0) | (f.convwb ? 2 : 0) | (f.hcfuse ? 4 : 0) | (f.compact ? 8 : 0) |
-                     (f.topk ? 16 : 0) | (f.idxq8 ? 32 : 0) | (f.mmv ? 64 : 0) | (f.mmvd ? 128 : 0);
+                     (f.topk ? 16 : 0) | (f.idxq8 ? 32 : 0) | (f.mmv ? 64 : 0) | (f.mmvd ? 128 : 0) | (f.q8f ? 256 : 0);
     static std::atomic<int> logged{-1};
     if (logged.exchange(mask) != mask) {
-        LLAMA_LOG_INFO("qwen4exp: [TAG_FN_L3_GPU] device levers:%s%s%s%s%s%s%s%s%s\n",
+        LLAMA_LOG_INFO("qwen4exp: [TAG_FN_L3_GPU] device levers:%s%s%s%s%s%s%s%s%s%s\n",
                 f.defer ? " DEFER" : "", f.convwb ? " CONVWB" : "", f.hcfuse ? " HCFUSE" : "", f.compact ? " COMPACT" : "",
                 f.topk ? " TOPK" : "", f.idxq8 ? " IDXQ8" : "", f.mmv ? " MMV" : "", f.mmvd ? " MMVD" : "",
-                mask == 0 ? " none" : "");
+                f.q8f ? " Q8F" : "", mask == 0 ? " none" : "");
     }
     return f;
 }
@@ -693,6 +694,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
     // grouped RMSNorm: reduce over one stream, then scale all streams with the [n_embd, hc] gamma
     // the converter folded each gamma to (1 + w)
     ggml_tensor * xn = ggml_mul(ctx0, ggml_rms_norm(ctx0, x, hparams.f_norm_rms_eps), w_norm);
+    if (l3.q8f) {
+        ggml_fn_l3_set(xn, GGML_FN_L3_Q8OUT); // [TAG_FN_L3_GPU_Q8F] the q8_1 copy for w_down, made by the norm kernel
+    }
     xn = ggml_reshape_2d(ctx0, xn, hc_dim, nt);
     cb(xn, "hc_norm", il);
 
@@ -703,7 +707,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
         ggml_fn_l3_set(lo_s, GGML_FN_L3_HCLO); // [TAG_FN_L3_GPU_HCFUSE] scale -> silu in one CUDA launch
     }
     lo = ggml_silu(ctx0, lo_s);
+    if (l3.q8f && l3.hcfuse) {
+        ggml_fn_l3_set(lo, GGML_FN_L3_Q8OUT); // [TAG_FN_L3_GPU_Q8F] the fused scale -> silu also writes the copy for w_up
+    }
     ggml_tensor * gate = build_lora_mm(w_up, lo);
+    qwen4exp_l3_mark_mm(gate, l3.mmv); // [TAG_FN_L3_GPU_MMV] 10240 rows of 320: one warp per block
     cb(gate, "hc_gate", il);
 
     ggml_tensor * mixed = nullptr;
@@ -713,6 +721,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
                 ggml_reshape_3d(ctx0, xn,   n_embd, hc, nt),
                 ggml_reshape_3d(ctx0, gate, n_embd, hc, nt), 1.0f / (float) hc);
         res->add_fused_node({LLM_FUSED_OP_DSV4_HC_PRE, mixed, il});
+        if (l3.q8f) {
+            ggml_fn_l3_set(mixed, GGML_FN_L3_Q8OUT); // [TAG_FN_L3_GPU_Q8F] the copy for the block's projections / experts
+        }
     } else {
         ggml_tensor * gated = ggml_mul(ctx0, xn, ggml_sigmoid(ctx0, gate));
         gated = ggml_reshape_3d(ctx0, gated, n_embd, hc, nt);
@@ -1909,6 +1920,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
     // comes after the shared expert (build_moe_bridge_finish below), so the device computes it while the host works
     moe_bridge_defer = true;
     moe_router_mark  = l3.mmv ? GGML_FN_L3_MMV : 0; // [TAG_FN_L3_GPU_MMV] the router: 512 rows of 2560
+    moe_q8in_mark    = l3.q8f ? GGML_FN_L3_Q8IN : 0; // [TAG_FN_L3_GPU_Q8F] the hot / DMA chains read hc_pre's q8_1 copy
     ggml_tensor * moe_out =
         build_moe_ffn(cur,
             model.layers[il].ffn_gate_inp,
@@ -1926,6 +1938,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
             model.layers[il].ffn_down_exps_s);
     moe_bridge_defer = false;
     moe_router_mark  = 0;
+    moe_q8in_mark    = 0;
 
     // [TAG_FN_L3_GPU_DEFER] after the post (and the hot chain), before the shared expert and the wait
     l3_expand_deferred();
@@ -1939,6 +1952,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
                 model.layers[il].ffn_down_shexp, NULL, model.layers[il].ffn_down_shexp_s,
                 NULL,
                 LLM_FFN_SILU, LLM_FFN_PAR, il);
+        qwen4exp_l3_mark_mm(ffn_shexp, l3.mmv); // [TAG_FN_L3_GPU_MMV] the down projection: 2560 rows of 640
         cb(ffn_shexp, "ffn_shexp", il);
 
         // shared expert has its own sigmoided gate (ffn_gate_inp_shexp, one value per token)

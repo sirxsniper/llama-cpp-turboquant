@@ -2557,7 +2557,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             ggml_cuda_op_dsv4_hc_comb(ctx, dst);
             break;
         case GGML_OP_DSV4_HC_PRE:
-            ggml_cuda_op_dsv4_hc_pre(ctx, dst);
+            if (!ggml_cuda_fn_l3_hc_pre_q8(ctx, dst)) { // [TAG_FN_L3_GPU_Q8F] the same op, plus the q8_1 copy when marked
+                ggml_cuda_op_dsv4_hc_pre(ctx, dst);
+            }
             break;
         case GGML_OP_DSV4_HC_POST:
             ggml_cuda_op_dsv4_hc_post(ctx, dst);
@@ -4834,6 +4836,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD }, {})) {
         ggml_cuda_op_rms_norm_fused_add(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
         return 2;
+    }
+
+    // [TAG_FN_L3_GPU_Q8F] a MUL the qwen4exp graph marked (the hc norm): the same kernel, plus the q8_1 copy of its output
+    if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL }, {}) &&
+            ggml_fn_l3_get(cgraph->nodes[i + 1]) == GGML_FN_L3_Q8OUT &&
+            ggml_cuda_fn_l3_rms_norm_mul_q8(*cuda_ctx, node, cgraph->nodes[i + 1])) {
+        return 1;
     }
 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL }, {})) {

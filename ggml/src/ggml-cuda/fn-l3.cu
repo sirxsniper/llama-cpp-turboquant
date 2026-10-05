@@ -85,6 +85,47 @@ static __global__ void k_fn_l3_hclo(const float * x, float * dst, const float s,
     dst[i] = t / (1.0f + expf(-t));
 }
 
+// [TAG_FN_L3_GPU_Q8F] quantize_q8_1 of one q8_1 block held by a warp: lane l holds element l. The same operations in the
+// same order as quantize_q8_1 (quantize.cu), so the same bytes. Every lane of the warp must call it.
+static __device__ __forceinline__ void fn_l3_q8_1_store(const float xi, block_q8_1 * yb, const int lane) {
+    float amax = fabsf(xi);
+    float sum  = xi;
+
+    amax = warp_reduce_max<QK8_1>(amax);
+    sum  = warp_reduce_sum<QK8_1>(sum);
+
+    const float  d = amax / 127.0f;
+    const int8_t q = amax == 0.0f ? 0 : roundf(xi / d);
+
+    yb->qs[lane] = q;
+
+    if (lane > 0) {
+        return;
+    }
+
+    yb->ds = make_half2(d, sum);
+}
+
+// [TAG_FN_L3_GPU_Q8F] scale -> silu with the q8_1 copy: thread (i0, r) of the padded rows as in quantize_q8_1; element
+// (i0, r) is flat element r*ne10 + i0 of x and of the output (both contiguous), the padding quantizes 0
+static __global__ void k_fn_l3_hclo_q8(const float * x, float * dst, const float s, const float b, const int64_t ne10,
+        block_q8_1 * q8, const int64_t bpr) {
+    ggml_cuda_pdl_lc();
+    const int64_t i0 = (int64_t) blockDim.x*blockIdx.x + threadIdx.x;
+    if (i0 >= bpr*QK8_1) {
+        return;
+    }
+    const int64_t r = blockIdx.y;
+    ggml_cuda_pdl_sync();
+    float v = 0.0f;
+    if (i0 < ne10) {
+        const float t = s * x[r*ne10 + i0] + b;
+        v = t / (1.0f + expf(-t));
+        dst[r*ne10 + i0] = v;
+    }
+    fn_l3_q8_1_store(v, q8 + r*bpr + i0/QK8_1, threadIdx.x % WARP_SIZE);
+}
+
 static float fn_l3_op_f32(const ggml_tensor * t, int slot) {
     float v;
     memcpy(&v, (const float *) t->op_params + slot, sizeof(float));
@@ -128,6 +169,19 @@ void ggml_cuda_fn_l3_hclo(ggml_backend_cuda_context & ctx, const ggml_tensor * s
     const ggml_tensor * x = s->src[0];
     const int64_t n = ggml_nelements(x);
     const int bs = 256;
+
+    // [TAG_FN_L3_GPU_Q8F] the silu marked Q8OUT: also the q8_1 copy for the mat-vec that reads it
+    ggml_cuda_fn_l3_q8_dst q8;
+    if (ggml_fn_l3_get(silu) == GGML_FN_L3_Q8OUT && ggml_nelements(silu) == n && ggml_cuda_mmvq_q8_produce(ctx, silu, q8, /*padding_ok =*/ true)) {
+        GGML_ASSERT(q8.ne10*q8.nrows == n);
+        const ggml_cuda_kernel_launch_params lpq(dim3((unsigned) ((q8.bpr*QK8_1 + bs - 1)/bs), (unsigned) q8.nrows, 1), bs, 0,
+                ctx.stream());
+        ggml_cuda_kernel_launch(k_fn_l3_hclo_q8, lpq, (const float *) x->data, (float *) silu->data,
+                fn_l3_op_f32(s, 0), fn_l3_op_f32(s, 1), q8.ne10, q8.y, q8.bpr);
+        ggml_cuda_fn_l3_note(GGML_CUDA_FN_L3_PATH_Q8F_HCLO, "Q8F: hc mixer low rank (scale -> silu) writes its q8_1 copy");
+        return;
+    }
+
     const ggml_cuda_kernel_launch_params lp((dim3) ((n + bs - 1)/bs), bs, 0, ctx.stream());
     ggml_cuda_kernel_launch(k_fn_l3_hclo, lp, (const float *) x->data, (float *) silu->data,
             fn_l3_op_f32(s, 0), fn_l3_op_f32(s, 1), n);
@@ -398,5 +452,183 @@ bool ggml_cuda_fn_l3_idxq8_skip(const ggml_cgraph * cgraph, int i) {
         return false;
     }
     ggml_cuda_fn_l3_note(GGML_CUDA_FN_L3_PATH_IDXQ8_SKIP, "IDXQ8: the f32 copy of the pooled indexer keys is not made");
+    return true;
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// [TAG_FN_L3_GPU_Q8F] producers that also write the q8_1 copy of their output for the mat-vec that reads it next.
+// Each kernel is the kernel of the unmarked op with the copy added: rms_norm_f32<block_size, true> (norm.cu) and
+// dsv4_hc_pre_f32<true> (dsv4-hc.cu), the same operations in the same order, then fn_l3_q8_1_store on the value it stores.
+// Element e of the (contiguous) output is element e % ne10 of row e / ne10 of the src1 that reads it; a warp holds 32
+// consecutive elements of one q8_1 block, so ncols (n_embd) and ne10 must be multiples of 32 and the rows unpadded.
+// ---------------------------------------------------------------------------------------------------------------------
+
+template <int block_size>
+static __global__ void k_fn_l3_rms_norm_mul_q8(
+        const float * x, float * dst, const int ncols, const int64_t stride_row, const int64_t stride_channel,
+        const int64_t stride_sample, const float eps, const float * mul, const int64_t mul_stride_row,
+        const int64_t mul_stride_channel, const int64_t mul_stride_sample, const uint3 mul_ncols_packed,
+        const uint3 mul_nrows_packed, const uint3 mul_nchannels_packed, const uint3 mul_nsamples_packed,
+        block_q8_1 * q8, const int64_t q8_ne10, const int64_t q8_bpr) {
+    ggml_cuda_pdl_lc();
+    const int nrows     = gridDim.x;
+    const int nchannels = gridDim.y;
+
+    const int row       = blockIdx.x;
+    const int channel   = blockIdx.y;
+    const int sample    = blockIdx.z;
+    const int tid       = threadIdx.x;
+
+    x   += sample*stride_sample + channel*stride_channel + row*stride_row;
+    const int64_t e0 = int64_t((sample*nchannels + channel)*nrows + row)*ncols;
+    dst += ((sample*nchannels + channel)*nrows + row)*ncols;
+
+    const uint32_t mul_row     = fastmodulo(row, mul_nrows_packed);
+    const uint32_t mul_channel = fastmodulo(channel, mul_nchannels_packed);
+    const uint32_t mul_sample  = fastmodulo(sample, mul_nsamples_packed);
+    mul += mul_sample * mul_stride_sample + mul_channel * mul_stride_channel + mul_row * mul_stride_row;
+
+    float tmp = 0.0f; // partial sum for thread in warp
+
+    ggml_cuda_pdl_sync();
+    for (int col = tid; col < ncols; col += block_size) {
+        const float xi = x[col];
+        tmp += xi * xi;
+    }
+
+    // sum up partial sums
+    extern __shared__ float s_sum[];
+    tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
+
+    const float mean = tmp / ncols;
+    const float scale = rsqrtf(mean + eps);
+
+    for (int col = tid; col < ncols; col += block_size) {
+        const int mul_col = fastmodulo(col, mul_ncols_packed);
+        const float v = scale * x[col] * mul[mul_col];
+        dst[col] = v;
+        const int64_t e = e0 + col;
+        fn_l3_q8_1_store(v, q8 + (e / q8_ne10)*q8_bpr + (e % q8_ne10)/QK8_1, tid % WARP_SIZE);
+    }
+}
+
+bool ggml_cuda_fn_l3_rms_norm_mul_q8(ggml_backend_cuda_context & ctx, ggml_tensor * rms_norm, ggml_tensor * mul_tensor) {
+    if (!ggml_cuda_fn_l3_enabled() || ggml_fn_l3_get(mul_tensor) != GGML_FN_L3_Q8OUT) {
+        return false;
+    }
+    const ggml_tensor * x = rms_norm->src[0];
+    const ggml_tensor * w = mul_tensor->src[0] == rms_norm ? mul_tensor->src[1] : mul_tensor->src[0];
+    if ((mul_tensor->src[0] != rms_norm && mul_tensor->src[1] != rms_norm) || x == nullptr || w == nullptr ||
+            x->type != GGML_TYPE_F32 || w->type != GGML_TYPE_F32 || rms_norm->type != GGML_TYPE_F32 ||
+            mul_tensor->type != GGML_TYPE_F32 || x->nb[0] != sizeof(float) || w->nb[0] != sizeof(float) ||
+            !ggml_is_contiguous(mul_tensor) || !ggml_are_same_shape(x, mul_tensor) || x->ne[0] % QK8_1 != 0 ||
+            x->ne[0] > INT32_MAX || ggml_nrows(x) > INT32_MAX) {
+        return false;
+    }
+    float eps = 0.0f;
+    memcpy(&eps, rms_norm->op_params, sizeof(float));
+
+    ggml_cuda_fn_l3_q8_dst q8;
+    if (!ggml_cuda_mmvq_q8_produce(ctx, mul_tensor, q8, /*padding_ok =*/ false)) {
+        return false;
+    }
+
+    // the launch rms_norm_mul_f32_cuda makes
+    const int64_t s01 = x->nb[1]/sizeof(float);
+    const int64_t s02 = x->nb[2]/sizeof(float);
+    const int64_t s03 = x->nb[3]/sizeof(float);
+    const dim3 blocks_num((unsigned) x->ne[1], (unsigned) x->ne[2], (unsigned) x->ne[3]);
+    const uint3 mul_ncols_packed     = init_fastdiv_values((uint32_t) w->ne[0]);
+    const uint3 mul_nrows_packed     = init_fastdiv_values((uint32_t) w->ne[1]);
+    const uint3 mul_nchannels_packed = init_fastdiv_values((uint32_t) w->ne[2]);
+    const uint3 mul_nsamples_packed  = init_fastdiv_values((uint32_t) w->ne[3]);
+    const int ncols = (int) x->ne[0];
+    if (ncols < 1024) {
+        const dim3 block_dims(256, 1, 1);
+        const ggml_cuda_kernel_launch_params lp(blocks_num, block_dims, 32*sizeof(float), ctx.stream());
+        ggml_cuda_kernel_launch(k_fn_l3_rms_norm_mul_q8<256>, lp, (const float *) x->data, (float *) mul_tensor->data,
+                ncols, s01, s02, s03, eps, (const float *) w->data, (int64_t) (w->nb[1]/sizeof(float)),
+                (int64_t) (w->nb[2]/sizeof(float)), (int64_t) (w->nb[3]/sizeof(float)), mul_ncols_packed, mul_nrows_packed,
+                mul_nchannels_packed, mul_nsamples_packed, q8.y, q8.ne10, q8.bpr);
+    } else {
+        const dim3 block_dims(1024, 1, 1);
+        const ggml_cuda_kernel_launch_params lp(blocks_num, block_dims, 32*sizeof(float), ctx.stream());
+        ggml_cuda_kernel_launch(k_fn_l3_rms_norm_mul_q8<1024>, lp, (const float *) x->data, (float *) mul_tensor->data,
+                ncols, s01, s02, s03, eps, (const float *) w->data, (int64_t) (w->nb[1]/sizeof(float)),
+                (int64_t) (w->nb[2]/sizeof(float)), (int64_t) (w->nb[3]/sizeof(float)), mul_ncols_packed, mul_nrows_packed,
+                mul_nchannels_packed, mul_nsamples_packed, q8.y, q8.ne10, q8.bpr);
+    }
+    ggml_cuda_fn_l3_note(GGML_CUDA_FN_L3_PATH_Q8F_NORM, "Q8F: hc mixer norm (rms_norm * w) writes its q8_1 copy");
+    return true;
+}
+
+static __global__ void k_fn_l3_hc_pre_q8(
+        const float * x, const float * weights, float * dst, int64_t n_embd, int64_t hc, int64_t n_tokens,
+        int64_t sx0, int64_t sx1, int64_t sx2, int64_t sw0, int64_t sw1, int64_t sw2, int64_t sd0, int64_t sd1,
+        float scale, block_q8_1 * q8, const int64_t q8_ne10, const int64_t q8_bpr) {
+    ggml_cuda_pdl_lc();
+    const int64_t ir = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    const int64_t nr = n_embd * n_tokens;
+
+    if (ir >= nr) {
+        return;
+    }
+
+    ggml_cuda_pdl_sync();
+
+    const int64_t i0 = ir % n_embd;
+    const int64_t it = ir / n_embd;
+
+    float sum = 0.0f;
+    for (int64_t ih = 0; ih < hc; ++ih) {
+        const float xv = x[i0*sx0 + ih*sx1 + it*sx2];
+        float wv;
+        wv = 1.0f / (1.0f + expf(-weights[i0*sw0 + ih*sw1 + it*sw2]));
+        sum += xv * wv;
+    }
+
+    const float v = scale * sum;
+    dst[i0*sd0 + it*sd1] = v;
+    const int64_t e = it*n_embd + i0;
+    fn_l3_q8_1_store(v, q8 + (e / q8_ne10)*q8_bpr + (e % q8_ne10)/QK8_1, threadIdx.x % WARP_SIZE);
+}
+
+bool ggml_cuda_fn_l3_hc_pre_q8(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    if (!ggml_cuda_fn_l3_enabled() || ggml_fn_l3_get(dst) != GGML_FN_L3_Q8OUT) {
+        return false;
+    }
+    const ggml_tensor * x       = dst->src[0];
+    const ggml_tensor * weights = dst->src[1];
+    const bool gated = ggml_get_op_params_i32(dst, 1) != 0;
+    if (!gated || x == nullptr || weights == nullptr || x->type != GGML_TYPE_F32 || weights->type != GGML_TYPE_F32 ||
+            dst->type != GGML_TYPE_F32 || !ggml_is_contiguous(dst) || x->ne[0] % QK8_1 != 0 ||
+            dst->ne[0] != x->ne[0] || dst->ne[1] != x->ne[2]) {
+        return false;
+    }
+
+    ggml_cuda_fn_l3_q8_dst q8;
+    if (!ggml_cuda_mmvq_q8_produce(ctx, dst, q8, /*padding_ok =*/ false)) {
+        return false;
+    }
+
+    // the launch ggml_cuda_op_dsv4_hc_pre makes
+    const int64_t n_embd   = x->ne[0];
+    const int64_t hc       = x->ne[1];
+    const int64_t n_tokens = x->ne[2];
+    const float   scale    = ggml_get_op_params_f32(dst, 0);
+
+    const int block_size = 256;
+    const int64_t nr = n_embd * n_tokens;
+    const dim3 block_dims(block_size, 1, 1);
+    const dim3 grid_dims((unsigned) ((nr + block_size - 1) / block_size), 1, 1);
+    const ggml_cuda_kernel_launch_params lp(grid_dims, block_dims, 0, ctx.stream());
+    ggml_cuda_kernel_launch(k_fn_l3_hc_pre_q8, lp,
+            (const float *) x->data, (const float *) weights->data, (float *) dst->data,
+            n_embd, hc, n_tokens,
+            (int64_t) (x->nb[0]/sizeof(float)), (int64_t) (x->nb[1]/sizeof(float)), (int64_t) (x->nb[2]/sizeof(float)),
+            (int64_t) (weights->nb[0]/sizeof(float)), (int64_t) (weights->nb[1]/sizeof(float)), (int64_t) (weights->nb[2]/sizeof(float)),
+            (int64_t) (dst->nb[0]/sizeof(float)), (int64_t) (dst->nb[1]/sizeof(float)),
+            scale, q8.y, q8.ne10, q8.bpr);
+    ggml_cuda_fn_l3_note(GGML_CUDA_FN_L3_PATH_Q8F_HCPRE, "Q8F: hc_pre (gated mean of the streams) writes its q8_1 copy");
     return true;
 }
