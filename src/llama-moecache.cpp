@@ -1590,8 +1590,103 @@ struct hot_lend_state {
     ggml_backend_buffer_t buf  = nullptr;
     uint8_t *             lo   = nullptr;
     size_t                size = 0;
+
+    // the refill: two pinned staging halves, filled by REFILL_THREADS copy threads while the other half uploads on the
+    // hot set's own upload stream (mmap -> pinned -> device, the prefill stream's pattern); events order the reuse
+    ggml_backend_buffer_t stage    = nullptr;
+    uint8_t *             stage_p  = nullptr;
+    size_t                half     = 0;
+    ggml_backend_event_t  ev[2]    = { nullptr, nullptr };
+    bool                  ev_rec[2] = { false, false };
 };
 hot_lend_state g_lend;
+
+constexpr int    REFILL_THREADS = 8;
+constexpr size_t REFILL_HALF    = 128u << 20;
+
+struct refill_job {
+    ggml_tensor * dst;
+    size_t        off;  // byte offset in dst
+    const void *  src;
+    size_t        size;
+};
+
+// the resident experts of the lent layers whose bytes the stream may have overwritten: through the pinned halves when
+// the hot set has an upload stream, else one synchronous copy per slice. Returns the bytes uploaded.
+size_t hot_refill(moe_cache * mc, const std::vector<refill_job> & jobs) {
+    size_t bytes = 0;
+    ggml_backend_dev_t dev = mc->up_backend ? ggml_backend_get_device(mc->up_backend) : nullptr;
+    if (dev && !g_lend.stage) {
+        if (ggml_backend_buffer_type_t hb = ggml_backend_dev_host_buffer_type(dev)) {
+            g_lend.stage = ggml_backend_buft_alloc_buffer(hb, 2*REFILL_HALF);
+        }
+        if (g_lend.stage) {
+            g_lend.stage_p = (uint8_t *) ggml_backend_buffer_get_base(g_lend.stage);
+            g_lend.half    = REFILL_HALF;
+            g_lend.ev[0]   = ggml_backend_event_new(dev);
+            g_lend.ev[1]   = ggml_backend_event_new(dev);
+            if (!g_lend.ev[0] || !g_lend.ev[1]) {
+                if (g_lend.ev[0]) { ggml_backend_event_free(g_lend.ev[0]); }
+                if (g_lend.ev[1]) { ggml_backend_event_free(g_lend.ev[1]); }
+                g_lend.ev[0] = g_lend.ev[1] = nullptr;
+                ggml_backend_buffer_free(g_lend.stage);
+                g_lend.stage   = nullptr;
+                g_lend.stage_p = nullptr;
+            }
+        }
+    }
+    if (!g_lend.stage) {
+        for (const auto & j : jobs) {
+            ggml_backend_tensor_set(j.dst, j.src, j.off, j.size);
+            bytes += j.size;
+        }
+        return bytes;
+    }
+    size_t i = 0;
+    int    h = 0;
+    std::vector<size_t> stage_off;
+    while (i < jobs.size()) {
+        // the jobs that fit into this half (a slice larger than a half goes alone, synchronously)
+        size_t n = 0, used = 0;
+        stage_off.clear();
+        while (i + n < jobs.size() && used + jobs[i + n].size <= g_lend.half) {
+            stage_off.push_back(used);
+            used += jobs[i + n].size;
+            n++;
+        }
+        if (n == 0) {
+            ggml_backend_tensor_set(jobs[i].dst, jobs[i].src, jobs[i].off, jobs[i].size);
+            bytes += jobs[i].size;
+            i++;
+            continue;
+        }
+        if (g_lend.ev_rec[h]) {
+            ggml_backend_event_synchronize(g_lend.ev[h]); // this half's previous uploads have read it
+        }
+        uint8_t * base = g_lend.stage_p + (size_t) h*g_lend.half;
+        std::vector<std::thread> th;
+        for (int t = 0; t < REFILL_THREADS; ++t) {
+            th.emplace_back([&, t]() {
+                for (size_t k = (size_t) t; k < n; k += REFILL_THREADS) {
+                    memcpy(base + stage_off[k], jobs[i + k].src, jobs[i + k].size);
+                }
+            });
+        }
+        for (auto & x : th) {
+            x.join();
+        }
+        for (size_t k = 0; k < n; ++k) {
+            ggml_backend_tensor_set_async(mc->up_backend, jobs[i + k].dst, base + stage_off[k], jobs[i + k].off, jobs[i + k].size);
+            bytes += jobs[i + k].size;
+        }
+        ggml_backend_event_record(g_lend.ev[h], mc->up_backend);
+        g_lend.ev_rec[h] = true;
+        i += n;
+        h ^= 1;
+    }
+    ggml_backend_synchronize(mc->up_backend);
+    return bytes;
+}
 
 } // namespace
 
@@ -1705,21 +1800,37 @@ void llama_moe_hot_unlend(const void * owner) {
         return;
     }
     const int64_t t0 = ggml_time_us();
-    size_t bytes = 0;
     ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(g_lend.buf);
+    // the slices of resident experts that reach into the lent range (the stream wrote only there)
+    std::vector<refill_job> jobs;
     for (auto & ls : mc->layers) {
         if (!ls.lent) {
             continue;
         }
+        ggml_tensor *       dsts[3] = { ls.pub.up_c,   ls.pub.gate_c,   ls.pub.down_c   };
+        const ggml_tensor * srcs[3] = { ls.pub.up_src, ls.pub.gate_src, ls.pub.down_src };
         for (int32_t s = 0; s < ls.pub.n_slots; ++s) {
             const int32_t e = ls.slot_expert[s];
             if (e < 0) {
                 continue; // empty: no table entry names it
             }
-            upload_slice(ls.pub.up_c,   ls.pub.up_src,   e, s);
-            upload_slice(ls.pub.gate_c, ls.pub.gate_src, e, s);
-            upload_slice(ls.pub.down_c, ls.pub.down_src, e, s);
-            bytes += ls.pub.up_src->nb[2] + ls.pub.gate_src->nb[2] + ls.pub.down_src->nb[2];
+            for (int k = 0; k < 3; ++k) {
+                const size_t sz  = srcs[k]->nb[2];
+                const size_t off = (size_t) s*dsts[k]->nb[2];
+                if ((uint8_t *) dsts[k]->data + off + sz <= g_lend.lo) {
+                    continue; // below the lent range: never overwritten
+                }
+                if (off + sz > ggml_nbytes(dsts[k]) || (size_t) (e + 1)*sz > ggml_nbytes(srcs[k])) {
+                    continue; // upload_slice's bound check
+                }
+                jobs.push_back({ dsts[k], off, (const char *) srcs[k]->data + (size_t) e*sz, sz });
+            }
+        }
+    }
+    const size_t bytes = hot_refill(mc, jobs);
+    for (auto & ls : mc->layers) {
+        if (!ls.lent) {
+            continue;
         }
         // the zero slot every miss reads, and the alloc-size tail after it (kernels may read padded rows there)
         ggml_tensor * ts[3] = { ls.pub.up_c, ls.pub.gate_c, ls.pub.down_c };
