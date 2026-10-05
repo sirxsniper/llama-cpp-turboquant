@@ -58,6 +58,10 @@ void llama_moe_cache_init(const llama_model & model, int32_t n_slots, int32_t ma
 // nullptr when the cache is disabled or this tensor has no cached layer
 const llama_moe_cache_layer * llama_moe_cache_lookup(const ggml_tensor * up_exps);
 
+// [TAG_FN_L3_VRAM_CBUF] as llama_moe_cache_lookup, also while the layer's slots are out (the compute-buffer lend): for a
+// reader of the host table only (the bridge), which is always valid ("not hot" for every expert while the layer is out)
+const llama_moe_cache_layer * llama_moe_cache_lookup_table(const ggml_tensor * up_exps);
+
 // apply throttled LRU updates; call between graph executions only. ctx: the calling llama_context
 // ([TAG_FN_MOE_HOT_ADAPT] only the owner of an adaptive hot set updates it)
 void llama_moe_cache_step(const void * ctx);
@@ -78,7 +82,27 @@ void llama_moe_cache_step(const void * ctx);
 // the ones the environment does not set. LLAMA_MOE_HOT_PROFILE=even: no routing profile; every host layer gets the same
 // number of slots, empty at start, and the adaptive set (required) fills them. =off / 0 / none: no hot set.
 // [TAG_FN_VRAM_FIT] budget_bytes > 0: the VRAM fit's budget (LLAMA_MOE_HOT_MIB is then not read).
-bool llama_moe_hot_init(const llama_model & model, const void * owner, size_t budget_bytes = 0);
+// [TAG_FN_L3_VRAM_CBUF] tail_bytes > 0: the device buffer lives on CUDA virtual memory, and its top layers (whole layers, at
+// least tail_bytes, starting at a granule boundary) form a tail that gives its VRAM back while a big prompt runs
+// (llama_moe_hot_cbuf_release / _restore). Needs one device with llama_moe_hot_vmm_granularity() > 0 and at least one
+// layer below the tail; otherwise nothing is allocated and false comes back.
+bool llama_moe_hot_init(const llama_model & model, const void * owner, size_t budget_bytes = 0, size_t tail_bytes = 0);
+
+// [TAG_FN_L3_VRAM_CBUF] the virtual-memory granularity of the hot set's device (0: no such buffers there)
+size_t llama_moe_hot_vmm_granularity(const llama_model & model);
+
+// [TAG_FN_L3_VRAM_CBUF] the tail's bytes (0: no tail), and whether it is out (its VRAM given back) right now
+size_t llama_moe_hot_cbuf_tail_bytes();
+bool   llama_moe_hot_cbuf_out();
+
+// [TAG_FN_L3_VRAM_CBUF] the owner's graphs are synchronized: the tail layers leave both tables and the hot chain
+// (llama_moe_cache_lookup returns nullptr for them while they are out), uploads into them stop, then the tail's VRAM goes
+// back to the driver. Returns the bytes given back (0: no tail, already out, or another owner).
+size_t llama_moe_hot_cbuf_release(const void * owner);
+
+// [TAG_FN_L3_VRAM_CBUF] map the tail again, clear it, upload the tail layers' resident experts and restore their tables.
+// false: the mapping failed, the tail layers stay out (correct, fewer hot slots) and the next call tries again.
+bool   llama_moe_hot_cbuf_restore(const void * owner);
 
 // [TAG_FN_AUTO] a hot set is configured for this model (LLAMA_MOE_HOT_PROFILE names a file or "even")
 bool llama_moe_hot_wanted(const llama_model & model);

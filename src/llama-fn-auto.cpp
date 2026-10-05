@@ -447,6 +447,52 @@ size_t llama_fn_vram_fit_budget(size_t total, size_t free, size_t ceiling, size_
     return std::min(a, b);
 }
 
+// [TAG_FN_L3_VRAM_CBUF] ---------------------------------------------------------------------------------------------
+
+uint32_t llama_fn_cbuf_small_t(uint32_t requested, int op_offload_min, uint32_t n_seqs) {
+    const uint32_t below = (uint32_t) std::max(9, op_offload_min) - 1;
+    const uint32_t t     = std::max<uint32_t>(1, std::min<uint32_t>(requested, below));
+    n_seqs = std::max<uint32_t>(1, n_seqs);
+    return std::max<uint32_t>(n_seqs, t / n_seqs * n_seqs);
+}
+
+size_t llama_fn_cbuf_tail(size_t full, size_t small, size_t pool_extra, size_t gran, size_t min_gain) {
+    if (full < small + min_gain || full <= small) {
+        return 0;
+    }
+    const size_t t = full - small + pool_extra;
+    return gran > 0 ? (t + gran - 1) / gran * gran : t;
+}
+
+int llama_fn_cbuf_first_tail_layer(const std::vector<size_t> & layer_bytes, size_t tail_bytes) {
+    if (tail_bytes == 0) {
+        return -1;
+    }
+    size_t acc = 0;
+    for (size_t k = layer_bytes.size(); k > 0; --k) {
+        acc += layer_bytes[k - 1];
+        if (acc >= tail_bytes) {
+            return k - 1 >= 1 ? (int) (k - 1) : -1;
+        }
+    }
+    return -1;
+}
+
+bool llama_fn_cbuf_fits(size_t budget, size_t tail, size_t stream_lend) {
+    const size_t need = tail + stream_lend + budget/32 + ((size_t) 64 << 20);
+    return tail > 0 && budget >= need;
+}
+
+size_t llama_fn_cbuf_budget(size_t budget, size_t pool_extra, size_t free, size_t budget_max) {
+    const size_t keep = (size_t) 256 << 20;
+    const size_t room = free > keep ? free - keep : 0;
+    size_t b = budget + pool_extra;
+    if (b > room) {
+        b = std::max(budget, room);
+    }
+    return std::min(b, budget_max);
+}
+
 // [TAG_FN_RAM_FIT] -------------------------------------------------------------------------------------------------
 
 llama_ram_fit_out llama_ram_fit_plan(const llama_ram_fit_in & in) {

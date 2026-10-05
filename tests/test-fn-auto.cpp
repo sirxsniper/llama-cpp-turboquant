@@ -343,6 +343,74 @@ static void test_even_slots() {
     TCHECK(llama_fn_even_slots({}, b, 512) == 0, "no layers");
 }
 
+// [TAG_FN_L3_VRAM_CBUF] the compute-buffer lend at the r2/ab3 numbers (file A, -c 262144, -ub 8192): FULL reserve
+// 3725.44 MiB, a SMALL one of about 250 MiB, the 10312 MiB hot-set budget of today's fit, the stream's 2 x 1950 MiB banks
+static void test_cbuf() {
+    TCHECK(llama_fn_cbuf_small_t(31, 32, 1) == 31, "default: 31 below the op-offload minimum 32");
+    TCHECK(llama_fn_cbuf_small_t(100, 32, 1) == 31, "never at or above the op-offload minimum");
+    TCHECK(llama_fn_cbuf_small_t(4, 32, 1) == 4, "below the hot chain's 8 tokens on request (MTP n_max 2: 3)");
+    TCHECK(llama_fn_cbuf_small_t(3, 32, 1) == 3, "3: the MTP verify of n_max 2");
+    TCHECK(llama_fn_cbuf_small_t(3, 32, 2) == 2, "3 with 2 sequences: 2 (a multiple of n_seqs)");
+    TCHECK(llama_fn_cbuf_small_t(1, 32, 1) == 1, "1: decode without drafts");
+    TCHECK(llama_fn_cbuf_small_t(31, 16, 1) == 15, "GGML_OP_OFFLOAD_MIN_BATCH=16 -> 15");
+    TCHECK(llama_fn_cbuf_small_t(31, 0, 1) == 8, "a nonsense minimum still leaves 8");
+    TCHECK(llama_fn_cbuf_small_t(31, 32, 4) == 28, "4 sequences: 28 (the reserve rounds 31 up to 32, an op-offload graph)");
+    TCHECK(llama_fn_cbuf_small_t(31, 32, 0) == 31, "n_seqs 0 counts as 1");
+    TCHECK(llama_fn_cbuf_small_t(31, 32, 40) == 40, "more sequences than 31: one token each (FULL - SMALL then decides)");
+
+    const size_t gran  = 2 * MiB;
+    const size_t full  = (size_t) (3725.44 * MiB);
+    const size_t small = 250 * MiB;
+    const size_t tail  = llama_fn_cbuf_tail(full, small, 0, gran, 256 * MiB);
+    TCHECK(tail == 3476 * MiB, "tail = FULL - SMALL on granules: %zu MiB", tail / MiB);
+    TCHECK(tail % gran == 0, "tail on a granule");
+    TCHECK(llama_fn_cbuf_tail(full, small, 300 * MiB, gran, 256 * MiB) == 3776 * MiB, "plus the pool's growth");
+    TCHECK(llama_fn_cbuf_tail(500 * MiB, 400 * MiB, 0, gran, 256 * MiB) == 0, "under the minimum gain: no tail");
+    TCHECK(llama_fn_cbuf_tail(400 * MiB, 500 * MiB, 0, gran, 0) == 0, "SMALL above FULL: no tail");
+
+    // the hot set grows by the difference: 71 -> 95 even slots per layer (+33 %), 13 top layers form the tail
+    const std::vector<size_t> bytes = flash_next_expert_bytes();
+    const size_t b_old = 10312 * MiB;
+    const size_t b_new = b_old + (full - small);
+    const int32_t n_old = llama_fn_even_slots(bytes, b_old, 512);
+    const int32_t n_new = llama_fn_even_slots(bytes, b_new - 5*gran, 512); // the layout's pads and guards
+    TCHECK(n_old == 71 && n_new == 95, "even slots %d -> %d", n_old, n_new);
+    std::vector<size_t> layer_bytes;
+    for (size_t x : bytes) {
+        layer_bytes.push_back(x * (size_t) (n_new + 1));
+    }
+    const int k = llama_fn_cbuf_first_tail_layer(layer_bytes, tail);
+    TCHECK(k == 35, "the tail starts at layer %d", k);
+    size_t in_tail = 0;
+    for (size_t i = (size_t) std::max(k, 0); i < layer_bytes.size(); ++i) {
+        in_tail += layer_bytes[i];
+    }
+    TCHECK(in_tail >= tail && in_tail - layer_bytes[(size_t) std::max(k, 0)] < tail, "whole layers, the fewest that hold it");
+    TCHECK(llama_fn_cbuf_first_tail_layer(layer_bytes, 0) == -1, "no tail");
+    TCHECK(llama_fn_cbuf_first_tail_layer(layer_bytes, layer_bytes.back()) == 47, "one layer's bytes: the last layer");
+    TCHECK(llama_fn_cbuf_first_tail_layer(layer_bytes, layer_bytes.back() + 1) == 46, "a byte more: two layers");
+    size_t all = 0;
+    for (size_t x : layer_bytes) {
+        all += x;
+    }
+    TCHECK(llama_fn_cbuf_first_tail_layer(layer_bytes, all) == -1, "every layer: refused (one stays below the tail)");
+    TCHECK(llama_fn_cbuf_first_tail_layer(layer_bytes, all - layer_bytes[0]) == 1, "all but the first layer");
+    TCHECK(llama_fn_cbuf_first_tail_layer({}, tail) == -1, "no layers");
+
+    TCHECK(llama_fn_cbuf_fits(b_new, tail, 3900 * MiB), "13.8 GB hot set: the tail beside the stream's banks fits");
+    TCHECK(!llama_fn_cbuf_fits(7 * 1024 * MiB, tail, 3900 * MiB), "7 GB: it does not");
+    TCHECK(!llama_fn_cbuf_fits(b_new, 0, 3900 * MiB), "no tail: nothing to fit");
+
+    // LLAMA_FN_CBUF_POOL_MIB also grows the budget: up to free - 256 MiB and the LLAMA_FN_HOT_BUDGET_MAX_MIB cap
+    const size_t free_v = 15000 * MiB;
+    TCHECK(llama_fn_cbuf_budget(b_new, 0, free_v, SIZE_MAX) == b_new, "no extra: the fit's budget");
+    TCHECK(llama_fn_cbuf_budget(b_new, 512 * MiB, free_v, SIZE_MAX) == b_new + 512 * MiB, "+512 MiB");
+    TCHECK(llama_fn_cbuf_budget(b_new, 4096 * MiB, free_v, SIZE_MAX) == free_v - 256 * MiB, "never above free - 256 MiB");
+    TCHECK(llama_fn_cbuf_budget(free_v, 512 * MiB, free_v, SIZE_MAX) == free_v, "a budget already above it stays");
+    TCHECK(llama_fn_cbuf_budget(b_new, 512 * MiB, free_v, 8000 * MiB) == 8000 * MiB, "the cap wins");
+    TCHECK(llama_fn_cbuf_budget(b_new, 512 * MiB, 0, SIZE_MAX) == b_new, "free unknown (0): the fit's budget");
+}
+
 static void test_ram_fit() {
     // Flash-Next on a 96 GB box: host experts (72 GB) + PLE (28.8 GB) mapped, bigger than RAM on their own
     llama_ram_fit_in fn;
@@ -430,6 +498,7 @@ int main() {
     test_inject();
     test_even_slots();
     test_vram_fit();
+    test_cbuf();
     test_ram_fit();
 
     printf("test-fn-auto: %d checks, %d failed\n", g_checks, g_fail);

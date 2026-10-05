@@ -742,6 +742,14 @@ llama_pfs_counters llama_prefill_stream_get_counters() {
     return s->ctr;
 }
 
+size_t llama_prefill_stream_lend_bytes(const void * owner) {
+    const pfs_state * s = g_pfs;
+    if (!s || !s->lend || s->owner != owner || s->min_tokens == INT64_MAX) {
+        return 0;
+    }
+    return (size_t) s->n_bufs*s->bank_size;
+}
+
 bool llama_prefill_stream_before_ubatch(const void * owner, ggml_backend_sched_t sched, int64_t n_tokens) {
     pfs_state * s = g_pfs;
     if (!s || !s->lend || s->owner != owner) {

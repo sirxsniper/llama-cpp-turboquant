@@ -114,6 +114,54 @@ allocated. Budget = min(free - margin, ceiling - used - margin):
 The log prints the breakdown (`moe-hot: VRAM fit ...`). Works at any `-c`, including 262144. `LLAMA_MOE_HOT_FIT=1`
 enables the same for any model that uses `LLAMA_MOE_HOT_MIB=auto`.
 
+## Compute-buffer lend `[TAG_FN_L3_VRAM_CBUF]` (lever round 3, off by default)
+
+`LLAMA_FN_CBUF=1` (qwen4exp only, the hot set's owner context, needs CUDA virtual memory management): the trunk's
+compute buffer is sized for a `-ub 8192` prompt (3.7 GB at 262K) and idle in every decode step. With the switch the
+scheduler holds a SMALL reserve between prompts (graphs of at most 31 tokens: decode, MTP verify, short prompts) and the
+hot set keeps the difference as extra slots:
+
+- At the VRAM fit the trunk reserves SMALL first, so the fit sees FULL - SMALL as free VRAM (about +3.4 GB, 71 -> about
+  95 even slots per layer at 262K). The hot set's device buffer is then allocated on CUDA virtual memory; its top layers,
+  whole layers from a 2 MiB boundary on and at least FULL - SMALL bytes plus a slack of max(128 MiB, FULL / 16) (the FULL reserve can grow once the hot set exists; a larger tail costs the decode nothing), form a tail that is mapped apart from the rest. FULL is reserved once more at the fit, so it includes the draft context's outputs.
+- A batch wider than 31 tokens: the tail layers leave both tables and the hot chain, uploads into them stop, the tail's
+  VRAM goes back to the driver, then the FULL reserve is allocated (the prefill stream borrows its banks from the part
+  below the tail, as before).
+- The next narrow batch: the stream's banks come back, the FULL compute buffer is freed, the trunk backend's pools give
+  back what the prompt grew (`[TAG_FN_L3_VRAM_TRIM]`), the tail is mapped again at the same addresses and cleared, its
+  resident experts come back (through the upload worker by default, see `LLAMA_FN_CBUF_ASYNC`), and the SMALL reserve is
+  allocated. The device use never passes the larger of the two states'; the log prints it at each switch
+  (`cbuf_set: [TAG_FN_L3_VRAM_CBUF] -> FULL / SMALL`).
+- Layers past the trunk (an MTP block, when its experts are on the host) are placed below the tail, so the tail never
+  holds a layer that the draft context reads while a prompt runs.
+- Failures stay local: a FULL reserve that fails returns to SMALL and fails that batch only (so does a reserve left
+  pending by a failed switch: decode returns -2 instead of throwing); a tail that cannot be
+  mapped again leaves its layers on the host and is tried again every 64 narrow batches; a hot set with a tail that
+  cannot be allocated falls back to the FULL reserve and a hot set without one. The bridge reads the hot tables through
+  `llama_moe_cache_lookup_table`, which also answers while the tail is out.
+- Exactness: with `-b` equal to `-ub` every batch is one ubatch, so a prompt never runs a narrow ubatch with the tail
+  out, and a decode always sees the whole hot set: the outputs equal the lend-off run with the same hot set (static
+  profile, MTP off). With `-b` larger than `-ub`, a prompt's trailing ubatch of at most 8 tokens computes the tail
+  layers' experts on the host (placement noise, the early9 KLD band).
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `LLAMA_FN_CBUF` | 0 | the compute-buffer lend |
+| `LLAMA_FN_CBUF_SMALL_T` | 31 | widest graph of the SMALL reserve (clamped to 1 .. `GGML_OP_OFFLOAD_MIN_BATCH` - 1, a multiple of the sequences); below 8 the 4..8-token graphs run with FULL and without the tail's hot chain (3 = the MTP verify of n_max 2: the smallest SMALL reserve at 262K, whose attention temporaries grow with the width) |
+| `LLAMA_FN_CBUF_POOL_MIB` | 0 | N MiB more for the hot set and N MiB more in its tail: between prompts the experts use the room that a prompt's pool growth takes while the tail is out (the pools are trimmed at each return to SMALL). The FULL-state device use does not change; the SMALL state's grows by N - keep N at or below the measured pool growth of a FULL period (the `-> SMALL` line prints it) or the room under the 28,500 MiB peak |
+| `LLAMA_FN_CBUF_TRIM` | 1 | trim the trunk backend's pools at each return to SMALL |
+| `LLAMA_FN_CBUF_EAGER` | 1 | return to SMALL at the end of a FULL batch that did not fill `-b` (the last batch of a prompt with one stream), so the switch belongs to the prompt and the tail's refill starts before the first decode step; 0 = at the first narrow batch. Batches of exactly `-b` tokens stay FULL (KLD runs, multi-batch prompts) |
+| `LLAMA_FN_CBUF_ASYNC` | 1 | with the adaptive hot set the tail's resident experts come back through its upload worker and are published as they land (the host computes them until then), so the first decode step after a prompt does not wait for the refill; 0 = a synchronous refill before that step (also the path of a static hot set) |
+| `LLAMA_FN_CBUF_THRASH` | 8 | that many FULL switches within 64 batches (steps wider than the SMALL reserve, e.g. several streams drafting 8 tokens each) pin the FULL state: the tail stays out until 256 narrow batches in a row; 0 = never |
+| `LLAMA_FN_CBUF_DRAFT_TRIM` | 1 | `[TAG_FN_L3_VRAM_TRIM]` with `LLAMA_FN_CBUF=1`, the MTP draft context gives its pools' prompt growth back at its first batch of <= 64 tokens after a wider one (its own backends, after its own synchronize). It gains hot-set room only with `LLAMA_FN_CBUF_EAGER=0` (the trunk then returns to SMALL after the draft's prompt pass) and `LLAMA_FN_CBUF_POOL_MIB` set to the measured growth (the `draft prompt` / `draft decode` account lines and the trim line) |
+| `LLAMA_FN_CBUF_REFILL_THREADS` | 8 | copy threads of the synchronous refill (mmap -> pinned halves -> device) |
+| `LLAMA_FN_HOT_BUDGET_MAX_MIB` | unset | upper bound on the VRAM fit's hot-set budget (any lend setting; used to give two configurations the same hot set) |
+| `LLAMA_FN_VRAM_ACCOUNT` | 0 | `[TAG_FN_L3_VRAM_ACCOUNT]` device use at each stage (context, KV, bridge, gen5, reserve, fit, hot set, switches, prompt/decode changes), the pools, and the model's device tensors by kind (qwen4exp only, logging only) |
+
+ggml-cuda (any model, used only by the code above): `ggml_backend_cuda_vmm_buffer_alloc / _map / _unmap / _mapped`,
+`ggml_backend_cuda_vmm_granularity`, `ggml_backend_cuda_pool_stats / _trim` (also through get_proc_address as
+`ggml_backend_vmm_*` / `ggml_backend_pool_*`); `tests/test-vmm-lend.cpp` checks them on the GPU.
+
 ## RAM fit `[TAG_FN_RAM_FIT]`
 
 llama-server, after loading: when the host-resident model bytes (mmap), the host buffers, the prompt cache
