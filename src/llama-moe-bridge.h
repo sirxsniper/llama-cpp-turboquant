@@ -58,6 +58,8 @@
 //                                         slowest workers (CPU, GB/s), the slowest job, the wait for a stopped prefetch
 //   LLAMA_MOE_POOL_EXEC_CPU=<cpu>         [TAG_FN_L3_CPU_PLACE] (default: the first core of the pool) the executor's CPU,
 //                                         e.g. 1 = the SMT sibling of core 0 (the main thread): every pool core computes
+//   LLAMA_MOE_POOL_PF_STREAMS=<n>         [TAG_FN_L3_CPU_PFSTREAMS] (default 1; with split stable / steal) each worker pulls
+//                                         n regions of an expert at once, one line of each in turn (more misses in flight)
 //   LLAMA_MOE_DMA_FILL_GAP=1              [TAG_FN_L3_CPU_FILL] (with the DMA share) the ring fills pause while a pool job
 //                                         reads DRAM and run between the jobs (placement noise: the ring-ready set moves)
 //   LLAMA_MOE_DMA_FILL_CPUS=<hex mask>    [TAG_FN_L3_CPU_FILL] the ring fill threads on these CPUs only (e.g. 0xA = 1, 3:

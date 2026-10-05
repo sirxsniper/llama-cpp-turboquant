@@ -93,6 +93,7 @@ struct bench_params {
     int              pf_k         = 0;      // ids per token of the prediction (0: n_used + 2)
     bool             roofline_only = false;
     int              pool_exec_cpu = -1;    // [TAG_FN_L3_CPU_PLACE] -1: the caller keeps its affinity
+    int              pf_streams    = 1;     // [TAG_FN_L3_CPU_PFSTREAMS]
 };
 
 // the fp16 scale fields at the start of a block (all of them must hold normal numbers in random blocks)
@@ -184,6 +185,7 @@ void usage(const char * argv0) {
     printf("  --pf-k K               predicted ids per token (default n_used + 2)\n");
     printf("  --roofline-only        print the read rooflines and stop\n");
     printf("  --pool-exec-cpu N      pin the pool's caller (worker 0) to CPU N; the workers take the rest of the mask\n");
+    printf("  --pf-streams N         a split >= 1 prefetch pulls N regions at once (LLAMA_MOE_POOL_PF_STREAMS)\n");
     printf("switches (environment variables, read at start): ");
     for (int i = 0; i < GGML_CPU_FN_SWITCH_COUNT; i++) {
         printf("%s%s", i ? ", " : "", ggml_cpu_fn_switch_env((ggml_cpu_fn_switch) i));
@@ -274,6 +276,8 @@ bench_params parse_args(int argc, char ** argv) {
             p.roofline_only = true;
         } else if (a == "--pool-exec-cpu") {
             p.pool_exec_cpu = atoi(next());
+        } else if (a == "--pf-streams") {
+            p.pf_streams = atoi(next());
         } else if (a == "--ab") {
             std::string list = next();
             size_t pos = 0;
@@ -1012,6 +1016,10 @@ void run_set(run_ctx & rc, const weight_set & ws, int & n_bad) {
                     }
                 }
                 printf("; slowest job %.1f us, %" PRIu64 " over 1 ms\n", pst.job_max_us, pst.jobs_slow);
+                if (pst.pred_jobs > 0) {
+                    printf("        prediction over %" PRIu64 " jobs: precision %.2f (first 4: %.2f), recall %.2f\n", pst.pred_jobs,
+                           pst.pf_precision, pst.pf_prec_top4, pst.pf_recall);
+                }
             }
         }
         if (rc.p.per_op) {
@@ -1063,6 +1071,7 @@ int main(int argc, char ** argv) {
         pp.swpf            = p.pool_swpf;       // [TAG_FN_L3_CPU_SWPF]
         pp.stats           = p.pool_stats;      // [TAG_FN_L3_CPU_STATS]
         pp.skip_first_core = p.pool_skip_first;
+        pp.pf_streams      = p.pf_streams; // [TAG_FN_L3_CPU_PFSTREAMS]
         if (p.pool_exec_cpu >= 0) { // [TAG_FN_L3_CPU_PLACE]
             pp.pin_caller  = true;
             pp.caller_cpu1 = p.pool_exec_cpu + 1;

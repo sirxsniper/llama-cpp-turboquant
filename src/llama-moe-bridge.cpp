@@ -131,6 +131,7 @@ struct llama_moe_bridge {
     int                                 pool_swpf    = 0;     // LLAMA_MOE_POOL_SWPF
     bool                                pf_rank      = false; // LLAMA_MOE_BRIDGE_PF_RANK
     int                                 exec_cpu     = -1;    // [TAG_FN_L3_CPU_PLACE] LLAMA_MOE_POOL_EXEC_CPU
+    int                                 pf_streams   = 1;     // [TAG_FN_L3_CPU_PFSTREAMS] LLAMA_MOE_POOL_PF_STREAMS
     bool                                fill_gap     = false; // [TAG_FN_L3_CPU_FILL] LLAMA_MOE_DMA_FILL_GAP (with the DMA share)
     uint64_t                            fill_mask    = 0;     // [TAG_FN_L3_CPU_FILL] LLAMA_MOE_DMA_FILL_CPUS
     int                                 hint_k       = 0;     // [TAG_FN_L3_CPU_DEVPRED] LLAMA_MOE_BRIDGE_PF_DEV: ids per token
@@ -697,6 +698,7 @@ llama_moe_bridge * llama_moe_bridge_create(const llama_model & model, int n_thre
         const bool rank  = env_int("LLAMA_MOE_BRIDGE_PF_RANK", 0) > 0;
         const bool dev   = env_int("LLAMA_MOE_BRIDGE_PF_DEV", 0) > 0;
         const int  exec  = env_int("LLAMA_MOE_POOL_EXEC_CPU", -1);
+        const int  pfs   = env_int("LLAMA_MOE_POOL_PF_STREAMS", 1);
         const bool fgap  = env_int("LLAMA_MOE_DMA_FILL_GAP", 0) > 0;
         const char * fm  = getenv("LLAMA_MOE_DMA_FILL_CPUS");
         if (model.arch == LLM_ARCH_QWEN4EXP) {
@@ -706,10 +708,11 @@ llama_moe_bridge * llama_moe_bridge_create(const llama_model & model, int n_thre
             br->pf_rank    = rank;
             br->hint_k     = dev ? 1 : 0; // the count is set with the prefetch below
             br->exec_cpu   = exec >= 0 && exec < GGML_MAX_N_THREADS ? exec : -1;
+            br->pf_streams = std::min(8, std::max(1, pfs));
             br->fill_gap   = fgap;
             br->fill_mask  = fm && fm[0] ? strtoull(fm, nullptr, 16) : 0;
-        } else if (split != 0 || swpf != 0 || stats || rank || dev || exec >= 0 || fgap || (fm && fm[0])) {
-            LLAMA_LOG_WARN("%s: LLAMA_MOE_POOL_SPLIT / _SWPF / _STATS / _EXEC_CPU, LLAMA_MOE_BRIDGE_PF_RANK / _PF_DEV and "
+        } else if (split != 0 || swpf != 0 || stats || rank || dev || exec >= 0 || pfs > 1 || fgap || (fm && fm[0])) {
+            LLAMA_LOG_WARN("%s: LLAMA_MOE_POOL_SPLIT / _SWPF / _STATS / _EXEC_CPU / _PF_STREAMS, LLAMA_MOE_BRIDGE_PF_RANK / _PF_DEV and "
                     "LLAMA_MOE_DMA_FILL_GAP / _CPUS act on qwen4exp only: ignored\n", __func__);
         }
         br->hint_wait_us = std::min(1000, std::max(0, env_int("LLAMA_MOE_BRIDGE_PF_DEV_WAIT_US", 50)));
@@ -724,6 +727,7 @@ llama_moe_bridge * llama_moe_bridge_create(const llama_model & model, int n_thre
     br->pool_params.stats   = br->pool_stats; // [TAG_FN_L3_CPU_STATS]
     br->pool_params.pf_rank = br->pf_rank;    // [TAG_FN_L3_CPU_PFRANK]
     br->pool_params.caller_cpu1 = br->exec_cpu + 1; // [TAG_FN_L3_CPU_PLACE] 0: the first CPU of the list, as before
+    br->pool_params.pf_streams  = br->pf_streams;   // [TAG_FN_L3_CPU_PFSTREAMS]
     if (br->pool_stats) {
         br->pool_get_stats = (pool_get_stats_t) ggml_backend_reg_get_proc_address(cpu_reg, "ggml_cpu_moe_pool_get_stats");
         if (br->pool_get_stats == nullptr) {
@@ -848,11 +852,12 @@ llama_moe_bridge * llama_moe_bridge_create(const llama_model & model, int n_thre
                     "(top-%d per token, the cold ones pulled into the CPU caches between two jobs by %s%s), router copies "
                     "%.1f MiB\n", __func__, n_pf, br->chans.size(), br->pf_k, br->pf_mode == 0 ? "real loads" : "software prefetches",
                     br->pf_solo ? "; solo: the workers compute, the executor dispatches" : "", n_bytes/1048576.0);
-            if (br->pool_split > 0 || br->pf_rank || br->hint_k > 0) {
-                LLAMA_LOG_INFO("%s: [TAG_FN_L3_CPU] pool split %s, prefetch order %s, prediction %s\n", __func__,
+            if (br->pool_split > 0 || br->pf_rank || br->hint_k > 0 || br->pf_streams > 1) {
+                LLAMA_LOG_INFO("%s: [TAG_FN_L3_CPU] pool split %s, prefetch order %s, prediction %s, %d pull streams%s\n", __func__,
                         br->pool_split == 2 ? "steal" : br->pool_split == 1 ? "stable" : "range",
                         br->pf_rank || br->hint_k > 0 ? "by rank" : "by expert id",
-                        br->hint_k > 0 ? "on the device (hints)" : "host router");
+                        br->hint_k > 0 ? "on the device (hints)" : "host router", br->pf_streams,
+                        br->pf_streams > 1 && br->pool_split == 0 ? " (they need split stable or steal)" : "");
             }
         }
     }
@@ -1142,8 +1147,9 @@ bool llama_moe_bridge_end(llama_moe_bridge * br) {
             llama_moe_dma_bridge_fill_held(&held_us, &held_n);
         }
         LLAMA_LOG_INFO("%s: MoE bridge %d: [TAG_FN_L3_CPU_STATS] workers slowest first: %s; slowest job %.1f us, %" PRIu64 " jobs "
-                "over 1 ms; fills held %" PRIu64 " times, %.1f ms in all\n", __func__, br->bid, wl.c_str(), ps.job_max_us,
-                ps.jobs_slow, held_n, held_us/1e3);
+                "over 1 ms; fills held %" PRIu64 " times, %.1f ms in all; prediction over %" PRIu64 " jobs: precision %.2f (first 4: "
+                "%.2f), recall %.2f\n", __func__, br->bid, wl.c_str(), ps.job_max_us, ps.jobs_slow, held_n, held_us/1e3,
+                ps.pred_jobs, ps.pf_precision, ps.pf_prec_top4, ps.pf_recall);
     }
     if (err == GGML_MOE_BRIDGE_ERR_NONE) {
         return true;

@@ -119,10 +119,10 @@ size_t ggml_fn_moe_prefetch(const struct ggml_tensor * up, const struct ggml_ten
                             const int32_t * list, int n, int ith, int nth, const volatile int32_t * stop, int mode);
 // [TAG_FN_L3_CPU_SPLIT] the same for a split >= 1 job: thread ith's own pieces of the experts list[0..n) in list order
 // (per expert its gate + up pieces, then its down pieces). done (or NULL): [n_expert], set to 1 for every expert whose
-// pieces of this thread were all pulled before the stop.
+// pieces of this thread were all pulled before the stop. [TAG_FN_L3_CPU_PFSTREAMS] streams > 1: that many at a time.
 size_t ggml_fn_moe_prefetch_stable(const struct ggml_tensor * up, const struct ggml_tensor * gate, const struct ggml_tensor * down,
                                    const int32_t * list, int n, int ith, int nth, const volatile int32_t * stop, int mode,
-                                   uint8_t * done);
+                                   uint8_t * done, int streams);
 
 
 #if defined(_MSC_VER)

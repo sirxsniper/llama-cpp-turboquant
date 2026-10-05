@@ -2733,12 +2733,59 @@ static inline bool ggml_fn_prefetch_bytes_fine(const char * a, size_t len, int m
     return true;
 }
 
+// [TAG_FN_L3_CPU_PFSTREAMS] real loads of up to GGML_FN_PF_MAX_STREAMS regions at once, one line of each in turn: as many
+// independent streams (page walks, stream prefetcher restarts at every page) instead of one
+#define GGML_FN_PF_MAX_STREAMS 8
+
+struct ggml_fn_pf_group {
+    const char * a[GGML_FN_PF_MAX_STREAMS];
+    size_t       len[GGML_FN_PF_MAX_STREAMS];
+    int          k;
+    int          ns;
+};
+
+// pull the group's regions; false (and nothing more pulled) once *stop != 0, checked every 4 KiB of each region
+static bool ggml_fn_pf_group_pull(struct ggml_fn_pf_group * g, const volatile int32_t * stop, size_t * bytes) {
+    const char * c[GGML_FN_PF_MAX_STREAMS];
+    const char * end[GGML_FN_PF_MAX_STREAMS];
+    size_t span = 0;
+    for (int r = 0; r < g->k; ++r) {
+        c[r]   = (const char *) ((uintptr_t) g->a[r] & ~(uintptr_t) 63);
+        end[r] = g->a[r] + g->len[r];
+        span   = MAX(span, (size_t) (end[r] - c[r]));
+    }
+    for (size_t o = 0; o < span; o += 64) {
+        if ((o & 4095) == 0 && *stop) {
+            g->k = 0;
+            return false;
+        }
+        for (int r = 0; r < g->k; ++r) {
+            if (c[r] + o < end[r]) {
+                (void) *(const volatile char *) (c[r] + o);
+            }
+        }
+    }
+    for (int r = 0; r < g->k; ++r) {
+        *bytes += g->len[r];
+    }
+    g->k = 0;
+    return true;
+}
+
+static bool ggml_fn_pf_group_add(struct ggml_fn_pf_group * g, const char * a, size_t len, const volatile int32_t * stop, size_t * bytes) {
+    g->a[g->k]   = a;
+    g->len[g->k] = len;
+    g->k++;
+    return g->k < g->ns || ggml_fn_pf_group_pull(g, stop, bytes);
+}
+
 // [TAG_FN_L3_CPU_SPLIT] the stable split's prefetch: thread ith's own pieces (owner0(e) + pp mod nth, as in a split >= 1
 // job) of the experts list[0..n) in list order, each expert's gate + up pieces then its down pieces, so a stopped
 // prefetch has covered the first (most likely) experts. done[e] = 1 once all its pieces of this thread are pulled.
+// [TAG_FN_L3_CPU_PFSTREAMS] streams > 1 (real loads): an expert's regions are pulled that many at a time, interleaved.
 size_t ggml_fn_moe_prefetch_stable(const struct ggml_tensor * up, const struct ggml_tensor * gate, const struct ggml_tensor * down,
                                    const int32_t * list, int n, int ith, int nth, const volatile int32_t * stop, int mode,
-                                   uint8_t * done) {
+                                   uint8_t * done, int streams) {
     if (n <= 0 || nth <= 0 || ith < 0 || ith >= nth) {
         return 0;
     }
@@ -2750,6 +2797,40 @@ size_t ggml_fn_moe_prefetch_stable(const struct ggml_tensor * up, const struct g
     const int64_t pd     = GGML_FN_MOE_PD;
     const int64_t np4    = (n_embd + pd - 1)/pd;
     size_t bytes = 0;
+    if (streams > 1 && mode == 0) {
+        struct ggml_fn_pf_group g;
+        g.k  = 0;
+        g.ns = MIN(streams, GGML_FN_PF_MAX_STREAMS);
+        for (int i = 0; i < n; ++i) {
+            const int32_t e = list[i];
+            if (e < 0 || e >= n_exp) {
+                continue;
+            }
+            const int64_t p0 = (ith - ggml_fn_moe_owner0(e, nth) + nth) % nth;
+            for (int64_t pp = p0; pp < np3; pp += nth) {
+                const int64_t r0 = pp*pr;
+                const int64_t nr = MIN(pr, n_ff - r0);
+                if (!ggml_fn_pf_group_add(&g, (const char *) gate->data + (size_t) e*gate->nb[2] + (size_t) r0*gate->nb[1], (size_t) nr*gate->nb[1], stop, &bytes) ||
+                    !ggml_fn_pf_group_add(&g, (const char *) up->data   + (size_t) e*up->nb[2]   + (size_t) r0*up->nb[1],   (size_t) nr*up->nb[1], stop, &bytes)) {
+                    return bytes;
+                }
+            }
+            for (int64_t pp = p0; pp < np4; pp += nth) {
+                const int64_t r0 = pp*pd;
+                const int64_t nr = MIN(pd, n_embd - r0);
+                if (!ggml_fn_pf_group_add(&g, (const char *) down->data + (size_t) e*down->nb[2] + (size_t) r0*down->nb[1], (size_t) nr*down->nb[1], stop, &bytes)) {
+                    return bytes;
+                }
+            }
+            if (g.k > 0 && !ggml_fn_pf_group_pull(&g, stop, &bytes)) {
+                return bytes;
+            }
+            if (done) {
+                done[e] = 1;
+            }
+        }
+        return bytes;
+    }
     for (int i = 0; i < n; ++i) {
         const int32_t e = list[i];
         if (e < 0 || e >= n_exp) {

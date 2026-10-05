@@ -195,6 +195,8 @@ extern "C" {
                                              // lines at every 4 KiB page of their next piece before the current one
         int  caller_cpu1;                    // [TAG_FN_L3_CPU_PLACE] with pin_caller: 1 + the CPU of worker 0, which then
                                              // leaves the workers' list (0: worker 0 takes the first CPU of the list)
+        int  pf_streams;                     // [TAG_FN_L3_CPU_PFSTREAMS] 0 / 1, or a split >= 1 prefetch pulls an expert's
+                                             // regions this many at a time, interleaved (real loads; <= 8)
     };
 
     // [TAG_FN_L3_CPU_SPLIT] how a pool job gives its pieces (32 gate / up rows or 64 down rows of one expert) to the threads.
@@ -272,6 +274,10 @@ extern "C" {
         double   pf_stopped;      // share of the prefetches stopped by the next job
         double   pf_stop_us;      // a stopped prefetch: the caller's wait until every worker has left it (on the job's path)
         double   pf_stop_max_us;
+        uint64_t pred_jobs;       // jobs whose layer the last prefetch predicted
+        double   pf_precision;    // of those: predicted experts the job computed / predicted experts
+        double   pf_prec_top4;    // the same for the first 4 of the list (its order: by rank with a ranked or given list)
+        double   pf_recall;       // experts the job computed that were predicted / experts the job computed
         int      n_thr;           // workers with records below (worker index; worker 0 is the caller)
         int      thr_cpu[GGML_CPU_MOE_STATS_MAX_THR];     // its CPU (-1: not pinned)
         double   thr_busy_us[GGML_CPU_MOE_STATS_MAX_THR]; // its gate / up + down time per job (0: it computed nothing)

@@ -258,6 +258,8 @@ struct moe_stats_acc {
     double   pf_t = 0, pf_router = 0, pf_bytes = 0, pf_experts = 0;
     uint64_t job_max = 0, jobs_slow = 0, pf_stop_max = 0;
     double   pf_stop = 0;
+    uint64_t pred_jobs = 0;
+    double   pred_n = 0, pred_job = 0, pred_hit = 0, pred_hit4 = 0, pred_top4 = 0;
     std::vector<double> thr_busy, thr_bytes; // by worker index
 };
 
@@ -310,6 +312,7 @@ struct ggml_cpu_moe_pool {
     int                   split   = GGML_CPU_MOE_SPLIT_RANGE;
     bool                  pf_rank = false;         // [TAG_FN_L3_CPU_PFRANK]
     int                   swpf    = 0;             // [TAG_FN_L3_CPU_SWPF]
+    int                   pf_streams = 1;          // [TAG_FN_L3_CPU_PFSTREAMS]
     bool                  pf_given = false;        // the posted prefetch carries its list: no router phase
     const ggml_tensor *   pf_up   = nullptr;       // the layer (its up tensor) the last prefetch predicted
     std::vector<int32_t>  pf_topk;                 // [n_tokens][k] by rank (pf_rank)
@@ -410,7 +413,7 @@ static void moe_pool_prefetch_pull(ggml_cpu_moe_pool * p, int ith, moe_pf_rec * 
     if (p->split >= GGML_CPU_MOE_SPLIT_STABLE && c_nth >= 2) { // as ggml_cpu_moe_run: one compute thread splits by range
         uint8_t * done = rec && p->pf_done_n_exp == n_exp ? p->pf_done.data() + (size_t) c_ith*n_exp : nullptr;
         b = ggml_fn_moe_prefetch_stable(L->up, L->gate, L->down, p->pf_list.data(), p->pf_n, c_ith, c_nth, &p->pf_stop,
-                J.mode, done);
+                J.mode, done, p->pf_streams);
     } else {
         b = ggml_fn_moe_prefetch(L->up, L->gate, L->down, p->pf_list.data(), p->pf_n, c_ith, c_nth, &p->pf_stop, J.mode);
     }
@@ -641,6 +644,7 @@ struct ggml_cpu_moe_pool * ggml_cpu_moe_pool_new(const struct ggml_cpu_moe_pool_
     p->pf_rank   = pp->pf_rank;
     p->stats     = pp->stats;
     p->swpf      = std::min(std::max(pp->swpf, 0), 64); // [TAG_FN_L3_CPU_SWPF]
+    p->pf_streams = std::min(std::max(pp->pf_streams, 1), 8); // [TAG_FN_L3_CPU_PFSTREAMS]
 
     std::vector<int> list;
     for (int i = 0; i < GGML_MAX_N_THREADS; i++) {
@@ -873,6 +877,32 @@ enum ggml_status ggml_cpu_moe_run(struct ggml_cpu_moe_pool * p, const struct ggm
         a.epoch = (int32_t) p->epoch;
     }
     const bool pf_mine = p->pf_up != nullptr && p->pf_up == l->up;
+    if (p->stats && pf_mine && p->pf_n > 0 && p->pf_mark.size() >= (size_t) l->up->ne[2]) {
+        // [TAG_FN_L3_CPU_STATS] the prediction against this job: the predicted experts it computes (the first 4 apart)
+        auto & mk = p->pf_mark;
+        std::fill(mk.begin(), mk.end(), (uint8_t) 0);
+        for (int i = 0; i < p->pf_n; ++i) {
+            mk[p->pf_list[i]] = i < 4 ? 3 : 1;
+        }
+        int n_job = 0, n_hit = 0, n_hit4 = 0;
+        for (int i = 0; i < n_used*T; ++i) {
+            const int32_t e = job->ids[i];
+            if (e < 0 || e >= l->up->ne[2] || (l->table != nullptr && l->table[e] != l->table_miss) || (mk[e] & 4)) {
+                continue;
+            }
+            mk[e] |= 4;
+            n_job++;
+            n_hit  += mk[e] & 1;
+            n_hit4 += (mk[e] & 2) ? 1 : 0;
+        }
+        std::lock_guard<std::mutex> lk(p->st_mtx);
+        p->st.pred_jobs++;
+        p->st.pred_n    += p->pf_n;
+        p->st.pred_job  += n_job;
+        p->st.pred_hit  += n_hit;
+        p->st.pred_hit4 += n_hit4;
+        p->st.pred_top4 += std::min(4, p->pf_n);
+    }
     if (a.split >= GGML_CPU_MOE_SPLIT_STABLE && pf_mine && p->pf_n > 0) {
         a.prio   = p->pf_list.data();
         a.n_prio = p->pf_n;
@@ -1055,6 +1085,10 @@ void ggml_cpu_moe_pool_get_stats(struct ggml_cpu_moe_pool * p, struct ggml_cpu_m
         out->jobs_slow      = s.jobs_slow;
         out->pf_stop_us     = s.pf_stop/(s.pf_stopped > 0 ? (double) s.pf_stopped : 1.0)/us;
         out->pf_stop_max_us = (double) s.pf_stop_max/us;
+        out->pred_jobs      = s.pred_jobs;
+        out->pf_precision   = s.pred_n    > 0.0 ? s.pred_hit /s.pred_n    : 0.0;
+        out->pf_prec_top4   = s.pred_top4 > 0.0 ? s.pred_hit4/s.pred_top4 : 0.0;
+        out->pf_recall      = s.pred_job  > 0.0 ? s.pred_hit /s.pred_job  : 0.0;
         out->n_thr = std::min<int>(p->n_threads, GGML_CPU_MOE_STATS_MAX_THR);
         for (int k = 0; k < out->n_thr; ++k) {
             const double busy = k < (int) s.thr_busy.size() ? s.thr_busy[k] : 0.0;
