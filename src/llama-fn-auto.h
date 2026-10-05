@@ -147,6 +147,9 @@ bool         llama_fn_active(const llama_model & model);
 //   LLAMA_FN_HOST_DMAOFF=1   [TAG_FN_L3_HOST_DMAOFF] no DMA share at all: the bridge makes no fetch side and no context
 //                            makes a DMA state (LLAMA_MOE_BRIDGE_DMA=0 alone let the MTP draft context make one: 148.5 MiB
 //                            of banks, a 1 GiB pinned ring and fill threads that no graph of it uses)
+//   LLAMA_FN_HOST_REARM=1|N  [TAG_FN_L3_HOST_REARM] a bridge that 3 errors turned off comes back after a cool-down (1: 256
+//                            steps or 30 s, N > 1: N steps or N/8 s, whichever ends first), doubled at every further
+//                            turn-off up to 64x; 65536 clean graphs start the back-off over. Off: off for good (as before)
 //   LLAMA_FN_HOST_DIAG=1|N   [TAG_FN_L3_HOST_DIAG] the bridge's per-graph host timing every N (1: 64) bridged graphs
 //   LLAMA_FN_HOST_SYNC_TRACE=<us>  [TAG_FN_L3_HOST_DIAG] every synchronize / blocking device copy of >= us is counted by
 //                            its call stack (ggml_backend_sync_trace_set), a report every 256 such waits

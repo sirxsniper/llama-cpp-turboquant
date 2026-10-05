@@ -212,6 +212,15 @@ struct llama_moe_bridge {
     uint64_t n_graphs   = 0;
     uint64_t err_graph  = 0; // [TAG_FN_R1_BRIDGE_RB] n_graphs at the last error
 
+    // [TAG_FN_L3_HOST_REARM] LLAMA_FN_HOST_REARM=1|N: a bridge that 3 errors turned off comes back after a cool-down of
+    // rearm_steps << k steps or rearm_ms << k ms (k = turn-offs so far - 1, at most 6), whichever ends first; 0: off for good
+    int      rearm_steps = 0;
+    int64_t  rearm_ms    = 0;
+    int      n_off       = 0;  // turn-offs so far
+    int64_t  off_steps   = 0;  // steps left in this cool-down
+    int64_t  off_until   = 0;  // ggml_time_ms() at which this cool-down ends
+    uint64_t off_graph   = 0;  // n_graphs at the last turn-off
+
     // job statistics (runner thread)
     std::atomic<uint64_t> n_jobs{0};
     std::atomic<uint64_t> job_ns{0};
@@ -806,6 +815,12 @@ llama_moe_bridge * llama_moe_bridge_create(const llama_model & model, int n_thre
         LLAMA_LOG_INFO("%s: [TAG_FN_L3_HOST_QUIET] the hot set's uploads and the DMA ring's fills wait while a bridged graph "
                 "runs and copy between graphs\n", __func__);
     }
+    if (const int rv = llama_fn_l3_int(model, "LLAMA_FN_HOST_REARM", 0); rv > 0) { // [TAG_FN_L3_HOST_REARM]
+        br->rearm_steps = rv > 1 ? rv : 256;
+        br->rearm_ms    = rv > 1 ? std::max<int64_t>(1000, (int64_t) rv * 125) : 30000;
+        LLAMA_LOG_INFO("%s: [TAG_FN_L3_HOST_REARM] a bridge that 3 errors turn off comes back after %d steps or %.0f s, "
+                "doubled at every further turn-off (up to 64x)\n", __func__, br->rearm_steps, br->rearm_ms/1e3);
+    }
 
     if (br->mode == GGML_MOE_BRIDGE_WAIT_HOSTFUNC) {
         br->pool = br->pool_new(&br->pool_params); // run by the driver's callback thread, which keeps its affinity
@@ -937,8 +952,19 @@ bool llama_moe_bridge_layer(const llama_moe_bridge * br, const ggml_tensor * up_
 }
 
 void llama_moe_bridge_step(llama_moe_bridge * br) {
-    if (br == nullptr || br->active || br->disabled) {
+    if (br == nullptr || br->active) {
         return;
+    }
+    if (br->disabled) {
+        // [TAG_FN_L3_HOST_REARM] the cool-down ends after its steps or its time, then the re-arm below runs as after a pause
+        if (br->rearm_steps <= 0 || (--br->off_steps > 0 && ggml_time_ms() < br->off_until)) {
+            return;
+        }
+        br->disabled   = false;
+        br->n_errors   = 0;
+        br->pause_left = 0;
+        LLAMA_LOG_INFO("%s: MoE bridge %d: [TAG_FN_L3_HOST_REARM] cool-down over (turn-off %d), re-arming\n", __func__,
+                br->bid, br->n_off);
     }
     if (br->pause_left > 0) {
         br->pause_left--;
@@ -1099,6 +1125,21 @@ bool llama_moe_bridge_end(llama_moe_bridge * br) {
     br->pause_left = 16;
     if (br->n_errors >= 3) {
         br->disabled = true;
+        if (br->rearm_steps > 0) { // [TAG_FN_L3_HOST_REARM] back-off; a long clean run since the last turn-off starts over
+            if (br->n_off > 0 && br->n_graphs - br->off_graph > 65536) {
+                br->n_off = 0;
+            }
+            const int k = std::min(br->n_off, 6);
+            br->n_off++;
+            br->off_graph = br->n_graphs;
+            br->off_steps = (int64_t) br->rearm_steps << k;
+            br->off_until = ggml_time_ms() + (br->rearm_ms << k);
+            LLAMA_LOG_WARN("%s: MoE bridge %d: %s at layer %d: this ubatch fails; 3 errors, [TAG_FN_L3_HOST_REARM] the bridge "
+                    "is off for %" PRId64 " steps or %.0f s (turn-off %d)\n", __func__, br->bid,
+                    err == GGML_MOE_BRIDGE_ERR_TIMEOUT ? "wait timeout" : "host job failed", il, br->off_steps,
+                    (br->rearm_ms << k)/1e3, br->n_off);
+            return false;
+        }
     }
     LLAMA_LOG_WARN("%s: MoE bridge %d: %s at layer %d: this ubatch fails; %s\n", __func__, br->bid,
             err == GGML_MOE_BRIDGE_ERR_TIMEOUT ? "wait timeout" : "host job failed", il,
