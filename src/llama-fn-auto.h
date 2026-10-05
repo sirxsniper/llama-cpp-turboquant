@@ -144,6 +144,9 @@ bool         llama_fn_active(const llama_model & model);
 //                            keeps it (and full execution speed) when minimized or occluded
 //   LLAMA_FN_HOST_QUIET=1    [TAG_FN_L3_HOST_QUIET] the hot set's upload worker and the DMA ring's fill threads wait
 //                            while a bridged graph runs (its CPU experts are DRAM bound) and copy between graphs
+//   LLAMA_FN_HOST_DMAOFF=1   [TAG_FN_L3_HOST_DMAOFF] no DMA share at all: the bridge makes no fetch side and no context
+//                            makes a DMA state (LLAMA_MOE_BRIDGE_DMA=0 alone let the MTP draft context make one: 148.5 MiB
+//                            of banks, a 1 GiB pinned ring and fill threads that no graph of it uses)
 //   LLAMA_FN_HOST_DIAG=1|N   [TAG_FN_L3_HOST_DIAG] the bridge's per-graph host timing every N (1: 64) bridged graphs
 //   LLAMA_FN_HOST_SYNC_TRACE=<us>  [TAG_FN_L3_HOST_DIAG] every synchronize / blocking device copy of >= us is counted by
 //                            its call stack (ggml_backend_sync_trace_set), a report every 256 such waits

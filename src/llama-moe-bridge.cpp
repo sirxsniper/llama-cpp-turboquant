@@ -695,8 +695,9 @@ llama_moe_bridge * llama_moe_bridge_create(const llama_model & model, int n_thre
     bp.stats      = br->stats;
     // [TAG_FN_R4_BRIDGE_DMA] LLAMA_MOE_BRIDGE_DMA=1 with a DMA share: the fetch side (plan areas, device scratch); the ring
     // is registered later (llama_moe_bridge_attach_dma). Spin mode only: a fetch spins on the plan the executor writes.
+    // [TAG_FN_L3_HOST_DMAOFF] LLAMA_FN_HOST_DMAOFF=1: no fetch side either
     if (env_int("LLAMA_MOE_BRIDGE_DMA", 0) > 0 && gen5::dma_requested() && br->fn_set_ring && br->fn_publish_plan &&
-            br->fn_chan_times) {
+            br->fn_chan_times && !llama_fn_l3_flag(model, "LLAMA_FN_HOST_DMAOFF")) {
         if (br->mode == GGML_MOE_BRIDGE_WAIT_SPIN) {
             br->max_fetch = std::min(GGML_MOE_BRIDGE_MAX_FETCH, std::max(1, env_int("LLAMA_MOE_DMA_SLOTS", 8)));
         } else {
