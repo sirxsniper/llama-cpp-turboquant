@@ -1196,6 +1196,10 @@ static __global__ void mul_mat_vec_q_moe_fn_l3(
         }
         dst_row[threadIdx.x] = result;
     }
+
+    if constexpr (!has_fusion) {
+        GGML_UNUSED_VARS(vgate, tmp_gate, fusion);
+    }
 }
 
 template<ggml_type type>
