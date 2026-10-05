@@ -4116,6 +4116,21 @@ static int ggml_cuda_fn_l3_try_gdnab(ggml_backend_cuda_context * cuda_ctx, ggml_
             ggml_nelements(add) != wa->ne[1]*y->ne[1] || ggml_nelements(sp) != wa->ne[1]*y->ne[1]) {
         return 0;
     }
+    // only where ggml_cuda_mul_mat computes both unmarked products with mul_mat_vec_f (f32 at T <= 3 on a GPU with fp32
+    // MMA: wider products go to MMF / cuBLAS, whose sums round differently), and the sigmoid / add read the products in
+    // their own element order (contiguous views at offset 0)
+    const int cc = ggml_cuda_info().devices[cuda_ctx->device].cc;
+    const auto mmvf_path = [cc](const ggml_tensor * mm) {
+        const ggml_tensor * w = mm->src[0];
+        const bool bad_padding_clear = w->buffer != nullptr &&
+            ggml_backend_buffer_get_usage(w->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
+            ggml_nbytes(w) != ggml_backend_buffer_get_alloc_size(w->buffer, w) && w->view_src;
+        return !bad_padding_clear && !ggml_cuda_op_mul_mat_use_fwht(mm) &&
+               ggml_cuda_should_use_mmvf(w->type, cc, w->ne, w->nb, mm->src[1]->ne[1]);
+    };
+    if (!mmvf_path(mb) || !mmvf_path(ma) || !ggml_is_contiguous(sig->src[0]) || !ggml_is_contiguous(add->src[0])) {
+        return 0;
+    }
     // every node but the two outputs has this chain as its only reader
     for (int k : { idx[0], idx[2], idx[3], idx[4] }) {
         if (ggml_node_get_use_count(cgraph, k) != 1 || (cgraph->nodes[k]->flags & GGML_TENSOR_FLAG_OUTPUT)) {
