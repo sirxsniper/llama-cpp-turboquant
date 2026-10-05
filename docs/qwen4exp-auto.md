@@ -101,7 +101,7 @@ hot set keeps the difference as extra slots:
 
 - At the VRAM fit the trunk reserves SMALL first, so the fit sees FULL - SMALL as free VRAM (about +3.4 GB, 71 -> about
   95 even slots per layer at 262K). The hot set's device buffer is then allocated on CUDA virtual memory; its top layers,
-  whole layers from a 2 MiB boundary on and at least FULL - SMALL bytes, form a tail that is mapped apart from the rest.
+  whole layers from a 2 MiB boundary on and at least FULL - SMALL bytes plus a slack of max(128 MiB, FULL / 16) (the FULL reserve can grow once the hot set exists; a larger tail costs the decode nothing), form a tail that is mapped apart from the rest. FULL is reserved once more at the fit, so it includes the draft context's outputs.
 - A batch wider than 31 tokens: the tail layers leave both tables and the hot chain, uploads into them stop, the tail's
   VRAM goes back to the driver, then the FULL reserve is allocated (the prefill stream borrows its banks from the part
   below the tail, as before).

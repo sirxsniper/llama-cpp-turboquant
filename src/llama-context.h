@@ -429,6 +429,8 @@ private:
     uint32_t cbuf_small_t   = 31;
     size_t   cbuf_full_b    = 0;   // device bytes of the trunk's compute buffers at the FULL reserve
     size_t   cbuf_small_b   = 0;
+    size_t   cbuf_slack_b   = 0;   // extra tail for a FULL reserve that grows once the hot set exists
+    bool     cbuf_grew      = false;
     size_t   cbuf_pool_mib  = 0;   // LLAMA_FN_CBUF_POOL_MIB: extra tail for the pool growth of a FULL prompt
     bool     cbuf_trim      = true;
     bool     cbuf_eager     = true;  // LLAMA_FN_CBUF_EAGER: return to SMALL at the end of a prompt's last (partial) batch

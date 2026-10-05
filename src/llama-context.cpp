@@ -5569,12 +5569,18 @@ size_t llama_context::cbuf_prepare(ggml_backend_dev_t dev) {
     }
     llama_perf_hold hold(n_queued_tokens, t_compute_start_us);
     synchronize();
+    // FULL as prompts see it now (the constructor reserved before the draft context set its outputs), then SMALL
+    sched_need_reserve = true;
+    sched_reserve();
     const size_t full = cbuf_compute_bytes(dev);
     cbuf_state         = CBUF_SMALL;
     sched_need_reserve = true;
     sched_reserve();
     const size_t small = cbuf_compute_bytes(dev);
-    const size_t tail  = llama_fn_cbuf_tail(full, small, cbuf_pool_mib << 20, gran, (size_t) 256 << 20);
+    // the FULL reserve once the hot set exists can be larger (more splits: +235 MiB at -c 16384), and a larger tail costs
+    // the decode nothing (all of it is mapped between prompts): a slack of max(128 MiB, FULL / 16)
+    cbuf_slack_b = std::max<size_t>((size_t) 128 << 20, full/16);
+    const size_t tail = llama_fn_cbuf_tail(full, small, (cbuf_pool_mib << 20) + cbuf_slack_b, gran, (size_t) 256 << 20);
     if (tail == 0) {
         LLAMA_LOG_INFO("%s: [TAG_FN_L3_VRAM_CBUF] the FULL compute reserve (%.0f MiB) is not much larger than the SMALL one "
                 "(%.0f MiB): off\n", __func__, full/MiB, small/MiB);
@@ -5584,8 +5590,9 @@ size_t llama_context::cbuf_prepare(ggml_backend_dev_t dev) {
     cbuf_full_b  = full;
     cbuf_small_b = small;
     LLAMA_LOG_INFO("%s: [TAG_FN_L3_VRAM_CBUF] compute reserve FULL %.0f MiB (ubatch %u), SMALL %.0f MiB (<= %u tokens): the hot "
-            "set keeps a tail of %.0f MiB for the difference (+ %zu MiB LLAMA_FN_CBUF_POOL_MIB)\n", __func__, full/MiB,
-            std::min(cparams.n_ctx, cparams.n_ubatch), small/MiB, cbuf_small_t, (full - small)/MiB, cbuf_pool_mib);
+            "set keeps a tail of %.0f MiB for the difference (+ %zu MiB LLAMA_FN_CBUF_POOL_MIB + %.0f MiB slack)\n", __func__,
+            full/MiB, std::min(cparams.n_ctx, cparams.n_ubatch), small/MiB, cbuf_small_t, (full - small)/MiB, cbuf_pool_mib,
+            cbuf_slack_b/MiB);
     return tail;
 }
 
@@ -5643,6 +5650,13 @@ bool llama_context::cbuf_set(bool full) {
             return false;
         }
         cbuf_n_full++;
+        const size_t full_now = cbuf_compute_bytes(dev);
+        if (full_now > cbuf_full_b + cbuf_slack_b && !cbuf_grew) {
+            cbuf_grew = true;
+            LLAMA_LOG_WARN("%s: [TAG_FN_L3_VRAM_CBUF] the FULL reserve is %.0f MiB, %.0f MiB more than planned with its slack: the FULL "
+                    "state holds that much more than the SMALL one\n", __func__, full_now/MiB,
+                    (full_now - cbuf_full_b - cbuf_slack_b)/MiB);
+        }
     } else {
         // the stream's banks come back while FULL is still there (no VRAM moves), then FULL goes, then the tail returns
         llama_moe_gen5_before_ubatch(this, sched.get(), 0);
