@@ -103,7 +103,12 @@ size_t llama_moe_hot_device_bytes();
 // pinned halves (LLAMA_MOE_HOT_UP_STAGE_MIB each, default 8) - one is filled while the other uploads, so the staging stays
 // in the CPU caches - and LLAMA_MOE_HOT_UP_MIB_STEP=<n> (0 = no limit) caps its bytes per decode step (a token bucket that
 // the owner's step refills, at most two steps' worth), so a large refill spreads over steps instead of taking DRAM and
-// PCIe from one. No host CUDA call waits on the compute stream; the worker waits only for its own copies.
+// PCIe from one; a pass then queues at most what the bucket gives until the next pass. No host CUDA call waits on the
+// compute stream; the worker waits only for its own copies.
+// [TAG_FN_L3_POLICY_BURST] LLAMA_MOE_HOT_BURST_MIB=<n> (qwen4exp, decayed adaptive set; 0 = off): past the pass budget
+// (LLAMA_MOE_HOT_DECAY_MIB) a pass may queue up to n MiB more for strong pairs only - a free slot, or a candidate whose count
+// is over LLAMA_MOE_HOT_BURST_RATIO (default 3) x its victim's - so a shifted working set (a new request) refills fast while
+// the steady state keeps the small budget. LLAMA_MOE_HOT_STATS adds the step's host time to the adaptive stats line.
 // [TAG_FN_MOE_HOT_ADAPT] LLAMA_MOE_HOT_ADAPT=1: windowed-frequency admission into the hot slots, evict first, publish
 // after the upload has landed (LLAMA_MOE_HOT_ADMIT=N/W default 3/16, LLAMA_MOE_HOT_HYST=1, LLAMA_MOE_HOT_ADAPT_MIB=64 per
 // step, LLAMA_MOE_HOT_VERIFY=<steps> compares one resident slot with its source). The owner context must synchronize

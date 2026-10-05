@@ -189,8 +189,14 @@ struct moe_cache {
     std::atomic<uint64_t> up_bytes    { 0 };   // written by the worker, read by the stats line
     std::atomic<uint64_t> up_waits    { 0 };   // times the bucket made the worker wait
     uint64_t              up_batches  = 0;     // worker only
+    size_t                dc_burst       = 0;     // [TAG_FN_L3_POLICY_BURST] LLAMA_MOE_HOT_BURST_MIB, 0 = off
+    float                 dc_burst_ratio = 3.0f;  // LLAMA_MOE_HOT_BURST_RATIO
+    uint64_t              dc_burst_n     = 0;     // swaps taken on the burst budget
+    uint64_t              dc_burst_logs  = 0;
     uint64_t              sd_folded   = 0;     // [TAG_FN_L3_POLICY_SEED] prompt tokens folded so far (owner's step)
     uint64_t              sd_folds    = 0;
+    std::atomic<uint64_t> st_step_us  { 0 };   // [TAG_FN_L3_POLICY] LLAMA_MOE_HOT_STATS: host time of the owner's steps
+    std::atomic<uint64_t> st_step_n   { 0 };
 };
 
 moe_cache * g_cache = nullptr;
@@ -648,10 +654,14 @@ void hot_obs_cb(const char * name, const struct ggml_tensor * ids, void * ud) {
     LLAMA_LOG_INFO("moe-hot: %" PRIu64 " decode steps, hit rate %.3f (host layers only; layer min %.3f max %.3f)%s\n",
             mc->hot_steps, t ? (double) h / t : 0.0, lo, hi, mc->adapt ? " adaptive" : "");
     if (mc->adapt) {
-        LLAMA_LOG_INFO("moe-hot: adaptive: %" PRIu64 " experts admitted, %" PRIu64 " verify mismatches%s%s\n", mc->ad_admitted, mc->ad_bad,
+        const uint64_t sn = mc->st_step_n.load(std::memory_order_relaxed);
+        LLAMA_LOG_INFO("moe-hot: adaptive: %" PRIu64 " experts admitted, %" PRIu64 " verify mismatches%s, step host time %.0f us%s\n",
+                mc->ad_admitted, mc->ad_bad,
                 mc->dc_on ? format(", %" PRIu64 " decay passes, %" PRIu64 " swaps queued", mc->dc_passes, mc->dc_swaps).c_str() : "",
-                mc->up_pipe || mc->up_rate > 0 || mc->sd_node ? format(" [TAG_FN_L3_POLICY] uploaded %.0f MiB, %" PRIu64 " bucket waits, "
-                        "%" PRIu64 " prompt tokens seeded", mc->up_bytes.load()/1048576.0, mc->up_waits.load(), mc->sd_tokens.load()).c_str() : "");
+                sn ? (double) mc->st_step_us.load(std::memory_order_relaxed)/sn : 0.0,
+                mc->up_pipe || mc->up_rate > 0 || mc->sd_node || mc->dc_burst > 0 ? format(" [TAG_FN_L3_POLICY] uploaded %.0f MiB, %" PRIu64
+                        " bucket waits, %" PRIu64 " prompt tokens seeded, %" PRIu64 " burst swaps", mc->up_bytes.load()/1048576.0,
+                        mc->up_waits.load(), mc->sd_tokens.load(), mc->dc_burst_n).c_str() : "");
     }
 }
 
@@ -1088,7 +1098,11 @@ void hot_adapt_decay(moe_cache * mc, bool decode_step) {
 
     // [TAG_FN_L3_POLICY_UPLOAD] with a rate limit a pass queues at most what the bucket gives the worker until the next
     // pass, minus what is still queued: evicted slots must not wait empty behind a growing queue
-    size_t pass_bytes = mc->dc_bytes;
+    // [TAG_FN_L3_POLICY_BURST] LLAMA_MOE_HOT_BURST_MIB: past the pass budget, strong pairs (a free slot, or a candidate over
+    // LLAMA_MOE_HOT_BURST_RATIO x its victim) take up to that many bytes more, so a shifted working set refills fast
+    // while the steady state keeps the small budget
+    size_t pass_bytes  = mc->dc_bytes;
+    size_t total_bytes = mc->dc_bytes + mc->dc_burst;
     if (mc->up_rate > 0) {
         size_t queued_b = 0;
         {
@@ -1099,16 +1113,25 @@ void hot_adapt_decay(moe_cache * mc, bool decode_step) {
             }
         }
         const size_t cap = mc->up_rate*(size_t) std::max(1, mc->dc.every);
-        pass_bytes = std::min(pass_bytes, cap > queued_b ? cap - queued_b : 0);
+        pass_bytes  = std::min(pass_bytes,  cap > queued_b ? cap - queued_b : 0);
+        total_bytes = std::min(total_bytes, cap > queued_b ? cap - queued_b : 0);
     }
 
     size_t bytes = 0;
+    size_t n_burst = 0;
     bool queued = false;
     for (const auto & w : swaps) {
         layer_state & ls = mc->layers[w.layer];
         const size_t b = ls.pub.up_src->nb[2] + ls.pub.gate_src->nb[2] + ls.pub.down_src->nb[2];
         if (bytes + b > pass_bytes) {
-            break;
+            if (bytes + b > total_bytes) {
+                break;
+            }
+            const layer_state & vl = w.victim_layer >= 0 ? mc->layers[w.victim_layer] : ls;
+            if (w.victim >= 0 && !(ls.dcnt[w.expert] > mc->dc_burst_ratio*vl.dcnt[w.victim])) {
+                continue; // [TAG_FN_L3_POLICY_BURST] not strong: only the pass budget
+            }
+            n_burst++;
         }
         // evict first: the victim leaves both tables now, so no later graph reads the slot being overwritten
         // [TAG_FN_L3_POLICY_POOL] in a pool the victim may belong to another layer of the class
@@ -1138,6 +1161,13 @@ void hot_adapt_decay(moe_cache * mc, bool decode_step) {
     }
     if (queued) {
         mc->wcv.notify_one();
+    }
+    if (n_burst > 0) {
+        mc->dc_burst_n += n_burst;
+        if (mc->dc_burst_logs++ < 3) {
+            LLAMA_LOG_INFO("moe-hot: [TAG_FN_L3_POLICY_BURST] pass %" PRIu64 ": %zu of its swaps on the burst budget, %.0f MiB "
+                    "queued\n", mc->dc_passes, n_burst, bytes/1048576.0);
+        }
     }
     for (auto & ls : mc->layers) {
         llama_moe_decay_apply(ls.dcnt, mc->dc.decay);
@@ -1170,7 +1200,7 @@ void hot_adapt_publish(moe_cache * mc) {
 
 // the owning context's step boundary, after its compute has been synchronized: publish finished uploads, roll the
 // windows, then evict and queue new uploads (byte-capped). Nothing here runs while a graph of this context runs.
-void hot_adapt_step(moe_cache * mc) {
+void hot_adapt_step_impl(moe_cache * mc) {
     hot_adapt_publish(mc);
 
     bool any = false;
@@ -1311,6 +1341,18 @@ void hot_adapt_step(moe_cache * mc) {
     }
 }
 
+// [TAG_FN_L3_POLICY] LLAMA_MOE_HOT_STATS: the step's host time (it runs between two graphs, so it adds to the step)
+void hot_adapt_step(moe_cache * mc) {
+    if (!mc->ad_stats) {
+        hot_adapt_step_impl(mc);
+        return;
+    }
+    const int64_t t0 = ggml_time_us();
+    hot_adapt_step_impl(mc);
+    mc->st_step_us.fetch_add((uint64_t) (ggml_time_us() - t0), std::memory_order_relaxed);
+    mc->st_step_n.fetch_add(1, std::memory_order_relaxed);
+}
+
 void hot_adapt_init(moe_cache * mc, const llama_model & model, const void * owner, ggml_backend_dev_t dev) {
     if (!owner || !dev || !mc->tbl_all) {
         LLAMA_LOG_WARN("moe-hot: LLAMA_MOE_HOT_ADAPT needs one device and equal expert counts - static hot set only\n");
@@ -1442,6 +1484,15 @@ void hot_adapt_init(moe_cache * mc, const llama_model & model, const void * owne
             mc->save_every = (uint64_t) std::max(0, atoi(v));
         }
     }
+    // [TAG_FN_L3_POLICY_BURST] strong pairs past the pass budget
+    if (l3 && mc->dc_on) {
+        if (const char * e = llama_fn_env(model, "LLAMA_MOE_HOT_BURST_MIB")) {
+            mc->dc_burst = (size_t) std::max(0, atoi(e)) << 20;
+        }
+        if (const char * e = llama_fn_env(model, "LLAMA_MOE_HOT_BURST_RATIO")) {
+            mc->dc_burst_ratio = std::max(1.0f, (float) atof(e));
+        }
+    }
     // [TAG_FN_L3_POLICY_SEED] the prompt's routing from the graph node (llama_moe_hot_build_seed)
     if (l3 && mc->dc_on && mc->dc.seed > 0.0f) {
         if (const char * e = llama_fn_env(model, "LLAMA_MOE_HOT_SEED_NODE")) {
@@ -1475,15 +1526,17 @@ void hot_adapt_init(moe_cache * mc, const llama_model & model, const void * owne
     mc->owner = owner;
     mc->adapt = true;
     mc->worker = std::thread(hot_adapt_worker, mc);
-    if (mc->sd_node || mc->sd_norm > 0.0f || mc->up_pipe || mc->up_rate > 0 || !mc->st_path.empty()) {
+    if (mc->sd_node || mc->sd_norm > 0.0f || mc->up_pipe || mc->up_rate > 0 || !mc->st_path.empty() || mc->dc_burst > 0) {
         const std::string up = mc->up_pipe ? format("2 x %zu MiB pinned halves", mc->up_half >> 20) : std::string("one staging buffer");
         const std::string rt = mc->up_rate > 0 ? format("<= %zu MiB per decode step (bucket %zu MiB)", mc->up_rate >> 20, mc->up_cap >> 20) :
                                                  std::string("no step limit");
         const std::string st = mc->st_path.empty() ? std::string("off") :
                 format("%s (load %s, every %llu steps)", mc->st_path.c_str(), mc->st_load ? "on" : "off", (unsigned long long) mc->st_every);
-        LLAMA_LOG_INFO("moe-hot: [TAG_FN_L3_POLICY] prompt seed from the graph node: %s%s; uploads: %s, %s; saved state: %s\n",
+        const std::string bu = mc->dc_burst > 0 ? format("+%zu MiB for pairs over %.1fx their victim", mc->dc_burst >> 20, mc->dc_burst_ratio) :
+                                                  std::string("off");
+        LLAMA_LOG_INFO("moe-hot: [TAG_FN_L3_POLICY] prompt seed from the graph node: %s%s; uploads: %s, %s; burst: %s; saved state: %s\n",
                 mc->sd_node ? "on" : "off", mc->sd_norm > 0.0f ? format(" (a prompt counts as %.0f decode steps x %.3f)", mc->sd_norm, mc->dc.seed).c_str() : "",
-                up.c_str(), rt.c_str(), st.c_str());
+                up.c_str(), rt.c_str(), bu.c_str(), st.c_str());
     }
     if (mc->dc_on) {
         LLAMA_LOG_INFO("moe-hot: adaptive [TAG_FN_R4_ADAPT_DECAY]: decayed counts x %.2f every %d steps, admit at %.2f and "

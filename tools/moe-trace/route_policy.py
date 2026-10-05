@@ -240,7 +240,7 @@ class Geo:
 
 DEF = dict(decay=0.92, every=2, admit=2.0, ratio=1.2, hyst=0.5, up_mib=128.0, up_n=0, up_bw_mib=256.0, seed=0.0,
            count="union", alloc="even", pool=False, value="count", start="empty", lat=0, token_w=0.0, fold="add",
-           prof=None, admit_free=None, seed_norm=0.0, pace=False)
+           prof=None, admit_free=None, seed_norm=0.0, pace=False, burst_mib=0.0, burst_ratio=3.0)
 
 
 def sim_policy(tr, geo, budget, cfg, state=None, collect_answers=True):
@@ -399,17 +399,26 @@ def sim_policy(tr, geo, budget, cfg, state=None, collect_answers=True):
             bytes_q = 0.0
             n_q = 0
             budget_q = up_budget
+            total_q = up_budget + c["burst_mib"] * 2**20
             if c["pace"]:
                 # [TAG_FN_L3_POLICY_UPLOAD] LLAMA_MOE_HOT_UP_MIB_STEP: at most what the worker moves until the next pass,
                 # minus the queued bytes (hot_adapt_decay's cap)
-                budget_q = min(up_budget, max(0.0, up_bw * c["every"] - sum(q[1] for q in queue)))
+                pace = max(0.0, up_bw * c["every"] - sum(q[1] for q in queue))
+                budget_q = min(budget_q, pace)
+                total_q = min(total_q, pace)
             for g, _, pi, k, v in swaps:
                 bk = pool_bytes[pi]
                 if up_n > 0:
                     if n_q >= up_n:
                         break
                 elif bytes_q + bk > budget_q:
-                    break
+                    # [TAG_FN_L3_POLICY_BURST] LLAMA_MOE_HOT_BURST_MIB: past the pass budget only strong pairs (a free slot,
+                    # or a candidate over burst_ratio x its victim) take the burst budget, so a shifted working set
+                    # refills fast while the steady state keeps the small budget
+                    if bytes_q + bk > total_q:
+                        break
+                    if not (v < 0 or cnt[k] > c["burst_ratio"] * cnt[v]):
+                        continue
                 if v >= 0:
                     res[v] = False  # evict first: the slot is busy until the new expert has landed
                 else:
@@ -575,6 +584,10 @@ def grid_real():
     for d in (0.95, 0.97, 0.98):
         g["d%d_r15h10" % round(d * 100)] = {"decay": d, "ratio": 1.5, "hyst": 1.0}
         g["pool_d%d_r15h10" % round(d * 100)] = {"pool": True, "decay": d, "ratio": 1.5, "hyst": 1.0}
+    for d in (0.95, 0.97):
+        g["pool_d%d_r15h10_seed03" % round(d * 100)] = {"pool": True, "decay": d, "ratio": 1.5, "hyst": 1.0, "seed": 0.03}
+        g["pool_d%d_r15h10_seednorm16" % round(d * 100)] = {"pool": True, "decay": d, "ratio": 1.5, "hyst": 1.0,
+                                                           "seed": 1.0, "seed_norm": 16.0}
     g["pool_d95_u256"] = {"pool": True, "decay": 0.95, "up_mib": 256.0}
     g["strata_tuned"] = {"admit": 2.0, "ratio": 1.0, "hyst": 1.5, "up_n": 192, "up_mib": 1e9}
     for bw in (32.0, 64.0, 96.0):
