@@ -190,7 +190,7 @@ struct moe_cache {
     std::atomic<uint64_t> up_waits    { 0 };   // times the bucket made the worker wait
     uint64_t              up_batches  = 0;     // worker only
     size_t                dc_burst       = 0;     // [TAG_FN_L3_POLICY_BURST] LLAMA_MOE_HOT_BURST_MIB, 0 = off
-    float                 dc_burst_ratio = 3.0f;  // LLAMA_MOE_HOT_BURST_RATIO
+    float                 dc_burst_ratio = 2.0f;  // LLAMA_MOE_HOT_BURST_RATIO
     uint64_t              dc_burst_n     = 0;     // swaps taken on the burst budget
     uint64_t              dc_burst_logs  = 0;
     uint64_t              sd_folded   = 0;     // [TAG_FN_L3_POLICY_SEED] prompt tokens folded so far (owner's step)

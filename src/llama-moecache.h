@@ -107,7 +107,7 @@ size_t llama_moe_hot_device_bytes();
 // compute stream; the worker waits only for its own copies.
 // [TAG_FN_L3_POLICY_BURST] LLAMA_MOE_HOT_BURST_MIB=<n> (qwen4exp, decayed adaptive set; 0 = off): past the pass budget
 // (LLAMA_MOE_HOT_DECAY_MIB) a pass may queue up to n MiB more for strong pairs only - a free slot, or a candidate whose count
-// is over LLAMA_MOE_HOT_BURST_RATIO (default 3) x its victim's - so a shifted working set (a new request) refills fast while
+// is over LLAMA_MOE_HOT_BURST_RATIO (default 2) x its victim's - so a shifted working set (a new request) refills fast while
 // the steady state keeps the small budget. LLAMA_MOE_HOT_STATS adds the step's host time to the adaptive stats line.
 // [TAG_FN_MOE_HOT_ADAPT] LLAMA_MOE_HOT_ADAPT=1: windowed-frequency admission into the hot slots, evict first, publish
 // after the upload has landed (LLAMA_MOE_HOT_ADMIT=N/W default 3/16, LLAMA_MOE_HOT_HYST=1, LLAMA_MOE_HOT_ADAPT_MIB=64 per

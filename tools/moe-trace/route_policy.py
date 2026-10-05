@@ -240,7 +240,7 @@ class Geo:
 
 DEF = dict(decay=0.92, every=2, admit=2.0, ratio=1.2, hyst=0.5, up_mib=128.0, up_n=0, up_bw_mib=256.0, seed=0.0,
            count="union", alloc="even", pool=False, value="count", start="empty", lat=0, token_w=0.0, fold="add",
-           prof=None, admit_free=None, seed_norm=0.0, pace=False, burst_mib=0.0, burst_ratio=3.0)
+           prof=None, admit_free=None, seed_norm=0.0, pace=False, burst_mib=0.0, burst_ratio=2.0)
 
 
 def sim_policy(tr, geo, budget, cfg, state=None, collect_answers=True):
@@ -588,8 +588,20 @@ def grid_real():
         g["pool_d%d_r15h10_seed03" % round(d * 100)] = {"pool": True, "decay": d, "ratio": 1.5, "hyst": 1.0, "seed": 0.03}
         g["pool_d%d_r15h10_seednorm16" % round(d * 100)] = {"pool": True, "decay": d, "ratio": 1.5, "hyst": 1.0,
                                                            "seed": 1.0, "seed_norm": 16.0}
+    for d, bm, br in ((0.95, 256.0, 2.0), (0.97, 256.0, 2.0), (0.95, 512.0, 3.0)):
+        g["pool_d%d_r15h10_b%d_r%g" % (round(d * 100), bm, br)] = {"pool": True, "decay": d, "ratio": 1.5, "hyst": 1.0,
+                                                                  "burst_mib": bm, "burst_ratio": br}
+        g["pool_d%d_r15h10_b%d_r%g_seed03" % (round(d * 100), bm, br)] = {"pool": True, "decay": d, "ratio": 1.5,
+                                                                         "hyst": 1.0, "burst_mib": bm, "burst_ratio": br,
+                                                                         "seed": 0.03}
     g["pool_d95_u256"] = {"pool": True, "decay": 0.95, "up_mib": 256.0}
+    # Strata's long-memory decayed LFU: x0.92 per 2-step pass, admit over 1.2-1.5x the weakest resident, 64-192 uploads
     g["strata_tuned"] = {"admit": 2.0, "ratio": 1.0, "hyst": 1.5, "up_n": 192, "up_mib": 1e9}
+    for n in (64, 128, 192):
+        g["strata_r15_n%d" % n] = {"admit": 2.0, "ratio": 1.5, "hyst": 0.0, "up_n": n, "up_mib": 1e9}
+    # counting: once per verify step (the union the step pays for, shipped), per token, or the union + 0.5 per extra token
+    g["count_token"] = {"count": "token"}
+    g["count_mix05"] = {"count": "mix", "token_w": 0.5}
     for bw in (32.0, 64.0, 96.0):
         g["pool_pace%d" % bw] = {"pool": True, "pace": True, "up_bw_mib": bw}
     return g
