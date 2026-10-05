@@ -1135,6 +1135,69 @@ static std::vector<float> get_logits_mtp(llama_model * model, const std::vector<
     return ret;
 }
 
+// [TAG_FN_R4_REVIEW] an M-RoPE image between two text runs, decoded the way mtmd decodes one: 8 text tokens, a 3 x 4
+// embedding batch whose entries share their temporal position (t, t + y, t + x, 0: mtmd's set_position_mrope_2d), then 4
+// text tokens from t + max(nx, ny). Inside the image the explicit KQ mask orders the entries by (y, x) (is_2d_gt); the
+// logits of every image entry and of the text after it depend on that order. Empty for a model without M-RoPE positions.
+static std::vector<float> get_logits_img(llama_model * model, const std::vector<llama_token> & tokens, const size_t seed) {
+    const llama_rope_type rope_type = llama_model_rope_type(model);
+    if (rope_type != LLAMA_ROPE_TYPE_MROPE && rope_type != LLAMA_ROPE_TYPE_IMROPE) {
+        return {};
+    }
+    const uint32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+    const int32_t  n_embd  = llama_model_n_embd_inp(model);
+    const int      nx      = 4;
+    const int      ny      = 3;
+    const int      n_txt0  = 8;
+    const int      n_txt1  = 4;
+    GGML_ASSERT(tokens.size() >= (size_t) (n_txt0 + n_txt1));
+
+    llama_context_ptr lctx = get_ctx_mtp(model, LLAMA_CONTEXT_TYPE_DEFAULT);
+    llama_context * ctx = lctx.get();
+
+    std::vector<float> ret;
+    auto decode = [&](common_batch & b, const int32_t n_out, const char * what) {
+        if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, b.get())) {
+            throw std::runtime_error(std::string("failed to decode ") + what);
+        }
+        for (int32_t i = 0; i < n_out; i++) {
+            const float * l = llama_get_logits_ith(ctx, b.size() - n_out + i);
+            ret.insert(ret.end(), l, l + n_vocab);
+        }
+    };
+
+    common_batch batch(ctx);
+    llama_pos pos = 0;
+    for (int i = 0; i < n_txt0; i++) {
+        batch.add(tokens[i], pos++, 0, false);
+    }
+    decode(batch, 0, "the text before the image");
+
+    std::mt19937 rng((uint32_t) seed + 7);
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    std::vector<float> img((size_t) nx*ny*n_embd);
+    for (float & v : img) {
+        v = nd(rng);
+    }
+    batch.clear();
+    const llama_pos t = pos;
+    for (int y = 0; y < ny; y++) {
+        for (int x = 0; x < nx; x++) {
+            const llama_pos p[4] = { t, t + y, t + x, 0 };
+            batch.add_embd({ img.data() + (size_t) (y*nx + x)*n_embd, 1, (size_t) n_embd }, p, 0, true);
+        }
+    }
+    decode(batch, nx*ny, "the image");
+
+    batch.clear();
+    pos = t + std::max(nx, ny);
+    for (int i = 0; i < n_txt1; i++) {
+        batch.add(tokens[n_txt0 + i], pos++, 0, true);
+    }
+    decode(batch, n_txt1, "the text after the image");
+    return ret;
+}
+
 static bool all_finite(const std::vector<float> & v) {
     for (const float x : v) {
         if (!std::isfinite(x)) {
@@ -1390,6 +1453,36 @@ static int test_mtp(const std::string & arch_filter, const size_t seed, const fl
                           cpu && !chunk ? nmse_h == 0.0 : nmse_h <= 1e-6, nmse_h);
                     check(arch_name, label, chunk ? "QSA pos mask chunk 16: MTP" : "QSA pos mask: MTP",
                           all_finite(logits_mtp_pos) && nmse_m <= 1e-6, nmse_m);
+                }
+            }
+
+            // [TAG_FN_R4_REVIEW] an M-RoPE image under LLAMA_QSA_POS_MASK: the same logits as without the switch (bit for
+            // bit on the CPU). Two layouts: the fixture's (the trunk's attention layer runs QSA, whose in-order k-pool
+            // selection already orders the image's entries by their cells), and the same model with every compress ratio
+            // 0 (the attention runs dense, nothing but the mask orders the image): there the image's ubatch must keep the
+            // explicit mask, since the positional test (kv_pos <= q_pos) would let every image entry see the whole image.
+            if (mtp_env_free && !getenv("LLAMA_QSA_POS_MASK") && !getenv("LLAMA_QSA_POS_CHUNK")) {
+                gguf_context_ptr gguf_dense = get_gguf_ctx_mtp(arch);
+                {
+                    llama_model_saver msd(arch, gguf_dense.get());
+                    const int64_t kid = gguf_find_key(gguf_dense.get(), msd.llm_kv(LLM_KV_BLOCK_COUNT).c_str());
+                    GGML_ASSERT(kid >= 0);
+                    msd.add_kv(LLM_KV_ATTENTION_COMPRESS_RATIOS, std::vector<uint32_t>(gguf_get_val_u32(gguf_dense.get(), kid), 0));
+                }
+                llama_model_ptr model_dense = get_model_mtp(gguf_dense.get(), nullptr, seed, stdev, devs, /*load_mtp =*/ true);
+                for (llama_model * m : { model.get(), model_dense.get() }) {
+                    const bool dense = m == model_dense.get();
+                    const std::vector<float> logits_img = get_logits_img(m, tokens, seed);
+                    if (logits_img.empty()) {
+                        continue;
+                    }
+                    mtp_test_set_env("LLAMA_QSA_POS_MASK", "1");
+                    const std::vector<float> logits_img_pos = get_logits_img(m, tokens, seed);
+                    mtp_test_set_env("LLAMA_QSA_POS_MASK", nullptr);
+                    const double nmse_i = nmse(logits_img, logits_img_pos);
+                    check(arch_name, label, dense ? "QSA pos mask: M-RoPE image, dense" : "QSA pos mask: M-RoPE image, QSA",
+                          all_finite(logits_img) && all_finite(logits_img_pos) &&
+                          (label == "CPU" ? logits_img == logits_img_pos : nmse_i <= 1e-6), nmse_i);
                 }
             }
 

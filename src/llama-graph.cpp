@@ -4574,7 +4574,15 @@ llm_graph_input_mem_hybrid * llm_graph_context::build_inp_mem_hybrid() const {
     // [TAG_FN_R4_QSA_POS] qwen4exp under LLAMA_QSA_POS_MASK: the positional vectors instead of the explicit mask; its
     // QSA layers make their masks with ggml_qsa_mask and a dense layer (the nextn block) reads the vectors in FA. Not
     // with a windowed cache (the LLAMA_MTP_ATTN_WINDOW draft cache): the positional test has no window.
-    const bool indexer_pos = arch == LLM_ARCH_QWEN4EXP && cparams.qsa_pos_mask && mctx_cur->get_attn()->get_swa_window() == 0;
+    // [TAG_FN_R4_REVIEW] Not for an M-RoPE embedding batch either (an image: ubatch.token is null, the positions 2-D):
+    // its tokens share one temporal position, and set_input_kq_mask orders them by (y, x) (is_2d_gt, raster-causal),
+    // a rule the positional test (kv_pos <= q_pos) does not have. A QSA layer is ordered anyway (the in-order k-pool
+    // selects only the cells up to the token's own rank), but a dense attention layer (compress ratio 0, or a file
+    // without QSA) would let every image token see the whole image. Such a ubatch keeps the explicit mask, as it did
+    // before this switch; text batches never reach that rule (a text token shares its temporal position with no other
+    // cell of its sequence).
+    const bool indexer_pos = arch == LLM_ARCH_QWEN4EXP && cparams.qsa_pos_mask && mctx_cur->get_attn()->get_swa_window() == 0 &&
+        (ubatch.token != nullptr || !ubatch.is_pos_2d());
 
     auto inp_rs   = build_rs_inp_impl     (ctx0, ubatch, mctx_cur->get_recr());
     auto inp_attn = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur->get_attn(), indexer_pos);
