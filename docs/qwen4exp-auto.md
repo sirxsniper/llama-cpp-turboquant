@@ -22,6 +22,10 @@ Ryzen 9950X3D, 96 GB RAM, file A = Qwen3.8-Flash-Next UD-Q4_K_XL with the Q8_0 M
   - real use (temp 1, thinking on, 1536-token answers, context filled to 32K / 131K / 246K): 61.4 / 59.3 / 55.1 t/s;
   - prefill: 1650 t/s for a 32K prompt, 2104 t/s for a 131K prompt;
   - VRAM peak 28,320 MiB.
+- Lever round 2 (`[TAG_FN_SHIP2]`, the same setup, 2048-token answers on prompts without literal end-of-turn text):
+  - benchmark: 64.2 t/s greedy code, 58.9 t/s temp-1 prose (+6.5 % / +5.8 % over the round-1 default, same session);
+  - real use: 65.4 / 58.6 / 60.7 t/s at 32K / 131K / 246K (mean 61.6 t/s, +1.8 %);
+  - prefill unchanged (fill 1571 t/s to 32K, 2127 t/s to 131K); VRAM peak 27,999 MiB.
 
 ## The switch
 
@@ -64,7 +68,7 @@ Ryzen 9950X3D, 96 GB RAM, file A = Qwen3.8-Flash-Next UD-Q4_K_XL with the Q8_0 M
 
 | Group | Variables |
 |---|---|
-| host bridge and DMA share | `LLAMA_MOE_BRIDGE=1` (with its rollback ring), `LLAMA_MOE_BRIDGE_DMA=1`, `LLAMA_MOE_DMA_SHARE=auto` |
+| host bridge and DMA share | `LLAMA_MOE_BRIDGE=1` (with its rollback ring), `LLAMA_MOE_BRIDGE_DMA=1`, `LLAMA_MOE_DMA_SHARE=auto`, `LLAMA_MOE_BRIDGE_PF=1` and `LLAMA_MOE_BRIDGE_PF_SOLO=1` (the next-layer prefetch, see below) |
 | CPU expert kernels | `GGML_CPU_APPLY_ONCE=1`, `GGML_CPU_Q5_1_AVX512=1`, `GGML_CPU_MMID_MR=1`, `GGML_CPU_MOE_FUSE=1`, `GGML_CPU_VNNI=1` |
 | host trims | `GGML_SCHED_SPLIT_ASYNC=1`, `LLAMA_GRAPH_PER_WIDTH=1`, `GGML_CUDA_GRAPH_POKE=1`, `LLAMA_NO_ECOQOS=1` |
 | PLE | `LLAMA_PLE_HOST_GATHER=1`, `LLAMA_PLE_DIRECT_IO=1` |
@@ -76,6 +80,24 @@ Evidence (E:/turbot-gates/flashnext/test/history.md, lever round 1): all of them
 binary, 2 interleaved rounds at -c 262144: real use +38.6 %, benchmark code +24.8 %, decode KLD in the placement band
 (0.0117 vs 0.0121). The binary search over the groups removed none. With the fix-r1 code (k-pool tail, wide sparse-index
 compaction, bridge rollback ring): real use 35.3 -> 58.6 t/s (+65.9 %) against the round's start.
+
+Lever round 2 (`[TAG_FN_R2_BRIDGE_PF]`, r2/ab4, 2 interleaved rounds against the round-1 default on the same binary):
+after each layer's host job the CPU MoE pool predicts the next layer's experts from its router and loads the cold ones
+into the CPU caches while the device runs that layer's attention (real loads; with `_SOLO` the executor only
+dispatches, so every worker computes the pieces it loaded). Values are never touched: greedy identity on file A,
+test-backend-ops bit for bit. Benchmark code +6.5 %, prose +5.8 %, real use +1.8 %, VRAM unchanged.
+`LLAMA_MOE_BRIDGE_PF=0` turns it off.
+
+## Bridge stalls `[TAG_FN_R2_BRIDGE_NOSPEC]` `[TAG_FN_R2_BRIDGE_SYNC]`
+
+Code defaults of every context with the host bridge (not profile items):
+- A bridged ubatch whose host side misses the device's deadline (page-ins after a long prefill or after another model
+  ran) is rolled back and computed again. With MTP the speculative ring gets one more token (`[TAG_FN_R1_BRIDGE_RB]`);
+  without speculative decoding the context gets a recurrent ring of `LLAMA_MOE_BRIDGE_RB_TOKENS` tokens (default 1,
+  at most 8) and the bridge takes only graphs that ring can roll back whole. `LLAMA_MOE_BRIDGE_RB=0` turns both off.
+- While the bridge is paused or off after a miss, its layers run the host job as a CPU graph op
+  (`GGML_OP_MOE_HOST_SUM`) and sum like the bridged graph, so a stall never changes the output (forced-stall tests with
+  and without MTP: identical tokens). `LLAMA_MOE_BRIDGE_SYNC=0` restores the plain CPU split.
 
 ## VRAM fit `[TAG_FN_VRAM_FIT]`
 
