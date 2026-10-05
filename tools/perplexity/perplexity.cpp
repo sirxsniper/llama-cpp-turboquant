@@ -563,6 +563,18 @@ static void kld_add_token(kl_divergence_result & kld, const kld_token_result & t
     kld.max_p_diff = std::max(kld.max_p_diff, std::fabs(p_diff));
 }
 
+// [TAG_FN_R1_PPL_TAIL] LLAMA_PPL_TAIL_BATCH=<n> (sparse base and sparse KLD only): the positions from the first scored
+// one (LLAMA_PPL_SCORE_FIRST) on go in batches of at most n tokens - decode-width graphs, 3 = an MTP verify - and the
+// context before them in -b batches. A filled-depth check of the decode attention path (qwen4exp's sparse turbot FA
+// needs n_kv >= twice the cells a query tile gathers) without decoding the whole context at -ub 3.
+static int ppl_batch_len(int j, int n_batch, int first, int n_ctx, int tail) {
+    int n = std::min(n_batch, n_ctx - j);
+    if (tail > 0) {
+        n = j >= first ? std::min(n, tail) : std::min(n, first - j);
+    }
+    return n;
+}
+
 // Sparse streaming base writer: env LLAMA_PPL_SPARSE_K=K with --kl-divergence-base and without --kl-divergence. Only the
 // scored positions p = first, first + stride, ... <= n_ctx - 2 get logits (LLAMA_PPL_SCORE_FIRST, default n_ctx/2;
 // LLAMA_PPL_SCORE_STRIDE, default 1); each batch's rows are appended to the file, no n_ctx x n_vocab buffer.
@@ -641,6 +653,10 @@ static results_perplexity perplexity_sparse_base(llama_context * ctx, const comm
             params.logits_file.c_str());
 
     const int n_batch = std::min(params.n_batch, n_ctx);
+    const int tail_b  = ppl_env_int("LLAMA_PPL_TAIL_BATCH", 0); // [TAG_FN_R1_PPL_TAIL]
+    if (tail_b > 0) {
+        LOG_INF("%s: LLAMA_PPL_TAIL_BATCH=%d: positions >= %d in batches of <= %d tokens\n", __func__, tail_b, first, tail_b);
+    }
     llama_batch batch = llama_batch_init(n_batch, 0, 1);
 
     std::vector<std::thread> workers(std::thread::hardware_concurrency() - 1);
@@ -655,8 +671,8 @@ static results_perplexity perplexity_sparse_base(llama_context * ctx, const comm
         llama_memory_clear(llama_get_memory(ctx), true);
 
         const llama_token * toks = tokens.data() + size_t(c)*n_ctx;
-        for (int j = 0; j < n_ctx; j += n_batch) {
-            const int n = std::min(n_batch, n_ctx - j);
+        for (int j = 0, n = 0; j < n_ctx; j += n) {
+            n = ppl_batch_len(j, n_batch, first, n_ctx, tail_b);
             common_batch_clear(batch);
             pos_out.clear();
             for (int i = 0; i < n; ++i) {
@@ -2300,6 +2316,10 @@ static void kl_divergence_sparse(llama_context * ctx, const common_params & para
     const int    n_batch   = std::min(params.n_batch, (int) n_ctx);
     const size_t row_bytes = sparse_row_bytes(K);
     const int    n_decoys  = ppl_env_int("LLAMA_PPL_DECOYS", 0);
+    const int    tail_b    = ppl_env_int("LLAMA_PPL_TAIL_BATCH", 0); // [TAG_FN_R1_PPL_TAIL]
+    if (tail_b > 0) {
+        LOG_INF("%s: LLAMA_PPL_TAIL_BATCH=%d: positions >= %d in batches of <= %d tokens\n", __func__, tail_b, first, tail_b);
+    }
     GGML_ASSERT(!llama_vocab_get_add_eos(vocab));
 
     LOG_INF("%s: sparse base: K %d, %d scored rows per chunk (first %d, stride %d)%s\n", __func__, K, n_scored, first, stride,
@@ -2359,8 +2379,8 @@ static void kl_divergence_sparse(llama_context * ctx, const common_params & para
 
         const llama_token * toks = tokens.data() + size_t(c)*n_ctx;
         int r0 = 0;
-        for (int j = 0; j < (int) n_ctx; j += n_batch) {
-            const int n = std::min(n_batch, (int) n_ctx - j);
+        for (int j = 0, n = 0; j < (int) n_ctx; j += n) {
+            n = ppl_batch_len(j, n_batch, first, (int) n_ctx, tail_b);
             common_batch_clear(batch);
             pos_out.clear();
             for (int i = 0; i < n; ++i) {
