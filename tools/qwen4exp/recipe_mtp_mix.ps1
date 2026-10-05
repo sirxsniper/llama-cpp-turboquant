@@ -5,10 +5,17 @@
 #
 #   powershell -File tools\qwen4exp\recipe_mtp_mix.ps1 [-Force] [-DryRun] [-Bin <dir with ggml-base.dll>]
 #
+# [TAG_FN_L3_MTP_Q2] -Mix gate,up,down -Name <set name> makes another head mix the same way, e.g. the Strata / flashrt
+# draft experts: -Mix q2_0,q2_0,q2_0 -Name MTPq2 (q2_0 by mtp_requant.py's scale search, ~1.83 GiB freed), or
+# -Mix q3_K,q3_K,q4_0 -Name MTPq3 (~1.38 GiB). The set's <shard 1>.ple is a hardlink of file A's (PLE direct I/O copies
+# nothing). -AllowBuilds runs beside compiler processes (CPU work like a build); a llama / test / sanitizer process
+# still refuses it.
+#
 # CPU and disk only: reads the 2.6 GB head, writes a ~1.6 GB head and a 5-shard set whose shards 2-4 are hardlinks of the
 # downloaded trunk (no copy) and whose shard 5 is the new head. It refuses while a llama / test / build / sanitizer process
 # runs or commit charge is high (it must not overlap a GPU speed measurement), and never touches the source files.
-param([switch]$Force, [switch]$DryRun, [string]$Bin = "D:\Projects\LocalAI\source-build\wt-fsync\build-fsync\bin")
+param([switch]$Force, [switch]$DryRun, [string]$Bin = "D:\Projects\LocalAI\source-build\wt-fsync\build-fsync\bin",
+      [string]$Mix = "", [string]$Name = "MTPmix", [switch]$AllowBuilds)
 $ErrorActionPreference = "Stop"
 
 $M       = "D:\Projects\LocalAI\models"
@@ -17,8 +24,15 @@ $Head    = "$M\mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf"
 $HeadMix = "$M\mtp-Qwen3.8-Flash-Next-shared-trunkmix.gguf"
 $SrcPat  = "$M\Qwen3.8-Flash-Next-UD-Q4_K_XL-%05d-of-00004.gguf"
 $A1      = "$M\Qwen3.8-Flash-Next-UD-Q4_K_XL-MTP-00001-of-00005.gguf"
-$MixPat  = "$M\Qwen3.8-Flash-Next-UD-Q4_K_XL-MTPmix-%05d-of-00005.gguf"
+$MixPat  = "$M\Qwen3.8-Flash-Next-UD-Q4_K_XL-$Name-%05d-of-00005.gguf"
 $Out     = "E:\turbot-gates\flashnext\test\r4\recipe_mtp_mix"
+if ($Mix) {
+  # [TAG_FN_L3_MTP_Q2] another mix: its own head file and output folder
+  if ($Name -eq "MTPmix") { throw "-Mix needs its own -Name (MTPmix is recipe C)" }
+  $tag     = ($Mix -replace ',', '-')
+  $HeadMix = "$M\mtp-Qwen3.8-Flash-Next-shared-$tag.gguf"
+  $Out     = "E:\turbot-gates\flashnext\test\l3\mtp\recipe_$Name"
+}
 New-Item -ItemType Directory -Force $Out | Out-Null
 
 # inputs present
@@ -30,12 +44,16 @@ $env:PYTHONIOENCODING = "utf-8"
 $env:CUDA_VISIBLE_DEVICES = "-1"
 
 # 1. the plan (header reads only), and the tensor-type file of the same plan for the llama-quantize route
-& python "$Tools\mtp_requant.py" --head $Head --trunk $A1 --dry-run --tt-out "$Out\tt_mtp48_trunkmix.txt" *>&1 | Tee-Object "$Out\plan.log"
+$mixArg = @("--trunk", $A1)
+if ($Mix) { $mixArg = @("--mix", $Mix) }
+& python "$Tools\mtp_requant.py" --head $Head @mixArg --dry-run --tt-out "$Out\tt_mtp48_$Name.txt" *>&1 | Tee-Object "$Out\plan.log"
 if ($LASTEXITCODE -ne 0) { throw "mtp_requant.py --dry-run failed ($LASTEXITCODE)" }
 if ($DryRun) { "dry run only: $Out\plan.log"; exit 0 }
 
 # guards before any write: a quiet machine, commit charge, disk space, the quantizer
-$busy = Get-Process | Where-Object { $_.ProcessName -match 'llama|ggml|test-|compute-sanitizer|cmake|ninja|nvcc|^cl$|cicc|^link$' }
+$pat = 'llama|ggml|test-|compute-sanitizer|cmake|ninja|nvcc|^cl$|cicc|^link$'
+if ($AllowBuilds) { $pat = 'llama|ggml|test-|compute-sanitizer' }
+$busy = Get-Process | Where-Object { $_.ProcessName -match $pat }
 if ($busy) { throw ("REFUSED: busy: " + (($busy | ForEach-Object { "$($_.ProcessName) $($_.Id)" }) -join ", ")) }
 $os = Get-CimInstance Win32_OperatingSystem
 $commitGB = ($os.TotalVirtualMemorySize - $os.FreeVirtualMemory) / 1MB
@@ -45,7 +63,7 @@ if ($freeD -lt 10) { throw ("REFUSED: D: has {0:N0} GB free, 10 GB needed" -f $f
 if (-not (Test-Path "$Bin\ggml-base.dll")) { throw "missing $Bin\ggml-base.dll (-Bin)" }
 
 # 2. the requantized head (ggml's quantizer, verified: tensor set, types, byte-equal rest, requantization error)
-$argv = @("$Tools\mtp_requant.py", "--head", $Head, "--trunk", $A1, "--out", $HeadMix, "--ggml", $Bin, "--threads", "8")
+$argv = @("$Tools\mtp_requant.py", "--head", $Head) + $mixArg + @("--out", $HeadMix, "--ggml", $Bin, "--threads", "8")
 if ($Force) { $argv += "--force" }
 & python @argv *>&1 | Tee-Object "$Out\requant.log"
 if ($LASTEXITCODE -ne 0) { throw "mtp_requant.py failed ($LASTEXITCODE), see $Out\requant.log" }
@@ -58,6 +76,16 @@ if ($Force) { $argv += "--force" }
 if ($LASTEXITCODE -ne 0) { throw "merge_mtp.py failed ($LASTEXITCODE), see $Out\merge.log" }
 
 # 4. the type report: trunk as file A, blk.48 gate/up q4_K and down q5_1 (expect C)
-& python "$Tools\fn_types.py" $MixPat.Replace("%05d", "00001") --expect C --json "$Out\types_mix.json" *>&1 | Tee-Object "$Out\types.log"
+$expect = @("--expect", "C")
+if ($Mix) { $expect = @("--expect-mtp", $Mix) }
+& python "$Tools\fn_types.py" $MixPat.Replace("%05d", "00001") @expect --json "$Out\types_mix.json" *>&1 | Tee-Object "$Out\types.log"
 if ($LASTEXITCODE -ne 0) { throw "type check failed, see $Out\types.log" }
-"MTPmix ready: " + $MixPat.Replace("%05d", "00001")
+
+# 5. [TAG_FN_L3_MTP_Q2] the PLE direct I/O copy: a hardlink of file A's (same trunk table), so the first load copies nothing
+$PleA = "$A1.ple"
+$PleN = $MixPat.Replace("%05d", "00001") + ".ple"
+if ((Test-Path $PleA) -and -not (Test-Path $PleN)) {
+  New-Item -ItemType HardLink -Path $PleN -Target $PleA | Out-Null
+  "hardlinked $PleN -> $PleA"
+}
+"$Name ready: " + $MixPat.Replace("%05d", "00001")
