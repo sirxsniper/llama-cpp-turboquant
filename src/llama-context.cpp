@@ -6585,6 +6585,20 @@ int32_t llama_memory_attn_n_free_ext(llama_context * ctx, llama_seq_id seq_id) {
     return (int32_t) (cells.size() - cells.get_used());
 }
 
+// [TAG_FN_L3_MTP_COST2]
+bool llama_moe_bridge_track_ext(llama_context * ctx, bool on) {
+    llama_moe_bridge * br = ctx ? ctx->get_moe_bridge() : nullptr;
+    if (br == nullptr) {
+        return false;
+    }
+    llama_moe_bridge_track(br, on);
+    return true;
+}
+
+bool llama_moe_bridge_last_ext(const llama_context * ctx, int32_t * n_tokens, uint32_t * cold, int32_t n, uint64_t * serial) {
+    return ctx != nullptr && llama_moe_bridge_last(ctx->get_moe_bridge(), n_tokens, cold, n, serial);
+}
+
 uint32_t llama_memory_attn_swa_ext(llama_context * ctx) {
     llama_memory_i * mem = ctx ? ctx->get_memory() : nullptr;
     llama_kv_cache * kv  = dynamic_cast<llama_kv_cache *>(mem);

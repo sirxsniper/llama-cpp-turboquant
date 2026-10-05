@@ -79,6 +79,14 @@ int  llama_moe_bridge_n_used(const llama_moe_bridge * br);
 // the bridge id and channel for this layer's up_exps, false if the layer is not bridged
 bool llama_moe_bridge_layer (const llama_moe_bridge * br, const ggml_tensor * up_exps, int32_t * id, int32_t * chan);
 
+// [TAG_FN_L3_MTP_COST2] cold-expert counts for the MTP draft-length policy (SPEC_MTP_COST=2). With tracking on, each
+// bridged graph sums over its layers, per token prefix t, the distinct experts of tokens 0..t that are not in the VRAM
+// hot set. llama_moe_bridge_last: the last bridged graph that completed without error - its width, its counts
+// (cold[t] for t < min(width, n)) and its serial number (one per bridged graph). Owner thread only.
+constexpr int LLAMA_MOE_BRIDGE_TRACK_T = 16;
+void llama_moe_bridge_track(llama_moe_bridge * br, bool on);
+bool llama_moe_bridge_last (const llama_moe_bridge * br, int32_t * n_tokens, uint32_t * cold, int32_t n, uint64_t * serial);
+
 // runtime, on the owning context's thread
 void llama_moe_bridge_step (llama_moe_bridge * br);            // before the graph parameters: re-arm after a pause
 void llama_moe_bridge_begin(llama_moe_bridge * br, bool used); // before the graph runs: wake the executor, or park it

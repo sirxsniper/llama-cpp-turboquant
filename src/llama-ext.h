@@ -171,6 +171,14 @@ LLAMA_API int32_t llama_memory_attn_n_free_ext(struct llama_context * ctx, llama
 // LLAMA_MTP_ATTN_WINDOW (llama-model.cpp).
 LLAMA_API uint32_t llama_memory_attn_swa_ext(struct llama_context * ctx);
 
+// [TAG_FN_L3_MTP_COST2] Cold-expert counts of the MoE bridge (LLAMA_MOE_BRIDGE=1) of ctx, for the MTP draft-length
+// policy. llama_moe_bridge_track_ext(ctx, true): every bridged graph then records, per token prefix t, the sum over its
+// bridged layers of the distinct experts of tokens 0..t that are not in the VRAM hot set; false when ctx owns no bridge.
+// llama_moe_bridge_last_ext: the last bridged graph that completed without error - its width (*n_tokens), cold[t] for
+// t < min(width, n) and its serial number (one per bridged graph); false when there is none. The context's thread only.
+LLAMA_API bool llama_moe_bridge_track_ext(struct llama_context * ctx, bool on);
+LLAMA_API bool llama_moe_bridge_last_ext(const struct llama_context * ctx, int32_t * n_tokens, uint32_t * cold, int32_t n, uint64_t * serial);
+
 // [TAG_TURBOT] Process-wide turbot plan path; takes precedence over env LLAMA_TURBOT_PLAN. nullptr or "" clears it.
 // [TAG_TURBOT_EMBED_PLAN] "default" selects the built-in plan; with neither set, the built-in plan is used when it fits.
 LLAMA_API void llama_turbot_set_plan_path(const char * path);
