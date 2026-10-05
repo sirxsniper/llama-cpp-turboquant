@@ -420,6 +420,38 @@ private:
     uint32_t moe_hot_waits   = 0;
     void     moe_hot_fit_try();
 
+    // [TAG_FN_L3_VRAM_CBUF] LLAMA_FN_CBUF=1 (qwen4exp, the hot set's owner; the [TAG_FN_R3_CBUF_LEND] design of round 2):
+    // between prompts the scheduler holds a SMALL reserve (graphs of <= cbuf_small_t tokens), and the hot set keeps the
+    // difference to the FULL reserve as a tail of its device buffer; a wider batch first gives the tail's VRAM back and
+    // reserves FULL, the next narrow one returns
+    enum { CBUF_OFF = 0, CBUF_FULL = 1, CBUF_SMALL = 2 };
+    int      cbuf_state     = CBUF_OFF;
+    uint32_t cbuf_small_t   = 31;
+    size_t   cbuf_full_b    = 0;   // device bytes of the trunk's compute buffers at the FULL reserve
+    size_t   cbuf_small_b   = 0;
+    size_t   cbuf_pool_mib  = 0;   // LLAMA_FN_CBUF_POOL_MIB: extra tail for the pool growth of a FULL prompt
+    bool     cbuf_trim      = true;
+    uint64_t cbuf_n_full    = 0;
+    uint64_t cbuf_n_small   = 0;
+    double   cbuf_ms_full   = 0.0;
+    double   cbuf_ms_small  = 0.0;
+    size_t   cbuf_peak      = 0;   // the most device use (all processes) seen at a switch
+    bool     cbuf_wanted() const;
+    size_t   cbuf_prepare(ggml_backend_dev_t dev);
+    void     cbuf_off();
+    bool     cbuf_set(bool full);
+    void     cbuf_free_compute();
+    size_t   cbuf_compute_bytes(ggml_backend_dev_t dev) const;
+    uint32_t reserve_n_tokens() const;
+
+    // [TAG_FN_L3_VRAM_ACCOUNT] LLAMA_FN_VRAM_ACCOUNT=1 (qwen4exp): device use at each stage, the model's device tensors by
+    // kind, and the temporary-memory pools of this context's backends
+    bool     vram_acc_on   = false;
+    size_t   vram_acc_last = 0;
+    bool     vram_acc_wide = false; // the last batch was wider than 31 tokens (a prompt)
+    uint32_t vram_acc_n    = 0;
+    void     vram_account(const char * stage);
+
     llm_graph_result * get_gf_res_prev(const llama_ubatch & ubatch);
     void gf_res_prev_reset_all();
 

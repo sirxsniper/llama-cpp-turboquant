@@ -28,14 +28,18 @@
 
 #include "ggml-turbot.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cinttypes>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <limits>
+#include <map>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 //
 // llama_context
@@ -1338,6 +1342,13 @@ llama_context::llama_context(
         }
         backends.emplace_back(backend_cpu);
 
+        // [TAG_FN_L3_VRAM_ACCOUNT]
+        if (model.arch == LLM_ARCH_QWEN4EXP && !model.hparams.no_alloc) {
+            const char * e = getenv("LLAMA_FN_VRAM_ACCOUNT");
+            vram_acc_on = e && atoi(e) != 0;
+        }
+        vram_account("backends");
+
         // create a list of the set_n_threads functions in the backends
         for (auto & backend : backends) {
             ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());
@@ -1409,6 +1420,7 @@ llama_context::llama_context(
             params_mem.type_v_swa = swa_types_retry.second;
             build_memory();
         }
+        vram_account("memory"); // [TAG_FN_L3_VRAM_ACCOUNT]
     }
 
     // init backends
@@ -1476,6 +1488,7 @@ llama_context::llama_context(
 
         // [TAG_MOE_BRIDGE] LLAMA_MOE_BRIDGE=1: before the reserve, so decode graphs are reserved with the bridge ops
         moe_bridge = llama_moe_bridge_create(model, (int) cparams.n_threads, bridge_rb ? (int) cparams.n_rs_seq : 0);
+        vram_account("bridge"); // [TAG_FN_L3_VRAM_ACCOUNT]
 
         // [TAG_MOE_DMA_SHARE] [TAG_FN_PREFILL_STREAM] before the reserve: the graphs it builds use the gen5 banks
         // [TAG_FN_MERGE] with a host bridge the DMA share / prefetch stay off (they need the CPU split the bridge removes)
@@ -1484,6 +1497,7 @@ llama_context::llama_context(
         // [TAG_FN_R4_BRIDGE_DMA] LLAMA_MOE_BRIDGE_DMA=1: the DMA share inside the bridged graphs (the gen5 state above is in
         // bridge mode then); before the reserve, so decode graphs are reserved with the fetch ops
         llama_moe_bridge_attach_dma(moe_bridge, this);
+        vram_account("gen5"); // [TAG_FN_L3_VRAM_ACCOUNT] DMA banks (VRAM), rings and stream staging (pinned host)
 
         // [TAG_MOE_BRIDGE] [TAG_FN_PREFILL_STREAM] a throw below (a reserve whose compute buffers do not fit) leaves the
         // constructor without the destructor: free the bridge (executor thread, pinned channels) and the gen5 state
@@ -1502,6 +1516,7 @@ llama_context::llama_context(
         } moe_guard { moe_bridge, this, true };
 
         sched_reserve();
+        vram_account("reserve"); // [TAG_FN_L3_VRAM_ACCOUNT]
 
         // [TAG_FN_MOE_HOT] sized after the reserve, so LLAMA_MOE_HOT_MIB=auto sees what the KV cache and the compute
         // buffers left; decode graphs then carry the hot chain, so reserve again with it
@@ -1745,7 +1760,7 @@ void llama_context::sched_reserve() {
     const int64_t t_start_us = ggml_time_us();
 
     const uint32_t n_seqs = cparams.n_seq_max;
-    const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
+    const uint32_t n_tokens = reserve_n_tokens(); // [TAG_FN_L3_VRAM_CBUF] n_ubatch, or the SMALL width between prompts
 
     const size_t max_nodes = this->graph_max_nodes(n_tokens);
 
@@ -2133,6 +2148,11 @@ bool llama_context::memory_update(bool optimize) {
                 }
         }
 
+        // [TAG_FN_L3_VRAM_CBUF] an update graph (a K shift over the whole cache) is sized like a prompt, not like a decode
+        if (cbuf_state == CBUF_SMALL) {
+            cbuf_set(true);
+        }
+
         // reset the previous graph results to make sure that they won't be reused
         // TODO: make mctx->apply() report if a graph reserve is needed, then reset graph results only if the memory module reset the scheduler
         for (auto & res : gf_res_prev) {
@@ -2158,7 +2178,8 @@ bool llama_context::memory_update(bool optimize) {
         const uint32_t n_seqs = cparams.n_seq_max;
         // [TAG_4C_DFT_RESERVE] the DFlash token graph at the drafting width, as in sched_reserve (the buffers already
         // hold the inject graph); the full width here would grow the drafter buffer back after a K-shift
-        const uint32_t n_tokens = llama_dflash_reserve_n_tokens(model, cparams, std::min(cparams.n_ctx, cparams.n_ubatch));
+        // [TAG_FN_L3_VRAM_CBUF] reserve_n_tokens(): the width of the current reserve
+        const uint32_t n_tokens = llama_dflash_reserve_n_tokens(model, cparams, reserve_n_tokens());
 
         const uint32_t n_outputs_max = std::min(n_tokens, cparams.n_outputs_max);
 
@@ -3328,6 +3349,22 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     // [TAG_FN_VRAM_FIT] size the deferred hot set now that the model's other contexts exist
     if (moe_hot_pending) {
         moe_hot_fit_try();
+    }
+
+    // [TAG_FN_L3_VRAM_CBUF] a batch wider than the SMALL reserve runs with the FULL one (the hot set's tail gives its VRAM
+    // back first); the next narrow batch returns to SMALL and refills the tail. The whole batch keeps one state: its
+    // ubatches are at most n_ubatch wide either way, and a narrow ubatch under FULL just runs without the tail layers
+    if (cbuf_state != CBUF_OFF && !cbuf_set(n_tokens_all > cbuf_small_t)) {
+        return -2;
+    }
+
+    // [TAG_FN_L3_VRAM_ACCOUNT] device use when the batches change from prompts to decodes and back (the state the last
+    // period left: a prompt's pool growth and lazily loaded kernels show up at the first narrow batch after it)
+    if (vram_acc_on && cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP && (n_tokens_all > 31) != vram_acc_wide) {
+        vram_acc_wide = n_tokens_all > 31;
+        if (++vram_acc_n <= 16 || vram_acc_n % 64 == 0) {
+            vram_account(vram_acc_wide ? "-> prompt" : "-> decode");
+        }
     }
 
     sched_reserve();
@@ -5287,6 +5324,13 @@ void llama_context::moe_hot_fit_try() {
     if (!dev) {
         return;
     }
+    vram_account("fit start");
+    // [TAG_FN_L3_VRAM_CBUF] SMALL first: the fit below then sees the FULL reserve's difference as free VRAM
+    size_t cbuf_tail = 0;
+    if (cbuf_wanted()) {
+        cbuf_tail = cbuf_prepare(dev);
+        vram_account("fit SMALL");
+    }
     size_t mem_free = 0, mem_total = 0;
     ggml_backend_dev_memory(dev, &mem_free, &mem_total);
 
@@ -5327,7 +5371,13 @@ void llama_context::moe_hot_fit_try() {
     if (const char * e = llama_fn_env(model, "LLAMA_MOE_HOT_HEADROOM_MIB")) {
         margin = (size_t) std::max(0, atoi(e)) << 20;
     }
-    const size_t budget = llama_fn_vram_fit_budget(mem_total, mem_free, ceiling, margin);
+    // [TAG_FN_L3_VRAM_CBUF] LLAMA_FN_HOT_BUDGET_MAX_MIB: an upper bound on the budget, so two configurations get the same
+    // hot set (the identity check of the compute-buffer lend: a static profile, with and without the lend)
+    size_t budget_max = SIZE_MAX;
+    if (const char * e = llama_fn_env(model, "LLAMA_FN_HOT_BUDGET_MAX_MIB"); e && atoi(e) > 0) {
+        budget_max = (size_t) atoi(e) << 20;
+    }
+    size_t budget = std::min(budget_max, llama_fn_vram_fit_budget(mem_total, mem_free, ceiling, margin));
 
     LLAMA_LOG_INFO("moe-hot: VRAM fit on %s: %.0f of %.0f MiB used = model %.0f + KV %.0f + compute %.0f + other %.0f "
             "(CUDA runtime, other processes)\n", ggml_backend_dev_name(dev), used/MiB, mem_total/MiB, m_model/MiB, m_kv/MiB,
@@ -5336,14 +5386,368 @@ void llama_context::moe_hot_fit_try() {
             "budget %.0f MiB\n", per.c_str(), ceiling/MiB, cap_src, margin/MiB, budget/MiB);
     if (budget == 0) {
         LLAMA_LOG_WARN("moe-hot: VRAM fit: no room under the ceiling - no hot set\n");
+        cbuf_off(); // [TAG_FN_L3_VRAM_CBUF]
         return;
     }
-    if (llama_moe_hot_init(model, this, budget)) {
+    // [TAG_FN_L3_VRAM_CBUF] the tail, the stream's lend range and the tables must fit the budget together, with one layer
+    // left between them (the even split gives every layer the same size, so 1/48 of the budget is about one layer)
+    if (cbuf_tail > 0) {
+        const size_t stream = llama_prefill_stream_lend_bytes(this);
+        if (!llama_fn_cbuf_fits(budget, cbuf_tail, stream)) {
+            LLAMA_LOG_WARN("moe-hot: [TAG_FN_L3_VRAM_CBUF] the budget %.0f MiB cannot hold a %.0f MiB tail beside the stream's "
+                    "%.0f MiB: FULL reserve, no tail\n", budget/MiB, cbuf_tail/MiB, stream/MiB);
+            cbuf_off();
+            cbuf_tail = 0;
+            ggml_backend_dev_memory(dev, &mem_free, &mem_total);
+            budget = std::min(budget_max, llama_fn_vram_fit_budget(mem_total, mem_free, ceiling, margin));
+            if (budget == 0) {
+                LLAMA_LOG_WARN("moe-hot: VRAM fit: no room under the ceiling - no hot set\n");
+                return;
+            }
+        }
+    }
+    if (llama_moe_hot_init(model, this, budget, cbuf_tail)) {
         sched_need_reserve = true;
         const size_t hot = llama_moe_hot_device_bytes();
         LLAMA_LOG_INFO("moe-hot: VRAM fit: hot set %.0f MiB, device use about %.0f MiB with it (ceiling %.0f MiB)\n",
                 hot/MiB, (used + hot)/MiB, ceiling/MiB);
+        if (cbuf_tail > 0) {
+            LLAMA_LOG_INFO("moe-hot: [TAG_FN_L3_VRAM_CBUF] between prompts the compute reserve is %.0f MiB (graphs of <= %u "
+                    "tokens) instead of %.0f MiB; the hot set's %.0f MiB tail gives its VRAM back to a wider batch\n",
+                    cbuf_small_b/MiB, cbuf_small_t, cbuf_full_b/MiB, llama_moe_hot_cbuf_tail_bytes()/MiB);
+        }
+    } else if (cbuf_tail > 0) {
+        cbuf_off(); // no hot set: the FULL reserve again
     }
+    vram_account("hot set");
+}
+
+// [TAG_FN_L3_VRAM_CBUF] ---------------------------------------------------------------------------------------------
+
+// a scheduler switch inside decode() synchronizes, and synchronize() closes the perf window: hold the batch's queued
+// tokens and start time out of it, so the batch is counted once, when it ran
+struct llama_perf_hold {
+    int64_t &     q;
+    int64_t &     t;
+    const int64_t q0;
+    const int64_t t0;
+    llama_perf_hold(int64_t & q, int64_t & t) : q(q), t(t), q0(q), t0(t) {
+        q = 0;
+    }
+    ~llama_perf_hold() {
+        q = q0;
+        t = t0;
+    }
+};
+
+bool llama_context::cbuf_wanted() const {
+    if (model.arch != LLM_ARCH_QWEN4EXP || cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP || model.hparams.no_alloc) {
+        return false;
+    }
+    const char * e = llama_fn_env(model, "LLAMA_FN_CBUF");
+    return e && atoi(e) != 0;
+}
+
+uint32_t llama_context::reserve_n_tokens() const {
+    const uint32_t n = std::min(cparams.n_ctx, cparams.n_ubatch);
+    return cbuf_state == CBUF_SMALL ? std::min(n, cbuf_small_t) : n;
+}
+
+size_t llama_context::cbuf_compute_bytes(ggml_backend_dev_t dev) const {
+    size_t b = 0;
+    if (!sched) {
+        return 0;
+    }
+    for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+        ggml_backend_t backend = backend_ptrs[i];
+        if (ggml_backend_get_device(backend) == dev) {
+            b += ggml_backend_sched_get_buffer_size(sched.get(), backend);
+        }
+    }
+    return b;
+}
+
+// the compute buffers go back to the driver now; the next sched_reserve() allocates them again
+void llama_context::cbuf_free_compute() {
+    for (auto & res : gf_res_prev) {
+        res.reset();
+    }
+    for (auto & res : gf_res_width) {
+        res.reset();
+    }
+    gf_res_prev_active = nullptr;
+    const size_t max_nodes = graph_max_nodes(reserve_n_tokens());
+    sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes,
+            cparams.pipeline_parallel, cparams.op_offload));
+    sched_need_reserve = true;
+}
+
+// the FULL reserve again, for good
+void llama_context::cbuf_off() {
+    if (cbuf_state == CBUF_OFF) {
+        return;
+    }
+    llama_perf_hold hold(n_queued_tokens, t_compute_start_us);
+    synchronize();
+    cbuf_state         = CBUF_OFF;
+    sched_need_reserve = true;
+    sched_reserve();
+}
+
+// at the VRAM fit (no hot set yet, the FULL reserve): reserve SMALL, so the fit sees the difference as free VRAM, and
+// return the tail the hot set must keep for it (0: stay FULL)
+size_t llama_context::cbuf_prepare(ggml_backend_dev_t dev) {
+    constexpr double MiB = 1024.0*1024.0;
+    const size_t gran = llama_moe_hot_vmm_granularity(model);
+    if (gran == 0) {
+        LLAMA_LOG_WARN("%s: [TAG_FN_L3_VRAM_CBUF] LLAMA_FN_CBUF=1 needs virtual-memory buffers on the hot set's device - off\n",
+                __func__);
+        return 0;
+    }
+    uint32_t small_t = 31;
+    if (const char * e = getenv("LLAMA_FN_CBUF_SMALL_T"); e && atoi(e) > 0) {
+        small_t = (uint32_t) atoi(e);
+    }
+    // a graph of >= GGML_OP_OFFLOAD_MIN_BATCH tokens copies host experts into the compute buffer (op offload), and the
+    // hot chain serves at most 8 tokens: SMALL stays below the first and at or above the second
+    int offload_min = 32;
+    if (const char * e = getenv("GGML_OP_OFFLOAD_MIN_BATCH"); e && atoi(e) > 0) {
+        offload_min = atoi(e);
+    }
+    cbuf_small_t = llama_fn_cbuf_small_t(small_t, offload_min, cparams.n_seq_max);
+    if (const char * e = getenv("LLAMA_FN_CBUF_POOL_MIB"); e && atoi(e) >= 0) {
+        cbuf_pool_mib = (size_t) atoi(e);
+    }
+    if (const char * e = getenv("LLAMA_FN_CBUF_TRIM")) {
+        cbuf_trim = atoi(e) != 0;
+    }
+    llama_perf_hold hold(n_queued_tokens, t_compute_start_us);
+    synchronize();
+    const size_t full = cbuf_compute_bytes(dev);
+    cbuf_state         = CBUF_SMALL;
+    sched_need_reserve = true;
+    sched_reserve();
+    const size_t small = cbuf_compute_bytes(dev);
+    const size_t tail  = llama_fn_cbuf_tail(full, small, cbuf_pool_mib << 20, gran, (size_t) 256 << 20);
+    if (tail == 0) {
+        LLAMA_LOG_INFO("%s: [TAG_FN_L3_VRAM_CBUF] the FULL compute reserve (%.0f MiB) is not much larger than the SMALL one "
+                "(%.0f MiB): off\n", __func__, full/MiB, small/MiB);
+        cbuf_off();
+        return 0;
+    }
+    cbuf_full_b  = full;
+    cbuf_small_b = small;
+    LLAMA_LOG_INFO("%s: [TAG_FN_L3_VRAM_CBUF] compute reserve FULL %.0f MiB (ubatch %u), SMALL %.0f MiB (<= %u tokens): the hot "
+            "set keeps a tail of %.0f MiB for the difference (+ %zu MiB LLAMA_FN_CBUF_POOL_MIB)\n", __func__, full/MiB,
+            std::min(cparams.n_ctx, cparams.n_ubatch), small/MiB, cbuf_small_t, (full - small)/MiB, cbuf_pool_mib);
+    return tail;
+}
+
+// before a batch: wider than SMALL -> FULL (the tail gives its VRAM back first), narrow -> SMALL (FULL goes first, then the
+// tail comes back and is refilled). The device use never passes the larger of the two states'. false: a reserve failed
+// (another process took the VRAM): the batch fails, the next one tries again
+bool llama_context::cbuf_set(bool full) {
+    const int want = full ? CBUF_FULL : CBUF_SMALL;
+    if (cbuf_state == CBUF_OFF || cbuf_state == want) {
+        return true;
+    }
+    constexpr double MiB = 1024.0*1024.0;
+    const int64_t t0 = ggml_time_us();
+    ggml_backend_dev_t dev = llama_moe_hot_device(model);
+    llama_perf_hold hold(n_queued_tokens, t_compute_start_us);
+    synchronize();
+    if (sched) {
+        ggml_backend_sched_synchronize(sched.get());
+    }
+    size_t mem_free = 0, mem_total = 0;
+    if (dev) {
+        ggml_backend_dev_memory(dev, &mem_free, &mem_total);
+    }
+    const size_t used0 = mem_total > mem_free ? mem_total - mem_free : 0;
+
+    // the pools' high-water of the period that ends here (the account; a FULL period's is what a prompt adds)
+    size_t pool_res = 0, pool_hwm = 0;
+    for (auto & backend : backends) {
+        ggml_backend_dev_t d = ggml_backend_get_device(backend.get());
+        ggml_backend_reg_t reg = d ? ggml_backend_dev_backend_reg(d) : nullptr;
+        auto * stats = reg ? (void (*)(ggml_backend_t, size_t *, size_t *)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_pool_stats") : nullptr;
+        if (stats) {
+            size_t r = 0, h = 0;
+            stats(backend.get(), &r, &h);
+            pool_res += r;
+            pool_hwm  = std::max(pool_hwm, h);
+        }
+    }
+
+    size_t released = 0;
+    size_t trimmed  = 0;
+    bool   restored = true;
+    if (full) {
+        released           = llama_moe_hot_cbuf_release(this);
+        cbuf_state         = CBUF_FULL;
+        sched_need_reserve = true;
+        try {
+            sched_reserve();
+        } catch (const std::exception & err) {
+            LLAMA_LOG_ERROR("%s: [TAG_FN_L3_VRAM_CBUF] the FULL reserve failed (%s): this batch fails\n", __func__, err.what());
+            sched_need_reserve = true;
+            return false;
+        }
+        cbuf_n_full++;
+    } else {
+        // the stream's banks come back while FULL is still there (no VRAM moves), then FULL goes, then the tail returns
+        llama_moe_gen5_before_ubatch(this, sched.get(), 0);
+        cbuf_state = CBUF_SMALL;
+        cbuf_free_compute();
+        if (cbuf_trim) {
+            // [TAG_FN_L3_VRAM_TRIM] the temporaries of the prompt's kernels: the decode needs a fraction of them
+            for (auto & backend : backends) {
+                ggml_backend_dev_t d = ggml_backend_get_device(backend.get());
+                if (d != dev) {
+                    continue;
+                }
+                ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(d);
+                auto * trim = reg ? (size_t (*)(ggml_backend_t, size_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_pool_trim") : nullptr;
+                if (trim) {
+                    trimmed += trim(backend.get(), 0);
+                }
+            }
+        }
+        restored = llama_moe_hot_cbuf_restore(this);
+        try {
+            sched_reserve();
+        } catch (const std::exception & err) {
+            // the tail took VRAM the SMALL reserve needs (another process grew): give it back, its layers sit out
+            LLAMA_LOG_ERROR("%s: [TAG_FN_L3_VRAM_CBUF] the SMALL reserve failed (%s): the tail goes out again\n", __func__,
+                    err.what());
+            llama_moe_hot_cbuf_release(this);
+            restored           = false;
+            sched_need_reserve = true;
+            try {
+                sched_reserve();
+            } catch (const std::exception & err2) {
+                LLAMA_LOG_ERROR("%s: [TAG_FN_L3_VRAM_CBUF] the SMALL reserve failed again (%s): this batch fails\n",
+                        __func__, err2.what());
+                sched_need_reserve = true;
+                return false;
+            }
+        }
+        cbuf_n_small++;
+    }
+    const double ms = (ggml_time_us() - t0)/1000.0;
+    (full ? cbuf_ms_full : cbuf_ms_small) += ms;
+    if (dev) {
+        ggml_backend_dev_memory(dev, &mem_free, &mem_total);
+    }
+    const size_t used1 = mem_total > mem_free ? mem_total - mem_free : 0;
+    cbuf_peak = std::max(cbuf_peak, std::max(used0, used1));
+    const uint64_t n = full ? cbuf_n_full : cbuf_n_small;
+    if (n <= 3 || n % 32 == 0 || !restored) {
+        const std::string what = full ?
+            format("tail given back %.0f MiB", released/MiB) :
+            format("tail %s, pools trimmed by %.0f MiB", restored ? "mapped and refilled" : "NOT mapped (its layers stay on the host)",
+                    trimmed/MiB);
+        LLAMA_LOG_INFO("%s: [TAG_FN_L3_VRAM_CBUF] -> %s %" PRIu64 " in %.1f ms: device use %.0f -> %.0f MiB (most at a switch "
+                "%.0f), compute %.0f MiB, %s; the period before held pools of %.0f MiB (high-water %.0f MiB)\n", __func__,
+                full ? "FULL" : "SMALL", n, ms, used0/MiB, used1/MiB, cbuf_peak/MiB, cbuf_compute_bytes(dev)/MiB,
+                what.c_str(), pool_res/MiB, pool_hwm/MiB);
+    }
+    vram_account(full ? "cbuf FULL" : "cbuf SMALL");
+    return true;
+}
+
+// [TAG_FN_L3_VRAM_ACCOUNT] ------------------------------------------------------------------------------------------
+
+void llama_context::vram_account(const char * stage) {
+    if (!vram_acc_on) {
+        return;
+    }
+    constexpr double MiB = 1024.0*1024.0;
+    ggml_backend_dev_t dev = nullptr;
+    for (auto & backend : backends) {
+        ggml_backend_dev_t d = ggml_backend_get_device(backend.get());
+        if (d && ggml_backend_dev_type(d) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+            dev = d;
+            break;
+        }
+    }
+    if (!dev) {
+        return;
+    }
+    size_t mem_free = 0, mem_total = 0;
+    ggml_backend_dev_memory(dev, &mem_free, &mem_total);
+    const size_t used = mem_total > mem_free ? mem_total - mem_free : 0;
+    size_t pool_res = 0, pool_hwm = 0;
+    for (auto & backend : backends) {
+        ggml_backend_dev_t d = ggml_backend_get_device(backend.get());
+        ggml_backend_reg_t reg = d ? ggml_backend_dev_backend_reg(d) : nullptr;
+        auto * stats = reg ? (void (*)(ggml_backend_t, size_t *, size_t *)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_pool_stats") : nullptr;
+        if (stats) {
+            size_t r = 0, h = 0;
+            stats(backend.get(), &r, &h);
+            pool_res += r;
+            pool_hwm  = std::max(pool_hwm, h);
+        }
+    }
+    size_t compute = 0;
+    if (sched) {
+        for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+            if (ggml_backend_get_device(backend_ptrs[i]) == dev) {
+                compute += ggml_backend_sched_get_buffer_size(sched.get(), backend_ptrs[i]);
+            }
+        }
+    }
+    const long long delta = (long long) used - (long long) vram_acc_last;
+    LLAMA_LOG_INFO("vram-account [TAG_FN_L3_VRAM_ACCOUNT] ctx %p %-12s: device use %8.1f MiB (%+9.1f), free %8.1f, compute "
+            "%7.1f, pools %7.1f (high-water %.1f), hot set %.1f MiB%s\n", (const void *) this, stage, used/MiB, delta/MiB,
+            mem_free/MiB, compute/MiB, pool_res/MiB, pool_hwm/MiB, llama_moe_hot_device_bytes()/MiB,
+            llama_moe_hot_cbuf_out() ? " (tail out)" : "");
+    vram_acc_last = used;
+
+    // the model's tensors on this device by kind, once per process
+    static std::atomic<bool> model_done{false};
+    if (model_done.exchange(true)) {
+        return;
+    }
+    std::map<std::string, std::pair<size_t, int>> cat;
+    size_t tot = 0;
+    const int n_layer = (int) model.hparams.n_layer();
+    for (const auto & [name, t] : model.tensors_by_name) {
+        if (!t || !t->buffer || ggml_backend_buffer_is_host(t->buffer) ||
+                ggml_backend_buft_get_device(ggml_backend_buffer_get_type(t->buffer)) != dev) {
+            continue;
+        }
+        int il = -1;
+        if (sscanf(name.c_str(), "blk.%d.", &il) != 1) {
+            il = -1;
+        }
+        auto has = [&](const char * s) { return name.find(s) != std::string::npos; };
+        std::string k = has("_exps")            ? "routed experts" :
+                        has("_shexp")           ? "shared expert" :
+                        has("ffn_gate_inp")     ? "routers" :
+                        has("hc_")              ? "hyper-connection mixes" :
+                        has("indexer")          ? "lightning indexer" :
+                        has("attn_")            ? "attention projections" :
+                        has("ssm_")             ? "GDN projections" :
+                        has("nextn")            ? "nextn head" :
+                        name == "output.weight" ? "lm head" :
+                        has("ple_")             ? "PLE" :
+                        has("token_embd")       ? "token embedding" : "other";
+        if (il >= n_layer) {
+            k = "MTP " + k;
+        }
+        cat[k].first  += ggml_nbytes(t);
+        cat[k].second += 1;
+        tot += ggml_nbytes(t);
+    }
+    std::vector<std::pair<std::string, std::pair<size_t, int>>> v(cat.begin(), cat.end());
+    std::sort(v.begin(), v.end(), [](const auto & a, const auto & b) { return a.second.first > b.second.first; });
+    std::string s;
+    for (const auto & [k, b] : v) {
+        s += format(" %s %.1f (%d);", k.c_str(), b.first/MiB, b.second);
+    }
+    LLAMA_LOG_INFO("vram-account [TAG_FN_L3_VRAM_ACCOUNT] model tensors on %s: %.1f MiB =%s\n", ggml_backend_dev_name(dev),
+            tot/MiB, s.c_str());
 }
 
 //
