@@ -16910,6 +16910,7 @@ static bool run_moe_bridge(ggml_backend_t backend, ggml_backend_t backend_ref, c
     // [TAG_FN_L3_HOST_EXEC] optional: the ring watch (the poll zeroes taken stamps; the next entry's word shows a post)
     auto br_watch = (ggml_backend_moe_bridge_set_watch_t)      ggml_backend_reg_get_proc_address(reg, "ggml_backend_moe_bridge_set_watch");
     auto br_next  = (ggml_backend_moe_bridge_next_post_word_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_moe_bridge_next_post_word");
+    auto br_seed  = (ggml_backend_moe_bridge_test_seed_t)      ggml_backend_reg_get_proc_address(reg, "ggml_backend_moe_bridge_test_seed");
     ggml_backend_reg_t creg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_ref));
     using pp_def_t    = ggml_cpu_moe_pool_params (*)(int);
     using pool_new_t  = ggml_cpu_moe_pool * (*)(const ggml_cpu_moe_pool_params *);
@@ -16991,6 +16992,15 @@ static bool run_moe_bridge(ggml_backend_t backend, ggml_backend_t backend_ref, c
                 n_run++;
                 if (w0 == nullptr || *w0 != 0) {
                     printf("  FAIL moe bridge %s: the next post word is %s before any post\n", mname, w0 ? "nonzero" : "missing");
+                    n_fail++;
+                }
+            }
+            // [TAG_FN_L3_HOST_EXEC] the ring counter starts 24 posts before its 2^32 wrap: the cases below cross it (stamp 0 is
+            // never a post, so the zeroed entries of the watch stay unambiguous)
+            if (mode == GGML_MOE_BRIDGE_WAIT_SPIN && br_seed) {
+                n_run++;
+                if (!br_seed(br, 0xFFFFFFFFu - 23u)) {
+                    printf("  FAIL moe bridge %s: the ring counter could not be seeded\n", mname);
                     n_fail++;
                 }
             }

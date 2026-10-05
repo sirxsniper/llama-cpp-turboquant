@@ -144,6 +144,9 @@ typedef void     (*ggml_backend_moe_bridge_set_watch_t)(struct ggml_moe_bridge *
 // "ggml_backend_moe_bridge_next_post_word": with watch on, a host word that turns nonzero when the next job is posted
 //                                           (no CUDA call to read it); valid until the next poll. Executor thread only.
 typedef const volatile int32_t * (*ggml_backend_moe_bridge_next_post_word_t)(struct ggml_moe_bridge * bridge);
+// "ggml_backend_moe_bridge_test_seed": test hook, spin mode, no graph running and no job owed: the ring counter restarts
+//                                      at g (nonzero), so a test crosses the 2^32 wrap of the ring stamps in a few posts
+typedef bool     (*ggml_backend_moe_bridge_test_seed_t)(struct ggml_moe_bridge * bridge, uint32_t g);
 
 #ifdef __cplusplus
 }
