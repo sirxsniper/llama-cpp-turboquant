@@ -1195,6 +1195,8 @@ struct server_slot {
 
     std::vector<completion_token_output> generated_token_probs;
 
+    int32_t n_block_verify = 0; // [TAG_FN_L3_MTP_BLOCK] verify steps of this request decided by the block rule
+
     bool has_next_token = true;
     bool has_new_line   = false;
     bool truncated      = false;
@@ -1351,6 +1353,7 @@ struct server_slot {
         }
         generated_tokens.clear();
         generated_token_probs.clear();
+        n_block_verify = 0; // [TAG_FN_L3_MTP_BLOCK]
         json_schema = json();
 
         task_prev = std::move(task);
@@ -1688,6 +1691,9 @@ struct server_slot {
                     draft_ratio, n_draft_accepted, n_draft_total, mean_acc_len);
             SLT_TRC(*this,
                     "     acc per pos = (%s)\n", acceptance_rates_per_pos.c_str());
+            if (n_block_verify > 0) {
+                SLT_INF(*this, "[TAG_FN_L3_MTP_BLOCK] %d of %d verify steps by the block rule\n", n_block_verify, n_draft_verif_steps);
+            }
         }
 
         common_speculative_print_stats(spec);
@@ -6958,6 +6964,7 @@ private:
                     // [TAG_FN_L3_MTP_BLOCK] the block rule where it applies (no token probabilities to report)
                     if (spec_block_verify && slot.task->params.sampling.n_probs == 0) {
                         accepted = common_sampler_sample_and_accept_n_block(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft, slot.spec_draft_q);
+                        slot.n_block_verify += accepted.empty() ? 0 : 1;
                     }
                     if (accepted.empty()) {
                         accepted = common_sampler_sample_and_accept_n_rejection(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft, slot.spec_draft_q);
