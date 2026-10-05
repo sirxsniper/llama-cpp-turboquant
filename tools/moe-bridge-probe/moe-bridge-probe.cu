@@ -10,7 +10,8 @@
 // reports a timeout instead of hanging (far below the 2 s TDR). Stops at the first CUDA error.
 //
 //   moe-bridge-probe [--log E:/turbot-gates/flashnext/probe.log] [--pinned-mib 4096] [--stream-mib 8192]
-//                    [--threads 16] [--mask 0x55555555] [--quick] [--only rt|hostfn|memops|bw|bwcpu]
+//                    [--threads 16] [--mask 0x55555555] [--quick] [--only rt|hostfn|memops|bw|bwcpu|zc]
+//                    [--zc-file <gguf shard>] [--zc-mib 1024]   (zc: [TAG_FN_L3_CPU_ZC] test 6, only on request)
 //   moe-bridge-probe --selftest [--threads 8] [--experts 64] [--reps 4] [--quick]
 //                    [TAG_MOE_BRIDGE] the ggml bridge ops against the CPU MUL_MAT_ID chain (moe-bridge-selftest.cpp)
 
@@ -574,6 +575,119 @@ static void test_bw(size_t pinned_mib, size_t stream_mib, int n_threads, uint64_
     CK(cudaFreeHost(h));
 }
 
+// ---------------------------------------------------------------------------------------------------------------------
+// [TAG_FN_L3_CPU_ZC] 6. zero-copy device reads of a read-only file view (lever round 3, item 3): can the GPU read the
+// page-cache pages of a model shard in place (cudaHostRegister of a mapped view), how fast with SM loads over PCIe, and
+// how fast while CPU threads stream other memory (the combined DRAM read ceiling). The file is only read; nothing stays
+// registered after the test. Each kernel reads the view once (about 20 ms per GiB), far below the 2 s TDR.
+
+static __global__ void k_zc_sum(const uint4 * __restrict__ p, size_t n16, unsigned long long * __restrict__ out) {
+    unsigned long long s = 0;
+    for (size_t i = (size_t) blockIdx.x*blockDim.x + threadIdx.x; i < n16; i += (size_t) gridDim.x*blockDim.x) {
+        const uint4 v = p[i];
+        s += (unsigned long long) v.x + v.y + v.z + v.w;
+    }
+    atomicAdd(out, s);
+}
+
+static void test_zc(const std::string & path, size_t mib, size_t stream_mib, int n_threads, uint64_t mask, bool quick) {
+    say("\n== 6. zero-copy device reads of a read-only file view (%s, %zu MiB)\n", path.c_str(), mib);
+    int ro = 0, hp = 0, pma = 0;
+    cudaDeviceGetAttribute(&ro, cudaDevAttrHostRegisterReadOnlySupported, 0);
+    cudaDeviceGetAttribute(&hp, cudaDevAttrCanUseHostPointerForRegisteredMem, 0);
+    cudaDeviceGetAttribute(&pma, cudaDevAttrPageableMemoryAccess, 0);
+    say("  attributes: register read-only %d, host pointer usable %d, pageable memory access %d\n", ro, hp, pma);
+#ifdef _WIN32
+    HANDLE f = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f == INVALID_HANDLE_VALUE) {
+        say("  cannot open the file\n");
+        return;
+    }
+    LARGE_INTEGER fsz;
+    GetFileSizeEx(f, &fsz);
+    const size_t bytes = std::min<size_t>(mib << 20, (size_t) fsz.QuadPart) & ~(size_t) 0xFFFF;
+    HANDLE m = CreateFileMappingA(f, nullptr, PAGE_READONLY, 0, 0, nullptr);
+    const uint8_t * v = m ? (const uint8_t *) MapViewOfFile(m, FILE_MAP_READ, 0, 0, bytes) : nullptr;
+    if (v == nullptr || bytes == 0) {
+        say("  cannot map the file\n");
+        if (m) {
+            CloseHandle(m);
+        }
+        CloseHandle(f);
+        return;
+    }
+    unsigned long long cpu_sum = 0;
+    const uint32_t * w32 = (const uint32_t *) v;
+    for (size_t i = 0; i < bytes/4; ++i) {
+        cpu_sum += w32[i]; // also pages the view in
+    }
+    const double tr = now_s();
+    const cudaError_t e = cudaHostRegister((void *) v, bytes, cudaHostRegisterMapped | cudaHostRegisterPortable | (ro ? cudaHostRegisterReadOnly : 0));
+    say("  cudaHostRegister(%zu MiB view, read-only flag %d): %s (%.1f ms)\n", bytes >> 20, ro, cudaGetErrorString(e), (now_s() - tr)*1e3);
+    if (e != cudaSuccess) {
+        (void) cudaGetLastError();
+        UnmapViewOfFile(v);
+        CloseHandle(m);
+        CloseHandle(f);
+        say("  -> the device cannot read the file pages in place on this box: a zero-copy path needs its own pinned copy\n");
+        return;
+    }
+    void * dp = nullptr;
+    CK(cudaHostGetDevicePointer(&dp, (void *) v, 0));
+    say("  device pointer %s the host pointer\n", dp == (const void *) v ? "equals" : "differs from");
+    cudaDeviceProp prop;
+    CK(cudaGetDeviceProperties(&prop, 0));
+    unsigned long long * d_sum = nullptr;
+    CK(cudaMalloc(&d_sum, sizeof(unsigned long long)));
+    bool sum_ok = true;
+    auto gpu_read = [&](double secs) -> double {
+        double moved = 0.0;
+        const double t0 = now_s();
+        do {
+            CK(cudaMemset(d_sum, 0, sizeof(unsigned long long)));
+            k_zc_sum<<<prop.multiProcessorCount*4, 256>>>((const uint4 *) dp, bytes/16, d_sum);
+            CK(cudaGetLastError());
+            unsigned long long gs = 0;
+            CK(cudaMemcpy(&gs, d_sum, sizeof(gs), cudaMemcpyDeviceToHost));
+            sum_ok = sum_ok && gs == cpu_sum;
+            moved += (double) bytes;
+        } while (now_s() - t0 < secs);
+        return moved/(now_s() - t0)/1e9;
+    };
+    const double g_alone = gpu_read(quick ? 1.0 : 3.0);
+    say("  device zero-copy reads alone: %.1f GB/s, checksum %s\n", g_alone, sum_ok ? "equal" : "DIFFERENT");
+
+    const size_t rb = stream_mib << 20;
+    uint8_t * region = (uint8_t *) VirtualAlloc(nullptr, rb, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (region) {
+        memset(region, 2, rb);
+        streamer st;
+        st.base = region; st.bytes = rb; st.n_threads = n_threads; st.mask = mask;
+        double t0 = now_s();
+        st.start();
+        std::this_thread::sleep_for(std::chrono::milliseconds(quick ? 800 : 2000));
+        const double c_alone = st.join()/(now_s() - t0);
+        st.stop = false;
+        st.th.clear();
+        t0 = now_s();
+        st.start();
+        const double g_during = gpu_read(quick ? 1.5 : 4.0);
+        const double c_during = st.join()/(now_s() - t0);
+        say("  CPU alone %.1f GB/s; CPU during the device reads %.1f GB/s + device %.1f GB/s = %.1f GB/s combined (%d threads, mask 0x%llx), checksum %s\n",
+                c_alone, c_during, g_during, c_during + g_during, n_threads, (unsigned long long) mask, sum_ok ? "equal" : "DIFFERENT");
+        VirtualFree(region, 0, MEM_RELEASE);
+    }
+    CK(cudaFree(d_sum));
+    CK(cudaHostUnregister((void *) v));
+    UnmapViewOfFile(v);
+    CloseHandle(m);
+    CloseHandle(f);
+#else
+    (void) path; (void) mib; (void) stream_mib; (void) n_threads; (void) mask; (void) quick;
+    say("  (Windows only in this probe)\n");
+#endif
+}
+
 int moe_bridge_selftest(int argc, char ** argv); // [TAG_MOE_BRIDGE] moe-bridge-selftest.cpp
 
 int main(int argc, char ** argv) {
@@ -590,6 +704,8 @@ int main(int argc, char ** argv) {
     int responder_cpu = 30;
     bool quick = false;
     std::string only;
+    std::string zc_file = "D:/Projects/LocalAI/models/Qwen3.8-Flash-Next-UD-Q4_K_XL-MTP-00002-of-00005.gguf"; // [TAG_FN_L3_CPU_ZC]
+    size_t zc_mib = 1024;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto next = [&]() -> const char * { return i + 1 < argc ? argv[++i] : ""; };
@@ -601,6 +717,8 @@ int main(int argc, char ** argv) {
         else if (a == "--responder-cpu") { responder_cpu = atoi(next()); }
         else if (a == "--quick") { quick = true; }
         else if (a == "--only") { only = next(); }
+        else if (a == "--zc-file") { zc_file = next(); }
+        else if (a == "--zc-mib") { zc_mib = std::max<size_t>(64, std::min<size_t>(4096, strtoull(next(), nullptr, 10))); }
         else { printf("unknown argument %s\n", a.c_str()); return 1; }
     }
     if (pinned_mib < 64) {
@@ -622,6 +740,7 @@ int main(int argc, char ** argv) {
     if (only.empty() || only == "memops") { test_memops(responder_cpu); }
     if (only.empty() || only == "bw")     { test_bw(pinned_mib, stream_mib, n_threads, mask, false, quick); }
     if (only.empty() || only == "bwcpu")  { test_bw(pinned_mib, stream_mib, n_threads, mask, true, quick); }
+    if (only == "zc")                     { test_zc(zc_file, zc_mib, stream_mib, n_threads, mask, quick); } // [TAG_FN_L3_CPU_ZC]
 
     say("\nmoe-bridge-probe done. D4: in-graph hop <= 20 us -> spin bridge; 20-40 us -> build, expect the low end;"
         " > 40 us -> check the host-function hop, else stop at F4.\n");
