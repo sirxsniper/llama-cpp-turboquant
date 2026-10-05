@@ -5975,9 +5975,10 @@ void ggml_backend_cuda_limits(ggml_backend_t backend, size_t * stack, size_t * h
         CUDA_CHECK(cudaDeviceGetLimit(&s, cudaLimitStackSize));
         CUDA_CHECK(cudaDeviceGetLimit(&h, cudaLimitMallocHeapSize));
         CUDA_CHECK(cudaDeviceGetLimit(&f, cudaLimitPrintfFifoSize));
+        const int phys = ggml_cuda_get_physical_device(device);
         int n_sm = 0, n_thr = 0;
-        CUDA_CHECK(cudaDeviceGetAttribute(&n_sm,  cudaDevAttrMultiProcessorCount, device));
-        CUDA_CHECK(cudaDeviceGetAttribute(&n_thr, cudaDevAttrMaxThreadsPerMultiProcessor, device));
+        CUDA_CHECK(cudaDeviceGetAttribute(&n_sm,  cudaDevAttrMultiProcessorCount, phys));
+        CUDA_CHECK(cudaDeviceGetAttribute(&n_thr, cudaDevAttrMaxThreadsPerMultiProcessor, phys));
         t = (size_t) n_sm * (size_t) n_thr;
     }
     if (stack)   { *stack   = s; }
