@@ -100,3 +100,22 @@ lowered (not below 512 MiB) and then the prompt cache (0 below 256 MiB), so the 
 cache. `--cache-ram`, `--ctx-checkpoints` and `LLAMA_CTX_CHECKPOINT_BUDGET_MIB` given by the user are kept.
 `LLAMA_RAM_FIT=1` enables it for any model, `=0` disables it; `LLAMA_RAM_FIT_PCT` (85) and `LLAMA_RAM_FIT_CKPT_MIB`
 (512) tune it.
+
+## MTP draft switches of lever round 3 (`[TAG_FN_L3_MTP_*]`, off by default, not in any profile)
+
+For A/B runs on qwen4exp only; every other model ignores them (a warning says so).
+
+| Variable | Values | What it does |
+|---|---|---|
+| `SPEC_MTP_COST` | `2` | the draft length v2 (`[TAG_FN_L3_MTP_COST2]`, common/speculative-mtp-cost2.h): a verify row is priced by the cold experts the MoE bridge counts per step (k us per cold expert-layer, measured from the step-to-step variation at one width) plus a per-width row cost; a token is kept when its expected tokens pay for its row at the realized rate, and a further draft decode only when the expected next token pays for the decode. `1` is version 1 unchanged (the profile's value), `0` the fixed n_max / p_min rule. `SPEC_MTP_COST2_LOG=1` prints a summary every 256 policy steps and at the end |
+| `SPEC_MTP_PMIN_POS` | `p1,p2,...` | the p_min rule per draft position, the last value for the rest (`[TAG_FN_L3_MTP_CHAIN]`), e.g. `0.5,0.5,0.85` with `--spec-draft-n-max 3`: a third draft only when the drafter is confident. Applies wherever the rule decides (no cost policy, and the warm-up and probe steps of the policies) |
+| `LLAMA_MTP_HEAD_PROMPT` | `<n>` | with `LLAMA_MTP_HEAD_IDS` (or `_ROWS`): the drafts also score up to n tokens of each request's prompt that the draft vocabulary leaves out (`[TAG_FN_L3_MTP_HEADPROMPT]`, full head rows); verify is unchanged |
+
+- The third draft needs `--spec-draft-n-max 3`; the recurrent ring and the bridge follow it (n_rs_seq = n_max, +1 with
+  the bridge rollback ring), so 4-row verify graphs stay bridged.
+- MTP head experts at the trunk's own mix (recipe C, `[TAG_FN_R4_MTP_MIX]`): the file set
+  `Qwen3.8-Flash-Next-UD-Q4_K_XL-MTPmix-0000N-of-00005.gguf` (shards 2-4 hardlinked to the trunk, shard 5 = the head with
+  its 512 experts at q4_K / q4_K / q5_1, 1.03 GiB less VRAM, more of it for the hot set). Only drafts change. Its PLE copy
+  `<file>.ple` is a hardlink of file A's, so the first load copies nothing.
+- `LLAMA_MTP_ATTN_WINDOW` (32768 in the profile) and `LLAMA_MTP_HEAD_ROWS` (98304) stay as they are; `=0` turns either off
+  for an A/B arm.
