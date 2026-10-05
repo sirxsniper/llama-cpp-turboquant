@@ -27,6 +27,7 @@
 
 #include "llama-moe-gen5.h"
 #include "llama-moe-gen5-impl.h"
+#include "llama-moe-bridge.h" // [TAG_FN_L3_HOST_QUIET]
 
 #include "llama-impl.h"
 
@@ -325,6 +326,7 @@ void dma_filler_run(dma_state * s) {
             }
             s->f_running++;
         }
+        llama_moe_bridge_quiet_wait(100); // [TAG_FN_L3_HOST_QUIET] the fills are for later steps
         const dma_layer & L = s->layers[j.pos];
         uint8_t * dst = s->ring.ptr + (size_t) j.slot*s->slot_size;
         size_t o = 0;

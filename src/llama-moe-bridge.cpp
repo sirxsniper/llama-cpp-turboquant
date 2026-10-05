@@ -63,6 +63,25 @@ int env_int(const char * name, int def) {
 
 std::atomic<bool> g_bridge_owned{false};
 
+// [TAG_FN_L3_HOST_QUIET] the gate of the background host copies: closed while a bridged graph of a bridge with
+// LLAMA_FN_HOST_QUIET runs (busy under the mutex), statistics of the waits
+std::mutex              g_quiet_mtx;
+std::condition_variable g_quiet_cv;
+bool                    g_quiet_busy = false;
+std::atomic<bool>       g_quiet_on{false};
+std::atomic<uint64_t>   g_quiet_waits{0};
+std::atomic<uint64_t>   g_quiet_wait_us{0};
+
+void br_quiet_set(bool busy) {
+    {
+        std::lock_guard<std::mutex> lk(g_quiet_mtx);
+        g_quiet_busy = busy;
+    }
+    if (!busy) {
+        g_quiet_cv.notify_all();
+    }
+}
+
 } // namespace
 
 struct llama_moe_bridge {
@@ -115,6 +134,7 @@ struct llama_moe_bridge {
     // [TAG_FN_L3_HOST_DIAG] LLAMA_FN_HOST_DIAG=1|N (qwen4exp): host timing of the bridged graphs (steady clock, ns), a
     // line every diag_every graphs (N > 1, else 64)
     bool                 diag = false;
+    bool                 quiet = false; // [TAG_FN_L3_HOST_QUIET] LLAMA_FN_HOST_QUIET
     int64_t              diag_every = 64;
     std::atomic<int64_t> dg_t_begin{0};     // owner: begin() of the running graph
     std::atomic<bool>    dg_first{false};   // owner sets it in begin(), the executor clears it at the graph's first post
@@ -454,6 +474,10 @@ static void br_destroy(llama_moe_bridge * br) {
     if (br->gb && br->fn_release) {
         br->fn_release(br->gb); // [TAG_FN_R4_BRIDGE_DMA] no device wait or fetch of this bridge keeps spinning
     }
+    if (br->quiet) { // [TAG_FN_L3_HOST_QUIET] no background copy waits for this bridge any more
+        g_quiet_on.store(false);
+        br_quiet_set(false);
+    }
     if (br->exec.joinable()) { // spin mode: the executor frees its pool
         br->stop.store(true, std::memory_order_seq_cst);
         {
@@ -775,6 +799,12 @@ llama_moe_bridge * llama_moe_bridge_create(const llama_model & model, int n_thre
         br->diag_every = dv > 1 ? dv : 64;
         LLAMA_LOG_INFO("%s: [TAG_FN_L3_HOST_DIAG] bridge host timing every %" PRId64 " bridged graphs\n", __func__, br->diag_every);
     }
+    if (llama_fn_l3_flag(model, "LLAMA_FN_HOST_QUIET")) { // [TAG_FN_L3_HOST_QUIET]
+        br->quiet = true;
+        g_quiet_on.store(true);
+        LLAMA_LOG_INFO("%s: [TAG_FN_L3_HOST_QUIET] the hot set's uploads and the DMA ring's fills wait while a bridged graph "
+                "runs and copy between graphs\n", __func__);
+    }
 
     if (br->mode == GGML_MOE_BRIDGE_WAIT_HOSTFUNC) {
         br->pool = br->pool_new(&br->pool_params); // run by the driver's callback thread, which keeps its affinity
@@ -801,6 +831,22 @@ llama_moe_bridge * llama_moe_bridge_create(const llama_model & model, int n_thre
 
 void llama_moe_bridge_free(llama_moe_bridge * br) {
     br_destroy(br);
+}
+
+// [TAG_FN_L3_HOST_QUIET]
+void llama_moe_bridge_quiet_wait(int max_ms) {
+    if (!g_quiet_on.load(std::memory_order_relaxed)) {
+        return;
+    }
+    std::unique_lock<std::mutex> lk(g_quiet_mtx);
+    if (!g_quiet_busy) {
+        return;
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    g_quiet_cv.wait_for(lk, std::chrono::milliseconds(std::max(1, max_ms)), [] { return !g_quiet_busy || !g_quiet_on.load(); });
+    g_quiet_waits.fetch_add(1, std::memory_order_relaxed);
+    g_quiet_wait_us.fetch_add((uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count(),
+            std::memory_order_relaxed);
 }
 
 // [TAG_FN_R4_BRIDGE_DMA]
@@ -922,6 +968,9 @@ void llama_moe_bridge_begin(llama_moe_bridge * br, bool used) {
             std::lock_guard<std::mutex> lk(br->graph_mtx);
             br->in_graph = true;
         }
+        if (br->quiet) {
+            br_quiet_set(true); // [TAG_FN_L3_HOST_QUIET]
+        }
         br->parked.store(false, std::memory_order_relaxed);
         br->wake_gen.fetch_add(1, std::memory_order_seq_cst);
         if (br->n_sleeping.load(std::memory_order_seq_cst) > 0) {
@@ -948,6 +997,9 @@ bool llama_moe_bridge_end(llama_moe_bridge * br) {
     {
         std::lock_guard<std::mutex> lk(br->graph_mtx); // waits for an observer call in progress
         br->in_graph = false;
+    }
+    if (br->quiet) {
+        br_quiet_set(false); // [TAG_FN_L3_HOST_QUIET]
     }
     br->n_graphs++;
     const uint32_t err = br->fn_error(br->gb);
@@ -1015,6 +1067,11 @@ bool llama_moe_bridge_end(llama_moe_bridge * br) {
             LLAMA_LOG_INFO("%s: MoE bridge %d: [TAG_FN_R2_BRIDGE_PF] %" PRIu64 " prefetches, %.1f%% stopped by the next job, "
                     "%.2f predicted cold experts and %.2f MiB per prefetch\n", __func__, br->bid, pj, pj ? 100.0*ps/pj : 0.0,
                     pj ? (double) pe/pj : 0.0, pj ? pb/1048576.0/pj : 0.0);
+            if (br->quiet) { // [TAG_FN_L3_HOST_QUIET]
+                const uint64_t qw = g_quiet_waits.load();
+                LLAMA_LOG_INFO("%s: MoE bridge %d: [TAG_FN_L3_HOST_QUIET] background copies waited %" PRIu64 " times for a "
+                        "bridged graph, %.1f ms in total\n", __func__, br->bid, qw, g_quiet_wait_us.load()/1e3);
+            }
             if (br->exec_on) { // [TAG_FN_L3_HOST_EXEC]
                 uint64_t cc = 0, cs = 0, cb = 0;
                 br->pool_pfc_stats(br->pool, &cc, &cs, &cb);
