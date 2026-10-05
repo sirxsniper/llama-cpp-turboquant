@@ -1326,6 +1326,20 @@ ggml_backend_buffer_t hot_vmm_place(moe_cache * mc, ggml_context * ctx_d, ggml_b
             return nullptr;
         }
     }
+    // every slot tensor of a layer below the tail ends below it and every tail layer's starts in it (a slot tensor shared
+    // by layers on both sides, e.g. a shape-class pool, would lose its VRAM under a layer that still reads it)
+    for (size_t i = 0; i < n; ++i) {
+        const layer_state & ls = mc->layers[li0 + i];
+        for (const ggml_tensor * t : { ls.pub.up_c, ls.pub.gate_c, ls.pub.down_c }) {
+            const uint8_t * p = (const uint8_t *) t->data;
+            const bool ok = i < (size_t) k ? p + tsize(t) <= base + lo : p >= base + lo && p + tsize(t) <= base + total;
+            if (!ok) {
+                LLAMA_LOG_WARN("moe-hot: [TAG_FN_L3_VRAM_CBUF] %s crosses the tail boundary - no tail\n", t->name);
+                ggml_backend_buffer_free(buf);
+                return nullptr;
+            }
+        }
+    }
     ggml_init_params ip = { ggml_tensor_overhead()*2, nullptr, true };
     ggml_context * cctx = ggml_init(ip);
     if (!cctx) {
