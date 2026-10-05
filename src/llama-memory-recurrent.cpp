@@ -7,6 +7,7 @@
 #include "llama-model.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <cstring>
 #include <limits>
@@ -55,12 +56,18 @@ static bool llama_xseq_fix_enabled() {
 // Prefill: [TAG_GDN_CHUNKED_PF] a long ubatch runs its first T - n_w tokens on the chunked kernel and the last n_w on the
 //   replay op, with the same committed state and ring layout (design note in src/models/delta-net-base.cpp).
 // Cost: the kernel runs up to n_rs_seq extra state-only token steps and writes 1 state per cell instead of K.
+static std::atomic<bool> g_rs_nw_full{false}; // [TAG_FN_R1_BRIDGE_RB]
+
+void llama_rs_set_nw_full(bool full) {
+    g_rs_nw_full.store(full, std::memory_order_relaxed);
+}
+
 uint32_t llama_rs_n_w(uint32_t n_seq_tokens, uint32_t n_rs_seq) {
     static const bool cap = [] {
         const char * e = getenv("GDN_NW_CAP");
         return !(e && e[0] == '0' && e[1] == '\0');
     }();
-    if (cap && n_seq_tokens >= 2) {
+    if (cap && !g_rs_nw_full.load(std::memory_order_relaxed) && n_seq_tokens >= 2) {
         return std::min(n_seq_tokens - 1, n_rs_seq);
     }
     return std::min(n_seq_tokens, n_rs_seq);

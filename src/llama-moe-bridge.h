@@ -15,10 +15,14 @@
 //   LLAMA_MOE_BRIDGE_TIMEOUT_MS=500       a device wait gives up after this long if the host has not taken the job
 //                                         ([TAG_FN_R1_BRIDGE_RETRY] was 50, and a cold start missed it). The context
 //                                         then rolls the ubatch back and computes it again without the bridge when the
-//                                         memory can drop the whole ubatch (attention caches; a recurrent state only
-//                                         for a 1-token decode), else the ubatch fails as below
+//                                         memory can drop the whole ubatch (attention caches always; a recurrent state
+//                                         with [TAG_FN_R1_BRIDGE_RB]), else the ubatch fails as below
+//   LLAMA_MOE_BRIDGE_RB=0                 [TAG_FN_R1_BRIDGE_RB] (on by default with speculative decoding on a hybrid
+//                                         model) off: no extra ring token, the bridge keeps graphs up to MAX_T, and a
+//                                         failed bridged verify ubatch fails (its recurrent state cannot roll back)
 //   LLAMA_MOE_BRIDGE_JOB_MAX_MS=1000        ... or after this long once it has (slow job); either way the ubatch fails
-//                                         (decode returns an error, its memory is rolled back) and the bridge pauses
+//                                         (and is computed again as above) and the bridge pauses 16 steps; 3 errors
+//                                         within 1024 bridged graphs turn it off for the context
 //   LLAMA_MOE_BRIDGE_MAX_T=8              largest graph width that uses it (1..16)
 //   LLAMA_MOE_BRIDGE_THREADS=<n>          pool threads including the executor (default: the context's n_threads)
 //   LLAMA_MOE_BRIDGE_CPUMASK=<hex>        pool CPUs (default: one per physical core, except the first core)
@@ -37,8 +41,9 @@ struct llama_model;
 struct ggml_tensor;
 struct llama_moe_bridge;
 
-// nullptr when disabled or not possible here (the reason is logged)
-llama_moe_bridge * llama_moe_bridge_create(const llama_model & model, int n_threads);
+// nullptr when disabled or not possible here (the reason is logged). max_t_cap > 0: graphs wider than that never take
+// the bridge ([TAG_FN_R1_BRIDGE_RB]: the widest ubatch the recurrent ring can roll back whole)
+llama_moe_bridge * llama_moe_bridge_create(const llama_model & model, int n_threads, int max_t_cap = 0);
 void               llama_moe_bridge_free(llama_moe_bridge * br);
 
 // [TAG_FN_R4_BRIDGE_DMA] LLAMA_MOE_BRIDGE_DMA=1 (with LLAMA_MOE_DMA_SHARE=<share>|auto): after llama_moe_gen5_init (bridge

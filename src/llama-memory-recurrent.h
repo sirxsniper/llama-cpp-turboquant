@@ -13,6 +13,11 @@
 // A 4-token verify step with n_rs_seq 7 then does the n_rs_seq 3 work. GDN_NW_CAP=0: min(T, n_rs_seq) (old).
 uint32_t llama_rs_n_w(uint32_t n_seq_tokens, uint32_t n_rs_seq);
 
+// [TAG_FN_R1_BRIDGE_RB] process-wide: the ring keeps every token of a ubatch (n_w = min(T, n_rs_seq), no [TAG_GDN_NW_CAP]
+// T - 1), so a ubatch of up to n_rs_seq tokens can be rolled back whole (the MoE bridge's retry after a failed ubatch).
+// Set by the llama_context constructor before any memory or graph exists; GDN_NW_CAP=0 has the same effect.
+void llama_rs_set_nw_full(bool full);
+
 //
 // llama_memory_recurrent
 //

@@ -1038,6 +1038,26 @@ llama_context::llama_context(
         cparams.n_rs_seq = 0;
     }
 
+    // [TAG_FN_R1_BRIDGE_RB] a MoE bridge fails a ubatch when its host side misses the device's deadline (page-ins after a
+    // long prefill, a starved executor), and decode() computes it again only if the memory can drop the whole ubatch. A
+    // speculative verify ubatch is n_rs_seq + 1 tokens and the ring kept T - 1 of them, so a recurrent state refused.
+    // With the bridge on: one more ring token and a ring that keeps every token of a ubatch (llama_rs_set_nw_full), and
+    // the bridge takes graphs of at most n_rs_seq tokens - every bridged ubatch rolls back. The cost is one more
+    // replayed state-only token per step. LLAMA_MOE_BRIDGE_RB=0 keeps the old ring (a failure then fails the ubatch).
+    bool bridge_rb = false;
+    {
+        const char * eb = getenv("LLAMA_MOE_BRIDGE");
+        const char * er = getenv("LLAMA_MOE_BRIDGE_RB");
+        if (cparams.n_rs_seq > 0 && eb && atoi(eb) > 0 && !(er && er[0] == '0')) {
+            cparams.n_rs_seq += 1;
+            llama_rs_set_nw_full(true);
+            bridge_rb = true;
+            LLAMA_LOG_INFO("%s: [TAG_FN_R1_BRIDGE_RB] MoE bridge on: the recurrent ring keeps whole ubatches of up to %u "
+                    "tokens (n_rs_seq + 1), so a failed bridged ubatch is rolled back and computed again\n", __func__,
+                    cparams.n_rs_seq);
+        }
+    }
+
     cparams.n_threads               = params.n_threads;
     cparams.n_threads_batch         = params.n_threads_batch;
     cparams.yarn_ext_factor         = params.yarn_ext_factor  >= 0.0f ? params.yarn_ext_factor  : hparams.yarn_ext_factor;
@@ -1443,7 +1463,7 @@ llama_context::llama_context(
         }
 
         // [TAG_MOE_BRIDGE] LLAMA_MOE_BRIDGE=1: before the reserve, so decode graphs are reserved with the bridge ops
-        moe_bridge = llama_moe_bridge_create(model, (int) cparams.n_threads);
+        moe_bridge = llama_moe_bridge_create(model, (int) cparams.n_threads, bridge_rb ? (int) cparams.n_rs_seq : 0);
 
         // [TAG_MOE_DMA_SHARE] [TAG_FN_PREFILL_STREAM] before the reserve: the graphs it builds use the gen5 banks
         // [TAG_FN_MERGE] with a host bridge the DMA share / prefetch stay off (they need the CPU split the bridge removes)
@@ -3396,7 +3416,8 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         // compute it once more: the bridge pauses after a failure, so the retry runs the plain graph (the CPU split).
         // Without this the caller got a compute error for a transient stall - llama-server dropped the whole slot.
         // The rollback needs a memory that can drop the whole ubatch: an attention cache always can, a recurrent state
-        // only the tokens its ring keeps (a 1-token decode, not a 3-token speculative verify ubatch with n_rs_seq 2).
+        // only the tokens its ring keeps - every bridged ubatch with [TAG_FN_R1_BRIDGE_RB] (the constructor), else a
+        // 1-token decode but not a 3-token speculative verify ubatch (n_rs_seq 2 keeps 2 of its tokens).
         // When it refuses (a refused seq_rm changes nothing; the failure path below removes the same ranges again) the
         // ubatch fails as before.
         if (!res && moe_bridge_failed) {

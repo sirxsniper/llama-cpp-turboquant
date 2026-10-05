@@ -140,6 +140,7 @@ struct llama_moe_bridge {
     int      n_errors   = 0;
     int      pause_left = 0;
     uint64_t n_graphs   = 0;
+    uint64_t err_graph  = 0; // [TAG_FN_R1_BRIDGE_RB] n_graphs at the last error
 
     // job statistics (runner thread)
     std::atomic<uint64_t> n_jobs{0};
@@ -382,7 +383,7 @@ static void br_destroy(llama_moe_bridge * br) {
     g_bridge_owned.store(false);
 }
 
-llama_moe_bridge * llama_moe_bridge_create(const llama_model & model, int n_threads) {
+llama_moe_bridge * llama_moe_bridge_create(const llama_model & model, int n_threads, int max_t_cap) {
     if (env_int("LLAMA_MOE_BRIDGE", 0) <= 0) {
         return nullptr;
     }
@@ -504,6 +505,10 @@ llama_moe_bridge * llama_moe_bridge_create(const llama_model & model, int n_thre
     const char * wm = getenv("LLAMA_MOE_BRIDGE_WAIT");
     br->mode       = wm && strcmp(wm, "hostfunc") == 0 ? GGML_MOE_BRIDGE_WAIT_HOSTFUNC : GGML_MOE_BRIDGE_WAIT_SPIN;
     br->max_t      = std::min(16, std::max(1, env_int("LLAMA_MOE_BRIDGE_MAX_T", 8)));
+    if (max_t_cap > 0 && br->max_t > max_t_cap) {
+        // [TAG_FN_R1_BRIDGE_RB] wider graphs (a prompt's last few tokens) run the plain CPU split
+        br->max_t = max_t_cap;
+    }
     br->spin_us    = std::max(0, env_int("LLAMA_MOE_BRIDGE_SPIN_US", 2000));
     br->timeout_ms = std::min(1200, std::max(1, env_int("LLAMA_MOE_BRIDGE_TIMEOUT_MS", 500))); // [TAG_FN_R1_BRIDGE_RETRY]
     br->job_max_ms = std::min(1200, std::max(br->timeout_ms, env_int("LLAMA_MOE_BRIDGE_JOB_MAX_MS", 1000)));
@@ -765,6 +770,12 @@ bool llama_moe_bridge_end(llama_moe_bridge * br) {
     ggml_moe_bridge_stats s;
     br->fn_get_stats(br->gb, &s);
     const int il = s.error_chan >= 0 && s.error_chan < (int) br->chans.size() ? br->chans[s.error_chan].il : -1;
+    // [TAG_FN_R1_BRIDGE_RB] errors far apart are transient stalls whose ubatch was computed again: only 3 within 1024
+    // bridged graphs turn the bridge off for the rest of the context (a host side that keeps failing)
+    if (br->n_graphs - br->err_graph > 1024) {
+        br->n_errors = 0;
+    }
+    br->err_graph = br->n_graphs;
     br->n_errors++;
     br->active     = false;
     br->pause_left = 16;
