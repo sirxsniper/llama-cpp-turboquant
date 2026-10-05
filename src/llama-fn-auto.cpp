@@ -58,7 +58,7 @@ const fn_item k_items[] = {
 
     // [TAG_FN_SHIP1] lever round 1 (see above). Lookups (llama_fn_env), never put into the environment:
     { "LLAMA_MOE_HOT_HEADROOM_MIB",   "1280",  P_ALL }, // the 768 default went over 28,500 MiB at depth (28,622)
-    { "LLAMA_MOE_HOT_DECAY",          "0.92",  P_ALL }, // decayed hot set (bs3: without it -2.5 % code, -3.4 % prose)
+    { "LLAMA_MOE_HOT_DECAY",          "0.95",  P_ALL }, // [TAG_FN_L3_ADOPT] 0.92 until lever round 3 (L3P_nopool) // decayed hot set (bs3: without it -2.5 % code, -3.4 % prose)
     { "LLAMA_MOE_HOT_SEED",           "0.03",  P_ALL },
     { "LLAMA_PLE_DIO_FILE",           "",      P_ALL }, // set at load: <model>.ple (the unmapped PLE table copy)
     // read with getenv() elsewhere, so they are in the environment while the model is loaded:
@@ -86,13 +86,40 @@ const fn_item k_items[] = {
     { "TURBO_QSA_CHUNK",              "512",   P_ALL },
     { "TURBO_QSA_SPARSE",             "1",     P_ALL },
     { "TURBO_QSA_TOPK_UNORDERED",     "1",     P_ALL },
-    { "SPEC_MTP_COST",                "1",     P_ALL },
+    { "SPEC_MTP_COST",                "2",     P_ALL }, // [TAG_FN_L3_ADOPT] draft length v2 [TAG_FN_L3_MTP_COST2] (1 until round 3)
     { "LLAMA_MTP_ATTN_WINDOW",        "32768", P_ALL },
     { "LLAMA_MTP_HEAD_ROWS",          "98304", P_ALL },
     { "SPEC_DFT_UBATCH",              "128",   P_ALL }, // the MTP draft context's ubatch (its logits buffer at -ub 8192)
     { "LLAMA_PREFILL_STREAM",         "1",     P_ALL },
     { "LLAMA_PREFILL_STREAM_LEND",    "1",     P_ALL },
     { "LLAMA_PREFILL_STREAM_THREADS", "16",    P_ALL },
+    // [TAG_FN_L3_ADOPT] lever round 3 (flashnext/int-l3): ALL-ON against the shipped default at -c 262144, turbot, MTP,
+    // 2 interleaved rounds: real use +19.5 % (70.5 vs 59.0 t/s, the SHIP round without a stall; +30.7 % over both rounds); see
+    // E:/turbot-gates/flashnext/test/l3/int/REPORT.md
+    { "LLAMA_FN_CBUF",               "1",     P_ALL }, // compute-buffer lend to the hot set [TAG_FN_L3_VRAM_CBUF]
+    { "LLAMA_MOE_HOT_DECAY_RATIO",   "1.5",   P_ALL }, // L3P_nopool policy [TAG_FN_L3_POLICY_BURST]
+    { "LLAMA_MOE_HOT_DECAY_HYST",    "1.0",   P_ALL },
+    { "LLAMA_MOE_HOT_DECAY_MIB",     "64",    P_ALL },
+    { "LLAMA_MOE_HOT_BURST_MIB",     "512",   P_ALL },
+    { "LLAMA_MOE_HOT_BURST_RATIO",   "2",     P_ALL },
+    { "LLAMA_FN_GPU",                "1",     P_ALL }, // device levers [TAG_FN_L3_GPU]
+    { "LLAMA_FN_GPU_IDXQ8",          "0",     P_ALL }, // FAULT 2026-10-05 22:06:26 (memcheck OOB read in the fused indexer): left off
+    { "LLAMA_FN_GPU_DEFER",          "0",     P_ALL }, // DEFER / CONVWB / HCFUSE / Q8F: not bitwise in the model (greedy identity, first diff at token 47): left off
+    { "LLAMA_FN_GPU_CONVWB",         "0",     P_ALL },
+    { "LLAMA_FN_GPU_HCFUSE",         "0",     P_ALL },
+    { "LLAMA_FN_GPU_Q8F",            "0",     P_ALL },
+    { "LLAMA_FN_HOST_EXEC",          "1",     P_BR  }, // host levers [TAG_FN_L3_HOST]
+    { "LLAMA_FN_HOST_STEP",          "1",     P_ALL },
+    { "LLAMA_FN_HOST_QOS",           "1",     P_ALL },
+    { "LLAMA_FN_HOST_POKE",          "1",     P_ALL },
+    { "LLAMA_FN_HOST_REARM",         "1",     P_BR  }, // a bridge off after 3 errors comes back with back-off [TAG_FN_L3_HOST_REARM]
+    { "LLAMA_FN_HOST_DMAOFF",        "1",     P_BR  }, // no DMA share [TAG_FN_L3_HOST_DMAOFF]
+    { "SPEC_MTP_BLOCK_VERIFY",       "1",     P_ALL }, // block verification of sampled drafts [TAG_FN_L3_MTP_BLOCK]
+    { "LLAMA_MOE_POOL_SPLIT",        "steal", P_BR  }, // CPU pool levers [TAG_FN_L3_CPU] (LLAMA_MOE_BRIDGE_PF_DEV stays off: FAULT 21:21:24)
+    { "LLAMA_MOE_POOL_PF_STREAMS",   "4",     P_BR  },
+    { "LLAMA_MOE_POOL_SWPF",         "2",     P_BR  },
+    { "LLAMA_MOE_BRIDGE_PF_RANK",    "1",     P_BR  },
+    { "LLAMA_MOE_POOL_EXEC_CPU",     "1",     P_BR  },
 };
 
 // names the fn-auto aware code reads through llama_fn_env(): never put into the environment
