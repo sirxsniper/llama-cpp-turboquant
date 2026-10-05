@@ -131,6 +131,7 @@ bool         llama_fn_active(const llama_model & model);
 //                            own caches between two jobs, until the next job is posted (it watches the next ring word)
 //   LLAMA_FN_HOST_STEP=1     [TAG_FN_L3_HOST_STEP] the hot set's and the DMA ring's step after each decode of their
 //                            owner run on a helper thread, joined at that context's next decode / reserve / free
+//                            (inline while the hot set holds an MTP block layer: the draft context reads those)
 //   LLAMA_FN_HOST_LAUNCH2=N  [TAG_FN_L3_HOST_LAUNCH2] the scheduler starts a second split after layer N's output
 //                            (l_last-N, 0 <= N < n_layer - 1): two device graph launches per step, the first runs while
 //                            the host launches the second
