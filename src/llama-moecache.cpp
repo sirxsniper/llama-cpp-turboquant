@@ -2162,7 +2162,7 @@ size_t llama_moe_hot_cbuf_release(const void * owner) {
         }
     }
     hot_drain_out(mc);
-    mc->cb_async_left = 0; // what the asynchronous refill had not uploaded yet was dropped (those slots stay empty)
+    mc->cb_async_left = 0; // the refill jobs not uploaded yet were dropped; their slots keep the expert for the next restore
     for (auto & ls : mc->layers) {
         if (ls.cb_lent) {
             hot_write_tables(mc, ls);
