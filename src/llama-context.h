@@ -411,6 +411,8 @@ private:
 
     // [TAG_MOE_BRIDGE] LLAMA_MOE_BRIDGE=1: the host doorbell of the host-resident expert layers (llama-moe-bridge.h)
     struct llama_moe_bridge * moe_bridge = nullptr;
+    bool     moe_bridge_failed = false; // [TAG_FN_R1_BRIDGE_RETRY] the last process_ubatch failed in the bridge
+    uint64_t n_bridge_retry    = 0;     // [TAG_FN_R1_BRIDGE_RETRY] ubatches computed again after a bridge failure
 
     // [TAG_FN_VRAM_FIT] the hot set waits for the first decode after every context of the model exists (the MTP draft
     // context is created after this one), then takes what the model, KV, compute buffers and draft context left

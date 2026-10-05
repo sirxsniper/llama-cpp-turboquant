@@ -87,7 +87,7 @@ struct llama_moe_bridge {
     int     n_used     = 0;
     int64_t n_embd     = 0;
     int     spin_us    = 2000;
-    int     timeout_ms = 50;
+    int     timeout_ms = 500; // [TAG_FN_R1_BRIDGE_RETRY] was 50: a cold start missed it
     int     job_max_ms = 1000;
     bool    stats      = false;
     int     max_fetch  = 0;     // [TAG_FN_R4_BRIDGE_DMA] experts per fetch the device side was made for (0: no fetch)
@@ -505,7 +505,7 @@ llama_moe_bridge * llama_moe_bridge_create(const llama_model & model, int n_thre
     br->mode       = wm && strcmp(wm, "hostfunc") == 0 ? GGML_MOE_BRIDGE_WAIT_HOSTFUNC : GGML_MOE_BRIDGE_WAIT_SPIN;
     br->max_t      = std::min(16, std::max(1, env_int("LLAMA_MOE_BRIDGE_MAX_T", 8)));
     br->spin_us    = std::max(0, env_int("LLAMA_MOE_BRIDGE_SPIN_US", 2000));
-    br->timeout_ms = std::min(1200, std::max(1, env_int("LLAMA_MOE_BRIDGE_TIMEOUT_MS", 50)));
+    br->timeout_ms = std::min(1200, std::max(1, env_int("LLAMA_MOE_BRIDGE_TIMEOUT_MS", 500))); // [TAG_FN_R1_BRIDGE_RETRY]
     br->job_max_ms = std::min(1200, std::max(br->timeout_ms, env_int("LLAMA_MOE_BRIDGE_JOB_MAX_MS", 1000)));
     br->stats      = env_int("LLAMA_MOE_BRIDGE_STATS", 0) > 0;
     br->stall_ms    = std::max(0, env_int("LLAMA_MOE_BRIDGE_TEST_STALL", 0));

@@ -2746,6 +2746,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     }
 
     llama_moe_bridge_step(moe_bridge); // [TAG_MOE_BRIDGE] re-arm a paused bridge before the graph parameters are taken
+    moe_bridge_failed = false;         // [TAG_FN_R1_BRIDGE_RETRY]
 
     // [TAG_FN_R1_PFS_LEND] a prompt ubatch borrows the prefill stream's banks from the hot set, a decode gives them back
     // first; a graph built under the other state is never reused (its MoE reads the banks or the op offload)
@@ -2871,6 +2872,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     if (moe_bridge_used) {
         ggml_backend_sched_synchronize(sched.get());
         if (!llama_moe_bridge_end(moe_bridge)) {
+            moe_bridge_failed = true; // [TAG_FN_R1_BRIDGE_RETRY]
             ret = GGML_STATUS_FAILED;
             return nullptr;
         }
@@ -3388,6 +3390,38 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
         // [TAG_TURBOT] the tier of a turbot attention cache: demotion only after a successful ubatch (SPEC 9.6)
         llama_kv_cache * turbot_kv = llama_turbot_kv_of(memory.get());
+
+        // [TAG_FN_R1_BRIDGE_RETRY] the bridge's host side missed its deadline (a cold start: page faults, a starved
+        // executor), so the ubatch carries zeros and failed. Roll it back exactly as the failure path below does, then
+        // compute it once more: the bridge pauses after a failure, so the retry runs the plain graph (the CPU split).
+        // Without this the caller got a compute error for a transient stall - llama-server dropped the whole slot.
+        if (!res && moe_bridge_failed) {
+            if (turbot_kv) {
+                turbot_kv->turbot_abort_ubatch();
+            }
+            llama_pos pos_min_r[LLAMA_MAX_SEQ];
+            for (int s = 0; s < LLAMA_MAX_SEQ; ++s) {
+                pos_min_r[s] = std::numeric_limits<llama_pos>::max();
+            }
+            for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+                const auto & seq_id = ubatch.seq_id[i][0];
+                pos_min_r[seq_id] = std::min(pos_min_r[seq_id], ubatch.pos[i]);
+            }
+            bool rolled = true;
+            for (int s = 0; s < LLAMA_MAX_SEQ; ++s) {
+                if (pos_min_r[s] != std::numeric_limits<llama_pos>::max()) {
+                    rolled = memory->seq_rm(s, pos_min_r[s], -1) && rolled;
+                }
+            }
+            n_bridge_retry++;
+            LLAMA_LOG_WARN("%s: [TAG_FN_R1_BRIDGE_RETRY] the bridge failed this ubatch of %u tokens (%s rolled back); "
+                    "computing it again without the bridge (retry %" PRIu64 ")\n", __func__, ubatch.n_tokens,
+                    rolled ? "" : "NOT", n_bridge_retry);
+            if (rolled) {
+                gf_res_prev_active = nullptr; // never reuse the bridged graph
+                res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
+            }
+        }
 
         if (turbot_kv && res && llama_turbot_fail_ubatch_hit()) {
             LLAMA_LOG_WARN("%s: LLAMA_TURBOT_FAIL_UBATCH: reporting this ubatch as failed\n", __func__);
