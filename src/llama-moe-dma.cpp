@@ -1175,6 +1175,14 @@ int llama_moe_dma_bridge_plan(void * handle, const int32_t * ids, int n_used, in
     const int64_t n_exp = L->n_expert;
     auto is_hot = [&](int32_t e) { return hot_tbl && hot_tbl[e] != hot_miss; };
 
+    // [TAG_FN_R4_REVIEW] the layer's hot table for the step boundary: dma_step_impl drops the ring entries of experts that
+    // became hot and keeps hot experts out of the warm start through L.is_hot, which reads the table a plan node sets in
+    // the CPU-split mode (llama_moe_dma_build_plan). Bridge mode has no plan node, so without this every layer's table
+    // stayed null: the warm start queued the profile's best experts - the hot ones - and hot experts kept their ring
+    // slots. The owner reads it only after the bridged graph synced (the plan runs under the bridge's graph_mtx).
+    L->hot_tbl  = hot_tbl;
+    L->hot_miss = hot_miss;
+
     // unique routed experts and tokens per expert, in routing order; the cold ones feed the ring admission
     auto & tok    = L->s_tok;
     auto & uniq   = L->s_uniq;
