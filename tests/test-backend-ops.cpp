@@ -16539,6 +16539,8 @@ static bool run_cpu_fn_moe_fuse(ggml_backend_t backend, ggml_backend_t backend_r
     using pool_pf_stats_t = void (*)(ggml_cpu_moe_pool *, uint64_t *, uint64_t *, uint64_t *, uint64_t *);
     auto pool_pf       = (pool_pf_t)       ggml_backend_reg_get_proc_address(reg, "ggml_cpu_moe_prefetch");
     auto pool_pf_stats = (pool_pf_stats_t) ggml_backend_reg_get_proc_address(reg, "ggml_cpu_moe_prefetch_stats");
+    using pool_set_solo_t = void (*)(ggml_cpu_moe_pool *, bool);
+    auto pool_set_solo = (pool_set_solo_t) ggml_backend_reg_get_proc_address(reg, "ggml_cpu_moe_pool_set_solo");
     const int saved_fuse = get_sw(GGML_CPU_FN_MOE_FUSE);
     const int saved_mr   = get_sw(GGML_CPU_FN_MMID_MR);
 
@@ -16693,7 +16695,17 @@ static bool run_cpu_fn_moe_fuse(ggml_backend_t backend, ggml_backend_t backend_r
                         const bool r1 = pool_run(pool, &job) == GGML_STATUS_SUCCESS;
                         const bool p2 = pool_pf(pool, &pjob) == GGML_STATUS_SUCCESS;
                         job.out = out_f2.data();
-                        const bool r2 = pool_run(pool, &job) == GGML_STATUS_SUCCESS;
+                        bool r2 = false;
+                        if (pool_set_solo && T % 2 == 1) {
+                            // solo: the workers alone compute the job, after a prefetch split the same way
+                            pool_set_solo(pool, true);
+                            const bool p2s = pool_pf(pool, &pjob) == GGML_STATUS_SUCCESS;
+                            r2 = p2s && pool_run(pool, &job) == GGML_STATUS_SUCCESS;
+                            pool_set_solo(pool, false);
+                            pj0 += 1; // a third prefetch is counted
+                        } else {
+                            r2 = pool_run(pool, &job) == GGML_STATUS_SUCCESS;
+                        }
                         pool_pf_stats(pool, &pj1, nullptr, nullptr, nullptr);
                         ran_f = p1 && r1 && p2 && r2 && pj1 == pj0 + 2;
                     }

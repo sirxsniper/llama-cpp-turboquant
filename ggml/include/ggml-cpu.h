@@ -222,6 +222,10 @@ extern "C" {
     };
     GGML_BACKEND_API enum ggml_status ggml_cpu_moe_prefetch     (struct ggml_cpu_moe_pool * pool, const struct ggml_cpu_moe_prefetch_job * job);
     GGML_BACKEND_API void             ggml_cpu_moe_prefetch_stop(struct ggml_cpu_moe_pool * pool);
+    // [TAG_FN_R2_BRIDGE_PF] solo: the caller stays out of ggml_cpu_moe_run's compute (it waits) and the workers split the
+    // job, as they split a prefetch, so every worker computes exactly the pieces it pulled into its own caches. The values
+    // are the same (the kernel's do not depend on the thread count). Needs >= 2 pool threads; caller thread only.
+    GGML_BACKEND_API void             ggml_cpu_moe_pool_set_solo(struct ggml_cpu_moe_pool * pool, bool solo);
     // totals since the pool was made: prefetch jobs, jobs stopped before their end, bytes covered, experts predicted
     // (not resident)
     GGML_BACKEND_API void             ggml_cpu_moe_prefetch_stats(struct ggml_cpu_moe_pool * pool, uint64_t * jobs,

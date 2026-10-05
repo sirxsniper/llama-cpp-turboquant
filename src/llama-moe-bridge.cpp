@@ -39,6 +39,7 @@ using layer_supported_t     = bool (*)(const ggml_cpu_moe_layer *);
 using pool_pf_t             = ggml_status (*)(ggml_cpu_moe_pool *, const ggml_cpu_moe_prefetch_job *); // [TAG_FN_R2_BRIDGE_PF]
 using pool_pf_stop_t        = void (*)(ggml_cpu_moe_pool *);
 using pool_pf_stats_t       = void (*)(ggml_cpu_moe_pool *, uint64_t *, uint64_t *, uint64_t *, uint64_t *);
+using pool_set_solo_t       = void (*)(ggml_cpu_moe_pool *, bool);
 
 inline void br_relax() {
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
@@ -91,6 +92,8 @@ struct llama_moe_bridge {
     bool                                  pf_on         = false;
     int                                   pf_k          = 12;
     int                                   pf_mode       = 0; // LLAMA_MOE_BRIDGE_PF_MODE: 0 real loads, 1 prefetches
+    bool                                  pf_solo       = false; // LLAMA_MOE_BRIDGE_PF_SOLO: the executor only dispatches
+    pool_set_solo_t                       pool_set_solo = nullptr;
     std::vector<int>                      pf_next;   // per channel: the channel of layer il + 1, or -1
     std::vector<std::vector<ggml_fp16_t>> pf_router; // per channel: its router rows in f16 ([n_expert][n_embd]) if predicted
 
@@ -336,6 +339,9 @@ static void br_exec_main(llama_moe_bridge * br) {
     ggml_cpu_moe_pool_params pp = br->pool_params;
     pp.pin_caller = true;
     ggml_cpu_moe_pool * pool = br->pool_new(&pp);
+    if (pool && br->pf_on && br->pf_solo) {
+        br->pool_set_solo(pool, true); // [TAG_FN_R2_BRIDGE_PF]
+    }
     {
         std::lock_guard<std::mutex> lk(br->mtx);
         br->pool  = pool;
@@ -651,6 +657,8 @@ llama_moe_bridge * llama_moe_bridge_create(const llama_model & model, int n_thre
         } else {
             br->pf_k    = std::min(64, std::max(1, env_int("LLAMA_MOE_BRIDGE_PF_K", 12)));
             br->pf_mode = std::min(1, std::max(0, env_int("LLAMA_MOE_BRIDGE_PF_MODE", 0)));
+            br->pool_set_solo = (pool_set_solo_t) ggml_backend_reg_get_proc_address(cpu_reg, "ggml_cpu_moe_pool_set_solo");
+            br->pf_solo = env_int("LLAMA_MOE_BRIDGE_PF_SOLO", 0) > 0 && br->pool_set_solo != nullptr;
             std::unordered_map<int, int> chan_of;
             for (size_t c = 0; c < br->chans.size(); ++c) {
                 chan_of[br->chans[c].il] = (int) c;
@@ -692,9 +700,9 @@ llama_moe_bridge * llama_moe_bridge_create(const llama_model & model, int n_thre
             }
             br->pf_on = n_pf > 0;
             LLAMA_LOG_INFO("%s: [TAG_FN_R2_BRIDGE_PF] next-layer prefetch: %d of %zu layers predict their successor's experts "
-                    "(top-%d per token, the cold ones pulled into the CPU caches between two jobs by %s), router copies %.1f MiB\n",
-                    __func__, n_pf, br->chans.size(), br->pf_k, br->pf_mode == 0 ? "real loads" : "software prefetches",
-                    n_bytes/1048576.0);
+                    "(top-%d per token, the cold ones pulled into the CPU caches between two jobs by %s%s), router copies "
+                    "%.1f MiB\n", __func__, n_pf, br->chans.size(), br->pf_k, br->pf_mode == 0 ? "real loads" : "software prefetches",
+                    br->pf_solo ? "; solo: the workers compute, the executor dispatches" : "", n_bytes/1048576.0);
         }
     }
 

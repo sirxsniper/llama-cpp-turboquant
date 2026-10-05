@@ -205,7 +205,9 @@ struct ggml_cpu_moe_pool {
     std::vector<uint8_t> work;
 
     // [TAG_FN_R2_BRIDGE_PF] the asynchronous next-layer prefetch (ggml_cpu_moe_prefetch)
-    std::atomic<int>          kind{0};             // of the posted job: 0 compute (args), 1 prefetch (pf)
+    std::atomic<int>          kind{0};             // of the posted job: 0 compute (args), 1 prefetch (pf), 2 compute
+                                                   // by the workers alone (solo)
+    bool                      solo = false;        // ggml_cpu_moe_pool_set_solo
     volatile int32_t          pf_stop     = 0;     // nonzero: the prefetching workers stop at their next piece
     bool                      pf_inflight = false; // the caller's side: a prefetch is posted and not waited for yet
     alignas(64) std::atomic<int> pf_bar_count{0};  // the workers' own barrier (the caller does not take part)
@@ -253,6 +255,12 @@ static void moe_pool_pf_barrier(ggml_cpu_moe_pool * p, int nw) {
     while (p->pf_bar_gen.load(std::memory_order_acquire) == gen) {
         moe_pool_relax();
     }
+}
+
+// [TAG_FN_R2_BRIDGE_PF] the barrier of a solo compute job (the workers only)
+static void moe_pool_solo_barrier(void * ctx) {
+    auto * p = (ggml_cpu_moe_pool *) ctx;
+    moe_pool_pf_barrier(p, p->n_threads - 1);
 }
 
 // [TAG_FN_R2_BRIDGE_PF] worker ith (>= 1) of a prefetch job: the router logits of its share of the experts, then (worker
@@ -309,7 +317,11 @@ static void moe_pool_prefetch_part(ggml_cpu_moe_pool * p, int ith) {
     }
     moe_pool_pf_barrier(p, nw);
 
-    const size_t b = ggml_fn_moe_prefetch(L->up, L->gate, L->down, p->pf_list.data(), p->pf_n, ith, p->n_threads, &p->pf_stop,
+    // the pieces this worker computes in a job of the predicted experts: thread ith of n_threads, or (solo) thread
+    // ith - 1 of the n_threads - 1 workers
+    const int c_ith = p->solo ? ith - 1 : ith;
+    const int c_nth = p->solo ? p->n_threads - 1 : p->n_threads;
+    const size_t b = ggml_fn_moe_prefetch(L->up, L->gate, L->down, p->pf_list.data(), p->pf_n, c_ith, c_nth, &p->pf_stop,
             J.mode);
     p->pf_bytes.fetch_add((uint64_t) b, std::memory_order_relaxed);
 }
@@ -374,8 +386,11 @@ static void moe_pool_worker(ggml_cpu_moe_pool * p, int ith) {
             break;
         }
         last = s;
-        if (p->kind.load(std::memory_order_acquire) == 1) { // [TAG_FN_R2_BRIDGE_PF]
+        const int kind = p->kind.load(std::memory_order_acquire);
+        if (kind == 1) { // [TAG_FN_R2_BRIDGE_PF]
             moe_pool_prefetch_part(p, ith);
+        } else if (kind == 2) {
+            ggml_fn_moe_compute(&p->args, ith - 1, p->n_threads - 1, moe_pool_solo_barrier, p);
         } else {
             ggml_fn_moe_compute(&p->args, ith, p->n_threads, moe_pool_barrier, p);
         }
@@ -529,7 +544,8 @@ enum ggml_status ggml_cpu_moe_run(struct ggml_cpu_moe_pool * p, const struct ggm
     }
     a.wdata = p->work.data();
 
-    p->kind.store(0, std::memory_order_relaxed); // [TAG_FN_R2_BRIDGE_PF]
+    const bool solo = p->solo && p->n_threads >= 2; // [TAG_FN_R2_BRIDGE_PF]
+    p->kind.store(solo ? 2 : 0, std::memory_order_relaxed);
     p->n_done.store(0, std::memory_order_relaxed);
     p->parked.store(false, std::memory_order_relaxed); // [TAG_MOE_BRIDGE]
     p->seq.fetch_add(1, std::memory_order_seq_cst);
@@ -540,7 +556,9 @@ enum ggml_status ggml_cpu_moe_run(struct ggml_cpu_moe_pool * p, const struct ggm
         p->cv.notify_all();
     }
 
-    ggml_fn_moe_compute(&a, 0, p->n_threads, moe_pool_barrier, p);
+    if (!solo) {
+        ggml_fn_moe_compute(&a, 0, p->n_threads, moe_pool_barrier, p);
+    }
 
     while (p->n_done.load(std::memory_order_acquire) != p->n_threads - 1) {
         moe_pool_relax();
@@ -592,6 +610,13 @@ enum ggml_status ggml_cpu_moe_prefetch(struct ggml_cpu_moe_pool * p, const struc
 void ggml_cpu_moe_prefetch_stop(struct ggml_cpu_moe_pool * p) {
     if (p) {
         p->pf_stop = 1;
+    }
+}
+
+void ggml_cpu_moe_pool_set_solo(struct ggml_cpu_moe_pool * p, bool solo) {
+    if (p) {
+        moe_pool_prefetch_finish(p);
+        p->solo = solo && p->n_threads >= 2;
     }
 }
 
