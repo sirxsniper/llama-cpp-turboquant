@@ -182,7 +182,8 @@ static bool br_run(const ggml_moe_bridge_job * j, void * ud) {
         // the graph built a device chain over the moe-cache slots of this layer: skip the experts it serves
         if (!c.tbl_looked) {
             c.tbl_looked = true;
-            const llama_moe_cache_layer * mc = llama_moe_cache_lookup(c.up);
+            // [TAG_FN_L3_VRAM_CBUF] the host table only: never nullptr for a layer whose slots are out right now
+            const llama_moe_cache_layer * mc = llama_moe_cache_lookup_table(c.up);
             if (mc && mc->host_table && mc->host_table->data) {
                 c.layer_tbl            = c.layer;
                 c.layer_tbl.table      = (const int32_t *) mc->host_table->data;

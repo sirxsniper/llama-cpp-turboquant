@@ -74,6 +74,7 @@ struct upload_job {
     int32_t expert;
     int32_t slot;
     bool    done = false;
+    bool    cb   = false; // [TAG_FN_L3_VRAM_CBUF] a refill job of the tail's restore
 };
 
 struct moe_cache {
@@ -450,6 +451,14 @@ const llama_moe_cache_layer * llama_moe_cache_lookup(const ggml_tensor * up_exps
         return nullptr; // [TAG_FN_L3_VRAM_CBUF] its slots have no VRAM now: the host computes all of its experts
     }
     return &ls.pub;
+}
+
+const llama_moe_cache_layer * llama_moe_cache_lookup_table(const ggml_tensor * up_exps) {
+    if (!g_cache) {
+        return nullptr;
+    }
+    auto it = g_cache->by_up_src.find(up_exps);
+    return it == g_cache->by_up_src.end() ? nullptr : &g_cache->layers[it->second].pub;
 }
 
 void llama_moe_cache_step(const void * ctx) {
@@ -912,7 +921,7 @@ void hot_adapt_publish(moe_cache * mc) {
         hot_adapt_set_entry(mc, ls, j.expert, ls.out() ? ls.pub.n_slots : j.slot);
         mc->ad_admitted++;
         // [TAG_FN_L3_VRAM_CBUF] the asynchronous refill of the tail landed
-        if (ls.cb_tail && mc->cb_async_left > 0 && --mc->cb_async_left == 0 && (mc->cb_n_res <= 2 || mc->cb_n_res % 16 == 0)) {
+        if (j.cb && mc->cb_async_left > 0 && --mc->cb_async_left == 0 && (mc->cb_n_res <= 2 || mc->cb_n_res % 16 == 0)) {
             LLAMA_LOG_INFO("moe-hot: [TAG_FN_L3_VRAM_CBUF] restore %" PRIu64 ": the tail's resident experts are back %.1f ms "
                     "after the restore\n", mc->cb_n_res, (ggml_time_us() - mc->cb_async_t0)/1000.0);
         }
@@ -1384,6 +1393,16 @@ bool llama_moe_hot_init(const llama_model & model, const void * owner, size_t bu
     }
     g_init_done = true; // one attempt per process: on any failure below the model runs without a hot set
 
+    // [TAG_FN_L3_VRAM_CBUF] a failed attempt with a tail leaves one more attempt to the caller (without a tail)
+    struct retry_on_fail {
+        bool armed;
+        ~retry_on_fail() {
+            if (armed) {
+                g_init_done = false;
+            }
+        }
+    } retry { tail_bytes > 0 };
+
     int max_t = 8;
     if (const char * e = llama_fn_env(model, "LLAMA_MOE_HOT_MAX_T")) {
         max_t = std::max(1, std::min(8, atoi(e)));
@@ -1585,6 +1604,14 @@ bool llama_moe_hot_init(const llama_model & model, const void * owner, size_t bu
         if (n_hot_layers == 0) {
             break;
         }
+        if (tail_bytes > 0) {
+            // [TAG_FN_L3_VRAM_CBUF] the layers past the trunk (an MTP block) first: the tail and the stream's range below it
+            // then hold trunk layers only, which no other context's graphs read (the draft context runs while the tail is out)
+            const int n_trunk = (int) model.hparams.n_layer();
+            for (auto & g : groups) {
+                std::stable_partition(g.second.begin(), g.second.end(), [&](int li) { return layers[li].il >= n_trunk; });
+            }
+        }
         mc->layers.reserve(n_hot_layers); // layer_state addresses must stay stable
 
         auto new_ctx = [&](size_t n) -> ggml_context * {
@@ -1773,6 +1800,7 @@ bool llama_moe_hot_init(const llama_model & model, const void * owner, size_t bu
             ggml_set_moe_obs_callback(hot_obs_cb, mc);
         }
         g_cache = mc;
+        retry.armed = false;
         return true;
     }
 
@@ -1833,6 +1861,12 @@ void hot_drain_out(moe_cache * mc) {
             if (ls.out()) {
                 ls.slot_in_flight[it->slot]     = false;
                 ls.expert_in_flight[it->expert] = false;
+                // [TAG_FN_L3_VRAM_CBUF] a tail slot keeps the expert it was getting: the next restore uploads it with the
+                // others, so prompts in quick succession do not empty the tail (a lent layer's slot comes back empty)
+                if (ls.cb_lent) {
+                    ls.slot_expert[it->slot]   = it->expert;
+                    ls.expert_slot[it->expert] = it->slot;
+                }
                 it = mc->todo.erase(it);
             } else {
                 ++it;
@@ -2195,6 +2229,7 @@ bool llama_moe_hot_cbuf_restore(const void * owner) {
                 j.layer_idx = li;
                 j.expert    = e;
                 j.slot      = s;
+                j.cb        = true;
                 mc->todo.push_back(j);
                 bytes += b;
                 mc->cb_async_left++; // published by this thread only, so counted before any can land

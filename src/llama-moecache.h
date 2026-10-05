@@ -58,6 +58,10 @@ void llama_moe_cache_init(const llama_model & model, int32_t n_slots, int32_t ma
 // nullptr when the cache is disabled or this tensor has no cached layer
 const llama_moe_cache_layer * llama_moe_cache_lookup(const ggml_tensor * up_exps);
 
+// [TAG_FN_L3_VRAM_CBUF] as llama_moe_cache_lookup, also while the layer's slots are out (the compute-buffer lend): for a
+// reader of the host table only (the bridge), which is always valid ("not hot" for every expert while the layer is out)
+const llama_moe_cache_layer * llama_moe_cache_lookup_table(const ggml_tensor * up_exps);
+
 // apply throttled LRU updates; call between graph executions only. ctx: the calling llama_context
 // ([TAG_FN_MOE_HOT_ADAPT] only the owner of an adaptive hot set updates it)
 void llama_moe_cache_step(const void * ctx);
