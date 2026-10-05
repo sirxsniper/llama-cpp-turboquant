@@ -1044,17 +1044,14 @@ llama_context::llama_context(
     // With the bridge on: one more ring token and a ring that keeps every token of a ubatch (llama_rs_set_nw_full), and
     // the bridge takes graphs of at most n_rs_seq tokens - every bridged ubatch rolls back. The cost is one more
     // replayed state-only token per step. LLAMA_MOE_BRIDGE_RB=0 keeps the old ring (a failure then fails the ubatch).
-    bool bridge_rb = false;
+    bool bridge_rb        = false;
+    bool bridge_rb_nospec = false; // [TAG_FN_R2_BRIDGE_UB] the ring exists for the bridge alone (no speculative decoding)
     {
         const char * eb = getenv("LLAMA_MOE_BRIDGE");
         const char * er = getenv("LLAMA_MOE_BRIDGE_RB");
         if (cparams.n_rs_seq > 0 && eb && atoi(eb) > 0 && !(er && er[0] == '0')) {
             cparams.n_rs_seq += 1;
-            llama_rs_set_nw_full(true);
             bridge_rb = true;
-            LLAMA_LOG_INFO("%s: [TAG_FN_R1_BRIDGE_RB] MoE bridge on: the recurrent ring keeps whole ubatches of up to %u "
-                    "tokens (n_rs_seq + 1), so a failed bridged ubatch is rolled back and computed again\n", __func__,
-                    cparams.n_rs_seq);
         } else if (cparams.n_rs_seq == 0 && params.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && !(er && er[0] == '0') &&
                 llm_arch_supports_rs_rollback(model.arch) && llama_moe_bridge_wanted(model)) {
             // [TAG_FN_R2_BRIDGE_NOSPEC] no speculative decoding, so no ring: a failed bridged ubatch could not roll back and
@@ -1062,12 +1059,10 @@ llama_context::llama_context(
             // small ring; the bridge then takes only graphs the ring can roll back whole.
             const char * et = getenv("LLAMA_MOE_BRIDGE_RB_TOKENS");
             cparams.n_rs_seq = (uint32_t) std::min(8, std::max(1, et && et[0] ? atoi(et) : 1));
-            llama_rs_set_nw_full(true);
-            bridge_rb = true;
-            LLAMA_LOG_INFO("%s: [TAG_FN_R2_BRIDGE_NOSPEC] MoE bridge on without speculative decoding: the recurrent ring "
-                    "keeps whole ubatches of up to %u tokens, so a failed bridged ubatch is rolled back and computed again\n",
-                    __func__, cparams.n_rs_seq);
+            bridge_rb        = true;
+            bridge_rb_nospec = true;
         }
+        // [TAG_FN_R2_BRIDGE_UB] the ring is checked against n_ubatch below, before the memory is created
     }
 
     cparams.n_threads               = params.n_threads;
@@ -1207,6 +1202,43 @@ llama_context::llama_context(
     cparams.n_batch = cparams.causal_attn ? std::min(cparams.n_ctx, params.n_batch) : params.n_batch;
 
     cparams.n_ubatch = std::min(cparams.n_batch, params.n_ubatch == 0 ? params.n_batch : params.n_ubatch);
+
+    // [TAG_FN_R2_BRIDGE_UB] with a ring (n_rs_seq > 0) the hybrid and recurrent memories split every batch with
+    // n_keep_tail = n_rs_seq + 1 and need n_ubatch > n_keep_tail (llama_batch_allocr::split_equal asserts it). The ring
+    // the MoE bridge adds must not push a small ubatch over that limit: in the push #1 gate llama-perplexity -ub 3 with
+    // LLAMA_MOE_BRIDGE_RB_TOKENS=3 failed GGML_ASSERT(n_ubatch > n_keep_tail), and so did the default 1-token ring at
+    // -ub 1 and -ub 2 without MTP. Without speculative decoding the ring shrinks to the n_ubatch - 2 tokens the ubatch
+    // holds. When no ring fits (n_ubatch <= 2), or the extra token of a speculative ring does not, the context keeps the
+    // ring it asked for (none without speculative decoding) and runs without the bridge: its host experts take the plain
+    // CPU split, which has no deadline to miss.
+    bool bridge_off_ub = false;
+    if (bridge_rb && cparams.n_ubatch <= cparams.n_rs_seq + 1) {
+        if (bridge_rb_nospec && cparams.n_ubatch >= 3) {
+            LLAMA_LOG_WARN("%s: [TAG_FN_R2_BRIDGE_UB] n_ubatch %u holds a ring of at most %u tokens: the MoE bridge ring "
+                    "shrinks from %u to %u tokens\n", __func__, cparams.n_ubatch, cparams.n_ubatch - 2, cparams.n_rs_seq,
+                    cparams.n_ubatch - 2);
+            cparams.n_rs_seq = cparams.n_ubatch - 2;
+        } else {
+            LLAMA_LOG_WARN("%s: [TAG_FN_R2_BRIDGE_UB] n_ubatch %u cannot hold the %u-token ring the MoE bridge needs to roll "
+                    "a ubatch back: the bridge stays off in this context (its host experts run the CPU split)\n", __func__,
+                    cparams.n_ubatch, cparams.n_rs_seq);
+            cparams.n_rs_seq = bridge_rb_nospec ? 0 : cparams.n_rs_seq - 1;
+            bridge_rb        = false;
+            bridge_off_ub    = true;
+        }
+    }
+    if (bridge_rb) {
+        llama_rs_set_nw_full(true);
+        if (bridge_rb_nospec) {
+            LLAMA_LOG_INFO("%s: [TAG_FN_R2_BRIDGE_NOSPEC] MoE bridge on without speculative decoding: the recurrent ring "
+                    "keeps whole ubatches of up to %u tokens, so a failed bridged ubatch is rolled back and computed again\n",
+                    __func__, cparams.n_rs_seq);
+        } else {
+            LLAMA_LOG_INFO("%s: [TAG_FN_R1_BRIDGE_RB] MoE bridge on: the recurrent ring keeps whole ubatches of up to %u "
+                    "tokens (n_rs_seq + 1), so a failed bridged ubatch is rolled back and computed again\n", __func__,
+                    cparams.n_rs_seq);
+        }
+    }
 
     cparams.n_outputs_max = params.n_outputs_max == 0 || llama_model_has_encoder(&model) ? cparams.n_batch : params.n_outputs_max;
     cparams.n_outputs_max_per_seq = params.n_outputs_max_per_seq == 0 ?
@@ -1475,7 +1507,9 @@ llama_context::llama_context(
         }
 
         // [TAG_MOE_BRIDGE] LLAMA_MOE_BRIDGE=1: before the reserve, so decode graphs are reserved with the bridge ops
-        moe_bridge = llama_moe_bridge_create(model, (int) cparams.n_threads, bridge_rb ? (int) cparams.n_rs_seq : 0);
+        // [TAG_FN_R2_BRIDGE_UB] no bridge when the ubatch cannot hold the ring the bridge needs (see n_ubatch above)
+        moe_bridge = bridge_off_ub ? nullptr :
+                llama_moe_bridge_create(model, (int) cparams.n_threads, bridge_rb ? (int) cparams.n_rs_seq : 0);
 
         // [TAG_MOE_DMA_SHARE] [TAG_FN_PREFILL_STREAM] before the reserve: the graphs it builds use the gen5 banks
         // [TAG_FN_MERGE] with a host bridge the DMA share / prefetch stay off (they need the CPU split the bridge removes)
