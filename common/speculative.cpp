@@ -3495,6 +3495,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         return pmin_pos[std::min<size_t>((size_t) std::max(0, i), pmin_pos.size() - 1)];
     }
 
+    // [TAG_FN_L3_MTP_HEADPROMPT] LLAMA_MTP_HEAD_PROMPT with a draft vocabulary: begin() hands the model the prompt's tokens
+    bool head_prompt_on = false;
+
     // [TAG_FN_MTP_ATTN_WINDOW] LLAMA_MTP_ATTN_WINDOW on a qwen4exp MTP context: its draft KV keeps only this many
     // positions (llama-model.cpp), so prompt rows further back than that from their prompt's end are not decoded
     int32_t mtp_win = 0;
@@ -3709,6 +3712,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
         }
 
+        // [TAG_FN_L3_MTP_HEADPROMPT] the model has a draft vocabulary with prompt rows (qwen4exp only)
+        if (!is_mem_shared && !chain_heads && llama_model_mtp_head_set_prompt(llama_get_model(ctx_dft), nullptr, 0) >= 0) {
+            head_prompt_on = true;
+            LOG_INF("%s: [TAG_FN_L3_MTP_HEADPROMPT] each request's prompt tokens outside the MTP draft vocabulary are scored "
+                    "too (most frequent first)\n", __func__);
+        }
+
         // [TAG_FN_L3_MTP_CHAIN] per-position p_min of the rule
         if (const char * e = getenv("SPEC_MTP_PMIN_POS"); e && e[0]) {
             std::vector<float> v;
@@ -3783,6 +3793,29 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
 
         auto * ctx_dft = this->params.ctx_dft;
+
+        // [TAG_FN_L3_MTP_HEADPROMPT] the prompt's distinct tokens, most frequent first (the model keeps the ones its draft
+        // vocabulary leaves out, up to its cap); the last request's set replaces the one before
+        if (head_prompt_on) {
+            std::unordered_map<llama_token, int32_t> cnt;
+            cnt.reserve(4096);
+            for (const llama_token t : prompt) {
+                cnt[t]++;
+            }
+            std::vector<std::pair<int32_t, llama_token>> order;
+            order.reserve(cnt.size());
+            for (const auto & kv : cnt) {
+                order.emplace_back(-kv.second, kv.first);
+            }
+            std::sort(order.begin(), order.end());
+            std::vector<llama_token> ids;
+            ids.reserve(order.size());
+            for (const auto & o : order) {
+                ids.push_back(o.second);
+            }
+            const int32_t n_set = llama_model_mtp_head_set_prompt(llama_get_model(ctx_dft), ids.data(), (int32_t) ids.size());
+            SPC_DBG("[TAG_FN_L3_MTP_HEADPROMPT] seq %d: %d prompt tokens added to the draft vocabulary\n", (int) seq_id, (int) n_set);
+        }
 
         const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_dft), seq_id);
 

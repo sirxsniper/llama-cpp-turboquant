@@ -179,6 +179,11 @@ LLAMA_API uint32_t llama_memory_attn_swa_ext(struct llama_context * ctx);
 LLAMA_API bool llama_moe_bridge_track_ext(struct llama_context * ctx, bool on);
 LLAMA_API bool llama_moe_bridge_last_ext(const struct llama_context * ctx, int32_t * n_tokens, uint32_t * cold, int32_t n, uint64_t * serial);
 
+// [TAG_FN_L3_MTP_HEADPROMPT] qwen4exp with a MTP draft vocabulary and LLAMA_MTP_HEAD_PROMPT=<cap>: the drafts also score
+// these prompt tokens where the vocabulary leaves them out (the first cap such ids in the given order replace the last
+// set). Returns how many were taken, -1 when the model has no such list. Only drafts change; verify uses the full head.
+LLAMA_API int32_t llama_model_mtp_head_set_prompt(const struct llama_model * model, const llama_token * ids, int32_t n);
+
 // [TAG_TURBOT] Process-wide turbot plan path; takes precedence over env LLAMA_TURBOT_PLAN. nullptr or "" clears it.
 // [TAG_TURBOT_EMBED_PLAN] "default" selects the built-in plan; with neither set, the built-in plan is used when it fits.
 LLAMA_API void llama_turbot_set_plan_path(const char * path);

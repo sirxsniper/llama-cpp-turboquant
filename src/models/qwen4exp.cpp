@@ -16,6 +16,7 @@
 #include <cstring>
 #include <filesystem>     // [TAG_FN_SHIP1]
 #include <fstream>
+#include <unordered_set> // [TAG_FN_L3_MTP_HEADPROMPT]
 
 // bad metadata must be catchable: GGML_ASSERT aborts the whole process
 static void qwen4exp_require_nonzero(const llama_model_loader & ml, llm_kv kid, uint32_t value) {
@@ -601,6 +602,42 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
         }
     }
 
+    // [TAG_FN_L3_MTP_HEADPROMPT] LLAMA_MTP_HEAD_PROMPT=<n> (0/unset = off), with a draft vocabulary only: the drafts also
+    // score up to n tokens of the current prompt that the vocabulary leaves out, from the full head rows (verify is
+    // unchanged). The MTP driver sets them per request (llama_model_mtp_head_set_prompt).
+    if (ml.load_mtp && n_layer_all > n_layer && (!mtp_head_ids.empty() || mtp_head_rows > 0)) {
+        const char * e = getenv("LLAMA_MTP_HEAD_PROMPT");
+        const int64_t cap = e ? atoll(e) : 0;
+        if (cap > 0) {
+            mtp_head_in_vocab.assign((size_t) n_vocab, 0);
+            if (!mtp_head_ids.empty()) {
+                for (int32_t id : mtp_head_ids) {
+                    mtp_head_in_vocab[id] = 1;
+                }
+            } else {
+                std::fill(mtp_head_in_vocab.begin(), mtp_head_in_vocab.begin() + mtp_head_rows, 1);
+                for (int32_t id : mtp_head_extra) {
+                    mtp_head_in_vocab[id] = 1;
+                }
+            }
+            for (int64_t id = 0; id < (int64_t) n_vocab && mtp_head_pad_id < 0; ++id) {
+                const auto attr = vocab.token_get_attr((llama_token) id);
+                if (!mtp_head_in_vocab[id] && (attr & LLAMA_TOKEN_ATTR_NORMAL) &&
+                        !(attr & (LLAMA_TOKEN_ATTR_CONTROL | LLAMA_TOKEN_ATTR_USER_DEFINED | LLAMA_TOKEN_ATTR_UNUSED))) {
+                    mtp_head_pad_id = (int32_t) id;
+                }
+            }
+            if (mtp_head_pad_id < 0) {
+                LLAMA_LOG_WARN("%s: [TAG_FN_L3_MTP_HEADPROMPT] the draft vocabulary leaves no normal token out: no prompt rows\n", __func__);
+            } else {
+                mtp_head_prompt_cap = (int32_t) std::min<int64_t>(cap, 8192);
+                mtp_head_prompt_ids.assign((size_t) mtp_head_prompt_cap, mtp_head_pad_id);
+                LLAMA_LOG_INFO("%s: [TAG_FN_L3_MTP_HEADPROMPT] MTP drafts also score up to %d prompt tokens outside the draft "
+                        "vocabulary (full head rows)\n", __func__, mtp_head_prompt_cap);
+            }
+        }
+    }
+
     // [TAG_QWEN4EXP_MTP] [TAG_SYNC_1004] without MTP the block above is skipped, and the generic scale pass of
     // load_tensors keys on the loaded weights, so it never asks for the block's optional ".scale" / ".input_scale"
     // tensors (NVFP4, or any file the saver wrote): skip them here too, or the tensor count of such a file fails.
@@ -952,6 +989,56 @@ const llama_model_qwen4exp::mtp_head_compact * llama_model_qwen4exp::mtp_head_ge
     return mtp_head_c.get();
 }
 
+// [TAG_FN_L3_MTP_HEADPROMPT]
+int32_t llama_model_qwen4exp::mtp_head_set_prompt(const int32_t * ids, int32_t n) const {
+    if (mtp_head_prompt_cap <= 0) {
+        return -1;
+    }
+    const int64_t n_vocab = (int64_t) mtp_head_in_vocab.size();
+    std::vector<int32_t> v;
+    v.reserve((size_t) mtp_head_prompt_cap);
+    std::unordered_set<int32_t> seen;
+    for (int32_t i = 0; ids && i < n && (int32_t) v.size() < mtp_head_prompt_cap; ++i) {
+        const int32_t id = ids[i];
+        if (id < 0 || id >= n_vocab || mtp_head_in_vocab[id] || !seen.insert(id).second) {
+            continue;
+        }
+        v.push_back(id);
+    }
+    const int32_t n_set = (int32_t) v.size();
+    // a repeat of a set id computes the same row again; with none, an id outside the vocabulary
+    v.resize((size_t) mtp_head_prompt_cap, n_set > 0 ? v[0] : mtp_head_pad_id);
+    std::lock_guard<std::mutex> lock(mtp_head_prompt_mutex);
+    mtp_head_prompt_ids.swap(v);
+    return n_set;
+}
+
+int32_t llama_model_mtp_head_set_prompt(const struct llama_model * model, const llama_token * ids, int32_t n) {
+    const auto * m = dynamic_cast<const llama_model_qwen4exp *>(model);
+    return m ? m->mtp_head_set_prompt(ids, n) : -1;
+}
+
+// [TAG_FN_L3_MTP_HEADPROMPT] the prompt rows' ids, copied from the model at every graph (they change per request)
+class llm_graph_input_ids_prompt : public llm_graph_input_i {
+public:
+    llm_graph_input_ids_prompt(const llama_model_qwen4exp & m) : m(m) {}
+    virtual ~llm_graph_input_ids_prompt() = default;
+
+    void set_input(const llama_ubatch * /*ubatch*/) override {
+        std::lock_guard<std::mutex> lock(m.mtp_head_prompt_mutex);
+        GGML_ASSERT(ids && (int64_t) m.mtp_head_prompt_ids.size() == ids->ne[0]);
+        ggml_backend_tensor_set(ids, m.mtp_head_prompt_ids.data(), 0, m.mtp_head_prompt_ids.size()*sizeof(int32_t));
+    }
+
+    bool can_reuse(const llm_graph_params & /*params*/) override {
+        return true;
+    }
+
+    ggml_tensor * ids = nullptr;
+
+    const llama_model_qwen4exp & m;
+};
+
 llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_graph_params & params) :
     graph(model, params, no_build{}) {
     GGML_ASSERT(hparams.n_layer_nextn == 1 && "qwen4exp MTP has a single block");
@@ -1061,9 +1148,33 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
         head_c = pm.mtp_head_get(head_w);
     }
 
+    // [TAG_FN_L3_MTP_HEADPROMPT] the prompt's own tokens outside the draft vocabulary, from the full head rows, scattered
+    // over the draft logits after the vocabulary's own rows
+    auto add_prompt_rows = [&](ggml_tensor * full, ggml_tensor * normed) -> ggml_tensor * {
+        if (pm.mtp_head_prompt_cap <= 0) {
+            return full;
+        }
+        const int64_t n_p   = pm.mtp_head_prompt_cap;
+        const int64_t n_out = full->ne[1];
+        auto inp_p = std::make_unique<llm_graph_input_ids_prompt>(pm);
+        inp_p->ids = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_p);
+        ggml_set_input(inp_p->ids);
+
+        ggml_tensor * extra = ggml_mul_mat(ctx0, ggml_get_rows(ctx0, head_w, inp_p->ids), normed);
+        if (head_s) {
+            extra = ggml_mul(ctx0, extra, head_s);
+        }
+        ggml_tensor * out = ggml_set_rows(ctx0, ggml_reshape_3d(ctx0, full, 1, n_vocab_head, n_out),
+                ggml_reshape_3d(ctx0, extra, 1, n_p, n_out),
+                ggml_reshape_2d(ctx0, inp_p->ids, n_p, 1));
+        res->add_input(std::move(inp_p));
+        return ggml_reshape_2d(ctx0, out, n_vocab_head, n_out);
+    };
+
     if (head_c != nullptr) {
         const int64_t n_ids = head_c->w->ne[1];
         const int64_t n_out = cur->ne[1];
+        ggml_tensor * normed = cur;
 
         ggml_tensor * draft = ggml_mul_mat(ctx0, head_c->w, cur);
         if (head_s) {
@@ -1074,6 +1185,7 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
                 ggml_reshape_3d(ctx0, draft, 1, n_ids, n_out),
                 ggml_reshape_2d(ctx0, head_c->ids, n_ids, 1));
         cur = ggml_reshape_2d(ctx0, cur, n_vocab_head, n_out);
+        cur = add_prompt_rows(cur, normed); // [TAG_FN_L3_MTP_HEADPROMPT]
     } else if (pm.mtp_head_rows > 0 && pm.mtp_head_rows < n_vocab_head && head_s_scalar && loras->empty() &&
             n_vocab_head == (int64_t) model.vocab.n_tokens()) {
         const int64_t n_rows  = pm.mtp_head_rows;
@@ -1103,6 +1215,7 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
 
             res->add_input(std::move(inp_ids));
         }
+        cur = add_prompt_rows(cur, normed); // [TAG_FN_L3_MTP_HEADPROMPT]
     } else {
         if ((pm.mtp_head_rows > 0 || !pm.mtp_head_ids.empty()) && head_w->buffer != nullptr) {
             // [TAG_FN_MTP_HEAD_ROWS] [TAG_FN_MTP_HEAD_IDS] say so once, so a draft-vocabulary arm is not read as "no effect"
