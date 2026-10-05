@@ -58,7 +58,52 @@ struct ggml_fn_moe_args {
     const float *   w;                  // or NULL: [n_used, n_tokens] weights of the weighted sum
     float *         out_sum;            // w != NULL: [n_embd, n_tokens]
     void *          wdata;              // ggml_fn_moe_work_size() bytes
+
+    // [TAG_FN_L3_CPU_SPLIT] (the worker pool only; zero = the default split) how the pieces go to the threads:
+    // 0: contiguous ranges of the expert-major piece list; 1: piece p of expert e to thread (h(e) + p) mod nth, the same
+    // owner the stable prefetch uses; 2: as 1, then a thread with no own piece left takes the last free pieces of the
+    // others (claims, one word per piece). Any owner computes the same values.
+    int             split;
+    int32_t *       claim;              // split 2: GGML_FN_MOE_CLAIM_WORDS() words, kept between jobs
+    int32_t         epoch;              // split 2: != 0 and != the previous job's
+    const int32_t * prio;               // split >= 1, or NULL: experts computed first, in this order (the prefetch's list)
+    int             n_prio;
+    uint64_t *      ts;                 // [TAG_FN_L3_CPU_STATS] or NULL: GGML_FN_MOE_TS_N words per thread (ts + ith*GGML_FN_MOE_TS_N)
+    const uint8_t * pf_done;            // [TAG_FN_L3_CPU_STATS] stats with split >= 1, or NULL: [nth][n_expert], 1 = the
+                                        // thread's stable prefetch covered all its pieces of the expert
+    int             swpf;               // [TAG_FN_L3_CPU_SWPF] 0, or software-prefetch this many cache lines at every 4 KiB
+                                        // page of a thread's next piece before it computes the current one
 };
+
+// [TAG_FN_L3_CPU_STATS] the per-thread record of a job (ggml_fn_moe_args.ts): ticks of ggml_fn_moe_tick()
+enum {
+    GGML_FN_MOE_TS_START = 0,  // entry
+    GGML_FN_MOE_TS_P3    = 1,  // gate / up pieces done (own and taken)
+    GGML_FN_MOE_TS_B1    = 2,  // after the barrier before down
+    GGML_FN_MOE_TS_P4    = 3,  // down pieces done
+    GGML_FN_MOE_TS_B2    = 4,  // after the barrier before the weighted sum (= P4 without one)
+    GGML_FN_MOE_TS_END   = 5,  // exit
+    GGML_FN_MOE_TS_BYTES = 6,  // weight bytes of the pieces computed
+    GGML_FN_MOE_TS_TAKEN = 7,  // pieces taken from other threads (split 2)
+    GGML_FN_MOE_TS_PFHIT = 8,  // weight bytes of pieces whose expert this thread's prefetch covered (split >= 1)
+    GGML_FN_MOE_TS_NACT  = 9,  // experts the job computes
+    GGML_FN_MOE_TS_N     = 16, // words per thread (two cache lines)
+};
+
+// [TAG_FN_L3_CPU_SPLIT] claim words a split-2 job needs: two phases x nth threads x one padded run per thread
+#define GGML_FN_MOE_CLAIM_RUN(n_act, np_max, nth) ((((int64_t) (n_act)*(((np_max) + (nth) - 1)/(nth)) + 15)/16)*16)
+#define GGML_FN_MOE_CLAIM_WORDS(n_act, np_max, nth) (2*(int64_t) (nth)*GGML_FN_MOE_CLAIM_RUN(n_act, np_max, nth))
+
+// [TAG_FN_L3_CPU_SPLIT] the first owner of expert e's pieces (piece p goes to (owner0 + p) mod nth)
+static inline int ggml_fn_moe_owner0(int32_t e, int nth) {
+    return (int) (((uint32_t) e*2654435761u >> 16) % (uint32_t) nth);
+}
+
+// [TAG_FN_L3_CPU_SPLIT] the largest number of pieces of one expert in either phase (the claim run size)
+int64_t ggml_fn_moe_np_max(const struct ggml_tensor * up, const struct ggml_tensor * down);
+
+// [TAG_FN_L3_CPU_STATS] a cheap monotonic tick (the TSC on x86, else microseconds)
+uint64_t ggml_fn_moe_tick(void);
 
 // false if the fused kernel does not take these weights (types, shapes)
 bool   ggml_fn_moe_supported(const struct ggml_tensor * up, const struct ggml_tensor * gate, const struct ggml_tensor * down);
@@ -72,6 +117,12 @@ bool   ggml_cpu_moe_host_sum_supported(const struct ggml_tensor * op);
 // stops before the next piece once *stop != 0; returns the bytes covered. mode 0: real loads, 1: software prefetches
 size_t ggml_fn_moe_prefetch(const struct ggml_tensor * up, const struct ggml_tensor * gate, const struct ggml_tensor * down,
                             const int32_t * list, int n, int ith, int nth, const volatile int32_t * stop, int mode);
+// [TAG_FN_L3_CPU_SPLIT] the same for a split >= 1 job: thread ith's own pieces of the experts list[0..n) in list order
+// (per expert its gate + up pieces, then its down pieces). done (or NULL): [n_expert], set to 1 for every expert whose
+// pieces of this thread were all pulled before the stop.
+size_t ggml_fn_moe_prefetch_stable(const struct ggml_tensor * up, const struct ggml_tensor * gate, const struct ggml_tensor * down,
+                                   const int32_t * list, int n, int ith, int nth, const volatile int32_t * stop, int mode,
+                                   uint8_t * done);
 
 
 #if defined(_MSC_VER)

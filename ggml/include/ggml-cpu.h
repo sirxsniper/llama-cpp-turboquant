@@ -187,6 +187,25 @@ extern "C" {
                                              // of the list, with prio; create the pool on the thread that runs the jobs
         bool skip_first_core;                // [TAG_MOE_BRIDGE] leave the first CPU of the list free (the main thread
                                              // of a ggml threadpool sits there) and use at most the rest, one thread each
+        int  split;                          // [TAG_FN_L3_CPU_SPLIT] enum ggml_cpu_moe_split (default RANGE)
+        bool stats;                          // [TAG_FN_L3_CPU_STATS] per-job timing and byte counts (ggml_cpu_moe_pool_get_stats)
+        bool pf_rank;                        // [TAG_FN_L3_CPU_PFRANK] a router prefetch pulls its experts by rank (each token's
+                                             // most likely expert first), not in expert order
+        int  swpf;                           // [TAG_FN_L3_CPU_SWPF] 0, or a job's threads software-prefetch this many cache
+                                             // lines at every 4 KiB page of their next piece before the current one
+        int  caller_cpu1;                    // [TAG_FN_L3_CPU_PLACE] with pin_caller: 1 + the CPU of worker 0, which then
+                                             // leaves the workers' list (0: worker 0 takes the first CPU of the list)
+    };
+
+    // [TAG_FN_L3_CPU_SPLIT] how a pool job gives its pieces (32 gate / up rows or 64 down rows of one expert) to the threads.
+    // Every split computes the same values bit for bit.
+    enum ggml_cpu_moe_split {
+        GGML_CPU_MOE_SPLIT_RANGE  = 0, // contiguous ranges of the expert-major piece list (the default)
+        GGML_CPU_MOE_SPLIT_STABLE = 1, // piece p of expert e to thread (h(e) + p) mod n, in the job and in the prefetch:
+                                       // a prefetched piece is computed by the core that pulled it, whatever else is routed;
+                                       // the experts of the last prefetch go first, in its order
+        GGML_CPU_MOE_SPLIT_STEAL  = 2, // STABLE, then a thread with no own piece left takes free pieces from the end of the
+                                       // others' lists (one claim word per piece), so no thread waits at a barrier for long
     };
 
     struct ggml_cpu_moe_pool;
@@ -219,7 +238,47 @@ extern "C" {
         const float * x;                          // [n_tokens][n_embd] f32, copied by the call
         int32_t       k;                          // experts predicted per token
         int32_t       mode;                       // 0: real loads (they wait for the data), 1: software prefetches
+        // [TAG_FN_L3_CPU_DEVPRED] or NULL: the predicted experts are given, [n_tokens][k] by rank (e.g. the device's
+        // top-k of the router); the router and x are not used then. Out-of-range ids, duplicates and the table's
+        // experts are dropped; the experts are pulled rank by rank (every token's first, then every token's second ...)
+        const int32_t * list;
     };
+
+    // [TAG_FN_L3_CPU_STATS] means over the jobs (and prefetches) since the last reset; times in microseconds
+    #define GGML_CPU_MOE_STATS_MAX_THR 64
+    struct ggml_cpu_moe_pool_stats {
+        uint64_t jobs;
+        double   job_us;          // wall time: publish -> every compute thread done (the caller's view)
+        double   job_max_us;      // the slowest job of the window
+        uint64_t jobs_slow;       // jobs over 1 ms (page faults, preemption)
+        double   mib;             // weight MiB a job read
+        double   experts;         // experts a job computed
+        double   lag_us;          // publish -> a compute thread's first instruction
+        double   p3_us, w3_us;    // a thread's gate / up time, then its wait at the barrier before down
+        double   p4_us, w4_us;    // its down time, then its wait at the barrier before the weighted sum
+        double   p5_us;           // its weighted-sum time
+        double   spread3_us;      // latest - earliest gate / up end over the threads
+        double   spread4_us;      // the same for down
+        double   taken;           // pieces a job's threads took from others (split STEAL)
+        double   pf_hit_mib;      // MiB of a job computed by the thread whose stable prefetch pulled the expert
+        int      n_dom;           // L3 domains of the compute threads (<= 4)
+        int      dom_threads[4];
+        double   dom_gbs[4];      // per thread of the domain: bytes / (gate / up + down time), GB/s
+        uint64_t pf_jobs;         // prefetches
+        double   pf_us;           // post -> the last worker left it (stopped or done)
+        double   pf_router_us;    // the router phase of a host prediction (0 with a given list)
+        double   pf_mib;          // MiB pulled per prefetch
+        double   pf_experts;      // predicted experts not in the table, per prefetch
+        double   pf_stopped;      // share of the prefetches stopped by the next job
+        double   pf_stop_us;      // a stopped prefetch: the caller's wait until every worker has left it (on the job's path)
+        double   pf_stop_max_us;
+        int      n_thr;           // workers with records below (worker index; worker 0 is the caller)
+        int      thr_cpu[GGML_CPU_MOE_STATS_MAX_THR];     // its CPU (-1: not pinned)
+        double   thr_busy_us[GGML_CPU_MOE_STATS_MAX_THR]; // its gate / up + down time per job (0: it computed nothing)
+        double   thr_gbs[GGML_CPU_MOE_STATS_MAX_THR];     // its weight bytes / that time
+    };
+    // copies the means into st (NULL: only reset) and, if reset, starts a new window. Zeros without params.stats.
+    GGML_BACKEND_API void ggml_cpu_moe_pool_get_stats(struct ggml_cpu_moe_pool * pool, struct ggml_cpu_moe_pool_stats * st, bool reset);
     GGML_BACKEND_API enum ggml_status ggml_cpu_moe_prefetch     (struct ggml_cpu_moe_pool * pool, const struct ggml_cpu_moe_prefetch_job * job);
     GGML_BACKEND_API void             ggml_cpu_moe_prefetch_stop(struct ggml_cpu_moe_pool * pool);
     // [TAG_FN_R2_BRIDGE_PF] solo: the caller stays out of ggml_cpu_moe_run's compute (it waits) and the workers split the
