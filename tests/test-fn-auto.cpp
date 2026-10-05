@@ -348,7 +348,10 @@ static void test_even_slots() {
 static void test_cbuf() {
     TCHECK(llama_fn_cbuf_small_t(31, 32, 1) == 31, "default: 31 below the op-offload minimum 32");
     TCHECK(llama_fn_cbuf_small_t(100, 32, 1) == 31, "never at or above the op-offload minimum");
-    TCHECK(llama_fn_cbuf_small_t(4, 32, 1) == 8, "never below the hot chain's 8 tokens");
+    TCHECK(llama_fn_cbuf_small_t(4, 32, 1) == 4, "below the hot chain's 8 tokens on request (MTP n_max 2: 3)");
+    TCHECK(llama_fn_cbuf_small_t(3, 32, 1) == 3, "3: the MTP verify of n_max 2");
+    TCHECK(llama_fn_cbuf_small_t(3, 32, 2) == 2, "3 with 2 sequences: 2 (a multiple of n_seqs)");
+    TCHECK(llama_fn_cbuf_small_t(1, 32, 1) == 1, "1: decode without drafts");
     TCHECK(llama_fn_cbuf_small_t(31, 16, 1) == 15, "GGML_OP_OFFLOAD_MIN_BATCH=16 -> 15");
     TCHECK(llama_fn_cbuf_small_t(31, 0, 1) == 8, "a nonsense minimum still leaves 8");
     TCHECK(llama_fn_cbuf_small_t(31, 32, 4) == 28, "4 sequences: 28 (the reserve rounds 31 up to 32, an op-offload graph)");
@@ -370,7 +373,7 @@ static void test_cbuf() {
     const size_t b_old = 10312 * MiB;
     const size_t b_new = b_old + (full - small);
     const int32_t n_old = llama_fn_even_slots(bytes, b_old, 512);
-    const int32_t n_new = llama_fn_even_slots(bytes, b_new - 3*gran, 512);
+    const int32_t n_new = llama_fn_even_slots(bytes, b_new - 5*gran, 512); // the layout's pads and guards
     TCHECK(n_old == 71 && n_new == 95, "even slots %d -> %d", n_old, n_new);
     std::vector<size_t> layer_bytes;
     for (size_t x : bytes) {

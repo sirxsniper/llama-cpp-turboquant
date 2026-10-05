@@ -451,7 +451,7 @@ size_t llama_fn_vram_fit_budget(size_t total, size_t free, size_t ceiling, size_
 
 uint32_t llama_fn_cbuf_small_t(uint32_t requested, int op_offload_min, uint32_t n_seqs) {
     const uint32_t below = (uint32_t) std::max(9, op_offload_min) - 1;
-    const uint32_t t     = std::max<uint32_t>(8, std::min<uint32_t>(requested, below));
+    const uint32_t t     = std::max<uint32_t>(1, std::min<uint32_t>(requested, below));
     n_seqs = std::max<uint32_t>(1, n_seqs);
     return std::max<uint32_t>(n_seqs, t / n_seqs * n_seqs);
 }

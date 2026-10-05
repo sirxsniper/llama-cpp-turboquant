@@ -106,8 +106,9 @@ LLAMA_API size_t llama_fn_vram_ceiling_default(size_t total);
 LLAMA_API size_t llama_fn_vram_fit_budget(size_t total, size_t free, size_t ceiling, size_t margin);
 
 // [TAG_FN_L3_VRAM_CBUF] the compute-buffer lend (LLAMA_FN_CBUF):
-// the widest graph the SMALL reserve serves: at least 8 (the hot chain's widest graph) and below the op-offload minimum
-// (a graph that wide copies host experts into the compute buffer), a multiple of n_seqs (the reserve rounds up to one)
+// the widest graph the SMALL reserve serves: below the op-offload minimum (a graph that wide copies host experts into the
+// compute buffer), a multiple of n_seqs (the reserve rounds up to one), at least 1. Below 8 (the hot chain's widest graph)
+// the graphs between it and 8 tokens run with the FULL reserve and without the tail's hot chain (correct, a switch each)
 LLAMA_API uint32_t llama_fn_cbuf_small_t(uint32_t requested, int op_offload_min, uint32_t n_seqs);
 // the tail the hot set keeps: the FULL - SMALL reserve difference plus pool_extra, rounded up to the granularity; 0 when
 // FULL is not at least min_gain larger than SMALL
