@@ -16710,8 +16710,7 @@ static bool run_cpu_fn_moe_fuse(ggml_backend_t backend, ggml_backend_t backend_r
                             const bool ok_s = !out_s.empty() && nd_s == 0;
                             n_run++;
                             if (!ok_s) {
-                                printf("  FAIL moe host sum %s/%s/%s T=%" PRId64 " table=%d threads=%d: %s, %zu values differ from the pool's weighted sum
-",
+                                printf("  FAIL moe host sum %s/%s/%s T=%" PRId64 " table=%d threads=%d: %s, %zu values differ from the pool's weighted sum\n",
                                        ggml_type_name(c.tu), ggml_type_name(c.tg), ggml_type_name(c.td), T, with_tbl, nt,
                                        out_s.empty() ? "did not run" : "ran", nd_s);
                             }
