@@ -2094,6 +2094,13 @@ bool ggml_cuda_fn_l3_mul_mat_vec_q(ggml_backend_cuda_context & ctx, const ggml_t
     if (ne11 == 1 && nwarps_1 > 1 && ne00/QK8_0 < nwarps_1*blocks_per_iter_1warp) {
         return false;
     }
+    // 2..4 columns and a row that one pass of the block covers: one warp per block of mul_mat_vec_q (SMK), else the
+    // run-ahead kernel (RA); each has its own off switch
+    const bool use_smk = ne11 >= 2 && ne11 <= 4 &&
+        ne00/QK8_0 <= calc_nwarps(GGML_TYPE_Q8_0, (int) ne11, MMVQ_PARAMETERS_GENERIC)*blocks_per_iter_1warp;
+    if (use_smk ? !ggml_cuda_fn_l3_smk_enabled() : !ggml_cuda_fn_l3_ra_enabled()) {
+        return false;
+    }
 
     cudaStream_t stream = ctx.stream();
 
@@ -2118,9 +2125,7 @@ bool ggml_cuda_fn_l3_mul_mat_vec_q(ggml_backend_cuda_context & ctx, const ggml_t
     const uint32_t s11 = (uint32_t) (ne10_padded / QK8_1);
     const uint32_t s1  = (uint32_t) (dst->nb[1] / sizeof(float));
 
-    // 2..4 columns and a row that one pass of the block covers: one warp per block of mul_mat_vec_q
-    if (ne11 >= 2 && ne11 <= 4 &&
-            ne00/QK8_0 <= calc_nwarps(GGML_TYPE_Q8_0, (int) ne11, MMVQ_PARAMETERS_GENERIC)*blocks_per_iter_1warp) {
+    if (use_smk) {
         const int      rpb     = calc_rows_per_block((int) ne11, MMVQ_PARAMETERS_GENERIC, false,
                                      calc_nwarps(GGML_TYPE_Q8_0, (int) ne11, MMVQ_PARAMETERS_GENERIC));
         const uint32_t nblocks = (uint32_t) ((ne01 + rpb - 1)/rpb);

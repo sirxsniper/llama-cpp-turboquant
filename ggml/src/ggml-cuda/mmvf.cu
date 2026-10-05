@@ -1012,7 +1012,7 @@ static void mul_mat_vec_f_fn_l3_launch(const float * x, const float * y, float *
 }
 
 bool ggml_cuda_fn_l3_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
-    if (!ggml_cuda_fn_l3_enabled() || src0->type != GGML_TYPE_F32 || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+    if (!ggml_cuda_fn_l3_ra_enabled() || src0->type != GGML_TYPE_F32 || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
         return false;
     }
     GGML_TENSOR_BINARY_OP_LOCALS;

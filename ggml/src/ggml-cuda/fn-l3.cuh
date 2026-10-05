@@ -9,6 +9,9 @@
 
 // false when GGML_CUDA_FN_L3=0
 bool ggml_cuda_fn_l3_enabled();
+// [TAG_FN_L3_GPU_MMV] false when GGML_CUDA_FN_L3_RA=0 (run-ahead mat-vecs) / GGML_CUDA_FN_L3_SMK=0 (one warp per block)
+bool ggml_cuda_fn_l3_ra_enabled();
+bool ggml_cuda_fn_l3_smk_enabled();
 
 // one log line per path, the first time it runs in this process
 void ggml_cuda_fn_l3_note(int path, const char * what);

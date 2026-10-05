@@ -14,6 +14,23 @@ bool ggml_cuda_fn_l3_enabled() {
     return on;
 }
 
+// [TAG_FN_L3_GPU_MMV] the two kinds of marked mat-vec, each with its own off switch (to tell them apart in an A/B)
+bool ggml_cuda_fn_l3_ra_enabled() {
+    static const bool on = [] {
+        const char * e = getenv("GGML_CUDA_FN_L3_RA");
+        return ggml_cuda_fn_l3_enabled() && !(e && e[0] == '0');
+    }();
+    return on;
+}
+
+bool ggml_cuda_fn_l3_smk_enabled() {
+    static const bool on = [] {
+        const char * e = getenv("GGML_CUDA_FN_L3_SMK");
+        return ggml_cuda_fn_l3_enabled() && !(e && e[0] == '0');
+    }();
+    return on;
+}
+
 void ggml_cuda_fn_l3_note(int path, const char * what) {
     static std::atomic<bool> seen[GGML_CUDA_FN_L3_PATH_COUNT];
     if (path < 0 || path >= GGML_CUDA_FN_L3_PATH_COUNT || seen[path].exchange(true)) {
