@@ -3457,8 +3457,9 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             if (rolled) {
                 n_bridge_retry++;
                 LLAMA_LOG_WARN("%s: [TAG_FN_R1_BRIDGE_RETRY] the bridge failed this ubatch of %u tokens: rolled back, "
-                        "computing it again without the bridge (retry %" PRIu64 ")\n", __func__, ubatch.n_tokens,
-                        n_bridge_retry);
+                        "computing it again without the bridge (retry %" PRIu64 "%s)\n", __func__, ubatch.n_tokens,
+                        n_bridge_retry, llama_moe_bridge_sync(moe_bridge) ?
+                        "; [TAG_FN_R2_BRIDGE_SYNC] its layers run the host job as a CPU op: the bridged values" : "");
                 gf_res_prev_active = nullptr; // never reuse the bridged graph
                 res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
             } else {

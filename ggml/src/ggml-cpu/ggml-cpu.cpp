@@ -809,6 +809,16 @@ static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const ch
     if (strcmp(name, "ggml_cpu_moe_layer_supported") == 0) {
         return (void *)ggml_cpu_moe_layer_supported;
     }
+    // [TAG_FN_R2_BRIDGE_PF]
+    if (strcmp(name, "ggml_cpu_moe_prefetch") == 0) {
+        return (void *)ggml_cpu_moe_prefetch;
+    }
+    if (strcmp(name, "ggml_cpu_moe_prefetch_stop") == 0) {
+        return (void *)ggml_cpu_moe_prefetch_stop;
+    }
+    if (strcmp(name, "ggml_cpu_moe_prefetch_stats") == 0) {
+        return (void *)ggml_cpu_moe_prefetch_stats;
+    }
     if (strcmp(name, "ggml_cpu_fn_moe_fused_calls") == 0) {
         return (void *)ggml_cpu_fn_moe_fused_calls;
     }

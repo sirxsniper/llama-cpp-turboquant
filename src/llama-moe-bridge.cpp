@@ -36,6 +36,9 @@ using pool_free_t           = void (*)(ggml_cpu_moe_pool *);
 using pool_run_t            = ggml_status (*)(ggml_cpu_moe_pool *, const ggml_cpu_moe_job *);
 using pool_park_t           = void (*)(ggml_cpu_moe_pool *);
 using layer_supported_t     = bool (*)(const ggml_cpu_moe_layer *);
+using pool_pf_t             = ggml_status (*)(ggml_cpu_moe_pool *, const ggml_cpu_moe_prefetch_job *); // [TAG_FN_R2_BRIDGE_PF]
+using pool_pf_stop_t        = void (*)(ggml_cpu_moe_pool *);
+using pool_pf_stats_t       = void (*)(ggml_cpu_moe_pool *, uint64_t *, uint64_t *, uint64_t *, uint64_t *);
 
 inline void br_relax() {
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
@@ -78,6 +81,17 @@ struct llama_moe_bridge {
     pool_run_t            pool_run            = nullptr;
     pool_park_t           pool_park           = nullptr;
     pool_park_t           pool_wake           = nullptr;
+
+    // [TAG_FN_R2_BRIDGE_PF] next-layer prefetch (LLAMA_MOE_BRIDGE_PF=1, spin mode): after a layer's job the pool
+    // predicts the next layer's experts from its router and pulls the cold ones into the CPU caches, while the device
+    // runs that layer's attention; the next job stops it
+    pool_pf_t                             pool_pf       = nullptr;
+    pool_pf_stop_t                        pool_pf_stop  = nullptr;
+    pool_pf_stats_t                       pool_pf_stats = nullptr;
+    bool                                  pf_on         = false;
+    int                                   pf_k          = 12;
+    std::vector<int>                      pf_next;   // per channel: the channel of layer il + 1, or -1
+    std::vector<std::vector<ggml_fp16_t>> pf_router; // per channel: its router rows in f16 ([n_expert][n_embd]) if predicted
 
     ggml_moe_bridge * gb  = nullptr;
     int32_t           bid = -1;
@@ -291,6 +305,30 @@ static bool br_run(const ggml_moe_bridge_job * j, void * ud) {
     return ok;
 }
 
+// [TAG_FN_R2_BRIDGE_PF] after the job of channel j.chan: predict the next layer's experts from its router on this
+// layer's input (still in the channel's mapped memory: the device posts to this channel again only in the next step)
+// and let the pool's workers pull the cold ones into the caches until the next job comes (ggml_cpu_moe_run stops them)
+static void br_prefetch_next(llama_moe_bridge * br, ggml_cpu_moe_pool * pool, const ggml_moe_bridge_job & j) {
+    if (j.chan < 0 || j.chan >= (int) br->pf_next.size() || j.x == nullptr || j.n_tokens < 1 || j.n_tokens > br->max_t) {
+        return;
+    }
+    const int nc = br->pf_next[j.chan];
+    if (nc < 0 || br->pf_router[nc].empty()) {
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lk(br->graph_mtx);
+        if (!br->in_graph) {
+            return; // the owner closed the graph (a stale job): a CPU split may run next
+        }
+    }
+    auto & cn = br->chans[nc];
+    // the table the next job takes: the hot set's when its layer has one (br_run sets it up at the layer's first job)
+    const ggml_cpu_moe_layer * lay = cn.tbl_ok ? &cn.layer_tbl : &cn.layer;
+    const ggml_cpu_moe_prefetch_job pj = { lay, br->pf_router[nc].data(), j.n_tokens, j.x, br->pf_k };
+    br->pool_pf(pool, &pj);
+}
+
 // spin mode: poll the posts in order, spin for spin_us after the last job, then sleep in 1 ms slices (so a post that
 // comes without a wake is still served) until the owning context wakes it
 static void br_exec_main(llama_moe_bridge * br) {
@@ -316,6 +354,9 @@ static void br_exec_main(llama_moe_bridge * br) {
         if (br->fn_poll(br->gb, &job)) {
             const bool ok = br_run(&job, br);
             br->fn_complete(br->gb, &job, ok);
+            if (br->pf_on && ok) {
+                br_prefetch_next(br, pool, job); // [TAG_FN_R2_BRIDGE_PF]
+            }
             last = std::chrono::steady_clock::now();
             // test: stall before the next job is taken, so its wait runs into timeout_ms
             const uint64_t n = br->n_jobs.load(std::memory_order_relaxed);
@@ -596,6 +637,64 @@ llama_moe_bridge * llama_moe_bridge_create(const llama_model & model, int n_thre
     }
     br->bid = br->fn_id(br->gb);
 
+    // [TAG_FN_R2_BRIDGE_PF] next-layer prefetch: the channels whose layer il + 1 is a channel too, and that layer's
+    // router rows in f16 on the host (2.5 MiB per layer at n_embd 2560 x 512 experts)
+    if (env_int("LLAMA_MOE_BRIDGE_PF", 0) > 0) {
+        br->pool_pf       = (pool_pf_t)       ggml_backend_reg_get_proc_address(cpu_reg, "ggml_cpu_moe_prefetch");
+        br->pool_pf_stop  = (pool_pf_stop_t)  ggml_backend_reg_get_proc_address(cpu_reg, "ggml_cpu_moe_prefetch_stop");
+        br->pool_pf_stats = (pool_pf_stats_t) ggml_backend_reg_get_proc_address(cpu_reg, "ggml_cpu_moe_prefetch_stats");
+        if (br->mode != GGML_MOE_BRIDGE_WAIT_SPIN) {
+            LLAMA_LOG_WARN("%s: LLAMA_MOE_BRIDGE_PF needs LLAMA_MOE_BRIDGE_WAIT=spin: no next-layer prefetch\n", __func__);
+        } else if (!br->pool_pf || !br->pool_pf_stop || !br->pool_pf_stats) {
+            LLAMA_LOG_WARN("%s: LLAMA_MOE_BRIDGE_PF: the CPU backend has no prefetch: no next-layer prefetch\n", __func__);
+        } else {
+            br->pf_k = std::min(64, std::max(1, env_int("LLAMA_MOE_BRIDGE_PF_K", 12)));
+            std::unordered_map<int, int> chan_of;
+            for (size_t c = 0; c < br->chans.size(); ++c) {
+                chan_of[br->chans[c].il] = (int) c;
+            }
+            br->pf_next.assign(br->chans.size(), -1);
+            br->pf_router.resize(br->chans.size());
+            size_t n_bytes = 0;
+            int    n_pf    = 0;
+            for (size_t c = 0; c < br->chans.size(); ++c) {
+                const auto it = chan_of.find(br->chans[c].il + 1);
+                if (it == chan_of.end()) {
+                    continue;
+                }
+                const int nc = it->second;
+                const ggml_tensor * r = model.layers[br->chans[nc].il].ffn_gate_inp;
+                if (r == nullptr || r->ne[0] != br->n_embd || r->ne[1] != br->chans[nc].up->ne[2] || r->ne[2] != 1 ||
+                    r->ne[3] != 1 || !ggml_is_contiguous(r)) {
+                    continue;
+                }
+                if (br->pf_router[nc].empty()) {
+                    const ggml_type_traits * tt = ggml_get_type_traits(r->type);
+                    if (r->type != GGML_TYPE_F32 && (tt == nullptr || tt->to_float == nullptr)) {
+                        continue;
+                    }
+                    std::vector<uint8_t> raw(ggml_nbytes(r));
+                    ggml_backend_tensor_get(r, raw.data(), 0, raw.size());
+                    std::vector<float> f32((size_t) ggml_nelements(r));
+                    if (r->type == GGML_TYPE_F32) {
+                        memcpy(f32.data(), raw.data(), f32.size()*sizeof(float));
+                    } else {
+                        tt->to_float(raw.data(), f32.data(), (int64_t) f32.size());
+                    }
+                    br->pf_router[nc].resize(f32.size());
+                    ggml_fp32_to_fp16_row(f32.data(), br->pf_router[nc].data(), (int64_t) f32.size());
+                    n_bytes += br->pf_router[nc].size()*sizeof(ggml_fp16_t);
+                }
+                br->pf_next[c] = nc;
+                n_pf++;
+            }
+            br->pf_on = n_pf > 0;
+            LLAMA_LOG_INFO("%s: [TAG_FN_R2_BRIDGE_PF] next-layer prefetch: %d of %zu layers predict their successor's experts "
+                    "(top-%d per token, the cold ones pulled into the CPU caches between two jobs), router copies %.1f MiB\n",
+                    __func__, n_pf, br->chans.size(), br->pf_k, n_bytes/1048576.0);
+        }
+    }
+
     if (br->mode == GGML_MOE_BRIDGE_WAIT_HOSTFUNC) {
         br->pool = br->pool_new(&br->pool_params); // run by the driver's callback thread, which keeps its affinity
         if (br->pool == nullptr) {
@@ -745,6 +844,9 @@ void llama_moe_bridge_begin(llama_moe_bridge * br, bool used) {
     } else {
         // other CPU work (prefill splits) is about to run on the pool's cores
         br->parked.store(true, std::memory_order_relaxed);
+        if (br->pf_on && br->pool) {
+            br->pool_pf_stop(br->pool); // [TAG_FN_R2_BRIDGE_PF] the workers leave a prefetch at their next piece
+        }
         br->pool_park(br->pool);
     }
 }
@@ -797,6 +899,13 @@ bool llama_moe_bridge_end(llama_moe_bridge * br) {
                 "device wait %.1f us avg, %.1f%% ready at the first look\n", __func__, br->bid, br->n_graphs, nj,
                 nj ? br->job_ns.load()/1e3/nj : 0.0, br->job_ns_max.load()/1e3,
                 s.waits ? s.wait_ns/1e3/s.waits : 0.0, s.waits ? 100.0*s.waits_ready/s.waits : 0.0);
+        if (br->pf_on && br->pool) { // [TAG_FN_R2_BRIDGE_PF]
+            uint64_t pj = 0, ps = 0, pb = 0, pe = 0;
+            br->pool_pf_stats(br->pool, &pj, &ps, &pb, &pe);
+            LLAMA_LOG_INFO("%s: MoE bridge %d: [TAG_FN_R2_BRIDGE_PF] %" PRIu64 " prefetches, %.1f%% stopped by the next job, "
+                    "%.2f predicted cold experts and %.2f MiB per prefetch\n", __func__, br->bid, pj, pj ? 100.0*ps/pj : 0.0,
+                    pj ? (double) pe/pj : 0.0, pj ? pb/1048576.0/pj : 0.0);
+        }
     }
     if (err == GGML_MOE_BRIDGE_ERR_NONE) {
         return true;

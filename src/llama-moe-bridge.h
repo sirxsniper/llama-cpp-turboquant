@@ -20,6 +20,11 @@
 //   LLAMA_MOE_BRIDGE_RB=0                 [TAG_FN_R1_BRIDGE_RB] (on by default with speculative decoding on a hybrid
 //                                         model) off: no extra ring token, the bridge keeps graphs up to MAX_T, and a
 //                                         failed bridged verify ubatch fails (its recurrent state cannot roll back)
+//   LLAMA_MOE_BRIDGE_PF=1                 [TAG_FN_R2_BRIDGE_PF] (spin mode) after each layer's job the pool's workers
+//                                         predict the next layer's experts (its router on this layer's input, top
+//                                         LLAMA_MOE_BRIDGE_PF_K=12 per token), skip the hot ones and pull the rest into
+//                                         the CPU caches while the device runs that layer's attention (DRAM is idle
+//                                         then); the next job stops them. Never changes a value.
 //   LLAMA_MOE_BRIDGE_SYNC=1               [TAG_FN_R2_BRIDGE_SYNC] (default) while the bridge is paused or off (the
 //                                         retried ubatch, the 16 steps after a deadline miss, after 3 errors), the
 //                                         layers it takes run its host job as a CPU graph op (ggml_moe_host_sum) and

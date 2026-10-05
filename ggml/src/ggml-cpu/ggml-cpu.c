@@ -2349,6 +2349,65 @@ void ggml_fn_moe_compute(const struct ggml_fn_moe_args * a, int ith, int nth, vo
 #undef GGML_FN_MOE_SKIP
 }
 
+// [TAG_FN_R2_BRIDGE_PF] pull a byte range into the caches (L2 and, through its evictions, the CCD's L3); never faults
+static inline void ggml_fn_prefetch_bytes(const char * a, size_t len) {
+    const char * end = a + len;
+    for (const char * c = (const char *) ((uintptr_t) a & ~(uintptr_t) 63); c < end; c += 64) {
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+        _mm_prefetch(c, _MM_HINT_T1);
+#elif defined(__GNUC__) || defined(__clang__)
+        __builtin_prefetch(c, 0, 2);
+#else
+        GGML_UNUSED(c);
+#endif
+    }
+}
+
+// [TAG_FN_R2_BRIDGE_PF] the weights thread ith of nth reads in ggml_fn_moe_compute for a job whose active experts are
+// list[0..n) (ascending, the job's own order): its gate + up pieces of step 3, then its down pieces of step 4, so the
+// job finds them in this core's L2 or the CCD's L3. Stops before the next piece once *stop != 0. Returns the bytes.
+size_t ggml_fn_moe_prefetch(const struct ggml_tensor * up, const struct ggml_tensor * gate, const struct ggml_tensor * down,
+                            const int32_t * list, int n, int ith, int nth, const volatile int32_t * stop) {
+    if (n <= 0 || nth <= 0 || ith < 0 || ith >= nth) {
+        return 0;
+    }
+    const int64_t n_embd = up->ne[0];
+    const int64_t n_ff   = up->ne[1];
+    size_t bytes = 0;
+    {
+        const int64_t pr   = ggml_fn_moe_pr(down);
+        const int64_t np_e = (n_ff + pr - 1)/pr;
+        const int64_t np   = (int64_t) n*np_e;
+        for (int64_t p = np*ith/nth; p < np*(ith + 1)/nth; ++p) {
+            if (*stop) {
+                return bytes;
+            }
+            const int32_t e  = list[p/np_e];
+            const int64_t r0 = (p % np_e)*pr;
+            const int64_t nr = MIN(pr, n_ff - r0);
+            ggml_fn_prefetch_bytes((const char *) gate->data + (size_t) e*gate->nb[2] + (size_t) r0*gate->nb[1], (size_t) nr*gate->nb[1]);
+            ggml_fn_prefetch_bytes((const char *) up->data   + (size_t) e*up->nb[2]   + (size_t) r0*up->nb[1],   (size_t) nr*up->nb[1]);
+            bytes += (size_t) nr*(gate->nb[1] + up->nb[1]);
+        }
+    }
+    {
+        const int64_t pd   = GGML_FN_MOE_PD;
+        const int64_t np_e = (n_embd + pd - 1)/pd;
+        const int64_t np   = (int64_t) n*np_e;
+        for (int64_t p = np*ith/nth; p < np*(ith + 1)/nth; ++p) {
+            if (*stop) {
+                return bytes;
+            }
+            const int32_t e  = list[p/np_e];
+            const int64_t r0 = (p % np_e)*pd;
+            const int64_t nr = MIN(pd, n_embd - r0);
+            ggml_fn_prefetch_bytes((const char *) down->data + (size_t) e*down->nb[2] + (size_t) r0*down->nb[1], (size_t) nr*down->nb[1]);
+            bytes += (size_t) nr*down->nb[1];
+        }
+    }
+    return bytes;
+}
+
 // the graph pattern: two MUL_MAT_ID on the same input and ids (up and gate, either order), GLU swiglu split(gate, up),
 // MUL_MAT_ID down on its result with the same ids; view nodes may sit in between; up, gate and the GLU result are used
 // by nothing else

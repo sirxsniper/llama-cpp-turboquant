@@ -205,6 +205,27 @@ extern "C" {
     // [TAG_MOE_BRIDGE] true if ggml_cpu_moe_run takes jobs of this layer (weight types and shapes)
     GGML_BACKEND_API bool                           ggml_cpu_moe_layer_supported(const struct ggml_cpu_moe_layer * layer);
 
+    // [TAG_FN_R2_BRIDGE_PF] next-layer prefetch, for the idle time between two jobs of a GPU/CPU doorbell: the workers
+    // predict the experts of the next MoE layer (top-k of its router logits on the current layer's input, per token),
+    // drop the ones its table serves elsewhere (the hot set), and pull the rest's weights into the CPU caches, every
+    // worker the pieces it computes in a job of those experts. Asynchronous: returns once the workers have the job; the
+    // caller is not one of them (it keeps polling for the next job). They stop at their next piece after
+    // ggml_cpu_moe_prefetch_stop (any thread); ggml_cpu_moe_run, the next prefetch and ggml_cpu_moe_pool_free stop and
+    // wait for them first. Values are never touched. Needs >= 2 pool threads.
+    struct ggml_cpu_moe_prefetch_job {
+        const struct ggml_cpu_moe_layer * layer;  // the predicted layer; its table marks the experts not to fetch
+        const ggml_fp16_t * router;               // [n_expert][n_embd]: the layer's router rows in f16
+        int32_t       n_tokens;                   // 1..16
+        const float * x;                          // [n_tokens][n_embd] f32, copied by the call
+        int32_t       k;                          // experts predicted per token
+    };
+    GGML_BACKEND_API enum ggml_status ggml_cpu_moe_prefetch     (struct ggml_cpu_moe_pool * pool, const struct ggml_cpu_moe_prefetch_job * job);
+    GGML_BACKEND_API void             ggml_cpu_moe_prefetch_stop(struct ggml_cpu_moe_pool * pool);
+    // totals since the pool was made: prefetch jobs, jobs stopped before their end, bytes covered, experts predicted
+    // (not resident)
+    GGML_BACKEND_API void             ggml_cpu_moe_prefetch_stats(struct ggml_cpu_moe_pool * pool, uint64_t * jobs,
+                                                                  uint64_t * stopped, uint64_t * bytes, uint64_t * experts);
+
     // [TAG_FN_CPU_MOE_FUSE] test / benchmark hook: how many fused MoE graph ops have run in this process
     GGML_BACKEND_API uint64_t ggml_cpu_fn_moe_fused_calls(void);
 

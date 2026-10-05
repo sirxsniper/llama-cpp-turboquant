@@ -203,6 +203,24 @@ struct ggml_cpu_moe_pool {
 
     ggml_fn_moe_args     args{};
     std::vector<uint8_t> work;
+
+    // [TAG_FN_R2_BRIDGE_PF] the asynchronous next-layer prefetch (ggml_cpu_moe_prefetch)
+    std::atomic<int>          kind{0};             // of the posted job: 0 compute (args), 1 prefetch (pf)
+    volatile int32_t          pf_stop     = 0;     // nonzero: the prefetching workers stop at their next piece
+    bool                      pf_inflight = false; // the caller's side: a prefetch is posted and not waited for yet
+    alignas(64) std::atomic<int> pf_bar_count{0};  // the workers' own barrier (the caller does not take part)
+    alignas(64) std::atomic<int> pf_bar_gen{0};
+    ggml_cpu_moe_prefetch_job pf{};
+    std::vector<ggml_fp16_t>  pf_xh;               // [n_tokens][n_embd] the input in f16 (the router rows' dot type)
+    std::vector<float>        pf_logits;           // [n_tokens][n_expert]
+    std::vector<int32_t>      pf_list;             // the predicted experts the table does not serve, ascending
+    std::vector<int32_t>      pf_idx;              // selection scratch
+    std::vector<uint8_t>      pf_mark;
+    int                       pf_n = 0;            // entries of pf_list (worker 1 writes it before the second barrier)
+    std::atomic<uint64_t>     pf_jobs{0};
+    std::atomic<uint64_t>     pf_stopped{0};
+    std::atomic<uint64_t>     pf_bytes{0};
+    std::atomic<uint64_t>     pf_experts{0};
 };
 
 static void moe_pool_barrier(void * ctx) {
@@ -219,6 +237,95 @@ static void moe_pool_barrier(void * ctx) {
     while (p->bar_gen.load(std::memory_order_acquire) == gen) {
         moe_pool_relax();
     }
+}
+
+// [TAG_FN_R2_BRIDGE_PF] the barrier of the prefetching workers (1 .. n_threads-1)
+static void moe_pool_pf_barrier(ggml_cpu_moe_pool * p, int nw) {
+    if (nw <= 1) {
+        return;
+    }
+    const int gen = p->pf_bar_gen.load(std::memory_order_acquire);
+    if (p->pf_bar_count.fetch_add(1, std::memory_order_acq_rel) == nw - 1) {
+        p->pf_bar_count.store(0, std::memory_order_relaxed);
+        p->pf_bar_gen.fetch_add(1, std::memory_order_acq_rel);
+        return;
+    }
+    while (p->pf_bar_gen.load(std::memory_order_acquire) == gen) {
+        moe_pool_relax();
+    }
+}
+
+// [TAG_FN_R2_BRIDGE_PF] worker ith (>= 1) of a prefetch job: the router logits of its share of the experts, then (worker
+// 1) the top-k of every token minus the table's experts, then its pieces of a job of those experts (as thread ith of
+// n_threads computes them). Every worker passes both barriers even after a stop, so the job always ends cleanly.
+static void moe_pool_prefetch_part(ggml_cpu_moe_pool * p, int ith) {
+    const ggml_cpu_moe_prefetch_job & J = p->pf;
+    const ggml_cpu_moe_layer * L = J.layer;
+    const int64_t n_embd = L->up->ne[0];
+    const int     n_exp  = (int) L->up->ne[2];
+    const int     T      = J.n_tokens;
+    const int     nw     = p->n_threads - 1;
+    const int     w      = ith - 1;
+
+    if (!p->pf_stop) {
+        const struct ggml_type_traits_cpu * tf = ggml_get_type_traits_cpu(GGML_TYPE_F16);
+        const int e0 = n_exp*w/nw;
+        const int e1 = n_exp*(w + 1)/nw;
+        for (int e = e0; e < e1; ++e) {
+            const ggml_fp16_t * row = J.router + (size_t) e*n_embd;
+            for (int t = 0; t < T; ++t) {
+                float v = 0.0f;
+                tf->vec_dot((int) n_embd, &v, 0, row, 0, p->pf_xh.data() + (size_t) t*n_embd, 0, 1);
+                p->pf_logits[(size_t) t*n_exp + e] = v;
+            }
+        }
+    }
+    moe_pool_pf_barrier(p, nw);
+
+    if (w == 0) {
+        int n = 0;
+        if (!p->pf_stop) {
+            std::fill(p->pf_mark.begin(), p->pf_mark.end(), (uint8_t) 0);
+            const int k = std::min<int>(J.k, n_exp);
+            for (int t = 0; t < T; ++t) {
+                const float * lg = p->pf_logits.data() + (size_t) t*n_exp;
+                for (int e = 0; e < n_exp; ++e) {
+                    p->pf_idx[e] = e;
+                }
+                std::nth_element(p->pf_idx.begin(), p->pf_idx.begin() + (k - 1), p->pf_idx.begin() + n_exp,
+                        [lg](int32_t a, int32_t b) { return lg[a] > lg[b]; });
+                for (int i = 0; i < k; ++i) {
+                    p->pf_mark[p->pf_idx[i]] = 1;
+                }
+            }
+            for (int e = 0; e < n_exp; ++e) {
+                if (p->pf_mark[e] && !(L->table != nullptr && L->table[e] != L->table_miss)) {
+                    p->pf_list[n++] = e;
+                }
+            }
+        }
+        p->pf_n = n;
+        p->pf_experts.fetch_add((uint64_t) n, std::memory_order_relaxed);
+    }
+    moe_pool_pf_barrier(p, nw);
+
+    const size_t b = ggml_fn_moe_prefetch(L->up, L->gate, L->down, p->pf_list.data(), p->pf_n, ith, p->n_threads, &p->pf_stop);
+    p->pf_bytes.fetch_add((uint64_t) b, std::memory_order_relaxed);
+}
+
+// [TAG_FN_R2_BRIDGE_PF] the caller's side: stop a posted prefetch and wait until every worker has left it
+static void moe_pool_prefetch_finish(ggml_cpu_moe_pool * p) {
+    if (!p->pf_inflight) {
+        return;
+    }
+    if (p->n_done.load(std::memory_order_acquire) != p->n_threads - 1) {
+        p->pf_stop = 1;
+        p->pf_stopped.fetch_add(1, std::memory_order_relaxed);
+        while (p->n_done.load(std::memory_order_acquire) != p->n_threads - 1) {
+            moe_pool_relax();
+        }
+    }
+    p->pf_inflight = false;
 }
 
 static void moe_pool_worker(ggml_cpu_moe_pool * p, int ith) {
@@ -266,7 +373,11 @@ static void moe_pool_worker(ggml_cpu_moe_pool * p, int ith) {
             break;
         }
         last = s;
-        ggml_fn_moe_compute(&p->args, ith, p->n_threads, moe_pool_barrier, p);
+        if (p->kind.load(std::memory_order_acquire) == 1) { // [TAG_FN_R2_BRIDGE_PF]
+            moe_pool_prefetch_part(p, ith);
+        } else {
+            ggml_fn_moe_compute(&p->args, ith, p->n_threads, moe_pool_barrier, p);
+        }
         p->n_done.fetch_add(1, std::memory_order_acq_rel);
     }
 }
@@ -336,6 +447,7 @@ void ggml_cpu_moe_pool_free(struct ggml_cpu_moe_pool * p) {
     if (p == nullptr) {
         return;
     }
+    moe_pool_prefetch_finish(p); // [TAG_FN_R2_BRIDGE_PF]
     p->stop.store(true, std::memory_order_seq_cst);
     {
         std::lock_guard<std::mutex> lk(p->mtx);
@@ -385,6 +497,8 @@ enum ggml_status ggml_cpu_moe_run(struct ggml_cpu_moe_pool * p, const struct ggm
     const int     T      = job->n_tokens;
     const int     n_used = job->n_used;
 
+    moe_pool_prefetch_finish(p); // [TAG_FN_R2_BRIDGE_PF] the workers leave a prefetch before the job (and its buffers)
+
     const size_t need = ggml_fn_moe_work_size(l->up, l->gate, l->down, n_used, T, p->n_threads);
     if (p->work.size() < need) {
         p->work.resize(need); // the workers are idle between jobs
@@ -414,6 +528,7 @@ enum ggml_status ggml_cpu_moe_run(struct ggml_cpu_moe_pool * p, const struct ggm
     }
     a.wdata = p->work.data();
 
+    p->kind.store(0, std::memory_order_relaxed); // [TAG_FN_R2_BRIDGE_PF]
     p->n_done.store(0, std::memory_order_relaxed);
     p->parked.store(false, std::memory_order_relaxed); // [TAG_MOE_BRIDGE]
     p->seq.fetch_add(1, std::memory_order_seq_cst);
@@ -430,4 +545,66 @@ enum ggml_status ggml_cpu_moe_run(struct ggml_cpu_moe_pool * p, const struct ggm
         moe_pool_relax();
     }
     return GGML_STATUS_SUCCESS;
+}
+
+// [TAG_FN_R2_BRIDGE_PF]
+enum ggml_status ggml_cpu_moe_prefetch(struct ggml_cpu_moe_pool * p, const struct ggml_cpu_moe_prefetch_job * job) {
+    if (p == nullptr || job == nullptr || job->layer == nullptr || job->router == nullptr || job->x == nullptr ||
+        p->n_threads < 2 || job->n_tokens < 1 || job->n_tokens > GGML_FN_MOE_MAX_T || job->k < 1) {
+        return GGML_STATUS_FAILED;
+    }
+    const ggml_cpu_moe_layer * l = job->layer;
+    if (!ggml_fn_moe_supported(l->up, l->gate, l->down)) {
+        return GGML_STATUS_FAILED;
+    }
+    moe_pool_prefetch_finish(p);
+
+    const int64_t n_embd = l->up->ne[0];
+    const int64_t n_exp  = l->up->ne[2];
+    const int     T      = job->n_tokens;
+    p->pf = *job;
+    p->pf.x = nullptr; // copied below, in the router's dot type
+    p->pf_xh.resize((size_t) n_embd*T);
+    ggml_cpu_fp32_to_fp16(job->x, p->pf_xh.data(), n_embd*T);
+    p->pf_logits.resize((size_t) n_exp*T);
+    p->pf_list.resize((size_t) n_exp);
+    p->pf_idx.resize((size_t) n_exp);
+    p->pf_mark.resize((size_t) n_exp);
+    p->pf_n    = 0;
+    p->pf_stop = 0;
+    p->pf_jobs.fetch_add(1, std::memory_order_relaxed);
+
+    p->kind.store(1, std::memory_order_relaxed);
+    p->n_done.store(0, std::memory_order_relaxed);
+    p->parked.store(false, std::memory_order_relaxed);
+    p->seq.fetch_add(1, std::memory_order_seq_cst);
+    if (p->n_sleeping.load(std::memory_order_seq_cst) > 0) {
+        {
+            std::lock_guard<std::mutex> lk(p->mtx);
+        }
+        p->cv.notify_all();
+    }
+    p->pf_inflight = true;
+    return GGML_STATUS_SUCCESS;
+}
+
+void ggml_cpu_moe_prefetch_stop(struct ggml_cpu_moe_pool * p) {
+    if (p) {
+        p->pf_stop = 1;
+    }
+}
+
+void ggml_cpu_moe_prefetch_stats(struct ggml_cpu_moe_pool * p, uint64_t * jobs, uint64_t * stopped, uint64_t * bytes, uint64_t * experts) {
+    if (jobs) {
+        *jobs = p ? p->pf_jobs.load() : 0;
+    }
+    if (stopped) {
+        *stopped = p ? p->pf_stopped.load() : 0;
+    }
+    if (bytes) {
+        *bytes = p ? p->pf_bytes.load() : 0;
+    }
+    if (experts) {
+        *experts = p ? p->pf_experts.load() : 0;
+    }
 }

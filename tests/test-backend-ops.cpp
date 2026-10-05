@@ -16534,6 +16534,11 @@ static bool run_cpu_fn_moe_fuse(ggml_backend_t backend, ggml_backend_t backend_r
     using pool_park_t = void (*)(ggml_cpu_moe_pool *);
     auto pool_park = (pool_park_t) ggml_backend_reg_get_proc_address(reg, "ggml_cpu_moe_pool_park");
     auto pool_wake = (pool_park_t) ggml_backend_reg_get_proc_address(reg, "ggml_cpu_moe_pool_wake");
+    // [TAG_FN_R2_BRIDGE_PF] optional: the asynchronous next-layer prefetch
+    using pool_pf_t       = ggml_status (*)(ggml_cpu_moe_pool *, const ggml_cpu_moe_prefetch_job *);
+    using pool_pf_stats_t = void (*)(ggml_cpu_moe_pool *, uint64_t *, uint64_t *, uint64_t *, uint64_t *);
+    auto pool_pf       = (pool_pf_t)       ggml_backend_reg_get_proc_address(reg, "ggml_cpu_moe_prefetch");
+    auto pool_pf_stats = (pool_pf_stats_t) ggml_backend_reg_get_proc_address(reg, "ggml_cpu_moe_prefetch_stats");
     const int saved_fuse = get_sw(GGML_CPU_FN_MOE_FUSE);
     const int saved_mr   = get_sw(GGML_CPU_FN_MMID_MR);
 
@@ -16667,6 +16672,31 @@ static bool run_cpu_fn_moe_fuse(ggml_backend_t backend, ggml_backend_t backend_r
                         });
                         th.join();
                     }
+                    // [TAG_FN_R2_BRIDGE_PF] a prefetch that runs to its end before the job, and one the job stops (posted
+                    // right before it): the job's values stay bit for bit the weighted sum, and both prefetches counted
+                    std::vector<float> out_f1((size_t) c.n_embd * T, 12345.0f);
+                    std::vector<float> out_f2((size_t) c.n_embd * T, 12345.0f);
+                    bool ran_f = false;
+                    const bool pf_opts = pool_pf && pool_pf_stats && pool;
+                    if (pf_opts) {
+                        std::vector<ggml_fp16_t> router((size_t) c.n_exp * c.n_embd);
+                        for (ggml_fp16_t & v : router) {
+                            v = ggml_fp32_to_fp16(uni(gen));
+                        }
+                        uint64_t pj0 = 0, pj1 = 0;
+                        pool_pf_stats(pool, &pj0, nullptr, nullptr, nullptr);
+                        const ggml_cpu_moe_prefetch_job pjob = { &layer, router.data(), (int32_t) T, x.data(), 4 };
+                        const bool p1 = pool_pf(pool, &pjob) == GGML_STATUS_SUCCESS;
+                        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                        job.w   = w.data();
+                        job.out = out_f1.data();
+                        const bool r1 = pool_run(pool, &job) == GGML_STATUS_SUCCESS;
+                        const bool p2 = pool_pf(pool, &pjob) == GGML_STATUS_SUCCESS;
+                        job.out = out_f2.data();
+                        const bool r2 = pool_run(pool, &job) == GGML_STATUS_SUCCESS;
+                        pool_pf_stats(pool, &pj1, nullptr, nullptr, nullptr);
+                        ran_f = p1 && r1 && p2 && r2 && pj1 == pj0 + 2;
+                    }
                     pool_free(pool);
 
                     // the weighted sum of the reference rows, in slot order, skipped slots left out
@@ -16716,6 +16746,19 @@ static bool run_cpu_fn_moe_fuse(ggml_backend_t backend, ggml_backend_t backend_r
                             }
                             n_fail += ok_s ? 0 : 1;
                         }
+                    }
+
+                    if (pf_opts) { // [TAG_FN_R2_BRIDGE_PF]
+                        size_t nd_f1 = 0, nd_f2 = 0;
+                        double err_f1 = 0.0, err_f2 = 0.0;
+                        const bool ok_f = ran_f && cpu_fn_same(out_f1, exp_w, &nd_f1, &err_f1) && cpu_fn_same(out_f2, exp_w, &nd_f2, &err_f2) &&
+                                          nd_f1 == 0 && nd_f2 == 0;
+                        n_run += 1;
+                        if (!ok_f) {
+                            printf("  FAIL moe pool prefetch %s/%s/%s T=%" PRId64 " table=%d: ran %d, %zu / %zu values differ after a finished / stopped prefetch\n",
+                                   ggml_type_name(c.tu), ggml_type_name(c.tg), ggml_type_name(c.td), T, with_tbl, (int) ran_f, nd_f1, nd_f2);
+                        }
+                        n_fail += ok_f ? 0 : 1;
                     }
 
                     if (bridge_opts) { // [TAG_MOE_BRIDGE]
