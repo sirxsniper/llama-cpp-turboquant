@@ -320,6 +320,10 @@ llama_build_and_test(test-moe-decay.cpp)
 # [TAG_FN_MTP_COST] cost-aware MTP draft length (common/speculative-mtp-cost.h): pieces and a step simulation, CPU only
 llama_build_and_test(test-mtp-cost.cpp)
 
+# [TAG_FN_L3_MTP_COST2] MTP draft length v2 from measured row costs (common/speculative-mtp-cost2.h): pieces and a step
+# simulation with stalls, draft-decode spikes and a slow start, against the fixed rules and version 1. CPU only.
+llama_build_and_test(test-mtp-cost2.cpp)
+
 # [TAG_FN_PLE_DIRECT_IO] unbuffered PLE row reads (src/llama-ple-dio.cpp) against the mapped rows of a real GGUF, CPU and
 # disk only. Built, not registered with ctest: it needs the model file. The reader is compiled in (libllama does not
 # export it).

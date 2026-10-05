@@ -12,6 +12,7 @@
 #include "ngram-mod.h"
 #include "sampling.h"
 #include "speculative-mtp-cost.h" // [TAG_FN_MTP_COST]
+#include "speculative-mtp-cost2.h" // [TAG_FN_L3_MTP_COST2]
 
 #include "../src/llama-ext.h" // staging API: llama_set_embeddings_nextn / llama_get_embeddings_nextn_ith (used by MTP)
 
@@ -28,6 +29,8 @@
 #include <map>
 #include <mutex>
 #include <random>
+#include <sstream>
+#include <unordered_map>
 
 #define SPC_DBG(fmt, ...) LOG_DBG("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
 #define SPC_TRC(fmt, ...) LOG_TRC("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
@@ -3457,6 +3460,41 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     uint64_t                        cost_n_none    = 0;  // policy steps that drafted nothing
     std::vector<uint64_t>           cost_hist;           // policy draft lengths (per drafting sequence)
 
+    // [TAG_FN_L3_MTP_COST2] SPEC_MTP_COST=2 on qwen4exp: the draft length from measured row costs (speculative-mtp-cost2.h)
+    bool                            is_qwen4exp  = false;
+    bool                            cost2_on     = false;
+    common_mtp_cost2                cost2;
+    bool                            c2_track     = false; // the target's MoE bridge counts the cold experts of each step
+    int64_t                         c2_t_start   = 0;     // start of the last draft() call in us (0 = no step to time)
+    int64_t                         c2_t_end     = 0;     // its end
+    int32_t                         c2_rows      = 0;     // verify rows it planned
+    bool                            c2_policy    = false; // its lengths came from the policy
+    int32_t                         c2_n_proc    = 0;     // process() calls since then
+    int32_t                         c2_proc_rows = 0;     // rows of the last one
+    uint32_t                        c2_cold[common_mtp_cost2::R_MAX] = {};
+    bool                            c2_cold_ok   = false; // c2_cold holds the last process() batch's counts
+    uint64_t                        c2_serial    = 0;     // bridge graph serial last read
+    std::vector<int32_t>            c2_acc;               // per sequence: drafts accepted in the last step, -1 = not in it
+    std::vector<std::vector<float>> c2_ps;                // per sequence: drafter confidence of each proposed token
+    std::vector<int8_t>             c2_mode;              // per sequence: 1 = sampled draft, 0 = greedy
+    uint64_t                        c2_n_policy  = 0;
+    uint64_t                        c2_n_rule    = 0;
+    uint64_t                        c2_n_none    = 0;     // policy steps that drafted nothing
+    int32_t                         c2_skip      = 0;     // steps after a prompt still to leave out of the samples
+    int64_t                         c2_guards    = 0;     // guard events logged
+    std::vector<uint64_t>           c2_hist;              // policy draft lengths (per drafting sequence)
+
+    // [TAG_FN_L3_MTP_CHAIN] SPEC_MTP_PMIN_POS=<p1,p2,...> on qwen4exp: the p_min rule's threshold per draft position (the
+    // last value for the positions after it), e.g. 0.5,0.5,0.85 lets a third draft through only when it is confident
+    std::vector<float>              pmin_pos;
+
+    float pmin_at(int i) const {
+        if (pmin_pos.empty()) {
+            return params.p_min;
+        }
+        return pmin_pos[std::min<size_t>((size_t) std::max(0, i), pmin_pos.size() - 1)];
+    }
+
     // [TAG_FN_MTP_ATTN_WINDOW] LLAMA_MTP_ATTN_WINDOW on a qwen4exp MTP context: its draft KV keeps only this many
     // positions (llama-model.cpp), so prompt rows further back than that from their prompt's end are not decoded
     int32_t mtp_win = 0;
@@ -3514,9 +3552,34 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 h.c_str(), cost.acc(0, 0, 0.95f), cost.acc(1, 0, 0.95f));
     }
 
+    // [TAG_FN_L3_MTP_COST2]
+    void cost2_log_summary(const char * when) const {
+        std::string v, d, dcs, h;
+        for (int r = 1; r <= 5; ++r) {
+            v += string_format("%s%.2f", r > 1 ? " " : "", cost2.v_med(r)/1000.0);
+            d += string_format("%s%.2f", r > 1 ? " " : "", cost2.dV(r)/1000.0);
+            dcs += string_format("%s%.0f", r > 1 ? " " : "", cost2.dc(r));
+        }
+        for (size_t k = 0; k < c2_hist.size(); ++k) {
+            h += string_format("%s%llu", k ? " " : "", (unsigned long long) c2_hist[k]);
+        }
+        const double rp = cost2.lu_pol  > 0.0 ? cost2.lt_pol /cost2.lu_pol *1000.0 : 0.0;
+        const double rr = cost2.lu_rule > 0.0 ? cost2.lt_rule/cost2.lu_rule*1000.0 : 0.0;
+        LOG_INF("%s: [TAG_FN_L3_MTP_COST2] %s: rate %.4f tok/ms (policy %.4f, rule %.4f), k %.1f us per cold expert-layer, "
+                "dV(R=1..5) ms {%s}, V median(R=1..5) ms {%s}, new cold per row {%s}, t_d %.2f ms, steps %lld (cold %lld, "
+                "dropped %lld), policy %llu (none %llu), rule %llu, lengths {%s}, cold counts %s\n",
+                __func__, when, cost2.lam()*1000.0, rp, rr, cost2.k_, d.c_str(), v.c_str(), dcs.c_str(),
+                cost2.t_d(1)/1000.0, (long long) cost2.n_valid, (long long) cost2.n_cold, (long long) cost2.n_drop,
+                (unsigned long long) c2_n_policy, (unsigned long long) c2_n_none, (unsigned long long) c2_n_rule,
+                h.c_str(), c2_track ? "on" : "off (no MoE bridge)");
+    }
+
     void print_stats_extra() override {
         if (cost_on && cost.log > 0) {
             cost_log_summary("end");
+        }
+        if (cost2_on && cost2.log > 0) {
+            cost2_log_summary("end"); // [TAG_FN_L3_MTP_COST2]
         }
     }
 
@@ -3595,10 +3658,26 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         verify_h.assign(n_seq, {});
         verify_h_rows.assign(n_seq, 0);
 
+        // [TAG_FN_L3_MTP_COST2] the new switches act on qwen4exp only
+        {
+            char arch[32] = { 0 };
+            is_qwen4exp = llama_model_meta_val_str(llama_get_model(ctx_dft), "general.architecture", arch, sizeof(arch)) > 0 &&
+                          strcmp(arch, "qwen4exp") == 0;
+        }
+
         // [TAG_FN_MTP_COST]
         {
             const char * e = getenv("SPEC_MTP_COST");
             cost_on = e && e[0] == '1';
+            // [TAG_FN_L3_MTP_COST2] SPEC_MTP_COST=2: version 2 on qwen4exp, version 1 elsewhere
+            if (e && e[0] == '2' && e[1] == '\0') {
+                if (is_qwen4exp && !is_mem_shared && !chain_heads) {
+                    cost2_on = true;
+                } else {
+                    cost_on = true;
+                    LOG_WRN("%s: [TAG_FN_L3_MTP_COST2] SPEC_MTP_COST=2 is for qwen4exp MTP: version 1 runs instead\n", __func__);
+                }
+            }
             if (cost_on) {
                 cost.init_env();
                 cost_ps.assign(n_seq, {});
@@ -3611,6 +3690,51 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 LOG_INF("%s: [TAG_FN_MTP_COST] cost-aware MTP draft length on: n_max %d is the cap, p_min %.2f only in warm-up "
                         "(%d steps) and probes (every %d), prior row cost %.3f, expert-union growth {%s}, log %d\n",
                         __func__, this->params.n_max, this->params.p_min, cost.warm, cost.probe, cost.row0, u.c_str(), cost.log);
+            }
+            // [TAG_FN_L3_MTP_COST2]
+            if (cost2_on) {
+                cost2.init_env();
+                c2_track      = llama_moe_bridge_track_ext(ctx_tgt, true);
+                cost2.no_cold = !c2_track;
+                c2_acc.assign(n_seq, -1);
+                c2_ps.assign(n_seq, {});
+                c2_mode.assign(n_seq, 0);
+                c2_hist.assign((size_t) std::max(1, this->params.n_max) + 1, 0);
+                LOG_INF("%s: [TAG_FN_L3_MTP_COST2] MTP draft length v2 on: n_max %d is the cap, the p_min rule in warm-up (%d "
+                        "steps) and probes (every %d); a verify row is priced by %s; prior %.0f us per cold expert-layer, "
+                        "%.0f us per row besides, %.0f new cold expert-layers per row; log %d\n", __func__,
+                        this->params.n_max, cost2.warm, cost2.probe,
+                        c2_track ? "the cold experts the MoE bridge counts per step" : "the step time per width (no MoE bridge)",
+                        cost2.k0, cost2.row0, cost2.dc0, cost2.log);
+            }
+        }
+
+        // [TAG_FN_L3_MTP_CHAIN] per-position p_min of the rule
+        if (const char * e = getenv("SPEC_MTP_PMIN_POS"); e && e[0]) {
+            std::vector<float> v;
+            std::string s = e;
+            for (char & ch : s) {
+                if (ch == ',' || ch == ';') {
+                    ch = ' ';
+                }
+            }
+            std::istringstream is(s);
+            float x;
+            while (is >> x) {
+                v.push_back(std::min(1.0f, std::max(0.0f, x)));
+            }
+            if (!is_qwen4exp) {
+                LOG_WRN("%s: [TAG_FN_L3_MTP_CHAIN] SPEC_MTP_PMIN_POS is for qwen4exp MTP: ignored\n", __func__);
+            } else if (v.empty()) {
+                LOG_WRN("%s: [TAG_FN_L3_MTP_CHAIN] SPEC_MTP_PMIN_POS=%s has no value: ignored\n", __func__, e);
+            } else {
+                pmin_pos = v;
+                std::string t;
+                for (size_t k = 0; k < v.size(); ++k) {
+                    t += string_format("%s%.2f", k ? " " : "", v[k]);
+                }
+                LOG_INF("%s: [TAG_FN_L3_MTP_CHAIN] the p_min rule per draft position: {%s} (the last for the rest), n_max %d\n",
+                        __func__, t.c_str(), this->params.n_max);
             }
         }
 
@@ -3649,6 +3773,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         // [TAG_FN_MTP_COST] the gap to the next draft() holds a prompt, not a step
         cost_t_end = 0;
+        c2_t_start = 0; // [TAG_FN_L3_MTP_COST2]
+        c2_t_end   = 0;
+        c2_skip    = cost2_on ? cost2.skip : 0;
 
         const int32_t N = (int32_t) prompt.size();
         if (N <= 0) {
@@ -3656,6 +3783,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
 
         auto * ctx_dft = this->params.ctx_dft;
+
         const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_dft), seq_id);
 
         if (pos_max < N - 1 && !is_mem_shared) {
@@ -3676,6 +3804,24 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         if (cost_on) {
             cost_n_proc++;
             cost_proc_rows = batch_in.size();
+        }
+        // [TAG_FN_L3_MTP_COST2] the same, and the cold experts of this batch's bridged graph (the target's decode of it
+        // has finished): its width must be the batch's and its serial new, else the step has no counts
+        if (cost2_on) {
+            c2_n_proc++;
+            c2_proc_rows = batch_in.size();
+            c2_cold_ok   = false;
+            if (c2_track) {
+                int32_t  T      = 0;
+                uint64_t serial = 0;
+                uint32_t cold[common_mtp_cost2::R_MAX] = {};
+                if (llama_moe_bridge_last_ext(this->params.ctx_tgt, &T, cold, common_mtp_cost2::R_MAX, &serial) &&
+                        serial != c2_serial && T == batch_in.size() && T <= common_mtp_cost2::R_MAX) {
+                    c2_serial  = serial;
+                    c2_cold_ok = true;
+                    std::copy(cold, cold + T, c2_cold);
+                }
+            }
         }
 
         // TODO: how to make it work with vision tokens?
@@ -3871,6 +4017,49 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             cs_R = cs_n;
         }
 
+        // [TAG_FN_L3_MTP_COST2] the previous step: its time and cold experts (one verify batch since then), the tokens it
+        // produced over the whole draft() to draft() step; then this step's rule
+        bool use_policy2 = false;
+        if (cost2_on) {
+            const int64_t t0 = ggml_time_us();
+            const bool step_ok = c2_t_start > 0 && c2_t_end > 0 && c2_n_proc == 1 && c2_proc_rows >= 1 &&
+                                 c2_proc_rows <= c2_rows + (int32_t) n_seq;
+            if (step_ok && c2_skip > 0) {
+                c2_skip--; // the first steps after a prompt: the hot set refills, pages come in
+            } else if (step_ok) {
+                const bool cold_ok = c2_cold_ok && c2_proc_rows <= common_mtp_cost2::R_MAX;
+                if (cost2.add_step(c2_proc_rows, cold_ok ? c2_cold : nullptr, (double) (t0 - c2_t_end))) {
+                    double tok = 0.0;
+                    for (llama_seq_id s = 0; s < (llama_seq_id) n_seq; ++s) {
+                        tok += c2_acc[s] >= 0 ? 1.0 + c2_acc[s] : 0.0;
+                    }
+                    cost2.add_cycle(tok, (double) (t0 - c2_t_start), c2_policy);
+                }
+            }
+            c2_t_start = t0;
+            c2_t_end   = 0;
+            c2_n_proc  = 0;
+            use_policy2 = cost2.policy_step();
+            cost2.refresh();
+            if (cost2.n_guard != c2_guards) {
+                c2_guards = cost2.n_guard;
+                LOG_WRN("%s: [TAG_FN_L3_MTP_COST2] the policy's realized rate fell below %.2f x the p_min probes': the "
+                        "rule decides the next %d steps (guard %lld)\n", __func__, cost2.gmargin, cost2.gsteps,
+                        (long long) cost2.n_guard);
+            }
+            cs_P.assign(n_seq, 1.0);
+            for (llama_seq_id s = 0; s < (llama_seq_id) n_seq; ++s) {
+                c2_acc[s] = dparams[s].drafting ? 0 : -1;
+                if (dparams[s].drafting) {
+                    cs_n++;
+                    c2_ps[s].clear();
+                    c2_mode[s] = ((params.probabilistic && dparams[s].result_q) ||
+                                  (mtp_dists_enabled() && dparams[s].dists && dparams[s].temp > 0.0f)) ? 1 : 0;
+                }
+            }
+            cs_R = cs_n;
+        }
+
         // keep track of which sequences are still drafting
         int n_drafting = 0;
         std::vector<bool> drafting(n_seq);
@@ -3884,6 +4073,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             // [TAG_FN_MTP_COST] no draft decode when even a best-case first token cannot pay for its row and the decode
             if (use_policy && !cost.more(1.0, cost.acc_hi(cost_mode[seq_id], 0), cs_E, cs_R, 0, cs_n)) {
+                continue;
+            }
+            // [TAG_FN_L3_MTP_COST2] no draft decode when the expected first token does not pay for its row and the decode
+            if (use_policy2 && !cost2.more(1.0, cs_R, c2_mode[seq_id], 0, cs_n)) {
                 continue;
             }
 
@@ -3927,6 +4120,28 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             return true;
         };
 
+        // [TAG_FN_L3_MTP_COST2] [TAG_FN_L3_MTP_CHAIN] the keep test of the three draft paths: version 2's cost test,
+        // version 1's, or the p_min rule (per draft position with SPEC_MTP_PMIN_POS; unset = params.p_min, as before)
+        auto keep_token = [&](llama_seq_id s, float conf, int d, int n) -> bool {
+            const int pos = (int) dparams[s].result->size();
+            if (cost2_on) {
+                cost2.observe_conf(c2_mode[s], pos, conf);
+            }
+            if (use_policy2) {
+                const double a = cost2.calib.acc(c2_mode[s], pos, conf);
+                if (!cost2.keep(cs_P[s]*a, cs_R)) {
+                    return false;
+                }
+                cs_P[s] *= a;
+                cs_R    += 1;
+                return true;
+            }
+            if (use_policy) {
+                return cost_keep(s, conf, d, n);
+            }
+            return !(conf < pmin_at(pos));
+        };
+
         int i = 0;
 
         while (n_drafting > 0) {
@@ -3946,7 +4161,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 llama_set_nextn_layer_offset(ctx_dft, i);
             }
 
-            const int64_t cost_it0 = cost_on ? ggml_time_us() : 0; // [TAG_FN_MTP_COST] one draft decode + sampling
+            const int64_t cost_it0 = (cost_on || cost2_on) ? ggml_time_us() : 0; // [TAG_FN_MTP_COST] one draft decode + sampling
             const int     cost_nit = n_drafting;
 
             int ret = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
@@ -4003,7 +4218,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     id = id_sampled;
 
                     // only collect very high-confidence draft tokens ([TAG_FN_MTP_COST] or the cost test under the policy)
-                    if (use_policy ? !cost_keep(seq_id, cur_p->data[0].p, i + 1, cost_nit) : cur_p->data[0].p < params.p_min) {
+                    if (!keep_token(seq_id, cur_p->data[0].p, i + 1, cost_nit)) { // [TAG_FN_L3_MTP_COST2]
                         drafting[seq_id] = false;
                         n_drafting--;
 
@@ -4039,7 +4254,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     // shipped Flash-Next profile uses mtp_p_min 0.5, and on prose most sampled
                     // tokens sit below that, so MTP would stop after the first draft every time.
                     // [TAG_FN_MTP_COST] under the policy the same confidence feeds the cost test instead
-                    if (use_policy ? !cost_keep(seq_id, cur_p->data[0].p, i + 1, cost_nit) : cur_p->data[0].p < params.p_min) {
+                    if (!keep_token(seq_id, cur_p->data[0].p, i + 1, cost_nit)) { // [TAG_FN_L3_MTP_COST2]
                         drafting[seq_id] = false;
                         n_drafting--;
 
@@ -4053,7 +4268,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     id = cur_p->data[0].id;
 
                     // only collect very high-confidence draft tokens
-                    if (use_policy ? !cost_keep(seq_id, cur_p->data[0].p, i + 1, cost_nit) : cur_p->data[0].p < params.p_min) { // [TAG_FN_MTP_COST]
+                    if (!keep_token(seq_id, cur_p->data[0].p, i + 1, cost_nit)) { // [TAG_FN_MTP_COST] [TAG_FN_L3_MTP_COST2]
                         drafting[seq_id] = false;
                         n_drafting--;
 
@@ -4066,6 +4281,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 result.push_back(id);
                 if (cost_on) {
                     cost_ps[seq_id].push_back(cur_p->data[0].p); // [TAG_FN_MTP_COST] for the calibration in accept()
+                }
+                if (cost2_on) {
+                    c2_ps[seq_id].push_back(cur_p->data[0].p); // [TAG_FN_L3_MTP_COST2]
                 }
 
                 if (dp.result_q) {
@@ -4084,6 +4302,16 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     const int n_cap = dp.n_max > 0 ? std::min(params.n_max, dp.n_max) : params.n_max;
                     const double a_hi = cost.acc_hi(cost_mode[seq_id], (int) result.size());
                     if ((int) result.size() >= n_cap || !cost.more(cs_P[seq_id], a_hi, cs_E, cs_R, i + 1, cost_nit)) {
+                        drafting[seq_id] = false;
+                        n_drafting--;
+                        continue;
+                    }
+                }
+                // [TAG_FN_L3_MTP_COST2] one more draft decode only if the next token is expected to pay for it
+                if (use_policy2) {
+                    const int n_cap = dp.n_max > 0 ? std::min(params.n_max, dp.n_max) : params.n_max;
+                    if ((int) result.size() >= n_cap ||
+                            !cost2.more(cs_P[seq_id], cs_R, c2_mode[seq_id], (int) result.size(), cost_nit)) {
                         drafting[seq_id] = false;
                         n_drafting--;
                         continue;
@@ -4116,6 +4344,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             if (cost_on) {
                 cost.add_td(cost_nit, (double) (ggml_time_us() - cost_it0)); // [TAG_FN_MTP_COST]
+            }
+            if (cost2_on) {
+                cost2.add_td(cost_nit, (double) (ggml_time_us() - cost_it0)); // [TAG_FN_L3_MTP_COST2]
             }
 
             if (batch.size() == 0) {
@@ -4176,6 +4407,40 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             cost_rows  = rows;
             cost_t_end = ggml_time_us();
         }
+
+        // [TAG_FN_L3_MTP_COST2] the same for version 2
+        if (cost2_on) {
+            int32_t rows = 0;
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                const auto & dp = dparams[seq_id];
+                if (!dp.drafting) {
+                    continue;
+                }
+                size_t len = dp.result->size();
+                if (dp.n_max > 0) {
+                    len = std::min(len, (size_t) dp.n_max); // the server cuts the draft to its cap
+                }
+                if (c2_ps[seq_id].size() > len) {
+                    c2_ps[seq_id].resize(len);
+                }
+                rows += (int32_t) len + 1;
+                if (use_policy2) {
+                    c2_hist[std::min(len, c2_hist.size() - 1)]++;
+                }
+            }
+            if (use_policy2) {
+                c2_n_policy++;
+                c2_n_none += rows == cs_n ? 1 : 0;
+                if (cost2.log > 0 && c2_n_policy % 256 == 0) {
+                    cost2_log_summary("every 256 policy steps");
+                }
+            } else {
+                c2_n_rule++;
+            }
+            c2_policy = use_policy2;
+            c2_rows   = rows;
+            c2_t_end  = ggml_time_us();
+        }
     }
 
     void accept(llama_seq_id seq_id, uint16_t n_accepted, bool /*is_other*/) override {
@@ -4187,6 +4452,16 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         if (cost_on && !cost_ps[seq_id].empty()) {
             cost.observe_accept(cost_mode[seq_id], cost_ps[seq_id], n_accepted);
             cost_ps[seq_id].clear();
+        }
+        // [TAG_FN_L3_MTP_COST2] the calibration, and the tokens of the step for the realized rate
+        if (cost2_on) {
+            if (!c2_ps[seq_id].empty()) {
+                cost2.observe_accept(c2_mode[seq_id], c2_ps[seq_id], n_accepted);
+                c2_ps[seq_id].clear();
+            }
+            if (c2_acc[seq_id] >= 0) {
+                c2_acc[seq_id] = n_accepted;
+            }
         }
 
         const int32_t n_rows = verify_h_rows[seq_id];
