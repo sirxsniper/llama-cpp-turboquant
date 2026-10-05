@@ -1783,6 +1783,10 @@ bool llama_moe_hot_init(const llama_model & model, const void * owner, size_t bu
         mc->pools.clear(); // [TAG_FN_L3_POLICY_POOL]
     };
 
+    // [TAG_FN_L3_POLICY_POOL] candidate layers that keep their own slot tensors even with pools: an integration point for a
+    // lever that needs whole layers at the top of the device buffer (e.g. a tail of layers that gives its VRAM back)
+    std::vector<bool> pool_excl(layers.size(), false);
+
     for (int attempt = 0; attempt < 32 && budget > 0; ++attempt) {
         std::vector<std::vector<int32_t>> hot_ids(layers.size());
         std::vector<int32_t>              n_slots_of(layers.size(), 0);
@@ -1876,6 +1880,9 @@ bool llama_moe_hot_init(const llama_model & model, const void * owner, size_t bu
             if (pool_req) {
                 std::map<std::vector<int64_t>, size_t> by_key;
                 for (int li : g.second) {
+                    if (pool_excl[li]) {
+                        continue; // keeps its own slots, created after the pools: the top of the buffer
+                    }
                     const llama_layer * l = layers[li].l;
                     std::vector<int64_t> key;
                     for (const ggml_tensor * t : { l->ffn_up_exps, l->ffn_gate_exps, l->ffn_down_exps }) {

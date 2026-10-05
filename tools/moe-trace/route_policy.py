@@ -793,7 +793,7 @@ def main():
                         print("    %-34s %s" % (k, fmt(row[k])))
             # variable per-layer slots: sized from another trace's counts (or the oracle)
             srcs = [n for n in traces if n != name] if a.var_from in ("", "others") else [a.var_from]
-            for src in srcs + ["self"]:
+            for src in list(dict.fromkeys(srcs + ["self"])):
                 prof = counts[name] if src == "self" else counts.get(src)
                 if prof is None:
                     continue
