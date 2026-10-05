@@ -10,6 +10,7 @@
 #include "llama-model.h"
 
 #include "ggml-turbot.h"   // [TAG_FN_TURBOT_IDX] ggml_turbot_is_type
+#include "llama-fn-auto.h"  // [TAG_FN_L3_HOST_DIAG] llama_fn_l3_flag
 
 #include <algorithm>
 #include <cassert>
@@ -109,7 +110,9 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
             model, hparams_idx, type_idx, type_idx, v_trans, offload, unified,
             kv_size, n_seq_max, n_pad, n_swa, swa_type,
             nullptr, filter_idx, nullptr, nullptr, "idx_");
-    }()) {}
+    }()) {
+    kpool_probe = llama_fn_l3_flag(model, "LLAMA_FN_HOST_KPOOL_PROBE"); // [TAG_FN_L3_HOST_DIAG]
+}
 
 llama_memory_context_ptr llama_memory_hybrid_idx::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
     // note: repeats llama_memory_hybrid::init_batch, as the indexer needs the attention slot infos that the base context hides
@@ -427,8 +430,8 @@ uint32_t kpool_pad(uint32_t n_pool) {
     return std::max<uint32_t>(64u, GGML_PAD(n_pool + 1, 64u));
 }
 
-// [TAG_FN_L3_HOST_DIAG] LLAMA_FN_HOST_KPOOL_PROBE=1: host time of the k-pool work per ubatch (the layout update and
-// re-pool marks in apply(), the input arrays in set_input_kpool), a line every 64 fills. Diagnostic only.
+// [TAG_FN_L3_HOST_DIAG] LLAMA_FN_HOST_KPOOL_PROBE=1 (qwen4exp): host time of the k-pool work per ubatch (the layout
+// update and re-pool marks in apply(), the input arrays in set_input_kpool), a line every 64 fills. Diagnostic only.
 struct kpool_probe {
     double   apply_us = 0.0;
     double   input_us = 0.0;
@@ -436,14 +439,6 @@ struct kpool_probe {
     uint64_t n_input  = 0;
     uint64_t pools    = 0;
 };
-
-bool kpool_probe_on() {
-    static const bool on = [] {
-        const char * e = getenv("LLAMA_FN_HOST_KPOOL_PROBE");
-        return e != nullptr && atoi(e) != 0;
-    }();
-    return on;
-}
 
 kpool_probe & kpool_probe_get() {
     static kpool_probe p; // the inference thread only (apply and set_inputs run on it)
@@ -727,14 +722,14 @@ bool llama_memory_hybrid_idx_context::apply() {
 
     // Extend the pool layout with this ubatch's cells, then pick what it must re-pool.
     if (res && kpool_track()) {
-        const int64_t t_kp = kpool_probe_on() ? ggml_time_us() : 0; // [TAG_FN_L3_HOST_DIAG]
+        const int64_t t_kp = mem->kpool_probe_on() ? ggml_time_us() : 0; // [TAG_FN_L3_HOST_DIAG]
         mem->kpool_layout_update();
         if (!kpool_st) {
             kpool_st = std::make_unique<kpool_state>();
         }
         kpool_build_state(get_ubatch());
         i_kpool  = i_cur;
-        if (kpool_probe_on()) {
+        if (mem->kpool_probe_on()) {
             kpool_probe_add(false, (double) (ggml_time_us() - t_kp), 0);
         }
     }
@@ -943,7 +938,7 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
                 kpool_probe_add(true, (double) (ggml_time_us() - t0), n_pool);
             }
         }
-    } probe { kpool_probe_on() ? ggml_time_us() : 0, (uint32_t) pool_cells->ne[0] };
+    } probe { mem != nullptr && mem->kpool_probe_on() ? ggml_time_us() : 0, (uint32_t) pool_cells->ne[0] };
 
     GGML_ASSERT(mem != nullptr && mem->get_mem_idx() != nullptr);
     GGML_ASSERT(ggml_backend_buffer_is_host(pool_cells->buffer));
