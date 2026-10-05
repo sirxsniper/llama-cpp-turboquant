@@ -620,20 +620,22 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
                     mtp_head_in_vocab[id] = 1;
                 }
             }
-            for (int64_t id = 0; id < (int64_t) n_vocab && mtp_head_pad_id < 0; ++id) {
+            const int32_t n_cap = (int32_t) std::min<int64_t>(cap, 8192);
+            for (int64_t id = 0; id < (int64_t) n_vocab && (int64_t) mtp_head_pad_ids.size() < 2*(int64_t) n_cap; ++id) {
                 const auto attr = vocab.token_get_attr((llama_token) id);
                 if (!mtp_head_in_vocab[id] && (attr & LLAMA_TOKEN_ATTR_NORMAL) &&
                         !(attr & (LLAMA_TOKEN_ATTR_CONTROL | LLAMA_TOKEN_ATTR_USER_DEFINED | LLAMA_TOKEN_ATTR_UNUSED))) {
-                    mtp_head_pad_id = (int32_t) id;
+                    mtp_head_pad_ids.push_back((int32_t) id);
                 }
             }
-            if (mtp_head_pad_id < 0) {
+            if (mtp_head_pad_ids.empty()) {
                 LLAMA_LOG_WARN("%s: [TAG_FN_L3_MTP_HEADPROMPT] the draft vocabulary leaves no normal token out: no prompt rows\n", __func__);
             } else {
-                mtp_head_prompt_cap = (int32_t) std::min<int64_t>(cap, 8192);
-                mtp_head_prompt_ids.assign((size_t) mtp_head_prompt_cap, mtp_head_pad_id);
-                LLAMA_LOG_INFO("%s: [TAG_FN_L3_MTP_HEADPROMPT] MTP drafts also score up to %d prompt tokens outside the draft "
-                        "vocabulary (full head rows)\n", __func__, mtp_head_prompt_cap);
+                mtp_head_prompt_cap = n_cap;
+                mtp_head_set_prompt(nullptr, 0); // the rows before the first request: the pad ids
+                LLAMA_LOG_INFO("%s: [TAG_FN_L3_MTP_HEADPROMPT] MTP drafts also score %d more rows: a request's prompt tokens "
+                        "outside the draft vocabulary first, then the next ids outside it (full head rows)\n", __func__,
+                        mtp_head_prompt_cap);
             }
         }
     }
@@ -1006,8 +1008,13 @@ int32_t llama_model_qwen4exp::mtp_head_set_prompt(const int32_t * ids, int32_t n
         v.push_back(id);
     }
     const int32_t n_set = (int32_t) v.size();
-    // a repeat of a set id computes the same row again; with none, an id outside the vocabulary
-    v.resize((size_t) mtp_head_prompt_cap, n_set > 0 ? v[0] : mtp_head_pad_id);
+    // the free slots: the pad ids not taken yet (distinct); only a vocabulary that leaves fewer than cap ids out repeats one
+    for (size_t k = 0; k < mtp_head_pad_ids.size() && (int32_t) v.size() < mtp_head_prompt_cap; ++k) {
+        if (seen.insert(mtp_head_pad_ids[k]).second) {
+            v.push_back(mtp_head_pad_ids[k]);
+        }
+    }
+    v.resize((size_t) mtp_head_prompt_cap, v.empty() ? mtp_head_pad_ids[0] : v.back());
     std::lock_guard<std::mutex> lock(mtp_head_prompt_mutex);
     mtp_head_prompt_ids.swap(v);
     return n_set;
@@ -1151,11 +1158,11 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     // [TAG_FN_L3_MTP_HEADPROMPT] the prompt's own tokens outside the draft vocabulary, from the full head rows, scattered
     // over the draft logits after the vocabulary's own rows
     auto add_prompt_rows = [&](ggml_tensor * full, ggml_tensor * normed) -> ggml_tensor * {
-        if (pm.mtp_head_prompt_cap <= 0) {
-            return full;
-        }
         const int64_t n_p   = pm.mtp_head_prompt_cap;
         const int64_t n_out = full->ne[1];
+        if (n_p <= 0 || n_out <= 0) {
+            return full; // off, or a graph without output rows (the catch-up of a verify batch)
+        }
         auto inp_p = std::make_unique<llm_graph_input_ids_prompt>(pm);
         inp_p->ids = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_p);
         ggml_set_input(inp_p->ids);

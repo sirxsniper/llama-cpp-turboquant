@@ -2528,12 +2528,13 @@ struct llama_model_qwen4exp : public llama_model_base {
     // nullptr: no draft vocabulary, or the head cannot be copied (the full head is used)
     const mtp_head_compact * mtp_head_get(const ggml_tensor * head_w) const;
 
-    // [TAG_FN_L3_MTP_HEADPROMPT] LLAMA_MTP_HEAD_PROMPT=<n> with a draft vocabulary (LLAMA_MTP_HEAD_IDS or _ROWS): up to n
-    // more ids the drafts score, the current prompt's tokens that the vocabulary leaves out (the MTP driver sets them per
-    // request). Unused entries repeat an id outside the vocabulary, so a fixed-size graph input serves every request.
+    // [TAG_FN_L3_MTP_HEADPROMPT] LLAMA_MTP_HEAD_PROMPT=<n> with a draft vocabulary (LLAMA_MTP_HEAD_IDS or _ROWS): n more
+    // ids the drafts score, first the current prompt's tokens that the vocabulary leaves out (the MTP driver sets them per
+    // request), then the next normal ids outside it in id order, all distinct: a fixed-size graph input serves every
+    // request and the scatter never writes one row twice.
     int32_t                      mtp_head_prompt_cap = 0;
     std::vector<uint8_t>         mtp_head_in_vocab;  // [n_vocab] 1 = the draft vocabulary scores it already
-    int32_t                      mtp_head_pad_id = -1;
+    std::vector<int32_t>         mtp_head_pad_ids;   // normal ids outside the vocabulary, id order, up to 2 x cap
     mutable std::mutex           mtp_head_prompt_mutex;
     mutable std::vector<int32_t> mtp_head_prompt_ids; // [mtp_head_prompt_cap]
     // ids in the given order, the ones outside the vocabulary first come first served; returns how many were taken

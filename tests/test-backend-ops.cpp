@@ -14891,6 +14891,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // [TAG_FN_L3_MTP_Q2] the MTP head's routed experts at q2_0 (Flash-Next blk.48: gate/up 2560 -> 640, down 640 -> 2560,
+    // 10 used; 64 experts keep the tensors small): a draft step (1), the catch-up of a verify batch (2-4) and of a prompt
+    // chunk (128), raw blocks with every code and either sign of d
+    for (int n : { 1, 2, 3, 4, 128 }) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q2_0, GGML_TYPE_F32, 64, 10, false, 640, n, 2560));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q2_0, GGML_TYPE_F32, 64, 10, false, 2560, n, 640));
+    }
+
     return test_cases;
 }
 #ifdef _MSC_VER
