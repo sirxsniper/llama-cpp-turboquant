@@ -651,3 +651,191 @@ bool ggml_cuda_fn_l3_hc_pre_q8(ggml_backend_cuda_context & ctx, ggml_tensor * ds
     ggml_cuda_fn_l3_note(GGML_CUDA_FN_L3_PATH_Q8F_HCPRE, "Q8F: hc_pre (gated mean of the streams) writes its q8_1 copy");
     return true;
 }
+
+// ---------------------------------------------------------------------------------------------------------------------
+// [TAG_FN_L3_GPU_GDNAB] the GDN gate inputs of a qwen4exp layer in one launch. Block r < rows_b is row r of the beta
+// mat-vec, block rows_b + r row r of the alpha mat-vec: the f32 path of mul_mat_vec_f<float, float, ncols_dst,
+// block_size> (each thread adds the same products in the same order, loads issued ahead as in mul_mat_vec_f_fn_l3; the
+// same reduction). Then beta: op_sigmoid; alpha: gdn_gate_prep_kernel (s = x + dt[r], softplus, * a[r]).
+// ---------------------------------------------------------------------------------------------------------------------
+
+static __device__ __forceinline__ float fn_l3_op_softplus(float x) {
+    return (x > 20.0f) ? x : logf(1.0f + expf(x));
+}
+
+template <int ncols_dst, int block_size>
+static __global__ void k_fn_l3_gdnab(
+        const float * wb, const float * wa, const float * y, const float * dt, const float * av, float * dst_b, float * dst_a,
+        const int rows_b, const int ncols2, const int stride_row_b, const int stride_row_a, const int stride_col_y2,
+        const int stride_col_dst_b, const int stride_col_dst_a) {
+    const bool is_a = (int) blockIdx.x >= rows_b;
+    const int  row  = is_a ? (int) blockIdx.x - rows_b : (int) blockIdx.x;
+    const int  tid  = threadIdx.x;
+
+    ggml_cuda_pdl_sync();
+
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+
+    const float * x = is_a ? wa + int64_t(row)*stride_row_a : wb + int64_t(row)*stride_row_b;
+
+    const float2 * y2 = (const float2 *) y;
+
+    extern __shared__ char data_mmv[];
+    float * buf_iw = (float *) data_mmv;
+
+    if (block_size > warp_size) {
+        if (tid < warp_size) {
+            buf_iw[tid] = 0.0f;
+        }
+        __syncthreads();
+    }
+
+    float sumf[ncols_dst] = {0.0f};
+
+    const float2 * x2 = (const float2 *) x;
+    constexpr int ahead = 4;
+    int col2 = tid;
+    for (; col2 + (ahead - 1)*block_size < ncols2; col2 += ahead*block_size) {
+        float2 tmpx[ahead];
+        float2 tmpy[ahead][ncols_dst];
+#pragma unroll
+        for (int u = 0; u < ahead; ++u) {
+            tmpx[u] = x2[col2 + u*block_size];
+        }
+#pragma unroll
+        for (int u = 0; u < ahead; ++u) {
+#pragma unroll
+            for (int j = 0; j < ncols_dst; ++j) {
+                tmpy[u][j] = y2[j*stride_col_y2 + col2 + u*block_size];
+            }
+        }
+#pragma unroll
+        for (int u = 0; u < ahead; ++u) {
+#pragma unroll
+            for (int j = 0; j < ncols_dst; ++j) {
+                ggml_cuda_mad(sumf[j], tmpx[u].x, tmpy[u][j].x);
+                ggml_cuda_mad(sumf[j], tmpx[u].y, tmpy[u][j].y);
+            }
+        }
+    }
+    for (; col2 < ncols2; col2 += block_size) {
+        const float2 tmpx = x2[col2];
+#pragma unroll
+        for (int j = 0; j < ncols_dst; ++j) {
+            const float2 tmpy = y2[j*stride_col_y2 + col2];
+            ggml_cuda_mad(sumf[j], tmpx.x, tmpy.x);
+            ggml_cuda_mad(sumf[j], tmpx.y, tmpy.y);
+        }
+    }
+
+    ggml_cuda_pdl_lc();
+#pragma unroll
+    for (int j = 0; j < ncols_dst; ++j) {
+        sumf[j] = warp_reduce_sum<warp_size>(sumf[j]);
+
+        if (block_size > warp_size) {
+            buf_iw[tid/warp_size] = sumf[j];
+            __syncthreads();
+            if (tid < warp_size) {
+                sumf[j] = buf_iw[tid];
+                sumf[j] = warp_reduce_sum<warp_size>(sumf[j]);
+            }
+
+            if (j < ncols_dst) {
+                __syncthreads();
+            }
+        }
+    }
+
+    if (tid >= ncols_dst) {
+        return;
+    }
+
+    const float v = sumf[tid];
+    if (is_a) {
+        const float s = v + dt[row];
+        const float p = fn_l3_op_softplus(s);
+        dst_a[tid*stride_col_dst_a + row] = p * av[row];
+    } else {
+        dst_b[tid*stride_col_dst_b + row] = 1.0f / (1.0f + expf(-v));
+    }
+}
+
+template <int ncols_dst>
+static void fn_l3_gdnab_launch(const float * wb, const float * wa, const float * y, const float * dt, const float * av,
+        float * dst_b, float * dst_a, const int64_t ncols, const int rows_b, const int rows_a, const int64_t stride_row_b,
+        const int64_t stride_row_a, const int64_t stride_col_y, const int64_t stride_col_dst_b, const int64_t stride_col_dst_a,
+        cudaStream_t stream) {
+    const int device    = ggml_cuda_get_device();
+    const int warp_size = ggml_cuda_info().devices[device].warp_size;
+
+    // the block size launch_mul_mat_vec_f_cuda picks for this row length (the same for both matrices)
+    int64_t block_size_best = warp_size;
+    int64_t niter_best      = (ncols + 2*warp_size - 1) / (2*warp_size);
+    int64_t max_block_size  = 256;
+    if (ggml_cuda_info().devices[device].cc > GGML_CUDA_CC_OFFSET_AMD && ggml_cuda_info().devices[device].cc < GGML_CUDA_CC_RDNA1) {
+        max_block_size = 128;
+    }
+    for (int64_t block_size = 2*warp_size; block_size <= max_block_size; block_size += warp_size) {
+        const int64_t niter = (ncols + 2*block_size - 1) / (2*block_size);
+        if (niter < niter_best) {
+            niter_best      = niter;
+            block_size_best = block_size;
+        }
+    }
+
+    const int nbytes_shared = warp_size*sizeof(float);
+    const ggml_cuda_kernel_launch_params lp(dim3((unsigned) (rows_b + rows_a), 1, 1), dim3((unsigned) block_size_best, 1, 1),
+            nbytes_shared, stream);
+    const int ncols2 = (int) (ncols/2);
+    switch (block_size_best) {
+#define FN_L3_GDNAB_CASE(bs) case bs: ggml_cuda_kernel_launch(k_fn_l3_gdnab<ncols_dst, bs>, lp, wb, wa, y, dt, av, dst_b, \
+        dst_a, rows_b, ncols2, (int) stride_row_b, (int) stride_row_a, (int) (stride_col_y/2), (int) stride_col_dst_b,     \
+        (int) stride_col_dst_a); break;
+        FN_L3_GDNAB_CASE(32)
+        FN_L3_GDNAB_CASE(64)
+        FN_L3_GDNAB_CASE(96)
+        FN_L3_GDNAB_CASE(128)
+        FN_L3_GDNAB_CASE(160)
+        FN_L3_GDNAB_CASE(192)
+        FN_L3_GDNAB_CASE(224)
+        FN_L3_GDNAB_CASE(256)
+#undef FN_L3_GDNAB_CASE
+        default:
+            GGML_ABORT("fatal error");
+    }
+}
+
+void ggml_cuda_fn_l3_gdnab(ggml_backend_cuda_context & ctx, const ggml_tensor * mb, const ggml_tensor * ma, const ggml_tensor * dt,
+        const ggml_tensor * a, ggml_tensor * sig, ggml_tensor * gate) {
+    const ggml_tensor * wb = mb->src[0];
+    const ggml_tensor * wa = ma->src[0];
+    const ggml_tensor * y  = mb->src[1];
+    const int64_t ncols  = wb->ne[0];
+    const int64_t T      = y->ne[1];
+    const int     rows_b = (int) wb->ne[1];
+    const int     rows_a = (int) wa->ne[1];
+    const int64_t sb  = wb->nb[1]/sizeof(float);
+    const int64_t sa  = wa->nb[1]/sizeof(float);
+    const int64_t sy  = y->nb[1]/sizeof(float);
+    cudaStream_t stream = ctx.stream();
+    const float * pwb = (const float *) wb->data;
+    const float * pwa = (const float *) wa->data;
+    const float * py  = (const float *) y->data;
+    const float * pdt = (const float *) dt->data;
+    const float * pav = (const float *) a->data;
+    float * pdb = (float *) sig->data;
+    float * pda = (float *) gate->data;
+    switch (T) {
+        case 1: fn_l3_gdnab_launch<1>(pwb, pwa, py, pdt, pav, pdb, pda, ncols, rows_b, rows_a, sb, sa, sy, rows_b, rows_a, stream); break;
+        case 2: fn_l3_gdnab_launch<2>(pwb, pwa, py, pdt, pav, pdb, pda, ncols, rows_b, rows_a, sb, sa, sy, rows_b, rows_a, stream); break;
+        case 3: fn_l3_gdnab_launch<3>(pwb, pwa, py, pdt, pav, pdb, pda, ncols, rows_b, rows_a, sb, sa, sy, rows_b, rows_a, stream); break;
+        case 4: fn_l3_gdnab_launch<4>(pwb, pwa, py, pdt, pav, pdb, pda, ncols, rows_b, rows_a, sb, sa, sy, rows_b, rows_a, stream); break;
+        case 5: fn_l3_gdnab_launch<5>(pwb, pwa, py, pdt, pav, pdb, pda, ncols, rows_b, rows_a, sb, sa, sy, rows_b, rows_a, stream); break;
+        case 6: fn_l3_gdnab_launch<6>(pwb, pwa, py, pdt, pav, pdb, pda, ncols, rows_b, rows_a, sb, sa, sy, rows_b, rows_a, stream); break;
+        case 7: fn_l3_gdnab_launch<7>(pwb, pwa, py, pdt, pav, pdb, pda, ncols, rows_b, rows_a, sb, sa, sy, rows_b, rows_a, stream); break;
+        case 8: fn_l3_gdnab_launch<8>(pwb, pwa, py, pdt, pav, pdb, pda, ncols, rows_b, rows_a, sb, sa, sy, rows_b, rows_a, stream); break;
+        default: GGML_ABORT("fatal error");
+    }
+    ggml_cuda_fn_l3_note(GGML_CUDA_FN_L3_PATH_GDNAB, "GDNAB: GDN beta (sigmoid) and alpha (gate prep) mat-vecs in one launch");
+}

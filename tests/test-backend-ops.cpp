@@ -12138,6 +12138,62 @@ struct test_fn_l3_convwb : public test_case {
     }
 };
 
+// [TAG_FN_L3_GPU_GDNAB] the GDN gate inputs of a qwen4exp layer (build_layer_attn_linear): beta = sigmoid(Wb x), gate =
+// softplus(Wa x + dt) * a, Wa / Wb f32 [2560, 48], built next to each other as the GDNAB switch builds them
+struct test_fn_l3_gdnab : public test_case {
+    const int64_t n_tokens;
+    const bool    marked;
+
+    std::string op_desc(ggml_tensor *) override { return "FN_L3_GPU"; }
+    std::string vars() override { return "gdnab," + VARS_TO_STR2(n_tokens, marked); }
+    bool run_whole_graph() override { return true; }
+    double max_nmse_err() override { return 1e-6; }
+
+    test_fn_l3_gdnab(int64_t n_tokens = 3, bool marked = true) : n_tokens(n_tokens), marked(marked) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t K = 2560;
+        const int64_t H = 48;
+        ggml_tensor * x  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, n_tokens);
+        ggml_set_name(x, "x");
+        ggml_tensor * wb = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, H);
+        ggml_set_name(wb, "w_beta");
+        ggml_tensor * wa = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, H);
+        ggml_set_name(wa, "w_alpha");
+        ggml_tensor * dt = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, H);
+        ggml_set_name(dt, "dt");
+        ggml_tensor * a  = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, H);
+        ggml_set_name(a, "a");
+
+        ggml_tensor * mb = ggml_mul_mat(ctx, wb, x);
+        ggml_tensor * beta = ggml_sigmoid(ctx, ggml_reshape_4d(ctx, mb, 1, H, n_tokens, 1));
+        ggml_tensor * ma = ggml_mul_mat(ctx, wa, x);
+        ggml_tensor * gate = ggml_mul(ctx, ggml_softplus(ctx, ggml_add(ctx, ggml_reshape_3d(ctx, ma, H, n_tokens, 1), dt)), a);
+        if (marked) {
+            ggml_fn_l3_set(mb, GGML_FN_L3_GDNAB);
+            ggml_fn_l3_set(ma, GGML_FN_L3_GDNAB);
+        }
+        ggml_tensor * out = ggml_concat(ctx, ggml_reshape_2d(ctx, beta, H, n_tokens), ggml_reshape_2d(ctx, gate, H, n_tokens), 0);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->view_src != nullptr || t->op != GGML_OP_NONE) {
+                continue;
+            }
+            // spread the dot products over the sigmoid and softplus ranges (incl. above the softplus cut at 20)
+            const std::string name = ggml_get_name(t);
+            if (name == "dt") {
+                init_tensor_uniform(t, -4.0f, 22.0f);
+            } else {
+                init_tensor_uniform(t, -1.0f, 1.0f);
+            }
+        }
+    }
+};
+
 // [TAG_FN_L3_GPU_ZSKIP] the expert chain of the hot set / a DMA bank (build_slot_chain): up and gate MUL_MAT_IDs, SWIGLU,
 // down, over slot tensors whose last slot is all zeros; the ids route some (token, slot) pairs there (every third, and all
 // of the last token when zero_all). marked = ZSKIP on the ids.
@@ -14876,6 +14932,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
         test_cases.emplace_back(new test_fn_l3_zskip(GGML_TYPE_Q4_K, GGML_TYPE_Q5_1, t, false, true)); // [TAG_FN_L3_GPU_ZSKIP]
         test_cases.emplace_back(new test_fn_l3_zskip(GGML_TYPE_Q5_K, GGML_TYPE_Q8_0, t, true, true));
+        test_cases.emplace_back(new test_fn_l3_gdnab(t, true)); // [TAG_FN_L3_GPU_GDNAB]
     }
     for (int64_t nb : { 1, 3 }) {
         test_cases.emplace_back(new test_flash_attn_ext_turbot(TURBOT_TW_NR2_Q8, 32768, nb, TURBOT_MIX_BAND64K, 3, false, 0.0f, false,
@@ -15629,6 +15686,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
                 test_cases.emplace_back(new test_fn_l3_q8f(mode, t, m)); // [TAG_FN_L3_GPU_Q8F]
             }
             test_cases.emplace_back(new test_fn_l3_zskip(GGML_TYPE_Q4_K, GGML_TYPE_Q5_1, t, false, m)); // [TAG_FN_L3_GPU_ZSKIP]
+            test_cases.emplace_back(new test_fn_l3_gdnab(t, m)); // [TAG_FN_L3_GPU_GDNAB]
             for (int64_t np : { 8192, 32768, 61440 }) {
                 test_cases.emplace_back(new test_fn_l3_idxq8(np*4 + 3, np, t, m));
                 test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, { np, t, 1, 1 }, 512, false, true, m));
@@ -17439,6 +17497,8 @@ static bool run_fn_l3_gpu(ggml_backend_t backend, ggml_backend_t backend_ref, co
                 cases.push_back({ [=](bool m) { return std::unique_ptr<test_case>(new test_fn_l3_zskip(tu, td, t, za, m)); }, false });
             }
         }
+        // [TAG_FN_L3_GPU_GDNAB] the GDN gate inputs in one launch
+        cases.push_back({ [=](bool m) { return std::unique_ptr<test_case>(new test_fn_l3_gdnab(t, m)); }, false });
     }
     for (int64_t t : { 1, 3, 4 }) {
         if (cpu) {

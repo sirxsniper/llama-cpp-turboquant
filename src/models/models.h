@@ -2583,6 +2583,7 @@ struct llama_model_qwen4exp : public llama_model_base {
             bool q8f     = false; // Q8F:     the hc norm, low rank (with HCFUSE) and hc_pre write the q8_1 copy of their output
                                   //          for the mat-vecs that read it; the expert MUL_MAT_IDs read that copy too
             bool zskip   = false; // ZSKIP:   the hot / DMA-bank expert chains write the zero slot's outputs without reading it
+            bool gdnab   = false; // GDNAB:   the GDN beta (sigmoid) and alpha (gate prep) mat-vecs in one launch
         };
         static l3_flags l3_read(const llama_model & model);
         l3_flags l3;

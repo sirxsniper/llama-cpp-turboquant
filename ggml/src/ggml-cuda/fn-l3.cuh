@@ -32,8 +32,15 @@ enum ggml_cuda_fn_l3_path {
     GGML_CUDA_FN_L3_PATH_Q8F_HCPRE,
     GGML_CUDA_FN_L3_PATH_Q8F_MMID,
     GGML_CUDA_FN_L3_PATH_ZSKIP,
+    GGML_CUDA_FN_L3_PATH_GDNAB,
     GGML_CUDA_FN_L3_PATH_COUNT,
 };
+
+// [TAG_FN_L3_GPU_GDNAB] the GDN gate inputs in one launch: sig = sigmoid(Wb x), gate = softplus(Wa x + dt) * a. Each row is
+// mul_mat_vec_f's (f32, no fusion, the block size it picks), the epilogues op_sigmoid and gdn_gate_prep_kernel's, so the
+// same bits. ggml-cuda.cu matches the nodes.
+void ggml_cuda_fn_l3_gdnab(ggml_backend_cuda_context & ctx, const ggml_tensor * mb, const ggml_tensor * ma, const ggml_tensor * dt,
+        const ggml_tensor * a, ggml_tensor * sig, ggml_tensor * gate);
 
 // [TAG_FN_L3_GPU_Q8F] where a producer kernel writes the q8_1 copy of its output: the MMVQ reuse cache's buffer, laid
 // out as quantize_row_q8_1_cuda lays out the src1 that reads it (nrows rows of bpr blocks, the last bpr - ne10/32 of them

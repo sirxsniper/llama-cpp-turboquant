@@ -651,16 +651,17 @@ llama_model_qwen4exp::graph::l3_flags llama_model_qwen4exp::graph::l3_read(const
     f.mmvd    = on("LLAMA_FN_GPU_MMVD");
     f.q8f     = on("LLAMA_FN_GPU_Q8F");
     f.zskip   = on("LLAMA_FN_GPU_ZSKIP");
+    f.gdnab   = on("LLAMA_FN_GPU_GDNAB");
 
     const int mask = (f.defer ? 1 : 0) | (f.convwb ? 2 : 0) | (f.hcfuse ? 4 : 0) | (f.compact ? 8 : 0) |
                      (f.topk ? 16 : 0) | (f.idxq8 ? 32 : 0) | (f.mmv ? 64 : 0) | (f.mmvd ? 128 : 0) | (f.q8f ? 256 : 0) |
-                     (f.zskip ? 512 : 0);
+                     (f.zskip ? 512 : 0) | (f.gdnab ? 1024 : 0);
     static std::atomic<int> logged{-1};
     if (logged.exchange(mask) != mask) {
-        LLAMA_LOG_INFO("qwen4exp: [TAG_FN_L3_GPU] device levers:%s%s%s%s%s%s%s%s%s%s%s\n",
+        LLAMA_LOG_INFO("qwen4exp: [TAG_FN_L3_GPU] device levers:%s%s%s%s%s%s%s%s%s%s%s%s\n",
                 f.defer ? " DEFER" : "", f.convwb ? " CONVWB" : "", f.hcfuse ? " HCFUSE" : "", f.compact ? " COMPACT" : "",
                 f.topk ? " TOPK" : "", f.idxq8 ? " IDXQ8" : "", f.mmv ? " MMV" : "", f.mmvd ? " MMVD" : "",
-                f.q8f ? " Q8F" : "", f.zskip ? " ZSKIP" : "", mask == 0 ? " none" : "");
+                f.q8f ? " Q8F" : "", f.zskip ? " ZSKIP" : "", f.gdnab ? " GDNAB" : "", mask == 0 ? " none" : "");
     }
     return f;
 }
@@ -1798,6 +1799,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
 
     ggml_tensor * beta = build_lora_mm(model.layers[il].ssm_beta, cur, model.layers[il].ssm_beta_s);
     qwen4exp_l3_mark_mm(beta, l3.mmv); // [TAG_FN_L3_GPU_MMV] 48 rows of 2560
+    ggml_tensor * beta_mm = beta;      // [TAG_FN_L3_GPU_GDNAB]
     beta = ggml_reshape_4d(ctx0, beta, 1, num_v_heads, n_seq_tokens, n_seqs);
     cb(beta, "beta", il);
 
@@ -1806,6 +1808,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
 
     ggml_tensor * alpha = build_lora_mm(model.layers[il].ssm_alpha, cur, model.layers[il].ssm_alpha_s);
     qwen4exp_l3_mark_mm(alpha, l3.mmv); // [TAG_FN_L3_GPU_MMV]
+    ggml_tensor * alpha_mm = alpha;     // [TAG_FN_L3_GPU_GDNAB]
     alpha = ggml_reshape_3d(ctx0, alpha, num_v_heads, n_seq_tokens, n_seqs);
     cb(alpha, "alpha", il);
 
@@ -1815,6 +1818,14 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
 
     ggml_tensor * gate = ggml_mul(ctx0, alpha_softplus, model.layers[il].ssm_a);  // -A_log.exp() * softplus
     cb(gate, "gate", il);
+
+    // [TAG_FN_L3_GPU_GDNAB] the two chains next to each other, so CUDA computes both in one launch
+    if (l3.gdnab && beta_mm->op == GGML_OP_MUL_MAT && alpha_mm->op == GGML_OP_MUL_MAT) {
+        ggml_fn_l3_set(beta_mm,  GGML_FN_L3_GDNAB);
+        ggml_fn_l3_set(alpha_mm, GGML_FN_L3_GDNAB);
+        ggml_build_forward_expand(gf, beta);
+        ggml_build_forward_expand(gf, gate);
+    }
 
     gate = ggml_reshape_4d(ctx0, gate, 1, num_v_heads, n_seq_tokens, n_seqs);
 

@@ -4052,6 +4052,84 @@ static int ggml_cuda_fn_l3_try_hc(ggml_backend_cuda_context * cuda_ctx, ggml_cgr
     return 2;
 }
 
+// [TAG_FN_L3_GPU_GDNAB] at the GDN beta MUL_MAT the qwen4exp graph marked: beta -> sigmoid, alpha (the other marked MUL_MAT
+// of the same input) -> add dt -> softplus -> mul a, in this order with only views between them; one launch writes the
+// sigmoid and the mul (fn-l3.cu). Returns the nodes after i that the launch covered (0: none).
+static int ggml_cuda_fn_l3_try_gdnab(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+    ggml_tensor * mb = cgraph->nodes[i];
+    if (mb->op != GGML_OP_MUL_MAT || ggml_fn_l3_get(mb) != GGML_FN_L3_GDNAB || !ggml_cuda_fn_l3_enabled()) {
+        return 0;
+    }
+    // the next five nodes that are not views
+    int idx[6] = { i, -1, -1, -1, -1, -1 };
+    int n = 1;
+    for (int j = i + 1; j < cgraph->n_nodes && n < 6; ++j) {
+        if (ggml_cuda_is_view_or_noop(cgraph->nodes[j])) {
+            // only the views of this chain may sit between its nodes
+            if (ggml_node_get_use_count(cgraph, j) != 1 || (cgraph->nodes[j]->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+                return 0;
+            }
+            continue;
+        }
+        idx[n++] = j;
+    }
+    if (n < 6) {
+        return 0;
+    }
+    ggml_tensor * sig  = cgraph->nodes[idx[1]];
+    ggml_tensor * ma   = cgraph->nodes[idx[2]];
+    ggml_tensor * add  = cgraph->nodes[idx[3]];
+    ggml_tensor * sp   = cgraph->nodes[idx[4]];
+    ggml_tensor * gate = cgraph->nodes[idx[5]];
+    const auto base = [](const ggml_tensor * t) {
+        for (int k = 0; k < 4 && t != nullptr && (t->op == GGML_OP_RESHAPE || (t->op == GGML_OP_VIEW && t->view_offs == 0)); ++k) {
+            t = t->src[0];
+        }
+        return t;
+    };
+    const auto vec_of = [](const ggml_tensor * v, int64_t ne0) {
+        return v != nullptr && v->op == GGML_OP_NONE && v->type == GGML_TYPE_F32 && ggml_is_contiguous(v) &&
+               v->ne[0] == ne0 && v->ne[1] == 1 && v->ne[2] == 1 && v->ne[3] == 1;
+    };
+    const ggml_tensor * wb = mb->src[0];
+    const ggml_tensor * y  = mb->src[1];
+    if (sig->op != GGML_OP_UNARY || ggml_get_unary_op(sig) != GGML_UNARY_OP_SIGMOID || base(sig->src[0]) != mb ||
+            ma->op != GGML_OP_MUL_MAT || ggml_fn_l3_get(ma) != GGML_FN_L3_GDNAB || ma->src[1] != y ||
+            add->op != GGML_OP_ADD || base(add->src[0]) != ma ||
+            sp->op != GGML_OP_UNARY || ggml_get_unary_op(sp) != GGML_UNARY_OP_SOFTPLUS || sp->src[0] != add ||
+            gate->op != GGML_OP_MUL || gate->src[0] != sp) {
+        return 0;
+    }
+    const ggml_tensor * wa = ma->src[0];
+    // plain f32 [K, rows] x [K, T] products of one input, T <= 8, the rows of each output contiguous and token-major
+    if (wb->type != GGML_TYPE_F32 || wa->type != GGML_TYPE_F32 || y->type != GGML_TYPE_F32 || mb->type != GGML_TYPE_F32 ||
+            ma->type != GGML_TYPE_F32 || wb->ne[0] != y->ne[0] || wa->ne[0] != y->ne[0] || y->ne[0] % 2 != 0 ||
+            wb->ne[2] != 1 || wb->ne[3] != 1 || wa->ne[2] != 1 || wa->ne[3] != 1 || y->ne[2] != 1 || y->ne[3] != 1 ||
+            y->ne[1] < 1 || y->ne[1] > MMVF_MAX_BATCH_SIZE || wb->nb[0] != sizeof(float) || wa->nb[0] != sizeof(float) ||
+            y->nb[0] != sizeof(float) || (wb->nb[1]/sizeof(float)) % 2 != 0 || (wa->nb[1]/sizeof(float)) % 2 != 0 ||
+            (y->nb[1]/sizeof(float)) % 2 != 0 || wb->ne[0] > INT32_MAX || (wb->nb[1]/sizeof(float)) > INT32_MAX ||
+            (wa->nb[1]/sizeof(float)) > INT32_MAX || (y->nb[1]/sizeof(float)) > INT32_MAX ||
+            !vec_of(add->src[1], wa->ne[1]) || !vec_of(gate->src[1], wa->ne[1]) ||
+            sig->type != GGML_TYPE_F32 || gate->type != GGML_TYPE_F32 || add->type != GGML_TYPE_F32 || sp->type != GGML_TYPE_F32 ||
+            !ggml_is_contiguous(sig) || !ggml_is_contiguous(gate) || !ggml_is_contiguous(mb) || !ggml_is_contiguous(ma) ||
+            ggml_nelements(sig) != wb->ne[1]*y->ne[1] || ggml_nelements(gate) != wa->ne[1]*y->ne[1] ||
+            ggml_nelements(add) != wa->ne[1]*y->ne[1] || ggml_nelements(sp) != wa->ne[1]*y->ne[1]) {
+        return 0;
+    }
+    // every node but the two outputs has this chain as its only reader
+    for (int k : { idx[0], idx[2], idx[3], idx[4] }) {
+        if (ggml_node_get_use_count(cgraph, k) != 1 || (cgraph->nodes[k]->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+            return 0;
+        }
+    }
+    const int outs[2] = { idx[1], idx[5] };
+    if (!ggml_cuda_check_fusion_memory_ranges(cgraph, i, idx[5] - i + 1, outs, 2)) {
+        return 0;
+    }
+    ggml_cuda_fn_l3_gdnab(*cuda_ctx, mb, ma, add->src[1], gate->src[1], sig, gate);
+    return idx[5] - i;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
@@ -4064,6 +4142,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     // [TAG_FN_L3_GPU_HCFUSE]
     if (node->op == GGML_OP_SCALE && ggml_fn_l3_get(node) != GGML_FN_L3_NONE) {
         const int n = ggml_cuda_fn_l3_try_hc(cuda_ctx, cgraph, i);
+        if (n > 0) {
+            return n;
+        }
+    }
+
+    // [TAG_FN_L3_GPU_GDNAB]
+    if (node->op == GGML_OP_MUL_MAT && ggml_fn_l3_get(node) == GGML_FN_L3_GDNAB) {
+        const int n = ggml_cuda_fn_l3_try_gdnab(cuda_ctx, cgraph, i);
         if (n > 0) {
             return n;
         }
