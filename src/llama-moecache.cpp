@@ -1033,6 +1033,28 @@ void hot_adapt_decay(moe_cache * mc, bool decode_step) {
         return;
     }
     mc->dc_passes++;
+
+    // [TAG_FN_L3_POLICY_UPLOAD] with a rate limit a pass queues at most what the bucket gives the worker until the next
+    // pass, minus what is still queued: evicted slots must not wait empty behind a growing queue
+    // [TAG_FN_L3_POLICY_BURST] LLAMA_MOE_HOT_BURST_MIB: past the pass budget, strong pairs (a free slot, or a candidate over
+    // LLAMA_MOE_HOT_BURST_RATIO x its victim) take up to that many bytes more, so a shifted working set refills fast
+    // while the steady state keeps the small budget
+    size_t pass_bytes  = mc->dc_bytes;
+    size_t total_bytes = mc->dc_bytes + mc->dc_burst;
+    if (mc->up_rate > 0) {
+        size_t queued_b = 0;
+        {
+            std::lock_guard<std::mutex> lk(mc->wmtx);
+            for (const auto & j : mc->todo) {
+                const layer_state & ls = mc->layers[j.layer_idx];
+                queued_b += ls.pub.up_src->nb[2] + ls.pub.gate_src->nb[2] + ls.pub.down_src->nb[2];
+            }
+        }
+        const size_t cap = mc->up_rate*(size_t) std::max(1, mc->dc.every);
+        pass_bytes  = std::min(pass_bytes,  cap > queued_b ? cap - queued_b : 0);
+        total_bytes = std::min(total_bytes, cap > queued_b ? cap - queued_b : 0);
+    }
+
     std::vector<llama_moe_decay_swap> swaps;
     std::vector<uint8_t> slot_busy;
     std::vector<uint8_t> expert_busy;
@@ -1086,8 +1108,13 @@ void hot_adapt_decay(moe_cache * mc, bool decode_step) {
             se[s] = ow.slot_expert[s];
             sb[s] = ow.slot_in_flight[s] ? 1 : 0;
         }
+        // a pool's pairs come in falling gain and the strong ones first, so the pass takes a prefix of them: no more than
+        // its byte budget holds (exact, and the sort runs over that many instead of every candidate of the pool)
+        const layer_state & l0 = mc->layers[P.layers[0]];
+        const size_t pb = l0.pub.up_src->nb[2] + l0.pub.gate_src->nb[2] + l0.pub.down_src->nb[2];
+        const size_t max_pairs = std::max(pass_bytes, total_bytes)/std::max<size_t>(1, pb) + 1;
         std::vector<llama_moe_decay_swap> ps;
-        llama_moe_decay_pairs_pool(cnts, busy, sl, se, sb, mc->dc, ps);
+        llama_moe_decay_pairs_pool(cnts, busy, sl, se, sb, mc->dc, ps, max_pairs);
         for (auto w : ps) {
             w.layer        = (int) P.layers[w.layer];
             w.victim_layer = w.victim_layer >= 0 ? (int) P.layers[w.victim_layer] : -1;
@@ -1095,27 +1122,6 @@ void hot_adapt_decay(moe_cache * mc, bool decode_step) {
         }
     }
     llama_moe_decay_order(swaps);
-
-    // [TAG_FN_L3_POLICY_UPLOAD] with a rate limit a pass queues at most what the bucket gives the worker until the next
-    // pass, minus what is still queued: evicted slots must not wait empty behind a growing queue
-    // [TAG_FN_L3_POLICY_BURST] LLAMA_MOE_HOT_BURST_MIB: past the pass budget, strong pairs (a free slot, or a candidate over
-    // LLAMA_MOE_HOT_BURST_RATIO x its victim) take up to that many bytes more, so a shifted working set refills fast
-    // while the steady state keeps the small budget
-    size_t pass_bytes  = mc->dc_bytes;
-    size_t total_bytes = mc->dc_bytes + mc->dc_burst;
-    if (mc->up_rate > 0) {
-        size_t queued_b = 0;
-        {
-            std::lock_guard<std::mutex> lk(mc->wmtx);
-            for (const auto & j : mc->todo) {
-                const layer_state & ls = mc->layers[j.layer_idx];
-                queued_b += ls.pub.up_src->nb[2] + ls.pub.gate_src->nb[2] + ls.pub.down_src->nb[2];
-            }
-        }
-        const size_t cap = mc->up_rate*(size_t) std::max(1, mc->dc.every);
-        pass_bytes  = std::min(pass_bytes,  cap > queued_b ? cap - queued_b : 0);
-        total_bytes = std::min(total_bytes, cap > queued_b ? cap - queued_b : 0);
-    }
 
     auto bytes_of = [mc](const llama_moe_decay_swap & w) {
         const layer_state & l = mc->layers[w.layer];

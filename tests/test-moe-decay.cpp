@@ -11,6 +11,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <numeric>
 #include <random>
 #include <sstream>
 #include <string>
@@ -466,6 +467,53 @@ static void test_select() {
     TCHECK(sel.empty(), "no budget: nothing (%s)", ids().c_str());
 }
 
+// [TAG_FN_L3_POLICY_POOL] max_pairs: exactly the first k pairs of the unbounded call, ties included (counts from a few
+// values, free and busy slots, busy experts)
+static void test_max_pairs() {
+    std::mt19937 rng(5);
+    int n_bad = 0;
+    for (int it = 0; it < 200; ++it) {
+        const int n_exp = 64 + (int) (rng() % 200), n_slots = 8 + (int) (rng() % 64);
+        std::vector<float> cnt(n_exp);
+        for (auto & c : cnt) {
+            c = (float) (rng() % 7) * 0.5f;
+        }
+        std::vector<int32_t> se(n_slots, -1);
+        std::vector<uint8_t> sb(n_slots, 0), eb(n_exp, 0);
+        std::vector<int32_t> perm(n_exp);
+        std::iota(perm.begin(), perm.end(), 0);
+        std::shuffle(perm.begin(), perm.end(), rng);
+        for (int s = 0; s < n_slots; ++s) {
+            const unsigned r = rng() % 10;
+            if (r < 6) {
+                se[s] = perm[s];
+                eb[perm[s]] = 1;
+            } else if (r < 7) {
+                sb[s] = 1;
+            }
+        }
+        for (int e = 0; e < n_exp; ++e) {
+            eb[e] = eb[e] || rng() % 16 == 0;
+        }
+        llama_moe_decay_params p;
+        p.ratio = 1.0f + (float) (rng() % 3)*0.25f;
+        p.hyst  = (float) (rng() % 3)*0.5f;
+        std::vector<llama_moe_decay_swap> full;
+        llama_moe_decay_pairs(3, cnt, se, sb, eb, p, full);
+        for (size_t k : { (size_t) 0, (size_t) 1, (size_t) 2, (size_t) 5, full.size(), full.size() + 3 }) {
+            std::vector<llama_moe_decay_swap> part;
+            llama_moe_decay_pairs(3, cnt, se, sb, eb, p, part, k);
+            bool same = part.size() == std::min(k, full.size());
+            for (size_t i = 0; same && i < part.size(); ++i) {
+                same = part[i].expert == full[i].expert && part[i].slot == full[i].slot && part[i].victim == full[i].victim &&
+                       part[i].gain == full[i].gain;
+            }
+            n_bad += same ? 0 : 1;
+        }
+    }
+    TCHECK(n_bad == 0, "max_pairs: %d of 1200 bounded calls differ from the first pairs of the full call", n_bad);
+}
+
 // [TAG_FN_L3_POLICY_POOL] the pass at Flash-Next's sizes (43 pooled layers x 512 experts, 3052 slots; steady-state counts
 // of a skewed routing), printed only: it runs between two decode graphs, so its time adds to the step
 static void test_pool_timing() {
@@ -496,19 +544,29 @@ static void test_pool_timing() {
     const int reps = 50;
     std::vector<llama_moe_decay_swap> sw;
     std::vector<std::pair<size_t, bool>> sel;
-    const auto t0 = std::chrono::steady_clock::now();
-    size_t n_sw = 0;
-    for (int r = 0; r < reps; ++r) {
-        sw.clear();
-        llama_moe_decay_pairs_pool(pc, pb, sl, se, sb, p, sw);
-        llama_moe_decay_order(sw);
-        llama_moe_decay_select(sw, (size_t) 64 << 20, (size_t) 576 << 20, [](const llama_moe_decay_swap &) { return (size_t) 3072000; },
-                [](const llama_moe_decay_swap &) { return true; }, sel);
-        n_sw += sw.size();
+    double us[2] = { 0.0, 0.0 };
+    size_t n_sw[2] = { 0, 0 };
+    std::vector<std::pair<size_t, bool>> sel_full;
+    for (int bounded = 0; bounded < 2; ++bounded) {
+        const auto t0 = std::chrono::steady_clock::now();
+        for (int r = 0; r < reps; ++r) {
+            sw.clear();
+            // the hot set's bound: (64 + 512 MiB) / 3072000 bytes + 1
+            llama_moe_decay_pairs_pool(pc, pb, sl, se, sb, p, sw, bounded ? ((size_t) 576 << 20)/3072000 + 1 : SIZE_MAX);
+            llama_moe_decay_order(sw);
+            llama_moe_decay_select(sw, (size_t) 64 << 20, (size_t) 576 << 20, [](const llama_moe_decay_swap &) { return (size_t) 3072000; },
+                    [](const llama_moe_decay_swap &) { return true; }, sel);
+            n_sw[bounded] += sw.size();
+        }
+        us[bounded] = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count()/reps;
+        if (!bounded) {
+            sel_full = sel;
+        }
     }
-    const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count()/reps;
-    printf("  pool pass at Flash-Next size: %.0f us (%zu pairs, %zu selected)\n", us, n_sw/reps, sel.size());
-    TCHECK(us < 20000.0, "the pool pass takes %.0f us", us);
+    printf("  pool pass at Flash-Next size: %.0f us (%zu pairs), bounded %.0f us (%zu pairs), %zu selected\n", us[0],
+           n_sw[0]/reps, us[1], n_sw[1]/reps, sel.size());
+    TCHECK(sel == sel_full, "the bounded pass selects the same swaps");
+    TCHECK(us[1] < 20000.0, "the pool pass takes %.0f us", us[1]);
 }
 
 int main() {
@@ -522,6 +580,7 @@ int main() {
     test_pool_pairs();
     test_pool_vs_fixed();
     test_select();
+    test_max_pairs();
     test_pool_timing();
     printf("test-moe-decay: %d checks, %d errors%s\n", g_checks, g_fail, g_fail ? "" : " - PASSED");
     return g_fail == 0 ? 0 : 1;

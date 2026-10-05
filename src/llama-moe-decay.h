@@ -19,6 +19,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -48,19 +49,20 @@ struct llama_moe_decay_swap {
 
 // the pairs of one layer, appended to out. cnt: [n_expert] decayed counts; slot_expert[s]: the resident expert or -1;
 // slot_busy[s]: an upload into s is in flight (neither a victim nor free); expert_busy[e]: e is resident or on its way.
+// [TAG_FN_L3_POLICY_POOL] max_pairs: only the first max_pairs pairs (a partial sort with the stable sort's tie order, so
+// they are exactly the first max_pairs of the full call): a pass that can take at most k swaps of these slots needs no more
 inline void llama_moe_decay_pairs(int layer, const std::vector<float> & cnt, const std::vector<int32_t> & slot_expert,
         const std::vector<uint8_t> & slot_busy, const std::vector<uint8_t> & expert_busy, const llama_moe_decay_params & p,
-        std::vector<llama_moe_decay_swap> & out) {
+        std::vector<llama_moe_decay_swap> & out, size_t max_pairs = SIZE_MAX) {
     std::vector<int32_t> cand;
     for (int32_t e = 0; e < (int32_t) cnt.size(); ++e) {
         if (!expert_busy[e] && cnt[e] >= p.admit) {
             cand.push_back(e);
         }
     }
-    if (cand.empty()) {
+    if (cand.empty() || max_pairs == 0) {
         return;
     }
-    std::stable_sort(cand.begin(), cand.end(), [&](int32_t a, int32_t b) { return cnt[a] > cnt[b]; });
 
     // victims: free slots first, then residents by ascending count (slot order on ties)
     std::vector<int32_t> vict;
@@ -75,11 +77,28 @@ inline void llama_moe_decay_pairs(int layer, const std::vector<float> & cnt, con
             vict.push_back(s);
         }
     }
-    std::stable_sort(vict.begin() + n_free, vict.end(), [&](int32_t a, int32_t b) {
-        return cnt[slot_expert[a]] < cnt[slot_expert[b]];
-    });
+    if (max_pairs >= std::min(cand.size(), vict.size())) {
+        std::stable_sort(cand.begin(), cand.end(), [&](int32_t a, int32_t b) { return cnt[a] > cnt[b]; });
+        std::stable_sort(vict.begin() + n_free, vict.end(), [&](int32_t a, int32_t b) {
+            return cnt[slot_expert[a]] < cnt[slot_expert[b]];
+        });
+    } else {
+        // the first max_pairs of each list in the stable order: ties by index (candidates and residents were collected
+        // in ascending index order)
+        std::partial_sort(cand.begin(), cand.begin() + max_pairs, cand.end(), [&](int32_t a, int32_t b) {
+            return cnt[a] > cnt[b] || (cnt[a] == cnt[b] && a < b);
+        });
+        if (max_pairs > n_free) {
+            const size_t k = std::min(max_pairs, vict.size());
+            std::partial_sort(vict.begin() + n_free, vict.begin() + k, vict.end(), [&](int32_t a, int32_t b) {
+                const float ca = cnt[slot_expert[a]];
+                const float cb = cnt[slot_expert[b]];
+                return ca < cb || (ca == cb && a < b);
+            });
+        }
+    }
 
-    const size_t n = std::min(cand.size(), vict.size());
+    const size_t n = std::min({ cand.size(), vict.size(), max_pairs });
     for (size_t i = 0; i < n; ++i) {
         const int32_t e  = cand[i];
         const int32_t s  = vict[i];
@@ -100,7 +119,7 @@ inline void llama_moe_decay_pairs(int layer, const std::vector<float> & cnt, con
 inline void llama_moe_decay_pairs_pool(const std::vector<const std::vector<float> *> & cnt,
         const std::vector<const std::vector<uint8_t> *> & expert_busy, const std::vector<int32_t> & slot_layer,
         const std::vector<int32_t> & slot_expert, const std::vector<uint8_t> & slot_busy, const llama_moe_decay_params & p,
-        std::vector<llama_moe_decay_swap> & out) {
+        std::vector<llama_moe_decay_swap> & out, size_t max_pairs = SIZE_MAX) {
     if (cnt.empty() || cnt.size() != expert_busy.size()) {
         return;
     }
@@ -122,7 +141,7 @@ inline void llama_moe_decay_pairs_pool(const std::vector<const std::vector<float
         }
     }
     std::vector<llama_moe_decay_swap> tmp;
-    llama_moe_decay_pairs(0, fc, fs, slot_busy, fb, p, tmp);
+    llama_moe_decay_pairs(0, fc, fs, slot_busy, fb, p, tmp, max_pairs);
     for (const auto & w : tmp) {
         llama_moe_decay_swap o = { w.expert / n_exp, w.expert % n_exp, w.slot, w.victim >= 0 ? w.victim % n_exp : -1, w.gain };
         o.victim_layer = w.victim >= 0 ? w.victim / n_exp : -1;
