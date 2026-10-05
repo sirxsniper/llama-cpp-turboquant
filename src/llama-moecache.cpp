@@ -1117,22 +1117,27 @@ void hot_adapt_decay(moe_cache * mc, bool decode_step) {
         total_bytes = std::min(total_bytes, cap > queued_b ? cap - queued_b : 0);
     }
 
+    auto bytes_of = [mc](const llama_moe_decay_swap & w) {
+        const layer_state & l = mc->layers[w.layer];
+        return l.pub.up_src->nb[2] + l.pub.gate_src->nb[2] + l.pub.down_src->nb[2];
+    };
+    // [TAG_FN_L3_POLICY_BURST] strong: a free slot, or a candidate over LLAMA_MOE_HOT_BURST_RATIO x its victim
+    auto strong = [mc](const llama_moe_decay_swap & w) {
+        const layer_state & l  = mc->layers[w.layer];
+        const layer_state & vl = w.victim_layer >= 0 ? mc->layers[w.victim_layer] : l;
+        return w.victim < 0 || l.dcnt[w.expert] > mc->dc_burst_ratio*vl.dcnt[w.victim];
+    };
+    std::vector<std::pair<size_t, bool>> sel;
+    llama_moe_decay_select(swaps, pass_bytes, total_bytes, bytes_of, strong, sel);
+
     size_t bytes = 0;
     size_t n_burst = 0;
     bool queued = false;
-    for (const auto & w : swaps) {
+    for (const auto & [si, over] : sel) {
+        const llama_moe_decay_swap & w = swaps[si];
         layer_state & ls = mc->layers[w.layer];
-        const size_t b = ls.pub.up_src->nb[2] + ls.pub.gate_src->nb[2] + ls.pub.down_src->nb[2];
-        if (bytes + b > pass_bytes) {
-            if (bytes + b > total_bytes) {
-                break;
-            }
-            const layer_state & vl = w.victim_layer >= 0 ? mc->layers[w.victim_layer] : ls;
-            if (w.victim >= 0 && !(ls.dcnt[w.expert] > mc->dc_burst_ratio*vl.dcnt[w.victim])) {
-                continue; // [TAG_FN_L3_POLICY_BURST] not strong: only the pass budget
-            }
-            n_burst++;
-        }
+        const size_t b = bytes_of(w);
+        n_burst += over ? 1 : 0;
         // evict first: the victim leaves both tables now, so no later graph reads the slot being overwritten
         // [TAG_FN_L3_POLICY_POOL] in a pool the victim may belong to another layer of the class
         layer_state & vs = w.victim_layer >= 0 ? mc->layers[w.victim_layer] : ls;

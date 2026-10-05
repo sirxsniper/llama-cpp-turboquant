@@ -25,6 +25,7 @@
 #include <istream>
 #include <sstream>
 #include <string>
+#include <utility>
 #include <vector>
 
 struct llama_moe_decay_params {
@@ -134,6 +135,30 @@ inline void llama_moe_decay_order(std::vector<llama_moe_decay_swap> & swaps) {
     std::stable_sort(swaps.begin(), swaps.end(), [](const llama_moe_decay_swap & a, const llama_moe_decay_swap & b) {
         return a.gain > b.gain;
     });
+}
+
+// [TAG_FN_L3_POLICY_BURST] the swaps one pass queues, best gain first: any pair within pass_bytes; past it, up to
+// total_bytes, only the pairs strong() accepts (LLAMA_MOE_HOT_BURST_MIB). total_bytes <= pass_bytes: the first pair over the
+// pass budget ends the pass. out: (index into swaps, taken past the pass budget)
+template <typename BytesOf, typename Strong>
+inline void llama_moe_decay_select(const std::vector<llama_moe_decay_swap> & swaps, size_t pass_bytes, size_t total_bytes,
+        BytesOf bytes_of, Strong strong, std::vector<std::pair<size_t, bool>> & out) {
+    out.clear();
+    size_t used = 0;
+    for (size_t i = 0; i < swaps.size(); ++i) {
+        const size_t b    = bytes_of(swaps[i]);
+        const bool   over = used + b > pass_bytes;
+        if (over) {
+            if (used + b > total_bytes) {
+                break;
+            }
+            if (!strong(swaps[i])) {
+                continue;
+            }
+        }
+        used += b;
+        out.push_back({ i, over });
+    }
 }
 
 // one decode step's routing (ids [n], any value outside [0, n_expert) ignored) into the counts

@@ -436,6 +436,35 @@ static void test_hotstate() {
     }
 }
 
+// [TAG_FN_L3_POLICY_BURST] the pass selection: the pass budget alone stops at the first pair over it; with a burst budget
+// the pairs past it are taken only when strong, until the total
+static void test_select() {
+    std::vector<llama_moe_decay_swap> sw;
+    for (int i = 0; i < 6; ++i) {
+        sw.push_back({ 0, i, i, i % 2 ? i + 100 : -1, 10.0f - i });
+    }
+    auto bytes_of = [](const llama_moe_decay_swap &) { return (size_t) 3; };
+    auto strong   = [](const llama_moe_decay_swap & w) { return w.victim < 0; }; // the free-slot pairs: 0, 2, 4
+    std::vector<std::pair<size_t, bool>> sel;
+    auto ids = [&]() {
+        std::string s;
+        for (const auto & [i, over] : sel) {
+            s += std::to_string(i) + (over ? "*" : "") + " ";
+        }
+        return s;
+    };
+    llama_moe_decay_select(sw, 7, 7, bytes_of, strong, sel);
+    TCHECK(ids() == "0 1 ", "pass budget only: %s", ids().c_str());
+    llama_moe_decay_select(sw, 7, 0, bytes_of, strong, sel);
+    TCHECK(ids() == "0 1 ", "a total under the pass budget changes nothing: %s", ids().c_str());
+    llama_moe_decay_select(sw, 7, 13, bytes_of, strong, sel);
+    TCHECK(ids() == "0 1 2* 4* ", "burst: the strong pairs past the pass budget up to the total: %s", ids().c_str());
+    llama_moe_decay_select(sw, 7, 100, bytes_of, [](const llama_moe_decay_swap &) { return false; }, sel);
+    TCHECK(ids() == "0 1 ", "burst without a strong pair: %s", ids().c_str());
+    llama_moe_decay_select(sw, 0, 0, bytes_of, strong, sel);
+    TCHECK(sel.empty(), "no budget: nothing (%s)", ids().c_str());
+}
+
 int main() {
     printf("test-moe-decay: [TAG_FN_R4_ADAPT_DECAY]\n");
     test_pairs();
@@ -446,6 +475,7 @@ int main() {
     test_hotstate();
     test_pool_pairs();
     test_pool_vs_fixed();
+    test_select();
     printf("test-moe-decay: %d checks, %d errors%s\n", g_checks, g_fail, g_fail ? "" : " - PASSED");
     return g_fail == 0 ? 0 : 1;
 }
