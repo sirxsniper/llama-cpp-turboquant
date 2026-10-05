@@ -495,6 +495,7 @@ void llama_fn_auto_on_load(llama_model & model, llama_model_loader & ml, const s
     if (model.arch != LLM_ARCH_QWEN4EXP || params.no_alloc || params.vocab_only) {
         return;
     }
+    llama_fn_l3_host_on_load(model); // [TAG_FN_L3_HOST_QOS] [TAG_FN_L3_HOST_POKE]
 
     const int n_layer = (int) model.hparams.n_layer();
     std::vector<std::pair<std::string, bool>> ov;
@@ -629,6 +630,7 @@ void llama_fn_auto_after_load(llama_model & model) {
 }
 
 void llama_fn_auto_on_free(llama_model & model) {
+    llama_fn_l3_host_on_free(model); // [TAG_FN_L3_HOST_QOS] [TAG_FN_L3_HOST_POKE] no-op for a model on_load skipped
     if (model.fn_auto) {
         llama_fn_state_undo(*model.fn_auto);
         model.fn_auto->active = false;
@@ -639,6 +641,19 @@ void llama_fn_auto_on_free(llama_model & model) {
 
 const char * llama_fn_env(const llama_model & model, const char * name) {
     return llama_fn_state_env(model.fn_auto.get(), name);
+}
+
+// [TAG_FN_L3_HOST] see llama-fn-auto.h
+int llama_fn_l3_int(const llama_model & model, const char * name, int def) {
+    if (model.arch != LLM_ARCH_QWEN4EXP) {
+        return def;
+    }
+    const char * v = llama_fn_env(model, name);
+    return v && v[0] ? atoi(v) : def;
+}
+
+bool llama_fn_l3_flag(const llama_model & model, const char * name) {
+    return llama_fn_l3_int(model, name, 0) != 0;
 }
 
 bool llama_fn_active(const llama_model & model) {

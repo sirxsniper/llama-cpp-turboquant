@@ -420,6 +420,13 @@ private:
     uint32_t moe_hot_waits   = 0;
     void     moe_hot_fit_try();
 
+    // [TAG_FN_L3_HOST_STEP] LLAMA_FN_HOST_STEP=1 (qwen4exp): the owner's moe-cache / DMA step after a decode runs on a
+    // helper thread; step_join() waits for it before anything that may read or change that state again
+    struct step_worker;
+    bool                         step_async_want = false;
+    std::unique_ptr<step_worker> step_async;
+    void                         step_join();
+
     llm_graph_result * get_gf_res_prev(const llama_ubatch & ubatch);
     void gf_res_prev_reset_all();
 

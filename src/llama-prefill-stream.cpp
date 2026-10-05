@@ -71,6 +71,8 @@ struct pfs_state {
     ggml_backend_t     compute  = nullptr;
     ggml_backend_t     copy     = nullptr; // own stream
     bool               own_copy = false;
+    // [TAG_FN_L3_HOST_POKE] flush the copy stream after a dispatch (a no-op unless LLAMA_FN_HOST_POKE turned it on)
+    void (*poke)(ggml_backend_t) = nullptr;
 
     // [TAG_FN_R1_PFS_LEND] LLAMA_PREFILL_STREAM_LEND=1: the banks are a range of the hot set's buffer, borrowed while
     // ubatches stream (lent) and returned before a decode; the aliases are placed there at the first lend
@@ -186,6 +188,9 @@ void pfs_run(pfs_state * s) {
             if (it.slot >= 0) {
                 gen5::ev_record(s->chunk_ev[it.slot], s->copy);
                 s->chunk_state[it.slot] = 2;
+            }
+            if (s->poke) {
+                s->poke(s->copy); // [TAG_FN_L3_HOST_POKE] the copy starts now, while this thread stages the next chunk
             }
             bytes += it.n;
         };
@@ -665,6 +670,10 @@ bool llama_prefill_stream_init_layers(const std::vector<llama_moe_gen5_layer_des
     if (!cpu_dev) {
         s->copy = ggml_backend_dev_init(d.dev, nullptr);
         s->own_copy = s->copy != nullptr;
+        // [TAG_FN_L3_HOST_POKE] the device backend's flush, if it has one (it does nothing unless the switch is on)
+        if (ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(d.dev)) {
+            s->poke = (void (*)(ggml_backend_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_stream_poke");
+        }
     } else {
         s->copy = d.compute; // CPU: copies are synchronous memcpy
     }

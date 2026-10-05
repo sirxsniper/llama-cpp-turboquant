@@ -3,6 +3,7 @@
 #include "llama-impl.h"
 #include "llama-model.h"
 #include "llama-moecache.h"
+#include "llama-fn-auto.h" // [TAG_FN_L3_HOST] llama_fn_l3_flag
 #include "llama-moe-gen5.h" // [TAG_FN_R4_BRIDGE_DMA]
 #include "llama-moe-gen5-impl.h" // [TAG_FN_R4_BRIDGE_DMA] gen5::dma_requested
 
@@ -40,6 +41,12 @@ using pool_pf_t             = ggml_status (*)(ggml_cpu_moe_pool *, const ggml_cp
 using pool_pf_stop_t        = void (*)(ggml_cpu_moe_pool *);
 using pool_pf_stats_t       = void (*)(ggml_cpu_moe_pool *, uint64_t *, uint64_t *, uint64_t *, uint64_t *);
 using pool_set_solo_t       = void (*)(ggml_cpu_moe_pool *, bool);
+using pool_pf_caller_t      = size_t (*)(ggml_cpu_moe_pool *, const volatile int32_t *);            // [TAG_FN_L3_HOST_EXEC]
+using pool_pfc_stats_t      = void (*)(ggml_cpu_moe_pool *, uint64_t *, uint64_t *, uint64_t *);
+
+int64_t br_now_ns() { // [TAG_FN_L3_HOST_DIAG]
+    return (int64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
 
 inline void br_relax() {
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
@@ -96,6 +103,28 @@ struct llama_moe_bridge {
     pool_set_solo_t                       pool_set_solo = nullptr;
     std::vector<int>                      pf_next;   // per channel: the channel of layer il + 1, or -1
     std::vector<std::vector<ggml_fp16_t>> pf_router; // per channel: its router rows in f16 ([n_expert][n_embd]) if predicted
+
+    // [TAG_FN_L3_HOST_EXEC] LLAMA_FN_HOST_EXEC=1 (qwen4exp, with the prefetch): the executor computes thread 0's share
+    // of every job and pulls it into its own caches after posting the workers' prefetch, until the next job is posted
+    bool                                      exec_on        = false;
+    ggml_backend_moe_bridge_set_watch_t       fn_set_watch   = nullptr;
+    ggml_backend_moe_bridge_next_post_word_t  fn_next_post   = nullptr;
+    pool_pf_caller_t                          pool_pf_caller = nullptr;
+    pool_pfc_stats_t                          pool_pfc_stats = nullptr;
+
+    // [TAG_FN_L3_HOST_DIAG] LLAMA_FN_HOST_DIAG=1 (qwen4exp): host timing of the bridged graphs (steady clock, ns)
+    bool                 diag = false;
+    std::atomic<int64_t> dg_t_begin{0};     // owner: begin() of the running graph
+    std::atomic<bool>    dg_first{false};   // owner sets it in begin(), the executor clears it at the graph's first post
+    std::atomic<int64_t> dg_first_sum{0};   // executor: begin -> first post, summed
+    std::atomic<int64_t> dg_first_n{0};
+    std::atomic<int64_t> dg_t_last_job{0};  // executor: the last completed job
+    int64_t              dg_t_end_prev = 0; // owner fields below
+    int64_t              dg_graph_sum  = 0;
+    int64_t              dg_tail_sum   = 0;
+    int64_t              dg_gap_sum    = 0;
+    int64_t              dg_n          = 0;
+    int64_t              dg_n_gap      = 0;
 
     ggml_moe_bridge * gb  = nullptr;
     int32_t           bid = -1;
@@ -359,10 +388,21 @@ static void br_exec_main(llama_moe_bridge * br) {
     for (uint32_t k = 1; ; ++k) {
         ggml_moe_bridge_job job;
         if (br->fn_poll(br->gb, &job)) {
+            if (br->diag && br->dg_first.exchange(false, std::memory_order_acq_rel)) { // [TAG_FN_L3_HOST_DIAG]
+                br->dg_first_sum.fetch_add(br_now_ns() - br->dg_t_begin.load(std::memory_order_acquire), std::memory_order_relaxed);
+                br->dg_first_n.fetch_add(1, std::memory_order_relaxed);
+            }
             const bool ok = br_run(&job, br);
             br->fn_complete(br->gb, &job, ok);
+            if (br->diag) {
+                br->dg_t_last_job.store(br_now_ns(), std::memory_order_release);
+            }
             if (br->pf_on && ok) {
                 br_prefetch_next(br, pool, job); // [TAG_FN_R2_BRIDGE_PF]
+                if (br->exec_on) {
+                    // [TAG_FN_L3_HOST_EXEC] this thread computes a share of the next job: pull it in until that job is posted
+                    br->pool_pf_caller(pool, br->fn_next_post(br->gb));
+                }
             }
             last = std::chrono::steady_clock::now();
             // test: stall before the next job is taken, so its wait runs into timeout_ms
@@ -706,6 +746,30 @@ llama_moe_bridge * llama_moe_bridge_create(const llama_model & model, int n_thre
         }
     }
 
+    // [TAG_FN_L3_HOST_EXEC] the executor takes a share of every job and prefetches it itself (before the executor starts:
+    // the watch must be on before the first graph, and solo is applied by the executor when it makes its pool)
+    if (llama_fn_l3_flag(model, "LLAMA_FN_HOST_EXEC")) {
+        br->fn_set_watch   = (ggml_backend_moe_bridge_set_watch_t)      proc("ggml_backend_moe_bridge_set_watch");
+        br->fn_next_post   = (ggml_backend_moe_bridge_next_post_word_t) proc("ggml_backend_moe_bridge_next_post_word");
+        br->pool_pf_caller = (pool_pf_caller_t) ggml_backend_reg_get_proc_address(cpu_reg, "ggml_cpu_moe_prefetch_caller");
+        br->pool_pfc_stats = (pool_pfc_stats_t) ggml_backend_reg_get_proc_address(cpu_reg, "ggml_cpu_moe_prefetch_caller_stats");
+        if (!br->pf_on) {
+            LLAMA_LOG_WARN("%s: [TAG_FN_L3_HOST_EXEC] LLAMA_FN_HOST_EXEC needs the next-layer prefetch (LLAMA_MOE_BRIDGE_PF=1, "
+                    "spin wait): the executor keeps its role\n", __func__);
+        } else if (!br->fn_set_watch || !br->fn_next_post || !br->pool_pf_caller || !br->pool_pfc_stats) {
+            LLAMA_LOG_WARN("%s: [TAG_FN_L3_HOST_EXEC] the backends lack the watch or the caller prefetch: the executor keeps its "
+                    "role\n", __func__);
+        } else {
+            br->fn_set_watch(br->gb, true);
+            br->exec_on = true;
+            br->pf_solo = false; // the executor computes thread 0 of the pool again, and prefetches exactly that
+            LLAMA_LOG_INFO("%s: [TAG_FN_L3_HOST_EXEC] the executor computes 1 of the pool's %d shares of every job and pulls "
+                    "it into its caches between two jobs, until the next post lands (PF_SOLO off)\n", __func__,
+                    br->pool_params.n_threads);
+        }
+    }
+    br->diag = llama_fn_l3_flag(model, "LLAMA_FN_HOST_DIAG"); // [TAG_FN_L3_HOST_DIAG]
+
     if (br->mode == GGML_MOE_BRIDGE_WAIT_HOSTFUNC) {
         br->pool = br->pool_new(&br->pool_params); // run by the driver's callback thread, which keeps its affinity
         if (br->pool == nullptr) {
@@ -839,6 +903,15 @@ void llama_moe_bridge_begin(llama_moe_bridge * br, bool used) {
         return;
     }
     if (used) {
+        if (br->diag) { // [TAG_FN_L3_HOST_DIAG] before in_graph: no job of this graph can be taken earlier
+            const int64_t t = br_now_ns();
+            if (br->dg_t_end_prev > 0) {
+                br->dg_gap_sum += t - br->dg_t_end_prev;
+                br->dg_n_gap++;
+            }
+            br->dg_t_begin.store(t, std::memory_order_release);
+            br->dg_first.store(true, std::memory_order_release);
+        }
         {
             std::lock_guard<std::mutex> lk(br->graph_mtx);
             br->in_graph = true;
@@ -872,6 +945,26 @@ bool llama_moe_bridge_end(llama_moe_bridge * br) {
     }
     br->n_graphs++;
     const uint32_t err = br->fn_error(br->gb);
+
+    if (br->diag) { // [TAG_FN_L3_HOST_DIAG] the graph has synced: its jobs are done
+        const int64_t t     = br_now_ns();
+        const int64_t t_beg = br->dg_t_begin.load(std::memory_order_acquire);
+        const int64_t t_job = br->dg_t_last_job.load(std::memory_order_acquire);
+        br->dg_graph_sum += t - t_beg;
+        br->dg_tail_sum  += t_job > t_beg ? t - t_job : 0;
+        br->dg_t_end_prev = t;
+        br->dg_first.store(false, std::memory_order_release);
+        if (++br->dg_n == 256) {
+            const int64_t nf = br->dg_first_n.exchange(0);
+            const int64_t sf = br->dg_first_sum.exchange(0);
+            LLAMA_LOG_INFO("%s: MoE bridge %d: [TAG_FN_L3_HOST_DIAG] per bridged graph (256): begin -> first post %.1f us, "
+                    "begin -> end %.1f us, last job -> end %.1f us; host between graphs %.1f us\n", __func__, br->bid,
+                    nf ? sf/1e3/nf : 0.0, br->dg_graph_sum/1e3/br->dg_n, br->dg_tail_sum/1e3/br->dg_n,
+                    br->dg_n_gap ? br->dg_gap_sum/1e3/br->dg_n_gap : 0.0);
+            br->dg_n = br->dg_n_gap = 0;
+            br->dg_graph_sum = br->dg_tail_sum = br->dg_gap_sum = 0;
+        }
+    }
 
     // [TAG_FN_R4_BRIDGE_DMA] the graph synced: the device's wait and fetch times and the host's job times of its layers
     // move the DMA/CPU split (only layers whose last job and device times belong to the same post)
@@ -916,6 +1009,12 @@ bool llama_moe_bridge_end(llama_moe_bridge * br) {
             LLAMA_LOG_INFO("%s: MoE bridge %d: [TAG_FN_R2_BRIDGE_PF] %" PRIu64 " prefetches, %.1f%% stopped by the next job, "
                     "%.2f predicted cold experts and %.2f MiB per prefetch\n", __func__, br->bid, pj, pj ? 100.0*ps/pj : 0.0,
                     pj ? (double) pe/pj : 0.0, pj ? pb/1048576.0/pj : 0.0);
+            if (br->exec_on) { // [TAG_FN_L3_HOST_EXEC]
+                uint64_t cc = 0, cs = 0, cb = 0;
+                br->pool_pfc_stats(br->pool, &cc, &cs, &cb);
+                LLAMA_LOG_INFO("%s: MoE bridge %d: [TAG_FN_L3_HOST_EXEC] executor share: %" PRIu64 " own prefetches, %.1f%% stopped "
+                        "by the next post, %.3f MiB each\n", __func__, br->bid, cc, cc ? 100.0*cs/cc : 0.0, cc ? cb/1048576.0/cc : 0.0);
+            }
         }
     }
     if (err == GGML_MOE_BRIDGE_ERR_NONE) {
