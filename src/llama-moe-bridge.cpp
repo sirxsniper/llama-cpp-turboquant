@@ -19,6 +19,7 @@
 #include <condition_variable>
 #include <cstdlib>
 #include <cstring>
+#include <iterator>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -182,6 +183,7 @@ struct llama_moe_bridge {
         bool                 job_fetch = false; // the job had a plan (its device fetch times are its own)
         uint32_t             job_seq = 0;       // written last (release fence), read first (acquire fence)
         std::vector<uint8_t> seen;              // [TAG_FN_R4_REVIEW] [n_expert] scratch of the distinct CPU expert count
+        std::vector<uint8_t> trk_seen;          // [TAG_FN_L3_MTP_COST2] [n_expert] scratch of the cold prefix counts
     };
     std::vector<chan> chans;
     std::unordered_map<const ggml_tensor *, int> by_up;
@@ -203,6 +205,19 @@ struct llama_moe_bridge {
     // moved on and may run the moe-cache step or a CPU split that calls the same routing observer. [TAG_MOE_BRIDGE]
     std::mutex graph_mtx;
     bool       in_graph = false; // guarded by graph_mtx
+
+    // [TAG_FN_L3_MTP_COST2] cold-expert prefix counts: the running graph's (its jobs add under graph_mtx) and the last
+    // completed one's (owner thread). Every member is guarded by graph_mtx.
+    bool     trk_on     = false;
+    int32_t  trk_T      = 0;     // width of the running graph's jobs (0 = no job yet)
+    uint32_t trk_layers = 0;
+    bool     trk_bad    = false; // a job the table cannot hold (wider than LLAMA_MOE_BRIDGE_TRACK_T, or another width)
+    uint32_t trk_cold[LLAMA_MOE_BRIDGE_TRACK_T] = {};
+    int32_t  last_T      = 0;
+    uint32_t last_layers = 0;
+    uint64_t last_serial = 0;
+    bool     last_ok     = false;
+    uint32_t last_cold[LLAMA_MOE_BRIDGE_TRACK_T] = {};
 
     // state, owning context's thread
     bool     active     = true;
@@ -229,6 +244,44 @@ struct llama_moe_bridge {
     int stall_ms    = 0;
     int stall_every = 0;
 };
+
+// [TAG_FN_L3_MTP_COST2] add one job's cold prefix counts to the running graph's: for t = 0..T-1 the distinct experts of
+// tokens 0..t that the hot table does not hold (no table: every expert). Caller holds graph_mtx; ~T x n_used steps.
+static void br_track_job(llama_moe_bridge * br, llama_moe_bridge::chan & c, const ggml_cpu_moe_layer * layer,
+        const ggml_moe_bridge_job * j) {
+    const int     T     = j->n_tokens;
+    const int     n_use = j->n_used;
+    const int64_t n_exp = c.up->ne[2];
+    if (T < 1 || T > LLAMA_MOE_BRIDGE_TRACK_T || n_use < 1 || (br->trk_T != 0 && br->trk_T != T)) {
+        br->trk_bad = true;
+        return;
+    }
+    br->trk_T = T;
+    if (c.trk_seen.size() != (size_t) n_exp) {
+        c.trk_seen.assign(n_exp, 0);
+    }
+    const int32_t * tbl  = layer->table;
+    const int32_t   miss = layer->table_miss;
+    uint32_t n = 0;
+    for (int t = 0; t < T; ++t) {
+        for (int i = 0; i < n_use; ++i) {
+            const int32_t e = j->ids[t*n_use + i];
+            if (e < 0 || e >= n_exp || c.trk_seen[e]) {
+                continue;
+            }
+            c.trk_seen[e] = 1;
+            n += (tbl == nullptr || tbl[e] == miss) ? 1 : 0;
+        }
+        br->trk_cold[t] += n;
+    }
+    for (int a = 0; a < T*n_use; ++a) {
+        const int32_t e = j->ids[a];
+        if (e >= 0 && e < n_exp) {
+            c.trk_seen[e] = 0;
+        }
+    }
+    br->trk_layers++;
+}
 
 // the job on the CPU MoE pool: runs on the executor thread (spin) or the driver's callback thread (hostfunc)
 static bool br_run(const ggml_moe_bridge_job * j, void * ud) {
@@ -285,6 +338,11 @@ static bool br_run(const ggml_moe_bridge_job * j, void * ud) {
         }
 
         br->n_jobs.fetch_add(1, std::memory_order_relaxed);
+
+        // [TAG_FN_L3_MTP_COST2] before the DMA plan swaps in its skip table: cold = not in the hot set
+        if (br->trk_on) {
+            br_track_job(br, c, layer, j);
+        }
 
         // [TAG_FN_R4_BRIDGE_DMA] the graph fetches a share of this job: plan it (ring-ready cold experts), publish the plan
         // for the device (mapped memory, no CUDA call), then the CPU skips the hot experts and the fetched ones. The plan
@@ -934,6 +992,34 @@ int llama_moe_bridge_max_t(const llama_moe_bridge * br) {
     return br ? br->max_t : 0;
 }
 
+// [TAG_FN_L3_MTP_COST2]
+void llama_moe_bridge_track(llama_moe_bridge * br, bool on) {
+    if (br == nullptr) {
+        return;
+    }
+    std::lock_guard<std::mutex> lk(br->graph_mtx);
+    br->trk_on = on;
+    if (!on) {
+        br->last_ok = false;
+    }
+}
+
+bool llama_moe_bridge_last(const llama_moe_bridge * br, int32_t * n_tokens, uint32_t * cold, int32_t n, uint64_t * serial) {
+    if (br == nullptr || !br->trk_on || !br->last_ok || br->last_T < 1) {
+        return false;
+    }
+    if (n_tokens) {
+        *n_tokens = br->last_T;
+    }
+    for (int32_t t = 0; cold && t < n && t < br->last_T; ++t) {
+        cold[t] = br->last_cold[t];
+    }
+    if (serial) {
+        *serial = br->last_serial;
+    }
+    return true;
+}
+
 int llama_moe_bridge_n_used(const llama_moe_bridge * br) {
     return br ? br->n_used : 0;
 }
@@ -994,6 +1080,11 @@ void llama_moe_bridge_begin(llama_moe_bridge * br, bool used) {
         {
             std::lock_guard<std::mutex> lk(br->graph_mtx);
             br->in_graph = true;
+            // [TAG_FN_L3_MTP_COST2] no job of this graph has run yet
+            br->trk_T      = 0;
+            br->trk_layers = 0;
+            br->trk_bad    = false;
+            std::fill(std::begin(br->trk_cold), std::end(br->trk_cold), 0u);
         }
         if (br->quiet) {
             br_quiet_set(true); // [TAG_FN_L3_HOST_QUIET]
@@ -1021,15 +1112,28 @@ bool llama_moe_bridge_end(llama_moe_bridge * br) {
     if (br == nullptr) {
         return true;
     }
+    bool trk_ok = false;
     {
         std::lock_guard<std::mutex> lk(br->graph_mtx); // waits for an observer call in progress
         br->in_graph = false;
+        // [TAG_FN_L3_MTP_COST2] every job of the graph added its counts under graph_mtx before the device went on
+        if (br->trk_on) {
+            trk_ok = !br->trk_bad && br->trk_T > 0 && br->trk_layers > 0;
+            br->last_T      = br->trk_T;
+            br->last_layers = br->trk_layers;
+            std::copy(std::begin(br->trk_cold), std::end(br->trk_cold), std::begin(br->last_cold));
+        }
     }
     if (br->quiet) {
         br_quiet_set(false); // [TAG_FN_L3_HOST_QUIET]
     }
     br->n_graphs++;
     const uint32_t err = br->fn_error(br->gb);
+    if (br->trk_on) {
+        std::lock_guard<std::mutex> lk(br->graph_mtx);
+        br->last_ok     = trk_ok && err == GGML_MOE_BRIDGE_ERR_NONE;
+        br->last_serial = br->n_graphs;
+    }
 
     if (br->diag) { // [TAG_FN_L3_HOST_DIAG] the graph has synced: its jobs are done
         const int64_t t     = br_now_ns();

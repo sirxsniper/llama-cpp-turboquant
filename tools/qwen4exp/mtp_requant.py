@@ -21,6 +21,14 @@
 #
 # Then merge it like file A (a dense nextn block): merge_mtp.py --mtp-ratio 0 --head <out> ... (recipe_mtp_mix.ps1).
 # CPU and disk only (reads ~2.6 GB, writes ~1.6 GB). Never run beside a GPU speed measurement.
+#
+# [TAG_FN_L3_MTP_Q2] --mix may name q2_0 (ggml type 42: 64 weights, one fp16 scale d, 2 bit codes c, weight (c - 1) * d).
+# ggml's own q2_0 quantizer takes d = the block's absmax and never uses code 3: on the MTP experts that is a relative
+# RMS weight error of 0.73 and an expert output error of 1.26 (worse than a zero output). So q2_0 is written here by a
+# scale search instead (--q2-ref keeps ggml's): per block the d (either sign, fp16) and codes of least squared error, from
+# 6 starting scales x 2 signs with 3 alternating code / scale steps each: weight error 0.36, output error 0.59 on the
+# same experts. Every value is a plain q2_0 block (the CUDA and CPU kernels take any d and all 4 codes; test-backend-ops
+# runs them with negative d and code 3, [TAG_Q2_0_CPU]). The check below decodes q2_0 here (gguf-py has no q2_0).
 from __future__ import annotations
 
 import argparse
@@ -41,7 +49,11 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from merge_mtp import GGUF_MAGIC, Header, nbytes, wstr, wval  # noqa: E402
 
 TYPE_IDS = {"f32": 0, "f16": 1, "q4_0": 2, "q4_1": 3, "q5_0": 6, "q5_1": 7, "q8_0": 8, "q2_K": 10, "q3_K": 11,
-            "q4_K": 12, "q5_K": 13, "q6_K": 14, "iq4_nl": 20, "iq4_xs": 23, "bf16": 30}
+            "q4_K": 12, "q5_K": 13, "q6_K": 14, "iq4_nl": 20, "iq4_xs": 23, "bf16": 30, "q2_0": 42}
+# [TAG_FN_L3_MTP_Q2] the largest relative RMS weight error the check accepts per target type (measured on the MTP
+# experts: q2_0 searched 0.36, q2_K 0.31, q3_K 0.16, q4_0 0.09, q4_K 0.075, q5_1 0.04)
+MAX_REL_ERR = {"q2_0": 0.45, "q2_K": 0.38, "q3_K": 0.22, "q4_0": 0.13, "q4_1": 0.12, "q4_K": 0.12, "iq4_nl": 0.12,
+               "iq4_xs": 0.12, "q5_0": 0.08, "q5_1": 0.08, "q5_K": 0.07, "q6_K": 0.05, "q8_0": 0.02}
 TYPE_NAMES = {v: k for k, v in TYPE_IDS.items()}
 EXP_RE = re.compile(r"^blk\.(\d+)\.ffn_(gate|up|down)_exps\.weight$")
 
@@ -105,6 +117,48 @@ def to_f32(raw, tt, n):
     raise SystemExit("source type %s is not supported here (q8_0, f16, bf16, f32)" % TYPE_NAMES.get(tt, tt))
 
 
+def q2_0_quantize(x):
+    """[TAG_FN_L3_MTP_Q2] q2_0 blocks of f32 x (a multiple of 64) by a scale search; returns the raw bytes"""
+    b = x.reshape(-1, 64).astype(np.float32)
+    amax = np.abs(b).max(axis=1)
+    best_err = np.full(b.shape[0], np.inf, dtype=np.float32)
+    best_d = np.zeros(b.shape[0], dtype=np.float16)
+    best_c = np.zeros(b.shape, dtype=np.float32)
+    # 6 starting scales x 2 signs, 3 code / scale steps each: the same error as 18 x 5 on the MTP experts (0.359)
+    for s in (1.0, -1.0):
+        for f in np.linspace(0.3, 0.9, 6):
+            d = (s * np.maximum(amax * f, 1e-30)).astype(np.float32)
+            for it in range(4):
+                dh = d.astype(np.float16)
+                df = dh.astype(np.float32)
+                df = np.where(df == 0.0, np.float32(1.0), df)  # a zero scale codes every weight as 0 anyway
+                c = np.clip(np.rint(b / df[:, None]), -1.0, 2.0)
+                if it == 3:
+                    break
+                s1 = (c * b).sum(axis=1)
+                s2 = (c * c).sum(axis=1)
+                d = np.where(s2 > 0.0, s1 / np.maximum(s2, np.float32(1e-30)), d).astype(np.float32)
+            err = ((c * dh.astype(np.float32)[:, None] - b) ** 2).sum(axis=1)
+            m = err < best_err
+            best_err = np.where(m, err, best_err)
+            best_d = np.where(m, dh, best_d)
+            best_c = np.where(m[:, None], c, best_c)
+    q = (best_c + 1.0).astype(np.uint8).reshape(-1, 16, 4)
+    qs = (q[:, :, 0] | (q[:, :, 1] << 2) | (q[:, :, 2] << 4) | (q[:, :, 3] << 6)).astype(np.uint8)
+    blk = np.empty(b.shape[0], dtype=np.dtype([("d", "<f2"), ("qs", "u1", 16)]))
+    blk["d"] = best_d
+    blk["qs"] = qs
+    return blk.tobytes()
+
+
+def q2_0_dequantize(raw):
+    """[TAG_FN_L3_MTP_Q2] f32 values of q2_0 bytes, as ggml's dequantize_row_q2_0"""
+    blk = np.frombuffer(raw, dtype=np.dtype([("d", "<f2"), ("qs", "u1", 16)]))
+    qs = blk["qs"].astype(np.int32)
+    c = np.stack([(qs >> (2 * j)) & 3 for j in range(4)], axis=2).reshape(-1, 64)
+    return ((c - 1).astype(np.float32) * blk["d"].astype(np.float32)[:, None]).reshape(-1)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--head", required=True)
@@ -117,6 +171,7 @@ def main():
     ap.add_argument("--tt-out", default="", help="write a llama-quantize --tensor-type-file for the same plan")
     ap.add_argument("--check-experts", type=int, default=6, help="experts per tensor dequantized again for the error")
     ap.add_argument("--force", action="store_true")
+    ap.add_argument("--q2-ref", action="store_true", help="q2_0 by ggml's own quantizer (absmax scale), not the search")
     a = ap.parse_args()
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
@@ -169,7 +224,11 @@ def main():
 
     lib, libpath = load_ggml(a.ggml)
     print("quantizer: %s" % libpath)
+    q2_search = not a.q2_ref
     for k in ("gate", "up", "down"):
+        if target[k] == TYPE_IDS["q2_0"] and q2_search:
+            print("  %s: q2_0 by the scale search ([TAG_FN_L3_MTP_Q2])" % exps[k][0])
+            continue
         lib.ggml_quantize_init(target[k])
         if lib.ggml_quantize_requires_imatrix(target[k]):
             raise SystemExit("%s needs an importance matrix" % TYPE_NAMES[target[k]])
@@ -192,6 +251,12 @@ def main():
 
             def work(e):
                 x = np.ascontiguousarray(to_f32(raw_all[e * src_e:(e + 1) * src_e], tt, ne0 * ne1))
+                if target[k] == TYPE_IDS["q2_0"] and q2_search:  # [TAG_FN_L3_MTP_Q2]
+                    qb = q2_0_quantize(x)
+                    if len(qb) != dst_e:
+                        raise RuntimeError("expert %d: %d bytes, expected %d" % (e, len(qb), dst_e))
+                    out[e * dst_e:(e + 1) * dst_e] = qb
+                    return e
                 n = lib.ggml_quantize_chunk(target[k], x.ctypes.data, ctypes.addressof(ob) + e * dst_e, 0, ne1, ne0, None)
                 if n != dst_e:
                     raise RuntimeError("expert %d: %d bytes, expected %d" % (e, n, dst_e))
@@ -301,13 +366,19 @@ def verify(a, hh, exps, target, new_data):
                     fs.seek(hh.data_start + off + e * src_e)
                     x = to_f32(fs.read(src_e), tt, ne0 * ne1)
                     fo.seek(ho.data_start + by_out[name][3] + e * dst_e)
-                    q = np.frombuffer(fo.read(dst_e), dtype=np.uint8)
-                    y = dequantize(q, GGMLQuantizationType(target[k])).reshape(-1).astype(np.float32)
+                    raw_q = fo.read(dst_e)
+                    if target[k] == TYPE_IDS["q2_0"]:  # [TAG_FN_L3_MTP_Q2] gguf-py has no q2_0
+                        y = q2_0_dequantize(raw_q)
+                    else:
+                        q = np.frombuffer(raw_q, dtype=np.uint8)
+                        y = dequantize(q, GGMLQuantizationType(target[k])).reshape(-1).astype(np.float32)
                     rel = float(np.sqrt(np.mean((x - y) ** 2)) / max(1e-12, np.sqrt(np.mean(x ** 2))))
                     worst = max(worst, rel)
                 print("  %s: relative RMS error vs the source <= %.4f over %d experts" % (name, worst, a.check_experts))
-                if not worst < 0.25:
-                    errors.append("%s: relative RMS error %.3f (a broken requantization)" % (name, worst))
+                band = MAX_REL_ERR.get(TYPE_NAMES.get(target[k], ""), 0.25)
+                if not worst < band:
+                    errors.append("%s: relative RMS error %.3f over the %s band %.2f (a broken requantization)"
+                                  % (name, worst, TYPE_NAMES.get(target[k], target[k]), band))
     except ImportError as ex:
         print("  (gguf-py not importable, the error check is skipped: %s)" % ex)
     if errors:

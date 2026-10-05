@@ -274,6 +274,9 @@ public:
 
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
 
+    // [TAG_FN_L3_MTP_COST2] the MoE bridge this context owns (nullptr: none)
+    struct llama_moe_bridge * get_moe_bridge() const { return moe_bridge; }
+
 private:
     llm_graph_result * get_gf_res_prev();
 

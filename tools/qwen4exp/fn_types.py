@@ -7,6 +7,7 @@
 #   A: exact UD-Q4_K_XL + shared Q8_0 head: ffn_down_exps q5_1 on 43 layers, q8_0 on 2,4,30,46,47; blk.48 all q8_0
 #   B: A with ffn_down_exps iq4_nl on those 43 layers; 2,4,30,46,47 still q8_0; blk.48 unchanged
 #   C: A with blk.48 experts gate/up q4_K and down q5_1
+# --expect-mtp gate,up,down ([TAG_FN_L3_MTP_Q2]): A's trunk with the MTP block's experts at that mix, e.g. q2_0,q2_0,q2_0
 # It also prints the expert bytes per layer and per routed token, which the perf model and the hot-set budget use.
 from __future__ import annotations
 
@@ -21,7 +22,7 @@ from merge_mtp import Header, nbytes  # noqa: E402
 
 TYPE_NAMES = {0: "f32", 1: "f16", 2: "q4_0", 3: "q4_1", 6: "q5_0", 7: "q5_1", 8: "q8_0", 10: "q2_K", 11: "q3_K",
               12: "q4_K", 13: "q5_K", 14: "q6_K", 16: "iq2_xxs", 17: "iq2_xs", 18: "iq3_xxs", 19: "iq1_s", 20: "iq4_nl",
-              21: "iq3_s", 22: "iq2_s", 23: "iq4_xs", 30: "bf16"}
+              21: "iq3_s", 22: "iq2_s", 23: "iq4_xs", 30: "bf16", 42: "q2_0"}
 Q8_LAYERS = {2, 4, 30, 46, 47}
 
 
@@ -37,8 +38,15 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("model")
     ap.add_argument("--expect", choices=["A", "B", "C"])
+    ap.add_argument("--expect-mtp", default="", help="gate,up,down types of blk.48 on A's trunk (implies --expect A)")
     ap.add_argument("--json", default="")
     a = ap.parse_args()
+    mtp_mix = None
+    if a.expect_mtp:  # [TAG_FN_L3_MTP_Q2]
+        mtp_mix = tuple(x.strip() for x in a.expect_mtp.split(","))
+        if len(mtp_mix) != 3:
+            raise SystemExit("--expect-mtp needs gate,up,down")
+        a.expect = "A"
 
     exps = {}   # (layer, kind) -> (type, bytes, n_expert)
     n_tensors = 0
@@ -76,6 +84,8 @@ def main():
             il = r["layer"]
             if il == 48:
                 want = ("q4_K", "q4_K", "q5_1") if a.expect == "C" else ("q8_0", "q8_0", "q8_0")
+                if mtp_mix:
+                    want = mtp_mix
                 if (r["gate"], r["up"], r["down"]) != want:
                     errors.append("blk.48 is %s/%s/%s, expected %s" % (r["gate"], r["up"], r["down"], "/".join(want)))
                 continue

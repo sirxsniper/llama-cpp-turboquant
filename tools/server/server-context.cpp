@@ -1195,6 +1195,8 @@ struct server_slot {
 
     std::vector<completion_token_output> generated_token_probs;
 
+    int32_t n_block_verify = 0; // [TAG_FN_L3_MTP_BLOCK] verify steps of this request decided by the block rule
+
     bool has_next_token = true;
     bool has_new_line   = false;
     bool truncated      = false;
@@ -1351,6 +1353,7 @@ struct server_slot {
         }
         generated_tokens.clear();
         generated_token_probs.clear();
+        n_block_verify = 0; // [TAG_FN_L3_MTP_BLOCK]
         json_schema = json();
 
         task_prev = std::move(task);
@@ -1688,6 +1691,9 @@ struct server_slot {
                     draft_ratio, n_draft_accepted, n_draft_total, mean_acc_len);
             SLT_TRC(*this,
                     "     acc per pos = (%s)\n", acceptance_rates_per_pos.c_str());
+            if (n_block_verify > 0) {
+                SLT_INF(*this, "[TAG_FN_L3_MTP_BLOCK] %d of %d verify steps by the block rule\n", n_block_verify, n_draft_verif_steps);
+            }
         }
 
         common_speculative_print_stats(spec);
@@ -1978,6 +1984,9 @@ public:
     //  - when not in sleeping state
     //  - and, with thread-safe APIs (e.g., tokenizer calls)
     llama_model * model_tgt = nullptr;
+
+    // [TAG_FN_L3_MTP_BLOCK] SPEC_MTP_BLOCK_VERIFY=1 on a qwen4exp target: sampled drafts are verified as a block
+    bool spec_block_verify = false;
 
     mtmd_context * mctx = nullptr;
     // note: video_params.ffmpeg_bin_dir points into params_base, which outlives this struct
@@ -2358,6 +2367,19 @@ private:
         }
 
         vocab = llama_model_get_vocab(model_tgt);
+
+        // [TAG_FN_L3_MTP_BLOCK]
+        {
+            const char * e = getenv("SPEC_MTP_BLOCK_VERIFY");
+            char arch[32] = { 0 };
+            spec_block_verify = e && e[0] == '1' &&
+                llama_model_meta_val_str(model_tgt, "general.architecture", arch, sizeof(arch)) > 0 &&
+                strcmp(arch, "qwen4exp") == 0;
+            if (e && e[0] == '1') {
+                SRV_INF("[TAG_FN_L3_MTP_BLOCK] sampled drafts verified as a block: %s\n",
+                        spec_block_verify ? "on" : "off (qwen4exp only)");
+            }
+        }
 
         try {
             decision.init(model_tgt);
@@ -6939,7 +6961,14 @@ private:
                 } else if (slot.spec_is_replay && slot.use_spec_rejection()) {
                     accepted = server_accept_replay(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
                 } else if (use_rejection) {
-                    accepted = common_sampler_sample_and_accept_n_rejection(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft, slot.spec_draft_q);
+                    // [TAG_FN_L3_MTP_BLOCK] the block rule where it applies (no token probabilities to report)
+                    if (spec_block_verify && slot.task->params.sampling.n_probs == 0) {
+                        accepted = common_sampler_sample_and_accept_n_block(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft, slot.spec_draft_q);
+                        slot.n_block_verify += accepted.empty() ? 0 : 1;
+                    }
+                    if (accepted.empty()) {
+                        accepted = common_sampler_sample_and_accept_n_rejection(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft, slot.spec_draft_q);
+                    }
                 } else if (use_coupling) {
                     accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft, slot.spec_dists);
                 } else {

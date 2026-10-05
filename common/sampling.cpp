@@ -1,4 +1,5 @@
 #include "sampling.h"
+#include "speculative-block.h" // [TAG_FN_L3_MTP_BLOCK]
 
 #include "common.h"
 #include "fit.h"
@@ -242,6 +243,10 @@ struct common_sampler {
     }
 
     mutable int64_t t_total_us = 0;
+
+    // [TAG_FN_L3_MTP_BLOCK] block verification's scratch sampler (SPEC_MTP_BLOCK_VERIFY on qwen4exp): a clone made at the
+    // first block step, this sampler's state copied into it at every later one (its candidate buffer stays allocated)
+    struct common_sampler * blk = nullptr;
 };
 
 std::string common_params_sampling::print() const {
@@ -582,6 +587,10 @@ void common_sampler_free(struct common_sampler * gsmpl) {
     llama_sampler_free(gsmpl->rbudget);
     llama_sampler_free(gsmpl->chain);
     llama_sampler_free(gsmpl->grmr_pretrim);
+
+    if (gsmpl->blk) {
+        common_sampler_free(gsmpl->blk); // [TAG_FN_L3_MTP_BLOCK]
+    }
 
     delete gsmpl;
 }
@@ -1236,6 +1245,140 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct com
         result.push_back(id);
         common_sampler_eog_trace(gsmpl, ctx, id, "bonus", -1.0f); // [TAG_FN_R2_EOG_TRACE]
     }
+
+    return result;
+}
+
+// [TAG_FN_L3_MTP_BLOCK] LLAMA_EOG_TRACE=1 for the block rule: the row's own target distribution (the sampler's candidate
+// array holds another row's when the block rule decides)
+static void block_eog_trace(const struct llama_context * ctx, llama_token id, const char * path, float q_x,
+        const std::vector<llama_token_data> & p) {
+    static const bool on = [] {
+        const char * e = getenv("LLAMA_EOG_TRACE");
+        return e && e[0] == '1';
+    }();
+    if (!on || !llama_vocab_is_eog(llama_model_get_vocab(llama_get_model(ctx)), id)) {
+        return;
+    }
+    std::vector<llama_token_data> top(p);
+    std::sort(top.begin(), top.end(), [](const llama_token_data & a, const llama_token_data & b) { return a.p > b.p; });
+    std::string s;
+    float p_sum = 0.0f;
+    for (size_t k = 0; k < top.size(); ++k) {
+        if (k < 8) {
+            s += string_format("%s%d:%.4f", k ? " " : "", top[k].id, top[k].p);
+        }
+        p_sum += top[k].p;
+    }
+    LOG_WRN("[TAG_FN_R2_EOG_TRACE] EOG %d via %s: p_target %.6f q_draft %.6f, %zu candidates (p sum %.4f), top: %s\n",
+            id, path, prob_of(p.data(), p.size(), id), q_x, p.size(), p_sum, s.c_str());
+}
+
+// [TAG_FN_L3_MTP_BLOCK] block verification of a sampled draft (common/speculative-block.h). An empty result means it does
+// not apply here (fewer than 2 drafts, a grammar or a reasoning budget, a row the backend sampler touched) and the caller
+// takes the per-token rule. A scratch copy of the sampler walks the drafts to get the target's distribution at each row
+// (the penalties see the same history as with the per-token rule); the real sampler then accepts the kept drafts and the
+// token after them. The scratch sampler and the buffers are kept between steps: a step allocates nothing (a clone per
+// step copied the 248K-entry candidate buffer into fresh pages, ~0.5 ms on Windows).
+std::vector<llama_token> common_sampler_sample_and_accept_n_block(struct common_sampler * gsmpl, struct llama_context * ctx,
+        const std::vector<int> & idxs, const llama_tokens & draft, const std::vector<std::vector<llama_token_data>> & draft_q) {
+    GGML_ASSERT(idxs.size()    == draft.size() + 1 && "idxs.size() must be draft.size() + 1");
+    GGML_ASSERT(draft_q.size() == draft.size() && "draft_q must have one entry per draft token");
+
+    const int gamma = (int) draft.size();
+    if (gamma < 2 || gsmpl->grmr || gsmpl->rbudget) {
+        return {};
+    }
+    for (int i = 0; i <= gamma; ++i) {
+        if (bs_row_on_backend(ctx, idxs[i])) {
+            return {};
+        }
+    }
+
+    // the scratch sampler: a clone the first time, then the chain's state (penalty counts, RNG, ...) and the history
+    // copied in; its candidate buffer stays allocated
+    if (gsmpl->blk == nullptr) {
+        gsmpl->blk = common_sampler_clone(gsmpl);
+    } else {
+        llama_sampler_copy(gsmpl->chain, gsmpl->blk->chain);
+        gsmpl->blk->prev = gsmpl->prev;
+    }
+    common_sampler * s = gsmpl->blk;
+
+    // the target's distribution at rows 0..gamma-1, each after the drafts before it
+    static thread_local std::vector<std::vector<llama_token_data>> p;
+    if (p.size() < (size_t) gamma) {
+        p.resize((size_t) gamma);
+    }
+    for (int i = 0; i < gamma; ++i) {
+        common_sampler_sample(s, ctx, idxs[i], false);
+        const auto * cur_p = common_sampler_get_candidates(s, false);
+        p[i].assign(cur_p->data, cur_p->data + cur_p->size);
+        common_sampler_accept(s, draft[i], true);
+    }
+
+    static thread_local std::vector<common_spec_block_dist> pd, qd;
+    pd.resize((size_t) gamma);
+    qd.resize((size_t) gamma);
+    for (int i = 0; i < gamma; ++i) {
+        pd[i] = { p[i].data(),       p[i].size() };
+        qd[i] = { draft_q[i].data(), draft_q[i].size() };
+    }
+    static thread_local std::vector<double> w, h;
+    common_spec_block_weights(pd.data(), qd.data(), draft.data(), gamma, w, h);
+
+    // draws from the sampler's own stream, independent of what was drafted
+    std::uniform_real_distribution<float> uni(0.0f, 1.0f);
+    static thread_local std::vector<float> u;
+    u.resize((size_t) gamma);
+    for (float & x : u) {
+        x = uni(gsmpl->rng);
+    }
+    const int tau = common_spec_block_tau(h, gamma, u.data());
+
+    const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx));
+
+    std::vector<llama_token> result;
+    result.reserve((size_t) tau + 1);
+    for (int i = 0; i < tau; ++i) {
+        common_sampler_accept(gsmpl, draft[i], true);
+        result.push_back(draft[i]);
+        block_eog_trace(ctx, draft[i], "block-accept", (float) common_spec_block_prob(qd[i], draft[i]), p[i]); // [TAG_FN_R2_EOG_TRACE]
+        if (llama_vocab_is_eog(vocab, draft[i])) {
+            return result; // nothing after an accepted end of generation
+        }
+    }
+
+    llama_token id = LLAMA_TOKEN_NULL;
+    if (tau == gamma) {
+        id = common_sampler_sample(gsmpl, ctx, idxs[gamma], false);
+        common_sampler_eog_trace(gsmpl, ctx, id, "block-bonus", -1.0f); // [TAG_FN_R2_EOG_TRACE]
+    } else {
+        // max(w_tau * p_tau - q_tau, 0); empty only through rounding (then p_tau itself)
+        static thread_local std::vector<llama_token_data> r;
+        const double sum = common_spec_block_excess(w[tau], pd[tau], qd[tau], &r);
+        const std::vector<llama_token_data> & from = sum > 0.0 ? r : p[tau];
+        double tot = 0.0;
+        for (const auto & e : from) {
+            tot += e.p;
+        }
+        double x = (double) uni(gsmpl->rng) * tot;
+        id = from.empty() ? LLAMA_TOKEN_NULL : from.back().id;
+        for (const auto & e : from) {
+            x -= e.p;
+            if (x <= 0.0) {
+                id = e.id;
+                break;
+            }
+        }
+        if (id == LLAMA_TOKEN_NULL) {
+            // no candidate at all at this row (cannot happen with a sampled row): the row's own sample
+            id = common_sampler_sample(gsmpl, ctx, idxs[tau], false);
+        }
+        block_eog_trace(ctx, id, "block-residual", (float) common_spec_block_prob(qd[tau], id), p[tau]); // [TAG_FN_R2_EOG_TRACE]
+    }
+    common_sampler_accept(gsmpl, id, true);
+    result.push_back(id);
 
     return result;
 }
