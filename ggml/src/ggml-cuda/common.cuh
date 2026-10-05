@@ -1463,11 +1463,16 @@ struct ggml_cuda_mmvq_q8_cache {
     const ggml_cgraph * cgraph   = nullptr;
     int                 node_idx = -1;
 
+    // [TAG_FN_L3_GPU_Q8F] the node whose kernel wrote the copy together with src1's bytes: its own write keeps the copy
+    const ggml_tensor * producer = nullptr;
+    uint64_t            n_prod   = 0;
+
     void reset() {
-        src1   = nullptr;
-        data   = nullptr;
-        span   = 0;
-        nbytes = 0;
+        src1     = nullptr;
+        data     = nullptr;
+        span     = 0;
+        nbytes   = 0;
+        producer = nullptr;
     }
 };
 

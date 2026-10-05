@@ -6,6 +6,7 @@
 #include "llama-moe-bridge.h" // [TAG_MOE_BRIDGE]
 #include "ggml-moe-bridge.h"  // [TAG_MOE_BRIDGE]
 #include "llama-moe-gen5.h" // [TAG_MOE_DMA_SHARE] [TAG_FN_PREFILL_STREAM]
+#include "ggml-fn-l3.h"     // [TAG_FN_L3_GPU]
 
 #include "llama-impl.h"
 #include "llama-model.h"
@@ -2304,6 +2305,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         if (gating_op == LLAMA_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS) {
             ggml_prec_set_acc(logits, GGML_PREC_F32);
         }
+        // [TAG_FN_L3_GPU_MMV] an arch's mark for its router mat-vec (qwen4exp sets it; 0 for every other model)
+        if (moe_router_mark != 0 && logits->op == GGML_OP_MUL_MAT) {
+            ggml_fn_l3_set(logits, moe_router_mark);
+        }
         cb(logits, "ffn_moe_logits", il);
     } else {
         logits = probs_in;
@@ -2533,11 +2538,19 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
     ggml_tensor * mc_inp = cur;
+    // [TAG_FN_L3_GPU_Q8F] an arch's mark for the expert chains' input (qwen4exp: read the q8_1 copy its producer made)
+    if (moe_q8in_mark != 0 && mc_inp->op == GGML_OP_RESHAPE) {
+        ggml_fn_l3_set(mc_inp, moe_q8in_mark);
+    }
 
     // device-side chain over the cached experts, mirroring the LLM_FFN_SILU activation below (the only type_op the
     // cache path is enabled for); uncached ids map to the zero slot
     // [TAG_MOE_DMA_SHARE] the same chain over the DMA bank (dma = true)
     auto build_slot_chain = [&](ggml_tensor * up_c, ggml_tensor * gate_c, ggml_tensor * down_c, ggml_tensor * slot_ids, bool dma) -> ggml_tensor * {
+        // [TAG_FN_L3_GPU_ZSKIP] an arch's mark for the slot ids: the last slot of the slot tensors is the zero slot
+        if (moe_zskip_mark != 0 && up_c->ne[2] == gate_c->ne[2] && up_c->ne[2] == down_c->ne[2]) {
+            ggml_fn_l3_set(slot_ids, moe_zskip_mark);
+        }
         ggml_tensor * up_g   = ggml_mul_mat_id(ctx0, up_c,   mc_inp, slot_ids);
         ggml_tensor * gate_g = ggml_mul_mat_id(ctx0, gate_c, mc_inp, slot_ids);
         cb(up_g,   dma ? "ffn_moe_dma_up"   : "ffn_moe_cache_up",   il);

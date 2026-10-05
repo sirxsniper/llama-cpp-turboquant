@@ -9,8 +9,10 @@
 
 #include "ggml-alloc.h"   // [TAG_FN_MTP_HEAD_IDS]
 #include "ggml-backend.h"
+#include "ggml-fn-l3.h"   // [TAG_FN_L3_GPU]
 
 #include <algorithm>
+#include <atomic>
 #include <cinttypes>
 #include <cstdlib>
 #include <cstring>
@@ -669,6 +671,57 @@ std::unique_ptr<llm_graph_context> llama_model_qwen4exp::build_arch_graph(const 
     return std::make_unique<graph>(*this, params);
 }
 
+// [TAG_FN_L3_GPU] the lever switches, through the qwen4exp profile's lookups (llama_model_fn_env: the environment first)
+llama_model_qwen4exp::graph::l3_flags llama_model_qwen4exp::graph::l3_read(const llama_model & model) {
+    const char * all_v = llama_model_fn_env(&model, "LLAMA_FN_GPU");
+    const bool   all   = all_v && all_v[0] && all_v[0] != '0';
+    auto on = [&](const char * name) {
+        const char * v = llama_model_fn_env(&model, name);
+        return v && v[0] ? v[0] != '0' : all;
+    };
+    l3_flags f;
+    f.defer   = on("LLAMA_FN_GPU_DEFER");
+    f.convwb  = on("LLAMA_FN_GPU_CONVWB");
+    f.hcfuse  = on("LLAMA_FN_GPU_HCFUSE");
+    f.compact = on("LLAMA_FN_GPU_COMPACT");
+    f.topk    = on("LLAMA_FN_GPU_TOPK");
+    f.idxq8   = on("LLAMA_FN_GPU_IDXQ8");
+    f.mmv     = on("LLAMA_FN_GPU_MMV");
+    f.mmvd    = on("LLAMA_FN_GPU_MMVD");
+    f.q8f     = on("LLAMA_FN_GPU_Q8F");
+    f.zskip   = on("LLAMA_FN_GPU_ZSKIP");
+    f.gdnab   = on("LLAMA_FN_GPU_GDNAB");
+
+    const int mask = (f.defer ? 1 : 0) | (f.convwb ? 2 : 0) | (f.hcfuse ? 4 : 0) | (f.compact ? 8 : 0) |
+                     (f.topk ? 16 : 0) | (f.idxq8 ? 32 : 0) | (f.mmv ? 64 : 0) | (f.mmvd ? 128 : 0) | (f.q8f ? 256 : 0) |
+                     (f.zskip ? 512 : 0) | (f.gdnab ? 1024 : 0);
+    // once per model and mask (a process-wide flag would be spent by the fit probe, which logs at DEBUG)
+    static std::atomic<int> logged_other{-1};
+    const auto * qm = dynamic_cast<const llama_model_qwen4exp *>(&model);
+    std::atomic<int> & logged = qm ? qm->l3_logged : logged_other;
+    if (logged.exchange(mask) != mask) {
+        LLAMA_LOG_INFO("qwen4exp: [TAG_FN_L3_GPU] device levers:%s%s%s%s%s%s%s%s%s%s%s%s\n",
+                f.defer ? " DEFER" : "", f.convwb ? " CONVWB" : "", f.hcfuse ? " HCFUSE" : "", f.compact ? " COMPACT" : "",
+                f.topk ? " TOPK" : "", f.idxq8 ? " IDXQ8" : "", f.mmv ? " MMV" : "", f.mmvd ? " MMVD" : "",
+                f.q8f ? " Q8F" : "", f.zskip ? " ZSKIP" : "", f.gdnab ? " GDNAB" : "", mask == 0 ? " none" : "");
+    }
+    return f;
+}
+
+void llama_model_qwen4exp::graph::l3_expand_deferred() {
+    for (ggml_tensor * t : l3_deferred) {
+        ggml_build_forward_expand(gf, t);
+    }
+    l3_deferred.clear();
+}
+
+// [TAG_FN_L3_GPU_MMV] marks a plain mat-vec node (a LoRA or a scale tensor makes build_lora_mm return another op)
+static void qwen4exp_l3_mark_mm(ggml_tensor * t, bool on) {
+    if (on && t && t->op == GGML_OP_MUL_MAT) {
+        ggml_fn_l3_set(t, GGML_FN_L3_MMV);
+    }
+}
+
 // Hyper-connections keep hc parallel residual streams [n_embd, hc, T] in place of layer norms.
 // Returns the mixed [n_embd, T] stream; `inject` gets the [hc, T] scatter weights.
 ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
@@ -686,12 +739,24 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
     // grouped RMSNorm: reduce over one stream, then scale all streams with the [n_embd, hc] gamma
     // the converter folded each gamma to (1 + w)
     ggml_tensor * xn = ggml_mul(ctx0, ggml_rms_norm(ctx0, x, hparams.f_norm_rms_eps), w_norm);
+    if (l3.q8f) {
+        ggml_fn_l3_set(xn, GGML_FN_L3_Q8OUT); // [TAG_FN_L3_GPU_Q8F] the q8_1 copy for w_down, made by the norm kernel
+    }
     xn = ggml_reshape_2d(ctx0, xn, hc_dim, nt);
     cb(xn, "hc_norm", il);
 
     ggml_tensor * lo = build_lora_mm(w_down, xn);
-    lo = ggml_silu(ctx0, ggml_scale(ctx0, lo, 1.0f / (float) hc));
+    qwen4exp_l3_mark_mm(lo, l3.mmv); // [TAG_FN_L3_GPU_MMV] 320 rows of 10240
+    ggml_tensor * lo_s = ggml_scale(ctx0, lo, 1.0f / (float) hc);
+    if (l3.hcfuse) {
+        ggml_fn_l3_set(lo_s, GGML_FN_L3_HCLO); // [TAG_FN_L3_GPU_HCFUSE] scale -> silu in one CUDA launch
+    }
+    lo = ggml_silu(ctx0, lo_s);
+    if (l3.q8f && l3.hcfuse) {
+        ggml_fn_l3_set(lo, GGML_FN_L3_Q8OUT); // [TAG_FN_L3_GPU_Q8F] the fused scale -> silu also writes the copy for w_up
+    }
     ggml_tensor * gate = build_lora_mm(w_up, lo);
+    qwen4exp_l3_mark_mm(gate, l3.mmv); // [TAG_FN_L3_GPU_MMV] 10240 rows of 320: one warp per block
     cb(gate, "hc_gate", il);
 
     ggml_tensor * mixed = nullptr;
@@ -701,6 +766,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
                 ggml_reshape_3d(ctx0, xn,   n_embd, hc, nt),
                 ggml_reshape_3d(ctx0, gate, n_embd, hc, nt), 1.0f / (float) hc);
         res->add_fused_node({LLM_FUSED_OP_DSV4_HC_PRE, mixed, il});
+        if (l3.q8f) {
+            ggml_fn_l3_set(mixed, GGML_FN_L3_Q8OUT); // [TAG_FN_L3_GPU_Q8F] the copy for the block's projections / experts
+        }
     } else {
         ggml_tensor * gated = ggml_mul(ctx0, xn, ggml_sigmoid(ctx0, gate));
         gated = ggml_reshape_3d(ctx0, gated, n_embd, hc, nt);
@@ -721,6 +789,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
 
     if (inject) {
         *inject = build_lora_mm(w_inject, xn);
+        qwen4exp_l3_mark_mm(*inject, l3.mmv); // [TAG_FN_L3_GPU_MMV] 4 rows of 10240
         cb(*inject, "hc_inject", il);
     }
 
@@ -732,12 +801,31 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_combine(
         ggml_tensor * block_out,
         ggml_tensor * inject,
         int           il) {
+    return build_hc_combine_post(residual, block_out, build_hc_combine_w(inject, il), il);
+}
+
+ggml_tensor * llama_model_qwen4exp::graph::build_hc_combine_w(
+        ggml_tensor * inject,
+        int           il) {
     const int64_t hc = hparams.dsv4_hc_mult;
-    const int64_t nt = residual->ne[2];
 
     // 2*sigmoid centres the scatter weights on 1, so a zero injection is a plain residual add
-    ggml_tensor * w = ggml_sigmoid(ctx0, ggml_scale(ctx0, inject, 1.0f / (float) hc));
+    ggml_tensor * w_s = ggml_scale(ctx0, inject, 1.0f / (float) hc);
+    if (l3.hcfuse && il >= 0) {
+        ggml_fn_l3_set(w_s, GGML_FN_L3_HCW); // [TAG_FN_L3_GPU_HCFUSE] scale -> sigmoid -> scale (-> hc post) in one launch
+    }
+    ggml_tensor * w = ggml_sigmoid(ctx0, w_s);
     w = ggml_scale(ctx0, w, 2.0f);
+    return w;
+}
+
+ggml_tensor * llama_model_qwen4exp::graph::build_hc_combine_post(
+        ggml_tensor * residual,
+        ggml_tensor * block_out,
+        ggml_tensor * w,
+        int           il) {
+    const int64_t hc = hparams.dsv4_hc_mult;
+    const int64_t nt = residual->ne[2];
 
     ggml_tensor * cur = nullptr;
     if (cparams.fused_dsv4_hc_post && il >= 0) {
@@ -758,7 +846,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_combine(
 }
 
 llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_params & params) :
-    llm_build_delta_net_base(params), model(model) {
+    llm_build_delta_net_base(params), l3(l3_read(model)), model(model) {
     const int64_t hc = hparams.dsv4_hc_mult;
 
     GGML_ASSERT(hparams.n_embd_head_v() == hparams.n_embd_head_k());
@@ -856,14 +944,24 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
                 model.layers[il].hc_ffn_inject,
                 &inject, il);
 
+        // [TAG_FN_L3_GPU_DEFER] the ffn half's combine weights read only this mixer's norm: build_layer_ffn puts them
+        // into the graph after the bridge post, so the device computes them while the host runs the experts
+        ggml_tensor * w_ffn = nullptr;
+        if (l3.defer) {
+            w_ffn = build_hc_combine_w(inject, il);
+            l3_deferred.push_back(w_ffn);
+        }
+
         cur = build_layer_ffn(cur, il);
         cb(cur, "ffn_out", il);
 
-        res_hc = build_hc_combine(res_hc, cur, inject, il);
+        res_hc = w_ffn ? build_hc_combine_post(res_hc, cur, w_ffn, il) : build_hc_combine(res_hc, cur, inject, il);
 
         // "l_last" is the layer output name that build_cvec and imatrix look for
         cb(res_hc, "l_last", il);
     }
+
+    l3_expand_deferred(); // [TAG_FN_L3_GPU_DEFER] nothing is left here; build_layer_ffn takes them
 
     // the MTP head reads the hc-wide residual, before the final mixer
     if (cparams.embeddings_nextn) {
@@ -887,6 +985,7 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
     res->t_embd = cur;
 
     cur = build_lora_mm(model.output, cur, model.output_s);
+    qwen4exp_l3_mark_mm(cur, l3.mmvd); // [TAG_FN_L3_GPU_MMV] the output head
     cb(cur, "result_output", -1);
     res->t_logits = cur;
 
@@ -1184,6 +1283,7 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
         ggml_tensor * normed = cur;
 
         ggml_tensor * draft = ggml_mul_mat(ctx0, head_c->w, cur);
+        qwen4exp_l3_mark_mm(draft, l3.mmvd); // [TAG_FN_L3_GPU_MMV] the compact draft head
         if (head_s) {
             draft = ggml_mul(ctx0, draft, head_s);
         }
@@ -1201,6 +1301,7 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
         ggml_tensor * normed  = cur;
 
         cur = ggml_mul_mat(ctx0, ggml_view_2d(ctx0, head_w, head_w->ne[0], n_rows, head_w->nb[1], 0), normed);
+        qwen4exp_l3_mark_mm(cur, l3.mmvd); // [TAG_FN_L3_GPU_MMV] the draft head rows
         if (head_s) {
             cur = ggml_mul(ctx0, cur, head_s); // [TAG_FN_MTP_HEAD_IDS] the per-tensor scale, as build_lora_mm applies it
         }
@@ -1234,6 +1335,7 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
             }
         }
         cur = build_lora_mm(head_w, cur, head_s);
+        qwen4exp_l3_mark_mm(cur, l3.mmvd); // [TAG_FN_L3_GPU_MMV] the full draft head
     }
     cb(cur, "result_output", -1);
     res->t_logits = cur;
@@ -1248,10 +1350,12 @@ std::pair<ggml_tensor *, ggml_tensor *> llama_model_qwen4exp::graph::build_qkvz(
     const int64_t n_seq_tokens = ubatch.n_seq_tokens;
 
     ggml_tensor * qkv_mixed = build_lora_mm(model.layers[il].wqkv, input, model.layers[il].wqkv_s);
+    qwen4exp_l3_mark_mm(qkv_mixed, l3.mmvd); // [TAG_FN_L3_GPU_MMV]
     qkv_mixed = ggml_reshape_3d(ctx0, qkv_mixed, qkv_mixed->ne[0], n_seq_tokens, n_seqs);
     cb(qkv_mixed, "linear_attn_qkv_mixed", il);
 
     ggml_tensor * z = build_lora_mm(model.layers[il].wqkv_gate, input, model.layers[il].wqkv_gate_s);
+    qwen4exp_l3_mark_mm(z, l3.mmvd);
     cb(z, "z", il);
 
     return { qkv_mixed, z };
@@ -1420,6 +1524,9 @@ llama_model_qwen4exp::graph::qsa_sel llama_model_qwen4exp::graph::build_qsa_sel(
         // write before the pool gather
         ggml_build_forward_expand(gf, kpool_cache.scatter_pooled(pooled_new, inp_kpool->new_pool_rep));
         pooled = kpool_cache.gather_pooled(inp_kpool->pool_cells);
+        if (l3.idxq8 && pooled->op == GGML_OP_GET_ROWS) {
+            ggml_fn_l3_set(pooled, GGML_FN_L3_IDXQ8); // [TAG_FN_L3_GPU_IDXQ8] the gather the marked indexers read through
+        }
     } else {
         // shared cells re-pool every pool, in layout order
         GGML_ASSERT(n_new < n_pool);
@@ -1458,10 +1565,18 @@ llama_model_qwen4exp::graph::qsa_sel llama_model_qwen4exp::graph::build_qsa_sel(
         ggml_tensor * score = ggml_lightning_indexer(ctx0, q_part, pooled, weights, mask_part); // [n_pool, nt]
         res->add_fused_node({LLM_FUSED_OP_LIGHTNING_INDEXER, score, il});
         cb(score, "indexer_score", il);
+        if (l3.idxq8) {
+            // [TAG_FN_L3_GPU_IDXQ8] CUDA reads the pooled keys from the q8_0 cache rows through the gather's indices
+            // (skipping the f32 gather when this is its only reader), with the dequantization the gather would do
+            ggml_fn_l3_set(score, GGML_FN_L3_IDXQ8);
+        }
 
         ggml_tensor * top_k = topk_unordered ? ggml_top_k_unordered(ctx0, score, n_top_pool)
                                              : ggml_top_k(ctx0, score, n_top_pool); // [n_top_pool, nt], unordered
         cb(top_k, "indexer_top_k", il);
+        if (l3.topk && topk_unordered) {
+            ggml_fn_l3_set(top_k, GGML_FN_L3_TOPK); // [TAG_FN_L3_GPU_TOPK] the same set from a chunked two-stage select
+        }
 
         *top_score = ggml_get_rows(ctx0, ggml_reshape_3d(ctx0, score, 1, n_pool, nt), top_k); // [1, n_top_pool, nt]
         return top_k;
@@ -1567,6 +1682,21 @@ llama_model_qwen4exp::graph::qsa_sel llama_model_qwen4exp::graph::build_qsa_sel(
     return qs;
 }
 
+// [TAG_FN_L3_GPU_COMPACT] marks the FLASH_ATTN_EXT node under the reshape / inverse WHT that build_attn_mha_kv puts on it
+static void qwen4exp_l3_mark_fa(ggml_tensor * t, bool on) {
+    for (int i = 0; on && t != nullptr && i < 8; ++i) {
+        if (t->op == GGML_OP_FLASH_ATTN_EXT) {
+            ggml_fn_l3_set(t, GGML_FN_L3_COMPACT);
+            return;
+        }
+        if (t->op != GGML_OP_RESHAPE && t->op != GGML_OP_VIEW && t->op != GGML_OP_PERMUTE &&
+            t->op != GGML_OP_CONT && t->op != GGML_OP_TURBO_WHT) {
+            return;
+        }
+        t = t->src[0];
+    }
+}
+
 // Dense GQA self-attention over the cells that the QSA mask keeps.
 ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
         llm_graph_input_attn_kv * inp,
@@ -1640,6 +1770,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
     if (mask) {
         cur = build_attn_mha_kv(mctx_cur, q, k, v, nullptr, mask, nullptr, nullptr, kq_scale, il,
                 nullptr, nullptr, inp->self_turbot_gtab, n_kv_max);
+        qwen4exp_l3_mark_fa(cur, l3.compact);
     } else {
         // [TAG_FN_R4_QSA_POS] the mask from the positional vectors, the selection and the picked scores: one f16 [n_kv, n]
         // buffer instead of the explicit KQ mask input, the -inf fill, the scatter and the sum (each about n_kv x n_ubatch).
@@ -1662,6 +1793,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
             cb(mask_c, "kq_mask_qsa", il);
             ggml_tensor * out_c = build_attn_mha_kv(mctx_cur, q_c, k, v, nullptr, mask_c, nullptr, nullptr, kq_scale, il,
                     nullptr, nullptr, inp->self_turbot_gtab, n_kv_max);
+            qwen4exp_l3_mark_fa(out_c, l3.compact); // [TAG_FN_L3_GPU_COMPACT]
             cur = cur ? ggml_concat(ctx0, cur, out_c, 1) : out_c;
         }
     }
@@ -1696,6 +1828,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
 
     // Qwen3Next uses a single Q projection that outputs query + gate
     ggml_tensor * Qcur_full = build_lora_mm(model.layers[il].wq, cur, model.layers[il].wq_s); // [ (n_embd_head * 2) * n_head, n_tokens ]
+    qwen4exp_l3_mark_mm(Qcur_full, l3.mmvd); // [TAG_FN_L3_GPU_MMV]
     cb(Qcur_full, "Qcur_full", il);
 
     ggml_tensor * Qcur = ggml_view_3d(ctx0, Qcur_full, n_embd_head, n_head, n_tokens,
@@ -1707,9 +1840,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
     cb(Qcur, "Qcur_normed", il);
 
     ggml_tensor * Kcur = build_lora_mm(model.layers[il].wk, cur, model.layers[il].wk_s);
+    qwen4exp_l3_mark_mm(Kcur, l3.mmvd);
     cb(Kcur, "Kcur", il);
 
     ggml_tensor * Vcur = build_lora_mm(model.layers[il].wv, cur, model.layers[il].wv_s);
+    qwen4exp_l3_mark_mm(Vcur, l3.mmvd);
     cb(Vcur, "Vcur", il);
 
     Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
@@ -1760,6 +1895,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
     cb(cur, "attn_gated", il);
 
     cur = build_lora_mm(model.layers[il].wo, cur, model.layers[il].wo_s);
+    qwen4exp_l3_mark_mm(cur, l3.mmvd); // [TAG_FN_L3_GPU_MMV]
     cb(cur, "attn_output", il);
 
     return cur;
@@ -1789,6 +1925,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
     ggml_tensor * z         = qkvz.second;
 
     ggml_tensor * beta = build_lora_mm(model.layers[il].ssm_beta, cur, model.layers[il].ssm_beta_s);
+    qwen4exp_l3_mark_mm(beta, l3.mmv); // [TAG_FN_L3_GPU_MMV] 48 rows of 2560
+    ggml_tensor * beta_mm = beta;      // [TAG_FN_L3_GPU_GDNAB]
     beta = ggml_reshape_4d(ctx0, beta, 1, num_v_heads, n_seq_tokens, n_seqs);
     cb(beta, "beta", il);
 
@@ -1796,6 +1934,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
     cb(beta, "beta_sigmoid", il);
 
     ggml_tensor * alpha = build_lora_mm(model.layers[il].ssm_alpha, cur, model.layers[il].ssm_alpha_s);
+    qwen4exp_l3_mark_mm(alpha, l3.mmv); // [TAG_FN_L3_GPU_MMV]
+    ggml_tensor * alpha_mm = alpha;     // [TAG_FN_L3_GPU_GDNAB]
     alpha = ggml_reshape_3d(ctx0, alpha, num_v_heads, n_seq_tokens, n_seqs);
     cb(alpha, "alpha", il);
 
@@ -1805,6 +1945,14 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
 
     ggml_tensor * gate = ggml_mul(ctx0, alpha_softplus, model.layers[il].ssm_a);  // -A_log.exp() * softplus
     cb(gate, "gate", il);
+
+    // [TAG_FN_L3_GPU_GDNAB] the two chains next to each other, so CUDA computes both in one launch
+    if (l3.gdnab && beta_mm->op == GGML_OP_MUL_MAT && alpha_mm->op == GGML_OP_MUL_MAT) {
+        ggml_fn_l3_set(beta_mm,  GGML_FN_L3_GDNAB);
+        ggml_fn_l3_set(alpha_mm, GGML_FN_L3_GDNAB);
+        ggml_build_forward_expand(gf, beta);
+        ggml_build_forward_expand(gf, gate);
+    }
 
     gate = ggml_reshape_4d(ctx0, gate, 1, num_v_heads, n_seq_tokens, n_seqs);
 
@@ -1885,6 +2033,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
     cb(final_output, "final_output", il);
 
     cur = build_lora_mm(model.layers[il].ssm_out, final_output, model.layers[il].ssm_out_s);
+    qwen4exp_l3_mark_mm(cur, l3.mmvd); // [TAG_FN_L3_GPU_MMV]
     cb(cur, "linear_attn_out", il);
 
     cur = ggml_reshape_2d(ctx0, cur, n_embd, n_seq_tokens * n_seqs);
@@ -1913,6 +2062,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
     // [TAG_MOE_BRIDGE] with the host bridge, build_moe_ffn posts the host experts and returns a placeholder; the wait
     // comes after the shared expert (build_moe_bridge_finish below), so the device computes it while the host works
     moe_bridge_defer = true;
+    moe_router_mark  = l3.mmv ? GGML_FN_L3_MMV : 0; // [TAG_FN_L3_GPU_MMV] the router: 512 rows of 2560
+    moe_q8in_mark    = l3.q8f ? GGML_FN_L3_Q8IN : 0; // [TAG_FN_L3_GPU_Q8F] the hot / DMA chains read hc_pre's q8_1 copy
+    moe_zskip_mark   = l3.zskip ? GGML_FN_L3_ZSKIP : 0; // [TAG_FN_L3_GPU_ZSKIP] their zero-slot pairs are not computed
     ggml_tensor * moe_out =
         build_moe_ffn(cur,
             model.layers[il].ffn_gate_inp,
@@ -1929,6 +2081,12 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
             model.layers[il].ffn_gate_exps_s,
             model.layers[il].ffn_down_exps_s);
     moe_bridge_defer = false;
+    moe_router_mark  = 0;
+    moe_q8in_mark    = 0;
+    moe_zskip_mark   = 0;
+
+    // [TAG_FN_L3_GPU_DEFER] after the post (and the hot chain), before the shared expert and the wait
+    l3_expand_deferred();
 
     // shared experts, as in the Qwen3Next reference
     if (model.layers[il].ffn_up_shexp != nullptr) {
@@ -1939,10 +2097,12 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
                 model.layers[il].ffn_down_shexp, NULL, model.layers[il].ffn_down_shexp_s,
                 NULL,
                 LLM_FFN_SILU, LLM_FFN_PAR, il);
+        qwen4exp_l3_mark_mm(ffn_shexp, l3.mmv); // [TAG_FN_L3_GPU_MMV] the down projection: 2560 rows of 640
         cb(ffn_shexp, "ffn_shexp", il);
 
         // shared expert has its own sigmoided gate (ffn_gate_inp_shexp, one value per token)
         ggml_tensor * shared_gate = build_lora_mm(model.layers[il].ffn_gate_inp_shexp, cur);
+        qwen4exp_l3_mark_mm(shared_gate, l3.mmv); // [TAG_FN_L3_GPU_MMV] one row of 2560
         cb(shared_gate, "shared_expert_gate", il);
 
         shared_gate = ggml_sigmoid(ctx0, shared_gate);
@@ -2235,7 +2395,17 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
                 conv_states_all->nb[1],
                 (slot * mem_size + kv_head) * row_size);
 
-        ggml_build_forward_expand(gf, ggml_cpy(ctx0, ggml_cont(ctx0, tail), dst));
+        // [TAG_FN_L3_GPU_CONVWB] copy the strided tail straight into the row: the slots' copies differ only by constant
+        // pointer steps, so CUDA chains them into one launch ([TAG_CPY_CHAIN_FUSION]) instead of a 2-D memcpy and a
+        // memcpy per slot (8 copy-engine nodes, ~28 us per GDN layer). Same bytes.
+        ggml_tensor * cpy = ggml_cpy(ctx0, l3.convwb ? tail : ggml_cont(ctx0, tail), dst);
+
+        // [TAG_FN_L3_GPU_DEFER] the next step reads these rows, this graph does not: after the bridge post
+        if (l3.defer) {
+            l3_deferred.push_back(cpy);
+        } else {
+            ggml_build_forward_expand(gf, cpy);
+        }
     }
 
     return conv_input;

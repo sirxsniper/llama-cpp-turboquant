@@ -1,5 +1,6 @@
 #include "argsort.cuh"
 #include "top-k.cuh"
+#include "fn-l3.cuh"   // [TAG_FN_L3_GPU_TOPK]
 
 #ifdef GGML_CUDA_USE_CUB
 #    include <cub/cub.cuh>
@@ -495,6 +496,56 @@ static bool top_k_split_cuda(ggml_cuda_pool & pool, const float * x, int * dst, 
     return true;
 }
 
+// [TAG_FN_L3_GPU_TOPK] The unordered top k of a few wide rows in two stages on many blocks, for the QSA selection that
+// the qwen4exp graph marks (k = 512 pools of up to 65536 at 262K). k_top_k_select runs one block per row: ~45 us per
+// call at 61K pools. Stage 1 is k_top_k_split_chunk: every row is cut into nchunks chunks of at most TOPK_SPLIT_MAX_N
+// and at least k entries, and a block writes its chunk's top k under the total order (value desc, index asc) in index
+// order. Stage 2: one block per row loads the nchunks*k candidates (index order) into shared memory and selects their
+// top k the same way. Every member of a row's top k is in its chunk's top k, so the set is the one k_top_k_select picks
+// (the lowest indices on ties). It is written in index order; k_top_k_select writes it in the order its warps find it,
+// and the graph reads it as a set.
+#define TOPK_FN_L3_MAX_CAND 8192
+
+static __global__ void __launch_bounds__(TOPK_SPLIT_THREADS)
+k_top_k_fn_l3_merge(const uint32_t * __restrict__ ckey, const int * __restrict__ cidx, int * __restrict__ dst,
+        const int n, const int k) {
+    __shared__ uint32_t keys[TOPK_FN_L3_MAX_CAND];
+    __shared__ int      hist[8*256];
+    __shared__ int      sh[16];
+
+    const int row = blockIdx.x;
+    for (int i = threadIdx.x; i < n; i += TOPK_SPLIT_THREADS) {
+        keys[i] = ckey[(int64_t) row*n + i];
+    }
+    __syncthreads();
+
+    const int * ri = cidx + (int64_t) row*n;
+    int       * rd = dst  + (int64_t) row*k;
+    topk_split_select(keys, n, k, hist, sh, [&](const int pos, const int i) {
+        rd[pos] = ri[i];
+    });
+}
+
+static bool top_k_fn_l3_cuda(ggml_cuda_pool & pool, const float * x, int * dst, const int64_t ncols, const int64_t nrows,
+        const int64_t k, cudaStream_t stream) {
+    if (k < 1 || nrows < 1 || nrows > 64 || ncols > INT32_MAX || (((uintptr_t) x) % sizeof(float)) != 0) {
+        return false;
+    }
+    const int64_t nchunks = (ncols + TOPK_SPLIT_MAX_N - 1) / TOPK_SPLIT_MAX_N;
+    if (nchunks < 2 || ncols / nchunks < k || nchunks*k > TOPK_FN_L3_MAX_CAND) {
+        return false;
+    }
+
+    ggml_cuda_pool_alloc<uint32_t> ckey(pool, (size_t) (nrows*nchunks*k));
+    ggml_cuda_pool_alloc<int>      cidx(pool, (size_t) (nrows*nchunks*k));
+    k_top_k_split_chunk<<<dim3((unsigned) nchunks, (unsigned) nrows, 1), TOPK_SPLIT_THREADS, 0, stream>>>(
+        x, ckey.get(), cidx.get(), (int) ncols, (int) nchunks, (int) k);
+    k_top_k_fn_l3_merge<<<(unsigned) nrows, TOPK_SPLIT_THREADS, 0, stream>>>(
+        ckey.get(), cidx.get(), dst, (int) (nchunks*k), (int) k);
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+
 #if !defined(GGML_CUDA_USE_CUB) && defined(GGML_USE_HIP)
 
 static __device__ __forceinline__ uint32_t top_k_float_to_ordered(float value) {
@@ -684,6 +735,12 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     // production without a rebuild if it ever misbehaves.
     static const bool topk_force_ordered = getenv("TURBO_TOPK_ORDERED") != nullptr;
     const bool topk_ordered = topk_force_ordered || dst->op_params[0] == 0;
+    // [TAG_FN_L3_GPU_TOPK] the QSA selection the qwen4exp graph marked: the same set from two chunked stages
+    if (!topk_ordered && ggml_fn_l3_get(dst) == GGML_FN_L3_TOPK && ggml_cuda_fn_l3_enabled() &&
+            top_k_fn_l3_cuda(pool, src0_d, dst_d, ncols, nrows, k, stream)) {
+        ggml_cuda_fn_l3_note(GGML_CUDA_FN_L3_PATH_TOPK, "TOPK: QSA top-k in two chunked stages");
+        return;
+    }
     if ((k <= TOPK_SELECT_MAX_K || !topk_ordered) && ncols >= 2048 && ncols <= INT32_MAX) {
         // [TAG_TOPK_SPLIT] few wide rows, small k: many blocks per row (same result and order)
         if (top_k_split_cuda(pool, src0_d, dst_d, ncols, nrows, k, stream)) {

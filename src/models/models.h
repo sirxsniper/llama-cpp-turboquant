@@ -8,6 +8,7 @@
 #include <cmath>
 #include <map>
 #include <mutex> // [TAG_FN_MTP_HEAD_IDS]
+#include <atomic> // [TAG_FN_L3_GPU]
 
 class llama_memory_hybrid_idx_context;
 struct llama_ple_dio; // [TAG_FN_PLE_DIRECT_IO] llama-ple-dio.h
@@ -2542,6 +2543,9 @@ struct llama_model_qwen4exp : public llama_model_base {
     // [TAG_FN_PLE_DIRECT_IO] LLAMA_PLE_DIRECT_IO=1: per_layer_tok_embd rows come from the file with unbuffered reads
     // (llama-ple-dio.h); nullptr = the mapped table (default). shared_ptr: the type stays incomplete here.
     std::shared_ptr<llama_ple_dio> ple_dio;
+    // [TAG_FN_L3_GPU] the lever mask this model last logged (-1: none yet). Per model: the fit probe builds its graphs on
+    // a model of its own while the log level is demoted, so the real model still logs its line at INFO.
+    mutable std::atomic<int> l3_logged{-1};
 
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
@@ -2552,7 +2556,7 @@ struct llama_model_qwen4exp : public llama_model_base {
         // the helpers alone, graph_mtp builds its own body
         struct no_build {};
         graph(const llama_model & model, const llm_graph_params & params, no_build) :
-            llm_build_delta_net_base(params), model(model) {}
+            llm_build_delta_net_base(params), l3(l3_read(model)), model(model) {}
 
         // HC replaces every layer norm: residual is [n_embd, hc, n_tokens]
         ggml_tensor * build_hc_mix(
@@ -2569,6 +2573,41 @@ struct llama_model_qwen4exp : public llama_model_base {
                     ggml_tensor * block_out,
                     ggml_tensor * inject,
                             int   il);
+
+        // [TAG_FN_L3_GPU] build_hc_combine in two parts: the scatter weights from the inject, then the combine
+        ggml_tensor * build_hc_combine_w(
+                    ggml_tensor * inject,
+                            int   il);
+
+        ggml_tensor * build_hc_combine_post(
+                    ggml_tensor * residual,
+                    ggml_tensor * block_out,
+                    ggml_tensor * w,
+                            int   il);
+
+        // [TAG_FN_L3_GPU] lever round 3, device time: LLAMA_FN_GPU=1 turns every lever on, LLAMA_FN_GPU_<NAME>=0|1 sets one
+        // (off by default). The marks are the ones of ggml-fn-l3.h; only this graph sets them.
+        struct l3_flags {
+            bool defer   = false; // DEFER:   conv write-back and the ffn combine weights after the bridge post
+            bool convwb  = false; // CONVWB:  conv write-back as direct strided copies (one chained CUDA launch)
+            bool hcfuse  = false; // HCFUSE:  hc scale -> sigmoid -> scale (-> hc post) and scale -> silu in one launch
+            bool compact = false; // COMPACT: QSA sparse-index compaction on many blocks
+            bool topk    = false; // TOPK:    QSA top-k as a chunked two-stage select
+            bool idxq8   = false; // IDXQ8:   the lightning indexer reads the q8_0 pooled keys in place
+            bool mmv     = false; // MMV:     few-row mat-vecs (hc down / inject, GDN alpha / beta, router) with run-ahead loads
+            bool mmvd    = false; // MMVD:    the same for the dense q8_0 projections (GDN qkv / z / out, attention q / k / v / o)
+            bool q8f     = false; // Q8F:     the hc norm, low rank (with HCFUSE) and hc_pre write the q8_1 copy of their output
+                                  //          for the mat-vecs that read it; the expert MUL_MAT_IDs read that copy too
+            bool zskip   = false; // ZSKIP:   the hot / DMA-bank expert chains write the zero slot's outputs without reading it
+            bool gdnab   = false; // GDNAB:   the GDN beta (sigmoid) and alpha (gate prep) mat-vecs in one launch
+        };
+        static l3_flags l3_read(const llama_model & model);
+        l3_flags l3;
+
+        // [TAG_FN_L3_GPU_DEFER] nodes the next layer does not read: build_layer_ffn puts them into the graph right after
+        // the bridge post, so the device computes them while the host computes the layer's experts
+        std::vector<ggml_tensor *> l3_deferred;
+        void l3_expand_deferred();
 
         ggml_tensor * build_layer_attn(
               llm_graph_input_attn_kv * inp_attn,

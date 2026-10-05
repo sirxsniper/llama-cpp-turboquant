@@ -23,6 +23,7 @@
 #include "fattn-mma-f16.cuh"
 #include "turbot-tables.cuh"
 #include "ggml-turbot.h"
+#include "fn-l3.cuh"   // [TAG_FN_L3_GPU_COMPACT]
 
 #include <climits>
 #include <cstdio>
@@ -3190,8 +3191,14 @@ static void launch_fattn_turbot(
         const size_t n_lists = (size_t) ntiles_x * (size_t) mask->ne[3];
 
         KV_max.alloc((size_t) n_kv_list*n_lists + n_lists);
+        // [TAG_FN_L3_GPU_COMPACT] a QSA attention the qwen4exp graph marked: the same lists from many blocks
+        if (ggml_fn_l3_get(KQV) == GGML_FN_L3_COMPACT && ggml_cuda_fn_l3_enabled()) {
+            ggml_cuda_fn_l3_compact_mask(pool, mask, KV_max.ptr, KV_max.ptr + (size_t) n_kv_list*n_lists, (int32_t) Q->ne[1],
+                ncols1, (int32_t) n_kv_list, main_stream);
+        } else {
         ggml_cuda_flash_attn_ext_compact_mask(mask, KV_max.ptr, KV_max.ptr + (size_t) n_kv_list*n_lists, (int32_t) Q->ne[1], ncols1,
             (int32_t) n_kv_list, main_stream);
+        }
     }
 
     const char * kv_scan = use_sparse ? "sparse" : "none";   // [TAG_TURBOT_FA_DEBUG]
