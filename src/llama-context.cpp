@@ -2150,6 +2150,7 @@ bool llama_context::memory_update(bool optimize) {
 
         // [TAG_FN_L3_VRAM_CBUF] an update graph (a K shift over the whole cache) is sized like a prompt, not like a decode
         if (cbuf_state == CBUF_SMALL) {
+            cbuf_note_full(); // counts toward LLAMA_FN_CBUF_THRASH like a wide batch
             cbuf_set(true);
         }
 
@@ -3354,8 +3355,22 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     // [TAG_FN_L3_VRAM_CBUF] a batch wider than the SMALL reserve runs with the FULL one (the hot set's tail gives its VRAM
     // back first); the next narrow batch returns to SMALL and refills the tail. The whole batch keeps one state: its
     // ubatches are at most n_ubatch wide either way, and a narrow ubatch under FULL just runs without the tail layers
-    if (cbuf_state != CBUF_OFF && !cbuf_set(n_tokens_all > cbuf_small_t)) {
-        return -2;
+    if (cbuf_state != CBUF_OFF) {
+        cbuf_n_batch++;
+        const bool wide = n_tokens_all > cbuf_small_t;
+        if (wide) {
+            cbuf_narrow_run = 0;
+            if (cbuf_state == CBUF_SMALL) {
+                cbuf_note_full(); // may pin FULL (LLAMA_FN_CBUF_THRASH)
+            }
+        } else if (cbuf_pinned && ++cbuf_narrow_run >= 256) {
+            cbuf_pinned = false;
+            cbuf_full_at.clear();
+            LLAMA_LOG_INFO("%s: [TAG_FN_L3_VRAM_CBUF] 256 narrow batches in a row: the lend switches again\n", __func__);
+        }
+        if (!cbuf_set(wide || cbuf_pinned)) {
+            return -2;
+        }
     }
     if (cbuf_state == CBUF_SMALL && llama_moe_hot_cbuf_out()) {
         if (++cbuf_n_retry % 64 == 0) {
@@ -3367,11 +3382,21 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
     // [TAG_FN_L3_VRAM_ACCOUNT] device use when the batches change from prompts to decodes and back (the state the last
     // period left: a prompt's pool growth and lazily loaded kernels show up at the first narrow batch after it)
-    if (vram_acc_on && cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP && (n_tokens_all > 31) != vram_acc_wide) {
-        vram_acc_wide = n_tokens_all > 31;
-        if (++vram_acc_n <= 16 || vram_acc_n % 64 == 0) {
-            vram_account(vram_acc_wide ? "-> prompt" : "-> decode");
+    // (the MTP draft context too, with its own prompt width: its decode batches carry up to n_streams x 8 tokens)
+    {
+        const uint32_t wide_t = cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP ? 64 : 31;
+        if (vram_acc_on && (n_tokens_all > wide_t) != vram_acc_wide) {
+            vram_acc_wide = n_tokens_all > wide_t;
+            if (++vram_acc_n <= 16 || vram_acc_n % 64 == 0) {
+                const bool mtp = cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP;
+                vram_account(vram_acc_wide ? (mtp ? "draft prompt" : "-> prompt") : (mtp ? "draft decode" : "-> decode"));
+            }
         }
+    }
+
+    // [TAG_FN_L3_VRAM_TRIM] the MTP draft context: the pools' prompt growth goes back at the first narrow batch after it
+    if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && dtrim_on != 0) {
+        draft_trim(n_tokens_all);
     }
 
     if (cbuf_state != CBUF_OFF) {
@@ -3783,7 +3808,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     // [TAG_FN_L3_VRAM_CBUF] LLAMA_FN_CBUF_EAGER (default 1): a FULL batch that did not fill n_batch ends a prompt (one
     // stream), so the return to SMALL happens now: its cost belongs to the prompt, and the tail's refill starts before
     // the first decode step. The outputs are in host buffers once cbuf_set has synchronized.
-    if (cbuf_state == CBUF_FULL && cbuf_eager && n_tokens_all < cparams.n_batch) {
+    if (cbuf_state == CBUF_FULL && cbuf_eager && !cbuf_pinned && n_tokens_all < cparams.n_batch) {
         cbuf_set(false);
     }
 
@@ -5551,8 +5576,9 @@ size_t llama_context::cbuf_prepare(ggml_backend_dev_t dev) {
     if (const char * e = getenv("LLAMA_FN_CBUF_SMALL_T"); e && atoi(e) > 0) {
         small_t = (uint32_t) atoi(e);
     }
-    // a graph of >= GGML_OP_OFFLOAD_MIN_BATCH tokens copies host experts into the compute buffer (op offload), and the
-    // hot chain serves at most 8 tokens: SMALL stays below the first and at or above the second
+    // a graph of >= GGML_OP_OFFLOAD_MIN_BATCH tokens copies host experts into the compute buffer (op offload): SMALL stays
+    // below it. The hot chain serves at most 8 tokens: a SMALL_T below 8 (e.g. 3 for the MTP verify of n_max 2: a smaller
+    // SMALL reserve at 262K, whose attention temporaries grow with the width) sends 4..8-token graphs to FULL
     int offload_min = 32;
     if (const char * e = getenv("GGML_OP_OFFLOAD_MIN_BATCH"); e && atoi(e) > 0) {
         offload_min = atoi(e);
@@ -5566,6 +5592,9 @@ size_t llama_context::cbuf_prepare(ggml_backend_dev_t dev) {
     }
     if (const char * e = getenv("LLAMA_FN_CBUF_EAGER")) {
         cbuf_eager = atoi(e) != 0;
+    }
+    if (const char * e = getenv("LLAMA_FN_CBUF_THRASH")) {
+        cbuf_thrash = std::max(0, atoi(e));
     }
     llama_perf_hold hold(n_queued_tokens, t_compute_start_us);
     synchronize();
@@ -5747,6 +5776,79 @@ void llama_context::cbuf_retry_restore() {
     gf_res_prev_active = nullptr;
     LLAMA_LOG_INFO("%s: [TAG_FN_L3_VRAM_CBUF] the tail is mapped again (retry after %" PRIu64 " narrow batches)\n", __func__,
             cbuf_n_retry);
+}
+
+// [TAG_FN_L3_VRAM_CBUF] LLAMA_FN_CBUF_THRASH (default 8, 0 = never): one FULL switch per prompt is cheap, one per step
+// is not (two reserves and a tail refill each time). When that many FULL switches fall within 64 batches, the steps
+// themselves are wider than the SMALL reserve (several streams drafting many tokens each): FULL stays and the tail stays
+// out (the device use of the FULL state is at most the SMALL state's), until 256 narrow batches in a row
+void llama_context::cbuf_note_full() {
+    if (cbuf_thrash <= 0 || cbuf_pinned) {
+        return;
+    }
+    cbuf_full_at.push_back(cbuf_n_batch);
+    while (!cbuf_full_at.empty() && cbuf_full_at.front() + 64 <= cbuf_n_batch) {
+        cbuf_full_at.erase(cbuf_full_at.begin());
+    }
+    if ((int) cbuf_full_at.size() >= cbuf_thrash) {
+        cbuf_pinned     = true;
+        cbuf_narrow_run = 0;
+        LLAMA_LOG_WARN("%s: [TAG_FN_L3_VRAM_CBUF] %zu FULL switches within 64 batches (steps wider than %u tokens): the FULL "
+                "reserve stays and the hot set's tail stays out until 256 narrow batches in a row (LLAMA_FN_CBUF_THRASH=%d)\n",
+                __func__, cbuf_full_at.size(), cbuf_small_t, cbuf_thrash);
+    }
+}
+
+// [TAG_FN_L3_VRAM_TRIM] LLAMA_FN_CBUF_DRAFT_TRIM (default 1 with LLAMA_FN_CBUF=1; the MTP draft context of qwen4exp): the
+// draft context runs a prompt's hidden states in wide batches (its pools grow for them) and then 1-8 token batches. At the
+// first batch of at most 64 tokens after a wider one, its pools give the prompt's growth back to the driver (its own
+// backends only; this context's thread, after its own synchronize: no other context's graph is touched). With
+// LLAMA_FN_CBUF_EAGER=0 the trunk returns to SMALL after this, so LLAMA_FN_CBUF_POOL_MIB may count this growth as well.
+void llama_context::draft_trim(uint32_t n_tokens_all) {
+    constexpr double MiB = 1024.0*1024.0;
+    if (dtrim_on < 0) {
+        dtrim_on = 0;
+        if (model.arch == LLM_ARCH_QWEN4EXP && !model.hparams.no_alloc) {
+            const char * c = llama_fn_env(model, "LLAMA_FN_CBUF");
+            const char * e = getenv("LLAMA_FN_CBUF_DRAFT_TRIM");
+            dtrim_on = c && atoi(c) != 0 && (!e || atoi(e) != 0) ? 1 : 0;
+        }
+        if (dtrim_on == 0) {
+            return;
+        }
+    }
+    if (n_tokens_all > 64) {
+        dtrim_wide = true;
+        return;
+    }
+    if (!dtrim_wide) {
+        return;
+    }
+    dtrim_wide = false;
+    const int64_t t0 = ggml_time_us();
+    llama_perf_hold hold(n_queued_tokens, t_compute_start_us);
+    synchronize();
+    size_t held  = 0;
+    size_t freed = 0;
+    for (auto & backend : backends) {
+        ggml_backend_dev_t d = ggml_backend_get_device(backend.get());
+        ggml_backend_reg_t reg = d ? ggml_backend_dev_backend_reg(d) : nullptr;
+        auto * stats = reg ? (void (*)(ggml_backend_t, size_t *, size_t *)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_pool_stats") : nullptr;
+        auto * trim  = reg ? (size_t (*)(ggml_backend_t, size_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_pool_trim") : nullptr;
+        if (stats && trim) {
+            size_t r = 0, h = 0;
+            stats(backend.get(), &r, &h);
+            held  += r;
+            freed += trim(backend.get(), 0);
+        }
+    }
+    dtrim_n++;
+    dtrim_b += freed;
+    if (dtrim_n <= 3 || dtrim_n % 32 == 0) {
+        LLAMA_LOG_INFO("%s: [TAG_FN_L3_VRAM_TRIM] draft context, trim %" PRIu64 ": its pools held %.1f MiB after the prompt, %.1f MiB "
+                "given back in %.1f ms (%.1f MiB per trim on average)\n", __func__, dtrim_n, held/MiB, freed/MiB,
+                (ggml_time_us() - t0)/1000.0, dtrim_b/MiB/dtrim_n);
+    }
 }
 
 // [TAG_FN_L3_VRAM_ACCOUNT] ------------------------------------------------------------------------------------------

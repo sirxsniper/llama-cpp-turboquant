@@ -440,7 +440,16 @@ private:
     double   cbuf_ms_small  = 0.0;
     size_t   cbuf_peak      = 0;   // the most device use (all processes) seen at a switch
     uint64_t cbuf_n_retry   = 0;   // narrow batches since the last return to SMALL left the tail out
+    // LLAMA_FN_CBUF_THRASH: that many FULL switches within 64 batches (steps wider than the SMALL reserve, e.g. several
+    // streams drafting 8 tokens each) pin the FULL state: the tail stays out, no switch per step; 256 narrow batches in a
+    // row unpin it
+    int      cbuf_thrash    = 8;
+    bool     cbuf_pinned    = false;
+    uint64_t cbuf_n_batch   = 0;
+    uint64_t cbuf_narrow_run = 0;  // narrow batches in a row while pinned (256 unpin)
+    std::vector<uint64_t> cbuf_full_at; // the batch numbers of the recent FULL switches
     bool     cbuf_wanted() const;
+    void     cbuf_note_full();
     size_t   cbuf_prepare(ggml_backend_dev_t dev);
     void     cbuf_off();
     bool     cbuf_set(bool full);
@@ -458,6 +467,14 @@ private:
     size_t   vram_acc_stack = 0;    // the CUDA stack limit last printed
     uint32_t vram_acc_n    = 0;
     void     vram_account(const char * stage);
+
+    // [TAG_FN_L3_VRAM_TRIM] LLAMA_FN_CBUF_DRAFT_TRIM (the MTP draft context of qwen4exp with LLAMA_FN_CBUF=1): the first
+    // narrow batch after a prompt (a batch of more than 64 tokens) gives the pools' prompt growth back to the driver
+    int      dtrim_on      = -1;    // -1: not decided yet
+    bool     dtrim_wide    = false;
+    uint64_t dtrim_n       = 0;
+    size_t   dtrim_b       = 0;
+    void     draft_trim(uint32_t n_tokens_all);
 
     llm_graph_result * get_gf_res_prev(const llama_ubatch & ubatch);
     void gf_res_prev_reset_all();
