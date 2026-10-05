@@ -88,6 +88,7 @@ public:
     // It is kept here because it outlives the batch: pools are fixed by the positions relative to the
     // sequence's first one, so a ubatch only ever appends to it. Sequence edits drop it, see mem_idx_stale.
     struct kpool_layout;
+    struct kpool_layout_seq; // [TAG_FN_R1_KPOOL_TAIL] one sequence of it
 
     const kpool_layout & kpool_layout_update();
     const kpool_layout & kpool_layout_get() const;
