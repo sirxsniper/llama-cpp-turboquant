@@ -1507,8 +1507,12 @@ llama_context::llama_context(
         }
 
         // [TAG_MOE_BRIDGE] LLAMA_MOE_BRIDGE=1: before the reserve, so decode graphs are reserved with the bridge ops
-        // [TAG_FN_R2_BRIDGE_UB] no bridge when the ubatch cannot hold the ring the bridge needs (see n_ubatch above)
-        moe_bridge = bridge_off_ub ? nullptr :
+        // [TAG_FN_R2_BRIDGE_UB] no bridge when the ubatch cannot hold the ring the bridge needs (see n_ubatch above), and
+        // none in an MTP draft context: its graphs run the MTP block alone, never a bridged trunk layer, and a draft
+        // context created after a target that declined the bridge would otherwise take it without the target's ring
+        // (push #1 gate, -ub 4 with MTP: the draft context made a bridge of T <= 8). With a target that owns the bridge the
+        // draft context never had one (llama_moe_bridge_create: another context owns the MoE bridge).
+        moe_bridge = bridge_off_ub || cparams.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT ? nullptr :
                 llama_moe_bridge_create(model, (int) cparams.n_threads, bridge_rb ? (int) cparams.n_rs_seq : 0);
 
         // [TAG_MOE_DMA_SHARE] [TAG_FN_PREFILL_STREAM] before the reserve: the graphs it builds use the gen5 banks
