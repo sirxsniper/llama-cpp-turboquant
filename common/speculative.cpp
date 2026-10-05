@@ -3673,13 +3673,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         {
             const char * e = getenv("SPEC_MTP_COST");
             cost_on = e && e[0] == '1';
-            // [TAG_FN_L3_MTP_COST2] SPEC_MTP_COST=2: version 2 on qwen4exp, version 1 elsewhere
+            // [TAG_FN_L3_MTP_COST2] SPEC_MTP_COST=2: version 2 on qwen4exp; any other model keeps what "2" did before (the
+            // fixed n_max / p_min rule), so none of the new code runs there
             if (e && e[0] == '2' && e[1] == '\0') {
                 if (is_qwen4exp && !is_mem_shared && !chain_heads) {
                     cost2_on = true;
                 } else {
-                    cost_on = true;
-                    LOG_WRN("%s: [TAG_FN_L3_MTP_COST2] SPEC_MTP_COST=2 is for qwen4exp MTP: version 1 runs instead\n", __func__);
+                    LOG_WRN("%s: [TAG_FN_L3_MTP_COST2] SPEC_MTP_COST=2 is for qwen4exp MTP: ignored (the fixed n_max / p_min "
+                            "rule)\n", __func__);
                 }
             }
             if (cost_on) {

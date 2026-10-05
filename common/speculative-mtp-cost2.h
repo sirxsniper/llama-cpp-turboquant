@@ -1,8 +1,8 @@
 #pragma once
 
 // [TAG_FN_L3_MTP_COST2] Draft length from measured costs, version 2, for the MTP driver (common/speculative.cpp,
-// draft-mtp). Switch: SPEC_MTP_COST=2, qwen4exp only (other models keep version 1 there). SPEC_MTP_COST=1 is version 1
-// (speculative-mtp-cost.h) unchanged, 0 / unset the fixed n_max / p_min rule.
+// draft-mtp). Switch: SPEC_MTP_COST=2, qwen4exp only (other models ignore it: the fixed rule, as before).
+// SPEC_MTP_COST=1 is version 1 (speculative-mtp-cost.h) unchanged, 0 / unset the fixed n_max / p_min rule.
 //
 // Version 1 priced a verify row with a curve through the mean step time of its two most used widths and an EMA of the
 // draft decode. Single slow steps and its own choices moved both: on file A it cut the drafts to 1.26-1.30 tokens per
