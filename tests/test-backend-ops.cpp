@@ -12138,6 +12138,63 @@ struct test_fn_l3_convwb : public test_case {
     }
 };
 
+// [TAG_FN_L3_GPU] a whole hc mixer of a qwen4exp layer (build_hc_mix + the next block's first projection + the combine)
+// with every mark the levers set (marked) or none: Q8F producers feeding the run-ahead and one-warp MMVQ kernels through
+// the reuse cache, HCFUSE's low rank and combine, the f32 inject. Shapes: n_embd 2560, hc 4, low rank 320.
+struct test_fn_l3_hcmix : public test_case {
+    const int64_t n_tokens;
+    const bool    marked;
+
+    std::string op_desc(ggml_tensor *) override { return "FN_L3_GPU"; }
+    std::string vars() override { return "hcmix," + VARS_TO_STR2(n_tokens, marked); }
+    bool run_whole_graph() override { return true; }
+    double max_nmse_err() override { return 5e-4; }
+
+    test_fn_l3_hcmix(int64_t n_tokens = 3, bool marked = true) : n_tokens(n_tokens), marked(marked) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t n_embd = 2560;
+        const int64_t hc     = 4;
+        const int64_t T      = n_tokens;
+        const auto mark = [&](ggml_tensor * t, int32_t m) {
+            if (marked) {
+                ggml_fn_l3_set(t, m);
+            }
+            return t;
+        };
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, T);
+        ggml_set_name(x, "res_hc");
+        ggml_tensor * w_norm = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, hc);
+        ggml_set_name(w_norm, "w_norm");
+        ggml_tensor * w_down = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, n_embd*hc, 320);
+        ggml_set_name(w_down, "w_down");
+        ggml_tensor * w_up = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, 320, n_embd*hc);
+        ggml_set_name(w_up, "w_up");
+        ggml_tensor * w_inj = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd*hc, hc);
+        ggml_set_name(w_inj, "w_inject");
+        ggml_tensor * w_qkv = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, n_embd, 10240);
+        ggml_set_name(w_qkv, "w_qkv");
+        ggml_tensor * block_out = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, T);
+        ggml_set_name(block_out, "block_out");
+
+        ggml_tensor * xn = mark(ggml_mul(ctx, ggml_rms_norm(ctx, x, 1e-6f), w_norm), GGML_FN_L3_Q8OUT);
+        xn = ggml_reshape_2d(ctx, xn, n_embd*hc, T);
+        ggml_tensor * lo = mark(ggml_mul_mat(ctx, w_down, xn), GGML_FN_L3_MMV);
+        ggml_tensor * lo_s = mark(ggml_scale(ctx, lo, 1.0f/(float) hc), GGML_FN_L3_HCLO);
+        lo = mark(ggml_silu(ctx, lo_s), GGML_FN_L3_Q8OUT);
+        ggml_tensor * gate = mark(ggml_mul_mat(ctx, w_up, lo), GGML_FN_L3_MMV);
+        ggml_tensor * mixed = mark(ggml_dsv4_hc_pre_gated(ctx, ggml_reshape_3d(ctx, xn, n_embd, hc, T),
+                ggml_reshape_3d(ctx, gate, n_embd, hc, T), 1.0f/(float) hc), GGML_FN_L3_Q8OUT);
+        ggml_tensor * qkv = mark(ggml_mul_mat(ctx, w_qkv, mixed), GGML_FN_L3_MMV);
+        ggml_tensor * inject = mark(ggml_mul_mat(ctx, w_inj, xn), GGML_FN_L3_MMV);
+        ggml_tensor * w = ggml_scale(ctx, ggml_sigmoid(ctx, mark(ggml_scale(ctx, inject, 1.0f/(float) hc), GGML_FN_L3_HCW)), 2.0f);
+        ggml_tensor * post = ggml_dsv4_hc_post(ctx, block_out, x, w, nullptr);
+        ggml_tensor * out = ggml_concat(ctx, qkv, ggml_reshape_2d(ctx, post, n_embd*hc, T), 0);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // [TAG_FN_L3_GPU_GDNAB] the GDN gate inputs of a qwen4exp layer (build_layer_attn_linear): beta = sigmoid(Wb x), gate =
 // softplus(Wa x + dt) * a, Wa / Wb f32 [2560, 48], built next to each other as the GDNAB switch builds them
 struct test_fn_l3_gdnab : public test_case {
@@ -14933,6 +14990,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_fn_l3_zskip(GGML_TYPE_Q4_K, GGML_TYPE_Q5_1, t, false, true)); // [TAG_FN_L3_GPU_ZSKIP]
         test_cases.emplace_back(new test_fn_l3_zskip(GGML_TYPE_Q5_K, GGML_TYPE_Q8_0, t, true, true));
         test_cases.emplace_back(new test_fn_l3_gdnab(t, true)); // [TAG_FN_L3_GPU_GDNAB]
+        test_cases.emplace_back(new test_fn_l3_hcmix(t, true)); // [TAG_FN_L3_GPU]
     }
     for (int64_t nb : { 1, 3 }) {
         test_cases.emplace_back(new test_flash_attn_ext_turbot(TURBOT_TW_NR2_Q8, 32768, nb, TURBOT_MIX_BAND64K, 3, false, 0.0f, false,
@@ -15687,6 +15745,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             }
             test_cases.emplace_back(new test_fn_l3_zskip(GGML_TYPE_Q4_K, GGML_TYPE_Q5_1, t, false, m)); // [TAG_FN_L3_GPU_ZSKIP]
             test_cases.emplace_back(new test_fn_l3_gdnab(t, m)); // [TAG_FN_L3_GPU_GDNAB]
+            test_cases.emplace_back(new test_fn_l3_hcmix(t, m)); // [TAG_FN_L3_GPU]
             for (int64_t np : { 8192, 32768, 61440 }) {
                 test_cases.emplace_back(new test_fn_l3_idxq8(np*4 + 3, np, t, m));
                 test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, { np, t, 1, 1 }, 512, false, true, m));
@@ -17499,6 +17558,8 @@ static bool run_fn_l3_gpu(ggml_backend_t backend, ggml_backend_t backend_ref, co
         }
         // [TAG_FN_L3_GPU_GDNAB] the GDN gate inputs in one launch
         cases.push_back({ [=](bool m) { return std::unique_ptr<test_case>(new test_fn_l3_gdnab(t, m)); }, false });
+        // [TAG_FN_L3_GPU] a whole hc mixer with every mark
+        cases.push_back({ [=](bool m) { return std::unique_ptr<test_case>(new test_fn_l3_hcmix(t, m)); }, false });
     }
     for (int64_t t : { 1, 3, 4 }) {
         if (cpu) {
