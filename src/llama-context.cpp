@@ -2740,11 +2740,30 @@ static bool turbo_nan_scan_cb(struct ggml_tensor * t, bool ask, void * /*user_da
         buf.resize(n);
         for (int64_t i = 0; i < n; ++i) { buf[i] = ggml_fp16_to_fp32(h[i]); }
     }
-    int64_t n_nan = 0, n_inf = 0;
+    // [TAG_NAN_SCAN] [TAG_FN_L3_VRAM_CBUF] GATED_DELTA_NET: only its attention rows. The snapshot rows after them are
+    // left unwritten for slots >= n_tokens (and all of them when the op writes the cache directly); the graph copies only
+    // the written slots into the recurrent cache, so whatever bytes the compute buffer held there are never read (a fresh
+    // buffer, e.g. after a compute-buffer lend switch, can hold NaN patterns). Those copies are checked as nodes of their own.
+    int64_t n_scan = n;
+    if (t->op == GGML_OP_GATED_DELTA_NET && t->src[2] != nullptr) {
+        const int64_t n_y = t->ne[0] * t->src[2]->ne[2] * t->src[2]->ne[3];
+        if (n_y > 0 && n_y <= n) {
+            n_scan = n_y;
+        }
+    }
+    int64_t n_nan = 0, n_inf = 0, n_nan_unread = 0;
     for (int64_t i = 0; i < n; ++i) {
         const float v = buf[i];
-        if (v != v)                       { ++n_nan; }
+        if (i >= n_scan)                  { n_nan_unread += v != v; }
+        else if (v != v)                  { ++n_nan; }
         else if (v > 3.0e38f || v < -3.0e38f) { ++n_inf; }
+    }
+    static bool noted = false;
+    if (n_nan_unread && !noted) {
+        noted = true;
+        fprintf(stderr, "[NAN] note: op=%s name='%s' holds %lld NaN in its %lld snapshot elements (not counted here: the unwritten slots are never read, the written ones are checked in the copies that read them)\n",
+                ggml_op_name(t->op), ggml_get_name(t), (long long) n_nan_unread, (long long) (n - n_scan));
+        fflush(stderr);
     }
     // -INF in a causal mask is CORRECT, not a defect: skip masks, and only a real NaN counts.
     // (An earlier version of this scanner flagged attn_inp_kq_mask with 509/512 -INF and that was

@@ -1260,6 +1260,21 @@ hot_vmm_fns hot_vmm_lookup(ggml_backend_buffer_type_t buft) {
     return f;
 }
 
+// [TAG_FN_L3_VRAM_ACCOUNT] device use (all processes) on buft's device while LLAMA_FN_VRAM_ACCOUNT=1, else 0
+size_t hot_acc_used(ggml_backend_buffer_type_t buft) {
+    static const bool on = [] {
+        const char * e = getenv("LLAMA_FN_VRAM_ACCOUNT");
+        return e && atoi(e) != 0;
+    }();
+    ggml_backend_dev_t dev = on && buft ? ggml_backend_buft_get_device(buft) : nullptr;
+    if (!dev) {
+        return 0;
+    }
+    size_t mem_free = 0, mem_total = 0;
+    ggml_backend_dev_memory(dev, &mem_free, &mem_total);
+    return mem_total > mem_free ? mem_total - mem_free : 0;
+}
+
 size_t hot_round_up(size_t x, size_t g) {
     return g > 0 ? (x + g - 1) / g * g : x;
 }
@@ -1576,6 +1591,7 @@ bool llama_moe_hot_init(const llama_model & model, const void * owner, size_t bu
         mc->cb_raw  = nullptr;
     };
 
+    const size_t acc_used0 = layers.empty() ? 0 : hot_acc_used(layers[0].buft); // [TAG_FN_L3_VRAM_ACCOUNT]
     for (int attempt = 0; attempt < 32 && budget > 0; ++attempt) {
         std::vector<std::vector<int32_t>> hot_ids(layers.size());
         std::vector<int32_t>              n_slots_of(layers.size(), 0);
@@ -1732,6 +1748,8 @@ bool llama_moe_hot_init(const llama_model & model, const void * owner, size_t bu
             continue;
         }
 
+        const size_t acc_used1 = acc_used0 ? hot_acc_used(layers[0].buft) : 0; // [TAG_FN_L3_VRAM_ACCOUNT]
+
         // upload the hot slices from the host (mmap) copy and write both tables
         size_t vram = 0;
         const int64_t t0 = ggml_time_us();
@@ -1810,6 +1828,15 @@ bool llama_moe_hot_init(const llama_model & model, const void * owner, size_t bu
 
         if (adapt_req) {
             hot_adapt_init(mc, model, owner, groups.size() == 1 ? ggml_backend_buft_get_device(groups.begin()->first) : nullptr);
+        }
+        if (acc_used0) {
+            // [TAG_FN_L3_VRAM_ACCOUNT] what the hot set adds beyond its tensors: the buffers' own cost, then the adaptive
+            // set's start (its upload backend and stream, the pinned staging)
+            const size_t acc_used2 = hot_acc_used(layers[0].buft);
+            LLAMA_LOG_INFO("moe-hot: [TAG_FN_L3_VRAM_ACCOUNT] device use %.1f MiB before the hot set, %+.1f MiB with its buffers "
+                    "(%.1f MiB of tensors%s), %+.1f MiB more after the uploads and the adaptive set's start\n",
+                    acc_used0/1048576.0, ((double) acc_used1 - (double) acc_used0)/1048576.0, vram/1048576.0,
+                    mc->cb_buf ? ", virtual memory" : "", ((double) acc_used2 - (double) acc_used1)/1048576.0);
         }
         if (even && !mc->adapt) {
             // [TAG_FN_AUTO] nothing would ever fill the empty slots
