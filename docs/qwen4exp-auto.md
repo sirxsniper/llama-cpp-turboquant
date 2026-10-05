@@ -109,7 +109,8 @@ For A/B runs on qwen4exp only; every other model ignores them (a warning says so
 |---|---|---|
 | `SPEC_MTP_COST` | `2` | the draft length v2 (`[TAG_FN_L3_MTP_COST2]`, common/speculative-mtp-cost2.h): a verify row is priced by the cold experts the MoE bridge counts per step (k us per cold expert-layer, measured from the step-to-step variation at one width) plus a per-width row cost; a token is kept when its expected tokens pay for its row at the realized rate, and a further draft decode only when the expected next token pays for the decode. `1` is version 1 unchanged (the profile's value), `0` the fixed n_max / p_min rule. `SPEC_MTP_COST2_LOG=1` prints a summary every 256 policy steps and at the end |
 | `SPEC_MTP_PMIN_POS` | `p1,p2,...` | the p_min rule per draft position, the last value for the rest (`[TAG_FN_L3_MTP_CHAIN]`), e.g. `0.5,0.5,0.85` with `--spec-draft-n-max 3`: a third draft only when the drafter is confident. Applies wherever the rule decides (no cost policy, and the warm-up and probe steps of the policies) |
-| `LLAMA_MTP_HEAD_PROMPT` | `<n>` | with `LLAMA_MTP_HEAD_IDS` (or `_ROWS`): the drafts also score up to n tokens of each request's prompt that the draft vocabulary leaves out (`[TAG_FN_L3_MTP_HEADPROMPT]`, full head rows); verify is unchanged |
+| `LLAMA_MTP_HEAD_PROMPT` | `<n>` | with `LLAMA_MTP_HEAD_IDS` (or `_ROWS`): the drafts also score n more rows (`[TAG_FN_L3_MTP_HEADPROMPT]`, full head rows): each request's prompt tokens that the draft vocabulary leaves out, most frequent first, then the next ids outside the vocabulary in id order (all distinct). 1024 costs ~10 MiB of the draft context's compute buffer; verify is unchanged |
+| `SPEC_MTP_COST2_TRACE` | `<file>` | one CSV line per kept step of version 2 (rows, policy, tokens, rest-of-step us, step us, k, rate, dV, the cold prefix counts); `tools/qwen4exp`-style check: `E:/turbot-gates/flashnext/test/l3/mtp/tools/l3_trace_check.py` |
 
 - The third draft needs `--spec-draft-n-max 3`; the recurrent ring and the bridge follow it (n_rs_seq = n_max, +1 with
   the bridge rollback ring), so 4-row verify graphs stay bridged.
@@ -119,3 +120,14 @@ For A/B runs on qwen4exp only; every other model ignores them (a warning says so
   `<file>.ple` is a hardlink of file A's, so the first load copies nothing.
 - `LLAMA_MTP_ATTN_WINDOW` (32768 in the profile) and `LLAMA_MTP_HEAD_ROWS` (98304) stay as they are; `=0` turns either off
   for an A/B arm.
+- MTP head experts at q2_0 (`[TAG_FN_L3_MTP_Q2]`, the Strata / flashrt draft layer): `recipe_mtp_mix.ps1 -Mix
+  q2_0,q2_0,q2_0 -Name MTPq2` writes `Qwen3.8-Flash-Next-UD-Q4_K_XL-MTPq2-0000N-of-00005.gguf` (1.83 GiB less VRAM than file
+  A's q8_0 experts). ggml's own q2_0 quantizer (absmax scale, never code 3) has a relative RMS weight error of 0.73 on
+  these experts and an expert output error of 1.26, so `mtp_requant.py` writes q2_0 by a scale search (0.36 / 0.59; recipe
+  C: 0.075 / 0.11). `-Mix q3_K,q3_K,q4_0 -Name MTPq3` is the middle point (1.38 GiB, 0.16 / 0.24). The down projection's
+  640-wide rows rule out k-quants for it. Only drafts change: the A/B is the acceptance and the speed.
+- A ranked draft vocabulary for `LLAMA_MTP_HEAD_IDS` (`[TAG_FN_L3_MTP_HEADIDS]`, `tools/qwen4exp/mtp_head_rank.py`): ids
+  by frequency in real answers, then in tokenized prompt text, then by id. On 160K held-out answer tokens 40,960 ids cover
+  99.68 % and 32,768 ids 99.59 %, against 99.80 % for `LLAMA_MTP_HEAD_ROWS=98304`: 58 % fewer head rows per draft step for
+  ~0.1 point of coverage, but the compact head is a ~109 MiB copy in VRAM, and the answers were English text about code
+  (other languages fall back to the id order).
