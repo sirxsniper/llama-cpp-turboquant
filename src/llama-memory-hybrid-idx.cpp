@@ -428,7 +428,7 @@ uint32_t kpool_pad(uint32_t n_pool) {
 }
 
 // [TAG_FN_L3_HOST_DIAG] LLAMA_FN_HOST_KPOOL_PROBE=1: host time of the k-pool work per ubatch (the layout update and
-// re-pool marks in apply(), the input arrays in set_input_kpool), a line every 256 ubatches. Diagnostic only.
+// re-pool marks in apply(), the input arrays in set_input_kpool), a line every 64 fills. Diagnostic only.
 struct kpool_probe {
     double   apply_us = 0.0;
     double   input_us = 0.0;
@@ -455,10 +455,10 @@ void kpool_probe_add(bool input, double us, uint32_t n_pool) {
     if (input) {
         p.input_us += us;
         p.pools    += n_pool;
-        if (++p.n_input % 256 == 0) {
+        if (++p.n_input % 64 == 0) {
             LLAMA_LOG_INFO("kpool-probe: [TAG_FN_L3_HOST_DIAG] %llu ubatches: layout update + re-pool marks %.1f us, input "
                     "arrays %.1f us per ubatch (%.0f pools)\n", (unsigned long long) p.n_input,
-                    p.n_apply ? p.apply_us / p.n_apply : 0.0, p.input_us / 256.0, (double) p.pools / 256.0);
+                    p.n_apply ? p.apply_us / p.n_apply : 0.0, p.input_us / 64.0, (double) p.pools / 64.0);
             p.apply_us = p.input_us = 0.0;
             p.n_apply  = 0;
             p.pools    = 0;
