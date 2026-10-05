@@ -56,6 +56,10 @@ struct layer_state {
     std::vector<float>                dcnt;      // [n_expert]
     std::vector<float>                dseed;     // [n_expert]
     bool                              dseed_any = false;
+
+    // [TAG_FN_R1_PFS_LEND] the slots of this layer lie in the range the prefill stream borrowed: both tables say "not
+    // hot" for every expert, nothing uploads into it, and llama_moe_hot_unlend refills it from slot_expert
+    bool                              lent = false;
 };
 
 struct upload_job {
@@ -128,6 +132,15 @@ struct moe_cache {
     std::deque<upload_job>   todo;
     std::vector<upload_job>  done;
     bool                     stop = false;
+
+    // [TAG_FN_R1_PFS_LEND] the worker holds a batch (its uploads may still be writing slots); wcv_idle: it put one down
+    bool                     worker_busy = false;
+    std::condition_variable  wcv_idle;
+    bool                     lent_any    = false;
+    size_t                   lent_bytes  = 0;
+    uint64_t                 n_lend      = 0;
+    double                   unlend_ms   = 0.0;
+    size_t                   unlend_b    = 0;
 };
 
 moe_cache * g_cache = nullptr;
@@ -658,6 +671,7 @@ void hot_adapt_worker(moe_cache * mc) {
             }
             batch.assign(mc->todo.begin(), mc->todo.end());
             mc->todo.clear();
+            mc->worker_busy = true; // [TAG_FN_R1_PFS_LEND]
         }
         size_t used = 0;
         auto flush = [&]() {
@@ -692,6 +706,8 @@ void hot_adapt_worker(moe_cache * mc) {
             j.done = true;
             mc->done.push_back(j);
         }
+        mc->worker_busy = false; // [TAG_FN_R1_PFS_LEND]
+        mc->wcv_idle.notify_all();
     }
 }
 
@@ -700,7 +716,7 @@ void hot_adapt_verify(moe_cache * mc) {
     static uint64_t pick = 0;
     for (size_t tries = 0; tries < mc->layers.size(); ++tries) {
         layer_state & ls = mc->layers[(pick++) % mc->layers.size()];
-        if (ls.pub.n_slots == 0) {
+        if (ls.pub.n_slots == 0 || ls.lent) { // [TAG_FN_R1_PFS_LEND] a lent layer's slots hold the stream's bytes
             continue;
         }
         const int32_t s = (int32_t) ((pick*2654435761u) % (uint64_t) ls.pub.n_slots);
@@ -792,7 +808,7 @@ void hot_adapt_decay(moe_cache * mc, bool decode_step) {
     std::vector<uint8_t> expert_busy;
     for (int li = 0; li < (int) mc->layers.size(); ++li) {
         const layer_state & ls = mc->layers[li];
-        if (ls.pub.n_slots == 0 || ls.dcnt.empty()) {
+        if (ls.pub.n_slots == 0 || ls.dcnt.empty() || ls.lent) { // [TAG_FN_R1_PFS_LEND] no upload into a lent layer
             continue;
         }
         slot_busy.assign(ls.pub.n_slots, 0);
@@ -843,22 +859,26 @@ void hot_adapt_decay(moe_cache * mc, bool decode_step) {
     }
 }
 
+// finished uploads enter the bookkeeping and both tables. [TAG_FN_R1_PFS_LEND] a lent layer keeps the expert in
+// slot_expert (llama_moe_hot_unlend uploads it again), but its tables stay "not hot" until then
+void hot_adapt_publish(moe_cache * mc) {
+    std::lock_guard<std::mutex> lk(mc->wmtx);
+    for (const auto & j : mc->done) {
+        layer_state & ls = mc->layers[j.layer_idx];
+        ls.slot_expert[j.slot]        = j.expert;
+        ls.expert_slot[j.expert]      = j.slot;
+        ls.slot_in_flight[j.slot]     = false;
+        ls.expert_in_flight[j.expert] = false;
+        hot_adapt_set_entry(mc, ls, j.expert, ls.lent ? ls.pub.n_slots : j.slot);
+        mc->ad_admitted++;
+    }
+    mc->done.clear();
+}
+
 // the owning context's step boundary, after its compute has been synchronized: publish finished uploads, roll the
 // windows, then evict and queue new uploads (byte-capped). Nothing here runs while a graph of this context runs.
 void hot_adapt_step(moe_cache * mc) {
-    {
-        std::lock_guard<std::mutex> lk(mc->wmtx);
-        for (const auto & j : mc->done) {
-            layer_state & ls = mc->layers[j.layer_idx];
-            ls.slot_expert[j.slot]        = j.expert;
-            ls.expert_slot[j.expert]      = j.slot;
-            ls.slot_in_flight[j.slot]     = false;
-            ls.expert_in_flight[j.expert] = false;
-            hot_adapt_set_entry(mc, ls, j.expert, j.slot);
-            mc->ad_admitted++;
-        }
-        mc->done.clear();
-    }
+    hot_adapt_publish(mc);
 
     bool any = false;
     for (const auto & ls : mc->layers) {
@@ -914,7 +934,7 @@ void hot_adapt_step(moe_cache * mc) {
         std::vector<cand> cands;
         for (int li = 0; li < (int) mc->layers.size(); ++li) {
             const layer_state & ls = mc->layers[li];
-            if (ls.pub.n_slots == 0) {
+            if (ls.pub.n_slots == 0 || ls.lent) { // [TAG_FN_R1_PFS_LEND] no upload into a lent layer
                 continue;
             }
             for (const int32_t e : ls.win_ring[pos]) {
@@ -1537,5 +1557,189 @@ void llama_moe_hot_save_now(const void * owner) {
     moe_cache * mc = g_cache;
     if (mc && mc->adapt && mc->owner == owner) {
         hot_adapt_save(mc);
+    }
+}
+
+// [TAG_FN_R1_PFS_LEND] ---------------------------------------------------------------------------------------------
+
+namespace {
+
+// both tables of one layer: every expert "not hot" (lent), or the resident ones from expert_slot. The host table
+// directly, the device table in one copy (the caller has synchronized the owner's graphs), the adaptive set's mirror too
+void hot_write_tables(moe_cache * mc, layer_state & ls, bool lent) {
+    const int64_t n_exp = ls.pub.host_table->ne[1];
+    std::vector<int32_t> tbl((size_t) n_exp, ls.pub.n_slots);
+    if (!lent) {
+        for (int64_t e = 0; e < n_exp && e < (int64_t) ls.expert_slot.size(); ++e) {
+            if (ls.expert_slot[e] >= 0) {
+                tbl[e] = ls.expert_slot[e];
+            }
+        }
+    }
+    memcpy(ls.pub.host_table->data, tbl.data(), tbl.size()*sizeof(int32_t));
+    ggml_backend_tensor_set(ls.pub.dev_table, tbl.data(), 0, tbl.size()*sizeof(int32_t));
+    if (!mc->tbl_mirror.empty() && ls.tbl_off + n_exp <= (int64_t) mc->tbl_mirror.size()) {
+        memcpy(mc->tbl_mirror.data() + ls.tbl_off, tbl.data(), tbl.size()*sizeof(int32_t));
+    }
+}
+
+// the lent range as one I8 tensor (byte-offset clears of the tails that the slot tensors' alloc sizes pad after them)
+struct hot_lend_state {
+    ggml_context *        ctx  = nullptr;
+    ggml_tensor *         raw  = nullptr;
+    ggml_backend_buffer_t buf  = nullptr;
+    uint8_t *             lo   = nullptr;
+    size_t                size = 0;
+};
+hot_lend_state g_lend;
+
+} // namespace
+
+bool llama_moe_hot_lend(const void * owner, size_t bytes, ggml_backend_buffer_t * out_buf, uint8_t ** out_base) {
+    moe_cache * mc = g_cache;
+    if (!mc || !mc->hot || bytes == 0 || mc->layers.empty() || !mc->tbl_all || !out_buf || !out_base) {
+        return false;
+    }
+    if (mc->adapt && owner != mc->owner) {
+        return false;
+    }
+    if (mc->lent_any) {
+        *out_buf  = g_lend.buf;
+        *out_base = g_lend.lo;
+        return bytes <= g_lend.size;
+    }
+    ggml_backend_buffer_t dbuf = mc->layers.front().pub.up_c->buffer;
+    if (!dbuf || mc->tbl_all->buffer != dbuf) {
+        return false;
+    }
+    for (const auto & ls : mc->layers) {
+        if (ls.pub.up_c->buffer != dbuf || ls.pub.gate_c->buffer != dbuf || ls.pub.down_c->buffer != dbuf) {
+            return false; // the slots of one device buffer only
+        }
+    }
+    uint8_t *    base  = (uint8_t *) ggml_backend_buffer_get_base(dbuf);
+    const size_t size  = ggml_backend_buffer_get_size(dbuf);
+    const size_t align = std::max<size_t>(256, ggml_backend_buffer_get_alignment(dbuf));
+    if (bytes + align > size) {
+        return false;
+    }
+    const size_t start = (size - bytes) / align * align;
+    uint8_t * lo = base + start;
+    if ((uint8_t *) mc->tbl_all->data + ggml_nbytes(mc->tbl_all) > lo) {
+        return false; // the tables must stay below the lent range
+    }
+    if (!g_lend.ctx) {
+        ggml_init_params ip = { ggml_tensor_overhead()*2, nullptr, true };
+        g_lend.ctx = ggml_init(ip);
+        if (!g_lend.ctx) {
+            return false;
+        }
+        g_lend.raw = ggml_new_tensor_1d(g_lend.ctx, GGML_TYPE_I8, (int64_t) (size - start));
+        ggml_set_name(g_lend.raw, "moe_hot_lent");
+        if (ggml_backend_tensor_alloc(dbuf, g_lend.raw, lo) != GGML_STATUS_SUCCESS) {
+            ggml_free(g_lend.ctx);
+            g_lend = {};
+            return false;
+        }
+        g_lend.buf  = dbuf;
+        g_lend.lo   = lo;
+        g_lend.size = size - start;
+    } else if (g_lend.buf != dbuf || g_lend.lo != lo) {
+        return false; // the hot buffer never moves; another range would invalidate the stream's bank aliases
+    }
+
+    ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(dbuf);
+    auto overlaps = [&](const ggml_tensor * t) {
+        return (uint8_t *) t->data + ggml_backend_buft_get_alloc_size(buft, t) > lo;
+    };
+    size_t n_lent = 0;
+    for (auto & ls : mc->layers) {
+        if (overlaps(ls.pub.up_c) || overlaps(ls.pub.gate_c) || overlaps(ls.pub.down_c)) {
+            ls.lent = true;
+            n_lent++;
+        }
+    }
+    if (mc->adapt) {
+        // no upload goes into a lent layer any more: queued ones are dropped (their slots were evicted already, so they
+        // come back empty), and the worker puts its running batch down before anything overwrites a slot
+        std::unique_lock<std::mutex> lk(mc->wmtx);
+        for (auto it = mc->todo.begin(); it != mc->todo.end(); ) {
+            layer_state & ls = mc->layers[it->layer_idx];
+            if (ls.lent) {
+                ls.slot_in_flight[it->slot]     = false;
+                ls.expert_in_flight[it->expert] = false;
+                it = mc->todo.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        mc->wcv_idle.wait(lk, [mc]() { return !mc->worker_busy; });
+    }
+    if (mc->adapt) {
+        hot_adapt_publish(mc); // the batch the worker just finished: slot_expert knows it, the tables stay "not hot"
+    }
+    for (auto & ls : mc->layers) {
+        if (ls.lent) {
+            hot_write_tables(mc, ls, true);
+        }
+    }
+    mc->lent_any   = true;
+    mc->lent_bytes = bytes;
+    mc->n_lend++;
+    if (mc->n_lend == 1) {
+        LLAMA_LOG_INFO("moe-hot: [TAG_FN_R1_PFS_LEND] the prefill stream borrows the top %.0f MiB of the hot set's %.0f MiB "
+                "while a prompt streams (%zu of %zu layers refilled after it)\n", bytes/1048576.0, size/1048576.0, n_lent,
+                mc->layers.size());
+    }
+    *out_buf  = dbuf;
+    *out_base = lo;
+    return true;
+}
+
+void llama_moe_hot_unlend(const void * owner) {
+    moe_cache * mc = g_cache;
+    if (!mc || !mc->lent_any) {
+        return;
+    }
+    if (mc->adapt && owner != mc->owner) {
+        return;
+    }
+    const int64_t t0 = ggml_time_us();
+    size_t bytes = 0;
+    ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(g_lend.buf);
+    for (auto & ls : mc->layers) {
+        if (!ls.lent) {
+            continue;
+        }
+        for (int32_t s = 0; s < ls.pub.n_slots; ++s) {
+            const int32_t e = ls.slot_expert[s];
+            if (e < 0) {
+                continue; // empty: no table entry names it
+            }
+            upload_slice(ls.pub.up_c,   ls.pub.up_src,   e, s);
+            upload_slice(ls.pub.gate_c, ls.pub.gate_src, e, s);
+            upload_slice(ls.pub.down_c, ls.pub.down_src, e, s);
+            bytes += ls.pub.up_src->nb[2] + ls.pub.gate_src->nb[2] + ls.pub.down_src->nb[2];
+        }
+        // the zero slot every miss reads, and the alloc-size tail after it (kernels may read padded rows there)
+        ggml_tensor * ts[3] = { ls.pub.up_c, ls.pub.gate_c, ls.pub.down_c };
+        for (ggml_tensor * t : ts) {
+            ggml_backend_tensor_memset(t, 0, (size_t) ls.pub.n_slots*t->nb[2], t->nb[2]);
+            uint8_t * tail_lo = std::max((uint8_t *) t->data + ggml_nbytes(t), g_lend.lo);
+            uint8_t * tail_hi = (uint8_t *) t->data + ggml_backend_buft_get_alloc_size(buft, t);
+            if (tail_hi > tail_lo) {
+                ggml_backend_tensor_memset(g_lend.raw, 0, (size_t) (tail_lo - g_lend.lo), (size_t) (tail_hi - tail_lo));
+            }
+        }
+        ls.lent = false;
+        hot_write_tables(mc, ls, false);
+    }
+    mc->lent_any = false;
+    const double ms = (ggml_time_us() - t0)/1000.0;
+    mc->unlend_ms += ms;
+    mc->unlend_b  += bytes;
+    if (mc->n_lend <= 2 || mc->n_lend % 16 == 0) {
+        LLAMA_LOG_INFO("moe-hot: [TAG_FN_R1_PFS_LEND] lend %" PRIu64 ": %.2f GiB of resident experts refilled in %.1f ms "
+                "(%.1f GiB/s)\n", mc->n_lend, bytes/1073741824.0, ms, ms > 0 ? bytes/1073741824.0/(ms/1000.0) : 0.0);
     }
 }

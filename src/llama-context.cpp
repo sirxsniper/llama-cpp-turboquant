@@ -1706,6 +1706,10 @@ void llama_context::sched_reserve() {
 
     synchronize();
 
+    // [TAG_FN_R1_PFS_LEND] reserve with the prefill stream's banks returned: the reserve graphs keep the op offload
+    // copies in the compute buffer, which a prompt that cannot borrow the banks needs
+    llama_moe_gen5_before_ubatch(this, nullptr, 0);
+
     const int64_t t_start_us = ggml_time_us();
 
     const uint32_t n_seqs = cparams.n_seq_max;
@@ -2742,6 +2746,12 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     }
 
     llama_moe_bridge_step(moe_bridge); // [TAG_MOE_BRIDGE] re-arm a paused bridge before the graph parameters are taken
+
+    // [TAG_FN_R1_PFS_LEND] a prompt ubatch borrows the prefill stream's banks from the hot set, a decode gives them back
+    // first; a graph built under the other state is never reused (its MoE reads the banks or the op offload)
+    if (llama_moe_gen5_before_ubatch(this, sched.get(), ubatch.n_tokens)) {
+        gf_res_prev_active = nullptr;
+    }
 
     auto * res = get_gf_res_prev(ubatch); // [TAG_FN_GRAPH_PER_WIDTH] same as get_gf_res_prev() unless enabled
     auto * gf  = res->get_gf();

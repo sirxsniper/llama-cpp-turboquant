@@ -32,6 +32,8 @@
 //   math is the one the scheduler's op offload uses today for these ubatches (same kernels, same weights). A source in
 //   a pinned buffer (--no-mmap) is copied without staging. LLAMA_PREFILL_STREAM_WRAP=1 (default) loads the first layer
 //   for the next ubatch after the last one; LLAMA_PREFILL_STREAM_STATS=1 prints per ubatch.
+//   [TAG_FN_R1_PFS_LEND] LLAMA_PREFILL_STREAM_LEND=1: the banks are borrowed from the hot set's VRAM while a prompt
+//   streams instead of being allocated (see llama_prefill_stream_before_ubatch).
 
 #include "llama.h"
 
@@ -83,6 +85,8 @@ void llama_moe_gen5_init(const llama_model & model, const void * owner, const st
         bool host_bridge = false);
 void llama_moe_gen5_step(const void * owner); // end of the owner's decode()
 void llama_moe_gen5_free(const void * owner); // owner destructor
+// [TAG_FN_R1_PFS_LEND] before each ubatch's graph of the owner: the prefill stream borrows / returns its banks
+bool llama_moe_gen5_before_ubatch(const void * owner, ggml_backend_sched_t sched, int64_t n_tokens);
 
 // --- [TAG_MOE_DMA_SHARE] [TAG_MOE_PREFETCH] ---
 
@@ -176,5 +180,16 @@ struct llama_pfs_counters {
     uint64_t bytes    = 0;
     uint64_t reused   = 0; // gates that found their layer already in the bank
     double   wait_s   = 0; // host time the gates waited for copies
+    uint64_t lends    = 0; // [TAG_FN_R1_PFS_LEND] times the banks were borrowed from the hot set
 };
 LLAMA_API llama_pfs_counters llama_prefill_stream_get_counters();
+
+// [TAG_FN_R1_PFS_LEND] LLAMA_PREFILL_STREAM_LEND=1: the stream allocates no VRAM banks of its own. A ubatch of >= the
+// stream's minimum borrows them from the top of the hot set's device buffer (llama_moe_hot_lend: those hot layers leave
+// both tables and nothing uploads into them), the first ubatch below the minimum (a decode) gives them back: the queued
+// and running copies are cancelled and waited for, and the hot set uploads its resident experts there again before the
+// graph runs. So the banks cost the decode no hot slots; a prompt costs one refill (the lent layers' resident experts).
+// Without a hot set that can lend, the stream stays off (the scheduler's op offload). The owner context calls this
+// before each ubatch's graph; sched: its scheduler (synchronized here before a lend or a return).
+// Returns true when the banks were borrowed or returned (graphs built before must not be reused).
+LLAMA_API bool llama_prefill_stream_before_ubatch(const void * owner, ggml_backend_sched_t sched, int64_t n_tokens);

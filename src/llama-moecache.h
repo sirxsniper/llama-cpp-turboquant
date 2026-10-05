@@ -110,3 +110,16 @@ void llama_moe_hot_save_now(const void * owner);
 
 // max graph width for the hot chain, 0 when hot mode is off
 int llama_moe_hot_max_t();
+
+// [TAG_FN_R1_PFS_LEND] the prefill stream borrows the top `bytes` of the hot set's device buffer as its VRAM banks while
+// a prompt streams (LLAMA_PREFILL_STREAM_LEND=1), so the banks cost the decode no hot slots. The caller must have
+// synchronized every graph of the owner context: the hot layers whose slots lie in the lent range leave both tables
+// (the CPU and the zero slot serve them), uploads into them stop, and their slots and zero slots may be overwritten.
+// Returns false (and lends nothing) without a single-device hot set with one table tensor, or when `bytes` does not fit
+// above the tables. *buf / *base: the device buffer and the first lent byte (the same every time).
+struct ggml_backend_buffer;
+bool llama_moe_hot_lend(const void * owner, size_t bytes, struct ggml_backend_buffer ** buf, uint8_t ** base);
+
+// [TAG_FN_R1_PFS_LEND] the lent range is back (the device is idle, nothing writes it any more): the resident experts of
+// the lent layers are uploaded again, their zero slots cleared, and both tables restored. No-op when nothing is lent.
+void llama_moe_hot_unlend(const void * owner);

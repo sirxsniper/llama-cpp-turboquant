@@ -309,6 +309,10 @@ void llama_moe_gen5_step(const void * owner) {
     llama_moe_dma_step(owner);
 }
 
+bool llama_moe_gen5_before_ubatch(const void * owner, ggml_backend_sched_t sched, int64_t n_tokens) {
+    return llama_prefill_stream_before_ubatch(owner, sched, n_tokens); // [TAG_FN_R1_PFS_LEND]
+}
+
 void llama_moe_gen5_free(const void * owner) {
     llama_moe_dma_free(owner);
     llama_prefill_stream_free(owner);

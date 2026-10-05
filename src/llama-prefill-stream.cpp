@@ -13,6 +13,7 @@
 
 #include "llama-moe-gen5.h"
 #include "llama-moe-gen5-impl.h"
+#include "llama-moecache.h" // [TAG_FN_R1_PFS_LEND]
 
 #include "llama-impl.h"
 
@@ -70,6 +71,15 @@ struct pfs_state {
     ggml_backend_t     compute  = nullptr;
     ggml_backend_t     copy     = nullptr; // own stream
     bool               own_copy = false;
+
+    // [TAG_FN_R1_PFS_LEND] LLAMA_PREFILL_STREAM_LEND=1: the banks are a range of the hot set's buffer, borrowed while
+    // ubatches stream (lent) and returned before a decode; the aliases are placed there at the first lend
+    bool                  lend        = false;
+    bool                  lent        = false;
+    bool                  lend_ready  = false;
+    bool                  lend_warned = false;
+    ggml_backend_buffer_t lend_buf    = nullptr;
+    uint8_t *             lend_base   = nullptr;
 
     int64_t min_tokens = 32;
     int     n_bufs     = 2;
@@ -288,6 +298,10 @@ void pfs_gate_op(ggml_tensor * dst, int ith, int nth, void * ud) {
     if (!s || L->pos >= (int) s->layers.size() || &s->layers[L->pos] != L) {
         GGML_ABORT("prefill-stream: a graph outlived its stream state");
     }
+    if (s->lend && !s->lent) {
+        // [TAG_FN_R1_PFS_LEND] the banks are the hot set's slots right now: a decode could be reading them
+        GGML_ABORT("prefill-stream: a streamed graph ran while its banks were not borrowed");
+    }
     const int64_t t0 = ggml_time_us();
     pfs_bank & B = s->banks[L->bank];
     bool had = false;
@@ -400,6 +414,10 @@ void pfs_destroy(pfs_state * s) {
     if (s->copy) {
         ggml_backend_synchronize(s->copy);
     }
+    if (s->lent) {
+        llama_moe_hot_unlend(s->owner); // [TAG_FN_R1_PFS_LEND] the hot set gets its range back (no copy runs any more)
+        s->lent = false;
+    }
     for (auto & b : s->banks) {
         if (b.ev_done) { ggml_backend_event_free(b.ev_done); }
         if (b.ev_free) { ggml_backend_event_free(b.ev_free); }
@@ -421,6 +439,85 @@ void pfs_destroy(pfs_state * s) {
 
 } // namespace
 
+// [TAG_FN_R1_PFS_LEND] borrow the banks from the hot set (the owner's graphs are synchronized); the first time, the bank
+// and layer aliases are placed in the lent range, which is the same range every time
+static bool pfs_take(pfs_state * s) {
+    const size_t need = (size_t) s->n_bufs*s->bank_size;
+    ggml_backend_buffer_t buf  = nullptr;
+    uint8_t *             base = nullptr;
+    if (!llama_moe_hot_lend(s->owner, need, &buf, &base)) {
+        if (!s->lend_warned) {
+            s->lend_warned = true;
+            LLAMA_LOG_WARN("prefill-stream: [TAG_FN_R1_PFS_LEND] the hot set cannot lend %.0f MiB (none yet, or too small): this "
+                    "prompt uses the scheduler's op offload\n", need/1048576.0);
+        }
+        return false;
+    }
+    if (!s->lend_ready) {
+        bool ok = true;
+        for (size_t b = 0; b < s->banks.size() && ok; ++b) {
+            ok = ggml_backend_tensor_alloc(buf, s->banks[b].raw, base + b*s->bank_size) == GGML_STATUS_SUCCESS;
+        }
+        for (auto & L : s->layers) {
+            for (int k = 0; k < 3 && ok; ++k) {
+                ok = ggml_backend_tensor_alloc(buf, L.dev[k], base + (size_t) L.bank*s->bank_size + s->off[k]) == GGML_STATUS_SUCCESS;
+            }
+        }
+        if (!ok) {
+            // the aliases cannot be placed: never stream (a partly placed set must not be used)
+            LLAMA_LOG_WARN("prefill-stream: [TAG_FN_R1_PFS_LEND] placing the banks in the lent range failed - stream off\n");
+            llama_moe_hot_unlend(s->owner);
+            s->lend_warned = true;
+            s->min_tokens  = INT64_MAX;
+            return false;
+        }
+        s->lend_buf   = buf;
+        s->lend_base  = base;
+        s->lend_ready = true;
+    } else if (buf != s->lend_buf || base != s->lend_base) {
+        llama_moe_hot_unlend(s->owner); // cannot happen: the hot buffer never moves
+        return false;
+    }
+    {
+        std::lock_guard<std::mutex> lk(s->mtx);
+        for (auto & B : s->banks) {
+            B.holds    = -1;
+            B.complete = false;
+            B.consumed = true;
+            B.used_pos = -1;
+        }
+        s->ctr.lends++;
+    }
+    s->lent = true;
+    return true;
+}
+
+// [TAG_FN_R1_PFS_LEND] give the banks back: the queued and the running copies stop and land, then the hot set refills them
+static void pfs_return(pfs_state * s) {
+    {
+        std::unique_lock<std::mutex> lk(s->mtx);
+        s->gen++; // the running job sees a new generation and stops; queued ones never start
+        std::deque<pfs_job> q;
+        if (s->cur_pos >= 0 && !s->queue.empty()) {
+            q.push_back(s->queue.front()); // the streamer pops its running job itself
+        }
+        s->queue.swap(q);
+        s->cv.notify_all();
+        s->cv_done.wait(lk, [&]() { return s->cur_pos < 0 || s->stop; });
+        for (auto & B : s->banks) {
+            B.holds    = -1;
+            B.complete = false;
+            B.consumed = true;
+            B.used_pos = -1;
+        }
+    }
+    if (s->copy) {
+        ggml_backend_synchronize(s->copy); // what it dispatched has landed
+    }
+    s->lent = false;
+    llama_moe_hot_unlend(s->owner);
+}
+
 bool llama_prefill_stream_init_layers(const std::vector<llama_moe_gen5_layer_desc> & layers, const llama_moe_gen5_device & d, const void * owner) {
     std::lock_guard<std::mutex> init_lock(g_pfs_init);
     if (g_pfs || layers.empty() || !d.compute || !d.buft) {
@@ -435,9 +532,10 @@ bool llama_prefill_stream_init_layers(const std::vector<llama_moe_gen5_layer_des
     s->wrap       = gen5::env_int("LLAMA_PREFILL_STREAM_WRAP", 1, 0, 1) != 0;
     s->stats      = gen5::env_flag("LLAMA_PREFILL_STREAM_STATS");
     s->chunk      = (size_t) gen5::env_int("LLAMA_PREFILL_STREAM_CHUNK_MIB", 32, 1, 256) << 20;
+    s->lend       = gen5::env_int("LLAMA_PREFILL_STREAM_LEND", 0, 0, 1) != 0; // [TAG_FN_R1_PFS_LEND]
     const size_t ring_bytes = (size_t) gen5::env_int("LLAMA_PREFILL_STREAM_RING_MIB", 512, 2, 4096) << 20;
     const int    n_threads  = gen5::env_int("LLAMA_PREFILL_STREAM_THREADS", 8, 1, 64);
-    if (s->min_tokens > 32) {
+    if (s->min_tokens > 32 && !s->lend) { // [TAG_FN_R1_PFS_LEND] a lending stream reserves with the op offload
         LLAMA_LOG_WARN("prefill-stream: LLAMA_PREFILL_STREAM_MIN=%" PRId64 " > 32: ubatches of 32..%" PRId64 " tokens keep the "
                 "op-offload copies, which the compute buffer was not reserved for\n", s->min_tokens, s->min_tokens - 1);
     }
@@ -488,6 +586,13 @@ bool llama_prefill_stream_init_layers(const std::vector<llama_moe_gen5_layer_des
         pfs_bank bank;
         bank.raw = ggml_new_tensor_1d(ctx, GGML_TYPE_I8, (int64_t) s->bank_size);
         ggml_format_name(bank.raw, "pfs_bank.%d", b);
+        if (s->lend) {
+            // [TAG_FN_R1_PFS_LEND] placed in the hot set's range at the first lend (pfs_take)
+            bank.ev_done = gen5::ev_new(d.dev);
+            bank.ev_free = gen5::ev_new(d.dev);
+            s->banks.push_back(bank);
+            continue;
+        }
         bank.buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, d.buft);
         if (!bank.buf) {
             if (b == 0) {
@@ -520,6 +625,9 @@ bool llama_prefill_stream_init_layers(const std::vector<llama_moe_gen5_layer_des
                 const ggml_tensor * t = L.src[k];
                 L.dev[k] = ggml_new_tensor_4d(ctx, t->type, t->ne[0], t->ne[1], t->ne[2], t->ne[3]);
                 ggml_format_name(L.dev[k], "pfs.%d.%s", L.il, nm[k]);
+                if (s->lend) {
+                    continue; // [TAG_FN_R1_PFS_LEND] placed at the first lend
+                }
                 void * addr = (char *) ggml_backend_buffer_get_base(B.buf) + s->off[k];
                 if (ggml_backend_tensor_alloc(B.buf, L.dev[k], addr) != GGML_STATUS_SUCCESS) {
                     return fail("alias allocation failed");
@@ -568,9 +676,10 @@ bool llama_prefill_stream_init_layers(const std::vector<llama_moe_gen5_layer_des
     s->thr = std::thread(pfs_run, s);
     g_pfs = s;
 
-    LLAMA_LOG_INFO("prefill-stream: %zu host expert layers, ubatches >= %" PRId64 " tokens, %d VRAM bank(s) x %.0f MiB, "
+    LLAMA_LOG_INFO("prefill-stream: %zu host expert layers, ubatches >= %" PRId64 " tokens, %d VRAM bank(s) x %.0f MiB%s, "
             "%s ring %zu x %zu MiB, %d copy threads, wrap %s\n", s->layers.size(), s->min_tokens, s->n_bufs,
-            s->bank_size/1048576.0, s->ring.pinned ? "pinned" : (need_ring ? "plain" : "no"), (size_t) s->n_chunks,
+            s->bank_size/1048576.0, s->lend ? " borrowed from the hot set while a prompt streams [TAG_FN_R1_PFS_LEND]" : "",
+            s->ring.pinned ? "pinned" : (need_ring ? "plain" : "no"), (size_t) s->n_chunks,
             s->chunk >> 20, s->pool.size(), s->wrap ? "on" : "off");
     return true;
 }
@@ -589,6 +698,9 @@ const llama_pfs_view * llama_prefill_stream_lookup(ggml_backend_sched_t sched, c
     pfs_state * s = g_pfs;
     if (!s || n_tokens < s->min_tokens || !gen5::sched_has(sched, s->compute)) {
         return nullptr;
+    }
+    if (s->lend && !s->lent) {
+        return nullptr; // [TAG_FN_R1_PFS_LEND] not borrowed (also at the reserve): the scheduler's op offload
     }
     auto it = s->by_up.find(up_exps);
     return it != s->by_up.end() ? &s->layers[it->second].view : nullptr;
@@ -619,4 +731,23 @@ llama_pfs_counters llama_prefill_stream_get_counters() {
     }
     std::lock_guard<std::mutex> lk(s->mtx);
     return s->ctr;
+}
+
+bool llama_prefill_stream_before_ubatch(const void * owner, ggml_backend_sched_t sched, int64_t n_tokens) {
+    pfs_state * s = g_pfs;
+    if (!s || !s->lend || s->owner != owner) {
+        return false;
+    }
+    const bool want = n_tokens >= s->min_tokens;
+    if (want == s->lent) {
+        return false;
+    }
+    if (sched) {
+        ggml_backend_sched_synchronize(sched); // the owner's last graph is done: nothing reads the slots or the banks
+    }
+    if (want) {
+        return pfs_take(s);
+    }
+    pfs_return(s);
+    return true;
 }
