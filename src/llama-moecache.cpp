@@ -197,6 +197,10 @@ struct moe_cache {
     uint64_t              sd_folds    = 0;
     std::atomic<uint64_t> st_step_us  { 0 };   // [TAG_FN_L3_POLICY] LLAMA_MOE_HOT_STATS: host time of the owner's steps
     std::atomic<uint64_t> st_step_n   { 0 };
+
+    // [TAG_FN_L3_POLICY_STATE] the owner's step, the lend / unlend and the saves change or read the bookkeeping: one at a
+    // time, also when a step runs on a helper thread while the server saves a slot. Taken before wmtx, never inside it.
+    std::mutex            step_mtx;
 };
 
 moe_cache * g_cache = nullptr;
@@ -1354,6 +1358,7 @@ void hot_adapt_step_impl(moe_cache * mc) {
 
 // [TAG_FN_L3_POLICY] LLAMA_MOE_HOT_STATS: the step's host time (it runs between two graphs, so it adds to the step)
 void hot_adapt_step(moe_cache * mc) {
+    std::lock_guard<std::mutex> slk(mc->step_mtx); // [TAG_FN_L3_POLICY_STATE]
     if (!mc->ad_stats) {
         hot_adapt_step_impl(mc);
         return;
@@ -2108,6 +2113,7 @@ const void * llama_moe_hot_adapt_owner() {
 void llama_moe_hot_save_now(const void * owner) {
     moe_cache * mc = g_cache;
     if (mc && mc->adapt && mc->owner == owner) {
+        std::lock_guard<std::mutex> slk(mc->step_mtx); // [TAG_FN_L3_POLICY_STATE]
         hot_adapt_save(mc);
     }
 }
@@ -2311,6 +2317,7 @@ bool llama_moe_hot_lend(const void * owner, size_t bytes, ggml_backend_buffer_t 
     if (mc->adapt && owner != mc->owner) {
         return false;
     }
+    std::lock_guard<std::mutex> slk(mc->step_mtx); // [TAG_FN_L3_POLICY_STATE]
     if (mc->lent_any) {
         *out_buf  = g_lend.buf;
         *out_base = g_lend.lo;
@@ -2419,6 +2426,10 @@ void llama_moe_hot_unlend(const void * owner) {
         return;
     }
     if (mc->adapt && owner != mc->owner) {
+        return;
+    }
+    std::lock_guard<std::mutex> slk(mc->step_mtx); // [TAG_FN_L3_POLICY_STATE]
+    if (!mc->lent_any) {
         return;
     }
     const int64_t t0 = ggml_time_us();
@@ -2660,7 +2671,8 @@ void hot_state_load(moe_cache * mc) {
 
 void llama_moe_hot_state_save(const void * owner) {
     moe_cache * mc = g_cache;
-    if (mc && mc->adapt && mc->owner == owner) {
+    if (mc && mc->adapt && mc->owner == owner && !mc->st_path.empty()) {
+        std::lock_guard<std::mutex> slk(mc->step_mtx);
         hot_state_save(mc);
     }
 }
