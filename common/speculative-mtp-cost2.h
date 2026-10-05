@@ -24,9 +24,12 @@
 //   draft once more          E_p[max(0, P * a(p) - lam * dV(R))] >= lam * t_d  p: the drafter's confidence at that
 //                                                                             position, from its own history
 // a(p) is the acceptance calibrated per drafter confidence bin and draft position (version 1's calibration). Medians of
-// recent steps drop stalls (page-ins, a prompt between steps); the draft decode time is a median too. A probe step (the
-// p_min rule) every N policy steps keeps the longer widths measured. Exact: only the draft length changes, the target
-// verifies every draft. Pure arithmetic, no llama calls: tests/test-mtp-cost2.cpp drives it with simulated steps.
+// recent steps drop stalls (page-ins, a prompt between steps); the draft decode time is a median too. The first steps
+// after a prompt and the steps of a paused bridge (no cold counts) are no regression samples. A probe step (the p_min
+// rule) every N policy steps keeps the longer widths measured, and a guard compares the policy's realized rate with the
+// probes' over the same window: a policy that does clearly worse hands the steps to the rule for a while. Exact: only
+// the draft length changes, the target verifies every draft. Pure arithmetic, no llama calls: tests/test-mtp-cost2.cpp
+// drives it with simulated steps.
 
 #include "speculative-mtp-cost.h"
 

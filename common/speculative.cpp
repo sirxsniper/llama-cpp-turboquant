@@ -3482,6 +3482,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     uint64_t                        c2_n_none    = 0;     // policy steps that drafted nothing
     int32_t                         c2_skip      = 0;     // steps after a prompt still to leave out of the samples
     int64_t                         c2_guards    = 0;     // guard events logged
+    FILE *                          c2_trace     = nullptr; // SPEC_MTP_COST2_TRACE=<file>: one CSV line per kept step
     std::vector<uint64_t>           c2_hist;              // policy draft lengths (per drafting sequence)
 
     // [TAG_FN_L3_MTP_CHAIN] SPEC_MTP_PMIN_POS=<p1,p2,...> on qwen4exp: the p_min rule's threshold per draft position (the
@@ -3703,6 +3704,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 c2_ps.assign(n_seq, {});
                 c2_mode.assign(n_seq, 0);
                 c2_hist.assign((size_t) std::max(1, this->params.n_max) + 1, 0);
+                if (const char * tp = getenv("SPEC_MTP_COST2_TRACE"); tp && tp[0]) {
+                    c2_trace = fopen(tp, "a");
+                    if (!c2_trace) {
+                        LOG_WRN("%s: [TAG_FN_L3_MTP_COST2] cannot open SPEC_MTP_COST2_TRACE=%s\n", __func__, tp);
+                    }
+                }
                 LOG_INF("%s: [TAG_FN_L3_MTP_COST2] MTP draft length v2 on: n_max %d is the cap, the p_min rule in warm-up (%d "
                         "steps) and probes (every %d); a verify row is priced by %s; prior %.0f us per cold expert-layer, "
                         "%.0f us per row besides, %.0f new cold expert-layers per row; log %d\n", __func__,
@@ -3764,6 +3771,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     }
 
     ~common_speculative_impl_draft_mtp() override {
+        if (c2_trace) {
+            fclose(c2_trace); // [TAG_FN_L3_MTP_COST2]
+            c2_trace = nullptr;
+        }
         auto * ctx_dft = this->params.ctx_dft;
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) backend_chains.size(); ++seq_id) {
             if (backend_chains[seq_id] == nullptr) {
@@ -4067,6 +4078,17 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                         tok += c2_acc[s] >= 0 ? 1.0 + c2_acc[s] : 0.0;
                     }
                     cost2.add_cycle(tok, (double) (t0 - c2_t_start), c2_policy);
+                    if (c2_trace) {
+                        // rows, policy, tokens, rest-of-step us, whole step us, k, rate (tok/ms), dV(rows) us, C(1..rows)
+                        fprintf(c2_trace, "%d,%d,%.0f,%lld,%lld,%.2f,%.5f,%.0f", c2_proc_rows, c2_policy ? 1 : 0, tok,
+                                (long long) (t0 - c2_t_end), (long long) (t0 - c2_t_start), cost2.k_, cost2.lam_*1000.0,
+                                cost2.dV(c2_proc_rows));
+                        for (int32_t t = 0; t < c2_proc_rows; ++t) {
+                            fprintf(c2_trace, ",%u", cold_ok ? c2_cold[t] : 0u);
+                        }
+                        fprintf(c2_trace, "%s\n", cold_ok ? "" : ",nocold");
+                        fflush(c2_trace); // the harness may terminate the server without an exit
+                    }
                 }
             }
             c2_t_start = t0;
