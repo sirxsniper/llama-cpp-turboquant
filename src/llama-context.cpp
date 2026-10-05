@@ -84,6 +84,8 @@ struct llama_context::step_worker {
                 j();
             } catch (const std::exception & e) {
                 LLAMA_LOG_ERROR("%s: [TAG_FN_L3_HOST_STEP] the step failed: %s\n", __func__, e.what());
+            } catch (...) {
+                LLAMA_LOG_ERROR("%s: [TAG_FN_L3_HOST_STEP] the step failed\n", __func__);
             }
             {
                 std::lock_guard<std::mutex> lk(mtx);
