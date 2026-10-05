@@ -110,12 +110,22 @@ hot set keeps the difference as extra slots:
   resident experts come back (through the upload worker by default, see `LLAMA_FN_CBUF_ASYNC`), and the SMALL reserve is
   allocated. The device use never passes the larger of the two states'; the log prints it at each switch
   (`cbuf_set: [TAG_FN_L3_VRAM_CBUF] -> FULL / SMALL`).
+- Layers past the trunk (an MTP block, when its experts are on the host) are placed below the tail, so the tail never
+  holds a layer that the draft context reads while a prompt runs.
+- Failures stay local: a FULL reserve that fails returns to SMALL and fails that batch only; a tail that cannot be
+  mapped again leaves its layers on the host and is tried again every 64 narrow batches; a hot set with a tail that
+  cannot be allocated falls back to the FULL reserve and a hot set without one. The bridge reads the hot tables through
+  `llama_moe_cache_lookup_table`, which also answers while the tail is out.
+- Exactness: with `-b` equal to `-ub` every batch is one ubatch, so a prompt never runs a narrow ubatch with the tail
+  out, and a decode always sees the whole hot set: the outputs equal the lend-off run with the same hot set (static
+  profile, MTP off). With `-b` larger than `-ub`, a prompt's trailing ubatch of at most 8 tokens computes the tail
+  layers' experts on the host (placement noise, the early9 KLD band).
 
 | Variable | Default | Meaning |
 |---|---|---|
 | `LLAMA_FN_CBUF` | 0 | the compute-buffer lend |
 | `LLAMA_FN_CBUF_SMALL_T` | 31 | widest graph of the SMALL reserve (clamped to 8 .. `GGML_OP_OFFLOAD_MIN_BATCH` - 1) |
-| `LLAMA_FN_CBUF_POOL_MIB` | 0 | extra tail for the pool growth of a FULL prompt (the FULL-state device use then stays at the SMALL state's) |
+| `LLAMA_FN_CBUF_POOL_MIB` | 0 | N MiB more for the hot set and N MiB more in its tail: between prompts the experts use the room that a prompt's pool growth takes while the tail is out (the pools are trimmed at each return to SMALL). The FULL-state device use does not change; the SMALL state's grows by N - keep N at or below the measured pool growth of a FULL period (the `-> SMALL` line prints it) or the room under the 28,500 MiB peak |
 | `LLAMA_FN_CBUF_TRIM` | 1 | trim the trunk backend's pools at each return to SMALL |
 | `LLAMA_FN_CBUF_ASYNC` | 1 | with the adaptive hot set the tail's resident experts come back through its upload worker and are published as they land (the host computes them until then), so the first decode step after a prompt does not wait for the refill; 0 = a synchronous refill before that step (also the path of a static hot set) |
 | `LLAMA_FN_CBUF_REFILL_THREADS` | 8 | copy threads of the synchronous refill (mmap -> pinned halves -> device) |

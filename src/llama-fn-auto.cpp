@@ -483,6 +483,16 @@ bool llama_fn_cbuf_fits(size_t budget, size_t tail, size_t stream_lend) {
     return tail > 0 && budget >= need;
 }
 
+size_t llama_fn_cbuf_budget(size_t budget, size_t pool_extra, size_t free, size_t budget_max) {
+    const size_t keep = (size_t) 256 << 20;
+    const size_t room = free > keep ? free - keep : 0;
+    size_t b = budget + pool_extra;
+    if (b > room) {
+        b = std::max(budget, room);
+    }
+    return std::min(b, budget_max);
+}
+
 // [TAG_FN_RAM_FIT] -------------------------------------------------------------------------------------------------
 
 llama_ram_fit_out llama_ram_fit_plan(const llama_ram_fit_in & in) {

@@ -117,6 +117,9 @@ LLAMA_API size_t   llama_fn_cbuf_tail(size_t full, size_t small, size_t pool_ext
 LLAMA_API int      llama_fn_cbuf_first_tail_layer(const std::vector<size_t> & layer_bytes, size_t tail_bytes);
 // the budget holds the tail, the prefill stream's lend range and about one layer (budget / 32) between them, plus slack
 LLAMA_API bool     llama_fn_cbuf_fits(size_t budget, size_t tail, size_t stream_lend);
+// the hot-set budget with the lend: the fit's budget plus pool_extra (LLAMA_FN_CBUF_POOL_MIB, also in the tail), never
+// above budget_max nor above free - 256 MiB (unless the fit's budget already is)
+LLAMA_API size_t   llama_fn_cbuf_budget(size_t budget, size_t pool_extra, size_t free, size_t budget_max);
 
 //
 // model hooks (src/llama.cpp) and lookups

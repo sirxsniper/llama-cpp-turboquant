@@ -3357,6 +3357,13 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     if (cbuf_state != CBUF_OFF && !cbuf_set(n_tokens_all > cbuf_small_t)) {
         return -2;
     }
+    if (cbuf_state == CBUF_SMALL && llama_moe_hot_cbuf_out()) {
+        if (++cbuf_n_retry % 64 == 0) {
+            cbuf_retry_restore(); // the tail could not come back at the switch: try again now and then
+        }
+    } else {
+        cbuf_n_retry = 0;
+    }
 
     // [TAG_FN_L3_VRAM_ACCOUNT] device use when the batches change from prompts to decodes and back (the state the last
     // period left: a prompt's pool growth and lazily loaded kernels show up at the first narrow batch after it)
@@ -5389,9 +5396,17 @@ void llama_context::moe_hot_fit_try() {
         cbuf_off(); // [TAG_FN_L3_VRAM_CBUF]
         return;
     }
-    // [TAG_FN_L3_VRAM_CBUF] the tail, the stream's lend range and the tables must fit the budget together, with one layer
-    // left between them (the even split gives every layer the same size, so 1/48 of the budget is about one layer)
+    // [TAG_FN_L3_VRAM_CBUF] LLAMA_FN_CBUF_POOL_MIB: the hot set also gets the room a prompt's pool growth takes (in its tail
+    // while the prompt runs, trimmed at each return to SMALL). The tail, the stream's lend range and the tables must fit
+    // the budget together, with one layer left between them (the even split gives every layer the same size, so 1/48 of
+    // the budget is about one layer)
     if (cbuf_tail > 0) {
+        const size_t b0 = budget;
+        budget = llama_fn_cbuf_budget(budget, cbuf_pool_mib << 20, mem_free, budget_max);
+        if (budget != b0) {
+            LLAMA_LOG_INFO("moe-hot: [TAG_FN_L3_VRAM_CBUF] hot set budget %.0f -> %.0f MiB (LLAMA_FN_CBUF_POOL_MIB=%zu: the tail "
+                    "gives the same back while a prompt runs)\n", b0/MiB, budget/MiB, cbuf_pool_mib);
+        }
         const size_t stream = llama_prefill_stream_lend_bytes(this);
         if (!llama_fn_cbuf_fits(budget, cbuf_tail, stream)) {
             LLAMA_LOG_WARN("moe-hot: [TAG_FN_L3_VRAM_CBUF] the budget %.0f MiB cannot hold a %.0f MiB tail beside the stream's "
@@ -5406,7 +5421,17 @@ void llama_context::moe_hot_fit_try() {
             }
         }
     }
-    if (llama_moe_hot_init(model, this, budget, cbuf_tail)) {
+    bool hot_ok = llama_moe_hot_init(model, this, budget, cbuf_tail);
+    if (!hot_ok && cbuf_tail > 0) {
+        // [TAG_FN_L3_VRAM_CBUF] no hot set with a tail (no virtual-memory buffer): the FULL reserve and a hot set without one
+        LLAMA_LOG_WARN("moe-hot: [TAG_FN_L3_VRAM_CBUF] the hot set with a tail could not be allocated: FULL reserve, no tail\n");
+        cbuf_off();
+        cbuf_tail = 0;
+        ggml_backend_dev_memory(dev, &mem_free, &mem_total);
+        budget = std::min(budget_max, llama_fn_vram_fit_budget(mem_total, mem_free, ceiling, margin));
+        hot_ok = budget > 0 && llama_moe_hot_init(model, this, budget, 0);
+    }
+    if (hot_ok) {
         sched_need_reserve = true;
         const size_t hot = llama_moe_hot_device_bytes();
         LLAMA_LOG_INFO("moe-hot: VRAM fit: hot set %.0f MiB, device use about %.0f MiB with it (ceiling %.0f MiB)\n",
@@ -5416,8 +5441,8 @@ void llama_context::moe_hot_fit_try() {
                     "tokens) instead of %.0f MiB; the hot set's %.0f MiB tail gives its VRAM back to a wider batch\n",
                     cbuf_small_b/MiB, cbuf_small_t, cbuf_full_b/MiB, llama_moe_hot_cbuf_tail_bytes()/MiB);
         }
-    } else if (cbuf_tail > 0) {
-        cbuf_off(); // no hot set: the FULL reserve again
+    } else {
+        cbuf_off(); // [TAG_FN_L3_VRAM_CBUF] no hot set: the FULL reserve again (nothing when the lend is off)
     }
     vram_account("hot set");
 }
@@ -5589,48 +5614,19 @@ bool llama_context::cbuf_set(bool full) {
         try {
             sched_reserve();
         } catch (const std::exception & err) {
-            LLAMA_LOG_ERROR("%s: [TAG_FN_L3_VRAM_CBUF] the FULL reserve failed (%s): this batch fails\n", __func__, err.what());
-            sched_need_reserve = true;
+            // another process holds the VRAM the prompt needs: back to SMALL, so the context stays consistent and the
+            // narrow batches keep running; this batch fails and the next wide one tries again
+            LLAMA_LOG_ERROR("%s: [TAG_FN_L3_VRAM_CBUF] the FULL reserve failed (%s): back to SMALL, this batch fails\n",
+                    __func__, err.what());
+            cbuf_to_small(dev, trimmed, restored);
             return false;
         }
         cbuf_n_full++;
     } else {
         // the stream's banks come back while FULL is still there (no VRAM moves), then FULL goes, then the tail returns
         llama_moe_gen5_before_ubatch(this, sched.get(), 0);
-        cbuf_state = CBUF_SMALL;
-        cbuf_free_compute();
-        if (cbuf_trim) {
-            // [TAG_FN_L3_VRAM_TRIM] the temporaries of the prompt's kernels: the decode needs a fraction of them
-            for (auto & backend : backends) {
-                ggml_backend_dev_t d = ggml_backend_get_device(backend.get());
-                if (d != dev) {
-                    continue;
-                }
-                ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(d);
-                auto * trim = reg ? (size_t (*)(ggml_backend_t, size_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_pool_trim") : nullptr;
-                if (trim) {
-                    trimmed += trim(backend.get(), 0);
-                }
-            }
-        }
-        restored = llama_moe_hot_cbuf_restore(this);
-        try {
-            sched_reserve();
-        } catch (const std::exception & err) {
-            // the tail took VRAM the SMALL reserve needs (another process grew): give it back, its layers sit out
-            LLAMA_LOG_ERROR("%s: [TAG_FN_L3_VRAM_CBUF] the SMALL reserve failed (%s): the tail goes out again\n", __func__,
-                    err.what());
-            llama_moe_hot_cbuf_release(this);
-            restored           = false;
-            sched_need_reserve = true;
-            try {
-                sched_reserve();
-            } catch (const std::exception & err2) {
-                LLAMA_LOG_ERROR("%s: [TAG_FN_L3_VRAM_CBUF] the SMALL reserve failed again (%s): this batch fails\n",
-                        __func__, err2.what());
-                sched_need_reserve = true;
-                return false;
-            }
+        if (!cbuf_to_small(dev, trimmed, restored)) {
+            return false;
         }
         cbuf_n_small++;
     }
@@ -5654,6 +5650,68 @@ bool llama_context::cbuf_set(bool full) {
     }
     vram_account(full ? "cbuf FULL" : "cbuf SMALL");
     return true;
+}
+
+// the SMALL state from FULL (or from a failed FULL reserve): the compute buffers go, the pools give back what the prompt
+// grew, the tail is mapped and refilled, then SMALL is reserved. A SMALL reserve that fails gives the tail back (its layers
+// sit out) and tries once more. false: no reserve now (the next batch tries again).
+bool llama_context::cbuf_to_small(ggml_backend_dev_t dev, size_t & trimmed, bool & restored) {
+    cbuf_state = CBUF_SMALL;
+    cbuf_free_compute();
+    if (cbuf_trim) {
+        // [TAG_FN_L3_VRAM_TRIM] the temporaries of the prompt's kernels: the decode needs a fraction of them
+        for (auto & backend : backends) {
+            ggml_backend_dev_t d = ggml_backend_get_device(backend.get());
+            if (d != dev) {
+                continue;
+            }
+            ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(d);
+            auto * trim = reg ? (size_t (*)(ggml_backend_t, size_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_pool_trim") : nullptr;
+            if (trim) {
+                trimmed += trim(backend.get(), 0);
+            }
+        }
+    }
+    restored = llama_moe_hot_cbuf_restore(this);
+    try {
+        sched_reserve();
+        return true;
+    } catch (const std::exception & err) {
+        // the tail took VRAM the SMALL reserve needs (another process grew): give it back, its layers sit out
+        LLAMA_LOG_ERROR("%s: [TAG_FN_L3_VRAM_CBUF] the SMALL reserve failed (%s): the tail goes out again\n", __func__,
+                err.what());
+    }
+    llama_moe_hot_cbuf_release(this);
+    restored           = false;
+    sched_need_reserve = true;
+    try {
+        sched_reserve();
+        return true;
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: [TAG_FN_L3_VRAM_CBUF] the SMALL reserve failed again (%s): this batch fails\n", __func__,
+                err.what());
+    }
+    sched_need_reserve = true;
+    return false;
+}
+
+// a tail that could not be mapped again at the return to SMALL (another process held the VRAM): try now, between two
+// batches; graphs built while it was out lack its hot chain, so they are built again
+void llama_context::cbuf_retry_restore() {
+    llama_perf_hold hold(n_queued_tokens, t_compute_start_us);
+    synchronize();
+    if (!llama_moe_hot_cbuf_restore(this)) {
+        return;
+    }
+    for (auto & res : gf_res_prev) {
+        if (res) {
+            res->reset();
+        }
+    }
+    gf_res_prev_reset_all();
+    gf_res_prev_active = nullptr;
+    LLAMA_LOG_INFO("%s: [TAG_FN_L3_VRAM_CBUF] the tail is mapped again (retry after %" PRIu64 " narrow batches)\n", __func__,
+            cbuf_n_retry);
 }
 
 // [TAG_FN_L3_VRAM_ACCOUNT] ------------------------------------------------------------------------------------------

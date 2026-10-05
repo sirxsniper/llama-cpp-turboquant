@@ -397,6 +397,15 @@ static void test_cbuf() {
     TCHECK(llama_fn_cbuf_fits(b_new, tail, 3900 * MiB), "13.8 GB hot set: the tail beside the stream's banks fits");
     TCHECK(!llama_fn_cbuf_fits(7 * 1024 * MiB, tail, 3900 * MiB), "7 GB: it does not");
     TCHECK(!llama_fn_cbuf_fits(b_new, 0, 3900 * MiB), "no tail: nothing to fit");
+
+    // LLAMA_FN_CBUF_POOL_MIB also grows the budget: up to free - 256 MiB and the LLAMA_FN_HOT_BUDGET_MAX_MIB cap
+    const size_t free_v = 15000 * MiB;
+    TCHECK(llama_fn_cbuf_budget(b_new, 0, free_v, SIZE_MAX) == b_new, "no extra: the fit's budget");
+    TCHECK(llama_fn_cbuf_budget(b_new, 512 * MiB, free_v, SIZE_MAX) == b_new + 512 * MiB, "+512 MiB");
+    TCHECK(llama_fn_cbuf_budget(b_new, 4096 * MiB, free_v, SIZE_MAX) == free_v - 256 * MiB, "never above free - 256 MiB");
+    TCHECK(llama_fn_cbuf_budget(free_v, 512 * MiB, free_v, SIZE_MAX) == free_v, "a budget already above it stays");
+    TCHECK(llama_fn_cbuf_budget(b_new, 512 * MiB, free_v, 8000 * MiB) == 8000 * MiB, "the cap wins");
+    TCHECK(llama_fn_cbuf_budget(b_new, 512 * MiB, 0, SIZE_MAX) == b_new, "free unknown (0): the fit's budget");
 }
 
 static void test_ram_fit() {

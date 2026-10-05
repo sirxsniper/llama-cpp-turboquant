@@ -436,10 +436,13 @@ private:
     double   cbuf_ms_full   = 0.0;
     double   cbuf_ms_small  = 0.0;
     size_t   cbuf_peak      = 0;   // the most device use (all processes) seen at a switch
+    uint64_t cbuf_n_retry   = 0;   // narrow batches since the last return to SMALL left the tail out
     bool     cbuf_wanted() const;
     size_t   cbuf_prepare(ggml_backend_dev_t dev);
     void     cbuf_off();
     bool     cbuf_set(bool full);
+    bool     cbuf_to_small(ggml_backend_dev_t dev, size_t & trimmed, bool & restored);
+    void     cbuf_retry_restore();
     void     cbuf_free_compute();
     size_t   cbuf_compute_bytes(ggml_backend_dev_t dev) const;
     uint32_t reserve_n_tokens() const;
