@@ -943,6 +943,7 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
     res->t_embd = cur;
 
     cur = build_lora_mm(model.output, cur, model.output_s);
+    qwen4exp_l3_mark_mm(cur, l3.mmvd); // [TAG_FN_L3_GPU_MMV] the output head
     cb(cur, "result_output", -1);
     res->t_logits = cur;
 
@@ -1161,6 +1162,7 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
         const int64_t n_out = cur->ne[1];
 
         ggml_tensor * draft = ggml_mul_mat(ctx0, head_c->w, cur);
+        qwen4exp_l3_mark_mm(draft, l3.mmvd); // [TAG_FN_L3_GPU_MMV] the compact draft head
         if (head_s) {
             draft = ggml_mul(ctx0, draft, head_s);
         }
@@ -1177,6 +1179,7 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
         ggml_tensor * normed  = cur;
 
         cur = ggml_mul_mat(ctx0, ggml_view_2d(ctx0, head_w, head_w->ne[0], n_rows, head_w->nb[1], 0), normed);
+        qwen4exp_l3_mark_mm(cur, l3.mmvd); // [TAG_FN_L3_GPU_MMV] the draft head rows
         if (head_s) {
             cur = ggml_mul(ctx0, cur, head_s); // [TAG_FN_MTP_HEAD_IDS] the per-tensor scale, as build_lora_mm applies it
         }
@@ -1209,6 +1212,7 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
             }
         }
         cur = build_lora_mm(head_w, cur, head_s);
+        qwen4exp_l3_mark_mm(cur, l3.mmvd); // [TAG_FN_L3_GPU_MMV] the full draft head
     }
     cb(cur, "result_output", -1);
     res->t_logits = cur;
