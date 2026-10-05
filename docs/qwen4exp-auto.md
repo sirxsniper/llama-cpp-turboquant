@@ -112,7 +112,8 @@ hot set keeps the difference as extra slots:
   (`cbuf_set: [TAG_FN_L3_VRAM_CBUF] -> FULL / SMALL`).
 - Layers past the trunk (an MTP block, when its experts are on the host) are placed below the tail, so the tail never
   holds a layer that the draft context reads while a prompt runs.
-- Failures stay local: a FULL reserve that fails returns to SMALL and fails that batch only; a tail that cannot be
+- Failures stay local: a FULL reserve that fails returns to SMALL and fails that batch only (so does a reserve left
+  pending by a failed switch: decode returns -2 instead of throwing); a tail that cannot be
   mapped again leaves its layers on the host and is tried again every 64 narrow batches; a hot set with a tail that
   cannot be allocated falls back to the FULL reserve and a hot set without one. The bridge reads the hot tables through
   `llama_moe_cache_lookup_table`, which also answers while the tail is out.
@@ -127,6 +128,7 @@ hot set keeps the difference as extra slots:
 | `LLAMA_FN_CBUF_SMALL_T` | 31 | widest graph of the SMALL reserve (clamped to 8 .. `GGML_OP_OFFLOAD_MIN_BATCH` - 1) |
 | `LLAMA_FN_CBUF_POOL_MIB` | 0 | N MiB more for the hot set and N MiB more in its tail: between prompts the experts use the room that a prompt's pool growth takes while the tail is out (the pools are trimmed at each return to SMALL). The FULL-state device use does not change; the SMALL state's grows by N - keep N at or below the measured pool growth of a FULL period (the `-> SMALL` line prints it) or the room under the 28,500 MiB peak |
 | `LLAMA_FN_CBUF_TRIM` | 1 | trim the trunk backend's pools at each return to SMALL |
+| `LLAMA_FN_CBUF_EAGER` | 1 | return to SMALL at the end of a FULL batch that did not fill `-b` (the last batch of a prompt with one stream), so the switch belongs to the prompt and the tail's refill starts before the first decode step; 0 = at the first narrow batch. Batches of exactly `-b` tokens stay FULL (KLD runs, multi-batch prompts) |
 | `LLAMA_FN_CBUF_ASYNC` | 1 | with the adaptive hot set the tail's resident experts come back through its upload worker and are published as they land (the host computes them until then), so the first decode step after a prompt does not wait for the refill; 0 = a synchronous refill before that step (also the path of a static hot set) |
 | `LLAMA_FN_CBUF_REFILL_THREADS` | 8 | copy threads of the synchronous refill (mmap -> pinned halves -> device) |
 | `LLAMA_FN_HOT_BUDGET_MAX_MIB` | unset | upper bound on the VRAM fit's hot-set budget (any lend setting; used to give two configurations the same hot set) |

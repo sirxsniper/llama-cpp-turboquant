@@ -3374,7 +3374,18 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         }
     }
 
-    sched_reserve();
+    if (cbuf_state != CBUF_OFF) {
+        // [TAG_FN_L3_VRAM_CBUF] a reserve left pending by a failed switch fails this batch, not the process
+        try {
+            sched_reserve();
+        } catch (const std::exception & err) {
+            LLAMA_LOG_ERROR("%s: [TAG_FN_L3_VRAM_CBUF] the compute reserve failed (%s): this batch fails\n", __func__, err.what());
+            sched_need_reserve = true;
+            return -2;
+        }
+    } else {
+        sched_reserve();
+    }
 
     bool did_optimize = false;
 
@@ -3768,6 +3779,13 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     }
     llama_moe_cache_step(this);
     llama_moe_gen5_step(this); // [TAG_MOE_DMA_SHARE] ring admission and stats, owner only
+
+    // [TAG_FN_L3_VRAM_CBUF] LLAMA_FN_CBUF_EAGER (default 1): a FULL batch that did not fill n_batch ends a prompt (one
+    // stream), so the return to SMALL happens now: its cost belongs to the prompt, and the tail's refill starts before
+    // the first decode step. The outputs are in host buffers once cbuf_set has synchronized.
+    if (cbuf_state == CBUF_FULL && cbuf_eager && n_tokens_all < cparams.n_batch) {
+        cbuf_set(false);
+    }
 
     return 0;
 }
@@ -5545,6 +5563,9 @@ size_t llama_context::cbuf_prepare(ggml_backend_dev_t dev) {
     }
     if (const char * e = getenv("LLAMA_FN_CBUF_TRIM")) {
         cbuf_trim = atoi(e) != 0;
+    }
+    if (const char * e = getenv("LLAMA_FN_CBUF_EAGER")) {
+        cbuf_eager = atoi(e) != 0;
     }
     llama_perf_hold hold(n_queued_tokens, t_compute_start_us);
     synchronize();

@@ -431,6 +431,7 @@ private:
     size_t   cbuf_small_b   = 0;
     size_t   cbuf_pool_mib  = 0;   // LLAMA_FN_CBUF_POOL_MIB: extra tail for the pool growth of a FULL prompt
     bool     cbuf_trim      = true;
+    bool     cbuf_eager     = true;  // LLAMA_FN_CBUF_EAGER: return to SMALL at the end of a prompt's last (partial) batch
     uint64_t cbuf_n_full    = 0;
     uint64_t cbuf_n_small   = 0;
     double   cbuf_ms_full   = 0.0;
