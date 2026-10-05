@@ -74,12 +74,14 @@
 //   LLAMA_MOE_BRIDGE_PF_RANK=1            [TAG_FN_L3_CPU_PFRANK] the host-router prefetch pulls by rank (every token's
 //                                         most likely expert first) instead of in expert order, so a stopped prefetch
 //                                         holds the likeliest experts
-//   LLAMA_MOE_BRIDGE_PF_DEV=1             [TAG_FN_L3_CPU_DEVPRED] (with LLAMA_MOE_BRIDGE_PF=1) the device predicts: after
+//   LLAMA_MOE_BRIDGE_PF_DEV=1|2           [TAG_FN_L3_CPU_DEVPRED] (with LLAMA_MOE_BRIDGE_PF=1) the device predicts: after
 //                                         each post the graph applies the next layer's router to this layer's input
 //                                         (top LLAMA_MOE_BRIDGE_PF_K per token) and writes the ids to the channel; the
 //                                         executor prefetches from them (by rank) with no router on the host and no
 //                                         f16 router copies (-117 MiB RAM); LLAMA_MOE_BRIDGE_PF_DEV_WAIT_US=50 bounds the
-//                                         wait for a hint that is late
+//                                         wait for a hint that is late. 2: the router's input is the next layer's own FFN
+//                                         mixer (hyper-connection norm and gates) applied to this layer's residual, a
+//                                         closer stand-in for that layer's input (a few more small kernels after the post)
 
 #include <cstdint>
 
@@ -95,8 +97,10 @@ void               llama_moe_bridge_free(llama_moe_bridge * br);
 bool               llama_moe_bridge_wanted(const llama_model & model);
 // [TAG_FN_R2_BRIDGE_SYNC] the bridge exists, is paused or off, and LLAMA_MOE_BRIDGE_SYNC is on
 bool               llama_moe_bridge_sync(const llama_moe_bridge * br);
-// [TAG_FN_L3_CPU_DEVPRED] predicted ids per token a graph writes after each post (0: no hints)
+// [TAG_FN_L3_CPU_DEVPRED] predicted ids per token a graph writes after each post (0: no hints), and the input of the
+// prediction: 1 = this layer's FFN input, 2 = the next layer's FFN mixer on this layer's residual (0: no hints)
 int                llama_moe_bridge_hint_k(const llama_moe_bridge * br);
+int                llama_moe_bridge_hint_mode(const llama_moe_bridge * br);
 
 // [TAG_FN_R4_BRIDGE_DMA] LLAMA_MOE_BRIDGE_DMA=1 (with LLAMA_MOE_DMA_SHARE=<share>|auto): after llama_moe_gen5_init (bridge
 // mode) and before the reserve, register the DMA ring with the device side; the bridged graphs then fetch a share of

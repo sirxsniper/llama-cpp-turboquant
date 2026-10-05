@@ -1114,8 +1114,10 @@ struct llm_graph_context {
     const llama_moe_bridge * moe_bridge_sync = nullptr; // [TAG_FN_R2_BRIDGE_SYNC] see llm_graph_params
     mutable bool moe_bridge_defer = false;
     // [TAG_FN_L3_CPU_DEVPRED] set by an arch before build_moe_ffn, which takes and clears it: the next layer's router,
-    // whose top-k on this layer's input a bridged post hands to the host as that layer's prefetch hint
+    // whose top-k on this layer's input a bridged post hands to the host as that layer's prefetch hint; and, if set, the
+    // router's input instead of this layer's FFN input ([n_embd, n_tokens], put into the graph after the post)
     mutable ggml_tensor * moe_bridge_hint_router = nullptr;
+    mutable ggml_tensor * moe_bridge_hint_input  = nullptr;
     struct moe_bridge_post {
         ggml_tensor * ticket;
         ggml_tensor * hot;      // the device part, weighted and summed [n_embd, T], or nullptr

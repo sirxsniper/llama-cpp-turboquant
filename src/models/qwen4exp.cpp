@@ -776,6 +776,30 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
     // make sure hc_init is in the same graph split as the first layer (-sm tensor)
     ggml_build_forward_expand(gf, res_hc);
 
+    // [TAG_FN_L3_CPU_DEVPRED] LLAMA_MOE_BRIDGE_PF_DEV=2: the next layer's own FFN mixer (grouped RMSNorm with its gamma,
+    // its stream gates) on this layer's residual is the input of the next layer's router in the prefetch hint. Built
+    // here, the hint puts it into the graph after this layer's post (off the device's critical path). No fused node and
+    // no 1/hc on the stream mean: a positive scale does not change a linear router's top-k.
+    const bool hint_mix = moe_bridge && llama_moe_bridge_hint_mode(moe_bridge) == 2;
+    auto build_hint_mix = [&](ggml_tensor * x, int jl) -> ggml_tensor * {
+        const auto & L = model.layers[jl];
+        if (!L.hc_ffn_norm || !L.hc_ffn_down || !L.hc_ffn_up) {
+            return nullptr;
+        }
+        const int64_t nt = x->ne[2];
+        ggml_tensor * xn = ggml_mul(ctx0, ggml_rms_norm(ctx0, x, hparams.f_norm_rms_eps), L.hc_ffn_norm);
+        xn = ggml_reshape_2d(ctx0, xn, hc * n_embd, nt);
+        ggml_tensor * lo = ggml_silu(ctx0, ggml_scale(ctx0, build_lora_mm(L.hc_ffn_down, xn), 1.0f / (float) hc));
+        ggml_tensor * gated = ggml_mul(ctx0, xn, ggml_sigmoid(ctx0, build_lora_mm(L.hc_ffn_up, lo)));
+        gated = ggml_reshape_3d(ctx0, gated, n_embd, hc, nt);
+        const size_t rs = ggml_row_size(gated->type, n_embd);
+        ggml_tensor * mixed = ggml_cont(ctx0, ggml_view_2d(ctx0, gated, n_embd, nt, rs*hc, 0));
+        for (int64_t c = 1; c < hc; ++c) {
+            mixed = ggml_add(ctx0, mixed, ggml_view_2d(ctx0, gated, n_embd, nt, rs*hc, rs*c));
+        }
+        return mixed;
+    };
+
     for (int il = 0; il < n_layer; ++il) {
         res->t_layer_inp[il] = res_hc;
 
@@ -818,6 +842,9 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
                 model.layers[il].hc_ffn_inject,
                 &inject, il);
 
+        if (hint_mix && il + 1 < n_layer) {
+            moe_bridge_hint_input = build_hint_mix(res_hc, il + 1); // [TAG_FN_L3_CPU_DEVPRED] build_moe_ffn takes it
+        }
         cur = build_layer_ffn(cur, il);
         cb(cur, "ffn_out", il);
 

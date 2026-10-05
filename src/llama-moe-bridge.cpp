@@ -135,6 +135,7 @@ struct llama_moe_bridge {
     bool                                fill_gap     = false; // [TAG_FN_L3_CPU_FILL] LLAMA_MOE_DMA_FILL_GAP (with the DMA share)
     uint64_t                            fill_mask    = 0;     // [TAG_FN_L3_CPU_FILL] LLAMA_MOE_DMA_FILL_CPUS
     int                                 hint_k       = 0;     // [TAG_FN_L3_CPU_DEVPRED] LLAMA_MOE_BRIDGE_PF_DEV: ids per token
+    int                                 hint_mode    = 0;     // [TAG_FN_L3_CPU_DEVPRED] 1: this layer's FFN input, 2: the next layer's FFN mixer
     int                                 hint_wait_us = 50;
     ggml_backend_moe_bridge_read_hint_t fn_read_hint = nullptr;
     pool_get_stats_t                    pool_get_stats = nullptr;
@@ -696,7 +697,7 @@ llama_moe_bridge * llama_moe_bridge_create(const llama_model & model, int n_thre
         const bool stats = env_int("LLAMA_MOE_POOL_STATS", 0) > 0;
         const int  swpf  = std::min(64, std::max(0, env_int("LLAMA_MOE_POOL_SWPF", 0)));
         const bool rank  = env_int("LLAMA_MOE_BRIDGE_PF_RANK", 0) > 0;
-        const bool dev   = env_int("LLAMA_MOE_BRIDGE_PF_DEV", 0) > 0;
+        const int  dev   = std::min(2, std::max(0, env_int("LLAMA_MOE_BRIDGE_PF_DEV", 0)));
         const int  exec  = env_int("LLAMA_MOE_POOL_EXEC_CPU", -1);
         const int  pfs   = env_int("LLAMA_MOE_POOL_PF_STREAMS", 1);
         const bool fgap  = env_int("LLAMA_MOE_DMA_FILL_GAP", 0) > 0;
@@ -706,12 +707,13 @@ llama_moe_bridge * llama_moe_bridge_create(const llama_model & model, int n_thre
             br->pool_swpf  = swpf;
             br->pool_stats = stats;
             br->pf_rank    = rank;
-            br->hint_k     = dev ? 1 : 0; // the count is set with the prefetch below
+            br->hint_k     = dev > 0 ? 1 : 0; // the count is set with the prefetch below
+            br->hint_mode  = dev;
             br->exec_cpu   = exec >= 0 && exec < GGML_MAX_N_THREADS ? exec : -1;
             br->pf_streams = std::min(8, std::max(1, pfs));
             br->fill_gap   = fgap;
             br->fill_mask  = fm && fm[0] ? strtoull(fm, nullptr, 16) : 0;
-        } else if (split != 0 || swpf != 0 || stats || rank || dev || exec >= 0 || pfs > 1 || fgap || (fm && fm[0])) {
+        } else if (split != 0 || swpf != 0 || stats || rank || dev > 0 || exec >= 0 || pfs > 1 || fgap || (fm && fm[0])) {
             LLAMA_LOG_WARN("%s: LLAMA_MOE_POOL_SPLIT / _SWPF / _STATS / _EXEC_CPU / _PF_STREAMS, LLAMA_MOE_BRIDGE_PF_RANK / _PF_DEV and "
                     "LLAMA_MOE_DMA_FILL_GAP / _CPUS act on qwen4exp only: ignored\n", __func__);
         }
@@ -856,7 +858,8 @@ llama_moe_bridge * llama_moe_bridge_create(const llama_model & model, int n_thre
                 LLAMA_LOG_INFO("%s: [TAG_FN_L3_CPU] pool split %s, prefetch order %s, prediction %s, %d pull streams%s\n", __func__,
                         br->pool_split == 2 ? "steal" : br->pool_split == 1 ? "stable" : "range",
                         br->pf_rank || br->hint_k > 0 ? "by rank" : "by expert id",
-                        br->hint_k > 0 ? "on the device (hints)" : "host router", br->pf_streams,
+                        br->hint_k > 0 ? (br->hint_mode == 2 ? "on the device (hints, the next layer's FFN mixer)" : "on the device (hints)") :
+                        "host router", br->pf_streams,
                         br->pf_streams > 1 && br->pool_split == 0 ? " (they need split stable or steal)" : "");
             }
         }
@@ -972,6 +975,10 @@ bool llama_moe_bridge_sync(const llama_moe_bridge * br) {
 // [TAG_FN_L3_CPU_DEVPRED]
 int llama_moe_bridge_hint_k(const llama_moe_bridge * br) {
     return br != nullptr && br->pf_on ? br->hint_k : 0;
+}
+
+int llama_moe_bridge_hint_mode(const llama_moe_bridge * br) {
+    return llama_moe_bridge_hint_k(br) > 0 ? br->hint_mode : 0;
 }
 
 int llama_moe_bridge_max_t(const llama_moe_bridge * br) {

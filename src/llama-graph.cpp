@@ -2278,7 +2278,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     const int64_t n_tokens = cur->ne[1];
     const bool weight_before_ffn = arch == LLM_ARCH_LLAMA4; // for llama4, we apply the sigmoid-ed weights before the FFN
     ggml_tensor * const hint_router = moe_bridge_hint_router; // [TAG_FN_L3_CPU_DEVPRED] for this call only
+    ggml_tensor * const hint_input  = moe_bridge_hint_input;
     moe_bridge_hint_router = nullptr;
+    moe_bridge_hint_input  = nullptr;
 
     // [TAG_FN_PREFILL_STREAM] large ubatches read this layer's host experts from a VRAM bank the streamer fills; the gate
     // node waits for the bank before the router runs
@@ -2501,7 +2503,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             cb(br_ticket, "ffn_moe_bridge_post", il);
             res->n_moe_bridge++;
             if (hint) {
-                ggml_tensor * lg = build_lora_mm(hint_router, cur); // [n_expert of il + 1, n_tokens]
+                const bool own_in = hint_input && hint_input->ne[0] == cur->ne[0] && hint_input->ne[1] == cur->ne[1] &&
+                                    ggml_nrows(hint_input) == cur->ne[1];
+                ggml_tensor * lg = build_lora_mm(hint_router, own_in ? hint_input : cur); // [n_expert of il + 1, n_tokens]
                 ggml_tensor * pr = ggml_argsort_top_k(ctx0, lg, hint_k);       // [hint_k, n_tokens] by rank
                 ggml_tensor * hn = ggml_moe_host_hint(ctx0, br_ticket, pr, br_id, br_chan);
                 cb(hn, "ffn_moe_bridge_hint", il);
