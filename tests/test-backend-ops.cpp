@@ -16541,6 +16541,11 @@ static bool run_cpu_fn_moe_fuse(ggml_backend_t backend, ggml_backend_t backend_r
     auto pool_pf_stats = (pool_pf_stats_t) ggml_backend_reg_get_proc_address(reg, "ggml_cpu_moe_prefetch_stats");
     using pool_set_solo_t = void (*)(ggml_cpu_moe_pool *, bool);
     auto pool_set_solo = (pool_set_solo_t) ggml_backend_reg_get_proc_address(reg, "ggml_cpu_moe_pool_set_solo");
+    // [TAG_FN_L3_HOST_EXEC] optional: the caller's own part of a prefetch
+    using pool_pfc_t       = size_t (*)(ggml_cpu_moe_pool *, const volatile int32_t *);
+    using pool_pfc_stats_t = void (*)(ggml_cpu_moe_pool *, uint64_t *, uint64_t *, uint64_t *);
+    auto pool_pfc       = (pool_pfc_t)       ggml_backend_reg_get_proc_address(reg, "ggml_cpu_moe_prefetch_caller");
+    auto pool_pfc_stats = (pool_pfc_stats_t) ggml_backend_reg_get_proc_address(reg, "ggml_cpu_moe_prefetch_caller_stats");
     const int saved_fuse = get_sw(GGML_CPU_FN_MOE_FUSE);
     const int saved_mr   = get_sw(GGML_CPU_FN_MMID_MR);
 
@@ -16709,6 +16714,50 @@ static bool run_cpu_fn_moe_fuse(ggml_backend_t backend, ggml_backend_t backend_r
                         pool_pf_stats(pool, &pj1, nullptr, nullptr, nullptr);
                         ran_f = p1 && r1 && p2 && r2 && pj1 == pj0 + 2;
                     }
+                    // [TAG_FN_L3_HOST_EXEC] the caller's own part of a prefetch (not solo), then a job it computes thread 0
+                    // of: a part that runs to its end, one stopped before it starts (it covers nothing), and one another
+                    // thread stops while it runs. Every job stays bit for bit the weighted sum; three caller parts counted.
+                    std::vector<float> out_e1((size_t) c.n_embd * T, 12345.0f);
+                    std::vector<float> out_e2((size_t) c.n_embd * T, 12345.0f);
+                    std::vector<float> out_e3((size_t) c.n_embd * T, 12345.0f);
+                    bool ran_e = false;
+                    const bool pfc_opts = pf_opts && pool_pfc && pool_pfc_stats;
+                    if (pfc_opts) {
+                        std::vector<ggml_fp16_t> router((size_t) c.n_exp * c.n_embd);
+                        for (ggml_fp16_t & v : router) {
+                            v = ggml_fp32_to_fp16(uni(gen));
+                        }
+                        const ggml_cpu_moe_prefetch_job pjob = { &layer, router.data(), (int32_t) T, x.data(), 6, (int32_t) (T % 2) };
+                        uint64_t pc0 = 0, pc1 = 0;
+                        pool_pfc_stats(pool, &pc0, nullptr, nullptr);
+                        volatile int32_t stop = 0;
+                        job.w = w.data();
+
+                        bool ok1 = pool_pf(pool, &pjob) == GGML_STATUS_SUCCESS;
+                        pool_pfc(pool, &stop);
+                        job.out = out_e1.data();
+                        ok1 = ok1 && pool_run(pool, &job) == GGML_STATUS_SUCCESS;
+
+                        bool ok2 = pool_pf(pool, &pjob) == GGML_STATUS_SUCCESS;
+                        stop = 1;
+                        const size_t b2 = pool_pfc(pool, &stop);
+                        job.out = out_e2.data();
+                        ok2 = ok2 && b2 == 0 && pool_run(pool, &job) == GGML_STATUS_SUCCESS;
+
+                        stop = 0;
+                        bool ok3 = pool_pf(pool, &pjob) == GGML_STATUS_SUCCESS;
+                        std::thread stopper([&stop]() {
+                            std::this_thread::sleep_for(std::chrono::microseconds(30));
+                            stop = 1;
+                        });
+                        pool_pfc(pool, &stop);
+                        stopper.join();
+                        job.out = out_e3.data();
+                        ok3 = ok3 && pool_run(pool, &job) == GGML_STATUS_SUCCESS;
+
+                        pool_pfc_stats(pool, &pc1, nullptr, nullptr);
+                        ran_e = ok1 && ok2 && ok3 && pc1 == pc0 + 3;
+                    }
                     pool_free(pool);
 
                     // the weighted sum of the reference rows, in slot order, skipped slots left out
@@ -16771,6 +16820,19 @@ static bool run_cpu_fn_moe_fuse(ggml_backend_t backend, ggml_backend_t backend_r
                                    ggml_type_name(c.tu), ggml_type_name(c.tg), ggml_type_name(c.td), T, with_tbl, (int) ran_f, nd_f1, nd_f2);
                         }
                         n_fail += ok_f ? 0 : 1;
+                    }
+
+                    if (pfc_opts) { // [TAG_FN_L3_HOST_EXEC]
+                        size_t nd_e1 = 0, nd_e2 = 0, nd_e3 = 0;
+                        double err_e = 0.0;
+                        const bool ok_e = ran_e && cpu_fn_same(out_e1, exp_w, &nd_e1, &err_e) && cpu_fn_same(out_e2, exp_w, &nd_e2, &err_e) &&
+                                          cpu_fn_same(out_e3, exp_w, &nd_e3, &err_e) && nd_e1 == 0 && nd_e2 == 0 && nd_e3 == 0;
+                        n_run += 1;
+                        if (!ok_e) {
+                            printf("  FAIL moe pool caller prefetch %s/%s/%s T=%" PRId64 " table=%d: ran %d, %zu / %zu / %zu values differ after a finished / unstarted / stopped caller part\n",
+                                   ggml_type_name(c.tu), ggml_type_name(c.tg), ggml_type_name(c.td), T, with_tbl, (int) ran_e, nd_e1, nd_e2, nd_e3);
+                        }
+                        n_fail += ok_e ? 0 : 1;
                     }
 
                     if (bridge_opts) { // [TAG_MOE_BRIDGE]
@@ -16845,6 +16907,9 @@ static bool run_moe_bridge(ggml_backend_t backend, ggml_backend_t backend_ref, c
     if (!br_new || !br_free || !br_id || !br_runner || !br_poll || !br_complete || !br_error || !br_reset || !br_stats) {
         return true; // this backend has no host bridge
     }
+    // [TAG_FN_L3_HOST_EXEC] optional: the ring watch (the poll zeroes taken stamps; the next entry's word shows a post)
+    auto br_watch = (ggml_backend_moe_bridge_set_watch_t)      ggml_backend_reg_get_proc_address(reg, "ggml_backend_moe_bridge_set_watch");
+    auto br_next  = (ggml_backend_moe_bridge_next_post_word_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_moe_bridge_next_post_word");
     ggml_backend_reg_t creg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_ref));
     using pp_def_t    = ggml_cpu_moe_pool_params (*)(int);
     using pool_new_t  = ggml_cpu_moe_pool * (*)(const ggml_cpu_moe_pool_params *);
@@ -16894,8 +16959,14 @@ static bool run_moe_bridge(ggml_backend_t backend, ggml_backend_t backend_ref, c
         a_g->data = (void *) wg.data();
         a_d->data = (void *) wd.data();
 
-        for (int mode : { (int) GGML_MOE_BRIDGE_WAIT_SPIN, (int) GGML_MOE_BRIDGE_WAIT_HOSTFUNC }) {
-            const char * mname = mode == GGML_MOE_BRIDGE_WAIT_SPIN ? "spin" : "hostfunc";
+        // [TAG_FN_L3_HOST_EXEC] mode 2: spin with the ring watch on
+        for (int mode_x : { 0, 2, 1 }) {
+            const bool watch = mode_x == 2;
+            if (watch && (!br_watch || !br_next)) {
+                continue;
+            }
+            const int mode = watch ? (int) GGML_MOE_BRIDGE_WAIT_SPIN : mode_x;
+            const char * mname = watch ? "spin+watch" : mode == GGML_MOE_BRIDGE_WAIT_SPIN ? "spin" : "hostfunc";
             ggml_moe_bridge_params bp = {};
             bp.device     = dev_index;
             bp.n_chan     = 2;
@@ -16914,6 +16985,15 @@ static bool run_moe_bridge(ggml_backend_t backend, ggml_backend_t backend_ref, c
                 continue;
             }
             const int32_t bid = br_id(br);
+            if (watch) {
+                br_watch(br, true);
+                const volatile int32_t * w0 = br_next(br);
+                n_run++;
+                if (w0 == nullptr || *w0 != 0) {
+                    printf("  FAIL moe bridge %s: the next post word is %s before any post\n", mname, w0 ? "nonzero" : "missing");
+                    n_fail++;
+                }
+            }
 
             moe_bridge_test_runner run;
             run.pool_run  = pool_run;
@@ -17054,6 +17134,9 @@ static bool run_moe_bridge(ggml_backend_t backend, ggml_backend_t backend_ref, c
                 const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
                 const bool timed_out = br_error(br) == GGML_MOE_BRIDGE_ERR_TIMEOUT;
                 const bool refused   = !br_reset(br);
+                // [TAG_FN_L3_HOST_EXEC] the post nobody took shows in the next entry's word (the executor is paused)
+                const volatile int32_t * w_post = watch ? br_next(br) : nullptr;
+                const bool word_set = !watch || (w_post != nullptr && *w_post != 0);
                 paused = false;
                 bool reset_ok = false;
                 for (int k = 0; k < 1000 && !reset_ok; k++) {
@@ -17062,10 +17145,13 @@ static bool run_moe_bridge(ggml_backend_t backend, ggml_backend_t backend_ref, c
                         std::this_thread::sleep_for(std::chrono::milliseconds(1));
                     }
                 }
-                fok = fok && timed_out && refused && reset_ok && ms >= 90.0;
+                // ... and once the executor took it, that entry is zero again and the next word reads 0 (nothing posted)
+                const volatile int32_t * w_next = watch ? br_next(br) : nullptr;
+                const bool word_clear = !watch || (w_post != nullptr && *w_post == 0 && w_next != nullptr && *w_next == 0);
+                fok = fok && timed_out && refused && reset_ok && ms >= 90.0 && word_set && word_clear;
                 if (!fok) {
-                    printf("  FAIL moe bridge spin stall: %.0f ms, timeout error %d, reset refused while owed %d, reset %d\n",
-                           ms, (int) timed_out, (int) refused, (int) reset_ok);
+                    printf("  FAIL moe bridge %s stall: %.0f ms, timeout error %d, reset refused while owed %d, reset %d, watch word set %d / cleared %d\n",
+                           mname, ms, (int) timed_out, (int) refused, (int) reset_ok, (int) word_set, (int) word_clear);
                 }
             } else {
                 run.fail_next = true;
@@ -17447,6 +17533,115 @@ static bool run_moe_bridge_fetch(ggml_backend_t backend, ggml_backend_t backend_
     return n_fail == 0;
 }
 
+// [TAG_FN_L3_HOST_LAUNCH2] ggml_backend_sched_set_split_after: a scheduler over {backend, CPU} splits the device part of
+// a small chain after the named node (two splits instead of one), and a graph input first used after the cut is copied
+// with the first split's inputs. Two computes of one allocation with new input values each time: the cut graph gives the
+// values of the uncut graph bit for bit, and both match the host formula (so the moved input was copied every time).
+static bool run_sched_split_after(ggml_backend_t backend, ggml_backend_t backend_ref, const char * op_names_filter) {
+    if (!op_names_filter_selects(op_names_filter, "SCHED_SPLIT_AFTER")) {
+        return true;
+    }
+    GGML_UNUSED(backend_ref);
+    ggml_backend_ptr cpu(ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr));
+    if (!cpu) {
+        printf("  FAIL sched split after: no CPU backend\n");
+        return false;
+    }
+    const bool is_cpu = backend_is_cpu(backend);
+    std::vector<ggml_backend_t> backends;
+    if (!is_cpu) {
+        backends.push_back(backend);
+    }
+    backends.push_back(cpu.get());
+
+    const int64_t n = 4096;
+    std::default_random_engine gen(1234);
+    std::uniform_real_distribution<float> uni(-1.0f, 1.0f);
+
+    int n_run  = 0;
+    int n_fail = 0;
+    std::vector<std::vector<float>> outs[2]; // [cut][run]
+    for (int cut = 0; cut < 2; cut++) {
+        ggml_init_params params = { ggml_tensor_overhead()*16 + ggml_graph_overhead(), NULL, true };
+        ggml_context_ptr ctx(ggml_init(params));
+        ggml_tensor * a = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, n);
+        ggml_tensor * b = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, n);
+        ggml_set_name(a, "a");
+        ggml_set_name(b, "b");
+        ggml_set_input(a);
+        ggml_set_input(b);
+        // ops no backend fuses across the cut (scale | add), so cut and uncut graphs run the same kernels
+        ggml_tensor * x1 = ggml_sqr(ctx.get(), a);
+        ggml_set_name(x1, "x1");
+        ggml_tensor * x2 = ggml_scale(ctx.get(), x1, 0.5f);
+        ggml_set_name(x2, "l_last-0");
+        ggml_tensor * x3 = ggml_add(ctx.get(), x2, b); // b: first used after the cut
+        ggml_set_name(x3, "x3");
+        ggml_tensor * x4 = ggml_sqr(ctx.get(), x3);
+        ggml_set_name(x4, "x4");
+        ggml_set_output(x4);
+        ggml_cgraph * gf = ggml_new_graph(ctx.get());
+        ggml_build_forward_expand(gf, x4);
+
+        ggml_backend_sched_ptr sched(ggml_backend_sched_new(backends.data(), nullptr, (int) backends.size(), 64, false, false));
+        if (!is_cpu) {
+            // the chain runs on the device (no weights pull it there); the inputs stay on the CPU, so they are split inputs
+            for (ggml_tensor * t : { x1, x2, x3, x4 }) {
+                ggml_backend_sched_set_tensor_backend(sched.get(), t, backend);
+            }
+        }
+        ggml_backend_sched_set_split_after(sched.get(), cut ? "l_last-0" : nullptr);
+        if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
+            printf("  FAIL sched split after: alloc failed (cut %d)\n", cut);
+            return false;
+        }
+        const int n_splits = ggml_backend_sched_get_n_splits(sched.get());
+        n_run++;
+        if (n_splits != (cut ? 2 : 1)) {
+            printf("  FAIL sched split after %s cut %d: %d splits\n", ggml_backend_name(backend), cut, n_splits);
+            n_fail++;
+        }
+        std::default_random_engine gen_run(99);
+        for (int r = 0; r < 2; r++) {
+            std::vector<float> av(n), bv(n);
+            for (int64_t i = 0; i < n; i++) {
+                av[i] = uni(gen_run);
+                bv[i] = uni(gen_run) + (float) r;
+            }
+            ggml_backend_tensor_set(a, av.data(), 0, n*sizeof(float));
+            ggml_backend_tensor_set(b, bv.data(), 0, n*sizeof(float));
+            if (ggml_backend_sched_graph_compute(sched.get(), gf) != GGML_STATUS_SUCCESS) {
+                printf("  FAIL sched split after: compute failed (cut %d run %d)\n", cut, r);
+                return false;
+            }
+            std::vector<float> got(n);
+            ggml_backend_tensor_get(x4, got.data(), 0, n*sizeof(float));
+            double err = 0.0;
+            for (int64_t i = 0; i < n; i++) {
+                const double s   = 0.5*(double) av[i]*av[i] + bv[i];
+                const double ref = s*s;
+                err = std::max(err, std::fabs(ref - got[i]));
+            }
+            n_run++;
+            if (err > 1e-4) {
+                printf("  FAIL sched split after %s cut %d run %d: max error %g from the host formula\n", ggml_backend_name(backend), cut, r, err);
+                n_fail++;
+            }
+            outs[cut].push_back(std::move(got));
+        }
+    }
+    for (size_t r = 0; r < outs[0].size() && r < outs[1].size(); r++) {
+        n_run++;
+        if (memcmp(outs[0][r].data(), outs[1][r].data(), n*sizeof(float)) != 0) {
+            printf("  FAIL sched split after %s run %zu: the cut graph's values differ from the uncut graph's\n", ggml_backend_name(backend), r);
+            n_fail++;
+        }
+    }
+    GGML_UNUSED(gen);
+    printf("  scheduler split after a named node (%s): %d checks, %d failed\n", ggml_backend_name(backend), n_run, n_fail);
+    return n_fail == 0;
+}
+
 static bool test_backend(ggml_backend_t backend, ggml_backend_dev_t dev, test_mode mode, const char * op_names_filter, const char * params_filter,
                          printer * output_printer, const char * test_file_path, int parallel_workers) {
     auto filter_test_cases = [](std::vector<std::unique_ptr<test_case>> & test_cases, const char * params_filter) {
@@ -17597,7 +17792,10 @@ static bool test_backend(ggml_backend_t backend, ggml_backend_dev_t dev, test_mo
         const bool moe_bridge_ok = run_moe_bridge(backend, backend_cpu.get(), op_names_filter) && // [TAG_MOE_BRIDGE]
                                    run_moe_bridge_fetch(backend, backend_cpu.get(), op_names_filter); // [TAG_FN_R4_BRIDGE_DMA]
 
-        return n_ok == tests_run && slice_ok && q2_0_repack_ok && fn_repack_skip_ok && fn_mmid_mr_ok && fn_moe_fuse_ok && moe_bridge_ok;
+        const bool split_after_ok = run_sched_split_after(backend, backend_cpu.get(), op_names_filter); // [TAG_FN_L3_HOST_LAUNCH2]
+
+        return n_ok == tests_run && slice_ok && q2_0_repack_ok && fn_repack_skip_ok && fn_mmid_mr_ok && fn_moe_fuse_ok && moe_bridge_ok &&
+               split_after_ok;
     }
 
     if (mode == MODE_GRAD) {
