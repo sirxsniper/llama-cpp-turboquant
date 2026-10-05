@@ -106,6 +106,11 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(
 // upstream #27694: verifies by rejection sampling; draft_q holds the draft's candidates per token
 std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, const std::vector<std::vector<llama_token_data>> & draft_q, bool grammar_first = false);
 
+// [TAG_FN_L3_MTP_BLOCK] the same draft verified as a block (common/speculative-block.h): the target's distribution, at
+// least as many tokens kept. Empty when it does not apply (fewer than 2 drafts, a grammar or a reasoning budget, a row the
+// backend sampler touched): then take the per-token rule above
+std::vector<llama_token> common_sampler_sample_and_accept_n_block(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, const std::vector<std::vector<llama_token_data>> & draft_q);
+
 // assume idxs == [ 0, 1, 2, ..., draft.size() ]
 std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const llama_tokens & draft, bool grammar_first = false);
 

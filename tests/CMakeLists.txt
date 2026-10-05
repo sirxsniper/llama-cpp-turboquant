@@ -324,6 +324,10 @@ llama_build_and_test(test-mtp-cost.cpp)
 # simulation with stalls, draft-decode spikes and a slow start, against the fixed rules and version 1. CPU only.
 llama_build_and_test(test-mtp-cost2.cpp)
 
+# [TAG_FN_L3_MTP_BLOCK] block verification of sampled drafts (common/speculative-block.h): exactness by enumeration, the
+# kept length against the per-token rule, the draw. CPU only.
+llama_build_and_test(test-spec-block.cpp)
+
 # [TAG_FN_PLE_DIRECT_IO] unbuffered PLE row reads (src/llama-ple-dio.cpp) against the mapped rows of a real GGUF, CPU and
 # disk only. Built, not registered with ctest: it needs the model file. The reader is compiled in (libllama does not
 # export it).

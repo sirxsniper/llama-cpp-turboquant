@@ -1979,6 +1979,9 @@ public:
     //  - and, with thread-safe APIs (e.g., tokenizer calls)
     llama_model * model_tgt = nullptr;
 
+    // [TAG_FN_L3_MTP_BLOCK] SPEC_MTP_BLOCK_VERIFY=1 on a qwen4exp target: sampled drafts are verified as a block
+    bool spec_block_verify = false;
+
     mtmd_context * mctx = nullptr;
     // note: video_params.ffmpeg_bin_dir points into params_base, which outlives this struct
     mtmd_helper_init_opt init_opt = mtmd_helper_init_opt_default();
@@ -2358,6 +2361,19 @@ private:
         }
 
         vocab = llama_model_get_vocab(model_tgt);
+
+        // [TAG_FN_L3_MTP_BLOCK]
+        {
+            const char * e = getenv("SPEC_MTP_BLOCK_VERIFY");
+            char arch[32] = { 0 };
+            spec_block_verify = e && e[0] == '1' &&
+                llama_model_meta_val_str(model_tgt, "general.architecture", arch, sizeof(arch)) > 0 &&
+                strcmp(arch, "qwen4exp") == 0;
+            if (e && e[0] == '1') {
+                SRV_INF("[TAG_FN_L3_MTP_BLOCK] sampled drafts verified as a block: %s\n",
+                        spec_block_verify ? "on" : "off (qwen4exp only)");
+            }
+        }
 
         try {
             decision.init(model_tgt);
@@ -6939,7 +6955,13 @@ private:
                 } else if (slot.spec_is_replay && slot.use_spec_rejection()) {
                     accepted = server_accept_replay(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
                 } else if (use_rejection) {
-                    accepted = common_sampler_sample_and_accept_n_rejection(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft, slot.spec_draft_q);
+                    // [TAG_FN_L3_MTP_BLOCK] the block rule where it applies (no token probabilities to report)
+                    if (spec_block_verify && slot.task->params.sampling.n_probs == 0) {
+                        accepted = common_sampler_sample_and_accept_n_block(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft, slot.spec_draft_q);
+                    }
+                    if (accepted.empty()) {
+                        accepted = common_sampler_sample_and_accept_n_rejection(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft, slot.spec_draft_q);
+                    }
                 } else if (use_coupling) {
                     accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft, slot.spec_dists);
                 } else {
