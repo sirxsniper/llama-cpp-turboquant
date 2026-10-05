@@ -591,7 +591,7 @@ void ggml_backend_tensor_memset(struct ggml_tensor * tensor, uint8_t value, size
 }
 
 // [TAG_FN_L3_HOST_DIAG] ggml_backend_sync_trace_set: every backend synchronize, event synchronize and blocking tensor
-// get / set that takes at least threshold_us is counted under its call stack, and every 1024 such waits the stacks with
+// get / set that takes at least threshold_us is counted under its call stack, and every 256 such waits the stacks with
 // the most total time are printed. Windows: frames symbolized by dbghelp, which reads the export tables when there is
 // no PDB, so a large displacement means an unexported function of that module. Diagnostic only; 0 (default) costs one
 // relaxed load per call.
@@ -695,13 +695,20 @@ static void ggml_sync_trace_record(const char * what, double us) {
     }
     e.n++;
     e.us += us;
-    if (++g_sync_trace_n % 1024 == 0) {
+    if (++g_sync_trace_n % 256 == 0) {
         ggml_sync_trace_report();
     }
 }
 
 void ggml_backend_sync_trace_set(int threshold_us) {
-    g_sync_trace_us.store(threshold_us > 0 ? threshold_us : 0, std::memory_order_relaxed);
+    const int prev = g_sync_trace_us.exchange(threshold_us > 0 ? threshold_us : 0, std::memory_order_relaxed);
+    if (prev > 0 && threshold_us <= 0) {
+        // turned off: the waits since the last report
+        std::lock_guard<std::mutex> lk(g_sync_trace_mtx);
+        if (g_sync_trace_n % 256 != 0) {
+            ggml_sync_trace_report();
+        }
+    }
 }
 
 void ggml_backend_synchronize(ggml_backend_t backend) {

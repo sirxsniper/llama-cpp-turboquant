@@ -2975,6 +2975,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
         }
+        if (launch2_decode && llama_fn_l3_int(model, "LLAMA_FN_HOST_LAUNCH2", -1) >= 0) { // [TAG_FN_L3_HOST_LAUNCH2]
+            static std::atomic<int> n_logged{0};
+            if (n_logged.fetch_add(1) < 2) {
+                LLAMA_LOG_INFO("%s: [TAG_FN_L3_HOST_LAUNCH2] a decode graph of %u tokens: %d scheduler splits\n", __func__,
+                        ubatch.n_tokens, ggml_backend_sched_get_n_splits(sched.get()));
+            }
+        }
 
         gf_res_prev_active = res;
     }
@@ -3848,8 +3855,17 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             step_async = std::make_unique<step_worker>();
         }
         step_async->post([this]() {
+            const int64_t t0 = ggml_time_us();
             llama_moe_cache_step(this);
             llama_moe_gen5_step(this);
+            // the helper's own counters (only this thread touches them)
+            static thread_local uint64_t n_step  = 0;
+            static thread_local double   step_us = 0.0;
+            step_us += (double) (ggml_time_us() - t0);
+            if (++n_step == 1 || n_step % 256 == 0) {
+                LLAMA_LOG_INFO("decode: [TAG_FN_L3_HOST_STEP] %" PRIu64 " steps on the helper thread, %.1f us each (off the "
+                        "caller's path)\n", n_step, step_us / (double) n_step);
+            }
         });
     } else {
         llama_moe_cache_step(this);

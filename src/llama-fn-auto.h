@@ -138,9 +138,9 @@ bool         llama_fn_active(const llama_model & model);
 //                            split and after the prefill stream's / DMA issuer's queued copies
 //   LLAMA_FN_HOST_QOS=1      [TAG_FN_L3_HOST_QOS] Windows: 1 ms timer resolution while the model lives, and the process
 //                            keeps it (and full execution speed) when minimized or occluded
-//   LLAMA_FN_HOST_DIAG=1     [TAG_FN_L3_HOST_DIAG] the bridge's per-graph host timing every 256 bridged graphs
+//   LLAMA_FN_HOST_DIAG=1|N   [TAG_FN_L3_HOST_DIAG] the bridge's per-graph host timing every N (1: 64) bridged graphs
 //   LLAMA_FN_HOST_SYNC_TRACE=<us>  [TAG_FN_L3_HOST_DIAG] every synchronize / blocking device copy of >= us is counted by
-//                            its call stack (ggml_backend_sync_trace_set), a report every 1024 such waits
+//                            its call stack (ggml_backend_sync_trace_set), a report every 256 such waits
 bool llama_fn_l3_flag(const llama_model & model, const char * name);
 int  llama_fn_l3_int (const llama_model & model, const char * name, int def);
 // [TAG_FN_L3_HOST_QOS] [TAG_FN_L3_HOST_POKE] model hooks (load: after the arch check; free)

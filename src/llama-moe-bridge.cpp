@@ -112,8 +112,10 @@ struct llama_moe_bridge {
     pool_pf_caller_t                          pool_pf_caller = nullptr;
     pool_pfc_stats_t                          pool_pfc_stats = nullptr;
 
-    // [TAG_FN_L3_HOST_DIAG] LLAMA_FN_HOST_DIAG=1 (qwen4exp): host timing of the bridged graphs (steady clock, ns)
+    // [TAG_FN_L3_HOST_DIAG] LLAMA_FN_HOST_DIAG=1|N (qwen4exp): host timing of the bridged graphs (steady clock, ns), a
+    // line every diag_every graphs (N > 1, else 64)
     bool                 diag = false;
+    int64_t              diag_every = 64;
     std::atomic<int64_t> dg_t_begin{0};     // owner: begin() of the running graph
     std::atomic<bool>    dg_first{false};   // owner sets it in begin(), the executor clears it at the graph's first post
     std::atomic<int64_t> dg_first_sum{0};   // executor: begin -> first post, summed
@@ -768,7 +770,11 @@ llama_moe_bridge * llama_moe_bridge_create(const llama_model & model, int n_thre
                     br->pool_params.n_threads);
         }
     }
-    br->diag = llama_fn_l3_flag(model, "LLAMA_FN_HOST_DIAG"); // [TAG_FN_L3_HOST_DIAG]
+    if (const int dv = llama_fn_l3_int(model, "LLAMA_FN_HOST_DIAG", 0); dv > 0) { // [TAG_FN_L3_HOST_DIAG]
+        br->diag       = true;
+        br->diag_every = dv > 1 ? dv : 64;
+        LLAMA_LOG_INFO("%s: [TAG_FN_L3_HOST_DIAG] bridge host timing every %" PRId64 " bridged graphs\n", __func__, br->diag_every);
+    }
 
     if (br->mode == GGML_MOE_BRIDGE_WAIT_HOSTFUNC) {
         br->pool = br->pool_new(&br->pool_params); // run by the driver's callback thread, which keeps its affinity
@@ -954,12 +960,12 @@ bool llama_moe_bridge_end(llama_moe_bridge * br) {
         br->dg_tail_sum  += t_job > t_beg ? t - t_job : 0;
         br->dg_t_end_prev = t;
         br->dg_first.store(false, std::memory_order_release);
-        if (++br->dg_n == 256) {
+        if (++br->dg_n == br->diag_every) {
             const int64_t nf = br->dg_first_n.exchange(0);
             const int64_t sf = br->dg_first_sum.exchange(0);
-            LLAMA_LOG_INFO("%s: MoE bridge %d: [TAG_FN_L3_HOST_DIAG] per bridged graph (256): begin -> first post %.1f us, "
+            LLAMA_LOG_INFO("%s: MoE bridge %d: [TAG_FN_L3_HOST_DIAG] per bridged graph (%" PRId64 "): begin -> first post %.1f us, "
                     "begin -> end %.1f us, last job -> end %.1f us; host between graphs %.1f us\n", __func__, br->bid,
-                    nf ? sf/1e3/nf : 0.0, br->dg_graph_sum/1e3/br->dg_n, br->dg_tail_sum/1e3/br->dg_n,
+                    br->dg_n, nf ? sf/1e3/nf : 0.0, br->dg_graph_sum/1e3/br->dg_n, br->dg_tail_sum/1e3/br->dg_n,
                     br->dg_n_gap ? br->dg_gap_sum/1e3/br->dg_n_gap : 0.0);
             br->dg_n = br->dg_n_gap = 0;
             br->dg_graph_sum = br->dg_tail_sum = br->dg_gap_sum = 0;

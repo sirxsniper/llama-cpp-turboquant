@@ -356,7 +356,7 @@ extern "C" {
     GGML_API void                 ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backend_sched_eval_callback callback, void * user_data);
 
     // [TAG_FN_L3_HOST_DIAG] count every backend synchronize, event synchronize and blocking device tensor get / set that
-    // takes at least threshold_us by its call stack, and log the stacks with the most total time every 1024 such waits
+    // takes at least threshold_us by its call stack, and log the stacks with the most total time every 256 such waits
     // (process wide; 0 = off, the default). Diagnostic only.
     GGML_API void                 ggml_backend_sync_trace_set(int threshold_us);
 

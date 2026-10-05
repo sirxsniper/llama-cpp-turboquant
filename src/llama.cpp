@@ -231,7 +231,7 @@ void llama_fn_l3_host_on_load(const llama_model & model) {
     if (const int us = llama_fn_l3_int(model, "LLAMA_FN_HOST_SYNC_TRACE", 0); us > 0) {
         ggml_backend_sync_trace_set(us);
         g_l3_trace_models.push_back(&model);
-        LLAMA_LOG_INFO("%s: [TAG_FN_L3_HOST_DIAG] waits of >= %d us are counted by call stack (a report every 1024)\n", __func__, us);
+        LLAMA_LOG_INFO("%s: [TAG_FN_L3_HOST_DIAG] waits of >= %d us are counted by call stack (a report every 256)\n", __func__, us);
     }
 }
 
