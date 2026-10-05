@@ -121,6 +121,9 @@ GGML_BACKEND_API bool     ggml_backend_cuda_moe_bridge_set_ring(struct ggml_moe_
 GGML_BACKEND_API void     ggml_backend_cuda_moe_bridge_publish_plan(struct ggml_moe_bridge * bridge, const struct ggml_moe_bridge_job * job);
 GGML_BACKEND_API void     ggml_backend_cuda_moe_bridge_chan_times(const struct ggml_moe_bridge * bridge, int32_t chan, struct ggml_moe_bridge_chan_times * t);
 GGML_BACKEND_API void     ggml_backend_cuda_moe_bridge_release(struct ggml_moe_bridge * bridge);
+// [TAG_FN_L3_CPU_DEVPRED]
+GGML_BACKEND_API bool     ggml_backend_cuda_moe_bridge_read_hint(const struct ggml_moe_bridge * bridge, int32_t chan, uint32_t seq,
+                                                                 int32_t * ids, int max_ids, int * k, int * n_tokens);
 
 #ifdef  __cplusplus
 }

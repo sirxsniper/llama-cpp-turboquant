@@ -6663,6 +6663,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_moe_bridge_release") == 0) {
         return (void *)ggml_backend_cuda_moe_bridge_release;
     }
+    if (strcmp(name, "ggml_backend_moe_bridge_read_hint") == 0) { // [TAG_FN_L3_CPU_DEVPRED]
+        return (void *)ggml_backend_cuda_moe_bridge_read_hint;
+    }
     return nullptr;
 }
 

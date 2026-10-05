@@ -25,6 +25,11 @@
 // bank slots. The host makes no CUDA call inside a running graph (the Strata #31 driver deadlock: a host copy issued
 // while the GPU spins on a mapped flag). The device writes its wait and fetch times per channel into the mapped header,
 // for the host's DMA/CPU split. glob.release (host memory) makes every wait and fetch give up at once (exit paths).
+//
+// [TAG_FN_L3_CPU_DEVPRED] A hint (a MOE_HOST_POST node with op param 3 = 1, ggml_moe_host_hint) runs after a layer's
+// post: it copies the device's predicted ids of the next layer (the top-k of that layer's router on this layer's input)
+// into the channel's hint area under the post's ticket, seqlock style (seq 0, ids, fence, seq). The executor reads them
+// after the job (ggml_backend_moe_bridge_read_hint) and prefetches the next layer's experts without a router on the host.
 
 #include "moe-bridge.cuh"
 
@@ -91,6 +96,15 @@ static_assert(sizeof(mb_ring_entry) == 64,  "mb_ring_entry size");
 static_assert(sizeof(mb_chan_hdr)   == 128, "mb_chan_hdr size");
 static_assert(sizeof(mb_glob)       == 128, "mb_glob size");
 
+// [TAG_FN_L3_CPU_DEVPRED] the head of a channel's hint area; the ids [n_tokens][k] follow it
+struct alignas(64) mb_hint_hdr {
+    uint32_t seq;      // the job whose prediction the ids are; 0 while the device writes them
+    int32_t  k;
+    int32_t  n_tokens;
+    uint32_t pad[13];
+};
+static_assert(sizeof(mb_hint_hdr) == 64, "mb_hint_hdr size");
+
 // [TAG_FN_R4_BRIDGE_DMA] the plan of a channel's last fetch, in device memory (the copy blocks read it there)
 struct mb_fetch_dev {
     int32_t            n_copy;
@@ -113,6 +127,8 @@ struct mb_dev {
     size_t          off_w;
     size_t          off_out;
     size_t          off_plan;  // [TAG_FN_R4_BRIDGE_DMA] the channel's plan area (0 without fetches)
+    size_t          off_hint;  // [TAG_FN_L3_CPU_DEVPRED] the channel's hint area (0 without hints)
+    int             hint_k;    // [TAG_FN_L3_CPU_DEVPRED] the largest k of a hint (0: no hints)
     mb_fetch_dev  * fetch;     // [TAG_FN_R4_BRIDGE_DMA] device memory, one per channel (nullptr without fetches)
     const char    * dma_ring;  // [TAG_FN_R4_BRIDGE_DMA] the registered DMA ring, device view (nullptr: none)
     unsigned long long dma_ring_size;
@@ -477,6 +493,36 @@ static __global__ void k_mb_fetch_copy(const mb_dev v, const int chan,
     }
 }
 
+// [TAG_FN_L3_CPU_DEVPRED] one block: the predicted ids [n_tokens][k] of the job of ticket into the channel's hint area
+static __global__ void k_mb_hint(const mb_dev v, const int chan, const int32_t * __restrict__ ticket,
+        const char * __restrict__ ids, const int64_t ids_nb1, const int k, const int n_tokens) {
+    __shared__ uint32_t s_seq;
+    mb_hint_hdr * h    = (mb_hint_hdr *) (v.data + (size_t) chan*v.chan_bytes + v.off_hint);
+    int32_t     * hids = (int32_t *) (h + 1);
+    if (threadIdx.x == 0) {
+        s_seq = (uint32_t) ticket[0]; // 0: the post was skipped (sticky error)
+        *(volatile uint32_t *) &h->seq = 0;
+        __threadfence_system();
+    }
+    __syncthreads();
+    if (s_seq == 0) {
+        return;
+    }
+    for (int i = threadIdx.x; i < k*n_tokens; i += blockDim.x) {
+        const int t = i/k;
+        hids[i] = ((const int32_t *) (ids + t*ids_nb1))[i - t*k];
+    }
+    __threadfence_system();
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        *(volatile int32_t *) &h->k        = k;
+        *(volatile int32_t *) &h->n_tokens = n_tokens;
+        __threadfence_system();
+        *(volatile uint32_t *) &h->seq = s_seq;
+        __threadfence_system();
+    }
+}
+
 static void mb_make_job(const ggml_moe_bridge * b, int32_t chan, uint32_t seq, ggml_moe_bridge_job * job) {
     const mb_chan_hdr * h = b->hdr + chan;
     char * p = b->data + (size_t) chan*b->dev.chan_bytes;
@@ -577,6 +623,7 @@ ggml_moe_bridge * ggml_backend_cuda_moe_bridge_new(const ggml_moe_bridge_params 
     if (p == nullptr || p->device < 0 || p->device >= ggml_backend_cuda_get_device_count() ||
         p->n_chan < 1 || p->n_chan > 4096 || p->n_embd < 1 || p->n_embd > (1 << 20) || p->n_used < 1 || p->n_used > 256 ||
         p->max_tokens < 1 || p->max_tokens > 64 || p->max_fetch < 0 || p->max_fetch > GGML_MOE_BRIDGE_MAX_FETCH ||
+        p->hint_k < 0 || p->hint_k > GGML_MOE_BRIDGE_MAX_HINT_K ||
         (p->wait_mode != GGML_MOE_BRIDGE_WAIT_SPIN && p->wait_mode != GGML_MOE_BRIDGE_WAIT_HOSTFUNC)) {
         GGML_LOG_ERROR("%s: invalid parameters\n", __func__);
         return nullptr;
@@ -604,7 +651,9 @@ ggml_moe_bridge * ggml_backend_cuda_moe_bridge_new(const ggml_moe_bridge_params 
     // [TAG_FN_R4_BRIDGE_DMA] the plan area: the fixed part and the slot ids of [n_used, max_t]
     const size_t  sp = p->max_fetch > 0 ?
         mb_pad(offsetof(ggml_moe_bridge_plan, slot_ids) + (size_t) p->n_used*max_t*sizeof(int32_t)) : 0;
-    const size_t  chan_bytes = sx + si + si + sx + sp;
+    // [TAG_FN_L3_CPU_DEVPRED] the hint area: its head and the ids of [hint_k, max_t]
+    const size_t  sh = p->hint_k > 0 ? mb_pad(sizeof(mb_hint_hdr) + (size_t) p->hint_k*max_t*sizeof(int32_t)) : 0;
+    const size_t  chan_bytes = sx + si + si + sx + sp + sh;
 
     const size_t off_ring = mb_pad(sizeof(mb_glob));
     const size_t off_hdr  = off_ring + (size_t) MB_RING*sizeof(mb_ring_entry);
@@ -685,6 +734,8 @@ ggml_moe_bridge * ggml_backend_cuda_moe_bridge_new(const ggml_moe_bridge_params 
     b->dev.off_w      = sx + si;
     b->dev.off_out    = sx + si + si;
     b->dev.off_plan   = sx + si + si + sx; // [TAG_FN_R4_BRIDGE_DMA]
+    b->dev.off_hint   = sh > 0 ? sx + si + si + sx + sp : 0; // [TAG_FN_L3_CPU_DEVPRED]
+    b->dev.hint_k     = p->hint_k;
     b->dev.fetch      = b->fetch;
     b->dev.dma_ring      = nullptr;
     b->dev.dma_ring_size = 0;
@@ -710,10 +761,10 @@ ggml_moe_bridge * ggml_backend_cuda_moe_bridge_new(const ggml_moe_bridge_params 
         return fail("registering (too many bridges)", cudaSuccess);
     }
 
-    GGML_LOG_INFO("%s: bridge %d on device %d: %d channels, n_embd %" PRId64 ", n_used %d, T <= %d, %s wait, timeout %d ms (%d ms once taken), %.2f MiB mapped, fetch <= %d experts\n",
+    GGML_LOG_INFO("%s: bridge %d on device %d: %d channels, n_embd %" PRId64 ", n_used %d, T <= %d, %s wait, timeout %d ms (%d ms once taken), %.2f MiB mapped, fetch <= %d experts, hints <= %d ids per token\n",
             __func__, b->id, p->device, p->n_chan, n_embd, p->n_used, max_t,
             p->wait_mode == GGML_MOE_BRIDGE_WAIT_SPIN ? "spin" : "hostfunc", b->params.timeout_ms, b->params.job_max_ms, total/1024.0/1024.0,
-            p->max_fetch);
+            p->max_fetch, p->hint_k);
     return b;
 #endif
 }
@@ -890,6 +941,47 @@ void ggml_backend_cuda_moe_bridge_release(ggml_moe_bridge * b) {
     }
 }
 
+// [TAG_FN_L3_CPU_DEVPRED] seqlock read: the seq, the ids, the seq again; both must be the job's
+bool ggml_backend_cuda_moe_bridge_read_hint(const ggml_moe_bridge * b, int32_t chan, uint32_t seq, int32_t * ids, int max_ids,
+                                            int * k, int * n_tokens) {
+#ifdef GGML_MOE_BRIDGE_DISABLED
+    GGML_UNUSED(b);
+    GGML_UNUSED(chan);
+    GGML_UNUSED(seq);
+    GGML_UNUSED(ids);
+    GGML_UNUSED(max_ids);
+    GGML_UNUSED(k);
+    GGML_UNUSED(n_tokens);
+    return false;
+#else
+    if (b == nullptr || b->dev.hint_k <= 0 || chan < 0 || chan >= b->params.n_chan || seq == 0 || ids == nullptr) {
+        return false;
+    }
+    const char * area = (const char *) b->data + (size_t) chan*b->dev.chan_bytes + b->dev.off_hint;
+    const volatile mb_hint_hdr * h = (const volatile mb_hint_hdr *) area;
+    if (h->seq != seq) {
+        return false;
+    }
+    std::atomic_thread_fence(std::memory_order_acquire);
+    const int hk = h->k;
+    const int ht = h->n_tokens;
+    if (hk < 1 || hk > b->dev.hint_k || ht < 1 || ht > b->params.max_tokens || hk*ht > max_ids) {
+        return false;
+    }
+    const volatile int32_t * src = (const volatile int32_t *) (area + sizeof(mb_hint_hdr));
+    for (int i = 0; i < hk*ht; ++i) {
+        ids[i] = src[i];
+    }
+    std::atomic_thread_fence(std::memory_order_acquire);
+    if (h->seq != seq) {
+        return false; // the device rewrote it meanwhile
+    }
+    *k        = hk;
+    *n_tokens = ht;
+    return true;
+#endif
+}
+
 // ---- ops ------------------------------------------------------------------------------------------------------------
 
 bool ggml_cuda_moe_bridge_supports_op(int device, const ggml_tensor * op) {
@@ -904,6 +996,14 @@ bool ggml_cuda_moe_bridge_supports_op(int device, const ggml_tensor * op) {
         return false;
     }
     const auto & p = b->params;
+    if (op->op == GGML_OP_MOE_HOST_POST && ggml_get_op_params_i32(op, 3) == 1) {
+        // [TAG_FN_L3_CPU_DEVPRED] a hint: src[0] the post's ticket, src[1] the predicted ids [k, T]
+        const ggml_tensor * ticket = op->src[0];
+        const ggml_tensor * ids    = op->src[1];
+        return p.hint_k > 0 && ticket && ids && ticket->type == GGML_TYPE_I32 && ggml_nelements(ticket) == 1 &&
+            ids->type == GGML_TYPE_I32 && ids->nb[0] == sizeof(int32_t) && ids->ne[0] >= 1 && ids->ne[0] <= p.hint_k &&
+            ids->ne[1] >= 1 && ids->ne[1] <= p.max_tokens && ids->ne[2] == 1 && ids->ne[3] == 1;
+    }
     if (op->op == GGML_OP_MOE_HOST_POST) {
         const ggml_tensor * x   = op->src[0];
         const ggml_tensor * ids = op->src[1];
@@ -935,6 +1035,16 @@ void ggml_cuda_op_moe_host_post(ggml_backend_cuda_context & ctx, ggml_tensor * d
     GGML_ASSERT(b != nullptr && b->params.device == ctx.device);
     const int32_t chan  = ggml_get_op_params_i32(dst, 1);
     const int32_t flags = ggml_get_op_params_i32(dst, 2);
+
+    if (ggml_get_op_params_i32(dst, 3) == 1) { // [TAG_FN_L3_CPU_DEVPRED] a hint
+        GGML_ASSERT(b->dev.hint_k > 0 && b->dev.off_hint > 0);
+        const ggml_tensor * ids = dst->src[1];
+        GGML_ASSERT(ids->ne[0] <= b->dev.hint_k && ids->ne[1] <= b->params.max_tokens);
+        k_mb_hint<<<1, 128, 0, ctx.stream()>>>(b->dev, chan, (const int32_t *) dst->src[0]->data, (const char *) ids->data,
+                ids->nb[1], (int) ids->ne[0], (int) ids->ne[1]);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
 
     const ggml_tensor * x   = dst->src[0];
     const ggml_tensor * ids = dst->src[1];

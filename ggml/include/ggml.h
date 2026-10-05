@@ -2842,6 +2842,16 @@ extern "C" {
             int32_t               bridge,
             int32_t               chan);
 
+    // [TAG_FN_L3_CPU_DEVPRED] after a post: hand the host the predicted experts of the next MoE layer (ids [k, T] i32,
+    // e.g. the top-k of that layer's router on this layer's input) under the post's ticket, for its prefetch. A
+    // GGML_OP_MOE_HOST_POST node with op param 3 = 1 (no job is posted) -> ticket i32 [1] (unused)
+    GGML_API struct ggml_tensor * ggml_moe_host_hint(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * ticket,
+            struct ggml_tensor  * ids,
+            int32_t               bridge,
+            int32_t               chan);
+
     // [TAG_FN_R2_BRIDGE_SYNC] the host side of a bridged MoE layer as a CPU graph op (CPU backend only), for the graphs
     // that run while the bridge is paused or off: for every token t,
     //   out[:, t] = sum, in slot order, over the slots s whose expert e = ids[s, t] passes the table (table == NULL or
