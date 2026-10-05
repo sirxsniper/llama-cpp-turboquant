@@ -1740,11 +1740,7 @@ void llama_context::sched_reserve() {
 
     // [TAG_FN_R1_PFS_LEND] reserve with the prefill stream's banks returned: the reserve graphs keep the op offload
     // copies in the compute buffer, which a prompt that cannot borrow the banks needs
-    // [TAG_FN_R2_RESERVE_LENT] once the hot set can lend, every prompt ubatch streams: reserve with the banks borrowed, so
-    // the compute buffer holds no op-offload copy of a layer's experts (the next decode gives the banks back)
-    if (!llama_prefill_stream_reserve_take(this)) {
-        llama_moe_gen5_before_ubatch(this, nullptr, 0);
-    }
+    llama_moe_gen5_before_ubatch(this, nullptr, 0);
 
     const int64_t t_start_us = ggml_time_us();
 
@@ -5331,19 +5327,7 @@ void llama_context::moe_hot_fit_try() {
     if (const char * e = llama_fn_env(model, "LLAMA_MOE_HOT_HEADROOM_MIB")) {
         margin = (size_t) std::max(0, atoi(e)) << 20;
     }
-    // [TAG_FN_R2_RESERVE_LENT] the reserve after the hot set's init borrows the stream's banks, so the trunk's compute buffer
-    // loses its op-offload copy space (one bank): that VRAM goes to the hot set. The old compute buffers are released
-    // first, so the hot set's allocation never sees both.
-    const size_t rl_give = std::min(llama_prefill_stream_reserve_saving(this), m_compute);
-    const size_t budget  = llama_fn_vram_fit_budget(mem_total, mem_free + rl_give, ceiling, margin);
-    if (rl_give > 0) {
-        LLAMA_LOG_INFO("moe-hot: VRAM fit: [TAG_FN_R2_RESERVE_LENT] the reserve borrows the prefill stream's banks, so the "
-                "compute buffer drops its op-offload copy space: +%.0f MiB for the hot set\n", rl_give/MiB);
-        synchronize();
-        sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(),
-                    graph_max_nodes(std::min(cparams.n_ctx, cparams.n_ubatch)), cparams.pipeline_parallel, cparams.op_offload));
-        sched_need_reserve = true;
-    }
+    const size_t budget = llama_fn_vram_fit_budget(mem_total, mem_free, ceiling, margin);
 
     LLAMA_LOG_INFO("moe-hot: VRAM fit on %s: %.0f of %.0f MiB used = model %.0f + KV %.0f + compute %.0f + other %.0f "
             "(CUDA runtime, other processes)\n", ggml_backend_dev_name(dev), used/MiB, mem_total/MiB, m_model/MiB, m_kv/MiB,

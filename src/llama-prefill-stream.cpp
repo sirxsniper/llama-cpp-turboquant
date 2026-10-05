@@ -733,34 +733,6 @@ llama_pfs_counters llama_prefill_stream_get_counters() {
     return s->ctr;
 }
 
-// [TAG_FN_R2_RESERVE_LENT] LLAMA_PREFILL_STREAM_RESERVE_LENT=1: the scheduler reserves with the banks borrowed, so its pp
-// graph streams and the compute buffer holds no op-offload copy of a layer's experts. Only with a lending stream whose
-// minimum is not above the op-offload batch (smaller prompt ubatches never offload), and only once the hot set can lend.
-static bool pfs_reserve_lent_on(const pfs_state * s) {
-    static const bool on = gen5::env_int("LLAMA_PREFILL_STREAM_RESERVE_LENT", 0, 0, 1) != 0;
-    static const int64_t off_min = [] {
-        const char * e = getenv("GGML_OP_OFFLOAD_MIN_BATCH");
-        return (int64_t) (e && e[0] ? atoi(e) : 32);
-    }();
-    return on && s && s->lend && s->min_tokens <= off_min && s->min_tokens < INT64_MAX;
-}
-
-size_t llama_prefill_stream_reserve_saving(const void * owner) {
-    pfs_state * s = g_pfs;
-    if (!s || s->owner != owner || !pfs_reserve_lent_on(s)) {
-        return 0;
-    }
-    return s->bank_size;
-}
-
-bool llama_prefill_stream_reserve_take(const void * owner) {
-    pfs_state * s = g_pfs;
-    if (!s || s->owner != owner || !pfs_reserve_lent_on(s)) {
-        return false;
-    }
-    return s->lent || pfs_take(s);
-}
-
 bool llama_prefill_stream_before_ubatch(const void * owner, ggml_backend_sched_t sched, int64_t n_tokens) {
     pfs_state * s = g_pfs;
     if (!s || !s->lend || s->owner != owner) {

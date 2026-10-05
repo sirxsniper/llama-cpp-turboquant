@@ -197,9 +197,3 @@ LLAMA_API llama_pfs_counters llama_prefill_stream_get_counters();
 // before each ubatch's graph; sched: its scheduler (synchronized here before a lend or a return).
 // Returns true when the banks were borrowed or returned (graphs built before must not be reused).
 LLAMA_API bool llama_prefill_stream_before_ubatch(const void * owner, ggml_backend_sched_t sched, int64_t n_tokens);
-
-// [TAG_FN_R2_RESERVE_LENT] LLAMA_PREFILL_STREAM_RESERVE_LENT=1 with a lending stream: the owner's scheduler reserves its
-// pp graph with the banks borrowed (reserve_take, once the hot set can lend), so the compute buffer keeps no op-offload
-// copy of a layer's experts; reserve_saving is that copy's size (one bank), which the VRAM fit gives to the hot set.
-LLAMA_API size_t llama_prefill_stream_reserve_saving(const void * owner);
-LLAMA_API bool   llama_prefill_stream_reserve_take(const void * owner);
