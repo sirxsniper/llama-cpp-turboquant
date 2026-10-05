@@ -495,7 +495,12 @@ void llama_fn_auto_on_load(llama_model & model, llama_model_loader & ml, const s
     if (model.arch != LLM_ARCH_QWEN4EXP || params.no_alloc || params.vocab_only) {
         return;
     }
-    llama_fn_l3_host_on_load(model); // [TAG_FN_L3_HOST_QOS] [TAG_FN_L3_HOST_POKE]
+    // [TAG_FN_L3_HOST_QOS] [TAG_FN_L3_HOST_POKE] on every way out: after the profile state below exists, so a value the
+    // profile sets counts as well as one from the environment
+    struct l3_host_hook {
+        llama_model & m;
+        ~l3_host_hook() { llama_fn_l3_host_on_load(m); }
+    } l3_hook { model };
 
     const int n_layer = (int) model.hparams.n_layer();
     std::vector<std::pair<std::string, bool>> ov;
