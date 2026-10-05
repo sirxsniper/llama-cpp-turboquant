@@ -650,15 +650,17 @@ llama_model_qwen4exp::graph::l3_flags llama_model_qwen4exp::graph::l3_read(const
     f.mmv     = on("LLAMA_FN_GPU_MMV");
     f.mmvd    = on("LLAMA_FN_GPU_MMVD");
     f.q8f     = on("LLAMA_FN_GPU_Q8F");
+    f.zskip   = on("LLAMA_FN_GPU_ZSKIP");
 
     const int mask = (f.defer ? 1 : 0) | (f.convwb ? 2 : 0) | (f.hcfuse ? 4 : 0) | (f.compact ? 8 : 0) |
-                     (f.topk ? 16 : 0) | (f.idxq8 ? 32 : 0) | (f.mmv ? 64 : 0) | (f.mmvd ? 128 : 0) | (f.q8f ? 256 : 0);
+                     (f.topk ? 16 : 0) | (f.idxq8 ? 32 : 0) | (f.mmv ? 64 : 0) | (f.mmvd ? 128 : 0) | (f.q8f ? 256 : 0) |
+                     (f.zskip ? 512 : 0);
     static std::atomic<int> logged{-1};
     if (logged.exchange(mask) != mask) {
-        LLAMA_LOG_INFO("qwen4exp: [TAG_FN_L3_GPU] device levers:%s%s%s%s%s%s%s%s%s%s\n",
+        LLAMA_LOG_INFO("qwen4exp: [TAG_FN_L3_GPU] device levers:%s%s%s%s%s%s%s%s%s%s%s\n",
                 f.defer ? " DEFER" : "", f.convwb ? " CONVWB" : "", f.hcfuse ? " HCFUSE" : "", f.compact ? " COMPACT" : "",
                 f.topk ? " TOPK" : "", f.idxq8 ? " IDXQ8" : "", f.mmv ? " MMV" : "", f.mmvd ? " MMVD" : "",
-                f.q8f ? " Q8F" : "", mask == 0 ? " none" : "");
+                f.q8f ? " Q8F" : "", f.zskip ? " ZSKIP" : "", mask == 0 ? " none" : "");
     }
     return f;
 }
@@ -1924,6 +1926,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
     moe_bridge_defer = true;
     moe_router_mark  = l3.mmv ? GGML_FN_L3_MMV : 0; // [TAG_FN_L3_GPU_MMV] the router: 512 rows of 2560
     moe_q8in_mark    = l3.q8f ? GGML_FN_L3_Q8IN : 0; // [TAG_FN_L3_GPU_Q8F] the hot / DMA chains read hc_pre's q8_1 copy
+    moe_zskip_mark   = l3.zskip ? GGML_FN_L3_ZSKIP : 0; // [TAG_FN_L3_GPU_ZSKIP] their zero-slot pairs are not computed
     ggml_tensor * moe_out =
         build_moe_ffn(cur,
             model.layers[il].ffn_gate_inp,
@@ -1942,6 +1945,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
     moe_bridge_defer = false;
     moe_router_mark  = 0;
     moe_q8in_mark    = 0;
+    moe_zskip_mark   = 0;
 
     // [TAG_FN_L3_GPU_DEFER] after the post (and the hot chain), before the shared expert and the wait
     l3_expand_deferred();

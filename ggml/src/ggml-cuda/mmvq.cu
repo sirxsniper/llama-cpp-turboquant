@@ -1103,6 +1103,130 @@ static __global__ void mul_mat_vec_q_moe(
     }
 }
 
+// [TAG_FN_L3_GPU_ZSKIP] mul_mat_vec_q_moe for the expert chains of the qwen4exp hot set and DMA banks, without a bias, a
+// scale or a shared expert and with no glu or SWIGLU: matrix zero_x is the slot's zero matrix. A warp whose token routes
+// there writes 0 without reading it: its dot products are exactly +0 (zero scales and quants), and so is SWIGLU of them
+// (silu(0) * 0). Every other warp runs the code of mul_mat_vec_q_moe unchanged, so the output has the same bits.
+template <ggml_type type, int c_rows_per_block, bool has_fusion>
+__launch_bounds__(get_mmvq_mmid_max_batch_for_device<type>()*ggml_cuda_get_physical_warp_size(), 1)
+static __global__ void mul_mat_vec_q_moe_fn_l3(
+        const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion,
+        float * dst_ptr,
+        const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t nrows_x,
+        const uint32_t stride_row_x, const uint32_t stride_col_y, uint32_t stride_col_dst,
+        const uint32_t stride_channel_x, const uint32_t stride_channel_y, const uint32_t stride_channel_dst,
+        const uint32_t ncols_dst, const uint32_t ids_stride, const uint32_t zero_x) {
+    const void    * GGML_CUDA_RESTRICT vx  = vx_ptr;
+    const void    * GGML_CUDA_RESTRICT vy  = vy_ptr;
+    const int32_t * GGML_CUDA_RESTRICT ids = ids_ptr;
+    float         * GGML_CUDA_RESTRICT dst = dst_ptr;
+
+    constexpr int qk  = ggml_cuda_type_traits<type>::qk;
+    constexpr int qi  = ggml_cuda_type_traits<type>::qi;
+    constexpr int vdr = get_vdr_mmvq(type);
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+
+    constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
+
+    const void * vgate = nullptr;
+    if constexpr (has_fusion) {
+        vgate = fusion.gate;
+    }
+
+    const uint32_t token_idx   = threadIdx.y;
+    const int      row0        = c_rows_per_block*blockIdx.x;
+    const int      blocks_per_row_x = ncols_x / qk;
+    constexpr int  blocks_per_iter  = vdr * warp_size / qi;
+
+    const uint32_t channel_dst = blockIdx.y;
+
+    if (token_idx >= ncols_dst) {
+        return;
+    }
+
+    ggml_cuda_pdl_sync();
+    const uint32_t channel_x = ids[channel_dst + token_idx * ids_stride];
+    const uint32_t channel_y = fastmodulo(channel_dst, nchannels_y);
+
+    float * dst_row = dst + channel_dst*stride_channel_dst + token_idx*stride_col_dst + row0;
+
+    if (channel_x == zero_x) {
+        ggml_cuda_pdl_lc();
+        if (threadIdx.x < c_rows_per_block && (c_rows_per_block == 1 || uint32_t(row0 + threadIdx.x) < nrows_x)) {
+            dst_row[threadIdx.x] = 0.0f;
+        }
+        return;
+    }
+
+    const block_q8_1 * y = ((const block_q8_1 *) vy) + channel_y*stride_channel_y + token_idx*stride_col_y;
+    const int kbx_offset  = channel_x*stride_channel_x + row0*stride_row_x;
+
+    // partial sum for each thread
+    float tmp[c_rows_per_block] = {0.0f};
+    float tmp_gate[c_rows_per_block] = {0.0f};
+
+    for (int kbx = threadIdx.x / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
+        const int kby = kbx * (qk/QK8_1);
+        const int kqs = vdr * (threadIdx.x % (qi/vdr));
+
+#pragma unroll
+        for (int i = 0; i < c_rows_per_block; ++i) {
+            tmp[i] += vec_dot_q_cuda(vx, &y[kby], kbx_offset + i*stride_row_x + kbx, kqs);
+            if constexpr (has_fusion) {
+                tmp_gate[i] += vec_dot_q_cuda(vgate, &y[kby], kbx_offset + i*stride_row_x + kbx, kqs);
+            }
+        }
+    }
+
+    ggml_cuda_pdl_lc();
+
+#pragma unroll
+    for (int i = 0; i < c_rows_per_block; ++i) {
+        tmp[i] = warp_reduce_sum<warp_size>(tmp[i]);
+        if constexpr (has_fusion) {
+            tmp_gate[i] = warp_reduce_sum<warp_size>(tmp_gate[i]);
+        }
+    }
+
+    if (threadIdx.x < c_rows_per_block && (c_rows_per_block == 1 || uint32_t(row0 + threadIdx.x) < nrows_x)) {
+        float result = tmp[threadIdx.x];
+        if constexpr (has_fusion) {
+            const float gate_value = tmp_gate[threadIdx.x];
+            result *= ggml_cuda_op_silu_single(gate_value);
+        }
+        dst_row[threadIdx.x] = result;
+    }
+}
+
+template<ggml_type type>
+static void mul_mat_vec_q_moe_fn_l3_launch(
+        const void * vx, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
+        const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t nrows_x,
+        const uint32_t stride_row_x, const uint32_t stride_col_y, const uint32_t stride_col_dst,
+        const uint32_t stride_channel_x, const uint32_t stride_channel_y, const uint32_t stride_channel_dst,
+        const uint32_t ncols_dst, const uint32_t ids_stride, const uint32_t zero_x,
+        const int warp_size, const int nchannels_dst, cudaStream_t stream) {
+    constexpr int rows_per_block = 2; // as mul_mat_vec_q_moe_launch
+    const int64_t nblocks_rows = (nrows_x + rows_per_block - 1) / rows_per_block;
+    const dim3 block_nums(nblocks_rows, nchannels_dst);
+    const dim3 block_dims(warp_size, ncols_dst);
+    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, 0, stream);
+
+    if (fusion.gate != nullptr) {
+        ggml_cuda_kernel_launch(mul_mat_vec_q_moe_fn_l3<type, rows_per_block, true>, launch_params,
+            vx, vy, ids, fusion, dst, ncols_x, nchannels_y, nrows_x,
+            stride_row_x, stride_col_y, stride_col_dst,
+            stride_channel_x, stride_channel_y, stride_channel_dst,
+            ncols_dst, ids_stride, zero_x);
+    } else {
+        ggml_cuda_kernel_launch(mul_mat_vec_q_moe_fn_l3<type, rows_per_block, false>, launch_params,
+            vx, vy, ids, fusion, dst, ncols_x, nchannels_y, nrows_x,
+            stride_row_x, stride_col_y, stride_col_dst,
+            stride_channel_x, stride_channel_y, stride_channel_dst,
+            ncols_dst, ids_stride, zero_x);
+    }
+}
+
 template<ggml_type type>
 static std::pair<dim3, dim3> calc_launch_params(
         const int ncols_dst, const int nrows_x, const int nchannels_dst, const int nsamples_or_ntokens,
@@ -1858,6 +1982,38 @@ void ggml_cuda_mul_mat_vec_q(
     const int64_t stride_channel_y   = ids ? s11  : s12;
 
     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
+
+    // [TAG_FN_L3_GPU_ZSKIP] the expert chains of the qwen4exp hot set / DMA banks (ids marked): the outputs of the zero
+    // slot (matrix ne02 - 1) are written as 0 without reading it; no bias, scale or shared expert, glu SWIGLU or none
+    if (ids && ncols_dst > 1 && ggml_fn_l3_get(ids) == GGML_FN_L3_ZSKIP && ggml_cuda_fn_l3_enabled() &&
+            fusion_local.shared_up == nullptr && fusion_local.x_bias == nullptr && fusion_local.gate_bias == nullptr &&
+            fusion_local.x_scale == nullptr && fusion_local.gate_scale == nullptr &&
+            (fusion_local.gate == nullptr || fusion_local.glu_op == GGML_GLU_OP_SWIGLU)) {
+        const int    warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
+        const uint3  nch_y_fd  = init_fastdiv_values((uint32_t) nchannels_y);
+        bool launched = true;
+#define FN_L3_ZSKIP_CASE(t) case t:                                                                                       \
+            mul_mat_vec_q_moe_fn_l3_launch<t>(src0->data, src1_q8, ids_d, fusion_local, dst_d, (uint32_t) ne00, nch_y_fd,  \
+                    (uint32_t) ne01, (uint32_t) s01, (uint32_t) stride_col_y, (uint32_t) stride_col_dst, (uint32_t) s02,    \
+                    (uint32_t) stride_channel_y, (uint32_t) stride_channel_dst, (uint32_t) ncols_dst, (uint32_t) ids_stride, \
+                    (uint32_t) (ne02 - 1), warp_size, (int) nchannels_dst, stream);                                        \
+            break;
+        switch (src0->type) {
+            FN_L3_ZSKIP_CASE(GGML_TYPE_Q4_K)
+            FN_L3_ZSKIP_CASE(GGML_TYPE_Q5_K)
+            FN_L3_ZSKIP_CASE(GGML_TYPE_Q6_K)
+            FN_L3_ZSKIP_CASE(GGML_TYPE_Q5_1)
+            FN_L3_ZSKIP_CASE(GGML_TYPE_Q8_0)
+            default:
+                launched = false;
+                break;
+        }
+#undef FN_L3_ZSKIP_CASE
+        if (launched) {
+            ggml_cuda_fn_l3_note(GGML_CUDA_FN_L3_PATH_ZSKIP, "ZSKIP: expert chains write the zero slot's outputs without reading it");
+            return;
+        }
+    }
 
     mul_mat_vec_q_switch_type(
         src0->data, src0->type, src1_q8, ids_d, fusion_local, dst_d, ne00,

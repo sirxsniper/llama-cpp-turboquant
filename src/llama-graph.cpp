@@ -2547,6 +2547,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // cache path is enabled for); uncached ids map to the zero slot
     // [TAG_MOE_DMA_SHARE] the same chain over the DMA bank (dma = true)
     auto build_slot_chain = [&](ggml_tensor * up_c, ggml_tensor * gate_c, ggml_tensor * down_c, ggml_tensor * slot_ids, bool dma) -> ggml_tensor * {
+        // [TAG_FN_L3_GPU_ZSKIP] an arch's mark for the slot ids: the last slot of the slot tensors is the zero slot
+        if (moe_zskip_mark != 0 && up_c->ne[2] == gate_c->ne[2] && up_c->ne[2] == down_c->ne[2]) {
+            ggml_fn_l3_set(slot_ids, moe_zskip_mark);
+        }
         ggml_tensor * up_g   = ggml_mul_mat_id(ctx0, up_c,   mc_inp, slot_ids);
         ggml_tensor * gate_g = ggml_mul_mat_id(ctx0, gate_c, mc_inp, slot_ids);
         cb(up_g,   dma ? "ffn_moe_dma_up"   : "ffn_moe_cache_up",   il);

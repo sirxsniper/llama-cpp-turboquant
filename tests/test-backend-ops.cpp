@@ -12138,6 +12138,78 @@ struct test_fn_l3_convwb : public test_case {
     }
 };
 
+// [TAG_FN_L3_GPU_ZSKIP] the expert chain of the hot set / a DMA bank (build_slot_chain): up and gate MUL_MAT_IDs, SWIGLU,
+// down, over slot tensors whose last slot is all zeros; the ids route some (token, slot) pairs there (every third, and all
+// of the last token when zero_all). marked = ZSKIP on the ids.
+struct test_fn_l3_zskip : public test_case {
+    const ggml_type type_ud;
+    const ggml_type type_down;
+    const int64_t   n_tokens;
+    const bool      zero_all;
+    const bool      marked;
+
+    std::string op_desc(ggml_tensor *) override { return "FN_L3_GPU"; }
+    std::string vars() override { return "zskip," + VARS_TO_STR5(type_ud, type_down, n_tokens, zero_all, marked); }
+    bool run_whole_graph() override { return true; }
+    double max_nmse_err() override { return 5e-4; }
+
+    test_fn_l3_zskip(ggml_type type_ud = GGML_TYPE_Q4_K, ggml_type type_down = GGML_TYPE_Q5_1, int64_t n_tokens = 3,
+            bool zero_all = false, bool marked = true)
+        : type_ud(type_ud), type_down(type_down), n_tokens(n_tokens), zero_all(zero_all), marked(marked) {}
+
+    static constexpr int64_t n_embd  = 2560;
+    static constexpr int64_t n_ff    = 640;
+    static constexpr int64_t n_slots = 6;
+    static constexpr int64_t n_used  = 4;
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * up_c   = ggml_new_tensor_3d(ctx, type_ud,   n_embd, n_ff, n_slots + 1);
+        ggml_set_name(up_c, "up_c");
+        ggml_tensor * gate_c = ggml_new_tensor_3d(ctx, type_ud,   n_embd, n_ff, n_slots + 1);
+        ggml_set_name(gate_c, "gate_c");
+        ggml_tensor * down_c = ggml_new_tensor_3d(ctx, type_down, n_ff, n_embd, n_slots + 1);
+        ggml_set_name(down_c, "down_c");
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+        ggml_set_name(x, "x");
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, n_tokens);
+        ggml_set_name(ids, "slot_ids");
+        if (marked) {
+            ggml_fn_l3_set(ids, GGML_FN_L3_ZSKIP);
+        }
+        ggml_tensor * mc   = ggml_reshape_3d(ctx, x, n_embd, 1, n_tokens);
+        ggml_tensor * up   = ggml_mul_mat_id(ctx, up_c,   mc, ids);
+        ggml_tensor * gate = ggml_mul_mat_id(ctx, gate_c, mc, ids);
+        ggml_tensor * act  = ggml_swiglu_split(ctx, gate, up);
+        ggml_tensor * out  = ggml_mul_mat_id(ctx, down_c, act, ids); // [n_embd, n_used, T]
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->view_src != nullptr || t->op != GGML_OP_NONE) {
+                continue;
+            }
+            const std::string name = ggml_get_name(t);
+            if (name == "slot_ids") {
+                std::vector<int32_t> v(n_used*n_tokens);
+                for (int64_t i = 0; i < (int64_t) v.size(); ++i) {
+                    const int64_t tok = i / n_used;
+                    v[i] = (i % 3 == 2) || (zero_all && tok == n_tokens - 1) ? (int32_t) n_slots : (int32_t) ((i*5 + 1) % n_slots);
+                }
+                ggml_backend_tensor_set(t, v.data(), 0, v.size()*sizeof(int32_t));
+                continue;
+            }
+            init_tensor_uniform(t);
+            if (t->ne[2] == n_slots + 1) {
+                // the zero slot
+                std::vector<uint8_t> zeros(t->nb[2], 0);
+                ggml_backend_tensor_set(t, zeros.data(), n_slots*t->nb[2], t->nb[2]);
+            }
+        }
+    }
+};
+
 // [TAG_FN_L3_GPU_Q8F] the producers that write the q8_1 copy of their output for the mat-vecs that read it, at Flash-Next
 // shapes (n_embd 2560, hc 4, low rank 320); marked = Q8OUT on the producer (and Q8IN on the expert input):
 //   mode 0: xn = rms_norm(x) * w -> [10240, T] -> q8_0 down (320 rows) and the f32 inject (4 rows)
@@ -14802,6 +14874,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         for (int mode : { 0, 1, 2, 3 }) {
             test_cases.emplace_back(new test_fn_l3_q8f(mode, t, true)); // [TAG_FN_L3_GPU_Q8F]
         }
+        test_cases.emplace_back(new test_fn_l3_zskip(GGML_TYPE_Q4_K, GGML_TYPE_Q5_1, t, false, true)); // [TAG_FN_L3_GPU_ZSKIP]
+        test_cases.emplace_back(new test_fn_l3_zskip(GGML_TYPE_Q5_K, GGML_TYPE_Q8_0, t, true, true));
     }
     for (int64_t nb : { 1, 3 }) {
         test_cases.emplace_back(new test_flash_attn_ext_turbot(TURBOT_TW_NR2_Q8, 32768, nb, TURBOT_MIX_BAND64K, 3, false, 0.0f, false,
@@ -15554,6 +15628,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             for (int mode : { 0, 1, 2, 3 }) {
                 test_cases.emplace_back(new test_fn_l3_q8f(mode, t, m)); // [TAG_FN_L3_GPU_Q8F]
             }
+            test_cases.emplace_back(new test_fn_l3_zskip(GGML_TYPE_Q4_K, GGML_TYPE_Q5_1, t, false, m)); // [TAG_FN_L3_GPU_ZSKIP]
             for (int64_t np : { 8192, 32768, 61440 }) {
                 test_cases.emplace_back(new test_fn_l3_idxq8(np*4 + 3, np, t, m));
                 test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, { np, t, 1, 1 }, 512, false, true, m));
@@ -17353,6 +17428,16 @@ static bool run_fn_l3_gpu(ggml_backend_t backend, ggml_backend_t backend_ref, co
         // [TAG_FN_L3_GPU_Q8F] the q8_1 copies of the producers against the MMVQ / MMID own quantization
         for (int mode : { 0, 1, 2, 3 }) {
             cases.push_back({ [=](bool m) { return std::unique_ptr<test_case>(new test_fn_l3_q8f(mode, t, m)); }, false });
+        }
+        // [TAG_FN_L3_GPU_ZSKIP] the zero slot's outputs written without reading it
+        static const ggml_type zskip_types[][2] = { { GGML_TYPE_Q4_K, GGML_TYPE_Q5_1 }, { GGML_TYPE_Q5_K, GGML_TYPE_Q8_0 },
+                                                     { GGML_TYPE_Q6_K, GGML_TYPE_Q8_0 } };
+        for (const auto & tt : zskip_types) {
+            for (bool za : { false, true }) {
+                const ggml_type tu = tt[0];
+                const ggml_type td = tt[1];
+                cases.push_back({ [=](bool m) { return std::unique_ptr<test_case>(new test_fn_l3_zskip(tu, td, t, za, m)); }, false });
+            }
         }
     }
     for (int64_t t : { 1, 3, 4 }) {

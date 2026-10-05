@@ -1117,6 +1117,8 @@ struct llm_graph_context {
     mutable int32_t moe_router_mark = 0;
     // [TAG_FN_L3_GPU_Q8F] a ggml-fn-l3.h mark build_moe_ffn puts on the input of the device expert chains (0 = none)
     mutable int32_t moe_q8in_mark = 0;
+    // [TAG_FN_L3_GPU_ZSKIP] a ggml-fn-l3.h mark build_moe_ffn puts on the slot ids of the device expert chains (0 = none)
+    mutable int32_t moe_zskip_mark = 0;
     struct moe_bridge_post {
         ggml_tensor * ticket;
         ggml_tensor * hot;      // the device part, weighted and summed [n_embd, T], or nullptr

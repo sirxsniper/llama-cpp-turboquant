@@ -29,6 +29,8 @@ enum ggml_fn_l3_mark {
     GGML_FN_L3_Q8OUT   = 0x4C334707, // MUL of an RMS_NORM, SILU of an HCLO chain, DSV4_HC_PRE: also writes the q8_1 copy
                                      // of its output for the MUL_MAT that reads it (the MMVQ reuse cache, same bytes)
     GGML_FN_L3_Q8IN    = 0x4C334708, // the src1 of MUL_MAT_IDs: they read a q8_1 copy of it from the reuse cache if it has one
+    GGML_FN_L3_ZSKIP   = 0x4C334709, // the ids of a MUL_MAT_ID: matrix ne02 - 1 of src0 is all zeros (the zero slot of the
+                                     // hot set / a DMA bank), so its outputs are 0 and are written without reading it
 };
 
 static inline void ggml_fn_l3_set(struct ggml_tensor * t, int32_t mark) {
