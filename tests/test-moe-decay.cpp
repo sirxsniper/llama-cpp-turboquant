@@ -8,8 +8,11 @@
 
 #include "../src/llama-moe-decay.h"
 
+#include <cmath>
 #include <cstdio>
 #include <random>
+#include <sstream>
+#include <string>
 #include <vector>
 
 static int g_fail   = 0;
@@ -258,6 +261,181 @@ static void test_skewed() {
     TCHECK(rate > 0.5, "hit rate %.3f > 0.5 on a Zipf stream with a quarter of the experts", rate);
 }
 
+// [TAG_FN_L3_POLICY_POOL] the pairs of a slot pool shared by two layers: the same rules across the layers, victims of
+// another layer, busy slots and experts
+static void test_pool_pairs() {
+    llama_moe_decay_params p;
+    p.admit = 2.0f;
+    p.ratio = 1.2f;
+    p.hyst  = 0.5f;
+    std::vector<float>   c0 = { 4.0f, 0.0f, 9.0f, 0.0f, 1.0f, 0.0f, 1.9f, 0.0f };
+    std::vector<float>   c1 = { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 5.0f, 0.0f, 3.0f };
+    std::vector<uint8_t> b0 = { 1, 0, 0, 0, 1, 0, 0, 0 }; // e0 and e4 of layer 0 are resident
+    std::vector<uint8_t> b1 = { 0, 0, 0, 0, 0, 0, 0, 0 };
+    // 4 slots: (layer 0, e0), free, (layer 0, e4), an upload in flight
+    std::vector<int32_t> sl = { 0, -1, 0, 1 };
+    std::vector<int32_t> se = { 0, -1, 4, -1 };
+    std::vector<uint8_t> sb = { 0, 0, 0, 1 };
+    std::vector<llama_moe_decay_swap> out;
+    llama_moe_decay_pairs_pool({ &c0, &c1 }, { &b0, &b1 }, sl, se, sb, p, out);
+    // candidates: (0, e2) 9, (1, e5) 5, (1, e7) 3; (0, e6) 1.9 is under admit. Victims: slot 1 free, then (0, e4) 1 in
+    // slot 2, then (0, e0) 4 in slot 0; slot 3 is busy. (0, e2) -> slot 1; (1, e5) 5 > 1.2 and > 1.5 -> slot 2 over
+    // layer 0's e4; (1, e7) 3 vs (0, e0) 4: no
+    TCHECK(out.size() == 2, "pool: two pairs, got %zu", out.size());
+    if (out.size() == 2) {
+        TCHECK(out[0].layer == 0 && out[0].expert == 2 && out[0].slot == 1 && out[0].victim == -1 && out[0].victim_layer == -1,
+               "pool: the best candidate into the free slot");
+        TCHECK(out[1].layer == 1 && out[1].expert == 5 && out[1].slot == 2 && out[1].victim == 4 && out[1].victim_layer == 0,
+               "pool: layer 1 takes layer 0's weakest slot (layer %d e%d slot %d victim %d of layer %d)", out[1].layer,
+               out[1].expert, out[1].slot, out[1].victim, out[1].victim_layer);
+        TCHECK(out[0].gain == 10.0f && out[1].gain == 4.0f, "pool: gains");
+    }
+}
+
+// [TAG_FN_L3_POLICY_POOL] two layers, a wide working set (12 experts a step) and a narrow one (2): 16 slots as one pool
+// against a fixed 8 + 8. The pool gives the wide layer the slots the narrow one does not need.
+static void test_pool_vs_fixed() {
+    llama_moe_decay_params p;
+    const int n_exp = 32;
+    double hit_rate[2] = { 0.0, 0.0 };
+    for (int pooled = 0; pooled < 2; ++pooled) {
+        std::vector<float> cnt[2] = { std::vector<float>(n_exp, 0.0f), std::vector<float>(n_exp, 0.0f) };
+        std::vector<int32_t> eslot[2] = { std::vector<int32_t>(n_exp, -1), std::vector<int32_t>(n_exp, -1) };
+        const int n_slots = 16;
+        std::vector<int32_t> sl(n_slots, -1); // pooled: owner layer of a slot; fixed: slots 0..7 layer 0, 8..15 layer 1
+        std::vector<int32_t> se(n_slots, -1);
+        uint64_t hit = 0, tot = 0;
+        for (int step = 0; step < 400; ++step) {
+            std::vector<int32_t> ids[2];
+            for (int e = 0; e < 12; ++e) {
+                ids[0].push_back(e);
+            }
+            ids[1] = { 0, 1 };
+            for (int l = 0; l < 2; ++l) {
+                if (step >= 100) {
+                    for (const int32_t e : ids[l]) {
+                        hit += eslot[l][e] >= 0 ? 1 : 0;
+                        tot++;
+                    }
+                }
+                llama_moe_decay_count(cnt[l], ids[l].data(), (int64_t) ids[l].size());
+            }
+            if ((step + 1) % p.every != 0) {
+                continue;
+            }
+            std::vector<llama_moe_decay_swap> sw;
+            if (pooled) {
+                std::vector<uint8_t> b[2];
+                for (int l = 0; l < 2; ++l) {
+                    b[l].assign(n_exp, 0);
+                    for (int e = 0; e < n_exp; ++e) {
+                        b[l][e] = eslot[l][e] >= 0 ? 1 : 0;
+                    }
+                }
+                std::vector<uint8_t> sb(n_slots, 0);
+                llama_moe_decay_pairs_pool({ &cnt[0], &cnt[1] }, { &b[0], &b[1] }, sl, se, sb, p, sw);
+            } else {
+                for (int l = 0; l < 2; ++l) {
+                    std::vector<int32_t> lse(se.begin() + 8*l, se.begin() + 8*l + 8);
+                    std::vector<uint8_t> lsb(8, 0);
+                    std::vector<uint8_t> b(n_exp, 0);
+                    for (int e = 0; e < n_exp; ++e) {
+                        b[e] = eslot[l][e] >= 0 ? 1 : 0;
+                    }
+                    std::vector<llama_moe_decay_swap> lw;
+                    llama_moe_decay_pairs(l, cnt[l], lse, lsb, b, p, lw);
+                    for (auto w : lw) {
+                        w.slot += 8*l;
+                        sw.push_back(w);
+                    }
+                }
+            }
+            llama_moe_decay_order(sw);
+            for (const auto & w : sw) {
+                const int vl = w.victim_layer >= 0 ? w.victim_layer : w.layer;
+                if (w.victim >= 0) {
+                    eslot[vl][w.victim] = -1;
+                }
+                eslot[w.layer][w.expert] = w.slot;
+                se[w.slot] = w.expert;
+                sl[w.slot] = w.layer;
+            }
+            for (int l = 0; l < 2; ++l) {
+                llama_moe_decay_apply(cnt[l], p.decay);
+            }
+        }
+        hit_rate[pooled] = tot ? (double) hit/tot : 0.0;
+    }
+    printf("  pool vs fixed: hit rate %.3f pooled, %.3f fixed (8 + 8 slots, working sets 12 and 2)\n", hit_rate[1], hit_rate[0]);
+    TCHECK(hit_rate[1] > 0.99 && hit_rate[0] < 0.75, "the pool holds both working sets (%.3f), fixed shares do not (%.3f)",
+           hit_rate[1], hit_rate[0]);
+}
+
+// [TAG_FN_L3_POLICY_STATE] the saved state's text format: round trip, the model / expert count check, broken lines
+static void test_hotstate() {
+    const int64_t n_exp = 8;
+    std::vector<llama_moe_hotstate_layer> in(2);
+    in[0].il = 3;
+    in[0].bytes = 3072000;
+    in[0].res = { 5, 1, 7 };
+    in[0].cnt = { 0.0f, 3.25f, 0.5f, 0.0f, 0.0f, 9.125f, 1e-7f, 2.0f };
+    in[1].il = 47;
+    in[1].bytes = 3584000;
+    in[1].res = {};
+    in[1].cnt = { 1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f, 7.0f, 123456.789f };
+    const std::string model = "Qwen3.8 Flash Next";
+    const std::string text = llama_moe_hotstate_format(n_exp, 4096, model, in);
+    TCHECK(text.rfind("moehot v1 n_expert=8 layers=2 steps=4096 model=Qwen3.8_Flash_Next\n", 0) == 0, "header: %s",
+           text.substr(0, 80).c_str());
+
+    std::vector<llama_moe_hotstate_layer> out;
+    uint64_t steps = 0;
+    std::string why;
+    size_t bad = 99;
+    {
+        std::istringstream is(text);
+        TCHECK(llama_moe_hotstate_parse(is, n_exp, model, out, steps, why, &bad), "round trip parses (%s)", why.c_str());
+    }
+    TCHECK(steps == 4096 && bad == 0 && out.size() == 2, "steps %llu, bad %zu, layers %zu", (unsigned long long) steps, bad, out.size());
+    if (out.size() == 2) {
+        for (size_t i = 0; i < 2; ++i) {
+            TCHECK(out[i].il == in[i].il && out[i].bytes == in[i].bytes && out[i].res == in[i].res, "layer %zu ids", i);
+            for (int64_t e = 0; e < n_exp; ++e) {
+                const float a = in[i].cnt[e];
+                const float b = out[i].cnt[e];
+                TCHECK(std::fabs(a - b) <= 1e-5f*std::max(1.0f, std::fabs(a)), "layer %zu count %lld: %g vs %g", i, (long long) e, a, b);
+            }
+        }
+    }
+    // another model, another expert count, not a state file: not used
+    {
+        std::istringstream is(text);
+        TCHECK(!llama_moe_hotstate_parse(is, n_exp, "Qwen3.8 27B", out, steps, why), "another model is refused");
+    }
+    {
+        std::istringstream is(text);
+        TCHECK(!llama_moe_hotstate_parse(is, 16, model, out, steps, why), "another expert count is refused");
+    }
+    {
+        std::istringstream is("moeprof v1 n_layer=48\n");
+        TCHECK(!llama_moe_hotstate_parse(is, n_exp, model, out, steps, why), "a moeprof file is refused");
+    }
+    // broken layer lines are left out and counted; the good one is kept
+    {
+        std::string t = "moehot v1 n_expert=8 layers=6 steps=1 model=m\n";
+        t += "L 0 100 2 1 2 ; 1 1 1 1 1 1 1 1\n";        // good
+        t += "L 1 100 2 1 9 ; 1 1 1 1 1 1 1 1\n";        // id out of range
+        t += "L 2 100 1 1 1 1 1 1 1 1 1 1\n";            // no ';'
+        t += "L 3 100 1 1 ; 1 1 1 1 1 1 1\n";            // a count missing
+        t += "L 4 100 1 1 ; 1 1 1 1 1 1 1 1 7\n";        // one number too many
+        t += "L 5 100 1 1 ; 1 1 1 1 -2 1 1 1\n";         // a negative count
+        std::istringstream is(t);
+        bad = 0;
+        TCHECK(llama_moe_hotstate_parse(is, n_exp, "m", out, steps, why, &bad), "header ok");
+        TCHECK(out.size() == 1 && out[0].il == 0 && bad == 5, "one good line, 5 broken (got %zu good, %zu bad)", out.size(), bad);
+    }
+}
+
 int main() {
     printf("test-moe-decay: [TAG_FN_R4_ADAPT_DECAY]\n");
     test_pairs();
@@ -265,6 +443,9 @@ int main() {
     test_steady_vs_bursts();
     test_shift();
     test_skewed();
+    test_hotstate();
+    test_pool_pairs();
+    test_pool_vs_fixed();
     printf("test-moe-decay: %d checks, %d errors%s\n", g_checks, g_fail, g_fail ? "" : " - PASSED");
     return g_fail == 0 ? 0 : 1;
 }
