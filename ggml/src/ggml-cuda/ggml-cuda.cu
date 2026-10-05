@@ -451,9 +451,22 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
 
     ggml_cuda_buffer buffer_pool[MAX_BUFFERS] = {};
     size_t pool_size = 0;
+    size_t live      = 0; // [TAG_FN_L3_VRAM_TRIM] bytes handed out and not returned
+    size_t live_hwm  = 0;
 
     explicit ggml_cuda_pool_leg(int device) :
         device(device) {
+    }
+
+    // [TAG_FN_L3_VRAM_TRIM] the cached buffers go back to the driver; handed-out ones stay (the pool does not track them)
+    size_t reserved() const override { return pool_size; }
+    size_t used_hwm() const override { return live_hwm; }
+    void   reset_hwm() override { live_hwm = live; }
+    size_t trim(size_t keep) override {
+        GGML_UNUSED(keep);
+        const size_t before = pool_size;
+        clear_pool();
+        return before - pool_size;
     }
 
     ~ggml_cuda_pool_leg() {
@@ -475,6 +488,13 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
     }
 
     void * alloc(size_t size, size_t * actual_size) override {
+        void * ptr = alloc_raw(size, actual_size);
+        live    += *actual_size; // [TAG_FN_L3_VRAM_TRIM]
+        live_hwm = std::max(live_hwm, live);
+        return ptr;
+    }
+
+    void * alloc_raw(size_t size, size_t * actual_size) {
 #ifdef DEBUG_CUDA_MALLOC
         int nnz = 0;
         size_t max_size = 0;
@@ -540,6 +560,7 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
     }
 
     void free(void * ptr, size_t size) override {
+        live -= std::min(live, size); // [TAG_FN_L3_VRAM_TRIM]
         for (int i = 0; i < MAX_BUFFERS; ++i) {
             ggml_cuda_buffer& b = buffer_pool[i];
             if (b.ptr == nullptr) {
@@ -565,10 +586,10 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
     CUdeviceptr pool_addr = 0;
     size_t pool_used = 0;
     size_t pool_size = 0;
+    size_t pool_hwm  = 0; // [TAG_FN_L3_VRAM_TRIM]
     size_t granularity;
-#if defined(GGML_USE_HIP)
+    // [TAG_FN_L3_VRAM_TRIM] every mapping in address order (HIP unmaps them one by one, trim() unmaps from the top)
     std::vector<std::pair<CUdeviceptr, size_t>> mappings;
-#endif
 
     explicit ggml_cuda_pool_vmm(int device) :
         device(device),
@@ -584,10 +605,32 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
                 CU_CHECK(cuMemUnmap(mapping.first, mapping.second));
             }
 #else
-            CU_CHECK(cuMemUnmap(pool_addr, pool_size));
+            if (pool_size > 0) { // [TAG_FN_L3_VRAM_TRIM] a trimmed pool may hold nothing
+                CU_CHECK(cuMemUnmap(pool_addr, pool_size));
+            }
 #endif
             CU_CHECK(cuMemAddressFree(pool_addr, CUDA_POOL_VMM_MAX_SIZE));
         }
+    }
+
+    // [TAG_FN_L3_VRAM_TRIM]
+    size_t reserved() const override { return pool_size; }
+    size_t used_hwm() const override { return pool_hwm; }
+    void   reset_hwm() override { pool_hwm = pool_used; }
+    size_t trim(size_t keep) override {
+        if (pool_used != 0) {
+            return 0;
+        }
+        size_t freed = 0;
+        while (!mappings.empty() && pool_size - mappings.back().second >= keep) {
+            const std::pair<CUdeviceptr, size_t> m = mappings.back();
+            GGML_ASSERT(m.first + m.second == pool_addr + pool_size);
+            CU_CHECK(cuMemUnmap(m.first, m.second));
+            pool_size -= m.second;
+            freed     += m.second;
+            mappings.pop_back();
+        }
+        return freed;
     }
 
     void * alloc(size_t size, size_t * actual_size) override {
@@ -620,9 +663,7 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
             // map at the end of the pool
             CUdeviceptr start_ptr = (CUdeviceptr)((char *)(pool_addr) + pool_size);
             CU_CHECK(cuMemMap(start_ptr, reserve_size, 0, handle, 0));
-#if defined(GGML_USE_HIP)
             mappings.push_back({start_ptr, reserve_size});
-#endif
 
             // the memory allocation handle is no longer needed after mapping
             CU_CHECK(cuMemRelease(handle));
@@ -685,6 +726,7 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
         void * ptr = (void *) ((CUdeviceptr)((char *)(pool_addr) + pool_used));
         *actual_size = size;
         pool_used += size;
+        pool_hwm   = std::max(pool_hwm, pool_used); // [TAG_FN_L3_VRAM_TRIM]
 
 #ifdef DEBUG_CUDA_MALLOC
         printf("cuda pool[%d]: allocated %llu bytes at %llx\n", device, (unsigned long long) size, ptr);
@@ -753,10 +795,20 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
 
 // cuda buffer
 
+#if defined(GGML_USE_VMM) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+#define GGML_CUDA_VMM_BUFFERS // [TAG_FN_L3_VRAM_CBUF]
+#endif
+
 struct ggml_backend_cuda_buffer_context {
     int device;
     void * dev_ptr = nullptr;
     std::string name;
+
+    // [TAG_FN_L3_VRAM_CBUF] vmm_size > 0: dev_ptr starts a reserved address range of vmm_size bytes, and only the
+    // vmm_segs (offset, size) ranges have physical memory (ggml_backend_cuda_vmm_buffer_*); else a cudaMalloc buffer
+    size_t vmm_size = 0;
+    size_t vmm_gran = 0;
+    std::vector<std::pair<size_t, size_t>> vmm_segs;
 
     ggml_backend_cuda_buffer_context(int device, void * dev_ptr) :
         device(device), dev_ptr(dev_ptr),
@@ -764,7 +816,18 @@ struct ggml_backend_cuda_buffer_context {
     }
 
     ~ggml_backend_cuda_buffer_context() {
-        CUDA_CHECK(cudaFree(dev_ptr));
+        if (vmm_size == 0) {
+            CUDA_CHECK(cudaFree(dev_ptr));
+            return;
+        }
+#ifdef GGML_CUDA_VMM_BUFFERS
+        ggml_cuda_set_device(device);
+        CUDA_CHECK(cudaDeviceSynchronize()); // cudaFree would wait for the device too
+        for (const auto & s : vmm_segs) {
+            CU_CHECK(cuMemUnmap((CUdeviceptr) dev_ptr + s.first, s.second));
+        }
+        CU_CHECK(cuMemAddressFree((CUdeviceptr) dev_ptr, vmm_size));
+#endif
     }
 };
 
@@ -876,7 +939,14 @@ static void ggml_backend_cuda_buffer_clear(ggml_backend_buffer_t buffer, uint8_t
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
 
     ggml_cuda_set_device(ctx->device);
-    CUDA_CHECK(cudaMemsetAsync(ctx->dev_ptr, value, buffer->size, cudaStreamPerThread));
+    if (ctx->vmm_size > 0) {
+        // [TAG_FN_L3_VRAM_CBUF] only the mapped ranges
+        for (const auto & s : ctx->vmm_segs) {
+            CUDA_CHECK(cudaMemsetAsync((char *) ctx->dev_ptr + s.first, value, s.second, cudaStreamPerThread));
+        }
+    } else {
+        CUDA_CHECK(cudaMemsetAsync(ctx->dev_ptr, value, buffer->size, cudaStreamPerThread));
+    }
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
 
@@ -989,6 +1059,190 @@ ggml_backend_buffer_type_t ggml_backend_cuda_buffer_type(int device) {
     }
 
     return &ggml_backend_cuda_buffer_types[device];
+}
+
+// [TAG_FN_L3_VRAM_CBUF] device buffers on reserved virtual memory --------------------------------------------------------
+// _alloc reserves the addresses of a buffer of buft's device and maps nothing; _map backs [offset, offset + size) with new
+// physical memory (its content is undefined); _unmap gives mapped segments back to the driver at once. Offsets and sizes
+// are multiples of the granularity, and an unmap covers whole segments of earlier maps. The buffer has the CUDA buffer
+// interface: a tensor in it works like in any CUDA buffer while its bytes are mapped. The caller makes sure that nothing
+// reads or writes a range while it is not mapped (synchronize before an unmap).
+
+size_t ggml_backend_cuda_vmm_granularity(ggml_backend_buffer_type_t buft) {
+#ifdef GGML_CUDA_VMM_BUFFERS
+    if (!buft || !ggml_backend_buft_is_cuda(buft)) {
+        return 0;
+    }
+    const int device = ((ggml_backend_cuda_buffer_type_context *) buft->context)->device;
+    const auto & info = ggml_cuda_info().devices[device];
+    return info.vmm ? info.vmm_granularity : 0;
+#else
+    GGML_UNUSED(buft);
+    return 0;
+#endif
+}
+
+ggml_backend_buffer_t ggml_backend_cuda_vmm_buffer_alloc(ggml_backend_buffer_type_t buft, size_t size) {
+#ifdef GGML_CUDA_VMM_BUFFERS
+    const size_t gran = ggml_backend_cuda_vmm_granularity(buft);
+    if (gran == 0 || size == 0) {
+        return nullptr;
+    }
+    const int device = ((ggml_backend_cuda_buffer_type_context *) buft->context)->device;
+    size = (size + gran - 1) / gran * gran;
+    ggml_cuda_set_device(device);
+    CUdeviceptr ptr = 0;
+    const CUresult r = cuMemAddressReserve(&ptr, size, 0, 0, 0);
+    if (r != CUDA_SUCCESS) {
+        const char * s = nullptr;
+        cuGetErrorString(r, &s);
+        GGML_LOG_WARN("%s: reserving %.1f MiB of addresses on device %d failed: %s\n", __func__, size/1048576.0, device, s ? s : "?");
+        return nullptr;
+    }
+    auto * ctx = new ggml_backend_cuda_buffer_context(device, (void *) ptr);
+    ctx->vmm_size = size;
+    ctx->vmm_gran = gran;
+    return ggml_backend_buffer_init(buft, ggml_backend_cuda_buffer_interface, ctx, size);
+#else
+    GGML_UNUSED(buft);
+    GGML_UNUSED(size);
+    return nullptr;
+#endif
+}
+
+bool ggml_backend_cuda_vmm_buffer_map(ggml_backend_buffer_t buffer, size_t offset, size_t size) {
+#ifdef GGML_CUDA_VMM_BUFFERS
+    if (!buffer || !ggml_backend_buffer_is_cuda(buffer)) {
+        return false;
+    }
+    auto * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
+    const size_t gran = ctx->vmm_gran;
+    if (ctx->vmm_size == 0 || size == 0 || offset % gran != 0 || size % gran != 0 || offset + size > ctx->vmm_size) {
+        return false;
+    }
+    for (const auto & s : ctx->vmm_segs) {
+        if (s.first < offset + size && offset < s.first + s.second) {
+            return false; // a part is mapped already
+        }
+    }
+    ggml_cuda_set_device(ctx->device);
+    const int phys = ggml_cuda_get_physical_device(ctx->device);
+    CUmemAllocationProp prop = {};
+    prop.type          = CU_MEM_ALLOCATION_TYPE_PINNED;
+    prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    prop.location.id   = phys;
+    CUmemAccessDesc acc = {};
+    acc.location.type  = CU_MEM_LOCATION_TYPE_DEVICE;
+    acc.location.id    = phys;
+    acc.flags          = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+
+    // physical allocations of at most 1 GiB: a failed one leaves less to undo
+    const size_t seg_max = std::max(gran, ((size_t) 1 << 30) / gran * gran);
+    std::vector<std::pair<size_t, size_t>> done;
+    CUresult    r    = CUDA_SUCCESS;
+    const char * what = nullptr;
+    for (size_t o = offset; o < offset + size; ) {
+        const size_t      n = std::min(seg_max, offset + size - o);
+        const CUdeviceptr p = (CUdeviceptr) ctx->dev_ptr + o;
+        CUmemGenericAllocationHandle h;
+        r = cuMemCreate(&h, n, &prop, 0);
+        if (r != CUDA_SUCCESS) {
+            what = "cuMemCreate";
+            break;
+        }
+        r = cuMemMap(p, n, 0, h, 0);
+        (void) cuMemRelease(h); // the mapping holds the memory from here on (nothing does after a failed map)
+        if (r != CUDA_SUCCESS) {
+            what = "cuMemMap";
+            break;
+        }
+        r = cuMemSetAccess(p, n, &acc, 1);
+        if (r != CUDA_SUCCESS) {
+            (void) cuMemUnmap(p, n);
+            what = "cuMemSetAccess";
+            break;
+        }
+        done.push_back({ o, n });
+        o += n;
+    }
+    if (what) {
+        const char * s = nullptr;
+        cuGetErrorString(r, &s);
+        GGML_LOG_WARN("%s: mapping %.1f MiB at +%.1f MiB on device %d failed (%s: %s)\n", __func__, size/1048576.0,
+                offset/1048576.0, ctx->device, what, s ? s : "?");
+        for (const auto & d : done) {
+            (void) cuMemUnmap((CUdeviceptr) ctx->dev_ptr + d.first, d.second);
+        }
+        return false;
+    }
+    ctx->vmm_segs.insert(ctx->vmm_segs.end(), done.begin(), done.end());
+    std::sort(ctx->vmm_segs.begin(), ctx->vmm_segs.end());
+    return true;
+#else
+    GGML_UNUSED(buffer);
+    GGML_UNUSED(offset);
+    GGML_UNUSED(size);
+    return false;
+#endif
+}
+
+bool ggml_backend_cuda_vmm_buffer_unmap(ggml_backend_buffer_t buffer, size_t offset, size_t size) {
+#ifdef GGML_CUDA_VMM_BUFFERS
+    if (!buffer || !ggml_backend_buffer_is_cuda(buffer)) {
+        return false;
+    }
+    auto * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
+    if (ctx->vmm_size == 0 || offset + size > ctx->vmm_size) {
+        return false;
+    }
+    for (const auto & s : ctx->vmm_segs) {
+        const bool touch = s.first < offset + size && offset < s.first + s.second;
+        if (touch && (s.first < offset || s.first + s.second > offset + size)) {
+            return false; // a segment reaches out of the range: it cannot be unmapped in part
+        }
+    }
+    ggml_cuda_set_device(ctx->device);
+    bool ok = true;
+    for (auto it = ctx->vmm_segs.begin(); it != ctx->vmm_segs.end(); ) {
+        if (it->first >= offset && it->first + it->second <= offset + size) {
+            const CUresult r = cuMemUnmap((CUdeviceptr) ctx->dev_ptr + it->first, it->second);
+            if (r != CUDA_SUCCESS) {
+                const char * s = nullptr;
+                cuGetErrorString(r, &s);
+                GGML_LOG_WARN("%s: unmapping %.1f MiB at +%.1f MiB failed: %s\n", __func__, it->second/1048576.0,
+                        it->first/1048576.0, s ? s : "?");
+                ok = false;
+                ++it;
+                continue;
+            }
+            it = ctx->vmm_segs.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    return ok;
+#else
+    GGML_UNUSED(buffer);
+    GGML_UNUSED(offset);
+    GGML_UNUSED(size);
+    return false;
+#endif
+}
+
+// mapped bytes of a buffer from ggml_backend_cuda_vmm_buffer_alloc (the whole size of any other CUDA buffer)
+size_t ggml_backend_cuda_vmm_buffer_mapped(ggml_backend_buffer_t buffer) {
+    if (!buffer || !ggml_backend_buffer_is_cuda(buffer)) {
+        return 0;
+    }
+    const auto * ctx = (const ggml_backend_cuda_buffer_context *) buffer->context;
+    if (ctx->vmm_size == 0) {
+        return ggml_backend_buffer_get_size(buffer);
+    }
+    size_t n = 0;
+    for (const auto & s : ctx->vmm_segs) {
+        n += s.second;
+    }
+    return n;
 }
 
 // Communication context for multi-GPU AllReduce during tensor parallelism.
@@ -5650,6 +5904,67 @@ bool ggml_backend_is_cuda(ggml_backend_t backend) {
     return backend != NULL && ggml_guid_matches(backend->guid, ggml_backend_cuda_guid());
 }
 
+// [TAG_FN_L3_VRAM_TRIM] the temporary-memory pools of one CUDA backend: device bytes they hold, and the most they handed
+// out at once since the last trim (or since they were created)
+void ggml_backend_cuda_pool_stats(ggml_backend_t backend, size_t * reserved, size_t * hwm) {
+    size_t r = 0;
+    size_t h = 0;
+    if (ggml_backend_is_cuda(backend)) {
+        auto * ctx = (ggml_backend_cuda_context *) backend->context;
+        for (int d = 0; d < GGML_CUDA_MAX_DEVICES; ++d) {
+            for (int s = 0; s < GGML_CUDA_MAX_STREAMS; ++s) {
+                if (ctx->pools[d][s]) {
+                    r += ctx->pools[d][s]->reserved();
+                    h  = std::max(h, ctx->pools[d][s]->used_hwm());
+                }
+            }
+        }
+    }
+    if (reserved) {
+        *reserved = r;
+    }
+    if (hwm) {
+        *hwm = h;
+    }
+}
+
+// [TAG_FN_L3_VRAM_TRIM] give the pools' device memory above keep back to the driver. Waits for the backend's streams; the
+// captured CUDA graphs of the backend are dropped, because their kernels keep the pool addresses of the capture (the next
+// runs capture again). Returns the bytes given back.
+size_t ggml_backend_cuda_pool_trim(ggml_backend_t backend, size_t keep) {
+    if (!ggml_backend_is_cuda(backend)) {
+        return 0;
+    }
+    auto * ctx = (ggml_backend_cuda_context *) backend->context;
+    for (int d = 0; d < GGML_CUDA_MAX_DEVICES; ++d) {
+        for (int s = 0; s < GGML_CUDA_MAX_STREAMS; ++s) {
+            if (ctx->streams[d][s]) {
+                ggml_cuda_set_device(d);
+                CUDA_CHECK(cudaStreamSynchronize(ctx->streams[d][s]));
+            }
+        }
+    }
+    ggml_cuda_set_device(ctx->device);
+#ifdef USE_CUDA_GRAPH
+    ctx->cuda_graphs.clear();
+    for (auto & m : ctx->graph_key_memo) {
+        m = ggml_cuda_graph_key_memo();
+    }
+#endif
+    size_t freed = 0;
+    for (int d = 0; d < GGML_CUDA_MAX_DEVICES; ++d) {
+        for (int s = 0; s < GGML_CUDA_MAX_STREAMS; ++s) {
+            if (ctx->pools[d][s]) {
+                ggml_cuda_set_device(d);
+                freed += ctx->pools[d][s]->trim(keep);
+                ctx->pools[d][s]->reset_hwm();
+            }
+        }
+    }
+    ggml_cuda_set_device(ctx->device);
+    return freed;
+}
+
 int ggml_backend_cuda_get_device_count() {
     return ggml_cuda_info().device_count;
 }
@@ -6662,6 +6977,28 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_moe_bridge_release") == 0) {
         return (void *)ggml_backend_cuda_moe_bridge_release;
+    }
+    // [TAG_FN_L3_VRAM_CBUF] [TAG_FN_L3_VRAM_TRIM]
+    if (strcmp(name, "ggml_backend_vmm_granularity") == 0) {
+        return (void *)ggml_backend_cuda_vmm_granularity;
+    }
+    if (strcmp(name, "ggml_backend_vmm_buffer_alloc") == 0) {
+        return (void *)ggml_backend_cuda_vmm_buffer_alloc;
+    }
+    if (strcmp(name, "ggml_backend_vmm_buffer_map") == 0) {
+        return (void *)ggml_backend_cuda_vmm_buffer_map;
+    }
+    if (strcmp(name, "ggml_backend_vmm_buffer_unmap") == 0) {
+        return (void *)ggml_backend_cuda_vmm_buffer_unmap;
+    }
+    if (strcmp(name, "ggml_backend_vmm_buffer_mapped") == 0) {
+        return (void *)ggml_backend_cuda_vmm_buffer_mapped;
+    }
+    if (strcmp(name, "ggml_backend_pool_stats") == 0) {
+        return (void *)ggml_backend_cuda_pool_stats;
+    }
+    if (strcmp(name, "ggml_backend_pool_trim") == 0) {
+        return (void *)ggml_backend_cuda_pool_trim;
     }
     return nullptr;
 }

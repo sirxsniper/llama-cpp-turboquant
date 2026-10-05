@@ -122,6 +122,19 @@ GGML_BACKEND_API void     ggml_backend_cuda_moe_bridge_publish_plan(struct ggml_
 GGML_BACKEND_API void     ggml_backend_cuda_moe_bridge_chan_times(const struct ggml_moe_bridge * bridge, int32_t chan, struct ggml_moe_bridge_chan_times * t);
 GGML_BACKEND_API void     ggml_backend_cuda_moe_bridge_release(struct ggml_moe_bridge * bridge);
 
+// [TAG_FN_L3_VRAM_CBUF] device buffers on reserved virtual memory whose ranges give their VRAM back and take it again at the
+// same addresses (also returned by get_proc_address as ggml_backend_vmm_*). granularity 0: not possible on this buffer
+// type. A new buffer maps nothing; map / unmap take granularity multiples, and an unmap covers whole earlier maps.
+GGML_BACKEND_API size_t                ggml_backend_cuda_vmm_granularity(ggml_backend_buffer_type_t buft);
+GGML_BACKEND_API ggml_backend_buffer_t ggml_backend_cuda_vmm_buffer_alloc(ggml_backend_buffer_type_t buft, size_t size);
+GGML_BACKEND_API bool                  ggml_backend_cuda_vmm_buffer_map(ggml_backend_buffer_t buffer, size_t offset, size_t size);
+GGML_BACKEND_API bool                  ggml_backend_cuda_vmm_buffer_unmap(ggml_backend_buffer_t buffer, size_t offset, size_t size);
+GGML_BACKEND_API size_t                ggml_backend_cuda_vmm_buffer_mapped(ggml_backend_buffer_t buffer);
+
+// [TAG_FN_L3_VRAM_TRIM] a CUDA backend's temporary-memory pools (get_proc_address: ggml_backend_pool_stats / _trim)
+GGML_BACKEND_API void   ggml_backend_cuda_pool_stats(ggml_backend_t backend, size_t * reserved, size_t * hwm);
+GGML_BACKEND_API size_t ggml_backend_cuda_pool_trim(ggml_backend_t backend, size_t keep);
+
 #ifdef  __cplusplus
 }
 #endif

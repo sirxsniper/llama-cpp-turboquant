@@ -1200,6 +1200,13 @@ struct ggml_cuda_pool {
 
     virtual void * alloc(size_t size, size_t * actual_size) = 0;
     virtual void free(void * ptr, size_t size) = 0;
+
+    // [TAG_FN_L3_VRAM_TRIM] device bytes the pool holds, the most it handed out since reset_hwm(), and trim(): give the
+    // memory above keep back to the driver. trim() needs an idle device and no live allocation (returns 0 otherwise).
+    virtual size_t reserved() const { return 0; }
+    virtual size_t used_hwm() const { return 0; }
+    virtual void   reset_hwm() {}
+    virtual size_t trim(size_t keep) { GGML_UNUSED(keep); return 0; }
 };
 
 template<typename T>
