@@ -744,7 +744,9 @@ bool ggml_backend_cuda_moe_bridge_poll(ggml_moe_bridge * b, ggml_moe_bridge_job 
     mb_ring_entry * e = b->ring + (next % MB_RING);
     const uint32_t st = *(const volatile uint32_t *) &e->stamp;
     if (st != next) {
-        // [TAG_FN_L3_HOST_EXEC] a zeroed entry (watch on) reads as not posted: (0 - next) is negative, not a lap
+        if (b->watch && st == 0) {
+            return false; // [TAG_FN_L3_HOST_EXEC] a zeroed entry is not posted yet, never a lap (whatever next is)
+        }
         if ((int32_t) (st - next) > 0) {
             // the device lapped the ring: the jobs before st are lost and their waits time out; resume at st
             if (b->n_lapped.fetch_add(1, std::memory_order_relaxed) < 8) {
