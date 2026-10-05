@@ -17423,6 +17423,9 @@ static bool fn_l3_run_pair(ggml_backend_t be, const std::function<std::unique_pt
     int64_t row_len = 0;
     for (int pass = 0; pass < 2; ++pass) {
         std::unique_ptr<test_case> tc = make(pass == 1);
+        // the base class adds a sentinel tensor after every tensor in MODE_TEST; its mode member starts uninitialized, so
+        // without this the two passes could build different input lists (a "different inputs" failure at random)
+        tc->mode = MODE_TEST;
         ggml_init_params ip = { ggml_tensor_overhead()*512 + ggml_graph_overhead_custom(4096, false), nullptr, true };
         ggml_context_ptr ctx(ggml_init(ip));
         ggml_tensor * o = tc->build_graph(ctx.get());
@@ -17468,6 +17471,18 @@ static bool fn_l3_run_pair(ggml_backend_t be, const std::function<std::unique_pt
         if (ggml_backend_graph_compute(be, gf) != GGML_STATUS_SUCCESS) {
             err = "compute failed";
             return false;
+        }
+        // a sentinel that changed: a kernel of this pass wrote past the end of a tensor
+        for (size_t i = 0; i < leaves.size(); ++i) {
+            if (strncmp(leaves[i]->name, "sent_", 5) != 0) {
+                continue;
+            }
+            std::vector<uint8_t> now(ggml_nbytes(leaves[i]));
+            ggml_backend_tensor_get(leaves[i], now.data(), 0, now.size());
+            if (now != inputs[i]) {
+                err = std::string(pass == 1 ? "marked" : "plain") + " graph wrote past a tensor (" + leaves[i]->name + " changed)";
+                return false;
+            }
         }
         out[pass].resize(ggml_nbytes(o));
         ggml_backend_tensor_get(o, out[pass].data(), 0, ggml_nbytes(o));
