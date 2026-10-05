@@ -25,6 +25,7 @@
 //                                         LLAMA_MOE_BRIDGE_PF_K=12 per token), skip the hot ones and pull the rest into
 //                                         the CPU caches while the device runs that layer's attention (DRAM is idle
 //                                         then); the next job stops them. Never changes a value.
+//                                         LLAMA_MOE_BRIDGE_PF_MODE=0 real loads (default), 1 software prefetches
 //   LLAMA_MOE_BRIDGE_SYNC=1               [TAG_FN_R2_BRIDGE_SYNC] (default) while the bridge is paused or off (the
 //                                         retried ubatch, the 16 steps after a deadline miss, after 3 errors), the
 //                                         layers it takes run its host job as a CPU graph op (ggml_moe_host_sum) and

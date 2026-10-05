@@ -90,6 +90,7 @@ struct llama_moe_bridge {
     pool_pf_stats_t                       pool_pf_stats = nullptr;
     bool                                  pf_on         = false;
     int                                   pf_k          = 12;
+    int                                   pf_mode       = 0; // LLAMA_MOE_BRIDGE_PF_MODE: 0 real loads, 1 prefetches
     std::vector<int>                      pf_next;   // per channel: the channel of layer il + 1, or -1
     std::vector<std::vector<ggml_fp16_t>> pf_router; // per channel: its router rows in f16 ([n_expert][n_embd]) if predicted
 
@@ -325,7 +326,7 @@ static void br_prefetch_next(llama_moe_bridge * br, ggml_cpu_moe_pool * pool, co
     auto & cn = br->chans[nc];
     // the table the next job takes: the hot set's when its layer has one (br_run sets it up at the layer's first job)
     const ggml_cpu_moe_layer * lay = cn.tbl_ok ? &cn.layer_tbl : &cn.layer;
-    const ggml_cpu_moe_prefetch_job pj = { lay, br->pf_router[nc].data(), j.n_tokens, j.x, br->pf_k };
+    const ggml_cpu_moe_prefetch_job pj = { lay, br->pf_router[nc].data(), j.n_tokens, j.x, br->pf_k, br->pf_mode };
     br->pool_pf(pool, &pj);
 }
 
@@ -648,7 +649,8 @@ llama_moe_bridge * llama_moe_bridge_create(const llama_model & model, int n_thre
         } else if (!br->pool_pf || !br->pool_pf_stop || !br->pool_pf_stats) {
             LLAMA_LOG_WARN("%s: LLAMA_MOE_BRIDGE_PF: the CPU backend has no prefetch: no next-layer prefetch\n", __func__);
         } else {
-            br->pf_k = std::min(64, std::max(1, env_int("LLAMA_MOE_BRIDGE_PF_K", 12)));
+            br->pf_k    = std::min(64, std::max(1, env_int("LLAMA_MOE_BRIDGE_PF_K", 12)));
+            br->pf_mode = std::min(1, std::max(0, env_int("LLAMA_MOE_BRIDGE_PF_MODE", 0)));
             std::unordered_map<int, int> chan_of;
             for (size_t c = 0; c < br->chans.size(); ++c) {
                 chan_of[br->chans[c].il] = (int) c;
@@ -690,8 +692,9 @@ llama_moe_bridge * llama_moe_bridge_create(const llama_model & model, int n_thre
             }
             br->pf_on = n_pf > 0;
             LLAMA_LOG_INFO("%s: [TAG_FN_R2_BRIDGE_PF] next-layer prefetch: %d of %zu layers predict their successor's experts "
-                    "(top-%d per token, the cold ones pulled into the CPU caches between two jobs), router copies %.1f MiB\n",
-                    __func__, n_pf, br->chans.size(), br->pf_k, n_bytes/1048576.0);
+                    "(top-%d per token, the cold ones pulled into the CPU caches between two jobs by %s), router copies %.1f MiB\n",
+                    __func__, n_pf, br->chans.size(), br->pf_k, br->pf_mode == 0 ? "real loads" : "software prefetches",
+                    n_bytes/1048576.0);
         }
     }
 

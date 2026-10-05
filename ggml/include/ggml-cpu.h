@@ -218,6 +218,7 @@ extern "C" {
         int32_t       n_tokens;                   // 1..16
         const float * x;                          // [n_tokens][n_embd] f32, copied by the call
         int32_t       k;                          // experts predicted per token
+        int32_t       mode;                       // 0: real loads (they wait for the data), 1: software prefetches
     };
     GGML_BACKEND_API enum ggml_status ggml_cpu_moe_prefetch     (struct ggml_cpu_moe_pool * pool, const struct ggml_cpu_moe_prefetch_job * job);
     GGML_BACKEND_API void             ggml_cpu_moe_prefetch_stop(struct ggml_cpu_moe_pool * pool);

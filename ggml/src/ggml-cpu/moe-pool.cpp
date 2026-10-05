@@ -271,7 +271,7 @@ static void moe_pool_prefetch_part(ggml_cpu_moe_pool * p, int ith) {
         const struct ggml_type_traits_cpu * tf = ggml_get_type_traits_cpu(GGML_TYPE_F16);
         const int e0 = n_exp*w/nw;
         const int e1 = n_exp*(w + 1)/nw;
-        for (int e = e0; e < e1; ++e) {
+        for (int e = e0; e < e1 && !p->pf_stop; ++e) { // a job that comes now waits for one row at most
             const ggml_fp16_t * row = J.router + (size_t) e*n_embd;
             for (int t = 0; t < T; ++t) {
                 float v = 0.0f;
@@ -309,7 +309,8 @@ static void moe_pool_prefetch_part(ggml_cpu_moe_pool * p, int ith) {
     }
     moe_pool_pf_barrier(p, nw);
 
-    const size_t b = ggml_fn_moe_prefetch(L->up, L->gate, L->down, p->pf_list.data(), p->pf_n, ith, p->n_threads, &p->pf_stop);
+    const size_t b = ggml_fn_moe_prefetch(L->up, L->gate, L->down, p->pf_list.data(), p->pf_n, ith, p->n_threads, &p->pf_stop,
+            J.mode);
     p->pf_bytes.fetch_add((uint64_t) b, std::memory_order_relaxed);
 }
 

@@ -16685,7 +16685,7 @@ static bool run_cpu_fn_moe_fuse(ggml_backend_t backend, ggml_backend_t backend_r
                         }
                         uint64_t pj0 = 0, pj1 = 0;
                         pool_pf_stats(pool, &pj0, nullptr, nullptr, nullptr);
-                        const ggml_cpu_moe_prefetch_job pjob = { &layer, router.data(), (int32_t) T, x.data(), 4 };
+                        const ggml_cpu_moe_prefetch_job pjob = { &layer, router.data(), (int32_t) T, x.data(), 4, (int32_t) (T % 2) };
                         const bool p1 = pool_pf(pool, &pjob) == GGML_STATUS_SUCCESS;
                         std::this_thread::sleep_for(std::chrono::milliseconds(2));
                         job.w   = w.data();

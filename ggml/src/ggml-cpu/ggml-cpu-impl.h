@@ -69,9 +69,9 @@ void   ggml_fn_moe_compute(const struct ggml_fn_moe_args * a, int ith, int nth, 
 // [TAG_FN_R2_BRIDGE_SYNC] GGML_OP_MOE_HOST_SUM on the CPU: types, shapes and the fused kernel (ggml-cpu.c)
 bool   ggml_cpu_moe_host_sum_supported(const struct ggml_tensor * op);
 // [TAG_FN_R2_BRIDGE_PF] prefetch the pieces thread ith of nth reads in a job of the experts list[0..n) (ascending);
-// stops before the next piece once *stop != 0; returns the bytes covered
+// stops before the next piece once *stop != 0; returns the bytes covered. mode 0: real loads, 1: software prefetches
 size_t ggml_fn_moe_prefetch(const struct ggml_tensor * up, const struct ggml_tensor * gate, const struct ggml_tensor * down,
-                            const int32_t * list, int n, int ith, int nth, const volatile int32_t * stop);
+                            const int32_t * list, int n, int ith, int nth, const volatile int32_t * stop, int mode);
 
 
 #if defined(_MSC_VER)
