@@ -114,6 +114,7 @@ struct moe_cache {
     // [TAG_FN_MOE_HOT] static hot set: tables written once, no observer / worker / step
     bool    hot       = false;
     int     hot_max_t = 0;
+    int     hot_short_t = 0; // [TAG_FN_L4_MEM_PROMPT] LLAMA_FN_L4_PROMPT_HOT: graphs of up to this many tokens build the hot chain too
     uint64_t hot_steps = 0;
 
     // [TAG_FN_MOE_HOT_ADAPT] adaptive hot set: tables change only in step() of the owning context, after its compute
@@ -1667,6 +1668,12 @@ int llama_moe_hot_max_t() {
     return mc && mc->hot ? mc->hot_max_t : 0;
 }
 
+// [TAG_FN_L4_MEM_PROMPT]
+int llama_moe_hot_graph_max_t() {
+    const moe_cache * mc = g_cache;
+    return mc && mc->hot ? std::max(mc->hot_max_t, mc->hot_short_t) : 0;
+}
+
 namespace {
 
 // host-resident expert layers with a device-resident router (the same rule as the LRU cache). A context of a model
@@ -2084,6 +2091,11 @@ bool llama_moe_hot_init(const llama_model & model, const void * owner, size_t bu
     auto * mc = new moe_cache();
     mc->hot       = true;
     mc->hot_max_t = max_t;
+    // [TAG_FN_L4_MEM_PROMPT] the short path's ubatches (<= 31 tokens, LLAMA_FN_L4_PROMPT) build the hot chain as well, so
+    // the CPU computes only the cold experts of a short prompt; the decode accounting (prompt seed above max_t) is unchanged
+    if (llama_fn_l3_flag(model, "LLAMA_FN_L4_PROMPT_HOT")) {
+        mc->hot_short_t = 31;
+    }
 
     auto free_all = [&]() {
         for (auto * b : mc->bufs) { ggml_backend_buffer_free(b); }

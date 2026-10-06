@@ -2481,7 +2481,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         !up_exps_b && !gate_exps_b && !down_exps_b &&
         !up_exps_s && !gate_exps_s && !down_exps_s &&
         type_op == LLM_FFN_SILU && !weight_before_ffn && loras->empty();
-    if ((n_tokens == 1 || n_tokens <= hot_max_t) && slot_chain_ok) {
+    // [TAG_FN_L4_MEM_PROMPT] llama_moe_hot_graph_max_t: also the short prompt path's ubatches with LLAMA_FN_L4_PROMPT_HOT
+    if ((n_tokens == 1 || n_tokens <= hot_max_t || (hot_max_t > 0 && n_tokens <= llama_moe_hot_graph_max_t())) && slot_chain_ok) {
         mcache = llama_moe_cache_lookup(up_exps);
     }
 
