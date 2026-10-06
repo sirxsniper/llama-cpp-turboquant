@@ -22,7 +22,7 @@ Three types are added to `enum ggml_type` (in `ggml/include/ggml.h`):
 
 These IDs are post-2026-05 values. They were 41/42/43 in the previous
 public snapshot and got renumbered when upstream's b9008 added
-`GGML_TYPE_Q1_0 = 41`. See *CHANGES-2026-05.md* section 2 for the
+`GGML_TYPE_Q1_0 = 41`. The git history (May 2026) has the
 migration note.
 
 The corresponding `ggml_ftype` values are not allocated. Turbo is intended
@@ -89,7 +89,7 @@ declarations of these symbols in your own files. Include the header.
 
 > Why this matters: prior to the May-2026 work the state lived in
 > `ggml-cuda.dll` and the build broke under `GGML_BACKEND_DL=ON`. See
-> *CHANGES-2026-05.md* section 2 for the move and section 1 for the
+> git history (May 2026) for the move and for the
 > interim `dllimport`/`dllexport` shim that preceded it.
 
 ---
