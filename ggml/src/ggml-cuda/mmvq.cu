@@ -3,6 +3,7 @@
 #include "unary.cuh"
 #include "vecdotq.cuh"
 #include "fn-l3.cuh" // [TAG_FN_L3_GPU]
+#include "fn-l4-qsa.cuh" // [TAG_FN_L4_QSA_QKV]
 
 #include <cstdint>
 #include <cstring>
@@ -2331,4 +2332,197 @@ bool ggml_cuda_fn_l3_mul_mat_vec_q(ggml_backend_cuda_context & ctx, const ggml_t
 #undef FN_L3_MMVQ_CASE
     ggml_cuda_fn_l3_note(GGML_CUDA_FN_L3_PATH_MMVQ, "MMV: q8_0 mat-vecs with the K loop four iterations per pass");
     return true;
+}
+
+// [TAG_FN_L4_QSA_QKV] The q, k and v projections of a qwen4exp QSA layer read one src1 (the layer input) and each takes the
+// run-ahead kernel above (q8_0, K 2560, 1..4 columns). Here the three run in one launch: block b of the grid is block
+// b - blk0 of its product's own launch, with that product's weights, rows and dst, and the body of mul_mat_vec_q_fn_l3
+// unchanged, so every row gets the same sums in the same order: the same bits. The q8_1 copy of src1 is made (or reused)
+// once, as the first of the three separate launches does.
+struct fn_l4_mmvq_seg {
+    const void * vx;
+    float      * dst;
+    uint32_t     stride_row_x;
+    uint32_t     stride_col_dst;
+    uint32_t     blk0;           // first block of this product in the grid
+};
+
+template <int ncols_dst>
+__launch_bounds__(calc_nwarps(GGML_TYPE_Q8_0, ncols_dst, get_device_table_id())*ggml_cuda_get_physical_warp_size(), 1)
+static __global__ void mul_mat_vec_q_fn_l4_multi(
+        const fn_l4_mmvq_seg s0, const fn_l4_mmvq_seg s1, const fn_l4_mmvq_seg s2, const int nseg,
+        const void * vy, const uint32_t ncols_x, const uint32_t stride_col_y) {
+    constexpr ggml_type type = GGML_TYPE_Q8_0;
+    constexpr int qk  = ggml_cuda_type_traits<type>::qk;
+    constexpr int qi  = ggml_cuda_type_traits<type>::qi;
+    constexpr int vdr = get_vdr_mmvq(type);
+    constexpr mmvq_parameter_table_id table_id = get_device_table_id();
+    constexpr int nwarps = calc_nwarps(type, ncols_dst, table_id);
+    constexpr int rows_per_cuda_block = calc_rows_per_block(ncols_dst, table_id, false, nwarps);
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+
+    constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
+
+    const uint32_t bid = blockIdx.x;
+    const fn_l4_mmvq_seg & s = nseg > 2 && bid >= s2.blk0 ? s2 : nseg > 1 && bid >= s1.blk0 ? s1 : s0;
+    const void * vx                = s.vx;
+    float      * dst               = s.dst;
+    const uint32_t stride_row_x    = s.stride_row_x;
+    const uint32_t stride_col_dst  = s.stride_col_dst;
+
+    // from here on: mul_mat_vec_q_fn_l3, with the block index inside its own product
+    const     int tid = warp_size*threadIdx.y + threadIdx.x;
+    const     int row0 = rows_per_cuda_block*(int) (bid - s.blk0);
+    const     int blocks_per_row_x = ncols_x / qk;
+    constexpr int blocks_per_iter = vdr * nwarps*warp_size / qi;
+
+    ggml_cuda_pdl_sync();
+
+    float tmp[ncols_dst][rows_per_cuda_block] = {{0.0f}};
+
+    const block_q8_1 * y = (const block_q8_1 *) vy;
+    const int kbx_offset = row0*stride_row_x;
+
+    constexpr int ahead = FN_L3_MMVQ_AHEAD;
+    const int kqs = vdr * (tid % (qi/vdr));
+    for (int kbx0 = tid / (qi/vdr); kbx0 < blocks_per_row_x; kbx0 += ahead*blocks_per_iter) {
+#pragma unroll
+        for (int u = 0; u < ahead; ++u) {
+            const int kbx = kbx0 + u*blocks_per_iter;
+            if (kbx < blocks_per_row_x) {
+                const int kby = kbx * (qk/QK8_1);
+#pragma unroll
+                for (int j = 0; j < ncols_dst; ++j) {
+#pragma unroll
+                    for (int i = 0; i < rows_per_cuda_block; ++i) {
+                        tmp[j][i] += vec_dot_q_cuda(vx, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
+                    }
+                }
+            }
+        }
+    }
+
+    __shared__ float tmp_shared[nwarps-1 > 0 ? nwarps-1 : 1][ncols_dst][rows_per_cuda_block][warp_size];
+
+    if (threadIdx.y > 0) {
+#pragma unroll
+        for (int j = 0; j < ncols_dst; ++j) {
+#pragma unroll
+            for (int i = 0; i < rows_per_cuda_block; ++i) {
+                tmp_shared[threadIdx.y-1][j][i][threadIdx.x] = tmp[j][i];
+            }
+        }
+    }
+    __syncthreads();
+    if (threadIdx.y > 0) {
+        return;
+    }
+
+    dst += row0;
+
+#pragma unroll
+    for (int j = 0; j < ncols_dst; ++j) {
+#pragma unroll
+        for (int i = 0; i < rows_per_cuda_block; ++i) {
+#pragma unroll
+            for (int l = 0; l < nwarps-1; ++l) {
+                tmp[j][i] += tmp_shared[l][j][i][threadIdx.x];
+            }
+            tmp[j][i] = warp_reduce_sum<warp_size>(tmp[j][i]);
+
+            if (threadIdx.x == i && (rows_per_cuda_block == 1 || uint32_t(row0 + i) < stride_col_dst)) {
+                dst[j*stride_col_dst + i] = tmp[j][i];
+            }
+        }
+    }
+}
+
+// the conditions under which ggml_cuda_fn_l3_mul_mat_vec_q computes src0 x src1 with mul_mat_vec_q_fn_l3 (the run-ahead
+// kernel), copied from it: the products that kernel computes alone and the fused launch below computes together
+bool ggml_cuda_fn_l4_mmvq_ra_ok(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
+    if (!ggml_cuda_fn_l3_enabled() || src0->type != GGML_TYPE_Q8_0 || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+        return false;
+    }
+    GGML_TENSOR_BINARY_OP_LOCALS;
+
+    const int cc        = ggml_cuda_info().devices[ctx.device].cc;
+    const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
+    const mmvq_parameter_table_id table_id = get_device_table_id(cc);
+    if (!GGML_CUDA_CC_IS_NVIDIA(cc) || warp_size != 32 || table_id != MMVQ_PARAMETERS_GENERIC) {
+        return false;
+    }
+    if (ne02 != 1 || ne03 != 1 || ne12 != 1 || ne13 != 1 || ne2 != 1 || ne3 != 1 || ne11 < 1 || ne11 > 4 ||
+            nb00 != ggml_type_size(src0->type) || nb10 != sizeof(float) || nb0 != sizeof(float) || ne00 % QK8_0 != 0 ||
+            ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE ||
+            ne00 > INT32_MAX || ne01 > INT32_MAX) {
+        return false;
+    }
+    constexpr int blocks_per_iter_1warp = get_vdr_mmvq(GGML_TYPE_Q8_0) * 32 / ggml_cuda_type_traits<GGML_TYPE_Q8_0>::qi;
+    const int nwarps_1 = calc_nwarps(GGML_TYPE_Q8_0, 1, MMVQ_PARAMETERS_GENERIC);
+    if (ne11 == 1 && nwarps_1 > 1 && ne00/QK8_0 < nwarps_1*blocks_per_iter_1warp) {
+        return false;
+    }
+    const bool use_smk = ne11 >= 2 && ne11 <= 4 &&
+        ne00/QK8_0 <= calc_nwarps(GGML_TYPE_Q8_0, (int) ne11, MMVQ_PARAMETERS_GENERIC)*blocks_per_iter_1warp;
+    if (use_smk || !ggml_cuda_fn_l3_ra_enabled()) {
+        return false;
+    }
+    if (ne00/QK8_0 > FN_L3_MMVQ_AHEAD*calc_nwarps(GGML_TYPE_Q8_0, (int) ne11, MMVQ_PARAMETERS_GENERIC)*blocks_per_iter_1warp) {
+        return false;
+    }
+    // the fused launch's own limits: contiguous dst rows of one column stride
+    return ggml_is_contiguous(dst) && ggml_is_contiguous(src1);
+}
+
+void ggml_cuda_fn_l4_mul_mat_vec_q_multi(ggml_backend_cuda_context & ctx, const ggml_tensor * const * src0, const ggml_tensor * src1,
+        ggml_tensor * const * dst, const int n) {
+    GGML_ASSERT(n >= 1 && n <= 3);
+    const int64_t ne10 = src1->ne[0];
+    const int64_t ne11 = src1->ne[1];
+    const int64_t ne12 = src1->ne[2];
+    const int64_t ne13 = src1->ne[3];
+
+    const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
+    const mmvq_parameter_table_id table_id = get_device_table_id(ggml_cuda_info().devices[ctx.device].cc);
+    cudaStream_t stream = ctx.stream();
+
+    // src1 to q8_1 as ggml_cuda_fn_l3_mul_mat_vec_q does for the first product, through the same reuse cache
+    const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
+    const size_t  nbytes_q8   = ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1;
+    bool q8_ready = false;
+    void * src1_q8 = ggml_cuda_mmvq_q8_cache_get(ctx, src1, nbytes_q8, q8_ready);
+    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool());
+    if (src1_q8 == nullptr) {
+        src1_q8 = src1_q8_1.alloc(nbytes_q8);
+    }
+    if (!q8_ready) {
+        const int64_t s11 = src1->nb[1] / sizeof(float);
+        const int64_t s12 = src1->nb[2] / sizeof(float);
+        const int64_t s13 = src1->nb[3] / sizeof(float);
+        quantize_row_q8_1_cuda((const float *) src1->data, nullptr, src1_q8, src0[0]->type, ne10, s11, s12, s13, ne10_padded,
+                ne11, ne12, ne13, stream);
+    }
+
+    fn_l4_mmvq_seg seg[3] = {};
+    uint32_t nblocks = 0;
+    dim3 block_dims;
+    for (int s = 0; s < n; ++s) {
+        const std::pair<dim3, dim3> dims = calc_launch_params<GGML_TYPE_Q8_0>((int) ne11, (int) src0[s]->ne[1], 1, 1, warp_size, table_id);
+        seg[s].vx             = src0[s]->data;
+        seg[s].dst            = (float *) dst[s]->data;
+        seg[s].stride_row_x   = (uint32_t) (src0[s]->nb[1] / ggml_type_size(src0[s]->type));
+        seg[s].stride_col_dst = (uint32_t) (dst[s]->nb[1] / sizeof(float));
+        seg[s].blk0           = nblocks;
+        nblocks   += dims.first.x;
+        block_dims = dims.second;
+    }
+    const uint32_t s11 = (uint32_t) (ne10_padded / QK8_1);
+    const ggml_cuda_kernel_launch_params lp(dim3(nblocks, 1, 1), block_dims, 0, stream);
+    switch (ne11) {
+        case 1: ggml_cuda_kernel_launch(mul_mat_vec_q_fn_l4_multi<1>, lp, seg[0], seg[1], seg[2], n, (const void *) src1_q8, (uint32_t) ne10, s11); break;
+        case 2: ggml_cuda_kernel_launch(mul_mat_vec_q_fn_l4_multi<2>, lp, seg[0], seg[1], seg[2], n, (const void *) src1_q8, (uint32_t) ne10, s11); break;
+        case 3: ggml_cuda_kernel_launch(mul_mat_vec_q_fn_l4_multi<3>, lp, seg[0], seg[1], seg[2], n, (const void *) src1_q8, (uint32_t) ne10, s11); break;
+        case 4: ggml_cuda_kernel_launch(mul_mat_vec_q_fn_l4_multi<4>, lp, seg[0], seg[1], seg[2], n, (const void *) src1_q8, (uint32_t) ne10, s11); break;
+        default: GGML_ABORT("fatal error");
+    }
 }

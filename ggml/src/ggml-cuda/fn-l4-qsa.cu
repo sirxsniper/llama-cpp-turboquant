@@ -7,6 +7,9 @@
 
 #include <algorithm>
 #include <atomic>
+#include <climits>
+#include <cmath>
+#include <cstdint>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -26,6 +29,7 @@ enum {
     FN_L4_NOTE_POOL,
     FN_L4_NOTE_STREAMS,
     FN_L4_NOTE_STREAMS_SKIP,
+    FN_L4_NOTE_LIST,
     FN_L4_NOTE_COUNT,
 };
 
@@ -582,6 +586,30 @@ static bool fn_l4_streams_region(ggml_cgraph * cg, const fn_l4_graph_index & gi,
     return true;
 }
 
+// [TAG_FN_L4_QSA_STREAMS] the indexer chain is a run of small kernels that the wide q projection (thousands of blocks,
+// launched at the same time on stream 0) would hold back until its last wave: stream 1 gets the device's highest priority,
+// so the dispatcher gives its blocks the next free slots. Only when this context has not created stream 1 yet (nothing
+// but the concurrent regions uses it). GGML_CUDA_FN_L4_QSA_PRIO=0: normal priority. Scheduling only: the same bits.
+static void fn_l4_streams_prio(ggml_backend_cuda_context * ctx) {
+    static const bool on = [] {
+        const char * e = getenv("GGML_CUDA_FN_L4_QSA_PRIO");
+        return !(e && e[0] == '0');
+    }();
+    if (!on || ctx->streams[ctx->device][1] != nullptr) {
+        return;
+    }
+    int lo = 0;
+    int hi = 0;
+    CUDA_CHECK(cudaDeviceGetStreamPriorityRange(&lo, &hi));
+    if (hi == lo) {
+        return;
+    }
+    ggml_cuda_set_device(ctx->device);
+    CUDA_CHECK(cudaStreamCreateWithPriority(&ctx->streams[ctx->device][1], cudaStreamNonBlocking, hi));
+    ctx->fn_l4_prio = true;
+    GGML_LOG_INFO("ggml_cuda: [TAG_FN_L4_QSA] STREAMS: the indexer stream runs at priority %d (range %d..%d)\n", hi, lo, hi);
+}
+
 void ggml_cuda_fn_l4_qsa_streams(ggml_backend_cuda_context * ctx, ggml_cgraph * cg, ggml_backend_graph_optimize_params * params) {
     if (params == nullptr || params->add_alloc_dep == nullptr || !ggml_cuda_fn_l4_qsa_enabled()) {
         return;
@@ -680,9 +708,37 @@ void ggml_cuda_fn_l4_qsa_streams(ggml_backend_cuda_context * ctx, ggml_cgraph * 
             params->add_alloc_dep(params->user_data, t, J);
         }
 
+        // GGML_CUDA_FN_L4_QSA_DEBUG=1 (diagnosis): the first region of the first graphs, node by node
+        static const bool dbg = [] {
+            const char * e = getenv("GGML_CUDA_FN_L4_QSA_DEBUG");
+            return e && e[0] == '1';
+        }();
+        static std::atomic<int> n_dbg{0};
+        if (dbg && n_events == 0 && n_dbg.fetch_add(1) < 3) {
+            GGML_LOG_INFO("fn_l4 region: fork %d %s (%s), join %d %s (%s), graph %d nodes\n", f, fork->name, ggml_op_desc(fork),
+                    j, J->name, ggml_op_desc(J), cg->n_nodes);
+            for (int k = f + 1; k < j; ++k) {
+                const ggml_tensor * x = cg->nodes[k];
+                GGML_LOG_INFO("fn_l4 region:   %d side %d %s (%s) data %p view_src %s\n", k, side[k - f - 1], x->name,
+                        ggml_op_desc(x), x->data, x->view_src ? x->view_src->name : "-");
+            }
+        }
+
+        // GGML_CUDA_FN_L4_QSA_DEPONLY=1 (diagnosis): the allocation dependencies of the regions, but one stream
+        static const bool dep_only = [] {
+            const char * e = getenv("GGML_CUDA_FN_L4_QSA_DEPONLY");
+            return e && e[0] == '1';
+        }();
+        if (dep_only) {
+            last_join = j;
+            continue;
+        }
         events.emplace(fork, std::move(ev));
         last_join = j;
         n_events++;
+    }
+    if (n_events > 0) {
+        fn_l4_streams_prio(ctx);
     }
     // the first few graphs only (decode, verify and draft graphs alternate)
     static std::atomic<int> n_logged{0};
@@ -690,4 +746,344 @@ void ggml_cuda_fn_l4_qsa_streams(ggml_backend_cuda_context * ctx, ggml_cgraph * 
         GGML_LOG_INFO("ggml_cuda: [TAG_FN_L4_QSA] STREAMS: %d of %d marked QSA layers of a %d-node graph on two streams\n",
                 n_events, n_cand, cg->n_nodes);
     }
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// [TAG_FN_L4_QSA_LIST] the QSA mask and the sparse FA's index lists in one launch.
+// Today a QSA layer's decode attention runs k_qsa_mask (the whole [n_kv, n_q] f16 mask: -inf everywhere, 0 at the selected,
+// live and visible cells), then inside the FA k_fn_l3_compact_count + k_fn_l3_compact_write (scan the whole mask, write per
+// query tile the ascending list of the cells any of its queries keeps, -1 past the count, then the counts). The sparse FA
+// reads the mask only at the listed cells. With LISTOK the QSA_MASK writes, per query tile, a bitmap of the kept cells (in
+// shared memory), the mask rows of the tile at those cells only (-inf, then 0 where the query keeps the cell: the values
+// k_qsa_mask writes there) and the lists from the bitmap (ascending, -1 past the count, the count); the FA takes them as
+// they are. The FA reads the same lists and the same mask values: the same bits. Cells no list names keep whatever the
+// buffer held (nothing reads them).
+// ---------------------------------------------------------------------------------------------------------------------
+
+#define FN_L4_LIST_THREADS   1024
+#define FN_L4_LIST_MAX_WORDS 10240  // n_kv <= 327680: a 40 KiB bitmap in shared memory
+#define FN_L4_LIST_P_NCOLS1  10     // QSA_MASK op_params slots of the layout graph_optimize matched
+#define FN_L4_LIST_P_NLIST   11
+#define FN_L4_LIST_P_NLISTS  12
+
+struct fn_l4_list_layout {
+    int     ncols1    = 0;
+    int64_t n_kv_list = 0;
+    int64_t n_lists   = 0;
+};
+
+// the layout launch_fattn_turbot gives the lists of a sparse FA with query-tile width ncols1
+static fn_l4_list_layout fn_l4_list_layout_of(const ggml_tensor * fa, const int ncols1) {
+    const ggml_tensor * Q    = fa->src[0];
+    const ggml_tensor * K    = fa->src[1];
+    const ggml_tensor * mask = fa->src[3];
+    const int32_t n_kv_max   = ggml_get_op_params_i32(fa, 4);
+    fn_l4_list_layout lo;
+    lo.ncols1    = ncols1;
+    lo.n_kv_list = std::min<int64_t>(K->ne[1], std::min<int64_t>(Q->ne[1], ncols1)*(int64_t) n_kv_max);
+    lo.n_lists   = ((Q->ne[1] + ncols1 - 1)/ncols1)*mask->ne[3];
+    return lo;
+}
+
+// the FLASH_ATTN_EXT after node i whose mask is m (or a view of all of it at offset 0), nullptr if none
+static ggml_tensor * fn_l4_list_fa_of(ggml_cgraph * cg, const int i, const ggml_tensor * m) {
+    for (int j = i + 1; j < cg->n_nodes && j <= i + 64; ++j) {
+        ggml_tensor * t = cg->nodes[j];
+        if (t->op != GGML_OP_FLASH_ATTN_EXT || t->src[3] == nullptr) {
+            continue;
+        }
+        const ggml_tensor * s = t->src[3];
+        for (int k = 0; k < 4 && s != m && (s->op == GGML_OP_RESHAPE || (s->op == GGML_OP_VIEW && s->view_offs == 0)); ++k) {
+            s = s->src[0];
+        }
+        if (s == m) {
+            return t;
+        }
+    }
+    return nullptr;
+}
+
+void ggml_cuda_fn_l4_qsa_list_prepare(ggml_backend_cuda_context * ctx, ggml_cgraph * cg) {
+    if (!ggml_cuda_fn_l4_qsa_enabled() || !ggml_cuda_fn_l3_enabled()) {
+        return;
+    }
+    for (int i = 0; i < cg->n_nodes; ++i) {
+        ggml_tensor * m = cg->nodes[i];
+        if (m->op != GGML_OP_QSA_MASK || !(ggml_fn_l4_qsa_get(m) & GGML_FN_L4_QSA_LIST) ||
+                (ggml_fn_l4_qsa_get(m) & GGML_FN_L4_QSA_LISTOK)) {
+            continue;
+        }
+        ggml_tensor * fa = fn_l4_list_fa_of(cg, i, m);
+        if (fa == nullptr || !(ggml_fn_l4_qsa_get(fa) & GGML_FN_L4_QSA_FA_LIST) || ggml_fn_l3_get(fa) != GGML_FN_L3_COMPACT) {
+            continue;
+        }
+        const ggml_tensor * fm = fa->src[3];
+        const ggml_tensor * Q  = fa->src[0];
+        // the shapes k_qsa_mask and the FA agree on: one [n_kv, n_q] f16 mask, the FA's own rows and cells
+        if (m->type != GGML_TYPE_F16 || m->ne[2] != 1 || m->ne[3] != 1 || fm->data != m->data || fm->nb[1] != m->nb[1] ||
+                fm->ne[0] != m->ne[0] || fm->ne[1] != m->ne[1] || fm->ne[2] != 1 || fm->ne[3] != 1 || Q->ne[1] != m->ne[1] ||
+                m->ne[0] > (int64_t) FN_L4_LIST_MAX_WORDS*32 || m->ne[1] > 64 || m->src[2] == nullptr ||
+                m->src[0] == nullptr || m->src[1] == nullptr) {
+            continue;
+        }
+        ggml_cuda_set_device(ctx->device);
+        const int ncols1 = ggml_cuda_fattn_turbot_sparse_route(ctx->device, fa);
+        if (ncols1 != 4 && ncols1 != 8) {
+            continue;
+        }
+        const fn_l4_list_layout lo = fn_l4_list_layout_of(fa, ncols1);
+        const size_t need = (size_t) (lo.n_kv_list*lo.n_lists + lo.n_lists);
+        // one query tile only (decode / verify widths): the FA's mask loader wraps the rows past n_q of the last tile onto
+        // rows of the first tile (fastmodulo), which this kernel writes only at the first tile's cells
+        if (lo.n_kv_list <= 0 || lo.n_lists != 1 || lo.n_kv_list > INT32_MAX/2) {
+            continue;
+        }
+        if (ctx->fn_l4_list_buf == nullptr) {
+            // once, never moved: 1 MiB covers 8 queries x 32K selected cells; a larger need takes the old path
+            const size_t cap = std::max<size_t>(need, (size_t) 256*1024);
+            CUDA_CHECK(cudaMalloc((void **) &ctx->fn_l4_list_buf, cap*sizeof(int32_t)));
+            ctx->fn_l4_list_cap = cap;
+        }
+        if (need > ctx->fn_l4_list_cap) {
+            continue;
+        }
+        ggml_set_op_params_i32(m, FN_L4_LIST_P_NCOLS1, lo.ncols1);
+        ggml_set_op_params_i32(m, FN_L4_LIST_P_NLIST,  (int32_t) lo.n_kv_list);
+        ggml_set_op_params_i32(m, FN_L4_LIST_P_NLISTS, (int32_t) lo.n_lists);
+        ggml_fn_l4_qsa_add(m, GGML_FN_L4_QSA_LISTOK);
+        ggml_fn_l4_qsa_add(fa, GGML_FN_L4_QSA_FA_LISTOK);
+    }
+}
+
+struct fn_l4_list_args {
+    const int32_t * kv_pos;
+    const int32_t * kv_seq;
+    const char    * q_pos;
+    int64_t         q_nb0;
+    int64_t         q_nb1;
+    int             ms;
+    const char    * sel;
+    int64_t         sel_nb0;
+    int64_t         sel_nb1;
+    int             n_sel;
+    const char    * live;
+    int64_t         live_nb0;
+    int64_t         live_nb1;
+    int             n_lsel;
+    int             group;
+    half          * mask;
+    int64_t         mask_nb1;
+    int             n_kv;
+    int             n_q;
+    int             ncols1;
+    int             n_kv_list;
+    int32_t       * lists;      // n_lists lists of n_kv_list entries, then the n_lists counts
+    int             n_lists;
+};
+
+// k_qsa_mask's test for slot s of query q: the cell it names when that cell gets 0, else -1
+static __device__ __forceinline__ int fn_l4_list_cell(const fn_l4_list_args & a, const int q, const int s, const int32_t qp,
+        const uint32_t qs) {
+    const int32_t c = *(const int32_t *) (a.sel + q*a.sel_nb1 + s*a.sel_nb0);
+    if (c < 0 || c >= a.n_kv) {
+        return -1;
+    }
+    if (s < a.n_lsel) {
+        const float l = *(const float *) (a.live + q*a.live_nb1 + (s/a.group)*a.live_nb0);
+        if (!(l > -INFINITY)) {
+            return -1;
+        }
+    }
+    const int32_t kp = a.kv_pos[c];
+    if (kp < 0 || kp > qp) {
+        return -1;
+    }
+    if (a.ms && (((uint32_t) a.kv_seq[c]) & qs) == 0u) {
+        return -1;
+    }
+    return c;
+}
+
+// one block per query tile (list)
+static __global__ void __launch_bounds__(FN_L4_LIST_THREADS)
+k_fn_l4_qsa_list(const fn_l4_list_args a) {
+    extern __shared__ uint32_t bm[];
+    __shared__ int s_warp[FN_L4_LIST_THREADS/WARP_SIZE];
+    __shared__ int s_total;
+
+    const int tid  = threadIdx.x;
+    const int lane = tid % WARP_SIZE;
+    const int warp = tid / WARP_SIZE;
+    const int jt   = blockIdx.x;
+    const int q0   = jt*a.ncols1;
+    const int nq   = min(a.ncols1, a.n_q - q0);
+    const int nw   = (a.n_kv + 31)/32;
+
+    for (int w = tid; w < nw; w += FN_L4_LIST_THREADS) {
+        bm[w] = 0u;
+    }
+    __syncthreads();
+
+    // 1. the kept cells of the tile
+    const int nslots = nq*a.n_sel;
+    for (int t = tid; t < nslots; t += FN_L4_LIST_THREADS) {
+        const int q = q0 + t/a.n_sel;
+        const int s = t % a.n_sel;
+        const int32_t  qp = *(const int32_t *) (a.q_pos + q*a.q_nb0);
+        const uint32_t qs = a.ms ? *(const uint32_t *) (a.q_pos + a.q_nb1 + q*a.q_nb0) : 0u;
+        const int c = fn_l4_list_cell(a, q, s, qp, qs);
+        if (c >= 0) {
+            atomicOr(&bm[c >> 5], 1u << (c & 31));
+        }
+    }
+    __syncthreads();
+
+    // 2. the tile's mask rows at every kept cell: -inf, then (after the barrier) 0 where the row keeps it
+    for (int w = tid; w < nw; w += FN_L4_LIST_THREADS) {
+        uint32_t bits = bm[w];
+        while (bits) {
+            const int c = w*32 + __ffs(bits) - 1;
+            bits &= bits - 1;
+            for (int q = q0; q < q0 + nq; ++q) {
+                a.mask[q*a.mask_nb1 + c] = __float2half(-INFINITY);
+            }
+        }
+    }
+    __syncthreads();
+    for (int t = tid; t < nslots; t += FN_L4_LIST_THREADS) {
+        const int q = q0 + t/a.n_sel;
+        const int s = t % a.n_sel;
+        const int32_t  qp = *(const int32_t *) (a.q_pos + q*a.q_nb0);
+        const uint32_t qs = a.ms ? *(const uint32_t *) (a.q_pos + a.q_nb1 + q*a.q_nb0) : 0u;
+        const int c = fn_l4_list_cell(a, q, s, qp, qs);
+        if (c >= 0) {
+            a.mask[q*a.mask_nb1 + c] = __float2half(0.0f);
+        }
+    }
+
+    // 3. the list: thread t owns words [w0, w1), the exclusive sum of the counts before it gives its first position
+    const int wpt = (nw + FN_L4_LIST_THREADS - 1)/FN_L4_LIST_THREADS;
+    const int w0  = min(nw, tid*wpt);
+    const int w1  = min(nw, w0 + wpt);
+    int cnt = 0;
+    for (int w = w0; w < w1; ++w) {
+        cnt += __popc(bm[w]);
+    }
+    int incl = cnt;
+#pragma unroll
+    for (int off = 1; off < WARP_SIZE; off <<= 1) {
+        const int v = __shfl_up_sync(0xFFFFFFFF, incl, off);
+        if (lane >= off) {
+            incl += v;
+        }
+    }
+    if (lane == WARP_SIZE - 1) {
+        s_warp[warp] = incl;
+    }
+    __syncthreads();
+    if (warp == 0) {
+        int v = lane < FN_L4_LIST_THREADS/WARP_SIZE ? s_warp[lane] : 0;
+        int vi = v;
+#pragma unroll
+        for (int off = 1; off < WARP_SIZE; off <<= 1) {
+            const int u = __shfl_up_sync(0xFFFFFFFF, vi, off);
+            if (lane >= off) {
+                vi += u;
+            }
+        }
+        if (lane < FN_L4_LIST_THREADS/WARP_SIZE) {
+            s_warp[lane] = vi - v; // exclusive
+        }
+        if (lane == WARP_SIZE - 1) {
+            s_total = vi;
+        }
+    }
+    __syncthreads();
+
+    int32_t * list = a.lists + (int64_t) jt*a.n_kv_list;
+    int pos = s_warp[warp] + incl - cnt;
+    for (int w = w0; w < w1 && pos < a.n_kv_list; ++w) {
+        uint32_t bits = bm[w];
+        while (bits && pos < a.n_kv_list) {
+            list[pos++] = w*32 + __ffs(bits) - 1;
+            bits &= bits - 1;
+        }
+    }
+    const int count = min(s_total, a.n_kv_list);
+    for (int i = count + tid; i < a.n_kv_list; i += FN_L4_LIST_THREADS) {
+        list[i] = -1;
+    }
+    if (tid == 0) {
+        a.lists[(int64_t) a.n_lists*a.n_kv_list + jt] = count;
+    }
+}
+
+bool ggml_cuda_fn_l4_qsa_list_mask(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    if (dst->op != GGML_OP_QSA_MASK || !(ggml_fn_l4_qsa_get(dst) & GGML_FN_L4_QSA_LISTOK) || !ggml_cuda_fn_l4_qsa_enabled()) {
+        return false;
+    }
+    const ggml_tensor * kv_pos = dst->src[0];
+    const ggml_tensor * q_pos  = dst->src[1];
+    const ggml_tensor * sel    = dst->src[2];
+    const ggml_tensor * live   = dst->src[3];
+
+    const int ncols1    = ggml_get_op_params_i32(dst, FN_L4_LIST_P_NCOLS1);
+    const int n_kv_list = ggml_get_op_params_i32(dst, FN_L4_LIST_P_NLIST);
+    const int n_lists   = ggml_get_op_params_i32(dst, FN_L4_LIST_P_NLISTS);
+    const int32_t group = ggml_get_op_params_i32(dst, 0);
+    const int64_t n_kv  = dst->ne[0];
+    const int64_t n_q   = dst->ne[1];
+    // graph_optimize checked the rest; these the kernel relies on
+    GGML_ASSERT(ctx.fn_l4_list_buf != nullptr && (size_t) n_kv_list*n_lists + n_lists <= ctx.fn_l4_list_cap);
+    GGML_ASSERT((ncols1 == 4 || ncols1 == 8) && (n_q + ncols1 - 1)/ncols1 == n_lists && n_kv <= (int64_t) FN_L4_LIST_MAX_WORDS*32);
+    GGML_ASSERT(!live || group >= 1);
+
+    fn_l4_list_args a;
+    a.ms       = kv_pos->ne[1] == 2 ? 1 : 0;
+    a.kv_pos   = (const int32_t *) kv_pos->data;
+    a.kv_seq   = a.ms ? (const int32_t *) ((const char *) kv_pos->data + kv_pos->nb[1]) : nullptr;
+    a.q_pos    = (const char *) q_pos->data;
+    a.q_nb0    = q_pos->nb[0];
+    a.q_nb1    = q_pos->nb[1];
+    a.sel      = (const char *) sel->data;
+    a.sel_nb0  = sel->nb[0];
+    a.sel_nb1  = sel->nb[1];
+    a.n_sel    = (int) sel->ne[0];
+    a.live     = live ? (const char *) live->data : nullptr;
+    a.live_nb0 = live ? live->nb[0] : 0;
+    a.live_nb1 = live ? live->nb[1] : 0;
+    a.n_lsel   = live ? (int) (live->ne[0]*group) : 0;
+    a.group    = group > 0 ? group : 1;
+    a.mask     = (half *) dst->data;
+    a.mask_nb1 = dst->nb[1]/sizeof(half);
+    a.n_kv     = (int) n_kv;
+    a.n_q      = (int) n_q;
+    a.ncols1   = ncols1;
+    a.n_kv_list = n_kv_list;
+    a.lists    = ctx.fn_l4_list_buf;
+    a.n_lists  = n_lists;
+
+    const size_t smem = (size_t) ((n_kv + 31)/32)*sizeof(uint32_t);
+    k_fn_l4_qsa_list<<<n_lists, FN_L4_LIST_THREADS, smem, ctx.stream()>>>(a);
+    CUDA_CHECK(cudaGetLastError());
+    fn_l4_note(FN_L4_NOTE_LIST, "LIST: the QSA mask at the selected cells and the sparse attention's index lists in one launch");
+    return true;
+}
+
+const int32_t * ggml_cuda_fn_l4_qsa_list_for_fa(ggml_backend_cuda_context & ctx, const ggml_tensor * fa, const int ncols1,
+        const int64_t n_kv_list, const int64_t n_lists) {
+    if (!(ggml_fn_l4_qsa_get(fa) & GGML_FN_L4_QSA_FA_LISTOK)) {
+        return nullptr;
+    }
+    // the QSA_MASK under the FA's mask view and the layout it wrote
+    const ggml_tensor * m = fa->src[3];
+    for (int k = 0; k < 4 && m != nullptr && m->op != GGML_OP_QSA_MASK; ++k) {
+        m = m->src[0];
+    }
+    if (m == nullptr || m->op != GGML_OP_QSA_MASK || !(ggml_fn_l4_qsa_get(m) & GGML_FN_L4_QSA_LISTOK) ||
+            ggml_get_op_params_i32(m, FN_L4_LIST_P_NCOLS1) != ncols1 || ggml_get_op_params_i32(m, FN_L4_LIST_P_NLIST) != n_kv_list ||
+            ggml_get_op_params_i32(m, FN_L4_LIST_P_NLISTS) != n_lists || ctx.fn_l4_list_buf == nullptr) {
+        GGML_ABORT("[TAG_FN_L4_QSA_LIST] the FA does not read the lists its QSA_MASK wrote (layout mismatch)");
+    }
+    return ctx.fn_l4_list_buf;
 }

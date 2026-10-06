@@ -792,6 +792,11 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
         CUDA_CHECK(cudaFree(mmvq_q8.buf));
         mmvq_q8.buf = nullptr;
     }
+    if (fn_l4_list_buf != nullptr) { // [TAG_FN_L4_QSA_LIST]
+        ggml_cuda_set_device(device);
+        CUDA_CHECK(cudaFree(fn_l4_list_buf));
+        fn_l4_list_buf = nullptr;
+    }
 }
 
 
@@ -2806,7 +2811,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             ggml_cuda_op_moe_host_fetch(ctx, dst);
             break;
         case GGML_OP_QSA_MASK: // [TAG_FN_R4_QSA_POS]
-            ggml_cuda_op_qsa_mask(ctx, dst);
+            if (!ggml_cuda_fn_l4_qsa_list_mask(ctx, dst)) { // [TAG_FN_L4_QSA_LIST] the mask at the selection + the FA's lists
+                ggml_cuda_op_qsa_mask(ctx, dst);
+            }
             break;
         case GGML_OP_DSV4_HC_COMB:
             ggml_cuda_op_dsv4_hc_comb(ctx, dst);
@@ -3203,7 +3210,11 @@ static void ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_c
         (void)cudaGetLastError();
         CUDA_CHECK(cudaGraphExecDestroy(graph->instance));
         graph->instance = nullptr;
+        if (cuda_ctx->fn_l4_prio) { // [TAG_FN_L4_QSA_STREAMS]
+            CUDA_CHECK(cudaGraphInstantiateWithFlags(&graph->instance, graph->graph, cudaGraphInstantiateFlagUseNodePriority));
+        } else {
         CUDA_CHECK(cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0));
+        }
     } else {
         GGML_ASSERT(stat == cudaSuccess);
     }
@@ -4400,6 +4411,54 @@ static int ggml_cuda_fn_l3_try_gdnab(ggml_backend_cuda_context * cuda_ctx, ggml_
     return idx[5] - i;
 }
 
+// [TAG_FN_L4_QSA_QKV] a MUL_MAT that ggml_cuda_mul_mat sends to the run-ahead kernel of ggml_cuda_fn_l3_mul_mat_vec_q
+static bool ggml_cuda_fn_l4_qkv_node_ok(ggml_backend_cuda_context & ctx, const ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+    if (dst->op != GGML_OP_MUL_MAT || src0 == nullptr || src1 == nullptr || src0->buffer == nullptr ||
+            (dst->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 || ggml_fn_l3_get(dst) != GGML_FN_L3_MMV ||
+            src0->type != GGML_TYPE_Q8_0 || ggml_cuda_op_mul_mat_use_fwht(dst)) {
+        return false;
+    }
+    const int     cc        = ggml_cuda_info().devices[ctx.device].cc;
+    const int     warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
+    const int64_t ne11      = src1->ne[1];
+    return !ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, ne11) &&
+           !ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, ne11, /*mul_mat_id =*/ false) &&
+           src0->ne[1] != 1 && !ggml_cuda_should_use_mmsb(src0, src1, dst, cc) &&
+           !ggml_cuda_should_use_mmqsn(src0, src1, dst, cc) &&
+           ggml_cuda_should_use_mmvq(src0->type, cc, ne11, /*ne01 =*/ src0->ne[1]) &&
+           ggml_cuda_fn_l4_mmvq_ra_ok(ctx, src0, src1, dst);
+}
+
+// [TAG_FN_L4_QSA_QKV] the marked q projection at node i and the two products after it (no-op views between) that read the
+// same src1, each one a run-ahead mat-vec: one launch. Returns the nodes skipped, 0 when not taken (nothing launched).
+static int ggml_cuda_fn_l4_try_qkv(ggml_backend_cuda_context * ctx, ggml_cgraph * cg, int i) {
+    ggml_tensor * mm[3] = { cg->nodes[i], nullptr, nullptr };
+    int j = i + 1;
+    for (int s = 1; s < 3; ++s) {
+        while (j < cg->n_nodes && ggml_cuda_is_view_or_noop(cg->nodes[j])) {
+            ++j;
+        }
+        if (j >= cg->n_nodes) {
+            return 0;
+        }
+        mm[s] = cg->nodes[j++];
+    }
+    for (ggml_tensor * t : mm) {
+        if (!ggml_cuda_fn_l4_qkv_node_ok(*ctx, t) || t->src[1] != mm[0]->src[1] || t->src[0]->ne[0] != mm[0]->src[0]->ne[0]) {
+            return 0;
+        }
+    }
+    const ggml_tensor * src0[3] = { mm[0]->src[0], mm[1]->src[0], mm[2]->src[0] };
+    ggml_cuda_fn_l4_mul_mat_vec_q_multi(*ctx, src0, mm[0]->src[1], mm, 3);
+    static std::atomic<bool> told{false};
+    if (!told.exchange(true)) {
+        GGML_LOG_INFO("ggml_cuda: [TAG_FN_L4_QSA] QKV: the q, k and v projections of a QSA layer in one launch\n");
+    }
+    return (j - 1) - i;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
@@ -4409,6 +4468,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     ggml_tensor * node = cgraph->nodes[i];
 
+    // [TAG_FN_L4_QSA_QKV]
+    if (node->op == GGML_OP_MUL_MAT && (ggml_fn_l4_qsa_get(node) & GGML_FN_L4_QSA_QKV) && ggml_cuda_fn_l4_qsa_enabled()) {
+        const int n = ggml_cuda_fn_l4_try_qkv(cuda_ctx, cgraph, i);
+        if (n > 0) {
+            return n;
+        }
+    }
     // [TAG_FN_L4_QSA_SEL] [TAG_FN_L4_QSA_KVW]
     if (node->op == GGML_OP_TOP_K) {
         const int n = ggml_cuda_fn_l4_qsa_try_sel(*cuda_ctx, cgraph, i);
@@ -5553,7 +5619,11 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
     if (use_cuda_graph) {
         ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
         if (graph->instance == nullptr) { // Create executable graph from captured graph.
+            if (cuda_ctx->fn_l4_prio) { // [TAG_FN_L4_QSA_STREAMS] the QSA side stream's kernels keep their high priority
+                CUDA_CHECK(cudaGraphInstantiateWithFlags(&graph->instance, graph->graph, cudaGraphInstantiateFlagUseNodePriority));
+            } else {
             CUDA_CHECK(cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0));
+            }
         }
         if (cuda_graph_update_required) { // Update graph executable
             ggml_cuda_graph_update_executable(cuda_ctx, graph_key);
@@ -5935,6 +6005,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
     // [TAG_FN_L4_QSA] the allocation dependencies of the qwen4exp IDXQ8 / SEL paths, and the two streams of its QSA
     // layers (STREAMS); a graph without the marks gets nothing
     ggml_cuda_fn_l4_qsa_deps(cgraph, params);
+    ggml_cuda_fn_l4_qsa_list_prepare(cuda_ctx, cgraph); // [TAG_FN_L4_QSA_LIST]
     const bool fn_l4_streams = ggml_cuda_fn_l4_qsa_streams_wanted(cgraph);
 
     if (!enable_graph_optimization && !fn_l4_streams) {

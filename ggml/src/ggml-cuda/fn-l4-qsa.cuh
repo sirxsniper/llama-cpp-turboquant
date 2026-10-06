@@ -69,6 +69,29 @@ struct ggml_cuda_fn_l4_pool_args {
 
 bool ggml_cuda_fn_l4_qsa_pool_launch(ggml_backend_cuda_context & ctx, ggml_cuda_fn_l4_pool_args a, const ggml_tensor * rope);
 
+// [TAG_FN_L4_QSA_LIST] graph_optimize: a QSA_MASK marked LIST whose FLASH_ATTN_EXT (same graph, marked FA_LIST) takes the
+// sparse turbot path with the [TAG_FN_L3_GPU_COMPACT] lists gets LISTOK and the list layout (op_params 10..12), its FA
+// FA_LISTOK; the context's list buffer is allocated here (never inside a stream capture).
+void ggml_cuda_fn_l4_qsa_list_prepare(ggml_backend_cuda_context * ctx, ggml_cgraph * cgraph);
+
+// eval of a QSA_MASK: with LISTOK, the mask at the cells of the selection union (the only ones the sparse FA reads) and
+// the FA's index lists, in one launch. false: not taken (the caller runs ggml_cuda_op_qsa_mask).
+bool ggml_cuda_fn_l4_qsa_list_mask(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+
+// fattn-turbot: the lists the FA's QSA_MASK wrote (FA_LISTOK), nullptr when the FA is not marked; aborts on a layout
+// that is not the one the QSA_MASK wrote (its mask is then only partly written: no fallback is possible)
+const int32_t * ggml_cuda_fn_l4_qsa_list_for_fa(ggml_backend_cuda_context & ctx, const ggml_tensor * fa, int ncols1,
+        int64_t n_kv_list, int64_t n_lists);
+
+// [TAG_FN_L4_QSA_QKV] mmvq.cu: true when ggml_cuda_fn_l3_mul_mat_vec_q computes src0 x src1 with its run-ahead kernel
+bool ggml_cuda_fn_l4_mmvq_ra_ok(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst);
+// mmvq.cu: n (1..3) such products of one src1 in one launch of the same kernel body (the same bits per row)
+void ggml_cuda_fn_l4_mul_mat_vec_q_multi(ggml_backend_cuda_context & ctx, const ggml_tensor * const * src0, const ggml_tensor * src1,
+        ggml_tensor * const * dst, int n);
+
+// fattn.cu: the query-tile width of the sparse turbot FA that ggml_cuda_flash_attn_ext runs for dst (0: another path)
+int ggml_cuda_fattn_turbot_sparse_route(int device, const ggml_tensor * dst);
+
 // top-k.cu: the unordered top k that ggml_cuda_op_top_k computes for dst with the [TAG_FN_L3_GPU_TOPK] path, plus the
 // outputs of the gathers / concat that read it. Same stage 1, same select, same order as k_top_k_fn_l3_merge.
 struct ggml_cuda_fn_l4_sel_args {

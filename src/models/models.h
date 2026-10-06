@@ -2611,6 +2611,8 @@ struct llama_model_qwen4exp : public llama_model_base {
             bool sel     = false; // SEL:     the top-k merge also writes the picked scores, the selected cells and the tail
             bool kvw     = false; // KVW:     the turbot K and V rows of a QSA layer in one launch
             bool pool    = false; // POOL:    the k-pool update (raw key rows, new pooled keys) in one launch
+            bool list    = false; // LIST:    the QSA mask at the selected cells only, with the sparse FA's index lists
+            bool qkv     = false; // QKV:     the q, k and v projections of a QSA layer in one launch
             int  fasplit = 0;     // FASPLIT: live cells per block of the sparse turbot attention (0 = off; not in the
                                   //          all-on switch: another split of the softmax sums, not the same bits)
         };

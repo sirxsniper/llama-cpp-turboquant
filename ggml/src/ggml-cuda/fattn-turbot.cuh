@@ -25,6 +25,7 @@
 #include "ggml-turbot.h"
 #include "fn-l3.cuh"   // [TAG_FN_L3_GPU_COMPACT]
 #include "ggml-fn-l4-qsa.h"   // [TAG_FN_L4_QSA_FASPLIT]
+#include "fn-l4-qsa.cuh"      // [TAG_FN_L4_QSA_LIST]
 
 #include <climits>
 #include <cstdio>
@@ -3153,6 +3154,7 @@ static void launch_fattn_turbot(
     const int nsm = ggml_cuda_info().devices[id].nsm;
 
     ggml_cuda_pool_alloc<int>    KV_max(pool);
+    const int *                  KV_max_lists = nullptr;   // [TAG_FN_L4_QSA_LIST] the lists the QSA_MASK wrote
     ggml_cuda_pool_alloc<float>  dst_tmp(pool);
     ggml_cuda_pool_alloc<float2> dst_tmp_meta(pool);
 
@@ -3191,6 +3193,9 @@ static void launch_fattn_turbot(
 
         const size_t n_lists = (size_t) ntiles_x * (size_t) mask->ne[3];
 
+        // [TAG_FN_L4_QSA_LIST] a QSA layer whose QSA_MASK wrote the lists (and the mask only at their cells)
+        KV_max_lists = ggml_cuda_fn_l4_qsa_list_for_fa(ctx, KQV, ncols1, n_kv_list, (int64_t) n_lists);
+        if (KV_max_lists == nullptr) {
         KV_max.alloc((size_t) n_kv_list*n_lists + n_lists);
         // [TAG_FN_L3_GPU_COMPACT] a QSA attention the qwen4exp graph marked: the same lists from many blocks
         if (ggml_fn_l3_get(KQV) == GGML_FN_L3_COMPACT && ggml_cuda_fn_l3_enabled()) {
@@ -3200,8 +3205,11 @@ static void launch_fattn_turbot(
         ggml_cuda_flash_attn_ext_compact_mask(mask, KV_max.ptr, KV_max.ptr + (size_t) n_kv_list*n_lists, (int32_t) Q->ne[1], ncols1,
             (int32_t) n_kv_list, main_stream);
         }
+        }
     }
 
+    // [TAG_FN_L4_QSA_LIST] a QSA_MASK that wrote lists for this FA wrote its mask only at their cells: only the sparse walk reads it
+    GGML_ASSERT(use_sparse || !(ggml_fn_l4_qsa_get(KQV) & GGML_FN_L4_QSA_FA_LISTOK));
     const char * kv_scan = use_sparse ? "sparse" : "none";   // [TAG_TURBOT_FA_DEBUG]
     if (!use_sparse && mask && K->ne[1] % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1 || kvmax_worth_it)) {
         const int64_t s31 = mask->nb[1] / sizeof(half2);
@@ -3481,7 +3489,7 @@ static void launch_fattn_turbot(
         sinks ? ((const char *) sinks->data) : nullptr,
         kv_pos_t ? (const int32_t *) kv_pos_t->data : nullptr,
         q_pos_t  ? (const int32_t *) q_pos_t->data  : nullptr,
-        KV_max.ptr,
+        KV_max_lists ? const_cast<int *>(KV_max_lists) : KV_max.ptr,   // [TAG_FN_L4_QSA_LIST]
         !stream_k && parallel_blocks > 1 ? dst_tmp.ptr : (float *) KQV->data, dst_tmp_meta.ptr,
         scale, max_bias, m0, m1, n_head_log2, logit_softcap,
         Q->ne[0], ne01,     Q->ne[2], Q->ne[3], Q->nb[1], Q->nb[2], Q->nb[3],

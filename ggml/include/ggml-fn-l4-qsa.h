@@ -24,8 +24,11 @@ enum ggml_fn_l4_qsa_bit {
     GGML_FN_L4_QSA_SEL     = 0x0002, // the top-k merge also writes the picked scores, the selected cells and the tail
     GGML_FN_L4_QSA_KVW     = 0x0004, // the layer's turbot K and V rows in one launch
     GGML_FN_L4_QSA_POOL    = 0x0008, // the layer's k-pool update (raw key rows, new pooled keys) in one launch (on its FILL)
+    GGML_FN_L4_QSA_LIST    = 0x0010, // on the QSA_MASK: the mask at the selected cells only, plus the sparse FA's index lists
+    GGML_FN_L4_QSA_QKV     = 0x0020, // on the q projection (MUL_MAT): it and the k and v projections after it in one launch
     GGML_FN_L4_QSA_IDXDEP  = 0x0100, // backend: the IDXQ8 gather's indices stay allocated until the indexer ran
     GGML_FN_L4_QSA_SELDEP  = 0x0200, // backend: the SEL nodes' inputs and outputs stay allocated until the last one ran
+    GGML_FN_L4_QSA_LISTOK  = 0x0400, // backend: the QSA_MASK writes the lists of its FA (layout in op_params 10..12)
 };
 
 static inline int32_t ggml_fn_l4_qsa_get(const struct ggml_tensor * t) {
@@ -45,8 +48,14 @@ static inline int32_t ggml_fn_l4_qsa_fa_cells(const struct ggml_tensor * t) {
 
 static inline void ggml_fn_l4_qsa_set_fa_cells(struct ggml_tensor * t, int32_t cells) {
     const int32_t u = cells <= 0 ? 0 : (cells + 15) / 16 > 0xFFF ? 0xFFF : (cells + 15) / 16;
-    t->op_params[GGML_FN_L4_QSA_SLOT] = (int32_t) (GGML_FN_L4_QSA_MAGIC | (uint32_t) u);
+    const uint32_t keep = (uint32_t) ggml_fn_l4_qsa_get(t) & ~0xFFFu; // [TAG_FN_L4_QSA_LIST] the FA_LIST bit stays
+    t->op_params[GGML_FN_L4_QSA_SLOT] = (int32_t) (GGML_FN_L4_QSA_MAGIC | keep | (uint32_t) u);
 }
+
+// [TAG_FN_L4_QSA_LIST] on a QSA layer's FLASH_ATTN_EXT: the sparse attention reads the index lists its QSA_MASK (marked
+// GGML_FN_L4_QSA_LIST) wrote, when that node wrote them for it (the CUDA backend checks), instead of compacting the mask
+#define GGML_FN_L4_QSA_FA_LIST   0x1000
+#define GGML_FN_L4_QSA_FA_LISTOK 0x2000 // backend: its QSA_MASK writes the lists (graph_optimize matched the two)
 
 #ifdef __cplusplus
 }
