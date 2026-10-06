@@ -2,6 +2,7 @@
 
 #include "fn-l3.cuh"
 #include "ggml-impl.h"
+#include "ggml-fn-l4-qsa.h"   // [TAG_FN_L4_QSA_IDXDEP]
 
 #include <atomic>
 #include <cmath>
@@ -399,6 +400,11 @@ static bool fn_l3_is_noop_view(const ggml_tensor * t) {
 const ggml_tensor * ggml_cuda_fn_l3_idxq8_gather(const ggml_tensor * indexer) {
     if (!ggml_cuda_fn_l3_enabled() || indexer == nullptr || indexer->op != GGML_OP_LIGHTNING_INDEXER ||
             ggml_fn_l3_get(indexer) != GGML_FN_L3_IDXQ8) {
+        return nullptr;
+    }
+    // [TAG_FN_L4_QSA_IDXDEP] only once graph_optimize keeps the gather's indices allocated up to this indexer: they are
+    // not a source of the indexer, and without the dependency the allocator may hand their memory to a node in between
+    if (!(ggml_fn_l4_qsa_get(indexer) & GGML_FN_L4_QSA_IDXDEP)) {
         return nullptr;
     }
     const ggml_tensor * q = indexer->src[0];

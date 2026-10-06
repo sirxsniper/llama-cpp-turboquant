@@ -79,6 +79,7 @@
 #include "ggml-cuda/fill.cuh"
 #include "ggml-cuda/lightning-indexer.cuh"
 #include "ggml-cuda/fn-l3.cuh"            // [TAG_FN_L3_GPU]
+#include "ggml-cuda/fn-l4-qsa.cuh"        // [TAG_FN_L4_QSA]
 #include "ggml.h"
 
 #include <algorithm>
@@ -4408,6 +4409,27 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     ggml_tensor * node = cgraph->nodes[i];
 
+    // [TAG_FN_L4_QSA_SEL] [TAG_FN_L4_QSA_KVW]
+    if (node->op == GGML_OP_TOP_K) {
+        const int n = ggml_cuda_fn_l4_qsa_try_sel(*cuda_ctx, cgraph, i);
+        if (n > 0) {
+            return n;
+        }
+    }
+    if (node->op == GGML_OP_TURBOT_SET_ROWS) {
+        const int n = ggml_cuda_fn_l4_qsa_try_kvw(*cuda_ctx, cgraph, i);
+        if (n > 0) {
+            return n;
+        }
+    }
+    // [TAG_FN_L4_QSA_POOL]
+    if (node->op == GGML_OP_FILL) {
+        const int n = ggml_cuda_fn_l4_qsa_try_pool(*cuda_ctx, cgraph, i);
+        if (n > 0) {
+            return n;
+        }
+    }
+
     // [TAG_FN_L3_GPU_HCFUSE]
     if (node->op == GGML_OP_SCALE && ggml_fn_l3_get(node) != GGML_FN_L3_NONE) {
         const int n = ggml_cuda_fn_l3_try_hc(cuda_ctx, cgraph, i);
@@ -4454,7 +4476,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     // [TAG_SYNC_1004] upstream #29184: shared experts fused into the routed MMVQ
-    if (node->op == GGML_OP_MUL_MAT_ID && cuda_ctx->stream_context().concurrent_events.empty() &&
+    // [TAG_FN_L4_QSA_STREAMS] the QSA streams keep the node order: only GGML_CUDA_GRAPH_OPT's regions (which interleave
+    // the branches) stop this fusion
+    static const bool graph_opt_env = [] {
+        const char * env = getenv("GGML_CUDA_GRAPH_OPT");
+        return env != nullptr && atoi(env) == 1;
+    }();
+    if (node->op == GGML_OP_MUL_MAT_ID && (cuda_ctx->stream_context().concurrent_events.empty() || !graph_opt_env) &&
             ggml_cuda_match_shared_expert(cgraph, i, i + 3)) {
         const int outputs[] = { i + 2, i + 5 };
         if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, 6, outputs, 2)) {
@@ -5391,8 +5419,13 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                         is_concurrent_event_active = false;
                         concurrent_event           = nullptr;
                     } else {
-                        GGML_ASSERT (concurrent_event->stream_mapping.find(node) != concurrent_event->stream_mapping.end());
-                        cuda_ctx->curr_stream_no = concurrent_event->stream_mapping[node];
+                        // [TAG_FN_L4_QSA_STREAMS] the QSA regions map the computed nodes only: a no-op between fork and
+                        // join (a view, the scheduler's allocation dependency nodes) computes nothing on any stream
+                        const auto it_map = concurrent_event->stream_mapping.find(node);
+                        GGML_ASSERT(it_map != concurrent_event->stream_mapping.end() || ggml_cuda_is_view_or_noop(node));
+                        if (it_map != concurrent_event->stream_mapping.end()) {
+                            cuda_ctx->curr_stream_no = it_map->second;
+                        }
                         GGML_LOG_DEBUG("Setting stream no to %d for node %s\n", cuda_ctx->curr_stream_no, node->name);
                     }
                 } else if (i - prev_i > 1) {
@@ -5401,7 +5434,12 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     try_launch_concurrent_event(prev_node);
 
                     if (is_concurrent_event_active) {
-                        cuda_ctx->curr_stream_no = concurrent_event->stream_mapping[node];
+                        // [TAG_FN_L4_QSA_STREAMS] find, not operator[]: an unmapped no-op must not enter the mapping
+                        const auto it_map = concurrent_event->stream_mapping.find(node);
+                        GGML_ASSERT(it_map != concurrent_event->stream_mapping.end() || ggml_cuda_is_view_or_noop(node));
+                        if (it_map != concurrent_event->stream_mapping.end()) {
+                            cuda_ctx->curr_stream_no = it_map->second;
+                        }
                         GGML_LOG_DEBUG("Setting stream no to %d for node %s\n", cuda_ctx->curr_stream_no, node->name);
                     }
                 }
@@ -5886,7 +5924,16 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
         return env != nullptr && atoi(env) == 1;
     }();
 
-    if (!enable_graph_optimization) {
+    // [TAG_FN_L4_QSA] the allocation dependencies of the qwen4exp IDXQ8 / SEL paths, and the two streams of its QSA
+    // layers (STREAMS); a graph without the marks gets nothing
+    ggml_cuda_fn_l4_qsa_deps(cgraph, params);
+    const bool fn_l4_streams = ggml_cuda_fn_l4_qsa_streams_wanted(cgraph);
+
+    if (!enable_graph_optimization && !fn_l4_streams) {
+        // [TAG_FN_L4_QSA_STREAMS] the concurrent events of an earlier graph must not outlive it
+        if (!cuda_ctx->stream_context().concurrent_events.empty()) {
+            cuda_ctx->stream_context().reset();
+        }
         return;
     }
 
@@ -5895,6 +5942,14 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
 
     if (!use_cuda_graph) {
         return;
+    }
+
+    if (fn_l4_streams) {
+        ggml_cuda_set_device(cuda_ctx->device);
+        ggml_cuda_fn_l4_qsa_streams(cuda_ctx, cgraph, params);
+        if (!stream_context.concurrent_events.empty() || !enable_graph_optimization) {
+            return; // GGML_CUDA_GRAPH_OPT's own regions only for a graph without QSA streams
+        }
     }
 
     ggml_cuda_set_device(cuda_ctx->device);

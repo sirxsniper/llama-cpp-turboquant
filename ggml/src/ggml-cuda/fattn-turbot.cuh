@@ -24,6 +24,7 @@
 #include "turbot-tables.cuh"
 #include "ggml-turbot.h"
 #include "fn-l3.cuh"   // [TAG_FN_L3_GPU_COMPACT]
+#include "ggml-fn-l4-qsa.h"   // [TAG_FN_L4_QSA_FASPLIT]
 
 #include <climits>
 #include <cstdio>
@@ -3289,6 +3290,21 @@ static void launch_fattn_turbot(
                 : nblocks_stream_k_raw;
 
             blocks_num.x = nblocks_stream_k;
+
+            // [TAG_FN_L4_QSA_FASPLIT] a QSA attention the qwen4exp graph marked (LLAMA_FN_L4_QSA_FASPLIT=<cells>): the
+            // stream-k blocks per output tile follow the per-query budget n_kv_max instead of the list capacity
+            // (min(Q, ncols1) * n_kv_max), about <cells> live cells per block. The decode lists hold ~n_kv_max live
+            // cells, so the default layout gives most blocks one zero-contribution tile and the fixup combines them all.
+            // Another split of the same sums: not the same bits (the integration's KLD gate decides).
+            const int fa_cells = use_sparse ? ggml_fn_l4_qsa_fa_cells(KQV) : 0;
+            if (fa_cells > 0) {
+                const int32_t n_kv_max_query = ggml_get_op_params_i32(KQV, 4);
+                const int     per_tile       = std::max(2, (n_kv_max_query + fa_cells - 1) / fa_cells);
+                const int     nb             = std::min((int) blocks_num.x, per_tile*ntiles_dst);
+                if (nb >= 2*ntiles_dst && nb % ntiles_dst == 0) {
+                    blocks_num.x = nb;
+                }
+            }
         }
 
         if (ntiles_dst % blocks_num.x != 0) { // Fixup is only needed if the SMs work on fractional tiles.

@@ -2556,7 +2556,7 @@ struct llama_model_qwen4exp : public llama_model_base {
         // the helpers alone, graph_mtp builds its own body
         struct no_build {};
         graph(const llama_model & model, const llm_graph_params & params, no_build) :
-            llm_build_delta_net_base(params), l3(l3_read(model)), model(model) {}
+            llm_build_delta_net_base(params), l3(l3_read(model)), l4qsa(l4qsa_read(model)), model(model) {}
 
         // HC replaces every layer norm: residual is [n_embd, hc, n_tokens]
         ggml_tensor * build_hc_mix(
@@ -2603,6 +2603,19 @@ struct llama_model_qwen4exp : public llama_model_base {
         };
         static l3_flags l3_read(const llama_model & model);
         l3_flags l3;
+
+        // [TAG_FN_L4_QSA] lever round 4, the QSA layers: LLAMA_FN_L4_QSA=1 turns every lever on, LLAMA_FN_L4_QSA_<NAME>=0|1
+        // sets one (off by default). The marks are the ones of ggml-fn-l4-qsa.h; only this graph sets them.
+        struct l4qsa_flags {
+            bool streams = false; // STREAMS: the indexer chain and the q/k/v chain of a QSA layer on two CUDA streams
+            bool sel     = false; // SEL:     the top-k merge also writes the picked scores, the selected cells and the tail
+            bool kvw     = false; // KVW:     the turbot K and V rows of a QSA layer in one launch
+            bool pool    = false; // POOL:    the k-pool update (raw key rows, new pooled keys) in one launch
+            int  fasplit = 0;     // FASPLIT: live cells per block of the sparse turbot attention (0 = off; not in the
+                                  //          all-on switch: another split of the softmax sums, not the same bits)
+        };
+        static l4qsa_flags l4qsa_read(const llama_model & model);
+        l4qsa_flags l4qsa;
 
         // [TAG_FN_L3_GPU_DEFER] nodes the next layer does not read: build_layer_ffn puts them into the graph right after
         // the bridge post, so the device computes them while the host computes the layer's experts

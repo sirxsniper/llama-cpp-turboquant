@@ -2,6 +2,8 @@
 #include "ggml-cuda/common.cuh"
 #include "ggml.h"
 #include "rope.cuh"
+#include "cpy-utils.cuh"   // [TAG_FN_L4_QSA_POOL] quantize_f32_q8_0_block
+#include "fn-l4-qsa.cuh"   // [TAG_FN_L4_QSA_POOL]
 
 struct rope_corr_dims {
     float v[2];
@@ -938,4 +940,188 @@ void ggml_cuda_op_rms_norm_mul_rope_fused(ggml_backend_cuda_context & ctx,
     } else {
         GGML_ABORT("fatal error");
     }
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// [TAG_FN_L4_QSA_POOL] the k-pool update of a qwen4exp QSA layer in one launch (fn-l4-qsa.cu matches the nodes):
+//   W1: the raw indexer keys of the ubatch, [k_raw | 0], into their q8_0 cache rows    (FILL, CONCAT, SET_ROWS)
+//   the members' raw keys of every pool to re-pool, dequantized                        (GET_ROWS)
+//   their sum in member order, the scale, the norm, the rope                           (CONT, ADD x (kpool-1), SCALE,
+//                                                                                        RMS_NORM, MUL, ROPE)
+//   W2: the pooled keys into their q8_0 cache slots                                    (SET_ROWS)
+// One block of 256 threads. Every step is the unfused kernel's arithmetic in the same order: quantize_f32_q8_0_block,
+// dequantize_q8_0, a + b, scale*x + bias, rms_norm_f32<256, true> (block_reduce, rsqrtf, scale*x*mul), rope_multi
+// (rope_yarn, the same theta code), so the cache gets the same bytes. W1 is complete (barrier) before the gathers read,
+// as the separate launches order it; W2 writes only pooled halves, which no gather of this kernel reads.
+// ---------------------------------------------------------------------------------------------------------------------
+
+#define FN_L4_POOL_THREADS 256
+#define FN_L4_POOL_D       128   // indexer key width
+
+static __global__ void __launch_bounds__(FN_L4_POOL_THREADS)
+k_fn_l4_qsa_pool(const ggml_cuda_fn_l4_pool_args a, const rope_corr_dims corr_dims, const mrope_sections sections) {
+    const int tid = threadIdx.x;
+
+    // W1: one q8_0 block per thread, tokens x (row blocks); the second half of a row is the zero fill
+    {
+        const int bpr = a.w1_row_elems / QK8_0;
+        for (int ib = tid; ib < a.n_tok*bpr; ib += FN_L4_POOL_THREADS) {
+            const int t  = ib / bpr;
+            const int bi = ib % bpr;
+            float x[QK8_0];
+#pragma unroll
+            for (int j = 0; j < QK8_0; ++j) {
+                const int e = bi*QK8_0 + j;
+                x[j] = e < a.d ? a.k_raw[(int64_t) t*a.k_raw_ld + e] : 0.0f;
+            }
+            const int64_t cell = a.k_idxs_i64 ? ((const int64_t *) a.k_idxs)[t*a.k_idxs_ld] : (int64_t) ((const int32_t *) a.k_idxs)[t*a.k_idxs_ld];
+            block_q8_0 * dst = (block_q8_0 *) (a.cache + cell*a.cache_row_bytes) + bi;
+            quantize_f32_q8_0_block(x, dst);
+        }
+    }
+    __syncthreads();
+
+    __shared__ float s_sum[32];
+    __shared__ float s_x[FN_L4_POOL_D];
+    __shared__ float s_y[FN_L4_POOL_D];
+
+    for (int b = 0; b < a.n_new; ++b) {
+        // the members' raw keys (get_rows of the q8_0 key gate: d*q per element), summed in member order (cont, adds)
+        float v = 0.0f;
+        if (tid < a.d) {
+            for (int m = 0; m < a.kpool; ++m) {
+                const int32_t cell = a.new_idxs[(int64_t) b*a.kpool + m];
+                const block_q8_0 * row = (const block_q8_0 *) (a.cache + (int64_t) cell*a.cache_row_bytes);
+                // dequantize_q8_0's v.x: the int8 as float, times d
+                const float dq_d = row[tid / QK8_0].d;
+                float dq_x = row[tid / QK8_0].qs[tid % QK8_0];
+                dq_x *= dq_d;
+                v = m == 0 ? dq_x : v + dq_x;
+            }
+            v = a.scale * v + a.scale_bias;
+        }
+
+        // rms_norm_f32<256, true>: the thread sums of x*x, block_reduce, rsqrtf, scale*x*mul
+        float tmp = 0.0f;
+        for (int col = tid; col < a.d; col += FN_L4_POOL_THREADS) {
+            tmp += v * v;
+        }
+        tmp = block_reduce<block_reduce_method::SUM, FN_L4_POOL_THREADS>(tmp, s_sum);
+        const float mean = tmp / a.d;
+        const float nsc  = rsqrtf(mean + a.eps);
+        if (tid < a.d) {
+            s_x[tid] = nsc * v * a.norm_w[tid];
+        }
+        __syncthreads();
+
+        // rope_multi<forward, has_ff = false, float> of one row (ne01 = 1, ne02 = n_new, i2 = b)
+        if (tid < a.d/2) {
+            const int i0 = 2*tid;
+            if (i0 < a.n_offs || i0 >= a.n_offs + a.n_dims) {
+                s_y[i0 + 0] = s_x[i0 + 0];
+                s_y[i0 + 1] = s_x[i0 + 1];
+            } else {
+                const int iw = i0 - a.n_offs;
+                const int sect_dims = sections.v[0] + sections.v[1] + sections.v[2] + sections.v[3];
+                const int sec_w = sections.v[1] + sections.v[0];
+                const int sector = (iw / 2) % sect_dims;
+                const int32_t * pos = a.pos;
+                const int i2   = b;
+                const int ne02 = a.n_new;
+                const float theta_scale = a.theta_scale;
+
+                float theta_base = 0.0;
+                if (a.is_imrope) {
+                    if (sector % 3 == 1 && sector < 3 * sections.v[1]) {         // h
+                        theta_base = pos[i2 + ne02 * 1] * powf(theta_scale, iw / 2.0f);
+                    } else if (sector % 3 == 2 && sector < 3 * sections.v[2]) {  // w
+                        theta_base = pos[i2 + ne02 * 2] * powf(theta_scale, iw / 2.0f);
+                    } else if (sector % 3 == 0 && sector < 3 * sections.v[0]) {  // t
+                        theta_base = pos[i2] * powf(theta_scale, iw / 2.0f);
+                    } else {
+                        theta_base = pos[i2 + ne02 * 3] * powf(theta_scale, iw / 2.0f);
+                    }
+                } else {
+                    if (sector < sections.v[0]) {
+                        theta_base = pos[i2] * powf(theta_scale, iw / 2.0f);
+                    } else if (sector >= sections.v[0] && sector < sec_w) {
+                        theta_base = pos[i2 + ne02 * 1] * powf(theta_scale, iw / 2.0f);
+                    } else if (sector >= sec_w && sector < sec_w + sections.v[2]) {
+                        theta_base = pos[i2 + ne02 * 2] * powf(theta_scale, iw / 2.0f);
+                    } else if (sector >= sec_w + sections.v[2]) {
+                        theta_base = pos[i2 + ne02 * 3] * powf(theta_scale, iw / 2.0f);
+                    }
+                }
+
+                const float freq_factor = 1.0f;
+
+                float cos_theta;
+                float sin_theta;
+
+                rope_yarn<true>(theta_base/freq_factor, a.freq_scale, corr_dims, iw, a.ext_factor, a.attn_factor, cos_theta, sin_theta);
+
+                const float x0 = s_x[i0/2 + a.n_offs/2 + 0];
+                const float x1 = s_x[i0/2 + a.n_offs/2 + a.n_dims/2];
+
+                s_y[i0/2 + a.n_offs/2 + 0]          = x0*cos_theta - x1*sin_theta;
+                s_y[i0/2 + a.n_offs/2 + a.n_dims/2] = x0*sin_theta + x1*cos_theta;
+            }
+        }
+        __syncthreads();
+
+        // W2: the pooled key into its slot (one q8_0 block per thread)
+        if (tid < a.d/QK8_0) {
+            const int64_t cell = a.rep_i64 ? ((const int64_t *) a.rep)[b*a.rep_ld] : (int64_t) ((const int32_t *) a.rep)[b*a.rep_ld];
+            block_q8_0 * dst = (block_q8_0 *) (a.cache + cell*a.cache_row_bytes + a.pooled_off) + tid;
+            quantize_f32_q8_0_block(s_y + tid*QK8_0, dst);
+        }
+        __syncthreads();
+    }
+}
+
+bool ggml_cuda_fn_l4_qsa_pool_launch(ggml_backend_cuda_context & ctx, ggml_cuda_fn_l4_pool_args a, const ggml_tensor * rope) {
+    // the parameters of the ROPE node, as ggml_cuda_op_rope_impl reads them
+    const int n_dims     = ((const int32_t *) rope->op_params)[1];
+    const int mode       = ((const int32_t *) rope->op_params)[2];
+    const int n_ctx_orig = ((const int32_t *) rope->op_params)[4];
+    const int n_offs     = ((const int32_t *) rope->op_params)[15];
+    mrope_sections sections;
+    float freq_base;
+    float freq_scale;
+    float ext_factor;
+    float attn_factor;
+    float beta_fast;
+    float beta_slow;
+    memcpy(&freq_base,   (const int32_t *) rope->op_params +  5, sizeof(float));
+    memcpy(&freq_scale,  (const int32_t *) rope->op_params +  6, sizeof(float));
+    memcpy(&ext_factor,  (const int32_t *) rope->op_params +  7, sizeof(float));
+    memcpy(&attn_factor, (const int32_t *) rope->op_params +  8, sizeof(float));
+    memcpy(&beta_fast,   (const int32_t *) rope->op_params +  9, sizeof(float));
+    memcpy(&beta_slow,   (const int32_t *) rope->op_params + 10, sizeof(float));
+    memcpy(&sections.v,  (const int32_t *) rope->op_params + 11, sizeof(int)*4);
+
+    const bool is_neox   = mode & GGML_ROPE_TYPE_NEOX;
+    const bool is_mrope  = mode & GGML_ROPE_TYPE_MROPE;
+    const bool is_vision = mode == GGML_ROPE_TYPE_VISION;
+    // the rope_multi<true, false, float> instance only
+    if (is_neox || !is_mrope || is_vision || rope->src[2] != nullptr || rope->src[0]->type != GGML_TYPE_F32 ||
+            rope->type != GGML_TYPE_F32 || (sections.v[0] <= 0 && sections.v[1] <= 0 && sections.v[2] <= 0) ||
+            a.d > FN_L4_POOL_D || a.d % QK8_0 != 0 || a.d % 2 != 0 || n_dims <= 0 || n_offs < 0 || n_offs % 2 != 0 ||
+            n_offs + n_dims > a.d || a.w1_row_elems % QK8_0 != 0) {
+        return false;
+    }
+    a.n_dims      = n_dims;
+    a.n_offs      = n_offs;
+    a.is_imrope   = mode == GGML_ROPE_TYPE_IMROPE;
+    a.theta_scale = powf(freq_base, -2.0f / n_dims);
+    a.freq_scale  = freq_scale;
+    a.ext_factor  = ext_factor;
+    a.attn_factor = attn_factor;
+
+    rope_corr_dims corr_dims;
+    ggml_rope_yarn_corr_dims(n_dims, n_ctx_orig, freq_base, beta_fast, beta_slow, corr_dims.v);
+
+    k_fn_l4_qsa_pool<<<1, FN_L4_POOL_THREADS, 0, ctx.stream()>>>(a, corr_dims, sections);
+    CUDA_CHECK(cudaGetLastError());
+    return true;
 }
