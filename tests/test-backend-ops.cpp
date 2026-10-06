@@ -23,6 +23,7 @@
 #include "ggml-moe-bridge.h" // [TAG_MOE_BRIDGE]
 #include "ggml-turbot.h"
 #include "ggml-fn-l3.h"  // [TAG_FN_L3_GPU]
+#include "ggml-fn-l4-gpumoe.h" // [TAG_FN_L4_POST]
 
 #include <algorithm>
 #include <atomic>
@@ -18443,6 +18444,297 @@ static bool run_moe_bridge(ggml_backend_t backend, ggml_backend_t backend_ref, c
     return n_fail == 0;
 }
 
+// [TAG_FN_L4_POST] the qwen4exp bridge post marked GGML_FN_L4_POST (ggml-fn-l4-gpumoe.h) against the unmarked post, on the
+// router nodes build_moe_ffn makes (softmax, top-k, get_rows, norm, [scale], post, wait) with 512 experts, k = 10, n_embd
+// 2560, T = 1..8. Bitwise: the device ids and weights, the job the host reads (x, ids, w) and the wait's result.
+// Variants: fused (the top-k and the post in one launch), lean (a CONT in between: the one-fence post alone), with and
+// without the scale node, spin and hostfunc waits, 3 runs per graph (the CUDA graph path), and a sticky error (nothing is
+// posted, the ids and weights are still written, the wait returns zeros).
+struct fn_l4_post_rec {
+    std::mutex           m;
+    std::vector<float>   x;
+    std::vector<int32_t> ids;
+    std::vector<float>   w;
+    int                  n_jobs = 0;
+};
+
+static bool fn_l4_post_runner(const ggml_moe_bridge_job * j, void * ud) {
+    auto * r = (fn_l4_post_rec *) ud;
+    const size_t nx = (size_t) j->n_embd * j->n_tokens;
+    const size_t ni = (size_t) j->n_used * j->n_tokens;
+    {
+        std::lock_guard<std::mutex> lk(r->m);
+        r->x.assign(j->x, j->x + nx);
+        r->ids.assign(j->ids, j->ids + ni);
+        r->w.assign(j->w, j->w + ni);
+        r->n_jobs++;
+    }
+    for (int t = 0; t < j->n_tokens; ++t) {
+        for (int64_t i = 0; i < j->n_embd; ++i) {
+            j->out[(size_t) t * j->n_embd + i] = j->x[(size_t) t * j->n_embd + i] * j->w[(size_t) t * j->n_used] +
+                                                 (float) j->ids[(size_t) t * j->n_used + j->n_used - 1];
+        }
+    }
+    return true;
+}
+
+static bool run_fn_l4_post(ggml_backend_t backend, const char * op_names_filter) {
+    if (backend_is_cpu(backend) ||
+        (!op_names_filter_selects(op_names_filter, "MOE_HOST_POST") && !op_names_filter_selects(op_names_filter, "FN_L4_POST"))) {
+        return true;
+    }
+    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    auto br_new      = (ggml_backend_moe_bridge_new_t)        ggml_backend_reg_get_proc_address(reg, "ggml_backend_moe_bridge_new");
+    auto br_free     = (ggml_backend_moe_bridge_free_t)       ggml_backend_reg_get_proc_address(reg, "ggml_backend_moe_bridge_free");
+    auto br_id       = (ggml_backend_moe_bridge_id_t)         ggml_backend_reg_get_proc_address(reg, "ggml_backend_moe_bridge_id");
+    auto br_runner   = (ggml_backend_moe_bridge_set_runner_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_moe_bridge_set_runner");
+    auto br_poll     = (ggml_backend_moe_bridge_poll_t)       ggml_backend_reg_get_proc_address(reg, "ggml_backend_moe_bridge_poll");
+    auto br_complete = (ggml_backend_moe_bridge_complete_t)   ggml_backend_reg_get_proc_address(reg, "ggml_backend_moe_bridge_complete");
+    auto br_error    = (ggml_backend_moe_bridge_error_t)      ggml_backend_reg_get_proc_address(reg, "ggml_backend_moe_bridge_error");
+    auto br_reset    = (ggml_backend_moe_bridge_reset_t)      ggml_backend_reg_get_proc_address(reg, "ggml_backend_moe_bridge_reset");
+    if (!br_new || !br_free || !br_id || !br_runner || !br_poll || !br_complete || !br_error || !br_reset) {
+        return true; // this backend has no host bridge
+    }
+    int dev_index = -1;
+    for (size_t i = 0; i < ggml_backend_reg_dev_count(reg); i++) {
+        if (ggml_backend_reg_dev_get(reg, i) == dev) {
+            dev_index = (int) i;
+        }
+    }
+
+    const int64_t n_expert = 512;
+    const int64_t n_used   = 10;
+    const int64_t n_embd   = 2560;
+
+    std::default_random_engine gen(4404);
+    std::uniform_real_distribution<float> uni(-4.0f, 4.0f);
+
+    int n_run  = 0;
+    int n_fail = 0;
+
+    for (const int mode : { (int) GGML_MOE_BRIDGE_WAIT_SPIN, (int) GGML_MOE_BRIDGE_WAIT_HOSTFUNC }) {
+        const char * mname = mode == GGML_MOE_BRIDGE_WAIT_SPIN ? "spin" : "hostfunc";
+        ggml_moe_bridge_params bp = {};
+        bp.device     = dev_index;
+        bp.n_chan     = 2;
+        bp.n_embd     = n_embd;
+        bp.n_used     = (int32_t) n_used;
+        bp.max_tokens = 8;
+        bp.wait_mode  = mode;
+        bp.timeout_ms = 100;
+        bp.job_max_ms = 1000;
+        ggml_moe_bridge * br = dev_index >= 0 ? br_new(&bp) : nullptr;
+        n_run++;
+        if (br == nullptr) {
+            printf("  FAIL fn_l4 post %s: the backend could not create a bridge\n", mname);
+            n_fail++;
+            continue;
+        }
+        const int32_t bid = br_id(br);
+
+        fn_l4_post_rec rec;
+        std::atomic<bool> stop{false};
+        std::atomic<bool> paused{false};
+        std::thread exec;
+        if (mode == GGML_MOE_BRIDGE_WAIT_SPIN) {
+            exec = std::thread([&]() {
+                while (!stop.load()) {
+                    ggml_moe_bridge_job job;
+                    if (!paused.load() && br_poll(br, &job)) {
+                        br_complete(br, &job, fn_l4_post_runner(&job, &rec));
+                    } else {
+                        std::this_thread::yield();
+                    }
+                }
+            });
+        } else {
+            br_runner(br, fn_l4_post_runner, &rec);
+        }
+
+        // what one run of a graph produced
+        struct result {
+            std::vector<int32_t> ids;  // the top-k columns of the argsort rows
+            std::vector<float>   w;    // the weights
+            std::vector<float>   out;  // the wait
+            std::vector<float>   jx;   // the job the host read
+            std::vector<int32_t> jids;
+            std::vector<float>   jw;
+            int                  n_jobs = 0;
+        };
+
+        // variant: 0 = unmarked, 1 = marked (fused), 2 = marked with a CONT before the post (the one-fence post alone)
+        auto run_graph = [&](int64_t T, int variant, float scale_w, const std::vector<float> & lv, const std::vector<float> & xv,
+                             int reps, std::vector<result> & res) -> bool {
+            const int32_t chan = (int32_t) (T % 2);
+            ggml_init_params params = { ggml_tensor_overhead()*32 + ggml_graph_overhead(), NULL, true };
+            ggml_context_ptr ctx(ggml_init(params));
+            ggml_tensor * logits = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, n_expert, T);
+            ggml_tensor * x      = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, n_embd, T);
+            ggml_tensor * probs  = ggml_soft_max(ctx.get(), logits);
+            ggml_tensor * sel    = ggml_argsort_top_k(ctx.get(), probs, (int) n_used);
+            ggml_tensor * w      = ggml_get_rows(ctx.get(), ggml_reshape_3d(ctx.get(), probs, 1, n_expert, T), sel);
+            w = ggml_reshape_2d(ctx.get(), w, n_used, T);
+            ggml_tensor * wsum = ggml_sum_rows(ctx.get(), w);
+            wsum = ggml_clamp(ctx.get(), wsum, 6.103515625e-5, INFINITY);
+            w = ggml_div(ctx.get(), w, wsum);
+            w = ggml_reshape_3d(ctx.get(), w, 1, n_used, T);
+            if (scale_w != 0.0f) {
+                w = ggml_scale(ctx.get(), w, scale_w);
+            }
+            ggml_tensor * w2 = variant == 2 ? ggml_cont(ctx.get(), w) : w;
+            w2 = ggml_reshape_2d(ctx.get(), w2, n_used, T);
+            ggml_tensor * ticket = ggml_moe_host_post(ctx.get(), x, sel, w2, bid, chan, 0);
+            if (variant != 0) {
+                ggml_fn_l3_set(ticket, GGML_FN_L4_POST);
+            }
+            ggml_tensor * dep = ggml_scale(ctx.get(), ggml_sqr(ctx.get(), x), 0.25f);
+            ggml_tensor * out = ggml_moe_host_wait(ctx.get(), ticket, dep, n_embd, T, bid, chan);
+            if (!ggml_backend_supports_op(backend, ticket) || !ggml_backend_supports_op(backend, out)) {
+                printf("  FAIL fn_l4 post %s T=%" PRId64 ": the post or the wait is not supported\n", mname, T);
+                return false;
+            }
+            ggml_backend_buffer_ptr buf(ggml_backend_alloc_ctx_tensors(ctx.get(), backend));
+            if (buf == nullptr) {
+                return false;
+            }
+            ggml_cgraph * gf = ggml_new_graph(ctx.get());
+            ggml_build_forward_expand(gf, w); // as build_moe_ffn: the top-k nodes first, so CUDA fuses them
+            ggml_build_forward_expand(gf, out);
+            ggml_tensor * argsort = sel->view_src;
+            for (int r = 0; r < reps; r++) {
+                ggml_backend_tensor_set(logits, lv.data(), 0, lv.size() * sizeof(float));
+                ggml_backend_tensor_set(x, xv.data(), 0, xv.size() * sizeof(float));
+                const int jobs0 = rec.n_jobs;
+                if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) {
+                    printf("  FAIL fn_l4 post %s T=%" PRId64 ": graph compute failed\n", mname, T);
+                    return false;
+                }
+                ggml_backend_synchronize(backend);
+                result o;
+                std::vector<int32_t> full((size_t) n_expert * T);
+                ggml_backend_tensor_get(argsort, full.data(), 0, full.size() * sizeof(int32_t));
+                for (int64_t t = 0; t < T; t++) {
+                    o.ids.insert(o.ids.end(), full.begin() + t * n_expert, full.begin() + t * n_expert + n_used);
+                }
+                o.w.resize((size_t) n_used * T);
+                ggml_backend_tensor_get(w, o.w.data(), 0, o.w.size() * sizeof(float));
+                o.out.resize((size_t) n_embd * T);
+                ggml_backend_tensor_get(out, o.out.data(), 0, o.out.size() * sizeof(float));
+                {
+                    std::lock_guard<std::mutex> lk(rec.m);
+                    o.n_jobs = rec.n_jobs - jobs0;
+                    o.jx     = rec.x;
+                    o.jids   = rec.ids;
+                    o.jw     = rec.w;
+                }
+                res.push_back(std::move(o));
+            }
+            return true;
+        };
+
+        auto same = [](const auto & a, const auto & b) {
+            return a.size() == b.size() && (a.empty() || memcmp(a.data(), b.data(), a.size() * sizeof(a[0])) == 0);
+        };
+
+        for (int64_t T = 1; T <= 8; T++) {
+            for (const float scale_w : { 0.0f, 2.5f }) {
+                std::vector<float> lv((size_t) n_expert * T);
+                std::vector<float> xv((size_t) n_embd * T);
+                for (float & v : lv) {
+                    v = uni(gen);
+                }
+                for (float & v : xv) {
+                    v = uni(gen);
+                }
+                std::vector<result> ref;
+                std::vector<result> got[2];
+                bool ok = run_graph(T, 0, scale_w, lv, xv, 3, ref) && run_graph(T, 1, scale_w, lv, xv, 3, got[0]) &&
+                          run_graph(T, 2, scale_w, lv, xv, 3, got[1]);
+                for (int v = 0; ok && v < 2; v++) {
+                    for (size_t r = 0; r < got[v].size(); r++) {
+                        const result & a = ref[0];
+                        const result & b = got[v][r];
+                        const bool eq = same(a.ids, b.ids) && same(a.w, b.w) && same(a.out, b.out) && same(a.jx, b.jx) &&
+                                        same(a.jids, b.jids) && same(a.jw, b.jw) && b.n_jobs == 1 && a.n_jobs == 1 &&
+                                        same(a.jx, xv);
+                        if (!eq) {
+                            printf("  FAIL fn_l4 post %s T=%" PRId64 " scale=%g %s run %zu: ids %d w %d out %d job x %d ids %d w %d, jobs %d/%d\n",
+                                   mname, T, scale_w, v == 0 ? "fused" : "lean", r, (int) same(a.ids, b.ids), (int) same(a.w, b.w),
+                                   (int) same(a.out, b.out), (int) same(a.jx, b.jx), (int) same(a.jids, b.jids), (int) same(a.jw, b.jw),
+                                   a.n_jobs, b.n_jobs);
+                            ok = false;
+                        }
+                    }
+                }
+                ok = ok && br_error(br) == GGML_MOE_BRIDGE_ERR_NONE;
+                n_run++;
+                n_fail += ok ? 0 : 1;
+            }
+        }
+
+        // sticky error: no post, so no job; the ids and weights are still the top-k's, the wait gives zeros
+        if (mode == GGML_MOE_BRIDGE_WAIT_SPIN) {
+            n_run++;
+            const int64_t T = 3;
+            std::vector<float> lv((size_t) n_expert * T);
+            std::vector<float> xv((size_t) n_embd * T);
+            for (float & v : lv) {
+                v = uni(gen);
+            }
+            for (float & v : xv) {
+                v = uni(gen);
+            }
+            std::vector<result> ref;
+            std::vector<result> stall;
+            std::vector<result> sticky[2];
+            bool ok = run_graph(T, 0, 0.0f, lv, xv, 1, ref);
+            paused = true;
+            ok = ok && run_graph(T, 1, 0.0f, lv, xv, 1, stall); // nobody takes the job: timeout, the error is set
+            const bool timed_out = br_error(br) == GGML_MOE_BRIDGE_ERR_TIMEOUT;
+            ok = ok && run_graph(T, 1, 0.0f, lv, xv, 1, sticky[0]) && run_graph(T, 2, 0.0f, lv, xv, 1, sticky[1]);
+            paused = false;
+            bool reset_ok = false;
+            for (int k = 0; k < 1000 && !reset_ok; k++) {
+                reset_ok = br_reset(br);
+                if (!reset_ok) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                }
+            }
+            for (int v = 0; ok && v < 2; v++) {
+                const result & b = sticky[v][0];
+                const bool zeros = std::all_of(b.out.begin(), b.out.end(), [](float f) { return f == 0.0f; });
+                if (!same(ref[0].ids, b.ids) || !same(ref[0].w, b.w) || !zeros || b.n_jobs != 0) {
+                    printf("  FAIL fn_l4 post sticky error %s: ids %d w %d zeros %d jobs %d\n", v == 0 ? "fused" : "lean",
+                           (int) same(ref[0].ids, b.ids), (int) same(ref[0].w, b.w), (int) zeros, b.n_jobs);
+                    ok = false;
+                }
+            }
+            std::vector<result> after;
+            ok = ok && timed_out && reset_ok && run_graph(T, 1, 0.0f, lv, xv, 2, after) && br_error(br) == GGML_MOE_BRIDGE_ERR_NONE;
+            for (size_t r = 0; ok && r < after.size(); r++) {
+                ok = same(ref[0].out, after[r].out) && same(ref[0].jx, after[r].jx) && after[r].n_jobs == 1;
+            }
+            if (!ok) {
+                printf("  FAIL fn_l4 post sticky error: timeout %d, reset %d, error %u\n", (int) timed_out, (int) reset_ok, br_error(br));
+            }
+            n_fail += ok ? 0 : 1;
+        }
+
+        ggml_backend_synchronize(backend);
+        stop = true;
+        if (exec.joinable()) {
+            exec.join();
+        }
+        br_free(br);
+    }
+
+    printf("  FN_L4_POST (marked post vs unmarked: ids, weights, the host's job and the wait, bitwise): %d cases run, %d failed\n",
+           n_run, n_fail);
+    return n_fail == 0;
+}
+
+
 // [TAG_FN_L3_CPU_DEVPRED] the hint of a bridged post (ggml_moe_host_hint): a bridge made with hint_k gets, after each post,
 // the graph's predicted ids [k, T] (a strided view, as the argsort top-k is) in the channel's hint area under the post's
 // ticket; ggml_backend_moe_bridge_read_hint returns exactly them for that job and nothing for another job, the post's
@@ -19355,8 +19647,10 @@ static bool test_backend(ggml_backend_t backend, ggml_backend_dev_t dev, test_mo
 
         const bool fn_l3_gpu_ok = run_fn_l3_gpu(backend, backend_cpu.get(), op_names_filter); // [TAG_FN_L3_GPU]
 
+        const bool fn_l4_post_ok = run_fn_l4_post(backend, op_names_filter); // [TAG_FN_L4_POST]
+
         return n_ok == tests_run && slice_ok && q2_0_repack_ok && fn_repack_skip_ok && fn_mmid_mr_ok && fn_moe_fuse_ok && fn_pool_l3_ok &&
-               moe_bridge_ok && split_after_ok && fn_l3_gpu_ok;
+               moe_bridge_ok && split_after_ok && fn_l3_gpu_ok && fn_l4_post_ok;
     }
 
     if (mode == MODE_GRAD) {

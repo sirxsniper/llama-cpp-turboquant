@@ -32,12 +32,15 @@
 // after the job (ggml_backend_moe_bridge_read_hint) and prefetches the next layer's experts without a router on the host.
 
 #include "moe-bridge.cuh"
+#include "topk-moe.cuh" // [TAG_FN_L4_POST]
 
 #include "ggml-cuda.h"
+#include "ggml-fn-l4-gpumoe.h" // [TAG_FN_L4_POST]
 #include "ggml-impl.h"
 
 #include <algorithm>
 #include <atomic>
+#include <cfloat>
 #include <cinttypes>
 #include <cstddef>
 #include <cstring>
@@ -532,6 +535,382 @@ static __global__ void k_mb_hint(const mb_dev v, const int chan, const int32_t *
     }
 }
 
+// ---- [TAG_FN_L4_POST] the post of a node marked GGML_FN_L4_POST (qwen4exp only) ------------------------------------
+// The host reads the payload, the header and the ring entry only after it sees the stamp. Here every thread writes its
+// part of all of them, then makes one system fence, then the block syncs and one thread writes the stamp. k_mb_post
+// made four fences in a row on thread 0 (payload, header, ring entry, stamp). Same bytes, same order for the host.
+
+constexpr int FN_L4_POST_THREADS = 512;
+
+// the thread that takes the sequence number and writes the header and the stamp: the last one of the block
+static __device__ __forceinline__ int fn_l4_ctl() {
+    return blockDim.x - 1;
+}
+
+// thread ctl: the channel's next sequence number (0: sticky error, nothing is posted) and, in spin mode, the ring stamp
+static __device__ __forceinline__ void fn_l4_take_seq(const mb_dev & v, const int chan, uint32_t & seq, uint32_t & g) {
+    seq = 0;
+    g   = 0;
+    if (*(volatile uint32_t *) &v.state[1] == 0) {
+        uint32_t s = v.state[2 + chan] + 1;
+        if (s == 0) {
+            s = 1;
+        }
+        v.state[2 + chan] = s;
+        seq = s;
+        if (v.mode == GGML_MOE_BRIDGE_WAIT_SPIN) {
+            g = atomicAdd(&v.state[0], 1u) + 1u;
+            if (g == 0u) { // stamp 0 is never a post (mb_next_stamp)
+                g = atomicAdd(&v.state[0], 1u) + 1u;
+            }
+        }
+    }
+}
+
+// thread ctl, before the fence: the header and the ring entry, all but the stamp
+static __device__ __forceinline__ void fn_l4_post_head(const mb_dev & v, const int chan, const uint32_t seq, const uint32_t g,
+        const int n_tokens, const int n_used, const int flags) {
+    mb_chan_hdr * h = v.hdr + chan;
+    *(volatile int32_t  *) &h->n_tokens = n_tokens;
+    *(volatile int32_t  *) &h->n_used   = n_used;
+    *(volatile int32_t  *) &h->flags    = flags;
+    *(volatile uint32_t *) &h->seq      = seq;
+    if (v.mode == GGML_MOE_BRIDGE_WAIT_SPIN) {
+        mb_ring_entry * e = v.ring + (g % MB_RING);
+        *(volatile uint32_t *) &e->chan = (uint32_t) chan;
+        *(volatile uint32_t *) &e->seq  = seq;
+    }
+}
+
+// thread ctl, after every thread's fence and the barrier: the stamp, then the ticket (0 when nothing was posted)
+static __device__ __forceinline__ void fn_l4_post_publish(const mb_dev & v, const uint32_t seq, const uint32_t g, int32_t * ticket) {
+    if (seq != 0 && v.mode == GGML_MOE_BRIDGE_WAIT_SPIN) {
+        mb_ring_entry * e = v.ring + (g % MB_RING);
+        *(volatile uint32_t *) &e->stamp       = g;
+        *(volatile uint32_t *) &v.glob->posted = g;
+        __threadfence_system();
+    }
+    ticket[0] = (int32_t) seq;
+}
+
+// threads [t, t + nt) copy x (n_tokens rows of n_embd floats, row stride x_nb1) packed into hx, as k_mb_post lays it out;
+// up to 8 loads per thread are in flight before the stores
+static __device__ __forceinline__ void fn_l4_copy_x(float * hx, const char * x, const int64_t x_nb1, const int n_embd,
+        const int n_tokens, const int t, const int nt) {
+    if ((n_embd & 3) == 0 && (x_nb1 & 15) == 0 && ((uintptr_t) x & 15) == 0) {
+        constexpr int U = 8;
+        const int n4 = n_embd/4;
+        const int n  = n4*n_tokens;
+        for (int base = t; base < n; base += U*nt) {
+            float4 r[U];
+#pragma unroll
+            for (int u = 0; u < U; ++u) {
+                const int i = base + u*nt;
+                if (i < n) {
+                    const int tk = i/n4;
+                    r[u] = ((const float4 *) (x + tk*x_nb1))[i - tk*n4];
+                }
+            }
+#pragma unroll
+            for (int u = 0; u < U; ++u) {
+                const int i = base + u*nt;
+                if (i < n) {
+                    ((float4 *) hx)[i] = r[u];
+                }
+            }
+        }
+    } else {
+        for (int i = t; i < n_embd*n_tokens; i += nt) {
+            const int tk = i/n_embd;
+            hx[i] = ((const float *) (x + tk*x_nb1))[i - tk*n_embd];
+        }
+    }
+}
+
+// the post alone (no fused top-k in front of it): k_mb_post's arguments and result
+static __global__ void __launch_bounds__(FN_L4_POST_THREADS) k_fn_l4_mb_post(const mb_dev v, const int chan,
+        const char * x, const int64_t x_nb1, const char * ids, const int64_t ids_nb1, const float * w,
+        const int n_embd, const int n_used, const int n_tokens, const int flags, int32_t * ticket) {
+    __shared__ uint32_t s_seq;
+    __shared__ uint32_t s_g;
+    const int tid = threadIdx.x;
+    const int ctl = fn_l4_ctl();
+    if (tid == ctl) {
+        uint32_t seq;
+        uint32_t g;
+        fn_l4_take_seq(v, chan, seq, g);
+        s_seq = seq;
+        s_g   = g;
+    }
+    __syncthreads();
+    const uint32_t seq = s_seq;
+    if (seq == 0) {
+        if (tid == ctl) {
+            ticket[0] = 0;
+        }
+        return;
+    }
+
+    char    * p    = v.data + (size_t) chan*v.chan_bytes;
+    float   * hx   = (float   *) p;
+    int32_t * hids = (int32_t *) (p + v.off_ids);
+    float   * hw   = (float   *) (p + v.off_w);
+
+    fn_l4_copy_x(hx, x, x_nb1, n_embd, n_tokens, tid, blockDim.x);
+    for (int i = tid; i < n_used*n_tokens; i += blockDim.x) {
+        const int t = i/n_used;
+        hids[i] = ((const int32_t *) (ids + t*ids_nb1))[i - t*n_used];
+        hw[i]   = w[i];
+    }
+    if (tid == ctl) {
+        fn_l4_post_head(v, chan, seq, s_g, n_tokens, n_used, flags);
+    }
+
+    __threadfence_system();
+    __syncthreads();
+
+    if (tid == ctl) {
+        fn_l4_post_publish(v, seq, s_g, ticket);
+    }
+}
+
+// [TAG_FN_L4_POST] topk_moe_cuda (topk-moe.cu, no bias) and the post in one launch. Warp r < n_rows computes row r with
+// topk_moe_cuda's code (the same ops in the same order, so the same ids and weights) and writes ids and weights to the
+// device tensors and to the channel; the other warps copy x to the channel meanwhile.
+struct fn_l4_topk_config {
+    bool use_sigmoid;
+    bool use_sqrt_softplus;
+    bool with_norm;
+};
+
+template <int experts_per_thread, bool use_limit>
+static __device__ void fn_l4_softmax_warp_inplace(float (&vals)[experts_per_thread], const int limit, const int lane) {
+    float max_val = -INFINITY;
+
+#pragma unroll
+    for (int i = 0; i < experts_per_thread; i++) {
+        const int  idx    = lane + i * WARP_SIZE;
+        const bool active = !use_limit || (idx < limit);
+        if (active) {
+            max_val = max(max_val, vals[i]);
+        }
+    }
+
+    max_val = warp_reduce_max(max_val);
+
+    float sum = 0.f;
+
+#pragma unroll
+    for (int i = 0; i < experts_per_thread; i++) {
+        const int  idx    = lane + i * WARP_SIZE;
+        const bool active = !use_limit || (idx < limit);
+        if (active) {
+            const float val = expf(vals[i] - max_val);
+            vals[i]         = val;
+            sum += val;
+        } else {
+            vals[i] = 0.f;
+        }
+    }
+
+    sum = warp_reduce_sum(sum);
+
+    const float inv_sum = 1.0f / sum;
+
+#pragma unroll
+    for (int i = 0; i < experts_per_thread; i++) {
+        const int  idx    = lane + i * WARP_SIZE;
+        const bool active = !use_limit || (idx < limit);
+        if (active) {
+            vals[i] *= inv_sum;
+        }
+    }
+}
+
+template <int experts_per_thread, bool use_limit>
+static __device__ void fn_l4_sigmoid_warp_inplace(float (&vals)[experts_per_thread], const int limit, const int lane) {
+#pragma unroll
+    for (int i = 0; i < experts_per_thread; i++) {
+        const int  idx    = lane + i * WARP_SIZE;
+        const bool active = !use_limit || (idx < limit);
+        vals[i]           = active ? 1.f / (1.f + expf(-vals[i])) : -INFINITY;
+    }
+}
+
+template <int experts_per_thread, bool use_limit>
+static __device__ void fn_l4_sqrt_softplus_warp_inplace(float (&vals)[experts_per_thread], const int limit, const int lane) {
+#pragma unroll
+    for (int i = 0; i < experts_per_thread; i++) {
+        const int  idx    = lane + i * WARP_SIZE;
+        const bool active = !use_limit || (idx < limit);
+        vals[i]           = active ? sqrtf(vals[i] > 20.0f ? vals[i] : logf(1.0f + expf(vals[i]))) : -INFINITY;
+    }
+}
+
+template <int n_experts>
+static __global__ void __launch_bounds__(FN_L4_POST_THREADS, 1) k_fn_l4_topk_post(const mb_dev v, const int chan,
+        const float * logits, float * weights, int32_t * ids, const int n_rows, const int n_expert_used,
+        const float clamp_val, const float scale_val, const fn_l4_topk_config config,
+        const char * x, const int64_t x_nb1, const int n_embd, const int flags, int32_t * ticket) {
+    __shared__ uint32_t s_seq;
+    __shared__ uint32_t s_g;
+    const int  lane   = threadIdx.x % WARP_SIZE;
+    const int  row    = threadIdx.x / WARP_SIZE;
+    const bool is_row = row < n_rows;
+    const int  ctl    = fn_l4_ctl();
+
+    constexpr int experts_per_thread = (n_experts > WARP_SIZE) ? n_experts / WARP_SIZE : 1;
+
+    float wt[experts_per_thread];
+
+#pragma unroll
+    for (int i = 0; i < experts_per_thread; i++) {
+        wt[i] = -INFINITY;
+    }
+
+    ggml_cuda_pdl_sync();
+    if (is_row) {
+        const float * lg = logits + n_experts * row;
+#pragma unroll
+        for (int i = 0; i < n_experts; i += WARP_SIZE) {
+            const int expert  = i + lane;
+            wt[i / WARP_SIZE] = (n_experts % WARP_SIZE == 0 || expert < n_experts) ? lg[expert] : -INFINITY;
+        }
+    }
+    if (threadIdx.x == ctl) {
+        uint32_t seq;
+        uint32_t g;
+        fn_l4_take_seq(v, chan, seq, g);
+        s_seq = seq;
+        s_g   = g;
+    }
+
+    // weights and ids can alias logits: every row reads its logits before any thread writes
+    __syncthreads();
+    ggml_cuda_pdl_lc();
+
+    const uint32_t seq = s_seq;
+    char    * p    = v.data + (size_t) chan*v.chan_bytes;
+    float   * hx   = (float   *) p;
+    int32_t * hids = (int32_t *) (p + v.off_ids);
+    float   * hw   = (float   *) (p + v.off_w);
+
+    if (is_row) {
+        float   * wrow  = weights + n_expert_used * row;
+        int32_t * irow  = ids + n_experts * row;
+        int32_t * hirow = hids + n_expert_used * row;
+        float   * hwrow = hw + n_expert_used * row;
+
+        if (config.use_sigmoid) {
+            fn_l4_sigmoid_warp_inplace<experts_per_thread, false>(wt, n_experts, lane);
+        } else if (config.use_sqrt_softplus) {
+            fn_l4_sqrt_softplus_warp_inplace<experts_per_thread, false>(wt, n_experts, lane);
+        } else {
+            fn_l4_softmax_warp_inplace<experts_per_thread, false>(wt, n_experts, lane);
+        }
+
+        // NaN -> -FLT_MAX, as topk_moe_cuda: the iterative argmax then picks unique ids
+#pragma unroll
+        for (int i = 0; i < experts_per_thread; i++) {
+            if (__isnanf(wt[i])) {
+                wt[i] = -FLT_MAX;
+            }
+        }
+
+        float wt_sum = 0.f;
+
+        float output_weights[experts_per_thread];
+
+#pragma unroll
+        for (int i = 0; i < experts_per_thread; i++) {
+            output_weights[i] = 0.f;
+        }
+
+        for (int k = 0; k < n_expert_used; k++) {
+            float max_val    = wt[0];
+            int   max_expert = lane;
+
+#pragma unroll
+            for (int i = 1; i < experts_per_thread; i++) {
+                const int expert = lane + i * WARP_SIZE;
+                if ((n_experts % WARP_SIZE == 0 || expert < n_experts) && wt[i] > max_val) {
+                    max_val    = wt[i];
+                    max_expert = expert;
+                }
+            }
+
+#pragma unroll
+            for (int mask = WARP_SIZE / 2; mask > 0; mask /= 2) {
+                const float val    = __shfl_xor_sync(0xFFFFFFFF, max_val, mask, WARP_SIZE);
+                const int   expert = __shfl_xor_sync(0xFFFFFFFF, max_expert, mask, WARP_SIZE);
+                if (val > max_val || (val == max_val && expert < max_expert)) {
+                    max_val    = val;
+                    max_expert = expert;
+                }
+            }
+
+            if ((max_expert & (WARP_SIZE - 1)) == lane) {
+                wt[max_expert / WARP_SIZE] = -INFINITY;
+            }
+
+            if ((k & (WARP_SIZE - 1)) == lane) {
+                output_weights[k / WARP_SIZE] = max_val;
+            }
+
+            if ((max_expert & (WARP_SIZE - 1)) == lane) {
+                irow[k] = max_expert;
+                if (seq != 0) {
+                    hirow[k] = max_expert;
+                }
+                if (config.with_norm) {
+                    wt_sum += max_val;
+                }
+            }
+        }
+
+        if (config.with_norm) {
+            wt_sum              = warp_reduce_sum(wt_sum);
+            wt_sum              = max(wt_sum, clamp_val);
+            const float inv_sum = 1.0f / wt_sum;
+
+            for (int i = 0; i < experts_per_thread; i++) {
+                output_weights[i] *= inv_sum;
+            }
+        }
+
+#pragma unroll
+        for (int i = 0; i < experts_per_thread; i++) {
+            const int idx = i * WARP_SIZE + lane;
+            if (idx < n_expert_used) {
+                const float wv = output_weights[i] * scale_val;
+                wrow[idx] = wv;
+                if (seq != 0) {
+                    hwrow[idx] = wv;
+                }
+            }
+        }
+    } else if (seq != 0) {
+        const int t0 = n_rows * WARP_SIZE;
+        fn_l4_copy_x(hx, x, x_nb1, n_embd, n_rows, threadIdx.x - t0, blockDim.x - t0);
+        if (threadIdx.x == ctl) {
+            fn_l4_post_head(v, chan, seq, s_g, n_rows, n_expert_used, flags);
+        }
+    }
+
+    if (seq != 0) {
+        __threadfence_system();
+    }
+    __syncthreads();
+
+    if (threadIdx.x == ctl) {
+        fn_l4_post_publish(v, seq, s_g, ticket);
+    }
+}
+
+// hostfunc mode, after a post on stream: fork, the host job runs on the aux stream while this stream continues with the
+// device work of the layer
+static void mb_post_fork(ggml_moe_bridge * b, const int32_t chan, cudaStream_t stream);
+
 static void mb_make_job(const ggml_moe_bridge * b, int32_t chan, uint32_t seq, ggml_moe_bridge_job * job) {
     const mb_chan_hdr * h = b->hdr + chan;
     char * p = b->data + (size_t) chan*b->dev.chan_bytes;
@@ -575,6 +954,15 @@ static void CUDART_CB mb_hostfn(void * ud) {
     b->taken.fetch_add(1, std::memory_order_relaxed);
     const bool ok = mb_job_valid(b, &job) && b->runner && b->runner(&job, b->runner_ud);
     ggml_backend_cuda_moe_bridge_complete(b, &job, ok);
+}
+
+static void mb_post_fork(ggml_moe_bridge * b, const int32_t chan, cudaStream_t stream) {
+    if (b->params.wait_mode == GGML_MOE_BRIDGE_WAIT_HOSTFUNC) {
+        CUDA_CHECK(cudaEventRecord(b->ev_post[chan], stream));
+        CUDA_CHECK(cudaStreamWaitEvent(b->aux, b->ev_post[chan], 0));
+        CUDA_CHECK(cudaLaunchHostFunc(b->aux, mb_hostfn, &b->hf[chan]));
+        CUDA_CHECK(cudaEventRecord(b->ev_done[chan], b->aux));
+    }
 }
 
 #endif // GGML_MOE_BRIDGE_DISABLED
@@ -1130,18 +1518,88 @@ void ggml_cuda_op_moe_host_post(ggml_backend_cuda_context & ctx, ggml_tensor * d
     const ggml_tensor * w   = dst->src[2];
 
     cudaStream_t stream = ctx.stream();
-    k_mb_post<<<1, MB_POST_THREADS, 0, stream>>>(b->dev, chan,
-            (const char *) x->data, x->nb[1], (const char *) ids->data, ids->nb[1], (const float *) w->data,
-            (int) x->ne[0], (int) ids->ne[0], (int) x->ne[1], flags, (int32_t *) dst->data);
+    if (ggml_fn_l3_get(dst) == GGML_FN_L4_POST) { // [TAG_FN_L4_POST]
+        k_fn_l4_mb_post<<<1, FN_L4_POST_THREADS, 0, stream>>>(b->dev, chan,
+                (const char *) x->data, x->nb[1], (const char *) ids->data, ids->nb[1], (const float *) w->data,
+                (int) x->ne[0], (int) ids->ne[0], (int) x->ne[1], flags, (int32_t *) dst->data);
+    } else {
+        k_mb_post<<<1, MB_POST_THREADS, 0, stream>>>(b->dev, chan,
+                (const char *) x->data, x->nb[1], (const char *) ids->data, ids->nb[1], (const float *) w->data,
+                (int) x->ne[0], (int) ids->ne[0], (int) x->ne[1], flags, (int32_t *) dst->data);
+    }
     CUDA_CHECK(cudaGetLastError());
 
-    if (b->params.wait_mode == GGML_MOE_BRIDGE_WAIT_HOSTFUNC) {
-        // fork: the host job runs on the aux stream while this stream continues with the device work of the layer
-        CUDA_CHECK(cudaEventRecord(b->ev_post[chan], stream));
-        CUDA_CHECK(cudaStreamWaitEvent(b->aux, b->ev_post[chan], 0));
-        CUDA_CHECK(cudaLaunchHostFunc(b->aux, mb_hostfn, &b->hf[chan]));
-        CUDA_CHECK(cudaEventRecord(b->ev_done[chan], b->aux));
+    mb_post_fork(b, chan, stream);
+#endif
+}
+
+// [TAG_FN_L4_POST] see moe-bridge.cuh
+bool ggml_cuda_fn_l4_topk_post(ggml_backend_cuda_context & ctx, const ggml_tensor * logits, ggml_tensor * weights,
+        ggml_tensor * ids, const ggml_tensor * clamp, const ggml_tensor * scale, const ggml_tensor * bias,
+        const ggml_cuda_topk_moe_args & args, ggml_tensor * post) {
+#ifdef GGML_MOE_BRIDGE_DISABLED
+    GGML_UNUSED(ctx);
+    GGML_UNUSED(logits);
+    GGML_UNUSED(weights);
+    GGML_UNUSED(ids);
+    GGML_UNUSED(clamp);
+    GGML_UNUSED(scale);
+    GGML_UNUSED(bias);
+    GGML_UNUSED(args);
+    GGML_UNUSED(post);
+    return false;
+#else
+    if (post == nullptr || post->op != GGML_OP_MOE_HOST_POST || ggml_fn_l3_get(post) != GGML_FN_L4_POST ||
+        ggml_get_op_params_i32(post, 3) != 0 || bias != nullptr || args.delayed_softmax || args.prob_bias) {
+        return false;
     }
+    ggml_moe_bridge * b = mb_get(ggml_get_op_params_i32(post, 0));
+    const int32_t chan  = ggml_get_op_params_i32(post, 1);
+    const int32_t flags = ggml_get_op_params_i32(post, 2);
+    if (b == nullptr || b->params.device != ctx.device || chan < 0 || chan >= b->params.n_chan) {
+        return false;
+    }
+    const ggml_tensor * x    = post->src[0];
+    const ggml_tensor * pids = post->src[1];
+    const ggml_tensor * pw   = post->src[2];
+
+    const int64_t n_experts = logits->ne[0];
+    const int64_t n_rows    = logits->ne[1];
+    const int64_t n_used    = weights->ne[1];
+    // the top-k of 512 experts (Flash-Next), one block; the post reads exactly the top-k's two outputs
+    if (n_experts != 512 || n_rows < 1 || n_rows > TOPK_MOE_ROWS_PER_BLOCK || n_rows > b->params.max_tokens ||
+        n_used < 1 || n_used > b->params.n_used || n_used > n_experts || ggml_nrows(logits) != n_rows ||
+        logits->type != GGML_TYPE_F32 || weights->type != GGML_TYPE_F32 || ids->type != GGML_TYPE_I32 ||
+        !ggml_is_contiguous(logits) || !ggml_is_contiguous(weights) || ggml_nelements(weights) != n_used*n_rows ||
+        ids->nb[1] != (size_t) n_experts*sizeof(int32_t) ||
+        pids->data != ids->data || pids->nb[1] != ids->nb[1] || pids->ne[0] != n_used || pids->ne[1] != n_rows ||
+        pw->data != weights->data || ggml_nelements(pw) != n_used*n_rows ||
+        x->type != GGML_TYPE_F32 || x->ne[0] != b->params.n_embd || x->ne[1] != n_rows || x->nb[0] != sizeof(float)) {
+        return false;
+    }
+
+    fn_l4_topk_config config;
+    config.use_sigmoid       = args.sigmoid;
+    config.use_sqrt_softplus = args.sqrt_softplus;
+    config.with_norm         = clamp != nullptr;
+
+    const float clamp_val = clamp ? ggml_get_op_params_f32(clamp, 0) : -INFINITY;
+    const float scale_val = scale ? ggml_get_op_params_f32(scale, 0) : 1.0f;
+
+    cudaStream_t stream = ctx.stream();
+    const ggml_cuda_kernel_launch_params lp(dim3(1, 1, 1), dim3(FN_L4_POST_THREADS, 1, 1), 0, stream);
+    ggml_cuda_kernel_launch(k_fn_l4_topk_post<512>, lp, b->dev, (int) chan,
+            (const float *) logits->data, (float *) weights->data, (int32_t *) ids->data, (int) n_rows, (int) n_used,
+            clamp_val, scale_val, config, (const char *) x->data, (int64_t) x->nb[1], (int) x->ne[0], (int) flags,
+            (int32_t *) post->data);
+
+    mb_post_fork(b, chan, stream);
+
+    static std::atomic<bool> noted{false};
+    if (!noted.exchange(true)) {
+        GGML_LOG_INFO("%s: [TAG_FN_L4_POST] the router's top-k and the bridge post run in one launch\n", __func__);
+    }
+    return true;
 #endif
 }
 

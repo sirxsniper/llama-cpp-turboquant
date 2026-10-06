@@ -11,6 +11,7 @@
 #include "ggml-alloc.h"   // [TAG_FN_MTP_HEAD_IDS]
 #include "ggml-backend.h"
 #include "ggml-fn-l3.h"   // [TAG_FN_L3_GPU]
+#include "ggml-fn-l4-gpumoe.h" // [TAG_FN_L4_GPUMOE]
 
 #include <algorithm>
 #include <atomic>
@@ -709,6 +710,27 @@ llama_model_qwen4exp::graph::l3_flags llama_model_qwen4exp::graph::l3_read(const
     return f;
 }
 
+// [TAG_FN_L4_GPUMOE] the round-4 GPU chain B switches, through the qwen4exp profile's lookups (the environment first)
+llama_model_qwen4exp::graph::l4_flags llama_model_qwen4exp::graph::l4_read(const llama_model & model) {
+    auto on = [&](const char * name) {
+        const char * v = llama_model_fn_env(&model, name);
+        return v && v[0] && v[0] != '0';
+    };
+    l4_flags f;
+    f.post     = on("LLAMA_FN_L4_POST");
+    f.gdnstall = on("LLAMA_FN_L4_GDNSTALL");
+
+    const int mask = (f.post ? 1 : 0) | (f.gdnstall ? 2 : 0);
+    static std::atomic<int> logged_other{-1};
+    const auto * qm = dynamic_cast<const llama_model_qwen4exp *>(&model);
+    std::atomic<int> & logged = qm ? qm->l4_logged : logged_other;
+    if (logged.exchange(mask) != mask) {
+        LLAMA_LOG_INFO("qwen4exp: [TAG_FN_L4_GPUMOE] GPU chain B levers:%s%s%s\n",
+                f.post ? " POST" : "", f.gdnstall ? " GDNSTALL" : "", mask == 0 ? " none" : "");
+    }
+    return f;
+}
+
 void llama_model_qwen4exp::graph::l3_expand_deferred() {
     for (ggml_tensor * t : l3_deferred) {
         ggml_build_forward_expand(gf, t);
@@ -847,7 +869,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_combine_post(
 }
 
 llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_params & params) :
-    llm_build_delta_net_base(params), l3(l3_read(model)), model(model) {
+    llm_build_delta_net_base(params), l3(l3_read(model)), l4(l4_read(model)), model(model) {
     const int64_t hc = hparams.dsv4_hc_mult;
 
     GGML_ASSERT(hparams.n_embd_head_v() == hparams.n_embd_head_k());
@@ -2104,6 +2126,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
     moe_router_mark  = l3.mmv ? GGML_FN_L3_MMV : 0; // [TAG_FN_L3_GPU_MMV] the router: 512 rows of 2560
     moe_q8in_mark    = l3.q8f ? GGML_FN_L3_Q8IN : 0; // [TAG_FN_L3_GPU_Q8F] the hot / DMA chains read hc_pre's q8_1 copy
     moe_zskip_mark   = l3.zskip ? GGML_FN_L3_ZSKIP : 0; // [TAG_FN_L3_GPU_ZSKIP] their zero-slot pairs are not computed
+    moe_post_mark    = l4.post ? GGML_FN_L4_POST : 0;   // [TAG_FN_L4_POST] one-fence post, fused with the top-k
     ggml_tensor * moe_out =
         build_moe_ffn(cur,
             model.layers[il].ffn_gate_inp,
@@ -2123,6 +2146,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
     moe_router_mark  = 0;
     moe_q8in_mark    = 0;
     moe_zskip_mark   = 0;
+    moe_post_mark    = 0;
 
     // [TAG_FN_L3_GPU_DEFER] after the post (and the hot chain), before the shared expert and the wait
     l3_expand_deferred();
@@ -2437,10 +2461,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
         // [TAG_FN_L3_GPU_CONVWB] copy the strided tail straight into the row: the slots' copies differ only by constant
         // pointer steps, so CUDA chains them into one launch ([TAG_CPY_CHAIN_FUSION]) instead of a 2-D memcpy and a
         // memcpy per slot (8 copy-engine nodes, ~28 us per GDN layer). Same bytes.
-        ggml_tensor * cpy = ggml_cpy(ctx0, l3.convwb ? tail : ggml_cont(ctx0, tail), dst);
+        // [TAG_FN_L4_GDNSTALL] the same two levers, for these copies only
+        ggml_tensor * cpy = ggml_cpy(ctx0, l3.convwb || l4.gdnstall ? tail : ggml_cont(ctx0, tail), dst);
 
         // [TAG_FN_L3_GPU_DEFER] the next step reads these rows, this graph does not: after the bridge post
-        if (l3.defer) {
+        if (l3.defer || l4.gdnstall) {
             l3_deferred.push_back(cpy);
         } else {
             ggml_build_forward_expand(gf, cpy);

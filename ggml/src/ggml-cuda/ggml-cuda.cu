@@ -35,6 +35,7 @@
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/mmsb.cuh"   // [TAG_MMSB] [TAG_SMALLB]
 #include "ggml-cuda/moe-bridge.cuh" // [TAG_MOE_BRIDGE]
+#include "ggml-fn-l4-gpumoe.h"          // [TAG_FN_L4_POST]
 #include "ggml-cuda/qsa-mask.cuh"   // [TAG_FN_R4_QSA_POS]
 #include "ggml-cuda/mmqsn.cuh"  // [TAG_MMQSN]
 #include "ggml-cuda/mmvf.cuh"
@@ -4399,6 +4400,24 @@ static int ggml_cuda_fn_l3_try_gdnab(ggml_backend_cuda_context * cuda_ctx, ggml_
     return idx[5] - i;
 }
 
+// [TAG_FN_L4_POST] a bridge post marked GGML_FN_L4_POST right behind the fused topk-moe nodes (only views between them):
+// the top-k and the post in one launch. Returns the nodes to skip after i_last (0: not taken, nothing launched).
+static int ggml_cuda_fn_l4_try_topk_post(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i_last,
+        const ggml_tensor * logits, ggml_tensor * weights, ggml_tensor * ids, const ggml_tensor * clamp,
+        const ggml_tensor * scale, const ggml_tensor * bias, const ggml_cuda_topk_moe_args & args) {
+    for (int j = i_last + 1; j < cgraph->n_nodes; ++j) {
+        ggml_tensor * t = cgraph->nodes[j];
+        if (ggml_cuda_is_view_or_noop(t)) {
+            continue;
+        }
+        if (t->op != GGML_OP_MOE_HOST_POST || ggml_fn_l3_get(t) != GGML_FN_L4_POST || (t->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            return 0;
+        }
+        return ggml_cuda_fn_l4_topk_post(ctx, logits, weights, ids, clamp, scale, bias, args, t) ? j - i_last : 0;
+    }
+    return 0;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
@@ -4564,6 +4583,11 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 if (ggml_can_fuse_subgraph(cgraph, i, ops.size(), ops.data(), out_nodes, 2) &&
                         ggml_cuda_should_use_topk_moe(node, logits, weights, ids) &&
                         ggml_cuda_check_fusion_memory_ranges(cgraph, i, ops.size(), out_nodes, 2, /*is_topk_moe=*/true)) {
+                    const int n_post = ggml_cuda_fn_l4_try_topk_post(*cuda_ctx, cgraph, i + (int) ops.size() - 1, logits, weights,
+                            ids, clamp, scale, bias, args); // [TAG_FN_L4_POST]
+                    if (n_post > 0) {
+                        return ops.size() - 1 + n_post;
+                    }
                     ggml_cuda_op_topk_moe(*cuda_ctx, logits, weights, ids, clamp, scale, bias, args);
                     return ops.size() - 1;
                 }
