@@ -130,7 +130,11 @@ size_t ggml_fn_moe_prefetch(const struct ggml_tensor * up, const struct ggml_ten
 // pieces of this thread were all pulled before the stop. [TAG_FN_L3_CPU_PFSTREAMS] streams > 1: that many at a time.
 size_t ggml_fn_moe_prefetch_stable(const struct ggml_tensor * up, const struct ggml_tensor * gate, const struct ggml_tensor * down,
                                    const int32_t * list, int n, int ith, int nth, const volatile int32_t * stop, int mode,
-                                   uint8_t * done, int streams);
+                                   uint8_t * done, int streams, int flags);
+// [TAG_FN_L6_PF] flags of ggml_fn_moe_prefetch_stable (streams > 1, real loads): stop checks every 1 KiB of a region (not
+// 4 KiB), and whole-line vector loads
+#define GGML_FN_PF_FINE_STOP 1
+#define GGML_FN_PF_VEC       2
 
 
 #if defined(_MSC_VER)

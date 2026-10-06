@@ -2294,8 +2294,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     const bool weight_before_ffn = arch == LLM_ARCH_LLAMA4; // for llama4, we apply the sigmoid-ed weights before the FFN
     ggml_tensor * const hint_router = moe_bridge_hint_router; // [TAG_FN_L3_CPU_DEVPRED] for this call only
     ggml_tensor * const hint_input  = moe_bridge_hint_input;
+    const bool          hint_late   = moe_bridge_hint_late; // [TAG_FN_L6_PFDEV3]
     moe_bridge_hint_router = nullptr;
     moe_bridge_hint_input  = nullptr;
+    moe_bridge_hint_late   = false;
 
     // [TAG_FN_PREFILL_STREAM] large ubatches read this layer's host experts from a VRAM bank the streamer fills; the gate
     // node waits for the bank before the router runs
@@ -2537,7 +2539,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             }
             cb(br_ticket, "ffn_moe_bridge_post", il);
             res->n_moe_bridge++;
-            if (hint) {
+            if (hint && hint_late) {
+                moe_bridge_hints[il] = { hint_router, br_ticket, hint_k, br_id, br_chan }; // [TAG_FN_L6_PFDEV3] built later
+            } else if (hint) {
                 const bool own_in = hint_input && hint_input->ne[0] == cur->ne[0] && hint_input->ne[1] == cur->ne[1] &&
                                     ggml_nrows(hint_input) == cur->ne[1];
                 ggml_tensor * lg = build_lora_mm(hint_router, own_in ? hint_input : cur); // [n_expert of il + 1, n_tokens]
@@ -2983,6 +2987,25 @@ ggml_tensor * llm_graph_context::build_moe_bridge_finish(ggml_tensor * cur, int 
     }
     ggml_build_forward_expand(gf, out);
     return out;
+}
+
+// [TAG_FN_L6_PFDEV3]
+bool llm_graph_context::build_moe_bridge_hint(int il, ggml_tensor * input) const {
+    const auto it = moe_bridge_hints.find(il);
+    if (it == moe_bridge_hints.end()) {
+        return false;
+    }
+    const moe_bridge_hint_job h = it->second;
+    moe_bridge_hints.erase(it);
+    if (input == nullptr || input->ne[0] != h.router->ne[0] || ggml_nrows(input) != input->ne[1]) {
+        return false;
+    }
+    ggml_tensor * lg = build_lora_mm(h.router, input);  // [n_expert of il + 1, n_tokens]
+    ggml_tensor * pr = ggml_argsort_top_k(ctx0, lg, h.k); // [k, n_tokens] by rank
+    ggml_tensor * hn = ggml_moe_host_hint(ctx0, h.ticket, pr, h.id, h.chan);
+    cb(hn, "ffn_moe_bridge_hint", il);
+    ggml_build_forward_expand(gf, hn);
+    return true;
 }
 
 // input embeddings with optional lora

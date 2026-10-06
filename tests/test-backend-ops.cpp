@@ -18233,6 +18233,8 @@ static bool run_cpu_fn_moe_pool_l3(ggml_backend_t backend, ggml_backend_t backen
                             pp.pf_streams = 1 + 3 * (int) ((T + nt) % 2);       // [TAG_FN_L3_CPU_PFSTREAMS]
                             pp.dflow   = dfl != 0;
                             pp.pf_fix  = dfl != 0; // [TAG_FN_L4_MEM_PFDEV]
+                            pp.pf_score = dfl != 0 && variant == 0;          // [TAG_FN_L6_PF] learned order of a given list
+                            pp.pf_pull  = dfl != 0 ? 1 + 2 * variant : 0;    // [TAG_FN_L6_PF] fine stop, vector loads
                             ggml_cpu_moe_pool * pool = pool_new(&pp);
                             if (pool == nullptr) {
                                 printf("  FAIL moe pool l3: no pool (split %d, %d threads)\n", split, nt);
