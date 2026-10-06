@@ -377,6 +377,13 @@ extern "C" {
     GGML_API bool                 ggml_backend_sched_snap_restore(ggml_backend_sched_t sched, ggml_backend_sched_snap_t snap, struct ggml_cgraph * graph);
     GGML_API void                 ggml_backend_sched_snap_free(ggml_backend_sched_snap_t snap);
 
+    // [TAG_FN_L4_HOST_BATCHCPY] on: the host -> device copies of a split's graph inputs go to the split's backend as one
+    // batch when its registry offers "ggml_backend_set_tensors_batch_async" (CUDA: cudaMemcpyBatchAsync), else one by
+    // one as before. Same copies, same stream, before the split's graph. Off by default.
+    typedef bool (*ggml_backend_set_tensors_batch_async_t)(ggml_backend_t backend, int n, struct ggml_tensor * const * tensors,
+            const void * const * data, const size_t * sizes);
+    GGML_API void                 ggml_backend_sched_set_batch_inputs(ggml_backend_sched_t sched, bool on);
+
     //
     // Meta backend
     //

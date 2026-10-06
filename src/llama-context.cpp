@@ -1425,6 +1425,9 @@ llama_context::llama_context(
         // [TAG_FN_L4_HOST_EARLYOUT]
         early_out_on = llama_fn_l4_host_flag(&model, "LLAMA_FN_L4_HOST_EARLYOUT");
 
+        // [TAG_FN_L4_HOST_BATCHCPY] its own switch only (not LLAMA_FN_L4_HOST): applied where the scheduler is made
+        batch_inputs_on = llama_fn_l3_flag(model, "LLAMA_FN_L4_HOST_BATCHCPY");
+
         // [TAG_FN_L4_HOST_SNAP] qwen4exp only; not with the CUDA concurrency pass (its plan is per optimized graph)
         {
             const char * opt = getenv("GGML_CUDA_GRAPH_OPT");
@@ -1960,6 +1963,7 @@ void llama_context::sched_reserve() {
     gf_res_prev_active = nullptr;
 
     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
+    ggml_backend_sched_set_batch_inputs(sched.get(), batch_inputs_on); // [TAG_FN_L4_HOST_BATCHCPY]
 
     llama_memory_context_ptr mctx;
     if (memory) {
@@ -2002,6 +2006,7 @@ void llama_context::sched_reserve() {
                 LLAMA_LOG_WARN("%s: compute buffer allocation failed, retrying without pipeline parallelism\n", __func__);
                 cparams.pipeline_parallel = false;
                 sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
+                ggml_backend_sched_set_batch_inputs(sched.get(), batch_inputs_on); // [TAG_FN_L4_HOST_BATCHCPY]
                 gf = graph_reserve(n_tokens_pp, n_seqs, n_outputs_pp, mctx.get());
             }
             if (!gf) {
@@ -5907,6 +5912,7 @@ void llama_context::cbuf_free_compute() {
     const size_t max_nodes = graph_max_nodes(reserve_n_tokens());
     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes,
             cparams.pipeline_parallel, cparams.op_offload));
+    ggml_backend_sched_set_batch_inputs(sched.get(), batch_inputs_on); // [TAG_FN_L4_HOST_BATCHCPY]
     sched_need_reserve = true;
 }
 

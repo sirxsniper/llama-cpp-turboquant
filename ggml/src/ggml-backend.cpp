@@ -1157,6 +1157,11 @@ struct ggml_backend_sched {
     char     split_after[GGML_SCHED_MAX_CUTS][GGML_MAX_NAME];
 
     uint64_t snap_id; // [TAG_FN_L4_HOST_SNAP] unique per scheduler object
+
+    // [TAG_FN_L4_HOST_BATCHCPY] ggml_backend_sched_set_batch_inputs; the batch function per backend (resolved once)
+    bool                                    batch_inputs;
+    bool                                    batch_fn_tried[GGML_SCHED_MAX_BACKENDS];
+    ggml_backend_set_tensors_batch_async_t  batch_fn[GGML_SCHED_MAX_BACKENDS];
 };
 
 #define hash_id(tensor) ggml_hash_find_or_insert(&sched->hash_set, tensor)
@@ -2074,6 +2079,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     uint32_t pending_h2d = 0;
     static_assert(GGML_SCHED_MAX_BACKENDS <= 32, "pending_h2d is a 32-bit mask");
 
+    // [TAG_FN_L4_HOST_BATCHCPY] the input copies of the current split, when they go as one batch
+    static thread_local std::vector<ggml_tensor *> batch_t;
+    static thread_local std::vector<const void *>  batch_d;
+    static thread_local std::vector<size_t>        batch_s;
+
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
@@ -2094,6 +2104,21 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
         // copy the input tensors to the split backend
         int n_inputs_async = 0;
+        // [TAG_FN_L4_HOST_BATCHCPY] the batch function of this split's backend, if the scheduler batches
+        ggml_backend_set_tensors_batch_async_t batch_fn = nullptr;
+        if (sched->batch_inputs) {
+            if (!sched->batch_fn_tried[split_backend_id]) {
+                sched->batch_fn_tried[split_backend_id] = true;
+                ggml_backend_dev_t dev = ggml_backend_get_device(split_backend);
+                ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+                sched->batch_fn[split_backend_id] = reg ? (ggml_backend_set_tensors_batch_async_t)
+                    ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_tensors_batch_async") : nullptr;
+            }
+            batch_fn = sched->batch_fn[split_backend_id];
+            batch_t.clear();
+            batch_d.clear();
+            batch_s.clear();
+        }
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
             ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[input_id]);
             struct ggml_tensor * input = split->inputs[input_id];
@@ -2115,7 +2140,16 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     !ggml_backend_sched_input_sync_forced() &&
                     split_backend->iface.set_tensor_async != NULL &&
                     ggml_backend_buffer_is_host(input->buffer)) {
-                    ggml_backend_tensor_set_async(split_backend, input_cpy, input->data, 0, ggml_nbytes(input));
+                    if (batch_fn != nullptr && input_cpy->view_src == NULL && input_cpy->data != NULL) {
+                        // [TAG_FN_L4_HOST_BATCHCPY] queued below with the split's other input copies
+                        if (ggml_nbytes(input) > 0) {
+                            batch_t.push_back(input_cpy);
+                            batch_d.push_back(input->data);
+                            batch_s.push_back(ggml_nbytes(input));
+                        }
+                    } else {
+                        ggml_backend_tensor_set_async(split_backend, input_cpy, input->data, 0, ggml_nbytes(input));
+                    }
                     n_inputs_async++;
                 } else {
                     if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
@@ -2267,6 +2301,18 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     }
                 }
             }
+        }
+
+        // [TAG_FN_L4_HOST_BATCHCPY] the split's input copies as one call; one by one if the backend refuses the batch
+        if (!batch_t.empty()) {
+            if (!batch_fn(split_backend, (int) batch_t.size(), batch_t.data(), batch_d.data(), batch_s.data())) {
+                for (size_t k = 0; k < batch_t.size(); ++k) {
+                    ggml_backend_tensor_set_async(split_backend, batch_t[k], batch_d[k], 0, batch_s[k]);
+                }
+            }
+            batch_t.clear();
+            batch_d.clear();
+            batch_s.clear();
         }
 
         // [TAG_SCHED_INPUT_BATCH] one synchronize for every input queued above
@@ -2616,6 +2662,12 @@ bool ggml_backend_sched_snap_restore(ggml_backend_sched_t sched, ggml_backend_sc
 
 void ggml_backend_sched_snap_free(ggml_backend_sched_snap_t snap) {
     delete snap;
+}
+
+// [TAG_FN_L4_HOST_BATCHCPY]
+void ggml_backend_sched_set_batch_inputs(ggml_backend_sched_t sched, bool on) {
+    GGML_ASSERT(sched);
+    sched->batch_inputs = on;
 }
 
 void ggml_backend_sched_reset(ggml_backend_sched_t sched) {

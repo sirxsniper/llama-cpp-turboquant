@@ -424,6 +424,8 @@ private:
     // [TAG_FN_L4_HOST_EARLYOUT] LLAMA_FN_L4_HOST_EARLYOUT (qwen4exp): decode() hands process_ubatch the output copies of
     // the ubatch, which queues them behind a bridged graph before that graph's synchronize
     bool   early_out_on = false;
+
+    bool   batch_inputs_on = false; // [TAG_FN_L4_HOST_BATCHCPY] LLAMA_FN_L4_HOST_BATCHCPY (qwen4exp)
     void (*early_extract_fn)(void * ud, const llm_graph_result * res) = nullptr;
     void * early_extract_ud = nullptr;
 
