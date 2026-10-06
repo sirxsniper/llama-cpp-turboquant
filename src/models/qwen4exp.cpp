@@ -795,6 +795,53 @@ void llama_model_qwen4exp::graph::l4_hoist_gathers(int il) {
     }
 }
 
+// [TAG_FN_L6_PFDEV3] the kept hint of layer il: layer il + 1's FFN mixer (its norm gamma, low rank and stream gates; the
+// streams summed, so no 1/hc) on the combine of this layer's residual with the device's part of the FFN output (hot
+// experts + shared expert, the host's cold experts left out), then its router's top-k. Prediction only.
+void llama_model_qwen4exp::graph::l6_build_late_hint(int il, ggml_tensor * shexp) {
+    if (l6_hint_res == nullptr || l6_hint_inject == nullptr || il + 1 >= n_layer ||
+            moe_bridge_hints.find(il) == moe_bridge_hints.end()) {
+        return;
+    }
+    const auto & L = model.layers[il + 1];
+    ggml_tensor * part = shexp;
+    const auto it = moe_bridge_posts.find(il);
+    if (it != moe_bridge_posts.end() && it->second.hot) {
+        part = part ? ggml_add(ctx0, it->second.hot, part) : it->second.hot;
+    }
+    if (part == nullptr || !L.hc_ffn_norm || !L.hc_ffn_down || !L.hc_ffn_up) {
+        build_moe_bridge_hint(il, nullptr); // drops the kept hint
+        return;
+    }
+    const int64_t hc = hparams.dsv4_hc_mult;
+    const int64_t nt = l6_hint_res->ne[2];
+    ggml_tensor * w = ggml_scale(ctx0, ggml_sigmoid(ctx0, ggml_scale(ctx0, l6_hint_inject, 1.0f / (float) hc)), 2.0f);
+    ggml_tensor * x = nullptr;
+    if (cparams.fused_dsv4_hc_post) {
+        x = ggml_dsv4_hc_post(ctx0, part, l6_hint_res, w, nullptr);
+    } else {
+        ggml_tensor * b = ggml_repeat_4d(ctx0, ggml_reshape_3d(ctx0, part, n_embd, 1, nt), n_embd, hc, nt, 1);
+        x = ggml_add(ctx0, l6_hint_res, ggml_mul(ctx0, b, ggml_reshape_3d(ctx0, w, 1, hc, nt)));
+    }
+    ggml_tensor * xn = ggml_mul(ctx0, ggml_rms_norm(ctx0, x, hparams.f_norm_rms_eps), L.hc_ffn_norm);
+    xn = ggml_reshape_2d(ctx0, xn, hc * n_embd, nt);
+    ggml_tensor * lo = ggml_silu(ctx0, ggml_scale(ctx0, build_lora_mm(L.hc_ffn_down, xn), 1.0f / (float) hc));
+    ggml_tensor * g  = build_lora_mm(L.hc_ffn_up, lo);
+    ggml_tensor * mixed = nullptr;
+    if (cparams.fused_dsv4_hc_pre) {
+        mixed = ggml_dsv4_hc_pre_gated(ctx0, ggml_reshape_3d(ctx0, xn, n_embd, hc, nt), ggml_reshape_3d(ctx0, g, n_embd, hc, nt), 1.0f);
+    } else {
+        ggml_tensor * gated = ggml_reshape_3d(ctx0, ggml_mul(ctx0, xn, ggml_sigmoid(ctx0, g)), n_embd, hc, nt);
+        const size_t rs = ggml_row_size(gated->type, n_embd);
+        mixed = ggml_cont(ctx0, ggml_view_2d(ctx0, gated, n_embd, nt, rs*hc, 0));
+        for (int64_t c = 1; c < hc; ++c) {
+            mixed = ggml_add(ctx0, mixed, ggml_view_2d(ctx0, gated, n_embd, nt, rs*hc, rs*c));
+        }
+    }
+    cb(mixed, "l6_hint_mixed", il);
+    build_moe_bridge_hint(il, mixed);
+}
+
 void llama_model_qwen4exp::graph::l3_expand_deferred() {
     for (ggml_tensor * t : l3_deferred) {
         ggml_build_forward_expand(gf, t);
@@ -1019,7 +1066,8 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
     // its stream gates) on this layer's residual is the input of the next layer's router in the prefetch hint. Built
     // here, the hint puts it into the graph after this layer's post (off the device's critical path). No fused node and
     // no 1/hc on the stream mean: a positive scale does not change a linear router's top-k.
-    const bool hint_mix = moe_bridge && llama_moe_bridge_hint_mode(moe_bridge) == 2;
+    const bool hint_mix  = moe_bridge && llama_moe_bridge_hint_mode(moe_bridge) == 2;
+    const bool hint_late = moe_bridge && llama_moe_bridge_hint_mode(moe_bridge) == 3; // [TAG_FN_L6_PFDEV3]
     auto build_hint_mix = [&](ggml_tensor * x, int jl) -> ggml_tensor * {
         const auto & L = model.layers[jl];
         if (!L.hc_ffn_norm || !L.hc_ffn_down || !L.hc_ffn_up) {
@@ -1093,7 +1141,15 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
         if (hint_mix && il + 1 < n_layer) {
             moe_bridge_hint_input = build_hint_mix(res_hc, il + 1); // [TAG_FN_L3_CPU_DEVPRED] build_moe_ffn takes it
         }
+        if (hint_late && il + 1 < n_layer && inject != nullptr) {
+            moe_bridge_hint_late = true; // [TAG_FN_L6_PFDEV3] build_moe_ffn keeps the hint, build_layer_ffn builds it
+            l6_hint_res    = res_hc;
+            l6_hint_inject = inject;
+        }
         cur = build_layer_ffn(cur, il);
+        moe_bridge_hint_late = false;
+        l6_hint_res    = nullptr;
+        l6_hint_inject = nullptr;
         cb(cur, "ffn_out", il);
 
         res_hc = w_ffn ? build_hc_combine_post(res_hc, cur, w_ffn, il) : build_hc_combine(res_hc, cur, inject, il);
@@ -2351,12 +2407,14 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
         ffn_shexp = ggml_mul(ctx0, ffn_shexp, shared_gate);
         cb(ffn_shexp, "ffn_shexp_gated", il);
 
+        l6_build_late_hint(il, ffn_shexp); // [TAG_FN_L6_PFDEV3] before the wait
         moe_out = build_moe_bridge_finish(moe_out, il, ffn_shexp); // [TAG_MOE_BRIDGE] unchanged without a post
         cb(moe_out, "ffn_moe_out", il);
 
         cur = ggml_add(ctx0, moe_out, ffn_shexp);
         cb(cur, "ffn_out", il);
     } else {
+        l6_build_late_hint(il, nullptr); // [TAG_FN_L6_PFDEV3]
         moe_out = build_moe_bridge_finish(moe_out, il, nullptr); // [TAG_MOE_BRIDGE]
         cb(moe_out, "ffn_moe_out", il);
         cur = moe_out;

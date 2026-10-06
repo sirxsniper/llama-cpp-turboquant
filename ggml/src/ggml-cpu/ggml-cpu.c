@@ -2839,9 +2839,14 @@ struct ggml_fn_pf_group {
     size_t       len[GGML_FN_PF_MAX_STREAMS];
     int          k;
     int          ns;
+    size_t       stop_mask; // [TAG_FN_L6_PF] *stop is checked at every offset o with (o & stop_mask) == 0
+    bool         vec;       // [TAG_FN_L6_PF] whole-line vector loads (else one byte load per line)
 };
 
-// pull the group's regions; false (and nothing more pulled) once *stop != 0, checked every 4 KiB of each region
+static volatile uint32_t ggml_fn_pf_sink = 0; // [TAG_FN_L6_PF] keeps the vector loads
+
+// pull the group's regions; false (and nothing more pulled) once *stop != 0, checked every 4 KiB of each region (1 KiB
+// with [TAG_FN_L6_PF] flag 1)
 static bool ggml_fn_pf_group_pull(struct ggml_fn_pf_group * g, const volatile int32_t * stop, size_t * bytes) {
     const char * c[GGML_FN_PF_MAX_STREAMS];
     const char * end[GGML_FN_PF_MAX_STREAMS];
@@ -2851,8 +2856,38 @@ static bool ggml_fn_pf_group_pull(struct ggml_fn_pf_group * g, const volatile in
         end[r] = g->a[r] + g->len[r];
         span   = MAX(span, (size_t) (end[r] - c[r]));
     }
+#if defined(__AVX512F__)
+    if (g->vec) {
+        // [TAG_FN_L6_PF] the same lines with 64-byte loads, xor-folded so the loads stay
+        __m512i acc = _mm512_setzero_si512();
+        for (size_t o = 0; o < span; o += 64) {
+            if ((o & g->stop_mask) == 0 && *stop) {
+                for (int r = 0; r < g->k; ++r) {
+                    *bytes += MIN(o, g->len[r]);
+                }
+                g->k = 0;
+                ggml_fn_pf_sink ^= (uint32_t) _mm_cvtsi128_si32(_mm512_castsi512_si128(acc));
+                return false;
+            }
+            for (int r = 0; r < g->k; ++r) {
+                if (c[r] + o < end[r]) {
+                    acc = _mm512_xor_si512(acc, _mm512_loadu_si512((const void *) (c[r] + o)));
+                }
+            }
+        }
+        ggml_fn_pf_sink ^= (uint32_t) _mm_cvtsi128_si32(_mm512_castsi512_si128(acc));
+        for (int r = 0; r < g->k; ++r) {
+            *bytes += g->len[r];
+        }
+        g->k = 0;
+        return true;
+    }
+#endif
     for (size_t o = 0; o < span; o += 64) {
-        if ((o & 4095) == 0 && *stop) {
+        if ((o & g->stop_mask) == 0 && *stop) {
+            for (int r = 0; r < g->k; ++r) { // [TAG_FN_L6_PF] the stats count what the stopped group pulled too
+                *bytes += MIN(o, g->len[r]);
+            }
             g->k = 0;
             return false;
         }
@@ -2882,7 +2917,7 @@ static bool ggml_fn_pf_group_add(struct ggml_fn_pf_group * g, const char * a, si
 // [TAG_FN_L3_CPU_PFSTREAMS] streams > 1 (real loads): an expert's regions are pulled that many at a time, interleaved.
 size_t ggml_fn_moe_prefetch_stable(const struct ggml_tensor * up, const struct ggml_tensor * gate, const struct ggml_tensor * down,
                                    const int32_t * list, int n, int ith, int nth, const volatile int32_t * stop, int mode,
-                                   uint8_t * done, int streams) {
+                                   uint8_t * done, int streams, int flags) {
     if (n <= 0 || nth <= 0 || ith < 0 || ith >= nth) {
         return 0;
     }
@@ -2898,6 +2933,8 @@ size_t ggml_fn_moe_prefetch_stable(const struct ggml_tensor * up, const struct g
         struct ggml_fn_pf_group g;
         g.k  = 0;
         g.ns = MIN(streams, GGML_FN_PF_MAX_STREAMS);
+        g.stop_mask = (flags & GGML_FN_PF_FINE_STOP) ? 1023 : 4095; // [TAG_FN_L6_PF]
+        g.vec       = (flags & GGML_FN_PF_VEC) != 0;
         for (int i = 0; i < n; ++i) {
             const int32_t e = list[i];
             if (e < 0 || e >= n_exp) {

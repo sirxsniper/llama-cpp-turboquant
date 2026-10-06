@@ -204,6 +204,10 @@ extern "C" {
                                              // (ggml_cpu_moe_prefetch_caller) pulls the pieces it computes in the job (the
                                              // stable split's owners, not the range split's), and a given list is ready
                                              // for it at the post (it waited for a router phase that a given list skips)
+        bool pf_score;                       // [TAG_FN_L6_PF] a given list is pulled by its estimated chance to be computed
+                                             // (per rank hit rates learned from the jobs, combined over the tokens), not by rank
+        int  pf_pull;                        // [TAG_FN_L6_PF] bits: 1 a stopped pull leaves within 1 KiB of each region (not
+                                             // 4 KiB), 2 whole-line vector loads (pf_streams > 1, real loads)
     };
 
     // [TAG_FN_L3_CPU_SPLIT] how a pool job gives its pieces (32 gate / up rows or 64 down rows of one expert) to the threads.
@@ -285,6 +289,7 @@ extern "C" {
         double   pf_precision;    // of those: predicted experts the job computed / predicted experts
         double   pf_prec_top4;    // the same for the first 4 of the list (its order: by rank with a ranked or given list)
         double   pf_recall;       // experts the job computed that were predicted / experts the job computed
+        double   pf_rank_p[4];    // [TAG_FN_L6_PF] with pf_score: the learned hit rate of ranks 0, 1, 3 and 7 of a given list
         int      n_thr;           // workers with records below (worker index; worker 0 is the caller)
         int      thr_cpu[GGML_CPU_MOE_STATS_MAX_THR];     // its CPU (-1: not pinned)
         double   thr_busy_us[GGML_CPU_MOE_STATS_MAX_THR]; // its gate / up + down time per job (0: it computed nothing)

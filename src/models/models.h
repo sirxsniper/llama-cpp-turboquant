@@ -2661,6 +2661,13 @@ struct llama_model_qwen4exp : public llama_model_base {
         std::vector<ggml_tensor *> l3_deferred;
         void l3_expand_deferred();
 
+        // [TAG_FN_L6_PFDEV3] LLAMA_FN_L4_PFDEV=3: the prefetch hint of layer il + 1 from this layer's residual plus the device's
+        // part of this layer's FFN output (hot experts + shared expert), combined and mixed as layer il + 1 does; built in
+        // build_layer_ffn before the wait (prediction only: no value of the model reads it)
+        ggml_tensor * l6_hint_res    = nullptr;
+        ggml_tensor * l6_hint_inject = nullptr;
+        void l6_build_late_hint(int il, ggml_tensor * shexp);
+
         ggml_tensor * build_layer_attn(
               llm_graph_input_attn_kv * inp_attn,
   const llama_memory_hybrid_idx_context * mctx_hyb,

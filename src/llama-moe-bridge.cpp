@@ -835,7 +835,9 @@ llama_moe_bridge * llama_moe_bridge_create(const llama_model & model, int n_thre
         // [TAG_FN_L4_MEM_PFDEV] LLAMA_FN_L4_PFDEV=2 (qwen4exp): the device hints from the next layer's FFN mixer unless
         // LLAMA_MOE_BRIDGE_PF_DEV says otherwise
         const int  pfd   = llama_fn_l3_int(model, "LLAMA_FN_L4_PFDEV", 0);
-        const int  dev   = std::min(2, std::max(0, env_int("LLAMA_MOE_BRIDGE_PF_DEV", pfd >= 2 ? 2 : 0)));
+        // [TAG_FN_L6_PFDEV3] =3: the next layer's FFN mixer on this layer's residual plus the device's part of this layer's FFN
+        // output (hot experts + shared expert, combined), built before the wait
+        const int  dev   = std::min(3, std::max(0, env_int("LLAMA_MOE_BRIDGE_PF_DEV", pfd >= 3 ? 3 : pfd >= 2 ? 2 : 0)));
         const int  exec  = env_int("LLAMA_MOE_POOL_EXEC_CPU", -1);
         const int  pfs   = env_int("LLAMA_MOE_POOL_PF_STREAMS", 1);
         const bool fgap  = env_int("LLAMA_MOE_DMA_FILL_GAP", 0) > 0;
@@ -870,6 +872,16 @@ llama_moe_bridge * llama_moe_bridge_create(const llama_model & model, int n_thre
     br->pool_params.pf_streams  = br->pf_streams;   // [TAG_FN_L3_CPU_PFSTREAMS]
     br->pool_params.dflow       = llama_fn_l3_flag(model, "LLAMA_FN_L4_POOLBAR"); // [TAG_FN_L4_MEM_POOLBAR] qwen4exp only
     br->pool_params.pf_fix      = llama_fn_l3_int(model, "LLAMA_FN_L4_PFDEV", 0) >= 1; // [TAG_FN_L4_MEM_PFDEV] qwen4exp only
+    br->pool_params.pf_score    = llama_fn_l3_flag(model, "LLAMA_FN_L6_PFORDER"); // [TAG_FN_L6_PF] qwen4exp only
+    br->pool_params.pf_pull     = std::max(0, llama_fn_l3_int(model, "LLAMA_FN_L6_PFPULL", 0)); // [TAG_FN_L6_PF] 1 fine stop, 2 vector loads
+    if (br->pool_params.pf_pull) {
+        LLAMA_LOG_INFO("%s: [TAG_FN_L6_PF] prefetch pull flags %d (1: a stop lands within 1 KiB of a region, 2: whole-line vector "
+                "loads)\n", __func__, br->pool_params.pf_pull);
+    }
+    if (br->pool_params.pf_score) {
+        LLAMA_LOG_INFO("%s: [TAG_FN_L6_PF] a given prefetch list is pulled by the estimated chance of each expert (per rank hit "
+                "rates learned from the jobs), not by rank\n", __func__);
+    }
     if (br->pool_params.pf_fix) {
         LLAMA_LOG_INFO("%s: [TAG_FN_L4_MEM_PFDEV] the executor's part of a prefetch pulls the pieces it computes (split %d), a "
                 "device hint list is ready for it at the post\n", __func__, br->pool_split);
@@ -1007,7 +1019,8 @@ llama_moe_bridge * llama_moe_bridge_create(const llama_model & model, int n_thre
                 LLAMA_LOG_INFO("%s: [TAG_FN_L3_CPU] pool split %s, prefetch order %s, prediction %s, %d pull streams%s\n", __func__,
                         br->pool_split == 2 ? "steal" : br->pool_split == 1 ? "stable" : "range",
                         br->pf_rank || br->hint_k > 0 ? "by rank" : "by expert id",
-                        br->hint_k > 0 ? (br->hint_mode == 2 ? "on the device (hints, the next layer's FFN mixer)" : "on the device (hints)") :
+                        br->hint_k > 0 ? (br->hint_mode == 3 ? "on the device (hints, the next layer's FFN mixer after this layer's device FFN part)" :
+                                          br->hint_mode == 2 ? "on the device (hints, the next layer's FFN mixer)" : "on the device (hints)") :
                         "host router", br->pf_streams,
                         br->pf_streams > 1 && br->pool_split == 0 ? " (they need split stable or steal)" : "");
             }
@@ -1470,6 +1483,10 @@ bool llama_moe_bridge_end(llama_moe_bridge * br) {
                 "over 1 ms; fills held %" PRIu64 " times, %.1f ms in all; prediction over %" PRIu64 " jobs: precision %.2f (first 4: "
                 "%.2f), recall %.2f\n", __func__, br->bid, wl.c_str(), ps.job_max_us, ps.jobs_slow, held_n, held_us/1e3,
                 ps.pred_jobs, ps.pf_precision, ps.pf_prec_top4, ps.pf_recall);
+        if (br->pool_params.pf_score) {
+            LLAMA_LOG_INFO("%s: MoE bridge %d: [TAG_FN_L6_PF] learned hit rate of a cold hint entry by rank: r0 %.2f, r1 %.2f, r3 %.2f, "
+                    "r7 %.2f\n", __func__, br->bid, ps.pf_rank_p[0], ps.pf_rank_p[1], ps.pf_rank_p[2], ps.pf_rank_p[3]);
+        }
     }
     if (err == GGML_MOE_BRIDGE_ERR_NONE) {
         return true;

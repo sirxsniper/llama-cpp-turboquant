@@ -1133,6 +1133,17 @@ struct llm_graph_context {
     // router's input instead of this layer's FFN input ([n_embd, n_tokens], put into the graph after the post)
     mutable ggml_tensor * moe_bridge_hint_router = nullptr;
     mutable ggml_tensor * moe_bridge_hint_input  = nullptr;
+    // [TAG_FN_L6_PFDEV3] set by an arch before build_moe_ffn (which takes and clears it): the hint is not built after the
+    // post but kept in moe_bridge_hints; the arch builds it with build_moe_bridge_hint before the layer's wait
+    mutable bool moe_bridge_hint_late = false;
+    struct moe_bridge_hint_job {
+        ggml_tensor * router;
+        ggml_tensor * ticket;
+        int           k;
+        int32_t       id;
+        int32_t       chan;
+    };
+    mutable std::map<int, moe_bridge_hint_job> moe_bridge_hints;
     struct moe_bridge_post {
         ggml_tensor * ticket;
         ggml_tensor * hot;      // the device part, weighted and summed [n_embd, T], or nullptr
@@ -1272,6 +1283,9 @@ struct llm_graph_context {
     // part. Returns cur when layer il has no pending post (the unchanged path). With moe_bridge_defer, build_moe_ffn
     // returns the pending post's ticket as a placeholder and the caller passes it here as cur.
     ggml_tensor * build_moe_bridge_finish(ggml_tensor * cur, int il, ggml_tensor * dep) const;
+    // [TAG_FN_L6_PFDEV3] the kept hint of layer il: the next router on input ([n_embd, n_tokens]), top-k, to the host;
+    // false (nothing built) when layer il has no kept hint
+    bool build_moe_bridge_hint(int il, ggml_tensor * input) const;
 
     //
     // inputs
