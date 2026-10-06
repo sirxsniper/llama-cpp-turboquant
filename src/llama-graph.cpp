@@ -2607,6 +2607,24 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         return down_g;
     };
     auto build_cache_chain = [&]() -> ggml_tensor * {
+        // [TAG_FN_L4_MEM_PROMPT] a graph wider than hot_max_t (the short prompt path with LLAMA_FN_L4_PROMPT_HOT): chunks of
+        // hot_max_t tokens, so every chain takes the per-column MUL_MAT_ID kernels. The batched one (MMQ) groups an expert's
+        // columns assuming it appears at most once per token, but all uncached ids of a token map to the one zero slot.
+        if (hot_max_t > 0 && n_tokens > hot_max_t) {
+            ggml_tensor * inp_all = mc_inp;
+            ggml_tensor * out     = nullptr;
+            for (int64_t t0 = 0; t0 < n_tokens; t0 += hot_max_t) {
+                const int64_t nt = std::min<int64_t>(hot_max_t, n_tokens - t0);
+                mc_inp = ggml_view_3d(ctx0, inp_all, inp_all->ne[0], inp_all->ne[1], nt, inp_all->nb[1], inp_all->nb[2],
+                        t0*inp_all->nb[2]);
+                ggml_tensor * ids = ggml_view_2d(ctx0, mc_slot_ids, mc_slot_ids->ne[0], nt, mc_slot_ids->nb[1],
+                        t0*mc_slot_ids->nb[1]);
+                ggml_tensor * d = build_slot_chain(mcache->up_c, mcache->gate_c, mcache->down_c, ids, false);
+                out = out ? ggml_concat(ctx0, out, d, 2) : d;
+            }
+            mc_inp = inp_all;
+            return out;
+        }
         return build_slot_chain(mcache->up_c, mcache->gate_c, mcache->down_c, mc_slot_ids, false);
     };
     // expert skip table of the CPU MUL_MAT_IDs: the DMA plan's (hot + DMA) or the hot set's
