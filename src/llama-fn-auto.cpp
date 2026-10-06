@@ -136,6 +136,12 @@ const fn_item k_items[] = {
     { "LLAMA_FN_L4_POOLBAR",         "1",     P_BR  }, // CPU pool job without barriers, same values [TAG_FN_L4_MEM]
     { "LLAMA_FN_L4_PFDEV",           "2",     P_BR  }, // device-side prefetch hints (prefetch only) [TAG_FN_L4_MEM]
     { "LLAMA_FN_L4_HOST",            "1",     P_ALL }, // host levers TOPK / SNAP / EARLYOUT / BATCHCPY / PLEPRE [TAG_FN_L4_HOST]
+    // [TAG_FN_L5_ADOPT] round 5 (flashnext/int-l5): the hc mixer in three launches (bitwise: identity vs 1f570a818, no MTP and MTP;
+    // memcheck / racecheck clean) and the fused MTP draft update; A/B l4/int5/ab5.txt (2 rounds): with the q3 MTP head file
+    // bench code +6.6 %, prose +7.9 %, real +2.8 % vs 1f570a818
+    { "LLAMA_FN_L4_HC",              "1",     P_ALL }, // [TAG_FN_L4_HC]
+    { "LLAMA_FN_L4_HCQ8",            "1",     P_ALL },
+    { "LLAMA_FN_L4_HOST_MTPFUSE",    "1",     P_ALL }, // [TAG_FN_L4_HOST_MTPFUSE] drafts only
 };
 
 // names the fn-auto aware code reads through llama_fn_env(): never put into the environment
