@@ -73,7 +73,13 @@ struct ggml_fn_moe_args {
                                         // thread's stable prefetch covered all its pieces of the expert
     int             swpf;               // [TAG_FN_L3_CPU_SWPF] 0, or software-prefetch this many cache lines at every 4 KiB
                                         // page of a thread's next piece before it computes the current one
+    int32_t *       dflow;              // [TAG_FN_L4_MEM_POOLBAR] or NULL: ggml_fn_moe_dflow_words() words, zero at the job's
+                                        // start. No barrier: a down piece waits for its expert's gate / up pieces, and the
+                                        // thread that ends a block of down rows sums it (weighted mode). Same values.
 };
+
+// [TAG_FN_L4_MEM_POOLBAR] one dataflow counter per cache line
+#define GGML_FN_MOE_DFLOW_STRIDE 16
 
 // [TAG_FN_L3_CPU_STATS] the per-thread record of a job (ggml_fn_moe_args.ts): ticks of ggml_fn_moe_tick()
 enum {
@@ -109,6 +115,8 @@ uint64_t ggml_fn_moe_tick(void);
 bool   ggml_fn_moe_supported(const struct ggml_tensor * up, const struct ggml_tensor * gate, const struct ggml_tensor * down);
 size_t ggml_fn_moe_work_size(const struct ggml_tensor * up, const struct ggml_tensor * gate, const struct ggml_tensor * down,
                              int n_used, int n_tokens, int nth);
+// [TAG_FN_L4_MEM_POOLBAR] the counter words of a job (ggml_fn_moe_args.dflow): one per active expert, one per block of down rows
+int64_t ggml_fn_moe_dflow_words(const struct ggml_tensor * up, int n_used, int n_tokens);
 // every one of the nth threads calls it with its ith; barrier(barrier_ctx) must synchronize all of them
 void   ggml_fn_moe_compute(const struct ggml_fn_moe_args * a, int ith, int nth, void (*barrier)(void *), void * barrier_ctx);
 // [TAG_FN_R2_BRIDGE_SYNC] GGML_OP_MOE_HOST_SUM on the CPU: types, shapes and the fused kernel (ggml-cpu.c)

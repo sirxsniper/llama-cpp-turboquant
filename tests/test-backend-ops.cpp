@@ -17577,7 +17577,7 @@ static bool run_cpu_fn_moe_fuse(ggml_backend_t backend, ggml_backend_t backend_r
 
 // [TAG_FN_L3_CPU_SPLIT] [TAG_FN_L3_CPU_PFRANK] [TAG_FN_L3_CPU_DEVPRED] [TAG_FN_L3_CPU_STATS] the CPU MoE pool's lever-round-3
 // modes against today's pool (split RANGE, no statistics) and the unfused reference, bit for bit: the stable split and
-// the stealing split, on 2 .. 7 threads, with and without solo, with statistics, after a host-router prefetch (in
+// the stealing split, on 2 .. 7 threads, with and without solo and the dataflow job ([TAG_FN_L4_MEM_POOLBAR]), with statistics, after a host-router prefetch (in
 // expert order or by rank) and after a given list (finished, so every piece is prefetched by its own worker: the
 // prefetched-and-computed bytes must equal the job's bytes in the stable split; and stopped), T = 1..16, with and without
 // the skip table, a layer with fewer pieces per expert than threads, and many jobs of alternating widths (the claim
@@ -17605,7 +17605,9 @@ static bool run_cpu_fn_moe_pool_l3(ggml_backend_t backend, ggml_backend_t backen
     auto pool_pfst  = (pool_pfst_t)  ggml_backend_reg_get_proc_address(reg, "ggml_cpu_moe_prefetch_stats");
     auto pool_solo  = (pool_solo_t)  ggml_backend_reg_get_proc_address(reg, "ggml_cpu_moe_pool_set_solo");
     auto pool_stats = (pool_stats_t) ggml_backend_reg_get_proc_address(reg, "ggml_cpu_moe_pool_get_stats");
-    if (!pp_def || !pool_new || !pool_free || !pool_run || !pool_pf || !pool_pfst || !pool_solo || !pool_stats) {
+    using pool_pfc_t    = size_t (*)(ggml_cpu_moe_pool *, const volatile int32_t *); // [TAG_FN_L4_MEM_PFDEV]
+    auto pool_pfc   = (pool_pfc_t)   ggml_backend_reg_get_proc_address(reg, "ggml_cpu_moe_prefetch_caller");
+    if (!pp_def || !pool_new || !pool_free || !pool_run || !pool_pf || !pool_pfst || !pool_solo || !pool_stats || !pool_pfc) {
         printf("  FAIL moe pool l3: the CPU backend lacks a pool function\n");
         return false;
     }
@@ -17709,6 +17711,7 @@ static bool run_cpu_fn_moe_pool_l3(ggml_backend_t backend, ggml_backend_t backen
 
                 for (int split : {0, 1, 2}) { // range only with the software prefetch (else it is pool0)
                     for (int nt : {2, 4, 7}) {
+                      for (int dfl = 0; dfl < 2; dfl++) { // [TAG_FN_L4_MEM_POOLBAR] barriers, then the dataflow job
                         for (int solo = 0; solo < 2; solo++) {
                             const int variant = (int) (T + with_tbl + split + nt + solo) % 2; // alternate stats / rank / swpf
                             ggml_cpu_moe_pool_params pp = pp_def(nt);
@@ -17718,6 +17721,8 @@ static bool run_cpu_fn_moe_pool_l3(ggml_backend_t backend, ggml_backend_t backen
                             pp.pf_rank = variant == 1;
                             pp.swpf    = split == 0 || variant == 1 ? 2 : 0; // [TAG_FN_L3_CPU_SWPF]
                             pp.pf_streams = 1 + 3 * (int) ((T + nt) % 2);       // [TAG_FN_L3_CPU_PFSTREAMS]
+                            pp.dflow   = dfl != 0;
+                            pp.pf_fix  = dfl != 0; // [TAG_FN_L4_MEM_PFDEV]
                             ggml_cpu_moe_pool * pool = pool_new(&pp);
                             if (pool == nullptr) {
                                 printf("  FAIL moe pool l3: no pool (split %d, %d threads)\n", split, nt);
@@ -17727,7 +17732,8 @@ static bool run_cpu_fn_moe_pool_l3(ggml_backend_t backend, ggml_backend_t backen
                             if (solo) {
                                 pool_solo(pool, true);
                             }
-                            const char * tag = split == 2 ? "steal" : split == 1 ? "stable" : "range+swpf";
+                            const char * tag = split == 2 ? (dfl ? "steal+dflow" : "steal") : split == 1 ? (dfl ? "stable+dflow" : "stable") :
+                                                            (dfl ? "range+swpf+dflow" : "range+swpf");
                             auto check = [&](const std::vector<float> & got, const std::vector<float> & want, const char * what) {
                                 n_run++;
                                 const size_t nd = same(got, want);
@@ -17810,6 +17816,29 @@ static bool run_cpu_fn_moe_pool_l3(ggml_backend_t backend, ggml_backend_t backen
                                 pool_run(pool, &job);
                                 check(o6, out0, "after a stopped given list");
 
+                                // [TAG_FN_L4_MEM_PFDEV] the caller's part of a given list: ready at the post (no stop needed),
+                                // it pulls thread 0's pieces of the job, then the job
+                                if (pp.pf_fix && !solo) {
+                                    std::vector<float> o6c(out0.size(), 12345.0f);
+                                    job.out = o6c.data();
+                                    pool_pf(pool, &pg);
+                                    volatile int32_t no_stop = 0;
+                                    const size_t cb = pool_pfc(pool, &no_stop);
+                                    pool_run(pool, &job);
+                                    check(o6c, out0, "after the caller's part of a given list");
+                                    n_run++;
+                                    bool cold = false; // a listed expert the table does not serve
+                                    for (int32_t e : pred) {
+                                        cold = cold || !with_tbl || tbl[e] == c.n_exp;
+                                    }
+                                    // thread 0 owns a down piece of every expert when there are at least nt of them
+                                    if (cb == 0 && cold && c.n_embd/64 >= nt) {
+                                        printf("  FAIL moe pool l3 %s T=%" PRId64 " table=%d threads=%d: the caller pulled nothing of a given list\n",
+                                               tag, T, with_tbl, nt);
+                                        n_fail++;
+                                    }
+                                }
+
                                 // many jobs of alternating widths (stealing: epochs and claim buffer growth)
                                 for (int r = 0; r < 6; r++) {
                                     const int64_t Tr = r % 2 ? 1 : T;
@@ -17824,12 +17853,14 @@ static bool run_cpu_fn_moe_pool_l3(ggml_backend_t backend, ggml_backend_t backen
                             uint64_t pj = 0;
                             pool_pfst(pool, &pj, nullptr, nullptr, nullptr);
                             n_run++;
-                            if (pj != 4) {
-                                printf("  FAIL moe pool l3 %s T=%" PRId64 ": %" PRIu64 " prefetches counted, 4 posted\n", tag, T, pj);
+                            const uint64_t pj_want = pp.pf_fix && !solo ? 5 : 4; // [TAG_FN_L4_MEM_PFDEV] one more given list
+                            if (pj != pj_want) {
+                                printf("  FAIL moe pool l3 %s T=%" PRId64 ": %" PRIu64 " prefetches counted, %" PRIu64 " posted\n", tag, T, pj, pj_want);
                                 n_fail++;
                             }
                             pool_free(pool);
                         }
+                      }
                     }
                 }
 

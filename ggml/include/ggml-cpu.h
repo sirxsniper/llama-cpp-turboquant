@@ -197,6 +197,13 @@ extern "C" {
                                              // leaves the workers' list (0: worker 0 takes the first CPU of the list)
         int  pf_streams;                     // [TAG_FN_L3_CPU_PFSTREAMS] 0 / 1, or a split >= 1 prefetch pulls an expert's
                                              // regions this many at a time, interleaved (real loads; <= 8)
+        bool dflow;                          // [TAG_FN_L4_MEM_POOLBAR] no barriers in a job: a down piece waits only for
+                                             // its expert's gate / up pieces, and the thread that ends a block of down
+                                             // rows sums it. The same values bit for bit.
+        bool pf_fix;                         // [TAG_FN_L4_MEM_PFDEV] the caller's part of a prefetch
+                                             // (ggml_cpu_moe_prefetch_caller) pulls the pieces it computes in the job (the
+                                             // stable split's owners, not the range split's), and a given list is ready
+                                             // for it at the post (it waited for a router phase that a given list skips)
     };
 
     // [TAG_FN_L3_CPU_SPLIT] how a pool job gives its pieces (32 gate / up rows or 64 down rows of one expert) to the threads.

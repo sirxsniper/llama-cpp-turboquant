@@ -832,7 +832,10 @@ llama_moe_bridge * llama_moe_bridge_create(const llama_model & model, int n_thre
         const bool stats = env_int("LLAMA_MOE_POOL_STATS", 0) > 0;
         const int  swpf  = std::min(64, std::max(0, env_int("LLAMA_MOE_POOL_SWPF", 0)));
         const bool rank  = env_int("LLAMA_MOE_BRIDGE_PF_RANK", 0) > 0;
-        const int  dev   = std::min(2, std::max(0, env_int("LLAMA_MOE_BRIDGE_PF_DEV", 0)));
+        // [TAG_FN_L4_MEM_PFDEV] LLAMA_FN_L4_PFDEV=2 (qwen4exp): the device hints from the next layer's FFN mixer unless
+        // LLAMA_MOE_BRIDGE_PF_DEV says otherwise
+        const int  pfd   = llama_fn_l3_int(model, "LLAMA_FN_L4_PFDEV", 0);
+        const int  dev   = std::min(2, std::max(0, env_int("LLAMA_MOE_BRIDGE_PF_DEV", pfd >= 2 ? 2 : 0)));
         const int  exec  = env_int("LLAMA_MOE_POOL_EXEC_CPU", -1);
         const int  pfs   = env_int("LLAMA_MOE_POOL_PF_STREAMS", 1);
         const bool fgap  = env_int("LLAMA_MOE_DMA_FILL_GAP", 0) > 0;
@@ -865,6 +868,16 @@ llama_moe_bridge * llama_moe_bridge_create(const llama_model & model, int n_thre
     br->pool_params.pf_rank = br->pf_rank;    // [TAG_FN_L3_CPU_PFRANK]
     br->pool_params.caller_cpu1 = br->exec_cpu + 1; // [TAG_FN_L3_CPU_PLACE] 0: the first CPU of the list, as before
     br->pool_params.pf_streams  = br->pf_streams;   // [TAG_FN_L3_CPU_PFSTREAMS]
+    br->pool_params.dflow       = llama_fn_l3_flag(model, "LLAMA_FN_L4_POOLBAR"); // [TAG_FN_L4_MEM_POOLBAR] qwen4exp only
+    br->pool_params.pf_fix      = llama_fn_l3_int(model, "LLAMA_FN_L4_PFDEV", 0) >= 1; // [TAG_FN_L4_MEM_PFDEV] qwen4exp only
+    if (br->pool_params.pf_fix) {
+        LLAMA_LOG_INFO("%s: [TAG_FN_L4_MEM_PFDEV] the executor's part of a prefetch pulls the pieces it computes (split %d), a "
+                "device hint list is ready for it at the post\n", __func__, br->pool_split);
+    }
+    if (br->pool_params.dflow) {
+        LLAMA_LOG_INFO("%s: [TAG_FN_L4_MEM_POOLBAR] pool jobs without barriers: a down piece waits for its expert's gate / up "
+                "pieces, the thread that ends a block of down rows sums it\n", __func__);
+    }
     if (br->pool_stats) {
         br->pool_get_stats = (pool_get_stats_t) ggml_backend_reg_get_proc_address(cpu_reg, "ggml_cpu_moe_pool_get_stats");
         if (br->pool_get_stats == nullptr) {

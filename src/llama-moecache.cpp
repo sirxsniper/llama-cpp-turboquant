@@ -224,6 +224,11 @@ struct moe_cache {
     int64_t               cb_async_t0   = 0;
     bool (*cb_map)(ggml_backend_buffer_t, size_t, size_t)   = nullptr;
     bool (*cb_unmap)(ggml_backend_buffer_t, size_t, size_t) = nullptr;
+    // [TAG_FN_L4_MEM_UPLOAD] LLAMA_FN_L4_UPLOAD=1 (qwen4exp): the tail's refill first (no swap is queued behind it for up to
+    // l4_hold_ms after a restore), and the pinned halves (LLAMA_MOE_HOT_UP_PIPE) unless the environment says otherwise
+    bool                  l4_upload  = false;
+    int64_t               l4_hold_ms = 2000;
+    uint64_t              l4_held    = 0;     // passes held for a refill
     uint64_t              cb_n_rel  = 0;
     uint64_t              cb_n_res  = 0;
     uint64_t              cb_n_fail = 0;
@@ -1098,6 +1103,19 @@ void hot_adapt_decay(moe_cache * mc, bool decode_step) {
     }
     mc->dc_passes++;
 
+    // [TAG_FN_L4_MEM_UPLOAD] the tail's refill lands first: while its jobs are in flight (at most l4_hold_ms after the
+    // restore; a failed job never counts down) the pass queues no swap, the counts decay as usual
+    if (mc->l4_upload && mc->cb_async_left > 0 && (ggml_time_us() - mc->cb_async_t0)/1000 < mc->l4_hold_ms) {
+        if (mc->l4_held++ < 3) {
+            LLAMA_LOG_INFO("moe-hot: [TAG_FN_L4_MEM_UPLOAD] pass %" PRIu64 " held: %zu refill uploads of the tail in flight\n",
+                    mc->dc_passes, mc->cb_async_left);
+        }
+        for (auto & ls : mc->layers) {
+            llama_moe_decay_apply(ls.dcnt, mc->dc.decay);
+        }
+        return;
+    }
+
     // [TAG_FN_L3_POLICY_UPLOAD] with a rate limit a pass queues at most what the bucket gives the worker until the next
     // pass, minus what is still queued: evicted slots must not wait empty behind a growing queue
     // [TAG_FN_L3_POLICY_BURST] LLAMA_MOE_HOT_BURST_MIB: past the pass budget, strong pairs (a free slot, or a candidate over
@@ -1459,6 +1477,15 @@ void hot_adapt_init(moe_cache * mc, const llama_model & model, const void * owne
     // [TAG_FN_L3_POLICY_*] the switches of lever round 3 act for qwen4exp only; every other model keeps the code above
     const bool l3 = model.arch == LLM_ARCH_QWEN4EXP;
     if (l3) { // [TAG_FN_L3_POLICY_UPLOAD]
+        // [TAG_FN_L4_MEM_UPLOAD] the refill first, and the pinned halves by default (staging that stays in the CPU caches,
+        // the memcpy overlapping the DMA)
+        if (llama_fn_l3_flag(model, "LLAMA_FN_L4_UPLOAD")) {
+            mc->l4_upload = true;
+            mc->up_pipe   = true;
+            if (const char * e = llama_fn_env(model, "LLAMA_FN_L4_UPLOAD_HOLD_MS")) {
+                mc->l4_hold_ms = std::max(0, atoi(e));
+            }
+        }
         if (const char * e = llama_fn_env(model, "LLAMA_MOE_HOT_UP_PIPE")) {
             mc->up_pipe = atoi(e) != 0;
         }

@@ -458,6 +458,13 @@ private:
     uint64_t cbuf_n_batch   = 0;
     uint64_t cbuf_narrow_run = 0;  // narrow batches in a row while pinned (256 unpin)
     std::vector<uint64_t> cbuf_full_at; // the batch numbers of the recent FULL switches
+    // [TAG_FN_L4_MEM_PROMPT] LLAMA_FN_L4_PROMPT=<n>: a batch of cbuf_small_t + 1 .. n tokens that comes in the SMALL state
+    // stays SMALL: ubatches of <= cbuf_small_t tokens with the host experts on the CPU (the path of a prompt below the
+    // stream's minimum), no FULL reserve, no prefill stream and no tail refill afterwards
+    uint32_t cbuf_short_max = 0;
+    bool     cbuf_short     = false; // the running batch takes that path
+    uint64_t cbuf_n_short   = 0;
+    double   cbuf_ms_short  = 0.0;
     bool     cbuf_wanted() const;
     void     cbuf_note_full();
     size_t   cbuf_prepare(ggml_backend_dev_t dev);
