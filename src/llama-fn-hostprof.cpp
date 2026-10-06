@@ -12,6 +12,7 @@
 #include <chrono>
 #include <cinttypes>
 #include <cstdio>
+#include <cstdlib>
 #include <string>
 #include <thread>
 #include <vector>
@@ -21,6 +22,7 @@ namespace {
 struct hp_state {
     bool     on    = false;
     int64_t  every = 256;
+    int64_t  max_ns = 250*1000*1000LL; // LLAMA_FN_L4_HOSTPROF_MAXMS: longer steps are dropped (idle, prompts)
     std::thread::id owner;
     bool     owned = false;
 
@@ -135,6 +137,9 @@ void llama_hp_enable(int every) {
         return;
     }
     g_hp.every = every > 1 ? every : 256;
+    if (const char * e = getenv("LLAMA_FN_L4_HOSTPROF_MAXMS"); e && atoll(e) > 0) {
+        g_hp.max_ns = atoll(e)*1000*1000LL;
+    }
     g_hp.on    = true;
     LLAMA_LOG_INFO("%s: [TAG_FN_L4_HOST] host profile of the decode loop, a report every %" PRId64 " steps\n", __func__, g_hp.every);
 }
@@ -202,7 +207,7 @@ void llama_hp_step(int n_tokens) {
     const bool ok_now = n_tokens <= 16;
     if (g_hp.step_t0 > 0) {
         const int64_t dt = t - g_hp.step_t0;
-        if (g_hp.step_ok && ok_now && dt < 250*1000*1000LL) {
+        if (g_hp.step_ok && ok_now && dt < g_hp.max_ns) {
             g_hp.n_steps++;
             g_hp.tot_step_ns += dt;
             for (int s = 0; s < LLAMA_HP_N_SEG; ++s) {
