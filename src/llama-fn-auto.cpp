@@ -103,7 +103,7 @@ const fn_item k_items[] = {
     { "LLAMA_MOE_HOT_BURST_MIB",     "512",   P_ALL },
     { "LLAMA_MOE_HOT_BURST_RATIO",   "2",     P_ALL },
     { "LLAMA_FN_GPU",                "1",     P_ALL }, // device levers [TAG_FN_L3_GPU]
-    { "LLAMA_FN_GPU_IDXQ8",          "0",     P_ALL }, // FAULT 2026-10-05 22:06:26 (memcheck OOB read in the fused indexer): left off
+    { "LLAMA_FN_GPU_IDXQ8",          "1",     P_ALL }, // [TAG_FN_L4_ADOPT] the round-3 OOB read is fixed (TAG_FN_L4_QSA_IDXDEP, FIXED 2026-10-06 09:24:03): on
     { "LLAMA_FN_GPU_DEFER",          "0",     P_ALL }, // DEFER / CONVWB / HCFUSE / Q8F: not bitwise in the model (greedy identity, first diff at token 47): left off
     { "LLAMA_FN_GPU_CONVWB",         "0",     P_ALL },
     { "LLAMA_FN_GPU_HCFUSE",         "0",     P_ALL },
@@ -120,6 +120,22 @@ const fn_item k_items[] = {
     { "LLAMA_MOE_POOL_SWPF",         "2",     P_BR  },
     { "LLAMA_MOE_BRIDGE_PF_RANK",    "1",     P_BR  },
     { "LLAMA_MOE_POOL_EXEC_CPU",     "1",     P_BR  },
+    // [TAG_FN_L4_ADOPT] lever round 4 (flashnext/int-l4): real use +14.1 % (74.5 vs 65.3 t/s mean of 32K / 131K / 246K),
+    // bench code +11.8 %, prose +8.9 % vs main f23c6f638 (2 interleaved rounds, paired). Only switches whose output is bitwise identical (greedy static
+    // identity, no MTP and MTP, vs main f23c6f638: E:/turbot-gates/flashnext/test/l4/int/ident_*.txt); A/B at -c 262144 in
+    // E:/turbot-gates/flashnext/test/l4/int/ab.txt. Left off: QSA STREAMS (not bitwise), QSA FASPLIT, HOST_MTPFUSE, PROMPT /
+    // PROMPT_HOT / UPLOAD (not measured), the gpuhc family (not merged yet).
+    { "LLAMA_FN_L4_POST",            "1",     P_ALL }, // top-k + bridge post in one launch, one fence [TAG_FN_L4_POST]
+    { "LLAMA_FN_L4_GDNSTALL",        "1",     P_ALL }, // = 2|8: strided conv write-back + state copy after the post [TAG_FN_L4_GDNSTALL]
+    { "LLAMA_FN_L4_HOIST",           "1",     P_ALL }, // next GDN layer's gathers after the post [TAG_FN_L4_HOIST]
+    { "LLAMA_FN_L4_QSA_SEL",         "1",     P_ALL }, // QSA layer fusions [TAG_FN_L4_QSA]
+    { "LLAMA_FN_L4_QSA_KVW",         "1",     P_ALL },
+    { "LLAMA_FN_L4_QSA_POOL",        "1",     P_ALL },
+    { "LLAMA_FN_L4_QSA_LIST",        "1",     P_ALL },
+    { "LLAMA_FN_L4_QSA_QKV",         "1",     P_ALL },
+    { "LLAMA_FN_L4_POOLBAR",         "1",     P_BR  }, // CPU pool job without barriers, same values [TAG_FN_L4_MEM]
+    { "LLAMA_FN_L4_PFDEV",           "2",     P_BR  }, // device-side prefetch hints (prefetch only) [TAG_FN_L4_MEM]
+    { "LLAMA_FN_L4_HOST",            "1",     P_ALL }, // host levers TOPK / SNAP / EARLYOUT / BATCHCPY / PLEPRE [TAG_FN_L4_HOST]
 };
 
 // names the fn-auto aware code reads through llama_fn_env(): never put into the environment
