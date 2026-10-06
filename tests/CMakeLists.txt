@@ -338,6 +338,10 @@ target_include_directories(test-ple-dio PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../s
 # lookup and environment handling, expert placement detection, VRAM fit and RAM fit plans. CPU only, no model.
 llama_build_and_test(test-fn-auto.cpp)
 
+# [TAG_FN_L4_HOST_TOPK] the fast candidate path of the sampler (common/sampling.cpp) against the full-vocabulary partial
+# sort the top-k sampler runs: identical candidates or a fallback, never a different result. CPU only, no model.
+llama_build_and_test(test-fn-l4-host.cpp)
+
 # [TAG_FN_L3_VRAM_CBUF] [TAG_FN_L3_VRAM_TRIM] CUDA virtual-memory buffers (a tail given back and mapped again under the hot
 # set's MUL_MAT_ID chain) and the pool trim between CUDA-graph runs. Built, not registered with ctest: it needs the GPU (run
 # it under compute-sanitizer memcheck first); without one it prints SKIPPED.

@@ -11,6 +11,7 @@
 #include "llama-model-saver.h"
 #include "llama-model.h"
 #include "llama-fn-auto.h" // [TAG_FN_AUTO]
+#include "llama-ext.h"     // [TAG_FN_L4_HOST] llama_hp_enable
 
 #include "ggml.h"
 #include "ggml-cpp.h"
@@ -232,6 +233,10 @@ void llama_fn_l3_host_on_load(const llama_model & model) {
         ggml_backend_sync_trace_set(us);
         g_l3_trace_models.push_back(&model);
         LLAMA_LOG_INFO("%s: [TAG_FN_L3_HOST_DIAG] waits of >= %d us are counted by call stack (a report every 256)\n", __func__, us);
+    }
+    // [TAG_FN_L4_HOST] LLAMA_FN_L4_HOSTPROF=1|N: the host profile of the decode loop (src/llama-fn-hostprof.cpp)
+    if (const int every = llama_fn_l3_int(model, "LLAMA_FN_L4_HOSTPROF", 0); every > 0) {
+        llama_hp_enable(every);
     }
 }
 

@@ -2099,6 +2099,11 @@ void llama_context::sched_reserve() {
             __func__, (t_end_us - t_start_us)/1000.0, ggml_backend_sched_get_n_copies(sched.get()));
 }
 
+// [TAG_FN_L4_HOST] the hostprof segment of a decode class (0 target, 1 MTP process, 2 MTP draft) and step part
+static int llama_hp_dec_seg(int cls, int sub) {
+    return LLAMA_HP_DEC_BASE + cls*LLAMA_HP_DEC_N + sub;
+}
+
 // [TAG_HOST_GAP_PROBE] LLAMA_HOST_GAP_PROBE=1: in a serial decode loop the GPU has nothing queued from the end of
 // the synchronize that returned the last token until the next graph is launched. For each decode of <= 64 tokens
 // whose first ubatch follows a real synchronize of this context, split that time into: caller (end of synchronize to
@@ -2215,7 +2220,14 @@ void llama_context::synchronize() {
 
     const bool was_pending = sched_pending;
 
+    // [TAG_FN_L4_HOST] the wait for this context's queued work
+    const int hp_prev = was_pending && llama_hp_on() ? llama_hp_switch(llama_hp_dec_seg(llama_hp_ctx_class_get(this), LLAMA_HP_DEC_SYNC)) : -1;
+
     ggml_backend_sched_synchronize(sched.get());
+
+    if (hp_prev >= 0) {
+        llama_hp_switch(hp_prev);
+    }
 
     sched_pending = false;
 
@@ -2983,6 +2995,15 @@ static bool llama_turbot_fail_ubatch_hit() {
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+    // [TAG_FN_L4_HOST] the parts of this ubatch in the host profile
+    const int hp_cls = llama_hp_on() ? llama_hp_ctx_class_get(this) : -1;
+    auto hp = [hp_cls](int sub) {
+        if (hp_cls >= 0) {
+            llama_hp_switch(llama_hp_dec_seg(hp_cls, sub));
+        }
+    };
+    hp(LLAMA_HP_DEC_APPLY);
+
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
@@ -2997,6 +3018,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     if (llama_moe_gen5_before_ubatch(this, sched.get(), ubatch.n_tokens)) {
         gf_res_prev_active = nullptr;
     }
+
+    hp(LLAMA_HP_DEC_GRAPH); // [TAG_FN_L4_HOST]
 
     auto * res = get_gf_res_prev(ubatch); // [TAG_FN_GRAPH_PER_WIDTH] same as get_gf_res_prev() unless enabled
     auto * gf  = res->get_gf();
@@ -3091,6 +3114,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         gf_res_prev_active = res;
     }
 
+    hp(LLAMA_HP_DEC_INPUTS); // [TAG_FN_L4_HOST]
+
     // set the input data for the input tensors
     {
         //const auto t_start_us = ggml_time_us();
@@ -3101,6 +3126,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
+    hp(LLAMA_HP_DEC_LAUNCH); // [TAG_FN_L4_HOST]
+
     // [TAG_MOE_BRIDGE] wake the host executor for a graph that posts to it, or park it (a CPU split may run)
     const bool moe_bridge_used = res->n_moe_bridge > 0;
     llama_moe_bridge_begin(moe_bridge, moe_bridge_used);
@@ -3109,6 +3136,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     const int64_t t_gap_c0  = gap_probe ? ggml_time_us() : 0;
 
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+
+    hp(LLAMA_HP_DEC_WAIT); // [TAG_FN_L4_HOST] a step of the profile starts at each target graph launch
+    if (hp_cls == 0) {
+        llama_hp_step((int) ubatch.n_tokens);
+    }
 
     if (gap_probe) {
         llama_host_gap_probe_compute(this, ubatch.n_tokens, t_gap_c0, ggml_time_us(), graph_reused);
@@ -3128,6 +3160,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // the memory rollback of decode() runs and nothing wrong reaches the caller. The bridge pauses, then re-arms.
     if (moe_bridge_used) {
         ggml_backend_sched_synchronize(sched.get());
+        hp(LLAMA_HP_DEC_BEND); // [TAG_FN_L4_HOST]
         if (!llama_moe_bridge_end(moe_bridge)) {
             moe_bridge_failed = true; // [TAG_FN_R1_BRIDGE_RETRY]
             ret = GGML_STATUS_FAILED;
@@ -3138,6 +3171,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     if (!res->t_moe_ids.empty()) { // [TAG_FN_MOE_TRACE] only built when a trace switch is set
         llama_moe_trace_collect(sched.get(), res, ubatch, gtype == LLM_GRAPH_TYPE_DECODER_MTP);
     }
+
+    hp(LLAMA_HP_DEC_OUT); // [TAG_FN_L4_HOST]
 
     ret = GGML_STATUS_SUCCESS;
 
@@ -3465,6 +3500,13 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     if (llama_host_gap_probe_enabled()) { // [TAG_HOST_GAP_PROBE]
         llama_host_gap_probe_decode(this);
     }
+
+    // [TAG_FN_L4_HOST] the class of this decode comes from the caller's segment (MTP process / draft, else target)
+    const int hp_cls = llama_hp_on() ? llama_hp_class_of_caller() : -1;
+    if (hp_cls >= 0) {
+        llama_hp_ctx_class_set(this, hp_cls);
+    }
+    llama_hp_scope hp_dec(hp_cls >= 0 ? llama_hp_dec_seg(hp_cls, LLAMA_HP_DEC_PREP) : LLAMA_HP_OTHER);
 
     step_join(); // [TAG_FN_L3_HOST_STEP] the last step's table changes are on the device before this graph
 
@@ -4003,6 +4045,10 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
     // wait for the computation to finish (automatically done when obtaining the model output)
     //synchronize();
+
+    if (hp_cls >= 0) {
+        llama_hp_switch(llama_hp_dec_seg(hp_cls, LLAMA_HP_DEC_POST)); // [TAG_FN_L4_HOST]
+    }
 
     // apply throttled MoE expert-cache updates between graph executions
     // [TAG_FN_MOE_HOT_ADAPT] an adaptive hot set changes its tables only when no graph of its owner runs

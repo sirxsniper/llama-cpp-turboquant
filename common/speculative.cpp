@@ -3845,6 +3845,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             return true;
         }
 
+        llama_hp_scope hp_scope(LLAMA_HP_MTP_PROC); // [TAG_FN_L4_HOST]
+
         // [TAG_FN_MTP_COST] a step is timed only if exactly one target batch (the verify batch) ran since draft()
         if (cost_on) {
             cost_n_proc++;
@@ -4016,6 +4018,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
     void draft(common_speculative_draft_params_vec & dparams) override {
         auto & ctx_dft = params.ctx_dft;
+
+        llama_hp_scope hp_scope(LLAMA_HP_MTP_DRAFT); // [TAG_FN_L4_HOST]
 
         batch.clear();
 
@@ -4503,6 +4507,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
             return;
         }
+
+        llama_hp_scope hp_scope(LLAMA_HP_MTP_ACCEPT); // [TAG_FN_L4_HOST]
 
         // [TAG_FN_MTP_COST] calibrate the acceptance per drafter probability from what the target kept
         if (cost_on && !cost_ps[seq_id].empty()) {
