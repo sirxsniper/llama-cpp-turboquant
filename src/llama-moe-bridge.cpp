@@ -196,6 +196,9 @@ struct llama_moe_bridge {
     std::atomic<uint64_t>               n_disp{0};
     std::atomic<uint64_t>               n_hint_ok{0};
     std::atomic<uint64_t>               n_hint_miss{0};
+    std::atomic<uint64_t>               n_hint_late{0};    // [TAG_FN_L6_PF] read after waiting for it
+    std::atomic<uint64_t>               n_hint_wait_ns{0}; // [TAG_FN_L6_PF] the waits of those
+    std::atomic<uint64_t>               n_hint_bad_t{0};   // [TAG_FN_L6_PF] misses with another token count
     uint64_t                            st_faults = 0;     // owner thread: page faults and jobs at the last stats line
     uint64_t                            st_jobs   = 0;
 
@@ -526,9 +529,17 @@ static void br_prefetch_next(llama_moe_bridge * br, ggml_cpu_moe_pool * pool, co
                 br_relax();
                 ok = br->fn_read_hint(br->gb, j.chan, j.seq, ids, (int) (sizeof(ids)/sizeof(ids[0])), &k, &t);
             }
+            if (ok && br->stats) { // [TAG_FN_L6_PF]
+                br->n_hint_late.fetch_add(1, std::memory_order_relaxed);
+                br->n_hint_wait_ns.fetch_add((uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - t0).count(), std::memory_order_relaxed);
+            }
         }
         if (!ok || t != j.n_tokens) {
             br->n_hint_miss.fetch_add(1, std::memory_order_relaxed);
+            if (ok) {
+                br->n_hint_bad_t.fetch_add(1, std::memory_order_relaxed);
+            }
             return;
         }
         br->n_hint_ok.fetch_add(1, std::memory_order_relaxed);
@@ -1483,6 +1494,12 @@ bool llama_moe_bridge_end(llama_moe_bridge * br) {
                 "over 1 ms; fills held %" PRIu64 " times, %.1f ms in all; prediction over %" PRIu64 " jobs: precision %.2f (first 4: "
                 "%.2f), recall %.2f\n", __func__, br->bid, wl.c_str(), ps.job_max_us, ps.jobs_slow, held_n, held_us/1e3,
                 ps.pred_jobs, ps.pf_precision, ps.pf_prec_top4, ps.pf_recall);
+        {
+            const uint64_t hl = br->n_hint_late.exchange(0);
+            LLAMA_LOG_INFO("%s: MoE bridge %d: [TAG_FN_L6_PF] hints read after a wait: %" PRIu64 " (mean wait %.1f us), misses with "
+                    "another token count %" PRIu64 "\n", __func__, br->bid, hl, hl ? br->n_hint_wait_ns.exchange(0)/1e3/hl : 0.0,
+                    br->n_hint_bad_t.exchange(0));
+        }
         if (br->pool_params.pf_score) {
             LLAMA_LOG_INFO("%s: MoE bridge %d: [TAG_FN_L6_PF] learned hit rate of a cold hint entry by rank: r0 %.2f, r1 %.2f, r3 %.2f, "
                     "r7 %.2f\n", __func__, br->bid, ps.pf_rank_p[0], ps.pf_rank_p[1], ps.pf_rank_p[2], ps.pf_rank_p[3]);
