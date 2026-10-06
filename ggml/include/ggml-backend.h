@@ -367,6 +367,35 @@ extern "C" {
     // graph split (alloc / reserve).
     GGML_API void                 ggml_backend_sched_set_split_after(ggml_backend_sched_t sched, const char * names);
 
+    // [TAG_FN_L4_HOST_SNAP] the state ggml_backend_sched_alloc_graph leaves for a graph (splits, graph copy, input copies,
+    // backend assignments, split ids), saved right after that call, and put back later instead of a new split and
+    // allocation of the same graph. Valid while the graph's tensors keep that allocation (the caller does not rebuild,
+    // reset or re-split the graph) and the scheduler and its compute buffers are the same: restore returns false
+    // otherwise and changes nothing. Single copy (no pipeline parallelism) only; save returns NULL there.
+    typedef struct ggml_backend_sched_snap * ggml_backend_sched_snap_t;
+    GGML_API ggml_backend_sched_snap_t ggml_backend_sched_snap_save(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
+    GGML_API bool                 ggml_backend_sched_snap_restore(ggml_backend_sched_t sched, ggml_backend_sched_snap_t snap, struct ggml_cgraph * graph);
+    GGML_API void                 ggml_backend_sched_snap_free(ggml_backend_sched_snap_t snap);
+
+    // [TAG_FN_L4_HOST_BATCHCPY] on: the host -> device copies of a split's graph inputs go to the split's backend as one
+    // batch when its registry offers "ggml_backend_set_tensors_batch_async" (CUDA: cudaMemcpyBatchAsync), else one by
+    // one as before. Same copies, same stream, before the split's graph. Off by default.
+    typedef bool (*ggml_backend_set_tensors_batch_async_t)(ggml_backend_t backend, int n, struct ggml_tensor * const * tensors,
+            const void * const * data, const size_t * sizes);
+    GGML_API void                 ggml_backend_sched_set_batch_inputs(ggml_backend_sched_t sched, bool on);
+
+    // [TAG_FN_L4_HOST] host profile hook: called when graph compute enters a part (input copies, a wait, a host split's
+    // compute, a device split's compute or launch, the end). NULL (default) = off.
+    enum ggml_backend_sched_prof_ev {
+        GGML_SCHED_PROF_INPUTS = 0,
+        GGML_SCHED_PROF_SYNC   = 1,
+        GGML_SCHED_PROF_HOST   = 2,
+        GGML_SCHED_PROF_DEVICE = 3,
+        GGML_SCHED_PROF_END    = 4,
+    };
+    typedef void (*ggml_backend_sched_prof_cb_t)(void * user_data, int ev);
+    GGML_API void                 ggml_backend_sched_set_prof_cb(ggml_backend_sched_t sched, ggml_backend_sched_prof_cb_t cb, void * user_data);
+
     //
     // Meta backend
     //

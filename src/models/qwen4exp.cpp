@@ -21,6 +21,9 @@
 #include <filesystem>     // [TAG_FN_SHIP1]
 #include <fstream>
 #include <unordered_set> // [TAG_FN_L3_MTP_HEADPROMPT]
+#include <condition_variable> // [TAG_FN_L4_HOST_PLEPRE]
+#include <mutex>
+#include <thread>
 
 // bad metadata must be catchable: GGML_ASSERT aborts the whole process
 static void qwen4exp_require_nonzero(const llama_model_loader & ml, llm_kv kid, uint32_t value) {
@@ -2278,6 +2281,152 @@ static void qwen4exp_rows_to_float_dio(llama_ple_dio & dio, const ggml_tensor * 
             to_float(src, dst + r*n, n);
         }
     }
+}
+
+// [TAG_FN_L4_HOST_PLEPRE] the PLE rows of one token from its n-gram window win[0..n_gram) = (token, 1 back, 2 back, ...),
+// LLAMA_TOKEN_NULL where there is none: the same hash and EOS cut as llm_graph_input_qwen4exp_ple::set_input
+static void qwen4exp_ple_rows_of(const llama_hparams & hparams, const llama_token * win, int32_t * idx) {
+    const int64_t n_gram   = hparams.ple_ngram_size;
+    const int64_t per_gram = hparams.ple_heads_per_ngram;
+    const int64_t eos      = hparams.ple_eos_token_id;
+    int64_t ctx[16];
+    GGML_ASSERT(n_gram >= 1 && n_gram <= 16);
+    ctx[0] = win[0];
+    bool cut = false;
+    for (int64_t s = 1; s < n_gram; ++s) {
+        const llama_token t = cut ? LLAMA_TOKEN_NULL : win[s];
+        cut = cut || t < 0 || t == eos;
+        ctx[s] = cut ? eos : t;
+    }
+    for (int64_t n = 2; n <= n_gram; ++n) {
+        uint64_t mixed = (uint64_t) ctx[0] * hparams.ple_layer_multipliers[0];
+        for (int64_t j = 1; j < n; ++j) {
+            mixed ^= (uint64_t) ctx[j] * hparams.ple_layer_multipliers[j];
+        }
+        const int64_t base = (n - 2) * per_gram;
+        for (int64_t g = 0; g < per_gram; ++g) {
+            const int64_t h_i = base + g;
+            idx[h_i] = (int32_t) (mixed % hparams.ple_head_vocab_sizes[h_i] + hparams.ple_head_offsets[h_i]);
+        }
+    }
+}
+
+// [TAG_FN_L4_HOST_PLEPRE] one helper thread: each job is one read_rows of the dio into a scratch buffer, which leaves the
+// rows in the dio's row cache; the decode's own read_rows (same rows, same bytes) then finds them there. Its mutex orders
+// the two: a decode that comes while a job reads waits for it, then reads the rest.
+struct llama_model_qwen4exp::ple_prefetcher {
+    std::shared_ptr<llama_ple_dio> dio;
+    const uint8_t * fallback = nullptr;
+    size_t          row_bytes = 0;
+
+    std::thread             th;
+    std::mutex              mtx;
+    std::condition_variable cv;
+    std::vector<int32_t>    rows;  // queued, guarded by mtx
+    bool                    stop = false;
+    std::vector<int32_t>    work;  // the worker's copy
+    std::vector<uint8_t>    scratch;
+    uint64_t                n_jobs = 0;
+
+    ple_prefetcher(std::shared_ptr<llama_ple_dio> d, const ggml_tensor * table) : dio(std::move(d)) {
+        fallback  = (const uint8_t *) table->data;
+        row_bytes = table->nb[1];
+        th = std::thread([this]() { loop(); });
+    }
+
+    ~ple_prefetcher() {
+        {
+            std::lock_guard<std::mutex> lk(mtx);
+            stop = true;
+        }
+        cv.notify_all();
+        if (th.joinable()) {
+            th.join();
+        }
+    }
+
+    void post(const int32_t * r, int64_t n) {
+        {
+            std::lock_guard<std::mutex> lk(mtx);
+            rows.insert(rows.end(), r, r + n);
+        }
+        cv.notify_one();
+    }
+
+    void loop() {
+        while (true) {
+            {
+                std::unique_lock<std::mutex> lk(mtx);
+                cv.wait(lk, [this]() { return stop || !rows.empty(); });
+                if (stop) {
+                    return;
+                }
+                work.swap(rows);
+                rows.clear();
+            }
+            scratch.resize(work.size()*row_bytes);
+            try {
+                dio->read_rows(work.data(), (int64_t) work.size(), scratch.data(), 0, fallback);
+            } catch (const std::exception & e) {
+                LLAMA_LOG_WARN("%s: [TAG_FN_L4_HOST_PLEPRE] prefetch read failed (%s); the decode reads its rows itself\n", __func__, e.what());
+            }
+            n_jobs++;
+        }
+    }
+};
+
+void llama_ple_prefetch_ext(llama_context * ctx, llama_seq_id seq_id, llama_pos pos0, const llama_token * toks, int32_t n, int32_t i_first) {
+    if (ctx == nullptr || toks == nullptr || n <= 0 || i_first < 0 || i_first >= n || seq_id < 0 || seq_id >= LLAMA_MAX_SEQ) {
+        return;
+    }
+    const llama_model * model = llama_get_model(ctx);
+    const auto * m = dynamic_cast<const llama_model_qwen4exp *>(model);
+    if (m == nullptr || !m->ple_dio || m->per_layer_tok_embd == nullptr) {
+        return;
+    }
+    if (m->ple_pre_on < 0) {
+        m->ple_pre_on = llama_fn_l4_host_flag(model, "LLAMA_FN_L4_HOST_PLEPRE") ? 1 : 0;
+        if (m->ple_pre_on) {
+            LLAMA_LOG_INFO("%s: [TAG_FN_L4_HOST_PLEPRE] the PLE rows of sampled and drafted tokens are read ahead of their decode\n", __func__);
+        }
+    }
+    if (m->ple_pre_on == 0) {
+        return;
+    }
+    auto * hyb = dynamic_cast<llama_memory_hybrid *>(llama_get_memory(ctx));
+    const llama_kv_cache * kv = hyb ? hyb->get_mem_attn() : nullptr;
+    if (kv == nullptr) {
+        return;
+    }
+    const auto & hparams = m->hparams;
+    const int32_t n_gram  = (int32_t) hparams.ple_ngram_size;
+    const int32_t n_heads = (int32_t) hparams.ple_n_heads;
+    if (n_gram < 1 || n_gram > 16 || n_heads != (n_gram - 1)*(int32_t) hparams.ple_heads_per_ngram) {
+        return;
+    }
+    const llama_kv_cells & cells = kv->get_cells(seq_id);
+
+    std::vector<int32_t> idx((size_t) (n - i_first)*n_heads);
+    llama_token win[16];
+    for (int32_t i = i_first; i < n; ++i) {
+        win[0] = toks[i];
+        for (int32_t s = 1; s < n_gram; ++s) {
+            const int32_t k = i - s;
+            const llama_pos p = pos0 + k;
+            win[s] = k >= 0 ? toks[k] : (p < 0 ? LLAMA_TOKEN_NULL : cells.seq_pos_tok_le(seq_id, p));
+        }
+        qwen4exp_ple_rows_of(hparams, win, idx.data() + (size_t) (i - i_first)*n_heads);
+    }
+
+    std::shared_ptr<llama_model_qwen4exp::ple_prefetcher> pre;
+    {
+        std::lock_guard<std::mutex> lk(m->ple_pre_mutex);
+        if (!m->ple_pre) {
+            m->ple_pre = std::make_shared<llama_model_qwen4exp::ple_prefetcher>(m->ple_dio, m->per_layer_tok_embd);
+        }
+        pre = m->ple_pre;
+    }
+    pre->post(idx.data(), (int64_t) idx.size());
 }
 
 // [TAG_FN_PLE_HOST_GATHER] token rows as an f32 input; h is the MTP driver's hidden state input (nullptr in the trunk)

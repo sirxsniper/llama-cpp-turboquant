@@ -493,6 +493,8 @@ struct ggml_gallocr {
 
     struct leaf_alloc * leaf_allocs; // [n_leafs]
     int n_leafs;
+
+    uint64_t gen; // [TAG_FN_L4_HOST_SNAP] bumped whenever a buffer is freed or allocated
 };
 
 ggml_gallocr_t ggml_gallocr_new_n(ggml_backend_buffer_type_t * bufts, int n_bufs) {
@@ -933,6 +935,7 @@ static bool ggml_gallocr_reserve_n_impl(
             }
 #endif
             ggml_vbuffer_free(galloc->buffers[i]);
+            galloc->gen++; // [TAG_FN_L4_HOST_SNAP]
             if (no_alloc) {
                 galloc->buffers[i] = NULL;
             } else {
@@ -1095,6 +1098,11 @@ bool ggml_gallocr_alloc_graph(ggml_gallocr_t galloc, struct ggml_cgraph * graph)
     }
 
     return true;
+}
+
+// [TAG_FN_L4_HOST_SNAP]
+uint64_t ggml_gallocr_get_generation(ggml_gallocr_t galloc) {
+    return galloc->gen;
 }
 
 size_t ggml_gallocr_get_buffer_size(ggml_gallocr_t galloc, int buffer_id) {

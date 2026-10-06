@@ -932,7 +932,7 @@ class llm_graph_result {
 public:
     llm_graph_result(int64_t max_nodes);
 
-    virtual ~llm_graph_result() = default;
+    virtual ~llm_graph_result();
 
     ggml_tensor * get_inp_tokens()  const { return t_inp_tokens; }
     ggml_tensor * get_logits()      const { return t_logits; }
@@ -1034,6 +1034,13 @@ private:
     std::vector<tensor_state> build_state;
     std::vector<ggml_tensor *> build_nodes;
     std::vector<std::pair<ggml_tensor *, ggml_backend_t>> build_pins;
+
+public:
+    // [TAG_FN_L4_HOST_SNAP] LLAMA_FN_L4_HOST_SNAP (qwen4exp): the scheduler state right after this graph's split and
+    // allocation (ggml_backend_sched_snap_save), put back when this width runs again; dropped with the graph
+    ggml_backend_sched_snap_t snap = nullptr;
+    bool                      snap_launch2 = false; // the LAUNCH2 cut state it was split with
+    void snap_drop();
 };
 
 using llm_graph_result_ptr = std::unique_ptr<llm_graph_result>;

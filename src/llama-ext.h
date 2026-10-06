@@ -238,3 +238,60 @@ LLAMA_API llama_ram_fit_out llama_ram_fit_plan(const llama_ram_fit_in & in);
 // if out is nullptr, returns the number of tokens without writing to out
 // caller must allocate enough memory for out before calling
 LLAMA_API uint32_t llama_model_get_tok_embd(const struct llama_model * model, float * out);
+
+// [TAG_FN_L4_HOST] LLAMA_FN_L4_HOSTPROF=1|N (qwen4exp, src/llama-fn-hostprof.cpp): exclusive host time per named segment
+// of the decode loop, a report every N (1: 256) steps. Off: every call returns at its first branch (-1 / nothing).
+enum llama_hp_seg {
+    LLAMA_HP_OTHER = 0,
+    LLAMA_HP_SRV_PRE,     // server: pre_decode before the drafts
+    LLAMA_HP_SRV_CKPT,    // server: checkpoints and draft-context seq_rm after the drafts
+    LLAMA_HP_SRV_BATCH,   // server: the verify batch until llama_process(target)
+    LLAMA_HP_SRV_DPOST,   // server: decode() after the target decode
+    LLAMA_HP_SRV_SAMPLE,  // server: verify sampling and accept
+    LLAMA_HP_SRV_BOOK,    // server: accept bookkeeping
+    LLAMA_HP_SRV_TOKEN,   // server: process_token, responses
+    LLAMA_HP_MTP_PROC,    // MTP process(): host part
+    LLAMA_HP_MTP_DRAFT,   // MTP draft(): host part (incl. draft sampling)
+    LLAMA_HP_MTP_ACCEPT,  // MTP accept()
+    LLAMA_HP_DEC_BASE,    // + class * LLAMA_HP_DEC_N + sub: inside llama_decode (class 0 target, 1 MTP process, 2 MTP draft)
+};
+enum llama_hp_dec {
+    LLAMA_HP_DEC_PREP = 0, LLAMA_HP_DEC_APPLY, LLAMA_HP_DEC_GRAPH, LLAMA_HP_DEC_INPUTS, LLAMA_HP_DEC_LAUNCH,
+    LLAMA_HP_DEC_WAIT, LLAMA_HP_DEC_BEND, LLAMA_HP_DEC_OUT, LLAMA_HP_DEC_POST, LLAMA_HP_DEC_SYNC, LLAMA_HP_DEC_RESET,
+    LLAMA_HP_DEC_ALLOC,
+    // inside the launch (scheduler hook): split input copies, waits, a host split's compute, a device split's compute
+    LLAMA_HP_DEC_SCPY, LLAMA_HP_DEC_SSYNC, LLAMA_HP_DEC_SCPU, LLAMA_HP_DEC_SGPU,
+    LLAMA_HP_DEC_N,
+};
+#define LLAMA_HP_N_SEG ((int) LLAMA_HP_DEC_BASE + 3*(int) LLAMA_HP_DEC_N)
+
+LLAMA_API void llama_hp_enable(int every);
+LLAMA_API bool llama_hp_on(void);
+LLAMA_API int  llama_hp_switch(int seg);             // returns the previous segment, -1 when off or another thread
+LLAMA_API int  llama_hp_current(void);
+LLAMA_API void llama_hp_ctx_class_set(const void * ctx, int cls);
+LLAMA_API int  llama_hp_ctx_class_get(const void * ctx);
+LLAMA_API int  llama_hp_class_of_caller(void);       // the decode class the current segment implies
+LLAMA_API void llama_hp_step(int n_tokens);          // a target graph of n_tokens was launched
+
+// [TAG_FN_L4_HOST] a lever of the l4 host family: true only for a qwen4exp model and when the switch name (else the
+// umbrella LLAMA_FN_L4_HOST) is set to a non-zero value (environment or the model's automatic profile)
+LLAMA_API bool llama_fn_l4_host_flag(const struct llama_model * model, const char * name);
+
+// [TAG_FN_L4_HOST] the value of one switch only (no umbrella): def unless the model is qwen4exp and the switch is set
+LLAMA_API int llama_fn_l4_int(const struct llama_model * model, const char * name, int def);
+
+// [TAG_FN_L4_HOST_PLEPRE] LLAMA_FN_L4_HOST_PLEPRE (qwen4exp with PLE direct I/O): a helper thread reads the PLE rows of
+// toks[i_first..n), which a coming decode of seq_id holds at positions pos0 + i, into the row cache (predecessors: the
+// earlier toks, else the KV cells). A hint only: the decode computes and reads its own rows as before. No-op otherwise.
+LLAMA_API void llama_ple_prefetch_ext(struct llama_context * ctx, llama_seq_id seq_id, llama_pos pos0, const llama_token * toks,
+        int32_t n, int32_t i_first);
+
+// RAII: switch to seg, back to the previous segment at scope exit
+struct llama_hp_scope {
+    int prev;
+    explicit llama_hp_scope(int seg) : prev(llama_hp_switch(seg)) {}
+    ~llama_hp_scope() { if (prev >= 0) { llama_hp_switch(prev); } }
+    llama_hp_scope(const llama_hp_scope &) = delete;
+    llama_hp_scope & operator=(const llama_hp_scope &) = delete;
+};

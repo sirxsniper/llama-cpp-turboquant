@@ -19,6 +19,113 @@
 #include <unordered_map>
 #include <vector>
 
+#if defined(__SSE2__) || defined(_M_X64) || (defined(_M_IX86_FP) && _M_IX86_FP >= 2)
+#include <emmintrin.h>
+#define FN_L4_TOPK_SSE2 1
+#endif
+
+#include "../src/llama-ext.h" // [TAG_FN_L4_HOST_TOPK] llama_fn_l4_host_flag
+
+// [TAG_FN_L4_HOST_TOPK] the K largest logits of a row (ids in excl skipped) in strictly descending order, i.e. exactly
+// what std::partial_sort leaves at the front of the full candidate array. False when that order is not unique (equal
+// values among the K or at the K-th place), on a NaN, or when fewer than K candidates exist: the caller then takes
+// the full-vocabulary path, so the result never differs from it.
+bool common_sampler_fn_l4_topk_row(const float * x, int n, int K, const std::vector<llama_token> & excl,
+        std::vector<llama_token_data> & out) {
+    if (K <= 0 || K > 128 || n < K) {
+        return false;
+    }
+    llama_token_data top[128];
+    int   m        = 0;
+    float thr      = -INFINITY; // top[K-1].logit once m == K
+    float tie      = -INFINITY; // the largest value dropped while equal to or below the K-th of that time
+    bool  have_tie = false;
+    bool  nan      = false;
+
+    auto is_excl = [&](int id) {
+        return !excl.empty() && std::binary_search(excl.begin(), excl.end(), (llama_token) id);
+    };
+    auto note_tie = [&](float v) {
+        if (!have_tie || v > tie) {
+            tie      = v;
+            have_tie = true;
+        }
+    };
+    auto consider = [&](int i, float v) {
+        if (v != v) {
+            nan = true;
+            return;
+        }
+        if (m == K && !(v > thr)) {
+            if (v == thr && !is_excl(i)) {
+                note_tie(v);
+            }
+            return;
+        }
+        if (is_excl(i)) {
+            return;
+        }
+        if (m == K) {
+            note_tie(top[K - 1].logit);
+            m--;
+        }
+        int j = m;
+        while (j > 0 && top[j - 1].logit < v) {
+            top[j] = top[j - 1];
+            j--;
+        }
+        top[j] = llama_token_data{ (llama_token) i, v, 0.0f };
+        m++;
+        if (m == K) {
+            thr = top[K - 1].logit;
+        }
+    };
+
+    int i = 0;
+    for (; i < n && m < K; ++i) {
+        consider(i, x[i]);
+    }
+#if defined(FN_L4_TOPK_SSE2)
+    __m128 vt = _mm_set1_ps(thr);
+    for (; i + 16 <= n; i += 16) {
+        const __m128 a = _mm_loadu_ps(x + i);
+        const __m128 b = _mm_loadu_ps(x + i + 4);
+        const __m128 c = _mm_loadu_ps(x + i + 8);
+        const __m128 d = _mm_loadu_ps(x + i + 12);
+        // at or above the K-th, or unordered (NaN)
+        const int mask = _mm_movemask_ps(_mm_or_ps(_mm_cmpge_ps(a, vt), _mm_cmpunord_ps(a, a))) |
+                         _mm_movemask_ps(_mm_or_ps(_mm_cmpge_ps(b, vt), _mm_cmpunord_ps(b, b))) << 4 |
+                         _mm_movemask_ps(_mm_or_ps(_mm_cmpge_ps(c, vt), _mm_cmpunord_ps(c, c))) << 8 |
+                         _mm_movemask_ps(_mm_or_ps(_mm_cmpge_ps(d, vt), _mm_cmpunord_ps(d, d))) << 12;
+        if (mask != 0) {
+            for (int k = 0; k < 16; ++k) {
+                if (mask & (1 << k)) {
+                    consider(i + k, x[i + k]);
+                }
+            }
+            vt = _mm_set1_ps(thr);
+        }
+    }
+#endif
+    for (; i < n; ++i) {
+        consider(i, x[i]);
+    }
+
+    if (nan || m < K || top[K - 1].logit == -INFINITY) {
+        return false;
+    }
+    for (int j = 1; j < K; ++j) {
+        if (!(top[j - 1].logit > top[j].logit)) {
+            return false;
+        }
+    }
+    if (have_tie && tie == top[K - 1].logit) {
+        return false;
+    }
+    out.assign(top, top + K);
+    return true;
+}
+
 // the ring buffer works similarly to std::deque, but with a fixed capacity
 // TODO: deduplicate with llama-impl.h
 template<typename T>
@@ -238,6 +345,27 @@ struct common_sampler {
         cur_p = { cur.data(), cur.size(), -1, false };
     }
 
+    // [TAG_FN_L4_HOST_TOPK] the candidate array the chain's top-k leaves, built straight from the row (no full-vocabulary
+    // array, no partial sort over it); false: not exact here, the caller uses set_logits(). Only for a chain whose
+    // samplers before top-k change nothing (common_sampler_init sets fast_k), and only for plain logits rows.
+    bool set_logits_fast(struct llama_context * ctx, int idx) {
+        if (llama_get_sampled_probs_ith(ctx, idx) != nullptr || llama_get_sampled_logits_ith(ctx, idx) != nullptr ||
+                llama_get_sampled_token_ith(ctx, idx) != LLAMA_TOKEN_NULL) {
+            return false;
+        }
+        const float * logits = llama_get_logits_ith(ctx, idx);
+        if (logits == nullptr) {
+            return false;
+        }
+        const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx)));
+        if (!common_sampler_fn_l4_topk_row(logits, n_vocab, fast_k, fast_excl, cur)) {
+            return false;
+        }
+        // the state the chain's top-k leaves: the K largest, sorted
+        cur_p = { cur.data(), cur.size(), -1, true };
+        return true;
+    }
+
     common_time_meas tm() {
         return common_time_meas(t_total_us, params.no_perf);
     }
@@ -247,6 +375,11 @@ struct common_sampler {
     // [TAG_FN_L3_MTP_BLOCK] block verification's scratch sampler (SPEC_MTP_BLOCK_VERIFY on qwen4exp): a clone made at the
     // first block step, this sampler's state copied into it at every later one (its candidate buffer stays allocated)
     struct common_sampler * blk = nullptr;
+
+    // [TAG_FN_L4_HOST_TOPK] LLAMA_FN_L4_HOST_TOPK (qwen4exp): K of the fast candidate path, 0 = off; the ids the
+    // logit-bias sampler sets to -inf (sorted)
+    int                      fast_k = 0;
+    std::vector<llama_token> fast_excl;
 };
 
 std::string common_params_sampling::print() const {
@@ -560,6 +693,37 @@ struct common_sampler * common_sampler_init(
         pretrim = llama_sampler_init_top_k(std::max(params.top_k * 32, 1024));
     }
 
+    // [TAG_FN_L4_HOST_TOPK] the fast candidate path: every sampler before the first top-k is a no-op for these
+    // parameters (penalties, dry, top-n-sigma disabled; no user logit bias), no grammar, no reasoning budget, no mirostat,
+    // no token probabilities to report, 1 <= top_k <= 128 (the std::partial_sort branch of the top-k sampler)
+    int fast_k = 0;
+    std::vector<llama_token> fast_excl;
+    if (llama_fn_l4_host_flag(model, "LLAMA_FN_L4_HOST_TOPK") && params.mirostat == 0 && grmr == nullptr &&
+            rbudget == nullptr && params.logit_bias.empty() && params.n_probs == 0 && params.top_k >= 1 &&
+            params.top_k <= 128 &&
+            (params.penalty_last_n == 0 ||
+             (params.penalty_repeat == 1.0f && params.penalty_freq == 0.0f && params.penalty_present == 0.0f)) &&
+            (params.dry_multiplier == 0.0f || params.dry_base < 1.0f || params.dry_penalty_last_n == 0) &&
+            params.top_n_sigma <= 0.0f) {
+        bool first_top_k = false;
+        for (const auto t : params.samplers) {
+            if (t == COMMON_SAMPLER_TYPE_TOP_K) {
+                first_top_k = true;
+                break;
+            }
+            if (t != COMMON_SAMPLER_TYPE_PENALTIES && t != COMMON_SAMPLER_TYPE_DRY && t != COMMON_SAMPLER_TYPE_TOP_N_SIGMA) {
+                break;
+            }
+        }
+        if (first_top_k) {
+            fast_k = params.top_k;
+            int32_t n_suppress = 0;
+            const llama_token * suppress = llama_vocab_get_suppress_tokens(vocab, &n_suppress);
+            fast_excl.assign(suppress, suppress + n_suppress);
+            std::sort(fast_excl.begin(), fast_excl.end());
+        }
+    }
+
     // Keep verifier randomness independent from both target and draft sampling.
     const uint32_t speculative_seed = llama_sampler_get_seed(chain) ^ 0x9e3779b9U;
     auto * result = new common_sampler {
@@ -574,6 +738,8 @@ struct common_sampler * common_sampler_init(
         /* .speculative_seed = */ speculative_seed,
         /* .rng     = */ std::mt19937(speculative_seed),
     };
+    result->fast_k    = fast_k; // [TAG_FN_L4_HOST_TOPK]
+    result->fast_excl = std::move(fast_excl);
 
     return result;
 }
@@ -671,6 +837,8 @@ struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
     };
 
     res->cur_p.data = gsmpl->cur_p.data ? res->cur.data() : nullptr; // re-point to the clone's buffer
+    res->fast_k     = gsmpl->fast_k;    // [TAG_FN_L4_HOST_TOPK]
+    res->fast_excl  = gsmpl->fast_excl;
 
     return res;
 }
@@ -695,6 +863,8 @@ void common_sampler_copy(const common_sampler * src, common_sampler * dst) {
     dst->speculative_seed = src->speculative_seed;
     dst->rng        = src->rng;
     dst->t_total_us = src->t_total_us;
+    dst->fast_k     = src->fast_k;    // [TAG_FN_L4_HOST_TOPK]
+    dst->fast_excl  = src->fast_excl;
 }
 
 void common_perf_print(const struct llama_context * ctx, const struct common_sampler * gsmpl) {
@@ -763,7 +933,10 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     auto & chain = gsmpl->chain;
     auto & cur_p = gsmpl->cur_p; // initialized by set_logits
 
-    gsmpl->set_logits(ctx, idx);
+    // [TAG_FN_L4_HOST_TOPK] the K candidates straight from the row when that is exact, else the full array
+    if (gsmpl->fast_k <= 0 || !gsmpl->set_logits_fast(ctx, idx)) {
+        gsmpl->set_logits(ctx, idx);
+    }
 
     // Check if a backend sampler has already sampled a token in which case we
     // return that token id directly.

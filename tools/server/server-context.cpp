@@ -5431,6 +5431,7 @@ private:
 
         try {
             scoped_timer t(t_pre_decode, n_pre_decode);
+            llama_hp_scope hp_scope(LLAMA_HP_SRV_PRE); // [TAG_FN_L4_HOST]
             pre_decode();
         } catch (const std::exception & e) {
             SRV_ERR("pre_decode() failed: %s\n", e.what());
@@ -5470,6 +5471,7 @@ private:
                 // TODO @ngxson : maybe handle n_batch == 1 here instead of inside decode()
 
                 batch.render(off, n_tokens);
+                llama_hp_scope hp_scope(LLAMA_HP_SRV_BATCH); // [TAG_FN_L4_HOST]
                 bool ok = decode(n_batch, off);
 #ifdef DEBUG_TIMINGS
                 llama_synchronize(ctx_tgt);
@@ -5512,6 +5514,7 @@ private:
 
             try {
                 scoped_timer t(t_post_decode, n_post_decode);
+                llama_hp_scope hp_scope(LLAMA_HP_SRV_SAMPLE); // [TAG_FN_L4_HOST]
                 post_decode(n_tokens, off);
             } catch (const std::exception & e) {
                 SRV_ERR("post_decode() failed: %s\n", e.what());
@@ -5739,6 +5742,8 @@ private:
                 common_speculative_draft(spec.get());
             });
         }
+
+        llama_hp_switch(LLAMA_HP_SRV_CKPT); // [TAG_FN_L4_HOST] (pre_decode's scope restores its segment)
 
         // make checkpoints if needed
         iterate("drafting_3378", drafting, [&](server_slot & slot) {
@@ -6631,6 +6636,8 @@ private:
                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_dec0).count());
         }
 
+        llama_hp_switch(LLAMA_HP_SRV_DPOST); // [TAG_FN_L4_HOST] (the caller's scope restores its segment)
+
         if (ret != 0) {
             // [TAG_POOL_PREEMPT] never halve through a verify group and never fail every slot
             if (pool_preempt && ret == 1) {
@@ -7050,6 +7057,8 @@ private:
                     SLT_INF(slot, "accepted %2zu/%2zu draft tokens\n", accepted.size() - 1, n_draft);
                 }
 
+                llama_hp_switch(LLAMA_HP_SRV_BOOK); // [TAG_FN_L4_HOST]
+
                 common_speculative_accept(spec.get(), slot.id, accepted.size() - 1);
 
                 slot.spec_draft = std::move(accepted);
@@ -7089,6 +7098,9 @@ private:
             SLT_DBG(slot, "add accepted tokens: sampled=%d, ids.size=%zu, n_draft=%zu\n", slot.sampled, ids.size(), n_draft);
 
             slot.mem.seq_rm(slot.id, slot.prompt.tokens.pos_next(), -1);
+
+            // [TAG_FN_L4_HOST_PLEPRE] the next verify batch starts with this token: its PLE rows are read during the drafts
+            llama_ple_prefetch_ext(slot.ctx_tgt, slot.id, slot.prompt.tokens.pos_next(), &slot.sampled, 1, 0);
             TURBO_PHASE_END("bookkeep")
 
             TURBO_PHASE_BEGIN
@@ -7099,6 +7111,8 @@ private:
             // llama.cpp as well as here. Report the actual value and stop cleanly instead.
             const int n_vocab_tgt =
                 llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(slot.ctx_tgt)));
+
+            llama_hp_switch(LLAMA_HP_SRV_TOKEN); // [TAG_FN_L4_HOST]
 
             for (size_t i = 0; i < ids.size(); ++i) {
                 completion_token_output result;

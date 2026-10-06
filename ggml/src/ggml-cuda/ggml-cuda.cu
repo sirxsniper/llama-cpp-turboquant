@@ -2879,6 +2879,54 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
 }
 
+// [TAG_FN_L4_HOST_BATCHCPY] host -> device copies into whole device tensors as one cudaMemcpyBatchAsync on the backend's
+// stream (source read in stream order, as cudaMemcpyAsync does); false (nothing queued) where the API is missing or
+// refuses the batch, so the caller copies one by one
+static bool ggml_backend_cuda_set_tensors_batch_async(ggml_backend_t backend, int n, ggml_tensor * const * tensors,
+        const void * const * data, const size_t * sizes) {
+#if defined(CUDART_VERSION) && CUDART_VERSION >= 12080 && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    if (n <= 0) {
+        return true;
+    }
+    static thread_local std::vector<void *>       dst;
+    static thread_local std::vector<const void *> src;
+    static thread_local std::vector<size_t>       len;
+    dst.resize(n);
+    src.resize(n);
+    len.resize(n);
+    for (int i = 0; i < n; ++i) {
+        const ggml_tensor * t = tensors[i];
+        ggml_backend_buffer_t buf = t->view_src ? t->view_src->buffer : t->buffer;
+        if (buf == nullptr || buf->buft != ggml_backend_cuda_buffer_type(cuda_ctx->device) || sizes[i] > ggml_nbytes(t)) {
+            return false;
+        }
+        dst[i] = t->data;
+        src[i] = data[i];
+        len[i] = sizes[i];
+    }
+    ggml_cuda_set_device(cuda_ctx->device);
+    cudaMemcpyAttributes attr = {};
+    attr.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
+    size_t attr_idx = 0;
+    const cudaError_t e = cudaMemcpyBatchAsync(dst.data(), src.data(), len.data(), (size_t) n, &attr, &attr_idx, 1, cuda_ctx->stream());
+    if (e != cudaSuccess) {
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            GGML_LOG_WARN("%s: [TAG_FN_L4_HOST_BATCHCPY] cudaMemcpyBatchAsync failed (%s): copies go one by one\n", __func__,
+                    cudaGetErrorString(e));
+        }
+        (void) cudaGetLastError();
+        return false;
+    }
+    return true;
+#else
+    GGML_UNUSED(backend); GGML_UNUSED(n); GGML_UNUSED(tensors); GGML_UNUSED(data); GGML_UNUSED(sizes);
+    return false;
+#endif
+}
+
 static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
@@ -7218,6 +7266,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_cuda_get_features;
+    }
+    if (strcmp(name, "ggml_backend_set_tensors_batch_async") == 0) { // [TAG_FN_L4_HOST_BATCHCPY]
+        return (void *)ggml_backend_cuda_set_tensors_batch_async;
     }
     if (strcmp(name, "ggml_backend_turbot_supports_geometry") == 0) {   // [TAG_TURBOT_ANY_RESOLVE]
         return (void *)ggml_backend_cuda_turbot_supports_geometry;

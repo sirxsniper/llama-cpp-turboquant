@@ -1155,6 +1155,17 @@ struct ggml_backend_sched {
     int      n_split_after;
     uint64_t split_after_hash[GGML_SCHED_MAX_CUTS];
     char     split_after[GGML_SCHED_MAX_CUTS][GGML_MAX_NAME];
+
+    uint64_t snap_id; // [TAG_FN_L4_HOST_SNAP] unique per scheduler object
+
+    // [TAG_FN_L4_HOST_BATCHCPY] ggml_backend_sched_set_batch_inputs; the batch function per backend (resolved once)
+    bool                                    batch_inputs;
+    bool                                    batch_fn_tried[GGML_SCHED_MAX_BACKENDS];
+    ggml_backend_set_tensors_batch_async_t  batch_fn[GGML_SCHED_MAX_BACKENDS];
+
+    // [TAG_FN_L4_HOST] ggml_backend_sched_set_prof_cb
+    ggml_backend_sched_prof_cb_t prof_cb;
+    void *                       prof_ud;
 };
 
 #define hash_id(tensor) ggml_hash_find_or_insert(&sched->hash_set, tensor)
@@ -2072,6 +2083,19 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     uint32_t pending_h2d = 0;
     static_assert(GGML_SCHED_MAX_BACKENDS <= 32, "pending_h2d is a 32-bit mask");
 
+    // [TAG_FN_L4_HOST_BATCHCPY] the input copies of the current split, when they go as one batch
+    static thread_local std::vector<ggml_tensor *> batch_t;
+    static thread_local std::vector<const void *>  batch_d;
+    static thread_local std::vector<size_t>        batch_s;
+
+    // [TAG_FN_L4_HOST] host profile hook (NULL: off)
+    const ggml_backend_sched_prof_cb_t prof_cb = sched->prof_cb;
+    auto prof = [&](int ev) {
+        if (prof_cb) {
+            prof_cb(sched->prof_ud, ev);
+        }
+    };
+
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
@@ -2079,6 +2103,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
         const bool split_is_host = split_async && ggml_backend_buft_is_host(sched->bufts[split_backend_id]);
         uint32_t   d2h_async     = 0; // [TAG_FN_SCHED_SPLIT_ASYNC] backends with a queued device -> host input copy
+
+        prof(GGML_SCHED_PROF_SYNC); // [TAG_FN_L4_HOST]
 
         // ensure the previous split's async work has completed before we start
         // this split, the allocator may have reused buffer regions across splits
@@ -2090,8 +2116,25 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
+        prof(GGML_SCHED_PROF_INPUTS); // [TAG_FN_L4_HOST]
+
         // copy the input tensors to the split backend
         int n_inputs_async = 0;
+        // [TAG_FN_L4_HOST_BATCHCPY] the batch function of this split's backend, if the scheduler batches
+        ggml_backend_set_tensors_batch_async_t batch_fn = nullptr;
+        if (sched->batch_inputs) {
+            if (!sched->batch_fn_tried[split_backend_id]) {
+                sched->batch_fn_tried[split_backend_id] = true;
+                ggml_backend_dev_t dev = ggml_backend_get_device(split_backend);
+                ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+                sched->batch_fn[split_backend_id] = reg ? (ggml_backend_set_tensors_batch_async_t)
+                    ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_tensors_batch_async") : nullptr;
+            }
+            batch_fn = sched->batch_fn[split_backend_id];
+            batch_t.clear();
+            batch_d.clear();
+            batch_s.clear();
+        }
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
             ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[input_id]);
             struct ggml_tensor * input = split->inputs[input_id];
@@ -2113,7 +2156,16 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     !ggml_backend_sched_input_sync_forced() &&
                     split_backend->iface.set_tensor_async != NULL &&
                     ggml_backend_buffer_is_host(input->buffer)) {
-                    ggml_backend_tensor_set_async(split_backend, input_cpy, input->data, 0, ggml_nbytes(input));
+                    if (batch_fn != nullptr && input_cpy->view_src == NULL && input_cpy->data != NULL) {
+                        // [TAG_FN_L4_HOST_BATCHCPY] queued below with the split's other input copies
+                        if (ggml_nbytes(input) > 0) {
+                            batch_t.push_back(input_cpy);
+                            batch_d.push_back(input->data);
+                            batch_s.push_back(ggml_nbytes(input));
+                        }
+                    } else {
+                        ggml_backend_tensor_set_async(split_backend, input_cpy, input->data, 0, ggml_nbytes(input));
+                    }
                     n_inputs_async++;
                 } else {
                     if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
@@ -2267,6 +2319,20 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
+        // [TAG_FN_L4_HOST_BATCHCPY] the split's input copies as one call; one by one if the backend refuses the batch
+        if (!batch_t.empty()) {
+            if (!batch_fn(split_backend, (int) batch_t.size(), batch_t.data(), batch_d.data(), batch_s.data())) {
+                for (size_t k = 0; k < batch_t.size(); ++k) {
+                    ggml_backend_tensor_set_async(split_backend, batch_t[k], batch_d[k], 0, batch_s[k]);
+                }
+            }
+            batch_t.clear();
+            batch_d.clear();
+            batch_s.clear();
+        }
+
+        prof(GGML_SCHED_PROF_SYNC); // [TAG_FN_L4_HOST]
+
         // [TAG_SCHED_INPUT_BATCH] one synchronize for every input queued above
         if (n_inputs_async > 0) {
             ggml_backend_synchronize(split_backend);
@@ -2278,6 +2344,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             uint32_t m = d2h_async | pending_h2d;
             ggml_backend_sched_sync_mask(sched, m);
             pending_h2d = 0;
+        }
+
+        if (prof_cb) { // [TAG_FN_L4_HOST]
+            prof(ggml_backend_buft_is_host(sched->bufts[split_backend_id]) ? GGML_SCHED_PROF_HOST : GGML_SCHED_PROF_DEVICE);
         }
 
         if (!sched->callback_eval) {
@@ -2327,10 +2397,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         prev_backend_id = split_backend_id;
     }
 
+    prof(GGML_SCHED_PROF_SYNC); // [TAG_FN_L4_HOST]
+
     // [TAG_FN_SCHED_SPLIT_ASYNC] the caller's next set_inputs may write host memory a queued copy still reads
     if (pending_h2d != 0) {
         ggml_backend_sched_sync_mask(sched, pending_h2d);
     }
+
+    prof(GGML_SCHED_PROF_END); // [TAG_FN_L4_HOST]
 
     return GGML_STATUS_SUCCESS;
 }
@@ -2379,6 +2453,10 @@ ggml_backend_sched_t ggml_backend_sched_new(
 
     sched->context_buffer_size = ggml_sched_max_splits*GGML_SCHED_MAX_SPLIT_INPUTS*2*sizeof(struct ggml_tensor) + ggml_graph_overhead_custom(graph_size, false);
     sched->context_buffer = (char *) malloc(sched->context_buffer_size);
+
+    // [TAG_FN_L4_HOST_SNAP]
+    static std::atomic<uint64_t> snap_ids{0};
+    sched->snap_id = ++snap_ids;
 
     const int initial_splits_capacity = 16;
     sched->splits = (ggml_backend_sched_split *) calloc(initial_splits_capacity, sizeof(sched->splits[0]));
@@ -2434,6 +2512,195 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     free(sched->graph.nodes);
     free(sched->graph.leafs);
     free(sched);
+}
+
+// [TAG_FN_L4_HOST_SNAP] see ggml-backend.h
+#if defined(_MSC_VER)
+#include <intrin.h>
+#endif
+static inline int ggml_sched_snap_ctz(uint32_t x) {
+#if defined(_MSC_VER)
+    unsigned long i;
+    _BitScanForward(&i, x);
+    return (int) i;
+#else
+    return __builtin_ctz(x);
+#endif
+}
+
+struct ggml_backend_sched_snap {
+    uint64_t                    sched_id   = 0;
+    uint64_t                    gen        = 0;       // the allocator's buffer generation
+    const struct ggml_cgraph *  graph      = nullptr; // the caller's graph
+    uint64_t                    graph_uid  = 0;
+    int                         graph_n_nodes = 0;
+    int                         n_backends = 0;
+    // hash set: the used bits and the entries in use (index, key, backend id, copies)
+    std::vector<ggml_bitset_t>  used;
+    std::vector<size_t>         h_idx;
+    std::vector<ggml_tensor *>  h_key;
+    std::vector<int>            h_bid;
+    std::vector<ggml_tensor *>  h_cpy; // n_backends per entry
+    // graph copy and its backend ids
+    std::vector<ggml_tensor *>  nodes;
+    std::vector<ggml_tensor *>  leafs;
+    std::vector<int>            node_ids;
+    std::vector<int>            leaf_ids;
+    // splits, their inputs, the graph inputs
+    std::vector<ggml_backend_sched_split>   splits;
+    std::vector<std::vector<ggml_tensor *>> split_inputs;
+    std::vector<ggml_tensor *>              graph_inputs;
+    // the scheduler context's tensors (input copies, dependency views)
+    std::vector<char>           ctx_bytes;
+};
+
+ggml_backend_sched_snap_t ggml_backend_sched_snap_save(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
+    GGML_ASSERT(sched && graph);
+    if (sched->n_copies != 1 || !sched->is_alloc || sched->is_reset) {
+        return NULL;
+    }
+    auto * s = new ggml_backend_sched_snap;
+    s->sched_id      = sched->snap_id;
+    s->gen           = ggml_gallocr_get_generation(sched->galloc);
+    s->graph         = graph;
+    s->graph_uid     = graph->uid;
+    s->graph_n_nodes = graph->n_nodes;
+    s->n_backends    = sched->n_backends;
+
+    const size_t hs = sched->hash_set.size;
+    s->used.assign(sched->hash_set.used, sched->hash_set.used + ggml_bitset_size(hs));
+    for (size_t i = 0; i < hs; ++i) {
+        if (!ggml_bitset_get(sched->hash_set.used, i)) {
+            continue;
+        }
+        s->h_idx.push_back(i);
+        s->h_key.push_back(sched->hash_set.keys[i]);
+        s->h_bid.push_back(sched->hv_tensor_backend_ids[i]);
+        for (int b = 0; b < sched->n_backends; ++b) {
+            s->h_cpy.push_back(sched->hv_tensor_copies[i * sched->n_backends + b]);
+        }
+    }
+
+    s->nodes.assign(sched->graph.nodes, sched->graph.nodes + sched->graph.n_nodes);
+    s->leafs.assign(sched->graph.leafs, sched->graph.leafs + sched->graph.n_leafs);
+    s->node_ids.assign(sched->node_backend_ids, sched->node_backend_ids + sched->graph.n_nodes);
+    s->leaf_ids.assign(sched->leaf_backend_ids, sched->leaf_backend_ids + sched->graph.n_leafs);
+
+    s->splits.assign(sched->splits, sched->splits + sched->n_splits);
+    s->split_inputs.resize(sched->n_splits);
+    for (int i = 0; i < sched->n_splits; ++i) {
+        const auto & sp = sched->splits[i];
+        s->split_inputs[i].assign(sp.inputs, sp.inputs + sp.n_inputs);
+    }
+    s->graph_inputs.assign(sched->graph_inputs, sched->graph_inputs + sched->n_graph_inputs);
+
+    const size_t used_mem = sched->ctx ? ggml_used_mem(sched->ctx) : 0;
+    GGML_ASSERT(used_mem <= sched->context_buffer_size);
+    s->ctx_bytes.assign(sched->context_buffer, sched->context_buffer + used_mem);
+    return s;
+}
+
+bool ggml_backend_sched_snap_restore(ggml_backend_sched_t sched, ggml_backend_sched_snap_t s, struct ggml_cgraph * graph) {
+    GGML_ASSERT(sched && graph);
+    if (s == NULL || s->sched_id != sched->snap_id || s->gen != ggml_gallocr_get_generation(sched->galloc) ||
+            s->graph != graph || s->graph_n_nodes != graph->n_nodes || s->n_backends != sched->n_backends ||
+            sched->n_copies != 1 || s->used.size() != ggml_bitset_size(sched->hash_set.size) ||
+            s->nodes.size() > (size_t) sched->graph.size || s->leafs.size() > (size_t) sched->graph.size ||
+            s->ctx_bytes.size() > sched->context_buffer_size) {
+        return false;
+    }
+
+    // the entries in use go back to their defaults (every other entry already has them), then the saved ones
+    const size_t hs = sched->hash_set.size;
+    const size_t nw = ggml_bitset_size(hs);
+    for (size_t w = 0; w < nw; ++w) {
+        ggml_bitset_t bits = sched->hash_set.used[w];
+        while (bits != 0) {
+            const int    k = ggml_sched_snap_ctz(bits);
+            const size_t i = (w << BITSET_SHR) + (size_t) k;
+            bits &= bits - 1;
+            if (i >= hs) {
+                break;
+            }
+            sched->hv_tensor_backend_ids[i] = -1;
+            for (int b = 0; b < sched->n_backends; ++b) {
+                sched->hv_tensor_copies[i * sched->n_backends + b] = NULL;
+            }
+        }
+    }
+    std::copy(s->used.begin(), s->used.end(), sched->hash_set.used);
+    for (size_t e = 0; e < s->h_idx.size(); ++e) {
+        const size_t i = s->h_idx[e];
+        sched->hash_set.keys[i]          = s->h_key[e];
+        sched->hv_tensor_backend_ids[i]  = s->h_bid[e];
+        for (int b = 0; b < sched->n_backends; ++b) {
+            sched->hv_tensor_copies[i * sched->n_backends + b] = s->h_cpy[e * sched->n_backends + b];
+        }
+    }
+
+    std::copy(s->nodes.begin(), s->nodes.end(), sched->graph.nodes);
+    std::copy(s->leafs.begin(), s->leafs.end(), sched->graph.leafs);
+    sched->graph.n_nodes = (int) s->nodes.size();
+    sched->graph.n_leafs = (int) s->leafs.size();
+    std::copy(s->node_ids.begin(), s->node_ids.end(), sched->node_backend_ids);
+    std::copy(s->leaf_ids.begin(), s->leaf_ids.end(), sched->leaf_backend_ids);
+
+    while (sched->splits_capacity < (int) s->splits.size()) {
+        const int old_cap = sched->splits_capacity;
+        sched->splits_capacity *= 2;
+        sched->splits = (ggml_backend_sched_split *) realloc(sched->splits, sched->splits_capacity * sizeof(struct ggml_backend_sched_split));
+        GGML_ASSERT(sched->splits != NULL);
+        for (int k = old_cap; k < sched->splits_capacity; k++) {
+            memset(&sched->splits[k], 0, sizeof(struct ggml_backend_sched_split));
+        }
+    }
+    for (size_t i = 0; i < s->splits.size(); ++i) {
+        ggml_backend_sched_split * sp = &sched->splits[i];
+        // the split's own inputs array stays (capacity grows if needed); the rest is the saved split
+        ggml_tensor ** inputs = sp->inputs;
+        int            cap    = sp->inputs_capacity;
+        *sp = s->splits[i];
+        sp->inputs          = inputs;
+        sp->inputs_capacity = cap;
+        while (sp->inputs_capacity < (int) s->split_inputs[i].size()) {
+            ggml_backend_sched_split_inputs_grow(sp);
+        }
+        std::copy(s->split_inputs[i].begin(), s->split_inputs[i].end(), sp->inputs);
+        sp->n_inputs = (int) s->split_inputs[i].size();
+    }
+    sched->n_splits = (int) s->splits.size();
+
+    while (sched->graph_inputs_capacity < (int) s->graph_inputs.size()) {
+        ggml_backend_sched_graph_inputs_grow(sched);
+    }
+    std::copy(s->graph_inputs.begin(), s->graph_inputs.end(), sched->graph_inputs);
+    sched->n_graph_inputs = (int) s->graph_inputs.size();
+
+    std::copy(s->ctx_bytes.begin(), s->ctx_bytes.end(), sched->context_buffer);
+
+    graph->uid       = s->graph_uid;
+    sched->cur_copy  = 0;
+    sched->next_copy = 0;
+    sched->is_reset  = false;
+    sched->is_alloc  = true;
+    return true;
+}
+
+void ggml_backend_sched_snap_free(ggml_backend_sched_snap_t snap) {
+    delete snap;
+}
+
+// [TAG_FN_L4_HOST_BATCHCPY]
+void ggml_backend_sched_set_batch_inputs(ggml_backend_sched_t sched, bool on) {
+    GGML_ASSERT(sched);
+    sched->batch_inputs = on;
+}
+
+// [TAG_FN_L4_HOST]
+void ggml_backend_sched_set_prof_cb(ggml_backend_sched_t sched, ggml_backend_sched_prof_cb_t cb, void * user_data) {
+    GGML_ASSERT(sched);
+    sched->prof_cb = cb;
+    sched->prof_ud = user_data;
 }
 
 void ggml_backend_sched_reset(ggml_backend_sched_t sched) {

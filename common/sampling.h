@@ -146,6 +146,11 @@ llama_token_data_array * common_sampler_get_candidates(struct common_sampler * g
 // get the last accepted token
 llama_token common_sampler_last(const struct common_sampler * gsmpl);
 
+// [TAG_FN_L4_HOST_TOPK] the K largest logits of a row (ids in the sorted excl skipped) in strictly descending order, as
+// std::partial_sort leaves them; false when that order is not unique, on a NaN or when fewer than K exist (for tests)
+bool common_sampler_fn_l4_topk_row(const float * x, int n, int K, const std::vector<llama_token> & excl,
+        std::vector<llama_token_data> & out);
+
 // print the sampler chain into a string
 std::string common_sampler_print(const struct common_sampler * gsmpl);
 

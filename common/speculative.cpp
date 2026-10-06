@@ -3503,6 +3503,75 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     // positions (llama-model.cpp), so prompt rows further back than that from their prompt's end are not decoded
     int32_t mtp_win = 0;
 
+    // [TAG_FN_L4_HOST_MTPFUSE] LLAMA_FN_L4_HOST_MTPFUSE=1 (qwen4exp, single head): process() keeps the rows of a verify batch
+    // instead of decoding them, accept() keeps the accepted ones, and the first draft decode carries them in front of its own
+    // row: one draft-context decode less per step. Rows no draft follows are decoded alone (fuse_flush); rows at or past a
+    // position the target no longer holds (a replay restored it) are dropped (fuse_trim), as the old flow removed them.
+    bool                                  fuse_on = false;
+    std::vector<std::vector<llama_token>> fuse_tok;   // [n_seq] the kept rows
+    std::vector<std::vector<llama_pos>>   fuse_pos;
+    std::vector<std::vector<float>>       fuse_h;     // n_embd per row: the h process() would have paired with it
+    std::vector<int8_t>                   fuse_ok;    // 1: accept() trimmed them to the accepted rows
+    std::vector<int8_t>                   fuse_in;    // in the batch being built (cleared after its decode)
+    uint64_t                              fuse_n_fused = 0, fuse_n_alone = 0, fuse_n_drop = 0;
+
+    void fuse_clear(llama_seq_id s) {
+        fuse_tok[s].clear();
+        fuse_pos[s].clear();
+        fuse_h[s].clear();
+        fuse_ok[s] = 0;
+        fuse_in[s] = 0;
+    }
+
+    // add the kept rows of s to batch (no output); their h stays in fuse_h until the decode
+    void fuse_add(llama_seq_id s) {
+        for (size_t k = 0; k < fuse_tok[s].size(); ++k) {
+            const int32_t idx = batch.add(fuse_tok[s][k], fuse_pos[s][k], s, false);
+            batch.set_embd(idx, { fuse_h[s].data() + k*(size_t) n_embd, 1, (size_t) n_embd });
+        }
+        fuse_in[s] = 1;
+    }
+
+    // drop the kept rows of s at positions >= lim
+    void fuse_trim(llama_seq_id s, llama_pos lim) {
+        size_t keep = 0;
+        while (keep < fuse_pos[s].size() && fuse_pos[s][keep] < lim) {
+            keep++;
+        }
+        if (keep < fuse_pos[s].size()) {
+            fuse_n_drop += fuse_pos[s].size() - keep;
+            fuse_tok[s].resize(keep);
+            fuse_pos[s].resize(keep);
+            fuse_h[s].resize(keep*(size_t) n_embd);
+        }
+    }
+
+    // decode the kept rows of the sequences in want (every one when null) alone
+    bool fuse_flush(const std::vector<char> * want) {
+        batch.clear();
+        for (llama_seq_id s = 0; s < (llama_seq_id) n_seq; ++s) {
+            if (fuse_tok[s].empty() || (want && !(*want)[s])) {
+                continue;
+            }
+            fuse_add(s);
+            fuse_n_alone++;
+        }
+        bool ok = true;
+        if (batch.size() > 0) {
+            ok = llama_process(params.ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get()) == 0;
+            if (!ok) {
+                SPC_ERR("%s: [TAG_FN_L4_HOST_MTPFUSE] decoding %d kept rows failed\n", __func__, (int) batch.size());
+            }
+        }
+        batch.clear();
+        for (llama_seq_id s = 0; s < (llama_seq_id) n_seq; ++s) {
+            if (fuse_in[s]) {
+                fuse_clear(s);
+            }
+        }
+        return ok;
+    }
+
     // the rows of batch_in to decode; false (rows empty) when every row is needed. A sequence that loses rows starts
     // its draft KV fresh at its first kept row (a stale window from an earlier turn would leave a position gap).
     bool mtp_win_rows(const common_batch & b, llama_memory_t mem_dft, std::vector<int32_t> & rows) const {
@@ -3669,6 +3738,18 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                           strcmp(arch, "qwen4exp") == 0;
         }
 
+        // [TAG_FN_L4_HOST_MTPFUSE]
+        fuse_on = is_qwen4exp && !is_mem_shared && !chain_heads && n_mtp_layers == 1 &&
+                  llama_fn_l4_int(llama_get_model(ctx_dft), "LLAMA_FN_L4_HOST_MTPFUSE", 0) != 0;
+        fuse_tok.assign(n_seq, {});
+        fuse_pos.assign(n_seq, {});
+        fuse_h.assign(n_seq, {});
+        fuse_ok.assign(n_seq, 0);
+        fuse_in.assign(n_seq, 0);
+        if (fuse_on) {
+            LOG_INF("%s: [TAG_FN_L4_HOST_MTPFUSE] the rows of each verify batch go into the first draft decode after it\n", __func__);
+        }
+
         // [TAG_FN_MTP_COST]
         {
             const char * e = getenv("SPEC_MTP_COST");
@@ -3793,6 +3874,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         // reset here rather than per round, or two identical requests differ
         common_sampler_reset(smpls[seq_id].get());
 
+        // [TAG_FN_L4_HOST_MTPFUSE] rows kept from an earlier request are not this prompt's
+        if (fuse_on && seq_id >= 0 && seq_id < (llama_seq_id) n_seq) {
+            fuse_clear(seq_id);
+        }
+
         // [TAG_FN_MTP_COST] the gap to the next draft() holds a prompt, not a step
         cost_t_end = 0;
         c2_t_start = 0; // [TAG_FN_L3_MTP_COST2]
@@ -3845,6 +3931,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             return true;
         }
 
+        llama_hp_scope hp_scope(LLAMA_HP_MTP_PROC); // [TAG_FN_L4_HOST]
+
         // [TAG_FN_MTP_COST] a step is timed only if exactly one target batch (the verify batch) ran since draft()
         if (cost_on) {
             cost_n_proc++;
@@ -3896,8 +3984,40 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
 
+        // [TAG_FN_L4_HOST_MTPFUSE] rows kept from the last verify batch and not drafted after: decoded (or dropped) first
+        bool fuse_defer = false;
+        if (fuse_on) {
+            for (llama_seq_id s = 0; s < (llama_seq_id) n_seq; ++s) {
+                if (i_batch_beg[s] >= 0 && !fuse_tok[s].empty()) {
+                    fuse_trim(s, batch_in.tokens[i_batch_beg[s]].pos[0]);
+                }
+            }
+            if (!fuse_flush(nullptr)) {
+                return false;
+            }
+            // a verify batch: per sequence at most n_max + 1 rows at consecutive positions, no prompt still to come
+            fuse_defer = n_tokens <= 16;
+            for (int32_t k = 0; k < n_tokens && fuse_defer; ++k) {
+                const llama_seq_id s = batch_in.tokens[k].seq_id;
+                fuse_defer = s >= 0 && s < (llama_seq_id) n_seq && i_batch_end[s] - i_batch_beg[s] + 1 <= this->params.n_max + 1 &&
+                             prefill_after_for(s) == 0 &&
+                             (k == i_batch_beg[s] || batch_in.tokens[k].pos[0] == batch_in.tokens[k - 1].pos[0] + 1);
+            }
+        }
+
         // if kv is shared with target (e.g Gemma4), then we can skip this catch-up decode
-        if (!is_mem_shared) {
+        if (fuse_defer) {
+            // [TAG_FN_L4_HOST_MTPFUSE] the rows and the h each would pair with, as below, kept for the first draft decode
+            const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);
+            for (int32_t k = 0; k < n_tokens; ++k) {
+                const llama_seq_id s = batch_in.tokens[k].seq_id;
+                const float * h_row = k == i_batch_beg[s] ? pending_h[s].data() : h_tgt + (size_t) (k - 1)*n_embd;
+                fuse_tok[s].push_back(batch_in.tokens[k].id);
+                fuse_pos[s].push_back(batch_in.tokens[k].pos[0]);
+                fuse_h[s].insert(fuse_h[s].end(), h_row, h_row + n_embd);
+                fuse_ok[s] = 0;
+            }
+        } else if (!is_mem_shared) {
             // [TAG_MTP_CHUNK_DECODE] [TAG_SPEC_BATCH_FROM_TGT] These rows come from the TARGET's ubatch, up to
             // n_batch(ctx_tgt) wide, but they are decoded on the DRAFT context, whose n_batch SPEC_DFT_UBATCH
             // deliberately clamps (its compute buffer reserves a KQ mask of n_kv * n_ubatch f16: 128 MiB at ubatch
@@ -4017,6 +4137,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     void draft(common_speculative_draft_params_vec & dparams) override {
         auto & ctx_dft = params.ctx_dft;
 
+        llama_hp_scope hp_scope(LLAMA_HP_MTP_DRAFT); // [TAG_FN_L4_HOST]
+
         batch.clear();
 
         // [TAG_MTP_DISTS] q is recorded in lockstep with the draft; the server requires
@@ -4120,6 +4242,24 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         int n_drafting = 0;
         std::vector<bool> drafting(n_seq);
 
+        // [TAG_FN_L4_HOST_MTPFUSE] kept rows only up to what the target holds (a drafting sequence: before its draft position);
+        // rows that do not end right before that position are decoded alone
+        if (fuse_on) {
+            std::vector<char> alone(n_seq, 0);
+            for (llama_seq_id s = 0; s < (llama_seq_id) n_seq; ++s) {
+                if (fuse_tok[s].empty()) {
+                    continue;
+                }
+                const llama_pos lim = dparams[s].drafting ? dparams[s].pos0 :
+                        llama_memory_seq_pos_max(llama_get_memory(params.ctx_tgt), s) + 1;
+                fuse_trim(s, lim);
+                if (!fuse_tok[s].empty() && dparams[s].drafting && fuse_pos[s].back() + 1 != dparams[s].pos0) {
+                    alone[s] = 1;
+                }
+            }
+            fuse_flush(&alone);
+        }
+
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             auto & dp = dparams[seq_id];
 
@@ -4151,6 +4291,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             // a reset reseeds the chain, which breaks probabilistic drafting
             if (!dp.result_q) {
                 common_sampler_reset(smpls[seq_id].get());
+            }
+
+            // [TAG_FN_L4_HOST_MTPFUSE] the kept rows of the last verify batch in front of this sequence's first draft row
+            if (fuse_on && !fuse_tok[seq_id].empty()) {
+                fuse_add(seq_id);
+                fuse_n_fused++;
             }
 
             const int32_t idx = batch.add(dp.id_last, dp.pos0, seq_id, true);
@@ -4198,6 +4344,21 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             return !(conf < pmin_at(pos));
         };
 
+        // [TAG_FN_L4_HOST_MTPFUSE] kept rows of sequences that do not draft now: in the first draft decode too (no output),
+        // or alone when no sequence drafts
+        if (fuse_on) {
+            if (n_drafting == 0) {
+                fuse_flush(nullptr);
+            } else {
+                for (llama_seq_id s = 0; s < (llama_seq_id) n_seq; ++s) {
+                    if (!fuse_tok[s].empty() && !fuse_in[s]) {
+                        fuse_add(s);
+                        fuse_n_alone++;
+                    }
+                }
+            }
+        }
+
         int i = 0;
 
         while (n_drafting > 0) {
@@ -4221,6 +4382,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             const int     cost_nit = n_drafting;
 
             int ret = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+            // [TAG_FN_L4_HOST_MTPFUSE] the kept rows went with the first decode (their h views were read by it)
+            if (fuse_on && i == 0) {
+                for (llama_seq_id s = 0; s < (llama_seq_id) n_seq; ++s) {
+                    if (fuse_in[s]) {
+                        fuse_clear(s);
+                    }
+                }
+            }
             if (ret != 0) {
                 SPC_ERR("llama_process[%d] returned %d\n", i, ret);
                 break;
@@ -4335,6 +4504,15 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 common_sampler_accept(smpl, id, true);
 
                 result.push_back(id);
+
+                // [TAG_FN_L4_HOST_PLEPRE] the verify batch holds id_last + the drafts from pos0: read this draft's PLE rows now
+                if (!is_mem_shared && !chain_heads && result.size() < 16) {
+                    llama_token vtoks[16];
+                    vtoks[0] = dp.id_last;
+                    std::copy(result.begin(), result.end(), vtoks + 1);
+                    llama_ple_prefetch_ext(params.ctx_tgt, seq_id, dp.pos0, vtoks, (int32_t) result.size() + 1, (int32_t) result.size());
+                }
+
                 if (cost_on) {
                     cost_ps[seq_id].push_back(cur_p->data[0].p); // [TAG_FN_MTP_COST] for the calibration in accept()
                 }
@@ -4504,6 +4682,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             return;
         }
 
+        llama_hp_scope hp_scope(LLAMA_HP_MTP_ACCEPT); // [TAG_FN_L4_HOST]
+
         // [TAG_FN_MTP_COST] calibrate the acceptance per drafter probability from what the target kept
         if (cost_on && !cost_ps[seq_id].empty()) {
             cost.observe_accept(cost_mode[seq_id], cost_ps[seq_id], n_accepted);
@@ -4518,6 +4698,15 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             if (c2_acc[seq_id] >= 0) {
                 c2_acc[seq_id] = n_accepted;
             }
+        }
+
+        // [TAG_FN_L4_HOST_MTPFUSE] the kept rows: the sampled token and the accepted drafts
+        if (fuse_on && !fuse_tok[seq_id].empty() && !fuse_ok[seq_id]) {
+            const size_t keep = std::min(fuse_tok[seq_id].size(), (size_t) n_accepted + 1);
+            fuse_tok[seq_id].resize(keep);
+            fuse_pos[seq_id].resize(keep);
+            fuse_h[seq_id].resize(keep*(size_t) n_embd);
+            fuse_ok[seq_id] = 1;
         }
 
         const int32_t n_rows = verify_h_rows[seq_id];

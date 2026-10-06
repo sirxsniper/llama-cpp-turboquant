@@ -1492,7 +1492,21 @@ int64_t llm_graph_result::get_max_nodes() const {
     return max_nodes;
 }
 
+// [TAG_FN_L4_HOST_SNAP]
+llm_graph_result::~llm_graph_result() {
+    snap_drop();
+}
+
+void llm_graph_result::snap_drop() {
+    if (snap != nullptr) {
+        ggml_backend_sched_snap_free(snap);
+        snap = nullptr;
+    }
+}
+
 void llm_graph_result::reset() {
+    snap_drop(); // [TAG_FN_L4_HOST_SNAP]
+
     t_inp_tokens  = nullptr;
     t_inp_embd    = nullptr;
     t_logits      = nullptr;
