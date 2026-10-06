@@ -3546,11 +3546,33 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
     }
 
+    // [TAG_FN_L4_HOST_MTPFUSE] kept rows are valid only right after the draft context's last position for s: a slot restore,
+    // a replay or any other change of the draft state since they were kept leaves them stale (decoding them fails the batch
+    // init: 'failed to initialize batch', HTTP 500 after a slot restore, 2026-10-06 gap5). Stale rows are dropped.
+    bool fuse_valid(llama_seq_id s) {
+        if (fuse_tok[s].empty()) {
+            return true;
+        }
+        const llama_pos pmax = llama_memory_seq_pos_max(llama_get_memory(params.ctx_dft), s);
+        if (fuse_pos[s].front() != pmax + 1) {
+            static std::atomic<uint64_t> n_logged{0};
+            const uint64_t nl_ = n_logged.fetch_add(1);
+            if (nl_ < 8 || nl_ % 1000 == 0) {
+                LOG_INF("%s: [TAG_FN_L4_HOST_MTPFUSE] dropped %zu stale kept rows of seq %d (first pos %d, draft memory ends at %d), %" PRIu64 " drops so far\n",
+                        __func__, fuse_tok[s].size(), (int) s, (int) fuse_pos[s].front(), (int) pmax, nl_ + 1);
+            }
+            fuse_n_drop += fuse_tok[s].size();
+            fuse_clear(s);
+            return false;
+        }
+        return true;
+    }
+
     // decode the kept rows of the sequences in want (every one when null) alone
     bool fuse_flush(const std::vector<char> * want) {
         batch.clear();
         for (llama_seq_id s = 0; s < (llama_seq_id) n_seq; ++s) {
-            if (fuse_tok[s].empty() || (want && !(*want)[s])) {
+            if (fuse_tok[s].empty() || (want && !(*want)[s]) || !fuse_valid(s)) {
                 continue;
             }
             fuse_add(s);
@@ -4253,6 +4275,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 const llama_pos lim = dparams[s].drafting ? dparams[s].pos0 :
                         llama_memory_seq_pos_max(llama_get_memory(params.ctx_tgt), s) + 1;
                 fuse_trim(s, lim);
+                fuse_valid(s);
                 if (!fuse_tok[s].empty() && dparams[s].drafting && fuse_pos[s].back() + 1 != dparams[s].pos0) {
                     alone[s] = 1;
                 }
@@ -4294,7 +4317,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
 
             // [TAG_FN_L4_HOST_MTPFUSE] the kept rows of the last verify batch in front of this sequence's first draft row
-            if (fuse_on && !fuse_tok[seq_id].empty()) {
+            if (fuse_on && !fuse_tok[seq_id].empty() && fuse_valid(seq_id)) {
                 fuse_add(seq_id);
                 fuse_n_fused++;
             }
