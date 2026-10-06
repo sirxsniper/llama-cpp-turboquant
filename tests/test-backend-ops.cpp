@@ -17797,7 +17797,9 @@ static bool run_cpu_fn_moe_pool_l3(ggml_backend_t backend, ggml_backend_t backen
                                     // stable + solo: every piece the job computes was pulled by its own worker. Without solo the
                                     // caller (compute thread 0) takes no part in a prefetch, so its pieces are never prefetched;
                                     // stealing moves pieces to other threads
-                                    const bool hit_ok = split == 2 || !solo ? st0.pf_hit_mib <= st0.mib + 1e-9 && st0.pf_hit_mib > 0.0 :
+                                    // [TAG_FN_L4_MEM_POOLBAR] a stealing dataflow job has no barrier: the caller may take every
+                                    // piece before a sleeping worker wakes, so its prefetched pieces can all go to the caller
+                                    const bool hit_ok = split == 2 || !solo ? st0.pf_hit_mib <= st0.mib + 1e-9 && (st0.pf_hit_mib > 0.0 || (dfl && split == 2)) :
                                                                               std::fabs(st0.pf_hit_mib - st0.mib) < 1e-9;
                                     // [TAG_FN_L3_CPU_STATS] the list holds every routed expert: recall 1, precision <= 1
                                     const bool pred_ok = st0.pred_jobs == 1 && std::fabs(st0.pf_recall - 1.0) < 1e-9 &&
