@@ -154,6 +154,10 @@ void llama_moe_hot_save_now(const void * owner);
 // max graph width for the hot chain, 0 when hot mode is off
 int llama_moe_hot_max_t();
 
+// [TAG_FN_L4_MEM_PROMPT] the widest graph that builds the hot chain: llama_moe_hot_max_t, or 31 with LLAMA_FN_L4_PROMPT_HOT=1
+// (qwen4exp: the short prompt path's ubatches); 0 when hot mode is off
+int llama_moe_hot_graph_max_t();
+
 // [TAG_FN_R1_PFS_LEND] the prefill stream borrows the top `bytes` of the hot set's device buffer as its VRAM banks while
 // a prompt streams (LLAMA_PREFILL_STREAM_LEND=1), so the banks cost the decode no hot slots. The caller must have
 // synchronized every graph of the owner context: the hot layers whose slots lie in the lent range leave both tables

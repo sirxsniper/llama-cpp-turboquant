@@ -3579,9 +3579,20 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     // [TAG_FN_L3_VRAM_CBUF] a batch wider than the SMALL reserve runs with the FULL one (the hot set's tail gives its VRAM
     // back first); the next narrow batch returns to SMALL and refills the tail. The whole batch keeps one state: its
     // ubatches are at most n_ubatch wide either way, and a narrow ubatch under FULL just runs without the tail layers
+    cbuf_short = false;
     if (cbuf_state != CBUF_OFF) {
         cbuf_n_batch++;
-        const bool wide = n_tokens_all > cbuf_small_t;
+        bool wide = n_tokens_all > cbuf_small_t;
+        // [TAG_FN_L4_MEM_PROMPT] a short prompt between decodes stays SMALL (a FULL state of a running long prompt stays)
+        if (wide && cbuf_short_max > 0 && (uint32_t) n_tokens_all <= cbuf_short_max && cbuf_state == CBUF_SMALL && !cbuf_pinned) {
+            wide       = false;
+            cbuf_short = true;
+            if (cbuf_n_short++ < 3) {
+                LLAMA_LOG_INFO("%s: [TAG_FN_L4_MEM_PROMPT] a %d-token batch stays SMALL (<= %u tokens, LLAMA_FN_L4_PROMPT): "
+                        "ubatches of <= %u tokens with the host experts on the CPU, no FULL switch, no stream\n", __func__,
+                        (int) n_tokens_all, cbuf_short_max, cbuf_small_t);
+            }
+        }
         if (wide) {
             cbuf_narrow_run = 0;
             if (cbuf_state == CBUF_SMALL) {
@@ -3643,8 +3654,12 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
     llama_memory_context_ptr mctx;
 
+    // [TAG_FN_L4_MEM_PROMPT] the short path splits at the SMALL reserve's width
+    const uint32_t n_ubatch_split = cbuf_short ? std::min(cparams.n_ubatch, cbuf_small_t) : cparams.n_ubatch;
+    const int64_t  t_short0       = cbuf_short ? ggml_time_us() : 0;
+
     while (true) {
-        mctx = memory->init_batch(*balloc, cparams.n_ubatch, output_all);
+        mctx = memory->init_batch(*balloc, n_ubatch_split, output_all);
         if (!mctx) {
             return -2;
         }
@@ -4058,6 +4073,15 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     // the first decode step. The outputs are in host buffers once cbuf_set has synchronized.
     if (cbuf_state == CBUF_FULL && cbuf_eager && !cbuf_pinned && n_tokens_all < cparams.n_batch) {
         cbuf_set(false);
+    }
+
+    if (cbuf_short) { // [TAG_FN_L4_MEM_PROMPT] host time of the batch (its last graph may still run on the device)
+        cbuf_ms_short += (ggml_time_us() - t_short0)/1000.0;
+        if (cbuf_n_short <= 3 || cbuf_n_short % 32 == 0) {
+            LLAMA_LOG_INFO("%s: [TAG_FN_L4_MEM_PROMPT] short batch %" PRIu64 ": %d tokens, %.1f ms on the host; %.1f ms per short "
+                    "batch so far\n", __func__, cbuf_n_short, (int) n_tokens_all, (ggml_time_us() - t_short0)/1000.0,
+                    cbuf_ms_short/(double) cbuf_n_short);
+        }
     }
 
     return 0;
@@ -5849,6 +5873,7 @@ size_t llama_context::cbuf_prepare(ggml_backend_dev_t dev) {
     if (const char * e = getenv("LLAMA_FN_CBUF_THRASH")) {
         cbuf_thrash = std::max(0, atoi(e));
     }
+    cbuf_short_max = (uint32_t) std::max(0, llama_fn_l3_int(model, "LLAMA_FN_L4_PROMPT", 0)); // [TAG_FN_L4_MEM_PROMPT]
     llama_perf_hold hold(n_queued_tokens, t_compute_start_us);
     synchronize();
     // FULL as prompts see it now (the constructor reserved before the draft context set its outputs), then SMALL

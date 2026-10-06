@@ -327,6 +327,11 @@ struct ggml_cpu_moe_pool {
     std::vector<int32_t>  claim;                   // split STEAL: the claim words, kept between jobs
     uint32_t              epoch   = 0;
 
+    // [TAG_FN_L4_MEM_POOLBAR] the dataflow counters of a job (cleared before it is posted), 64-byte aligned
+    bool                  dflow   = false;
+    std::vector<int32_t>  dfl;
+    bool                  pf_fix  = false;         // [TAG_FN_L4_MEM_PFDEV]
+
     // [TAG_FN_L3_CPU_STATS]
     bool                    stats = false;
     double                  tick_per_us = 1.0;
@@ -654,6 +659,8 @@ struct ggml_cpu_moe_pool * ggml_cpu_moe_pool_new(const struct ggml_cpu_moe_pool_
     p->stats     = pp->stats;
     p->swpf      = std::min(std::max(pp->swpf, 0), 64); // [TAG_FN_L3_CPU_SWPF]
     p->pf_streams = std::min(std::max(pp->pf_streams, 1), 8); // [TAG_FN_L3_CPU_PFSTREAMS]
+    p->dflow     = pp->dflow;                                // [TAG_FN_L4_MEM_POOLBAR]
+    p->pf_fix    = pp->pf_fix;                               // [TAG_FN_L4_MEM_PFDEV]
 
     std::vector<int> list;
     for (int i = 0; i < GGML_MAX_N_THREADS; i++) {
@@ -922,6 +929,16 @@ enum ggml_status ggml_cpu_moe_run(struct ggml_cpu_moe_pool * p, const struct ggm
             a.pf_done = p->pf_done.data();
         }
     }
+    if (p->dflow) { // [TAG_FN_L4_MEM_POOLBAR] zero before the post below publishes them
+        const size_t words = (size_t) ggml_fn_moe_dflow_words(l->up, n_used, T);
+        if (p->dfl.size() < words + GGML_FN_MOE_DFLOW_STRIDE) {
+            p->dfl.resize(words + GGML_FN_MOE_DFLOW_STRIDE);
+        }
+        int32_t * d = p->dfl.data();
+        d += ((64 - ((uintptr_t) d & 63)) & 63)/sizeof(int32_t);
+        memset(d, 0, words*sizeof(int32_t));
+        a.dflow = d;
+    }
     p->pf_up = nullptr; // a later job of this layer (the next step) is not predicted by this prefetch
     p->pf_done_valid = false;
     if (p->stats) {
@@ -995,6 +1012,9 @@ enum ggml_status ggml_cpu_moe_prefetch(struct ggml_cpu_moe_pool * p, const struc
         // [TAG_FN_L3_CPU_DEVPRED] the workers only pull: the given list is ranked here, on the caller
         p->pf_n = moe_pool_rank_list(l, job->list, T, job->k, n_exp, p->pf_mark, p->pf_list.data());
         p->pf_experts.fetch_add((uint64_t) p->pf_n, std::memory_order_relaxed);
+        if (p->pf_fix) {
+            p->pf_list_gen.store(p->pf_gen, std::memory_order_release); // [TAG_FN_L4_MEM_PFDEV] no router phase publishes it
+        }
     } else if (p->pf_rank) {
         p->pf_topk.resize((size_t) T*std::min<int64_t>(job->k, n_exp)); // [TAG_FN_L3_CPU_PFRANK]
     }
@@ -1055,7 +1075,13 @@ size_t ggml_cpu_moe_prefetch_caller(struct ggml_cpu_moe_pool * p, const volatile
     const int n = p->pf_n;
     size_t b = 0;
     if (n > 0 && L != nullptr && !*stop) {
-        b = ggml_fn_moe_prefetch(L->up, L->gate, L->down, p->pf_list.data(), n, 0, p->n_threads, stop, p->pf.mode);
+        if (p->pf_fix && p->split >= GGML_CPU_MOE_SPLIT_STABLE) {
+            // [TAG_FN_L4_MEM_PFDEV] the pieces compute thread 0 owns in a split >= 1 job, as the workers' pull takes theirs
+            b = ggml_fn_moe_prefetch_stable(L->up, L->gate, L->down, p->pf_list.data(), n, 0, p->n_threads, stop, p->pf.mode,
+                    nullptr, p->pf_streams);
+        } else {
+            b = ggml_fn_moe_prefetch(L->up, L->gate, L->down, p->pf_list.data(), n, 0, p->n_threads, stop, p->pf.mode);
+        }
     }
     if (*stop) {
         p->pfc_stopped.fetch_add(1, std::memory_order_relaxed);

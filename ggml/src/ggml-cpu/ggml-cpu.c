@@ -2211,7 +2211,32 @@ struct ggml_fn_moe_ctx {
     size_t            o_nb1;
     size_t            o_nb2;
     int64_t           claim_run; // split 2: claim words per thread and phase
+    int32_t *         df_gu;     // [TAG_FN_L4_MEM_POOLBAR] or NULL: per active expert, its gate / up pieces done
+    int32_t *         df_dn;     // [TAG_FN_L4_MEM_POOLBAR] or NULL: per block of GGML_FN_MOE_PD down rows, its pieces done
+    int64_t           np3;       // gate / up pieces per expert
 };
+
+// [TAG_FN_L4_MEM_POOLBAR] the counters of a dataflow job: add returns the new value (acquire + release), load acquires
+static inline int32_t ggml_fn_moe_df_add(int32_t * w) {
+#if defined(_MSC_VER) && !defined(__clang__)
+    return (int32_t) InterlockedExchangeAdd((volatile LONG *) w, 1) + 1;
+#else
+    return __atomic_add_fetch(w, 1, __ATOMIC_ACQ_REL);
+#endif
+}
+
+static inline int32_t ggml_fn_moe_df_load(const int32_t * w) {
+#if defined(_MSC_VER) && !defined(__clang__)
+    return (int32_t) *(const volatile LONG *) w; // x64 /volatile:ms: an acquire load
+#else
+    return __atomic_load_n(w, __ATOMIC_ACQUIRE);
+#endif
+}
+
+int64_t ggml_fn_moe_dflow_words(const struct ggml_tensor * up, int n_used, int n_tokens) {
+    const int64_t n_blk = (up->ne[0] + GGML_FN_MOE_PD - 1)/GGML_FN_MOE_PD;
+    return ((int64_t) n_used*n_tokens + n_blk)*GGML_FN_MOE_DFLOW_STRIDE;
+}
 
 // gate + up + swiglu + quantized h, rows [pp*pr, pp*pr + nr) of active expert kk for all its entries; returns the weight
 // bytes read
@@ -2276,6 +2301,58 @@ static inline size_t ggml_fn_moe_piece(const struct ggml_fn_moe_ctx * c, int pha
     return phase == 0 ? ggml_fn_moe_piece_gu(c, kk, pp) : ggml_fn_moe_piece_down(c, kk, pp);
 }
 
+// [TAG_FN_L4_MEM_POOLBAR] rows [r_begin, r_end) of the weighted sum over the slots computed here, in slot order (as step 5
+// of ggml_fn_moe_compute)
+static void ggml_fn_moe_wsum(const struct ggml_fn_moe_ctx * c, int64_t r_begin, int64_t r_end) {
+    const struct ggml_fn_moe_args * a = c->a;
+    const float * dscr   = (const float *) c->orow;
+    const int     n_used = c->n_used;
+    const int64_t n_embd = c->n_embd;
+    for (int t = 0; t < a->n_tokens; ++t) {
+        float * dst = a->out_sum + (size_t) t*n_embd;
+        for (int64_t r = r_begin; r < r_end; ++r) {
+            float sum = 0.0f;
+            for (int slot = 0; slot < n_used; ++slot) {
+                const int32_t e = *(const int32_t *) (a->ids + (size_t) slot*a->ids_nb0 + (size_t) t*a->ids_nb1);
+                if (a->table != NULL && a->table[e] != a->table_miss) {
+                    continue;
+                }
+                sum += a->w[slot + (size_t) n_used*t]*dscr[((size_t) t*n_used + slot)*n_embd + r];
+            }
+            dst[r] = sum;
+        }
+    }
+}
+
+// [TAG_FN_L4_MEM_POOLBAR] a piece of a job with dataflow counters (else ggml_fn_moe_piece): a gate / up piece counts for its
+// expert; a down piece first waits until its expert's gate / up pieces are all done (acc[3]: ticks waited), then counts
+// for its block of rows, and the thread that completes a block sums it. Every piece runs exactly once, so the counts end
+// at np3 per expert and n_act per block.
+static size_t ggml_fn_moe_piece_dfl(const struct ggml_fn_moe_ctx * c, int phase, int kk, int64_t pp, uint64_t * acc) {
+    if (c->df_gu == NULL) {
+        return ggml_fn_moe_piece(c, phase, kk, pp);
+    }
+    if (phase == 0) {
+        const size_t b = ggml_fn_moe_piece_gu(c, kk, pp);
+        ggml_fn_moe_df_add(c->df_gu + (size_t) kk*GGML_FN_MOE_DFLOW_STRIDE);
+        return b;
+    }
+    const int32_t * g = c->df_gu + (size_t) kk*GGML_FN_MOE_DFLOW_STRIDE;
+    if (ggml_fn_moe_df_load(g) < c->np3) {
+        const uint64_t t0 = ggml_fn_moe_tick();
+        while (ggml_fn_moe_df_load(g) < c->np3) {
+            ggml_thread_cpu_relax();
+        }
+        acc[3] += ggml_fn_moe_tick() - t0;
+    }
+    const size_t b = ggml_fn_moe_piece_down(c, kk, pp);
+    if (c->df_dn != NULL && ggml_fn_moe_df_add(c->df_dn + (size_t) pp*GGML_FN_MOE_DFLOW_STRIDE) == c->n_act) {
+        const int64_t r0 = pp*GGML_FN_MOE_PD;
+        ggml_fn_moe_wsum(c, r0, MIN(r0 + GGML_FN_MOE_PD, c->n_embd));
+    }
+    return b;
+}
+
 // [TAG_FN_L3_CPU_SWPF] software prefetches of `lines` cache lines at the start of the range and at every 4 KiB page in it:
 // the page walks and the first misses of each page start early, where the hardware stream prefetcher stops at a page
 static void ggml_fn_moe_pf_pages(const char * p, size_t len, int lines) {
@@ -2328,7 +2405,8 @@ static bool ggml_fn_moe_next_own(const struct ggml_fn_moe_ctx * c, int64_t np_e,
 }
 
 // [TAG_FN_L3_CPU_SPLIT] the pieces of one phase (0: gate / up, 1: down) that thread ith computes. acc: [0] weight bytes,
-// [1] pieces taken from other threads, [2] bytes of experts this thread's stable prefetch covered
+// [1] pieces taken from other threads, [2] bytes of experts this thread's stable prefetch covered, [3] ticks its down
+// pieces waited for their experts ([TAG_FN_L4_MEM_POOLBAR])
 static void ggml_fn_moe_phase(const struct ggml_fn_moe_ctx * c, int phase, int ith, int nth, uint64_t * acc) {
     const struct ggml_fn_moe_args * a = c->a;
     const int64_t np_e  = phase == 0 ? (c->n_ff + c->pr - 1)/c->pr : (c->n_embd + GGML_FN_MOE_PD - 1)/GGML_FN_MOE_PD;
@@ -2342,7 +2420,7 @@ static void ggml_fn_moe_phase(const struct ggml_fn_moe_ctx * c, int phase, int i
             if (a->swpf > 0 && p + 1 < p1) { // [TAG_FN_L3_CPU_SWPF]
                 ggml_fn_moe_piece_pf(c, phase, (int) ((p + 1)/np_e), (p + 1) % np_e, a->swpf);
             }
-            acc[0] += ggml_fn_moe_piece(c, phase, (int) (p/np_e), p % np_e);
+            acc[0] += ggml_fn_moe_piece_dfl(c, phase, (int) (p/np_e), p % np_e, acc);
         }
         return;
     }
@@ -2363,7 +2441,7 @@ static void ggml_fn_moe_phase(const struct ggml_fn_moe_ctx * c, int phase, int i
                 ggml_fn_moe_piece_pf(c, phase, kn, pn, a->swpf);
             }
             const int32_t e = c->act[3*kk];
-            const size_t  b = ggml_fn_moe_piece(c, phase, kk, pp);
+            const size_t  b = ggml_fn_moe_piece_dfl(c, phase, kk, pp, acc);
             acc[0] += b;
             if (pfd && pfd[e]) {
                 acc[2] += b;
@@ -2402,7 +2480,7 @@ static void ggml_fn_moe_phase(const struct ggml_fn_moe_ctx * c, int phase, int i
                     met = true;
                     break;
                 }
-                acc[0] += ggml_fn_moe_piece(c, phase, kv, pv);
+                acc[0] += ggml_fn_moe_piece_dfl(c, phase, kv, pv, acc);
                 acc[1]++;
             }
         }
@@ -2567,9 +2645,14 @@ void ggml_fn_moe_compute(const struct ggml_fn_moe_args * a, int ith, int nth, vo
     c.o_nb1  = o_nb1;
     c.o_nb2  = o_nb2;
     c.claim_run = a->split >= 2 ? GGML_FN_MOE_CLAIM_RUN(n_used*T, ggml_fn_moe_np_max(wu, wd), nth) : 0;
+    // [TAG_FN_L4_MEM_POOLBAR] dataflow counters instead of the two barriers (n_used*T expert words, then the row blocks)
+    const bool dfl = a->dflow != NULL;
+    c.df_gu  = dfl ? a->dflow : NULL;
+    c.df_dn  = dfl && a->w ? a->dflow + (size_t) n_used*T*GGML_FN_MOE_DFLOW_STRIDE : NULL;
+    c.np3    = (n_ff + c.pr - 1)/c.pr;
     GGML_ASSERT(c.pr <= 256);
 
-    uint64_t acc[3] = { 0, 0, 0 };
+    uint64_t acc[4] = { 0, 0, 0, 0 };
 
     // 3. gate + up + swiglu + quantized h, in pieces of pr rows
     ggml_fn_moe_phase(&c, 0, ith, nth, acc);
@@ -2577,13 +2660,18 @@ void ggml_fn_moe_compute(const struct ggml_fn_moe_args * a, int ith, int nth, vo
         ts[GGML_FN_MOE_TS_P3] = ggml_fn_moe_tick();
     }
 
-    barrier(barrier_ctx);
+    if (!dfl) {
+        barrier(barrier_ctx);
+    }
     if (ts) {
         ts[GGML_FN_MOE_TS_B1] = ggml_fn_moe_tick();
     }
 
     // 4. down, in pieces of GGML_FN_MOE_PD rows of n_embd
     ggml_fn_moe_phase(&c, 1, ith, nth, acc);
+    if (ts && dfl) {
+        ts[GGML_FN_MOE_TS_B1] = ts[GGML_FN_MOE_TS_P3] + acc[3]; // the waits for experts count as the barrier's wait
+    }
     // graph layout: the rows of the slots computed elsewhere are zero, as the unfused op leaves them
     if (a->table && !a->w) {
         for (int i = ith; i < n_used*T; i += nth) {
@@ -2599,8 +2687,14 @@ void ggml_fn_moe_compute(const struct ggml_fn_moe_args * a, int ith, int nth, vo
         ts[GGML_FN_MOE_TS_B2] = ts[GGML_FN_MOE_TS_P4];
     }
 
+    // [TAG_FN_L4_MEM_POOLBAR] the threads that completed the row blocks summed them; a job with no expert here sums its zeros
+    // by row range (no thread writes the scratch)
+    if (a->w && dfl && n_act == 0) {
+        ggml_fn_moe_wsum(&c, n_embd*ith/nth, n_embd*(ith + 1)/nth);
+    }
+
     // 5. weighted sum over the slots computed here, in slot order
-    if (a->w) {
+    if (a->w && !dfl) {
         barrier(barrier_ctx);
         if (ts) {
             ts[GGML_FN_MOE_TS_B2] = ggml_fn_moe_tick();
