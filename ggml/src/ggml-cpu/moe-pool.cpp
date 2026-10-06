@@ -15,6 +15,7 @@
 #include <cstring>
 #include <mutex>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #if defined(_WIN32)
@@ -337,6 +338,9 @@ struct ggml_cpu_moe_pool {
     bool                  pf_score = false;
     int                   pf_pull  = 0;            // [TAG_FN_L6_PF] GGML_FN_PF_* flags of the pull
     int                   pf_cap   = 0;            // [TAG_FN_L6_PF] experts of a given list pulled at most (0: all)
+    int                   pf_fresh = 0;            // [TAG_FN_L6_PF] see ggml_cpu_moe_pool_params.pf_fresh
+    uint32_t              pf_clock = 0;            // jobs run
+    std::unordered_map<const ggml_tensor *, std::vector<uint32_t>> pf_seen; // per layer (up tensor): the job clock of each expert's last CPU job
     std::vector<int32_t>  pf_gt;
     int                   pf_gT = 0;
     int                   pf_gk = 0;
@@ -731,6 +735,7 @@ struct ggml_cpu_moe_pool * ggml_cpu_moe_pool_new(const struct ggml_cpu_moe_pool_
     p->pf_score  = pp->pf_score;                             // [TAG_FN_L6_PF]
     p->pf_pull   = pp->pf_pull & (GGML_FN_PF_FINE_STOP | GGML_FN_PF_VEC);
     p->pf_cap    = std::max(0, pp->pf_cap);
+    p->pf_fresh  = std::max(0, pp->pf_fresh);
 
     std::vector<int> list;
     for (int i = 0; i < GGML_MAX_N_THREADS; i++) {
@@ -1039,6 +1044,17 @@ enum ggml_status ggml_cpu_moe_run(struct ggml_cpu_moe_pool * p, const struct ggm
     if (score_learn) {
         moe_pool_score_learn(p, l, job->ids, n_used*T, l->up->ne[2]);
     }
+    if (p->pf_fresh > 0) { // [TAG_FN_L6_PF] the experts this job read on the CPU (their pages are resident now)
+        auto & v = p->pf_seen[l->up];
+        v.resize((size_t) l->up->ne[2], 0);
+        const uint32_t clk = ++p->pf_clock;
+        for (int i = 0; i < n_used*T; ++i) {
+            const int32_t e = job->ids[i];
+            if (e >= 0 && e < l->up->ne[2] && !(l->table != nullptr && l->table[e] != l->table_miss)) {
+                v[e] = clk;
+            }
+        }
+    }
     p->pf_gT = 0;
     if (p->stats) {
         p->st_job_pending = true;
@@ -1093,6 +1109,18 @@ enum ggml_status ggml_cpu_moe_prefetch(struct ggml_cpu_moe_pool * p, const struc
             p->pf_n  = moe_pool_score_list(p, l, job->list, T, job->k, n_exp, p->pf_list.data());
         } else {
             p->pf_n = moe_pool_rank_list(l, job->list, T, job->k, n_exp, p->pf_mark, p->pf_list.data());
+        }
+        if (p->pf_fresh > 0) { // [TAG_FN_L6_PF] only experts a recent job read (no page-in of a mispredicted expert)
+            const auto it = p->pf_seen.find(l->up);
+            int m = 0;
+            for (int i = 0; i < p->pf_n; ++i) {
+                const int32_t e = p->pf_list[i];
+                const uint32_t s = it != p->pf_seen.end() && (size_t) e < it->second.size() ? it->second[e] : 0;
+                if (s != 0 && p->pf_clock - s <= (uint32_t) p->pf_fresh) {
+                    p->pf_list[m++] = e;
+                }
+            }
+            p->pf_n = m;
         }
         if (p->pf_cap > 0 && p->pf_n > p->pf_cap) {
             p->pf_n = p->pf_cap; // [TAG_FN_L6_PF]

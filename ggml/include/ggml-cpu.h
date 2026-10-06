@@ -208,6 +208,9 @@ extern "C" {
                                              // (per rank hit rates learned from the jobs, combined over the tokens), not by rank
         int  pf_pull;                        // [TAG_FN_L6_PF] bits: 1 a stopped pull leaves within 1 KiB of each region (not
                                              // 4 KiB), 2 whole-line vector loads (pf_streams > 1, real loads)
+        int  pf_fresh;                       // [TAG_FN_L6_PF] 0, or a given list keeps only experts a job of the pool computed
+                                             // within the last pf_fresh jobs (their pages are resident: the pull never pages in
+                                             // a mispredicted expert from disk)
         int  pf_cap;                         // [TAG_FN_L6_PF] 0, or a given list is cut to its first pf_cap experts (less
                                              // DRAM traffic beside the device's host accesses at the end of the window)
     };
