@@ -1079,6 +1079,12 @@ void llama_moe_bridge_free(llama_moe_bridge * br) {
     br_destroy(br);
 }
 
+void llama_moe_bridge_release(llama_moe_bridge * br) {
+    if (br && br->gb && br->fn_release) {
+        br->fn_release(br->gb);
+    }
+}
+
 // [TAG_FN_L3_HOST_QUIET]
 void llama_moe_bridge_quiet_wait(int max_ms) {
     if (!g_quiet_on.load(std::memory_order_relaxed)) {

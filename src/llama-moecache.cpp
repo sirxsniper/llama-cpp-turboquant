@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cinttypes>
 #include <cmath>
 #include <condition_variable>
@@ -160,6 +161,13 @@ struct moe_cache {
     std::vector<upload_job>  done;
     bool                     stop = false;
 
+    // [TAG_FN_L4_EXIT] paused (under wmtx): the owner is idle (llama_moe_hot_idle), the queue waits for its next step.
+    // up_yield = stop, or paused without a drain: the worker takes no new batch and a bucket wait gives up. up_quit = stop:
+    // the worker leaves its batch after the chunk in flight. A batch holds at most UP_INFLIGHT_MAX bytes.
+    bool                     paused = false;
+    std::atomic<bool>        up_yield { false };
+    std::atomic<bool>        up_quit  { false };
+
     // [TAG_FN_R1_PFS_LEND] the worker holds a batch (its uploads may still be writing slots); wcv_idle: it put one down
     bool                     worker_busy = false;
     std::condition_variable  wcv_idle;
@@ -219,7 +227,7 @@ struct moe_cache {
     bool                  cb_out   = false;
     ggml_context *        cb_ctx   = nullptr;
     ggml_tensor *         cb_raw   = nullptr; // I8 over the tail: one clear after it is mapped again
-    bool                  cb_async = true;    // LLAMA_FN_CBUF_ASYNC: the refill through the upload worker
+    bool                  cb_async = false;   // LLAMA_FN_CBUF_ASYNC=1: the refill through the upload worker ([TAG_FN_L4_EXIT] off by default)
     size_t                cb_async_left = 0;  // tail jobs of the last restore not published yet
     int64_t               cb_async_t0   = 0;
     bool (*cb_map)(ggml_backend_buffer_t, size_t, size_t)   = nullptr;
@@ -776,16 +784,30 @@ bool hot_rate_take(moe_cache * mc, size_t bytes, bool wait = true) {
         return true;
     }
     std::unique_lock<std::mutex> lk(mc->wmtx);
-    if (mc->up_bucket < bytes && !mc->up_drain && !mc->stop) {
-        if (!wait) {
-            return false;
+    if (mc->up_bucket < bytes && !mc->up_drain) {
+        if (!wait || mc->up_yield.load()) {
+            return false; // [TAG_FN_L4_EXIT] stop or idle: the worker puts its batch down instead of waiting for a step
         }
         mc->up_waits.fetch_add(1, std::memory_order_relaxed);
-        mc->wcv.wait(lk, [&]() { return mc->up_bucket >= bytes || mc->up_drain || mc->stop; });
+        mc->wcv.wait(lk, [&]() { return mc->up_bucket >= bytes || mc->up_drain || mc->up_yield.load(); });
+        if (mc->up_bucket < bytes && !mc->up_drain) {
+            return false;
+        }
     }
     mc->up_bucket = mc->up_bucket > bytes ? mc->up_bucket - bytes : 0;
     return true;
 }
+
+// [TAG_FN_L4_EXIT] under wmtx: the worker yields (puts its batch down after the chunk in flight) on stop, and while the
+// owner is idle unless a lend / release drains the queue
+void hot_set_yield(moe_cache * mc) {
+    // a drain needs the worker only with a rate limit (it then waits for the queue to empty)
+    mc->up_yield.store(mc->stop || (mc->paused && !(mc->up_drain && mc->up_rate > 0)));
+    mc->up_quit.store(mc->stop);
+}
+
+// [TAG_FN_L4_EXIT] at most this many bytes of the worker's copies are in flight at any time
+constexpr size_t UP_INFLIGHT_MAX = 64u << 20;
 
 // a slice's source and destination are inside their tensors (upload_slice's check)
 bool hot_slice_ok(const ggml_tensor * dst_c, const ggml_tensor * src, int32_t expert, int32_t slot) {
@@ -800,7 +822,8 @@ bool hot_slice_ok(const ggml_tensor * dst_c, const ggml_tensor * src, int32_t ex
 // [TAG_FN_L3_POLICY_UPLOAD] LLAMA_MOE_HOT_UP_PIPE: the batch through two small pinned halves - the copy threads fill one
 // while the upload stream reads the other (an event per half orders the reuse) - so the staging stays cache resident and
 // the memcpy overlaps the DMA. Returns after every copy of the batch has landed.
-void hot_upload_pipe(moe_cache * mc, std::vector<upload_job> & batch) {
+// [TAG_FN_L4_EXIT] returns the jobs done; on stop (or a bucket wait at idle) the rest, from that index, is not uploaded
+size_t hot_upload_pipe(moe_cache * mc, std::vector<upload_job> & batch) {
     struct staged { ggml_tensor * dst; size_t off; size_t size; size_t stage_off; };
     std::vector<staged> st;
     int    h    = 0;
@@ -830,7 +853,12 @@ void hot_upload_pipe(moe_cache * mc, std::vector<upload_job> & batch) {
     wait_half(h);
     const int64_t t0 = ggml_time_us();
     size_t batch_bytes = 0;
-    for (auto & j : batch) {
+    size_t n_done = 0;
+    for (; n_done < batch.size(); ++n_done) {
+        if (mc->up_quit.load(std::memory_order_relaxed)) {
+            break; // [TAG_FN_L4_EXIT] stop: what is staged lands below, the rest is dropped
+        }
+        upload_job & j = batch[n_done];
         llama_moe_bridge_quiet_wait(100); // [TAG_FN_L3_HOST_QUIET] no expert copy while a bridged graph runs
         layer_state & ls = mc->layers[j.layer_idx];
         ggml_tensor *       dsts[3] = { ls.pub.up_c,   ls.pub.gate_c,   ls.pub.down_c   };
@@ -841,12 +869,16 @@ void hot_upload_pipe(moe_cache * mc, std::vector<upload_job> & batch) {
         if (j.failed) {
             continue;
         }
+        bool cut = false;
         for (int k = 0; k < 3; ++k) {
             const size_t sz = srcs[k]->nb[2];
             batch_bytes += sz;
             if (!hot_rate_take(mc, sz, false)) {
                 flush(); // what is staged uploads while the bucket refills
-                hot_rate_take(mc, sz, true);
+                if (!hot_rate_take(mc, sz, true)) {
+                    cut = true; // [TAG_FN_L4_EXIT] stop / idle: the job is dropped whole (its slot is in flight, no table names it)
+                    break;
+                }
             }
             if (sz > mc->up_half) {
                 flush();
@@ -862,6 +894,9 @@ void hot_upload_pipe(moe_cache * mc, std::vector<upload_job> & batch) {
             used += sz;
             mc->up_bytes.fetch_add(sz, std::memory_order_relaxed);
         }
+        if (cut) {
+            break;
+        }
     }
     flush();
     ggml_backend_synchronize(mc->up_backend); // every copy of the batch has landed
@@ -871,10 +906,12 @@ void hot_upload_pipe(moe_cache * mc, std::vector<upload_job> & batch) {
                 "(%.1f GiB/s, incl. bucket waits)\n", (unsigned long long) mc->up_batches, batch.size(), batch_bytes/1048576.0, ms,
                 ms > 0 ? batch_bytes/1073741824.0/(ms/1000.0) : 0.0);
     }
+    return n_done;
 }
 
 // the batch through the one large pinned staging buffer: fill it, upload, wait, repeat
-void hot_upload_staged(moe_cache * mc, const std::vector<upload_job> & batch) {
+// [TAG_FN_L4_EXIT] returns the jobs done, as hot_upload_pipe
+size_t hot_upload_staged(moe_cache * mc, const std::vector<upload_job> & batch) {
     struct staged { ggml_tensor * dst; size_t off; size_t size; size_t stage_off; };
     std::vector<staged> st;
     size_t used = 0;
@@ -887,14 +924,23 @@ void hot_upload_staged(moe_cache * mc, const std::vector<upload_job> & batch) {
         st.clear();
         used = 0;
     };
-    for (const auto & j : batch) {
+    size_t n_done = 0;
+    for (; n_done < batch.size(); ++n_done) {
+        if (mc->up_quit.load(std::memory_order_relaxed)) {
+            break; // [TAG_FN_L4_EXIT] stop: what is staged lands below, the rest is dropped
+        }
+        const upload_job & j = batch[n_done];
         llama_moe_bridge_quiet_wait(100); // [TAG_FN_L3_HOST_QUIET] no expert copy while a bridged graph runs
         layer_state & ls = mc->layers[j.layer_idx];
         ggml_tensor *       dsts[3] = { ls.pub.up_c,   ls.pub.gate_c,   ls.pub.down_c   };
         const ggml_tensor * srcs[3] = { ls.pub.up_src, ls.pub.gate_src, ls.pub.down_src };
+        bool cut = false;
         for (int k = 0; k < 3; ++k) {
             const size_t sz = srcs[k]->nb[2];
-            hot_rate_take(mc, sz); // [TAG_FN_L3_POLICY_UPLOAD] a no-op without LLAMA_MOE_HOT_UP_MIB_STEP
+            if (!hot_rate_take(mc, sz)) { // [TAG_FN_L3_POLICY_UPLOAD] a no-op without LLAMA_MOE_HOT_UP_MIB_STEP
+                cut = true; // [TAG_FN_L4_EXIT] stop / idle: the job is dropped whole
+                break;
+            }
             mc->up_bytes.fetch_add(sz, std::memory_order_relaxed);
             if (sz > mc->stage_size) {
                 upload_slice(dsts[k], srcs[k], j.expert, j.slot);
@@ -907,8 +953,12 @@ void hot_upload_staged(moe_cache * mc, const std::vector<upload_job> & batch) {
             st.push_back({ dsts[k], (size_t) j.slot*dsts[k]->nb[2], sz, used });
             used += sz;
         }
+        if (cut) {
+            break;
+        }
     }
     flush();
+    return n_done;
 }
 
 // uploads the queued slices: mmap -> pinned staging -> the upload backend's own stream, then marks them done
@@ -917,7 +967,8 @@ void hot_adapt_worker(moe_cache * mc) {
     for (;;) {
         {
             std::unique_lock<std::mutex> lk(mc->wmtx);
-            mc->wcv.wait(lk, [mc]() { return mc->stop || !mc->todo.empty(); });
+            // [TAG_FN_L4_EXIT] an idle owner's queue waits for its next step (or a drain)
+            mc->wcv.wait(lk, [mc]() { return mc->stop || (!mc->todo.empty() && !mc->up_yield.load()); });
             if (mc->stop) {
                 return;
             }
@@ -937,17 +988,20 @@ void hot_adapt_worker(moe_cache * mc) {
                     n++;
                 }
             }
-            // [TAG_FN_L3_VRAM_CBUF] with a tail (the lend on): at most 512 MiB per batch, so a long queue (the tail's
-            // refill) is published as it lands; an admission pass (<= LLAMA_MOE_HOT_DECAY_MIB, 128 MiB) stays one batch.
-            // Without a tail the whole queue (or what the [TAG_FN_L3_POLICY_UPLOAD] bucket allows), as before (cb_buf is set
-            // before this thread starts and never changes)
-            if (mc->cb_buf) {
-                const size_t cap = (size_t) 512 << 20;
+            // [TAG_FN_L4_EXIT] at most UP_INFLIGHT_MAX bytes per batch (at least one job), so the worker is back at the
+            // queue within one bounded chunk: an idle owner or a stop finds no long copy run in flight, and a long queue
+            // (the tail's refill with LLAMA_FN_CBUF_ASYNC=1) is published as it lands
+            {
+                const size_t cap = UP_INFLIGHT_MAX;
                 size_t take  = 0;
                 size_t bytes = 0;
-                while (take < n && (take == 0 || bytes < cap)) {
+                while (take < n) {
                     const layer_state & ls = mc->layers[mc->todo[take].layer_idx];
-                    bytes += ls.pub.up_src->nb[2] + ls.pub.gate_src->nb[2] + ls.pub.down_src->nb[2];
+                    const size_t jb = ls.pub.up_src->nb[2] + ls.pub.gate_src->nb[2] + ls.pub.down_src->nb[2];
+                    if (take > 0 && bytes + jb > cap) {
+                        break;
+                    }
+                    bytes += jb;
                     take++;
                 }
                 n = take;
@@ -956,13 +1010,11 @@ void hot_adapt_worker(moe_cache * mc) {
             mc->todo.erase(mc->todo.begin(), mc->todo.begin() + (std::ptrdiff_t) n);
             mc->worker_busy = true; // [TAG_FN_R1_PFS_LEND]
         }
-        if (mc->up_pipe) {
-            hot_upload_pipe(mc, batch); // [TAG_FN_L3_POLICY_UPLOAD]
-        } else {
-            hot_upload_staged(mc, batch);
-        }
+        const size_t n_done = mc->up_pipe ? hot_upload_pipe(mc, batch) : hot_upload_staged(mc, batch); // [TAG_FN_L3_POLICY_UPLOAD]
         std::lock_guard<std::mutex> lk(mc->wmtx);
-        for (auto j : batch) {
+        for (size_t i = 0; i < batch.size(); ++i) {
+            upload_job j = batch[i];
+            j.failed = j.failed || i >= n_done; // [TAG_FN_L4_EXIT] cut (stop, or a bucket wait at idle): the slot comes back empty
             j.done = true;
             mc->done.push_back(j);
         }
@@ -1281,6 +1333,13 @@ void hot_adapt_publish(moe_cache * mc) {
 // the owning context's step boundary, after its compute has been synchronized: publish finished uploads, roll the
 // windows, then evict and queue new uploads (byte-capped). Nothing here runs while a graph of this context runs.
 void hot_adapt_step_impl(moe_cache * mc) {
+    // [TAG_FN_L4_EXIT] the owner computes again: an idle pause ends (paused changes under step_mtx and wmtx)
+    if (mc->paused) {
+        std::lock_guard<std::mutex> lk(mc->wmtx);
+        mc->paused = false;
+        hot_set_yield(mc);
+        mc->wcv.notify_all();
+    }
     hot_adapt_publish(mc);
 
     bool any = false;
@@ -1464,6 +1523,7 @@ void hot_adapt_init(moe_cache * mc, const llama_model & model, const void * owne
         }
         if (const char * e = llama_fn_env(model, "LLAMA_MOE_HOT_UP_STAGE_MIB")) {
             mc->up_half = (size_t) std::max(2, std::min(256, atoi(e))) << 20;
+            mc->up_half = std::min(mc->up_half, UP_INFLIGHT_MAX/2); // [TAG_FN_L4_EXIT] both halves in flight stay bounded
         }
         if (const char * e = llama_fn_env(model, "LLAMA_MOE_HOT_UP_MIB_STEP")) {
             mc->up_rate = (size_t) std::max(0, atoi(e)) << 20;
@@ -1499,7 +1559,7 @@ void hot_adapt_init(moe_cache * mc, const llama_model & model, const void * owne
         }
     }
     if (!mc->up_pipe) {
-        mc->stage_size = std::max<size_t>(mc->ad_bytes, 16u << 20);
+        mc->stage_size = std::min(std::max<size_t>(mc->ad_bytes, 16u << 20), UP_INFLIGHT_MAX); // [TAG_FN_L4_EXIT] one flush in flight
         if (ggml_backend_buffer_type_t hb = ggml_backend_dev_host_buffer_type(dev)) {
             mc->staging = ggml_backend_buft_alloc_buffer(hb, mc->stage_size);
         }
@@ -2568,9 +2628,11 @@ void hot_drain_out(moe_cache * mc) {
         // a rate limit this also waits for the rest of the queue (the bucket may have left jobs in it), so no upload runs
         // beside the stream
         mc->up_drain = true;
+        hot_set_yield(mc); // [TAG_FN_L4_EXIT]
         mc->wcv.notify_all();
-        mc->wcv_idle.wait(lk, [mc]() { return !mc->worker_busy && (mc->up_rate == 0 || mc->todo.empty()); });
+        mc->wcv_idle.wait(lk, [mc]() { return !mc->worker_busy && (mc->stop || mc->up_rate == 0 || mc->todo.empty()); });
         mc->up_drain = false;
+        hot_set_yield(mc);
     }
     hot_adapt_publish(mc);
 }
@@ -3072,6 +3134,40 @@ size_t llama_moe_hot_cbuf_release(const void * owner) {
     mc->cb_n_rel++;
     mc->cb_rel_ms += (ggml_time_us() - t0)/1000.0;
     return bytes;
+}
+
+// [TAG_FN_L4_EXIT] ---------------------------------------------------------------------------------------------------
+
+void llama_moe_hot_idle(const void * owner) {
+    moe_cache * mc = g_cache;
+    if (!mc || !mc->adapt || owner != mc->owner || !mc->worker.joinable()) {
+        return;
+    }
+    std::lock_guard<std::mutex> slk(mc->step_mtx);
+    std::unique_lock<std::mutex> lk(mc->wmtx);
+    mc->paused = true;
+    hot_set_yield(mc);
+    mc->wcv.notify_all(); // a bucket wait gives up
+    // the batch in flight holds at most UP_INFLIGHT_MAX bytes; the bound only guards against a stuck copy
+    mc->wcv_idle.wait_for(lk, std::chrono::seconds(10), [mc]() { return !mc->worker_busy; });
+}
+
+void llama_moe_hot_stop(const void * owner) {
+    moe_cache * mc = g_cache;
+    if (!mc || !mc->adapt || owner != mc->owner || !mc->worker.joinable()) {
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lk(mc->wmtx);
+        mc->stop = true;
+        hot_set_yield(mc);
+    }
+    mc->wcv.notify_all();
+    mc->worker.join();
+    if (mc->up_backend) {
+        ggml_backend_synchronize(mc->up_backend);
+    }
+    LLAMA_LOG_INFO("moe-hot: [TAG_FN_L4_EXIT] the upload worker stopped (%zu jobs still queued, dropped)\n", mc->todo.size());
 }
 
 bool llama_moe_hot_cbuf_restore(const void * owner) {

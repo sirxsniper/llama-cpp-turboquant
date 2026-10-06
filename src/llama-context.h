@@ -59,6 +59,10 @@ struct llama_context {
 
     void synchronize();
 
+    // [TAG_FN_L4_EXIT] the caller has no work for now: the graphs, the host step after the last one and the hot set's
+    // upload batch in flight end before this returns, and the hot set's queue waits for the next graph
+    void quiesce();
+
     void set_layer_inp_extract(bool enable);
 
     const llama_model   & get_model()   const;

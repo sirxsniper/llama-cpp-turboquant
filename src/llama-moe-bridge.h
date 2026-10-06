@@ -93,6 +93,9 @@ struct llama_moe_bridge;
 // the bridge ([TAG_FN_R1_BRIDGE_RB]: the widest ubatch the recurrent ring can roll back whole)
 llama_moe_bridge * llama_moe_bridge_create(const llama_model & model, int n_threads, int max_t_cap = 0);
 void               llama_moe_bridge_free(llama_moe_bridge * br);
+// [TAG_FN_L4_EXIT] teardown only: every device wait and fetch of this bridge gives up at once (no CUDA call), so no graph
+// of its context spins on mapped flags while the context synchronizes and frees; the bridge is unusable afterwards
+void               llama_moe_bridge_release(llama_moe_bridge * br);
 // [TAG_FN_R2_BRIDGE_NOSPEC] LLAMA_MOE_BRIDGE=1 and the model has a layer the bridge could take (cheap, no pool, no device)
 bool               llama_moe_bridge_wanted(const llama_model & model);
 // [TAG_FN_R2_BRIDGE_SYNC] the bridge exists, is paused or off, and LLAMA_MOE_BRIDGE_SYNC is on

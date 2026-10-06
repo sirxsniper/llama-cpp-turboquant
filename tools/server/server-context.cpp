@@ -4397,6 +4397,22 @@ private:
 
         res->generation_params = slot.task->params; // copy the parameters
 
+        // [TAG_FN_L4_EXIT] the last busy slot ends: no graph (the draft context's update of the last batch included) and
+        // no hot-set upload runs on the device any more when the client gets this response (outputs never change)
+        bool others_busy = false;
+        for (const auto & other : slots) {
+            if (&other != &slot && other.is_processing()) {
+                others_busy = true;
+                break;
+            }
+        }
+        if (!others_busy) {
+            if (ctx_dft) {
+                llama_quiesce_ext(ctx_dft);
+            }
+            llama_quiesce_ext(ctx_tgt);
+        }
+
         queue_results.send(std::move(res));
     }
 

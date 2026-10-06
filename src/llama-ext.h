@@ -179,6 +179,11 @@ LLAMA_API uint32_t llama_memory_attn_swa_ext(struct llama_context * ctx);
 LLAMA_API bool llama_moe_bridge_track_ext(struct llama_context * ctx, bool on);
 LLAMA_API bool llama_moe_bridge_last_ext(const struct llama_context * ctx, int32_t * n_tokens, uint32_t * cold, int32_t n, uint64_t * serial);
 
+// [TAG_FN_L4_EXIT] The caller has no more work for ctx for now (a server whose slots all went idle): the context's graphs
+// (also one whose outputs nobody reads, e.g. a draft context's update), its host step and the MoE hot set's upload batch in
+// flight end before this returns, and the hot set's upload queue waits for the context's next graph. Outputs never change.
+LLAMA_API void llama_quiesce_ext(struct llama_context * ctx);
+
 // [TAG_FN_L3_MTP_HEADPROMPT] qwen4exp with a MTP draft vocabulary and LLAMA_MTP_HEAD_PROMPT=<cap>: the drafts also score
 // these prompt tokens where the vocabulary leaves them out (the first cap such ids in the given order replace the last
 // set). Returns how many were taken, -1 when the model has no such list. Only drafts change; verify uses the full head.

@@ -1725,11 +1725,17 @@ llama_context::llama_context(
 }
 
 llama_context::~llama_context() {
+    // [TAG_FN_L4_EXIT] no device wait of the bridge may block the synchronize below (or spin on mapped flags while host
+    // memory goes): they give up at once. Nothing of this context runs on the device when its memory is freed.
+    llama_moe_bridge_release(moe_bridge);
+
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
 
     step_join();        // [TAG_FN_L3_HOST_STEP] the last step is done before the hot set and the DMA state go
     step_async.reset();
+
+    llama_moe_hot_stop(this); // [TAG_FN_L4_EXIT] the hot set's upload worker lands its chunk in flight and is joined
 
     llama_fn_ctx_remove(model, this); // [TAG_FN_VRAM_FIT]
 
@@ -1740,6 +1746,11 @@ llama_context::~llama_context() {
     llama_moe_gen5_free(this); // [TAG_MOE_DMA_SHARE] [TAG_FN_PREFILL_STREAM]
 
     llama_moe_trace_flush(); // [TAG_FN_MOE_TRACE]
+
+    // [TAG_FN_L4_EXIT] the last work queued by the teardown above (bridge, prefill stream, DMA state) has ended
+    for (auto & backend : backends) {
+        ggml_backend_synchronize(backend.get());
+    }
 
     // when training, ggml_opt allocates extra buffers through the scheduler, so the sizes no longer match the expectation
     if (!model.hparams.no_alloc && !opt_ctx) {
@@ -2190,6 +2201,12 @@ static void llama_host_gap_probe_compute(const llama_context * ctx, uint32_t n_t
     e->caller_us = 0.0;
     e->setup_us  = 0.0;
     e->launch_us = 0.0;
+}
+
+void llama_context::quiesce() {
+    synchronize();
+    step_join(); // [TAG_FN_L3_HOST_STEP] the step after the last graph may queue uploads
+    llama_moe_hot_idle(this);
 }
 
 void llama_context::synchronize() {
@@ -6831,6 +6848,10 @@ void llama_set_warmup(llama_context * ctx, bool warmup) {
 
 void llama_synchronize(llama_context * ctx) {
     ctx->synchronize();
+}
+
+void llama_quiesce_ext(llama_context * ctx) {
+    ctx->quiesce(); // [TAG_FN_L4_EXIT]
 }
 
 float * llama_get_logits(llama_context * ctx) {

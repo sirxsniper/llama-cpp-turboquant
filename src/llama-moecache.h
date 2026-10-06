@@ -185,3 +185,11 @@ ggml_tensor * llama_moe_hot_build_seed(ggml_context * ctx, ggml_cgraph * gf, ggm
 // LLAMA_MOE_HOT_STATE_EVERY decode steps (0 = off), and loaded when the hot set starts: the even slots start filled with
 // the saved residents instead of empty, so a new process does not start cold. LLAMA_MOE_HOT_STATE_LOAD=0 saves only.
 void llama_moe_hot_state_save(const void * owner);
+
+// [TAG_FN_L4_EXIT] the owner is idle: the upload worker lands its batch in flight (at most 64 MiB) and keeps the rest of
+// its queue until the owner's next step, so nothing of the hot set runs on the device. Returns after that batch.
+void llama_moe_hot_idle(const void * owner);
+
+// [TAG_FN_L4_EXIT] the owner goes away: the upload worker stops after its chunk in flight and is joined, the upload stream
+// is synchronized; the hot set stays static from then on
+void llama_moe_hot_stop(const void * owner);

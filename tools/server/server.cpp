@@ -507,8 +507,27 @@ int llama_server(common_params & params, int argc, char ** argv) {
         sigaction(SIGINT, &sigint_action, NULL);
         sigaction(SIGTERM, &sigint_action, NULL);
 #elif defined (_WIN32)
+        // [TAG_FN_L4_EXIT] every console stop takes the normal shutdown path (the contexts drain their device work before
+        // they are freed). Ctrl+Break is what a parent that started the server in its own process group can send.
         auto console_ctrl_handler = +[](DWORD ctrl_type) -> BOOL {
-            return (ctrl_type == CTRL_C_EVENT) ? (signal_handler(SIGINT), true) : false;
+            switch (ctrl_type) {
+                case CTRL_C_EVENT:
+                case CTRL_BREAK_EVENT:
+                    signal_handler(SIGINT);
+                    return TRUE;
+                case CTRL_CLOSE_EVENT:
+                case CTRL_LOGOFF_EVENT:
+                case CTRL_SHUTDOWN_EVENT:
+                    // the system ends the process when this returns (or after its timeout): start the shutdown once and
+                    // wait here while the main thread finishes it and exits
+                    if (!is_terminating.test_and_set()) {
+                        shutdown_handler(SIGTERM);
+                    }
+                    Sleep(INFINITE);
+                    return TRUE;
+                default:
+                    return FALSE;
+            }
         };
         SetConsoleCtrlHandler(reinterpret_cast<PHANDLER_ROUTINE>(console_ctrl_handler), true);
 #endif
