@@ -367,6 +367,16 @@ extern "C" {
     // graph split (alloc / reserve).
     GGML_API void                 ggml_backend_sched_set_split_after(ggml_backend_sched_t sched, const char * names);
 
+    // [TAG_FN_L4_HOST_SNAP] the state ggml_backend_sched_alloc_graph leaves for a graph (splits, graph copy, input copies,
+    // backend assignments, split ids), saved right after that call, and put back later instead of a new split and
+    // allocation of the same graph. Valid while the graph's tensors keep that allocation (the caller does not rebuild,
+    // reset or re-split the graph) and the scheduler and its compute buffers are the same: restore returns false
+    // otherwise and changes nothing. Single copy (no pipeline parallelism) only; save returns NULL there.
+    typedef struct ggml_backend_sched_snap * ggml_backend_sched_snap_t;
+    GGML_API ggml_backend_sched_snap_t ggml_backend_sched_snap_save(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
+    GGML_API bool                 ggml_backend_sched_snap_restore(ggml_backend_sched_t sched, ggml_backend_sched_snap_t snap, struct ggml_cgraph * graph);
+    GGML_API void                 ggml_backend_sched_snap_free(ggml_backend_sched_snap_t snap);
+
     //
     // Meta backend
     //

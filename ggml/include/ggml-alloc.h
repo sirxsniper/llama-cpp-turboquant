@@ -73,6 +73,9 @@ GGML_API bool ggml_gallocr_alloc_graph(ggml_gallocr_t galloc, struct ggml_cgraph
 
 GGML_API size_t ggml_gallocr_get_buffer_size(ggml_gallocr_t galloc, int buffer_id);
 
+// [TAG_FN_L4_HOST_SNAP] changes whenever one of the allocator's buffers is freed or allocated
+GGML_API uint64_t ggml_gallocr_get_generation(ggml_gallocr_t galloc);
+
 // Utils
 // Create a buffer and allocate all the tensors in a ggml_context
 

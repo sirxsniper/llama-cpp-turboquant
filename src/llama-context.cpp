@@ -1421,6 +1421,16 @@ llama_context::llama_context(
         if (graph_per_width) {
             LLAMA_LOG_INFO("%s: one graph per decode width 1..%zu (LLAMA_GRAPH_PER_WIDTH)\n", __func__, gf_res_width.size());
         }
+
+        // [TAG_FN_L4_HOST_SNAP] qwen4exp only; not with the CUDA concurrency pass (its plan is per optimized graph)
+        {
+            const char * opt = getenv("GGML_CUDA_GRAPH_OPT");
+            snap_on = graph_per_width && !cparams.pipeline_parallel && llama_fn_l4_host_flag(&model, "LLAMA_FN_L4_HOST_SNAP") &&
+                      !(opt && atoi(opt) == 1);
+            if (snap_on) {
+                LLAMA_LOG_INFO("%s: [TAG_FN_L4_HOST_SNAP] width switches restore the scheduler state of that width\n", __func__);
+            }
+        }
     }
 
     // ref: https://github.com/ggml-org/llama.cpp/pull/17046#discussion_r2503085732
@@ -3046,10 +3056,22 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         n_reused++;
         graph_reused = true;
+    } else if (!graph_reuse_disable && graph_per_width && snap_on && res->snap != nullptr && res->has_build_state() &&
+               res->snap_launch2 == launch2_decode && res->can_reuse(gparams) &&
+               ggml_backend_sched_snap_restore(sched.get(), res->snap, res->get_gf())) {
+        // [TAG_FN_L4_HOST_SNAP] this width's split and allocation are still valid: the scheduler takes them back as they
+        // were (same splits, same addresses, same split ids, so the device graphs replay), no split, no allocation
+        gf_res_prev_active = res;
+        n_snap_restore++;
+        if (n_snap_restore == 1 || n_snap_restore % 4096 == 0) {
+            LLAMA_LOG_INFO("%s: [TAG_FN_L4_HOST_SNAP] %" PRIu64 " graph switches from a scheduler snapshot (%" PRIu64 " saved)\n",
+                    __func__, n_snap_restore, n_snap_save);
+        }
     } else if (!graph_reuse_disable && graph_per_width && res->has_build_state() && res->can_reuse(gparams)) {
         // [TAG_FN_GRAPH_PER_WIDTH] this width's graph still fits, but the scheduler holds another one:
         // restore the post-build state, then split and allocate again, without model.build_graph
         gf_res_prev_active = nullptr;
+        res->snap_drop(); // [TAG_FN_L4_HOST_SNAP] the split below replaces it
         hp(LLAMA_HP_DEC_RESET); // [TAG_FN_L4_HOST]
         ggml_backend_sched_reset(sched.get());
         if (turbo_nan_scan_on()) {
@@ -3072,6 +3094,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         if (n_width_switch == 1 || n_width_switch % 1024 == 0) {
             LLAMA_LOG_INFO("%s: graph per width: %" PRIu64 " switches without a rebuild\n", __func__, n_width_switch);
         }
+        snap_take(res, launch2_decode); // [TAG_FN_L4_HOST_SNAP]
     } else {
         gf_res_prev_active = nullptr;
         res->reset();
@@ -3115,6 +3138,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
 
         gf_res_prev_active = res;
+        if (graph_per_width && res->has_build_state()) {
+            snap_take(res, launch2_decode); // [TAG_FN_L4_HOST_SNAP]
+        }
     }
 
     hp(LLAMA_HP_DEC_INPUTS); // [TAG_FN_L4_HOST]
@@ -4559,6 +4585,15 @@ llm_graph_result * llama_context::get_gf_res_prev(const llama_ubatch & ubatch) {
         }
         return res.get();
     }
+    // [TAG_FN_L4_HOST_SNAP] the same for widths 1..4 without outputs (with the snapshots only)
+    if (graph_per_width && snap_on && !cparams.pipeline_parallel && n_outputs == 0 &&
+            ubatch.n_tokens >= 1 && ubatch.n_tokens <= gf_res_width_noout.size()) {
+        auto & res = gf_res_width_noout[ubatch.n_tokens - 1];
+        if (!res) {
+            res.reset(new llm_graph_result(gf_res_reserve->get_max_nodes()));
+        }
+        return res.get();
+    }
     return get_gf_res_prev();
 }
 
@@ -4568,6 +4603,22 @@ void llama_context::gf_res_prev_reset_all() {
             res->reset();
         }
     }
+    for (auto & res : gf_res_width_noout) { // [TAG_FN_L4_HOST_SNAP]
+        if (res) {
+            res->reset();
+        }
+    }
+}
+
+// [TAG_FN_L4_HOST_SNAP] the scheduler state right after res's split and allocation
+void llama_context::snap_take(llm_graph_result * res, bool launch2) {
+    if (!snap_on || cparams.pipeline_parallel) {
+        return;
+    }
+    res->snap_drop();
+    res->snap         = ggml_backend_sched_snap_save(sched.get(), res->get_gf());
+    res->snap_launch2 = launch2;
+    n_snap_save += res->snap != nullptr ? 1 : 0;
 }
 
 // pack sampler outputs into as few sequences as possible before using sequences without samplers

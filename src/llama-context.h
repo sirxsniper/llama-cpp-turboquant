@@ -412,6 +412,15 @@ private:
     std::array<llm_graph_result_ptr, 4> gf_res_width;
     uint64_t n_width_switch = 0;
 
+    // [TAG_FN_L4_HOST_SNAP] LLAMA_FN_L4_HOST_SNAP (qwen4exp, with LLAMA_GRAPH_PER_WIDTH): a width switch puts back the
+    // scheduler state of that width's last split instead of splitting and allocating again; decode widths 1..4 without
+    // outputs (the MTP verify catch-up) keep their own graph as well
+    bool     snap_on = false;
+    uint64_t n_snap_restore = 0;
+    uint64_t n_snap_save    = 0;
+    std::array<llm_graph_result_ptr, 4> gf_res_width_noout;
+    void snap_take(llm_graph_result * res, bool launch2);
+
     // [TAG_MOE_BRIDGE] LLAMA_MOE_BRIDGE=1: the host doorbell of the host-resident expert layers (llama-moe-bridge.h)
     struct llama_moe_bridge * moe_bridge = nullptr;
     bool     moe_bridge_failed = false; // [TAG_FN_R1_BRIDGE_RETRY] the last process_ubatch failed in the bridge
