@@ -12125,14 +12125,16 @@ struct test_fn_l3_mmv : public test_case {
     const int64_t   m;
     const int64_t   n_tokens;
     const bool      marked;
+    const bool      l6; // [TAG_FN_L6_PRESYNC] the round-6 bit on the marked node
 
     std::string op_desc(ggml_tensor *) override { return "FN_L3_GPU"; }
-    std::string vars() override { return "mmv," + VARS_TO_STR5(type, k, m, n_tokens, marked); }
+    std::string vars() override { return "mmv," + VARS_TO_STR6(type, k, m, n_tokens, marked, l6); }
     bool run_whole_graph() override { return true; }
     double max_nmse_err() override { return type == GGML_TYPE_F32 ? 1e-6 : 5e-4; }
 
-    test_fn_l3_mmv(ggml_type type = GGML_TYPE_F32, int64_t k = 10240, int64_t m = 4, int64_t n_tokens = 3, bool marked = true)
-        : type(type), k(k), m(m), n_tokens(n_tokens), marked(marked) {}
+    test_fn_l3_mmv(ggml_type type = GGML_TYPE_F32, int64_t k = 10240, int64_t m = 4, int64_t n_tokens = 3, bool marked = true,
+            bool l6 = false)
+        : type(type), k(k), m(m), n_tokens(n_tokens), marked(marked), l6(l6) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * w = ggml_new_tensor_2d(ctx, type, k, m);
@@ -12142,6 +12144,9 @@ struct test_fn_l3_mmv : public test_case {
         ggml_tensor * out = ggml_mul_mat(ctx, w, x);
         if (marked) {
             ggml_fn_l3_set(out, GGML_FN_L3_MMV);
+            if (l6) {
+                ggml_fn_l6_add(out, GGML_FN_L6_PRESYNC);
+            }
         }
         ggml_set_name(out, "out");
         return out;
@@ -12688,10 +12693,11 @@ struct test_fn_l4_hc : public test_case {
     const bool    q8;
     const bool    marked;
     const bool    add;
+    const bool    l6; // [TAG_FN_L6_PRESYNC] the round-6 bit on the marked mixer
     ggml_tensor * first[2] = { nullptr, nullptr };
 
     std::string op_desc(ggml_tensor *) override { return "FN_L3_GPU"; }
-    std::string vars() override { return "l4hc," + VARS_TO_STR6(n_tokens, post, inject, q8, marked, add); }
+    std::string vars() override { return "l4hc," + VARS_TO_STR7(n_tokens, post, inject, q8, marked, add, l6); }
     bool run_whole_graph() override { return true; }
     double max_nmse_err() override { return 5e-4; }
 
@@ -12704,8 +12710,8 @@ struct test_fn_l4_hc : public test_case {
     }
 
     test_fn_l4_hc(int64_t n_tokens = 3, bool post = true, bool inject = true, bool q8 = false, bool marked = true,
-            bool add = false)
-        : n_tokens(n_tokens), post(post), inject(inject), q8(q8), marked(marked), add(add) {}
+            bool add = false, bool l6 = false)
+        : n_tokens(n_tokens), post(post), inject(inject), q8(q8), marked(marked), add(add), l6(l6) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t n_embd = 2560;
@@ -12753,6 +12759,9 @@ struct test_fn_l4_hc : public test_case {
         ggml_set_name(w_qkv, "w_qkv");
 
         ggml_tensor * xn  = mark(ggml_mul(ctx, ggml_rms_norm(ctx, x, 1e-6f), w_norm), GGML_FN_L4_HC);
+        if (marked && l6) {
+            ggml_fn_l6_add(xn, GGML_FN_L6_PRESYNC);
+        }
         ggml_tensor * xn2 = ggml_reshape_2d(ctx, xn, n_embd*hc, T);
         ggml_tensor * lo  = ggml_mul_mat(ctx, w_down, xn2);
         first[0] = lo;
@@ -18673,7 +18682,13 @@ static bool run_fn_l3_gpu(ggml_backend_t backend, ggml_backend_t backend_ref, co
                 continue;
             }
             cases.push_back({ [=](bool m) { return std::unique_ptr<test_case>(new test_fn_l4_hc(t, vp, vi, vq, m, va)); }, false });
+            // [TAG_FN_L6_PRESYNC]
+            cases.push_back({ [=](bool m) { return std::unique_ptr<test_case>(new test_fn_l4_hc(t, vp, vi, vq, m, va, true)); }, false });
         }
+        // [TAG_FN_L6_PRESYNC] the router (512 rows of 2560 f32) and the hc inject shape with the round-6 bit
+        cases.push_back({ [=](bool m) { return std::unique_ptr<test_case>(new test_fn_l3_mmv(GGML_TYPE_F32, 2560, 512, t, m, true)); }, false });
+        cases.push_back({ [=](bool m) { return std::unique_ptr<test_case>(new test_fn_l3_mmv(GGML_TYPE_F32, 10240, 4, t, m, true)); }, false });
+        cases.push_back({ [=](bool m) { return std::unique_ptr<test_case>(new test_fn_l3_mmv(GGML_TYPE_F32, 2560, 48, t, m, true)); }, false });
     }
 
     int n_ok = 0;

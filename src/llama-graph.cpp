@@ -2327,6 +2327,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         // [TAG_FN_L3_GPU_MMV] an arch's mark for its router mat-vec (qwen4exp sets it; 0 for every other model)
         if (moe_router_mark != 0 && logits->op == GGML_OP_MUL_MAT) {
             ggml_fn_l3_set(logits, moe_router_mark);
+            if (moe_router_l6 != 0) {
+                ggml_fn_l6_add(logits, moe_router_l6); // [TAG_FN_L6_PRESYNC]
+            }
         }
         cb(logits, "ffn_moe_logits", il);
     } else {

@@ -42,7 +42,31 @@ enum ggml_fn_l3_mark {
                                      // GGML_FN_L4_HC mixer that reads the post
     GGML_FN_L4_HCQ8    = 0x4C344803, // DSV4_HC_PRE of such a mixer: also writes the q8_1 copy of its output for the MUL_MAT
                                      // that reads it (the MMVQ reuse cache, same bytes)
+
+    // [TAG_FN_L6_L2PF] lever round 6 (LLAMA_FN_L6_L2PF): MOE_HOST_WAIT of a bridged layer: before the wait, the device
+    // weights that the nodes up to the next MOE_HOST_POST read are prefetched into L2 (no value changes)
+    GGML_FN_L6_L2PF    = 0x4C364C01,
 };
+
+// [TAG_FN_L6] lever round 6 bits: int32 op_params slot 13 (bytes 52..55, free in MUL_MAT and MUL), magic in the high half.
+// Only the qwen4exp builder writes them (LLAMA_FN_L6_*); every backend but CUDA ignores them. Same bits as without.
+#define GGML_FN_L6_SLOT  13
+#define GGML_FN_L6_MAGIC 0x4C360000u
+enum ggml_fn_l6_bit {
+    GGML_FN_L6_PRESYNC = 0x0001, // MUL_MAT (MMV-marked f32 router) / MUL (GGML_FN_L4_HC mixer): the weights are loaded on
+                                 // chip before the PDL wait, while the previous kernel runs
+    GGML_FN_L6_HCCOMB  = 0x0002, // MUL (GGML_FN_L4_HC mixer): the combine's inputs stay allocated until its DSV4_HC_PRE, so
+                                 // that the combine always goes into the norm launch
+};
+
+static inline int32_t ggml_fn_l6_get(const struct ggml_tensor * t) {
+    const uint32_t v = t ? (uint32_t) t->op_params[GGML_FN_L6_SLOT] : 0u;
+    return (v & 0xFFFF0000u) == GGML_FN_L6_MAGIC ? (int32_t) (v & 0xFFFFu) : 0;
+}
+
+static inline void ggml_fn_l6_add(struct ggml_tensor * t, int32_t bits) {
+    t->op_params[GGML_FN_L6_SLOT] = (int32_t) (GGML_FN_L6_MAGIC | (uint32_t) ggml_fn_l6_get(t) | ((uint32_t) bits & 0xFFFFu));
+}
 
 static inline void ggml_fn_l3_set(struct ggml_tensor * t, int32_t mark) {
     t->op_params[GGML_FN_L3_SLOT] = mark;

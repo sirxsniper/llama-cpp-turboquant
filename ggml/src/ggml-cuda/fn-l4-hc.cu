@@ -157,6 +157,8 @@ struct fn_l4_down_args {
     const float *      wi; int stride_row_i;                         // f32 [ncols_x, inj_rows]
     const float *      xn; int stride_col_xn;                        // f32 [ncols_x, T]
     float *            part; int inj_rows; int inj_bs; int n_inj_blocks;
+    int                presync; // [TAG_FN_L6_PRESYNC] 1: the rows' q8_0 values, 2: the inject's f32 values, in shared memory before the PDL wait
+    int                inj_kmax; // values of the inject per thread (shared memory: [inj_kmax][4*WARP_SIZE] float2)
 };
 
 #define FN_L4_DOWN_AHEAD 10
@@ -166,6 +168,7 @@ __launch_bounds__(4*WARP_SIZE, 1)
 static __global__ void k_fn_l4_hc_down(const fn_l4_down_args a) {
     ggml_cuda_pdl_lc();
     const int lane = threadIdx.x;
+    extern __shared__ __align__(16) char fn_l6_down_smem[]; // [TAG_FN_L6_PRESYNC]
 
     if ((int) blockIdx.x < a.n_inj_blocks) {
         const int nvw  = a.inj_bs / WARP_SIZE;
@@ -175,7 +178,6 @@ static __global__ void k_fn_l4_hc_down(const fn_l4_down_args a) {
         if (vw >= nvw) {
             return;
         }
-        ggml_cuda_pdl_sync();
 
         const int bs            = a.inj_bs;
         const int ncols2        = a.ncols_x / 2;
@@ -183,16 +185,29 @@ static __global__ void k_fn_l4_hc_down(const fn_l4_down_args a) {
         const float2 * x2 = (const float2 *) (a.wi + int64_t(irow)*a.stride_row_i);
         const float2 * y2 = (const float2 *) a.xn;
 
+        // [TAG_FN_L6_PRESYNC] this thread's matrix values (only it reads them back), before the wait
+        const int  c0  = vw*WARP_SIZE + lane;
+        const int  tid = threadIdx.y*WARP_SIZE + lane;
+        const bool pre = (a.presync & 2) != 0;
+        float2 * s_x = (float2 *) fn_l6_down_smem;
+        if (pre) {
+            for (int c = c0, k = 0; c < ncols2; c += bs, ++k) {
+                s_x[k*(4*WARP_SIZE) + tid] = x2[c];
+            }
+        }
+        ggml_cuda_pdl_sync();
+
         float sumf[ncols_dst] = {0.0f};
 
         constexpr int ahead = 4;
-        int col2 = vw*WARP_SIZE + lane;
-        for (; col2 + (ahead - 1)*bs < ncols2; col2 += ahead*bs) {
+        int col2 = c0;
+        int kk   = 0; // (col2 - c0)/bs
+        for (; col2 + (ahead - 1)*bs < ncols2; col2 += ahead*bs, kk += ahead) {
             float2 tmpx[ahead];
             float2 tmpy[ahead][ncols_dst];
 #pragma unroll
             for (int u = 0; u < ahead; ++u) {
-                tmpx[u] = x2[col2 + u*bs];
+                tmpx[u] = pre ? s_x[(kk + u)*(4*WARP_SIZE) + tid] : x2[col2 + u*bs];
             }
 #pragma unroll
             for (int u = 0; u < ahead; ++u) {
@@ -210,8 +225,8 @@ static __global__ void k_fn_l4_hc_down(const fn_l4_down_args a) {
                 }
             }
         }
-        for (; col2 < ncols2; col2 += bs) {
-            const float2 tmpx = x2[col2];
+        for (; col2 < ncols2; col2 += bs, ++kk) {
+            const float2 tmpx = pre ? s_x[kk*(4*WARP_SIZE) + tid] : x2[col2];
 #pragma unroll
             for (int j = 0; j < ncols_dst; ++j) {
                 const float2 tmpy = y2[j*stride_col_y2 + col2];
@@ -243,12 +258,29 @@ static __global__ void k_fn_l4_hc_down(const fn_l4_down_args a) {
     const int row0 = blockIdx.x - a.n_inj_blocks;
     const int blocks_per_row_x = a.ncols_x / qk;
 
+    // [TAG_FN_L6_PRESYNC] the row's q8_0 blocks in shared memory (4-byte words), before the wait
+    const bool pre = (a.presync & 1) != 0;
+    const void * vx = a.wd;
+    int kbx_offset = row0*a.stride_row_x;
+    if (pre) {
+        const int * src = (const int *) ((const char *) a.wd + (size_t) kbx_offset*sizeof(block_q8_0));
+        int * dst = (int *) fn_l6_down_smem;
+        const int nw = blocks_per_row_x*(int) sizeof(block_q8_0)/4;
+        for (int k = tid; k < nw; k += nwarps*WARP_SIZE) {
+            dst[k] = src[k];
+        }
+        vx = fn_l6_down_smem;
+        kbx_offset = 0;
+    }
+
     ggml_cuda_pdl_sync();
+    if (pre) {
+        __syncthreads();
+    }
 
     float tmp[ncols_dst] = {0.0f};
 
     const block_q8_1 * y = a.xq;
-    const int kbx_offset = row0*a.stride_row_x;
 
     // the K loop FN_L4_DOWN_AHEAD iterations per pass, each guarded, so that their loads issue together (the hc down row
     // of 10240 is one pass); kbx still runs in the original order, so each thread's sum is the same
@@ -261,7 +293,7 @@ static __global__ void k_fn_l4_hc_down(const fn_l4_down_args a) {
                 const int kby = kbx * (qk/QK8_1);
 #pragma unroll
                 for (int j = 0; j < ncols_dst; ++j) {
-                    tmp[j] += vec_dot_q8_0_q8_1(a.wd, &y[j*a.stride_col_y + kby], kbx_offset + kbx, kqs);
+                    tmp[j] += vec_dot_q8_0_q8_1(vx, &y[j*a.stride_col_y + kby], kbx_offset + kbx, kqs);
                 }
             }
         }
@@ -310,6 +342,7 @@ struct fn_l4_up_args {
     const float * part; float * inj; int64_t inj_s1; int inj_rows; int nvw;
     int           n_main;
     float         zero;                          // 0.0f, a parameter so that no add of a zero partial sum is folded away
+    int           presync;                       // [TAG_FN_L6_PRESYNC] the block's rows of wu in shared memory before the PDL wait
 };
 
 #define FN_L4_HC 4
@@ -328,8 +361,25 @@ static __global__ void k_fn_l4_hc_up(const fn_l4_up_args a) {
 
     __shared__ block_q8_1 s_y[ncols_dst][WARP_SIZE];
     __shared__ float      s_gate[WARP_SIZE*FN_L4_HC][ncols_dst];
+    extern __shared__ __align__(16) char fn_l6_up_smem[]; // [TAG_FN_L6_PRESYNC] [FN_L4_HC][WARP_SIZE rows] of q8_0 rows
 
     ggml_cuda_pdl_lc();
+
+    const int blocks_per_row_x = a.lr / qk;
+    const int chunk_bytes      = WARP_SIZE*blocks_per_row_x*(int) sizeof(block_q8_0);
+    if (a.presync && (int) blockIdx.x < a.n_main) {
+        // rows h*n_embd + 32*blockIdx.x + [0, 32) of each stream h: one contiguous chunk each (stride_row_x == blocks_per_row_x)
+        const int nw = chunk_bytes/4;
+        for (int h = 0; h < FN_L4_HC; ++h) {
+            const int * src = (const int *) ((const char *) a.wu +
+                    (size_t) (h*a.n_embd + (int) blockIdx.x*WARP_SIZE)*a.stride_row_x*sizeof(block_q8_0));
+            int * dst = (int *) (fn_l6_up_smem + h*chunk_bytes);
+            for (int k = warp*WARP_SIZE + lane; k < nw; k += (int) (blockDim.x*blockDim.y)) {
+                dst[k] = src[k];
+            }
+        }
+    }
+
     ggml_cuda_pdl_sync();
 
     if ((int) blockIdx.x >= a.n_main) {
@@ -361,14 +411,14 @@ static __global__ void k_fn_l4_hc_up(const fn_l4_up_args a) {
     __syncthreads();
 
     const int i0b = blockIdx.x*WARP_SIZE;
-    const int blocks_per_row_x = a.lr / qk;
 #pragma unroll
     for (int rr = 0; rr < rows_per_warp; ++rr) {
         const int rl  = warp*rows_per_warp + rr;
         const int h   = rl / WARP_SIZE;
         const int i   = rl % WARP_SIZE;
         const int row = h*a.n_embd + i0b + i;
-        const int kbx_offset = row*a.stride_row_x;
+        const int kbx_offset = a.presync ? i*blocks_per_row_x : row*a.stride_row_x;
+        const void * vx = a.presync ? (const void *) (fn_l6_up_smem + h*chunk_bytes) : a.wu;
 
         float tmp[ncols_dst];
 #pragma unroll
@@ -385,7 +435,7 @@ static __global__ void k_fn_l4_hc_up(const fn_l4_up_args a) {
                 const int kqs = vdr * (tid % (qi/vdr));
 #pragma unroll
                 for (int j = 0; j < ncols_dst; ++j) {
-                    part[j] += vec_dot_q8_0_q8_1(a.wu, &s_y[j][kby], kbx_offset + kbx, kqs);
+                    part[j] += vec_dot_q8_0_q8_1(vx, &s_y[j][kby], kbx_offset + kbx, kqs);
                 }
             }
 #pragma unroll
@@ -553,7 +603,29 @@ void ggml_cuda_fn_l4_hc_run(ggml_backend_cuda_context & ctx, const ggml_cuda_fn_
             a.inj_bs        = c.inject_bs;
             a.n_inj_blocks  = n_inj_blocks;
         }
-        const ggml_cuda_kernel_launch_params lp(dim3((unsigned) (n_inj_blocks + lr), 1, 1), dim3(WARP_SIZE, 4, 1), 0, stream);
+        // [TAG_FN_L6_PRESYNC] rows: whole 4-byte words per row; inject: at most 48 KiB of shared memory
+        size_t smem = 0;
+        if (c.presync) {
+            const size_t row_bytes = (size_t) (hc_dim/QK8_0)*sizeof(block_q8_0);
+            if ((((size_t) a.stride_row_x*sizeof(block_q8_0)) % 4) == 0 && row_bytes % 4 == 0 && ((uintptr_t) a.wd % 4) == 0) {
+                a.presync |= 1;
+                smem = std::max(smem, row_bytes);
+            }
+            if (inj_fused) {
+                const int ncols2 = (int) (hc_dim/2);
+                a.inj_kmax = (ncols2 + a.inj_bs - 1)/a.inj_bs;
+                const size_t inj_bytes = (size_t) a.inj_kmax*4*WARP_SIZE*sizeof(float2);
+                if (inj_bytes <= 48*1024) {
+                    a.presync |= 2;
+                    smem = std::max(smem, inj_bytes);
+                }
+            }
+            if (smem > 48*1024) {
+                a.presync = 0;
+                smem = 0;
+            }
+        }
+        const ggml_cuda_kernel_launch_params lp(dim3((unsigned) (n_inj_blocks + lr), 1, 1), dim3(WARP_SIZE, 4, 1), smem, stream);
         switch (T) {
             case 1: ggml_cuda_kernel_launch(k_fn_l4_hc_down<1>, lp, a); break;
             case 2: ggml_cuda_kernel_launch(k_fn_l4_hc_down<2>, lp, a); break;
@@ -611,15 +683,99 @@ void ggml_cuda_fn_l4_hc_run(ggml_backend_cuda_context & ctx, const ggml_cuda_fn_
             }
         }
         constexpr int rpw = 4;
+        // [TAG_FN_L6_PRESYNC] the 4 chunks of 32 contiguous rows of each block (rows of whole 4-byte words), <= 64 KiB
+        size_t smem = 0;
+        if (c.presync) {
+            const size_t chunk = (size_t) WARP_SIZE*(lr/QK8_0)*sizeof(block_q8_0);
+            if (a.stride_row_x == (int) (lr/QK8_0) && chunk % 4 == 0 && ((uintptr_t) a.wu % 4) == 0 && FN_L4_HC*chunk <= 64*1024) {
+                a.presync = 1;
+                smem = FN_L4_HC*chunk;
+            }
+        }
         const ggml_cuda_kernel_launch_params lp(dim3((unsigned) (a.n_main + (inj_fused ? 1 : 0)), 1, 1),
-                dim3(WARP_SIZE, WARP_SIZE*FN_L4_HC/rpw, 1), 0, stream);
+                dim3(WARP_SIZE, WARP_SIZE*FN_L4_HC/rpw, 1), smem, stream);
+        if (smem > 0) {
+            static bool set[GGML_CUDA_MAX_DEVICES] = {};
+            if (!set[ctx.device]) {
+                CUDA_CHECK(cudaFuncSetAttribute(k_fn_l4_hc_up<1, rpw>, cudaFuncAttributeMaxDynamicSharedMemorySize, 64*1024));
+                CUDA_CHECK(cudaFuncSetAttribute(k_fn_l4_hc_up<2, rpw>, cudaFuncAttributeMaxDynamicSharedMemorySize, 64*1024));
+                CUDA_CHECK(cudaFuncSetAttribute(k_fn_l4_hc_up<3, rpw>, cudaFuncAttributeMaxDynamicSharedMemorySize, 64*1024));
+                CUDA_CHECK(cudaFuncSetAttribute(k_fn_l4_hc_up<4, rpw>, cudaFuncAttributeMaxDynamicSharedMemorySize, 64*1024));
+                set[ctx.device] = true;
+            }
+        }
+        const auto up_smem = [&](auto kern) {
+            ggml_cuda_kernel_launch(kern, lp, a);
+        };
         switch (T) {
-            case 1: ggml_cuda_kernel_launch(k_fn_l4_hc_up<1, rpw>, lp, a); break;
-            case 2: ggml_cuda_kernel_launch(k_fn_l4_hc_up<2, rpw>, lp, a); break;
-            case 3: ggml_cuda_kernel_launch(k_fn_l4_hc_up<3, rpw>, lp, a); break;
-            case 4: ggml_cuda_kernel_launch(k_fn_l4_hc_up<4, rpw>, lp, a); break;
+            case 1: up_smem(k_fn_l4_hc_up<1, rpw>); break;
+            case 2: up_smem(k_fn_l4_hc_up<2, rpw>); break;
+            case 3: up_smem(k_fn_l4_hc_up<3, rpw>); break;
+            case 4: up_smem(k_fn_l4_hc_up<4, rpw>); break;
             default: GGML_ABORT("fatal error");
         }
     }
     fn_l4_trace_step("K3");
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// [TAG_FN_L6_L2PF] L2 prefetch of byte ranges: chunk c of the ranges' FN_L6_PF_CHUNK-byte chunks per thread and pass.
+// sm_90+: one bulk prefetch per chunk; older: one prefetch per 128-byte line.
+// ---------------------------------------------------------------------------------------------------------------------
+
+#define FN_L6_PF_CHUNK 16384
+
+struct fn_l6_pf_args {
+    const char * p[FN_L6_PF_MAX];
+    unsigned int nc[FN_L6_PF_MAX];  // chunks of range r
+    unsigned int last[FN_L6_PF_MAX]; // bytes of its last chunk (a multiple of 16, > 0)
+    int          nr;
+    unsigned int n_chunks;
+};
+
+static __global__ void k_fn_l6_l2pf(const fn_l6_pf_args a) {
+    const unsigned int nt = gridDim.x*blockDim.x;
+    for (unsigned int c = blockIdx.x*blockDim.x + threadIdx.x; c < a.n_chunks; c += nt) {
+        int          r  = 0;
+        unsigned int c0 = 0;
+        while (r < a.nr - 1 && c >= c0 + a.nc[r]) {
+            c0 += a.nc[r];
+            ++r;
+        }
+        const unsigned int k  = c - c0;
+        const char *       p  = a.p[r] + (size_t) k*FN_L6_PF_CHUNK;
+        const unsigned int sz = k + 1 == a.nc[r] ? a.last[r] : FN_L6_PF_CHUNK;
+#if __CUDA_ARCH__ >= 900
+        asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" :: "l"(__cvta_generic_to_global(p)), "r"(sz) : "memory");
+#else
+        for (unsigned int o = 0; o < sz; o += 128) {
+            asm volatile("prefetch.global.L2 [%0];" :: "l"(p + o));
+        }
+#endif // __CUDA_ARCH__ >= 900
+    }
+}
+
+void ggml_cuda_fn_l6_l2pf_launch(ggml_backend_cuda_context & ctx, const ggml_cuda_fn_l6_pf_ranges & r) {
+    fn_l6_pf_args a = {};
+    for (int i = 0; i < r.nr && i < FN_L6_PF_MAX; ++i) {
+        GGML_ASSERT(((uintptr_t) r.p[i] & 15) == 0);
+        const size_t n = r.n[i] & ~(size_t) 15;
+        if (n == 0) {
+            continue;
+        }
+        const size_t nc = (n + FN_L6_PF_CHUNK - 1)/FN_L6_PF_CHUNK;
+        GGML_ASSERT(nc < (1u << 24));
+        a.p[a.nr]    = r.p[i];
+        a.nc[a.nr]   = (unsigned int) nc;
+        a.last[a.nr] = (unsigned int) (n - (nc - 1)*FN_L6_PF_CHUNK);
+        a.n_chunks  += (unsigned int) nc;
+        a.nr++;
+    }
+    if (a.n_chunks == 0) {
+        return;
+    }
+    const int threads = 128;
+    const int blocks  = (int) std::min<unsigned int>(4*ggml_cuda_info().devices[ctx.device].nsm, (a.n_chunks + threads - 1)/threads);
+    k_fn_l6_l2pf<<<blocks, threads, 0, ctx.stream()>>>(a);
+    CUDA_CHECK(cudaGetLastError());
 }

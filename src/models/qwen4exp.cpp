@@ -802,6 +802,17 @@ void llama_model_qwen4exp::graph::l3_expand_deferred() {
     l3_deferred.clear();
 }
 
+// [TAG_FN_L6_L2PF] the bridge wait of build_moe_bridge_finish's result (the wait itself, or the ADD of the hot chain and it)
+void llama_model_qwen4exp::graph::l6_mark_wait(ggml_tensor * moe_out) const {
+    ggml_tensor * w = moe_out;
+    if (w != nullptr && w->op == GGML_OP_ADD && w->src[1] != nullptr && w->src[1]->op == GGML_OP_MOE_HOST_WAIT) {
+        w = w->src[1];
+    }
+    if (l6_l2pf && w != nullptr && w->op == GGML_OP_MOE_HOST_WAIT) {
+        ggml_fn_l3_set(w, GGML_FN_L6_L2PF);
+    }
+}
+
 // [TAG_FN_L3_GPU_MMV] marks a plain mat-vec node (a LoRA or a scale tensor makes build_lora_mm return another op)
 static void qwen4exp_l3_mark_mm(ggml_tensor * t, bool on) {
     if (on && t && t->op == GGML_OP_MUL_MAT) {
@@ -831,6 +842,12 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
     ggml_tensor * xn = ggml_mul(ctx0, ggml_rms_norm(ctx0, x, hparams.f_norm_rms_eps), w_norm);
     if (l4hc) {
         ggml_fn_l3_set(xn, GGML_FN_L4_HC); // [TAG_FN_L4_HC] the mixer starts here
+        if (l6_presync) {
+            ggml_fn_l6_add(xn, GGML_FN_L6_PRESYNC); // [TAG_FN_L6_PRESYNC]
+        }
+        if (l6_hccomb) {
+            ggml_fn_l6_add(xn, GGML_FN_L6_HCCOMB); // [TAG_FN_L6_HCCOMB]
+        }
     } else if (l3.q8f) {
         ggml_fn_l3_set(xn, GGML_FN_L3_Q8OUT); // [TAG_FN_L3_GPU_Q8F] the q8_1 copy for w_down, made by the norm kernel
     }
@@ -956,6 +973,24 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
     llm_build_delta_net_base(params), l3(l3_read(model)), l4(l4_read(model)), l4qsa(l4qsa_read(model)), model(model) {
     if (l4.gdn_snap) {
         rs_snap_defer = &l3_deferred; // [TAG_FN_L4_GDNSTALL] the pre-ubatch state copy after the bridge post
+    }
+    {
+        // [TAG_FN_L6_L2PF] environment only (not in the automatic profile)
+        const char * v = llama_model_fn_env(&model, "LLAMA_FN_L6_L2PF");
+        l6_l2pf = v && v[0] && v[0] != '0';
+        static std::atomic<bool> noted{false};
+        if (l6_l2pf && !noted.exchange(true)) {
+            LLAMA_LOG_INFO("qwen4exp: [TAG_FN_L6_L2PF] bridge waits prefetch the next layer's weights into L2\n");
+        }
+        // [TAG_FN_L6_PRESYNC] environment only
+        const char * ps = llama_model_fn_env(&model, "LLAMA_FN_L6_PRESYNC");
+        l6_presync = ps && ps[0] && ps[0] != '0';
+        const char * hcc = llama_model_fn_env(&model, "LLAMA_FN_L6_HCCOMB"); // [TAG_FN_L6_HCCOMB]
+        l6_hccomb = hcc && hcc[0] && hcc[0] != '0';
+        static std::atomic<bool> noted_ps{false};
+        if (l6_presync && !noted_ps.exchange(true)) {
+            LLAMA_LOG_INFO("qwen4exp: [TAG_FN_L6_PRESYNC] hc mixer and router weights load before the PDL wait\n");
+        }
     }
     const int64_t hc = hparams.dsv4_hc_mult;
 
@@ -2299,6 +2334,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
     moe_q8in_mark    = l3.q8f ? GGML_FN_L3_Q8IN : 0; // [TAG_FN_L3_GPU_Q8F] the hot / DMA chains read hc_pre's q8_1 copy
     moe_zskip_mark   = l3.zskip ? GGML_FN_L3_ZSKIP : 0; // [TAG_FN_L3_GPU_ZSKIP] their zero-slot pairs are not computed
     moe_post_mark    = l4.post ? GGML_FN_L4_POST : 0;   // [TAG_FN_L4_POST] one-fence post, fused with the top-k
+    moe_router_l6    = l6_presync && l3.mmv ? GGML_FN_L6_PRESYNC : 0; // [TAG_FN_L6_PRESYNC]
     ggml_tensor * moe_out =
         build_moe_ffn(cur,
             model.layers[il].ffn_gate_inp,
@@ -2319,6 +2355,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
     moe_q8in_mark    = 0;
     moe_zskip_mark   = 0;
     moe_post_mark    = 0;
+    moe_router_l6    = 0;
 
     // [TAG_FN_L3_GPU_DEFER] after the post (and the hot chain), before the shared expert and the wait
     l3_expand_deferred();
@@ -2352,12 +2389,14 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
         cb(ffn_shexp, "ffn_shexp_gated", il);
 
         moe_out = build_moe_bridge_finish(moe_out, il, ffn_shexp); // [TAG_MOE_BRIDGE] unchanged without a post
+        l6_mark_wait(moe_out); // [TAG_FN_L6_L2PF]
         cb(moe_out, "ffn_moe_out", il);
 
         cur = ggml_add(ctx0, moe_out, ffn_shexp);
         cb(cur, "ffn_out", il);
     } else {
         moe_out = build_moe_bridge_finish(moe_out, il, nullptr); // [TAG_MOE_BRIDGE]
+        l6_mark_wait(moe_out); // [TAG_FN_L6_L2PF]
         cb(moe_out, "ffn_moe_out", il);
         cur = moe_out;
     }

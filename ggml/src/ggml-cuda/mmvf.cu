@@ -884,15 +884,34 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0
 template <int ncols_dst, int block_size>
 static __global__ void mul_mat_vec_f_fn_l3(
         const float * x, const float * y, float * dst, const int ncols2, const int stride_row, const int stride_col_y2,
-        const int stride_col_dst) {
+        const int stride_col_dst, const int presync) {
     const int row = blockIdx.x;
     const int tid = threadIdx.x;
+
+    constexpr int ahead = 4;
+
+    x += int64_t(row)*stride_row;
+
+    // [TAG_FN_L6_PRESYNC] presync: the matrix values of the first pass (and of the first tail step after it) are loaded
+    // before the PDL wait, while the previous kernel runs; they are then used in the same order as the loads they replace
+    const float2 * x2 = (const float2 *) x;
+    float2 px[ahead];
+    float2 px_tail = make_float2(0.0f, 0.0f);
+    const bool have_px   = presync && tid + (ahead - 1)*block_size < ncols2;
+    const bool have_tail = have_px && !(tid + (2*ahead - 1)*block_size < ncols2) && tid + ahead*block_size < ncols2;
+    if (have_px) {
+#pragma unroll
+        for (int u = 0; u < ahead; ++u) {
+            px[u] = x2[tid + u*block_size];
+        }
+        if (have_tail) {
+            px_tail = x2[tid + ahead*block_size];
+        }
+    }
 
     ggml_cuda_pdl_sync();
 
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
-
-    x += int64_t(row)*stride_row;
 
     const float2 * y2 = (const float2 *) y;
 
@@ -908,16 +927,16 @@ static __global__ void mul_mat_vec_f_fn_l3(
 
     float sumf[ncols_dst] = {0.0f};
 
-    const float2 * x2 = (const float2 *) x;
-    constexpr int ahead = 4;
     int col2 = tid;
+    bool first = have_px;
     for (; col2 + (ahead - 1)*block_size < ncols2; col2 += ahead*block_size) {
         float2 tmpx[ahead];
         float2 tmpy[ahead][ncols_dst];
 #pragma unroll
         for (int u = 0; u < ahead; ++u) {
-            tmpx[u] = x2[col2 + u*block_size];
+            tmpx[u] = first ? px[u] : x2[col2 + u*block_size];
         }
+        first = false;
 #pragma unroll
         for (int u = 0; u < ahead; ++u) {
 #pragma unroll
@@ -934,8 +953,10 @@ static __global__ void mul_mat_vec_f_fn_l3(
             }
         }
     }
+    bool first_tail = have_tail;
     for (; col2 < ncols2; col2 += block_size) {
-        const float2 tmpx = x2[col2];
+        const float2 tmpx = first_tail ? px_tail : x2[col2];
+        first_tail = false;
 #pragma unroll
         for (int j = 0; j < ncols_dst; ++j) {
             const float2 tmpy = y2[j*stride_col_y2 + col2];
@@ -972,7 +993,7 @@ static __global__ void mul_mat_vec_f_fn_l3(
 
 template <int ncols_dst>
 static void mul_mat_vec_f_fn_l3_launch(const float * x, const float * y, float * dst, const int64_t ncols, const int64_t nrows,
-        const int64_t stride_row, const int64_t stride_col_y, const int64_t stride_col_dst, cudaStream_t stream) {
+        const int64_t stride_row, const int64_t stride_col_y, const int64_t stride_col_dst, cudaStream_t stream, const int presync) {
     const int device    = ggml_cuda_get_device();
     const int warp_size = ggml_cuda_info().devices[device].warp_size;
 
@@ -996,7 +1017,7 @@ static void mul_mat_vec_f_fn_l3_launch(const float * x, const float * y, float *
     const int ncols2 = (int) (ncols/2);
     switch (block_size_best) {
 #define FN_L3_MMVF_CASE(bs) case bs: ggml_cuda_kernel_launch(mul_mat_vec_f_fn_l3<ncols_dst, bs>, lp, x, y, dst, ncols2, \
-        (int) stride_row, (int) (stride_col_y/2), (int) stride_col_dst); break;
+        (int) stride_row, (int) (stride_col_y/2), (int) stride_col_dst, presync); break;
         FN_L3_MMVF_CASE(32)
         FN_L3_MMVF_CASE(64)
         FN_L3_MMVF_CASE(96)
@@ -1032,15 +1053,16 @@ bool ggml_cuda_fn_l3_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_t
     const int64_t s11 = nb11/sizeof(float);
     const int64_t s1  = nb1/sizeof(float);
     cudaStream_t stream = ctx.stream();
+    const int presync = (ggml_fn_l6_get(dst) & GGML_FN_L6_PRESYNC) != 0; // [TAG_FN_L6_PRESYNC]
     switch (ne11) {
-        case 1: mul_mat_vec_f_fn_l3_launch<1>(x, y, d, ne00, ne01, s01, s11, s1, stream); break;
-        case 2: mul_mat_vec_f_fn_l3_launch<2>(x, y, d, ne00, ne01, s01, s11, s1, stream); break;
-        case 3: mul_mat_vec_f_fn_l3_launch<3>(x, y, d, ne00, ne01, s01, s11, s1, stream); break;
-        case 4: mul_mat_vec_f_fn_l3_launch<4>(x, y, d, ne00, ne01, s01, s11, s1, stream); break;
-        case 5: mul_mat_vec_f_fn_l3_launch<5>(x, y, d, ne00, ne01, s01, s11, s1, stream); break;
-        case 6: mul_mat_vec_f_fn_l3_launch<6>(x, y, d, ne00, ne01, s01, s11, s1, stream); break;
-        case 7: mul_mat_vec_f_fn_l3_launch<7>(x, y, d, ne00, ne01, s01, s11, s1, stream); break;
-        case 8: mul_mat_vec_f_fn_l3_launch<8>(x, y, d, ne00, ne01, s01, s11, s1, stream); break;
+        case 1: mul_mat_vec_f_fn_l3_launch<1>(x, y, d, ne00, ne01, s01, s11, s1, stream, presync); break;
+        case 2: mul_mat_vec_f_fn_l3_launch<2>(x, y, d, ne00, ne01, s01, s11, s1, stream, presync); break;
+        case 3: mul_mat_vec_f_fn_l3_launch<3>(x, y, d, ne00, ne01, s01, s11, s1, stream, presync); break;
+        case 4: mul_mat_vec_f_fn_l3_launch<4>(x, y, d, ne00, ne01, s01, s11, s1, stream, presync); break;
+        case 5: mul_mat_vec_f_fn_l3_launch<5>(x, y, d, ne00, ne01, s01, s11, s1, stream, presync); break;
+        case 6: mul_mat_vec_f_fn_l3_launch<6>(x, y, d, ne00, ne01, s01, s11, s1, stream, presync); break;
+        case 7: mul_mat_vec_f_fn_l3_launch<7>(x, y, d, ne00, ne01, s01, s11, s1, stream, presync); break;
+        case 8: mul_mat_vec_f_fn_l3_launch<8>(x, y, d, ne00, ne01, s01, s11, s1, stream, presync); break;
         default: return false;
     }
     ggml_cuda_fn_l3_note(GGML_CUDA_FN_L3_PATH_MMVF, "MMV: few-row f32 mat-vecs with run-ahead loads");

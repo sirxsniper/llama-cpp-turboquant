@@ -38,8 +38,19 @@ struct ggml_cuda_fn_l4_hc_chain {
     const ggml_tensor * up     = nullptr; // MUL_MAT up (not written)
     ggml_tensor *       pre    = nullptr; // DSV4_HC_PRE (written)
     bool                q8     = false;   // write the q8_1 copy of pre's output (reuse cache)
+    bool                presync = false;  // [TAG_FN_L6_PRESYNC] K2 / K3 load their weights on chip before the PDL wait
 };
 
 // launches the three kernels; plain_mm computes a MUL_MAT node as the backend would (the inject when not fused)
 void ggml_cuda_fn_l4_hc_run(ggml_backend_cuda_context & ctx, const ggml_cuda_fn_l4_hc_chain & c, ggml_cgraph * cgraph,
         int i_first, int i_last, void (*plain_mm)(ggml_backend_cuda_context & ctx, ggml_tensor * dst));
+
+// [TAG_FN_L6_L2PF] lever round 6: prefetch byte ranges of device memory into L2 (one launch; no value changes).
+// Ranges: 16-byte aligned starts; each is cut to a multiple of 16 bytes.
+#define FN_L6_PF_MAX 64
+struct ggml_cuda_fn_l6_pf_ranges {
+    const char * p[FN_L6_PF_MAX];
+    size_t       n[FN_L6_PF_MAX];
+    int          nr = 0;
+};
+void ggml_cuda_fn_l6_l2pf_launch(ggml_backend_cuda_context & ctx, const ggml_cuda_fn_l6_pf_ranges & r);

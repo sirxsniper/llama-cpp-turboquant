@@ -2637,6 +2637,13 @@ struct llama_model_qwen4exp : public llama_model_base {
         static l4_flags l4_read(const llama_model & model);
         l4_flags l4;
 
+        // [TAG_FN_L6_L2PF] lever round 6: LLAMA_FN_L6_L2PF=1 marks each bridge wait (GGML_FN_L6_L2PF): the CUDA backend
+        // prefetches the next layer's pre-post weights into L2 while the device waits for the host (off by default)
+        bool l6_l2pf = false;
+        bool l6_hccomb  = false; // [TAG_FN_L6_HCCOMB] LLAMA_FN_L6_HCCOMB=1: the combine's inputs stay allocated through the mixer
+        bool l6_presync = false; // [TAG_FN_L6_PRESYNC] LLAMA_FN_L6_PRESYNC=1: hc mixer K2/K3 and router weights on chip before the PDL wait
+        void l6_mark_wait(ggml_tensor * moe_out) const;
+
         // [TAG_FN_L4_HOIST] the recurrent input of the graph, and the hoisted state gather of a layer
         llm_graph_input_rs * l4_inp_rs = nullptr;
         std::map<int, ggml_tensor *> l4_state_rows;
