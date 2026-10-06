@@ -1010,8 +1010,9 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
 
         // [TAG_FN_L3_GPU_DEFER] the ffn half's combine weights read only this mixer's norm: build_layer_ffn puts them
         // into the graph after the bridge post, so the device computes them while the host runs the experts
+        // [TAG_FN_L4_HC] not with the round-4 hc path: there the weights are computed inside the next mixer's first launch
         ggml_tensor * w_ffn = nullptr;
-        if (l3.defer) {
+        if (l3.defer && !l4.hc) {
             w_ffn = build_hc_combine_w(inject, il);
             l3_deferred.push_back(w_ffn);
         }

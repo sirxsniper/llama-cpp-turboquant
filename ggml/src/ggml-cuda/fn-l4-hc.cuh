@@ -4,7 +4,8 @@
 // (ggml-fn-l3.h: GGML_FN_L4_HC / GGML_FN_L4_HCPOST / GGML_FN_L4_HCQ8, only with LLAMA_FN_L4_HC), ggml-cuda.cu matches it:
 //   [SCALE -> SIGMOID -> SCALE -> DSV4_HC_POST ->] RMS_NORM -> MUL -> MUL_MAT down [-> MUL_MAT inject] -> SCALE -> SILU
 //   -> MUL_MAT up -> DSV4_HC_PRE
-//   K1 norm: the combine (weights 2*sigmoid(inject/hc) computed in place), the grouped rms_norm * gamma, the q8_1 copy
+//   K1 norm: [the ADD of the block output (the FFN's routed + shared experts) ->] the combine (weights 2*sigmoid(inject/hc)
+//            computed in place), the grouped rms_norm * gamma, the q8_1 copy
 //   K2 down: the down mat-vec (mul_mat_vec_q's sums, one row per block) and the inject mat-vec's per-warp sums
 //            (mul_mat_vec_f's) in one grid
 //   K3 up:   the inject's last reduction, scale -> silu -> q8_1 of the low rank (in shared memory), the up mat-vec
@@ -23,6 +24,7 @@ bool ggml_cuda_fn_l4_mmvq_generic(int cc);
 
 // the tensors of one matched mixer; s1 == nullptr: no combine before it (the norm reads rms->src[0])
 struct ggml_cuda_fn_l4_hc_chain {
+    const ggml_tensor * add    = nullptr; // ADD whose output is the combine's block_out (not written: K1 adds), or nullptr
     const ggml_tensor * s1     = nullptr; // SCALE 1/hc of the raw inject
     const ggml_tensor * s2     = nullptr; // SCALE 2 after the sigmoid
     ggml_tensor *       post   = nullptr; // DSV4_HC_POST (written)

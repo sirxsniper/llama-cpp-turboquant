@@ -57,6 +57,7 @@ static __device__ __forceinline__ void fn_l4_q8_1_store(const float xi, block_q8
 
 struct fn_l4_norm_args {
     const float * bo;  int64_t sb0, sb1;         // block_out [n_embd, T]
+    const float * bo2; int64_t sb20, sb21;       // with an ADD before the combine: block_out = bo + bo2 (op_add)
     const float * res; int64_t sr0, sr1, sr2;    // residual [n_embd, hc, T]
     const float * inj; int     inj_hc;            // raw inject [hc, T], contiguous
     float         s1, b1, s2, b2;                 // the two SCALE ops
@@ -93,7 +94,11 @@ static __global__ void k_fn_l4_hc_norm(const fn_l4_norm_args a) {
         for (int k = 0; k < FN_L4_NORM_MAXV; ++k) {
             const int col = tid + k*block_size;
             if (col < ncols) {
-                float sum = a.bo[col*a.sb0 + channel*a.sb1] * pw;
+                float xb = a.bo[col*a.sb0 + channel*a.sb1];
+                if (a.bo2) {
+                    xb = xb + a.bo2[col*a.sb20 + channel*a.sb21];
+                }
+                float sum = xb * pw;
                 sum += a.res[col*a.sr0 + row*a.sr1 + channel*a.sr2];
                 a.post[col*a.sp0 + row*a.sp1 + channel*a.sp2] = sum;
                 r[k] = sum;
@@ -476,11 +481,17 @@ void ggml_cuda_fn_l4_hc_run(ggml_backend_cuda_context & ctx, const ggml_cuda_fn_
         a.ncols = (int) n_embd;
         const bool has_post = c.s1 != nullptr;
         if (has_post) {
-            const ggml_tensor * bo  = c.post->src[0];
+            const ggml_tensor * bo  = c.add ? c.add->src[0] : c.post->src[0];
             const ggml_tensor * res = c.post->src[1];
             a.bo  = (const float *) bo->data;
             a.sb0 = bo->nb[0]/sizeof(float);
             a.sb1 = bo->nb[1]/sizeof(float);
+            if (c.add) {
+                const ggml_tensor * bo2 = c.add->src[1];
+                a.bo2  = (const float *) bo2->data;
+                a.sb20 = bo2->nb[0]/sizeof(float);
+                a.sb21 = bo2->nb[1]/sizeof(float);
+            }
             a.res = (const float *) res->data;
             a.sr0 = res->nb[0]/sizeof(float);
             a.sr1 = res->nb[1]/sizeof(float);

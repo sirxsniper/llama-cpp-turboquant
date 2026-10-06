@@ -4443,8 +4443,7 @@ static bool ggml_cuda_fn_l4_mmvq_node(const ggml_tensor * mm, const int cc, cons
 // GGML_FN_L4_HC: the whole hc mixer in three launches (fn-l4-hc.cu). Returns the nodes after i that they cover (0: none).
 static int ggml_cuda_fn_l4_try_hc(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
     ggml_tensor * n0 = cgraph->nodes[i];
-    const bool at_post = n0->op == GGML_OP_SCALE && ggml_fn_l3_get(n0) == GGML_FN_L4_HCPOST;
-    if ((!at_post && n0->op != GGML_OP_RMS_NORM) || cuda_ctx->curr_stream_no != 0) {
+    if ((n0->op != GGML_OP_SCALE && n0->op != GGML_OP_RMS_NORM && n0->op != GGML_OP_ADD) || cuda_ctx->curr_stream_no != 0) {
         return 0;
     }
 
@@ -4463,9 +4462,24 @@ static int ggml_cuda_fn_l4_try_hc(ggml_backend_cuda_context * cuda_ctx, ggml_cgr
         return -1;
     };
 
+    // at an ADD: the block output of a combine that starts here (the FFN half's routed + shared experts)
+    ggml_tensor * add = nullptr;
+    int i_s1 = i;
+    if (n0->op == GGML_OP_ADD) {
+        i_s1 = next(i);
+        if (i_s1 < 0 || cgraph->nodes[i_s1]->op != GGML_OP_SCALE) {
+            return 0;
+        }
+        add = n0;
+    }
+    const bool at_post = cgraph->nodes[i_s1]->op == GGML_OP_SCALE && ggml_fn_l3_get(cgraph->nodes[i_s1]) == GGML_FN_L4_HCPOST;
+    if (!at_post && n0->op != GGML_OP_RMS_NORM) {
+        return 0;
+    }
+
     int i_rms = i;
     if (at_post) {
-        i_rms = next(next(next(next(i))));
+        i_rms = next(next(next(next(i_s1))));
     }
     const int i_mul = next(i_rms);
     if (i_mul < 0 || cgraph->nodes[i_rms]->op != GGML_OP_RMS_NORM || cgraph->nodes[i_mul]->op != GGML_OP_MUL ||
@@ -4505,10 +4519,10 @@ static int ggml_cuda_fn_l4_try_hc(ggml_backend_cuda_context * cuda_ctx, ggml_cgr
 
     const ggml_tensor * x_in = rms->src[0]; // what the norm reads without a combine
     if (at_post) {
-        const ggml_tensor * s1   = n0;
-        const ggml_tensor * sig  = cgraph->nodes[next(i)];
-        const ggml_tensor * s2   = cgraph->nodes[next(next(i))];
-        ggml_tensor *       post = cgraph->nodes[next(next(next(i)))];
+        const ggml_tensor * s1   = cgraph->nodes[i_s1];
+        const ggml_tensor * sig  = cgraph->nodes[next(i_s1)];
+        const ggml_tensor * s2   = cgraph->nodes[next(next(i_s1))];
+        ggml_tensor *       post = cgraph->nodes[next(next(next(i_s1)))];
         if (sig->op != GGML_OP_UNARY || ggml_get_unary_op(sig) != GGML_UNARY_OP_SIGMOID || sig->src[0] != s1 ||
                 s2->op != GGML_OP_SCALE || s2->src[0] != sig || post->op != GGML_OP_DSV4_HC_POST || post->src[2] != s2 ||
                 post->src[3] != nullptr || rms->src[0] != post || !f32c(s1) || !f32c(sig) || !f32c(s2) ||
@@ -4524,6 +4538,17 @@ static int ggml_cuda_fn_l4_try_hc(ggml_backend_cuda_context * cuda_ctx, ggml_cgr
                 res->nb[0] % sizeof(float) != 0 || post->nb[0] % sizeof(float) != 0) {
             return 0;
         }
+        // the ADD: two same-shaped f32 [n_embd, T] operands, its only reader the combine (its output is not written)
+        if (add != nullptr) {
+            const ggml_tensor * a0 = add->src[0];
+            const ggml_tensor * a1 = add->src[1];
+            if (bo != add || !f32c(add) || !inner(add) || a0 == nullptr || a1 == nullptr || a0->type != GGML_TYPE_F32 ||
+                    a1->type != GGML_TYPE_F32 || !ggml_are_same_shape(a0, add) || !ggml_are_same_shape(a1, add) ||
+                    a0->nb[0] != sizeof(float) || a1->nb[0] != sizeof(float)) {
+                return 0;
+            }
+        }
+        c.add  = add;
         c.s1   = s1;
         c.s2   = s2;
         c.post = post;
@@ -4631,8 +4656,9 @@ static int ggml_cuda_fn_l4_try_hc(ggml_backend_cuda_context * cuda_ctx, ggml_cgr
 
     // the written tensors overlap neither each other nor what a launch reads after another one wrote
     const ggml_tensor * outs[4] = { c.post, mul, c.inject, pre };
-    const ggml_tensor * ins[7]  = { c.post ? c.post->src[0] : nullptr, c.post ? c.post->src[1] : nullptr,
-                                    c.s1 ? c.s1->src[0] : nullptr, x_in, mul, w_norm, c.inject ? c.inject->src[0] : nullptr };
+    const ggml_tensor * ins[9]  = { c.post ? c.post->src[0] : nullptr, c.post ? c.post->src[1] : nullptr,
+                                    c.s1 ? c.s1->src[0] : nullptr, x_in, mul, w_norm, c.inject ? c.inject->src[0] : nullptr,
+                                    c.add ? c.add->src[0] : nullptr, c.add ? c.add->src[1] : nullptr };
     const auto overlap = [](const ggml_tensor * a, const ggml_tensor * b) {
         const char * a0 = (const char *) a->data;
         const char * b0 = (const char *) b->data;
@@ -4678,7 +4704,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     ggml_tensor * node = cgraph->nodes[i];
 
     // [TAG_FN_L4_HC] before the round-3 hc paths: the marked mixer as a whole
-    if ((node->op == GGML_OP_SCALE && ggml_fn_l3_get(node) == GGML_FN_L4_HCPOST) || node->op == GGML_OP_RMS_NORM) {
+    if ((node->op == GGML_OP_SCALE && ggml_fn_l3_get(node) == GGML_FN_L4_HCPOST) || node->op == GGML_OP_RMS_NORM ||
+            node->op == GGML_OP_ADD) {
         const int n = ggml_cuda_fn_l4_try_hc(cuda_ctx, cgraph, i);
         if (n > 0) {
             return n;

@@ -12311,17 +12311,19 @@ struct test_fn_l3_hcmix : public test_case {
 // [TAG_FN_L4_HC] an hc mixer of a qwen4exp layer as the builder makes it with LLAMA_FN_L4_HC (n_embd 2560, hc 4, low
 // rank 320): [the combine ->] rms_norm * gamma -> down [-> inject] -> scale -> silu -> up -> hc_pre, with the down and
 // the inject put into the graph first, then a q8_0 projection of hc_pre's output (the reader of its q8_1 copy). marked:
-// the round-4 marks (q8: GGML_FN_L4_HCQ8 too). Output: the combine, the norm, the inject, hc_pre and the projection.
+// the round-4 marks (q8: GGML_FN_L4_HCQ8 too). add: the combine's block output is an ADD (the FFN's routed + shared
+// experts). Output: the combine, the norm, the inject, hc_pre and the projection.
 struct test_fn_l4_hc : public test_case {
     const int64_t n_tokens;
     const bool    post;
     const bool    inject;
     const bool    q8;
     const bool    marked;
+    const bool    add;
     ggml_tensor * first[2] = { nullptr, nullptr };
 
     std::string op_desc(ggml_tensor *) override { return "FN_L3_GPU"; }
-    std::string vars() override { return "l4hc," + VARS_TO_STR5(n_tokens, post, inject, q8, marked); }
+    std::string vars() override { return "l4hc," + VARS_TO_STR6(n_tokens, post, inject, q8, marked, add); }
     bool run_whole_graph() override { return true; }
     double max_nmse_err() override { return 5e-4; }
 
@@ -12333,8 +12335,9 @@ struct test_fn_l4_hc : public test_case {
         }
     }
 
-    test_fn_l4_hc(int64_t n_tokens = 3, bool post = true, bool inject = true, bool q8 = false, bool marked = true)
-        : n_tokens(n_tokens), post(post), inject(inject), q8(q8), marked(marked) {}
+    test_fn_l4_hc(int64_t n_tokens = 3, bool post = true, bool inject = true, bool q8 = false, bool marked = true,
+            bool add = false)
+        : n_tokens(n_tokens), post(post), inject(inject), q8(q8), marked(marked), add(add) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t n_embd = 2560;
@@ -12357,6 +12360,11 @@ struct test_fn_l4_hc : public test_case {
             ggml_set_name(inj_prev, "inject_prev");
             ggml_tensor * block_out = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, T);
             ggml_set_name(block_out, "block_out");
+            if (add) {
+                ggml_tensor * shexp = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, T);
+                ggml_set_name(shexp, "shexp");
+                block_out = ggml_add(ctx, block_out, shexp);
+            }
             ggml_tensor * residual = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, T);
             ggml_set_name(residual, "residual");
             ggml_tensor * s1 = mark(ggml_scale(ctx, inj_prev, 1.0f/(float) hc), GGML_FN_L4_HCPOST);
@@ -15221,6 +15229,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_fn_l3_gdnab(t, true)); // [TAG_FN_L3_GPU_GDNAB]
         test_cases.emplace_back(new test_fn_l3_hcmix(t, true)); // [TAG_FN_L3_GPU]
         test_cases.emplace_back(new test_fn_l4_hc(t, true, true, true, true));   // [TAG_FN_L4_HC]
+        test_cases.emplace_back(new test_fn_l4_hc(t, true, true, true, true, true));
         test_cases.emplace_back(new test_fn_l4_hc(t, false, false, false, true));
     }
     for (int64_t nb : { 1, 3 }) {
@@ -18249,11 +18258,15 @@ static bool run_fn_l3_gpu(ggml_backend_t backend, ggml_backend_t backend_ref, co
         if (small && t > 3) {
             break;
         }
-        for (int v = 0; v < 8; ++v) {
+        for (int v = 0; v < 16; ++v) {
             const bool vp = (v & 1) != 0;
             const bool vi = (v & 2) != 0;
             const bool vq = (v & 4) != 0;
-            cases.push_back({ [=](bool m) { return std::unique_ptr<test_case>(new test_fn_l4_hc(t, vp, vi, vq, m)); }, false });
+            const bool va = (v & 8) != 0;
+            if (va && !vp) {
+                continue;
+            }
+            cases.push_back({ [=](bool m) { return std::unique_ptr<test_case>(new test_fn_l4_hc(t, vp, vi, vq, m, va)); }, false });
         }
     }
 
