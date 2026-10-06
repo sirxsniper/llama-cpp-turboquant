@@ -4607,8 +4607,14 @@ static int ggml_cuda_fn_l4_try_hc(ggml_backend_cuda_context * cuda_ctx, ggml_cgr
     const auto fn_l6_fail = [&](int line) {
         static std::atomic<int> shown{0};
         static const bool diag = getenv("GGML_CUDA_FN_L6_DIAG") != nullptr;
-        if (diag && at_post && shown.fetch_add(1) < 16) {
-            GGML_LOG_INFO("ggml_cuda: [TAG_FN_L6] hc combine not matched at node %d (%s): ggml-cuda.cu line %d\n", i, n0->name, line);
+        // decode widths only (the s1 / ADD output has T columns), with the ops of the next computing nodes
+        if (diag && at_post && cgraph->nodes[i_s1]->ne[1] <= 4 && shown.fetch_add(1) < 64) {
+            std::string ops;
+            for (int j = i_s1, k = 0; j >= 0 && k < 8; j = next(j), ++k) {
+                ops += std::string(" ") + ggml_op_desc(cgraph->nodes[j]) + "(" + cgraph->nodes[j]->name + ")";
+            }
+            GGML_LOG_INFO("ggml_cuda: [TAG_FN_L6] hc combine not matched at node %d (%s) T %lld: ggml-cuda.cu line %d:%s\n", i,
+                    n0->name, (long long) cgraph->nodes[i_s1]->ne[1], line, ops.c_str());
         }
         return 0;
     };

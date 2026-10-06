@@ -2075,7 +2075,7 @@ template <int ncols_dst>
 __launch_bounds__(calc_nwarps(GGML_TYPE_Q8_0, ncols_dst, get_device_table_id())*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q_fn_l3(
         const void * vx, const void * vy, float * dst, const uint32_t ncols_x, const uint32_t stride_row_x,
-        const uint32_t stride_col_y, const uint32_t stride_col_dst) {
+        const uint32_t stride_col_y, const uint32_t stride_col_dst, const int presync) {
     constexpr ggml_type type = GGML_TYPE_Q8_0;
     constexpr int qk  = ggml_cuda_type_traits<type>::qk;
     constexpr int qi  = ggml_cuda_type_traits<type>::qi;
@@ -2092,17 +2092,42 @@ static __global__ void mul_mat_vec_q_fn_l3(
     const     int blocks_per_row_x = ncols_x / qk;
     constexpr int blocks_per_iter = vdr * nwarps*warp_size / qi;
 
+    constexpr int ahead = FN_L3_MMVQ_AHEAD;
+    const int kqs        = vdr * (tid % (qi/vdr));
+    const int kbx_first  = tid / (qi/vdr);
+    const int kbx_offset = row0*stride_row_x;
+
+    // [TAG_FN_L6_PRESYNC] presync: the q8_0 values and scales of the first pass, loaded before the PDL wait (the
+    // previous kernel still runs); the first pass then takes vec_dot_q8_0_q8_1's operations on them, so the same sums
+    int  pv[ahead][rows_per_cuda_block][vdr];
+    half pd[ahead][rows_per_cuda_block];
+    if (presync) {
+#pragma unroll
+        for (int u = 0; u < ahead; ++u) {
+            const int kbx = kbx_first + u*blocks_per_iter;
+            if (kbx < blocks_per_row_x) {
+#pragma unroll
+                for (int i = 0; i < rows_per_cuda_block; ++i) {
+                    const block_q8_0 * bq = (const block_q8_0 *) vx + kbx_offset + i*stride_row_x + kbx;
+#pragma unroll
+                    for (int l = 0; l < vdr; ++l) {
+                        pv[u][i][l] = get_int_b2(bq->qs, kqs + l);
+                    }
+                    pd[u][i] = bq->d;
+                }
+            }
+        }
+    }
+
     ggml_cuda_pdl_sync();
 
     float tmp[ncols_dst][rows_per_cuda_block] = {{0.0f}};
 
     const block_q8_1 * y = (const block_q8_1 *) vy;
-    const int kbx_offset = row0*stride_row_x;
 
     // four iterations per pass, each guarded, so their loads can issue together; kbx still runs in the original order
-    constexpr int ahead = FN_L3_MMVQ_AHEAD;
-    const int kqs = vdr * (tid % (qi/vdr));
-    for (int kbx0 = tid / (qi/vdr); kbx0 < blocks_per_row_x; kbx0 += ahead*blocks_per_iter) {
+    for (int kbx0 = kbx_first; kbx0 < blocks_per_row_x; kbx0 += ahead*blocks_per_iter) {
+        const bool first = presync && kbx0 == kbx_first;
 #pragma unroll
         for (int u = 0; u < ahead; ++u) {
             const int kbx = kbx0 + u*blocks_per_iter;
@@ -2112,7 +2137,17 @@ static __global__ void mul_mat_vec_q_fn_l3(
                 for (int j = 0; j < ncols_dst; ++j) {
 #pragma unroll
                     for (int i = 0; i < rows_per_cuda_block; ++i) {
-                        tmp[j][i] += vec_dot_q_cuda(vx, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
+                        if (first) {
+                            const block_q8_1 * by = &y[j*stride_col_y + kby];
+                            int uq[vdr];
+#pragma unroll
+                            for (int l = 0; l < vdr; ++l) {
+                                uq[l] = get_int_b4(by->qs, kqs + l);
+                            }
+                            tmp[j][i] += vec_dot_q8_0_q8_1_impl<float, vdr>(pv[u][i], uq, pd[u][i], __low2half(by->ds));
+                        } else {
+                            tmp[j][i] += vec_dot_q_cuda(vx, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
+                        }
                     }
                 }
             }
@@ -2327,11 +2362,12 @@ bool ggml_cuda_fn_l3_mul_mat_vec_q(ggml_backend_cuda_context & ctx, const ggml_t
         return true;
     }
 
+    const int presync = (ggml_fn_l6_get(dst) & GGML_FN_L6_PRESYNC) != 0; // [TAG_FN_L6_PRESYNC]
 #define FN_L3_MMVQ_CASE(nc) case nc: {                                                                                     \
         const std::pair<dim3, dim3> dims = calc_launch_params<GGML_TYPE_Q8_0>(nc, (int) ne01, 1, 1, warp_size, table_id);  \
         const ggml_cuda_kernel_launch_params lp(dims.first, dims.second, 0, stream);                                     \
         ggml_cuda_kernel_launch(mul_mat_vec_q_fn_l3<nc>, lp, src0->data, (const void *) src1_q8, (float *) dst->data,     \
-                (uint32_t) ne00, s01, s11, s1);                                                                           \
+                (uint32_t) ne00, s01, s11, s1, presync);                                                                  \
     } break;
     switch (ne11) {
         FN_L3_MMVQ_CASE(1)

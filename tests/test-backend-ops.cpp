@@ -18689,6 +18689,9 @@ static bool run_fn_l3_gpu(ggml_backend_t backend, ggml_backend_t backend_ref, co
         cases.push_back({ [=](bool m) { return std::unique_ptr<test_case>(new test_fn_l3_mmv(GGML_TYPE_F32, 2560, 512, t, m, true)); }, false });
         cases.push_back({ [=](bool m) { return std::unique_ptr<test_case>(new test_fn_l3_mmv(GGML_TYPE_F32, 10240, 4, t, m, true)); }, false });
         cases.push_back({ [=](bool m) { return std::unique_ptr<test_case>(new test_fn_l3_mmv(GGML_TYPE_F32, 2560, 48, t, m, true)); }, false });
+        // the GDN qkv and z projections (q8_0, K 2560) with the round-6 bit
+        cases.push_back({ [=](bool m) { return std::unique_ptr<test_case>(new test_fn_l3_mmv(GGML_TYPE_Q8_0, 2560, 10240, t, m, true)); }, false });
+        cases.push_back({ [=](bool m) { return std::unique_ptr<test_case>(new test_fn_l3_mmv(GGML_TYPE_Q8_0, 2560, 6144, t, m, true)); }, false });
     }
 
     int n_ok = 0;
