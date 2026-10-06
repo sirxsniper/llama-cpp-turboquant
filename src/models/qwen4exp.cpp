@@ -985,6 +985,7 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
         // [TAG_FN_L6_PRESYNC] environment only
         const char * ps = llama_model_fn_env(&model, "LLAMA_FN_L6_PRESYNC");
         l6_presync = ps && ps[0] && ps[0] != '0';
+        l6_presync_mmvq = ps && ps[0] == '2'; // 2: also the GDN qkv / z projections (measured slower)
         const char * hcc = llama_model_fn_env(&model, "LLAMA_FN_L6_HCCOMB"); // [TAG_FN_L6_HCCOMB]
         l6_hccomb = hcc && hcc[0] && hcc[0] != '0';
         static std::atomic<bool> noted_ps{false};
@@ -1527,7 +1528,7 @@ std::pair<ggml_tensor *, ggml_tensor *> llama_model_qwen4exp::graph::build_qkvz(
 
     ggml_tensor * qkv_mixed = build_lora_mm(model.layers[il].wqkv, input, model.layers[il].wqkv_s);
     qwen4exp_l3_mark_mm(qkv_mixed, l3.mmvd); // [TAG_FN_L3_GPU_MMV]
-    if (l6_presync && l3.mmvd && qkv_mixed->op == GGML_OP_MUL_MAT) {
+    if (l6_presync_mmvq && l3.mmvd && qkv_mixed->op == GGML_OP_MUL_MAT) {
         ggml_fn_l6_add(qkv_mixed, GGML_FN_L6_PRESYNC); // [TAG_FN_L6_PRESYNC]
     }
     qkv_mixed = ggml_reshape_3d(ctx0, qkv_mixed, qkv_mixed->ne[0], n_seq_tokens, n_seqs);
@@ -1535,7 +1536,7 @@ std::pair<ggml_tensor *, ggml_tensor *> llama_model_qwen4exp::graph::build_qkvz(
 
     ggml_tensor * z = build_lora_mm(model.layers[il].wqkv_gate, input, model.layers[il].wqkv_gate_s);
     qwen4exp_l3_mark_mm(z, l3.mmvd);
-    if (l6_presync && l3.mmvd && z->op == GGML_OP_MUL_MAT) {
+    if (l6_presync_mmvq && l3.mmvd && z->op == GGML_OP_MUL_MAT) {
         ggml_fn_l6_add(z, GGML_FN_L6_PRESYNC); // [TAG_FN_L6_PRESYNC]
     }
     cb(z, "z", il);

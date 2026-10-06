@@ -20,6 +20,13 @@ static void fn_l4_trace_step(const char * what) {
     fflush(stderr);
 }
 
+// [TAG_FN_L6_PRESYNC] GGML_CUDA_FN_L6_K3PRE=1: K3 also loads wu before the PDL wait (off: measured slower, its blocks do
+// not become resident next to K2's)
+static bool fn_l6_k3pre() {
+    static const bool on = getenv("GGML_CUDA_FN_L6_K3PRE") != nullptr && atoi(getenv("GGML_CUDA_FN_L6_K3PRE")) != 0;
+    return on;
+}
+
 bool ggml_cuda_fn_l4_enabled() {
     static const bool on = [] {
         const char * e = getenv("GGML_CUDA_FN_L4");
@@ -712,7 +719,7 @@ void ggml_cuda_fn_l4_hc_run(ggml_backend_cuda_context & ctx, const ggml_cuda_fn_
         constexpr int rpw = 4;
         // [TAG_FN_L6_PRESYNC] the 4 chunks of 32 contiguous rows of each block (rows of whole 4-byte words), <= 64 KiB
         size_t smem = 0;
-        if (c.presync) {
+        if (c.presync && fn_l6_k3pre()) {
             const size_t chunk = (size_t) WARP_SIZE*(lr/QK8_0)*sizeof(block_q8_0);
             if (a.stride_row_x == (int) (lr/QK8_0) && chunk % 16 == 0 && ((size_t) n_embd*a.stride_row_x*sizeof(block_q8_0)) % 16 == 0 &&
                     ((uintptr_t) a.wu % 16) == 0 && FN_L4_HC*chunk <= 64*1024) {

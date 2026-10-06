@@ -2641,6 +2641,7 @@ struct llama_model_qwen4exp : public llama_model_base {
         // prefetches the next layer's pre-post weights into L2 while the device waits for the host (off by default)
         bool l6_l2pf = false;
         bool l6_hccomb  = false; // [TAG_FN_L6_HCCOMB] LLAMA_FN_L6_HCCOMB=1: the combine's inputs stay allocated through the mixer
+        bool l6_presync_mmvq = false; // [TAG_FN_L6_PRESYNC] LLAMA_FN_L6_PRESYNC=2: also the GDN qkv / z mat-vecs
         bool l6_presync = false; // [TAG_FN_L6_PRESYNC] LLAMA_FN_L6_PRESYNC=1: hc mixer K2/K3 and router weights on chip before the PDL wait
         void l6_mark_wait(ggml_tensor * moe_out) const;
 
