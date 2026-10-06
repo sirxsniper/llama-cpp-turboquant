@@ -3050,6 +3050,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         // [TAG_FN_GRAPH_PER_WIDTH] this width's graph still fits, but the scheduler holds another one:
         // restore the post-build state, then split and allocate again, without model.build_graph
         gf_res_prev_active = nullptr;
+        hp(LLAMA_HP_DEC_RESET); // [TAG_FN_L4_HOST]
         ggml_backend_sched_reset(sched.get());
         if (turbo_nan_scan_on()) {
             ggml_backend_sched_set_eval_callback(sched.get(), turbo_nan_scan_cb, nullptr);
@@ -3059,6 +3060,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         res->restore_build_state(sched.get());
         llama_launch2_apply(model, sched.get(), launch2_decode); // [TAG_FN_L3_HOST_LAUNCH2]
+        hp(LLAMA_HP_DEC_ALLOC); // [TAG_FN_L4_HOST]
         if (!ggml_backend_sched_alloc_graph(sched.get(), res->get_gf())) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
@@ -3098,6 +3100,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
 
         const bool launch_cut = llama_launch2_apply(model, sched.get(), launch2_decode); // [TAG_FN_L3_HOST_LAUNCH2]
+        hp(LLAMA_HP_DEC_ALLOC); // [TAG_FN_L4_HOST]
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;

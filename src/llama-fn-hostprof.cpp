@@ -65,7 +65,8 @@ bool hp_mine() {
 }
 
 const char * hp_dec_name(int sub) {
-    static const char * names[LLAMA_HP_DEC_N] = { "prep", "apply", "graph", "inputs", "launch", "wait", "bend", "out", "post", "sync" };
+    static const char * names[LLAMA_HP_DEC_N] = { "prep", "apply", "graph", "inputs", "launch", "wait", "bend", "out", "post", "sync",
+                                                  "reset", "alloc" };
     return sub >= 0 && sub < LLAMA_HP_DEC_N ? names[sub] : "?";
 }
 
