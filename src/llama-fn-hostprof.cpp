@@ -68,7 +68,7 @@ bool hp_mine() {
 
 const char * hp_dec_name(int sub) {
     static const char * names[LLAMA_HP_DEC_N] = { "prep", "apply", "graph", "inputs", "launch", "wait", "bend", "out", "post", "sync",
-                                                  "reset", "alloc" };
+                                                  "reset", "alloc", "scpy", "ssync", "scpu", "sgpu" };
     return sub >= 0 && sub < LLAMA_HP_DEC_N ? names[sub] : "?";
 }
 
@@ -130,6 +130,10 @@ bool llama_fn_l4_host_flag(const llama_model * model, const char * name) {
         return v != 0;
     }
     return llama_fn_l3_int(*model, "LLAMA_FN_L4_HOST", 0) != 0;
+}
+
+int llama_fn_l4_int(const llama_model * model, const char * name, int def) {
+    return model == nullptr ? def : llama_fn_l3_int(*model, name, def);
 }
 
 void llama_hp_enable(int every) {

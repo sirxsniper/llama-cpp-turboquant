@@ -1162,6 +1162,10 @@ struct ggml_backend_sched {
     bool                                    batch_inputs;
     bool                                    batch_fn_tried[GGML_SCHED_MAX_BACKENDS];
     ggml_backend_set_tensors_batch_async_t  batch_fn[GGML_SCHED_MAX_BACKENDS];
+
+    // [TAG_FN_L4_HOST] ggml_backend_sched_set_prof_cb
+    ggml_backend_sched_prof_cb_t prof_cb;
+    void *                       prof_ud;
 };
 
 #define hash_id(tensor) ggml_hash_find_or_insert(&sched->hash_set, tensor)
@@ -2084,6 +2088,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     static thread_local std::vector<const void *>  batch_d;
     static thread_local std::vector<size_t>        batch_s;
 
+    // [TAG_FN_L4_HOST] host profile hook (NULL: off)
+    const ggml_backend_sched_prof_cb_t prof_cb = sched->prof_cb;
+    auto prof = [&](int ev) {
+        if (prof_cb) {
+            prof_cb(sched->prof_ud, ev);
+        }
+    };
+
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
@@ -2091,6 +2103,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
         const bool split_is_host = split_async && ggml_backend_buft_is_host(sched->bufts[split_backend_id]);
         uint32_t   d2h_async     = 0; // [TAG_FN_SCHED_SPLIT_ASYNC] backends with a queued device -> host input copy
+
+        prof(GGML_SCHED_PROF_SYNC); // [TAG_FN_L4_HOST]
 
         // ensure the previous split's async work has completed before we start
         // this split, the allocator may have reused buffer regions across splits
@@ -2101,6 +2115,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 ggml_backend_synchronize(sched->backends[prev_backend_id]);
             }
         }
+
+        prof(GGML_SCHED_PROF_INPUTS); // [TAG_FN_L4_HOST]
 
         // copy the input tensors to the split backend
         int n_inputs_async = 0;
@@ -2315,6 +2331,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             batch_s.clear();
         }
 
+        prof(GGML_SCHED_PROF_SYNC); // [TAG_FN_L4_HOST]
+
         // [TAG_SCHED_INPUT_BATCH] one synchronize for every input queued above
         if (n_inputs_async > 0) {
             ggml_backend_synchronize(split_backend);
@@ -2326,6 +2344,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             uint32_t m = d2h_async | pending_h2d;
             ggml_backend_sched_sync_mask(sched, m);
             pending_h2d = 0;
+        }
+
+        if (prof_cb) { // [TAG_FN_L4_HOST]
+            prof(ggml_backend_buft_is_host(sched->bufts[split_backend_id]) ? GGML_SCHED_PROF_HOST : GGML_SCHED_PROF_DEVICE);
         }
 
         if (!sched->callback_eval) {
@@ -2375,10 +2397,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         prev_backend_id = split_backend_id;
     }
 
+    prof(GGML_SCHED_PROF_SYNC); // [TAG_FN_L4_HOST]
+
     // [TAG_FN_SCHED_SPLIT_ASYNC] the caller's next set_inputs may write host memory a queued copy still reads
     if (pending_h2d != 0) {
         ggml_backend_sched_sync_mask(sched, pending_h2d);
     }
+
+    prof(GGML_SCHED_PROF_END); // [TAG_FN_L4_HOST]
 
     return GGML_STATUS_SUCCESS;
 }
@@ -2668,6 +2694,13 @@ void ggml_backend_sched_snap_free(ggml_backend_sched_snap_t snap) {
 void ggml_backend_sched_set_batch_inputs(ggml_backend_sched_t sched, bool on) {
     GGML_ASSERT(sched);
     sched->batch_inputs = on;
+}
+
+// [TAG_FN_L4_HOST]
+void ggml_backend_sched_set_prof_cb(ggml_backend_sched_t sched, ggml_backend_sched_prof_cb_t cb, void * user_data) {
+    GGML_ASSERT(sched);
+    sched->prof_cb = cb;
+    sched->prof_ud = user_data;
 }
 
 void ggml_backend_sched_reset(ggml_backend_sched_t sched) {

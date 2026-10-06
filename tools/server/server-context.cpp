@@ -7082,6 +7082,9 @@ private:
             SLT_DBG(slot, "add accepted tokens: sampled=%d, ids.size=%zu, n_draft=%zu\n", slot.sampled, ids.size(), n_draft);
 
             slot.mem.seq_rm(slot.id, slot.prompt.tokens.pos_next(), -1);
+
+            // [TAG_FN_L4_HOST_PLEPRE] the next verify batch starts with this token: its PLE rows are read during the drafts
+            llama_ple_prefetch_ext(slot.ctx_tgt, slot.id, slot.prompt.tokens.pos_next(), &slot.sampled, 1, 0);
             TURBO_PHASE_END("bookkeep")
 
             TURBO_PHASE_BEGIN

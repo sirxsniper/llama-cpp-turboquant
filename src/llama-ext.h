@@ -253,7 +253,10 @@ enum llama_hp_seg {
 enum llama_hp_dec {
     LLAMA_HP_DEC_PREP = 0, LLAMA_HP_DEC_APPLY, LLAMA_HP_DEC_GRAPH, LLAMA_HP_DEC_INPUTS, LLAMA_HP_DEC_LAUNCH,
     LLAMA_HP_DEC_WAIT, LLAMA_HP_DEC_BEND, LLAMA_HP_DEC_OUT, LLAMA_HP_DEC_POST, LLAMA_HP_DEC_SYNC, LLAMA_HP_DEC_RESET,
-    LLAMA_HP_DEC_ALLOC, LLAMA_HP_DEC_N,
+    LLAMA_HP_DEC_ALLOC,
+    // inside the launch (scheduler hook): split input copies, waits, a host split's compute, a device split's compute
+    LLAMA_HP_DEC_SCPY, LLAMA_HP_DEC_SSYNC, LLAMA_HP_DEC_SCPU, LLAMA_HP_DEC_SGPU,
+    LLAMA_HP_DEC_N,
 };
 #define LLAMA_HP_N_SEG ((int) LLAMA_HP_DEC_BASE + 3*(int) LLAMA_HP_DEC_N)
 
@@ -269,6 +272,15 @@ LLAMA_API void llama_hp_step(int n_tokens);          // a target graph of n_toke
 // [TAG_FN_L4_HOST] a lever of the l4 host family: true only for a qwen4exp model and when the switch name (else the
 // umbrella LLAMA_FN_L4_HOST) is set to a non-zero value (environment or the model's automatic profile)
 LLAMA_API bool llama_fn_l4_host_flag(const struct llama_model * model, const char * name);
+
+// [TAG_FN_L4_HOST] the value of one switch only (no umbrella): def unless the model is qwen4exp and the switch is set
+LLAMA_API int llama_fn_l4_int(const struct llama_model * model, const char * name, int def);
+
+// [TAG_FN_L4_HOST_PLEPRE] LLAMA_FN_L4_HOST_PLEPRE (qwen4exp with PLE direct I/O): a helper thread reads the PLE rows of
+// toks[i_first..n), which a coming decode of seq_id holds at positions pos0 + i, into the row cache (predecessors: the
+// earlier toks, else the KV cells). A hint only: the decode computes and reads its own rows as before. No-op otherwise.
+LLAMA_API void llama_ple_prefetch_ext(struct llama_context * ctx, llama_seq_id seq_id, llama_pos pos0, const llama_token * toks,
+        int32_t n, int32_t i_first);
 
 // RAII: switch to seg, back to the previous segment at scope exit
 struct llama_hp_scope {

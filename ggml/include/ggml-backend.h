@@ -384,6 +384,18 @@ extern "C" {
             const void * const * data, const size_t * sizes);
     GGML_API void                 ggml_backend_sched_set_batch_inputs(ggml_backend_sched_t sched, bool on);
 
+    // [TAG_FN_L4_HOST] host profile hook: called when graph compute enters a part (input copies, a wait, a host split's
+    // compute, a device split's compute or launch, the end). NULL (default) = off.
+    enum ggml_backend_sched_prof_ev {
+        GGML_SCHED_PROF_INPUTS = 0,
+        GGML_SCHED_PROF_SYNC   = 1,
+        GGML_SCHED_PROF_HOST   = 2,
+        GGML_SCHED_PROF_DEVICE = 3,
+        GGML_SCHED_PROF_END    = 4,
+    };
+    typedef void (*ggml_backend_sched_prof_cb_t)(void * user_data, int ev);
+    GGML_API void                 ggml_backend_sched_set_prof_cb(ggml_backend_sched_t sched, ggml_backend_sched_prof_cb_t cb, void * user_data);
+
     //
     // Meta backend
     //

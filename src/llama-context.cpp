@@ -1963,7 +1963,7 @@ void llama_context::sched_reserve() {
     gf_res_prev_active = nullptr;
 
     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
-    ggml_backend_sched_set_batch_inputs(sched.get(), batch_inputs_on); // [TAG_FN_L4_HOST_BATCHCPY]
+    sched_hooks(); // [TAG_FN_L4_HOST_BATCHCPY] [TAG_FN_L4_HOST]
 
     llama_memory_context_ptr mctx;
     if (memory) {
@@ -2006,7 +2006,7 @@ void llama_context::sched_reserve() {
                 LLAMA_LOG_WARN("%s: compute buffer allocation failed, retrying without pipeline parallelism\n", __func__);
                 cparams.pipeline_parallel = false;
                 sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
-                ggml_backend_sched_set_batch_inputs(sched.get(), batch_inputs_on); // [TAG_FN_L4_HOST_BATCHCPY]
+                sched_hooks(); // [TAG_FN_L4_HOST_BATCHCPY] [TAG_FN_L4_HOST]
                 gf = graph_reserve(n_tokens_pp, n_seqs, n_outputs_pp, mctx.get());
             }
             if (!gf) {
@@ -2120,6 +2120,25 @@ void llama_context::sched_reserve() {
 // [TAG_FN_L4_HOST] the hostprof segment of a decode class (0 target, 1 MTP process, 2 MTP draft) and step part
 static int llama_hp_dec_seg(int cls, int sub) {
     return LLAMA_HP_DEC_BASE + cls*LLAMA_HP_DEC_N + sub;
+}
+
+// [TAG_FN_L4_HOST_BATCHCPY] [TAG_FN_L4_HOST] the l4 host hooks of a new scheduler: batched input copies, and with the
+// host profile the parts of its graph compute (input copies, waits, host / device split compute)
+void llama_context::sched_hooks() {
+    ggml_backend_sched_set_batch_inputs(sched.get(), batch_inputs_on);
+    if (llama_hp_on()) {
+        ggml_backend_sched_set_prof_cb(sched.get(), [](void * ud, int ev) {
+            int sub = LLAMA_HP_DEC_LAUNCH;
+            switch (ev) {
+                case GGML_SCHED_PROF_INPUTS: sub = LLAMA_HP_DEC_SCPY;  break;
+                case GGML_SCHED_PROF_SYNC:   sub = LLAMA_HP_DEC_SSYNC; break;
+                case GGML_SCHED_PROF_HOST:   sub = LLAMA_HP_DEC_SCPU;  break;
+                case GGML_SCHED_PROF_DEVICE: sub = LLAMA_HP_DEC_SGPU;  break;
+                default: break;
+            }
+            llama_hp_switch(llama_hp_dec_seg(llama_hp_ctx_class_get(ud), sub));
+        }, this);
+    }
 }
 
 // [TAG_HOST_GAP_PROBE] LLAMA_HOST_GAP_PROBE=1: in a serial decode loop the GPU has nothing queued from the end of
@@ -5912,7 +5931,7 @@ void llama_context::cbuf_free_compute() {
     const size_t max_nodes = graph_max_nodes(reserve_n_tokens());
     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes,
             cparams.pipeline_parallel, cparams.op_offload));
-    ggml_backend_sched_set_batch_inputs(sched.get(), batch_inputs_on); // [TAG_FN_L4_HOST_BATCHCPY]
+    sched_hooks(); // [TAG_FN_L4_HOST_BATCHCPY] [TAG_FN_L4_HOST]
     sched_need_reserve = true;
 }
 

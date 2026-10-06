@@ -426,6 +426,7 @@ private:
     bool   early_out_on = false;
 
     bool   batch_inputs_on = false; // [TAG_FN_L4_HOST_BATCHCPY] LLAMA_FN_L4_HOST_BATCHCPY (qwen4exp)
+    void   sched_hooks();           // [TAG_FN_L4_HOST_BATCHCPY] [TAG_FN_L4_HOST] set on every new scheduler
     void (*early_extract_fn)(void * ud, const llm_graph_result * res) = nullptr;
     void * early_extract_ud = nullptr;
 
