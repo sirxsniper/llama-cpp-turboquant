@@ -1,3 +1,0 @@
-blk.48.ffn_gate_exps.weight=q4_K
-blk.48.ffn_up_exps.weight=q4_K
-blk.48.ffn_down_exps.weight=q5_1
