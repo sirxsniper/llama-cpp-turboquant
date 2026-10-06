@@ -33,6 +33,15 @@ enum ggml_fn_l3_mark {
                                      // hot set / a DMA bank), so its outputs are 0 and are written without reading it
     GGML_FN_L3_GDNAB   = 0x4C33470A, // the GDN beta and alpha MUL_MATs: beta -> sigmoid, then alpha -> (+ dt, softplus,
                                      // * a), next to each other in the graph, in one launch
+
+    // [TAG_FN_L4_HC] lever round 4 (LLAMA_FN_L4_HC): a whole hc mixer of a qwen4exp layer in three launches (norm with
+    // its q8_1 copy, down + inject, up + hc_pre), and the combine before it folded into the norm launch
+    GGML_FN_L4_HC      = 0x4C344801, // MUL (rms_norm * gamma) that starts an hc mixer: RMS_NORM -> MUL -> MUL_MAT down
+                                     // [-> MUL_MAT inject] -> SCALE -> SILU -> MUL_MAT up -> DSV4_HC_PRE
+    GGML_FN_L4_HCPOST  = 0x4C344802, // SCALE of the combine weights: SCALE -> SIGMOID -> SCALE -> DSV4_HC_POST, then a
+                                     // GGML_FN_L4_HC mixer that reads the post
+    GGML_FN_L4_HCQ8    = 0x4C344803, // DSV4_HC_PRE of such a mixer: also writes the q8_1 copy of its output for the MUL_MAT
+                                     // that reads it (the MMVQ reuse cache, same bytes)
 };
 
 static inline void ggml_fn_l3_set(struct ggml_tensor * t, int32_t mark) {

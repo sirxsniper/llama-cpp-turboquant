@@ -3,6 +3,7 @@
 #include "unary.cuh"
 #include "vecdotq.cuh"
 #include "fn-l3.cuh" // [TAG_FN_L3_GPU]
+#include "fn-l4-hc.cuh" // [TAG_FN_L4_HC]
 
 #include <cstdint>
 #include <cstring>
@@ -1691,6 +1692,12 @@ void ggml_cuda_mmvq_q8_cache_note_write(ggml_backend_cuda_context & ctx, const g
     if (node == c.producer) {
         return;
     }
+    // [TAG_FN_L4_HC] a node of the producer's launch group (checked against the copy when it was matched)
+    for (int k = 0; k < c.n_group; ++k) {
+        if (c.group[k] == node) {
+            return;
+        }
+    }
     const char * w0 = (const char *) node->data;
     const char * w1 = w0 + ggml_nbytes(node);
     const char * r0 = (const char *) c.data;
@@ -2228,6 +2235,11 @@ static __global__ void mul_mat_vec_q_fn_l3_smk(
             }
         }
     }
+}
+
+// [TAG_FN_L4_HC]
+bool ggml_cuda_fn_l4_mmvq_generic(int cc) {
+    return GGML_CUDA_CC_IS_NVIDIA(cc) && get_device_table_id(cc) == MMVQ_PARAMETERS_GENERIC;
 }
 
 bool ggml_cuda_fn_l3_mul_mat_vec_q(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {

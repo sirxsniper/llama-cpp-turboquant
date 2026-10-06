@@ -79,6 +79,7 @@
 #include "ggml-cuda/fill.cuh"
 #include "ggml-cuda/lightning-indexer.cuh"
 #include "ggml-cuda/fn-l3.cuh"            // [TAG_FN_L3_GPU]
+#include "ggml-cuda/fn-l4-hc.cuh"         // [TAG_FN_L4_HC]
 #include "ggml.h"
 
 #include <algorithm>
@@ -4399,6 +4400,274 @@ static int ggml_cuda_fn_l3_try_gdnab(ggml_backend_cuda_context * cuda_ctx, ggml_
     return idx[5] - i;
 }
 
+// [TAG_FN_L4_HC] graph uses of t (0: not a node of the graph)
+static int32_t ggml_cuda_fn_l4_uses(const ggml_cgraph * cgraph, const ggml_tensor * t) {
+    const size_t pos = ggml_hash_find(&cgraph->visited_hash_set, t);
+    if (pos == GGML_HASHSET_FULL || !ggml_bitset_get(cgraph->visited_hash_set.used, pos)) {
+        return 0;
+    }
+    return cgraph->use_counts[pos];
+}
+
+// [TAG_FN_L4_HC] the tensor a chain of reshapes / offset-0 views starts from
+static const ggml_tensor * ggml_cuda_fn_l4_base(const ggml_tensor * t) {
+    for (int k = 0; k < 4 && t != nullptr && (t->op == GGML_OP_RESHAPE || (t->op == GGML_OP_VIEW && t->view_offs == 0)); ++k) {
+        t = t->src[0];
+    }
+    return t;
+}
+
+// [TAG_FN_L4_HC] true when ggml_cuda_mul_mat computes this q8_0 MUL_MAT (1..4 columns) with mul_mat_vec_q's generic launch
+static bool ggml_cuda_fn_l4_mmvq_node(const ggml_tensor * mm, const int cc, const int warp_size) {
+    const ggml_tensor * src0 = mm->src[0];
+    const ggml_tensor * src1 = mm->src[1];
+    if (src0 == nullptr || src1 == nullptr || src0->type != GGML_TYPE_Q8_0 || src1->type != GGML_TYPE_F32 ||
+            mm->type != GGML_TYPE_F32 || src0->buffer == nullptr || src0->data == nullptr ||
+            ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE ||
+            ggml_cuda_op_mul_mat_use_fwht(mm) || warp_size != 32 || !ggml_cuda_fn_l4_mmvq_generic(cc)) {
+        return false;
+    }
+    const int64_t ne11 = src1->ne[1];
+    if (src0->ne[2] != 1 || src0->ne[3] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1 || ne11 < 1 || ne11 > 4 ||
+            src0->nb[0] != ggml_type_size(src0->type) || src0->ne[0] % QK8_0 != 0 || src0->ne[0] != src1->ne[0] ||
+            src0->ne[0] > INT32_MAX/64 || src0->ne[1] > INT32_MAX/64 || !ggml_is_contiguous(src1) || !ggml_is_contiguous(mm)) {
+        return false;
+    }
+    return !ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, ne11) &&
+           !ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, ne11, /*mul_mat_id =*/ false) &&
+           !ggml_cuda_should_use_mmsb(src0, src1, mm, cc) && !ggml_cuda_should_use_mmqsn(src0, src1, mm, cc) &&
+           ggml_cuda_should_use_mmvq(src0->type, cc, ne11, /*ne01 =*/ src0->ne[1]);
+}
+
+// [TAG_FN_L4_HC] at a SCALE marked GGML_FN_L4_HCPOST (the combine, then the mixer) or at an RMS_NORM whose MUL is marked
+// GGML_FN_L4_HC: the whole hc mixer in three launches (fn-l4-hc.cu). Returns the nodes after i that they cover (0: none).
+static int ggml_cuda_fn_l4_try_hc(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+    ggml_tensor * n0 = cgraph->nodes[i];
+    const bool at_post = n0->op == GGML_OP_SCALE && ggml_fn_l3_get(n0) == GGML_FN_L4_HCPOST;
+    if ((!at_post && n0->op != GGML_OP_RMS_NORM) || cuda_ctx->curr_stream_no != 0) {
+        return 0;
+    }
+
+    // the next node that computes (views and no-ops between the chain's nodes are skipped), -1 when none
+    const auto next = [cgraph](int j) -> int {
+        if (j < 0) {
+            return -1;
+        }
+        for (++j; j < cgraph->n_nodes; ++j) {
+            const ggml_tensor * t = cgraph->nodes[j];
+            if (ggml_cuda_is_view_or_noop(t)) {
+                continue;
+            }
+            return (t->flags & GGML_TENSOR_FLAG_COMPUTE) ? j : -1;
+        }
+        return -1;
+    };
+
+    int i_rms = i;
+    if (at_post) {
+        i_rms = next(next(next(next(i))));
+    }
+    const int i_mul = next(i_rms);
+    if (i_mul < 0 || cgraph->nodes[i_rms]->op != GGML_OP_RMS_NORM || cgraph->nodes[i_mul]->op != GGML_OP_MUL ||
+            ggml_fn_l3_get(cgraph->nodes[i_mul]) != GGML_FN_L4_HC || !ggml_cuda_fn_l4_enabled()) {
+        return 0;
+    }
+    static const bool trace = getenv("GGML_CUDA_FN_L4_TRACE") != nullptr;
+    if (trace) {
+        fprintf(stderr, "fn_l4 trace: match at %d (%s), rms %d mul %d\n", i, ggml_op_name(n0->op), i_rms, i_mul);
+        fflush(stderr);
+    }
+
+    const auto f32c = [](const ggml_tensor * t) {
+        return t != nullptr && t->type == GGML_TYPE_F32 && ggml_is_contiguous(t);
+    };
+    // a node no launch writes: its only reader is the next node of the chain
+    const auto inner = [cgraph](const ggml_tensor * t) {
+        return ggml_cuda_fn_l4_uses(cgraph, t) == 1 && !(t->flags & GGML_TENSOR_FLAG_OUTPUT) && t->view_src == nullptr;
+    };
+
+    ggml_cuda_fn_l4_hc_chain c;
+    ggml_tensor * rms = cgraph->nodes[i_rms];
+    ggml_tensor * mul = cgraph->nodes[i_mul];
+    const int64_t n_embd = mul->ne[0];
+    const int64_t hc     = mul->ne[1];
+    const int64_t T      = mul->ne[2];
+    if (!f32c(mul) || mul->ne[3] != 1 || hc != 4 || T < 1 || T > 4 || n_embd % 32 != 0 || n_embd < 32 ||
+            n_embd > (n_embd < 1024 ? 4*256 : 4*1024) || !ggml_are_same_shape(rms, mul) || rms->type != GGML_TYPE_F32 ||
+            !inner(rms) || (mul->src[0] != rms && mul->src[1] != rms)) {
+        return 0;
+    }
+    const ggml_tensor * w_norm = mul->src[0] == rms ? mul->src[1] : mul->src[0];
+    if (w_norm == nullptr || w_norm->type != GGML_TYPE_F32 || w_norm->nb[0] != sizeof(float) || w_norm->ne[0] != n_embd ||
+            w_norm->ne[1] != hc || w_norm->ne[2] != 1 || w_norm->ne[3] != 1) {
+        return 0;
+    }
+
+    const ggml_tensor * x_in = rms->src[0]; // what the norm reads without a combine
+    if (at_post) {
+        const ggml_tensor * s1   = n0;
+        const ggml_tensor * sig  = cgraph->nodes[next(i)];
+        const ggml_tensor * s2   = cgraph->nodes[next(next(i))];
+        ggml_tensor *       post = cgraph->nodes[next(next(next(i)))];
+        if (sig->op != GGML_OP_UNARY || ggml_get_unary_op(sig) != GGML_UNARY_OP_SIGMOID || sig->src[0] != s1 ||
+                s2->op != GGML_OP_SCALE || s2->src[0] != sig || post->op != GGML_OP_DSV4_HC_POST || post->src[2] != s2 ||
+                post->src[3] != nullptr || rms->src[0] != post || !f32c(s1) || !f32c(sig) || !f32c(s2) ||
+                !f32c(s1->src[0]) || !inner(s1) || !inner(sig) || !inner(s2) || s1->ne[0] != hc || s1->ne[1] != T ||
+                ggml_nelements(s1) != hc*T || !ggml_are_same_shape(s1, s1->src[0])) {
+            return 0;
+        }
+        const ggml_tensor * bo  = post->src[0];
+        const ggml_tensor * res = post->src[1];
+        if (bo == nullptr || res == nullptr || bo->type != GGML_TYPE_F32 || res->type != GGML_TYPE_F32 ||
+                post->type != GGML_TYPE_F32 || bo->ne[0] != n_embd || bo->ne[1] != T || bo->ne[2] != 1 || bo->ne[3] != 1 ||
+                !ggml_are_same_shape(res, mul) || !ggml_are_same_shape(post, mul) || bo->nb[0] % sizeof(float) != 0 ||
+                res->nb[0] % sizeof(float) != 0 || post->nb[0] % sizeof(float) != 0) {
+            return 0;
+        }
+        c.s1   = s1;
+        c.s2   = s2;
+        c.post = post;
+        x_in   = nullptr;
+    } else if (x_in == nullptr || x_in->type != GGML_TYPE_F32 || x_in->nb[0] != sizeof(float) ||
+            !ggml_are_same_shape(x_in, mul)) {
+        return 0;
+    }
+    c.rms = rms;
+    c.mul = mul;
+
+    const int cc        = ggml_cuda_info().devices[cuda_ctx->device].cc;
+    const int warp_size = ggml_cuda_info().devices[cuda_ctx->device].warp_size;
+    const int64_t hc_dim = n_embd*hc;
+
+    // down, then the inject when it reads the same norm
+    const int i_down = next(i_mul);
+    if (i_down < 0) {
+        return 0;
+    }
+    ggml_tensor * down = cgraph->nodes[i_down];
+    if (down->op != GGML_OP_MUL_MAT || ggml_cuda_fn_l4_base(down->src[1]) != mul || down->src[1]->ne[0] != hc_dim ||
+            down->src[1]->ne[1] != T || !ggml_cuda_fn_l4_mmvq_node(down, cc, warp_size) || !inner(down) ||
+            down->src[0]->ne[1] % 32 != 0 || down->src[0]->ne[1] > 1024) {
+        return 0;
+    }
+    const int64_t lr = down->src[0]->ne[1];
+    c.down = down;
+
+    int i_ls = next(i_down);
+    if (i_ls < 0) {
+        return 0;
+    }
+    ggml_tensor * x = cgraph->nodes[i_ls];
+    if (x->op == GGML_OP_MUL_MAT && x->src[0] != nullptr && x->src[0]->type == GGML_TYPE_F32 &&
+            ggml_cuda_fn_l4_base(x->src[1]) == mul) {
+        const ggml_tensor * wi = x->src[0];
+        const ggml_tensor * yi = x->src[1];
+        if (x->type != GGML_TYPE_F32 || x->nb[0] != sizeof(float) || wi->ne[0] != hc_dim || wi->ne[2] != 1 ||
+                wi->ne[3] != 1 || wi->ne[1] < 1 || wi->ne[1] > 64 || !f32c(yi) || yi->ne[0] != hc_dim || yi->ne[1] != T ||
+                x->ne[0] != wi->ne[1] || x->ne[1] != T || x->ne[2] != 1 || x->ne[3] != 1) {
+            return 0;
+        }
+        c.inject = x;
+        // only where ggml_cuda_mul_mat computes it with mul_mat_vec_f (f32 at T <= 3 on a GPU with fp32 MMA), else the op runs
+        c.inject_fused = warp_size == 32 && wi->nb[0] == sizeof(float) && hc_dim % 2 == 0 &&
+            (wi->nb[1]/sizeof(float)) % 2 == 0 && (yi->nb[1]/sizeof(float)) % 2 == 0 && hc_dim <= INT32_MAX/4 &&
+            wi->buffer != nullptr && ggml_backend_buffer_get_usage(wi->buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
+            !ggml_cuda_op_mul_mat_use_fwht(x) && ggml_cuda_should_use_mmvf(wi->type, cc, wi->ne, wi->nb, T);
+        if (c.inject_fused) {
+            // the block size launch_mul_mat_vec_f_cuda picks
+            int64_t bs_best    = warp_size;
+            int64_t niter_best = (hc_dim + 2*warp_size - 1) / (2*warp_size);
+            for (int64_t bs = 2*warp_size; bs <= 256; bs += warp_size) {
+                const int64_t niter = (hc_dim + 2*bs - 1) / (2*bs);
+                if (niter < niter_best) {
+                    niter_best = niter;
+                    bs_best    = bs;
+                }
+            }
+            c.inject_bs = (int) bs_best;
+        }
+        i_ls = next(i_ls);
+        if (i_ls < 0) {
+            return 0;
+        }
+    }
+
+    const int i_silu = next(i_ls);
+    const int i_up   = next(i_silu);
+    const int i_pre  = next(i_up);
+    if (i_pre < 0) {
+        return 0;
+    }
+    ggml_tensor * lo_s = cgraph->nodes[i_ls];
+    ggml_tensor * silu = cgraph->nodes[i_silu];
+    ggml_tensor * up   = cgraph->nodes[i_up];
+    ggml_tensor * pre  = cgraph->nodes[i_pre];
+    if (lo_s->op != GGML_OP_SCALE || lo_s->src[0] != down || !f32c(lo_s) || !f32c(down) || !inner(lo_s) ||
+            silu->op != GGML_OP_UNARY || ggml_get_unary_op(silu) != GGML_UNARY_OP_SILU || silu->src[0] != lo_s ||
+            !f32c(silu) || !inner(silu) ||
+            up->op != GGML_OP_MUL_MAT || up->src[1] != silu || !ggml_cuda_fn_l4_mmvq_node(up, cc, warp_size) ||
+            up->src[0]->ne[0] != lr || up->src[0]->ne[1] != hc_dim || !inner(up) ||
+            pre->op != GGML_OP_DSV4_HC_PRE || ggml_get_op_params_i32(pre, 1) == 0 || pre->type != GGML_TYPE_F32 ||
+            pre->nb[0] % sizeof(float) != 0 || pre->ne[0] != n_embd || pre->ne[1] != T || pre->ne[2] != 1 ||
+            pre->ne[3] != 1) {
+        return 0;
+    }
+    // hc_pre reads the norm and the up output as [n_embd, hc, T], the latter through reshapes that only it reads
+    const ggml_tensor * px = pre->src[0];
+    const ggml_tensor * pw = pre->src[1];
+    if (!f32c(px) || !f32c(pw) || !ggml_are_same_shape(px, mul) || !ggml_are_same_shape(pw, mul) ||
+            ggml_cuda_fn_l4_base(px) != mul || ggml_cuda_fn_l4_base(pw) != up) {
+        return 0;
+    }
+    for (const ggml_tensor * v = pw; v != up; v = v->src[0]) {
+        if (ggml_cuda_fn_l4_uses(cgraph, v) != 1 || (v->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+            return 0;
+        }
+    }
+    c.lo_s = lo_s;
+    c.up   = up;
+    c.pre  = pre;
+    c.q8   = ggml_fn_l3_get(pre) == GGML_FN_L4_HCQ8;
+
+    // the written tensors overlap neither each other nor what a launch reads after another one wrote
+    const ggml_tensor * outs[4] = { c.post, mul, c.inject, pre };
+    const ggml_tensor * ins[7]  = { c.post ? c.post->src[0] : nullptr, c.post ? c.post->src[1] : nullptr,
+                                    c.s1 ? c.s1->src[0] : nullptr, x_in, mul, w_norm, c.inject ? c.inject->src[0] : nullptr };
+    const auto overlap = [](const ggml_tensor * a, const ggml_tensor * b) {
+        const char * a0 = (const char *) a->data;
+        const char * b0 = (const char *) b->data;
+        return a0 < b0 + ggml_nbytes(b) && b0 < a0 + ggml_nbytes(a);
+    };
+    for (int o = 0; o < 4; ++o) {
+        if (outs[o] == nullptr) {
+            continue;
+        }
+        for (int o2 = o + 1; o2 < 4; ++o2) {
+            if (outs[o2] != nullptr && overlap(outs[o], outs[o2])) {
+                return 0;
+            }
+        }
+        for (const ggml_tensor * in : ins) {
+            if (in != nullptr && in != outs[o] && overlap(outs[o], in)) {
+                return 0;
+            }
+        }
+    }
+
+    if (trace) {
+        fprintf(stderr, "fn_l4 trace: matched %d..%d\n", i, i_pre);
+        fflush(stderr);
+    }
+    ggml_cuda_fn_l4_hc_run(*cuda_ctx, c, cgraph, i, i_pre, [](ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+        ggml_cuda_mul_mat(ctx, dst->src[0], dst->src[1], dst);
+    });
+    static std::atomic<bool> noted{false};
+    if (!noted.exchange(true)) {
+        GGML_LOG_INFO("ggml_cuda: [TAG_FN_L4_HC] hc mixer in three launches (combine + norm + q8_1, down + inject, up + hc_pre)\n");
+    }
+    return i_pre - i;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
@@ -4407,6 +4676,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     ggml_tensor * node = cgraph->nodes[i];
+
+    // [TAG_FN_L4_HC] before the round-3 hc paths: the marked mixer as a whole
+    if ((node->op == GGML_OP_SCALE && ggml_fn_l3_get(node) == GGML_FN_L4_HCPOST) || node->op == GGML_OP_RMS_NORM) {
+        const int n = ggml_cuda_fn_l4_try_hc(cuda_ctx, cgraph, i);
+        if (n > 0) {
+            return n;
+        }
+    }
 
     // [TAG_FN_L3_GPU_HCFUSE]
     if (node->op == GGML_OP_SCALE && ggml_fn_l3_get(node) != GGML_FN_L3_NONE) {
