@@ -870,6 +870,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_combine_post(
 
 llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_params & params) :
     llm_build_delta_net_base(params), l3(l3_read(model)), l4(l4_read(model)), model(model) {
+    if (l4.gdnstall) {
+        rs_snap_defer = &l3_deferred; // [TAG_FN_L4_GDNSTALL] the pre-ubatch state copy after the bridge post
+    }
     const int64_t hc = hparams.dsv4_hc_mult;
 
     GGML_ASSERT(hparams.n_embd_head_v() == hparams.n_embd_head_k());

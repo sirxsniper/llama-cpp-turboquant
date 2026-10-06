@@ -105,6 +105,10 @@ struct llm_build_delta_net_base : public llm_graph_context {
             ggml_tensor *        b,
             ggml_tensor *        s,
             int                  il);
+
+    // [TAG_FN_L4_GDNSTALL] set by an arch: build_recurrent_attn puts the copy of the pre-ubatch state ([TAG_RS_SNAP_DEPTH])
+    // here instead of into the graph, and the arch adds it later (nullptr = into the graph at once, every model but qwen4exp)
+    std::vector<ggml_tensor *> * rs_snap_defer = nullptr;
 };
 
 struct llm_build_rwkv6_base : public llm_graph_context {

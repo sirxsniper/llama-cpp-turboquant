@@ -766,7 +766,12 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
         ggml_tensor * s_in  = ggml_reshape_2d(ctx0, ggml_is_contiguous(s) ? s : ggml_cont(ctx0, s), D, n_seqs);
         ggml_tensor * s_dst = ggml_view_2d(ctx0, ssm_states_all, D, n_seqs, ssm_states_all->nb[1],
             ((size_t) n_seq_tokens * mem_size + kv_head) * row_size);
-        ggml_build_forward_expand(gf, ggml_cpy(ctx0, s_in, s_dst));
+        ggml_tensor * s_cpy = ggml_cpy(ctx0, s_in, s_dst);
+        if (rs_snap_defer) {
+            rs_snap_defer->push_back(s_cpy); // [TAG_FN_L4_GDNSTALL]
+        } else {
+            ggml_build_forward_expand(gf, s_cpy);
+        }
     }
 
     return output;
