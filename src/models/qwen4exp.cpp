@@ -714,7 +714,7 @@ llama_model_qwen4exp::graph::l3_flags llama_model_qwen4exp::graph::l3_read(const
     return f;
 }
 
-// [TAG_FN_L4_GPUMOE] the round-4 GPU chain B switches, through the qwen4exp profile's lookups (the environment first)
+// [TAG_FN_L4_GPUMOE] the round-4 GPU chain B switches, through the qwen4exp profile's lookups (the environment first) and the hc switches [TAG_FN_L4_HC]
 llama_model_qwen4exp::graph::l4_flags llama_model_qwen4exp::graph::l4_read(const llama_model & model) {
     auto on = [&](const char * name) {
         const char * v = llama_model_fn_env(&model, name);
@@ -734,15 +734,19 @@ llama_model_qwen4exp::graph::l4_flags llama_model_qwen4exp::graph::l4_read(const
         f.gdnstall  = f.gdn_wb || f.gdn_defer || f.gdn_snap;
     }
     f.hoist = on("LLAMA_FN_L4_HOIST");
+    f.hc    = on("LLAMA_FN_L4_HC");   // [TAG_FN_L4_HC]
+    f.hcq8  = f.hc && on("LLAMA_FN_L4_HCQ8");
 
-    const int mask = (f.post ? 1 : 0) | (f.gdn_wb ? 2 : 0) | (f.gdn_defer ? 4 : 0) | (f.gdn_snap ? 8 : 0) | (f.hoist ? 16 : 0);
+    const int mask = (f.post ? 1 : 0) | (f.gdn_wb ? 2 : 0) | (f.gdn_defer ? 4 : 0) | (f.gdn_snap ? 8 : 0) | (f.hoist ? 16 : 0) |
+                     (f.hc ? 32 : 0) | (f.hcq8 ? 64 : 0);
     static std::atomic<int> logged_other{-1};
     const auto * qm = dynamic_cast<const llama_model_qwen4exp *>(&model);
     std::atomic<int> & logged = qm ? qm->l4_logged : logged_other;
     if (logged.exchange(mask) != mask) {
-        LLAMA_LOG_INFO("qwen4exp: [TAG_FN_L4_GPUMOE] GPU chain B levers:%s%s%s%s%s%s\n",
+        LLAMA_LOG_INFO("qwen4exp: [TAG_FN_L4_GPUMOE] GPU chain B + hc levers:%s%s%s%s%s%s%s%s\n",
                 f.post ? " POST" : "", f.gdn_wb ? " GDNSTALL(wb)" : "", f.gdn_defer ? " GDNSTALL(defer)" : "",
-                f.gdn_snap ? " GDNSTALL(snap)" : "", f.hoist ? " HOIST" : "", mask == 0 ? " none" : "");
+                f.gdn_snap ? " GDNSTALL(snap)" : "", f.hoist ? " HOIST" : "", f.hc ? " HC" : "",
+                f.hcq8 ? " HCQ8" : "", mask == 0 ? " none" : "");
     }
     return f;
 }
@@ -819,10 +823,15 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
     const int64_t hc_dim = hc * n_embd;
     const int64_t nt     = x->ne[2];
 
+    // [TAG_FN_L4_HC] the mixers with the fused hc_pre (not the trunk's head mixer)
+    const bool l4hc = l4.hc && cparams.fused_dsv4_hc_pre && il >= 0;
+
     // grouped RMSNorm: reduce over one stream, then scale all streams with the [n_embd, hc] gamma
     // the converter folded each gamma to (1 + w)
     ggml_tensor * xn = ggml_mul(ctx0, ggml_rms_norm(ctx0, x, hparams.f_norm_rms_eps), w_norm);
-    if (l3.q8f) {
+    if (l4hc) {
+        ggml_fn_l3_set(xn, GGML_FN_L4_HC); // [TAG_FN_L4_HC] the mixer starts here
+    } else if (l3.q8f) {
         ggml_fn_l3_set(xn, GGML_FN_L3_Q8OUT); // [TAG_FN_L3_GPU_Q8F] the q8_1 copy for w_down, made by the norm kernel
     }
     xn = ggml_reshape_2d(ctx0, xn, hc_dim, nt);
@@ -830,6 +839,17 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
 
     ggml_tensor * lo = build_lora_mm(w_down, xn);
     qwen4exp_l3_mark_mm(lo, l3.mmv); // [TAG_FN_L3_GPU_MMV] 320 rows of 10240
+    if (l4hc) {
+        // [TAG_FN_L4_HC] the inject reads the same norm: right after the down projection in the graph, where the CUDA
+        // path computes it (scheduling only: the same ops on the same inputs)
+        ggml_build_forward_expand(gf, lo);
+        if (inject) {
+            *inject = build_lora_mm(w_inject, xn);
+            qwen4exp_l3_mark_mm(*inject, l3.mmv);
+            cb(*inject, "hc_inject", il);
+            ggml_build_forward_expand(gf, *inject);
+        }
+    }
     ggml_tensor * lo_s = ggml_scale(ctx0, lo, 1.0f / (float) hc);
     if (l3.hcfuse) {
         ggml_fn_l3_set(lo_s, GGML_FN_L3_HCLO); // [TAG_FN_L3_GPU_HCFUSE] scale -> silu in one CUDA launch
@@ -849,7 +869,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
                 ggml_reshape_3d(ctx0, xn,   n_embd, hc, nt),
                 ggml_reshape_3d(ctx0, gate, n_embd, hc, nt), 1.0f / (float) hc);
         res->add_fused_node({LLM_FUSED_OP_DSV4_HC_PRE, mixed, il});
-        if (l3.q8f) {
+        if (l4hc && l4.hcq8) {
+            ggml_fn_l3_set(mixed, GGML_FN_L4_HCQ8); // [TAG_FN_L4_HC] the copy for the block's first q8_0 projection
+        } else if (l3.q8f) {
             ggml_fn_l3_set(mixed, GGML_FN_L3_Q8OUT); // [TAG_FN_L3_GPU_Q8F] the copy for the block's projections / experts
         }
     } else {
@@ -870,7 +892,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
     }
     cb(mixed, "hc_mixed", il);
 
-    if (inject) {
+    if (inject && !l4hc) {
         *inject = build_lora_mm(w_inject, xn);
         qwen4exp_l3_mark_mm(*inject, l3.mmv); // [TAG_FN_L3_GPU_MMV] 4 rows of 10240
         cb(*inject, "hc_inject", il);
@@ -894,7 +916,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_combine_w(
 
     // 2*sigmoid centres the scatter weights on 1, so a zero injection is a plain residual add
     ggml_tensor * w_s = ggml_scale(ctx0, inject, 1.0f / (float) hc);
-    if (l3.hcfuse && il >= 0) {
+    if (l4.hc && cparams.fused_dsv4_hc_post && il >= 0) {
+        ggml_fn_l3_set(w_s, GGML_FN_L4_HCPOST); // [TAG_FN_L4_HC] the combine goes into the next mixer's norm launch
+    } else if (l3.hcfuse && il >= 0) {
         ggml_fn_l3_set(w_s, GGML_FN_L3_HCW); // [TAG_FN_L3_GPU_HCFUSE] scale -> sigmoid -> scale (-> hc post) in one launch
     }
     ggml_tensor * w = ggml_sigmoid(ctx0, w_s);
@@ -1059,8 +1083,9 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
 
         // [TAG_FN_L3_GPU_DEFER] the ffn half's combine weights read only this mixer's norm: build_layer_ffn puts them
         // into the graph after the bridge post, so the device computes them while the host runs the experts
+        // [TAG_FN_L4_HC] not with the round-4 hc path: there the weights are computed inside the next mixer's first launch
         ggml_tensor * w_ffn = nullptr;
-        if (l3.defer) {
+        if (l3.defer && !l4.hc) {
             w_ffn = build_hc_combine_w(inject, il);
             l3_deferred.push_back(w_ffn);
         }

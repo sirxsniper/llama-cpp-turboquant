@@ -2628,6 +2628,11 @@ struct llama_model_qwen4exp : public llama_model_base {
             bool gdn_snap  = false; //          8: the pre-ubatch state copy after the post (bitwise)
             bool hoist     = false; // HOIST:    the state and conv-row gathers of the next GDN layer (they read only its
                                     //           caches) go into the graph after this layer's bridge post
+        // [TAG_FN_L4_HC] lever round 4, hc plumbing: LLAMA_FN_L4_HC=1 marks each hc mixer (and the combine before it) for
+        // the CUDA three-launch path and puts the mixer's inject right after its down projection in the graph;
+        // LLAMA_FN_L4_HCQ8=1 also lets the mixer's last launch write the q8_1 copy of its output (off by default)
+            bool hc        = false; // HC:       the hc mixer in three CUDA launches [TAG_FN_L4_HC]
+            bool hcq8      = false; // HCQ8:     its last launch also writes the q8_1 copy of its output
         };
         static l4_flags l4_read(const llama_model & model);
         l4_flags l4;

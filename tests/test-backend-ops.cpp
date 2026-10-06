@@ -1260,6 +1260,11 @@ struct test_case {
         return build_graph(ctx);
     }
 
+    // [TAG_FN_L4_HC] nodes to put into the graph before the output (the order a model's builder gives them)
+    virtual void expand_first(ggml_cgraph * gf) {
+        GGML_UNUSED(gf);
+    }
+
     virtual double max_nmse_err() {
         return 1e-7;
     }
@@ -1513,6 +1518,7 @@ struct test_case {
         }
 
         // build graph
+        expand_first(gf); // [TAG_FN_L4_HC]
         ggml_build_forward_expand(gf, out);
 
         // add sentinels as graph nodes so that they are checked in the callback
@@ -1686,6 +1692,7 @@ struct test_case {
 
         // build graph
         ggml_cgraph * gf = ggml_new_graph_custom(ctx.get(), graph_nodes, false);
+        expand_first(gf); // [TAG_FN_L4_HC]
         ggml_build_forward_expand(gf, out);
 
         // warmup run
@@ -12669,6 +12676,128 @@ struct test_fn_l3_hcmix : public test_case {
     }
 };
 
+// [TAG_FN_L4_HC] an hc mixer of a qwen4exp layer as the builder makes it with LLAMA_FN_L4_HC (n_embd 2560, hc 4, low
+// rank 320): [the combine ->] rms_norm * gamma -> down [-> inject] -> scale -> silu -> up -> hc_pre, with the down and
+// the inject put into the graph first, then a q8_0 projection of hc_pre's output (the reader of its q8_1 copy). marked:
+// the round-4 marks (q8: GGML_FN_L4_HCQ8 too). add: the combine's block output is an ADD (the FFN's routed + shared
+// experts). Output: the combine, the norm, the inject, hc_pre and the projection.
+struct test_fn_l4_hc : public test_case {
+    const int64_t n_tokens;
+    const bool    post;
+    const bool    inject;
+    const bool    q8;
+    const bool    marked;
+    const bool    add;
+    ggml_tensor * first[2] = { nullptr, nullptr };
+
+    std::string op_desc(ggml_tensor *) override { return "FN_L3_GPU"; }
+    std::string vars() override { return "l4hc," + VARS_TO_STR6(n_tokens, post, inject, q8, marked, add); }
+    bool run_whole_graph() override { return true; }
+    double max_nmse_err() override { return 5e-4; }
+
+    void expand_first(ggml_cgraph * gf) override {
+        for (ggml_tensor * t : first) {
+            if (t != nullptr) {
+                ggml_build_forward_expand(gf, t);
+            }
+        }
+    }
+
+    test_fn_l4_hc(int64_t n_tokens = 3, bool post = true, bool inject = true, bool q8 = false, bool marked = true,
+            bool add = false)
+        : n_tokens(n_tokens), post(post), inject(inject), q8(q8), marked(marked), add(add) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t n_embd = 2560;
+        const int64_t hc     = 4;
+        const int64_t lr     = 320;
+        const int64_t T      = n_tokens;
+        const auto mark = [&](ggml_tensor * t, int32_t m) {
+            if (marked) {
+                ggml_fn_l3_set(t, m);
+            }
+            return t;
+        };
+        first[0] = nullptr;
+        first[1] = nullptr;
+
+        ggml_tensor * x    = nullptr;
+        ggml_tensor * comb = nullptr;
+        if (post) {
+            ggml_tensor * inj_prev = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc, T);
+            ggml_set_name(inj_prev, "inject_prev");
+            ggml_tensor * block_out = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, T);
+            ggml_set_name(block_out, "block_out");
+            if (add) {
+                ggml_tensor * shexp = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, T);
+                ggml_set_name(shexp, "shexp");
+                block_out = ggml_add(ctx, block_out, shexp);
+            }
+            ggml_tensor * residual = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, T);
+            ggml_set_name(residual, "residual");
+            ggml_tensor * s1 = mark(ggml_scale(ctx, inj_prev, 1.0f/(float) hc), GGML_FN_L4_HCPOST);
+            ggml_tensor * w  = ggml_scale(ctx, ggml_sigmoid(ctx, s1), 2.0f);
+            comb = ggml_dsv4_hc_post(ctx, block_out, residual, w, nullptr);
+            x = comb;
+        } else {
+            x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, T);
+            ggml_set_name(x, "res_hc");
+        }
+        ggml_tensor * w_norm = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, hc);
+        ggml_set_name(w_norm, "w_norm");
+        ggml_tensor * w_down = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, n_embd*hc, lr);
+        ggml_set_name(w_down, "w_down");
+        ggml_tensor * w_up = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, lr, n_embd*hc);
+        ggml_set_name(w_up, "w_up");
+        ggml_tensor * w_qkv = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, n_embd, 1024);
+        ggml_set_name(w_qkv, "w_qkv");
+
+        ggml_tensor * xn  = mark(ggml_mul(ctx, ggml_rms_norm(ctx, x, 1e-6f), w_norm), GGML_FN_L4_HC);
+        ggml_tensor * xn2 = ggml_reshape_2d(ctx, xn, n_embd*hc, T);
+        ggml_tensor * lo  = ggml_mul_mat(ctx, w_down, xn2);
+        first[0] = lo;
+        ggml_tensor * inj = nullptr;
+        if (inject) {
+            ggml_tensor * w_inj = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd*hc, hc);
+            ggml_set_name(w_inj, "w_inject");
+            inj = ggml_mul_mat(ctx, w_inj, xn2);
+            first[1] = inj;
+        }
+        ggml_tensor * gate  = ggml_mul_mat(ctx, w_up, ggml_silu(ctx, ggml_scale(ctx, lo, 1.0f/(float) hc)));
+        ggml_tensor * mixed = ggml_dsv4_hc_pre_gated(ctx, ggml_reshape_3d(ctx, xn2, n_embd, hc, T),
+                ggml_reshape_3d(ctx, gate, n_embd, hc, T), 1.0f/(float) hc);
+        if (q8) {
+            mark(mixed, GGML_FN_L4_HCQ8);
+        }
+        ggml_tensor * proj = ggml_mul_mat(ctx, w_qkv, mixed);
+
+        ggml_tensor * out = ggml_concat(ctx, mixed, proj, 0);
+        if (inj != nullptr) {
+            out = ggml_concat(ctx, inj, out, 0);
+        }
+        out = ggml_concat(ctx, xn2, out, 0);
+        if (comb != nullptr) {
+            out = ggml_concat(ctx, ggml_reshape_2d(ctx, comb, n_embd*hc, T), out, 0);
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            // small inject weights so that W x stays inside the sigmoid's range, as in the model
+            const std::string name = ggml_get_name(t);
+            if (name == "w_inject") {
+                init_tensor_uniform(t, -0.05f, 0.05f);
+            } else if (name == "inject_prev") {
+                init_tensor_uniform(t, -4.0f, 4.0f);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // [TAG_FN_L3_GPU_GDNAB] the GDN gate inputs of a qwen4exp layer (build_layer_attn_linear): beta = sigmoid(Wb x), gate =
 // softplus(Wa x + dt) * a, Wa / Wb f32 [2560, 48], built next to each other as the GDNAB switch builds them
 struct test_fn_l3_gdnab : public test_case {
@@ -15467,6 +15596,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_fn_l3_zskip(GGML_TYPE_Q5_K, GGML_TYPE_Q8_0, t, true, true));
         test_cases.emplace_back(new test_fn_l3_gdnab(t, true)); // [TAG_FN_L3_GPU_GDNAB]
         test_cases.emplace_back(new test_fn_l3_hcmix(t, true)); // [TAG_FN_L3_GPU]
+        test_cases.emplace_back(new test_fn_l4_hc(t, true, true, true, true));   // [TAG_FN_L4_HC]
+        test_cases.emplace_back(new test_fn_l4_hc(t, true, true, true, true, true));
+        test_cases.emplace_back(new test_fn_l4_hc(t, false, false, false, true));
     }
     for (int64_t nb : { 1, 3 }) {
         test_cases.emplace_back(new test_flash_attn_ext_turbot(TURBOT_TW_NR2_Q8, 32768, nb, TURBOT_MIX_BAND64K, 3, false, 0.0f, false,
@@ -16243,6 +16375,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             test_cases.emplace_back(new test_fn_l3_zskip(GGML_TYPE_Q4_K, GGML_TYPE_Q5_1, t, false, m)); // [TAG_FN_L3_GPU_ZSKIP]
             test_cases.emplace_back(new test_fn_l3_gdnab(t, m)); // [TAG_FN_L3_GPU_GDNAB]
             test_cases.emplace_back(new test_fn_l3_hcmix(t, m)); // [TAG_FN_L3_GPU]
+            test_cases.emplace_back(new test_fn_l4_hc(t, true, true, true, m)); // [TAG_FN_L4_HC]
             for (int64_t np : { 8192, 32768, 61440 }) {
                 test_cases.emplace_back(new test_fn_l3_idxq8(np*4 + 3, np, t, m));
                 test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, { np, t, 1, 1 }, 512, false, true, m));
@@ -18370,6 +18503,7 @@ static bool fn_l3_run_pair(ggml_backend_t be, const std::function<std::unique_pt
             }
         }
         ggml_cgraph * gf = ggml_new_graph_custom(ctx.get(), 4096, false);
+        tc->expand_first(gf); // [TAG_FN_L4_HC]
         ggml_build_forward_expand(gf, o);
         if (tc->fn_graph_optimize() && be->iface.graph_optimize != nullptr) {
             // [TAG_FN_L4_QSA_LIST] every tensor has its own memory here: the allocation dependencies are not needed
@@ -18519,6 +18653,26 @@ static bool run_fn_l3_gpu(ggml_backend_t backend, ggml_backend_t backend_ref, co
                 return std::unique_ptr<test_case>(new test_flash_attn_ext_turbot(TURBOT_TW_NR2_Q8, kv, nb, TURBOT_MIX_BAND64K, 3,
                         false, 0.0f, false, 256, 2, 24, m));
             }, false });
+        }
+    }
+
+    // [TAG_FN_L4_HC] the round-4 hc mixers; FN_L4_ONLY=1: only these (sanitizer runs)
+    if (getenv("FN_L4_ONLY") != nullptr) {
+        cases.clear();
+    }
+    for (int64_t t : { 1, 2, 3, 4 }) {
+        if (small && t > 3) {
+            break;
+        }
+        for (int v = 0; v < 16; ++v) {
+            const bool vp = (v & 1) != 0;
+            const bool vi = (v & 2) != 0;
+            const bool vq = (v & 4) != 0;
+            const bool va = (v & 8) != 0;
+            if (va && !vp) {
+                continue;
+            }
+            cases.push_back({ [=](bool m) { return std::unique_ptr<test_case>(new test_fn_l4_hc(t, vp, vi, vq, m, va)); }, false });
         }
     }
 
@@ -20323,6 +20477,10 @@ static void usage(char ** argv) {
 }
 
 int main(int argc, char ** argv) {
+    // TBO_UNBUFFERED=1: stdout unbuffered, so a crashed run still shows the last case it finished
+    if (getenv("TBO_UNBUFFERED") != nullptr) {
+        setvbuf(stdout, nullptr, _IONBF, 0);
+    }
     test_mode mode = MODE_TEST;
     output_formats output_format = CONSOLE;
     const char * op_names_filter = nullptr;

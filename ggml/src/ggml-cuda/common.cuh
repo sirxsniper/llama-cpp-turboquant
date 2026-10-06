@@ -1474,12 +1474,19 @@ struct ggml_cuda_mmvq_q8_cache {
     const ggml_tensor * producer = nullptr;
     uint64_t            n_prod   = 0;
 
+    // [TAG_FN_L4_HC] the graph nodes of the fused launch group that made the copy: they wrote no byte of src1 but the
+    // producer's own (the group's nodes that are not computed may share addresses with src1)
+    ggml_tensor * const * group   = nullptr;
+    int                   n_group = 0;
+
     void reset() {
         src1     = nullptr;
         data     = nullptr;
         span     = 0;
         nbytes   = 0;
         producer = nullptr;
+        group    = nullptr;
+        n_group  = 0;
     }
 };
 
