@@ -142,6 +142,11 @@ const fn_item k_items[] = {
     { "LLAMA_FN_L4_HC",              "1",     P_ALL }, // [TAG_FN_L4_HC]
     { "LLAMA_FN_L4_HCQ8",            "1",     P_ALL },
     { "LLAMA_FN_L4_HOST_MTPFUSE",    "1",     P_ALL }, // [TAG_FN_L4_HOST_MTPFUSE] drafts only
+    // [TAG_FN_L6_ADOPT] round 6 (flashnext/int-l6): the next layer's pre-post weights prefetched into L2 during each bridge
+    // wait, and the hc combine kept fusable (graph_optimize holds its inputs); bitwise (identity vs 48de8cd41, no MTP and MTP);
+    // A/B 32K real use +2.8 %, ms/step -5.4 % (l6/gk/ab6.log). PRESYNC stays off (net zero).
+    { "LLAMA_FN_L6_L2PF",            "1",     P_ALL }, // [TAG_FN_L6_L2PF]
+    { "LLAMA_FN_L6_HCCOMB",          "1",     P_ALL }, // [TAG_FN_L6_HCCOMB]
 };
 
 // names the fn-auto aware code reads through llama_fn_env(): never put into the environment
