@@ -1955,6 +1955,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
         ggml_element_size(Qcur_full) * n_embd_head);
     gate = ggml_cont_2d(ctx0, gate, n_embd_head * n_head, n_tokens);
     cb(gate, "gate_reshaped", il);
+    if (qsa && l4qsa.streams && n_tokens <= 8) {
+        // [TAG_FN_L4_QSA_STREAMS] the gate copy before the attention: it runs on the q/k/v stream, not after the join
+        ggml_build_forward_expand(gf, gate);
+    }
 
     Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
 

@@ -523,6 +523,21 @@ static bool fn_l4_streams_region(ggml_cgraph * cg, const fn_l4_graph_index & gi,
         if (fn_l4_noop(x)) {
             continue;
         }
+        if (anc[k] == 0) {
+            // a node the attention does not read (the gate copy the builder puts here): the side of what it reads, so
+            // it runs next to its inputs and the join orders it before its readers
+            uint8_t s_in = 0;
+            for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                if (x->src[s] == nullptr) {
+                    continue;
+                }
+                auto it = gi.pos.find(fn_l4_base(x->src[s]));
+                if (it != gi.pos.end() && it->second > w0 + f && it->second < j) {
+                    s_in |= anc[it->second - w0];
+                }
+            }
+            anc[k] = s_in;
+        }
         if (anc[k] != 1 && anc[k] != 2) {
             return false;
         }
@@ -599,6 +614,7 @@ void ggml_cuda_fn_l4_qsa_streams(ggml_backend_cuda_context * ctx, ggml_cgraph * 
 
     auto & events = ctx->stream_context().concurrent_events;
     int n_events      = 0;
+    int n_cand        = 0;
     int last_join     = -1;
     int last_indexer  = -1;
     std::vector<uint8_t> side;
@@ -611,6 +627,7 @@ void ggml_cuda_fn_l4_qsa_streams(ggml_backend_cuda_context * ctx, ggml_cgraph * 
         if (J->op != GGML_OP_FLASH_ATTN_EXT || last_indexer < 0 || j - last_indexer > FN_L4_STREAMS_WINDOW) {
             continue;
         }
+        n_cand++;
         int f = -1;
         if (!fn_l4_streams_region(cg, gi, j, f, side) || f <= last_join) {
             if (f >= 0 && f <= last_join) {
@@ -667,7 +684,10 @@ void ggml_cuda_fn_l4_qsa_streams(ggml_backend_cuda_context * ctx, ggml_cgraph * 
         last_join = j;
         n_events++;
     }
-    if (n_events > 0) {
-        fn_l4_note(FN_L4_NOTE_STREAMS, "STREAMS: the indexer chain and the q/k/v chain of each QSA layer on two streams");
+    // the first few graphs only (decode, verify and draft graphs alternate)
+    static std::atomic<int> n_logged{0};
+    if (n_cand > 0 && n_logged.fetch_add(1) < 6) {
+        GGML_LOG_INFO("ggml_cuda: [TAG_FN_L4_QSA] STREAMS: %d of %d marked QSA layers of a %d-node graph on two streams\n",
+                n_events, n_cand, cg->n_nodes);
     }
 }

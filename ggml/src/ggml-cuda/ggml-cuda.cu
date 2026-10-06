@@ -5399,6 +5399,14 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     }
                 }
             } else {
+                // [TAG_FN_L4_QSA_STREAMS] say once that a graph's regions were dropped (a write overlap or a cross-stream source)
+                if (!stream_ctx.concurrent_events.empty()) {
+                    static std::atomic<bool> told{false};
+                    if (!told.exchange(true)) {
+                        GGML_LOG_INFO("ggml_cuda: [TAG_FN_L4_QSA] STREAMS: %zu concurrent regions failed the overlap check, the graph runs on one stream\n",
+                                stream_ctx.concurrent_events.size());
+                    }
+                }
                 stream_ctx.concurrent_events.clear();
             }
 
