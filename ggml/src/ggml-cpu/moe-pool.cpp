@@ -336,6 +336,7 @@ struct ggml_cpu_moe_pool {
     // [TAG_FN_L6_PF] pf_score: the given list of the last prefetch ([T][k] by rank) and the hit counts per rank (decayed)
     bool                  pf_score = false;
     int                   pf_pull  = 0;            // [TAG_FN_L6_PF] GGML_FN_PF_* flags of the pull
+    int                   pf_cap   = 0;            // [TAG_FN_L6_PF] experts of a given list pulled at most (0: all)
     std::vector<int32_t>  pf_gt;
     int                   pf_gT = 0;
     int                   pf_gk = 0;
@@ -729,6 +730,7 @@ struct ggml_cpu_moe_pool * ggml_cpu_moe_pool_new(const struct ggml_cpu_moe_pool_
     p->pf_fix    = pp->pf_fix;                               // [TAG_FN_L4_MEM_PFDEV]
     p->pf_score  = pp->pf_score;                             // [TAG_FN_L6_PF]
     p->pf_pull   = pp->pf_pull & (GGML_FN_PF_FINE_STOP | GGML_FN_PF_VEC);
+    p->pf_cap    = std::max(0, pp->pf_cap);
 
     std::vector<int> list;
     for (int i = 0; i < GGML_MAX_N_THREADS; i++) {
@@ -1091,6 +1093,9 @@ enum ggml_status ggml_cpu_moe_prefetch(struct ggml_cpu_moe_pool * p, const struc
             p->pf_n  = moe_pool_score_list(p, l, job->list, T, job->k, n_exp, p->pf_list.data());
         } else {
             p->pf_n = moe_pool_rank_list(l, job->list, T, job->k, n_exp, p->pf_mark, p->pf_list.data());
+        }
+        if (p->pf_cap > 0 && p->pf_n > p->pf_cap) {
+            p->pf_n = p->pf_cap; // [TAG_FN_L6_PF]
         }
         p->pf_experts.fetch_add((uint64_t) p->pf_n, std::memory_order_relaxed);
         if (p->pf_fix) {

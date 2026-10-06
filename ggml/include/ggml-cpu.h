@@ -208,6 +208,8 @@ extern "C" {
                                              // (per rank hit rates learned from the jobs, combined over the tokens), not by rank
         int  pf_pull;                        // [TAG_FN_L6_PF] bits: 1 a stopped pull leaves within 1 KiB of each region (not
                                              // 4 KiB), 2 whole-line vector loads (pf_streams > 1, real loads)
+        int  pf_cap;                         // [TAG_FN_L6_PF] 0, or a given list is cut to its first pf_cap experts (less
+                                             // DRAM traffic beside the device's host accesses at the end of the window)
     };
 
     // [TAG_FN_L3_CPU_SPLIT] how a pool job gives its pieces (32 gate / up rows or 64 down rows of one expert) to the threads.

@@ -885,9 +885,10 @@ llama_moe_bridge * llama_moe_bridge_create(const llama_model & model, int n_thre
     br->pool_params.pf_fix      = llama_fn_l3_int(model, "LLAMA_FN_L4_PFDEV", 0) >= 1; // [TAG_FN_L4_MEM_PFDEV] qwen4exp only
     br->pool_params.pf_score    = llama_fn_l3_flag(model, "LLAMA_FN_L6_PFORDER"); // [TAG_FN_L6_PF] qwen4exp only
     br->pool_params.pf_pull     = std::max(0, llama_fn_l3_int(model, "LLAMA_FN_L6_PFPULL", 0)); // [TAG_FN_L6_PF] 1 fine stop, 2 vector loads
-    if (br->pool_params.pf_pull) {
+    br->pool_params.pf_cap      = std::max(0, llama_fn_l3_int(model, "LLAMA_FN_L6_PFCAP", 0)); // [TAG_FN_L6_PF] experts per given list
+    if (br->pool_params.pf_pull || br->pool_params.pf_cap) {
         LLAMA_LOG_INFO("%s: [TAG_FN_L6_PF] prefetch pull flags %d (1: a stop lands within 1 KiB of a region, 2: whole-line vector "
-                "loads)\n", __func__, br->pool_params.pf_pull);
+                "loads), list cap %d experts (0: none)\n", __func__, br->pool_params.pf_pull, br->pool_params.pf_cap);
     }
     if (br->pool_params.pf_score) {
         LLAMA_LOG_INFO("%s: [TAG_FN_L6_PF] a given prefetch list is pulled by the estimated chance of each expert (per rank hit "
