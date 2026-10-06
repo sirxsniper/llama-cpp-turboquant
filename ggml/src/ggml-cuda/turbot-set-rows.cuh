@@ -7,6 +7,10 @@
 void ggml_cuda_op_turbot_set_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 bool ggml_cuda_turbot_set_rows_supported(const ggml_tensor * op);
 
+// [TAG_FN_L4_QSA_KVW] the K op dk and the V op dv of one layer in one launch, the same bytes as the two ops one after
+// the other; false: not taken (another shape or a centre fill), nothing launched
+bool ggml_cuda_turbot_set_rows_kv(ggml_backend_cuda_context & ctx, ggml_tensor * dk, ggml_tensor * dv);
+
 // [TAG_TURBOT_ANY_ROUTE] Kill switch of turbot on other KV geometries in the CUDA backend. GGML_TURBOT_ANY=0 accepts
 // only the 4 x 256 geometry (op-params flags 0, writer NG = 8): the FA routing (fattn.cu) and the writer supports
 // (turbot-set-rows.cu) are then exactly the pre-change ones. Default on. Read once per translation unit.

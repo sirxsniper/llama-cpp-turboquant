@@ -305,6 +305,228 @@ static __global__ void k_turbot_set_rows(
     }
 }
 
+// ---- [TAG_FN_L4_QSA_KVW] the K rows and the V rows of one layer in one launch ----
+// Blocks [0, nblk_k) are the K op's blocks, blocks [nblk_k, 2*nblk_k) the V op's, each with its own op's arguments. The
+// body is k_turbot_set_rows' verbatim (that kernel stays as it is), so every block computes and writes what the same
+// block of the separate launch does. The two sides write disjoint bytes: their own base cache, their own part of a pool
+// row ([K part][V part], SPEC 3.3) and their own gains, and both only read the young rows; without centre fills (the
+// only case taken) the two ops have no order between them.
+struct turbot_kvw_side {
+    const float   * src0;
+    const void    * src1;
+    const int32_t * young;
+    char          * dst;
+    char          * pool;
+    int64_t         s01;
+    int64_t         s10;
+    int64_t         s_young;
+    int64_t         nb_row;
+    int64_t         nb_pool;
+    int64_t         part_off;
+    uint32_t        bw;
+    uint32_t        yw;
+    uint64_t        base_offs;
+    uint64_t        young_offs;
+    int             base_gain_off;
+    int             young_gain_off;
+};
+
+template <typename idx_t, int LOG2_NG>
+__launch_bounds__(128)
+static __global__ void k_turbot_set_rows_kv(const turbot_kvw_side side_k, const turbot_kvw_side side_v, const uint32_t nblk_k) {
+    const bool v_side = (uint32_t) blockIdx.x >= nblk_k;
+
+    const float   * __restrict__ src0           = v_side ? side_v.src0 : side_k.src0;
+    const idx_t   * __restrict__ src1           = (const idx_t *) (v_side ? side_v.src1 : side_k.src1);
+    const int32_t * __restrict__ young          = v_side ? side_v.young : side_k.young;
+    char          * __restrict__ dst            = v_side ? side_v.dst : side_k.dst;
+    char          * __restrict__ pool           = v_side ? side_v.pool : side_k.pool;
+    const int64_t                s01            = v_side ? side_v.s01 : side_k.s01;
+    const int64_t                s10            = v_side ? side_v.s10 : side_k.s10;
+    const int64_t                s_young        = v_side ? side_v.s_young : side_k.s_young;
+    const int64_t                nb_row         = v_side ? side_v.nb_row : side_k.nb_row;
+    const int64_t                nb_pool        = v_side ? side_v.nb_pool : side_k.nb_pool;
+    const int64_t                part_off       = v_side ? side_v.part_off : side_k.part_off;
+    const uint32_t               bw             = v_side ? side_v.bw : side_k.bw;
+    const uint32_t               yw             = v_side ? side_v.yw : side_k.yw;
+    const uint64_t               base_offs      = v_side ? side_v.base_offs : side_k.base_offs;
+    const uint64_t               young_offs     = v_side ? side_v.young_offs : side_k.young_offs;
+    const int                    base_gain_off  = v_side ? side_v.base_gain_off : side_k.base_gain_off;
+    const int                    young_gain_off = v_side ? side_v.young_gain_off : side_k.young_gain_off;
+
+    // from here on: k_turbot_set_rows, with blk the block index inside its own op
+    const int j    = threadIdx.x;
+    const int lane = j % WARP_SIZE;
+
+    static_assert(LOG2_NG >= 1 && LOG2_NG <= 3, "turbot writer: 2, 4 or 8 groups per row");
+    const uint32_t blk = v_side ? (uint32_t) blockIdx.x - nblk_k : (uint32_t) blockIdx.x;
+    const int64_t  i   = (int64_t) (blk >> LOG2_NG);
+    const int      ig  = (int) (blk & ((1u << LOG2_NG) - 1u));
+    const int      h   = ig >> 1;
+    const int      g   = ig & 1;
+
+    const int b         = (int) ((bw >> (4*h)) & 0xFu);
+    const int y         = (int) ((yw >> (4*h)) & 0xFu);
+    const int r         = y - b;
+    const int base_off  = (int) ((base_offs  >> (16*h)) & 0xFFFFu);
+    const int young_off = (int) ((young_offs >> (16*h)) & 0xFFFFu);
+    const int ooff      = turbot_d_old_off(b);
+    const int yoff      = turbot_d_young_off(b, y);
+
+    const int64_t cell     = (int64_t) *(src1 + i*s10);
+    const int64_t yrow     = (int64_t) *(young + i*s_young);
+    const bool    is_young = yrow >= 0;
+
+    const float   * src_row   = src0 + i*s01;
+    const uint8_t * base_row  = (const uint8_t *) dst  + (size_t) cell*(size_t) nb_row;
+    const uint8_t * young_row = (const uint8_t *) pool + (size_t) (is_young ? yrow : 0)*(size_t) nb_pool + (size_t) part_off;
+    uint8_t * __restrict__ base_run  = (uint8_t *) base_row  + base_off;
+    uint8_t * __restrict__ young_run = (uint8_t *) young_row + young_off;
+    half    * __restrict__ gains_b   = (half *) (base_row  + base_gain_off);
+    half    * __restrict__ gains_y   = (half *) (young_row + young_gain_off);
+
+    __shared__ float x[GGML_TURBOT_GROUP];
+    x[j] = src_row[GGML_TURBOT_GROUP*ig + j];
+    __syncthreads();
+
+    constexpr int n_warps = GGML_TURBOT_GROUP / WARP_SIZE;  // = 4
+    __shared__ float warp_accum[n_warps];
+    float v = x[j];
+    float v2 = v * v;
+    for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1)
+        v2 += __shfl_xor_sync(0xffffffff, v2, offset);
+    if (j % WARP_SIZE == 0)
+        warp_accum[j / WARP_SIZE] = v2;
+    __syncthreads();
+
+    __shared__ float s_norm_sq;
+    if (j == 0) {
+        float total = 0.0f;
+        for (int w = 0; w < n_warps; w++) total += warp_accum[w];
+        s_norm_sq = total;
+    }
+    __syncthreads();
+    const float grp_norm  = sqrtf(s_norm_sq);
+    const float inv_norm  = (grp_norm > GGML_TURBOT_NORM_EPS) ? 1.0f / grp_norm : 0.0f;
+
+    x[j] *= inv_norm;
+    __syncthreads();
+
+    x[j] *= TURBO_WHT_SIGNS1[j];
+    __syncthreads();
+
+    {
+        float vw = x[j];
+#pragma unroll
+        for (int hs = 1; hs < 32; hs <<= 1) {
+            const float partner = __shfl_xor_sync(0xffffffffu, vw, hs);
+            vw = (j & hs) ? (partner - vw) : (vw + partner);
+        }
+        x[j] = vw;
+    }
+    __syncthreads();
+
+#define WHT_STAGE_SHARED_TBT(hs) \
+    if (j % (2*(hs)) < (hs)) { float a = x[j], c = x[j+(hs)]; x[j] = a+c; x[j+(hs)] = a-c; } \
+    __syncthreads();
+
+    WHT_STAGE_SHARED_TBT(32)
+    WHT_STAGE_SHARED_TBT(64)
+#undef WHT_STAGE_SHARED_TBT
+
+    constexpr float inv_sqrt_128 = 0.08838834764831845f;
+    x[j] = x[j] * inv_sqrt_128 * TURBO_WHT_SIGNS2[j];
+
+    __shared__ float lev_old[1 << GGML_TURBOT_B_MAX];
+    __shared__ float lev_young[1 << GGML_TURBOT_Y_MAX];
+    if (j < (1 << b)) {
+        lev_old[j] = TURBOT_D_OLD_LEVELS[ooff + j];
+    }
+    if (is_young && j < (1 << (y - 1))) {
+        lev_young[2*j]     = TURBOT_D_YOUNG_LUT[yoff + 2*j];
+        lev_young[2*j + 1] = TURBOT_D_YOUNG_LUT[yoff + 2*j + 1];
+    }
+#if GGML_CUDA_TURBOT_WRITER_BSEARCH
+    __shared__ float thr[1 << GGML_TURBOT_Y_MAX];
+    if (is_young) {
+        if (j < (1 << (y - 1))) {
+            thr[2*j]     = TURBOT_D_YOUNG_THR[yoff + 2*j];
+            thr[2*j + 1] = TURBOT_D_YOUNG_THR[yoff + 2*j + 1];
+        }
+    } else {
+        if (j < (1 << (b - 1))) {
+            thr[2*j]     = TURBOT_D_OLD_THR[ooff + 2*j];
+            thr[2*j + 1] = TURBOT_D_OLD_THR[ooff + 2*j + 1];
+        }
+    }
+#endif
+    __syncthreads();
+
+    const float u = x[j];
+    int idx = 0;
+#if GGML_CUDA_TURBOT_WRITER_BSEARCH
+    const int n_bits = is_young ? y : b;
+    for (int k = n_bits - 1; k >= 0; --k) {
+        idx += ((int) (u >= thr[idx + (1 << k) - 1])) << k;
+    }
+#else
+    if (is_young) {
+        const int n_thr = (1 << y) - 1;
+        for (int k = 0; k < n_thr; ++k) {
+            idx += (u >= TURBOT_D_YOUNG_THR[yoff + k]);
+        }
+    } else {
+        const int n_thr = (1 << b) - 1;
+        for (int k = 0; k < n_thr; ++k) {
+            idx += (u >= TURBOT_D_OLD_THR[ooff + k]);
+        }
+    }
+#endif
+    const int code_b = is_young ? (idx >> r) : idx;
+    const int code_r = is_young ? (idx & ((1 << r) - 1)) : 0;
+
+    TURBOT_PACK_CODE(base_run,  b, g, code_b, true)
+    TURBOT_PACK_CODE(young_run, r, g, code_r, is_young)
+
+    const float cb = lev_old[code_b];
+    const float cy = is_young ? lev_young[(code_b << r) | code_r] : 0.0f;
+    float rb2 = cb * cb;
+    float ry2 = cy * cy;
+    for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+        rb2 += __shfl_xor_sync(0xffffffff, rb2, offset);
+        ry2 += __shfl_xor_sync(0xffffffff, ry2, offset);
+    }
+    __shared__ float warp_accum_y[n_warps];
+    if (j % WARP_SIZE == 0) {
+        warp_accum[j / WARP_SIZE]   = rb2;
+        warp_accum_y[j / WARP_SIZE] = ry2;
+    }
+    __syncthreads();
+
+    __shared__ float s_recon_b_sq;
+    __shared__ float s_recon_y_sq;
+    if (j == 0) {
+        float total_b = 0.0f;
+        float total_y = 0.0f;
+        for (int w = 0; w < n_warps; w++) {
+            total_b += warp_accum[w];
+            total_y += warp_accum_y[w];
+        }
+        s_recon_b_sq = total_b;
+        s_recon_y_sq = total_y;
+    }
+    __syncthreads();
+
+    if (j == 0) {
+        const float recon_b = sqrtf(s_recon_b_sq);
+        gains_b[ig] = __float2half((recon_b > GGML_TURBOT_NORM_EPS) ? grp_norm / recon_b : grp_norm);
+        if (is_young) {
+            const float recon_y = sqrtf(s_recon_y_sq);
+            gains_y[ig] = __float2half((recon_y > GGML_TURBOT_NORM_EPS) ? grp_norm / recon_y : grp_norm);
+        }
+    }
+}
+
 // ---- [TAG_TURBOT] centre fill: refinement for a live cell that only holds an old code ----
 template <int LOG2_NG>   // [TAG_TURBOT_ANY_WRITER_NG] NG = 1 << LOG2_NG groups per row (3: 4 x 256)
 __launch_bounds__(128)
@@ -636,6 +858,99 @@ void ggml_cuda_op_turbot_set_rows(ggml_backend_cuda_context & ctx, ggml_tensor *
         case 2: turbot_set_rows_launch<1>(ctx, dst, *sd, lo, part_off); break;
         default: GGML_ABORT("turbot_set_rows: %d groups per row", ng);
     }
+}
+
+// [TAG_FN_L4_QSA_KVW] the K op dk and the V op dv of one layer in one launch of k_turbot_set_rows_kv. false: not taken
+// (nothing launched): another side order, other row counts or index types, or a centre fill on either side.
+static turbot_kvw_side turbot_kvw_side_of(const ggml_tensor * dst, const ggml_turbot_side & sd, const turbot_writer_layout & lo,
+        const int64_t part_off, const size_t idx_size) {
+    const ggml_tensor * src0  = dst->src[0];
+    const ggml_tensor * src1  = dst->src[1];
+    const ggml_tensor * pool  = dst->src[3];
+    const ggml_tensor * young = dst->src[4];
+    turbot_kvw_side s;
+    s.src0           = (const float *) src0->data;
+    s.src1           = src1->data;
+    s.young          = (const int32_t *) young->data;
+    s.dst            = (char *) dst->data;
+    s.pool           = (char *) pool->data;
+    s.s01            = (int64_t) (src0->nb[1]/sizeof(float));
+    s.s10            = (int64_t) (src1->nb[0]/idx_size);
+    s.s_young        = (int64_t) (young->nb[0]/sizeof(int32_t));
+    s.nb_row         = (int64_t) dst->nb[1];
+    s.nb_pool        = (int64_t) pool->nb[1];
+    s.part_off       = part_off;
+    s.bw             = lo.bw;
+    s.yw             = lo.yw;
+    s.base_offs      = lo.base_offs;
+    s.young_offs     = lo.young_offs;
+    s.base_gain_off  = (int) sd.base_gain_off;
+    s.young_gain_off = (int) sd.young_gain_off;
+    return s;
+}
+
+bool ggml_cuda_turbot_set_rows_kv(ggml_backend_cuda_context & ctx, ggml_tensor * dk, ggml_tensor * dv) {
+    ggml_turbot_layer        lk;
+    ggml_turbot_layer        lv;
+    const ggml_turbot_side * sk  = nullptr;
+    const ggml_turbot_side * sv  = nullptr;
+    int64_t                  pk  = 0;
+    int64_t                  pv  = 0;
+    int                      ngk = 0;
+    int                      ngv = 0;
+    if (!turbot_set_rows_layout(dk, lk, sk, pk, ngk) || !turbot_set_rows_layout(dv, lv, sv, pv, ngv)) {
+        return false;
+    }
+    ggml_turbot_op_params ok;
+    ggml_turbot_op_params ov;
+    if (!ggml_turbot_op_params_get(dk, &ok) || !ggml_turbot_op_params_get(dv, &ov) || ok.side != GGML_TURBOT_SIDE_K ||
+            ov.side != GGML_TURBOT_SIDE_V || ngk != ngv) {
+        return false;
+    }
+    const ggml_tensor * k0 = dk->src[0];
+    const ggml_tensor * v0 = dv->src[0];
+    const ggml_tensor * k1 = dk->src[1];
+    const ggml_tensor * v1 = dv->src[1];
+    if (k0->ne[1] != v0->ne[1] || k0->ne[1] == 0 || k1->type != v1->type ||
+            (dk->src[5] != nullptr && dk->src[5]->ne[1] > 0) || (dv->src[5] != nullptr && dv->src[5]->ne[1] > 0)) {
+        return false;
+    }
+    // the asserts of ggml_cuda_op_turbot_set_rows, both ops
+    for (const ggml_tensor * d : { (const ggml_tensor *) dk, (const ggml_tensor *) dv }) {
+        if (d->data != d->src[2]->data || d->nb[1] != d->src[2]->nb[1] || d->src[0]->ne[0] != (int64_t) ngk*GGML_TURBOT_GROUP ||
+                d->src[1]->ne[0] != d->src[0]->ne[1]) {
+            return false;
+        }
+    }
+    const int64_t n_rows = k0->ne[1];
+    const int     log2ng = ngk == 8 ? 3 : ngk == 4 ? 2 : ngk == 2 ? 1 : 0;
+    if (log2ng == 0 || n_rows > (int64_t) (INT_MAX / 2) >> log2ng) {
+        return false;
+    }
+    const size_t isz = k1->type == GGML_TYPE_I64 ? sizeof(int64_t) : sizeof(int32_t);
+    const turbot_kvw_side side_k = turbot_kvw_side_of(dk, *sk, turbot_writer_layout_of(*sk), pk, isz);
+    const turbot_kvw_side side_v = turbot_kvw_side_of(dv, *sv, turbot_writer_layout_of(*sv), pv, isz);
+    const uint32_t nblk = (uint32_t) (n_rows << log2ng);
+
+    cudaStream_t stream = ctx.stream();
+#define TURBOT_KVW_LAUNCH(idx_t, L) \
+    k_turbot_set_rows_kv<idx_t, L><<<(int) (2*nblk), GGML_TURBOT_GROUP, 0, stream>>>(side_k, side_v, nblk)
+    if (k1->type == GGML_TYPE_I64) {
+        switch (log2ng) {
+            case 3: TURBOT_KVW_LAUNCH(int64_t, 3); break;
+            case 2: TURBOT_KVW_LAUNCH(int64_t, 2); break;
+            default: TURBOT_KVW_LAUNCH(int64_t, 1); break;
+        }
+    } else {
+        switch (log2ng) {
+            case 3: TURBOT_KVW_LAUNCH(int32_t, 3); break;
+            case 2: TURBOT_KVW_LAUNCH(int32_t, 2); break;
+            default: TURBOT_KVW_LAUNCH(int32_t, 1); break;
+        }
+    }
+#undef TURBOT_KVW_LAUNCH
+    CUDA_CHECK(cudaGetLastError());
+    return true;
 }
 
 // SPEC 8.5: the 5.2 asserts, returning false instead of asserting, plus the geometry the kernels rely on. The CUDA

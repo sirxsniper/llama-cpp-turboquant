@@ -1,6 +1,7 @@
 #include "argsort.cuh"
 #include "top-k.cuh"
 #include "fn-l3.cuh"   // [TAG_FN_L3_GPU_TOPK]
+#include "fn-l4-qsa.cuh"   // [TAG_FN_L4_QSA_SEL]
 
 #ifdef GGML_CUDA_USE_CUB
 #    include <cub/cub.cuh>
@@ -542,6 +543,88 @@ static bool top_k_fn_l3_cuda(ggml_cuda_pool & pool, const float * x, int * dst, 
         x, ckey.get(), cidx.get(), (int) ncols, (int) nchunks, (int) k);
     k_top_k_fn_l3_merge<<<(unsigned) nrows, TOPK_SPLIT_THREADS, 0, stream>>>(
         ckey.get(), cidx.get(), dst, (int) (nchunks*k), (int) k);
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+
+// [TAG_FN_L4_QSA_SEL] The QSA picks of the [TAG_FN_L3_GPU_TOPK] path with the outputs of the nodes that read them:
+// stage 1 is k_top_k_split_chunk unchanged, stage 2 is k_top_k_fn_l3_merge (same select, same order) that also writes
+// the score of each pick (the GET_ROWS of the scores), the member cells of each pick (the GET_ROWS of the pool table)
+// and those rows followed by the tail cells (the CONCAT). All of them are copies, so the bits are the unfused ones.
+
+// the shape conditions of top_k_fn_l3_cuda
+static bool top_k_fn_l3_fits(const int64_t ncols, const int64_t nrows, const int64_t k, const void * x) {
+    if (k < 1 || nrows < 1 || nrows > 64 || ncols > INT32_MAX || (((uintptr_t) x) % sizeof(float)) != 0) {
+        return false;
+    }
+    const int64_t nchunks = (ncols + TOPK_SPLIT_MAX_N - 1) / TOPK_SPLIT_MAX_N;
+    return nchunks >= 2 && ncols / nchunks >= k && nchunks*k <= TOPK_FN_L3_MAX_CAND;
+}
+
+bool ggml_cuda_top_k_takes_fn_l3(const ggml_tensor * dst) {
+    static const bool topk_force_ordered = getenv("TURBO_TOPK_ORDERED") != nullptr;
+    const ggml_tensor * src0 = dst->src[0];
+    if (dst->op != GGML_OP_TOP_K || topk_force_ordered || dst->op_params[0] == 0 || ggml_fn_l3_get(dst) != GGML_FN_L3_TOPK ||
+            !ggml_cuda_fn_l3_enabled() || src0 == nullptr || src0->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_I32 ||
+            !ggml_is_contiguous(src0)) {
+        return false;
+    }
+    return top_k_fn_l3_fits(src0->ne[0], ggml_nrows(src0), dst->ne[0], src0->data);
+}
+
+static __global__ void __launch_bounds__(TOPK_SPLIT_THREADS)
+k_fn_l4_qsa_sel_merge(const uint32_t * __restrict__ ckey, const int * __restrict__ cidx, const int n,
+        const ggml_cuda_fn_l4_sel_args a) {
+    __shared__ uint32_t keys[TOPK_FN_L3_MAX_CAND];
+    __shared__ int      hist[8*256];
+    __shared__ int      sh[16];
+
+    const int row = blockIdx.x;
+    for (int i = threadIdx.x; i < n; i += TOPK_SPLIT_THREADS) {
+        keys[i] = ckey[(int64_t) row*n + i];
+    }
+    __syncthreads();
+
+    const int     k     = (int) a.k;
+    const int     kpool = a.kpool;
+    const int   * ri    = cidx + (int64_t) row*n;
+    const float * sc    = a.score + (int64_t) row*a.n_pool;
+    int32_t     * rt    = a.topk + (int64_t) row*k;
+    float       * rs    = a.ts   + (int64_t) row*k;
+    int32_t     * rg    = a.gs   + (int64_t) row*k*kpool;
+    int32_t     * rc    = a.cc   + (int64_t) row*a.cc_ld;
+    topk_split_select(keys, n, k, hist, sh, [&](const int pos, const int i) {
+        const int p = ri[i];
+        rt[pos] = p;
+        rs[pos] = sc[p];
+        const int32_t * pr = a.pool_idxs + (int64_t) p*a.pool_ld;
+        for (int m = 0; m < kpool; ++m) {
+            const int32_t v = pr[m];
+            rg[pos*kpool + m] = v;
+            rc[pos*kpool + m] = v;
+        }
+    });
+
+    const int32_t * tr = a.tail + (int64_t) row*a.tail_ld;
+    for (int t = threadIdx.x; t < a.n_tail; t += TOPK_SPLIT_THREADS) {
+        rc[k*kpool + t] = tr[t];
+    }
+}
+
+bool ggml_cuda_fn_l4_qsa_sel_launch(ggml_cuda_pool & pool, cudaStream_t stream, const ggml_cuda_fn_l4_sel_args & a) {
+    if (!top_k_fn_l3_fits(a.n_pool, a.n_rows, a.k, a.score) || a.kpool < 1 || a.n_tail < 0 || a.score == nullptr ||
+            a.pool_idxs == nullptr || (a.n_tail > 0 && a.tail == nullptr) || a.topk == nullptr || a.ts == nullptr ||
+            a.gs == nullptr || a.cc == nullptr || a.cc_ld < a.k*a.kpool + a.n_tail) {
+        return false;
+    }
+    const int64_t nchunks = (a.n_pool + TOPK_SPLIT_MAX_N - 1) / TOPK_SPLIT_MAX_N;
+
+    ggml_cuda_pool_alloc<uint32_t> ckey(pool, (size_t) (a.n_rows*nchunks*a.k));
+    ggml_cuda_pool_alloc<int>      cidx(pool, (size_t) (a.n_rows*nchunks*a.k));
+    k_top_k_split_chunk<<<dim3((unsigned) nchunks, (unsigned) a.n_rows, 1), TOPK_SPLIT_THREADS, 0, stream>>>(
+        a.score, ckey.get(), cidx.get(), (int) a.n_pool, (int) nchunks, (int) a.k);
+    k_fn_l4_qsa_sel_merge<<<(unsigned) a.n_rows, TOPK_SPLIT_THREADS, 0, stream>>>(
+        ckey.get(), cidx.get(), (int) (nchunks*a.k), a);
     CUDA_CHECK(cudaGetLastError());
     return true;
 }

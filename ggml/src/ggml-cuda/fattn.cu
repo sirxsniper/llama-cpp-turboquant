@@ -1531,3 +1531,13 @@ bool ggml_cuda_turbot_geometry_supported(const int device, const int head_dim, c
     const int cc = ggml_cuda_info().devices[device].cc;
     return turing_mma_available(cc);
 }
+
+// [TAG_FN_L4_QSA_LIST] the query-tile width of the sparse turbot FA that ggml_cuda_flash_attn_ext runs for dst on device
+// (its route: the MMA kernel, no two-row positional mask, then the sparse switch of ggml_cuda_flash_attn_ext_mma_f16),
+// 0 for every other path. fn-l4-qsa.cu: a QSA_MASK writes the index lists only for an FA that reads them.
+int ggml_cuda_fattn_turbot_sparse_route(const int device, const ggml_tensor * dst) {
+    if (ggml_cuda_get_best_fattn_kernel(device, dst) != BEST_FATTN_KERNEL_MMA_F16 || ggml_cuda_fattn_pos_rows(dst) == 2) {
+        return 0;
+    }
+    return ggml_cuda_fattn_turbot_sparse_ncols1(ggml_cuda_info().devices[device].cc, dst);
+}

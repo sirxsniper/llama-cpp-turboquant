@@ -1341,8 +1341,9 @@ struct ggml_cuda_concurrent_event {
     // 2. check whether all srcs are either within the branch or outside the nodes covered by ggml_cuda_concurrent_event
     // we assume all nodes have the same buffer
     bool is_valid() const {
+        // [TAG_FN_L4_QSA_STREAMS] one slot per stream number 0..n_streams (the QSA regions keep one branch on stream 0)
         std::vector<std::vector<std::pair<int64_t, int64_t>>> write_ranges;
-        write_ranges.resize(n_streams);
+        write_ranges.resize(n_streams + 1);
 
         // get join_node's memory range to exclude from overlap checking.
         // multiple nodes can use join_node's buffer; we synchronize on the join node.
@@ -1360,11 +1361,10 @@ struct ggml_cuda_concurrent_event {
                 continue;
             }
 
-            // concurrent streams begin from 1
-            write_ranges[stream - 1].emplace_back(t_start, t_end);
+            write_ranges[stream].emplace_back(t_start, t_end);
         }
 
-        for (int i = 0; i < n_streams; ++i) {
+        for (int i = 0; i <= n_streams; ++i) {
             // sorts first by start then by end of write range
             std::sort(write_ranges[i].begin(), write_ranges[i].end());
         }
@@ -1383,8 +1383,8 @@ struct ggml_cuda_concurrent_event {
 
             // check if this buffer's write data overlaps with another stream's
             std::pair<int64_t, int64_t> data_range = std::make_pair(t_start, t_end);
-            for (int i = 0; i < n_streams; ++i) {
-                if (i == stream - 1) {
+            for (int i = 0; i <= n_streams; ++i) {
+                if (i == stream) {
                     continue;
                 }
                 auto it = std::lower_bound(write_ranges[i].begin(), write_ranges[i].end(), data_range);
@@ -1507,6 +1507,13 @@ struct ggml_backend_cuda_context {
     cudaEvent_t copy_event = nullptr;
 
     ggml_cuda_mmvq_q8_cache mmvq_q8;                // [TAG_MMVQ_Q8_REUSE]
+    // [TAG_FN_L4_QSA_LIST] the index lists a marked qwen4exp QSA_MASK writes for its sparse FA (fn-l4-qsa.cu): one buffer,
+    // allocated once by graph_optimize, never moved (captured CUDA graphs hold its address)
+    int32_t * fn_l4_list_buf = nullptr;
+    size_t    fn_l4_list_cap = 0; // int32 elements
+    // [TAG_FN_L4_QSA_STREAMS] stream 1 was created with the highest priority for the QSA indexer chains: the CUDA graphs of
+    // this context run with their kernel nodes' captured priorities (cudaGraphInstantiateFlagUseNodePriority)
+    bool      fn_l4_prio = false;
     // [TAG_FN_GRAPH_KEY_MEMO] 256 entries, 4-way by uid: a Flash-Next step has ~45-100 splits per graph, and one
     // graph per verify width (LLAMA_GRAPH_PER_WIDTH) keeps up to 4 graphs live; 16 round-robin entries always missed
     static constexpr int GRAPH_KEY_MEMO_N = 256;

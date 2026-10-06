@@ -12,6 +12,7 @@
 #include "ggml-backend.h"
 #include "ggml-fn-l3.h"   // [TAG_FN_L3_GPU]
 #include "ggml-fn-l4-gpumoe.h" // [TAG_FN_L4_GPUMOE]
+#include "ggml-fn-l4-qsa.h"   // [TAG_FN_L4_QSA]
 
 #include <algorithm>
 #include <atomic>
@@ -746,6 +747,35 @@ llama_model_qwen4exp::graph::l4_flags llama_model_qwen4exp::graph::l4_read(const
     return f;
 }
 
+// [TAG_FN_L4_QSA] the round-4 QSA switches, through the qwen4exp profile's lookups (the environment first)
+llama_model_qwen4exp::graph::l4qsa_flags llama_model_qwen4exp::graph::l4qsa_read(const llama_model & model) {
+    const char * all_v = llama_model_fn_env(&model, "LLAMA_FN_L4_QSA");
+    const bool   all   = all_v && all_v[0] && all_v[0] != '0';
+    auto on = [&](const char * name) {
+        const char * v = llama_model_fn_env(&model, name);
+        return v && v[0] ? v[0] != '0' : all;
+    };
+    l4qsa_flags f;
+    f.streams = on("LLAMA_FN_L4_QSA_STREAMS");
+    f.sel     = on("LLAMA_FN_L4_QSA_SEL");
+    f.kvw     = on("LLAMA_FN_L4_QSA_KVW");
+    f.pool    = on("LLAMA_FN_L4_QSA_POOL");
+    f.list    = on("LLAMA_FN_L4_QSA_LIST");
+    f.qkv     = on("LLAMA_FN_L4_QSA_QKV");
+    const char * fs = llama_model_fn_env(&model, "LLAMA_FN_L4_QSA_FASPLIT");
+    f.fasplit = fs && fs[0] ? std::max(0, atoi(fs)) : 0;
+
+    const int mask = (f.streams ? 1 : 0) | (f.sel ? 2 : 0) | (f.kvw ? 4 : 0) | (f.pool ? 8 : 0) | (f.list ? 16 : 0) | (f.qkv ? 32 : 0) |
+                     (f.fasplit << 6);
+    static std::atomic<int> logged{-1};
+    if (logged.exchange(mask) != mask && mask != 0) {
+        LLAMA_LOG_INFO("qwen4exp: [TAG_FN_L4_QSA] QSA levers:%s%s%s%s%s%s FASPLIT=%d\n",
+                f.streams ? " STREAMS" : "", f.sel ? " SEL" : "", f.kvw ? " KVW" : "", f.pool ? " POOL" : "", f.list ? " LIST" : "",
+                f.qkv ? " QKV" : "", f.fasplit);
+    }
+    return f;
+}
+
 // [TAG_FN_L4_HOIST] the gathers of GDN layer il (its conv rows and its state) read only the caches of layer il, which no
 // node before layer il writes: built after the bridge post of layer il - 1, they run while the host computes its experts
 void llama_model_qwen4exp::graph::l4_hoist_gathers(int il) {
@@ -899,7 +929,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_combine_post(
 }
 
 llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_params & params) :
-    llm_build_delta_net_base(params), l3(l3_read(model)), l4(l4_read(model)), model(model) {
+    llm_build_delta_net_base(params), l3(l3_read(model)), l4(l4_read(model)), l4qsa(l4qsa_read(model)), model(model) {
     if (l4.gdn_snap) {
         rs_snap_defer = &l3_deferred; // [TAG_FN_L4_GDNSTALL] the pre-ubatch state copy after the bridge post
     }
@@ -1579,6 +1609,10 @@ llama_model_qwen4exp::graph::qsa_sel llama_model_qwen4exp::graph::build_qsa_sel(
     cb(k_raw, "indexer_k_raw", il);
 
     ggml_tensor * pzero  = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, idx_dim, n_tokens), 0.0f);
+    if (l4qsa.pool && n_tokens <= 8 && inp_kpool->cache_safe) {
+        // [TAG_FN_L4_QSA_POOL] CUDA writes the raw key rows and the new pooled keys below in one launch
+        ggml_fn_l4_qsa_add(pzero, GGML_FN_L4_QSA_POOL);
+    }
     ggml_tensor * packed = ggml_reshape_3d(ctx0, ggml_concat(ctx0, k_raw, pzero, 0), 2*idx_dim, 1, n_tokens);
     ggml_build_forward_expand(gf, mctx_idx->cpy_k(ctx0, packed, inp_kpool->k_idxs, il));
 
@@ -1656,6 +1690,18 @@ llama_model_qwen4exp::graph::qsa_sel llama_model_qwen4exp::graph::build_qsa_sel(
             // (skipping the f32 gather when this is its only reader), with the dequantization the gather would do
             ggml_fn_l3_set(score, GGML_FN_L3_IDXQ8);
         }
+        // [TAG_FN_L4_QSA] the layer's round-4 marks go on its indexer node: STREAMS for decode / verify graphs only (it
+        // keeps every tensor of the layer's attention allocated until the attention), SEL where the TOPK path runs
+        int32_t l4bits = 0;
+        if (l4qsa.streams && n_tokens <= 8) {
+            l4bits |= GGML_FN_L4_QSA_STREAMS;
+        }
+        if (l4qsa.sel && l3.topk && topk_unordered) {
+            l4bits |= GGML_FN_L4_QSA_SEL;
+        }
+        if (l4bits != 0) {
+            ggml_fn_l4_qsa_add(score, l4bits);
+        }
 
         ggml_tensor * top_k = topk_unordered ? ggml_top_k_unordered(ctx0, score, n_top_pool)
                                              : ggml_top_k(ctx0, score, n_top_pool); // [n_top_pool, nt], unordered
@@ -1665,6 +1711,10 @@ llama_model_qwen4exp::graph::qsa_sel llama_model_qwen4exp::graph::build_qsa_sel(
         }
 
         *top_score = ggml_get_rows(ctx0, ggml_reshape_3d(ctx0, score, 1, n_pool, nt), top_k); // [1, n_top_pool, nt]
+        if (l4bits & GGML_FN_L4_QSA_SEL) {
+            // [TAG_FN_L4_QSA_SEL] the picked scores right after the top-k, then the selection below: one run of nodes
+            ggml_build_forward_expand(gf, *top_score);
+        }
         return top_k;
     };
 
@@ -1783,6 +1833,36 @@ static void qwen4exp_l3_mark_fa(ggml_tensor * t, bool on) {
     }
 }
 
+// [TAG_FN_L4_QSA_FASPLIT] the FLASH_ATTN_EXT under the reshape / inverse WHT of build_attn_mha_kv, as qwen4exp_l3_mark_fa
+static void qwen4exp_l4_mark_fa(ggml_tensor * t, int cells) {
+    for (int i = 0; cells > 0 && t != nullptr && i < 8; ++i) {
+        if (t->op == GGML_OP_FLASH_ATTN_EXT) {
+            ggml_fn_l4_qsa_set_fa_cells(t, cells);
+            return;
+        }
+        if (t->op != GGML_OP_RESHAPE && t->op != GGML_OP_VIEW && t->op != GGML_OP_PERMUTE &&
+            t->op != GGML_OP_CONT && t->op != GGML_OP_TURBO_WHT) {
+            return;
+        }
+        t = t->src[0];
+    }
+}
+
+// [TAG_FN_L4_QSA_LIST] the FLASH_ATTN_EXT under the reshape / inverse WHT of build_attn_mha_kv, as qwen4exp_l3_mark_fa
+static void qwen4exp_l4_mark_fa_list(ggml_tensor * t, bool on) {
+    for (int i = 0; on && t != nullptr && i < 8; ++i) {
+        if (t->op == GGML_OP_FLASH_ATTN_EXT) {
+            ggml_fn_l4_qsa_add(t, GGML_FN_L4_QSA_FA_LIST);
+            return;
+        }
+        if (t->op != GGML_OP_RESHAPE && t->op != GGML_OP_VIEW && t->op != GGML_OP_PERMUTE &&
+            t->op != GGML_OP_CONT && t->op != GGML_OP_TURBO_WHT) {
+            return;
+        }
+        t = t->src[0];
+    }
+}
+
 // Dense GQA self-attention over the cells that the QSA mask keeps.
 ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
         llm_graph_input_attn_kv * inp,
@@ -1821,8 +1901,15 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
         if (mctx_cur->is_turbot()) {
             // [TAG_FN_TURBOT_QSA] the turbot writer, as in llm_graph_context::build_attn: base code, the young rows of
             // young granules and the center fills of this ubatch
-            ggml_build_forward_expand(gf, mctx_cur->turbot_cpy_k(ctx0, k_cur, k_idxs, inp->self_turbot_young, inp->self_turbot_fill, il));
-            ggml_build_forward_expand(gf, mctx_cur->turbot_cpy_v(ctx0, v_cur, v_idxs, inp->self_turbot_young, inp->self_turbot_fill, il));
+            ggml_tensor * wk = mctx_cur->turbot_cpy_k(ctx0, k_cur, k_idxs, inp->self_turbot_young, inp->self_turbot_fill, il);
+            ggml_tensor * wv = mctx_cur->turbot_cpy_v(ctx0, v_cur, v_idxs, inp->self_turbot_young, inp->self_turbot_fill, il);
+            if (l4qsa.kvw && wk->op == GGML_OP_TURBOT_SET_ROWS && wv->op == GGML_OP_TURBOT_SET_ROWS) {
+                // [TAG_FN_L4_QSA_KVW] CUDA writes both in one launch (op_params slot 14 is free in TURBOT_SET_ROWS)
+                ggml_fn_l4_qsa_add(wk, GGML_FN_L4_QSA_KVW);
+                ggml_fn_l4_qsa_add(wv, GGML_FN_L4_QSA_KVW);
+            }
+            ggml_build_forward_expand(gf, wk);
+            ggml_build_forward_expand(gf, wv);
         } else {
             ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
             ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
@@ -1857,6 +1944,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
         cur = build_attn_mha_kv(mctx_cur, q, k, v, nullptr, mask, nullptr, nullptr, kq_scale, il,
                 nullptr, nullptr, inp->self_turbot_gtab, n_kv_max);
         qwen4exp_l3_mark_fa(cur, l3.compact);
+        qwen4exp_l4_mark_fa(cur, l4qsa.fasplit); // [TAG_FN_L4_QSA_FASPLIT]
     } else {
         // [TAG_FN_R4_QSA_POS] the mask from the positional vectors, the selection and the picked scores: one f16 [n_kv, n]
         // buffer instead of the explicit KQ mask input, the -inf fill, the scatter and the sum (each about n_kv x n_ubatch).
@@ -1877,9 +1965,17 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
                 ggml_view_2d(ctx0, qs.live, qs.live->ne[0], nc, qs.live->nb[1], c0*qs.live->nb[1]);
             ggml_tensor * mask_c = ggml_qsa_mask(ctx0, kv_pos, qp_c, sl_c, lv_c, (int32_t) qs.group);
             cb(mask_c, "kq_mask_qsa", il);
+            const bool l4_list = l4qsa.list && n_tokens <= 8;
+            if (l4_list) {
+                // [TAG_FN_L4_QSA_LIST] CUDA writes this mask at the cells of the selection only, with the index lists of the
+                // sparse attention below (which then does not compact the mask)
+                ggml_fn_l4_qsa_add(mask_c, GGML_FN_L4_QSA_LIST);
+            }
             ggml_tensor * out_c = build_attn_mha_kv(mctx_cur, q_c, k, v, nullptr, mask_c, nullptr, nullptr, kq_scale, il,
                     nullptr, nullptr, inp->self_turbot_gtab, n_kv_max);
             qwen4exp_l3_mark_fa(out_c, l3.compact); // [TAG_FN_L3_GPU_COMPACT]
+            qwen4exp_l4_mark_fa(out_c, l4qsa.fasplit); // [TAG_FN_L4_QSA_FASPLIT]
+            qwen4exp_l4_mark_fa_list(out_c, l4_list);  // [TAG_FN_L4_QSA_LIST]
             cur = cur ? ggml_concat(ctx0, cur, out_c, 1) : out_c;
         }
     }
@@ -1933,6 +2029,15 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
     qwen4exp_l3_mark_mm(Vcur, l3.mmvd);
     cb(Vcur, "Vcur", il);
 
+    if (qsa && l4qsa.qkv && n_tokens <= 4) {
+        // [TAG_FN_L4_QSA_QKV] the q, k and v projections of the layer input as three nodes in a row: CUDA computes them in
+        // one launch (the same kernel and sums per row)
+        ggml_fn_l4_qsa_add(Qcur_full, GGML_FN_L4_QSA_QKV);
+        ggml_build_forward_expand(gf, Qcur_full);
+        ggml_build_forward_expand(gf, Kcur);
+        ggml_build_forward_expand(gf, Vcur);
+    }
+
     Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
     Kcur = build_norm(Kcur, model.layers[il].attn_k_norm, nullptr, LLM_NORM_RMS, il);
     cb(Kcur, "Kcur_normed", il);
@@ -1943,6 +2048,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
         ggml_element_size(Qcur_full) * n_embd_head);
     gate = ggml_cont_2d(ctx0, gate, n_embd_head * n_head, n_tokens);
     cb(gate, "gate_reshaped", il);
+    if (qsa && l4qsa.streams && n_tokens <= 8) {
+        // [TAG_FN_L4_QSA_STREAMS] the gate copy before the attention: it runs on the q/k/v stream, not after the join
+        ggml_build_forward_expand(gf, gate);
+    }
 
     Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
 
