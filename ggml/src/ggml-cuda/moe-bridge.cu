@@ -137,6 +137,7 @@ struct mb_dev {
     unsigned long long dma_ring_size;
     int             max_fetch;
     uint32_t      * state; // device memory: [0] ring counter, [1] sticky error, [2 + chan] channel sequence
+    uint32_t      * l4sync; // [TAG_FN_L4_POST] device memory after state: per channel 4 words (blocks done, seq, stamp, -)
     int             n_chan;
     int             mode;
     int             stats;
@@ -548,7 +549,7 @@ static __device__ __forceinline__ int fn_l4_ctl() {
 }
 
 // thread ctl: the channel's next sequence number (0: sticky error, nothing is posted) and, in spin mode, the ring stamp
-static __device__ __forceinline__ void fn_l4_take_seq(const mb_dev & v, const int chan, uint32_t & seq, uint32_t & g) {
+static __device__ __forceinline__ void fn_l4_take_seq(const mb_dev v, const int chan, uint32_t & seq, uint32_t & g) {
     seq = 0;
     g   = 0;
     if (*(volatile uint32_t *) &v.state[1] == 0) {
@@ -568,7 +569,7 @@ static __device__ __forceinline__ void fn_l4_take_seq(const mb_dev & v, const in
 }
 
 // thread ctl, before the fence: the header and the ring entry, all but the stamp
-static __device__ __forceinline__ void fn_l4_post_head(const mb_dev & v, const int chan, const uint32_t seq, const uint32_t g,
+static __device__ __forceinline__ void fn_l4_post_head(const mb_dev v, const int chan, const uint32_t seq, const uint32_t g,
         const int n_tokens, const int n_used, const int flags) {
     mb_chan_hdr * h = v.hdr + chan;
     *(volatile int32_t  *) &h->n_tokens = n_tokens;
@@ -583,7 +584,7 @@ static __device__ __forceinline__ void fn_l4_post_head(const mb_dev & v, const i
 }
 
 // thread ctl, after every thread's fence and the barrier: the stamp, then the ticket (0 when nothing was posted)
-static __device__ __forceinline__ void fn_l4_post_publish(const mb_dev & v, const uint32_t seq, const uint32_t g, int32_t * ticket) {
+static __device__ __forceinline__ void fn_l4_post_publish(const mb_dev v, const uint32_t seq, const uint32_t g, int32_t * ticket) {
     if (seq != 0 && v.mode == GGML_MOE_BRIDGE_WAIT_SPIN) {
         mb_ring_entry * e = v.ring + (g % MB_RING);
         *(volatile uint32_t *) &e->stamp       = g;
@@ -674,17 +675,22 @@ static __global__ void __launch_bounds__(FN_L4_POST_THREADS) k_fn_l4_mb_post(con
     }
 }
 
-// [TAG_FN_L4_POST] topk_moe_cuda (topk-moe.cu, no bias) and the post in one launch. Warp r < n_rows computes row r with
-// topk_moe_cuda's code (the same ops in the same order, so the same ids and weights) and writes ids and weights to the
-// device tensors and to the channel; the other warps copy x to the channel meanwhile.
+// [TAG_FN_L4_POST] topk_moe_cuda (topk-moe.cu, no bias) and the post in one launch. Block 0: warp r < n_rows computes row r
+// with the code of topk_moe_cuda (the same ops in the same order, so the same ids and weights) and writes ids and weights
+// to the device tensors and to the channel; its last thread takes the sequence number and writes the header. Blocks 1..n
+// copy x to the channel meanwhile, one part each (PCIe writes from many SMs, not one). Every block fences its writes and
+// counts itself done; the last block writes the stamp and the ticket. Same bytes, same order for the host.
 struct fn_l4_topk_config {
     bool use_sigmoid;
     bool use_sqrt_softplus;
     bool with_norm;
 };
 
+constexpr int FN_L4_TOPK_THREADS = TOPK_MOE_ROWS_PER_BLOCK * WARP_SIZE; // block 0: one warp per row
+constexpr int FN_L4_XBLK_MAX     = 16;                                  // x blocks, at most
+
 template <int experts_per_thread, bool use_limit>
-static __device__ void fn_l4_softmax_warp_inplace(float (&vals)[experts_per_thread], const int limit, const int lane) {
+static __device__ __forceinline__ void fn_l4_softmax_warp_inplace(float (&vals)[experts_per_thread], const int limit, const int lane) {
     float max_val = -INFINITY;
 
 #pragma unroll
@@ -728,7 +734,7 @@ static __device__ void fn_l4_softmax_warp_inplace(float (&vals)[experts_per_thre
 }
 
 template <int experts_per_thread, bool use_limit>
-static __device__ void fn_l4_sigmoid_warp_inplace(float (&vals)[experts_per_thread], const int limit, const int lane) {
+static __device__ __forceinline__ void fn_l4_sigmoid_warp_inplace(float (&vals)[experts_per_thread], const int limit, const int lane) {
 #pragma unroll
     for (int i = 0; i < experts_per_thread; i++) {
         const int  idx    = lane + i * WARP_SIZE;
@@ -738,7 +744,7 @@ static __device__ void fn_l4_sigmoid_warp_inplace(float (&vals)[experts_per_thre
 }
 
 template <int experts_per_thread, bool use_limit>
-static __device__ void fn_l4_sqrt_softplus_warp_inplace(float (&vals)[experts_per_thread], const int limit, const int lane) {
+static __device__ __forceinline__ void fn_l4_sqrt_softplus_warp_inplace(float (&vals)[experts_per_thread], const int limit, const int lane) {
 #pragma unroll
     for (int i = 0; i < experts_per_thread; i++) {
         const int  idx    = lane + i * WARP_SIZE;
@@ -747,163 +753,204 @@ static __device__ void fn_l4_sqrt_softplus_warp_inplace(float (&vals)[experts_pe
     }
 }
 
+// x block `part` of n_part: its share of x (n_tokens rows of n_embd floats, row stride x_nb1), packed into hx as k_mb_post
+static __device__ __forceinline__ void fn_l4_copy_x_part(float * hx, const char * x, const int64_t x_nb1, const int n_embd,
+        const int n_tokens, const int part, const int n_part) {
+    if ((n_embd & 3) == 0 && (x_nb1 & 15) == 0 && ((uintptr_t) x & 15) == 0) {
+        const int n4  = n_embd/4;
+        const int n   = n4*n_tokens;
+        const int per = (n + n_part - 1)/n_part;
+        const int end = min(n, (part + 1)*per);
+        for (int i = part*per + threadIdx.x; i < end; i += blockDim.x) {
+            const int tk = i/n4;
+            ((float4 *) hx)[i] = ((const float4 *) (x + tk*x_nb1))[i - tk*n4];
+        }
+    } else {
+        const int n   = n_embd*n_tokens;
+        const int per = (n + n_part - 1)/n_part;
+        const int end = min(n, (part + 1)*per);
+        for (int i = part*per + threadIdx.x; i < end; i += blockDim.x) {
+            const int tk = i/n_embd;
+            hx[i] = ((const float *) (x + tk*x_nb1))[i - tk*n_embd];
+        }
+    }
+}
+
 template <int n_experts>
-static __global__ void __launch_bounds__(FN_L4_POST_THREADS, 1) k_fn_l4_topk_post(const mb_dev v, const int chan,
+static __global__ void __launch_bounds__(FN_L4_TOPK_THREADS, 1) k_fn_l4_topk_post(const mb_dev v, const int chan,
         const float * logits, float * weights, int32_t * ids, const int n_rows, const int n_expert_used,
         const float clamp_val, const float scale_val, const fn_l4_topk_config config,
         const char * x, const int64_t x_nb1, const int n_embd, const int flags, int32_t * ticket) {
-    __shared__ uint32_t s_seq;
-    __shared__ uint32_t s_g;
-    const int  lane   = threadIdx.x % WARP_SIZE;
-    const int  row    = threadIdx.x / WARP_SIZE;
-    const bool is_row = row < n_rows;
-    const int  ctl    = fn_l4_ctl();
+    uint32_t * sy = v.l4sync + 4*chan; // [0] blocks done, [1] seq, [2] stamp
 
-    constexpr int experts_per_thread = (n_experts > WARP_SIZE) ? n_experts / WARP_SIZE : 1;
-
-    float wt[experts_per_thread];
-
-#pragma unroll
-    for (int i = 0; i < experts_per_thread; i++) {
-        wt[i] = -INFINITY;
-    }
-
-    ggml_cuda_pdl_sync();
-    if (is_row) {
-        const float * lg = logits + n_experts * row;
-#pragma unroll
-        for (int i = 0; i < n_experts; i += WARP_SIZE) {
-            const int expert  = i + lane;
-            wt[i / WARP_SIZE] = (n_experts % WARP_SIZE == 0 || expert < n_experts) ? lg[expert] : -INFINITY;
-        }
-    }
-    if (threadIdx.x == ctl) {
-        uint32_t seq;
-        uint32_t g;
-        fn_l4_take_seq(v, chan, seq, g);
-        s_seq = seq;
-        s_g   = g;
-    }
-
-    // weights and ids can alias logits: every row reads its logits before any thread writes
-    __syncthreads();
-    ggml_cuda_pdl_lc();
-
-    const uint32_t seq = s_seq;
     char    * p    = v.data + (size_t) chan*v.chan_bytes;
     float   * hx   = (float   *) p;
     int32_t * hids = (int32_t *) (p + v.off_ids);
     float   * hw   = (float   *) (p + v.off_w);
 
-    if (is_row) {
-        float   * wrow  = weights + n_expert_used * row;
-        int32_t * irow  = ids + n_experts * row;
-        int32_t * hirow = hids + n_expert_used * row;
-        float   * hwrow = hw + n_expert_used * row;
+    ggml_cuda_pdl_sync();
 
-        if (config.use_sigmoid) {
-            fn_l4_sigmoid_warp_inplace<experts_per_thread, false>(wt, n_experts, lane);
-        } else if (config.use_sqrt_softplus) {
-            fn_l4_sqrt_softplus_warp_inplace<experts_per_thread, false>(wt, n_experts, lane);
-        } else {
-            fn_l4_softmax_warp_inplace<experts_per_thread, false>(wt, n_experts, lane);
-        }
+    if (blockIdx.x > 0) {
+        ggml_cuda_pdl_lc();
+        // also with a sticky error: then nothing is posted and the host does not read it
+        fn_l4_copy_x_part(hx, x, x_nb1, n_embd, n_rows, blockIdx.x - 1, gridDim.x - 1);
+    } else {
+        __shared__ uint32_t s_seq;
+        __shared__ uint32_t s_g;
+        const int  lane   = threadIdx.x % WARP_SIZE;
+        const int  row    = threadIdx.x / WARP_SIZE;
+        const bool is_row = row < n_rows;
+        const int  ctl    = fn_l4_ctl();
 
-        // NaN -> -FLT_MAX, as topk_moe_cuda: the iterative argmax then picks unique ids
-#pragma unroll
-        for (int i = 0; i < experts_per_thread; i++) {
-            if (__isnanf(wt[i])) {
-                wt[i] = -FLT_MAX;
-            }
-        }
+        constexpr int experts_per_thread = (n_experts > WARP_SIZE) ? n_experts / WARP_SIZE : 1;
 
-        float wt_sum = 0.f;
-
-        float output_weights[experts_per_thread];
+        float wt[experts_per_thread];
 
 #pragma unroll
         for (int i = 0; i < experts_per_thread; i++) {
-            output_weights[i] = 0.f;
+            wt[i] = -INFINITY;
         }
 
-        for (int k = 0; k < n_expert_used; k++) {
-            float max_val    = wt[0];
-            int   max_expert = lane;
-
+        if (is_row) {
+            const float * lg = logits + n_experts * row;
 #pragma unroll
-            for (int i = 1; i < experts_per_thread; i++) {
-                const int expert = lane + i * WARP_SIZE;
-                if ((n_experts % WARP_SIZE == 0 || expert < n_experts) && wt[i] > max_val) {
-                    max_val    = wt[i];
-                    max_expert = expert;
-                }
-            }
-
-#pragma unroll
-            for (int mask = WARP_SIZE / 2; mask > 0; mask /= 2) {
-                const float val    = __shfl_xor_sync(0xFFFFFFFF, max_val, mask, WARP_SIZE);
-                const int   expert = __shfl_xor_sync(0xFFFFFFFF, max_expert, mask, WARP_SIZE);
-                if (val > max_val || (val == max_val && expert < max_expert)) {
-                    max_val    = val;
-                    max_expert = expert;
-                }
-            }
-
-            if ((max_expert & (WARP_SIZE - 1)) == lane) {
-                wt[max_expert / WARP_SIZE] = -INFINITY;
-            }
-
-            if ((k & (WARP_SIZE - 1)) == lane) {
-                output_weights[k / WARP_SIZE] = max_val;
-            }
-
-            if ((max_expert & (WARP_SIZE - 1)) == lane) {
-                irow[k] = max_expert;
-                if (seq != 0) {
-                    hirow[k] = max_expert;
-                }
-                if (config.with_norm) {
-                    wt_sum += max_val;
-                }
+            for (int i = 0; i < n_experts; i += WARP_SIZE) {
+                const int expert  = i + lane;
+                wt[i / WARP_SIZE] = (n_experts % WARP_SIZE == 0 || expert < n_experts) ? lg[expert] : -INFINITY;
             }
         }
-
-        if (config.with_norm) {
-            wt_sum              = warp_reduce_sum(wt_sum);
-            wt_sum              = max(wt_sum, clamp_val);
-            const float inv_sum = 1.0f / wt_sum;
-
-            for (int i = 0; i < experts_per_thread; i++) {
-                output_weights[i] *= inv_sum;
-            }
-        }
-
-#pragma unroll
-        for (int i = 0; i < experts_per_thread; i++) {
-            const int idx = i * WARP_SIZE + lane;
-            if (idx < n_expert_used) {
-                const float wv = output_weights[i] * scale_val;
-                wrow[idx] = wv;
-                if (seq != 0) {
-                    hwrow[idx] = wv;
-                }
-            }
-        }
-    } else if (seq != 0) {
-        const int t0 = n_rows * WARP_SIZE;
-        fn_l4_copy_x(hx, x, x_nb1, n_embd, n_rows, threadIdx.x - t0, blockDim.x - t0);
         if (threadIdx.x == ctl) {
-            fn_l4_post_head(v, chan, seq, s_g, n_rows, n_expert_used, flags);
+            uint32_t seq;
+            uint32_t g;
+            fn_l4_take_seq(v, chan, seq, g);
+            s_seq = seq;
+            s_g   = g;
+        }
+
+        // weights and ids can alias logits: every row reads its logits before any thread writes
+        __syncthreads();
+        ggml_cuda_pdl_lc();
+
+        const uint32_t seq = s_seq;
+
+        if (is_row) {
+            float   * wrow  = weights + n_expert_used * row;
+            int32_t * irow  = ids + n_experts * row;
+            int32_t * hirow = hids + n_expert_used * row;
+            float   * hwrow = hw + n_expert_used * row;
+
+            if (config.use_sigmoid) {
+                fn_l4_sigmoid_warp_inplace<experts_per_thread, false>(wt, n_experts, lane);
+            } else if (config.use_sqrt_softplus) {
+                fn_l4_sqrt_softplus_warp_inplace<experts_per_thread, false>(wt, n_experts, lane);
+            } else {
+                fn_l4_softmax_warp_inplace<experts_per_thread, false>(wt, n_experts, lane);
+            }
+
+            // NaN -> -FLT_MAX, as topk_moe_cuda: the iterative argmax then picks unique ids
+#pragma unroll
+            for (int i = 0; i < experts_per_thread; i++) {
+                if (__isnanf(wt[i])) {
+                    wt[i] = -FLT_MAX;
+                }
+            }
+
+            float wt_sum = 0.f;
+
+            float output_weights[experts_per_thread];
+
+#pragma unroll
+            for (int i = 0; i < experts_per_thread; i++) {
+                output_weights[i] = 0.f;
+            }
+
+            for (int k = 0; k < n_expert_used; k++) {
+                float max_val    = wt[0];
+                int   max_expert = lane;
+
+#pragma unroll
+                for (int i = 1; i < experts_per_thread; i++) {
+                    const int expert = lane + i * WARP_SIZE;
+                    if ((n_experts % WARP_SIZE == 0 || expert < n_experts) && wt[i] > max_val) {
+                        max_val    = wt[i];
+                        max_expert = expert;
+                    }
+                }
+
+#pragma unroll
+                for (int mask = WARP_SIZE / 2; mask > 0; mask /= 2) {
+                    const float val    = __shfl_xor_sync(0xFFFFFFFF, max_val, mask, WARP_SIZE);
+                    const int   expert = __shfl_xor_sync(0xFFFFFFFF, max_expert, mask, WARP_SIZE);
+                    if (val > max_val || (val == max_val && expert < max_expert)) {
+                        max_val    = val;
+                        max_expert = expert;
+                    }
+                }
+
+                if ((max_expert & (WARP_SIZE - 1)) == lane) {
+                    wt[max_expert / WARP_SIZE] = -INFINITY;
+                }
+
+                if ((k & (WARP_SIZE - 1)) == lane) {
+                    output_weights[k / WARP_SIZE] = max_val;
+                }
+
+                if ((max_expert & (WARP_SIZE - 1)) == lane) {
+                    irow[k] = max_expert;
+                    if (seq != 0) {
+                        hirow[k] = max_expert;
+                    }
+                    if (config.with_norm) {
+                        wt_sum += max_val;
+                    }
+                }
+            }
+
+            if (config.with_norm) {
+                wt_sum              = warp_reduce_sum(wt_sum);
+                wt_sum              = max(wt_sum, clamp_val);
+                const float inv_sum = 1.0f / wt_sum;
+
+#pragma unroll
+                for (int i = 0; i < experts_per_thread; i++) {
+                    output_weights[i] *= inv_sum;
+                }
+            }
+
+#pragma unroll
+            for (int i = 0; i < experts_per_thread; i++) {
+                const int idx = i * WARP_SIZE + lane;
+                if (idx < n_expert_used) {
+                    const float wv = output_weights[i] * scale_val;
+                    wrow[idx] = wv;
+                    if (seq != 0) {
+                        hwrow[idx] = wv;
+                    }
+                }
+            }
+        }
+
+        if (threadIdx.x == ctl) {
+            if (seq != 0) {
+                fn_l4_post_head(v, chan, seq, s_g, n_rows, n_expert_used, flags);
+            }
+            *(volatile uint32_t *) &sy[1] = seq;
+            *(volatile uint32_t *) &sy[2] = s_g;
         }
     }
 
-    if (seq != 0) {
-        __threadfence_system();
-    }
+    // each block: its writes, then it counts itself done; the last one publishes
+    __threadfence_system();
     __syncthreads();
-
-    if (threadIdx.x == ctl) {
-        fn_l4_post_publish(v, seq, s_g, ticket);
+    if (threadIdx.x == 0) {
+        const uint32_t n_done = atomicAdd(&sy[0], 1u) + 1u;
+        if (n_done == gridDim.x) {
+            __threadfence(); // acquire: the writes of every block and the seq and stamp of block 0 come before its count
+            const uint32_t seq = *(volatile uint32_t *) &sy[1];
+            const uint32_t g   = *(volatile uint32_t *) &sy[2];
+            *(volatile uint32_t *) &sy[0] = 0;
+            fn_l4_post_publish(v, seq, g, ticket);
+        }
     }
 }
 
@@ -1080,7 +1127,7 @@ ggml_moe_bridge * ggml_backend_cuda_moe_bridge_new(const ggml_moe_bridge_params 
     b->data = (char *)          (b->host + off_data);
     b->glob->err_chan = -1;
 
-    rc = cudaMalloc((void **) &b->state, (2 + (size_t) p->n_chan)*sizeof(uint32_t));
+    rc = cudaMalloc((void **) &b->state, (2 + 5*(size_t) p->n_chan)*sizeof(uint32_t)); // [TAG_FN_L4_POST] + l4sync
     if (rc != cudaSuccess) {
         b->state = nullptr;
         return fail("cudaMalloc", rc);
@@ -1097,7 +1144,7 @@ ggml_moe_bridge * ggml_backend_cuda_moe_bridge_new(const ggml_moe_bridge_params 
         b->aux = nullptr;
         return fail("cudaStreamCreateWithFlags", rc);
     }
-    rc = cudaMemsetAsync(b->state, 0, (2 + (size_t) p->n_chan)*sizeof(uint32_t), b->aux);
+    rc = cudaMemsetAsync(b->state, 0, (2 + 5*(size_t) p->n_chan)*sizeof(uint32_t), b->aux);
     if (rc == cudaSuccess) {
         rc = cudaStreamSynchronize(b->aux);
     }
@@ -1138,6 +1185,7 @@ ggml_moe_bridge * ggml_backend_cuda_moe_bridge_new(const ggml_moe_bridge_params 
     b->dev.dma_ring_size = 0;
     b->dev.max_fetch  = p->max_fetch;
     b->dev.state      = b->state;
+    b->dev.l4sync     = b->state + 2 + p->n_chan; // [TAG_FN_L4_POST]
     b->dev.n_chan     = p->n_chan;
     b->dev.mode       = p->wait_mode;
     b->dev.stats      = p->stats ? 1 : 0;
@@ -1586,8 +1634,12 @@ bool ggml_cuda_fn_l4_topk_post(ggml_backend_cuda_context & ctx, const ggml_tenso
     const float clamp_val = clamp ? ggml_get_op_params_f32(clamp, 0) : -INFINITY;
     const float scale_val = scale ? ggml_get_op_params_f32(scale, 0) : 1.0f;
 
+    // x blocks: about one 16-byte word per thread
+    const int64_t x_words = n_rows*x->ne[0]/4;
+    const int     n_xblk  = (int) std::min<int64_t>(FN_L4_XBLK_MAX, std::max<int64_t>(1, (x_words + FN_L4_TOPK_THREADS - 1)/FN_L4_TOPK_THREADS));
+
     cudaStream_t stream = ctx.stream();
-    const ggml_cuda_kernel_launch_params lp(dim3(1, 1, 1), dim3(FN_L4_POST_THREADS, 1, 1), 0, stream);
+    const ggml_cuda_kernel_launch_params lp(dim3(1 + n_xblk, 1, 1), dim3(FN_L4_TOPK_THREADS, 1, 1), 0, stream);
     ggml_cuda_kernel_launch(k_fn_l4_topk_post<512>, lp, b->dev, (int) chan,
             (const float *) logits->data, (float *) weights->data, (int32_t *) ids->data, (int) n_rows, (int) n_used,
             clamp_val, scale_val, config, (const char *) x->data, (int64_t) x->nb[1], (int) x->ne[0], (int) flags,

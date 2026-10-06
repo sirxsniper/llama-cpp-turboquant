@@ -2615,10 +2615,21 @@ struct llama_model_qwen4exp : public llama_model_base {
                                    //           top-k and post in one launch (ggml-fn-l4-gpumoe.h)
             bool gdnstall = false; // GDNSTALL: the conv-state ring write-back (two copy-engine memcpys per slot, ~28 us
                                    //           per GDN layer before the post) as strided copies in one chained launch,
-                                   //           put into the graph after the bridge post
+                                   //           and the pre-ubatch state copy after the post. 1 = 2 | 8; else the bits:
+            bool gdn_wb    = false; //          2: strided conv copies (bitwise)
+            bool gdn_defer = false; //          4: conv copies after the post (NOT bitwise without MTP: first diff at
+                                    //             token 151, identical with GGML_CUDA_DISABLE_FUSION=1; cause open)
+            bool gdn_snap  = false; //          8: the pre-ubatch state copy after the post (bitwise)
+            bool hoist     = false; // HOIST:    the state and conv-row gathers of the next GDN layer (they read only its
+                                    //           caches) go into the graph after this layer's bridge post
         };
         static l4_flags l4_read(const llama_model & model);
         l4_flags l4;
+
+        // [TAG_FN_L4_HOIST] the recurrent input of the graph, and the hoisted state gather of a layer
+        llm_graph_input_rs * l4_inp_rs = nullptr;
+        std::map<int, ggml_tensor *> l4_state_rows;
+        void l4_hoist_gathers(int il);
 
         // [TAG_FN_L3_GPU_DEFER] nodes the next layer does not read: build_layer_ffn puts them into the graph right after
         // the bridge post, so the device computes them while the host computes the layer's experts
