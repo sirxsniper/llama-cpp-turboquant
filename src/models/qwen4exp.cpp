@@ -1145,6 +1145,10 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
             moe_bridge_hint_late = true; // [TAG_FN_L6_PFDEV3] build_moe_ffn keeps the hint, build_layer_ffn builds it
             l6_hint_res    = res_hc;
             l6_hint_inject = inject;
+            if (il == 0) {
+                const char * e = llama_model_fn_env(&model, "LLAMA_FN_L6_PFDEV3_EARLY");
+                l6_early = e && e[0] && e[0] != '0';
+            }
         }
         cur = build_layer_ffn(cur, il);
         moe_bridge_hint_late = false;
@@ -2375,6 +2379,12 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
     moe_q8in_mark    = 0;
     moe_zskip_mark   = 0;
     moe_post_mark    = 0;
+
+    // [TAG_FN_L6_PFDEV3] LLAMA_FN_L6_PFDEV3_EARLY=1: the kept hint right after the hot chain (hot part only, no shared expert),
+    // before the deferred nodes, the hoisted gathers and the shared expert
+    if (l6_hint_res != nullptr && l6_early) {
+        l6_build_late_hint(il, nullptr);
+    }
 
     // [TAG_FN_L3_GPU_DEFER] after the post (and the hot chain), before the shared expert and the wait
     l3_expand_deferred();

@@ -2666,6 +2666,7 @@ struct llama_model_qwen4exp : public llama_model_base {
         // build_layer_ffn before the wait (prediction only: no value of the model reads it)
         ggml_tensor * l6_hint_res    = nullptr;
         ggml_tensor * l6_hint_inject = nullptr;
+        bool          l6_early       = false; // LLAMA_FN_L6_PFDEV3_EARLY: built after the hot chain, without the shared expert
         void l6_build_late_hint(int il, ggml_tensor * shexp);
 
         ggml_tensor * build_layer_attn(
