@@ -105,6 +105,10 @@ struct llm_build_delta_net_base : public llm_graph_context {
             ggml_tensor *        b,
             ggml_tensor *        s,
             int                  il);
+
+    // [TAG_FN_L4_GDNSTALL] set by an arch: build_recurrent_attn puts the copy of the pre-ubatch state ([TAG_RS_SNAP_DEPTH])
+    // here instead of into the graph, and the arch adds it later (nullptr = into the graph at once, every model but qwen4exp)
+    std::vector<ggml_tensor *> * rs_snap_defer = nullptr;
 };
 
 struct llm_build_rwkv6_base : public llm_graph_context {
@@ -2546,6 +2550,7 @@ struct llama_model_qwen4exp : public llama_model_base {
     // [TAG_FN_L3_GPU] the lever mask this model last logged (-1: none yet). Per model: the fit probe builds its graphs on
     // a model of its own while the log level is demoted, so the real model still logs its line at INFO.
     mutable std::atomic<int> l3_logged{-1};
+    mutable std::atomic<int> l4_logged{-1}; // [TAG_FN_L4_GPUMOE]
 
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
@@ -2556,7 +2561,7 @@ struct llama_model_qwen4exp : public llama_model_base {
         // the helpers alone, graph_mtp builds its own body
         struct no_build {};
         graph(const llama_model & model, const llm_graph_params & params, no_build) :
-            llm_build_delta_net_base(params), l3(l3_read(model)), model(model) {}
+            llm_build_delta_net_base(params), l3(l3_read(model)), l4(l4_read(model)), model(model) {}
 
         // HC replaces every layer norm: residual is [n_embd, hc, n_tokens]
         ggml_tensor * build_hc_mix(
@@ -2603,6 +2608,28 @@ struct llama_model_qwen4exp : public llama_model_base {
         };
         static l3_flags l3_read(const llama_model & model);
         l3_flags l3;
+
+        // [TAG_FN_L4_GPUMOE] lever round 4, GPU chain B: LLAMA_FN_L4_<NAME>=1 turns one on (off by default). Same bits.
+        struct l4_flags {
+            bool post     = false; // POST:     the bridge post with one system fence; after the router's fused top-k,
+                                   //           top-k and post in one launch (ggml-fn-l4-gpumoe.h)
+            bool gdnstall = false; // GDNSTALL: the conv-state ring write-back (two copy-engine memcpys per slot, ~28 us
+                                   //           per GDN layer before the post) as strided copies in one chained launch,
+                                   //           and the pre-ubatch state copy after the post. 1 = 2 | 8; else the bits:
+            bool gdn_wb    = false; //          2: strided conv copies (bitwise)
+            bool gdn_defer = false; //          4: conv copies after the post (NOT bitwise without MTP: first diff at
+                                    //             token 151, identical with GGML_CUDA_DISABLE_FUSION=1; cause open)
+            bool gdn_snap  = false; //          8: the pre-ubatch state copy after the post (bitwise)
+            bool hoist     = false; // HOIST:    the state and conv-row gathers of the next GDN layer (they read only its
+                                    //           caches) go into the graph after this layer's bridge post
+        };
+        static l4_flags l4_read(const llama_model & model);
+        l4_flags l4;
+
+        // [TAG_FN_L4_HOIST] the recurrent input of the graph, and the hoisted state gather of a layer
+        llm_graph_input_rs * l4_inp_rs = nullptr;
+        std::map<int, ggml_tensor *> l4_state_rows;
+        void l4_hoist_gathers(int il);
 
         // [TAG_FN_L3_GPU_DEFER] nodes the next layer does not read: build_layer_ffn puts them into the graph right after
         // the bridge post, so the device computes them while the host computes the layer's experts

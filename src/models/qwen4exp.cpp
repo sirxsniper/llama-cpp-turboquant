@@ -11,6 +11,7 @@
 #include "ggml-alloc.h"   // [TAG_FN_MTP_HEAD_IDS]
 #include "ggml-backend.h"
 #include "ggml-fn-l3.h"   // [TAG_FN_L3_GPU]
+#include "ggml-fn-l4-gpumoe.h" // [TAG_FN_L4_GPUMOE]
 
 #include <algorithm>
 #include <atomic>
@@ -709,6 +710,54 @@ llama_model_qwen4exp::graph::l3_flags llama_model_qwen4exp::graph::l3_read(const
     return f;
 }
 
+// [TAG_FN_L4_GPUMOE] the round-4 GPU chain B switches, through the qwen4exp profile's lookups (the environment first)
+llama_model_qwen4exp::graph::l4_flags llama_model_qwen4exp::graph::l4_read(const llama_model & model) {
+    auto on = [&](const char * name) {
+        const char * v = llama_model_fn_env(&model, name);
+        return v && v[0] && v[0] != '0';
+    };
+    l4_flags f;
+    f.post = on("LLAMA_FN_L4_POST");
+    {
+        const char * v = llama_model_fn_env(&model, "LLAMA_FN_L4_GDNSTALL");
+        int m = v && v[0] ? atoi(v) : 0;
+        if (m == 1) {
+            m = 2 | 8; // the bitwise parts; 4 only when asked for (not bitwise in the model, see models.h)
+        }
+        f.gdn_wb    = (m & 2) != 0;
+        f.gdn_defer = (m & 4) != 0;
+        f.gdn_snap  = (m & 8) != 0;
+        f.gdnstall  = f.gdn_wb || f.gdn_defer || f.gdn_snap;
+    }
+    f.hoist = on("LLAMA_FN_L4_HOIST");
+
+    const int mask = (f.post ? 1 : 0) | (f.gdn_wb ? 2 : 0) | (f.gdn_defer ? 4 : 0) | (f.gdn_snap ? 8 : 0) | (f.hoist ? 16 : 0);
+    static std::atomic<int> logged_other{-1};
+    const auto * qm = dynamic_cast<const llama_model_qwen4exp *>(&model);
+    std::atomic<int> & logged = qm ? qm->l4_logged : logged_other;
+    if (logged.exchange(mask) != mask) {
+        LLAMA_LOG_INFO("qwen4exp: [TAG_FN_L4_GPUMOE] GPU chain B levers:%s%s%s%s%s%s\n",
+                f.post ? " POST" : "", f.gdn_wb ? " GDNSTALL(wb)" : "", f.gdn_defer ? " GDNSTALL(defer)" : "",
+                f.gdn_snap ? " GDNSTALL(snap)" : "", f.hoist ? " HOIST" : "", mask == 0 ? " none" : "");
+    }
+    return f;
+}
+
+// [TAG_FN_L4_HOIST] the gathers of GDN layer il (its conv rows and its state) read only the caches of layer il, which no
+// node before layer il writes: built after the bridge post of layer il - 1, they run while the host computes its experts
+void llama_model_qwen4exp::graph::l4_hoist_gathers(int il) {
+    const auto *  mctx_cur = l4_inp_rs->mctx;
+    const int64_t n_seqs   = ubatch.n_seqs;
+
+    ggml_tensor * conv_states_all = mctx_cur->get_r_l(il);
+    if (rs_rows.find(conv_states_all) == rs_rows.end()) {
+        rs_rows.emplace(conv_states_all, build_rs(l4_inp_rs, conv_states_all, conv_states_all->ne[0], n_seqs));
+    }
+    if (l4_state_rows.find(il) == l4_state_rows.end()) {
+        l4_state_rows.emplace(il, build_rs(l4_inp_rs, mctx_cur->get_s_l(il), hparams.n_embd_s(), n_seqs));
+    }
+}
+
 void llama_model_qwen4exp::graph::l3_expand_deferred() {
     for (ggml_tensor * t : l3_deferred) {
         ggml_build_forward_expand(gf, t);
@@ -847,7 +896,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_combine_post(
 }
 
 llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_params & params) :
-    llm_build_delta_net_base(params), l3(l3_read(model)), model(model) {
+    llm_build_delta_net_base(params), l3(l3_read(model)), l4(l4_read(model)), model(model) {
+    if (l4.gdn_snap) {
+        rs_snap_defer = &l3_deferred; // [TAG_FN_L4_GDNSTALL] the pre-ubatch state copy after the bridge post
+    }
     const int64_t hc = hparams.dsv4_hc_mult;
 
     GGML_ASSERT(hparams.n_embd_head_v() == hparams.n_embd_head_k());
@@ -867,6 +919,9 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
     ggml_build_forward_expand(gf, inpL);
 
     auto * inp = build_inp_mem_hybrid();
+    if (l4.hoist) {
+        l4_inp_rs = inp->get_recr(); // [TAG_FN_L4_HOIST]
+    }
 
     // qwen4exp always builds llama_memory_hybrid_idx, so this downcast is safe
     // the indexer cache inside it is absent when the GGUF has no indexer tensors
@@ -1996,7 +2051,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
     ggml_tensor * conv_input = build_conv_state_at(inp, conv_states_all, qkv_mixed,
             conv_kernel_size - 1, conv_channels, il);
 
-    ggml_tensor * state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
+    // [TAG_FN_L4_HOIST] the gather built after the bridge post of the layer before, if any
+    const auto it_state = l4_state_rows.find(il);
+    ggml_tensor * state = it_state != l4_state_rows.end() ? it_state->second : build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
     state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
     cb(state, "state_predelta", il);
 
@@ -2104,6 +2161,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
     moe_router_mark  = l3.mmv ? GGML_FN_L3_MMV : 0; // [TAG_FN_L3_GPU_MMV] the router: 512 rows of 2560
     moe_q8in_mark    = l3.q8f ? GGML_FN_L3_Q8IN : 0; // [TAG_FN_L3_GPU_Q8F] the hot / DMA chains read hc_pre's q8_1 copy
     moe_zskip_mark   = l3.zskip ? GGML_FN_L3_ZSKIP : 0; // [TAG_FN_L3_GPU_ZSKIP] their zero-slot pairs are not computed
+    moe_post_mark    = l4.post ? GGML_FN_L4_POST : 0;   // [TAG_FN_L4_POST] one-fence post, fused with the top-k
     ggml_tensor * moe_out =
         build_moe_ffn(cur,
             model.layers[il].ffn_gate_inp,
@@ -2123,9 +2181,15 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
     moe_router_mark  = 0;
     moe_q8in_mark    = 0;
     moe_zskip_mark   = 0;
+    moe_post_mark    = 0;
 
     // [TAG_FN_L3_GPU_DEFER] after the post (and the hot chain), before the shared expert and the wait
     l3_expand_deferred();
+
+    // [TAG_FN_L4_HOIST] the gathers of the next layer, if it is a GDN layer
+    if (l4.hoist && l4_inp_rs != nullptr && il + 1 < n_layer && hparams.is_recr(il + 1)) {
+        l4_hoist_gathers(il + 1);
+    }
 
     // shared experts, as in the Qwen3Next reference
     if (model.layers[il].ffn_up_shexp != nullptr) {
@@ -2421,6 +2485,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
 
     const int64_t n_slots = (int64_t) cparams.n_rs_seq + 1;
 
+    // [TAG_FN_L4_GDNSTALL] the history in the graph here, as when the copies are put in here: the other nodes keep their order
+    if (l4.gdn_defer) {
+        ggml_build_forward_expand(gf, conv_input);
+    }
+
     for (int64_t slot = 0; slot < n_slots; ++slot) {
         const int64_t s_idx = std::max<int64_t>(0, conv_input->ne[0] - state_cols - slot);
 
@@ -2437,10 +2506,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
         // [TAG_FN_L3_GPU_CONVWB] copy the strided tail straight into the row: the slots' copies differ only by constant
         // pointer steps, so CUDA chains them into one launch ([TAG_CPY_CHAIN_FUSION]) instead of a 2-D memcpy and a
         // memcpy per slot (8 copy-engine nodes, ~28 us per GDN layer). Same bytes.
-        ggml_tensor * cpy = ggml_cpy(ctx0, l3.convwb ? tail : ggml_cont(ctx0, tail), dst);
+        // [TAG_FN_L4_GDNSTALL] the same two levers, for these copies only
+        ggml_tensor * cpy = ggml_cpy(ctx0, l3.convwb || l4.gdn_wb ? tail : ggml_cont(ctx0, tail), dst);
 
         // [TAG_FN_L3_GPU_DEFER] the next step reads these rows, this graph does not: after the bridge post
-        if (l3.defer) {
+        if (l3.defer || l4.gdn_defer) {
             l3_deferred.push_back(cpy);
         } else {
             ggml_build_forward_expand(gf, cpy);

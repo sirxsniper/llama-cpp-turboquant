@@ -2514,6 +2514,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             const int32_t br_flags = (mcache ? GGML_MOE_BRIDGE_JOB_TABLE : 0) | (br_dma ? GGML_MOE_BRIDGE_JOB_DMA : 0) |
                                      (hint ? GGML_MOE_BRIDGE_JOB_HINT : 0);
             br_ticket = ggml_moe_host_post(ctx0, cur, selected_experts, w2, br_id, br_chan, br_flags);
+            if (moe_post_mark != 0) {
+                ggml_fn_l3_set(br_ticket, moe_post_mark); // [TAG_FN_L4_POST]
+            }
             cb(br_ticket, "ffn_moe_bridge_post", il);
             res->n_moe_bridge++;
             if (hint) {
