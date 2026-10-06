@@ -421,6 +421,12 @@ private:
     std::array<llm_graph_result_ptr, 4> gf_res_width_noout;
     void snap_take(llm_graph_result * res, bool launch2);
 
+    // [TAG_FN_L4_HOST_EARLYOUT] LLAMA_FN_L4_HOST_EARLYOUT (qwen4exp): decode() hands process_ubatch the output copies of
+    // the ubatch, which queues them behind a bridged graph before that graph's synchronize
+    bool   early_out_on = false;
+    void (*early_extract_fn)(void * ud, const llm_graph_result * res) = nullptr;
+    void * early_extract_ud = nullptr;
+
     // [TAG_MOE_BRIDGE] LLAMA_MOE_BRIDGE=1: the host doorbell of the host-resident expert layers (llama-moe-bridge.h)
     struct llama_moe_bridge * moe_bridge = nullptr;
     bool     moe_bridge_failed = false; // [TAG_FN_R1_BRIDGE_RETRY] the last process_ubatch failed in the bridge
