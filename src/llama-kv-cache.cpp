@@ -15,9 +15,13 @@
 #include "ggml-turbot.h"
 
 #include <algorithm>
+#if defined(__SSE2__) || defined(_M_X64) || (defined(_M_IX86_FP) && _M_IX86_FP >= 2)
+#include <emmintrin.h> // [TAG_FN_L7_MASK]
+#endif
 #include <cassert>
 #include <cmath>
 #include <cstdio>
+#include <atomic>
 #include <cstring>
 #include <limits>
 #include <map>
@@ -1835,7 +1839,21 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
 
     // pad the n_kv value so that the graph remains constant across batches and can be reused
     // note: this also helps some backends with performance (f.ex https://github.com/ggml-org/llama.cpp/pull/16812#issuecomment-3455112220)
-    const uint32_t n_pad_cur = std::max(n_pad, 256u);
+    // [TAG_FN_L7_KVPAD] sparse-attention indexer models (qwen4exp): n_kv in steps of LLAMA_KV_PAD_INDEXER cells (default
+    // 2048, a power of two >= 256). The CUDA graph of a decode width is keyed by its shapes, so every n_kv step makes a new
+    // key per width (1-3 with MTP): one uncaptured run of ~8500 nodes + one capture each, ~1 ms per step on average at
+    // 256-cell steps. The extra cells are masked (-inf): FA stops at the mask's last visible block (KV_max), the indexer's
+    // block selection reads the mask. Other models keep 256.
+    static const uint32_t pad_idx = [] {
+        const char * e = getenv("LLAMA_KV_PAD_INDEXER");
+        const int    v = e ? atoi(e) : 2048;
+        uint32_t     p = 256;
+        while (p < (uint32_t) std::min(v, 65536)) {
+            p *= 2;
+        }
+        return p;
+    }();
+    const uint32_t n_pad_cur = std::max(n_pad, hparams.indexer_n_head > 0 ? pad_idx : 256u);
 
     for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
         const auto & cells = v_cells[sinfo.strm[s]];
@@ -2505,6 +2523,37 @@ void llama_kv_cache::set_input_q_pos(ggml_tensor * dst, const llama_ubatch * uba
     ggml_backend_tensor_set(dst, bits.data(), dst->nb[1], ubatch->n_tokens*ggml_element_size(dst));
 }
 
+// [TAG_FN_L7_MASK] row i of the [n_kv, n_tokens] mask: 0 where 0 <= pos[j] <= qpos[i], -inf elsewhere (F16 or F32)
+static void kq_mask_fill_pos(const llama_pos * pos, int64_t n_kv, const llama_pos * qpos, uint32_t n_tokens, void * dst, bool f16) {
+    for (uint32_t i = 0; i < n_tokens; ++i) {
+        const int32_t p1 = qpos[i];
+        int64_t j = 0;
+        if (f16) {
+            uint16_t * d = (uint16_t *) dst + (int64_t) i*n_kv;
+#if defined(__SSE2__) || defined(_M_X64) || (defined(_M_IX86_FP) && _M_IX86_FP >= 2)
+            const __m128i vp1  = _mm_set1_epi32(p1);
+            const __m128i vz   = _mm_setzero_si128();
+            const __m128i vinf = _mm_set1_epi16((short) 0xFC00);
+            for (; j + 8 <= n_kv; j += 8) {
+                const __m128i a  = _mm_loadu_si128((const __m128i *) (pos + j));
+                const __m128i b  = _mm_loadu_si128((const __m128i *) (pos + j + 4));
+                const __m128i da = _mm_or_si128(_mm_cmpgt_epi32(a, vp1), _mm_cmplt_epi32(a, vz));
+                const __m128i db = _mm_or_si128(_mm_cmpgt_epi32(b, vp1), _mm_cmplt_epi32(b, vz));
+                _mm_storeu_si128((__m128i *) (d + j), _mm_and_si128(_mm_packs_epi32(da, db), vinf));
+            }
+#endif
+            for (; j < n_kv; ++j) {
+                d[j] = pos[j] >= 0 && pos[j] <= p1 ? (uint16_t) 0 : (uint16_t) 0xFC00;
+            }
+        } else {
+            float * d = (float *) dst + (int64_t) i*n_kv;
+            for (; j < n_kv; ++j) {
+                d[j] = pos[j] >= 0 && pos[j] <= p1 ? 0.0f : -INFINITY;
+            }
+        }
+    }
+}
+
 void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
     const uint32_t n_tokens = ubatch->n_tokens;
 
@@ -2533,6 +2582,81 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
         return e != nullptr && atoi(e) != 0;
     }();
     const int64_t t_start = mask_probe ? ggml_time_us() : 0;
+
+    // [TAG_FN_L7_MASK] one sequence that owns every used cell, causal, no SWA / ALiBi: a cell is visible to a
+    // query iff its position is set (!= -1) and <= the query's position - the same mask the cell walk below builds (it
+    // also tests the cell's sequence bitset, which holds the sequence for every used cell here). SSE2 over the position
+    // array instead of the per-cell bitset: ~0.1 ns instead of ~3 ns per cell, i.e. ~0.7 ms less per mask at 245K
+    // cells. Sparse-attention indexer models only (qwen4exp: the indexer needs the explicit mask, so every target,
+    // MTP process and MTP draft decode fills one); LLAMA_KQ_MASK_FAST=0 turns it off.
+    static const bool mask_fast_env = [] {
+        const char * e = getenv("LLAMA_KQ_MASK_FAST");
+        return !(e && e[0] == '0');
+    }();
+    if (mask_fast_env && hparams.indexer_n_head > 0 && causal_attn && swa_type == LLAMA_SWA_TYPE_NONE && !hparams.use_alibi &&
+        n_stream == 1 && n_tokens > 0) {
+        const llama_seq_id s0 = ubatch->seq_id[0][0];
+        bool one = s0 >= 0 && s0 < LLAMA_MAX_SEQ;
+        for (uint32_t i = 0; one && i < n_tokens; ++i) {
+            one = ubatch->seq_id[i][0] == s0;
+        }
+        const llama_kv_cells * cp = one ? &v_cells.at(seq_to_stream[s0]) : nullptr;
+        if (cp != nullptr && cp->seq_n_cells(s0) == cp->get_used() && (int64_t) cp->size() >= n_kv) {
+            kq_mask_fill_pos(cp->pos_data(), n_kv, ubatch->pos, n_tokens, dst->data, dst->type == GGML_TYPE_F16);
+            if (ubatch->is_pos_2d()) {
+                // M-RoPE (every Qwen3.x text batch has n_pos >= 3): the cell walk also masks a cell at the query's own
+                // position whose 2D position is after the query's (image tokens); the same test on just those cells
+                const auto & sp = cp->seq_pos_get(s0);
+                for (uint32_t i = 0; i < n_tokens; ++i) {
+                    const llama_pos p1   = ubatch->pos[i];
+                    const llama_pos p1_x = ubatch->pos[i + ubatch->n_tokens*2];
+                    const llama_pos p1_y = ubatch->pos[i + ubatch->n_tokens];
+                    for (auto it = sp.lower_bound({ p1, 0u }); it != sp.end() && it->first == p1; ++it) {
+                        const uint32_t j = it->second;
+                        if ((int64_t) j < n_kv && cp->ext_get(j).is_2d_gt(p1_x, p1_y)) {
+                            if (dst->type == GGML_TYPE_F16) {
+                                ((ggml_fp16_t *) dst->data)[(int64_t) i*n_kv + j] = ggml_fp32_to_fp16(-INFINITY);
+                            } else {
+                                ((float *) dst->data)[(int64_t) i*n_kv + j] = -INFINITY;
+                            }
+                        }
+                    }
+                }
+            }
+            // LLAMA_KQ_MASK_CHECK=1: build the mask the slow way too and compare (a test switch)
+            static const bool mask_check = [] {
+                const char * e = getenv("LLAMA_KQ_MASK_CHECK");
+                return e != nullptr && atoi(e) != 0;
+            }();
+            if (mask_check) {
+                const size_t esz = dst->type == GGML_TYPE_F16 ? sizeof(ggml_fp16_t) : sizeof(float);
+                std::vector<uint8_t> ref((size_t) n_kv*n_tokens*esz);
+                const args_set_input_kq_mask a2 = { hparams, ubatch, v_cells, seq_to_stream, n_swa, swa_type, n_kv, n_stream, (int64_t) n_tokens };
+                if (dst->type == GGML_TYPE_F16) {
+                    set_input_kq_mask_impl<ggml_fp16_t>(a2, (ggml_fp16_t *) ref.data(), causal_attn);
+                } else {
+                    set_input_kq_mask_impl<float>(a2, (float *) ref.data(), causal_attn);
+                }
+                static std::atomic<int64_t> n_chk{0}, n_bad{0};
+                const bool bad = memcmp(ref.data(), dst->data, ref.size()) != 0;
+                n_bad += bad ? 1 : 0;
+                if (bad || (++n_chk % 1024) == 0) {
+                    LLAMA_LOG_INFO("%s: [TAG_FN_L7_MASK] fast mask check: %lld checked, %lld different (n_kv %lld, %u tokens)\n", __func__,
+                            (long long) n_chk.load(), (long long) n_bad.load(), (long long) n_kv, n_tokens);
+                }
+            }
+            if (mask_probe) {
+                static int64_t acc_us = 0, calls = 0, max_kv = 0;
+                acc_us += ggml_time_us() - t_start;
+                max_kv  = std::max<int64_t>(max_kv, n_kv);
+                if (++calls % 512 == 0) {
+                    fprintf(stderr, "turbo-probe: kq-mask fast fill %lld calls  avg %.3f ms/call  max n_kv %lld\n",
+                            (long long) calls, acc_us / 1000.0 / calls, (long long) max_kv);
+                }
+            }
+            return;
+        }
+    }
 
     const args_set_input_kq_mask args = {
         /*.hparams          =*/ hparams,

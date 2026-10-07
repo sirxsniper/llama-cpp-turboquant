@@ -84,6 +84,11 @@ public:
         return pos[i] == -1;
     }
 
+    // [TAG_FN_L7_MASK] the position of every cell (-1: empty), for a vectorized mask fill
+    const llama_pos * pos_data() const {
+        return pos.data();
+    }
+
     uint32_t get_used() const {
         return used.size();
     }
