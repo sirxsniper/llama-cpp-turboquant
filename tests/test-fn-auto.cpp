@@ -151,7 +151,7 @@ static void test_profile_opts() {
            find_opt(tdma, "LLAMA_MOE_BRIDGE_PF") == nullptr && find_opt(tdma, "LLAMA_MOE_BRIDGE_PF_SOLO") == nullptr,
            "trial-dma has no bridge (and none of its switches)");
     TCHECK(find_opt(tdma, "LLAMA_MOE_DMA_SHARE") && find_opt(tdma, "LLAMA_MOE_DMA_SHARE")->value == "auto", "trial-dma DMA share");
-    TCHECK(find_opt(tdma, "GGML_CPU_MOE_FUSE") != nullptr && tdma.size() == safe.size() - 14, "trial-dma keeps the rest"); // [TAG_FN_L4_ADOPT] + POOLBAR, PFDEV (bridge only)
+    TCHECK(find_opt(tdma, "GGML_CPU_MOE_FUSE") != nullptr && tdma.size() == safe.size() - 15, "trial-dma keeps the rest"); // [TAG_FN_L4_ADOPT] + POOLBAR, PFDEV, [TAG_FN_L9_ADOPT] HINTTOPK (bridge only)
 
     // safe ignores LLAMA_FLASHNEXT_FAST
     const auto safe_c = llama_fn_profile_opts(LLAMA_FN_PROFILE_SAFE, "GGML_CPU_MOE_FUSE=0,LLAMA_FN_TEST_X=1");

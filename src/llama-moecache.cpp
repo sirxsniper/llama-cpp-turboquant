@@ -2003,8 +2003,7 @@ ggml_backend_buffer_t hot_vmm_place(moe_cache * mc, ggml_context * ctx_d, ggml_b
                 const size_t a = hot_round_up(o + (size_t) ls.sl_base*sb + SL_SLACK, gran);
                 const size_t b = (o + (size_t) ls.pub.n_slots*sb)/gran*gran;
                 if (o + (size_t) (ls.pub.n_slots + 1)*sb > lim) {
-                    LLAMA_LOG_WARN("moe-hot: [TAG_FN_L10_SLOTLEND] %s reaches into the stream's range or the tail - no slot lend
-",
+                    LLAMA_LOG_WARN("moe-hot: [TAG_FN_L10_SLOTLEND] %s reaches into the stream's range or the tail - no slot lend\n",
                             ts[k]->name);
                     mc->sl_fail = true;
                     return nullptr;
@@ -2030,8 +2029,7 @@ ggml_backend_buffer_t hot_vmm_place(moe_cache * mc, ggml_context * ctx_d, ggml_b
         }
         if (sum < g_kv_want) {
             LLAMA_LOG_WARN("moe-hot: [TAG_FN_L10_SLOTLEND] the lend layers' segments hold %.0f MiB, the KV cache may want %.0f MiB "
-                    "- no slot lend
-", sum/1048576.0, g_kv_want/1048576.0);
+                    "- no slot lend\n", sum/1048576.0, g_kv_want/1048576.0);
             mc->sl_fail = true;
             return nullptr;
         }
@@ -3081,8 +3079,7 @@ size_t hot_sl_release(moe_cache * mc, const void * owner, size_t need) {
         }
         if (!ok) {
             // its slots stay out; what could not be unmapped holds VRAM, so the group counts nothing given
-            LLAMA_LOG_WARN("moe-hot: [TAG_FN_L10_SLOTLEND] group %zu could not give all of its VRAM back
-", g);
+            LLAMA_LOG_WARN("moe-hot: [TAG_FN_L10_SLOTLEND] group %zu could not give all of its VRAM back\n", g);
             mc->sl_given[g] = 1; // out, a token amount (the restore maps it again)
         }
         given      += mc->sl_given[g];
