@@ -23,6 +23,7 @@
 #        define WIN32_LEAN_AND_MEAN
 #    endif
 #    include <windows.h>
+#    include <psapi.h>
 #endif
 
 namespace {
@@ -75,6 +76,31 @@ struct llama_fn_tier {
 
 namespace {
 
+// the bytes of layer i that are not in this process's working set yet, from every 16th page (pages the server already
+// touched cost no RAM to lock: only the rest has to come out of the available memory)
+size_t fn_tier_nonresident(const llama_fn_tier * t, size_t i) {
+    constexpr size_t step = 16;
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    const size_t page = si.dwPageSize ? si.dwPageSize : 4096;
+    std::vector<PSAPI_WORKING_SET_EX_INFORMATION> q;
+    for (const auto & r : t->layers[i]) {
+        for (size_t o = 0; o < r.n; o += step*page) {
+            PSAPI_WORKING_SET_EX_INFORMATION x = {};
+            x.VirtualAddress = r.lo + o;
+            q.push_back(x);
+        }
+    }
+    if (q.empty() || !K32QueryWorkingSetEx(GetCurrentProcess(), q.data(), (DWORD) (q.size()*sizeof(q[0])))) {
+        return t->layer_bytes[i];
+    }
+    size_t out = 0;
+    for (const auto & x : q) {
+        out += x.VirtualAttributes.Valid ? 0 : 1;
+    }
+    return (size_t) ((double) t->layer_bytes[i]*out/q.size());
+}
+
 size_t fn_tier_avail() {
     MEMORYSTATUSEX ms;
     ms.dwLength = sizeof(ms);
@@ -104,7 +130,7 @@ bool fn_tier_lock_next(llama_fn_tier * t) {
     }
     const size_t i = t->n_locked;
     const size_t b = t->layer_bytes[i];
-    if (t->locked_bytes + b > t->cap || fn_tier_avail() < t->free_min) {
+    if (t->locked_bytes + b > t->cap || fn_tier_avail() < t->free_min + fn_tier_nonresident(t, i)) {
         return false;
     }
     if (!fn_tier_ws_add((int64_t) b)) {
@@ -159,7 +185,8 @@ void fn_tier_worker(llama_fn_tier * t) {
     if (WaitForSingleObject(t->stop, (DWORD) t->delay_ms) == WAIT_OBJECT_0) {
         return;
     }
-    SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN);
+    // below-normal CPU priority, normal I/O priority (background mode made the reads crawl: 9.5 GiB in 47 s)
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
     const auto t0 = std::chrono::steady_clock::now();
     while (WaitForSingleObject(t->stop, 0) != WAIT_OBJECT_0 && fn_tier_lock_next(t)) {
         WaitForSingleObject(t->stop, 20);
@@ -168,7 +195,6 @@ void fn_tier_worker(llama_fn_tier * t) {
             "%.1f GiB RAM available (cap %.1f GiB)\n", t->n_locked, t->layers.size(), t->locked_bytes/1073741824.0,
             t->total/1073741824.0, std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(),
             fn_tier_avail()/1073741824.0, t->cap/1073741824.0);
-    SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_END);
 
     auto healthy_since = std::chrono::steady_clock::now();
     for (;;) {
