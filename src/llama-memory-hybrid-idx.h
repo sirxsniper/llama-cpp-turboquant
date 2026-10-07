@@ -111,6 +111,10 @@ public:
     // [TAG_FN_L3_HOST_DIAG] LLAMA_FN_HOST_KPOOL_PROBE=1 on a qwen4exp model (llama-fn-auto.h): time the k-pool host work
     bool kpool_probe_on() const { return kpool_probe; }
 
+    // [TAG_FN_L10_KPOOLINC] qwen4exp (LLAMA_FN_L10_KPOOLINC, default 1): the k-pool input arrays kept per sequence and
+    // updated at the layout's tail instead of rebuilt over every pool on each ubatch
+    bool kpool_inc_on() const { return kpool_inc; }
+
 private:
     // forget seq_id (all of it if seq_id < 0) in every cache at once, so a failed restore cannot leave the caches out of step
     // seq_id < 0 drops the whole context, as the caches themselves do on a failed restore
@@ -126,6 +130,7 @@ private:
     std::unique_ptr<kpool_layout> kpool_lay;
 
     bool kpool_probe = false; // [TAG_FN_L3_HOST_DIAG]
+    bool kpool_inc   = false; // [TAG_FN_L10_KPOOLINC]
 
     // whether the current layout has cells shared between sequences (kpool_layout is incomplete here, so out of line)
     bool kpool_layout_shared() const;

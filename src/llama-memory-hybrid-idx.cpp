@@ -112,6 +112,7 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
             nullptr, filter_idx, nullptr, nullptr, "idx_");
     }()) {
     kpool_probe = llama_fn_l3_flag(model, "LLAMA_FN_HOST_KPOOL_PROBE"); // [TAG_FN_L3_HOST_DIAG]
+    kpool_inc   = llama_fn_l3_int(model, "LLAMA_FN_L10_KPOOLINC", 1) != 0; // [TAG_FN_L10_KPOOLINC] qwen4exp only
 }
 
 llama_memory_context_ptr llama_memory_hybrid_idx::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
@@ -401,6 +402,10 @@ struct llama_memory_hybrid_idx::kpool_layout_seq {
 
     // Whether any cell also carries another sequence, which rules out caching this sequence's pooled keys.
     bool shared = false;
+
+    // [TAG_FN_L10_KPOOLINC] how many leading pools are unchanged (same start, same cells) since set_input_kpool last
+    // brought the input cache below up to date; only ever lowered here, raised by the consumer
+    mutable size_t pools_keep = 0;
 };
 
 struct llama_memory_hybrid_idx::kpool_layout {
@@ -410,11 +415,22 @@ struct llama_memory_hybrid_idx::kpool_layout {
 
     uint32_t n_pool_real = 0;
     bool cache_safe      = true;
+
+    // [TAG_FN_L10_KPOOLINC] the input values of each sequence's pools (one stream: the cell is the K row), valid for the
+    // first pools_keep pools, and how many of those pools use each cell as their rep (the pad search's "is a rep")
+    struct inc_seq {
+        std::vector<int32_t>   pcell; // rep cell per pool
+        std::vector<int32_t>   pidx;  // kpool member cells per pool
+        std::vector<llama_pos> end;   // position of the last member per pool
+    };
+    mutable std::array<inc_seq, LLAMA_MAX_SEQ> inc;
+    mutable std::vector<uint16_t> inc_rep_cnt;
 };
 
 // Which pools of the layout the current ubatch must re-pool, in the layout's pool order.
 struct llama_memory_hybrid_idx_context::kpool_state {
     std::vector<uint32_t> is_new;
+    std::vector<uint32_t> new_list; // [TAG_FN_L10_KPOOLINC] the marked pools (cache-safe layouts), sorted before use
     uint32_t generation = 0;
 
     uint32_t n_pool_real = 0;
@@ -603,6 +619,7 @@ const llama_memory_hybrid_idx::kpool_layout & llama_memory_hybrid_idx::kpool_lay
             while (!sq.pools.empty() && (size_t) sq.pools.back() + kpool > n_cut) {
                 sq.pools.pop_back();
             }
+            sq.pools_keep = std::min(sq.pools_keep, sq.pools.size()); // [TAG_FN_L10_KPOOLINC]
             sq.j_next = sq.pools.empty() ? 0 : (size_t) sq.pools.back() + kpool;
             for (auto it = sp.lower_bound(std::make_pair(p_st, (uint32_t) 0)); it != sp.end(); ++it) {
                 sq.cells.push_back(*it);
@@ -617,6 +634,7 @@ const llama_memory_hybrid_idx::kpool_layout & llama_memory_hybrid_idx::kpool_lay
         if (sq.cells.size() != sp.size() || (mem_idx_stale[s] != POS_CLEAN && !tail)) {
             sq.cells.assign(sp.begin(), sp.end());
             sq.pools.clear();
+            sq.pools_keep = 0; // [TAG_FN_L10_KPOOLINC]
             sq.j_next  = 0;
             sq.shared  = false;
             sq.pos_min = sp.empty() ? 0 : sp.begin()->first;
@@ -837,6 +855,7 @@ void llama_memory_hybrid_idx_context::kpool_build_state(const llama_ubatch & uba
     st.n_pool_real = lay.n_pool_real;
     st.cache_safe  = lay.cache_safe;
     st.n_new       = 0;
+    st.new_list.clear(); // [TAG_FN_L10_KPOOLINC]
     if (++st.generation == 0) {
         std::fill(st.is_new.begin(), st.is_new.end(), 0);
         st.generation = 1;
@@ -847,6 +866,7 @@ void llama_memory_hybrid_idx_context::kpool_build_state(const llama_ubatch & uba
         if (st.is_new[ip] != st.generation) {
             st.is_new[ip] = st.generation;
             ++st.n_new;
+            st.new_list.push_back(ip); // [TAG_FN_L10_KPOOLINC]
         }
     };
 
@@ -1048,8 +1068,7 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
 
     // pools are laid out per sequence
     std::vector<uint32_t>  seq_pool_start(LLAMA_MAX_SEQ, 0);
-    std::vector<llama_pos> pool_end;
-    pool_end.reserve(n_pool);
+    std::vector<llama_pos> pool_end; // the full rebuild's
 
     int32_t * pcell = (int32_t *) pool_cells->data;
     int32_t * pidx  = (int32_t *) pool_idxs->data;
@@ -1060,6 +1079,12 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
     if (npos != nullptr) {
         std::fill(npos, npos + 4*n_new_g, 0);
     }
+
+    // the full rebuild: every pool's entries, the pad search over a fresh bitmap, the masks
+    auto fill_full = [&]() {
+    std::fill(seq_pool_start.begin(), seq_pool_start.end(), 0);
+    pool_end.clear();
+    pool_end.reserve(n_pool);
 
     uint32_t i_new = 0;
     for (llama_seq_id s = 0; s < LLAMA_MAX_SEQ; ++s) {
@@ -1180,6 +1205,174 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
         fill_mask((ggml_fp16_t *) pool_mask->data);
     } else {
         fill_mask((float *) pool_mask->data);
+    }
+    };
+
+    // [TAG_FN_L10_KPOOLINC] one stream (the cell is the K row, no inert sequences) and no shared cells: the per-pool
+    // entries come from the layout's input cache, brought up to date at each sequence's tail (the pools after pools_keep
+    // dropped, the new ones appended), and are copied in; the new-pool list comes from the marks, the pad cells from the
+    // rep counts. The same values as the full rebuild (LLAMA_KPOOL_VERIFY=1 compares them on every fill); the full
+    // rebuild cost ~6 ns per pool each ubatch (0.05 ms at 32K, 0.35 ms at 245K with 62K pools)
+    auto fill_inc = [&]() {
+        const int64_t n_cells = (int64_t) kv_size;
+        if ((int64_t) lay.inc_rep_cnt.size() != n_cells) {
+            lay.inc_rep_cnt.assign((size_t) n_cells, 0);
+            for (llama_seq_id s = 0; s < LLAMA_MAX_SEQ; ++s) {
+                lay.inc[s] = {};
+                lay.seqs[s].pools_keep = 0;
+            }
+        }
+        uint16_t * rc = lay.inc_rep_cnt.data();
+        // drop every sequence's changed tail first, then append: a cell can move from one sequence to another
+        for (llama_seq_id s = 0; s < LLAMA_MAX_SEQ; ++s) {
+            auto &       c    = lay.inc[s];
+            const size_t keep = std::min(lay.seqs[s].pools_keep, c.end.size());
+            for (size_t k = keep; k < c.end.size(); ++k) {
+                GGML_ASSERT(rc[c.pcell[k]] > 0);
+                --rc[c.pcell[k]];
+            }
+            c.pcell.resize(keep);
+            c.pidx.resize(keep*kpool);
+            c.end.resize(keep);
+        }
+        uint32_t ip0 = 0;
+        for (llama_seq_id s = 0; s < LLAMA_MAX_SEQ; ++s) {
+            const auto & sq = lay.seqs[s];
+            auto &       c  = lay.inc[s];
+            for (size_t pi = c.end.size(); pi < sq.pools.size(); ++pi) {
+                const uint32_t j   = sq.pools[pi];
+                const uint32_t rep = sq.cells[j + kpool - 1].second;
+                GGML_ASSERT((int64_t) rep < n_cells);
+                c.pcell.push_back((int32_t) rep);
+                ++rc[rep];
+                for (uint32_t k = 0; k < kpool; ++k) {
+                    c.pidx.push_back((int32_t) sq.cells[j + k].second);
+                }
+                c.end.push_back(sq.cells[j + kpool - 1].first);
+            }
+            sq.pools_keep = sq.pools.size();
+
+            const uint32_t n = (uint32_t) c.end.size();
+            seq_pool_start[s] = ip0;
+            if (n > 0) {
+                GGML_ASSERT(ip0 + n < n_pool);
+                memcpy(pcell + ip0,                c.pcell.data(), (size_t) n*sizeof(int32_t));
+                memcpy(pidx + (size_t) ip0*kpool, c.pidx.data(),  (size_t) n*kpool*sizeof(int32_t));
+            }
+            ip0 += n;
+        }
+        GGML_ASSERT(ip0 == st.n_pool_real);
+
+        // the new pools in the layout's order
+        GGML_ASSERT(st.new_list.size() == n_new);
+        std::vector<uint32_t> nl = st.new_list;
+        std::sort(nl.begin(), nl.end());
+        llama_seq_id s = 0;
+        for (uint32_t i_new = 0; i_new < n_new; ++i_new) {
+            const uint32_t ip = nl[i_new];
+            while (ip >= seq_pool_start[s] + (uint32_t) lay.seqs[s].pools.size()) {
+                ++s;
+                GGML_ASSERT(s < LLAMA_MAX_SEQ);
+            }
+            const auto &   sq = lay.seqs[s];
+            const uint32_t j  = sq.pools[ip - seq_pool_start[s]];
+            for (uint32_t k = 0; k < kpool; ++k) {
+                nidx[(size_t) i_new*kpool + k] = (int32_t) gcell(sq, sq.cells[j + k].second);
+            }
+            if (nrep != nullptr) {
+                nrep[i_new] = gcell(sq, sq.cells[j + kpool - 1].second);
+            }
+            if (npos != nullptr) {
+                const uint32_t c = sq.cells[j].second;
+                const auto &   e = mem->get_mem_idx()->get_cells(s).ext_get(c);
+                npos[0*n_new_g + i_new] = sq.cells[j].first;
+                npos[1*n_new_g + i_new] = e.y;
+                npos[2*n_new_g + i_new] = e.x;
+                npos[3*n_new_g + i_new] = sq.cells[j].first;
+            }
+        }
+
+        // padded entries: the smallest cells that are no pool's rep
+        int64_t pad_cell = 0;
+        for (uint32_t i = n_new; i < n_new_g; ++i, ++pad_cell) {
+            while (pad_cell < n_cells && rc[pad_cell] != 0) {
+                ++pad_cell;
+            }
+            GGML_ASSERT(pad_cell < n_cells);
+            for (uint32_t k = 0; k < kpool; ++k) {
+                nidx[(size_t) i*kpool + k] = (int32_t) pad_cell;
+            }
+            if (nrep != nullptr) {
+                nrep[i] = pad_cell;
+            }
+        }
+
+        for (uint32_t ip = ip0; ip < n_pool; ++ip) {
+            pcell[ip] = (int32_t) dummy_cell;
+        }
+        std::fill(pidx + (size_t) ip0*kpool, pidx + (size_t) n_pool*kpool, sentinel);
+
+        // the masks: each row written once (dropped, the visible pools of the token's sequence, dropped)
+        auto fill_mask_inc = [&](auto * data) {
+            using T = std::remove_pointer_t<decltype(data)>;
+            const T keep = llama_cast<T>(0.0f);
+            const T drop = llama_cast<T>(-INFINITY);
+
+            for (uint32_t i = 0; i < n_tokens; ++i) {
+                const llama_seq_id si = ubatch->seq_id[i][0];
+                const llama_pos    p  = ubatch->pos[i];
+                const auto &       ce = lay.inc[si].end;
+
+                const uint32_t p0 = seq_pool_start[si];
+                const uint32_t nv = by_order ? std::min((uint32_t) ce.size(), (uint32_t) ((rank[i] + 1)/kpool)) :
+                    (uint32_t) (std::upper_bound(ce.begin(), ce.end(), p) - ce.begin());
+
+                T * row = data + (size_t) i*n_pool;
+                std::fill(row,           row + p0,     drop);
+                std::fill(row + p0,      row + p0 + nv, keep);
+                std::fill(row + p0 + nv, row + n_pool, drop);
+
+                if (gm != nullptr) {
+                    const uint32_t nvc = std::min(nv, n_top);
+                    float * grow = gm + (size_t) i*n_sel;
+                    std::fill(grow,                        grow + (size_t) nvc*kpool,  0.0f);
+                    std::fill(grow + (size_t) nvc*kpool,   grow + (size_t) n_top*kpool, -INFINITY);
+                }
+            }
+        };
+        if (pool_mask->type == GGML_TYPE_F16) {
+            fill_mask_inc((ggml_fp16_t *) pool_mask->data);
+        } else {
+            fill_mask_inc((float *) pool_mask->data);
+        }
+    };
+
+    if (mem->kpool_inc_on() && st.cache_safe && n_stream_kv == 1) {
+        fill_inc();
+        if (kpool_tail_mode() & 2) {
+            // LLAMA_KPOOL_VERIFY=1: the full rebuild must give the same bytes
+            auto snap = [](const ggml_tensor * t) {
+                const uint8_t * d = (const uint8_t *) t->data;
+                return std::vector<uint8_t>(d, d + ggml_nbytes(t));
+            };
+            const auto v_pcell = snap(pool_cells);
+            const auto v_pidx  = snap(pool_idxs);
+            const auto v_mask  = snap(pool_mask);
+            const auto v_nidx  = snap(new_pool_idxs);
+            const auto v_nrep  = new_pool_rep ? snap(new_pool_rep) : std::vector<uint8_t>();
+            const auto v_npos  = new_pool_pos ? snap(new_pool_pos) : std::vector<uint8_t>();
+            const auto v_gm    = gather_mask ? snap(gather_mask) : std::vector<uint8_t>();
+            fill_full();
+            const bool same = v_pcell == snap(pool_cells) && v_pidx == snap(pool_idxs) && v_mask == snap(pool_mask) &&
+                v_nidx == snap(new_pool_idxs) && (!new_pool_rep || v_nrep == snap(new_pool_rep)) &&
+                (!new_pool_pos || v_npos == snap(new_pool_pos)) && (!gather_mask || v_gm == snap(gather_mask));
+            if (!same) {
+                GGML_ABORT("[TAG_FN_L10_KPOOLINC] the incremental k-pool inputs differ from a rebuild (%u pools, %u new, %u tokens)",
+                        st.n_pool_real, n_new, n_tokens);
+            }
+        }
+    } else {
+        fill_full();
     }
 
     int32_t * tidx = (int32_t *) tail_idxs->data;

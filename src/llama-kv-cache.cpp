@@ -1127,6 +1127,43 @@ llama_kv_cache::llama_kv_cache(
         }
     }
 
+    // [TAG_FN_L10_ROTDEV] qwen4exp (sparse-attention indexer models): the rotation matrices live on the cache's device, written
+    // once, instead of being graph inputs that are memcpy'd and uploaded on every decode (the MTP draft cache: 256x256 + 64x64
+    // f32 each draft step). The same values; LLAMA_KV_ROT_DEV=0 keeps the inputs.
+    static const bool rot_dev_env = [] {
+        const char * e = getenv("LLAMA_KV_ROT_DEV");
+        return !(e && e[0] == '0');
+    }();
+    // one device buffer type only (a cache split over devices keeps the inputs)
+    if ((attn_rot_k || attn_rot_v) && rot_dev_env && hparams.indexer_n_head > 0 && !hparams.no_alloc && ctx_map.size() == 1) {
+        ggml_backend_buffer_type_t rot_buft = ctx_map.begin()->first;
+        if (!ggml_backend_buft_is_host(rot_buft)) {
+            ggml_init_params ip = { 2*ggml_tensor_overhead(), nullptr, true };
+            rot_ctx.reset(ggml_init(ip));
+            const int64_t nk = n_rot_k();
+            if (attn_rot_k && attn_rot_hadamard.count(nk)) {
+                rot_dev_k = ggml_new_tensor_2d(rot_ctx.get(), GGML_TYPE_F32, nk, nk);
+                ggml_set_name(rot_dev_k, "attn_k_rot_dev");
+            }
+            if (attn_rot_v && attn_rot_hadamard.count(64)) {
+                rot_dev_v = ggml_new_tensor_2d(rot_ctx.get(), GGML_TYPE_F32, 64, 64);
+                ggml_set_name(rot_dev_v, "attn_v_rot_dev");
+            }
+            rot_buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(rot_ctx.get(), rot_buft));
+            if (rot_buf) {
+                if (rot_dev_k) {
+                    ggml_backend_tensor_set(rot_dev_k, attn_rot_hadamard.at(nk).data(), 0, ggml_nbytes(rot_dev_k));
+                }
+                if (rot_dev_v) {
+                    ggml_backend_tensor_set(rot_dev_v, attn_rot_hadamard.at(64).data(), 0, ggml_nbytes(rot_dev_v));
+                }
+            } else {
+                rot_dev_k = nullptr;
+                rot_dev_v = nullptr;
+            }
+        }
+    }
+
     const char * LLAMA_KV_CACHE_DEBUG = getenv("LLAMA_KV_CACHE_DEBUG");
     debug = LLAMA_KV_CACHE_DEBUG ? atoi(LLAMA_KV_CACHE_DEBUG) : 0;
 }
@@ -2449,18 +2486,27 @@ ggml_tensor * llama_kv_cache::build_input_v_idxs(ggml_context * ctx, const llama
     return v_idxs;
 }
 
+// [TAG_FN_L10_ROTDEV] the K rotation size (build_input_k_rot)
+int64_t llama_kv_cache::n_rot_k() const {
+    int nrot = 64;
+
+    // TODO: investigate if using the smallest rotation matrix is beneficial also for K (similar as for V)
+    // ref: https://github.com/ggml-org/llama.cpp/pull/21038#issuecomment-4141323088
+    do {
+        nrot *= 2;
+    } while (n_embd_head_k_all % nrot == 0);
+    nrot /= 2;
+    return nrot;
+}
+
 ggml_tensor * llama_kv_cache::build_input_k_rot(ggml_context * ctx) const {
     ggml_tensor * res = nullptr;
 
+    if (attn_rot_k && rot_dev_k) {
+        return rot_dev_k; // [TAG_FN_L10_ROTDEV]
+    }
     if (attn_rot_k) {
-        int nrot = 64;
-
-        // TODO: investigate if using the smallest rotation matrix is beneficial also for K (similar as for V)
-        // ref: https://github.com/ggml-org/llama.cpp/pull/21038#issuecomment-4141323088
-        do {
-            nrot *= 2;
-        } while (n_embd_head_k_all % nrot == 0);
-        nrot /= 2;
+        const int64_t nrot = n_rot_k();
 
         res = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, nrot, nrot);
         ggml_set_input(res);
@@ -2473,6 +2519,9 @@ ggml_tensor * llama_kv_cache::build_input_k_rot(ggml_context * ctx) const {
 ggml_tensor * llama_kv_cache::build_input_v_rot(ggml_context * ctx) const {
     ggml_tensor * res = nullptr;
 
+    if (attn_rot_v && rot_dev_v) {
+        return rot_dev_v; // [TAG_FN_L10_ROTDEV]
+    }
     if (attn_rot_v) {
         int nrot = 64;
         // using smaller rotation matrices for V seems beneficial
@@ -3064,6 +3113,9 @@ void llama_kv_cache::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch 
 }
 
 void llama_kv_cache::set_input_k_rot(ggml_tensor * dst) const {
+    if (dst == rot_dev_k && rot_dev_k != nullptr) {
+        return; // [TAG_FN_L10_ROTDEV] a device leaf, written once
+    }
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
 
     const auto n_rot = dst->ne[0];
@@ -3073,6 +3125,9 @@ void llama_kv_cache::set_input_k_rot(ggml_tensor * dst) const {
 }
 
 void llama_kv_cache::set_input_v_rot(ggml_tensor * dst) const {
+    if (dst == rot_dev_v && rot_dev_v != nullptr) {
+        return; // [TAG_FN_L10_ROTDEV] a device leaf, written once
+    }
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
 
     const auto n_rot = dst->ne[0];

@@ -381,6 +381,13 @@ private:
     // pre-computed hadamard martrices
     std::unordered_map<int64_t, std::vector<float>> attn_rot_hadamard;
 
+    // [TAG_FN_L10_ROTDEV] qwen4exp: the K / V rotation matrices as device leaves, filled once (nullptr: graph inputs)
+    ggml_tensor *           rot_dev_k = nullptr;
+    ggml_tensor *           rot_dev_v = nullptr;
+    ggml_context_ptr        rot_ctx;
+    ggml_backend_buffer_ptr rot_buf;
+    int64_t                 n_rot_k() const;
+
     // env: LLAMA_KV_CACHE_DEBUG
     int debug = 0;
 

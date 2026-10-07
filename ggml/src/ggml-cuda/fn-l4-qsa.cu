@@ -762,6 +762,7 @@ void ggml_cuda_fn_l4_qsa_streams(ggml_backend_cuda_context * ctx, ggml_cgraph * 
 
 #define FN_L4_LIST_THREADS   1024
 #define FN_L4_LIST_MAX_WORDS 10240  // n_kv <= 327680: a 40 KiB bitmap in shared memory
+#define FN_L4_LIST_CACHE     8      // [TAG_FN_L10_LISTCACHE] slots per thread whose cell stays in registers
 #define FN_L4_LIST_P_NCOLS1  10     // QSA_MASK op_params slots of the layout graph_optimize matched
 #define FN_L4_LIST_P_NLIST   11
 #define FN_L4_LIST_P_NLISTS  12
@@ -925,8 +926,27 @@ k_fn_l4_qsa_list(const fn_l4_list_args a) {
     __syncthreads();
 
     // 1. the kept cells of the tile
+    // [TAG_FN_L10_LISTCACHE] a thread's first FN_L4_LIST_CACHE slots keep their cell in registers for step 2 (the second
+    // evaluation was a second round of dependent loads: sel -> kv_pos -> kv_seq); the slots past them are evaluated again
     const int nslots = nq*a.n_sel;
-    for (int t = tid; t < nslots; t += FN_L4_LIST_THREADS) {
+    int cc[FN_L4_LIST_CACHE];
+#pragma unroll
+    for (int k = 0; k < FN_L4_LIST_CACHE; ++k) {
+        const int t = tid + k*FN_L4_LIST_THREADS;
+        int c = -1;
+        if (t < nslots) {
+            const int q = q0 + t/a.n_sel;
+            const int s = t % a.n_sel;
+            const int32_t  qp = *(const int32_t *) (a.q_pos + q*a.q_nb0);
+            const uint32_t qs = a.ms ? *(const uint32_t *) (a.q_pos + a.q_nb1 + q*a.q_nb0) : 0u;
+            c = fn_l4_list_cell(a, q, s, qp, qs);
+            if (c >= 0) {
+                atomicOr(&bm[c >> 5], 1u << (c & 31));
+            }
+        }
+        cc[k] = c;
+    }
+    for (int t = tid + FN_L4_LIST_CACHE*FN_L4_LIST_THREADS; t < nslots; t += FN_L4_LIST_THREADS) {
         const int q = q0 + t/a.n_sel;
         const int s = t % a.n_sel;
         const int32_t  qp = *(const int32_t *) (a.q_pos + q*a.q_nb0);
@@ -950,7 +970,14 @@ k_fn_l4_qsa_list(const fn_l4_list_args a) {
         }
     }
     __syncthreads();
-    for (int t = tid; t < nslots; t += FN_L4_LIST_THREADS) {
+#pragma unroll
+    for (int k = 0; k < FN_L4_LIST_CACHE; ++k) {
+        const int t = tid + k*FN_L4_LIST_THREADS;
+        if (t < nslots && cc[k] >= 0) {
+            a.mask[(q0 + t/a.n_sel)*a.mask_nb1 + cc[k]] = __float2half(0.0f);
+        }
+    }
+    for (int t = tid + FN_L4_LIST_CACHE*FN_L4_LIST_THREADS; t < nslots; t += FN_L4_LIST_THREADS) {
         const int q = q0 + t/a.n_sel;
         const int s = t % a.n_sel;
         const int32_t  qp = *(const int32_t *) (a.q_pos + q*a.q_nb0);
