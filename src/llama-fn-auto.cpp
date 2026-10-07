@@ -151,6 +151,10 @@ const fn_item k_items[] = {
     // MiB): +2 GB of hot experts, A/B l7/ab7 (2 rounds, 262K) real use +7.2 % (32K +7.7, 131K +9.2, 245K +4.7 %), device use
     // 29.7 GB in decode
     { "LLAMA_FN_VRAM_KEEP_MIB",      "2100",  P_ALL }, // [TAG_FN_L7_VRAMKEEP]
+    // [TAG_FN_L8_GRAPHPAD] round 8: the indexer pool count and n_kv in 2048-token steps, so the decode graphs (and their
+    // CUDA graphs) keep their shapes 8x longer
+    { "LLAMA_KPOOL_PAD",             "512",   P_ALL },
+    { "LLAMA_KV_PAD_INDEXER",        "2048",  P_ALL },
 };
 
 // names the fn-auto aware code reads through llama_fn_env(): never put into the environment

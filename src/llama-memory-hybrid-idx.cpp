@@ -426,8 +426,22 @@ struct llama_memory_hybrid_idx_context::kpool_state {
 namespace {
 
 // The last padded pool is always unused.
+// [TAG_FN_L8_GRAPHPAD] LLAMA_KPOOL_PAD=<pools> (a power of two >= 64, default 64): the pool count in coarser steps. Every
+// step changes the shapes of the decode graphs, so the shape-keyed CUDA graph of each verify width (1-3 with MTP) is made
+// again (one uncaptured run of ~8500 nodes + a capture): at 64 pools x kpool 4 that was every 256 tokens, ~5 % of the
+// target graphs (TURBO_GRAPH_DIFF, l8/diag). The padded pools point at a dummy cell and are masked. The qwen4exp profile
+// sets 512 (2048 tokens) together with LLAMA_KV_PAD_INDEXER=2048.
 uint32_t kpool_pad(uint32_t n_pool) {
-    return std::max<uint32_t>(64u, GGML_PAD(n_pool + 1, 64u));
+    static const uint32_t g = [] {
+        const char * e = getenv("LLAMA_KPOOL_PAD");
+        const int    v = e ? atoi(e) : 64;
+        uint32_t     p = 64;
+        while (p < (uint32_t) std::min(v, 65536)) {
+            p *= 2;
+        }
+        return p;
+    }();
+    return std::max<uint32_t>(g, GGML_PAD(n_pool + 1, g));
 }
 
 // [TAG_FN_L3_HOST_DIAG] LLAMA_FN_HOST_KPOOL_PROBE=1 (qwen4exp): host time of the k-pool work per ubatch (the layout
