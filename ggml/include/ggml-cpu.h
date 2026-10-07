@@ -213,10 +213,6 @@ extern "C" {
                                              // a mispredicted expert from disk)
         int  pf_cap;                         // [TAG_FN_L6_PF] 0, or a given list is cut to its first pf_cap experts (less
                                              // DRAM traffic beside the device's host accesses at the end of the window)
-        int  stale_ra;                       // [TAG_FN_L7_STALERA] 0, or before a job the caller asks the OS to read the
-                                             // weights of every expert no job of the pool read within the last stale_ra jobs
-                                             // (Windows PrefetchVirtualMemory: a few large reads instead of the workers'
-                                             // 4 KiB page faults when a mapped model larger than RAM lost those pages)
     };
 
     // [TAG_FN_L3_CPU_SPLIT] how a pool job gives its pieces (32 gate / up rows or 64 down rows of one expert) to the threads.
@@ -282,8 +278,6 @@ extern "C" {
         double   slow_w_us;       //   minus the median thread, per phase; its own barrier waits
         int      slow_cpu[3];     //   the CPUs that ended a slow job last most often (-1: none)
         uint64_t slow_cpu_n[3];
-        uint64_t ra_experts;      // [TAG_FN_L7_STALERA] experts read ahead before their job, and their MiB
-        double   ra_mib;
         double   mib;             // weight MiB a job read
         double   experts;         // experts a job computed
         double   lag_us;          // publish -> a compute thread's first instruction

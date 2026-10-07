@@ -358,10 +358,6 @@ struct ggml_cpu_moe_pool {
     int                   pf_pull  = 0;            // [TAG_FN_L6_PF] GGML_FN_PF_* flags of the pull
     int                   pf_cap   = 0;            // [TAG_FN_L6_PF] experts of a given list pulled at most (0: all)
     int                   pf_fresh = 0;            // [TAG_FN_L6_PF] see ggml_cpu_moe_pool_params.pf_fresh
-    int                   stale_ra = 0;            // [TAG_FN_L7_STALERA] see ggml_cpu_moe_pool_params.stale_ra
-    std::vector<int32_t>  ra_ids;                  // this job's experts already read ahead (dedup)
-    std::vector<uint8_t>  ra_buf;                  // the range entries of one call
-    uint64_t              ra_n = 0, ra_bytes = 0;  // since the last stats read (caller thread only)
     uint32_t              pf_clock = 0;            // jobs run
     std::unordered_map<const ggml_tensor *, std::vector<uint32_t>> pf_seen; // per layer (up tensor): the job clock of each expert's last CPU job
     std::vector<int32_t>  pf_gt;
@@ -762,7 +758,6 @@ struct ggml_cpu_moe_pool * ggml_cpu_moe_pool_new(const struct ggml_cpu_moe_pool_
     p->pf_pull   = pp->pf_pull & (GGML_FN_PF_FINE_STOP | GGML_FN_PF_VEC);
     p->pf_cap    = std::max(0, pp->pf_cap);
     p->pf_fresh  = std::max(0, pp->pf_fresh);
-    p->stale_ra  = std::max(0, pp->stale_ra); // [TAG_FN_L7_STALERA]
 
     std::vector<int> list;
     for (int i = 0; i < GGML_MAX_N_THREADS; i++) {
@@ -965,63 +960,6 @@ static void moe_pool_stats_add_job(ggml_cpu_moe_pool * p, int nth, int base, uin
     }
 }
 
-// [TAG_FN_L7_STALERA] the cold experts of a job that no job read within the last stale_ra jobs: one PrefetchVirtualMemory
-// call over their up / gate / down rows. The OS reads every non-resident range in large I/Os at once (resident pages cost a
-// walk only); the workers then wait for reads already in flight instead of faulting the pages in 4 KiB at a time - the
-// hard-fault storms of a mapped model larger than RAM (a job of > 500 ms ran the bridge into its wait timeout).
-static void moe_pool_stale_readahead(ggml_cpu_moe_pool * p, const ggml_cpu_moe_layer * l, const int32_t * ids, int n) {
-#if defined(_WIN32)
-    struct ra_range { void * addr; size_t size; }; // the layout of WIN32_MEMORY_RANGE_ENTRY
-    using pvm_t = BOOL (WINAPI *)(HANDLE, ULONG_PTR, void *, ULONG);
-    static const pvm_t pvm = (pvm_t) (void *) GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "PrefetchVirtualMemory");
-    if (pvm == nullptr || l->up == nullptr || l->down == nullptr) {
-        return;
-    }
-    const int64_t ne = l->up->ne[2];
-    auto & v = p->pf_seen[l->up];
-    v.resize((size_t) ne, 0);
-    p->ra_ids.clear();
-    p->ra_buf.resize(sizeof(ra_range)*3*(size_t) std::max(n, 1));
-    ra_range * r = (ra_range *) p->ra_buf.data();
-    ULONG  nr    = 0;
-    size_t bytes = 0;
-    const ggml_tensor * ts[3] = { l->up, l->gate, l->down };
-    for (int i = 0; i < n; ++i) {
-        const int32_t e = ids[i];
-        if (e < 0 || e >= ne || (l->table != nullptr && l->table[e] != l->table_miss)) {
-            continue; // invalid, or the device computes it
-        }
-        const uint32_t s = v[(size_t) e];
-        if (s != 0 && p->pf_clock - s <= (uint32_t) p->stale_ra) {
-            continue; // a recent job read it
-        }
-        if (std::find(p->ra_ids.begin(), p->ra_ids.end(), e) != p->ra_ids.end()) {
-            continue;
-        }
-        p->ra_ids.push_back(e);
-        for (const ggml_tensor * t : ts) {
-            if (t == nullptr || t->data == nullptr) {
-                continue;
-            }
-            r[nr].addr = (char *) t->data + (size_t) e*t->nb[2];
-            r[nr].size = t->nb[2];
-            bytes += t->nb[2];
-            nr++;
-        }
-    }
-    if (nr > 0) {
-        pvm(GetCurrentProcess(), (ULONG_PTR) nr, r, 0);
-        p->ra_n     += p->ra_ids.size();
-        p->ra_bytes += bytes;
-    }
-#else
-    GGML_UNUSED(p);
-    GGML_UNUSED(l);
-    GGML_UNUSED(ids);
-    GGML_UNUSED(n);
-#endif
-}
-
 enum ggml_status ggml_cpu_moe_run(struct ggml_cpu_moe_pool * p, const struct ggml_cpu_moe_job * job) {
     if (p == nullptr || job == nullptr || job->layer == nullptr || job->x == nullptr || job->ids == nullptr || job->out == nullptr) {
         return GGML_STATUS_FAILED;
@@ -1140,9 +1078,6 @@ enum ggml_status ggml_cpu_moe_run(struct ggml_cpu_moe_pool * p, const struct ggm
         moe_pool_stats_flush(p); // usually done already, after the last job (ggml_cpu_moe_prefetch)
     }
 
-    if (p->stale_ra > 0) { // [TAG_FN_L7_STALERA] before the post: the reads are in flight when the workers touch the pages
-        moe_pool_stale_readahead(p, l, job->ids, n_used*T);
-    }
     const uint64_t f_pub = p->stats ? moe_proc_faults() : 0; // [TAG_FN_L7_FAULTS]
     const uint64_t t_pub = p->stats ? ggml_fn_moe_tick() : 0;
     p->kind.store(solo ? 2 : 0, std::memory_order_relaxed);
@@ -1166,7 +1101,7 @@ enum ggml_status ggml_cpu_moe_run(struct ggml_cpu_moe_pool * p, const struct ggm
     if (score_learn) {
         moe_pool_score_learn(p, l, job->ids, n_used*T, l->up->ne[2]);
     }
-    if (p->pf_fresh > 0 || p->stale_ra > 0) { // [TAG_FN_L6_PF] the experts this job read on the CPU (resident now)
+    if (p->pf_fresh > 0) { // [TAG_FN_L6_PF] the experts this job read on the CPU (their pages are resident now)
         auto & v = p->pf_seen[l->up];
         v.resize((size_t) l->up->ne[2], 0);
         const uint32_t clk = ++p->pf_clock;
@@ -1403,8 +1338,6 @@ void ggml_cpu_moe_pool_get_stats(struct ggml_cpu_moe_pool * p, struct ggml_cpu_m
         out->slow_us        = s.jobs_slow ? s.slow_t/(double) s.jobs_slow/us : 0.0;
         out->slow_nofault   = s.slow_nofault;
         out->fast_fault     = s.fast_fault;
-        out->ra_experts     = p->ra_n; // [TAG_FN_L7_STALERA] caller-thread counters, read between jobs
-        out->ra_mib         = p->ra_bytes/1048576.0;
         if (s.jobs_slow > 0) { // [TAG_FN_L7_SLOW]
             const double ns = (double) s.jobs_slow;
             out->slow_x_lag_us = s.slow_x_lag/ns/us;
@@ -1447,7 +1380,5 @@ void ggml_cpu_moe_pool_get_stats(struct ggml_cpu_moe_pool * p, struct ggml_cpu_m
     }
     if (reset) {
         p->st = moe_stats_acc();
-        p->ra_n     = 0;
-        p->ra_bytes = 0;
     }
 }

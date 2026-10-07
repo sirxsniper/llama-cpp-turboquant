@@ -887,11 +887,6 @@ llama_moe_bridge * llama_moe_bridge_create(const llama_model & model, int n_thre
     br->pool_params.pf_pull     = std::max(0, llama_fn_l3_int(model, "LLAMA_FN_L6_PFPULL", 0)); // [TAG_FN_L6_PF] 1 fine stop, 2 vector loads
     br->pool_params.pf_cap      = std::max(0, llama_fn_l3_int(model, "LLAMA_FN_L6_PFCAP", 0)); // [TAG_FN_L6_PF] experts per given list
     br->pool_params.pf_fresh    = std::max(0, llama_fn_l3_int(model, "LLAMA_FN_L6_PFFRESH", 0)); // [TAG_FN_L6_PF] jobs
-    br->pool_params.stale_ra    = std::max(0, llama_fn_l3_int(model, "LLAMA_FN_L7_STALERA", 0)); // [TAG_FN_L7_STALERA] jobs
-    if (br->pool_params.stale_ra) {
-        LLAMA_LOG_INFO("%s: [TAG_FN_L7_STALERA] a job's cold experts that no job read within the last %d jobs are read ahead "
-                "(PrefetchVirtualMemory) before the job\n", __func__, br->pool_params.stale_ra);
-    }
     if (br->pool_params.pf_fresh) {
         LLAMA_LOG_INFO("%s: [TAG_FN_L6_PF] the prefetch pulls only experts a CPU job read within the last %d jobs\n", __func__,
                 br->pool_params.pf_fresh);
@@ -1508,10 +1503,6 @@ bool llama_moe_bridge_end(llama_moe_bridge * br) {
         LLAMA_LOG_INFO("%s: MoE bridge %d: [TAG_FN_L7_FAULTS] page faults inside jobs: %.2f per job; jobs over 1 ms: %.0f us and "
                 "%.1f faults each, %" PRIu64 " of %" PRIu64 " without a fault; %" PRIu64 " jobs under 1 ms with a fault\n", __func__, br->bid,
                 ps.flt_job, ps.slow_us, ps.flt_slow, ps.slow_nofault, ps.jobs_slow, ps.fast_fault);
-        if (br->pool_params.stale_ra) {
-            LLAMA_LOG_INFO("%s: MoE bridge %d: [TAG_FN_L7_STALERA] read ahead %" PRIu64 " experts (%.1f MiB) in the window\n",
-                    __func__, br->bid, ps.ra_experts, ps.ra_mib);
-        }
         if (ps.jobs_slow > 0) {
             LLAMA_LOG_INFO("%s: MoE bridge %d: [TAG_FN_L7_SLOW] last thread of a slow job vs the median: lag %+.0f, gate/up %+.0f, "
                     "down %+.0f, sum %+.0f us (its barrier waits %.0f us); ended last: cpu %d x%" PRIu64 ", cpu %d x%" PRIu64 ", cpu %d x%" PRIu64 "\n",

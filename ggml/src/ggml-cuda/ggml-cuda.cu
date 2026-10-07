@@ -103,6 +103,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
@@ -6307,6 +6308,48 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     }
     if (host_probe) {
         hp_t2 = host_probe_clock::now();
+    }
+    // [TAG_FN_L7_GDIFF] TURBO_GRAPH_DIFF=1: a graph of > 1000 nodes that does not replay: its first node that differs (name,
+    // op, shape) from the previous graph of > 1000 nodes this context ran, or the node count change (diagnostic)
+    {
+        static const bool gdiff2 = [] {
+            const char * e = getenv("TURBO_GRAPH_DIFF");
+            return e != nullptr && e[0] == '1';
+        }();
+        if (gdiff2 && cgraph->n_nodes > 1000) {
+            struct sig { std::string name; int op; int64_t ne[4]; };
+            static std::unordered_map<const void *, std::vector<sig>> last; // per context
+            static std::atomic<int> n_logged{0};
+            std::vector<sig> cur((size_t) cgraph->n_nodes);
+            for (int i = 0; i < cgraph->n_nodes; ++i) {
+                const ggml_tensor * t = cgraph->nodes[i];
+                cur[i].name = t->name;
+                cur[i].op   = (int) t->op;
+                memcpy(cur[i].ne, t->ne, sizeof(cur[i].ne));
+            }
+            auto & prev = last[(const void *) cuda_ctx];
+            if (gp_reason != 0 && !prev.empty() && n_logged.load() < 600) {
+                n_logged.fetch_add(1);
+                int d = -1;
+                const size_t n = std::min(prev.size(), cur.size());
+                for (size_t i = 0; i < n; ++i) {
+                    if (prev[i].name != cur[i].name || prev[i].op != cur[i].op || memcmp(prev[i].ne, cur[i].ne, sizeof(prev[i].ne)) != 0) {
+                        d = (int) i;
+                        break;
+                    }
+                }
+                if (d < 0) {
+                    fprintf(stderr, "turbo-probe: graph-warm ctx %p reason %d: nodes %zu -> %zu, the first %zu equal\n", (void *) cuda_ctx,
+                            gp_reason, prev.size(), cur.size(), n);
+                } else {
+                    fprintf(stderr, "turbo-probe: graph-warm ctx %p reason %d: nodes %zu -> %zu, node %d '%s' op %d ne %lld,%lld,%lld,%lld -> '%s' op %d ne %lld,%lld,%lld,%lld\n",
+                            (void *) cuda_ctx, gp_reason, prev.size(), cur.size(), d, prev[d].name.c_str(), prev[d].op,
+                            (long long) prev[d].ne[0], (long long) prev[d].ne[1], (long long) prev[d].ne[2], (long long) prev[d].ne[3],
+                            cur[d].name.c_str(), cur[d].op, (long long) cur[d].ne[0], (long long) cur[d].ne[1], (long long) cur[d].ne[2], (long long) cur[d].ne[3]);
+                }
+            }
+            prev.swap(cur);
+        }
     }
     {
         static const bool probe_on = [] {
