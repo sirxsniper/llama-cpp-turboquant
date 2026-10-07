@@ -3075,6 +3075,19 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     hp(LLAMA_HP_DEC_GRAPH); // [TAG_FN_L4_HOST]
 
+    // [TAG_FN_L8_KVLEND] a KV lend release / restore changed which hot layers have device memory: no graph built before
+    // is reused (it may read slots that have none now)
+    if (const uint64_t hg = llama_moe_hot_generation(); hg != hot_gen_seen) {
+        hot_gen_seen       = hg;
+        gf_res_prev_active = nullptr;
+        gf_res_prev_reset_all();
+        for (auto & r : gf_res_prev) {
+            if (r) {
+                r->reset();
+            }
+        }
+    }
+
     auto * res = get_gf_res_prev(ubatch); // [TAG_FN_GRAPH_PER_WIDTH] same as get_gf_res_prev() unless enabled
     auto * gf  = res->get_gf();
 
@@ -5898,7 +5911,28 @@ void llama_context::moe_hot_fit_try() {
             }
         }
     }
+    // [TAG_FN_L8_KVLEND] the KV cache's unmapped cells are free VRAM in the fit above: the hot set holds them in layers that
+    // give them back as the context grows (none: the hot set fails, the KV cache maps whole and the fit runs again)
+    const size_t kv_want = cbuf_tail > 0 ? llama_kv_lend_unmapped_bytes() : 0;
+    if (kv_want > 0) {
+        llama_moe_hot_set_kv_lend(kv_want, llama_prefill_stream_lend_bytes(this), (int) model.hparams.n_layer());
+    }
     bool hot_ok = llama_moe_hot_init(model, this, budget, cbuf_tail);
+    if (kv_want > 0) {
+        llama_moe_hot_set_kv_lend(0, 0, 0);
+        if (hot_ok && llama_moe_hot_kv_bytes() >= kv_want) {
+            llama_kv_lend_set_hooks(llama_moe_hot_kv_release, llama_moe_hot_kv_restore, this);
+            LLAMA_LOG_INFO("moe-hot: [TAG_FN_L8_KVLEND] %.0f MiB of unused KV cells lent to the hot set (%.0f MiB of KV layers)\n",
+                    kv_want/MiB, llama_moe_hot_kv_bytes()/MiB);
+        } else if (!hot_ok && llama_kv_lend_map_all()) {
+            ggml_backend_dev_memory(dev, &mem_free, &mem_total);
+            budget = std::min(budget_max, llama_fn_vram_fit_budget(mem_total, mem_free, ceiling, margin));
+            if (cbuf_tail > 0 && budget > 0) {
+                budget = llama_fn_cbuf_budget(budget, cbuf_pool_mib << 20, mem_free, budget_max);
+            }
+            hot_ok = budget > 0 && llama_moe_hot_init(model, this, budget, cbuf_tail);
+        }
+    }
     if (!hot_ok && cbuf_tail > 0) {
         // [TAG_FN_L3_VRAM_CBUF] no hot set with a tail (no virtual-memory buffer): the FULL reserve and a hot set without one
         LLAMA_LOG_WARN("moe-hot: [TAG_FN_L3_VRAM_CBUF] the hot set with a tail could not be allocated: FULL reserve, no tail\n");

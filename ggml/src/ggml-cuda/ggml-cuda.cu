@@ -6265,6 +6265,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
     ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
 
+    const bool gd_new_key = cuda_ctx->cuda_graphs.find(graph_key) == cuda_ctx->cuda_graphs.end(); // [TAG_FN_L7_GDIFF]
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
     // [TAG_CUDA_GRAPH_PROBE] why a call did or did not run as a CUDA graph.
     // Windows WDDM charges ~7us of CPU per kernel launch, and a decode step issues
@@ -6327,8 +6328,16 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                 cur[i].op   = (int) t->op;
                 memcpy(cur[i].ne, t->ne, sizeof(cur[i].ne));
             }
-            auto & prev = last[(const void *) cuda_ctx];
-            if (gp_reason != 0 && !prev.empty() && n_logged.load() < 600) {
+            // the previous graph of the same width (the input embedding's token count) in this context
+            int64_t width = -1;
+            for (const auto & g : cur) {
+                if (g.name.rfind("model.input_embed", 0) == 0) {
+                    width = g.ne[2];
+                    break;
+                }
+            }
+            auto & prev = last[(const void *) ((uintptr_t) cuda_ctx + (uintptr_t) (width & 0xff))];
+            if (gp_reason != 0 && n_logged.load() < 600) {
                 n_logged.fetch_add(1);
                 int d = -1;
                 const size_t n = std::min(prev.size(), cur.size());
@@ -6338,14 +6347,14 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                         break;
                     }
                 }
-                if (d < 0) {
-                    fprintf(stderr, "turbo-probe: graph-warm ctx %p reason %d: nodes %zu -> %zu, the first %zu equal\n", (void *) cuda_ctx,
-                            gp_reason, prev.size(), cur.size(), n);
+                if (prev.empty() || d < 0) {
+                    fprintf(stderr, "turbo-probe: graph-warm width %lld reason %d new key %d: nodes %zu -> %zu, %s\n", (long long) width,
+                            gp_reason, gd_new_key ? 1 : 0, prev.size(), cur.size(), prev.empty() ? "first of its width" : "same shapes as before");
                 } else {
-                    fprintf(stderr, "turbo-probe: graph-warm ctx %p reason %d: nodes %zu -> %zu, node %d '%s' op %d ne %lld,%lld,%lld,%lld -> '%s' op %d ne %lld,%lld,%lld,%lld\n",
-                            (void *) cuda_ctx, gp_reason, prev.size(), cur.size(), d, prev[d].name.c_str(), prev[d].op,
+                    fprintf(stderr, "turbo-probe: graph-warm width %lld reason %d new key %d: node %d '%s' op %d ne %lld,%lld,%lld,%lld -> '%s' ne %lld,%lld,%lld,%lld\n",
+                            (long long) width, gp_reason, gd_new_key ? 1 : 0, d, prev[d].name.c_str(), prev[d].op,
                             (long long) prev[d].ne[0], (long long) prev[d].ne[1], (long long) prev[d].ne[2], (long long) prev[d].ne[3],
-                            cur[d].name.c_str(), cur[d].op, (long long) cur[d].ne[0], (long long) cur[d].ne[1], (long long) cur[d].ne[2], (long long) cur[d].ne[3]);
+                            cur[d].name.c_str(), (long long) cur[d].ne[0], (long long) cur[d].ne[1], (long long) cur[d].ne[2], (long long) cur[d].ne[3]);
                 }
             }
             prev.swap(cur);

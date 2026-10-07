@@ -231,6 +231,14 @@ public:
 
     bool update(llama_context * lctx, bool do_shift, const stream_copy_info & sc_info);
 
+    // [TAG_FN_L8_KVLEND] the lend (llama-kv-cache.cpp): map every cell below `need` (grow in chunks, the hot set giving its
+    // VRAM back first) or give whole chunks back far above it; the cells the used range needs; this cache's lend buffer;
+    // clear the mapped cells
+    bool     kvl_update(uint32_t need) const;
+    uint32_t kvl_need() const;
+    bool     kvl_owns(ggml_backend_buffer_t buf) const;
+    void     kvl_clear() const;
+
     // find a slot of kv cells that can hold the ubatch
     // if cont == true, then the slot must be continuous
     // return empty slot_info on failure
@@ -621,3 +629,9 @@ private:
     // as the cache gets filled, the benefit from this heuristic disappears
     int32_t n_kv;
 };
+
+// [TAG_FN_L8_KVLEND] the lend of the process's qwen4exp KV cache (one): the bytes of its cells not mapped now; the hot
+// set's release / restore (owner = its context) for growing and shrinking; map everything (the lend off)
+size_t llama_kv_lend_unmapped_bytes();
+void   llama_kv_lend_set_hooks(size_t (*release)(const void *, size_t), size_t (*restore)(const void *, size_t), const void * owner);
+bool   llama_kv_lend_map_all();

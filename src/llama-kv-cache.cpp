@@ -11,6 +11,7 @@
 #include "llama-context.h"
 #include "llama-kv-tier.h"
 #include "llama-kv-cache-resolve.h"   // [TAG_KV_RESOLVE] turbot refusals shared with the KV type resolver
+#include "llama-fn-auto.h"            // [TAG_FN_L8_KVLEND] llama_fn_l3_flag
 
 #include "ggml-turbot.h"
 
@@ -90,6 +91,302 @@ static inline bool llama_type_is_turbo(ggml_type t) {
     return t == GGML_TYPE_TURBO2_0 || t == GGML_TYPE_TURBO3_0 ||
            t == GGML_TYPE_TURBO4_0 || t == GGML_TYPE_TURBO4P_0 || t == GGML_TYPE_TURBO5P_0 ||
            t == GGML_TYPE_TURBO5P512_0;
+}
+
+
+// [TAG_FN_L8_KVLEND] -------------------------------------------------------------------------------------------------
+// The KV cache of a qwen4exp context (turbot, one stream) maps only the cells its context needs (in chunks) on CUDA
+// virtual memory; the VRAM of the rest goes to the hot expert set, which gives it back layer by layer as the context
+// grows (llama_moe_hot_kv_release / _restore through the hooks the VRAM fit sets). Every base K/V tensor gets a region of
+// its own (a guard granule before the next one); the other tensors (young pools, rotations) stay mapped. No kernel reads
+// a cell at or past n_kv, and n_kv never exceeds the mapped cells: apply() maps first.
+namespace {
+
+struct kvl_region {
+    ggml_tensor * t     = nullptr;
+    size_t        start = 0;  // byte offset in the buffer
+    size_t        ext   = 0;  // the bytes up to the next region (the guard included)
+    size_t        row   = 0;  // bytes per cell
+    size_t        mapped = 0; // bytes mapped from start
+    std::vector<std::pair<size_t, size_t>> maps; // [lo, hi) relative to start, one map call each
+};
+
+struct kvl_state {
+    const llama_kv_cache * kv = nullptr;
+    ggml_backend_buffer_t buf = nullptr;
+    size_t   gran = 0;
+    bool (*map)(ggml_backend_buffer_t, size_t, size_t)   = nullptr;
+    bool (*unmap)(ggml_backend_buffer_t, size_t, size_t) = nullptr;
+    std::vector<kvl_region> regs;
+    uint32_t kv_size    = 0;
+    uint32_t cells      = 0;  // mapped in every region
+    uint32_t init_cells = 0;
+    uint32_t chunk      = 0;
+    size_t   init_bytes = 0;  // mapped bytes at the start, all regions
+    size_t   full_bytes = 0;  // every region whole
+    size_t (*release)(const void *, size_t) = nullptr;
+    size_t (*restore)(const void *, size_t) = nullptr;
+    const void * owner = nullptr;
+    bool     whole = false;   // everything mapped (the lend is off)
+    uint64_t n_grow = 0, n_shrink = 0;
+};
+kvl_state g_kvl;
+
+size_t kvl_round_up(size_t x, size_t g) {
+    return g ? (x + g - 1) / g * g : x;
+}
+
+size_t kvl_bytes_for(const kvl_region & r, uint32_t cells) {
+    return std::min(r.ext, kvl_round_up((size_t) cells * r.row, g_kvl.gran));
+}
+
+size_t kvl_mapped_total() {
+    size_t b = 0;
+    for (const auto & r : g_kvl.regs) {
+        b += r.mapped;
+    }
+    return b;
+}
+
+void kvl_set_cells() {
+    uint32_t c = g_kvl.kv_size;
+    for (const auto & r : g_kvl.regs) {
+        c = std::min<uint32_t>(c, (uint32_t) std::min<size_t>(g_kvl.kv_size, r.mapped / r.row));
+    }
+    g_kvl.cells = c;
+}
+
+// map every region up to `cells` (new bytes cleared); false: a map failed (what was mapped stays)
+bool kvl_map_to(uint32_t cells) {
+    for (auto & r : g_kvl.regs) {
+        const size_t b = kvl_bytes_for(r, cells);
+        // one map per chunk: a shrink can give back any chunk boundary (an unmap takes whole earlier maps)
+        const size_t step = std::max(g_kvl.gran, kvl_round_up((size_t) std::max<uint32_t>(1, g_kvl.chunk) * r.row, g_kvl.gran));
+        while (r.mapped < b) {
+            const size_t e = std::min(b, kvl_round_up(r.mapped + 1, step));
+            if (!g_kvl.map(g_kvl.buf, r.start + r.mapped, e - r.mapped)) {
+                kvl_set_cells();
+                return false;
+            }
+            const size_t tb = ggml_nbytes(r.t);
+            if (r.mapped < tb) {
+                ggml_backend_tensor_memset(r.t, 0, r.mapped, std::min(e, tb) - r.mapped);
+            }
+            r.maps.push_back({ r.mapped, e });
+            r.mapped = e;
+        }
+    }
+    kvl_set_cells();
+    return true;
+}
+
+} // namespace
+
+// the lend's buffer for ctx's tensors (nullptr: not possible here - the caller allocates as usual)
+static ggml_backend_buffer_t kvl_alloc(const llama_kv_cache * kv, ggml_context * ctx, ggml_backend_buffer_type_t buft,
+        const std::set<const ggml_tensor *> & base, uint32_t kv_size, uint32_t init_cells, uint32_t chunk) {
+    if (g_kvl.kv != nullptr || base.empty()) {
+        return nullptr;
+    }
+    ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+    ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+    if (!reg || ggml_backend_buft_is_host(buft)) {
+        return nullptr;
+    }
+    using fgran_t  = size_t (*)(ggml_backend_buffer_type_t);
+    using falloc_t = ggml_backend_buffer_t (*)(ggml_backend_buffer_type_t, size_t);
+    using fmap_t   = bool (*)(ggml_backend_buffer_t, size_t, size_t);
+    const auto fgran  = (fgran_t)  ggml_backend_reg_get_proc_address(reg, "ggml_backend_vmm_granularity");
+    const auto falloc = (falloc_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_vmm_buffer_alloc");
+    const auto fmap   = (fmap_t)   ggml_backend_reg_get_proc_address(reg, "ggml_backend_vmm_buffer_map");
+    const auto funmap = (fmap_t)   ggml_backend_reg_get_proc_address(reg, "ggml_backend_vmm_buffer_unmap");
+    const size_t gran = fgran ? fgran(buft) : 0;
+    if (!falloc || !fmap || !funmap || gran == 0) {
+        return nullptr;
+    }
+    const size_t align = std::max<size_t>(1, ggml_backend_buft_get_alignment(buft));
+    std::vector<std::pair<ggml_tensor *, size_t>> place;
+    std::vector<kvl_region> regs;
+    size_t off = 0;
+    for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+        if (t->view_src == nullptr && base.count(t) == 0) {
+            place.push_back({ t, off });
+            off += kvl_round_up(ggml_backend_buft_get_alloc_size(buft, t), align);
+        }
+    }
+    for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+        if (t->view_src == nullptr && base.count(t) != 0) {
+            off = kvl_round_up(off, gran) + gran;
+            kvl_region r;
+            r.t     = t;
+            r.start = off;
+            r.row   = t->nb[1];
+            regs.push_back(r);
+            place.push_back({ t, off });
+            off += ggml_backend_buft_get_alloc_size(buft, t);
+        }
+    }
+    const size_t total = kvl_round_up(off, gran) + gran;
+    for (size_t i = 0; i < regs.size(); ++i) {
+        regs[i].ext = (i + 1 < regs.size() ? regs[i + 1].start : total) - regs[i].start;
+        if (regs[i].row == 0 || (size_t) kv_size * regs[i].row > regs[i].ext) {
+            return nullptr;
+        }
+    }
+    ggml_backend_buffer_t buf = falloc(buft, total);
+    if (!buf) {
+        return nullptr;
+    }
+    g_kvl = kvl_state();
+    g_kvl.buf   = buf;
+    g_kvl.gran  = gran;
+    g_kvl.map   = fmap;
+    g_kvl.unmap = funmap;
+    g_kvl.regs  = regs;
+    g_kvl.kv_size    = kv_size;
+    g_kvl.init_cells = init_cells;
+    g_kvl.chunk      = chunk;
+    auto fail = [&]() -> ggml_backend_buffer_t {
+        ggml_backend_buffer_free(buf);
+        g_kvl = kvl_state();
+        return nullptr;
+    };
+    if (!fmap(buf, 0, regs.front().start)) {
+        return fail();
+    }
+    uint8_t * p0 = (uint8_t *) ggml_backend_buffer_get_base(buf);
+    for (const auto & [t, o] : place) {
+        if (ggml_backend_tensor_alloc(buf, t, p0 + o) != GGML_STATUS_SUCCESS) {
+            return fail();
+        }
+    }
+    for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+        if (t->view_src != nullptr && t->buffer == nullptr && ggml_backend_view_init(t) != GGML_STATUS_SUCCESS) {
+            return fail();
+        }
+    }
+    for (const auto & [t, o] : place) {
+        if (base.count(t) == 0) {
+            ggml_backend_tensor_memset(t, 0, 0, ggml_nbytes(t));
+        }
+    }
+    if (!kvl_map_to(init_cells)) {
+        return fail();
+    }
+    g_kvl.kv         = kv;
+    g_kvl.init_bytes = kvl_mapped_total();
+    for (const auto & r : g_kvl.regs) {
+        g_kvl.full_bytes += kvl_bytes_for(r, kv_size);
+    }
+    LLAMA_LOG_INFO("%s: [TAG_FN_L8_KVLEND] KV on virtual memory: %zu K/V regions, %u of %u cells mapped (%.0f of %.0f MiB), "
+            "chunks of %u cells; the rest goes to the hot expert set until the context needs it\n", __func__, g_kvl.regs.size(),
+            g_kvl.cells, kv_size, g_kvl.init_bytes/1048576.0, g_kvl.full_bytes/1048576.0, chunk);
+    return buf;
+}
+
+size_t llama_kv_lend_unmapped_bytes() {
+    return g_kvl.kv && !g_kvl.whole ? g_kvl.full_bytes - kvl_mapped_total() : 0;
+}
+
+void llama_kv_lend_set_hooks(size_t (*release)(const void *, size_t), size_t (*restore)(const void *, size_t), const void * owner) {
+    g_kvl.release = release;
+    g_kvl.restore = restore;
+    g_kvl.owner   = owner;
+}
+
+bool llama_kv_lend_map_all() {
+    if (!g_kvl.kv || g_kvl.whole) {
+        return true;
+    }
+    g_kvl.release = nullptr;
+    g_kvl.restore = nullptr;
+    if (!kvl_map_to(g_kvl.kv_size)) {
+        LLAMA_LOG_ERROR("%s: [TAG_FN_L8_KVLEND] mapping the whole KV cache failed\n", __func__);
+        return false;
+    }
+    g_kvl.whole = true;
+    LLAMA_LOG_INFO("%s: [TAG_FN_L8_KVLEND] the KV cache is mapped whole (no lend)\n", __func__);
+    return true;
+}
+
+bool llama_kv_cache::kvl_update(uint32_t need) const {
+    if (g_kvl.kv != this || g_kvl.whole) {
+        return true;
+    }
+    const uint32_t ch   = std::max<uint32_t>(1, g_kvl.chunk);
+    const uint32_t want = std::min<uint32_t>(g_kvl.kv_size, std::max<uint32_t>(g_kvl.init_cells, (uint32_t) kvl_round_up((size_t) need + ch/2, ch)));
+    if (need > g_kvl.cells) {
+        const int64_t t0 = ggml_time_us();
+        size_t after = 0;
+        for (const auto & r : g_kvl.regs) {
+            after += std::max(r.mapped, kvl_bytes_for(r, want));
+        }
+        const size_t extra = after > g_kvl.init_bytes ? after - g_kvl.init_bytes : 0;
+        if (g_kvl.release) {
+            g_kvl.release(g_kvl.owner, extra);
+        }
+        if (!kvl_map_to(want)) {
+            // the hot set gives one more layer, then once more the same request
+            if (g_kvl.release) {
+                g_kvl.release(g_kvl.owner, extra + ((size_t) 512 << 20));
+            }
+            if (!kvl_map_to(want)) {
+                LLAMA_LOG_ERROR("%s: [TAG_FN_L8_KVLEND] the KV cache needs %u cells and could map only %u\n", __func__, need, g_kvl.cells);
+                return need <= g_kvl.cells;
+            }
+        }
+        g_kvl.n_grow++;
+        LLAMA_LOG_INFO("%s: [TAG_FN_L8_KVLEND] %u cells mapped (%.0f MiB) in %.1f ms\n", __func__, g_kvl.cells,
+                kvl_mapped_total()/1048576.0, (ggml_time_us() - t0)/1000.0);
+    } else if (g_kvl.cells > want + ch) {
+        // shrink: whole maps above `want` go back, then the hot set takes back what it can
+        const int64_t  t0     = ggml_time_us();
+        const uint32_t before = g_kvl.cells;
+        for (auto & r : g_kvl.regs) {
+            const size_t b = kvl_bytes_for(r, want);
+            while (r.maps.size() > 1 && r.maps.back().first >= b) { // the first map (the initial cells) stays
+                const auto m = r.maps.back();
+                if (!g_kvl.unmap(g_kvl.buf, r.start + m.first, m.second - m.first)) {
+                    break;
+                }
+                r.mapped = m.first;
+                r.maps.pop_back();
+            }
+        }
+        kvl_set_cells();
+        if (g_kvl.cells == before) {
+            return need <= g_kvl.cells; // nothing could go back (no chunk boundary above `want`)
+        }
+        const size_t mapped = kvl_mapped_total();
+        if (g_kvl.restore) {
+            g_kvl.restore(g_kvl.owner, mapped > g_kvl.init_bytes ? mapped - g_kvl.init_bytes : 0);
+        }
+        g_kvl.n_shrink++;
+        LLAMA_LOG_INFO("%s: [TAG_FN_L8_KVLEND] the KV cache keeps %u cells (%.0f MiB) after a shrink in %.1f ms\n", __func__,
+                g_kvl.cells, mapped/1048576.0, (ggml_time_us() - t0)/1000.0);
+    }
+    return need <= g_kvl.cells;
+}
+
+uint32_t llama_kv_cache::kvl_need() const {
+    uint32_t need = 0;
+    for (uint32_t s = 0; s < n_stream; ++s) {
+        need = std::max(need, v_cells[s].used_max_p1());
+    }
+    return (uint32_t) kvl_round_up(need, std::max(n_pad, 256u));
+}
+
+bool llama_kv_cache::kvl_owns(ggml_backend_buffer_t buf) const {
+    return g_kvl.kv == this && g_kvl.buf == buf;
+}
+
+void llama_kv_cache::kvl_clear() const {
+    for (const auto & r : g_kvl.regs) {
+        const size_t tb = ggml_nbytes(r.t);
+        if (r.mapped > 0) {
+            ggml_backend_tensor_memset(r.t, 0, 0, std::min(r.mapped, tb));
+        }
+    }
 }
 
 llama_kv_cache::llama_kv_cache(
@@ -620,7 +917,24 @@ llama_kv_cache::llama_kv_cache(
                 t->buffer = buf; // set dummy buffer for KV cache so that the backend scheduler won't try to allocate it
             }
         } else {
-            buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft); // real buffer
+            buf = nullptr;
+            // [TAG_FN_L8_KVLEND] qwen4exp (LLAMA_FN_L8_KVLEND, the profile), turbot, one stream, no shared cells: the K/V
+            // tensors on virtual memory, only the cells the context needs mapped
+            if (turbot_plan && n_stream == 1 && other == nullptr && llama_fn_l3_flag(model, "LLAMA_FN_L8_KVLEND")) {
+                const uint32_t init_c  = (uint32_t) std::max(4096, llama_fn_l3_int(model, "LLAMA_FN_L8_KVLEND_INIT", 16384));
+                const uint32_t chunk_c = (uint32_t) std::max(2048, llama_fn_l3_int(model, "LLAMA_FN_L8_KVLEND_CHUNK", 16384));
+                if (kv_size >= 2*init_c) {
+                    std::set<const ggml_tensor *> base;
+                    for (const auto & l : layers) {
+                        if (l.k) { base.insert(l.k); }
+                        if (l.v) { base.insert(l.v); }
+                    }
+                    buf = kvl_alloc(this, ctx.get(), buft, base, kv_size, init_c, chunk_c);
+                }
+            }
+            if (!buf) {
+                buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft); // real buffer
+            }
         }
         if (!buf) {
             throw std::runtime_error("failed to allocate buffer for kv cache");
@@ -628,7 +942,9 @@ llama_kv_cache::llama_kv_cache(
 
         LLAMA_LOG_INFO("%s: %10s KV buffer size = %8.2f MiB\n", __func__, ggml_backend_buffer_name(buf), ggml_backend_buffer_get_size(buf)/1024.0/1024.0);
 
-        ggml_backend_buffer_clear(buf, 0);
+        if (!kvl_owns(buf)) { // [TAG_FN_L8_KVLEND] kvl_alloc cleared what it mapped
+            ggml_backend_buffer_clear(buf, 0);
+        }
 
         // Fill turbo rotation matrices AFTER buffer clear (clear zeroes everything)
         if (turbo_rotation != nullptr && turbo_rotation->buffer != nullptr && !model.hparams.no_alloc) {
@@ -836,6 +1152,21 @@ void llama_kv_cache::clear(bool data) {
 
     if (data) {
         for (auto & [_, buf] : ctxs_bufs) {
+            if (kvl_owns(buf.get())) {
+                // [TAG_FN_L8_KVLEND] the mapped cells of the K/V regions and every other tensor (no write may reach a
+                // region's unmapped part)
+                kvl_clear();
+                for (ggml_tensor * t = ggml_get_first_tensor(_.get()); t != nullptr; t = ggml_get_next_tensor(_.get(), t)) {
+                    bool is_base = false;
+                    for (const auto & l : layers) {
+                        is_base = is_base || t == l.k || t == l.v;
+                    }
+                    if (!is_base && t->view_src == nullptr && t->buffer == buf.get()) {
+                        ggml_backend_tensor_memset(t, 0, 0, ggml_nbytes(t));
+                    }
+                }
+                continue;
+            }
             ggml_backend_buffer_clear(buf.get(), 0);
         }
 
@@ -3088,6 +3419,7 @@ const slot_info_vec_t *   sinfos_in) {
 
         bool res = true;
         res = res && state_read_meta(io, strm, cell_count, sinfo, seq_id, sinfos_in ? &(*sinfos_in)[s] : nullptr);
+        res = res && kvl_update(kvl_need()); // [TAG_FN_L8_KVLEND] the restored cells mapped before their data lands
 
         try {
             res = res && state_read_data(io, strm, cell_count, sinfo);
@@ -4377,6 +4709,12 @@ bool llama_kv_cache_context::apply() {
 
     kv->apply_ubatch(sinfos[i_cur], ubatches[i_cur]);
     n_kv = kv->get_n_kv(sinfos[i_cur]);
+
+    // [TAG_FN_L8_KVLEND] every cell up to n_kv mapped before a graph reads or writes one
+    if (!kv->kvl_update(n_kv)) {
+        LLAMA_LOG_ERROR("%s: [TAG_FN_L8_KVLEND] %u KV cells are not mapped - the ubatch fails\n", __func__, n_kv);
+        return false;
+    }
 
     // [TAG_TURBOT] every row of this ubatch lands in a young granule before compute (SPEC 9.6). prepare() and
     // state_read_meta() call apply_ubatch() directly and never reach this.

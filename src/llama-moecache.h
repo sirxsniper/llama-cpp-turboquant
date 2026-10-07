@@ -104,6 +104,21 @@ size_t llama_moe_hot_cbuf_release(const void * owner);
 // false: the mapping failed, the tail layers stay out (correct, fewer hot slots) and the next call tries again.
 bool   llama_moe_hot_cbuf_restore(const void * owner);
 
+// [TAG_FN_L8_KVLEND] the KV cache lends the hot set the VRAM of its cells that no context needs yet. Before the hot set's
+// init: want = the bytes the KV cache may take back as its context grows, keep = the bytes to leave between the KV layers
+// and the tail (the prefill stream's lend range), n_trunk = the trunk's layer count (the MTP block's layers never lend).
+// The hot set then puts whole trunk layers of at least `want` bytes into regions of their own near the bottom of its
+// buffer. _kv_release (the owner's graphs synchronized): those layers leave both tables and the hot chain from the top
+// until `need` bytes are out, then their VRAM goes back to the driver; returns the bytes out. _kv_restore: maps them
+// again (lowest first) while at least `keep` bytes stay out, clears and refills them; returns the bytes out.
+// _generation changes with every release / restore: a graph built before must not be reused.
+void     llama_moe_hot_set_kv_lend(size_t want, size_t keep, int n_trunk);
+size_t   llama_moe_hot_kv_bytes();
+size_t   llama_moe_hot_kv_out();
+size_t   llama_moe_hot_kv_release(const void * owner, size_t need);
+size_t   llama_moe_hot_kv_restore(const void * owner, size_t keep);
+uint64_t llama_moe_hot_generation();
+
 // [TAG_FN_AUTO] a hot set is configured for this model (LLAMA_MOE_HOT_PROFILE names a file or "even")
 bool llama_moe_hot_wanted(const llama_model & model);
 

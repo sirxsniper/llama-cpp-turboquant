@@ -414,6 +414,7 @@ private:
     // widths that alternate 1/2/3 switch graphs with a scheduler re-split instead of a full rebuild
     bool graph_per_width = false;
     std::array<llm_graph_result_ptr, 4> gf_res_width;
+    uint64_t hot_gen_seen = 0; // [TAG_FN_L8_KVLEND] llama_moe_hot_generation() of the graphs built
     uint64_t n_width_switch = 0;
 
     // [TAG_FN_L4_HOST_SNAP] LLAMA_FN_L4_HOST_SNAP (qwen4exp, with LLAMA_GRAPH_PER_WIDTH): a width switch puts back the
