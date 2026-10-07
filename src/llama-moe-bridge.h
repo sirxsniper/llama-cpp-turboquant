@@ -103,6 +103,7 @@ bool               llama_moe_bridge_sync(const llama_moe_bridge * br);
 // [TAG_FN_L3_CPU_DEVPRED] predicted ids per token a graph writes after each post (0: no hints), and the input of the
 // prediction: 1 = this layer's FFN input, 2 = the next layer's FFN mixer on this layer's residual (0: no hints)
 int                llama_moe_bridge_hint_k(const llama_moe_bridge * br);
+bool               llama_moe_bridge_hint_fused(const llama_moe_bridge * br); // [TAG_FN_L9_HINTTOPK]
 int                llama_moe_bridge_hint_mode(const llama_moe_bridge * br);
 
 // [TAG_FN_R4_BRIDGE_DMA] LLAMA_MOE_BRIDGE_DMA=1 (with LLAMA_MOE_DMA_SHARE=<share>|auto): after llama_moe_gen5_init (bridge

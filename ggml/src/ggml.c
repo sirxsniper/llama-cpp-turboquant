@@ -6865,6 +6865,33 @@ struct ggml_tensor * ggml_moe_host_hint(
     return result;
 }
 
+// [TAG_FN_L9_HINTTOPK]
+struct ggml_tensor * ggml_moe_host_hint_logits(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * ticket,
+        struct ggml_tensor  * logits,
+        int32_t               k,
+        int32_t               bridge,
+        int32_t               chan) {
+    GGML_ASSERT(ticket->type == GGML_TYPE_I32 && ggml_nelements(ticket) == 1);
+    GGML_ASSERT(logits->type == GGML_TYPE_F32 && logits->nb[0] == sizeof(float) && logits->ne[2] == 1 && logits->ne[3] == 1);
+    GGML_ASSERT(k >= 1 && k <= logits->ne[0] && bridge >= 0 && chan >= 0);
+
+    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+
+    ggml_set_op_params_i32(result, 0, bridge);
+    ggml_set_op_params_i32(result, 1, chan);
+    ggml_set_op_params_i32(result, 2, 0);
+    ggml_set_op_params_i32(result, 3, 2); // a hint from logits
+    ggml_set_op_params_i32(result, 4, k);
+
+    result->op     = GGML_OP_MOE_HOST_POST;
+    result->src[0] = ticket;
+    result->src[1] = logits;
+
+    return result;
+}
+
 // [TAG_FN_R4_BRIDGE_DMA]
 struct ggml_tensor * ggml_moe_host_fetch(
         struct ggml_context * ctx,

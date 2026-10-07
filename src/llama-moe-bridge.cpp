@@ -189,6 +189,7 @@ struct llama_moe_bridge {
     uint64_t                            fill_mask    = 0;     // [TAG_FN_L3_CPU_FILL] LLAMA_MOE_DMA_FILL_CPUS
     int                                 hint_k       = 0;     // [TAG_FN_L3_CPU_DEVPRED] LLAMA_MOE_BRIDGE_PF_DEV: ids per token
     int                                 hint_mode    = 0;     // [TAG_FN_L3_CPU_DEVPRED] 1: this layer's FFN input, 2: the next layer's FFN mixer
+    bool                                hint_fused   = false; // [TAG_FN_L9_HINTTOPK] the top-k inside the hint kernel (LLAMA_FN_L9_HINTTOPK)
     int                                 hint_wait_us = 50;
     ggml_backend_moe_bridge_read_hint_t fn_read_hint = nullptr;
     pool_get_stats_t                    pool_get_stats = nullptr;
@@ -887,6 +888,7 @@ llama_moe_bridge * llama_moe_bridge_create(const llama_model & model, int n_thre
     br->pool_params.pf_pull     = std::max(0, llama_fn_l3_int(model, "LLAMA_FN_L6_PFPULL", 0)); // [TAG_FN_L6_PF] 1 fine stop, 2 vector loads
     br->pool_params.pf_cap      = std::max(0, llama_fn_l3_int(model, "LLAMA_FN_L6_PFCAP", 0)); // [TAG_FN_L6_PF] experts per given list
     br->pool_params.pf_fresh    = std::max(0, llama_fn_l3_int(model, "LLAMA_FN_L6_PFFRESH", 0)); // [TAG_FN_L6_PF] jobs
+    br->hint_fused              = llama_fn_l3_flag(model, "LLAMA_FN_L9_HINTTOPK"); // [TAG_FN_L9_HINTTOPK] qwen4exp only
     if (br->pool_params.pf_fresh) {
         LLAMA_LOG_INFO("%s: [TAG_FN_L6_PF] the prefetch pulls only experts a CPU job read within the last %d jobs\n", __func__,
                 br->pool_params.pf_fresh);
@@ -1219,6 +1221,11 @@ int llama_moe_bridge_hint_k(const llama_moe_bridge * br) {
 
 int llama_moe_bridge_hint_mode(const llama_moe_bridge * br) {
     return llama_moe_bridge_hint_k(br) > 0 ? br->hint_mode : 0;
+}
+
+// [TAG_FN_L9_HINTTOPK]
+bool llama_moe_bridge_hint_fused(const llama_moe_bridge * br) {
+    return llama_moe_bridge_hint_k(br) > 0 && br->hint_fused;
 }
 
 int llama_moe_bridge_max_t(const llama_moe_bridge * br) {

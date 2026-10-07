@@ -536,6 +536,74 @@ static __global__ void k_mb_hint(const mb_dev v, const int chan, const int32_t *
     }
 }
 
+// [TAG_FN_L9_HINTTOPK] the hint from the next layer's router logits in one launch: one warp per token picks the top k
+// (k argmax rounds over the row in registers, ties to the lower id, NaN as -inf), then the seqlock publish of k_mb_hint.
+// Replaces ARGSORT (a 512-wide bitonic sort, ~13.6 us) + k_mb_hint. Only the prefetch reads the ids: no value changes.
+template <int EPT>
+static __global__ void k_fn_l9_hint_topk(const mb_dev v, const int chan, const int32_t * __restrict__ ticket,
+        const char * __restrict__ logits, const int64_t nb1, const int n_exp, const int k, const int n_tokens) {
+    __shared__ uint32_t s_seq;
+    mb_hint_hdr * h    = (mb_hint_hdr *) (v.data + (size_t) chan*v.chan_bytes + v.off_hint);
+    int32_t     * hids = (int32_t *) (h + 1);
+    if (threadIdx.x == 0) {
+        s_seq = (uint32_t) ticket[0]; // 0: the post was skipped (sticky error)
+        *(volatile uint32_t *) &h->seq = 0;
+        __threadfence_system();
+    }
+    __syncthreads();
+    if (s_seq == 0) {
+        return;
+    }
+    const int warp = threadIdx.x / WARP_SIZE;
+    const int lane = threadIdx.x % WARP_SIZE;
+    for (int t = warp; t < n_tokens; t += blockDim.x / WARP_SIZE) {
+        const float * row = (const float *) (logits + t*nb1);
+        float wt[EPT];
+#pragma unroll
+        for (int i = 0; i < EPT; ++i) {
+            const int e = lane + i*WARP_SIZE;
+            const float x = e < n_exp ? row[e] : -INFINITY;
+            wt[i] = x != x ? -INFINITY : x;
+        }
+        for (int r = 0; r < k; ++r) {
+            float max_val    = wt[0];
+            int   max_expert = lane;
+#pragma unroll
+            for (int i = 1; i < EPT; ++i) {
+                const int e = lane + i*WARP_SIZE;
+                if (wt[i] > max_val) {
+                    max_val    = wt[i];
+                    max_expert = e;
+                }
+            }
+#pragma unroll
+            for (int mask = WARP_SIZE / 2; mask > 0; mask /= 2) {
+                const float val    = __shfl_xor_sync(0xFFFFFFFF, max_val, mask, WARP_SIZE);
+                const int   expert = __shfl_xor_sync(0xFFFFFFFF, max_expert, mask, WARP_SIZE);
+                if (val > max_val || (val == max_val && expert < max_expert)) {
+                    max_val    = val;
+                    max_expert = expert;
+                }
+            }
+            if ((max_expert & (WARP_SIZE - 1)) == lane) {
+                wt[max_expert / WARP_SIZE] = -INFINITY;
+            }
+            if (lane == 0) {
+                hids[t*k + r] = max_expert < n_exp ? max_expert : 0;
+            }
+        }
+    }
+    __threadfence_system();
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        *(volatile int32_t *) &h->k        = k;
+        *(volatile int32_t *) &h->n_tokens = n_tokens;
+        __threadfence_system();
+        *(volatile uint32_t *) &h->seq = s_seq;
+        __threadfence_system();
+    }
+}
+
 // ---- [TAG_FN_L4_POST] the post of a node marked GGML_FN_L4_POST (qwen4exp only) ------------------------------------
 // The host reads the payload, the header and the ring entry only after it sees the stamp. Here every thread writes its
 // part of all of them, then makes one system fence, then the block syncs and one thread writes the stamp. k_mb_post
@@ -1511,6 +1579,16 @@ bool ggml_cuda_moe_bridge_supports_op(int device, const ggml_tensor * op) {
         return false;
     }
     const auto & p = b->params;
+    if (op->op == GGML_OP_MOE_HOST_POST && ggml_get_op_params_i32(op, 3) == 2) {
+        // [TAG_FN_L9_HINTTOPK] a hint from logits: src[1] f32 [n_expert <= 512, T]
+        const ggml_tensor * ticket = op->src[0];
+        const ggml_tensor * lg     = op->src[1];
+        const int32_t       k      = ggml_get_op_params_i32(op, 4);
+        return p.hint_k > 0 && ticket && lg && ticket->type == GGML_TYPE_I32 && ggml_nelements(ticket) == 1 &&
+            lg->type == GGML_TYPE_F32 && lg->nb[0] == sizeof(float) && lg->ne[0] >= 1 && lg->ne[0] <= 16*WARP_SIZE &&
+            k >= 1 && k <= p.hint_k && k <= lg->ne[0] && lg->ne[1] >= 1 && lg->ne[1] <= p.max_tokens && lg->ne[1] <= 8 &&
+            lg->ne[2] == 1 && lg->ne[3] == 1;
+    }
     if (op->op == GGML_OP_MOE_HOST_POST && ggml_get_op_params_i32(op, 3) == 1) {
         // [TAG_FN_L3_CPU_DEVPRED] a hint: src[0] the post's ticket, src[1] the predicted ids [k, T]
         const ggml_tensor * ticket = op->src[0];
@@ -1551,6 +1629,16 @@ void ggml_cuda_op_moe_host_post(ggml_backend_cuda_context & ctx, ggml_tensor * d
     const int32_t chan  = ggml_get_op_params_i32(dst, 1);
     const int32_t flags = ggml_get_op_params_i32(dst, 2);
 
+    if (ggml_get_op_params_i32(dst, 3) == 2) { // [TAG_FN_L9_HINTTOPK] a hint from logits
+        GGML_ASSERT(b->dev.hint_k > 0 && b->dev.off_hint > 0);
+        const ggml_tensor * lg = dst->src[1];
+        const int k = ggml_get_op_params_i32(dst, 4);
+        GGML_ASSERT(k >= 1 && k <= b->dev.hint_k && lg->ne[1] <= b->params.max_tokens && lg->ne[1] <= 8 && lg->ne[0] <= 16*WARP_SIZE);
+        k_fn_l9_hint_topk<16><<<1, WARP_SIZE*(int) lg->ne[1], 0, ctx.stream()>>>(b->dev, chan, (const int32_t *) dst->src[0]->data,
+                (const char *) lg->data, lg->nb[1], (int) lg->ne[0], k, (int) lg->ne[1]);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
     if (ggml_get_op_params_i32(dst, 3) == 1) { // [TAG_FN_L3_CPU_DEVPRED] a hint
         GGML_ASSERT(b->dev.hint_k > 0 && b->dev.off_hint > 0);
         const ggml_tensor * ids = dst->src[1];

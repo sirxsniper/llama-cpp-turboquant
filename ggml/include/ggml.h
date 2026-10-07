@@ -2852,6 +2852,16 @@ extern "C" {
             int32_t               bridge,
             int32_t               chan);
 
+    // [TAG_FN_L9_HINTTOPK] the same hint from the next layer's router logits (f32 [n_expert, T]): the backend picks the top k
+    // per token itself (op param 3 = 2, op param 4 = k), so no argsort node runs
+    GGML_API struct ggml_tensor * ggml_moe_host_hint_logits(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * ticket,
+            struct ggml_tensor  * logits,
+            int32_t               k,
+            int32_t               bridge,
+            int32_t               chan);
+
     // [TAG_FN_R2_BRIDGE_SYNC] the host side of a bridged MoE layer as a CPU graph op (CPU backend only), for the graphs
     // that run while the bridge is paused or off: for every token t,
     //   out[:, t] = sum, in slot order, over the slots s whose expert e = ids[s, t] passes the table (table == NULL or
