@@ -29,6 +29,8 @@
 #include <algorithm>
 #include <cassert>
 #include <cmath>
+#include <map>
+#include <mutex>
 #include <cstring>
 #include <numeric>
 #include <sstream>
@@ -1554,8 +1556,40 @@ void llm_graph_result::reset() {
 }
 
 void llm_graph_result::set_inputs(const llama_ubatch * ubatch) {
+    // [TAG_FN_L8_INPROBE] LLAMA_INPUT_PROBE=1: host time per input type (by its graph: n_nodes), a line every 2048 calls
+    static const bool probe = [] {
+        const char * e = getenv("LLAMA_INPUT_PROBE");
+        return e != nullptr && e[0] == '1';
+    }();
+    if (!probe) {
+        for (auto & input : inputs) {
+            input->set_input(ubatch);
+        }
+        return;
+    }
+    static std::mutex mtx;
+    static std::map<std::string, std::pair<double, uint64_t>> acc;
+    static uint64_t n_calls = 0;
+    const int nn = gf ? ggml_graph_n_nodes(gf) : 0;
     for (auto & input : inputs) {
+        const int64_t t0 = ggml_time_us();
         input->set_input(ubatch);
+        const int64_t dt = ggml_time_us() - t0;
+        std::lock_guard<std::mutex> lk(mtx);
+        auto & a = acc[std::string(typeid(*input).name()) + " @" + std::to_string(nn > 2000 ? 1 : 0)];
+        a.first  += (double) dt;
+        a.second += 1;
+    }
+    std::lock_guard<std::mutex> lk(mtx);
+    if (++n_calls % 2048 == 0) {
+        std::string line;
+        for (const auto & [k, v] : acc) {
+            char tmp[256];
+            snprintf(tmp, sizeof(tmp), " | %s %.1f us x%llu", k.c_str(), v.first / (double) std::max<uint64_t>(1, v.second), (unsigned long long) v.second);
+            line += tmp;
+        }
+        LLAMA_LOG_INFO("%s: [TAG_FN_L8_INPROBE] %llu calls (@1 = graphs of > 2000 nodes)%s\n", __func__, (unsigned long long) n_calls, line.c_str());
+        acc.clear();
     }
 }
 
