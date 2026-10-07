@@ -188,6 +188,7 @@ static std::shared_ptr<llama_ple_dio> qwen4exp_open_ple_dio(const llama_model_lo
     p.cache_bytes = (size_t) std::max(0LL, env_ll("LLAMA_PLE_DIO_CACHE_MB", 64)) << 20;
     p.queue_depth = (int) std::max(1LL, std::min(1024LL, env_ll("LLAMA_PLE_DIO_QD", 64)));
     p.stats_every = (int) std::max(0LL, std::min((long long) INT32_MAX, env_ll("LLAMA_PLE_DIO_STATS", 0)));
+    p.spin_us     = (int) std::max(0LL, std::min(100000LL, env_ll("LLAMA_PLE_DIO_SPIN_US", 2000))); // [TAG_FN_L11_DIOSPIN]
     p.log         = qwen4exp_dio_log;
     // tests only: every Nth read fails, so its row comes from the mapped table (must not change any value)
     p.test_fail_every = (int) std::max(0LL, std::min((long long) INT32_MAX, env_ll("LLAMA_PLE_DIO_TEST_FAIL", 0)));

@@ -498,6 +498,7 @@ struct llama_ple_dio::impl {
         const size_t rb     = p.row_bytes;
         const int    n_miss = (int) miss.size();
         const int    qd     = p.queue_depth;
+        const auto   t_call = dio_clock::now(); // [TAG_FN_L11_DIOSPIN]
 
         failed.clear();
         if (broken) {
@@ -551,9 +552,16 @@ struct llama_ple_dio::impl {
             }
 
             ULONG got = 0;
+            // [TAG_FN_L11_DIOSPIN] poll first (p.spin_us per call): a blocked waiter wakes late while the expert pool's
+            // threads hold every core, which made a ~60 us NVMe read cost ~0.5 ms
+            const bool spin = p.spin_us > 0 && dio_us(dio_clock::now() - t_call) < (double) p.spin_us;
             if (!GetQueuedCompletionStatusEx(iocp, ents.data(), (ULONG) std::min<int>(inflight, (int) ents.size()), &got,
-                        1000, FALSE)) {
+                        spin ? 0 : 1000, FALSE)) {
                 const DWORD e = GetLastError();
+                if (spin && e == WAIT_TIMEOUT) {
+                    YieldProcessor();
+                    continue;
+                }
                 if (e == WAIT_TIMEOUT) {
                     ++wait_s;
                     if (wait_s % 10 == 0) {

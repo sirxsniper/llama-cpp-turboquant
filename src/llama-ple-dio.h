@@ -41,6 +41,7 @@ struct llama_ple_dio_params {
     int         queue_depth = 64;   // reads in flight at most
     int         stats_every = 0;    // 0 = no statistics, 1 = after 256 ubatches + at close, N > 1 = every N ubatches
     int         test_fail_every = 0; // tests only: every Nth read completes as failed (exercises the fallback path)
+    int         spin_us     = 0;    // [TAG_FN_L11_DIOSPIN] Windows: poll the completions for up to this long per call, then block
     void     (* log)(const char * line) = nullptr; // one line per call, ends with '\n'; nullptr = stderr
 };
 
