@@ -2558,7 +2558,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // stall never changes the output (the CPU split below sums the slots in another order)
     const llama_moe_bridge * br_any = moe_bridge ? moe_bridge : moe_bridge_sync;
     bool br_sync = false;
-    if (br_any && il >= 0 && n_tokens >= 1 && n_tokens <= llama_moe_bridge_max_t(br_any) &&
+    if (br_any && il >= 0 && llama_moe_bridge_fits(br_any, (int) n_tokens, (int) (ubatch.equal_seqs() ? ubatch.n_seq_tokens : ubatch.n_tokens)) &&
         n_expert_used <= llama_moe_bridge_n_used(br_any) &&
         !gate_up_exps && gate_exps && down_exps && !up_exps_b && !gate_exps_b && !down_exps_b &&
         !up_exps_s && !gate_exps_s && !down_exps_s && type_op == LLM_FFN_SILU && !weight_before_ffn &&

@@ -90,8 +90,9 @@ struct ggml_tensor;
 struct llama_moe_bridge;
 
 // nullptr when disabled or not possible here (the reason is logged). max_t_cap > 0: graphs wider than that never take
-// the bridge ([TAG_FN_R1_BRIDGE_RB]: the widest ubatch the recurrent ring can roll back whole)
-llama_moe_bridge * llama_moe_bridge_create(const llama_model & model, int n_threads, int max_t_cap = 0);
+// the bridge ([TAG_FN_R1_BRIDGE_RB]: the widest ubatch the recurrent ring can roll back whole). seq_t_cap > 0: nor graphs
+// with more tokens of one sequence ([TAG_FN_L13_BRIDGE_SEQS]: the ring is per sequence, so 2 streams of 3 tokens fit)
+llama_moe_bridge * llama_moe_bridge_create(const llama_model & model, int n_threads, int max_t_cap = 0, int seq_t_cap = 0);
 void               llama_moe_bridge_free(llama_moe_bridge * br);
 // [TAG_FN_L4_EXIT] teardown only: every device wait and fetch of this bridge gives up at once (no CUDA call), so no graph
 // of its context spins on mapped flags while the context synchronizes and frees; the bridge is unusable afterwards
@@ -115,6 +116,8 @@ bool               llama_moe_bridge_dma(const llama_moe_bridge * br);
 // graph side. active: graphs built now may use it (not paused after an error, not disabled)
 bool llama_moe_bridge_active(const llama_moe_bridge * br);
 int  llama_moe_bridge_max_t (const llama_moe_bridge * br);
+// [TAG_FN_L13_BRIDGE_SEQS] a graph of n_tokens whose largest sequence has n_seq_tokens of them may take the bridge
+bool llama_moe_bridge_fits  (const llama_moe_bridge * br, int n_tokens, int n_seq_tokens);
 int  llama_moe_bridge_n_used(const llama_moe_bridge * br);
 // the bridge id and channel for this layer's up_exps, false if the layer is not bridged
 bool llama_moe_bridge_layer (const llama_moe_bridge * br, const ggml_tensor * up_exps, int32_t * id, int32_t * chan);

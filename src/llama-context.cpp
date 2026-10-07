@@ -1661,8 +1661,10 @@ llama_context::llama_context(
         // context created after a target that declined the bridge would otherwise take it without the target's ring
         // (push #1 gate, -ub 4 with MTP: the draft context made a bridge of T <= 8). With a target that owns the bridge the
         // draft context never had one (llama_moe_bridge_create: another context owns the MoE bridge).
+        // [TAG_FN_L13_BRIDGE_SEQS] the ring is per sequence: a ubatch of n_seq_max streams of n_rs_seq tokens rolls back too
         moe_bridge = bridge_off_ub || cparams.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT ? nullptr :
-                llama_moe_bridge_create(model, (int) cparams.n_threads, bridge_rb ? (int) cparams.n_rs_seq : 0);
+                llama_moe_bridge_create(model, (int) cparams.n_threads, bridge_rb ? (int) (cparams.n_rs_seq*cparams.n_seq_max) : 0,
+                        bridge_rb ? (int) cparams.n_rs_seq : 0);
         vram_account("bridge"); // [TAG_FN_L3_VRAM_ACCOUNT]
 
         // [TAG_MOE_DMA_SHARE] [TAG_FN_PREFILL_STREAM] before the reserve: the graphs it builds use the gen5 banks
@@ -3093,7 +3095,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     // [TAG_FN_L3_HOST_LAUNCH2] the split boundary the scheduler uses if it splits this ubatch's graph below
     // (a paused or turned-off bridge: the graph runs the CPU split and is not cut)
-    const bool launch2_decode = llama_moe_bridge_active(moe_bridge) && (int) ubatch.n_tokens <= llama_moe_bridge_max_t(moe_bridge);
+    const bool launch2_decode = llama_moe_bridge_active(moe_bridge) && llama_moe_bridge_fits(moe_bridge, (int) ubatch.n_tokens,
+            (int) (ubatch.equal_seqs() ? ubatch.n_seq_tokens : ubatch.n_tokens));
 
     // the new graph parameters
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters

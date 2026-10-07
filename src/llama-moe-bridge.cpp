@@ -208,6 +208,7 @@ struct llama_moe_bridge {
 
     int     mode       = GGML_MOE_BRIDGE_WAIT_SPIN;
     int     max_t      = 8;
+    int     seq_t      = 0;    // [TAG_FN_L13_BRIDGE_SEQS] most tokens of one sequence per graph (0: max_t)
     bool    sync_on    = true; // [TAG_FN_R2_BRIDGE_SYNC] LLAMA_MOE_BRIDGE_SYNC
     int     n_used     = 0;
     int64_t n_embd     = 0;
@@ -699,7 +700,7 @@ bool llama_moe_bridge_wanted(const llama_model & model) {
     return false;
 }
 
-llama_moe_bridge * llama_moe_bridge_create(const llama_model & model, int n_threads, int max_t_cap) {
+llama_moe_bridge * llama_moe_bridge_create(const llama_model & model, int n_threads, int max_t_cap, int seq_t_cap) {
     if (env_int("LLAMA_MOE_BRIDGE", 0) <= 0) {
         return nullptr;
     }
@@ -826,6 +827,7 @@ llama_moe_bridge * llama_moe_bridge_create(const llama_model & model, int n_thre
         // [TAG_FN_R1_BRIDGE_RB] wider graphs (a prompt's last few tokens) run the plain CPU split
         br->max_t = max_t_cap;
     }
+    br->seq_t      = seq_t_cap > 0 && seq_t_cap < br->max_t ? seq_t_cap : 0;
     br->spin_us    = std::max(0, env_int("LLAMA_MOE_BRIDGE_SPIN_US", 2000));
     br->timeout_ms = std::min(1200, std::max(1, env_int("LLAMA_MOE_BRIDGE_TIMEOUT_MS", 500))); // [TAG_FN_R1_BRIDGE_RETRY]
     br->job_max_ms = std::min(1200, std::max(br->timeout_ms, env_int("LLAMA_MOE_BRIDGE_JOB_MAX_MS", 1000)));
@@ -1109,6 +1111,10 @@ llama_moe_bridge * llama_moe_bridge_create(const llama_model & model, int n_thre
             "taken), spin %d us, up to %d pool threads, prio %d\n", __func__, br->bid, ggml_backend_dev_name(dev), br->chans.size(),
             n_skipped, br->max_t, br->mode == GGML_MOE_BRIDGE_WAIT_SPIN ? "spin" : "hostfunc", br->timeout_ms, br->job_max_ms,
             br->spin_us, br->pool_params.n_threads, br->pool_params.prio);
+    if (br->seq_t > 0) {
+        LLAMA_LOG_INFO("%s: [TAG_FN_L13_BRIDGE_SEQS] graphs of up to %d tokens with at most %d of one sequence (the ring each "
+                "sequence rolls back)\n", __func__, br->max_t, br->seq_t);
+    }
     if (br->pool_stats) {
         br->st_faults = br_page_faults();
         LLAMA_LOG_INFO("%s: [TAG_FN_L3_CPU_STATS] pool statistics every 256 bridged graphs\n", __func__);
@@ -1230,6 +1236,10 @@ bool llama_moe_bridge_hint_fused(const llama_moe_bridge * br) {
 
 int llama_moe_bridge_max_t(const llama_moe_bridge * br) {
     return br ? br->max_t : 0;
+}
+
+bool llama_moe_bridge_fits(const llama_moe_bridge * br, int n_tokens, int n_seq_tokens) {
+    return br && n_tokens >= 1 && n_tokens <= br->max_t && (br->seq_t == 0 || n_seq_tokens <= br->seq_t);
 }
 
 // [TAG_FN_L3_MTP_COST2]
