@@ -6,6 +6,7 @@
 #include "llama-moe-gen5.h" // [TAG_MOE_PREFETCH]
 #include "llama-ple-dio.h"  // [TAG_FN_PLE_DIRECT_IO]
 #include "llama-mmap.h"     // [TAG_FN_L11_EMBDLOCK]
+#include "llama-fn-auto.h"  // [TAG_FN_L11_EMBDLOCK] llama_fn_l3_flag
 #include "llama-ext.h"      // [TAG_FN_SHIP1] llama_model_fn_env
 #include "llama-moe-bridge.h" // [TAG_FN_L3_CPU_DEVPRED]
 
@@ -2726,8 +2727,10 @@ static void qwen4exp_lock_embd(const llama_model & model, const ggml_tensor * ta
     ml->init(table->data);
     ml->grow_to(ggml_nbytes(table));
     m->embd_lock = ml;
-    LLAMA_LOG_INFO("%s: [TAG_FN_L11_EMBDLOCK] %s locked in the working set: %.0f MiB in %.0f ms\n", __func__, table->name,
-            ggml_nbytes(table)/1048576.0, (ggml_time_us() - t0)/1000.0);
+    // the PLE reader's row cache and read buffers as well (random row hashes: a trimmed page faults on a decode)
+    const bool dio_ok = m->ple_dio && m->ple_dio->lock_memory();
+    LLAMA_LOG_INFO("%s: [TAG_FN_L11_EMBDLOCK] %s locked in the working set: %.0f MiB in %.0f ms; PLE row cache %s\n", __func__,
+            table->name, ggml_nbytes(table)/1048576.0, (ggml_time_us() - t0)/1000.0, dio_ok ? "locked" : "not locked");
 }
 
 ggml_tensor * llama_model_qwen4exp::graph::build_inp_embd_host(ggml_tensor * table, ggml_tensor ** h_out) {

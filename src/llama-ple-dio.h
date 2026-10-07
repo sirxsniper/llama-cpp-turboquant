@@ -80,6 +80,9 @@ struct llama_ple_dio {
     std::string         stats_line() const;
     void                reset_stats();
 
+    // [TAG_FN_L11_EMBDLOCK] lock the row cache and the read buffers in the working set (Windows; false: not locked)
+    bool                lock_memory();
+
     struct impl;
 
 private:

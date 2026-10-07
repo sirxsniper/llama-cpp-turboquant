@@ -842,6 +842,42 @@ void llama_ple_dio::reset_stats() {
     pimpl->st = llama_ple_dio_stats();
 }
 
+// [TAG_FN_L11_EMBDLOCK] the row cache is read at random row hashes and the read buffers on every miss: a trimmed page
+// there costs a page fault per decode
+bool llama_ple_dio::lock_memory() {
+#if defined(_WIN32)
+    std::lock_guard<std::mutex> lock(pimpl->mtx);
+    impl & d = *pimpl;
+    std::vector<std::pair<void *, size_t>> ranges = {
+        { d.lru.data.data(), d.lru.data.size() },
+        { d.lru.key.data(),  d.lru.key.size()*sizeof(int32_t) },
+        { d.lru.prv.data(),  d.lru.prv.size()*sizeof(int32_t) },
+        { d.lru.nxt.data(),  d.lru.nxt.size()*sizeof(int32_t) },
+        { d.lru.tk.data(),   d.lru.tk.size()*sizeof(int32_t) },
+        { d.lru.tv.data(),   d.lru.tv.size()*sizeof(int32_t) },
+        { d.bufs,            d.bufs ? d.slots.size()*d.slot_bytes : 0 },
+    };
+    size_t total = 0;
+    for (const auto & r : ranges) {
+        total += r.second;
+    }
+    SIZE_T mn = 0, mx = 0;
+    if (total == 0 || !GetProcessWorkingSetSize(GetCurrentProcess(), &mn, &mx) ||
+        !SetProcessWorkingSetSize(GetCurrentProcess(), mn + total + ((size_t) 4 << 20), mx + total + ((size_t) 4 << 20))) {
+        return false;
+    }
+    bool ok = true;
+    for (const auto & r : ranges) {
+        if (r.first != nullptr && r.second > 0) {
+            ok = VirtualLock(r.first, r.second) != 0 && ok;
+        }
+    }
+    return ok;
+#else
+    return false;
+#endif
+}
+
 void llama_ple_dio::read_rows(const int32_t * rows, int64_t n, uint8_t * dst, int64_t n_tokens, const uint8_t * fallback) {
     impl & d = *pimpl;
     std::lock_guard<std::mutex> lock(d.mtx);
