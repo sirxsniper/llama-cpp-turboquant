@@ -31,7 +31,7 @@ code, 1 stream · 262K context · 4 slots
 **Qwen3.8-Flash-Next** · UD-Q4_K_XL (100+ GB MoE)
 
 ## 101 t/s
-real use at 32K · **89 t/s at 131K and 245K** · 103 / 93 / 91 with the MTPq3 files
+real use at 32K · **89 t/s at 131K and 245K** · 103 / 93 / 91 with the MTPq3 files · a short new turn starts in 0.3–1.4 s instead of 3.4 s
 
 prompt reading **1,500–2,060 t/s**
 
@@ -137,6 +137,15 @@ Five GPU memory bugs found with compute-sanitizer and fixed; no GPU work left in
 | Prompt reading, fresh 32K / 131K | ~150 t/s | 1,508 / 2,059 t/s | about the same | 1,862 / 2,068 t/s |
 
 - Quality: KLD vs the original file **0.0109** (same top token 97.3 %); needle recall passes at 131K and 245K.
+
+**New turn on a conversation** (v0.18.0): the time from sending a message to the first answer token, 24K conversation already in the cache.
+
+| New tokens | 32 | 64 | 128 | 256 | 512 | 1,024 | 2,048 |
+|:--|--:|--:|--:|--:|--:|--:|--:|
+| v0.17.0 | 3.39 s | 3.41 s | 3.40 s | 3.38 s | 3.41 s | 3.78 s | 3.88 s |
+| **v0.18.0** | **0.33 s** | **0.54 s** | **0.84 s** | **1.39 s** | 3.50 s | 3.85 s | 3.90 s |
+
+- Chunks under 384 tokens now compute their CPU-side experts on the CPU instead of streaming every expert through the GPU once (~3.4 s whatever the size); 384 tokens and more still stream (faster there). Decoding is not touched: output identical to v0.17.0, the real-use numbers above stand.
 - v0.16.0 and v0.17.0 measured back to back in one session (2 interleaved rounds); the MTPq3 column against v0.17.0 with the standard files in another session (3 rounds: 100.2 / 88.4 / 88.3 -> 103.1 / 92.7 / 91.3). Real use at the first depth after a load varies by about 3 %.
 - VRAM about 29.9 GB while generating (the expert hot set takes the free VRAM up to 2.1 GB below the card total, plus the part of the 262K KV cache a shorter context does not use yet; `LLAMA_FN_VRAM_KEEP_MIB=4096` keeps more free); the rest of the model stays memory-mapped.
 - Vision works: add `--mmproj mmproj-Qwen3.8-Flash-Next-F16.gguf`.
