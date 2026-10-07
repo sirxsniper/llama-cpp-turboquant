@@ -2,8 +2,9 @@
 
 // [TAG_FN_L14_TIER] qwen4exp (profile switch LLAMA_FN_L14_TIER): the routed experts of the host layers stay in the mapped
 // model file, at the same addresses, and a background thread locks their pages in the working set, whole layers, from
-// LLAMA_FN_L14_TIER_DELAY_MS after the load (default 20000: the context's warm-up and first kernel loads come first) while
-// the RAM above a reserve allows (LLAMA_FN_L14_TIER_RESERVE_MIB, default 24576: the GPU driver locks memory too). Nothing is
+// LLAMA_FN_L14_TIER_DELAY_MS after the load (default 20000: the context's warm-up and first kernel loads come first), up to
+// LLAMA_FN_L14_TIER_MAX_MIB (default 60 % of the RAM: the GPU driver locks memory too) while LLAMA_FN_L14_TIER_FREE_MIB
+// (6144) of RAM stays available. Nothing is
 // copied or charged to commit, and the load no longer prefetches those ranges. Below LLAMA_FN_L14_TIER_LOW_MIB (4096) of
 // available RAM one layer is unlocked every 5 s at most; after a minute with room again one more is locked.
 // A no-op on other architectures and other platforms.

@@ -61,7 +61,8 @@ struct llama_fn_tier {
     size_t                          total        = 0;
     size_t                          n_locked     = 0; // layers [0, n_locked) are locked
     size_t                          locked_bytes = 0;
-    size_t                          reserve      = 0;
+    size_t                          cap          = 0; // most bytes locked (default 60 % of the RAM)
+    size_t                          free_min     = 0; // a layer is locked only while this much RAM stays available
     size_t                          low          = 0;
     int                             delay_ms     = 0;
 #ifdef _WIN32
@@ -95,14 +96,15 @@ bool fn_tier_ws_add(int64_t delta) {
             QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE) != 0;
 }
 
-// lock candidate layer t->n_locked if the RAM above the reserve allows it
+// lock candidate layer t->n_locked while the cap allows it and the system keeps free_min available (pages this process
+// already touched are in its working set, not in the available RAM: locking them takes nothing more)
 bool fn_tier_lock_next(llama_fn_tier * t) {
     if (t->n_locked >= t->layers.size()) {
         return false;
     }
     const size_t i = t->n_locked;
     const size_t b = t->layer_bytes[i];
-    if (fn_tier_avail() < b + t->reserve) {
+    if (t->locked_bytes + b > t->cap || fn_tier_avail() < t->free_min) {
         return false;
     }
     if (!fn_tier_ws_add((int64_t) b)) {
@@ -151,8 +153,8 @@ void fn_tier_unlock_last(llama_fn_tier * t) {
 }
 
 // after the start delay (the context, its warm-up and the first kernels' loads come first): lock layer by layer at
-// background priority while the RAM above the reserve allows; then watch: below `low` one layer goes back every 5 s at
-// most, and after a minute with room above the reserve one more layer is locked
+// background priority up to the cap; then watch: below `low` one layer goes back every 5 s at most, and after a minute
+// with room again (and room under the cap) one more layer is locked
 void fn_tier_worker(llama_fn_tier * t) {
     if (WaitForSingleObject(t->stop, (DWORD) t->delay_ms) == WAIT_OBJECT_0) {
         return;
@@ -163,9 +165,9 @@ void fn_tier_worker(llama_fn_tier * t) {
         WaitForSingleObject(t->stop, 20);
     }
     LLAMA_LOG_INFO("[TAG_FN_L14_TIER] %zu of %zu host layers' routed experts (%.2f GiB of %.2f GiB) locked in place in %.1f s; "
-            "%.1f GiB RAM available (reserve %.1f GiB)\n", t->n_locked, t->layers.size(), t->locked_bytes/1073741824.0,
+            "%.1f GiB RAM available (cap %.1f GiB)\n", t->n_locked, t->layers.size(), t->locked_bytes/1073741824.0,
             t->total/1073741824.0, std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(),
-            fn_tier_avail()/1073741824.0, t->reserve/1073741824.0);
+            fn_tier_avail()/1073741824.0, t->cap/1073741824.0);
     SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_END);
 
     auto healthy_since = std::chrono::steady_clock::now();
@@ -186,7 +188,8 @@ void fn_tier_worker(llama_fn_tier * t) {
             continue;
         }
         const bool room = t->n_locked < t->layers.size() &&
-                          a > t->reserve + t->layer_bytes[t->n_locked] + ((size_t) 8 << 30);
+                          t->locked_bytes + t->layer_bytes[t->n_locked] <= t->cap &&
+                          a > t->free_min + t->layer_bytes[t->n_locked] + ((size_t) 4 << 30);
         if (!room) {
             healthy_since = now;
             continue;
@@ -295,9 +298,15 @@ llama_fn_tier_ptr llama_fn_tier_build(llama_model & model, llama_model_loader & 
         LLAMA_LOG_INFO("%s: [TAG_FN_L14_TIER] no host layer with mapped routed experts\n", __func__);
         return nullptr;
     }
-    // the reserve: the GPU driver locks memory too (its pinned buffers, every kernel module it loads on first use); with
-    // ~60 GiB locked at load and ~12 GiB left, module loads failed ("shared object initialization failed")
-    tier->reserve  = (size_t) std::max(0, llama_fn_l3_int(model, "LLAMA_FN_L14_TIER_RESERVE_MIB", 24576)) << 20;
+    // the cap: the GPU driver locks memory too (its pinned buffers, every kernel module it loads on first use); with ~61
+    // GiB locked at the load, module loads failed ("shared object initialization failed"), and page-locked budgets past
+    // ~55 GB of 96 GB fail on Windows. Default: 60 % of the RAM (~56 GiB here)
+    MEMORYSTATUSEX ms;
+    ms.dwLength = sizeof(ms);
+    GlobalMemoryStatusEx(&ms);
+    const int cap_mib = llama_fn_l3_int(model, "LLAMA_FN_L14_TIER_MAX_MIB", (int) (ms.ullTotalPhys*6/10 >> 20));
+    tier->cap      = (size_t) std::max(0, cap_mib) << 20;
+    tier->free_min = (size_t) std::max(0, llama_fn_l3_int(model, "LLAMA_FN_L14_TIER_FREE_MIB", 6144)) << 20;
     tier->low      = (size_t) std::max(0, llama_fn_l3_int(model, "LLAMA_FN_L14_TIER_LOW_MIB", 4096)) << 20;
     tier->delay_ms = std::max(0, llama_fn_l3_int(model, "LLAMA_FN_L14_TIER_DELAY_MS", 20000));
     tier->stop     = CreateEventW(nullptr, TRUE, FALSE, nullptr);
@@ -306,8 +315,8 @@ llama_fn_tier_ptr llama_fn_tier_build(llama_model & model, llama_model_loader & 
     }
     tier->worker = std::thread(fn_tier_worker, tier.get());
     LLAMA_LOG_INFO("%s: [TAG_FN_L14_TIER] %zu host layers (%.2f GiB of routed experts) are locked in place in the background "
-            "from %.0f s after the load, above a %.1f GiB RAM reserve\n", __func__, tier->layers.size(), tier->total/1073741824.0,
-            tier->delay_ms/1000.0, tier->reserve/1073741824.0);
+            "from %.0f s after the load, up to %.1f GiB while %.1f GiB of RAM stays available\n", __func__, tier->layers.size(),
+            tier->total/1073741824.0, tier->delay_ms/1000.0, tier->cap/1073741824.0, tier->free_min/1073741824.0);
     return tier;
 }
 
