@@ -920,7 +920,9 @@ llama_kv_cache::llama_kv_cache(
             buf = nullptr;
             // [TAG_FN_L8_KVLEND] qwen4exp (LLAMA_FN_L8_KVLEND, the profile), turbot, one stream, no shared cells: the K/V
             // tensors on virtual memory, only the cells the context needs mapped
-            if (turbot_plan && n_stream == 1 && other == nullptr && llama_fn_l3_flag(model, "LLAMA_FN_L8_KVLEND")) {
+            // [TAG_FN_L10_SLOTLEND] the slot-granular lend uses the same KV side
+            if (turbot_plan && n_stream == 1 && other == nullptr &&
+                    (llama_fn_l3_flag(model, "LLAMA_FN_L8_KVLEND") || llama_fn_l3_flag(model, "LLAMA_FN_L10_SLOTLEND"))) {
                 const uint32_t init_c  = (uint32_t) std::max(4096, llama_fn_l3_int(model, "LLAMA_FN_L8_KVLEND_INIT", 16384));
                 const uint32_t chunk_c = (uint32_t) std::max(2048, llama_fn_l3_int(model, "LLAMA_FN_L8_KVLEND_CHUNK", 16384));
                 if (kv_size >= 2*init_c) {
