@@ -8,6 +8,7 @@
 #include "llama-cparams.h"
 #include "llama-model-loader.h"
 #include "llama-fn-auto.h" // [TAG_FN_AUTO]
+#include "llama-fn-arena.h" // [TAG_FN_L14_ARENA]
 
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
@@ -1206,6 +1207,7 @@ struct llama_model::impl {
     // objects representing data potentially being locked in memory
     llama_mlocks mlock_bufs;
     llama_mlocks mlock_mmaps;
+    llama_fn_arena_ptr fn_arena; // [TAG_FN_L14_ARENA] after the mappings: its buffers are freed first
 
     // contexts where the model tensors metadata is stored as well as the corresponding buffers:
     std::vector<std::pair<ggml_context_ptr, std::vector<ggml_backend_buffer_ptr>>> ctxs_bufs;
@@ -1961,6 +1963,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             pimpl->mappings.emplace_back(std::move(mapping));
         }
     }
+
+    // [TAG_FN_L14_ARENA] qwen4exp: the host layers' routed experts into locked RAM (the mappings stay for the rest)
+    pimpl->fn_arena = llama_fn_arena_build(*this, ml);
 
     return true;
 }

@@ -171,6 +171,8 @@ const fn_item k_items[] = {
     { "GGML_OP_OFFLOAD_MIN_BATCH",   "384",   P_ALL }, // [TAG_FN_L12_PROMPTMIN] no op-offload copy below it either
     // [TAG_FN_L13_SPEC_EQUAL] round 13: streams that draft together draft the same length, so a step is one ubatch
     { "SPEC_MTP_EQUAL_SEQS",         "1",     P_ALL },
+    // [TAG_FN_L14_ARENA] round 14: the host layers' routed experts read once into locked RAM, whole layers above a reserve
+    { "LLAMA_FN_L14_ARENA",          "1",     P_ALL },
 };
 
 // names the fn-auto aware code reads through llama_fn_env(): never put into the environment

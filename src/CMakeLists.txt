@@ -43,6 +43,7 @@ set(LLAMA_CORE_SOURCES
     llama-moe-gen5.cpp       # [TAG_MOE_DMA_SHARE] [TAG_FN_PREFILL_STREAM] fork-only
     llama-moe-dma.cpp        # [TAG_MOE_DMA_SHARE] [TAG_MOE_PREFETCH] fork-only
     llama-fn-auto.cpp        # [TAG_FN_AUTO] fork-only
+    llama-fn-arena.cpp       # [TAG_FN_L14_ARENA] fork-only
     llama-fn-hostprof.cpp    # [TAG_FN_L4_HOST] fork-only
     llama-prefill-stream.cpp # [TAG_FN_PREFILL_STREAM] fork-only
     llama-ple-dio.cpp        # [TAG_FN_PLE_DIRECT_IO] fork-only
