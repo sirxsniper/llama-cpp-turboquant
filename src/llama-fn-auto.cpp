@@ -169,6 +169,8 @@ const fn_item k_items[] = {
     // 3.39 / 3.40 / 3.38 s, now 0.33 / 0.84 / 1.42 s (l11/pp_mid; the CPU path costs more than the stream from ~600 tokens)
     { "LLAMA_PREFILL_STREAM_MIN",    "384",   P_ALL }, // [TAG_FN_L12_PROMPTMIN]
     { "GGML_OP_OFFLOAD_MIN_BATCH",   "384",   P_ALL }, // [TAG_FN_L12_PROMPTMIN] no op-offload copy below it either
+    // [TAG_FN_L13_SPEC_EQUAL] round 13: streams that draft together draft the same length, so a step is one ubatch
+    { "SPEC_MTP_EQUAL_SEQS",         "1",     P_ALL },
 };
 
 // names the fn-auto aware code reads through llama_fn_env(): never put into the environment

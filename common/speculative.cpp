@@ -3489,6 +3489,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     // last value for the positions after it), e.g. 0.5,0.5,0.85 lets a third draft through only when it is confident
     std::vector<float>              pmin_pos;
 
+    // [TAG_FN_L13_SPEC_EQUAL] SPEC_MTP_EQUAL_SEQS=1, a recurrent or hybrid target, 2+ sequences: the sequences that draft
+    // together keep drafting while one of them passes the p_min rule. Their verify rows match, so split_equal keeps them in
+    // one ubatch (a 3 + 2 row step ran as two graphs: the recurrent ring needs each sequence's rows in one ubatch)
+    bool                            equal_seqs = false;
+    std::vector<llama_token>        eq_id;
+    uint64_t                        eq_steps = 0; // draft decodes with 2+ sequences under the rule
+    uint64_t                        eq_ext   = 0; // tokens kept that the p_min rule alone would have dropped
+
     float pmin_at(int i) const {
         if (pmin_pos.empty()) {
             return params.p_min;
@@ -3676,6 +3684,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         if (cost2_on && cost2.log > 0) {
             cost2_log_summary("end"); // [TAG_FN_L3_MTP_COST2]
         }
+        if (equal_seqs && eq_steps > 0) {
+            LOG_INF("%s: [TAG_FN_L13_SPEC_EQUAL] %llu draft decodes of 2+ sequences, %llu tokens kept below p_min\n", __func__,
+                    (unsigned long long) eq_steps, (unsigned long long) eq_ext);
+        }
     }
 
     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
@@ -3758,6 +3770,17 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             char arch[32] = { 0 };
             is_qwen4exp = llama_model_meta_val_str(llama_get_model(ctx_dft), "general.architecture", arch, sizeof(arch)) > 0 &&
                           strcmp(arch, "qwen4exp") == 0;
+        }
+
+        // [TAG_FN_L13_SPEC_EQUAL]
+        if (const char * e = getenv("SPEC_MTP_EQUAL_SEQS"); e && atoi(e) > 0 && n_seq > 1) {
+            const llama_model * mt = this->params.ctx_tgt ? llama_get_model(this->params.ctx_tgt) : nullptr;
+            equal_seqs = mt && (llama_model_is_recurrent(mt) || llama_model_is_hybrid(mt)) && !chain_heads && !is_mem_shared;
+            if (equal_seqs) {
+                eq_id.assign(n_seq, LLAMA_TOKEN_NULL);
+                LOG_INF("%s: [TAG_FN_L13_SPEC_EQUAL] sequences that draft together keep drafting while one passes the p_min "
+                        "rule: equal verify rows, one ubatch per step\n", __func__);
+            }
         }
 
         // [TAG_FN_L4_HOST_MTPFUSE]
@@ -4423,6 +4446,27 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             // whole prefix at the next head. dropped sequences are simply not re-added.
             batch.clear();
 
+            // [TAG_FN_L13_SPEC_EQUAL] sample every drafting sequence first, then one keep decision for all of them
+            const bool eq_step = equal_seqs && !cost_on && !cost2_on && n_drafting > 1;
+            bool       eq_keep = false;
+            if (eq_step) {
+                eq_steps++;
+                for (llama_seq_id s = 0; s < (llama_seq_id) n_seq; ++s) {
+                    if (drafting[s]) {
+                        eq_id[s] = common_sampler_sample(smpls[s].get(), ctx_dft, i_last[s], true);
+                        const auto * cp = common_sampler_get_candidates(smpls[s].get(), true);
+                        eq_keep = eq_keep || (cp->size > 0 && !(cp->data[0].p < pmin_at((int) dparams[s].result->size())));
+                    }
+                }
+            }
+            auto keep_tok = [&](llama_seq_id s, float conf) -> bool {
+                if (!eq_step) {
+                    return keep_token(s, conf, i + 1, cost_nit);
+                }
+                eq_ext += eq_keep && conf < pmin_at((int) dparams[s].result->size()) ? 1 : 0;
+                return eq_keep;
+            };
+
             for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
                 if (!drafting[seq_id]) {
                     continue;
@@ -4430,7 +4474,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 auto * smpl = smpls[seq_id].get();
 
-                const llama_token id_sampled = common_sampler_sample(smpl, ctx_dft, i_last[seq_id], true);
+                const llama_token id_sampled = eq_step ? eq_id[seq_id] : common_sampler_sample(smpl, ctx_dft, i_last[seq_id], true);
                 const float * h_row = llama_get_embeddings_nextn_ith(ctx_dft, i_last[seq_id]);
 
                 const auto * cur_p = common_sampler_get_candidates(smpl, true);
@@ -4466,7 +4510,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     id = id_sampled;
 
                     // only collect very high-confidence draft tokens ([TAG_FN_MTP_COST] or the cost test under the policy)
-                    if (!keep_token(seq_id, cur_p->data[0].p, i + 1, cost_nit)) { // [TAG_FN_L3_MTP_COST2]
+                    if (!keep_tok(seq_id, cur_p->data[0].p)) { // [TAG_FN_L3_MTP_COST2]
                         drafting[seq_id] = false;
                         n_drafting--;
 
@@ -4502,7 +4546,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     // shipped Flash-Next profile uses mtp_p_min 0.5, and on prose most sampled
                     // tokens sit below that, so MTP would stop after the first draft every time.
                     // [TAG_FN_MTP_COST] under the policy the same confidence feeds the cost test instead
-                    if (!keep_token(seq_id, cur_p->data[0].p, i + 1, cost_nit)) { // [TAG_FN_L3_MTP_COST2]
+                    if (!keep_tok(seq_id, cur_p->data[0].p)) { // [TAG_FN_L3_MTP_COST2]
                         drafting[seq_id] = false;
                         n_drafting--;
 
@@ -4516,7 +4560,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     id = cur_p->data[0].id;
 
                     // only collect very high-confidence draft tokens
-                    if (!keep_token(seq_id, cur_p->data[0].p, i + 1, cost_nit)) { // [TAG_FN_MTP_COST] [TAG_FN_L3_MTP_COST2]
+                    if (!keep_tok(seq_id, cur_p->data[0].p)) { // [TAG_FN_MTP_COST] [TAG_FN_L3_MTP_COST2]
                         drafting[seq_id] = false;
                         n_drafting--;
 
