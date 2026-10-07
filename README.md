@@ -30,8 +30,8 @@ code, 1 stream · 262K context · 4 slots
 
 **Qwen3.8-Flash-Next** · UD-Q4_K_XL (100+ GB MoE)
 
-## 99 t/s
-real use at 32K · **89 t/s at 131K** filled
+## 101 t/s
+real use at 32K · **89 t/s at 131K and 245K** · 103 / 93 / 91 with the MTPq3 files
 
 prompt reading **1,500–2,060 t/s**
 
@@ -128,16 +128,16 @@ Five GPU memory bugs found with compute-sanitizer and fixed; no GPU work left in
 
 262K context, turbot KV, 1 stream. *Real use* = temperature 1, top-p 0.95, top-k 20, thinking on, 2,048-token answers on a context already filled to the given depth.
 
-| | first 262K build (Oct 4) | v0.15.0 | **v0.16.0** |
-|:--|--:|--:|--:|
-| Real use, 32K filled | 30.3 t/s | 91.0 t/s | **99.1 t/s** |
-| Real use, 131K filled | 26.1 t/s | 82.8 t/s | **89.5 t/s** |
-| Real use, 245K filled | 24.5 t/s | 84.8 t/s | **92.0 t/s** |
-| Benchmark, greedy code | 39 t/s | 89 t/s | **93 t/s** |
-| Prompt reading, fresh 32K / 131K | ~150 t/s | 1,508 / 2,059 t/s | about the same |
+| | first 262K build (Oct 4) | v0.16.0 | **v0.17.0** | **v0.17.0 + MTPq3 files** |
+|:--|--:|--:|--:|--:|
+| Real use, 32K filled | 30.3 t/s | 102.3 t/s | **101.5 t/s** | **103.1 t/s** |
+| Real use, 131K filled | 26.1 t/s | 85.7 t/s | **89.1 t/s** | **92.7 t/s** |
+| Real use, 245K filled | 24.5 t/s | 85.1 t/s | **89.7 t/s** | **91.3 t/s** |
+| Benchmark, greedy code | 39 t/s | 93 t/s | **93 t/s** | 94 t/s |
+| Prompt reading, fresh 32K / 131K | ~150 t/s | 1,508 / 2,059 t/s | about the same | 1,862 / 2,068 t/s |
 
 - Quality: KLD vs the original file **0.0109** (same top token 97.3 %); needle recall passes at 131K and 245K.
-- v0.15.0 and v0.16.0 measured back to back in one session (2 interleaved rounds; the first depth after a load varies by about 3 %).
+- v0.16.0 and v0.17.0 measured back to back in one session (2 interleaved rounds); the MTPq3 column against v0.17.0 with the standard files in another session (3 rounds: 100.2 / 88.4 / 88.3 -> 103.1 / 92.7 / 91.3). Real use at the first depth after a load varies by about 3 %.
 - VRAM about 29.9 GB while generating (the expert hot set takes the free VRAM up to 2.1 GB below the card total, plus the part of the 262K KV cache a shorter context does not use yet; `LLAMA_FN_VRAM_KEEP_MIB=4096` keeps more free); the rest of the model stays memory-mapped.
 - Vision works: add `--mmproj mmproj-Qwen3.8-Flash-Next-F16.gguf`.
 
@@ -238,7 +238,7 @@ llama-server.exe --model Qwen3.8-Flash-Next-UD-Q4_K_XL-MTP-00001-of-00005.gguf -
 
 - **Keep the model memory-mapped**: never `--load-mode none` / `--no-mmap` — it is larger than RAM.
 - The first one or two answers after a load are slower while the GPU expert set fills.
-- **Optional:** the `...-MTPq3-*` shard set (the same model with a 1.3 GB instead of 2.8 GB draft head) is about 2–3 % faster in real use. The main model checks every token either way.
+- **Recommended:** the `...-MTPq3-*` shard set (the same model with a 1.3 GB instead of 2.8 GB draft head): the freed VRAM holds ~10 more experts per layer, real use +6 % (103 / 93 / 91 t/s at 32K / 131K / 245K). The main model checks every token either way, so the output quality is the same. Make it once from the shipped head: `python tools/qwen4exp/mtp_requant.py --head mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf --mix q3_K,q3_K,q4_0 --out mtp-q3.gguf`, then the `merge_mtp.py` line above with `--head mtp-q3.gguf --out-pattern Qwen3.8-Flash-Next-UD-Q4_K_XL-MTPq3-%05d-of-00005.gguf`.
 - `LLAMA_FLASHNEXT_PROFILE=off` turns the whole engine off (for comparison).
 
 </details>
