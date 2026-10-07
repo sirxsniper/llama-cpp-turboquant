@@ -40,6 +40,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cfloat>
 #include <cinttypes>
 #include <cstddef>
@@ -75,7 +76,9 @@ struct alignas(64) mb_chan_hdr {
     unsigned long long fetch_ns; // [TAG_FN_R4_BRIDGE_DMA] device: the last fetch, plan to last copied byte
     uint32_t n_fetch;            // [TAG_FN_R4_BRIDGE_DMA] device: experts the last fetch copied
     uint32_t times_seq;          // [TAG_FN_R4_BRIDGE_DMA] device: the job of these times
-    uint32_t pad0[6];
+    unsigned long long t_post;   // [TAG_FN_L14_PROBE] device clock: the job's post
+    unsigned long long t_wstart; // [TAG_FN_L14_PROBE] device clock: the wait for its result began / ended
+    unsigned long long t_wend;
     uint32_t done;  // host: the answered job
     uint32_t taken; // host: the job being computed (a wait then allows job_max_ns instead of timeout_ns)
     uint32_t plan;  // [TAG_FN_R4_BRIDGE_DMA] host: the job whose plan is published
@@ -278,6 +281,7 @@ static __global__ void k_mb_post(const mb_dev v, const int chan,
         *(volatile int32_t *) &h->n_tokens = n_tokens;
         *(volatile int32_t *) &h->n_used   = n_used;
         *(volatile int32_t *) &h->flags    = flags;
+        *(volatile unsigned long long *) &h->t_post = mb_now_ns(); // [TAG_FN_L14_PROBE]
         __threadfence_system();
         *(volatile uint32_t *) &h->seq = seq;
         if (v.mode == GGML_MOE_BRIDGE_WAIT_SPIN) {
@@ -343,6 +347,8 @@ static __global__ void k_mb_wait(const mb_dev v, const int chan, const int32_t *
             if (blockIdx.x == 0) { // [TAG_FN_R4_BRIDGE_DMA] the host's DMA/CPU split reads this
                 volatile mb_chan_hdr * h = v.hdr + chan;
                 h->wait_ns   = ready ? 0ull : dt;
+                h->t_wstart  = t0;      // [TAG_FN_L14_PROBE]
+                h->t_wend    = t0 + dt;
                 h->times_seq = want;
             }
         }
@@ -643,6 +649,7 @@ static __device__ __forceinline__ void fn_l4_post_head(const mb_dev v, const int
     *(volatile int32_t  *) &h->n_tokens = n_tokens;
     *(volatile int32_t  *) &h->n_used   = n_used;
     *(volatile int32_t  *) &h->flags    = flags;
+    *(volatile unsigned long long *) &h->t_post = mb_now_ns(); // [TAG_FN_L14_PROBE]
     *(volatile uint32_t *) &h->seq      = seq;
     if (v.mode == GGML_MOE_BRIDGE_WAIT_SPIN) {
         mb_ring_entry * e = v.ring + (g % MB_RING);
@@ -1452,6 +1459,102 @@ void ggml_backend_cuda_moe_bridge_chan_times(const ggml_moe_bridge * b, int32_t 
     t->wait_ns  = h->wait_ns;
     t->fetch_ns = h->fetch_ns;
     t->n_fetch  = h->n_fetch;
+    t->t_post   = h->t_post;   // [TAG_FN_L14_PROBE]
+    t->t_wstart = h->t_wstart;
+    t->t_wend   = h->t_wend;
+}
+
+// [TAG_FN_L14_PROBE] the device clock (%globaltimer) minus the host clock (steady_clock ns): five round trips through
+// mapped memory, each the mean of a host -> device and a device -> host stamp (their latencies cancel), the median kept.
+// false when the device cannot run it
+#ifndef GGML_MOE_BRIDGE_DISABLED
+static __global__ void k_mb_clock(volatile uint32_t * flag, volatile unsigned long long * g, const int rounds) {
+    for (int r = 1; r <= rounds; ++r) {
+        const unsigned long long t_lim = mb_now_ns() + 200000000ull;
+        while (flag[0] != (uint32_t) r) {
+            if (mb_now_ns() > t_lim) {
+                return;
+            }
+        }
+        g[2*r] = mb_now_ns();
+        __threadfence_system();
+        g[2*r + 1] = mb_now_ns();
+        __threadfence_system();
+        flag[1] = (uint32_t) r;
+        __threadfence_system();
+    }
+}
+#endif
+
+bool ggml_backend_cuda_moe_bridge_clock_offset(const ggml_moe_bridge * b, int64_t * off_ns) {
+#ifdef GGML_MOE_BRIDGE_DISABLED
+    GGML_UNUSED(b);
+    GGML_UNUSED(off_ns);
+    return false;
+#else
+    if (b == nullptr || off_ns == nullptr) {
+        return false;
+    }
+    constexpr int R = 5;
+    void * hp = nullptr;
+    if (cudaHostAlloc(&hp, 256, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return false;
+    }
+    memset(hp, 0, 256);
+    volatile uint32_t           * flag = (volatile uint32_t *) hp;
+    volatile unsigned long long * g    = (volatile unsigned long long *) ((char *) hp + 64);
+    void * dflag = nullptr;
+    void * dg    = nullptr;
+    cudaStream_t st = nullptr;
+    bool ok = cudaHostGetDevicePointer(&dflag, hp, 0) == cudaSuccess &&
+              cudaHostGetDevicePointer(&dg, (char *) hp + 64, 0) == cudaSuccess &&
+              cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking) == cudaSuccess;
+    std::vector<int64_t> offs;
+    if (ok) {
+        k_mb_clock<<<1, 1, 0, st>>>((volatile uint32_t *) dflag, (volatile unsigned long long *) dg, R);
+        ok = cudaGetLastError() == cudaSuccess;
+    }
+    auto now = []() -> int64_t {
+        return (int64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    };
+    for (int r = 1; ok && r <= R; ++r) {
+        const int64_t h1 = now();
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        flag[0] = (uint32_t) r;
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        int64_t h2 = 0;
+        for (;;) {
+            if (flag[1] == (uint32_t) r) {
+                h2 = now();
+                break;
+            }
+            if (now() - h1 > 1000000000ll) {
+                ok = false;
+                break;
+            }
+        }
+        if (ok) {
+            std::atomic_thread_fence(std::memory_order_acquire);
+            const int64_t g1 = (int64_t) g[2*r];
+            const int64_t g2 = (int64_t) g[2*r + 1];
+            offs.push_back(((g1 - h1) + (g2 - h2))/2);
+        }
+    }
+    if (st) {
+        flag[0] = 0xffffffffu; // a kernel still waiting for a round gives up at its own limit
+        cudaStreamSynchronize(st);
+        cudaStreamDestroy(st);
+    }
+    cudaFreeHost(hp);
+    (void) cudaGetLastError();
+    if (!ok || offs.empty()) {
+        return false;
+    }
+    std::sort(offs.begin(), offs.end());
+    *off_ns = offs[offs.size()/2];
+    return true;
+#endif
 }
 
 void ggml_backend_cuda_moe_bridge_release(ggml_moe_bridge * b) {

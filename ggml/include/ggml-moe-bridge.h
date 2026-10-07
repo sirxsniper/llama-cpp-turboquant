@@ -94,6 +94,9 @@ struct ggml_moe_bridge_chan_times {
     uint64_t fetch_ns;   // the fetch: from its plan to the last copied byte (0: no fetch, or nothing copied)
     uint32_t n_fetch;    // experts the fetch copied
     uint32_t seq;        // the job these belong to
+    uint64_t t_post;     // [TAG_FN_L14_PROBE] device clock (ns): the job's post, the start and the end of the wait
+    uint64_t t_wstart;
+    uint64_t t_wend;
 };
 
 struct ggml_moe_bridge_stats {
@@ -140,6 +143,8 @@ typedef bool     (*ggml_backend_moe_bridge_set_ring_t)(struct ggml_moe_bridge * 
 typedef void     (*ggml_backend_moe_bridge_publish_plan_t)(struct ggml_moe_bridge * bridge, const struct ggml_moe_bridge_job * job);
 // "ggml_backend_moe_bridge_chan_times": the device's times of the last job of a channel
 typedef void     (*ggml_backend_moe_bridge_chan_times_t)(const struct ggml_moe_bridge * bridge, int32_t chan, struct ggml_moe_bridge_chan_times * t);
+// [TAG_FN_L14_PROBE] "ggml_backend_moe_bridge_clock_offset": the device clock minus the host's steady_clock, in ns
+typedef bool     (*ggml_backend_moe_bridge_clock_offset_t)(const struct ggml_moe_bridge * bridge, int64_t * off_ns);
 // "ggml_backend_moe_bridge_release": make every device wait and fetch of this bridge give up at once (exit and crash
 //                                     paths: no kernel keeps spinning on a flag nobody will raise); host memory only
 typedef void     (*ggml_backend_moe_bridge_release_t)(struct ggml_moe_bridge * bridge);

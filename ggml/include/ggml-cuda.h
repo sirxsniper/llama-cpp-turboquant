@@ -120,6 +120,7 @@ GGML_BACKEND_API void     ggml_backend_cuda_moe_bridge_get_stats(const struct gg
 GGML_BACKEND_API bool     ggml_backend_cuda_moe_bridge_set_ring(struct ggml_moe_bridge * bridge, void * host_ptr, size_t size);
 GGML_BACKEND_API void     ggml_backend_cuda_moe_bridge_publish_plan(struct ggml_moe_bridge * bridge, const struct ggml_moe_bridge_job * job);
 GGML_BACKEND_API void     ggml_backend_cuda_moe_bridge_chan_times(const struct ggml_moe_bridge * bridge, int32_t chan, struct ggml_moe_bridge_chan_times * t);
+GGML_BACKEND_API bool     ggml_backend_cuda_moe_bridge_clock_offset(const struct ggml_moe_bridge * bridge, int64_t * off_ns); // [TAG_FN_L14_PROBE]
 GGML_BACKEND_API void     ggml_backend_cuda_moe_bridge_release(struct ggml_moe_bridge * bridge);
 // [TAG_FN_L3_HOST_EXEC]
 GGML_BACKEND_API void     ggml_backend_cuda_moe_bridge_set_watch(struct ggml_moe_bridge * bridge, bool on);

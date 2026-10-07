@@ -7980,6 +7980,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_moe_bridge_chan_times") == 0) {
         return (void *)ggml_backend_cuda_moe_bridge_chan_times;
     }
+    if (strcmp(name, "ggml_backend_moe_bridge_clock_offset") == 0) { // [TAG_FN_L14_PROBE]
+        return (void *)ggml_backend_cuda_moe_bridge_clock_offset;
+    }
     if (strcmp(name, "ggml_backend_moe_bridge_release") == 0) {
         return (void *)ggml_backend_cuda_moe_bridge_release;
     }

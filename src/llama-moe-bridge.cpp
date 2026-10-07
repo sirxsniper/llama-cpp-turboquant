@@ -165,6 +165,14 @@ struct llama_moe_bridge {
     // line every diag_every graphs (N > 1, else 64)
     bool                 diag = false;
     bool                 quiet = false; // [TAG_FN_L3_HOST_QUIET] LLAMA_FN_HOST_QUIET
+    // [TAG_FN_L14_PROBE] LLAMA_FN_L14_PROBE=1 (qwen4exp): per layer, where the time from the device's post to its resume
+    // goes (host and device clocks aligned once at creation); a line every diag_every graphs
+    bool                 probe     = false;
+    int64_t              probe_off = 0; // device clock minus the host's steady clock (ns)
+    double               pr_sum[8] = {};
+    int64_t              pr_n      = 0;
+    int64_t              pr_graphs = 0;
+    ggml_backend_moe_bridge_clock_offset_t fn_clock_off = nullptr;
     int64_t              diag_every = 64;
     std::atomic<int64_t> dg_t_begin{0};     // owner: begin() of the running graph
     std::atomic<bool>    dg_first{false};   // owner sets it in begin(), the executor clears it at the graph's first post
@@ -237,6 +245,12 @@ struct llama_moe_bridge {
         uint32_t             job_n_cpu = 0;
         bool                 job_fetch = false; // the job had a plan (its device fetch times are its own)
         uint32_t             job_seq = 0;       // written last (release fence), read first (acquire fence)
+        // [TAG_FN_L14_PROBE] the host's times of the channel's last job (steady clock, ns); p_seq written last
+        int64_t              p_seen = 0;
+        int64_t              p_js   = 0;
+        int64_t              p_je   = 0;
+        int64_t              p_done = 0;
+        uint32_t             p_seq  = 0;
         std::vector<uint8_t> seen;              // [TAG_FN_R4_REVIEW] [n_expert] scratch of the distinct CPU expert count
         std::vector<uint8_t> trk_seen;          // [TAG_FN_L3_MTP_COST2] [n_expert] scratch of the cold prefix counts
     };
@@ -451,7 +465,13 @@ static bool br_run(const ggml_moe_bridge_job * j, void * ud) {
     if (hold) {
         llama_moe_dma_bridge_hold(true);
     }
+    if (br->probe) {
+        c.p_js = br_now_ns(); // [TAG_FN_L14_PROBE]
+    }
     const bool ok = br->pool_run(br->pool, &job) == GGML_STATUS_SUCCESS;
+    if (br->probe) {
+        c.p_je = br_now_ns();
+    }
     if (hold) {
         llama_moe_dma_bridge_hold(false);
     }
@@ -584,12 +604,20 @@ static void br_exec_main(llama_moe_bridge * br) {
     for (uint32_t k = 1; ; ++k) {
         ggml_moe_bridge_job job;
         if (br->fn_poll(br->gb, &job)) {
+            const int64_t t_seen = br->probe ? br_now_ns() : 0; // [TAG_FN_L14_PROBE]
             if (br->diag && br->dg_first.exchange(false, std::memory_order_acq_rel)) { // [TAG_FN_L3_HOST_DIAG]
                 br->dg_first_sum.fetch_add(br_now_ns() - br->dg_t_begin.load(std::memory_order_acquire), std::memory_order_relaxed);
                 br->dg_first_n.fetch_add(1, std::memory_order_relaxed);
             }
             const bool ok = br_run(&job, br);
             br->fn_complete(br->gb, &job, ok);
+            if (br->probe && job.chan >= 0 && job.chan < (int) br->chans.size()) { // [TAG_FN_L14_PROBE]
+                auto & pc = br->chans[job.chan];
+                pc.p_seen = t_seen;
+                pc.p_done = br_now_ns();
+                std::atomic_thread_fence(std::memory_order_release);
+                pc.p_seq  = job.seq;
+            }
             if (br->diag) {
                 br->dg_t_last_job.store(br_now_ns(), std::memory_order_release);
             }
@@ -802,6 +830,7 @@ llama_moe_bridge * llama_moe_bridge_create(const llama_model & model, int n_thre
     br->fn_set_ring     = (ggml_backend_moe_bridge_set_ring_t)     proc("ggml_backend_moe_bridge_set_ring");
     br->fn_publish_plan = (ggml_backend_moe_bridge_publish_plan_t) proc("ggml_backend_moe_bridge_publish_plan");
     br->fn_chan_times   = (ggml_backend_moe_bridge_chan_times_t)   proc("ggml_backend_moe_bridge_chan_times");
+    br->fn_clock_off    = (ggml_backend_moe_bridge_clock_offset_t) proc("ggml_backend_moe_bridge_clock_offset"); // [TAG_FN_L14_PROBE]
     br->fn_release      = (ggml_backend_moe_bridge_release_t)      proc("ggml_backend_moe_bridge_release");
     if (!br->fn_new || !br->fn_free || !br->fn_id || !br->fn_set_runner || !br->fn_poll || !br->fn_complete ||
         !br->fn_error || !br->fn_reset || !br->fn_get_stats) {
@@ -976,6 +1005,13 @@ llama_moe_bridge * llama_moe_bridge_create(const llama_model & model, int n_thre
         return give_up("the device could not create the bridge");
     }
     br->bid = br->fn_id(br->gb);
+    // [TAG_FN_L14_PROBE] diagnostics only: the clocks are aligned once, and the stamps never change a value
+    if (llama_fn_l3_flag(model, "LLAMA_FN_L14_PROBE") && br->fn_chan_times && br->fn_clock_off) {
+        br->probe = br->fn_clock_off(br->gb, &br->probe_off);
+        LLAMA_LOG_INFO("%s: [TAG_FN_L14_PROBE] %s (device clock - host clock = %" PRId64 " ns)\n", __func__,
+                br->probe ? "per-layer post / pickup / job / completion times on" : "the clocks could not be aligned: probe off",
+                br->probe_off);
+    }
 
     // [TAG_FN_R2_BRIDGE_PF] next-layer prefetch: the channels whose layer il + 1 is a channel too, and that layer's
     // router rows in f16 on the host (2.5 MiB per layer at n_embd 2560 x 512 experts)
@@ -1406,6 +1442,49 @@ bool llama_moe_bridge_end(llama_moe_bridge * br) {
                     br->dg_n_gap ? br->dg_gap_sum/1e3/br->dg_n_gap : 0.0);
             br->dg_n = br->dg_n_gap = 0;
             br->dg_graph_sum = br->dg_tail_sum = br->dg_gap_sum = 0;
+        }
+    }
+
+    // [TAG_FN_L14_PROBE] the graph synced: each channel's last job, host stamps moved to the device clock
+    if (br->probe && err == GGML_MOE_BRIDGE_ERR_NONE) {
+        for (int ch = 0; ch < (int) br->chans.size(); ++ch) {
+            auto & c = br->chans[ch];
+            const uint32_t seq = c.p_seq;
+            std::atomic_thread_fence(std::memory_order_acquire);
+            if (seq == 0) {
+                continue;
+            }
+            c.p_seq = 0;
+            ggml_moe_bridge_chan_times t;
+            br->fn_chan_times(br->gb, ch, &t);
+            if (t.seq != seq || t.t_post == 0 || t.t_wend == 0) {
+                continue;
+            }
+            const double off = (double) br->probe_off;
+            const double tp  = (double) t.t_post;
+            const double tws = (double) t.t_wstart;
+            const double twe = (double) t.t_wend;
+            const double hs  = (double) c.p_seen + off;
+            const double hjs = (double) c.p_js   + off;
+            const double hje = (double) c.p_je   + off;
+            const double hd  = (double) c.p_done + off;
+            const double v[8] = { hs - tp, hjs - hs, hje - hjs, hd - hje, twe - hd, tws - tp, twe - tws, twe - tp };
+            for (int i = 0; i < 8; ++i) {
+                br->pr_sum[i] += v[i];
+            }
+            br->pr_n++;
+        }
+        if (++br->pr_graphs >= br->diag_every && br->pr_n > 0) {
+            const double n = (double) br->pr_n*1e3;
+            LLAMA_LOG_INFO("%s: MoE bridge %d: [TAG_FN_L14_PROBE] per layer (%" PRId64 " jobs): post -> host sees %.1f us, -> job start "
+                    "%.1f, job %.1f, job end -> done %.1f, done -> device sees %.1f | device: post -> wait start %.1f, wait %.1f, "
+                    "post -> resume %.1f\n", __func__, br->bid, br->pr_n, br->pr_sum[0]/n, br->pr_sum[1]/n, br->pr_sum[2]/n,
+                    br->pr_sum[3]/n, br->pr_sum[4]/n, br->pr_sum[5]/n, br->pr_sum[6]/n, br->pr_sum[7]/n);
+            for (double & x : br->pr_sum) {
+                x = 0.0;
+            }
+            br->pr_n      = 0;
+            br->pr_graphs = 0;
         }
     }
 
