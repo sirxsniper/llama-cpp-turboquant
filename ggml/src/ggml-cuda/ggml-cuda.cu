@@ -7892,6 +7892,24 @@ static bool ggml_backend_cuda_turbot_supports_geometry(ggml_backend_dev_t dev, i
     return ggml_cuda_turbot_geometry_supported(dev_ctx->device, head_dim, n_head_kv);
 }
 
+// [TAG_FN_L14_ARENA] the expert arena (locked host memory) registered for direct DMA, without the GGML_CUDA_REGISTER_HOST
+// switch the generic pair needs; false when the driver refuses (the caller keeps its staged copies then)
+static bool ggml_backend_cuda_fn_register_host(void * buffer, size_t size) {
+    cudaError_t err = cudaHostRegister(buffer, size, cudaHostRegisterPortable | cudaHostRegisterReadOnly);
+    if (err != cudaSuccess) {
+        (void) cudaGetLastError();
+        GGML_LOG_WARN("%s: %.0f MiB not registered: %s\n", __func__, size/1048576.0, cudaGetErrorString(err));
+        return false;
+    }
+    return true;
+}
+
+static void ggml_backend_cuda_fn_unregister_host(void * buffer) {
+    if (cudaHostUnregister(buffer) != cudaSuccess) {
+        (void) cudaGetLastError();
+    }
+}
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
@@ -7908,6 +7926,12 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_unregister_host_buffer") == 0) {
         return (void *)ggml_backend_cuda_unregister_host_buffer;
+    }
+    if (strcmp(name, "ggml_backend_fn_register_host") == 0) { // [TAG_FN_L14_ARENA]
+        return (void *)ggml_backend_cuda_fn_register_host;
+    }
+    if (strcmp(name, "ggml_backend_fn_unregister_host") == 0) {
+        return (void *)ggml_backend_cuda_fn_unregister_host;
     }
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_cuda_get_features;

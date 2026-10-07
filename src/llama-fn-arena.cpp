@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstring>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -31,10 +32,27 @@ struct llama_fn_arena {
         void * p      = nullptr;
         size_t size   = 0;
         bool   locked = false;
+        bool   pinned = false;
     };
     std::vector<chunk>                 chunks;
     std::vector<ggml_backend_buffer_t> bufs;
+    void (*unreg)(void *) = nullptr;
 };
+
+// the registered chunks of every arena, for llama_fn_arena_pinned
+static std::mutex                                     g_fn_arena_mtx;
+static std::vector<std::pair<const char *, size_t>>   g_fn_arena_pinned;
+
+bool llama_fn_arena_pinned(const void * p, size_t n) {
+    const char * c = (const char *) p;
+    std::lock_guard<std::mutex> lk(g_fn_arena_mtx);
+    for (const auto & r : g_fn_arena_pinned) {
+        if (c >= r.first && c + n <= r.first + r.second) {
+            return true;
+        }
+    }
+    return false;
+}
 
 void llama_fn_arena_deleter::operator()(llama_fn_arena * a) const {
     if (a == nullptr) {
@@ -42,6 +60,18 @@ void llama_fn_arena_deleter::operator()(llama_fn_arena * a) const {
     }
     for (ggml_backend_buffer_t b : a->bufs) {
         ggml_backend_buffer_free(b);
+    }
+    for (auto & c : a->chunks) {
+        if (c.pinned) {
+            {
+                std::lock_guard<std::mutex> lk(g_fn_arena_mtx);
+                g_fn_arena_pinned.erase(std::remove_if(g_fn_arena_pinned.begin(), g_fn_arena_pinned.end(),
+                        [&](const std::pair<const char *, size_t> & r) { return r.first == (const char *) c.p; }), g_fn_arena_pinned.end());
+            }
+            if (a->unreg) {
+                a->unreg(c.p);
+            }
+        }
     }
 #ifdef _WIN32
     for (auto & c : a->chunks) {
@@ -332,6 +362,30 @@ llama_fn_arena_ptr llama_fn_arena_build(llama_model & model, llama_model_loader 
         }
     }
 
+    // [TAG_FN_L14_ARENA] each chunk registered for direct device copies (the prefill stream reads it without its staging
+    // ring); the driver may refuse past its limit, and those layers keep the ring
+    size_t n_pinned = 0;
+    size_t pinned_bytes = 0;
+    const int64_t t_pin0 = ggml_time_us();
+    if (llama_fn_l3_int(model, "LLAMA_FN_L14_ARENA_PIN", 1) != 0) {
+        ggml_backend_reg_t reg = ggml_backend_reg_by_name("CUDA");
+        auto reg_fn = reg ? (bool (*)(void *, size_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_fn_register_host") : nullptr;
+        arena->unreg = reg ? (void (*)(void *)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_fn_unregister_host") : nullptr;
+        if (reg_fn != nullptr && arena->unreg != nullptr) {
+            for (auto & c : arena->chunks) {
+                if (!reg_fn(c.p, c.size)) {
+                    break;
+                }
+                c.pinned = true;
+                n_pinned++;
+                pinned_bytes += c.size;
+                std::lock_guard<std::mutex> lk(g_fn_arena_mtx);
+                g_fn_arena_pinned.emplace_back((const char *) c.p, c.size);
+            }
+        }
+    }
+    const double secs_pin = (ggml_time_us() - t_pin0)/1e6;
+
     GlobalMemoryStatusEx(&ms);
     const double secs = (ggml_time_us() - t0)/1e6;
     LLAMA_LOG_INFO("%s: [TAG_FN_L14_ARENA] %zu of %d host layers' routed experts (%.2f GiB) read into locked RAM in %.1f s "
@@ -339,6 +393,8 @@ llama_fn_arena_ptr llama_fn_arena_build(llama_model & model, llama_model_loader 
             layers.size(), n_layer, moved/1073741824.0, secs, n_bytes.load()/1e9/std::max(1e-6, t_read/1e6),
             (size_t) n_layer - layers.size(), (total - locked_bytes)/1073741824.0, ms.ullAvailPhys/1073741824.0,
             reserve/1073741824.0);
+    LLAMA_LOG_INFO("%s: [TAG_FN_L14_ARENA] %zu of %zu arena layers (%.2f GiB) registered for direct device copies in %.1f s\n",
+            __func__, n_pinned, arena->chunks.size(), pinned_bytes/1073741824.0, secs_pin);
     return arena;
 }
 

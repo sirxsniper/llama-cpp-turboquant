@@ -14,6 +14,7 @@
 #include "llama-moe-gen5.h"
 #include "llama-moe-gen5-impl.h"
 #include "llama-moecache.h" // [TAG_FN_R1_PFS_LEND]
+#include "llama-fn-arena.h"  // [TAG_FN_L14_ARENA]
 
 #include "llama-impl.h"
 
@@ -571,6 +572,12 @@ bool llama_prefill_stream_init_layers(const std::vector<llama_moe_gen5_layer_des
             max_alloc[k] = std::max(max_alloc[k], a);
             L.src_pinned = L.src_pinned && L.src[k]->buffer && ggml_backend_buffer_get_type(L.src[k]->buffer) == host_buft;
         }
+        // [TAG_FN_L14_ARENA] the expert arena's registered layers: direct copies, no staging ring
+        bool arena = true;
+        for (int k = 0; k < 3; ++k) {
+            arena = arena && llama_fn_arena_pinned(L.src[k]->data, ggml_nbytes(L.src[k]));
+        }
+        L.src_pinned = L.src_pinned || arena;
         s->by_up[L.src[0]] = (int) p;
     }
     s->off[0]    = 0;
