@@ -5838,6 +5838,15 @@ void llama_context::moe_hot_fit_try() {
 
     size_t ceiling = llama_fn_vram_ceiling_default(mem_total);
     const char * cap_src = "default: total - max(1536 MiB, total/8)";
+    // [TAG_FN_L7_VRAMKEEP] LLAMA_FN_VRAM_KEEP_MIB (the qwen4exp profile sets it): the ceiling keeps this much of the device
+    // free instead of total/8 (at least 1536 MiB). The hot set is the decode's main lever (A/B l7/probe: +1.6 GB of hot
+    // experts = +6.9 % real use); LLAMA_MOE_HOT_CAP_MIB still overrides.
+    if (const char * e = llama_fn_env(model, "LLAMA_FN_VRAM_KEEP_MIB"); e && atoi(e) > 0) {
+        const size_t keep = std::max<size_t>((size_t) 1536 << 20, (size_t) atoi(e) << 20);
+        const size_t step = (size_t) 256 << 20;
+        ceiling = mem_total > keep ? (mem_total - keep) / step * step : 0;
+        cap_src = "LLAMA_FN_VRAM_KEEP_MIB";
+    }
     if (const char * e = llama_fn_env(model, "LLAMA_MOE_HOT_CAP_MIB"); e && atoi(e) > 0) {
         ceiling = (size_t) atoi(e) << 20;
         cap_src = "LLAMA_MOE_HOT_CAP_MIB";

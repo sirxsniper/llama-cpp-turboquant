@@ -147,6 +147,10 @@ const fn_item k_items[] = {
     // A/B 32K real use +2.8 %, ms/step -5.4 % (l6/gk/ab6.log). PRESYNC stays off (net zero).
     { "LLAMA_FN_L6_L2PF",            "1",     P_ALL }, // [TAG_FN_L6_L2PF]
     { "LLAMA_FN_L6_HCCOMB",          "1",     P_ALL }, // [TAG_FN_L6_HCCOMB]
+    // [TAG_FN_L7_ADOPT] round 7: the VRAM ceiling keeps 2100 MiB free instead of total/8 (5090: 30,464 instead of 28,416
+    // MiB): +2 GB of hot experts, A/B l7/ab7 (2 rounds, 262K) real use +7.2 % (32K +7.7, 131K +9.2, 245K +4.7 %), device use
+    // 29.7 GB in decode
+    { "LLAMA_FN_VRAM_KEEP_MIB",      "2100",  P_ALL }, // [TAG_FN_L7_VRAMKEEP]
 };
 
 // names the fn-auto aware code reads through llama_fn_env(): never put into the environment
