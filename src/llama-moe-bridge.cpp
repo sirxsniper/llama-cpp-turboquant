@@ -168,10 +168,14 @@ struct llama_moe_bridge {
     // [TAG_FN_L14_PROBE] LLAMA_FN_L14_PROBE=1 (qwen4exp): per layer, where the time from the device's post to its resume
     // goes (host and device clocks aligned once at creation); a line every diag_every graphs
     bool                 probe     = false;
-    int64_t              probe_off = 0; // device clock minus the host's steady clock (ns)
-    double               pr_sum[8] = {};
-    int64_t              pr_n      = 0;
+    int64_t              probe_off = 0; // device clock minus the host's steady clock (ns), at probe_t0 (host)
+    int64_t              probe_t0  = 0;
     int64_t              pr_graphs = 0;
+    struct pr_job {
+        int64_t  seen, js, je, done;          // host clock
+        uint64_t tp, tpub, tws, twe;          // device clock
+    };
+    std::vector<pr_job>  pr_jobs;             // the window's jobs; split once the window's end calibration is known
     ggml_backend_moe_bridge_clock_offset_t fn_clock_off = nullptr;
     int64_t              diag_every = 64;
     std::atomic<int64_t> dg_t_begin{0};     // owner: begin() of the running graph
@@ -1007,7 +1011,8 @@ llama_moe_bridge * llama_moe_bridge_create(const llama_model & model, int n_thre
     br->bid = br->fn_id(br->gb);
     // [TAG_FN_L14_PROBE] diagnostics only: the clocks are aligned once, and the stamps never change a value
     if (llama_fn_l3_flag(model, "LLAMA_FN_L14_PROBE") && br->fn_chan_times && br->fn_clock_off) {
-        br->probe = br->fn_clock_off(br->gb, &br->probe_off);
+        br->probe    = br->fn_clock_off(br->gb, &br->probe_off);
+        br->probe_t0 = br_now_ns();
         LLAMA_LOG_INFO("%s: [TAG_FN_L14_PROBE] %s (device clock - host clock = %" PRId64 " ns)\n", __func__,
                 br->probe ? "per-layer post / pickup / job / completion times on" : "the clocks could not be aligned: probe off",
                 br->probe_off);
@@ -1445,7 +1450,9 @@ bool llama_moe_bridge_end(llama_moe_bridge * br) {
         }
     }
 
-    // [TAG_FN_L14_PROBE] the graph synced: each channel's last job, host stamps moved to the device clock
+    // [TAG_FN_L14_PROBE] the graph synced: each channel's last job is kept; at the end of a window the clocks are aligned
+    // again (no graph runs, nothing spins on mapped memory) and the offset is interpolated over the window (the two
+    // clocks drift ~10 us per second), so every job's stamps compare on one clock
     if (br->probe && err == GGML_MOE_BRIDGE_ERR_NONE) {
         for (int ch = 0; ch < (int) br->chans.size(); ++ch) {
             auto & c = br->chans[ch];
@@ -1457,33 +1464,52 @@ bool llama_moe_bridge_end(llama_moe_bridge * br) {
             c.p_seq = 0;
             ggml_moe_bridge_chan_times t;
             br->fn_chan_times(br->gb, ch, &t);
-            if (t.seq != seq || t.t_post == 0 || t.t_wend == 0) {
+            if (t.seq != seq || t.t_post == 0 || t.t_wend == 0 || t.t_pub == 0) {
                 continue;
             }
-            const double off = (double) br->probe_off;
-            const double tp  = (double) t.t_post;
-            const double tws = (double) t.t_wstart;
-            const double twe = (double) t.t_wend;
-            const double hs  = (double) c.p_seen + off;
-            const double hjs = (double) c.p_js   + off;
-            const double hje = (double) c.p_je   + off;
-            const double hd  = (double) c.p_done + off;
-            const double v[8] = { hs - tp, hjs - hs, hje - hjs, hd - hje, twe - hd, tws - tp, twe - tws, twe - tp };
-            for (int i = 0; i < 8; ++i) {
-                br->pr_sum[i] += v[i];
-            }
-            br->pr_n++;
+            br->pr_jobs.push_back({ c.p_seen, c.p_js, c.p_je, c.p_done, t.t_post, t.t_pub, t.t_wstart, t.t_wend });
         }
-        if (++br->pr_graphs >= br->diag_every && br->pr_n > 0) {
-            const double n = (double) br->pr_n*1e3;
-            LLAMA_LOG_INFO("%s: MoE bridge %d: [TAG_FN_L14_PROBE] per layer (%" PRId64 " jobs): post -> host sees %.1f us, -> job start "
-                    "%.1f, job %.1f, job end -> done %.1f, done -> device sees %.1f | device: post -> wait start %.1f, wait %.1f, "
-                    "post -> resume %.1f\n", __func__, br->bid, br->pr_n, br->pr_sum[0]/n, br->pr_sum[1]/n, br->pr_sum[2]/n,
-                    br->pr_sum[3]/n, br->pr_sum[4]/n, br->pr_sum[5]/n, br->pr_sum[6]/n, br->pr_sum[7]/n);
-            for (double & x : br->pr_sum) {
-                x = 0.0;
+        if (++br->pr_graphs >= br->diag_every && !br->pr_jobs.empty()) {
+            int64_t off1 = 0;
+            const int64_t t1 = br_now_ns();
+            if (br->fn_clock_off(br->gb, &off1)) {
+                const double t0  = (double) br->probe_t0;
+                const double o0  = (double) br->probe_off;
+                const double rate = t1 > br->probe_t0 ? ((double) off1 - o0)/((double) t1 - t0) : 0.0;
+                double s_kpub = 0, s_seen = 0, s_js = 0, s_job = 0, s_done = 0, s_dsee = 0, s_dev = 0, s_wait = 0, s_slack = 0, s_res = 0;
+                int64_t n = 0, n_wait = 0, n_ready = 0;
+                for (const auto & j : br->pr_jobs) {
+                    const double off = o0 + rate*((double) j.seen - t0);
+                    const double hs  = (double) j.seen + off;
+                    const double hd  = (double) j.done + off;
+                    s_kpub += (double) j.tpub - (double) j.tp;
+                    s_seen += hs - (double) j.tpub;
+                    s_js   += (double) (j.js - j.seen);
+                    s_job  += (double) (j.je - j.js);
+                    s_done += (double) (j.done - j.je);
+                    s_dev  += (double) j.tws - (double) j.tp;
+                    s_wait += (double) j.twe - (double) j.tws;
+                    s_res  += (double) j.twe - (double) j.tp;
+                    if (hd > (double) j.tws) {
+                        s_dsee += (double) j.twe - hd; // the device was already waiting when the host answered
+                        n_wait++;
+                    } else {
+                        s_slack += (double) j.tws - hd; // the answer was there before the device looked
+                        n_ready++;
+                    }
+                    n++;
+                }
+                const double u = 1e3;
+                LLAMA_LOG_INFO("%s: MoE bridge %d: [TAG_FN_L14_PROBE] per layer (%" PRId64 " jobs): post kernel to stamp %.1f us, stamp -> "
+                        "host sees %.1f, -> job start %.1f, job %.1f, -> done %.1f; done -> device sees %.1f (%" PRId64 " jobs the "
+                        "device waited for), answer ready %.1f us before the device looked (%" PRId64 " jobs) | device: post -> wait "
+                        "start %.1f, wait %.1f, post -> resume %.1f | clock drift %.1f us/s\n", __func__, br->bid, n,
+                        s_kpub/n/u, s_seen/n/u, s_js/n/u, s_job/n/u, s_done/n/u, n_wait ? s_dsee/n_wait/u : 0.0, n_wait,
+                        n_ready ? s_slack/n_ready/u : 0.0, n_ready, s_dev/n/u, s_wait/n/u, s_res/n/u, rate*1e6/1e3);
+                br->probe_off = off1;
+                br->probe_t0  = t1;
             }
-            br->pr_n      = 0;
+            br->pr_jobs.clear();
             br->pr_graphs = 0;
         }
     }

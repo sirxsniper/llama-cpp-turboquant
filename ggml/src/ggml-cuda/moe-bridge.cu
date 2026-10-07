@@ -82,7 +82,9 @@ struct alignas(64) mb_chan_hdr {
     uint32_t done;  // host: the answered job
     uint32_t taken; // host: the job being computed (a wait then allows job_max_ns instead of timeout_ns)
     uint32_t plan;  // [TAG_FN_R4_BRIDGE_DMA] host: the job whose plan is published
-    uint32_t pad1[13];
+    uint32_t pad1a;
+    unsigned long long t_pub; // [TAG_FN_L14_PROBE] device clock: the post's stamp was published (the host may see it)
+    uint32_t pad1[10];
 };
 
 struct alignas(64) mb_glob {
@@ -292,6 +294,7 @@ static __global__ void k_mb_post(const mb_dev v, const int chan,
             mb_ring_entry * e = v.ring + (g % MB_RING);
             *(volatile uint32_t *) &e->chan = (uint32_t) chan;
             *(volatile uint32_t *) &e->seq  = seq;
+            *(volatile unsigned long long *) &h->t_pub = mb_now_ns(); // [TAG_FN_L14_PROBE]
             __threadfence_system();
             *(volatile uint32_t *) &e->stamp        = g;
             *(volatile uint32_t *) &v.glob->posted  = g;
@@ -659,8 +662,9 @@ static __device__ __forceinline__ void fn_l4_post_head(const mb_dev v, const int
 }
 
 // thread ctl, after every thread's fence and the barrier: the stamp, then the ticket (0 when nothing was posted)
-static __device__ __forceinline__ void fn_l4_post_publish(const mb_dev v, const uint32_t seq, const uint32_t g, int32_t * ticket) {
+static __device__ __forceinline__ void fn_l4_post_publish(const mb_dev v, const int chan, const uint32_t seq, const uint32_t g, int32_t * ticket) {
     if (seq != 0 && v.mode == GGML_MOE_BRIDGE_WAIT_SPIN) {
+        *(volatile unsigned long long *) &v.hdr[chan].t_pub = mb_now_ns(); // [TAG_FN_L14_PROBE]
         mb_ring_entry * e = v.ring + (g % MB_RING);
         *(volatile uint32_t *) &e->stamp       = g;
         *(volatile uint32_t *) &v.glob->posted = g;
@@ -746,7 +750,7 @@ static __global__ void __launch_bounds__(FN_L4_POST_THREADS) k_fn_l4_mb_post(con
     __syncthreads();
 
     if (tid == ctl) {
-        fn_l4_post_publish(v, seq, s_g, ticket);
+        fn_l4_post_publish(v, chan, seq, s_g, ticket);
     }
 }
 
@@ -1024,7 +1028,7 @@ static __global__ void __launch_bounds__(FN_L4_TOPK_THREADS, 1) k_fn_l4_topk_pos
             const uint32_t seq = *(volatile uint32_t *) &sy[1];
             const uint32_t g   = *(volatile uint32_t *) &sy[2];
             *(volatile uint32_t *) &sy[0] = 0;
-            fn_l4_post_publish(v, seq, g, ticket);
+            fn_l4_post_publish(v, chan, seq, g, ticket);
         }
     }
 }
@@ -1462,6 +1466,7 @@ void ggml_backend_cuda_moe_bridge_chan_times(const ggml_moe_bridge * b, int32_t 
     t->t_post   = h->t_post;   // [TAG_FN_L14_PROBE]
     t->t_wstart = h->t_wstart;
     t->t_wend   = h->t_wend;
+    t->t_pub    = h->t_pub;
 }
 
 // [TAG_FN_L14_PROBE] the device clock (%globaltimer) minus the host clock (steady_clock ns): five round trips through

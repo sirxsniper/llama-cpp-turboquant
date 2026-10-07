@@ -97,6 +97,7 @@ struct ggml_moe_bridge_chan_times {
     uint64_t t_post;     // [TAG_FN_L14_PROBE] device clock (ns): the job's post, the start and the end of the wait
     uint64_t t_wstart;
     uint64_t t_wend;
+    uint64_t t_pub;      // [TAG_FN_L14_PROBE] device clock: the post's stamp published
 };
 
 struct ggml_moe_bridge_stats {
