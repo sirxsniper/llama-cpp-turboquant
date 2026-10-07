@@ -155,6 +155,9 @@ const fn_item k_items[] = {
     // CUDA graphs) keep their shapes 8x longer
     { "LLAMA_KPOOL_PAD",             "512",   P_ALL },
     { "LLAMA_KV_PAD_INDEXER",        "2048",  P_ALL },
+    // [TAG_FN_L9_ADOPT] round 9: the prefetch hint picks the next layer's top-k in its own kernel (exact, identity PASS);
+    // A/B l9/ab9 (2 rounds, 262K) real use mean +3.3 % (131K +6.4, 245K +3.2 %), prose +5.2 %
+    { "LLAMA_FN_L9_HINTTOPK",        "1",     P_BR  }, // [TAG_FN_L9_HINTTOPK]
 };
 
 // names the fn-auto aware code reads through llama_fn_env(): never put into the environment
