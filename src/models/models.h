@@ -2553,6 +2553,11 @@ struct llama_model_qwen4exp : public llama_model_base {
     mutable std::mutex                      ple_pre_mutex;
     mutable std::shared_ptr<ple_prefetcher> ple_pre;
     mutable int                             ple_pre_on = -1; // -1: the switch is not read yet
+    // [TAG_FN_L11_EMBDLOCK] LLAMA_FN_L11_EMBDLOCK=1: the host token-embedding table locked in the working set (its rows were
+    // read back from disk after Windows trimmed them: ~0.9 hard faults per host gather); shared_ptr: the type stays incomplete
+    mutable std::mutex                      embd_lock_mtx;
+    mutable std::shared_ptr<struct llama_mlock> embd_lock;
+    mutable bool                            embd_lock_tried = false;
     // [TAG_FN_L3_GPU] the lever mask this model last logged (-1: none yet). Per model: the fit probe builds its graphs on
     // a model of its own while the log level is demoted, so the real model still logs its line at INFO.
     mutable std::atomic<int> l3_logged{-1};

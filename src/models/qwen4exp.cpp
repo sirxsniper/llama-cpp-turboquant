@@ -5,6 +5,7 @@
 #include "llama-moetrace.h" // [TAG_FN_MOE_TRACE]
 #include "llama-moe-gen5.h" // [TAG_MOE_PREFETCH]
 #include "llama-ple-dio.h"  // [TAG_FN_PLE_DIRECT_IO]
+#include "llama-mmap.h"     // [TAG_FN_L11_EMBDLOCK]
 #include "llama-ext.h"      // [TAG_FN_SHIP1] llama_model_fn_env
 #include "llama-moe-bridge.h" // [TAG_FN_L3_CPU_DEVPRED]
 
@@ -2706,10 +2707,34 @@ public:
     std::vector<float>  buf;
 };
 
+// [TAG_FN_L11_EMBDLOCK] once per model: lock the host table the gathers read (qwen4exp, LLAMA_FN_L11_EMBDLOCK)
+static void qwen4exp_lock_embd(const llama_model & model, const ggml_tensor * table) {
+    const auto * m = dynamic_cast<const llama_model_qwen4exp *>(&model);
+    if (m == nullptr || table == nullptr || table->data == nullptr) {
+        return;
+    }
+    std::lock_guard<std::mutex> lk(m->embd_lock_mtx);
+    if (m->embd_lock_tried) {
+        return;
+    }
+    m->embd_lock_tried = true;
+    if (!llama_mlock::SUPPORTED || !llama_fn_l3_flag(model, "LLAMA_FN_L11_EMBDLOCK")) {
+        return;
+    }
+    const int64_t t0 = ggml_time_us();
+    auto ml = std::make_shared<llama_mlock>();
+    ml->init(table->data);
+    ml->grow_to(ggml_nbytes(table));
+    m->embd_lock = ml;
+    LLAMA_LOG_INFO("%s: [TAG_FN_L11_EMBDLOCK] %s locked in the working set: %.0f MiB in %.0f ms\n", __func__, table->name,
+            ggml_nbytes(table)/1048576.0, (ggml_time_us() - t0)/1000.0);
+}
+
 ggml_tensor * llama_model_qwen4exp::graph::build_inp_embd_host(ggml_tensor * table, ggml_tensor ** h_out) {
     if (!ubatch.token || !loras->empty() || !qwen4exp_host_gather_ok(table)) {
         return nullptr;
     }
+    qwen4exp_lock_embd(model, table); // [TAG_FN_L11_EMBDLOCK]
     auto inp = std::make_unique<llm_graph_input_embd_host>(table);
     inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, table->ne[0], n_tokens);
     ggml_set_input(inp->embd);
