@@ -1535,7 +1535,10 @@ bool llama_moe_bridge_end(llama_moe_bridge * br) {
     br->err_graph = br->n_graphs;
     br->n_errors++;
     br->active     = false;
-    br->pause_left = 16;
+    // [TAG_FN_L7_PAUSE1] a first error (none within 1024 graphs) pauses only the retried ubatch: the stall was transient (a
+    // cold first job after an idle gap - its pages are in now) and every paused step runs the slow CPU path (16 paused
+    // steps cost 7 s in l4/int7/conf7_L7_r1.log); a second error within 1024 graphs pauses 16 steps as before
+    br->pause_left = br->n_errors <= 1 ? 1 : 16;
     if (br->n_errors >= 3) {
         br->disabled = true;
         if (br->rearm_steps > 0) { // [TAG_FN_L3_HOST_REARM] back-off; a long clean run since the last turn-off starts over
@@ -1556,6 +1559,6 @@ bool llama_moe_bridge_end(llama_moe_bridge * br) {
     }
     LLAMA_LOG_WARN("%s: MoE bridge %d: %s at layer %d: this ubatch fails; %s\n", __func__, br->bid,
             err == GGML_MOE_BRIDGE_ERR_TIMEOUT ? "wait timeout" : "host job failed", il,
-            br->disabled ? "3 errors, the bridge stays off for this context" : "the bridge pauses for 16 steps");
+            br->disabled ? "3 errors, the bridge stays off for this context" : br->pause_left > 1 ? "the bridge pauses for 16 steps" : "only the retry runs without the bridge");
     return false;
 }
