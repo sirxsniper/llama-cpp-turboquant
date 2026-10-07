@@ -164,6 +164,11 @@ const fn_item k_items[] = {
     // [TAG_FN_L11_ADOPT] round 11: the host token-embedding table and the PLE row cache locked in the working set (0.9 / 1.4
     // page faults per host input before); embd gather 69 -> 5 us (target) and 99 -> 9 us (draft) per graph
     { "LLAMA_FN_L11_EMBDLOCK",       "1",     P_ALL }, // [TAG_FN_L11_EMBDLOCK]
+    // [TAG_FN_L12_ADOPT] round 12: a prompt chunk under 384 tokens runs its host experts on the CPU instead of streaming every
+    // expert of all 48 layers through the GPU (~3.4 s whatever the size): on a 24K context 32 / 128 / 256 new tokens took
+    // 3.39 / 3.40 / 3.38 s, now 0.33 / 0.84 / 1.42 s (l11/pp_mid; the CPU path costs more than the stream from ~600 tokens)
+    { "LLAMA_PREFILL_STREAM_MIN",    "384",   P_ALL }, // [TAG_FN_L12_PROMPTMIN]
+    { "GGML_OP_OFFLOAD_MIN_BATCH",   "384",   P_ALL }, // [TAG_FN_L12_PROMPTMIN] no op-offload copy below it either
 };
 
 // names the fn-auto aware code reads through llama_fn_env(): never put into the environment
