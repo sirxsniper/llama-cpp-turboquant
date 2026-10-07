@@ -108,6 +108,7 @@ struct kvl_region {
     size_t        ext   = 0;  // the bytes up to the next region (the guard included)
     size_t        row   = 0;  // bytes per cell
     size_t        mapped = 0; // bytes mapped from start
+    size_t        alloc  = 0; // [TAG_FN_L10_KVLEND2] the tensor's alloc size (a quantized tensor's rows pad past nbytes)
     std::vector<std::pair<size_t, size_t>> maps; // [lo, hi) relative to start, one map call each
 };
 
@@ -171,7 +172,9 @@ size_t kvl_extra_total(const kvl_state * self, size_t self_bytes) {
 }
 
 size_t kvl_bytes_for(const kvl_region & r, uint32_t cells) {
-    return std::min(r.ext, kvl_round_up((size_t) cells * r.row, g_kvl.gran));
+    // [TAG_FN_L10_KVLEND2] all cells: the alloc size's padding too
+    const size_t want = cells >= g_kvl.kv_size ? std::max((size_t) cells * r.row, r.alloc) : (size_t) cells * r.row;
+    return std::min(r.ext, kvl_round_up(want, g_kvl.gran));
 }
 
 size_t kvl_mapped_total() {
@@ -208,6 +211,11 @@ bool kvl_map_to(uint32_t cells) {
             }
             r.maps.push_back({ r.mapped, e });
             r.mapped = e;
+            // [TAG_FN_L10_KVLEND2] the padding past nbytes is mapped now: the buffer's tensor init clears it (it was
+            // skipped at the placement, where these bytes had no memory yet)
+            if (r.alloc > tb && r.mapped >= r.alloc) {
+                ggml_backend_buffer_init_tensor(g_kvl.buf, r.t);
+            }
         }
     }
     kvl_set_cells();
@@ -263,6 +271,7 @@ static ggml_backend_buffer_t kvl_alloc(const llama_kv_cache * kv, ggml_context *
             r.t     = t;
             r.start = off;
             r.row   = t->nb[1];
+            r.alloc = ggml_backend_buft_get_alloc_size(buft, t); // [TAG_FN_L10_KVLEND2]
             regs.push_back(r);
             place.push_back({ t, off });
             off += ggml_backend_buft_get_alloc_size(buft, t);
@@ -298,6 +307,13 @@ static ggml_backend_buffer_t kvl_alloc(const llama_kv_cache * kv, ggml_context *
     }
     uint8_t * p0 = (uint8_t *) ggml_backend_buffer_get_base(buf);
     for (const auto & [t, o] : place) {
+        if (base.count(t) != 0) {
+            // [TAG_FN_L10_KVLEND2] a base tensor's padding (quantized rows) lies past the mapped cells: no tensor init
+            // here (it would clear unmapped bytes), kvl_map_to runs it once the padding is mapped
+            t->buffer = buf;
+            t->data   = p0 + o;
+            continue;
+        }
         if (ggml_backend_tensor_alloc(buf, t, p0 + o) != GGML_STATUS_SUCCESS) {
             return fail();
         }
