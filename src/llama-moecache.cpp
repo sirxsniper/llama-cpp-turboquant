@@ -259,6 +259,8 @@ struct moe_cache {
     // (group j = the j-th share of every lend tensor), given to the KV cache top group first, taken back bottom first
     bool                  sl_req  = false; // asked for at this init
     bool                  sl_fail = false; // the placement could not lend: the init fails, the KV cache maps whole
+    bool                  sl_retry = false; // the segments came out short of the KV cache's want: one slot more per lend layer
+    int32_t               sl_extra = 0;
     bool                  sl_on   = false;
     std::vector<std::vector<std::pair<size_t, size_t>>> sl_grp; // per group: [lo, hi) byte ranges of the buffer
     std::vector<size_t>   sl_grp_bytes;
@@ -2050,9 +2052,7 @@ ggml_backend_buffer_t hot_vmm_place(moe_cache * mc, ggml_context * ctx_d, ggml_b
             }
         }
         if (sum < g_kv_want) {
-            LLAMA_LOG_WARN("moe-hot: [TAG_FN_L10_SLOTLEND] the lend layers' segments hold %.0f MiB, the KV cache may want %.0f MiB "
-                    "- no slot lend\n", sum/1048576.0, g_kv_want/1048576.0);
-            mc->sl_fail = true;
+            mc->sl_retry = true; // the caller sizes one slot more per lend layer
             return nullptr;
         }
     }
@@ -2509,12 +2509,16 @@ bool llama_moe_hot_init(const llama_model & model, const void * owner, size_t bu
                     per += layers[trunk[i]].bytes;
                 }
                 if (per > 0) {
-                    const size_t waste = sl_layers.size()*3*(2*vmm_gran + SL_SLACK);
-                    sl_e = (int32_t) ((g_kv_want + waste + per - 1)/per) + 1;
+                    // about one granule per tensor stays mapped at its segment ends (the start's slack, the zero slot's
+                    // granule); a placement that comes out short asks for one slot more (sl_extra)
+                    const size_t waste = sl_layers.size()*3*(vmm_gran + SL_SLACK);
+                    sl_e = (int32_t) ((g_kv_want + waste + per - 1)/per) + mc->sl_extra;
                 }
             }
-            const size_t sl_used = (size_t) sl_e*[&]() { size_t p = 0; for (int li : sl_layers) { p += layers[li].bytes; } return p; }();
-            const int32_t n = llama_fn_even_slots(bytes, budget_slots > sl_used ? budget_slots - sl_used : 0, n_exp_min);
+            // the base slots from the budget without the KV cache's unmapped bytes: what a fit with the KV cache mapped
+            // whole would give (the lend's few granules of waste come out of the headroom)
+            const size_t sl_base_cut = sl_e > 0 ? g_kv_want : 0;
+            const int32_t n = llama_fn_even_slots(bytes, budget_slots > sl_base_cut ? budget_slots - sl_base_cut : 0, n_exp_min);
             for (size_t li = 0; li < layers.size(); ++li) {
                 n_slots_of[li] = n;
                 used += (size_t) n*layers[li].bytes;
@@ -2723,6 +2727,16 @@ bool llama_moe_hot_init(const llama_model & model, const void * owner, size_t bu
             if (ok) {
                 mc->bufs.push_back(buf);
             }
+        }
+        if (!ok && mc->sl_retry) {
+            // [TAG_FN_L10_SLOTLEND] the segments fell short: one slot more per lend layer, the same budget
+            mc->sl_retry = false;
+            if (++mc->sl_extra <= 4) {
+                LLAMA_LOG_INFO("moe-hot: [TAG_FN_L10_SLOTLEND] the lend layers' segments fall short of the KV cache's want: "
+                        "%d slot(s) more per lend layer\n", mc->sl_extra);
+                continue;
+            }
+            mc->sl_fail = true;
         }
         if (!ok && mc->sl_fail) {
             break; // [TAG_FN_L10_SLOTLEND] logged: the caller maps the KV cache whole and fits again
