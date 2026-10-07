@@ -30,8 +30,8 @@ code, 1 stream · 262K context · 4 slots
 
 **Qwen3.8-Flash-Next** · UD-Q4_K_XL (100+ GB MoE)
 
-## 95 t/s
-real use at 32K · **82 t/s at 245K** filled
+## 99 t/s
+real use at 32K · **89 t/s at 131K** filled
 
 prompt reading **1,500–2,060 t/s**
 
@@ -128,16 +128,18 @@ Five GPU memory bugs found with compute-sanitizer and fixed; no GPU work left in
 
 262K context, turbot KV, 1 stream. *Real use* = temperature 1, top-p 0.95, top-k 20, thinking on, 2,048-token answers on a context already filled to the given depth.
 
-| | first 262K build (Oct 4) | **v0.15.0** |
-|:--|--:|--:|
-| Real use, 32K filled | 30.3 t/s | **94.6 t/s** |
-| Real use, 131K filled | 26.1 t/s | **84.2 t/s** |
-| Real use, 245K filled | 24.5 t/s | **81.5 t/s** |
-| Benchmark, greedy code | 39 t/s | **91 t/s** |
-| Prompt reading, fresh 32K / 131K | ~150 t/s | **1,508 / 2,059 t/s** |
+| | first 262K build (Oct 4) | v0.15.0 | **v0.16.0** |
+|:--|--:|--:|--:|
+| Real use, 32K filled | 30.3 t/s | 91.0 t/s | **99.1 t/s** |
+| Real use, 131K filled | 26.1 t/s | 82.8 t/s | **89.5 t/s** |
+| Real use, 245K filled | 24.5 t/s | 84.8 t/s | **92.0 t/s** |
+| Benchmark, greedy code | 39 t/s | 89 t/s | **93 t/s** |
+| Prompt reading, fresh 32K / 131K | ~150 t/s | 1,508 / 2,059 t/s | about the same |
 
 - Quality: KLD vs the original file **0.0109** (same top token 97.3 %); needle recall passes at 131K and 245K.
-- VRAM about 29.5 GB while generating (the expert hot set takes the free VRAM up to 2.1 GB below the card total; `LLAMA_FN_VRAM_KEEP_MIB=4096` keeps more free); the rest of the model stays memory-mapped.
+- v0.15.0 and v0.16.0 measured back to back in one session (2 interleaved rounds; the first depth after a load varies by about 3 %).
+- VRAM about 29.9 GB while generating (the expert hot set takes the free VRAM up to 2.1 GB below the card total, plus the part of the 262K KV cache a shorter context does not use yet; `LLAMA_FN_VRAM_KEEP_MIB=4096` keeps more free); the rest of the model stays memory-mapped.
+- Vision works: add `--mmproj mmproj-Qwen3.8-Flash-Next-F16.gguf`.
 
 > Numbers are real-use medians over interleaved A/B rounds, not best-case benchmark runs. A greedy short-prompt benchmark always reads higher than a long, sampled answer — both are listed where it matters.
 
