@@ -7749,7 +7749,11 @@ static int64_t get_op_batch_size(const ggml_tensor * op) {
 static bool ggml_backend_cuda_device_offload_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
 
-    return get_op_batch_size(op) >= dev_ctx->op_offload_min_batch_size;
+    // [TAG_FN_L12_PROMPTMIN] GGML_OP_OFFLOAD_MIN_BATCH as it is now: a model's automatic profile sets it at load, after the
+    // backend registered (the value read at registration stays the default)
+    const char * e = getenv("GGML_OP_OFFLOAD_MIN_BATCH");
+    const int min_batch = e ? atoi(e) : dev_ctx->op_offload_min_batch_size;
+    return get_op_batch_size(op) >= min_batch;
 }
 
 static ggml_backend_event_t ggml_backend_cuda_device_event_new(ggml_backend_dev_t dev) {
