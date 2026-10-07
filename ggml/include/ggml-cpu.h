@@ -213,6 +213,10 @@ extern "C" {
                                              // a mispredicted expert from disk)
         int  pf_cap;                         // [TAG_FN_L6_PF] 0, or a given list is cut to its first pf_cap experts (less
                                              // DRAM traffic beside the device's host accesses at the end of the window)
+        int  stale_ra;                       // [TAG_FN_L7_STALERA] 0, or before a job the caller asks the OS to read the
+                                             // weights of every expert no job of the pool read within the last stale_ra jobs
+                                             // (Windows PrefetchVirtualMemory: a few large reads instead of the workers'
+                                             // 4 KiB page faults when a mapped model larger than RAM lost those pages)
     };
 
     // [TAG_FN_L3_CPU_SPLIT] how a pool job gives its pieces (32 gate / up rows or 64 down rows of one expert) to the threads.
@@ -269,6 +273,17 @@ extern "C" {
         double   job_us;          // wall time: publish -> every compute thread done (the caller's view)
         double   job_max_us;      // the slowest job of the window
         uint64_t jobs_slow;       // jobs over 1 ms (page faults, preemption)
+        double   flt_job;         // [TAG_FN_L7_FAULTS] process page faults (soft + hard) between a job's publish and its end
+        double   flt_slow;        // the same, per job over 1 ms
+        double   slow_us;         // the mean time of a job over 1 ms
+        uint64_t slow_nofault;    // jobs over 1 ms without a page fault (preemption, DRAM, ...)
+        uint64_t fast_fault;      // jobs under 1 ms with a page fault
+        double   slow_x_lag_us, slow_x_p3_us, slow_x_p4_us, slow_x_p5_us; // [TAG_FN_L7_SLOW] the last thread of a slow job
+        double   slow_w_us;       //   minus the median thread, per phase; its own barrier waits
+        int      slow_cpu[3];     //   the CPUs that ended a slow job last most often (-1: none)
+        uint64_t slow_cpu_n[3];
+        uint64_t ra_experts;      // [TAG_FN_L7_STALERA] experts read ahead before their job, and their MiB
+        double   ra_mib;
         double   mib;             // weight MiB a job read
         double   experts;         // experts a job computed
         double   lag_us;          // publish -> a compute thread's first instruction

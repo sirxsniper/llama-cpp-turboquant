@@ -24,6 +24,7 @@
 #        define NOMINMAX
 #    endif
 #    include <windows.h>
+#    include <psapi.h> // [TAG_FN_L7_FAULTS] K32GetProcessMemoryInfo
 #else
 #    include <pthread.h>
 #    include <sched.h>
@@ -45,6 +46,18 @@ inline void moe_pool_relax() {
     __asm__ volatile("yield" ::: "memory");
 #else
     std::this_thread::yield();
+#endif
+}
+
+// [TAG_FN_L7_FAULTS] the process's page faults so far (soft + hard), for the pool statistics only
+uint64_t moe_proc_faults() {
+#if defined(_WIN32)
+    PROCESS_MEMORY_COUNTERS pmc;
+    memset(&pmc, 0, sizeof(pmc));
+    pmc.cb = sizeof(pmc);
+    return K32GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc)) ? (uint64_t) pmc.PageFaultCount : 0;
+#else
+    return 0;
 #endif
 }
 
@@ -260,6 +273,12 @@ struct moe_stats_acc {
     uint64_t pf_jobs = 0, pf_stopped = 0;
     double   pf_t = 0, pf_router = 0, pf_bytes = 0, pf_experts = 0;
     uint64_t job_max = 0, jobs_slow = 0, pf_stop_max = 0;
+    double   flt = 0, flt_slow = 0, slow_t = 0; // [TAG_FN_L7_FAULTS] page faults inside jobs, inside slow jobs; slow jobs' time
+    uint64_t slow_nofault = 0, fast_fault = 0;  // slow jobs without a page fault, jobs under 1 ms with one
+    // [TAG_FN_L7_SLOW] per slow job: the compute thread that ended last (by worker index) and where its excess over the
+    // median thread went: start lag, gate/up, down, sum
+    std::vector<uint32_t> slow_last;            // by worker index
+    double   slow_x_lag = 0, slow_x_p3 = 0, slow_x_p4 = 0, slow_x_p5 = 0, slow_x_w = 0;
     double   pf_stop = 0;
     uint64_t pred_jobs = 0;
     double   pred_n = 0, pred_job = 0, pred_hit = 0, pred_hit4 = 0, pred_top4 = 0;
@@ -339,6 +358,10 @@ struct ggml_cpu_moe_pool {
     int                   pf_pull  = 0;            // [TAG_FN_L6_PF] GGML_FN_PF_* flags of the pull
     int                   pf_cap   = 0;            // [TAG_FN_L6_PF] experts of a given list pulled at most (0: all)
     int                   pf_fresh = 0;            // [TAG_FN_L6_PF] see ggml_cpu_moe_pool_params.pf_fresh
+    int                   stale_ra = 0;            // [TAG_FN_L7_STALERA] see ggml_cpu_moe_pool_params.stale_ra
+    std::vector<int32_t>  ra_ids;                  // this job's experts already read ahead (dedup)
+    std::vector<uint8_t>  ra_buf;                  // the range entries of one call
+    uint64_t              ra_n = 0, ra_bytes = 0;  // since the last stats read (caller thread only)
     uint32_t              pf_clock = 0;            // jobs run
     std::unordered_map<const ggml_tensor *, std::vector<uint32_t>> pf_seen; // per layer (up tensor): the job clock of each expert's last CPU job
     std::vector<int32_t>  pf_gt;
@@ -365,6 +388,8 @@ struct ggml_cpu_moe_pool {
     bool                    st_job_pending = false;
     uint64_t                st_t_pub  = 0;
     uint64_t                st_t_done = 0;
+    uint64_t                st_f_pub  = 0; // [TAG_FN_L7_FAULTS]
+    uint64_t                st_f_done = 0;
     int                     st_nth    = 0;
     int                     st_base   = 0;
     bool                    st_pf_pending = false;
@@ -618,12 +643,13 @@ static void moe_pool_prefetch_finish(ggml_cpu_moe_pool * p) {
 }
 
 // [TAG_FN_L3_CPU_STATS] the caller, while no worker runs: add the last job's and the last prefetch's records to the window
-static void moe_pool_stats_add_job(ggml_cpu_moe_pool * p, int nth, int base, uint64_t t_pub, uint64_t t_done);
+static void moe_pool_stats_add_job(ggml_cpu_moe_pool * p, int nth, int base, uint64_t t_pub, uint64_t t_done, uint64_t faults);
 
 static void moe_pool_stats_flush(ggml_cpu_moe_pool * p) {
     if (p->st_job_pending) {
         p->st_job_pending = false;
-        moe_pool_stats_add_job(p, p->st_nth, p->st_base, p->st_t_pub, p->st_t_done);
+        moe_pool_stats_add_job(p, p->st_nth, p->st_base, p->st_t_pub, p->st_t_done,
+                p->st_f_done > p->st_f_pub ? p->st_f_done - p->st_f_pub : 0);
     }
     if (p->st_pf_pending) {
         p->st_pf_pending = false;
@@ -736,6 +762,7 @@ struct ggml_cpu_moe_pool * ggml_cpu_moe_pool_new(const struct ggml_cpu_moe_pool_
     p->pf_pull   = pp->pf_pull & (GGML_FN_PF_FINE_STOP | GGML_FN_PF_VEC);
     p->pf_cap    = std::max(0, pp->pf_cap);
     p->pf_fresh  = std::max(0, pp->pf_fresh);
+    p->stale_ra  = std::max(0, pp->stale_ra); // [TAG_FN_L7_STALERA]
 
     std::vector<int> list;
     for (int i = 0; i < GGML_MAX_N_THREADS; i++) {
@@ -844,7 +871,7 @@ bool ggml_cpu_moe_layer_supported(const struct ggml_cpu_moe_layer * l) {
 }
 
 // [TAG_FN_L3_CPU_STATS] the caller, after a job: add the compute threads' records to the window
-static void moe_pool_stats_add_job(ggml_cpu_moe_pool * p, int nth, int base, uint64_t t_pub, uint64_t t_done) {
+static void moe_pool_stats_add_job(ggml_cpu_moe_pool * p, int nth, int base, uint64_t t_pub, uint64_t t_done, uint64_t faults) {
     double lag = 0, p3 = 0, w3 = 0, p4 = 0, w4 = 0, p5 = 0, bytes = 0, taken = 0, pfhit = 0;
     uint64_t e3_min = UINT64_MAX, e3_max = 0, e4_min = UINT64_MAX, e4_max = 0;
     double dom_bytes[4] = {}, dom_busy[4] = {};
@@ -883,6 +910,40 @@ static void moe_pool_stats_add_job(ggml_cpu_moe_pool * p, int nth, int base, uin
     const uint64_t t_job = t_done > t_pub ? t_done - t_pub : 0;
     s.job_max    = std::max(s.job_max, t_job);
     s.jobs_slow += (double) t_job > 1000.0*p->tick_per_us ? 1 : 0;
+    s.flt       += (double) faults; // [TAG_FN_L7_FAULTS]
+    if ((double) t_job > 1000.0*p->tick_per_us) {
+        // [TAG_FN_L7_SLOW] the thread that ended last and its phases against the median thread's
+        if (s.slow_last.size() != (size_t) p->n_threads) {
+            s.slow_last.assign(p->n_threads, 0);
+        }
+        int last = 0;
+        std::vector<double> lagv, p3v, p4v, p5v;
+        for (int c = 0; c < nth; ++c) {
+            const uint64_t * r = p->ts[c].v;
+            if (r[GGML_FN_MOE_TS_END] > p->ts[last].v[GGML_FN_MOE_TS_END]) {
+                last = c;
+            }
+            lagv.push_back((double) (r[GGML_FN_MOE_TS_START] > t_pub ? r[GGML_FN_MOE_TS_START] - t_pub : 0));
+            p3v.push_back((double) (r[GGML_FN_MOE_TS_P3]  - r[GGML_FN_MOE_TS_START]));
+            p4v.push_back((double) (r[GGML_FN_MOE_TS_P4]  - r[GGML_FN_MOE_TS_B1]));
+            p5v.push_back((double) (r[GGML_FN_MOE_TS_END] - r[GGML_FN_MOE_TS_B2]));
+        }
+        auto med = [](std::vector<double> v) { std::nth_element(v.begin(), v.begin() + v.size()/2, v.end()); return v[v.size()/2]; };
+        if (base + last < p->n_threads) {
+            s.slow_last[base + last]++;
+        }
+        const uint64_t * rl = p->ts[last].v;
+        s.slow_x_lag += lagv[last] - med(lagv);
+        s.slow_x_p3  += p3v[last]  - med(p3v);
+        s.slow_x_p4  += p4v[last]  - med(p4v);
+        s.slow_x_p5  += p5v[last]  - med(p5v);
+        s.slow_x_w   += (double) (rl[GGML_FN_MOE_TS_B1] - rl[GGML_FN_MOE_TS_P3]) + (double) (rl[GGML_FN_MOE_TS_B2] - rl[GGML_FN_MOE_TS_P4]);
+        s.flt_slow     += (double) faults;
+        s.slow_t       += (double) t_job;
+        s.slow_nofault += faults == 0 ? 1 : 0;
+    } else {
+        s.fast_fault   += faults > 0 ? 1 : 0;
+    }
     s.jobs++;
     s.job     += (double) (t_done - t_pub);
     s.bytes   += bytes;
@@ -902,6 +963,63 @@ static void moe_pool_stats_add_job(ggml_cpu_moe_pool * p, int nth, int base, uin
         s.dom_busy[d]   += dom_busy[d];
         s.dom_threads[d] = std::max(s.dom_threads[d], dom_threads[d]);
     }
+}
+
+// [TAG_FN_L7_STALERA] the cold experts of a job that no job read within the last stale_ra jobs: one PrefetchVirtualMemory
+// call over their up / gate / down rows. The OS reads every non-resident range in large I/Os at once (resident pages cost a
+// walk only); the workers then wait for reads already in flight instead of faulting the pages in 4 KiB at a time - the
+// hard-fault storms of a mapped model larger than RAM (a job of > 500 ms ran the bridge into its wait timeout).
+static void moe_pool_stale_readahead(ggml_cpu_moe_pool * p, const ggml_cpu_moe_layer * l, const int32_t * ids, int n) {
+#if defined(_WIN32)
+    struct ra_range { void * addr; size_t size; }; // the layout of WIN32_MEMORY_RANGE_ENTRY
+    using pvm_t = BOOL (WINAPI *)(HANDLE, ULONG_PTR, void *, ULONG);
+    static const pvm_t pvm = (pvm_t) (void *) GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "PrefetchVirtualMemory");
+    if (pvm == nullptr || l->up == nullptr || l->down == nullptr) {
+        return;
+    }
+    const int64_t ne = l->up->ne[2];
+    auto & v = p->pf_seen[l->up];
+    v.resize((size_t) ne, 0);
+    p->ra_ids.clear();
+    p->ra_buf.resize(sizeof(ra_range)*3*(size_t) std::max(n, 1));
+    ra_range * r = (ra_range *) p->ra_buf.data();
+    ULONG  nr    = 0;
+    size_t bytes = 0;
+    const ggml_tensor * ts[3] = { l->up, l->gate, l->down };
+    for (int i = 0; i < n; ++i) {
+        const int32_t e = ids[i];
+        if (e < 0 || e >= ne || (l->table != nullptr && l->table[e] != l->table_miss)) {
+            continue; // invalid, or the device computes it
+        }
+        const uint32_t s = v[(size_t) e];
+        if (s != 0 && p->pf_clock - s <= (uint32_t) p->stale_ra) {
+            continue; // a recent job read it
+        }
+        if (std::find(p->ra_ids.begin(), p->ra_ids.end(), e) != p->ra_ids.end()) {
+            continue;
+        }
+        p->ra_ids.push_back(e);
+        for (const ggml_tensor * t : ts) {
+            if (t == nullptr || t->data == nullptr) {
+                continue;
+            }
+            r[nr].addr = (char *) t->data + (size_t) e*t->nb[2];
+            r[nr].size = t->nb[2];
+            bytes += t->nb[2];
+            nr++;
+        }
+    }
+    if (nr > 0) {
+        pvm(GetCurrentProcess(), (ULONG_PTR) nr, r, 0);
+        p->ra_n     += p->ra_ids.size();
+        p->ra_bytes += bytes;
+    }
+#else
+    GGML_UNUSED(p);
+    GGML_UNUSED(l);
+    GGML_UNUSED(ids);
+    GGML_UNUSED(n);
+#endif
 }
 
 enum ggml_status ggml_cpu_moe_run(struct ggml_cpu_moe_pool * p, const struct ggml_cpu_moe_job * job) {
@@ -1022,6 +1140,10 @@ enum ggml_status ggml_cpu_moe_run(struct ggml_cpu_moe_pool * p, const struct ggm
         moe_pool_stats_flush(p); // usually done already, after the last job (ggml_cpu_moe_prefetch)
     }
 
+    if (p->stale_ra > 0) { // [TAG_FN_L7_STALERA] before the post: the reads are in flight when the workers touch the pages
+        moe_pool_stale_readahead(p, l, job->ids, n_used*T);
+    }
+    const uint64_t f_pub = p->stats ? moe_proc_faults() : 0; // [TAG_FN_L7_FAULTS]
     const uint64_t t_pub = p->stats ? ggml_fn_moe_tick() : 0;
     p->kind.store(solo ? 2 : 0, std::memory_order_relaxed);
     p->n_done.store(0, std::memory_order_relaxed);
@@ -1044,7 +1166,7 @@ enum ggml_status ggml_cpu_moe_run(struct ggml_cpu_moe_pool * p, const struct ggm
     if (score_learn) {
         moe_pool_score_learn(p, l, job->ids, n_used*T, l->up->ne[2]);
     }
-    if (p->pf_fresh > 0) { // [TAG_FN_L6_PF] the experts this job read on the CPU (their pages are resident now)
+    if (p->pf_fresh > 0 || p->stale_ra > 0) { // [TAG_FN_L6_PF] the experts this job read on the CPU (resident now)
         auto & v = p->pf_seen[l->up];
         v.resize((size_t) l->up->ne[2], 0);
         const uint32_t clk = ++p->pf_clock;
@@ -1060,6 +1182,8 @@ enum ggml_status ggml_cpu_moe_run(struct ggml_cpu_moe_pool * p, const struct ggm
         p->st_job_pending = true;
         p->st_t_pub       = t_pub;
         p->st_t_done      = ggml_fn_moe_tick();
+        p->st_f_pub       = f_pub;
+        p->st_f_done      = moe_proc_faults();
         p->st_nth         = nth;
         p->st_base        = solo ? 1 : 0;
     }
@@ -1274,6 +1398,35 @@ void ggml_cpu_moe_pool_get_stats(struct ggml_cpu_moe_pool * p, struct ggml_cpu_m
         out->pf_stopped   = (double) s.pf_stopped/np;
         out->job_max_us     = (double) s.job_max/us;
         out->jobs_slow      = s.jobs_slow;
+        out->flt_job        = s.flt/nj; // [TAG_FN_L7_FAULTS]
+        out->flt_slow       = s.jobs_slow ? s.flt_slow/(double) s.jobs_slow : 0.0;
+        out->slow_us        = s.jobs_slow ? s.slow_t/(double) s.jobs_slow/us : 0.0;
+        out->slow_nofault   = s.slow_nofault;
+        out->fast_fault     = s.fast_fault;
+        out->ra_experts     = p->ra_n; // [TAG_FN_L7_STALERA] caller-thread counters, read between jobs
+        out->ra_mib         = p->ra_bytes/1048576.0;
+        if (s.jobs_slow > 0) { // [TAG_FN_L7_SLOW]
+            const double ns = (double) s.jobs_slow;
+            out->slow_x_lag_us = s.slow_x_lag/ns/us;
+            out->slow_x_p3_us  = s.slow_x_p3/ns/us;
+            out->slow_x_p4_us  = s.slow_x_p4/ns/us;
+            out->slow_x_p5_us  = s.slow_x_p5/ns/us;
+            out->slow_w_us     = s.slow_x_w/ns/us;
+            for (int k = 0; k < 3; ++k) {
+                out->slow_cpu[k] = -1;
+            }
+            std::vector<int> ord;
+            for (int k = 0; k < (int) s.slow_last.size(); ++k) {
+                if (s.slow_last[k] > 0) {
+                    ord.push_back(k);
+                }
+            }
+            std::sort(ord.begin(), ord.end(), [&s](int a, int b) { return s.slow_last[a] > s.slow_last[b]; });
+            for (int k = 0; k < 3 && k < (int) ord.size(); ++k) {
+                out->slow_cpu[k]   = ord[k] < (int) p->cpus.size() ? p->cpus[ord[k]] : -1;
+                out->slow_cpu_n[k] = s.slow_last[ord[k]];
+            }
+        }
         out->pf_stop_us     = s.pf_stop/(s.pf_stopped > 0 ? (double) s.pf_stopped : 1.0)/us;
         out->pf_stop_max_us = (double) s.pf_stop_max/us;
         out->pred_jobs      = s.pred_jobs;
@@ -1294,5 +1447,7 @@ void ggml_cpu_moe_pool_get_stats(struct ggml_cpu_moe_pool * p, struct ggml_cpu_m
     }
     if (reset) {
         p->st = moe_stats_acc();
+        p->ra_n     = 0;
+        p->ra_bytes = 0;
     }
 }

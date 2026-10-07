@@ -3230,6 +3230,32 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
         }
 
         if (res || memcmp(&graph->node_props[i], &prop, sizeof(prop)) != 0) {
+            // [TAG_FN_L7_GDIFF] TURBO_GRAPH_DIFF=1: the first node whose properties changed, and what changed (diagnostic)
+            static const bool gdiff = [] {
+                const char * e = getenv("TURBO_GRAPH_DIFF");
+                return e != nullptr && e[0] == '1';
+            }();
+            if (gdiff && !res && (int) graph->node_props.size() == cgraph->n_nodes) {
+                static std::atomic<int> n_logged{0};
+                if (n_logged.fetch_add(1) < 400) {
+                    const ggml_tensor & a = graph->node_props[i].node;
+                    const ggml_tensor & b = prop.node;
+                    char what[256];
+                    int  w = 0;
+                    what[0] = 0;
+                    if (memcmp(a.ne, b.ne, sizeof(a.ne)) != 0) { w += snprintf(what + w, sizeof(what) - w, " ne(%lld,%lld,%lld,%lld->%lld,%lld,%lld,%lld)", (long long) a.ne[0], (long long) a.ne[1], (long long) a.ne[2], (long long) a.ne[3], (long long) b.ne[0], (long long) b.ne[1], (long long) b.ne[2], (long long) b.ne[3]); }
+                    if (memcmp(a.nb, b.nb, sizeof(a.nb)) != 0) { w += snprintf(what + w, sizeof(what) - w, " nb"); }
+                    if (a.data != b.data)                       { w += snprintf(what + w, sizeof(what) - w, " data"); }
+                    if (memcmp(a.op_params, b.op_params, sizeof(a.op_params)) != 0) { w += snprintf(what + w, sizeof(what) - w, " op_params"); }
+                    for (int j = 0; j < GGML_MAX_SRC && w < (int) sizeof(what) - 32; ++j) {
+                        if (graph->node_props[i].node_src_data_ptrs[j] != prop.node_src_data_ptrs[j]) { w += snprintf(what + w, sizeof(what) - w, " src%d.data(%s)", j, b.src[j] ? b.src[j]->name : "-"); }
+                        if (memcmp(graph->node_props[i].node_src_ne[j], prop.node_src_ne[j], sizeof(prop.node_src_ne[j])) != 0) { w += snprintf(what + w, sizeof(what) - w, " src%d.ne", j); }
+                    }
+                    if (w == 0) { snprintf(what, sizeof(what), " other fields"); }
+                    fprintf(stderr, "turbo-probe: graph-diff ctx %p key %p nodes %d: node %d '%s' %s:%s\n", (void *) cuda_ctx,
+                            graph_key, cgraph->n_nodes, i, b.name, ggml_op_desc(&b), what);
+                }
+            }
             graph->node_props[i] = prop;
             res = true;
         }
