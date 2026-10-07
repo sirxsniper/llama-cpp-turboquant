@@ -31,7 +31,7 @@ code, 1 stream · 262K context · 4 slots
 **Qwen3.8-Flash-Next** · UD-Q4_K_XL (100+ GB MoE)
 
 ## 83 t/s
-real use at 32K · **77 t/s at 245K** filled
+real use at 32K · **78 t/s at 245K** filled
 
 prompt reading **1,500–2,060 t/s**
 
@@ -128,11 +128,11 @@ Five GPU memory bugs found with compute-sanitizer and fixed; no GPU work left in
 
 262K context, turbot KV, 1 stream. *Real use* = temperature 1, top-p 0.95, top-k 20, thinking on, 2,048-token answers on a context already filled to the given depth.
 
-| | first 262K build (Oct 4) | **v0.13.0** |
+| | first 262K build (Oct 4) | **v0.14.0** |
 |:--|--:|--:|
-| Real use, 32K filled | 30.3 t/s | **83.0 t/s** |
-| Real use, 131K filled | 26.1 t/s | **75.0 t/s** |
-| Real use, 245K filled | 24.5 t/s | **77.2 t/s** |
+| Real use, 32K filled | 30.3 t/s | **83.2 t/s** |
+| Real use, 131K filled | 26.1 t/s | **76.6 t/s** |
+| Real use, 245K filled | 24.5 t/s | **77.6 t/s** |
 | Benchmark, greedy code | 39 t/s | **84–91 t/s** |
 | Prompt reading, fresh 32K / 131K | ~150 t/s | **1,508 / 2,059 t/s** |
 
