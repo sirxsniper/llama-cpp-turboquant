@@ -2789,8 +2789,18 @@ void llama_kv_cache::set_input_kv_pos(ggml_tensor * dst, const llama_ubatch * ub
         const llama_seq_id seq_id = ubatch->seq_id[0][0];
         const auto & cells = v_cells.at(seq_to_stream[seq_id]);
         const int64_t n_cells = cells.size();
+        if (hparams.indexer_n_head > 0 && cells.seq_n_cells(seq_id) == cells.get_used()) {
+            // [TAG_FN_L9_KVPOS] (qwen4exp) the sequence owns every used cell: a used cell's entry is its position, an empty
+            // cell's is -1 - the cell array itself (the walk below gives the same values)
+            const int64_t n = std::min<int64_t>(n_kv, n_cells);
+            memcpy(data, cells.pos_data(), (size_t) n*sizeof(int32_t));
+            for (int64_t j = n; j < n_kv; ++j) {
+                data[j] = -1;
+            }
+        } else {
         for (int64_t j = 0; j < n_kv; ++j) {
             data[j] = (j < n_cells && !cells.is_empty(j) && cells.seq_has(j, seq_id)) ? cells.pos_get(j) : -1;
+        }
         }
     } else {
         GGML_ASSERT(n_rows == 2 && ggml_is_contiguous(dst));
@@ -2853,32 +2863,36 @@ void llama_kv_cache::set_input_q_pos(ggml_tensor * dst, const llama_ubatch * uba
     ggml_backend_tensor_set(dst, bits.data(), dst->nb[1], ubatch->n_tokens*ggml_element_size(dst));
 }
 
-// [TAG_FN_L7_MASK] row i of the [n_kv, n_tokens] mask: 0 where 0 <= pos[j] <= qpos[i], -inf elsewhere (F16 or F32)
-static void kq_mask_fill_pos(const llama_pos * pos, int64_t n_kv, const llama_pos * qpos, uint32_t n_tokens, void * dst, bool f16) {
+// [TAG_FN_L7_MASK] row i of the [n_kv, n_tokens] mask: 0 where lo <= pos[j] <= qpos[i], -inf elsewhere (F16 or F32), with
+// lo = 0, or [TAG_FN_L9_SWAMASK] for a standard sliding window of n_swa > 0 lo = max(0, qpos[i] - n_swa + 1) (the cell walk's
+// is_masked_swa: masked when qpos - pos >= n_swa)
+static void kq_mask_fill_pos(const llama_pos * pos, int64_t n_kv, const llama_pos * qpos, uint32_t n_tokens, void * dst, bool f16,
+        uint32_t n_swa = 0) {
     for (uint32_t i = 0; i < n_tokens; ++i) {
         const int32_t p1 = qpos[i];
+        const int32_t lo = n_swa > 0 ? std::max<int32_t>(0, p1 - (int32_t) n_swa + 1) : 0;
         int64_t j = 0;
         if (f16) {
             uint16_t * d = (uint16_t *) dst + (int64_t) i*n_kv;
 #if defined(__SSE2__) || defined(_M_X64) || (defined(_M_IX86_FP) && _M_IX86_FP >= 2)
             const __m128i vp1  = _mm_set1_epi32(p1);
-            const __m128i vz   = _mm_setzero_si128();
+            const __m128i vlo  = _mm_set1_epi32(lo);
             const __m128i vinf = _mm_set1_epi16((short) 0xFC00);
             for (; j + 8 <= n_kv; j += 8) {
                 const __m128i a  = _mm_loadu_si128((const __m128i *) (pos + j));
                 const __m128i b  = _mm_loadu_si128((const __m128i *) (pos + j + 4));
-                const __m128i da = _mm_or_si128(_mm_cmpgt_epi32(a, vp1), _mm_cmplt_epi32(a, vz));
-                const __m128i db = _mm_or_si128(_mm_cmpgt_epi32(b, vp1), _mm_cmplt_epi32(b, vz));
+                const __m128i da = _mm_or_si128(_mm_cmpgt_epi32(a, vp1), _mm_cmplt_epi32(a, vlo));
+                const __m128i db = _mm_or_si128(_mm_cmpgt_epi32(b, vp1), _mm_cmplt_epi32(b, vlo));
                 _mm_storeu_si128((__m128i *) (d + j), _mm_and_si128(_mm_packs_epi32(da, db), vinf));
             }
 #endif
             for (; j < n_kv; ++j) {
-                d[j] = pos[j] >= 0 && pos[j] <= p1 ? (uint16_t) 0 : (uint16_t) 0xFC00;
+                d[j] = pos[j] >= lo && pos[j] <= p1 ? (uint16_t) 0 : (uint16_t) 0xFC00;
             }
         } else {
             float * d = (float *) dst + (int64_t) i*n_kv;
             for (; j < n_kv; ++j) {
-                d[j] = pos[j] >= 0 && pos[j] <= p1 ? 0.0f : -INFINITY;
+                d[j] = pos[j] >= lo && pos[j] <= p1 ? 0.0f : -INFINITY;
             }
         }
     }
@@ -2923,8 +2937,10 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
         const char * e = getenv("LLAMA_KQ_MASK_FAST");
         return !(e && e[0] == '0');
     }();
-    if (mask_fast_env && hparams.indexer_n_head > 0 && causal_attn && swa_type == LLAMA_SWA_TYPE_NONE && !hparams.use_alibi &&
-        n_stream == 1 && n_tokens > 0) {
+    // [TAG_FN_L9_SWAMASK] a standard sliding window too: the qwen4exp MTP draft cache (LLAMA_MTP_ATTN_WINDOW) filled its
+    // mask by the cell walk on every draft decode (~0.2 ms each at 32K)
+    if (mask_fast_env && hparams.indexer_n_head > 0 && causal_attn && !hparams.use_alibi && n_stream == 1 && n_tokens > 0 &&
+        (swa_type == LLAMA_SWA_TYPE_NONE || (swa_type == LLAMA_SWA_TYPE_STANDARD && n_swa > 0))) {
         const llama_seq_id s0 = ubatch->seq_id[0][0];
         bool one = s0 >= 0 && s0 < LLAMA_MAX_SEQ;
         for (uint32_t i = 0; one && i < n_tokens; ++i) {
@@ -2932,7 +2948,8 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
         }
         const llama_kv_cells * cp = one ? &v_cells.at(seq_to_stream[s0]) : nullptr;
         if (cp != nullptr && cp->seq_n_cells(s0) == cp->get_used() && (int64_t) cp->size() >= n_kv) {
-            kq_mask_fill_pos(cp->pos_data(), n_kv, ubatch->pos, n_tokens, dst->data, dst->type == GGML_TYPE_F16);
+            kq_mask_fill_pos(cp->pos_data(), n_kv, ubatch->pos, n_tokens, dst->data, dst->type == GGML_TYPE_F16,
+                    swa_type == LLAMA_SWA_TYPE_STANDARD ? n_swa : 0);
             if (ubatch->is_pos_2d()) {
                 // M-RoPE (every Qwen3.x text batch has n_pos >= 3): the cell walk also masks a cell at the query's own
                 // position whose 2D position is after the query's (image tokens); the same test on just those cells
