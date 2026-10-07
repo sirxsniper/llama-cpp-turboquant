@@ -118,6 +118,8 @@ bool llama_moe_bridge_active(const llama_moe_bridge * br);
 int  llama_moe_bridge_max_t (const llama_moe_bridge * br);
 // [TAG_FN_L13_BRIDGE_SEQS] a graph of n_tokens whose largest sequence has n_seq_tokens of them may take the bridge
 bool llama_moe_bridge_fits  (const llama_moe_bridge * br, int n_tokens, int n_seq_tokens);
+// [TAG_FN_L13_BRIDGE_RING] the ring rolls back a ubatch whose largest sequence has n_seq_tokens tokens
+bool llama_moe_bridge_ring_ok(const llama_moe_bridge * br, int n_seq_tokens);
 int  llama_moe_bridge_n_used(const llama_moe_bridge * br);
 // the bridge id and channel for this layer's up_exps, false if the layer is not bridged
 bool llama_moe_bridge_layer (const llama_moe_bridge * br, const ggml_tensor * up_exps, int32_t * id, int32_t * chan);

@@ -2558,18 +2558,21 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // stall never changes the output (the CPU split below sums the slots in another order)
     const llama_moe_bridge * br_any = moe_bridge ? moe_bridge : moe_bridge_sync;
     bool br_sync = false;
-    if (br_any && il >= 0 && llama_moe_bridge_fits(br_any, (int) n_tokens, (int) (ubatch.equal_seqs() ? ubatch.n_seq_tokens : ubatch.n_tokens)) &&
+    // [TAG_FN_L13_BRIDGE_RING] a layer cut to its output rows (the last one without MTP) can fit while its ubatch holds
+    // more tokens of one sequence than the ring rolls back: it runs the host job as the sync op (same values, no deadline)
+    const bool br_ring = llama_moe_bridge_ring_ok(br_any, (int) (ubatch.equal_seqs() ? ubatch.n_seq_tokens : ubatch.n_tokens));
+    if (br_any && il >= 0 && llama_moe_bridge_fits(br_any, (int) n_tokens, 1) &&
         n_expert_used <= llama_moe_bridge_n_used(br_any) &&
         !gate_up_exps && gate_exps && down_exps && !up_exps_b && !gate_exps_b && !down_exps_b &&
         !up_exps_s && !gate_exps_s && !down_exps_s && type_op == LLM_FFN_SILU && !weight_before_ffn &&
         loras->empty() && !(hparams.swiglu_clamp_exp[il] > 1e-6f) &&
         llama_moe_bridge_layer(br_any, up_exps, &br_id, &br_chan)) {
-        if (moe_bridge && llama_moe_bridge_dma(moe_bridge) && !pfs) {
+        if (moe_bridge && br_ring && llama_moe_bridge_dma(moe_bridge) && !pfs) {
             br_dma = llama_moe_dma_bridge_lookup(up_exps, n_tokens);
         }
         ggml_tensor * w2 = ggml_is_contiguous(weights) ? weights : ggml_cont(ctx0, weights);
         w2 = ggml_reshape_2d(ctx0, w2, n_expert_used, n_tokens);
-        if (moe_bridge) {
+        if (moe_bridge && br_ring) {
             // [TAG_FN_L3_CPU_DEVPRED] the next layer's router on this input, top hint_k per token, right after the post
             const int hint_k = hint_router ? llama_moe_bridge_hint_k(moe_bridge) : 0;
             const bool hint  = hint_k > 0 && hint_router->ne[0] == cur->ne[0] && hint_router->ne[1] >= hint_k;

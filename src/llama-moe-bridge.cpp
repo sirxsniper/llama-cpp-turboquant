@@ -1239,7 +1239,11 @@ int llama_moe_bridge_max_t(const llama_moe_bridge * br) {
 }
 
 bool llama_moe_bridge_fits(const llama_moe_bridge * br, int n_tokens, int n_seq_tokens) {
-    return br && n_tokens >= 1 && n_tokens <= br->max_t && (br->seq_t == 0 || n_seq_tokens <= br->seq_t);
+    return br && n_tokens >= 1 && n_tokens <= br->max_t && llama_moe_bridge_ring_ok(br, n_seq_tokens);
+}
+
+bool llama_moe_bridge_ring_ok(const llama_moe_bridge * br, int n_seq_tokens) {
+    return br && n_seq_tokens <= (br->seq_t > 0 ? br->seq_t : br->max_t);
 }
 
 // [TAG_FN_L3_MTP_COST2]
