@@ -130,10 +130,44 @@ struct kvl_state {
     bool     whole = false;   // everything mapped (the lend is off)
     uint64_t n_grow = 0, n_shrink = 0;
 };
-kvl_state g_kvl;
+// [TAG_FN_L10_KVLEND2] one lend per cache: the attention cache and (qwen4exp) the indexer's key cache; the functions below
+// work on kvl_cur, which each entry point points at its cache's state; the hot set sees the sum of both
+kvl_state   g_kvls[2];
+kvl_state * kvl_cur = &g_kvls[0];
+#define g_kvl (*kvl_cur)
 
 size_t kvl_round_up(size_t x, size_t g) {
     return g ? (x + g - 1) / g * g : x;
+}
+
+size_t kvl_mapped_of(const kvl_state & s) {
+    size_t b = 0;
+    for (const auto & r : s.regs) {
+        b += r.mapped;
+    }
+    return b;
+}
+
+kvl_state * kvl_find(const llama_kv_cache * kv) {
+    for (auto & s : g_kvls) {
+        if (s.kv != nullptr && s.kv == kv) {
+            return &s;
+        }
+    }
+    return nullptr;
+}
+
+// the bytes past the initial cells of every lend, `self` counted at `self_bytes` mapped
+size_t kvl_extra_total(const kvl_state * self, size_t self_bytes) {
+    size_t e = 0;
+    for (const auto & s : g_kvls) {
+        if (s.kv == nullptr || s.whole) {
+            continue;
+        }
+        const size_t m = &s == self ? self_bytes : kvl_mapped_of(s);
+        e += m > s.init_bytes ? m - s.init_bytes : 0;
+    }
+    return e;
 }
 
 size_t kvl_bytes_for(const kvl_region & r, uint32_t cells) {
@@ -185,9 +219,17 @@ bool kvl_map_to(uint32_t cells) {
 // the lend's buffer for ctx's tensors (nullptr: not possible here - the caller allocates as usual)
 static ggml_backend_buffer_t kvl_alloc(const llama_kv_cache * kv, ggml_context * ctx, ggml_backend_buffer_type_t buft,
         const std::set<const ggml_tensor *> & base, uint32_t kv_size, uint32_t init_cells, uint32_t chunk) {
-    if (g_kvl.kv != nullptr || base.empty()) {
+    kvl_state * fs = nullptr; // [TAG_FN_L10_KVLEND2] a free state
+    for (auto & s : g_kvls) {
+        if (s.kv == nullptr && s.buf == nullptr) {
+            fs = &s;
+            break;
+        }
+    }
+    if (fs == nullptr || base.empty()) {
         return nullptr;
     }
+    kvl_cur = fs;
     ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
     ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
     if (!reg || ggml_backend_buft_is_host(buft)) {
@@ -285,34 +327,51 @@ static ggml_backend_buffer_t kvl_alloc(const llama_kv_cache * kv, ggml_context *
 }
 
 size_t llama_kv_lend_unmapped_bytes() {
-    return g_kvl.kv && !g_kvl.whole ? g_kvl.full_bytes - kvl_mapped_total() : 0;
+    size_t b = 0;
+    for (const auto & s : g_kvls) { // [TAG_FN_L10_KVLEND2]
+        if (s.kv && !s.whole) {
+            b += s.full_bytes - kvl_mapped_of(s);
+        }
+    }
+    return b;
 }
 
 void llama_kv_lend_set_hooks(size_t (*release)(const void *, size_t), size_t (*restore)(const void *, size_t), const void * owner) {
-    g_kvl.release = release;
-    g_kvl.restore = restore;
-    g_kvl.owner   = owner;
+    for (auto & s : g_kvls) { // [TAG_FN_L10_KVLEND2]
+        s.release = release;
+        s.restore = restore;
+        s.owner   = owner;
+    }
 }
 
 bool llama_kv_lend_map_all() {
-    if (!g_kvl.kv || g_kvl.whole) {
-        return true;
+    bool ok = true;
+    for (auto & s : g_kvls) { // [TAG_FN_L10_KVLEND2]
+        s.release = nullptr;
+        s.restore = nullptr;
     }
-    g_kvl.release = nullptr;
-    g_kvl.restore = nullptr;
-    if (!kvl_map_to(g_kvl.kv_size)) {
-        LLAMA_LOG_ERROR("%s: [TAG_FN_L8_KVLEND] mapping the whole KV cache failed\n", __func__);
-        return false;
+    for (auto & s : g_kvls) {
+        if (!s.kv || s.whole) {
+            continue;
+        }
+        kvl_cur = &s;
+        if (!kvl_map_to(g_kvl.kv_size)) {
+            LLAMA_LOG_ERROR("%s: [TAG_FN_L8_KVLEND] mapping the whole KV cache failed\n", __func__);
+            ok = false;
+            continue;
+        }
+        g_kvl.whole = true;
+        LLAMA_LOG_INFO("%s: [TAG_FN_L8_KVLEND] the KV cache is mapped whole (no lend)\n", __func__);
     }
-    g_kvl.whole = true;
-    LLAMA_LOG_INFO("%s: [TAG_FN_L8_KVLEND] the KV cache is mapped whole (no lend)\n", __func__);
-    return true;
+    return ok;
 }
 
 bool llama_kv_cache::kvl_update(uint32_t need) const {
-    if (g_kvl.kv != this || g_kvl.whole) {
+    kvl_state * ks = kvl_find(this); // [TAG_FN_L10_KVLEND2]
+    if (ks == nullptr || ks->whole) {
         return true;
     }
+    kvl_cur = ks;
     const uint32_t ch   = std::max<uint32_t>(1, g_kvl.chunk);
     const uint32_t want = std::min<uint32_t>(g_kvl.kv_size, std::max<uint32_t>(g_kvl.init_cells, (uint32_t) kvl_round_up((size_t) need + ch/2, ch)));
     if (need > g_kvl.cells) {
@@ -321,7 +380,7 @@ bool llama_kv_cache::kvl_update(uint32_t need) const {
         for (const auto & r : g_kvl.regs) {
             after += std::max(r.mapped, kvl_bytes_for(r, want));
         }
-        const size_t extra = after > g_kvl.init_bytes ? after - g_kvl.init_bytes : 0;
+        const size_t extra = kvl_extra_total(ks, after); // [TAG_FN_L10_KVLEND2] both lends' bytes
         if (g_kvl.release) {
             g_kvl.release(g_kvl.owner, extra);
         }
@@ -359,7 +418,7 @@ bool llama_kv_cache::kvl_update(uint32_t need) const {
         }
         const size_t mapped = kvl_mapped_total();
         if (g_kvl.restore) {
-            g_kvl.restore(g_kvl.owner, mapped > g_kvl.init_bytes ? mapped - g_kvl.init_bytes : 0);
+            g_kvl.restore(g_kvl.owner, kvl_extra_total(ks, mapped)); // [TAG_FN_L10_KVLEND2]
         }
         g_kvl.n_shrink++;
         LLAMA_LOG_INFO("%s: [TAG_FN_L8_KVLEND] the KV cache keeps %u cells (%.0f MiB) after a shrink in %.1f ms\n", __func__,
@@ -377,10 +436,16 @@ uint32_t llama_kv_cache::kvl_need() const {
 }
 
 bool llama_kv_cache::kvl_owns(ggml_backend_buffer_t buf) const {
-    return g_kvl.kv == this && g_kvl.buf == buf;
+    const kvl_state * ks = kvl_find(this); // [TAG_FN_L10_KVLEND2]
+    return ks != nullptr && ks->buf == buf;
 }
 
 void llama_kv_cache::kvl_clear() const {
+    kvl_state * ks = kvl_find(this); // [TAG_FN_L10_KVLEND2]
+    if (ks == nullptr) {
+        return;
+    }
+    kvl_cur = ks;
     for (const auto & r : g_kvl.regs) {
         const size_t tb = ggml_nbytes(r.t);
         if (r.mapped > 0) {
@@ -920,8 +985,11 @@ llama_kv_cache::llama_kv_cache(
             buf = nullptr;
             // [TAG_FN_L8_KVLEND] qwen4exp (LLAMA_FN_L8_KVLEND, the profile), turbot, one stream, no shared cells: the K/V
             // tensors on virtual memory, only the cells the context needs mapped
-            // [TAG_FN_L10_SLOTLEND] the slot-granular lend uses the same KV side
-            if (turbot_plan && n_stream == 1 && other == nullptr &&
+            // [TAG_FN_L10_SLOTLEND] the slot-granular lend uses the same KV side; [TAG_FN_L10_KVLEND2] with it also the
+            // qwen4exp indexer's key cache (name tag idx_)
+            const bool kvl_idx = model.arch == LLM_ARCH_QWEN4EXP && name_tag != nullptr && strcmp(name_tag, "idx_") == 0 &&
+                    llama_fn_l3_flag(model, "LLAMA_FN_L10_SLOTLEND");
+            if ((turbot_plan || kvl_idx) && n_stream == 1 && other == nullptr &&
                     (llama_fn_l3_flag(model, "LLAMA_FN_L8_KVLEND") || llama_fn_l3_flag(model, "LLAMA_FN_L10_SLOTLEND"))) {
                 const uint32_t init_c  = (uint32_t) std::max(4096, llama_fn_l3_int(model, "LLAMA_FN_L8_KVLEND_INIT", 16384));
                 const uint32_t chunk_c = (uint32_t) std::max(2048, llama_fn_l3_int(model, "LLAMA_FN_L8_KVLEND_CHUNK", 16384));
