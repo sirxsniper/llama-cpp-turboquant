@@ -161,6 +161,9 @@ const fn_item k_items[] = {
     // [TAG_FN_L10_ADOPT] round 10: the KV caches' unused cells as extra hot slots in the lower layers, given back slot by slot
     // as the context grows; A/B l10s/ab10v (3 rounds, 262K) real use 88.4 -> 91.6 t/s (32K 92.1 -> 101.2, 131K 85.9 -> 90.2)
     { "LLAMA_FN_L10_SLOTLEND",       "1",     P_ALL }, // [TAG_FN_L10_SLOTLEND]
+    // [TAG_FN_L11_ADOPT] round 11: the host token-embedding table and the PLE row cache locked in the working set (0.9 / 1.4
+    // page faults per host input before); embd gather 69 -> 5 us (target) and 99 -> 9 us (draft) per graph
+    { "LLAMA_FN_L11_EMBDLOCK",       "1",     P_ALL }, // [TAG_FN_L11_EMBDLOCK]
 };
 
 // names the fn-auto aware code reads through llama_fn_env(): never put into the environment
