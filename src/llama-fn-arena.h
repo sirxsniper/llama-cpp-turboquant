@@ -21,6 +21,6 @@ using llama_fn_arena_ptr = std::unique_ptr<llama_fn_arena, llama_fn_arena_delete
 // after the tensor data is loaded (mapped); nullptr when off, not possible, or nothing fits
 llama_fn_arena_ptr llama_fn_arena_build(llama_model & model, llama_model_loader & ml);
 
-// [TAG_FN_L14_ARENA] [p, p + n) lies in an arena chunk that is registered with the GPU driver (LLAMA_FN_L14_ARENA_PIN,
-// default on): a device copy may read it directly, without a staging copy
+// [TAG_FN_L14_ARENA] [p, p + n) lies in an arena chunk that is registered with the GPU driver (at most
+// LLAMA_FN_L14_ARENA_PIN_MIB of the arena, default 0): a device copy may read it directly, without a staging copy
 bool llama_fn_arena_pinned(const void * p, size_t n);
