@@ -27,6 +27,7 @@
 #        define NOMINMAX
 #    endif
 #    include <windows.h>
+#    include <psapi.h>
 #else
 #    include <cerrno>
 #    include <fcntl.h>
@@ -1154,4 +1155,15 @@ bool llama_ple_dio_copy(const std::string & src, uint64_t offset, uint64_t size,
                 dst.c_str(), s);
     }
     return ok;
+}
+
+// [TAG_FN_L11_INFAULTS] the process's page faults so far (soft and hard), 0 where unknown
+uint64_t llama_proc_page_faults() {
+#if defined(_WIN32)
+    PROCESS_MEMORY_COUNTERS pmc = {};
+    if (K32GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc))) {
+        return pmc.PageFaultCount;
+    }
+#endif
+    return 0;
 }

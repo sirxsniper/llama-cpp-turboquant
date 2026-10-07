@@ -99,3 +99,6 @@ int64_t llama_ple_dio_file_size(const std::string & path);
 // false + err on failure (dst is left as it was). log (may be null) gets progress lines.
 bool llama_ple_dio_copy(const std::string & src, uint64_t offset, uint64_t size, const std::string & dst, size_t chunk,
         std::string & err, void (*log)(const char * line));
+
+// [TAG_FN_L11_INFAULTS] the process's page faults so far (soft and hard), 0 where unknown
+uint64_t llama_proc_page_faults();

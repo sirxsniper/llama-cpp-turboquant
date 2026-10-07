@@ -1,4 +1,5 @@
 #include "llama-graph.h"
+#include "llama-ple-dio.h" // [TAG_FN_L11_INFAULTS]
 #include <typeinfo>
 
 #include "llama-moecache.h"
@@ -1569,27 +1570,34 @@ void llm_graph_result::set_inputs(const llama_ubatch * ubatch) {
     }
     static std::mutex mtx;
     static std::map<std::string, std::pair<double, uint64_t>> acc;
+    static std::map<std::string, uint64_t> flt; // [TAG_FN_L11_INFAULTS] page faults per input type
     static uint64_t n_calls = 0;
     const int nn = gf ? ggml_graph_n_nodes(gf) : 0;
     for (auto & input : inputs) {
+        const uint64_t f0 = llama_proc_page_faults();
         const int64_t t0 = ggml_time_us();
         input->set_input(ubatch);
         const int64_t dt = ggml_time_us() - t0;
+        const uint64_t df = llama_proc_page_faults() - f0;
         std::lock_guard<std::mutex> lk(mtx);
-        auto & a = acc[std::string(typeid(*input).name()) + " @" + std::to_string(nn > 2000 ? 1 : 0)];
+        const std::string key = std::string(typeid(*input).name()) + " @" + std::to_string(nn > 2000 ? 1 : 0);
+        auto & a = acc[key];
         a.first  += (double) dt;
         a.second += 1;
+        flt[key] += df;
     }
     std::lock_guard<std::mutex> lk(mtx);
     if (++n_calls % 2048 == 0) {
         std::string line;
         for (const auto & [k, v] : acc) {
             char tmp[256];
-            snprintf(tmp, sizeof(tmp), " | %s %.1f us x%llu", k.c_str(), v.first / (double) std::max<uint64_t>(1, v.second), (unsigned long long) v.second);
+            snprintf(tmp, sizeof(tmp), " | %s %.1f us %.2f flt x%llu", k.c_str(), v.first / (double) std::max<uint64_t>(1, v.second),
+                     (double) flt[k] / (double) std::max<uint64_t>(1, v.second), (unsigned long long) v.second);
             line += tmp;
         }
-        LLAMA_LOG_INFO("%s: [TAG_FN_L8_INPROBE] %llu calls (@1 = graphs of > 2000 nodes)%s\n", __func__, (unsigned long long) n_calls, line.c_str());
+        LLAMA_LOG_INFO("%s: [TAG_FN_L8_INPROBE] %llu calls (@1 = graphs of > 2000 nodes; flt = page faults per call)%s\n", __func__, (unsigned long long) n_calls, line.c_str());
         acc.clear();
+        flt.clear();
     }
 }
 
