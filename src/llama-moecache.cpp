@@ -149,6 +149,7 @@ struct moe_cache {
     uint64_t      ad_admitted = 0;
     uint64_t      ad_bad      = 0;
     bool          ad_stats    = false;
+    bool          ad_stats_l  = false; // [TAG_FN_L10_STATS2] LLAMA_MOE_HOT_STATS=2: per-layer rates of each 256-step window
 
     // [TAG_FN_R4_ADAPT_DECAY] the decayed policy instead of the window (llama-moe-decay.h), and the learned set saved
     // as a routing profile (LLAMA_MOE_HOT_SAVE=<file>, every LLAMA_MOE_HOT_SAVE_EVERY decode steps and at the owner's end)
@@ -742,6 +743,27 @@ void hot_obs_cb(const char * name, const struct ggml_tensor * ids, void * ud) {
     }
     LLAMA_LOG_INFO("moe-hot: %" PRIu64 " decode steps, hit rate %.3f (host layers only; layer min %.3f max %.3f)%s\n",
             mc->hot_steps, t ? (double) h / t : 0.0, lo, hi, mc->adapt ? " adaptive" : "");
+    if (mc->ad_stats_l) {
+        // [TAG_FN_L10_STATS2] the last window per layer (hits / routed), then the window restarts
+        static std::vector<uint64_t> ph, pt;
+        ph.resize(g_hot_stats.hit.size(), 0);
+        pt.resize(g_hot_stats.tot.size(), 0);
+        std::string line;
+        uint64_t wh = 0, wt = 0;
+        for (size_t i = 0; i < g_hot_stats.hit.size(); ++i) {
+            const uint64_t dh = g_hot_stats.hit[i] - ph[i];
+            const uint64_t dt = g_hot_stats.tot[i] - pt[i];
+            ph[i] = g_hot_stats.hit[i];
+            pt[i] = g_hot_stats.tot[i];
+            if (dt == 0) {
+                continue;
+            }
+            wh += dh;
+            wt += dt;
+            line += format(" %zu:%.2f", i, (double) dh/dt);
+        }
+        LLAMA_LOG_INFO("moe-hot: [TAG_FN_L10_STATS2] window hit rate %.3f, per layer%s\n", wt ? (double) wh/wt : 0.0, line.c_str());
+    }
     if (mc->adapt) {
         const uint64_t sn = mc->st_step_n.load(std::memory_order_relaxed);
         LLAMA_LOG_INFO("moe-hot: adaptive: %" PRIu64 " experts admitted, %" PRIu64 " verify mismatches%s, step host time %.0f us%s\n",
@@ -2796,6 +2818,7 @@ bool llama_moe_hot_init(const llama_model & model, const void * owner, size_t bu
 
         if (const char * st = llama_fn_env(model, "LLAMA_MOE_HOT_STATS"); st && atoi(st) != 0) {
             mc->ad_stats = true;
+            mc->ad_stats_l = atoi(st) >= 2; // [TAG_FN_L10_STATS2]
             g_hot_stats.hit.assign(model.layers.size(), 0);
             g_hot_stats.tot.assign(model.layers.size(), 0);
             g_hot_stats.first_il = mc->layers.front().pub.il;
