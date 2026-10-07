@@ -158,6 +158,9 @@ const fn_item k_items[] = {
     // [TAG_FN_L9_ADOPT] round 9: the prefetch hint picks the next layer's top-k in its own kernel (exact, identity PASS);
     // A/B l9/ab9 (2 rounds, 262K) real use mean +3.3 % (131K +6.4, 245K +3.2 %), prose +5.2 %
     { "LLAMA_FN_L9_HINTTOPK",        "1",     P_BR  }, // [TAG_FN_L9_HINTTOPK]
+    // [TAG_FN_L10_ADOPT] round 10: the KV caches' unused cells as extra hot slots in the lower layers, given back slot by slot
+    // as the context grows; A/B l10s/ab10v (3 rounds, 262K) real use 88.4 -> 91.6 t/s (32K 92.1 -> 101.2, 131K 85.9 -> 90.2)
+    { "LLAMA_FN_L10_SLOTLEND",       "1",     P_ALL }, // [TAG_FN_L10_SLOTLEND]
 };
 
 // names the fn-auto aware code reads through llama_fn_env(): never put into the environment
