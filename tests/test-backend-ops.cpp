@@ -19196,7 +19196,9 @@ static bool run_fn_l4_post(ggml_backend_t backend, const char * op_names_filter)
         bp.n_used     = (int32_t) n_used;
         bp.max_tokens = 8;
         bp.wait_mode  = mode;
-        bp.timeout_ms = 100;
+        // only the spin mode's sticky-error case needs a short timeout; a host function can wait more than 100 ms for its
+        // driver thread on a loaded machine, and one timeout makes the error sticky for every later case
+        bp.timeout_ms = mode == GGML_MOE_BRIDGE_WAIT_SPIN ? 100 : 2000;
         bp.job_max_ms = 1000;
         ggml_moe_bridge * br = dev_index >= 0 ? br_new(&bp) : nullptr;
         n_run++;
