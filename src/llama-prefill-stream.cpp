@@ -74,6 +74,8 @@ struct pfs_state {
     bool               own_copy = false;
     // [TAG_FN_L3_HOST_POKE] flush the copy stream after a dispatch (a no-op unless LLAMA_FN_HOST_POKE turned it on)
     void (*poke)(ggml_backend_t) = nullptr;
+    // [TAG_FN_L14_PFSD2D] LLAMA_FN_L14_PFSD2D=1: the experts the hot set holds go slot -> bank on the device
+    bool (*d2d)(ggml_backend_t, int, void * const *, const void * const *, const size_t *) = nullptr;
 
     // [TAG_FN_R1_PFS_LEND] LLAMA_PREFILL_STREAM_LEND=1: the banks are a range of the hot set's buffer, borrowed while
     // ubatches stream (lent) and returned before a decode; the aliases are placed there at the first lend
@@ -118,6 +120,7 @@ struct pfs_state {
     llama_pfs_counters ctr;
     int64_t            t_ub0   = 0;
     uint64_t           ub_bytes = 0;
+    uint64_t           ub_d2d   = 0; // [TAG_FN_L14_PFSD2D]
     double             ub_wait  = 0.0;
 };
 
@@ -133,6 +136,14 @@ void pfs_run(pfs_state * s) {
     struct item { int slot; const uint8_t * src; size_t dst; size_t n; };
     std::vector<item> staged;
     int next_slot = 0;
+    // [TAG_FN_L14_PFSD2D]
+    std::vector<int32_t>                     hot_slot;
+    std::vector<std::pair<size_t, size_t>>   ranges;
+    std::vector<gen5::copy_seg>              segs;
+    std::vector<item>                        pieces;
+    std::vector<void *>                      d2d_dst;
+    std::vector<const void *>                d2d_src;
+    std::vector<size_t>                      d2d_len;
 
     for (;;) {
         pfs_job job;
@@ -162,6 +173,7 @@ void pfs_run(pfs_state * s) {
         bool dispatching = false;
         bool cancelled   = false;
         size_t bytes = 0;
+        size_t bytes_d2d = 0;
 
         // true while this job is still wanted
         auto alive = [&]() -> bool {
@@ -206,18 +218,24 @@ void pfs_run(pfs_state * s) {
             return true;
         };
 
-        for (int k = 0; k < 3 && !cancelled; ++k) {
+        // the byte ranges of tensor k in `ranges` from the host: through the ring, a slot filled by one copy of its pieces
+        auto stream_ranges = [&](int k) {
             const uint8_t * src = (const uint8_t *) L.src[k]->data;
-            for (size_t o = 0; o < L.nbytes[k] && !cancelled; o += s->chunk) {
-                const size_t n = std::min(s->chunk, L.nbytes[k] - o);
-                if (L.src_pinned) {
-                    if (!dispatching && !begin()) {
-                        cancelled = true;
-                        break;
+            if (L.src_pinned) {
+                for (const auto & r : ranges) {
+                    for (size_t o = r.first; o < r.second && !cancelled; o += s->chunk) {
+                        if (!dispatching && !begin()) {
+                            cancelled = true;
+                            break;
+                        }
+                        dispatch({ -1, src + o, s->off[k] + o, std::min(s->chunk, r.second - o) });
                     }
-                    dispatch({ -1, src + o, s->off[k] + o, n });
-                    continue;
                 }
+                return;
+            }
+            size_t ri = 0;
+            size_t ro = ranges.empty() ? 0 : ranges[0].first;
+            while (ri < ranges.size() && !cancelled) {
                 const int slot = next_slot;
                 next_slot = (next_slot + 1) % s->n_chunks;
                 if (s->chunk_state[slot] == 1 && !flush()) { // the ring is full of staged chunks of this job
@@ -229,13 +247,29 @@ void pfs_run(pfs_state * s) {
                     s->chunk_state[slot] = 0;
                 }
                 uint8_t * dst = s->ring.ptr + (size_t) slot*s->chunk;
-                s->pool.copy(dst, src + o, n);
+                size_t pos = 0;
+                segs.clear();
+                pieces.clear();
+                while (pos < s->chunk && ri < ranges.size()) {
+                    const size_t n = std::min(s->chunk - pos, ranges[ri].second - ro);
+                    segs.push_back({ dst + pos, src + ro, n });
+                    pieces.push_back({ slot, dst + pos, s->off[k] + ro, n });
+                    pos += n;
+                    ro  += n;
+                    if (ro == ranges[ri].second && ++ri < ranges.size()) {
+                        ro = ranges[ri].first;
+                    }
+                }
+                s->pool.copy_list(segs.data(), (int) segs.size());
                 s->chunk_state[slot] = 1;
-                const item it = { slot, dst, s->off[k] + o, n };
-                if (dispatching) {
-                    dispatch(it);
-                } else {
-                    staged.push_back(it);
+                for (const item & it : pieces) {
+                    if (dispatching) {
+                        dispatch(it);
+                    } else {
+                        staged.push_back(it);
+                    }
+                }
+                if (!dispatching) {
                     bool free_now;
                     {
                         std::lock_guard<std::mutex> lk(s->mtx);
@@ -249,9 +283,78 @@ void pfs_run(pfs_state * s) {
                     cancelled = true;
                 }
             }
+        };
+        // [TAG_FN_L14_PFSD2D] the runs of experts with (held = true) or without a hot slot, as byte ranges of tensor k
+        const int64_t n_exp = L.src[0]->ne[2];
+        auto expert_ranges = [&](int k, bool held) {
+            ranges.clear();
+            const size_t nb = L.src[k]->nb[2];
+            for (int64_t e = 0; e < n_exp; ) {
+                if ((hot_slot[e] >= 0) != held) {
+                    ++e;
+                    continue;
+                }
+                int64_t e1 = e + 1;
+                while (e1 < n_exp && (hot_slot[e1] >= 0) == held) {
+                    ++e1;
+                }
+                ranges.push_back({ (size_t) e*nb, (size_t) e1*nb });
+                e = e1;
+            }
+        };
+
+        // the experts the hot set holds come from its VRAM slots, the rest from the host
+        const ggml_tensor * hs3[3] = { nullptr, nullptr, nullptr };
+        bool d2d = s->d2d != nullptr && n_exp > 0;
+        if (d2d) {
+            hot_slot.resize((size_t) n_exp);
+            d2d = llama_moe_hot_slots(L.src[0], hot_slot.data(), n_exp, hs3);
+            for (int k = 0; d2d && k < 3; ++k) {
+                d2d = hs3[k] != nullptr && hs3[k]->nb[2] == L.src[k]->nb[2] && L.src[k]->ne[2] == n_exp &&
+                      L.src[k]->nb[2]*(size_t) n_exp == L.nbytes[k];
+            }
+        }
+        for (int k = 0; k < 3 && !cancelled; ++k) {
+            if (d2d) {
+                expert_ranges(k, false);
+            } else {
+                ranges.assign(1, { (size_t) 0, L.nbytes[k] });
+            }
+            stream_ranges(k);
         }
         if (!cancelled && !flush()) {
             cancelled = true;
+        }
+        if (!cancelled && d2d) { // the bank is owned now: slot -> bank on the copy stream
+            d2d_dst.clear();
+            d2d_src.clear();
+            d2d_len.clear();
+            for (int k = 0; k < 3; ++k) {
+                const size_t    nb    = L.src[k]->nb[2];
+                uint8_t *       bank  = (uint8_t *) B.raw->data + s->off[k];
+                const uint8_t * slots = (const uint8_t *) hs3[k]->data;
+                for (int64_t e = 0; e < n_exp; ++e) {
+                    if (hot_slot[e] >= 0) {
+                        d2d_dst.push_back(bank + (size_t) e*nb);
+                        d2d_src.push_back(slots + (size_t) hot_slot[e]*nb);
+                        d2d_len.push_back(nb);
+                        bytes_d2d += nb;
+                    }
+                }
+            }
+            if (!s->d2d(s->copy, (int) d2d_dst.size(), d2d_dst.data(), d2d_src.data(), d2d_len.data())) {
+                LLAMA_LOG_WARN("prefill-stream: [TAG_FN_L14_PFSD2D] the device copies failed: these experts and every later "
+                        "one come from the host\n");
+                s->d2d    = nullptr;
+                bytes_d2d = 0;
+                for (int k = 0; k < 3 && !cancelled; ++k) {
+                    expert_ranges(k, true);
+                    stream_ranges(k);
+                }
+                if (!cancelled && !flush()) {
+                    cancelled = true;
+                }
+            }
         }
         if (!cancelled) {
             for (int k = 0; k < 3; ++k) {
@@ -280,6 +383,8 @@ void pfs_run(pfs_state * s) {
                 s->ctr.jobs++;
                 s->ctr.bytes += bytes;
                 s->ub_bytes  += bytes;
+                s->ctr.d2d_bytes += bytes_d2d; // [TAG_FN_L14_PFSD2D]
+                s->ub_d2d        += bytes_d2d;
             } else if (B.holds == job.pos && dispatching) {
                 B.holds    = -1; // partly written
                 B.consumed = true;
@@ -345,6 +450,7 @@ void pfs_gate_op(ggml_tensor * dst, int ith, int nth, void * ud) {
             s->ctr.ubatches++;
             s->t_ub0    = t0;
             s->ub_bytes = 0;
+            s->ub_d2d   = 0;
             s->ub_wait  = 0.0;
             had = B.holds == 0 && B.complete;
             if (had) {
@@ -402,9 +508,10 @@ void pfs_release_op(ggml_tensor * dst, int ith, int nth, void * ud) {
         }
         if (s->stats && L->pos == (int) s->layers.size() - 1) {
             const double dt = (ggml_time_us() - s->t_ub0) / 1e6;
-            LLAMA_LOG_INFO("prefill-stream: ubatch %" PRIu64 ": %zu layers in %.1f ms, %.2f GiB copied (%.1f GiB/s), gates waited %.1f ms\n",
+            LLAMA_LOG_INFO("prefill-stream: ubatch %" PRIu64 ": %zu layers in %.1f ms, %.2f GiB copied (%.1f GiB/s), gates waited %.1f ms, "
+                    "%.2f GiB from the hot set's slots [TAG_FN_L14_PFSD2D]\n",
                     s->ctr.ubatches, s->layers.size(), dt*1e3, s->ub_bytes/1073741824.0,
-                    dt > 0 ? s->ub_bytes/1073741824.0/dt : 0.0, s->ub_wait*1e3);
+                    dt > 0 ? s->ub_bytes/1073741824.0/dt : 0.0, s->ub_wait*1e3, s->ub_d2d/1073741824.0);
         }
     }
     s->cv.notify_all();
@@ -684,6 +791,10 @@ bool llama_prefill_stream_init_layers(const std::vector<llama_moe_gen5_layer_des
         // [TAG_FN_L3_HOST_POKE] the device backend's flush, if it has one (it does nothing unless the switch is on)
         if (ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(d.dev)) {
             s->poke = (void (*)(ggml_backend_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_stream_poke");
+            if (gen5::env_flag("LLAMA_FN_L14_PFSD2D")) { // [TAG_FN_L14_PFSD2D]
+                s->d2d = (bool (*)(ggml_backend_t, int, void * const *, const void * const *, const size_t *))
+                        ggml_backend_reg_get_proc_address(reg, "ggml_backend_copy_d2d_batch_async");
+            }
         }
     } else {
         s->copy = d.compute; // CPU: copies are synchronous memcpy
@@ -697,10 +808,11 @@ bool llama_prefill_stream_init_layers(const std::vector<llama_moe_gen5_layer_des
     g_pfs = s;
 
     LLAMA_LOG_INFO("prefill-stream: %zu host expert layers, ubatches >= %" PRId64 " tokens, %d VRAM bank(s) x %.0f MiB%s, "
-            "%s ring %zu x %zu MiB, %d copy threads, wrap %s\n", s->layers.size(), s->min_tokens, s->n_bufs,
+            "%s ring %zu x %zu MiB, %d copy threads, wrap %s%s\n", s->layers.size(), s->min_tokens, s->n_bufs,
             s->bank_size/1048576.0, s->lend ? " borrowed from the hot set while a prompt streams [TAG_FN_R1_PFS_LEND]" : "",
             s->ring.pinned ? "pinned" : (need_ring ? "plain" : "no"), (size_t) s->n_chunks,
-            s->chunk >> 20, s->pool.size(), s->wrap ? "on" : "off");
+            s->chunk >> 20, s->pool.size(), s->wrap ? "on" : "off",
+            s->d2d ? ", the hot set's experts slot -> bank on the device [TAG_FN_L14_PFSD2D]" : "");
     return true;
 }
 

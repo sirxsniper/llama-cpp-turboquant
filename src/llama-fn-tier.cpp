@@ -6,13 +6,17 @@
 #include "llama-impl.h"
 #include "llama-model-loader.h"
 #include "llama-model.h"
+#include "llama-moecache.h"
 
 #include "ggml-backend.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <mutex>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #ifdef _WIN32
@@ -52,23 +56,35 @@ bool fn_tier_on(const llama_model & model) {
 } // namespace
 
 struct llama_fn_tier {
-    struct range {
-        char * lo;
-        size_t n;
+    struct layer {
+        int                  il      = -1;
+        const ggml_tensor *  up      = nullptr; // the hot set's key
+        char *               base[3] = {};      // up, gate, down
+        size_t               nb[3]   = {};      // bytes of one expert in each
+        int                  n_exp   = 0;
+        std::vector<uint8_t> locked;
+        std::vector<uint8_t> hot;               // the hot set holds it (last look)
     };
-    std::vector<std::vector<range>> layers;      // candidates, in lock order
-    std::vector<int>                layer_il;
-    std::vector<size_t>             layer_bytes;
-    size_t                          total        = 0;
-    size_t                          n_locked     = 0; // layers [0, n_locked) are locked
-    size_t                          locked_bytes = 0;
-    size_t                          cap          = 0; // most bytes locked (default 60 % of the RAM)
-    size_t                          free_min     = 0; // a layer is locked only while this much RAM stays available
-    size_t                          low          = 0;
-    int                             delay_ms     = 0;
+    struct item {
+        int l;
+        int e;
+    };
+    std::vector<layer>                 layers;
+    std::unordered_map<uintptr_t, int> edge;     // first / last page of a locked slice: the locked slices that hold it
+    std::mutex                         mtx;      // edge, the counters and the working-set size (fill threads)
+    size_t                             page         = 4096;
+    size_t                             total        = 0;
+    size_t                             locked_bytes = 0;
+    size_t                             reserved     = 0; // bytes a fill thread is locking right now
+    size_t                             n_locked     = 0; // experts
+    size_t                             cap          = 0;
+    size_t                             free_min     = 0;
+    size_t                             low          = 0;
+    int                                delay_ms     = 0;
+    int                                n_fill       = 4;
 #ifdef _WIN32
-    HANDLE                          stop = nullptr;
-    std::thread                     worker;
+    HANDLE                             stop = nullptr;
+    std::thread                        worker;
 #endif
 };
 
@@ -76,29 +92,50 @@ struct llama_fn_tier {
 
 namespace {
 
-// the bytes of layer i that are not in this process's working set yet, from every 16th page (pages the server already
-// touched cost no RAM to lock: only the rest has to come out of the available memory)
-size_t fn_tier_nonresident(const llama_fn_tier * t, size_t i) {
-    constexpr size_t step = 16;
-    SYSTEM_INFO si;
-    GetSystemInfo(&si);
-    const size_t page = si.dwPageSize ? si.dwPageSize : 4096;
+using tier_t = llama_fn_tier;
+
+// the page range of slice s (up, gate, down) of expert e
+void fn_tier_slice(const tier_t * t, const tier_t::layer & L, int e, int s, char ** lo, char ** hi) {
+    const uintptr_t a = (uintptr_t) L.base[s] + (uintptr_t) e*L.nb[s];
+    *lo = (char *) (a/t->page*t->page);
+    *hi = (char *) ((a + L.nb[s] + t->page - 1)/t->page*t->page);
+}
+
+size_t fn_tier_bytes(const tier_t * t, const tier_t::item & it) {
+    size_t b = 0;
+    for (int s = 0; s < 3; ++s) {
+        char * lo;
+        char * hi;
+        fn_tier_slice(t, t->layers[it.l], it.e, s, &lo, &hi);
+        b += (size_t) (hi - lo);
+    }
+    return b;
+}
+
+// the bytes of items [i0, i1) not in this process's working set yet, from every 16th page (pages the server already
+// touched cost no RAM to lock: only the rest comes out of the available memory)
+size_t fn_tier_nonresident(const tier_t * t, const std::vector<tier_t::item> & items, size_t i0, size_t i1, size_t bytes) {
     std::vector<PSAPI_WORKING_SET_EX_INFORMATION> q;
-    for (const auto & r : t->layers[i]) {
-        for (size_t o = 0; o < r.n; o += step*page) {
-            PSAPI_WORKING_SET_EX_INFORMATION x = {};
-            x.VirtualAddress = r.lo + o;
-            q.push_back(x);
+    for (size_t i = i0; i < i1; ++i) {
+        for (int s = 0; s < 3; ++s) {
+            char * lo;
+            char * hi;
+            fn_tier_slice(t, t->layers[items[i].l], items[i].e, s, &lo, &hi);
+            for (char * p = lo; p < hi; p += 16*t->page) {
+                PSAPI_WORKING_SET_EX_INFORMATION x = {};
+                x.VirtualAddress = p;
+                q.push_back(x);
+            }
         }
     }
     if (q.empty() || !K32QueryWorkingSetEx(GetCurrentProcess(), q.data(), (DWORD) (q.size()*sizeof(q[0])))) {
-        return t->layer_bytes[i];
+        return bytes;
     }
     size_t out = 0;
     for (const auto & x : q) {
         out += x.VirtualAttributes.Valid ? 0 : 1;
     }
-    return (size_t) ((double) t->layer_bytes[i]*out/q.size());
+    return (size_t) ((double) bytes*out/q.size());
 }
 
 size_t fn_tier_avail() {
@@ -122,110 +159,269 @@ bool fn_tier_ws_add(int64_t delta) {
             QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE) != 0;
 }
 
-// lock candidate layer t->n_locked while the cap allows it and the system keeps free_min available (pages this process
-// already touched are in its working set, not in the available RAM: locking them takes nothing more)
-bool fn_tier_lock_next(llama_fn_tier * t) {
-    if (t->n_locked >= t->layers.size()) {
-        return false;
-    }
-    const size_t i = t->n_locked;
-    const size_t b = t->layer_bytes[i];
-    if (t->locked_bytes + b > t->cap || fn_tier_avail() < t->free_min + fn_tier_nonresident(t, i)) {
-        return false;
-    }
-    if (!fn_tier_ws_add((int64_t) b)) {
-        return false;
-    }
-    using prefetch_t = BOOL (WINAPI *)(HANDLE, ULONG_PTR, PWIN32_MEMORY_RANGE_ENTRY, ULONG);
-    static const prefetch_t pf = (prefetch_t) (void *) GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "PrefetchVirtualMemory");
-    if (pf != nullptr) {
-        std::vector<WIN32_MEMORY_RANGE_ENTRY> e;
-        for (auto & r : t->layers[i]) {
-            WIN32_MEMORY_RANGE_ENTRY x;
-            x.VirtualAddress = r.lo;
-            x.NumberOfBytes  = r.n;
-            e.push_back(x);
-        }
-        pf(GetCurrentProcess(), (ULONG_PTR) e.size(), e.data(), 0);
-    }
-    size_t k = 0;
-    for (; k < t->layers[i].size(); ++k) {
-        if (!VirtualLock(t->layers[i][k].lo, t->layers[i][k].n)) {
-            break;
-        }
-    }
-    if (k < t->layers[i].size()) {
-        for (size_t j = 0; j < k; ++j) {
-            VirtualUnlock(t->layers[i][j].lo, t->layers[i][j].n);
-        }
-        fn_tier_ws_add(-(int64_t) b);
-        return false;
-    }
-    t->n_locked++;
-    t->locked_bytes += b;
-    return true;
+// the first and last page of a slice (one page when they are the same)
+int fn_tier_ends(const tier_t * t, char * lo, char * hi, char ** ends) {
+    ends[0] = lo;
+    ends[1] = hi - t->page;
+    return ends[1] != ends[0] ? 2 : 1;
 }
 
-void fn_tier_unlock_last(llama_fn_tier * t) {
-    if (t->n_locked == 0) {
+// unlock one expert: the inner pages of its slices, and their first / last page when no other locked slice holds it.
+// Only while no fill thread runs (the edge counts and the pages' lock state must agree).
+void fn_tier_unlock(tier_t * t, const tier_t::item & it) {
+    tier_t::layer & L = t->layers[it.l];
+    if (!L.locked[it.e]) {
         return;
     }
-    const size_t i = --t->n_locked;
-    for (auto & r : t->layers[i]) {
-        VirtualUnlock(r.lo, r.n);
+    size_t b = 0;
+    for (int s = 0; s < 3; ++s) {
+        char * lo;
+        char * hi;
+        fn_tier_slice(t, L, it.e, s, &lo, &hi);
+        b += (size_t) (hi - lo);
+        if (hi - lo > (ptrdiff_t) (2*t->page)) {
+            VirtualUnlock(lo + t->page, (size_t) (hi - lo) - 2*t->page);
+        }
+        char * ends[2];
+        const int n = fn_tier_ends(t, lo, hi, ends);
+        for (int k = 0; k < n; ++k) {
+            auto e = t->edge.find((uintptr_t) ends[k]);
+            if (e != t->edge.end() && --e->second == 0) {
+                t->edge.erase(e);
+                VirtualUnlock(ends[k], t->page);
+            }
+        }
     }
-    t->locked_bytes -= t->layer_bytes[i];
-    fn_tier_ws_add(-(int64_t) t->layer_bytes[i]);
+    L.locked[it.e] = 0;
+    t->locked_bytes -= b;
+    t->n_locked--;
+    fn_tier_ws_add(-(int64_t) b);
 }
 
-// after the start delay (the context, its warm-up and the first kernels' loads come first): lock layer by layer at
-// background priority up to the cap; then watch: below `low` one layer goes back every 5 s at most, and after a minute
-// with room again (and room under the cap) one more layer is locked
-void fn_tier_worker(llama_fn_tier * t) {
+// lock items in order with n_fill threads, 32 experts at a time, while the cap, the available RAM and max_bytes allow.
+// Each thread hints the read of its chunk, touches every page (the faults run in parallel) and locks it. Returns the bytes.
+size_t fn_tier_fill(tier_t * t, const std::vector<tier_t::item> & items, size_t max_bytes) {
+    constexpr size_t chunk = 32;
+    using prefetch_t = BOOL (WINAPI *)(HANDLE, ULONG_PTR, PWIN32_MEMORY_RANGE_ENTRY, ULONG);
+    static const prefetch_t pf = (prefetch_t) (void *) GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "PrefetchVirtualMemory");
+
+    std::atomic<size_t> next{0};
+    std::atomic<bool>   full{false};
+    size_t              added  = 0;
+    size_t              failed = 0;
+    auto run = [&]() {
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+        std::vector<WIN32_MEMORY_RANGE_ENTRY> rs;
+        std::vector<size_t> sizes;
+        for (;;) {
+            if (full.load() || WaitForSingleObject(t->stop, 0) == WAIT_OBJECT_0) {
+                return;
+            }
+            const size_t c0 = next.fetch_add(chunk);
+            if (c0 >= items.size()) {
+                return;
+            }
+            const size_t c1 = std::min(c0 + chunk, items.size());
+            sizes.clear();
+            size_t b = 0;
+            for (size_t i = c0; i < c1; ++i) {
+                sizes.push_back(fn_tier_bytes(t, items[i]));
+                b += sizes.back();
+            }
+            const size_t nonres = fn_tier_nonresident(t, items, c0, c1, b);
+            {
+                std::lock_guard<std::mutex> lk(t->mtx);
+                if (t->locked_bytes + t->reserved + b > t->cap || added + b > max_bytes ||
+                    fn_tier_avail() < t->free_min + nonres + t->reserved || !fn_tier_ws_add((int64_t) b)) {
+                    full.store(true);
+                    return;
+                }
+                t->reserved += b;
+                added       += b;
+            }
+            rs.clear();
+            for (size_t i = c0; i < c1; ++i) {
+                for (int s = 0; s < 3; ++s) {
+                    char * lo;
+                    char * hi;
+                    fn_tier_slice(t, t->layers[items[i].l], items[i].e, s, &lo, &hi);
+                    rs.push_back({ lo, (SIZE_T) (hi - lo) });
+                }
+            }
+            if (pf != nullptr) {
+                pf(GetCurrentProcess(), (ULONG_PTR) rs.size(), rs.data(), 0);
+            }
+            for (const auto & r : rs) {
+                for (size_t o = 0; o < r.NumberOfBytes; o += t->page) {
+                    (void) *(volatile const char *) ((const char *) r.VirtualAddress + o);
+                }
+            }
+            std::vector<uint8_t> ok(c1 - c0, 0);
+            for (size_t i = c0; i < c1; ++i) {
+                int s = 0;
+                for (; s < 3; ++s) {
+                    if (!VirtualLock(rs[(i - c0)*3 + s].VirtualAddress, rs[(i - c0)*3 + s].NumberOfBytes)) {
+                        break;
+                    }
+                }
+                if (s == 3) {
+                    ok[i - c0] = 1;
+                } else {
+                    for (int k = 0; k < s; ++k) { // inner pages only: a neighbour may hold the ends
+                        const auto & r = rs[(i - c0)*3 + k];
+                        if (r.NumberOfBytes > 2*t->page) {
+                            VirtualUnlock((char *) r.VirtualAddress + t->page, r.NumberOfBytes - 2*t->page);
+                        }
+                    }
+                }
+            }
+            std::lock_guard<std::mutex> lk(t->mtx);
+            size_t lost = 0;
+            for (size_t i = c0; i < c1; ++i) {
+                if (!ok[i - c0]) {
+                    lost += sizes[i - c0];
+                    failed++;
+                    continue;
+                }
+                for (int s = 0; s < 3; ++s) {
+                    const auto & r = rs[(i - c0)*3 + s];
+                    char * ends[2];
+                    const int n = fn_tier_ends(t, (char *) r.VirtualAddress, (char *) r.VirtualAddress + r.NumberOfBytes, ends);
+                    for (int k = 0; k < n; ++k) {
+                        t->edge[(uintptr_t) ends[k]]++;
+                    }
+                }
+                t->layers[items[i].l].locked[items[i].e] = 1;
+                t->locked_bytes += sizes[i - c0];
+                t->n_locked++;
+            }
+            t->reserved -= b;
+            if (lost > 0) {
+                fn_tier_ws_add(-(int64_t) lost);
+                added -= lost;
+                full.store(true); // the working-set quota or the RAM is short: stop here
+            }
+        }
+    };
+    std::vector<std::thread> ths;
+    for (int k = 1; k < t->n_fill; ++k) {
+        ths.emplace_back(run);
+    }
+    run();
+    for (auto & th : ths) {
+        th.join();
+    }
+    if (failed > 0) {
+        LLAMA_LOG_WARN("[TAG_FN_L14_TIER] %zu experts could not be locked (working-set quota or RAM)\n", failed);
+    }
+    return added;
+}
+
+// which experts the hot set holds now; a layer whose bookkeeping is busy keeps its last look
+void fn_tier_look(tier_t * t) {
+    std::vector<uint8_t> buf;
+    for (auto & L : t->layers) {
+        buf.assign((size_t) L.n_exp, 0);
+        const int r = llama_moe_hot_residents(L.up, buf.data(), L.n_exp);
+        if (r != 0) {
+            L.hot = buf;
+        }
+    }
+}
+
+// the experts to lock: those the CPU computes (cpu = true) or those the hot set holds, not locked yet, in layer order
+std::vector<tier_t::item> fn_tier_wanted(const tier_t * t, bool cpu) {
+    std::vector<tier_t::item> res;
+    for (int l = 0; l < (int) t->layers.size(); ++l) {
+        const auto & L = t->layers[l];
+        for (int e = 0; e < L.n_exp; ++e) {
+            if (!L.locked[e] && (L.hot[e] == 0) == cpu) {
+                res.push_back({ l, e });
+            }
+        }
+    }
+    return res;
+}
+
+// unlock about `bytes`: experts the hot set holds first, then the CPU's, from the last layer down
+size_t fn_tier_release(tier_t * t, size_t bytes, bool cpu_too) {
+    const size_t b0 = t->locked_bytes;
+    for (int pass = 0; pass < (cpu_too ? 2 : 1) && b0 - t->locked_bytes < bytes; ++pass) {
+        for (int l = (int) t->layers.size() - 1; l >= 0 && b0 - t->locked_bytes < bytes; --l) {
+            auto & L = t->layers[l];
+            for (int e = L.n_exp - 1; e >= 0 && b0 - t->locked_bytes < bytes; --e) {
+                if (L.locked[e] && (pass == 1 || L.hot[e])) {
+                    fn_tier_unlock(t, { l, e });
+                }
+            }
+        }
+    }
+    return b0 - t->locked_bytes;
+}
+
+size_t fn_tier_sum(const tier_t * t, const std::vector<tier_t::item> & items) {
+    size_t b = 0;
+    for (const auto & it : items) {
+        b += fn_tier_bytes(t, it);
+    }
+    return b;
+}
+
+// after the start delay (the context, its warm-up and the first kernels' loads come first): lock the experts the CPU
+// computes, then the hot set's, up to the cap. Then every 2 s follow the hot set: a CPU expert not locked yet is locked,
+// if need be in place of one the hot set holds; below `low` about 1 GiB goes back (the hot set's first); after a minute
+// with room the hot set's experts are added again
+void fn_tier_worker(tier_t * t) {
     if (WaitForSingleObject(t->stop, (DWORD) t->delay_ms) == WAIT_OBJECT_0) {
         return;
     }
-    // below-normal CPU priority, normal I/O priority (background mode made the reads crawl: 9.5 GiB in 47 s)
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
     const auto t0 = std::chrono::steady_clock::now();
-    while (WaitForSingleObject(t->stop, 0) != WAIT_OBJECT_0 && fn_tier_lock_next(t)) {
-        WaitForSingleObject(t->stop, 20);
-    }
-    LLAMA_LOG_INFO("[TAG_FN_L14_TIER] %zu of %zu host layers' routed experts (%.2f GiB of %.2f GiB) locked in place in %.1f s; "
-            "%.1f GiB RAM available (cap %.1f GiB)\n", t->n_locked, t->layers.size(), t->locked_bytes/1073741824.0,
-            t->total/1073741824.0, std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(),
-            fn_tier_avail()/1073741824.0, t->cap/1073741824.0);
+    fn_tier_look(t);
+    const auto   cpu   = fn_tier_wanted(t, true);
+    const size_t b_cpu = fn_tier_fill(t, cpu, SIZE_MAX);
+    const size_t b_hot = fn_tier_fill(t, fn_tier_wanted(t, false), SIZE_MAX);
+    LLAMA_LOG_INFO("[TAG_FN_L14_TIER] locked in %.1f s: %.2f of the %.2f GiB of experts the CPU computes, %.2f GiB of the hot "
+            "set's; %.2f of %.2f GiB locked (cap %.1f GiB), %.1f GiB RAM available\n",
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(), b_cpu/1073741824.0,
+            fn_tier_sum(t, cpu)/1073741824.0, b_hot/1073741824.0, t->locked_bytes/1073741824.0, t->total/1073741824.0,
+            t->cap/1073741824.0, fn_tier_avail()/1073741824.0);
 
-    auto healthy_since = std::chrono::steady_clock::now();
+    auto   healthy_since = std::chrono::steady_clock::now();
+    size_t q_bytes = 0; // locked by the watcher since its last line
+    auto   q_since = healthy_since;
     for (;;) {
-        if (WaitForSingleObject(t->stop, 1000) == WAIT_OBJECT_0) {
+        if (WaitForSingleObject(t->stop, 2000) == WAIT_OBJECT_0) {
             return;
         }
-        const size_t a   = fn_tier_avail();
-        const auto   now = std::chrono::steady_clock::now();
-        if (a < t->low && t->n_locked > 0) {
-            fn_tier_unlock_last(t);
-            LLAMA_LOG_WARN("[TAG_FN_L14_TIER] %.1f GiB RAM available (below %.1f GiB): one layer of experts unlocked, %zu layers / "
-                    "%.2f GiB stay locked\n", a/1073741824.0, t->low/1073741824.0, t->n_locked, t->locked_bytes/1073741824.0);
+        const auto now = std::chrono::steady_clock::now();
+        if (fn_tier_avail() < t->low && t->n_locked > 0) {
+            const size_t r = fn_tier_release(t, (size_t) 1 << 30, true);
+            LLAMA_LOG_WARN("[TAG_FN_L14_TIER] %.1f GiB RAM available (below %.1f GiB): %.2f GiB unlocked, %.2f GiB stay locked\n",
+                    fn_tier_avail()/1073741824.0, t->low/1073741824.0, r/1073741824.0, t->locked_bytes/1073741824.0);
             healthy_since = now;
             if (WaitForSingleObject(t->stop, 4000) == WAIT_OBJECT_0) {
                 return;
             }
             continue;
         }
-        const bool room = t->n_locked < t->layers.size() &&
-                          t->locked_bytes + t->layer_bytes[t->n_locked] <= t->cap &&
-                          a > t->free_min + t->layer_bytes[t->n_locked] + ((size_t) 4 << 30);
-        if (!room) {
-            healthy_since = now;
-            continue;
-        }
-        if (now - healthy_since > std::chrono::seconds(60)) {
-            if (fn_tier_lock_next(t)) {
-                LLAMA_LOG_INFO("[TAG_FN_L14_TIER] room again: one more layer of experts locked, %zu layers / %.2f GiB locked\n",
-                        t->n_locked, t->locked_bytes/1073741824.0);
+        fn_tier_look(t);
+        const auto want = fn_tier_wanted(t, true);
+        if (!want.empty()) {
+            const size_t need = std::min<size_t>(fn_tier_sum(t, want), (size_t) 2 << 30);
+            if (t->locked_bytes + need > t->cap) {
+                fn_tier_release(t, t->locked_bytes + need - t->cap, false);
             }
+            q_bytes += fn_tier_fill(t, want, (size_t) 2 << 30);
+        } else if (now - healthy_since > std::chrono::seconds(60)) {
+            q_bytes += fn_tier_fill(t, fn_tier_wanted(t, false), (size_t) 1 << 30);
             healthy_since = now;
+        }
+        if (q_bytes > 0 && now - q_since > std::chrono::seconds(60)) {
+            LLAMA_LOG_INFO("[TAG_FN_L14_TIER] the last minute: %.2f GiB more locked as the hot set moved; %.2f of %.2f GiB locked\n",
+                    q_bytes/1073741824.0, t->locked_bytes/1073741824.0, t->total/1073741824.0);
+            q_bytes = 0;
+            q_since = now;
         }
     }
 }
@@ -245,8 +441,10 @@ void llama_fn_tier_deleter::operator()(llama_fn_tier * t) const {
     if (t->worker.joinable()) {
         t->worker.join();
     }
-    while (t->n_locked > 0) {
-        fn_tier_unlock_last(t);
+    for (int l = 0; l < (int) t->layers.size(); ++l) {
+        for (int e = 0; e < t->layers[l].n_exp; ++e) {
+            fn_tier_unlock(t, { l, e });
+        }
     }
     if (t->stop) {
         CloseHandle(t->stop);
@@ -292,31 +490,33 @@ llama_fn_tier_ptr llama_fn_tier_build(llama_model & model, llama_model_loader & 
 
     SYSTEM_INFO si;
     GetSystemInfo(&si);
-    const size_t page = si.dwPageSize ? si.dwPageSize : 4096;
 
     llama_fn_tier_ptr tier(new llama_fn_tier());
-    // the host layers' expert ranges, page-aligned (a layer whose experts are not all in host buffers is skipped)
+    tier->page = si.dwPageSize ? si.dwPageSize : 4096;
+    // the host layers' experts (a layer whose three tensors are not all in host buffers, or differ in expert count, is skipped)
     int il = 0;
     for (const auto & ts : fn_tier_layers(model)) {
-        std::vector<llama_fn_tier::range> rs;
+        llama_fn_tier::layer L;
         bool ok = ts.size() == 3;
-        size_t b = 0;
-        for (ggml_tensor * t : ts) {
-            ok = ok && t->buffer && ggml_backend_buffer_is_host(t->buffer) && t->data;
-            if (!ok) {
-                break;
+        for (int s = 0; ok && s < 3; ++s) {
+            const ggml_tensor * t = ts[s];
+            ok = t->buffer && ggml_backend_buffer_is_host(t->buffer) && t->data && t->ne[2] >= 1 &&
+                 (s == 0 || t->ne[2] == L.n_exp) && t->nb[2]*t->ne[2] == ggml_nbytes(t);
+            if (ok) {
+                L.base[s] = (char *) t->data;
+                L.nb[s]   = t->nb[2];
+                L.n_exp   = (int) t->ne[2];
             }
-            const uintptr_t a  = (uintptr_t) t->data;
-            const uintptr_t lo = a/page*page;
-            const uintptr_t hi = (a + ggml_nbytes(t) + page - 1)/page*page;
-            rs.push_back({ (char *) lo, (size_t) (hi - lo) });
-            b += (size_t) (hi - lo);
         }
         if (ok) {
-            tier->layers.push_back(rs);
-            tier->layer_il.push_back(il);
-            tier->layer_bytes.push_back(b);
-            tier->total += b;
+            L.il = il;
+            L.up = ts[0];
+            L.locked.assign((size_t) L.n_exp, 0);
+            L.hot.assign((size_t) L.n_exp, 0);
+            tier->layers.push_back(L);
+            for (int e = 0; e < L.n_exp; ++e) {
+                tier->total += fn_tier_bytes(tier.get(), { (int) tier->layers.size() - 1, e });
+            }
         }
         il++;
     }
@@ -335,14 +535,16 @@ llama_fn_tier_ptr llama_fn_tier_build(llama_model & model, llama_model_loader & 
     tier->free_min = (size_t) std::max(0, llama_fn_l3_int(model, "LLAMA_FN_L14_TIER_FREE_MIB", 6144)) << 20;
     tier->low      = (size_t) std::max(0, llama_fn_l3_int(model, "LLAMA_FN_L14_TIER_LOW_MIB", 4096)) << 20;
     tier->delay_ms = std::max(0, llama_fn_l3_int(model, "LLAMA_FN_L14_TIER_DELAY_MS", 20000));
+    tier->n_fill   = std::max(1, std::min(16, llama_fn_l3_int(model, "LLAMA_FN_L14_TIER_THREADS", 4)));
     tier->stop     = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     if (tier->stop == nullptr) {
         return nullptr;
     }
     tier->worker = std::thread(fn_tier_worker, tier.get());
-    LLAMA_LOG_INFO("%s: [TAG_FN_L14_TIER] %zu host layers (%.2f GiB of routed experts) are locked in place in the background "
-            "from %.0f s after the load, up to %.1f GiB while %.1f GiB of RAM stays available\n", __func__, tier->layers.size(),
-            tier->total/1073741824.0, tier->delay_ms/1000.0, tier->cap/1073741824.0, tier->free_min/1073741824.0);
+    LLAMA_LOG_INFO("%s: [TAG_FN_L14_TIER] %zu host layers (%.2f GiB of routed experts): from %.0f s after the load %d threads "
+            "lock the experts the CPU computes, then the hot set's, up to %.1f GiB while %.1f GiB of RAM stays available\n",
+            __func__, tier->layers.size(), tier->total/1073741824.0, tier->delay_ms/1000.0, tier->n_fill, tier->cap/1073741824.0,
+            tier->free_min/1073741824.0);
     return tier;
 }
 

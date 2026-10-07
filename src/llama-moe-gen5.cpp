@@ -159,11 +159,25 @@ void copy_pool::stop() {
     workers.clear();
 }
 
+// bytes [off, off + len) of the segments taken as one range
+static void copy_segs_part(const copy_seg * sg, int n_sg, size_t off, size_t len) {
+    for (int i = 0; i < n_sg && len > 0; ++i) {
+        if (off >= sg[i].n) {
+            off -= sg[i].n;
+            continue;
+        }
+        const size_t n = std::min(len, sg[i].n - off);
+        memcpy(sg[i].dst + off, sg[i].src + off, n);
+        len -= n;
+        off  = 0;
+    }
+}
+
 void copy_pool::run(int idx) {
     uint64_t seen = 0;
     for (;;) {
-        uint8_t * d;
-        const uint8_t * s;
+        const copy_seg * sg;
+        int n_sg;
         size_t n;
         {
             std::unique_lock<std::mutex> lk(mtx);
@@ -172,14 +186,14 @@ void copy_pool::run(int idx) {
                 return;
             }
             seen = gen;
-            d = dst_p;
-            s = src_p;
-            n = n_bytes;
+            sg   = segs_p;
+            n_sg = n_segs;
+            n    = n_bytes;
         }
         size_t off, len;
         part_range(n, idx, size(), off, len);
         if (len > 0) {
-            memcpy(d + off, s + off, len);
+            copy_segs_part(sg, n_sg, off, len);
         }
         {
             std::lock_guard<std::mutex> lk(mtx);
@@ -191,15 +205,24 @@ void copy_pool::run(int idx) {
 }
 
 void copy_pool::copy(void * dst, const void * src, size_t n) {
+    const copy_seg sg = { (uint8_t *) dst, (const uint8_t *) src, n };
+    copy_list(&sg, 1);
+}
+
+void copy_pool::copy_list(const copy_seg * segs, int n_sg) {
+    size_t n = 0;
+    for (int i = 0; i < n_sg; ++i) {
+        n += segs[i].n;
+    }
     const int parts = size();
     if (parts == 1 || n < (1u << 20)) {
-        memcpy(dst, src, n);
+        copy_segs_part(segs, n_sg, 0, n);
         return;
     }
     {
         std::lock_guard<std::mutex> lk(mtx);
-        dst_p   = (uint8_t *) dst;
-        src_p   = (const uint8_t *) src;
+        segs_p  = segs;
+        n_segs  = n_sg;
         n_bytes = n;
         pending = parts - 1;
         gen++;
@@ -208,7 +231,7 @@ void copy_pool::copy(void * dst, const void * src, size_t n) {
     size_t off, len;
     part_range(n, 0, parts, off, len);
     if (len > 0) {
-        memcpy((uint8_t *) dst + off, (const uint8_t *) src + off, len);
+        copy_segs_part(segs, n_sg, off, len);
     }
     std::unique_lock<std::mutex> lk(mtx);
     cv_done.wait(lk, [&]() { return pending == 0; });

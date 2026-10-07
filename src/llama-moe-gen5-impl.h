@@ -65,12 +65,20 @@ void ev_sync(ggml_backend_event_t ev, ggml_backend_t src);
 bool dma_requested();
 
 // a memcpy split over worker threads; copy() blocks until every part is done
+struct copy_seg {
+    uint8_t *       dst;
+    const uint8_t * src;
+    size_t          n;
+};
+
 class copy_pool {
 public:
     ~copy_pool() { stop(); }
     void start(int n_threads);
     void stop();
     void copy(void * dst, const void * src, size_t n);
+    // [TAG_FN_L14_PFSD2D] the segments as one byte range split over the threads (one wake for many small pieces)
+    void copy_list(const copy_seg * segs, int n);
     int  size() const { return (int) workers.size() + 1; }
 
 private:
@@ -83,8 +91,8 @@ private:
     uint64_t                 gen     = 0;
     int                      pending = 0;
     bool                     quit    = false;
-    uint8_t *                dst_p   = nullptr;
-    const uint8_t *          src_p   = nullptr;
+    const copy_seg *         segs_p  = nullptr;
+    int                      n_segs  = 0;
     size_t                   n_bytes = 0;
 };
 

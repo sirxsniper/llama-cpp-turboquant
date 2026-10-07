@@ -62,6 +62,17 @@ const llama_moe_cache_layer * llama_moe_cache_lookup(const ggml_tensor * up_exps
 // reader of the host table only (the bridge), which is always valid ("not hot" for every expert while the layer is out)
 const llama_moe_cache_layer * llama_moe_cache_lookup_table(const ggml_tensor * up_exps);
 
+// [TAG_FN_L14_TIER] for the RAM tier: out[e] = 1 when the hot set holds expert e of the layer of up_exps, 0 when the host
+// computes it. A layer lent to a prompt or in the given-back tail keeps its residents (they come back); a layer that gave
+// its VRAM to the KV cache has none. 1: done; 0: busy right now (try later); -1: no hot set or no such layer
+int llama_moe_hot_residents(const ggml_tensor * up_exps, uint8_t * out, int64_t n_expert);
+
+// [TAG_FN_L14_PFSD2D] for the prefill stream: slot[e] = the slot that holds expert e of the layer of up_exps, or -1; slots3:
+// the up / gate / down slot tensors. While a prompt streams nothing is evicted (no decode step runs), so a slot read here
+// keeps its expert until the stream gives the lend back. false: no such layer, the layer is out (lent, tail, KV), the
+// bookkeeping is busy, or no expert is held
+bool llama_moe_hot_slots(const ggml_tensor * up_exps, int32_t * slot, int64_t n_expert, const ggml_tensor ** slots3);
+
 // apply throttled LRU updates; call between graph executions only. ctx: the calling llama_context
 // ([TAG_FN_MOE_HOT_ADAPT] only the owner of an adaptive hot set updates it)
 void llama_moe_cache_step(const void * ctx);

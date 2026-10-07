@@ -571,6 +571,64 @@ const llama_moe_cache_layer * llama_moe_cache_lookup_table(const ggml_tensor * u
     return it == g_cache->by_up_src.end() ? nullptr : &g_cache->layers[it->second].pub;
 }
 
+// [TAG_FN_L14_TIER] another thread: g_cache under the init lock, the bookkeeping under step_mtx, never waiting for either
+int llama_moe_hot_residents(const ggml_tensor * up_exps, uint8_t * out, int64_t n_expert) {
+    std::unique_lock<std::mutex> ilk(g_init_mtx, std::try_to_lock);
+    if (!ilk.owns_lock()) {
+        return 0;
+    }
+    moe_cache * mc = g_cache;
+    ilk.unlock();
+    if (!mc || !mc->hot) {
+        return -1;
+    }
+    const auto it = mc->by_up_src.find(up_exps);
+    if (it == mc->by_up_src.end()) {
+        return -1;
+    }
+    std::unique_lock<std::mutex> slk(mc->step_mtx, std::try_to_lock);
+    if (!slk.owns_lock()) {
+        return 0;
+    }
+    const layer_state & ls = mc->layers[it->second];
+    for (int64_t e = 0; e < n_expert; ++e) {
+        out[e] = !ls.kv_lent && e < (int64_t) ls.expert_slot.size() && ls.expert_slot[e] >= 0 ? 1 : 0;
+    }
+    return 1;
+}
+
+// [TAG_FN_L14_PFSD2D] see llama-moecache.h
+bool llama_moe_hot_slots(const ggml_tensor * up_exps, int32_t * slot, int64_t n_expert, const ggml_tensor ** slots3) {
+    moe_cache * mc = g_cache;
+    if (!mc || !mc->hot) {
+        return false;
+    }
+    const auto it = mc->by_up_src.find(up_exps);
+    if (it == mc->by_up_src.end()) {
+        return false;
+    }
+    std::unique_lock<std::mutex> slk(mc->step_mtx, std::try_to_lock);
+    if (!slk.owns_lock()) {
+        return false;
+    }
+    const layer_state & ls = mc->layers[it->second];
+    if (ls.out() || ls.pub.n_slots == 0 || !ls.pub.up_c || !ls.pub.gate_c || !ls.pub.down_c) {
+        return false;
+    }
+    const int64_t n_cap = ls.pub.up_c->ne[2];
+    bool any = false;
+    for (int64_t e = 0; e < n_expert; ++e) {
+        const int32_t s = e < (int64_t) ls.expert_slot.size() ? ls.expert_slot[e] : -1;
+        const bool ok = s >= 0 && s < n_cap && (ls.slot_out.empty() || !ls.slot_out[s]);
+        slot[e] = ok ? s : -1;
+        any = any || ok;
+    }
+    slots3[0] = ls.pub.up_c;
+    slots3[1] = ls.pub.gate_c;
+    slots3[2] = ls.pub.down_c;
+    return any;
+}
+
 void llama_moe_cache_step(const void * ctx) {
     moe_cache * mc = g_cache;
     if (!mc) {

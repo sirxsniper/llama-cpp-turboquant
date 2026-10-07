@@ -2892,6 +2892,41 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
 // [TAG_FN_L4_HOST_BATCHCPY] host -> device copies into whole device tensors as one cudaMemcpyBatchAsync on the backend's
 // stream (source read in stream order, as cudaMemcpyAsync does); false (nothing queued) where the API is missing or
 // refuses the batch, so the caller copies one by one
+// [TAG_FN_L14_PFSD2D] device-to-device copies on the backend's stream, one batch (the prefill stream's banks from the hot
+// set's slots); one copy at a time when the batch call is not there or fails
+static bool ggml_backend_cuda_copy_d2d_batch_async(ggml_backend_t backend, int n, void * const * dst, const void * const * src,
+        const size_t * sizes) {
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    if (n <= 0) {
+        return true;
+    }
+    ggml_cuda_set_device(cuda_ctx->device);
+#if defined(CUDART_VERSION) && CUDART_VERSION >= 12080 && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    {
+        static thread_local std::vector<void *>       d;
+        static thread_local std::vector<const void *> s;
+        static thread_local std::vector<size_t>       len;
+        d.assign(dst, dst + n);
+        s.assign(src, src + n);
+        len.assign(sizes, sizes + n);
+        cudaMemcpyAttributes attr = {};
+        attr.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
+        size_t attr_idx = 0;
+        if (cudaMemcpyBatchAsync(d.data(), s.data(), len.data(), (size_t) n, &attr, &attr_idx, 1, cuda_ctx->stream()) == cudaSuccess) {
+            return true;
+        }
+        (void) cudaGetLastError();
+    }
+#endif
+    for (int i = 0; i < n; ++i) {
+        if (cudaMemcpyAsync(dst[i], src[i], sizes[i], cudaMemcpyDeviceToDevice, cuda_ctx->stream()) != cudaSuccess) {
+            (void) cudaGetLastError();
+            return false;
+        }
+    }
+    return true;
+}
+
 static bool ggml_backend_cuda_set_tensors_batch_async(ggml_backend_t backend, int n, ggml_tensor * const * tensors,
         const void * const * data, const size_t * sizes) {
 #if defined(CUDART_VERSION) && CUDART_VERSION >= 12080 && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
@@ -7938,6 +7973,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_set_tensors_batch_async") == 0) { // [TAG_FN_L4_HOST_BATCHCPY]
         return (void *)ggml_backend_cuda_set_tensors_batch_async;
+    }
+    if (strcmp(name, "ggml_backend_copy_d2d_batch_async") == 0) { // [TAG_FN_L14_PFSD2D]
+        return (void *)ggml_backend_cuda_copy_d2d_batch_async;
     }
     if (strcmp(name, "ggml_backend_turbot_supports_geometry") == 0) {   // [TAG_TURBOT_ANY_RESOLVE]
         return (void *)ggml_backend_cuda_turbot_supports_geometry;

@@ -193,6 +193,7 @@ struct llama_pfs_counters {
     uint64_t reused   = 0; // gates that found their layer already in the bank
     double   wait_s   = 0; // host time the gates waited for copies
     uint64_t lends    = 0; // [TAG_FN_R1_PFS_LEND] times the banks were borrowed from the hot set
+    uint64_t d2d_bytes = 0; // [TAG_FN_L14_PFSD2D] bytes copied from the hot set's slots instead of the host
 };
 LLAMA_API llama_pfs_counters llama_prefill_stream_get_counters();
 
