@@ -1446,8 +1446,12 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
 
             const size_t prefetch_size = prefetch && use_mmap ? -1 : 0;
 
-            std::unique_ptr<llama_mmap> mapping = std::make_unique<llama_mmap>(file.get(), prefetch_size, is_numa,
-                    lazy.for_file(idx));
+            // [TAG_FN_L14_TIER] the ranges a tier locks itself are not prefetched either (the mapping uses its lazy list for that only)
+            llama_mmap::ranges skip = lazy.for_file(idx);
+            if (const auto it = noprefetch.find(idx); it != noprefetch.end()) {
+                skip.insert(skip.end(), it->second.begin(), it->second.end());
+            }
+            std::unique_ptr<llama_mmap> mapping = std::make_unique<llama_mmap>(file.get(), prefetch_size, is_numa, skip);
             mmaps_used.emplace_back(mapping->size(), 0);
             if (mlock_mmaps) {
                 std::unique_ptr<llama_mlock> mlock_mmap(new llama_mlock());

@@ -9,6 +9,7 @@
 #include "llama-model-loader.h"
 #include "llama-fn-auto.h" // [TAG_FN_AUTO]
 #include "llama-fn-arena.h" // [TAG_FN_L14_ARENA]
+#include "llama-fn-tier.h"  // [TAG_FN_L14_TIER]
 
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
@@ -1208,6 +1209,7 @@ struct llama_model::impl {
     llama_mlocks mlock_bufs;
     llama_mlocks mlock_mmaps;
     llama_fn_arena_ptr fn_arena; // [TAG_FN_L14_ARENA] after the mappings: its buffers are freed first
+    llama_fn_tier_ptr  fn_tier;  // [TAG_FN_L14_TIER] after the mappings: it unlocks before they close
 
     // contexts where the model tensors metadata is stored as well as the corresponding buffers:
     std::vector<std::pair<ggml_context_ptr, std::vector<ggml_backend_buffer_ptr>>> ctxs_bufs;
@@ -1816,6 +1818,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     // per-tensor activation precision policy
     prec_policy.load(ml, *this);
 
+    llama_fn_tier_plan(*this, ml); // [TAG_FN_L14_TIER] before the mappings: the expert ranges are not prefetched
     ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
     pimpl->mappings.reserve(ml.mappings.size());
 
@@ -1964,8 +1967,12 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
-    // [TAG_FN_L14_ARENA] qwen4exp: the host layers' routed experts into locked RAM (the mappings stay for the rest)
-    pimpl->fn_arena = llama_fn_arena_build(*this, ml);
+    // [TAG_FN_L14_TIER] qwen4exp: the host layers' routed experts locked in place; [TAG_FN_L14_ARENA] the copy into private
+    // locked RAM only when the tier is off
+    pimpl->fn_tier = llama_fn_tier_build(*this, ml);
+    if (!pimpl->fn_tier) {
+        pimpl->fn_arena = llama_fn_arena_build(*this, ml);
+    }
 
     return true;
 }
