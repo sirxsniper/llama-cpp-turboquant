@@ -657,14 +657,17 @@ bool llama_moe_hot_slots(const ggml_tensor * up_exps, int32_t * slot, int64_t n_
         return false;
     }
     const layer_state & ls = mc->layers[it->second];
-    if (ls.out() || ls.pub.n_slots == 0 || !ls.pub.up_c || !ls.pub.gate_c || !ls.pub.down_c) {
+    // a layer whose whole region the KV cache can take back (kv_tail) is never a source: a KV growth between two streamed
+    // ubatches unmaps it, while a copy queued for the next ubatch (the stream's wrap job) may still be waiting to run
+    if (ls.out() || ls.kv_tail || ls.pub.n_slots == 0 || !ls.pub.up_c || !ls.pub.gate_c || !ls.pub.down_c) {
         return false;
     }
     const int64_t n_cap = ls.pub.up_c->ne[2];
     bool any = false;
     for (int64_t e = 0; e < n_expert; ++e) {
         const int32_t s = e < (int64_t) ls.expert_slot.size() ? ls.expert_slot[e] : -1;
-        const bool ok = s >= 0 && s < n_cap && (ls.slot_out.empty() || !ls.slot_out[s]);
+        // [TAG_FN_L10_SLOTLEND] the slots from sl_base on can go to the KV cache the same way: never a source either
+        const bool ok = s >= 0 && s < n_cap && (ls.slot_out.empty() || !ls.slot_out[s]) && !(ls.sl_base >= 0 && s >= ls.sl_base);
         slot[e] = ok ? s : -1;
         any = any || ok;
     }

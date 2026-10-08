@@ -68,9 +68,10 @@ const llama_moe_cache_layer * llama_moe_cache_lookup_table(const ggml_tensor * u
 int llama_moe_hot_residents(const ggml_tensor * up_exps, uint8_t * out, int64_t n_expert);
 
 // [TAG_FN_L14_PFSD2D] for the prefill stream: slot[e] = the slot that holds expert e of the layer of up_exps, or -1; slots3:
-// the up / gate / down slot tensors. While a prompt streams nothing is evicted (no decode step runs), so a slot read here
-// keeps its expert until the stream gives the lend back. false: no such layer, the layer is out (lent, tail, KV), the
-// bookkeeping is busy, or no expert is held
+// the up / gate / down slot tensors. Only slots whose upload has landed, and never a slot the KV cache can take back (a
+// kv_tail layer, or a slot from sl_base on): a KV growth between two streamed ubatches unmaps those. No hot-set pass runs
+// during a prompt (passes run on decode steps), so a slot read here keeps its expert while the stream copies it. false: no
+// such layer, the layer is out (lent, tail, KV) or can go to the KV cache, the bookkeeping is busy, or no expert is held
 bool llama_moe_hot_slots(const ggml_tensor * up_exps, int32_t * slot, int64_t n_expert, const ggml_tensor ** slots3);
 
 // [TAG_FN_L15_TIER] the RAM tier's view of one layer: slot[e] = the hot slot of expert e or -1, cnt[e] = its decayed count

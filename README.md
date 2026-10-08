@@ -33,13 +33,13 @@ code, 1 stream · 262K context · 4 slots
 ## 101 t/s
 real use at 32K · **89 t/s at 131K and 245K** · 103 / 93 / 91 with the MTPq3 files · a short new turn starts in 0.3–1.4 s instead of 3.4 s · **2 streams at 32K: 111–120 t/s total**
 
-prompt reading **2,260 t/s** at 131K (v0.20.0, +10 %)
+prompt reading **2,260 t/s** at 131K with the MTPq3 files (v0.20.0, +10 %)
 
 </td>
 </tr>
 </table>
 
-<sub>RTX 5090 32 GB · Ryzen 9 9950X3D · 96 GB DDR5-6400 · PCIe Gen5 · Windows 11 · turbot KV cache · measured 2026-10-06/07</sub>
+<sub>RTX 5090 32 GB · Ryzen 9 9950X3D · 96 GB DDR5-6400 · PCIe Gen5 · Windows 11 · turbot KV cache · measured 2026-10-06/08</sub>
 
 </div>
 
@@ -79,7 +79,7 @@ Qwen3.8-Flash-Next is larger than VRAM *and* RAM. Every decode step is split bet
 
 - an **adaptive per-expert GPU hot set** that learns what you use;
 - a **MoE bridge**: the CPU computes the cold experts while the GPU computes the hot ones, in one CUDA graph per step;
-- **prompt streaming over PCIe Gen5**, so long prompts read at 1.5–2K t/s;
+- **prompt streaming over PCIe Gen5**, so long prompts read at 1.5–2.3K t/s;
 - MTP drafting with the model's own head, and dozens of fused decode kernels.
 
 It all switches on by itself for this architecture. Every other model is untouched.
@@ -165,11 +165,11 @@ Five GPU memory bugs found with compute-sanitizer and fixed; no GPU work left in
 
 | Prompt | v0.19.0 | **v0.20.0** |
 |:--|--:|--:|
-| 131K tokens | 2,062 t/s | **2,264 t/s** |
-| 32K tokens, first prompt after a start | 830 t/s | **932 t/s** |
+| 131K tokens (second prompt after a start) | 2,062 t/s | **2,264 t/s** |
+| 32K tokens, first prompt after a start (cold file cache) | 830 t/s | **931 t/s** |
 
-- The prompt stream copies the experts the VRAM hot set already holds (about 10 GiB of each 72 GiB pass) from their slots on the GPU instead of from RAM, and its RAM copies use non-temporal stores at every size. Decoding is not touched: output token-identical to v0.19.0.
-- The first prompt after a server start still reads about 35 GB from the disk: the model (105 GB) is larger than RAM.
+- 131K: the prompt stream copies the experts the VRAM hot set already holds (about 10 GiB of each 72 GiB pass) from their slots on the GPU instead of from RAM; a warm 8K pass takes 3.18 s instead of 3.53 s (medians). 32K first prompt: the stream reads the next layers' pages ahead when they are not in RAM, and a load drops the GPU tensors' pages from RAM first.
+- Decoding output is unchanged: token-identical to v0.19.0. The first long prompt after a server start still pages in about 37 GiB from the disk: the model (105 GiB) is larger than RAM.
 
 > Numbers are real-use medians over interleaved A/B rounds, not best-case benchmark runs. A greedy short-prompt benchmark always reads higher than a long, sampled answer — both are listed where it matters.
 
@@ -260,7 +260,7 @@ llama-server.exe --model Qwen3.8-Flash-Next-UD-Q4_K_XL-MTP-00001-of-00005.gguf -
 | Flag | Why |
 |:--|:--|
 | `--n-cpu-moe 48` | all experts start in RAM; the engine moves the ones you use into a GPU hot set by itself |
-| `--batch-size 8192 --ubatch-size 8192` | large prompt batches, so prompt reading streams experts over PCIe at 1.5–2K t/s |
+| `--batch-size 8192 --ubatch-size 8192` | large prompt batches, so prompt reading streams experts over PCIe at 1.5–2.3K t/s |
 | `--cpu-mask 55555555 --cpu-strict 1 --threads 16` | one CPU worker per physical core for the CPU expert pool |
 | `--cache-ram 0` | the model already uses most of the RAM |
 | `--spec-type draft-mtp --spec-draft-n-max 2 --spec-draft-p-min 0.5` | drafting with the model's own MTP head (draft length 3 measured slower) |
