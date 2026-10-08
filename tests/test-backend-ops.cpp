@@ -4998,23 +4998,6 @@ struct test_gated_delta_net : public test_case {
     }
 };
 
-// [TAG_UPSTREAM_30087] GGML_OP_GATED_DELTA_NET with the reorder hint (ggml_gated_delta_net_set_reorder), as the qwen4exp
-// graph builds it. The CUDA backend runs four state columns per warp for a scalar gate and S_v 128 (GGML_CUDA_GDN_COLS4=0:
-// the old kernel); other cases ignore the hint.
-struct test_gated_delta_net_reorder : public test_gated_delta_net {
-    using test_gated_delta_net::test_gated_delta_net;
-
-    std::string vars() override {
-        return test_gated_delta_net::vars() + ",reorder=1";
-    }
-
-    ggml_tensor * build_graph(ggml_context * ctx) override {
-        ggml_tensor * out = test_gated_delta_net::build_graph(ctx);
-        ggml_gated_delta_net_set_reorder(out, true);
-        return out;
-    }
-};
-
 // GGML_OP_GATED_DELTA_NET + GGML_OP_CPY (recurrent cache fusion)
 struct test_gated_delta_net_cache_fusion : public test_case {
     const ggml_type type;
@@ -5128,23 +5111,6 @@ struct test_gated_delta_net_cache_fusion : public test_case {
                 init_tensor_uniform(t);
             }
         }
-    }
-};
-
-// [TAG_UPSTREAM_30087] the cache fusion with the reorder hint: the four-columns kernel writes the snapshots into the cache
-struct test_gated_delta_net_cache_fusion_reorder : public test_gated_delta_net_cache_fusion {
-    using test_gated_delta_net_cache_fusion::test_gated_delta_net_cache_fusion;
-
-    std::string vars() override {
-        return test_gated_delta_net_cache_fusion::vars() + ",reorder=1";
-    }
-
-    ggml_tensor * build_graph(ggml_context * ctx) override {
-        ggml_tensor * out = test_gated_delta_net_cache_fusion::build_graph(ctx);
-        ggml_tensor * gdn = ggml_get_tensor(ctx, "gdn_out");
-        GGML_ASSERT(gdn != nullptr);
-        ggml_gated_delta_net_set_reorder(gdn, true);
-        return out;
     }
 };
 
@@ -16041,22 +16007,6 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 8, 32,   4, 2, 4));
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   8, 1, 4));
 
-    // [TAG_UPSTREAM_30087] reorder hint (qwen4exp): CUDA four state columns per warp at S_v 128; 48 v heads as in
-    // Qwen3.8-Flash-Next (4 warps per block), few heads (1-2 warps per block), K = 1, n_tokens < K and > K, strided V;
-    // KDA and S_v 64 ignore the hint
-    test_cases.emplace_back(new test_gated_delta_net_reorder(GGML_TYPE_F32, 16, 128,   3, 1, 3, false, false, /*K=*/3));
-    test_cases.emplace_back(new test_gated_delta_net_reorder(GGML_TYPE_F32, 16, 128,   1, 1, 3, false, false, /*K=*/3));
-    test_cases.emplace_back(new test_gated_delta_net_reorder(GGML_TYPE_F32, 16, 128, 300, 1, 3, false, false, /*K=*/3));
-    test_cases.emplace_back(new test_gated_delta_net_reorder(GGML_TYPE_F32, 16, 128,  64, 2, 3, false, false, /*K=*/3, /*strided_v=*/true));
-    test_cases.emplace_back(new test_gated_delta_net_reorder(GGML_TYPE_F32,  4, 128,   4, 1, 1, false, false, /*K=*/4));
-    test_cases.emplace_back(new test_gated_delta_net_reorder(GGML_TYPE_F32,  8, 128,   8, 2, 1, false, false, /*K=*/3));
-    test_cases.emplace_back(new test_gated_delta_net_reorder(GGML_TYPE_F32, 16, 128,  33, 1, 3, false, false, /*K=*/1));
-    test_cases.emplace_back(new test_gated_delta_net_reorder(GGML_TYPE_F32,  4, 128,   4, 1, 1, false, true,  /*K=*/3));
-    test_cases.emplace_back(new test_gated_delta_net_reorder(GGML_TYPE_F32,  4,  64,   4, 1, 1, false, false, /*K=*/3));
-    test_cases.emplace_back(new test_gated_delta_net_cache_fusion_reorder(GGML_TYPE_F32, 48, 128, 3, 1, 3));
-    test_cases.emplace_back(new test_gated_delta_net_cache_fusion_reorder(GGML_TYPE_F32, 48, 128, 1, 1, 3));
-    test_cases.emplace_back(new test_gated_delta_net_cache_fusion_reorder(GGML_TYPE_F32,  8, 128, 4, 2, 4));
-
     // [TAG_4C_GDN_REPLAY] replay op: (k heads, head size, tokens, seqs, v_repeat, n_ring, pad, strided_v, cache)
     test_cases.emplace_back(new test_gated_delta_net_replay(GGML_TYPE_F32, 4,  32,   4, 2, 1, 3));
     test_cases.emplace_back(new test_gated_delta_net_replay(GGML_TYPE_F32, 4,  32,   1, 4, 1, 3));
@@ -16970,12 +16920,6 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 4096, 1)); // PP-4096
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 2048, 4)); // B4 PP-2048
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 4096, 4)); // B4 PP-4096
-    // [TAG_UPSTREAM_30087] Qwen3.8-Flash-Next GDN (48 v heads, 16 k heads, K = 3; verify, 1K and 8K ubatches): the old
-    // kernel, then the reorder hint (CUDA: four state columns per warp)
-    for (int64_t toks : { 3, 1024, 8192 }) {
-        test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, toks, 1, 3, false, false, /*K=*/3));
-        test_cases.emplace_back(new test_gated_delta_net_reorder(GGML_TYPE_F32, 16, 128, toks, 1, 3, false, false, /*K=*/3));
-    }
 
     // lightning_indexer
     for (int kv : { 256, 4096, 65536 }) {

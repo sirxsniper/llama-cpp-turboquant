@@ -2791,14 +2791,6 @@ extern "C" {
             struct ggml_tensor * a,
             int32_t              n_min);
 
-    // [TAG_UPSTREAM_30087] kernel hint for a ggml_gated_delta_net (op param 2): no other op must give the same bits (for
-    // example a ggml_gated_delta_net_replay of the same tokens), so a backend may add the sums in a different order
-    // (CUDA: four state columns per warp, scalar gate, S_v 128). The result layout does not change. Set by the qwen4exp
-    // graph in src/models/delta-net-base.cpp.
-    GGML_API void ggml_gated_delta_net_set_reorder(
-            struct ggml_tensor * a,
-            bool                 reorder);
-
     // [TAG_4C_GDN_REPLAY] gated_delta_net with one committed state per sequence and a ring of recent token inputs
     // instead of K state snapshots. Scalar gate only. For each sequence s the op first applies the first ring_n[s]
     // ring tokens to state (no attention output for them), then the n_tokens new tokens, with the per-token arithmetic
