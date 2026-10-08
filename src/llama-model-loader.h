@@ -142,6 +142,9 @@ struct llama_model_loader {
     llama_files files;
     std::vector<std::string> files_paths; // [TAG_FN_PLE_DIRECT_IO] path of files[i] (empty when loaded from a FILE *)
     std::map<uint32_t, llama_mmap::ranges> noprefetch; // [TAG_FN_L14_TIER] file ranges the load does not prefetch
+    // [TAG_FN_L15_TRIM] Windows: tensors uploaded from the mapping are read at low memory priority and their pages leave the
+    // working set after the upload (nothing reads them again), so they are the first pages Windows reuses, before experts
+    bool trim_uploaded = false;
     llama_ftype ftype;
     llama_fver  fver;
 

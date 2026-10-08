@@ -500,6 +500,124 @@ static __global__ void lightning_indexer_kernel_vec_fn_l3(
     GGML_UNUSED_VARS(n_batch, nb2, nbq3, nbw2, nbm2);
 }
 
+// [TAG_FN_L15_IDXMQ] the kernel above for every query token of a small batch in one block: the block's keys are read
+// and dequantized once, then scored against each token in turn with the same per-token arithmetic (head order, warp sums,
+// relu, weights), so every score has the same bits. A decode or verify batch of T tokens read each key T times before.
+template <int WARPS_PER_BLOCK, int K_VECS_PER_BLOCK, int64_t N_EMBD, int64_t N_HEAD>
+static __global__ void lightning_indexer_kernel_vec_fn_l3_mq(
+        const float * Q, const char * K, const int32_t * rows, const float * W, const half * M, float * dst,
+        int64_t n_batch, int64_t n_kv, size_t nbk_row,
+        size_t nb1, size_t nb2, size_t nb3,
+        size_t nbq1, size_t nbq2, size_t nbq3,
+        size_t nbw1, size_t nbw2, size_t nbw3,
+        size_t nbm1, size_t nbm2, size_t nbm3,
+        int64_t nem3
+    ) {
+
+    constexpr int K_VECS_PER_WARP = K_VECS_PER_BLOCK / WARPS_PER_BLOCK;
+    constexpr int THREADS_PER_BLOCK = WARPS_PER_BLOCK * WARP_SIZE;
+
+    const int i_stream = blockIdx.z;
+    const int i_warp   = threadIdx.y;
+    const int i_lane   = threadIdx.x;
+    const int tid      = i_warp * WARP_SIZE + i_lane;
+
+    const int start_kv_block = blockIdx.x * K_VECS_PER_BLOCK;
+    const int start_kv = start_kv_block + i_warp * K_VECS_PER_WARP;
+
+    float4 k_reg_f[K_VECS_PER_WARP];
+
+    constexpr dequantize_V_t dequantize_k = get_dequantize_V<GGML_TYPE_Q8_0, float, 4>();
+#pragma unroll
+    for (int k = 0; k < K_VECS_PER_WARP; ++k) {
+        int i_kv = start_kv + k;
+        if (i_kv < n_kv) {
+            const void * k_base = (const void *) (K + (int64_t) rows[i_kv]*nbk_row);
+            dequantize_k(k_base, &k_reg_f[k], i_lane * 4);
+        } else {
+            k_reg_f[k] = make_float4(0, 0, 0, 0);
+        }
+    }
+
+    constexpr int N_HEAD_INNER = N_HEAD / 4;
+
+    __shared__ float  w_shared[N_HEAD_INNER];
+    __shared__ float4 q_shared_f[N_HEAD_INNER][N_EMBD / 4];
+    __shared__ float  dst_shared[K_VECS_PER_BLOCK];
+
+    for (int i_batch = 0; i_batch < n_batch; ++i_batch) {
+        const char  * q_base = (const char  *)                 Q + i_batch*nbq2 + i_stream*nbq3;
+        const float * w_base = (const float *) ((const char *) W + i_batch*nbw1 + i_stream*nbw3);
+
+        float score_k[K_VECS_PER_WARP] = { 0.0f };
+
+        for (int i_head_0 = 0; i_head_0 < N_HEAD; i_head_0 += N_HEAD_INNER) {
+            if (tid < N_HEAD_INNER) {
+                w_shared[tid] = w_base[i_head_0 + tid];
+            }
+
+            constexpr int n_q = N_HEAD_INNER * (N_EMBD / 4);
+#pragma unroll
+            for (int i_q = tid; i_q < n_q; i_q += THREADS_PER_BLOCK) {
+                const int i_head_inner = i_q / (N_EMBD / 4);
+                const int i_head = i_head_0 + i_head_inner;
+                const int i_embd = i_q % (N_EMBD / 4);
+                q_shared_f[i_head_inner][i_embd] = *(const float4 *) (q_base + i_head*nbq1 + i_embd*sizeof(float4));
+            }
+
+            __syncthreads();
+
+            for (int i_head_inner = 0; i_head_inner < N_HEAD_INNER; ++i_head_inner) {
+                const float w_val = w_shared[i_head_inner];
+                float qk[K_VECS_PER_WARP] = { 0.0f };
+
+                const float4 q_vec = q_shared_f[i_head_inner][i_lane];
+
+#pragma unroll
+                for (int k = 0; k < K_VECS_PER_WARP; ++k) {
+                    ggml_cuda_mad(qk[k], q_vec.x, k_reg_f[k].x);
+                    ggml_cuda_mad(qk[k], q_vec.y, k_reg_f[k].y);
+                    ggml_cuda_mad(qk[k], q_vec.z, k_reg_f[k].z);
+                    ggml_cuda_mad(qk[k], q_vec.w, k_reg_f[k].w);
+                }
+
+#pragma unroll
+                for (int k = 0; k < K_VECS_PER_WARP; ++k) {
+                    float sum = warp_reduce_sum(qk[k]);
+
+                    if (i_lane == 0) {
+                        sum = (sum > 0.0f) ? sum : 0.0f;
+                        score_k[k] += sum * w_val;
+                    }
+                }
+            }
+
+            __syncthreads();
+        }
+
+        if (i_lane == 0) {
+#pragma unroll
+            for (int k = 0; k < K_VECS_PER_WARP; ++k) {
+                dst_shared[i_warp * K_VECS_PER_WARP + k] = score_k[k];
+            }
+        }
+
+        __syncthreads();
+
+        if (tid < K_VECS_PER_BLOCK) {
+            int i_kv = start_kv_block + tid;
+            if (i_kv < n_kv) {
+                const half * m_base = (const half *) ((const char *) M + i_batch*nbm1 + (i_stream%nem3)*nbm3);
+                float * dst_base = (float *) ((char *) dst + i_batch*nb1 + i_stream*nb3);
+                dst_base[i_kv] = dst_shared[tid] + __half2float(m_base[i_kv]);
+            }
+        }
+
+        __syncthreads();
+    }
+    GGML_UNUSED_VARS(nb2, nbw2, nbm2);
+}
+
 // [TAG_FN_L3_GPU_IDXQ8] the launch of the kernel above for an indexer whose keys come from the gather g
 static void ggml_cuda_lightning_indexer_fn_l3(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const ggml_tensor * g) {
     const ggml_tensor * q = dst->src[0];
@@ -524,6 +642,27 @@ static void ggml_cuda_lightning_indexer_fn_l3(ggml_backend_cuda_context & ctx, g
 
     const dim3 block(32, WARPS_PER_BLOCK);
     const int num_kv_blocks = (n_kv + (K_VECS_PER_BLOCK) - 1) / (K_VECS_PER_BLOCK);
+
+    // [TAG_FN_L15_IDXMQ] a decode / verify batch: one block reads its keys once for every token
+    static const bool mq_on = [] {
+        const char * e = getenv("GGML_CUDA_FN_IDX_MQ");
+        return !(e && e[0] == '0');
+    }();
+    if (mq_on && n_batch >= 2 && n_batch <= 8) {
+        const dim3 grid_mq(num_kv_blocks, 1, n_stream);
+        lightning_indexer_kernel_vec_fn_l3_mq<WARPS_PER_BLOCK, K_VECS_PER_BLOCK, 128, 4><<<grid_mq, block, 0, ctx.stream()>>>(
+            (const float *) q->data, (const char *) kq->data, (const int32_t *) ki->data, (const float *) w->data,
+            (const half *) m->data, (float *) dst->data,
+            n_batch, n_kv, kq->nb[1],
+            nb1, nb2, nb3,
+            nbq1, nbq2, nbq3,
+            nbw1, nbw2, nbw3,
+            nbm1, nbm2, nbm3,
+            nem3);
+        CUDA_CHECK(cudaGetLastError());
+        ggml_cuda_fn_l3_note(GGML_CUDA_FN_L3_PATH_IDXQ8, "IDXQ8: the lightning indexer reads the q8_0 pooled keys in place");
+        return;
+    }
     const dim3 grid(num_kv_blocks, n_batch, n_stream);
 
     lightning_indexer_kernel_vec_fn_l3<WARPS_PER_BLOCK, K_VECS_PER_BLOCK, 128, 4><<<grid, block, 0, ctx.stream()>>>(

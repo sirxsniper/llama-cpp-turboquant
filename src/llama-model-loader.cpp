@@ -14,6 +14,16 @@
 #include <future>
 #include <regex>
 
+#ifdef _WIN32
+#    ifndef NOMINMAX
+#        define NOMINMAX
+#    endif
+#    ifndef WIN32_LEAN_AND_MEAN
+#        define WIN32_LEAN_AND_MEAN
+#    endif
+#    include <windows.h>
+#endif
+
 static const size_t kiB = 1024;
 static const size_t MiB = 1024*kiB;
 static const size_t GiB = 1024*MiB;
@@ -1526,6 +1536,32 @@ bool llama_model_loader::load_all_data(
     }
     GGML_ASSERT(size_data != 0 && "call init_mappings() first");
 
+    // [TAG_FN_L15_TRIM] the pages this thread reads now get the lowest memory priority (restored at the end)
+    size_t trimmed = 0;
+#if defined(_WIN32) && _WIN32_WINNT >= 0x0602
+    MEMORY_PRIORITY_INFORMATION mp_old = {};
+    bool mp_set = false;
+    if (trim_uploaded && GetThreadInformation(GetCurrentThread(), ThreadMemoryPriority, &mp_old, sizeof(mp_old))) {
+        MEMORY_PRIORITY_INFORMATION mp_low = {};
+        mp_low.MemoryPriority = MEMORY_PRIORITY_VERY_LOW;
+        mp_set = SetThreadInformation(GetCurrentThread(), ThreadMemoryPriority, &mp_low, sizeof(mp_low)) != 0;
+    }
+    struct mp_restore {
+        bool & set;
+        MEMORY_PRIORITY_INFORMATION & old;
+        size_t & trimmed;
+        ~mp_restore() {
+            if (set) {
+                SetThreadInformation(GetCurrentThread(), ThreadMemoryPriority, &old, sizeof(old));
+            }
+            if (trimmed > 0) {
+                LLAMA_LOG_INFO("llama_model_loader: [TAG_FN_L15_TRIM] %.2f GiB of uploaded tensors' pages left the working set "
+                        "(read at low memory priority)\n", trimmed/1073741824.0);
+            }
+        }
+    } mp_guard { mp_set, mp_old, trimmed };
+#endif
+
     std::vector<std::future<std::pair<ggml_tensor *, bool>>> validation_result;
 
     // 4 staging buffers for async uploads, each sized 1MB seems to be a good default for single NVMe drives.
@@ -1698,6 +1734,17 @@ bool llama_model_loader::load_all_data(
                 mmap_used.second = std::max(mmap_used.second, weight->offs + n_size);
             } else {
                 ggml_backend_tensor_set(cur, data, 0, n_size);
+#ifdef _WIN32
+                if (trim_uploaded) { // [TAG_FN_L15_TRIM] the inner pages (a neighbour may share the first and last)
+                    const uintptr_t pg = 4096;
+                    const uintptr_t lo = ((uintptr_t) data + pg - 1)/pg*pg;
+                    const uintptr_t hi = ((uintptr_t) data + n_size)/pg*pg;
+                    if (hi > lo) {
+                        VirtualUnlock((void *) lo, (SIZE_T) (hi - lo));
+                        trimmed += hi - lo;
+                    }
+                }
+#endif
             }
         } else {
             const auto & file = files.at(weight->idx);

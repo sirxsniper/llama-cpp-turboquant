@@ -176,7 +176,7 @@ const fn_item k_items[] = {
     // [TAG_FN_L14_TIER] the routed experts locked in place in the mapped file (no copy, no commit, no load-time prefetch)
     { "LLAMA_FN_L14_TIER",           "1",     P_ALL },
     // [TAG_FN_L14_PFSD2D] the prefill stream copies the experts the hot set holds from their VRAM slots, not the host
-    { "LLAMA_PREFILL_STREAM_D2D",         "1",     P_ALL },
+    { "LLAMA_PREFILL_STREAM_D2D",         "0",     P_ALL }, // off: 131K prompts 2092 -> 1591 t/s in l15/pp15a, and the hot set is not frozen while the stream borrows it
 };
 
 // names the fn-auto aware code reads through llama_fn_env(): never put into the environment
