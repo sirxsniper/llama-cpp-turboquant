@@ -2659,6 +2659,7 @@ struct llama_model_qwen4exp::ple_prefetcher {
 
     void loop() {
         while (true) {
+            bool stopping = false;
             {
                 std::unique_lock<std::mutex> lk(mtx);
                 cv.wait(lk, [this]() { return stop || !rows.empty() || !fills.empty(); });
@@ -2666,6 +2667,7 @@ struct llama_model_qwen4exp::ple_prefetcher {
                 if (stop && fills.empty()) {
                     return;
                 }
+                stopping = stop;
                 work.swap(rows);
                 rows.clear();
                 fill_work.swap(fills);
@@ -2676,7 +2678,7 @@ struct llama_model_qwen4exp::ple_prefetcher {
                 run_fill(f);
             }
             fill_work.clear();
-            if (work.empty() || stop) {
+            if (work.empty() || stopping) {
                 continue;
             }
             scratch.resize(work.size()*row_bytes);
