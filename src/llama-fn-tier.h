@@ -32,4 +32,11 @@ void llama_fn_tier_plan(const llama_model & model, llama_model_loader & ml);
 llama_fn_tier_ptr llama_fn_tier_build(llama_model & model, llama_model_loader & ml);
 
 // [TAG_FN_L15_WARM] qwen4exp on Windows (LLAMA_FN_L15_WARM, default on): the load does not prefetch the routed experts; a
-// background thread started by llama_fn_tier_build reads them into the working set, whose maximum it first raises
+// background thread started by llama_fn_tier_build reads them into the working set, whose maximum it first raises. It
+// starts when the trunk context's first decode returns (this call; a no-op after the first one)
+void llama_fn_warm_go();
+
+// [TAG_FN_L15_WARM] while the warm pass runs, a prompt's stream waits for each layer it has not reached: both faulting the same
+// pages in at once took the first 32K prompt from 21 s to 55 s (l15 abx6_v5_i5)
+void llama_fn_warm_wait_layer(int il);
+bool llama_fn_warm_running();

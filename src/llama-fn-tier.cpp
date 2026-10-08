@@ -30,7 +30,14 @@
 #    endif
 #    include <windows.h>
 #    include <psapi.h>
+static HANDLE g_fn_warm_go = nullptr; // [TAG_FN_L15_WARM] set when the trunk context's first decode returns
 #endif
+
+// [TAG_FN_L15_WARM] the running warm pass's progress, for the prefill stream (llama_fn_warm_wait_layer): ranges [0, mark) are
+// in the working set; layer il is complete once mark reaches layer_end[il]
+static std::atomic<bool>   g_warm_running{false};
+static std::atomic<size_t> g_warm_mark{0};
+static std::vector<size_t> g_warm_layer_end;
 
 namespace {
 
@@ -102,6 +109,7 @@ struct llama_fn_tier {
     std::atomic<uint64_t>                         n_gated{0};        // evictions the gate held back (for the log)
 #ifdef _WIN32
     HANDLE                                        stop = nullptr;
+    HANDLE                                        go   = nullptr; // [TAG_FN_L15_WARM]
     std::thread                                   worker;
 #endif
 };
@@ -578,6 +586,12 @@ void llama_fn_tier_deleter::operator()(llama_fn_tier * t) const {
     if (t->stop) {
         CloseHandle(t->stop);
     }
+    if (t->go) {
+        if (g_fn_warm_go == t->go) {
+            g_fn_warm_go = nullptr;
+        }
+        CloseHandle(t->go);
+    }
 #endif
     delete t;
 }
@@ -619,7 +633,7 @@ llama_fn_tier_ptr llama_fn_tier_build(llama_model & /*model*/, llama_model_loade
 
 // [TAG_FN_L15_WARM] layer by layer, one prefetch per 64 MiB piece of the routed experts, then every page touched: the
 // pages enter the working set as they arrive, so a later piece's read cannot push them out. Up to the available RAM
-// minus LLAMA_FN_L15_WARM_FREE_MIB (6144: the contexts are created meanwhile); LLAMA_FN_L15_WARM_THREADS (16) threads.
+// minus LLAMA_FN_L15_WARM_FREE_MIB (4096); LLAMA_FN_L15_WARM_THREADS (16) threads.
 static void fn_warm(const llama_model & model, HANDLE stop) {
     using prefetch_t = BOOL (WINAPI *)(HANDLE, ULONG_PTR, PWIN32_MEMORY_RANGE_ENTRY, ULONG);
     static const prefetch_t pf = (prefetch_t) (void *) GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "PrefetchVirtualMemory");
@@ -632,8 +646,10 @@ static void fn_warm(const llama_model & model, HANDLE stop) {
         size_t       n;
     };
     std::vector<range> rs;
+    std::vector<size_t> layer_end;
     size_t total = 0;
     for (const auto & ts : fn_tier_layers(model)) {
+        layer_end.push_back(rs.size());
         for (const ggml_tensor * t : ts) {
             if (!t->buffer || !ggml_backend_buffer_is_host(t->buffer) || !t->data) {
                 continue;
@@ -644,6 +660,7 @@ static void fn_warm(const llama_model & model, HANDLE stop) {
             }
             total += n;
         }
+        layer_end.back() = rs.size();
     }
     if (rs.empty()) {
         return;
@@ -651,7 +668,7 @@ static void fn_warm(const llama_model & model, HANDLE stop) {
     MEMORYSTATUSEX ms;
     ms.dwLength = sizeof(ms);
     GlobalMemoryStatusEx(&ms);
-    const size_t keep   = (size_t) std::max(0, llama_fn_l3_int(model, "LLAMA_FN_L15_WARM_FREE_MIB", 6144)) << 20;
+    const size_t keep   = (size_t) std::max(0, llama_fn_l3_int(model, "LLAMA_FN_L15_WARM_FREE_MIB", 4096)) << 20;
     const size_t budget = (size_t) ms.ullAvailPhys > keep ? (size_t) ms.ullAvailPhys - keep : 0;
     size_t n_use = 0;
     size_t bytes = 0;
@@ -662,6 +679,10 @@ static void fn_warm(const llama_model & model, HANDLE stop) {
     GetProcessMemoryInfo(GetCurrentProcess(), &pm0, sizeof(pm0));
     const int n_thr = std::max(1, std::min(32, llama_fn_l3_int(model, "LLAMA_FN_L15_WARM_THREADS", 16)));
     std::atomic<size_t> next{0};
+    std::unique_ptr<std::atomic<uint8_t>[]> done(new std::atomic<uint8_t>[n_use + 1]());
+    g_warm_layer_end = layer_end;
+    g_warm_mark.store(0);
+    g_warm_running.store(true, std::memory_order_release);
     auto run = [&]() {
         for (size_t i = next.fetch_add(1); i < n_use; i = next.fetch_add(1)) {
             if (WaitForSingleObject(stop, 0) == WAIT_OBJECT_0) {
@@ -675,6 +696,12 @@ static void fn_warm(const llama_model & model, HANDLE stop) {
                 (void) *(volatile const char *) (rs[i].p + o);
             }
             (void) *(volatile const char *) (rs[i].p + rs[i].n - 1);
+            done[i].store(1);
+            for (size_t m = g_warm_mark.load(); m < n_use && done[m].load(); ) {
+                if (g_warm_mark.compare_exchange_weak(m, m + 1)) {
+                    m++;
+                }
+            }
         }
     };
     const auto t0 = std::chrono::steady_clock::now();
@@ -686,6 +713,7 @@ static void fn_warm(const llama_model & model, HANDLE stop) {
     for (auto & th : ths) {
         th.join();
     }
+    g_warm_running.store(false, std::memory_order_release);
     const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     PROCESS_MEMORY_COUNTERS pm1 = {};
     GetProcessMemoryInfo(GetCurrentProcess(), &pm1, sizeof(pm1));
@@ -720,17 +748,28 @@ llama_fn_tier_ptr llama_fn_tier_build(llama_model & model, llama_model_loader & 
                         mx/1073741824.0, (unsigned long) GetLastError());
             }
         }
-        // then the background warm pass, while the contexts are created
+        // then the background warm pass, once the first decode (the server's warm-up run) has returned: started at the load
+        // it shared the disk and the page faults with the start, and the server was ready after 27-29 s instead of 7-8 s
+        // (l15 abx5 vs abx3); LLAMA_FN_L15_WARM_DELAY_MS (15000) after the load when no decode comes
         llama_fn_tier_ptr w(new llama_fn_tier());
         w->stop = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-        if (w->stop == nullptr) {
+        w->go   = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        if (w->stop == nullptr || w->go == nullptr) {
             return nullptr;
         }
+        g_fn_warm_go = w->go;
+        const DWORD delay = (DWORD) std::max(0, llama_fn_l3_int(model, "LLAMA_FN_L15_WARM_DELAY_MS", 15000));
         const llama_model * m = &model;
         llama_fn_tier * t = w.get();
-        w->worker = std::thread([m, t]() { fn_warm(*m, t->stop); });
-        LLAMA_LOG_INFO("%s: [TAG_FN_L15_WARM] the routed experts are read into the working set in the background (working-set "
-                "maximum %.1f GiB)\n", __func__, (ms.ullTotalPhys/10*9)/1073741824.0);
+        w->worker = std::thread([m, t, delay]() {
+            const HANDLE hs[2] = { t->stop, t->go };
+            if (WaitForMultipleObjects(2, hs, FALSE, delay) == WAIT_OBJECT_0) {
+                return;
+            }
+            fn_warm(*m, t->stop);
+        });
+        LLAMA_LOG_INFO("%s: [TAG_FN_L15_WARM] the routed experts are read into the working set in the background after the first "
+                "decode (working-set maximum %.1f GiB)\n", __func__, (ms.ullTotalPhys/10*9)/1073741824.0);
         return w;
     }
     if (!ml.use_mmap) {
@@ -806,3 +845,39 @@ llama_fn_tier_ptr llama_fn_tier_build(llama_model & model, llama_model_loader & 
 }
 
 #endif
+
+// [TAG_FN_L15_WARM] see llama-fn-tier.h
+void llama_fn_warm_go() {
+    static std::atomic<bool> done{false};
+    if (done.load(std::memory_order_relaxed) || done.exchange(true)) {
+        return;
+    }
+#ifdef _WIN32
+    if (g_fn_warm_go != nullptr) {
+        SetEvent(g_fn_warm_go);
+    }
+#endif
+}
+
+// [TAG_FN_L15_WARM] see llama-fn-tier.h
+void llama_fn_warm_wait_layer(int il) {
+#ifdef _WIN32
+    if (!g_warm_running.load(std::memory_order_acquire) || il < 0 || il >= (int) g_warm_layer_end.size()) {
+        return;
+    }
+    const size_t need = g_warm_layer_end[il];
+    while (g_warm_running.load(std::memory_order_acquire) && g_warm_mark.load() < need) {
+        Sleep(1);
+    }
+#else
+    GGML_UNUSED(il);
+#endif
+}
+
+bool llama_fn_warm_running() {
+#ifdef _WIN32
+    return g_warm_running.load(std::memory_order_acquire);
+#else
+    return false;
+#endif
+}

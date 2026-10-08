@@ -15,6 +15,7 @@
 #include "llama-moe-gen5-impl.h"
 #include "llama-moecache.h" // [TAG_FN_R1_PFS_LEND]
 #include "llama-fn-arena.h"  // [TAG_FN_L14_ARENA]
+#include "llama-fn-tier.h" // [TAG_FN_L15_WARM]
 
 #include "llama-impl.h"
 #include "llama-mmap.h" // [TAG_FN_L15_PFSAHEAD]
@@ -218,8 +219,9 @@ void pfs_run(pfs_state * s) {
         }
         const pfs_layer & L = s->layers[job.pos];
         pfs_bank &        B = s->banks[L.bank];
+        llama_fn_warm_wait_layer(L.il); // [TAG_FN_L15_WARM] the warm pass brings this layer in first
         // [TAG_FN_L15_PFSAHEAD] the next layers' pages: read ahead of the copies (positions wrap to 0 for the next ubatch)
-        if (s->ahead > 0 && !L.src_pinned) {
+        if (s->ahead > 0 && !L.src_pinned && !llama_fn_warm_running()) {
             const int np = (int) s->layers.size();
             llama_memory_ranges mr;
             for (int d = 1; d <= s->ahead && d < np; ++d) {

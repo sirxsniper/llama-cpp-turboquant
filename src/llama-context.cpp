@@ -5,6 +5,7 @@
 #include "llama-moe-bridge.h" // [TAG_MOE_BRIDGE]
 #include "llama-moe-gen5.h" // [TAG_MOE_DMA_SHARE] [TAG_FN_PREFILL_STREAM]
 #include "llama-fn-auto.h" // [TAG_FN_AUTO] [TAG_FN_VRAM_FIT]
+#include "llama-fn-tier.h" // [TAG_FN_L15_WARM]
 
 #include "ggml.h"
 #include "llama-arch.h"
@@ -3588,6 +3589,16 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
         return encode(batch_inp);
     }
+
+    // [TAG_FN_L15_WARM] the experts' background warm pass starts when the trunk context's first decode returns
+    struct warm_go_on_exit {
+        bool on;
+        ~warm_go_on_exit() {
+            if (on) {
+                llama_fn_warm_go();
+            }
+        }
+    } warm_go { cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP };
 
     if (llama_host_gap_probe_enabled()) { // [TAG_HOST_GAP_PROBE]
         llama_host_gap_probe_decode(this);
