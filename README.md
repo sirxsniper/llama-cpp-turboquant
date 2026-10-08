@@ -33,7 +33,7 @@ code, 1 stream · 262K context · 4 slots
 ## 101 t/s
 real use at 32K · **89 t/s at 131K and 245K** · 103 / 93 / 91 with the MTPq3 files · a short new turn starts in 0.3–1.4 s instead of 3.4 s · **2 conversations at 32K: 62–66 t/s each**
 
-prompt reading **2,300 t/s** at 131K with the MTPq3 files (v0.20.0, +12 %)
+prompt reading **2,300 t/s** at 131K with the MTPq3 files (v0.20.0, +12 %) · **the first 32K prompt after a start 2,020 t/s** (v0.20.2, was 944)
 
 </td>
 </tr>
@@ -174,15 +174,26 @@ Five GPU memory bugs found with compute-sanitizer and fixed; no GPU work left in
 - Before v0.20.1, an answering conversation got one step per 8K prompt chunk of the other (each chunk streams every expert, ~3.4 s), so it stopped for the whole prompt. Now, after each chunk, it decodes alone for half that chunk's time, at most 2 s (`LLAMA_SRV_GEN_SHARE=0.5` in the Flash-Next profile; `0` restores the old order). Once both answer, each runs at 47–60 t/s as before.
 - Fixed in v0.20.1: with two conversations, the prompt stream could give the first layer of its next chunk a wrong expert. The hot set could swap that expert into a slot after the stream had picked the slot and before its GPU copy ran (v0.20.0 only, found by code review). The stream now reads that layer from RAM. The two-conversation identity check (GPU copy on vs off) passes, and a compute-sanitizer run with two conversations reports 0 errors.
 
+**The first prompt after a start** (v0.20.2, MTPq3 files, same-session pairs, 2 rounds each):
+
+| Prompt | v0.20.1 | **v0.20.2** |
+|:--|--:|--:|
+| 32K tokens, first prompt after a start | 944 t/s (744 / 1,144), 36-38 GB read from the disk | **2,020 t/s** (2,016 / 2,025), ~0.1 GB |
+| The same after 38 GB of other files were read (start, 45 s idle, prompt) | 955-958 t/s | **1,554-1,570 t/s** |
+| 131K tokens | 2,298 t/s | 2,316 t/s |
+
+- The load used to prefetch the whole model file into the file cache. That left the routed experts (71.7 GiB) as the oldest cached pages, in the same order the first prompt reads the layers, so every page the prompt read pushed out a layer it had not reached yet: the first 8K chunk re-read 36-38 GB at 3-4 GB/s (17-37 s instead of ~3.5 s).
+- Now the experts stay out of that prefetch, and a background pass reads them into the server's working set right after the load (22-31 s on the 9950X3D; a first long prompt in that time shares the disk with it). It first raises the process's working-set maximum: the token-embedding lock had set it to ~0.74 GiB, which made Windows trim a filled working set back to 0.8 GiB. `LLAMA_FN_L15_WARM=0` restores the old load. Flash-Next on Windows only.
+- Answers: same-session A/B, 5 rounds: v0.20.2 is equal or slightly faster (paired mean +0.7 % over 2 rounds, +2.9 % over 3 more) and pages in at most 0.6 GB per answer instead of 0.3-2.4 GB. Output token-identical to v0.20.1.
+
 **Prompt reading** (v0.20.0, MTPq3 files, same-session pairs, 2 rounds):
 
 | Prompt | v0.19.0 | **v0.20.0** |
 |:--|--:|--:|
 | 131K tokens (second prompt after a start) | 2,061 t/s | **2,317 t/s** |
-| 32K tokens, first prompt after a start (cold file cache) | 840 t/s (median of 10 runs) | **933 t/s** (median of 6 runs) |
 
-- 131K: the prompt stream copies the experts the VRAM hot set already holds (about 8 GiB of each 72 GiB pass; never a slot the KV cache can take back) from their slots on the GPU instead of from RAM; a warm 8K pass takes about 3.0-3.2 s instead of 3.5 s. 32K first prompt: the stream reads the next layers' pages ahead when they are not in RAM, and a load drops the GPU tensors' pages from RAM first.
-- Decoding output is unchanged: token-identical to v0.19.0. The first long prompt after a server start still pages in about 37 GiB from the disk: the model (105 GiB) is larger than RAM.
+- 131K: the prompt stream copies the experts the VRAM hot set already holds (about 8 GiB of each 72 GiB pass; never a slot the KV cache can take back) from their slots on the GPU instead of from RAM; a warm 8K pass takes about 3.0-3.2 s instead of 3.5 s.
+- Decoding output is unchanged: token-identical to v0.19.0.
 
 > Numbers are real-use medians over interleaved A/B rounds, not best-case benchmark runs. A greedy short-prompt benchmark always reads higher than a long, sampled answer — both are listed where it matters.
 
