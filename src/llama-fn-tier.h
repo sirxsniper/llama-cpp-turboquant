@@ -30,3 +30,6 @@ void llama_fn_tier_plan(const llama_model & model, llama_model_loader & ml);
 
 // after the tensor data is loaded (mapped); nullptr when off, not possible, or nothing fits
 llama_fn_tier_ptr llama_fn_tier_build(llama_model & model, llama_model_loader & ml);
+
+// [TAG_FN_L15_WARM] qwen4exp on Windows (LLAMA_FN_L15_WARM, default on): the load does not prefetch the routed experts; a
+// background thread started by llama_fn_tier_build reads them into the working set, whose maximum it first raises

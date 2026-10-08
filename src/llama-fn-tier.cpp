@@ -55,6 +55,16 @@ bool fn_tier_on(const llama_model & model) {
     return model.arch == LLM_ARCH_QWEN4EXP && llama_fn_l3_flag(model, "LLAMA_FN_L14_TIER");
 }
 
+// [TAG_FN_L15_WARM] see llama_fn_tier_plan
+bool fn_warm_on(const llama_model & model) {
+#ifdef _WIN32
+    return model.arch == LLM_ARCH_QWEN4EXP && !fn_tier_on(model) && llama_fn_l3_int(model, "LLAMA_FN_L15_WARM", 1) != 0;
+#else
+    GGML_UNUSED(model);
+    return false;
+#endif
+}
+
 } // namespace
 
 struct llama_fn_tier {
@@ -577,7 +587,11 @@ void llama_fn_tier_plan(const llama_model & model, llama_model_loader & ml) {
     if (model.arch == LLM_ARCH_QWEN4EXP && ml.use_mmap && llama_fn_l3_int(model, "LLAMA_FN_L15_TRIM", 1) != 0) {
         ml.trim_uploaded = true;
     }
-    if (!fn_tier_on(model) || !ml.use_mmap) {
+    // [TAG_FN_L15_WARM] the routed experts (71.7 GiB) are read by the warm pass after the load instead: the load's prefetch of
+    // the whole file pushed the oldest cached pages out of RAM, often this model's own pages from an earlier run, and the
+    // first prompt faulted ~30 GB back in at ~3 GB/s (l15 trace1: first 8K ubatch 19.2 s instead of 3.1 s)
+    const bool warm = fn_warm_on(model);
+    if ((!fn_tier_on(model) && !warm) || !ml.use_mmap) {
         return;
     }
     size_t n = 0;
@@ -591,7 +605,8 @@ void llama_fn_tier_plan(const llama_model & model, llama_model_loader & ml) {
             n += ggml_nbytes(t);
         }
     }
-    LLAMA_LOG_INFO("%s: [TAG_FN_L14_TIER] %.2f GiB of routed experts kept out of the load's prefetch\n", __func__, n/1073741824.0);
+    LLAMA_LOG_INFO("%s: [%s] %.2f GiB of routed experts kept out of the load's prefetch\n", __func__,
+            warm ? "TAG_FN_L15_WARM" : "TAG_FN_L14_TIER", n/1073741824.0);
 }
 
 #ifndef _WIN32
@@ -602,9 +617,121 @@ llama_fn_tier_ptr llama_fn_tier_build(llama_model & /*model*/, llama_model_loade
 
 #else
 
+// [TAG_FN_L15_WARM] layer by layer, one prefetch per 64 MiB piece of the routed experts, then every page touched: the
+// pages enter the working set as they arrive, so a later piece's read cannot push them out. Up to the available RAM
+// minus LLAMA_FN_L15_WARM_FREE_MIB (6144: the contexts are created meanwhile); LLAMA_FN_L15_WARM_THREADS (16) threads.
+static void fn_warm(const llama_model & model, HANDLE stop) {
+    using prefetch_t = BOOL (WINAPI *)(HANDLE, ULONG_PTR, PWIN32_MEMORY_RANGE_ENTRY, ULONG);
+    static const prefetch_t pf = (prefetch_t) (void *) GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "PrefetchVirtualMemory");
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    const size_t page  = si.dwPageSize ? si.dwPageSize : 4096;
+    const size_t piece = (size_t) 64 << 20;
+    struct range {
+        const char * p;
+        size_t       n;
+    };
+    std::vector<range> rs;
+    size_t total = 0;
+    for (const auto & ts : fn_tier_layers(model)) {
+        for (const ggml_tensor * t : ts) {
+            if (!t->buffer || !ggml_backend_buffer_is_host(t->buffer) || !t->data) {
+                continue;
+            }
+            const size_t n = ggml_nbytes(t);
+            for (size_t o = 0; o < n; o += piece) {
+                rs.push_back({ (const char *) t->data + o, std::min(piece, n - o) });
+            }
+            total += n;
+        }
+    }
+    if (rs.empty()) {
+        return;
+    }
+    MEMORYSTATUSEX ms;
+    ms.dwLength = sizeof(ms);
+    GlobalMemoryStatusEx(&ms);
+    const size_t keep   = (size_t) std::max(0, llama_fn_l3_int(model, "LLAMA_FN_L15_WARM_FREE_MIB", 6144)) << 20;
+    const size_t budget = (size_t) ms.ullAvailPhys > keep ? (size_t) ms.ullAvailPhys - keep : 0;
+    size_t n_use = 0;
+    size_t bytes = 0;
+    for (; n_use < rs.size() && bytes + rs[n_use].n <= budget; ++n_use) {
+        bytes += rs[n_use].n;
+    }
+    PROCESS_MEMORY_COUNTERS pm0 = {};
+    GetProcessMemoryInfo(GetCurrentProcess(), &pm0, sizeof(pm0));
+    const int n_thr = std::max(1, std::min(32, llama_fn_l3_int(model, "LLAMA_FN_L15_WARM_THREADS", 16)));
+    std::atomic<size_t> next{0};
+    auto run = [&]() {
+        for (size_t i = next.fetch_add(1); i < n_use; i = next.fetch_add(1)) {
+            if (WaitForSingleObject(stop, 0) == WAIT_OBJECT_0) {
+                return;
+            }
+            WIN32_MEMORY_RANGE_ENTRY e = { (PVOID) rs[i].p, (SIZE_T) rs[i].n };
+            if (pf != nullptr) {
+                pf(GetCurrentProcess(), 1, &e, 0);
+            }
+            for (size_t o = 0; o < rs[i].n; o += page) {
+                (void) *(volatile const char *) (rs[i].p + o);
+            }
+            (void) *(volatile const char *) (rs[i].p + rs[i].n - 1);
+        }
+    };
+    const auto t0 = std::chrono::steady_clock::now();
+    std::vector<std::thread> ths;
+    for (int k = 1; k < n_thr; ++k) {
+        ths.emplace_back(run);
+    }
+    run();
+    for (auto & th : ths) {
+        th.join();
+    }
+    const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    PROCESS_MEMORY_COUNTERS pm1 = {};
+    GetProcessMemoryInfo(GetCurrentProcess(), &pm1, sizeof(pm1));
+    LLAMA_LOG_INFO("%s: [TAG_FN_L15_WARM] %.2f of %.2f GiB of routed experts read into the working set in %.1f s by %d threads "
+            "(%.1f GiB of RAM was available, %.1f GiB kept free; working set %.1f -> %.1f GiB)\n", __func__, bytes/1073741824.0,
+            total/1073741824.0, secs, n_thr, ms.ullAvailPhys/1073741824.0, keep/1073741824.0, pm0.WorkingSetSize/1073741824.0,
+            pm1.WorkingSetSize/1073741824.0);
+    if (n_use < rs.size()) {
+        LLAMA_LOG_WARN("%s: [TAG_FN_L15_WARM] %.2f GiB of routed experts did not fit in the available RAM: the first prompt reads "
+                "them from the disk\n", __func__, (total - bytes)/1073741824.0);
+    }
+}
+
 llama_fn_tier_ptr llama_fn_tier_build(llama_model & model, llama_model_loader & ml) {
     if (!fn_tier_on(model)) {
-        return nullptr;
+        if (!fn_warm_on(model) || !ml.use_mmap) {
+            return nullptr;
+        }
+        // [TAG_FN_L15_WARM] the working-set maximum first: every VirtualLock retry (EMBDLOCK's table and the PLE row cache,
+        // llama-mmap.cpp raw_lock) sets it to its old value + the lock, about 0.74 GiB, and that trimmed a 72 GiB working set
+        // to 0.8 GiB (l15 abw_new1/2, abx_new1/2). Only the minimum is charged to commit.
+        MEMORYSTATUSEX ms;
+        ms.dwLength = sizeof(ms);
+        GlobalMemoryStatusEx(&ms);
+        SIZE_T mn = 0;
+        SIZE_T mx = 0;
+        DWORD  fl = 0;
+        if (GetProcessWorkingSetSizeEx(GetCurrentProcess(), &mn, &mx, &fl)) {
+            const SIZE_T want = std::max<SIZE_T>(mx, (SIZE_T) (ms.ullTotalPhys/10*9));
+            if (!SetProcessWorkingSetSizeEx(GetCurrentProcess(), mn, want, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE)) {
+                LLAMA_LOG_WARN("%s: [TAG_FN_L15_WARM] the working-set maximum stays %.2f GiB (error %lu)\n", __func__,
+                        mx/1073741824.0, (unsigned long) GetLastError());
+            }
+        }
+        // then the background warm pass, while the contexts are created
+        llama_fn_tier_ptr w(new llama_fn_tier());
+        w->stop = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        if (w->stop == nullptr) {
+            return nullptr;
+        }
+        const llama_model * m = &model;
+        llama_fn_tier * t = w.get();
+        w->worker = std::thread([m, t]() { fn_warm(*m, t->stop); });
+        LLAMA_LOG_INFO("%s: [TAG_FN_L15_WARM] the routed experts are read into the working set in the background (working-set "
+                "maximum %.1f GiB)\n", __func__, (ms.ullTotalPhys/10*9)/1073741824.0);
+        return w;
     }
     if (!ml.use_mmap) {
         LLAMA_LOG_INFO("%s: [TAG_FN_L14_TIER] the model is not mapped: nothing to lock\n", __func__);
