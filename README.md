@@ -31,7 +31,7 @@ code, 1 stream · 262K context · 4 slots
 **Qwen3.8-Flash-Next** · UD-Q4_K_XL (100+ GB MoE)
 
 ## 101 t/s
-real use at 32K · **89 t/s at 131K and 245K** · 103 / 93 / 91 with the MTPq3 files · a short new turn starts in 0.3–1.4 s instead of 3.4 s · **2 streams: 111–120 t/s total**
+real use at 32K · **89 t/s at 131K and 245K** · 103 / 93 / 91 with the MTPq3 files · a short new turn starts in 0.3–1.4 s instead of 3.4 s · **2 streams at 32K: 111–120 t/s total**
 
 prompt reading **1,500–2,060 t/s**
 
@@ -39,7 +39,7 @@ prompt reading **1,500–2,060 t/s**
 </tr>
 </table>
 
-<sub>RTX 5090 32 GB · Ryzen 9 9950X3D · 96 GB DDR5-6400 · PCIe Gen5 · Windows 11 · turbot KV cache · measured 2026-10-06 (2 streams: 2026-10-07)</sub>
+<sub>RTX 5090 32 GB · Ryzen 9 9950X3D · 96 GB DDR5-6400 · PCIe Gen5 · Windows 11 · turbot KV cache · measured 2026-10-06/07</sub>
 
 </div>
 
@@ -147,19 +147,19 @@ Five GPU memory bugs found with compute-sanitizer and fixed; no GPU work left in
 
 - Chunks under 384 tokens now compute their CPU-side experts on the CPU instead of streaming every expert through the GPU once (~3.4 s whatever the size); 384 tokens and more still stream (faster there). Decoding is not touched: output identical to v0.17.0, the real-use numbers above stand.
 - v0.16.0 and v0.17.0 measured back to back in one session (2 interleaved rounds); the MTPq3 column against v0.17.0 with the standard files in another session (3 rounds: 100.2 / 88.4 / 88.3 -> 103.1 / 92.7 / 91.3). Real use at the first depth after a load varies by about 3 %.
-- When Windows has moved expert data out of RAM (right after a start, after long prompts, or with other programs using memory), real use is lower until it is read back: 93.7–95.5 / 78.7–83.6 / 85.2–85.5 t/s with the MTPq3 files in one such session (2 rounds, with other programs also using the CPU), and a fresh 32K prompt read at 850–1,070 t/s instead of ~1,860.
+- The model (105 GB) is larger than RAM. When Windows has dropped expert data from its file cache (seen after server restarts while other programs were busy; the cause is still being traced), real use is lower until the data is read back. v0.19.0 on the evening of 2026-10-07 (3 sessions of 2 rounds, other programs using 2–12 CPU cores): 86–99 / 79–86 / 82–89 t/s with the MTPq3 files, 84–89 / 78–82 / 82–86 t/s with the standard files, and a fresh 32K prompt read at 720–1,070 t/s instead of ~1,860.
 - VRAM about 29.9 GB while generating (the expert hot set takes the free VRAM up to 2.1 GB below the card total, plus the part of the 262K KV cache a shorter context does not use yet; `LLAMA_FN_VRAM_KEEP_MIB=4096` keeps more free); the rest of the model stays memory-mapped.
 - Vision works: add `--mmproj mmproj-Qwen3.8-Flash-Next-F16.gguf`.
 
-**Two conversations at once** (v0.19.0, `--parallel 2 --kv-unified`, both sharing the 262K pool; real-use sampling, 1,024-token answers at 32K, two runs):
+**Two conversations at once** (v0.19.0, `--parallel 2 --kv-unified`, both sharing the 262K pool; standard MTP files, real-use sampling, 1,024-token answers at 32K, two runs):
 
 | | total | each stream |
 |:--|--:|--:|
 | v0.18.0 | 75.2 / 75.5 t/s | ~38 t/s |
 | **v0.19.0** | **110.8 / 119.7 t/s** | **56–61 t/s** |
 
-- Both streams' verify rows now run as one bridged graph: the MoE bridge takes up to n_rs_seq tokens of each sequence, and sequences that draft together draft the same length, the longer one: both keep drafting while either passes the p_min rule (`SPEC_MTP_EQUAL_SEQS`, on in the Flash-Next profile). Acceptance per stream drops a little; the step count drops more.
-- One stream gives the same output: token-identical to v0.18.0 (identity checks with and without MTP).
+- Both streams' verify rows now run as one bridged graph: the MoE bridge takes up to n_rs_seq tokens of each sequence, and sequences that draft together draft the same length, the longer one: both keep drafting while either passes the p_min rule (`SPEC_MTP_EQUAL_SEQS`, on in the Flash-Next profile). This gives most of the gain (81 -> 111–120 t/s total); acceptance per stream drops a little (0.76–0.79 -> 0.68–0.72).
+- One stream gives the same output: token-identical to v0.18.0 (identity checks with and without MTP). Without MTP, the last layer of a long prompt chunk now runs its CPU part synchronously, so a stall can no longer fail the request.
 
 > Numbers are real-use medians over interleaved A/B rounds, not best-case benchmark runs. A greedy short-prompt benchmark always reads higher than a long, sampled answer — both are listed where it matters.
 
