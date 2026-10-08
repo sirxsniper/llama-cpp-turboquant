@@ -1527,6 +1527,12 @@ struct ggml_backend_cuda_context {
     ggml_cuda_upload_slot upload_slot[2];
     int                   upload_next = 0;
     bool                  upload_off  = false;
+    // [TAG_FN_L16_UPLOAD] what the packed uploads of this backend did (a log line now and then): calls, copies packed,
+    // their bytes, copies sent plain
+    uint64_t              upload_n_calls  = 0;
+    uint64_t              upload_n_packed = 0;
+    uint64_t              upload_b_packed = 0;
+    uint64_t              upload_n_plain  = 0;
 
     ggml_cuda_mmvq_q8_cache mmvq_q8;                // [TAG_MMVQ_Q8_REUSE]
     // [TAG_FN_L4_QSA_LIST] the index lists a marked qwen4exp QSA_MASK writes for its sparse FA (fn-l4-qsa.cu): one buffer,
