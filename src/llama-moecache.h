@@ -89,6 +89,9 @@ void llama_moe_hot_set_host_ready(llama_moe_host_ready_fn fn, void * ud);
 // ([TAG_FN_MOE_HOT_ADAPT] only the owner of an adaptive hot set updates it)
 void llama_moe_cache_step(const void * ctx);
 
+// [TAG_FN_L16_MTP_ASYNC] the LRU cache runs (no hot set): the step of every context changes slots that any graph reads
+bool llama_moe_cache_lru_on();
+
 // [TAG_FN_MOE_HOT] static per-expert hot set, chosen once from a routing profile (tools/moe-trace, LLAMA_MOE_PROFILE):
 //   LLAMA_MOE_HOT_PROFILE=<file.moeprof>  enables it (the LRU cache above is then not built)
 //   LLAMA_MOE_HOT_MIB=<n>|auto            VRAM budget; auto = free VRAM after the reserve minus LLAMA_MOE_HOT_HEADROOM_MIB (1536)

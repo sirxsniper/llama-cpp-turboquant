@@ -800,6 +800,23 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
         CUDA_CHECK(cudaFree(fn_l4_list_buf));
         fn_l4_list_buf = nullptr;
     }
+    for (ggml_cuda_upload_slot & s : upload_slot) { // [TAG_FN_L16_UPLOAD]
+        if (s.host == nullptr) {
+            continue; // never allocated (a slot has all three or none)
+        }
+        ggml_cuda_set_device(device);
+        if (s.done != nullptr) {
+            CUDA_CHECK(cudaEventSynchronize(s.done));
+            CUDA_CHECK(cudaEventDestroy(s.done));
+        }
+        if (s.dev != nullptr) {
+            CUDA_CHECK(cudaFree(s.dev));
+        }
+        if (s.host != nullptr) {
+            CUDA_CHECK(cudaFreeHost(s.host));
+        }
+        s = ggml_cuda_upload_slot();
+    }
 }
 
 
@@ -2970,6 +2987,134 @@ static bool ggml_backend_cuda_set_tensors_batch_async(ggml_backend_t backend, in
     GGML_UNUSED(backend); GGML_UNUSED(n); GGML_UNUSED(tensors); GGML_UNUSED(data); GGML_UNUSED(sizes);
     return false;
 #endif
+}
+
+// [TAG_FN_L16_UPLOAD] one table entry of a packed upload: the payload at slot + off goes to dst
+struct ggml_cuda_upload_item {
+    uint64_t dst;
+    uint32_t off;
+    uint32_t size;
+};
+static_assert(sizeof(ggml_cuda_upload_item) == 16, "the payload after the table must stay 16-byte aligned");
+
+static constexpr size_t GGML_CUDA_UPLOAD_SLOT_BYTES = 1024*1024; // [TAG_FN_L16_UPLOAD] per slot, host and device
+static constexpr size_t GGML_CUDA_UPLOAD_BIG        = 64*1024;   // [TAG_FN_L16_UPLOAD] larger copies go plain
+
+// [TAG_FN_L16_UPLOAD] one block per table entry: copy its payload to its device address (16-byte words when dst allows)
+static __global__ void k_unpack_inputs(const char * __restrict__ slot) {
+    const ggml_cuda_upload_item it = ((const ggml_cuda_upload_item *) slot)[blockIdx.x];
+    const char * src = slot + it.off;
+    char *       dst = (char *) it.dst;
+    uint32_t     i0  = 0;
+    if ((it.dst & 15) == 0) {
+        const uint32_t n16 = it.size >> 4;
+        for (uint32_t i = threadIdx.x; i < n16; i += blockDim.x) {
+            ((int4 *) dst)[i] = ((const int4 *) src)[i];
+        }
+        i0 = n16 << 4;
+    }
+    for (uint32_t i = i0 + threadIdx.x; i < it.size; i += blockDim.x) {
+        dst[i] = src[i];
+    }
+}
+
+static bool ggml_cuda_upload_slot_alloc(ggml_cuda_upload_slot & s, size_t cap) {
+    s.host = (char *) ggml_cuda_host_malloc(cap);
+    if (s.host == nullptr) {
+        return false;
+    }
+    if (cudaMalloc((void **) &s.dev, cap) != cudaSuccess ||
+        cudaEventCreateWithFlags(&s.done, cudaEventDisableTiming) != cudaSuccess) {
+        (void) cudaGetLastError();
+        if (s.dev != nullptr) {
+            (void) cudaFree(s.dev);
+        }
+        (void) cudaFreeHost(s.host);
+        s = ggml_cuda_upload_slot();
+        return false;
+    }
+    s.cap = cap;
+    return true;
+}
+
+// [TAG_FN_L16_UPLOAD] host -> device copies into whole device tensors (LLAMA_FN_L4_HOST_BATCHCPY=2): copies over 64 KiB
+// go first as plain cudaMemcpyAsync; the rest are packed into a pinned slot (a table of {dst, off, size}, then the 16-byte
+// aligned payloads), sent as one copy to the slot's device twin, and written to their tensors by one unpack kernel. All on
+// the backend's stream, before the split's graph. A slot is reused only after the event behind its last unpack. The same
+// bytes reach the same tensors. Without a slot: the cudaMemcpyBatchAsync batch (mode 1), else false (nothing queued).
+static bool ggml_backend_cuda_set_tensors_pack_async(ggml_backend_t backend, int n, ggml_tensor * const * tensors,
+        const void * const * data, const size_t * sizes) {
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    if (n <= 0) {
+        return true;
+    }
+    size_t n_small = 0;
+    for (int i = 0; i < n; ++i) {
+        const ggml_tensor * t = tensors[i];
+        ggml_backend_buffer_t buf = t->view_src ? t->view_src->buffer : t->buffer;
+        if (buf == nullptr || buf->buft != ggml_backend_cuda_buffer_type(cuda_ctx->device) || sizes[i] > ggml_nbytes(t)) {
+            return false;
+        }
+        n_small += sizes[i] > 0 && sizes[i] <= GGML_CUDA_UPLOAD_BIG ? 1 : 0;
+    }
+    if (cuda_ctx->upload_off) {
+        return ggml_backend_cuda_set_tensors_batch_async(backend, n, tensors, data, sizes);
+    }
+    ggml_cuda_set_device(cuda_ctx->device);
+    ggml_cuda_upload_slot & s = cuda_ctx->upload_slot[cuda_ctx->upload_next];
+    if (s.host == nullptr && !ggml_cuda_upload_slot_alloc(s, GGML_CUDA_UPLOAD_SLOT_BYTES)) {
+        cuda_ctx->upload_off = true;
+        GGML_LOG_WARN("%s: [TAG_FN_L16_UPLOAD] no staging slot (%zu bytes pinned + device): batched copies (mode 1) from now on\n",
+                __func__, GGML_CUDA_UPLOAD_SLOT_BYTES);
+        return ggml_backend_cuda_set_tensors_batch_async(backend, n, tensors, data, sizes);
+    }
+    cudaStream_t stream = cuda_ctx->stream();
+
+    for (int i = 0; i < n; ++i) {
+        if (sizes[i] > GGML_CUDA_UPLOAD_BIG) {
+            CUDA_CHECK(cudaMemcpyAsync(tensors[i]->data, data[i], sizes[i], cudaMemcpyHostToDevice, stream));
+        }
+    }
+    if (n_small == 0) {
+        return true;
+    }
+
+    // the last unpack that read this slot (and the copy before it) is done
+    if (s.busy) {
+        CUDA_CHECK(cudaEventSynchronize(s.done));
+        s.busy = false;
+    }
+
+    ggml_cuda_upload_item * tab = (ggml_cuda_upload_item *) s.host;
+    size_t   pos    = n_small*sizeof(ggml_cuda_upload_item);
+    uint32_t n_pack = 0;
+    for (int i = 0; i < n; ++i) {
+        const size_t sz = sizes[i];
+        if (sz == 0 || sz > GGML_CUDA_UPLOAD_BIG) {
+            continue;
+        }
+        if (pos + sz > s.cap) {
+            CUDA_CHECK(cudaMemcpyAsync(tensors[i]->data, data[i], sz, cudaMemcpyHostToDevice, stream)); // the slot is full
+            continue;
+        }
+        memcpy(s.host + pos, data[i], sz);
+        tab[n_pack].dst  = (uint64_t) (uintptr_t) tensors[i]->data;
+        tab[n_pack].off  = (uint32_t) pos;
+        tab[n_pack].size = (uint32_t) sz;
+        n_pack++;
+        pos = GGML_PAD(pos + sz, 16);
+    }
+    if (n_pack == 0) {
+        return true;
+    }
+
+    CUDA_CHECK(cudaMemcpyAsync(s.dev, s.host, pos, cudaMemcpyHostToDevice, stream));
+    k_unpack_inputs<<<n_pack, 256, 0, stream>>>(s.dev);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaEventRecord(s.done, stream));
+    s.busy = true;
+    cuda_ctx->upload_next ^= 1;
+    return true;
 }
 
 static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
@@ -7973,6 +8118,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_set_tensors_batch_async") == 0) { // [TAG_FN_L4_HOST_BATCHCPY]
         return (void *)ggml_backend_cuda_set_tensors_batch_async;
+    }
+    if (strcmp(name, "ggml_backend_set_tensors_pack_async") == 0) { // [TAG_FN_L16_UPLOAD]
+        return (void *)ggml_backend_cuda_set_tensors_pack_async;
     }
     if (strcmp(name, "ggml_backend_copy_d2d_batch_async") == 0) { // [TAG_FN_L14_PFSD2D]
         return (void *)ggml_backend_cuda_copy_d2d_batch_async;

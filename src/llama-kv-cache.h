@@ -153,6 +153,10 @@ public:
     llama_pos seq_pos_min(llama_seq_id seq_id) const override;
     llama_pos seq_pos_max(llama_seq_id seq_id) const override;
 
+    // [TAG_FN_L16_SEQRM] on: seq_rm of one sequence takes its cells from the sequence's (pos, cell) index instead of a scan
+    // of every used cell (same cells, same order); verify: the scan runs too and a difference aborts (debug)
+    void set_seq_rm_indexed(bool on, bool verify) { seq_rm_idx = on; seq_rm_verify = on && verify; }
+
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const override;
 
     // state write/load
@@ -390,6 +394,10 @@ private:
 
     // env: LLAMA_KV_CACHE_DEBUG
     int debug = 0;
+
+    // [TAG_FN_L16_SEQRM] set_seq_rm_indexed
+    bool seq_rm_idx    = false;
+    bool seq_rm_verify = false;
 
     // this is the SWA type of the cache - not to be confused with the model SWA type
     const llama_swa_type swa_type = LLAMA_SWA_TYPE_NONE;

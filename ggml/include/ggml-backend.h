@@ -377,12 +377,20 @@ extern "C" {
     GGML_API bool                 ggml_backend_sched_snap_restore(ggml_backend_sched_t sched, ggml_backend_sched_snap_t snap, struct ggml_cgraph * graph);
     GGML_API void                 ggml_backend_sched_snap_free(ggml_backend_sched_snap_t snap);
 
-    // [TAG_FN_L4_HOST_BATCHCPY] on: the host -> device copies of a split's graph inputs go to the split's backend as one
-    // batch when its registry offers "ggml_backend_set_tensors_batch_async" (CUDA: cudaMemcpyBatchAsync), else one by
-    // one as before. Same copies, same stream, before the split's graph. Off by default.
+    // [TAG_FN_L4_HOST_BATCHCPY] mode 1: the host -> device copies of a split's graph inputs go to the split's backend as
+    // one batch when its registry offers "ggml_backend_set_tensors_batch_async" (CUDA: cudaMemcpyBatchAsync), else one by
+    // one as before. Same copies, same stream, before the split's graph. 0 (default): off.
+    // [TAG_FN_L16_UPLOAD] mode 2: "ggml_backend_set_tensors_pack_async" first (CUDA: small copies packed into one pinned
+    // copy and one unpack kernel), and the split-async host -> device copies of non-input tensors join the batch.
+    // verify (debug): after each batch, read back every copied tensor and abort if it differs from its source.
     typedef bool (*ggml_backend_set_tensors_batch_async_t)(ggml_backend_t backend, int n, struct ggml_tensor * const * tensors,
             const void * const * data, const size_t * sizes);
-    GGML_API void                 ggml_backend_sched_set_batch_inputs(ggml_backend_sched_t sched, bool on);
+    GGML_API void                 ggml_backend_sched_set_batch_inputs(ggml_backend_sched_t sched, int mode, bool verify);
+
+    // [TAG_FN_L16_MTP_ASYNC] on: the input synchronize of a split also clears that backend's queued split-async uploads,
+    // so a graph with no later upload returns right after its launch (the caller's next synchronize waits for it).
+    // Off (default): unchanged.
+    GGML_API void                 ggml_backend_sched_set_tail_async(ggml_backend_sched_t sched, bool on);
 
     // [TAG_FN_L4_HOST] host profile hook: called when graph compute enters a part (input copies, a wait, a host split's
     // compute, a device split's compute or launch, the end). NULL (default) = off.

@@ -113,6 +113,17 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
     }()) {
     kpool_probe = llama_fn_l3_flag(model, "LLAMA_FN_HOST_KPOOL_PROBE"); // [TAG_FN_L3_HOST_DIAG]
     kpool_inc   = llama_fn_l3_int(model, "LLAMA_FN_L10_KPOOLINC", 1) != 0; // [TAG_FN_L10_KPOOLINC] qwen4exp only
+
+    // [TAG_FN_L16_SEQRM] qwen4exp (the trunk and the MTP draft context): seq_rm of one sequence walks only its own cells
+    if (llama_fn_l3_flag(model, "LLAMA_FN_L16_SEQRM")) {
+        const bool verify = llama_fn_l3_flag(model, "LLAMA_SEQ_RM_VERIFY");
+        get_mem_attn()->set_seq_rm_indexed(true, verify);
+        if (mem_idx) {
+            mem_idx->set_seq_rm_indexed(true, verify);
+        }
+        LLAMA_LOG_INFO("%s: [TAG_FN_L16_SEQRM] seq_rm from the sequence index (attention%s)%s\n", __func__,
+                mem_idx ? " and indexer caches" : " cache", verify ? ", checked against the scan (LLAMA_SEQ_RM_VERIFY)" : "");
+    }
 }
 
 llama_memory_context_ptr llama_memory_hybrid_idx::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {

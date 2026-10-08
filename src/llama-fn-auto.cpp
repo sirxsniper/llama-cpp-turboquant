@@ -181,6 +181,10 @@ const fn_item k_items[] = {
     // step per chunk (0.5-0.9 t/s); it now decodes alone for half the chunk's time between chunks: 28-30 t/s, the prompt
     // ~50 % longer (l15 c_gs_*)
     { "LLAMA_SRV_GEN_SHARE",         "0.5",   P_ALL },
+    // [TAG_FN_L16] round 16: exact host trims between graphs, each behind its own switch (same values, same order)
+    { "LLAMA_FN_L4_HOST_BATCHCPY",   "2",     P_ALL }, // [TAG_FN_L16_UPLOAD] packed input uploads (mode 2)
+    { "LLAMA_FN_L16_SEQRM",          "1",     P_ALL }, // [TAG_FN_L16_SEQRM] seq_rm walks the sequence's own cells
+    { "LLAMA_FN_L16_MTP_ASYNC",      "1",     P_ALL }, // [TAG_FN_L16_MTP_ASYNC] no tail synchronize in the MTP draft decode
 };
 
 // names the fn-auto aware code reads through llama_fn_env(): never put into the environment

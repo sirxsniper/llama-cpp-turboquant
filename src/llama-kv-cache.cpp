@@ -1309,6 +1309,49 @@ void llama_kv_cache::clear(bool data) {
     }
 }
 
+// [TAG_FN_L16_SEQRM] the cells to remove for seq_rm(seq_id, p0, p1), p0 >= 0: the cells of seq_id with p0 <= pos < p1,
+// read from the sequence's (pos, cell) index (one pair per cell of the sequence) and sorted, so the caller removes them
+// in the ascending cell order of the scan. Read before any cell changes (cells.seq_rm erases from the index).
+// false: more than 4096 cells, the caller scans as before. verify: the scan's predicate over [i_beg, i_end) must give the
+// same cells, else abort.
+static thread_local std::vector<uint32_t> g_seq_rm_ids;
+
+static bool llama_kv_seq_rm_ids(const llama_kv_cells & cells, llama_seq_id seq_id, llama_pos p0, llama_pos p1,
+        uint32_t i_beg, uint32_t i_end, bool verify) {
+    constexpr size_t n_max = 4096;
+    auto & ids = g_seq_rm_ids;
+    ids.clear();
+    const auto & sp = cells.seq_pos_get(seq_id);
+    for (auto it = sp.lower_bound({ p0, 0u }); it != sp.end() && it->first < p1; ++it) {
+        if (ids.size() == n_max) {
+            ids.clear();
+            return false;
+        }
+        ids.push_back(it->second);
+    }
+    std::sort(ids.begin(), ids.end());
+
+    if (verify) {
+        static std::atomic<uint64_t> n_checked{0};
+        std::vector<uint32_t> scan;
+        for (uint32_t i = i_beg; i < i_end; ++i) {
+            if (cells.pos_in(i, p0, p1) && cells.seq_has(i, seq_id)) {
+                scan.push_back(i);
+            }
+        }
+        if (scan != ids) {
+            GGML_ABORT("[TAG_FN_L16_SEQRM] LLAMA_SEQ_RM_VERIFY: seq %d, pos [%d, %d): the index gives %zu cells, the scan %zu (or other cells)",
+                    seq_id, p0, p1, ids.size(), scan.size());
+        }
+        const uint64_t n = ++n_checked;
+        if (n == 1 || n % 4096 == 0) {
+            LLAMA_LOG_INFO("%s: [TAG_FN_L16_SEQRM] LLAMA_SEQ_RM_VERIFY: %llu removals checked against the scan, all equal\n",
+                    __func__, (unsigned long long) n);
+        }
+    }
+    return true;
+}
+
 bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
@@ -1352,16 +1395,27 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
         const uint32_t i_beg = cells.used_min();
         const uint32_t i_end = cells.used_max_p1();
 
-        for (uint32_t i = i_beg; i < i_end; ++i) {
-            if (!cells.pos_in(i, p0, p1)) {
-                continue;
-            }
-
+        auto rm_cell = [&](uint32_t i) {
             if (cells.seq_has(i, seq_id) && cells.seq_rm(i, seq_id)) {
                 triattention_on_cell_removed(triattention_st, i);
                 if (new_head == cells.size()) {
                     new_head = i;
                 }
+            }
+        };
+
+        // [TAG_FN_L16_SEQRM] the same cells in the same order from the sequence's index
+        if (seq_rm_idx && llama_kv_seq_rm_ids(cells, seq_id, p0, p1, i_beg, i_end, seq_rm_verify)) {
+            for (const uint32_t i : g_seq_rm_ids) {
+                rm_cell(i);
+            }
+        } else {
+            for (uint32_t i = i_beg; i < i_end; ++i) {
+                if (!cells.pos_in(i, p0, p1)) {
+                    continue;
+                }
+
+                rm_cell(i);
             }
         }
 
@@ -4227,11 +4281,7 @@ void llama_kv_cache::seq_rm_turbot_stream(uint32_t strm, llama_seq_id seq_id, ll
         uint64_t min_st  = std::numeric_limits<uint64_t>::max();
         bool     removed = false;
 
-        for (uint32_t i = i_beg; i < i_end; ++i) {
-            if (!cells.pos_in(i, p0, p1) || !cells.seq_has(i, seq_id)) {
-                continue;
-            }
-
+        auto rm_cell = [&](uint32_t i) {
             min_st  = std::min(min_st, tier.stamp(i));
             removed = true;
 
@@ -4240,6 +4290,21 @@ void llama_kv_cache::seq_rm_turbot_stream(uint32_t strm, llama_seq_id seq_id, ll
                 if (new_head == cells.size()) {
                     new_head = i;
                 }
+            }
+        };
+
+        // [TAG_FN_L16_SEQRM] the same cells in the same order from the sequence's index
+        if (seq_rm_idx && llama_kv_seq_rm_ids(cells, seq_id, p0, p1, i_beg, i_end, seq_rm_verify)) {
+            for (const uint32_t i : g_seq_rm_ids) {
+                rm_cell(i);
+            }
+        } else {
+            for (uint32_t i = i_beg; i < i_end; ++i) {
+                if (!cells.pos_in(i, p0, p1) || !cells.seq_has(i, seq_id)) {
+                    continue;
+                }
+
+                rm_cell(i);
             }
         }
 

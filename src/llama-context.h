@@ -430,8 +430,11 @@ private:
     // the ubatch, which queues them behind a bridged graph before that graph's synchronize
     bool   early_out_on = false;
 
-    bool   batch_inputs_on = false; // [TAG_FN_L4_HOST_BATCHCPY] LLAMA_FN_L4_HOST_BATCHCPY (qwen4exp)
-    void   sched_hooks();           // [TAG_FN_L4_HOST_BATCHCPY] [TAG_FN_L4_HOST] set on every new scheduler
+    int    batch_inputs_mode = 0;     // [TAG_FN_L4_HOST_BATCHCPY] LLAMA_FN_L4_HOST_BATCHCPY (qwen4exp): 0 off, 1 batch, 2 packed
+    bool   upload_verify     = false; // [TAG_FN_L16_UPLOAD] LLAMA_FN_UPLOAD_VERIFY (qwen4exp, debug)
+    bool   mtp_async_on      = false; // [TAG_FN_L16_MTP_ASYNC] LLAMA_FN_L16_MTP_ASYNC (qwen4exp MTP draft context)
+    bool   mtp_tail_live     = false; // [TAG_FN_L16_MTP_ASYNC] the last decode returned before its graph ended; synchronize() clears it
+    void   sched_hooks();             // [TAG_FN_L4_HOST_BATCHCPY] [TAG_FN_L4_HOST] set on every new scheduler
     void (*early_extract_fn)(void * ud, const llm_graph_result * res) = nullptr;
     void * early_extract_ud = nullptr;
 

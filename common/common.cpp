@@ -1509,6 +1509,7 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
             common_batch batch = common_batch_get_one(lctx, tmp);
             llama_process(lctx, LLAMA_PROCESS_TYPE_DECODE, batch.get());
         }
+        llama_synchronize(lctx); // [TAG_FN_L16_MTP_ASYNC] the clear below does not wait for a graph still running
         llama_memory_clear(llama_get_memory(lctx), true);
         llama_synchronize(lctx);
         llama_perf_context_reset(lctx);
@@ -1575,6 +1576,8 @@ common_context_seq_rm_type common_context_can_seq_rm(llama_context * ctx) {
     {
         common_batch batch = common_batch_get_one(ctx, tmp);
         ret = llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+        // [TAG_FN_L16_MTP_ASYNC] nobody reads the outputs: wait for the graph here, the memory clear below does not
+        llama_synchronize(ctx);
     }
     if (ret != 0) {
         COM_ERR("llama_process() failed: %d\n", ret);

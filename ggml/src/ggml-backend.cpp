@@ -1159,9 +1159,12 @@ struct ggml_backend_sched {
     uint64_t snap_id; // [TAG_FN_L4_HOST_SNAP] unique per scheduler object
 
     // [TAG_FN_L4_HOST_BATCHCPY] ggml_backend_sched_set_batch_inputs; the batch function per backend (resolved once)
-    bool                                    batch_inputs;
+    int                                     batch_inputs; // [TAG_FN_L16_UPLOAD] the mode: 0 off, 1 batch, 2 packed
+    bool                                    batch_verify; // [TAG_FN_L16_UPLOAD] LLAMA_FN_UPLOAD_VERIFY
     bool                                    batch_fn_tried[GGML_SCHED_MAX_BACKENDS];
     ggml_backend_set_tensors_batch_async_t  batch_fn[GGML_SCHED_MAX_BACKENDS];
+
+    bool tail_async; // [TAG_FN_L16_MTP_ASYNC] ggml_backend_sched_set_tail_async
 
     // [TAG_FN_L4_HOST] ggml_backend_sched_set_prof_cb
     ggml_backend_sched_prof_cb_t prof_cb;
@@ -2067,6 +2070,29 @@ static void ggml_backend_sched_sync_mask(ggml_backend_sched_t sched, uint32_t & 
     }
 }
 
+// [TAG_FN_L16_UPLOAD] LLAMA_FN_UPLOAD_VERIFY: wait for the batch, read back every copied tensor, abort on a difference
+static void ggml_backend_sched_batch_verify(ggml_backend_t backend, const std::vector<ggml_tensor *> & t,
+        const std::vector<const void *> & d, const std::vector<size_t> & s) {
+    static thread_local std::vector<uint8_t> buf;
+    static std::atomic<uint64_t> n_batch{0};
+    static std::atomic<uint64_t> n_copy{0};
+    ggml_backend_synchronize(backend);
+    for (size_t k = 0; k < t.size(); ++k) {
+        buf.resize(s[k]);
+        ggml_backend_tensor_get(t[k], buf.data(), 0, s[k]);
+        if (memcmp(buf.data(), d[k], s[k]) != 0) {
+            GGML_ABORT("%s: [TAG_FN_L16_UPLOAD] LLAMA_FN_UPLOAD_VERIFY: tensor %s (%zu bytes, copy %zu of %zu) differs from its source after the upload",
+                    __func__, t[k]->name, s[k], k, t.size());
+        }
+    }
+    const uint64_t nb = ++n_batch;
+    const uint64_t nc = (n_copy += t.size());
+    if (nb == 1 || nb % 4096 == 0) {
+        GGML_LOG_INFO("%s: [TAG_FN_L16_UPLOAD] LLAMA_FN_UPLOAD_VERIFY: %" PRIu64 " batches, %" PRIu64 " copies read back, all equal\n",
+                __func__, nb, nc);
+    }
+}
+
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
@@ -2127,14 +2153,37 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 sched->batch_fn_tried[split_backend_id] = true;
                 ggml_backend_dev_t dev = ggml_backend_get_device(split_backend);
                 ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
-                sched->batch_fn[split_backend_id] = reg ? (ggml_backend_set_tensors_batch_async_t)
-                    ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_tensors_batch_async") : nullptr;
+                ggml_backend_set_tensors_batch_async_t fn = nullptr;
+                if (reg && sched->batch_inputs >= 2) { // [TAG_FN_L16_UPLOAD] the packed copy, else the plain batch
+                    fn = (ggml_backend_set_tensors_batch_async_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_tensors_pack_async");
+                }
+                if (reg && fn == nullptr) {
+                    fn = (ggml_backend_set_tensors_batch_async_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_tensors_batch_async");
+                }
+                sched->batch_fn[split_backend_id] = fn;
             }
             batch_fn = sched->batch_fn[split_backend_id];
             batch_t.clear();
             batch_d.clear();
             batch_s.clear();
         }
+        // [TAG_FN_L4_HOST_BATCHCPY] the split's queued copies as one call; one by one if the backend refuses the batch
+        auto flush_batch = [&]() {
+            if (batch_t.empty()) {
+                return;
+            }
+            if (!batch_fn(split_backend, (int) batch_t.size(), batch_t.data(), batch_d.data(), batch_s.data())) {
+                for (size_t k = 0; k < batch_t.size(); ++k) {
+                    ggml_backend_tensor_set_async(split_backend, batch_t[k], batch_d[k], 0, batch_s[k]);
+                }
+            }
+            if (sched->batch_verify) { // [TAG_FN_L16_UPLOAD]
+                ggml_backend_sched_batch_verify(split_backend, batch_t, batch_d, batch_s);
+            }
+            batch_t.clear();
+            batch_d.clear();
+            batch_s.clear();
+        };
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
             ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[input_id]);
             struct ggml_tensor * input = split->inputs[input_id];
@@ -2198,7 +2247,16 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     input->buffer != NULL && ggml_backend_buffer_is_host(input->buffer) &&
                     ggml_backend_buffer_get_usage(input->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
                     ggml_backend_sched_tensor_buft(input_cpy) == sched->bufts[split_backend_id]) {
-                    ggml_backend_tensor_set_async(split_backend, input_cpy, input->data, 0, ggml_nbytes(input));
+                    if (batch_fn != nullptr && sched->batch_inputs >= 2 && input_cpy->view_src == NULL && input_cpy->data != NULL) {
+                        // [TAG_FN_L16_UPLOAD] with the split's batch, queued before the split's input synchronize
+                        if (ggml_nbytes(input) > 0) {
+                            batch_t.push_back(input_cpy);
+                            batch_d.push_back(input->data);
+                            batch_s.push_back(ggml_nbytes(input));
+                        }
+                    } else {
+                        ggml_backend_tensor_set_async(split_backend, input_cpy, input->data, 0, ggml_nbytes(input));
+                    }
                     pending_h2d |= 1u << split_backend_id;
                     continue;
                 }
@@ -2247,6 +2305,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     }
 
                     if (ids_tensor != prev_ids_tensor) {
+                        flush_batch(); // [TAG_FN_L16_UPLOAD] the ids copy may be in the batch: queue it before the read
                         ids.resize(ggml_nbytes(ids_tensor) / sizeof(int32_t));
                         ggml_backend_tensor_get_async(ids_backend, ids_tensor, ids.data(), 0, ggml_nbytes(ids_tensor));
                         ggml_backend_synchronize(ids_backend);
@@ -2319,23 +2378,17 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
-        // [TAG_FN_L4_HOST_BATCHCPY] the split's input copies as one call; one by one if the backend refuses the batch
-        if (!batch_t.empty()) {
-            if (!batch_fn(split_backend, (int) batch_t.size(), batch_t.data(), batch_d.data(), batch_s.data())) {
-                for (size_t k = 0; k < batch_t.size(); ++k) {
-                    ggml_backend_tensor_set_async(split_backend, batch_t[k], batch_d[k], 0, batch_s[k]);
-                }
-            }
-            batch_t.clear();
-            batch_d.clear();
-            batch_s.clear();
-        }
+        flush_batch(); // [TAG_FN_L4_HOST_BATCHCPY]
 
         prof(GGML_SCHED_PROF_SYNC); // [TAG_FN_L4_HOST]
 
         // [TAG_SCHED_INPUT_BATCH] one synchronize for every input queued above
         if (n_inputs_async > 0) {
             ggml_backend_synchronize(split_backend);
+            // [TAG_FN_L16_MTP_ASYNC] this also waited for the split-async uploads queued on this backend so far
+            if (sched->tail_async) {
+                pending_h2d &= ~(1u << split_backend_id);
+            }
         }
 
         // [TAG_FN_SCHED_SPLIT_ASYNC] a host split waits for its queued gets and for every queued host -> device copy,
@@ -2691,9 +2744,23 @@ void ggml_backend_sched_snap_free(ggml_backend_sched_snap_t snap) {
 }
 
 // [TAG_FN_L4_HOST_BATCHCPY]
-void ggml_backend_sched_set_batch_inputs(ggml_backend_sched_t sched, bool on) {
+void ggml_backend_sched_set_batch_inputs(ggml_backend_sched_t sched, int mode, bool verify) {
     GGML_ASSERT(sched);
-    sched->batch_inputs = on;
+    if (sched->batch_inputs != mode) {
+        // [TAG_FN_L16_UPLOAD] the batch function depends on the mode: look it up again
+        for (int b = 0; b < GGML_SCHED_MAX_BACKENDS; b++) {
+            sched->batch_fn_tried[b] = false;
+            sched->batch_fn[b]       = nullptr;
+        }
+    }
+    sched->batch_inputs = mode;
+    sched->batch_verify = verify;
+}
+
+// [TAG_FN_L16_MTP_ASYNC]
+void ggml_backend_sched_set_tail_async(ggml_backend_sched_t sched, bool on) {
+    GGML_ASSERT(sched);
+    sched->tail_async = on;
 }
 
 // [TAG_FN_L4_HOST]

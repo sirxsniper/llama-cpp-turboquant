@@ -1427,7 +1427,19 @@ llama_context::llama_context(
         early_out_on = llama_fn_l4_host_flag(&model, "LLAMA_FN_L4_HOST_EARLYOUT");
 
         // [TAG_FN_L4_HOST_BATCHCPY] its own switch only (not LLAMA_FN_L4_HOST): applied where the scheduler is made
-        batch_inputs_on = llama_fn_l3_flag(model, "LLAMA_FN_L4_HOST_BATCHCPY");
+        // [TAG_FN_L16_UPLOAD] 2: small copies packed into one copy and one unpack kernel
+        batch_inputs_mode = std::max(0, llama_fn_l3_int(model, "LLAMA_FN_L4_HOST_BATCHCPY", 0));
+        upload_verify     = batch_inputs_mode > 0 && llama_fn_l3_flag(model, "LLAMA_FN_UPLOAD_VERIFY");
+        if (batch_inputs_mode >= 2 || upload_verify) {
+            LLAMA_LOG_INFO("%s: [TAG_FN_L16_UPLOAD] input uploads: mode %d%s\n", __func__, batch_inputs_mode,
+                    upload_verify ? ", every batch read back and compared (LLAMA_FN_UPLOAD_VERIFY)" : "");
+        }
+
+        // [TAG_FN_L16_MTP_ASYNC] the qwen4exp MTP draft context only: the target is bridged and keeps its tail synchronize
+        mtp_async_on = cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && llama_fn_l3_flag(model, "LLAMA_FN_L16_MTP_ASYNC");
+        if (mtp_async_on) {
+            LLAMA_LOG_INFO("%s: [TAG_FN_L16_MTP_ASYNC] a draft decode with outputs returns after its launch; the output getters wait\n", __func__);
+        }
 
         // [TAG_FN_L4_HOST_SNAP] qwen4exp only; not with the CUDA concurrency pass (its plan is per optimized graph)
         {
@@ -2139,7 +2151,7 @@ static int llama_hp_dec_seg(int cls, int sub) {
 // [TAG_FN_L4_HOST_BATCHCPY] [TAG_FN_L4_HOST] the l4 host hooks of a new scheduler: batched input copies, and with the
 // host profile the parts of its graph compute (input copies, waits, host / device split compute)
 void llama_context::sched_hooks() {
-    ggml_backend_sched_set_batch_inputs(sched.get(), batch_inputs_on);
+    ggml_backend_sched_set_batch_inputs(sched.get(), batch_inputs_mode, upload_verify);
     if (llama_hp_on()) {
         ggml_backend_sched_set_prof_cb(sched.get(), [](void * ud, int ev) {
             int sub = LLAMA_HP_DEC_LAUNCH;
@@ -2287,6 +2299,7 @@ void llama_context::synchronize() {
     }
 
     sched_pending = false;
+    mtp_tail_live = false; // [TAG_FN_L16_MTP_ASYNC]
 
     if (was_pending && llama_host_gap_probe_enabled()) { // [TAG_HOST_GAP_PROBE]
         llama_host_gap_probe_sync(this);
@@ -3844,6 +3857,14 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     int64_t n_tokens_prev  = 0;
     uint32_t n_ubatch_done = 0; // [TAG_4C_PROBE]
 
+    // [TAG_FN_L16_MTP_ASYNC] only a draft decode with outputs returns before its graph ends: the caller reads them next, and
+    // that getter waits. A decode without outputs keeps the tail synchronize, and so does every decode while the LRU expert
+    // cache runs (its step at the end of this decode changes slots this graph reads)
+    const bool tail_async = mtp_async_on && moe_bridge == nullptr && n_outputs_all > 0 && !llama_moe_cache_lru_on();
+    if (tail_async) {
+        ggml_backend_sched_set_tail_async(sched.get(), true);
+    }
+
     do {
         const auto & ubatch = mctx->get_ubatch();
 
@@ -4070,6 +4091,12 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         }
 
         if (!res) {
+            // [TAG_FN_L16_MTP_ASYNC] the rollback below runs after the graph ends, as with the tail synchronize
+            if (tail_async) {
+                ggml_backend_sched_set_tail_async(sched.get(), false);
+                ggml_backend_sched_synchronize(sched.get());
+            }
+
             // [TAG_TURBOT] before the seq_rm below: the fills of this ubatch are queued again, nothing is demoted
             if (turbot_kv) {
                 turbot_kv->turbot_abort_ubatch();
@@ -4123,6 +4150,12 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         n_tokens_prev  += ubatch.n_tokens;
         n_ubatch_done++;
     } while (mctx->next());
+
+    // [TAG_FN_L16_MTP_ASYNC] other graphs of this scheduler (a K-shift) keep the tail synchronize; synchronize() clears the mark
+    if (tail_async) {
+        ggml_backend_sched_set_tail_async(sched.get(), false);
+        mtp_tail_live = true;
+    }
 
     // [TAG_4C_PROBE]
     if (n_tokens_all <= 64 && llama_probe_ubatch_enabled()) {
@@ -4191,6 +4224,12 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     const bool hot_owner = llama_moe_hot_adapt_owner() == this;
     if (hot_owner) {
         ggml_backend_sched_synchronize(sched.get());
+        // [TAG_FN_L16_MTP_ASYNC] no draft graph may run either: wait for a draft decode whose outputs nobody read yet
+        for (const auto & c : llama_fn_ctx_list(model)) {
+            if (c.first != this && c.first->mtp_tail_live) {
+                c.first->synchronize();
+            }
+        }
     }
     if (step_async_want && hot_owner && !llama_moe_hot_has_layer_from((int) model.hparams.n_layer())) {
         // [TAG_FN_L3_HOST_STEP] the same two calls on the helper thread, while the caller samples and drafts; no graph of

@@ -1508,10 +1508,25 @@ struct ggml_cuda_graph_host_probe {
     uint64_t n_graph = 0; // calls that ran as a CUDA graph
 };
 
+// [TAG_FN_L16_UPLOAD] a staging slot of the packed input upload (ggml_backend_cuda_set_tensors_pack_async): pinned host
+// bytes, their device twin, and the event recorded after the unpack kernel that last read them
+struct ggml_cuda_upload_slot {
+    char *      host = nullptr;
+    char *      dev  = nullptr;
+    size_t      cap  = 0;
+    cudaEvent_t done = nullptr;
+    bool        busy = false; // done was recorded since the slot was last waited for
+};
+
 struct ggml_backend_cuda_context {
     int device;
     std::string name;
     cudaEvent_t copy_event = nullptr;
+
+    // [TAG_FN_L16_UPLOAD] two slots used in turn; upload_off: a slot could not be allocated, mode 1 from then on
+    ggml_cuda_upload_slot upload_slot[2];
+    int                   upload_next = 0;
+    bool                  upload_off  = false;
 
     ggml_cuda_mmvq_q8_cache mmvq_q8;                // [TAG_MMVQ_Q8_REUSE]
     // [TAG_FN_L4_QSA_LIST] the index lists a marked qwen4exp QSA_MASK writes for its sparse FA (fn-l4-qsa.cu): one buffer,
