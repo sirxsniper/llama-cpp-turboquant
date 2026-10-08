@@ -146,6 +146,7 @@ struct mb_dev {
     int             n_chan;
     int             mode;
     int             stats;
+    int             probe;     // [TAG_FN_L14_PROBE] LLAMA_FN_L14_PROBE=1: the device stamps its posts and waits (else no stamps)
     unsigned long long timeout_ns;
     unsigned long long job_max_ns;
 };
@@ -283,7 +284,9 @@ static __global__ void k_mb_post(const mb_dev v, const int chan,
         *(volatile int32_t *) &h->n_tokens = n_tokens;
         *(volatile int32_t *) &h->n_used   = n_used;
         *(volatile int32_t *) &h->flags    = flags;
-        *(volatile unsigned long long *) &h->t_post = mb_now_ns(); // [TAG_FN_L14_PROBE]
+        if (v.probe) {
+            *(volatile unsigned long long *) &h->t_post = mb_now_ns(); // [TAG_FN_L14_PROBE]
+        }
         __threadfence_system();
         *(volatile uint32_t *) &h->seq = seq;
         if (v.mode == GGML_MOE_BRIDGE_WAIT_SPIN) {
@@ -294,7 +297,9 @@ static __global__ void k_mb_post(const mb_dev v, const int chan,
             mb_ring_entry * e = v.ring + (g % MB_RING);
             *(volatile uint32_t *) &e->chan = (uint32_t) chan;
             *(volatile uint32_t *) &e->seq  = seq;
-            *(volatile unsigned long long *) &h->t_pub = mb_now_ns(); // [TAG_FN_L14_PROBE]
+            if (v.probe) {
+                *(volatile unsigned long long *) &h->t_pub = mb_now_ns(); // [TAG_FN_L14_PROBE]
+            }
             __threadfence_system();
             *(volatile uint32_t *) &e->stamp        = g;
             *(volatile uint32_t *) &v.glob->posted  = g;
@@ -350,8 +355,10 @@ static __global__ void k_mb_wait(const mb_dev v, const int chan, const int32_t *
             if (blockIdx.x == 0) { // [TAG_FN_R4_BRIDGE_DMA] the host's DMA/CPU split reads this
                 volatile mb_chan_hdr * h = v.hdr + chan;
                 h->wait_ns   = ready ? 0ull : dt;
-                h->t_wstart  = t0;      // [TAG_FN_L14_PROBE]
-                h->t_wend    = t0 + dt;
+                if (v.probe) { // [TAG_FN_L14_PROBE]
+                    h->t_wstart = t0;
+                    h->t_wend   = t0 + dt;
+                }
                 h->times_seq = want;
             }
         }
@@ -652,7 +659,9 @@ static __device__ __forceinline__ void fn_l4_post_head(const mb_dev v, const int
     *(volatile int32_t  *) &h->n_tokens = n_tokens;
     *(volatile int32_t  *) &h->n_used   = n_used;
     *(volatile int32_t  *) &h->flags    = flags;
-    *(volatile unsigned long long *) &h->t_post = mb_now_ns(); // [TAG_FN_L14_PROBE]
+    if (v.probe) {
+        *(volatile unsigned long long *) &h->t_post = mb_now_ns(); // [TAG_FN_L14_PROBE]
+    }
     *(volatile uint32_t *) &h->seq      = seq;
     if (v.mode == GGML_MOE_BRIDGE_WAIT_SPIN) {
         mb_ring_entry * e = v.ring + (g % MB_RING);
@@ -664,7 +673,9 @@ static __device__ __forceinline__ void fn_l4_post_head(const mb_dev v, const int
 // thread ctl, after every thread's fence and the barrier: the stamp, then the ticket (0 when nothing was posted)
 static __device__ __forceinline__ void fn_l4_post_publish(const mb_dev v, const int chan, const uint32_t seq, const uint32_t g, int32_t * ticket) {
     if (seq != 0 && v.mode == GGML_MOE_BRIDGE_WAIT_SPIN) {
-        *(volatile unsigned long long *) &v.hdr[chan].t_pub = mb_now_ns(); // [TAG_FN_L14_PROBE]
+        if (v.probe) {
+            *(volatile unsigned long long *) &v.hdr[chan].t_pub = mb_now_ns(); // [TAG_FN_L14_PROBE]
+        }
         mb_ring_entry * e = v.ring + (g % MB_RING);
         *(volatile uint32_t *) &e->stamp       = g;
         *(volatile uint32_t *) &v.glob->posted = g;
@@ -1268,6 +1279,10 @@ ggml_moe_bridge * ggml_backend_cuda_moe_bridge_new(const ggml_moe_bridge_params 
     b->dev.n_chan     = p->n_chan;
     b->dev.mode       = p->wait_mode;
     b->dev.stats      = p->stats ? 1 : 0;
+    {
+        const char * e = getenv("LLAMA_FN_L14_PROBE"); // [TAG_FN_L14_PROBE]
+        b->dev.probe = e && atoi(e) != 0 ? 1 : 0;
+    }
     b->dev.timeout_ns = (unsigned long long) b->params.timeout_ms*1000000ull;
     b->dev.job_max_ns = (unsigned long long) b->params.job_max_ms*1000000ull;
 

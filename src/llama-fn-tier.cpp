@@ -573,10 +573,13 @@ void llama_fn_tier_deleter::operator()(llama_fn_tier * t) const {
 }
 
 void llama_fn_tier_plan(const llama_model & model, llama_model_loader & ml) {
+    // [TAG_FN_L15_TRIM] qwen4exp: the GPU tensors' pages (5.7 GiB) leave RAM first, whether or not the tier runs
+    if (model.arch == LLM_ARCH_QWEN4EXP && ml.use_mmap && llama_fn_l3_int(model, "LLAMA_FN_L15_TRIM", 1) != 0) {
+        ml.trim_uploaded = true;
+    }
     if (!fn_tier_on(model) || !ml.use_mmap) {
         return;
     }
-    ml.trim_uploaded = true; // [TAG_FN_L15_TRIM]
     size_t n = 0;
     for (const auto & ts : fn_tier_layers(model)) {
         for (ggml_tensor * t : ts) {

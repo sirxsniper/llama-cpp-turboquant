@@ -643,10 +643,12 @@ static void ggml_cuda_lightning_indexer_fn_l3(ggml_backend_cuda_context & ctx, g
     const dim3 block(32, WARPS_PER_BLOCK);
     const int num_kv_blocks = (n_kv + (K_VECS_PER_BLOCK) - 1) / (K_VECS_PER_BLOCK);
 
-    // [TAG_FN_L15_IDXMQ] a decode / verify batch: one block reads its keys once for every token
+    // [TAG_FN_L15_IDXMQ] a decode / verify batch: one block reads its keys once for every token. Opt-in
+    // (GGML_CUDA_FN_IDX_MQ=1): nsys measured it slower, 13.0 vs 9.6 us at 32K and 34.6 vs 31.9 us at 245K (the pooled keys
+    // stay in L2, so the saved reads do not pay for the lost parallelism)
     static const bool mq_on = [] {
         const char * e = getenv("GGML_CUDA_FN_IDX_MQ");
-        return !(e && e[0] == '0');
+        return e && e[0] == '1';
     }();
     if (mq_on && n_batch >= 2 && n_batch <= 8) {
         const dim3 grid_mq(num_kv_blocks, 1, n_stream);

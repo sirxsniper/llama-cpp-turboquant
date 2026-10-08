@@ -19,6 +19,17 @@
 #include "llama-impl.h"
 #include "llama-mmap.h" // [TAG_FN_L15_PFSAHEAD]
 
+#ifdef _WIN32
+#    ifndef NOMINMAX
+#        define NOMINMAX
+#    endif
+#    ifndef WIN32_LEAN_AND_MEAN
+#        define WIN32_LEAN_AND_MEAN
+#    endif
+#    include <windows.h>
+#    include <psapi.h>
+#endif
+
 #include <algorithm>
 #include <cinttypes>
 #include <condition_variable>
@@ -131,6 +142,36 @@ struct pfs_state {
 };
 
 pfs_state * g_pfs = nullptr;
+
+// [TAG_FN_L15_PFSAHEAD] a sample of the layer's mapped pages (every 256th, 1 MiB apart) is not all in this process's
+// working set: a read ahead would bring pages from the disk
+bool pfs_pages_missing(const pfs_layer & L) {
+#ifdef _WIN32
+    std::vector<PSAPI_WORKING_SET_EX_INFORMATION> q;
+    for (int k = 0; k < 3; ++k) {
+        if (!L.src[k] || !L.src[k]->data) {
+            continue;
+        }
+        const char * p0 = (const char *) L.src[k]->data;
+        for (size_t o = 0; o < L.nbytes[k]; o += (size_t) 1 << 20) {
+            PSAPI_WORKING_SET_EX_INFORMATION x = {};
+            x.VirtualAddress = (void *) (p0 + o);
+            q.push_back(x);
+        }
+    }
+    if (q.empty() || !K32QueryWorkingSetEx(GetCurrentProcess(), q.data(), (DWORD) (q.size()*sizeof(q[0])))) {
+        return false;
+    }
+    size_t out = 0;
+    for (const auto & x : q) {
+        out += x.VirtualAttributes.Valid ? 0 : 1;
+    }
+    return out*50 > q.size(); // more than 2 % out
+#else
+    GGML_UNUSED(L);
+    return false;
+#endif
+}
 std::mutex  g_pfs_init;
 
 size_t align_up(size_t x, size_t a) {
@@ -186,6 +227,12 @@ void pfs_run(pfs_state * s) {
                     continue;
                 }
                 const pfs_layer & N = s->layers[q];
+                // asking for resident pages cost ~50 ms per layer (131K prompts 2057 -> 1263 t/s): only when a sample of
+                // the layer's pages (every 256th) finds some out of RAM
+                if (!pfs_pages_missing(N)) {
+                    s->ahead_to = q;
+                    continue;
+                }
                 for (int k = 0; k < 3; ++k) {
                     if (N.src[k] && N.src[k]->data) {
                         mr.push_back({ N.src[k]->data, N.nbytes[k] });
