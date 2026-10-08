@@ -17,6 +17,7 @@
 #include "llama-fn-arena.h"  // [TAG_FN_L14_ARENA]
 
 #include "llama-impl.h"
+#include "llama-mmap.h" // [TAG_FN_L15_PFSAHEAD]
 
 #include <algorithm>
 #include <cinttypes>
@@ -74,6 +75,11 @@ struct pfs_state {
     bool               own_copy = false;
     // [TAG_FN_L3_HOST_POKE] flush the copy stream after a dispatch (a no-op unless LLAMA_FN_HOST_POKE turned it on)
     void (*poke)(ggml_backend_t) = nullptr;
+    // [TAG_FN_L15_PFSAHEAD] LLAMA_PREFILL_STREAM_AHEAD=<n> (default 2, 0 = off): when the streamer starts a layer it asks the
+    // OS to read the mapped pages of the next n layers, so pages that are not in RAM arrive in large reads ahead of the
+    // copy threads instead of one 4 KiB fault at a time (the first prompt after a start paged in 24-36 GB that way)
+    int  ahead    = 2;
+    int  ahead_to = -1; // the last position asked for
     // [TAG_FN_L14_PFSD2D] LLAMA_PREFILL_STREAM_D2D=1: the experts the hot set holds go slot -> bank on the device
     bool (*d2d)(ggml_backend_t, int, void * const *, const void * const *, const size_t *) = nullptr;
 
@@ -170,6 +176,25 @@ void pfs_run(pfs_state * s) {
         }
         const pfs_layer & L = s->layers[job.pos];
         pfs_bank &        B = s->banks[L.bank];
+        // [TAG_FN_L15_PFSAHEAD] the next layers' pages: read ahead of the copies (positions wrap to 0 for the next ubatch)
+        if (s->ahead > 0 && !L.src_pinned) {
+            const int np = (int) s->layers.size();
+            llama_memory_ranges mr;
+            for (int d = 1; d <= s->ahead && d < np; ++d) {
+                const int q = (job.pos + d) % np;
+                if (q == s->ahead_to) {
+                    continue;
+                }
+                const pfs_layer & N = s->layers[q];
+                for (int k = 0; k < 3; ++k) {
+                    if (N.src[k] && N.src[k]->data) {
+                        mr.push_back({ N.src[k]->data, N.nbytes[k] });
+                    }
+                }
+                s->ahead_to = q;
+            }
+            llama_prefetch(mr);
+        }
         bool dispatching = false;
         bool cancelled   = false;
         size_t bytes = 0;
@@ -650,6 +675,7 @@ bool llama_prefill_stream_init_layers(const std::vector<llama_moe_gen5_layer_des
     s->stats      = gen5::env_flag("LLAMA_PREFILL_STREAM_STATS");
     s->chunk      = (size_t) gen5::env_int("LLAMA_PREFILL_STREAM_CHUNK_MIB", 32, 1, 256) << 20;
     s->lend       = gen5::env_int("LLAMA_PREFILL_STREAM_LEND", 0, 0, 1) != 0; // [TAG_FN_R1_PFS_LEND]
+    s->ahead      = gen5::env_int("LLAMA_PREFILL_STREAM_AHEAD", 2, 0, 8); // [TAG_FN_L15_PFSAHEAD]
     const size_t ring_bytes = (size_t) gen5::env_int("LLAMA_PREFILL_STREAM_RING_MIB", 512, 2, 4096) << 20;
     const int    n_threads  = gen5::env_int("LLAMA_PREFILL_STREAM_THREADS", 8, 1, 64);
     if (s->min_tokens > 32 && !s->lend) { // [TAG_FN_R1_PFS_LEND] a lending stream reserves with the op offload

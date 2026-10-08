@@ -226,6 +226,11 @@ struct moe_cache {
     std::atomic<uint64_t> up_waits    { 0 };   // times the bucket made the worker wait
     uint64_t              up_batches  = 0;     // worker only
     size_t                dc_burst       = 0;     // [TAG_FN_L3_POLICY_BURST] LLAMA_MOE_HOT_BURST_MIB, 0 = off
+    // [TAG_FN_L15_BURST] the burst budget only for this many passes after the set starts or a big prompt (a shifted working
+    // set); in the steady state strong pairs took it on every pass: ~100 MiB of uploads per step, about 4.5 GB/s of RAM reads
+    // beside the CPU experts' (LLAMA_MOE_HOT_BURST_PASSES, default 32; -1 = every pass, as before)
+    int                   dc_burst_passes = -1; // every pass, as before (l15 meas15b: a steadier set measured no gain)
+    int                   dc_burst_left   = 0;
     float                 dc_burst_ratio = 2.0f;  // LLAMA_MOE_HOT_BURST_RATIO
     uint64_t              dc_burst_n     = 0;     // swaps taken on the burst budget
     uint64_t              dc_burst_logs  = 0;
@@ -1327,7 +1332,12 @@ void hot_adapt_decay(moe_cache * mc, bool decode_step) {
     // LLAMA_MOE_HOT_BURST_RATIO x its victim) take up to that many bytes more, so a shifted working set refills fast
     // while the steady state keeps the small budget
     size_t pass_bytes  = mc->dc_bytes;
-    size_t total_bytes = mc->dc_bytes + mc->dc_burst;
+    // [TAG_FN_L15_BURST] the burst only in its window after a start or a big prompt
+    const bool burst_now = mc->dc_burst_passes < 0 || mc->dc_burst_left > 0;
+    if (mc->dc_burst_left > 0) {
+        mc->dc_burst_left--;
+    }
+    size_t total_bytes = mc->dc_bytes + (burst_now ? mc->dc_burst : 0);
     if (mc->up_rate > 0) {
         size_t queued_b = 0;
         {
@@ -1818,6 +1828,10 @@ void hot_adapt_init(moe_cache * mc, const llama_model & model, const void * owne
     }
     // [TAG_FN_L3_POLICY_BURST] strong pairs past the pass budget
     if (l3 && mc->dc_on) {
+        if (const char * e = llama_fn_env(model, "LLAMA_MOE_HOT_BURST_PASSES")) { // [TAG_FN_L15_BURST]
+            mc->dc_burst_passes = atoi(e);
+        }
+        mc->dc_burst_left = mc->dc_burst_passes;
         if (const char * e = llama_fn_env(model, "LLAMA_MOE_HOT_BURST_MIB")) {
             mc->dc_burst = (size_t) std::max(0, atoi(e)) << 20;
         }
@@ -3503,6 +3517,7 @@ void llama_moe_hot_unlend(const void * owner) {
         return;
     }
     std::lock_guard<std::mutex> slk(mc->step_mtx); // [TAG_FN_L3_POLICY_STATE]
+    mc->dc_burst_left = std::max(mc->dc_burst_left, mc->dc_burst_passes); // [TAG_FN_L15_BURST] a big prompt ran
     if (!mc->lent_any) {
         return;
     }
@@ -3984,6 +3999,7 @@ bool llama_moe_hot_cbuf_restore(const void * owner) {
         return false;
     }
     std::lock_guard<std::mutex> slk(mc->step_mtx); // [TAG_FN_L3_POLICY_STATE] the tail's bookkeeping, as the lend
+    mc->dc_burst_left = std::max(mc->dc_burst_left, mc->dc_burst_passes); // [TAG_FN_L15_BURST] a big prompt ran
     const int64_t t0 = ggml_time_us();
     const size_t  n  = mc->cb_hi - mc->cb_lo;
     // a failed release may have left a part mapped, and map() refuses a mapped range: give that back first (nothing
