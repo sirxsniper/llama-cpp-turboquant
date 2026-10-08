@@ -176,7 +176,7 @@ const fn_item k_items[] = {
     // [TAG_FN_L14_TIER] the routed experts locked in place in the mapped file (no copy, no commit, no load-time prefetch)
     { "LLAMA_FN_L14_TIER",           "0",     P_ALL }, // off: with the GPU holding ~33 GB of commit only ~40-55 GiB can be locked (VirtualLock 1455), and gating the hot set on locks froze it (l15 meas15b: 87 / 73 / 73 t/s)
     // [TAG_FN_L14_PFSD2D] the prefill stream copies the experts the hot set holds from their VRAM slots, not the host
-    { "LLAMA_PREFILL_STREAM_D2D",         "0",     P_ALL }, // off: 131K prompts 2092 -> 1591 t/s in l15/pp15a, and the hot set is not frozen while the stream borrows it
+    { "LLAMA_PREFILL_STREAM_D2D",         "1",     P_ALL },
 };
 
 // names the fn-auto aware code reads through llama_fn_env(): never put into the environment

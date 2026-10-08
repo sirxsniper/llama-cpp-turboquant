@@ -12,6 +12,9 @@
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
+#if defined(_M_X64) || defined(__x86_64__)
+#    include <immintrin.h> // [TAG_FN_L15_NTCOPY]
+#endif
 
 namespace gen5 {
 
@@ -160,6 +163,36 @@ void copy_pool::stop() {
 }
 
 // bytes [off, off + len) of the segments taken as one range
+// [TAG_FN_L15_NTCOPY] a copy into the pinned ring with non-temporal stores whatever its size: the CRT memcpy uses them
+// only above ~1.5 MiB, and a smaller piece (a run of experts, a thread's share of one) read each destination line first,
+// twice the RAM traffic of the stream's copies. The ring is written once and read by the DMA, never by the CPU.
+static void copy_nt(uint8_t * dst, const uint8_t * src, size_t n) {
+#if (defined(_M_X64) || defined(__x86_64__)) && (defined(_MSC_VER) || defined(__AVX__))
+    size_t i = 0;
+    // head up to a 32-byte aligned destination
+    const size_t head = std::min(n, (size_t) ((32 - ((uintptr_t) dst & 31)) & 31));
+    if (head) {
+        memcpy(dst, src, head);
+        i = head;
+    }
+    for (; i + 128 <= n; i += 128) {
+        const __m256i a = _mm256_loadu_si256((const __m256i *) (src + i));
+        const __m256i b = _mm256_loadu_si256((const __m256i *) (src + i + 32));
+        const __m256i c = _mm256_loadu_si256((const __m256i *) (src + i + 64));
+        const __m256i d = _mm256_loadu_si256((const __m256i *) (src + i + 96));
+        _mm256_stream_si256((__m256i *) (dst + i),      a);
+        _mm256_stream_si256((__m256i *) (dst + i + 32), b);
+        _mm256_stream_si256((__m256i *) (dst + i + 64), c);
+        _mm256_stream_si256((__m256i *) (dst + i + 96), d);
+    }
+    if (i < n) {
+        memcpy(dst + i, src + i, n - i);
+    }
+#else
+    memcpy(dst, src, n);
+#endif
+}
+
 static void copy_segs_part(const copy_seg * sg, int n_sg, size_t off, size_t len) {
     for (int i = 0; i < n_sg && len > 0; ++i) {
         if (off >= sg[i].n) {
@@ -167,10 +200,13 @@ static void copy_segs_part(const copy_seg * sg, int n_sg, size_t off, size_t len
             continue;
         }
         const size_t n = std::min(len, sg[i].n - off);
-        memcpy(sg[i].dst + off, sg[i].src + off, n);
+        copy_nt(sg[i].dst + off, sg[i].src + off, n);
         len -= n;
         off  = 0;
     }
+#if defined(_M_X64) || defined(__x86_64__)
+    _mm_sfence(); // the streamed lines are visible before the copy is reported done
+#endif
 }
 
 void copy_pool::run(int idx) {
