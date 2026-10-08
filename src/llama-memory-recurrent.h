@@ -237,6 +237,9 @@ public:
     // source row of the one-group tensors (committed state, ring) for cell i (relative to head); no plane offset
     int32_t s_copy_r(int i) const;
 
+    // [TAG_UPSTREAM_30139] the committed states of the ubatch can be read in place (each cell reads its own row)
+    bool get_rs_r_in_place(uint32_t n_seqs) const;
+
     // ring tokens that cell i (relative to head) replays in the current ubatch
     int32_t ring_n(int i) const;
 

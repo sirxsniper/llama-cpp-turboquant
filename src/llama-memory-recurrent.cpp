@@ -24,6 +24,15 @@ static bool llama_xseq_fix_enabled() {
     return enabled;
 }
 
+// [TAG_UPSTREAM_30139] LLAMA_RS_IN_PLACE=0 restores the old path (the committed GDN states are always gathered)
+static bool llama_rs_in_place_enabled() {
+    static const bool enabled = [] {
+        const char * e = getenv("LLAMA_RS_IN_PLACE");
+        return !(e && e[0] == '0' && e[1] == '\0');
+    }();
+    return enabled;
+}
+
 // [TAG_4C_GDN_REPLAY] Gated DeltaNet state replay instead of snapshot groups. Design note:
 //
 // Old layout: s_l has 1 + n_rs_seq row groups per cell. A ubatch writes the state after each of its last K tokens,
@@ -1752,6 +1761,22 @@ bool llama_memory_recurrent_context::get_replay() const {
 
 int32_t llama_memory_recurrent_context::s_copy_r(int i) const {
     return mem->cells[i + mem->head].src0;
+}
+
+// [TAG_UPSTREAM_30139] the gather of the committed states would copy each cell's own row: no zeroed state, no extra
+//   cell, and cell head + i reads row head + i. Reads src0 only, because s_copy() consumes rs_idx.
+bool llama_memory_recurrent_context::get_rs_r_in_place(uint32_t n_seqs) const {
+    if (is_full || !mem->replay || !llama_rs_in_place_enabled() || mem->rs_z >= 0 || mem->n != n_seqs) {
+        return false;
+    }
+
+    for (uint32_t i = 0; i < mem->n; ++i) {
+        if (mem->cells[mem->head + i].src0 != (int32_t) (mem->head + i)) {
+            return false;
+        }
+    }
+
+    return true;
 }
 
 int32_t llama_memory_recurrent_context::ring_n(int i) const {

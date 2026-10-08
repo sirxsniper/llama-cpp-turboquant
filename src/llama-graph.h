@@ -288,11 +288,15 @@ public:
     ggml_tensor * s_copy_r_tail  = nullptr; // I32 [n_rs - 1] (as s_copy_tail, upstream #29856)
     ggml_tensor * ring_n         = nullptr; // I32 [n_seqs], ring tokens each ubatch sequence replays
 
+    // [TAG_UPSTREAM_30139] the committed states are read from the cache (see get_rs_r_in_place), the gather is empty
+    ggml_tensor * s_copy_r_rows  = nullptr; // I32 [0], only when rs_r_in_place
+
     const llama_memory_recurrent_context * mctx;
 
     // used in view offsets, need to match for valid graph reuse
     uint32_t head;
     int32_t rs_z;
+    bool rs_r_in_place = false; // [TAG_UPSTREAM_30139]
 };
 
 class llm_graph_input_cross_embd : public llm_graph_input_i {
@@ -1486,16 +1490,19 @@ struct llm_graph_context {
                uint32_t   rs_head,
                uint32_t   rs_size,
                 int32_t   rs_zero,
-            const llm_graph_get_rows_fn & get_state_rows = nullptr) const;
+            const llm_graph_get_rows_fn & get_state_rows = nullptr,
+                   bool   in_place = false) const; // [TAG_UPSTREAM_30139]
 
     llm_graph_input_rs * build_rs_inp() const;
 
+    // [TAG_UPSTREAM_30139] allow_in_place: s is a replay committed state that only the GDN replay op reads
     ggml_tensor * build_rs(
             llm_graph_input_rs * inp,
             ggml_tensor * s,
                 int32_t   state_size,
                 int32_t   n_seqs,
-            const llm_graph_get_rows_fn & get_state_rows = nullptr) const;
+            const llm_graph_get_rows_fn & get_state_rows = nullptr,
+                   bool   allow_in_place = false) const;
 
     ggml_tensor * build_rwkv_token_shift_load(
         llm_graph_input_rs * inp,

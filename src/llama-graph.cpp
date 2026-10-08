@@ -424,6 +424,7 @@ bool llm_graph_input_rs::can_reuse(const llm_graph_params & params) {
 
     res &= head == mctx->get_head();
     res &= rs_z == mctx->get_rs_z();
+    res &= rs_r_in_place == mctx->get_rs_r_in_place(params.ubatch.n_seqs); // [TAG_UPSTREAM_30139]
     res &= (s_copy_planes != nullptr) == rs_planes_needed(mctx, params.ubatch.n_seqs);
 
     return res;
@@ -1287,6 +1288,7 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
 
     res &= inp_rs->head == mctx->get_recr()->get_head();
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
+    res &= inp_rs->rs_r_in_place == mctx->get_recr()->get_rs_r_in_place(params.ubatch.n_seqs); // [TAG_UPSTREAM_30139]
     res &= (inp_rs->s_copy_planes != nullptr) == rs_planes_needed(mctx->get_recr(), params.ubatch.n_seqs);
 
     return res;
@@ -1336,6 +1338,7 @@ bool llm_graph_input_mem_hybrid_k::can_reuse(const llm_graph_params & params) {
 
     res &= inp_rs->head == mctx->get_recr()->get_head();
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
+    res &= inp_rs->rs_r_in_place == mctx->get_recr()->get_rs_r_in_place(params.ubatch.n_seqs); // [TAG_UPSTREAM_30139]
     res &= (inp_rs->s_copy_planes != nullptr) == rs_planes_needed(mctx->get_recr(), params.ubatch.n_seqs);
 
     return res;
@@ -1438,6 +1441,7 @@ bool llm_graph_input_mem_hybrid_iswa::can_reuse(const llm_graph_params & params)
 
     res &= inp_rs->head == mctx->get_recr()->get_head();
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
+    res &= inp_rs->rs_r_in_place == mctx->get_recr()->get_rs_r_in_place(params.ubatch.n_seqs); // [TAG_UPSTREAM_30139]
     res &= (inp_rs->s_copy_planes != nullptr) == rs_planes_needed(mctx->get_recr(), params.ubatch.n_seqs);
 
     return res;
@@ -4563,7 +4567,8 @@ ggml_tensor * llm_graph_context::build_rs(
            uint32_t   rs_head,
            uint32_t   rs_size,
             int32_t   rs_zero,
-        const llm_graph_get_rows_fn & get_state_rows) const {
+        const llm_graph_get_rows_fn & get_state_rows,
+               bool   in_place) const {
 
     GGML_UNUSED(rs_size);
     ggml_tensor * states = ggml_reshape_2d(ctx0, s, state_size, s->ne[1]);
@@ -4581,9 +4586,18 @@ ggml_tensor * llm_graph_context::build_rs(
 
     ggml_tensor * states_all = ggml_get_rows(ctx0, states, state_copy);
 
-    ggml_tensor * output_states = get_state_rows ?
-        get_state_rows(ctx0, states, state_copy_main) :
-        ggml_view_2d(ctx0, states_all, state_size, n_seqs, states_all->nb[1], 0);
+    ggml_tensor * output_states;
+    if (in_place) {
+        // [TAG_UPSTREAM_30139] view of the cache rows, the gather has no rows; all readers must run before the new
+        //   states are stored over these rows
+        GGML_ASSERT(!get_state_rows && state_copy->ne[0] == 0 && n_rs == (uint32_t) n_seqs);
+        ggml_build_forward_expand(gf, states_all);
+        output_states = ggml_view_2d(ctx0, states, state_size, n_seqs, states->nb[1], rs_head*states->nb[1]);
+    } else {
+        output_states = get_state_rows ?
+            get_state_rows(ctx0, states, state_copy_main) :
+            ggml_view_2d(ctx0, states_all, state_size, n_seqs, states_all->nb[1], 0);
+    }
     ggml_build_forward_expand(gf, output_states);
 
     // copy extra states which won't be changed further (between n_seqs and n_rs)
@@ -4632,6 +4646,12 @@ static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
         inp->ring_n = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_seqs);
         ggml_set_input(inp->ring_n);
         ggml_set_name(inp->ring_n, "rs_ring_n");
+
+        // [TAG_UPSTREAM_30139] the committed states are read in place, their gather gets no rows
+        inp->rs_r_in_place = mctx_cur->get_rs_r_in_place((uint32_t) n_seqs);
+        if (inp->rs_r_in_place) {
+            inp->s_copy_r_rows = ggml_view_1d(ctx0, inp->s_copy_r, 0, 0);
+        }
     }
 
     inp->head = mctx_cur->get_head();
@@ -4653,7 +4673,8 @@ ggml_tensor * llm_graph_context::build_rs(
         ggml_tensor * s,
             int32_t   state_size,
             int32_t   n_seqs,
-        const llm_graph_get_rows_fn & get_state_rows) const {
+        const llm_graph_get_rows_fn & get_state_rows,
+               bool   allow_in_place) const {
     const auto * kv_state = inp->mctx;
 
     // [TAG_4C_GDN_REPLAY] a tensor with one row per cell (committed state, ring) under the replay layout: group-0
@@ -4661,6 +4682,14 @@ ggml_tensor * llm_graph_context::build_rs(
     //   [TAG_SYNC_1004] one gather of the replay sources as upstream #29856 does for s_copy (s_copy_r, or its tail
     //   with a custom getter)
     if (inp->s_copy_r != nullptr && ggml_nelements(s) == (int64_t) state_size*kv_state->get_size()) {
+        // [TAG_UPSTREAM_30139] only the committed state is read in place. Never the ring: other blocks of the fused
+        //   kernel still read the old ring while it is written.
+        if (allow_in_place && inp->rs_r_in_place && !get_state_rows) {
+            GGML_ASSERT(s->type == GGML_TYPE_F32); // the gather would convert to F32
+            return build_rs(s, inp->s_copy_r_rows, inp->s_copy_r_main, state_size, n_seqs,
+                    kv_state->get_n_rs(), kv_state->get_head(), kv_state->get_size(), kv_state->get_rs_z(),
+                    get_state_rows, true);
+        }
         return build_rs(s, get_state_rows ? inp->s_copy_r_tail : inp->s_copy_r, inp->s_copy_r_main, state_size, n_seqs,
                 kv_state->get_n_rs(), kv_state->get_head(), kv_state->get_size(), kv_state->get_rs_z(),
                 get_state_rows);
