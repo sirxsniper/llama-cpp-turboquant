@@ -33,7 +33,7 @@ code, 1 stream · 262K context · 4 slots
 ## 101 t/s
 real use at 32K · **89 t/s at 131K and 245K** · 103 / 93 / 91 with the MTPq3 files · a short new turn starts in 0.3–1.4 s instead of 3.4 s · **2 streams at 32K: 111–120 t/s total**
 
-prompt reading **2,260 t/s** at 131K with the MTPq3 files (v0.20.0, +10 %)
+prompt reading **2,300 t/s** at 131K with the MTPq3 files (v0.20.0, +12 %)
 
 </td>
 </tr>
@@ -165,10 +165,10 @@ Five GPU memory bugs found with compute-sanitizer and fixed; no GPU work left in
 
 | Prompt | v0.19.0 | **v0.20.0** |
 |:--|--:|--:|
-| 131K tokens (second prompt after a start) | 2,062 t/s | **2,264 t/s** |
-| 32K tokens, first prompt after a start (cold file cache) | 830 t/s | **931 t/s** |
+| 131K tokens (second prompt after a start) | 2,061 t/s | **2,317 t/s** |
+| 32K tokens, first prompt after a start (cold file cache) | 840 t/s (median of 10 runs) | **933 t/s** (median of 6 runs) |
 
-- 131K: the prompt stream copies the experts the VRAM hot set already holds (about 10 GiB of each 72 GiB pass) from their slots on the GPU instead of from RAM; a warm 8K pass takes 3.18 s instead of 3.53 s (medians). 32K first prompt: the stream reads the next layers' pages ahead when they are not in RAM, and a load drops the GPU tensors' pages from RAM first.
+- 131K: the prompt stream copies the experts the VRAM hot set already holds (about 8 GiB of each 72 GiB pass; never a slot the KV cache can take back) from their slots on the GPU instead of from RAM; a warm 8K pass takes about 3.0-3.2 s instead of 3.5 s. 32K first prompt: the stream reads the next layers' pages ahead when they are not in RAM, and a load drops the GPU tensors' pages from RAM first.
 - Decoding output is unchanged: token-identical to v0.19.0. The first long prompt after a server start still pages in about 37 GiB from the disk: the model (105 GiB) is larger than RAM.
 
 > Numbers are real-use medians over interleaved A/B rounds, not best-case benchmark runs. A greedy short-prompt benchmark always reads higher than a long, sampled answer — both are listed where it matters.
