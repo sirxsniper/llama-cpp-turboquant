@@ -1429,6 +1429,10 @@ llama_context::llama_context(
         // [TAG_FN_L4_HOST_BATCHCPY] its own switch only (not LLAMA_FN_L4_HOST): applied where the scheduler is made
         // [TAG_FN_L16_UPLOAD] 2: small copies packed into one copy and one unpack kernel
         batch_inputs_mode = std::max(0, llama_fn_l3_int(model, "LLAMA_FN_L4_HOST_BATCHCPY", 0));
+        // [TAG_FN_L16_UPLOAD] LLAMA_FN_L16_UPLOAD_DRAFT=<mode> (A/B only, not in a profile): the MTP draft context's own mode
+        if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
+            batch_inputs_mode = std::max(0, llama_fn_l3_int(model, "LLAMA_FN_L16_UPLOAD_DRAFT", batch_inputs_mode));
+        }
         upload_verify     = batch_inputs_mode > 0 && llama_fn_l3_flag(model, "LLAMA_FN_UPLOAD_VERIFY");
         if (batch_inputs_mode >= 2 || upload_verify) {
             LLAMA_LOG_INFO("%s: [TAG_FN_L16_UPLOAD] input uploads: mode %d%s\n", __func__, batch_inputs_mode,
