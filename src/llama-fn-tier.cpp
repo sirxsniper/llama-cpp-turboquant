@@ -917,3 +917,10 @@ void llama_fn_warm_small_decode(bool begin) {
     GGML_UNUSED(begin);
 #endif
 }
+
+// [TAG_FN_L16_PLEGATE] see llama-fn-tier.h
+void llama_fn_thread_priority_highest() {
+#ifdef _WIN32
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+#endif
+}

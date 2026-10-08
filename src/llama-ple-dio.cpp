@@ -447,7 +447,11 @@ struct llama_ple_dio::impl {
             }
         }
 
-        iocp = CreateIoCompletionPort(h, nullptr, 1, 1);
+        // [TAG_FN_L16_PLEGATE] concurrency 0 (one per processor), not 1: a thread that once waited on the port (the decode's
+        // set_input) stays counted while it runs, and with a limit of 1 the port then wakes no other waiter. The PLE prefetch
+        // thread's reads (its read-ahead, the gate's fills) got their completions only when the decode thread blocked: a
+        // gated decode waited for its fill until the bridge timed out (1 s). The reads still run one call at a time (mtx)
+        iocp = CreateIoCompletionPort(h, nullptr, 1, 0);
         if (iocp == nullptr) {
             err = "CreateIoCompletionPort failed: " + win_err(GetLastError());
             return false;

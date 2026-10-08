@@ -43,3 +43,6 @@ bool llama_fn_warm_running();
 
 // [TAG_FN_L15_WARMYIELD] a decode of small ubatches (answer steps, bridged) begins / ends: the warm pass waits meanwhile
 void llama_fn_warm_small_decode(bool begin);
+
+// [TAG_FN_L16_PLEGATE] the calling thread at THREAD_PRIORITY_HIGHEST (the MoE pool's level with --prio 2); a no-op elsewhere
+void llama_fn_thread_priority_highest();
