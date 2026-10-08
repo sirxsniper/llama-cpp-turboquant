@@ -74,7 +74,7 @@ struct pfs_state {
     bool               own_copy = false;
     // [TAG_FN_L3_HOST_POKE] flush the copy stream after a dispatch (a no-op unless LLAMA_FN_HOST_POKE turned it on)
     void (*poke)(ggml_backend_t) = nullptr;
-    // [TAG_FN_L14_PFSD2D] LLAMA_FN_L14_PFSD2D=1: the experts the hot set holds go slot -> bank on the device
+    // [TAG_FN_L14_PFSD2D] LLAMA_PREFILL_STREAM_D2D=1: the experts the hot set holds go slot -> bank on the device
     bool (*d2d)(ggml_backend_t, int, void * const *, const void * const *, const size_t *) = nullptr;
 
     // [TAG_FN_R1_PFS_LEND] LLAMA_PREFILL_STREAM_LEND=1: the banks are a range of the hot set's buffer, borrowed while
@@ -791,7 +791,7 @@ bool llama_prefill_stream_init_layers(const std::vector<llama_moe_gen5_layer_des
         // [TAG_FN_L3_HOST_POKE] the device backend's flush, if it has one (it does nothing unless the switch is on)
         if (ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(d.dev)) {
             s->poke = (void (*)(ggml_backend_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_stream_poke");
-            if (gen5::env_flag("LLAMA_FN_L14_PFSD2D")) { // [TAG_FN_L14_PFSD2D]
+            if (gen5::env_flag("LLAMA_PREFILL_STREAM_D2D")) { // [TAG_FN_L14_PFSD2D]
                 s->d2d = (bool (*)(ggml_backend_t, int, void * const *, const void * const *, const size_t *))
                         ggml_backend_reg_get_proc_address(reg, "ggml_backend_copy_d2d_batch_async");
             }
