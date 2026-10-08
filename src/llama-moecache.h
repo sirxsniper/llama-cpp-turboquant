@@ -73,6 +73,17 @@ int llama_moe_hot_residents(const ggml_tensor * up_exps, uint8_t * out, int64_t 
 // bookkeeping is busy, or no expert is held
 bool llama_moe_hot_slots(const ggml_tensor * up_exps, int32_t * slot, int64_t n_expert, const ggml_tensor ** slots3);
 
+// [TAG_FN_L15_TIER] the RAM tier's view of one layer: slot[e] = the hot slot of expert e or -1, cnt[e] = its decayed count
+// (0 without the decayed policy), vol[e] = 1 when it is resident in a slot that can lose its VRAM without a choice (the
+// tail given back for a big prompt, the prefill stream's lend, the KV cache's lend). 1: done; 0: busy (try later); -1: no
+// hot set or no such layer
+int llama_moe_hot_tier_view(const ggml_tensor * up_exps, int32_t * slot, float * cnt, uint8_t * vol, int64_t n_expert);
+
+// [TAG_FN_L15_TIER] the RAM tier's gate on evictions: the adaptive set evicts a resident only when ready(up_exps, e) says
+// its host copy is in RAM (locked), so the CPU never reads an evicted expert from the disk. nullptr: no gate
+using llama_moe_host_ready_fn = bool (*)(const ggml_tensor * up_exps, int32_t e, void * ud);
+void llama_moe_hot_set_host_ready(llama_moe_host_ready_fn fn, void * ud);
+
 // apply throttled LRU updates; call between graph executions only. ctx: the calling llama_context
 // ([TAG_FN_MOE_HOT_ADAPT] only the owner of an adaptive hot set updates it)
 void llama_moe_cache_step(const void * ctx);

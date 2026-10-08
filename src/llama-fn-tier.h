@@ -1,14 +1,16 @@
 #pragma once
 
-// [TAG_FN_L14_TIER] qwen4exp (profile switch LLAMA_FN_L14_TIER): the routed experts of the host layers stay in the mapped
-// model file, at the same addresses, and a background thread locks their pages in the working set expert by expert: first
-// the experts the CPU computes (not in the VRAM hot set), then the hot set's, from LLAMA_FN_L14_TIER_DELAY_MS after the load
-// (default 20000: the context's warm-up and first kernel loads come first), up to LLAMA_FN_L14_TIER_MAX_MIB (default 60 % of
-// the RAM: the GPU driver locks memory too) while LLAMA_FN_L14_TIER_FREE_MIB (6144) of RAM stays available.
-// LLAMA_FN_L14_TIER_THREADS (4) threads read the pages in parallel. Every 2 s it follows the hot set: a CPU expert that is
-// not locked is locked, in place of a hot one when the cap is in the way. Nothing is copied or charged to commit, and the
-// load no longer prefetches those ranges. Below LLAMA_FN_L14_TIER_LOW_MIB (4096) of available RAM about 1 GiB is unlocked
-// (the hot set's first); after a minute with room the hot set's experts are added again.
+// [TAG_FN_L14_TIER] [TAG_FN_L15_TIER] qwen4exp (profile switch LLAMA_FN_L14_TIER): VRAM holds the hot experts, RAM the rest.
+// The routed experts of the host layers stay in the mapped model file, at the same addresses; a background thread locks
+// their pages in the working set, expert by expert, in this order: the residents the hot set will evict next (the
+// LLAMA_FN_L15_TIER_VICTIMS lowest counts per layer, default 16), the experts the CPU computes (most used first), and the
+// residents that can lose their slot without a choice (the tail, the prefill stream's lend, the KV cache's lend). Room
+// under the cap comes from the other residents, whose RAM copy is not needed while they stay in VRAM. After the first
+// fill the hot set evicts only experts whose RAM copy is locked, so the CPU never reads an expert from the disk.
+// From LLAMA_FN_L14_TIER_DELAY_MS after the load (default 20000), a round every 500 ms, LLAMA_FN_L14_TIER_THREADS (8)
+// threads read the pages; up to LLAMA_FN_L14_TIER_MAX_MIB (default 72 % of the RAM, at least 22 GiB left) while
+// LLAMA_FN_L14_TIER_FREE_MIB (6144) of RAM stays available. Below LLAMA_FN_L14_TIER_LOW_MIB (4096) for 1.5 s about 1 GiB
+// is unlocked. Nothing is copied or charged to commit, and the load does not prefetch those ranges.
 // A no-op on other architectures and other platforms.
 
 #include <cstddef>

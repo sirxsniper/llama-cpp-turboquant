@@ -65,6 +65,7 @@ struct layer_state {
     // [TAG_FN_R1_PFS_LEND] the slots of this layer lie in the range the prefill stream borrowed: both tables say "not
     // hot" for every expert, nothing uploads into it, and llama_moe_hot_unlend refills it from slot_expert
     bool                              lent = false;
+    bool                              lend_range = false; // [TAG_FN_L15_TIER] lent at least once (the range never moves)
 
     // [TAG_FN_L3_VRAM_CBUF] the layer lies in the tail of the device buffer (cb_tail), and the tail is out right now
     // (cb_lent): as lent, and in addition no graph may read its tensors (not even the zero slot), so the lookup hides it
@@ -593,6 +594,45 @@ int llama_moe_hot_residents(const ggml_tensor * up_exps, uint8_t * out, int64_t 
     const layer_state & ls = mc->layers[it->second];
     for (int64_t e = 0; e < n_expert; ++e) {
         out[e] = !ls.kv_lent && e < (int64_t) ls.expert_slot.size() && ls.expert_slot[e] >= 0 ? 1 : 0;
+    }
+    return 1;
+}
+
+// [TAG_FN_L15_TIER] the eviction gate (set by the RAM tier of the model, read in the owner's step)
+std::atomic<llama_moe_host_ready_fn> g_host_ready{nullptr};
+std::atomic<void *>                  g_host_ready_ud{nullptr};
+
+void llama_moe_hot_set_host_ready(llama_moe_host_ready_fn fn, void * ud) {
+    g_host_ready_ud.store(ud);
+    g_host_ready.store(fn);
+}
+
+int llama_moe_hot_tier_view(const ggml_tensor * up_exps, int32_t * slot, float * cnt, uint8_t * vol, int64_t n_expert) {
+    std::unique_lock<std::mutex> ilk(g_init_mtx, std::try_to_lock);
+    if (!ilk.owns_lock()) {
+        return 0;
+    }
+    moe_cache * mc = g_cache;
+    ilk.unlock();
+    if (!mc || !mc->hot) {
+        return -1;
+    }
+    const auto it = mc->by_up_src.find(up_exps);
+    if (it == mc->by_up_src.end()) {
+        return -1;
+    }
+    std::unique_lock<std::mutex> slk(mc->step_mtx, std::try_to_lock);
+    if (!slk.owns_lock()) {
+        return 0;
+    }
+    const layer_state & ls = mc->layers[it->second];
+    // the whole layer can go: the tail, the stream's range, a KV region; else only the slots over the KV cache's segments
+    const bool vol_layer = ls.cb_tail || ls.lend_range || ls.kv_tail;
+    for (int64_t e = 0; e < n_expert; ++e) {
+        const int32_t s = !ls.kv_lent && e < (int64_t) ls.expert_slot.size() ? ls.expert_slot[e] : -1;
+        slot[e] = s;
+        cnt[e]  = e < (int64_t) ls.dcnt.size() ? ls.dcnt[e] : 0.0f;
+        vol[e]  = s >= 0 && (vol_layer || (ls.sl_base >= 0 && s >= ls.sl_base)) ? 1 : 0;
     }
     return 1;
 }
@@ -1314,8 +1354,14 @@ void hot_adapt_decay(moe_cache * mc, bool decode_step) {
             continue; // [TAG_FN_L3_POLICY_POOL] below, per pool
         }
         slot_busy.assign(ls.pub.n_slots, 0);
+        const llama_moe_host_ready_fn ready = g_host_ready.load(); // [TAG_FN_L15_TIER]
+        void * ready_ud = g_host_ready_ud.load();
         for (int32_t s = 0; s < ls.pub.n_slots; ++s) {
             slot_busy[s] = ls.slot_in_flight[s] || (!ls.slot_out.empty() && ls.slot_out[s]) ? 1 : 0; // [TAG_FN_L10_SLOTLEND]
+            // [TAG_FN_L15_TIER] a resident whose host copy is not locked in RAM stays until the tier has locked it
+            if (!slot_busy[s] && ready && ls.slot_expert[s] >= 0 && !ready(ls.pub.up_src, ls.slot_expert[s], ready_ud)) {
+                slot_busy[s] = 1;
+            }
         }
         expert_busy.assign(ls.dcnt.size(), 0);
         for (size_t e = 0; e < ls.dcnt.size(); ++e) {
@@ -1354,6 +1400,10 @@ void hot_adapt_decay(moe_cache * mc, bool decode_step) {
             sl[s] = ow.pool_k;
             se[s] = ow.slot_expert[s];
             sb[s] = ow.slot_in_flight[s] ? 1 : 0;
+            const llama_moe_host_ready_fn ready = g_host_ready.load(); // [TAG_FN_L15_TIER]
+            if (!sb[s] && ready && se[s] >= 0 && !ready(ow.pub.up_src, se[s], g_host_ready_ud.load())) {
+                sb[s] = 1;
+            }
         }
         // a pool's pairs come in falling gain and the strong ones first, so the pass takes a prefix of them: no more than
         // its byte budget holds (exact, and the sort runs over that many instead of every candidate of the pool)
@@ -3421,6 +3471,7 @@ bool llama_moe_hot_lend(const void * owner, size_t bytes, ggml_backend_buffer_t 
     for (auto & ls : mc->layers) {
         if (overlaps(ls.pub.up_c) || overlaps(ls.pub.gate_c) || overlaps(ls.pub.down_c)) {
             ls.lent = true;
+            ls.lend_range = true; // [TAG_FN_L15_TIER]
             n_lent++;
         }
     }
