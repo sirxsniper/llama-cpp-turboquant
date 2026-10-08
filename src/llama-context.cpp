@@ -3606,12 +3606,22 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     // [TAG_FN_L15_WARM] the experts' background warm pass starts when the trunk context's first decode returns
     struct warm_go_on_exit {
         bool on;
+        bool small;
         ~warm_go_on_exit() {
+            if (small) {
+                llama_fn_warm_small_decode(false);
+            }
             if (on) {
                 llama_fn_warm_go();
             }
         }
-    } warm_go { cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP };
+    } warm_go { cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP, false };
+    // [TAG_FN_L15_WARMYIELD] answer steps (small ubatches) make the experts' warm pass wait; a prompt chunk never does (its
+    // stream may be waiting for the pass)
+    if (model.arch == LLM_ARCH_QWEN4EXP && (batch_inp.tokens.size() <= 64 || cparams.n_ubatch <= 64)) {
+        warm_go.small = true;
+        llama_fn_warm_small_decode(true);
+    }
 
     if (llama_host_gap_probe_enabled()) { // [TAG_HOST_GAP_PROBE]
         llama_host_gap_probe_decode(this);

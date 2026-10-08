@@ -36,6 +36,17 @@ static HANDLE g_fn_warm_go = nullptr; // [TAG_FN_L15_WARM] set when the trunk co
 // [TAG_FN_L15_WARM] the running warm pass's progress, for the prefill stream (llama_fn_warm_wait_layer): ranges [0, mark) are
 // in the working set; layer il is complete once mark reaches layer_end[il]
 static std::atomic<bool>   g_warm_running{false};
+// [TAG_FN_L15_WARMYIELD] decodes of small ubatches running now (answer steps): the pass waits for them. At the same priority
+// its 16 threads took the CPU pool's time and the bridge timed out at load + 23 s (l15 p30087_kld)
+static std::atomic<int>    g_warm_small_decodes{0};
+// [TAG_FN_L15_WARMYIELD] when the last small decode ended (steady clock, us): the pass runs only after 50 ms without one, so
+// it never starts again between two answer steps (1-3 ms apart). Pausing only while a decode ran still left 2 bridge
+// timeouts in the first answer after a start (l15 wy_real)
+static std::atomic<int64_t> g_warm_small_end_us{0};
+
+static int64_t fn_warm_now_us() {
+    return std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
 static std::atomic<size_t> g_warm_mark{0};
 static std::vector<size_t> g_warm_layer_end;
 
@@ -684,16 +695,27 @@ static void fn_warm(const llama_model & model, HANDLE stop) {
     g_warm_mark.store(0);
     g_warm_running.store(true, std::memory_order_release);
     auto run = [&]() {
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST); // [TAG_FN_L15_WARMYIELD]
         for (size_t i = next.fetch_add(1); i < n_use; i = next.fetch_add(1)) {
             if (WaitForSingleObject(stop, 0) == WAIT_OBJECT_0) {
                 return;
             }
-            WIN32_MEMORY_RANGE_ENTRY e = { (PVOID) rs[i].p, (SIZE_T) rs[i].n };
-            if (pf != nullptr) {
-                pf(GetCurrentProcess(), 1, &e, 0);
-            }
-            for (size_t o = 0; o < rs[i].n; o += page) {
-                (void) *(volatile const char *) (rs[i].p + o);
+            // [TAG_FN_L15_WARMYIELD] 2 MiB at a time, each after 50 ms without an answer step
+            const size_t sub = (size_t) 2 << 20;
+            for (size_t o0 = 0; o0 < rs[i].n; o0 += sub) {
+                while ((g_warm_small_decodes.load(std::memory_order_relaxed) > 0 ||
+                        fn_warm_now_us() - g_warm_small_end_us.load(std::memory_order_relaxed) < 50000) &&
+                       WaitForSingleObject(stop, 0) != WAIT_OBJECT_0) {
+                    Sleep(2);
+                }
+                const size_t n0 = std::min(sub, rs[i].n - o0);
+                WIN32_MEMORY_RANGE_ENTRY e = { (PVOID) (rs[i].p + o0), (SIZE_T) n0 };
+                if (pf != nullptr) {
+                    pf(GetCurrentProcess(), 1, &e, 0);
+                }
+                for (size_t o = 0; o < n0; o += page) {
+                    (void) *(volatile const char *) (rs[i].p + o0 + o);
+                }
             }
             (void) *(volatile const char *) (rs[i].p + rs[i].n - 1);
             done[i].store(1);
@@ -879,5 +901,19 @@ bool llama_fn_warm_running() {
     return g_warm_running.load(std::memory_order_acquire);
 #else
     return false;
+#endif
+}
+
+// [TAG_FN_L15_WARMYIELD] see llama-fn-tier.h
+void llama_fn_warm_small_decode(bool begin) {
+#ifdef _WIN32
+    if (begin) {
+        g_warm_small_decodes.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        g_warm_small_end_us.store(fn_warm_now_us(), std::memory_order_relaxed);
+        g_warm_small_decodes.fetch_sub(1, std::memory_order_relaxed);
+    }
+#else
+    GGML_UNUSED(begin);
 #endif
 }

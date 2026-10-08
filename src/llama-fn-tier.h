@@ -40,3 +40,6 @@ void llama_fn_warm_go();
 // pages in at once took the first 32K prompt from 21 s to 55 s (l15 abx6_v5_i5)
 void llama_fn_warm_wait_layer(int il);
 bool llama_fn_warm_running();
+
+// [TAG_FN_L15_WARMYIELD] a decode of small ubatches (answer steps, bridged) begins / ends: the warm pass waits meanwhile
+void llama_fn_warm_small_decode(bool begin);
