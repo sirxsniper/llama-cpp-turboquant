@@ -33,7 +33,7 @@ code, 1 stream · 262K context · 4 slots
 ## 101 t/s
 real use at 32K · **89 t/s at 131K and 245K** · 103 / 93 / 91 with the MTPq3 files · a short new turn starts in 0.3–1.4 s instead of 3.4 s · **2 streams at 32K: 111–120 t/s total**
 
-prompt reading **1,500–2,060 t/s**
+prompt reading **2,260 t/s** at 131K (v0.20.0, +10 %)
 
 </td>
 </tr>
@@ -160,6 +160,16 @@ Five GPU memory bugs found with compute-sanitizer and fixed; no GPU work left in
 
 - Both streams' verify rows now run as one bridged graph: the MoE bridge takes up to n_rs_seq tokens of each sequence, and sequences that draft together draft the same length, the longer one: both keep drafting while either passes the p_min rule (`SPEC_MTP_EQUAL_SEQS`, on in the Flash-Next profile). This gives most of the gain (81 -> 111–120 t/s total); acceptance per stream drops a little (0.76–0.79 -> 0.68–0.72).
 - One stream gives the same output: token-identical to v0.18.0 (identity checks with and without MTP). Without MTP, the last layer of a long prompt chunk now runs its CPU part synchronously, so a stall can no longer fail the request.
+
+**Prompt reading** (v0.20.0, MTPq3 files, same-session pairs, 2 rounds):
+
+| Prompt | v0.19.0 | **v0.20.0** |
+|:--|--:|--:|
+| 131K tokens | 2,062 t/s | **2,264 t/s** |
+| 32K tokens, first prompt after a start | 830 t/s | **932 t/s** |
+
+- The prompt stream copies the experts the VRAM hot set already holds (about 10 GiB of each 72 GiB pass) from their slots on the GPU instead of from RAM, and its RAM copies use non-temporal stores at every size. Decoding is not touched: output token-identical to v0.19.0.
+- The first prompt after a server start still reads about 35 GB from the disk: the model (105 GB) is larger than RAM.
 
 > Numbers are real-use medians over interleaved A/B rounds, not best-case benchmark runs. A greedy short-prompt benchmark always reads higher than a long, sampled answer — both are listed where it matters.
 
