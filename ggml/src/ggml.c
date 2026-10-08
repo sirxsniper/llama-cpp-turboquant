@@ -6710,6 +6710,14 @@ void ggml_gated_delta_net_set_chunk_min(
     ggml_set_op_params_i32(a, 1, n_min);
 }
 
+// [TAG_UPSTREAM_30087]
+void ggml_gated_delta_net_set_reorder(
+        struct ggml_tensor * a,
+        bool                 reorder) {
+    GGML_ASSERT(a->op == GGML_OP_GATED_DELTA_NET);
+    ggml_set_op_params_i32(a, 2, reorder ? 1 : 0);
+}
+
 // ggml_gated_delta_net_replay [TAG_4C_GDN_REPLAY]
 
 struct ggml_tensor * ggml_gated_delta_net_replay(

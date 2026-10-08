@@ -724,6 +724,11 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
 
     // state s is 4D [S_v, S_v, H_v, n_seqs]; K snapshot slots are written into the output.
     ggml_tensor * gdn_out = ggml_gated_delta_net(ctx0, q, k, v, g, b, s, K);
+    // [TAG_UPSTREAM_30087] qwen4exp has no replay layout, so no other op must give the bits of this one: the backend may
+    // add the sums in its fastest order (CUDA: four state columns per warp; GGML_CUDA_GDN_COLS4=0 keeps the old kernel)
+    if (arch == LLM_ARCH_QWEN4EXP) {
+        ggml_gated_delta_net_set_reorder(gdn_out, true);
+    }
     if (n_seq_tokens > 1) {
         res->add_fused_node({LLM_FUSED_OP_GDN_CH, gdn_out, il});
     } else {
