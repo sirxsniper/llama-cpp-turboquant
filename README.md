@@ -33,7 +33,7 @@ code, 1 stream · 262K context · 4 slots
 ## 101 t/s
 real use at 32K · **89 t/s at 131K and 245K** · 103 / 93 / 91 with the MTPq3 files · a short new turn starts in 0.3–1.4 s instead of 3.4 s · **2 conversations at 32K: 62–66 t/s each**
 
-prompt reading **2,300 t/s** at 131K with the MTPq3 files (v0.20.0, +12 %) · **the first 32K prompt after a start 2,020 t/s** (v0.20.2, was 944)
+prompt reading **2,350 t/s** at 131K and 245K with vision (v0.20.4: +5 % / +8 %) · **start + warm-up request + first 32K prompt done in 41–49 s** (v0.20.4; v0.20.3 59–61 s)
 
 </td>
 </tr>
@@ -152,6 +152,8 @@ Five GPU memory bugs found with compute-sanitizer and fixed; no GPU work left in
 - Vision works: add `--mmproj mmproj-Qwen3.8-Flash-Next-F16.gguf`.
 
 **With vision** (`--mmproj mmproj-Qwen3.8-Flash-Next-F16.gguf`, v0.20.3, MTPq3, same session, 2 rounds): answers 96.1 / 87.7 / 85.5 t/s at 32K / 131K / 245K against 102.1 / 92.5 / 88.8 text only (about -5 %: the encoder takes 1.1 GiB of VRAM from the expert hot set); prompts unchanged (32K -2 %, 131K the same); needles at 131K and 245K pass with vision loaded.
+
+**v0.20.4, with vision** (MTPq3, v0.20.3 and v0.20.4 alternated in one session, 4 rounds, medians): answers 100.3 / 104.6 t/s at 32K (first answer after the warm-up / once the experts are in RAM; v0.20.3 101.2 / 103.1), **93.1 t/s at 131K** (89.2), 87.4 t/s at 245K (87.6, 2 rounds); prompts **2,347 / 2,344 t/s at 131K / 245K** (2,244 / 2,166). Per verified token the answers cost 2-4 % less at every depth (the t/s of sampled answers moves with draft acceptance). Output token-identical to v0.20.3. The 27B gains 3.0 % at temperature 0 (upstream #30139 and #29797; text identical 24/24).
 
 **Two conversations at once** (`--parallel 2 --kv-unified`, both sharing the 262K pool; real-use sampling, a 32K conversation on each, 2,048-token answers; each conversation's own speed):
 
