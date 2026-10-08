@@ -3249,6 +3249,11 @@ private:
     int      pool_n_parked         = 0;
     int      pool_no_progress      = 0;
     int      pool_want_room        = -1;       // slot whose next image does not fit, set by the prompt pass
+
+    // [TAG_FN_L15_GENSHARE] after a batch with prompt rows and generating rows, the prompt rows wait until this time, so
+    // the generating slots get decode-only steps for LLAMA_SRV_GEN_SHARE x the batch's time (0 = off)
+    int64_t  gen_share_until_us    = 0;
+
     struct pool_dbg_trigger { bool gen; int64_t at; bool nopark; bool done; };
     std::vector<pool_dbg_trigger> pool_dbg;    // TURBO_POOL_DEBUG_FAIL
     int      pool_dbg_firing       = -1;
@@ -5462,6 +5467,8 @@ private:
             llama_set_embeddings(ctx_tgt, slot_batched->need_embd());
         }
 
+        const int64_t t_batch0 = ggml_time_us(); // [TAG_FN_L15_GENSHARE]
+
         int32_t off_next = 0;
         int32_t n_batch = llama_n_batch(ctx_tgt);
         for (int32_t off = 0; off < batch.size(); off = off_next) {
@@ -5520,6 +5527,23 @@ private:
                 SRV_ERR("post_decode() failed: %s\n", e.what());
                 abort_all_slots("post_decode() failed: " + std::string(e.what()));
                 break; // stop any further processing
+            }
+        }
+
+        // [TAG_FN_L15_GENSHARE] a prompt chunk that held up generating slots opens their decode-only window; a chunk that
+        // read the experts from the disk counts as LLAMA_SRV_GEN_SHARE_CAP_MS at most
+        if (batch.n_gen_rows > 0 && batch.size() > batch.n_gen_rows) {
+            static const double share = [] {
+                const char * e = getenv("LLAMA_SRV_GEN_SHARE");
+                return e ? std::max(0.0, atof(e)) : 0.0;
+            }();
+            static const int64_t cap_us = [] {
+                const char * e = getenv("LLAMA_SRV_GEN_SHARE_CAP_MS");
+                return (int64_t) (e ? std::max(0, atoi(e)) : 4000)*1000;
+            }();
+            if (share > 0.0) {
+                const int64_t t1 = ggml_time_us();
+                gen_share_until_us = t1 + (int64_t) (share*(double) std::min(t1 - t_batch0, cap_us));
             }
         }
 
@@ -5821,8 +5845,11 @@ private:
         auto & alora_scale       = batch.alora_scale;
         auto & alora_disabled_id = batch.alora_disabled_id;
 
+        // [TAG_FN_L15_GENSHARE] inside the hold window the generating slots decode alone
+        const bool gen_share_hold = batch.n_gen_rows > 0 && ggml_time_us() < gen_share_until_us;
+
         // next, batch any pending prompts without exceeding n_batch
-        if (params_base.cont_batching || batch.size() == 0) {
+        if (!gen_share_hold && (params_base.cont_batching || batch.size() == 0)) {
             bool add_ok = true; // false means the batch is full, skip remaining slots
 
             iterate("slots_3456", slots, [&](server_slot & slot) {

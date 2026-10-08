@@ -2901,7 +2901,7 @@ static bool ggml_backend_cuda_copy_d2d_batch_async(ggml_backend_t backend, int n
         return true;
     }
     ggml_cuda_set_device(cuda_ctx->device);
-#if defined(CUDART_VERSION) && CUDART_VERSION >= 12080 && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+#if defined(CUDART_VERSION) && CUDART_VERSION >= 13000 && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) // [TAG_FN_L15_CUDA12] the CUDA 13 signature (12.8/12.9 have a fail index)
     {
         static thread_local std::vector<void *>       d;
         static thread_local std::vector<const void *> s;
@@ -2929,7 +2929,7 @@ static bool ggml_backend_cuda_copy_d2d_batch_async(ggml_backend_t backend, int n
 
 static bool ggml_backend_cuda_set_tensors_batch_async(ggml_backend_t backend, int n, ggml_tensor * const * tensors,
         const void * const * data, const size_t * sizes) {
-#if defined(CUDART_VERSION) && CUDART_VERSION >= 12080 && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+#if defined(CUDART_VERSION) && CUDART_VERSION >= 13000 && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) // [TAG_FN_L15_CUDA12] the CUDA 13 signature (12.8/12.9 have a fail index)
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
     if (n <= 0) {
         return true;

@@ -98,7 +98,7 @@ static void test_profile_opts() {
                                    "LLAMA_QSA_POS_MASK", "LLAMA_QSA_POS_CHUNK", "TURBO_QSA_CHUNK", "TURBO_QSA_SPARSE",
                                    "TURBO_QSA_TOPK_UNORDERED", "SPEC_MTP_COST", "LLAMA_MTP_ATTN_WINDOW",
                                    "LLAMA_MTP_HEAD_ROWS", "SPEC_DFT_UBATCH", "LLAMA_PREFILL_STREAM",
-                                   "LLAMA_PREFILL_STREAM_LEND", "LLAMA_PREFILL_STREAM_THREADS", "LLAMA_PREFILL_STREAM_MIN", "GGML_OP_OFFLOAD_MIN_BATCH", "SPEC_MTP_EQUAL_SEQS", "LLAMA_PREFILL_STREAM_D2D",
+                                   "LLAMA_PREFILL_STREAM_LEND", "LLAMA_PREFILL_STREAM_THREADS", "LLAMA_PREFILL_STREAM_MIN", "GGML_OP_OFFLOAD_MIN_BATCH", "SPEC_MTP_EQUAL_SEQS", "LLAMA_PREFILL_STREAM_D2D", "LLAMA_SRV_GEN_SHARE",
                                    "SPEC_MTP_BLOCK_VERIFY", "LLAMA_MOE_POOL_SPLIT", "LLAMA_MOE_POOL_PF_STREAMS", "LLAMA_MOE_POOL_SWPF", "LLAMA_MOE_BRIDGE_PF_RANK", "LLAMA_MOE_POOL_EXEC_CPU", "LLAMA_KPOOL_PAD", "LLAMA_KV_PAD_INDEXER" }; // [TAG_FN_L8_GRAPHPAD]
     const size_t n_lookup = sizeof(lookup_names)/sizeof(lookup_names[0]);
     const size_t n_lever  = sizeof(lever_names)/sizeof(lever_names[0]);

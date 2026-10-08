@@ -74,8 +74,9 @@ struct pfs_bank {
 };
 
 struct pfs_job {
-    int      pos = -1;
-    uint64_t gen = 0;
+    int      pos  = -1;
+    uint64_t gen  = 0;
+    bool     wrap = false; // [TAG_FN_L15_D2DWRAP] the next ubatch's layer 0, copied while the owner may run a hot-set step
 };
 
 struct pfs_state {
@@ -376,8 +377,10 @@ void pfs_run(pfs_state * s) {
         };
 
         // the experts the hot set holds come from its VRAM slots, the rest from the host
+        // [TAG_FN_L15_D2DWRAP] not the wrap job: a hot-set step between two calls (a decode row in the batch) can upload another
+        // expert into a slot of its snapshot before its device copy runs, and the next ubatch keeps bank 0 without a new snapshot
         const ggml_tensor * hs3[3] = { nullptr, nullptr, nullptr };
-        bool d2d = s->d2d != nullptr && n_exp > 0;
+        bool d2d = s->d2d != nullptr && n_exp > 0 && !job.wrap;
         if (d2d) {
             hot_slot.resize((size_t) n_exp);
             d2d = llama_moe_hot_slots(L.src[0], hot_slot.data(), n_exp, hs3);
@@ -516,7 +519,7 @@ void pfs_gate_op(ggml_tensor * dst, int ith, int nth, void * ud) {
                 q.push_back({ p, s->gen });
             }
             if (s->wrap) {
-                q.push_back({ 0, s->gen });
+                q.push_back({ 0, s->gen, true });
             }
             s->queue.swap(q);
             s->ctr.ubatches++;

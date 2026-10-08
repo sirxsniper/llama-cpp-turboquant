@@ -12,6 +12,15 @@
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
+
+#if (defined(_M_X64) || defined(__x86_64__)) && (defined(__AVX__) || (defined(_MSC_VER) && !defined(__clang__)))
+#define LLAMA_GEN5_NT_AVX 1
+#if defined(_MSC_VER)
+#include <intrin.h>
+#else
+#include <immintrin.h>
+#endif
+#endif
 #if defined(_M_X64) || defined(__x86_64__)
 #    include <immintrin.h> // [TAG_FN_L15_NTCOPY]
 #endif
@@ -167,7 +176,19 @@ void copy_pool::stop() {
 // only above ~1.5 MiB, and a smaller piece (a run of experts, a thread's share of one) read each destination line first,
 // twice the RAM traffic of the stream's copies. The ring is written once and read by the DMA, never by the CPU.
 static void copy_nt(uint8_t * dst, const uint8_t * src, size_t n) {
-#if (defined(_M_X64) || defined(__x86_64__)) && (defined(_MSC_VER) || defined(__AVX__))
+#if defined(LLAMA_GEN5_NT_AVX)
+#if !defined(__AVX__)
+    // [TAG_FN_L15_NTAVX] MSVC builds the AVX intrinsics without /arch:AVX: use them only when the CPU and the OS have AVX
+    static const bool has_avx = [] {
+        int r[4];
+        __cpuid(r, 1);
+        return (r[2] & (1 << 27)) != 0 && (r[2] & (1 << 28)) != 0 && (_xgetbv(0) & 6) == 6;
+    }();
+    if (!has_avx) {
+        memcpy(dst, src, n);
+        return;
+    }
+#endif
     size_t i = 0;
     // head up to a 32-byte aligned destination
     const size_t head = std::min(n, (size_t) ((32 - ((uintptr_t) dst & 31)) & 31));

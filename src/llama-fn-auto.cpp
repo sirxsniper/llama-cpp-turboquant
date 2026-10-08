@@ -177,6 +177,10 @@ const fn_item k_items[] = {
     { "LLAMA_FN_L14_TIER",           "0",     P_ALL }, // off: with the GPU holding ~33 GB of commit only ~40-55 GiB can be locked (VirtualLock 1455), and gating the hot set on locks froze it (l15 meas15b: 87 / 73 / 73 t/s)
     // [TAG_FN_L14_PFSD2D] the prefill stream copies the experts the hot set holds from their VRAM slots, not the host
     { "LLAMA_PREFILL_STREAM_D2D",         "1",     P_ALL },
+    // [TAG_FN_L15_GENSHARE] with 2 connections a streamed prompt chunk (~3.2 s) held the other connection's answer to one
+    // step per chunk (0.5-0.9 t/s); it now decodes alone for half the chunk's time between chunks: 28-30 t/s, the prompt
+    // ~50 % longer (l15 c_gs_*)
+    { "LLAMA_SRV_GEN_SHARE",         "0.5",   P_ALL },
 };
 
 // names the fn-auto aware code reads through llama_fn_env(): never put into the environment
