@@ -185,6 +185,7 @@ const fn_item k_items[] = {
     { "LLAMA_FN_L4_HOST_BATCHCPY",   "2",     P_ALL }, // [TAG_FN_L16_UPLOAD] packed input uploads (mode 2)
     { "LLAMA_FN_L16_SEQRM",          "1",     P_ALL }, // [TAG_FN_L16_SEQRM] seq_rm walks the sequence's own cells
     { "LLAMA_FN_L16_MTP_ASYNC",      "1",     P_ALL }, // [TAG_FN_L16_MTP_ASYNC] no tail synchronize in the MTP draft decode
+    { "LLAMA_FN_L16_PLE_GATE",       "1",     P_ALL }, // [TAG_FN_L16_PLEGATE] bridged decode graphs wait for the PLE rows on the device (needs the bridge)
 };
 
 // names the fn-auto aware code reads through llama_fn_env(): never put into the environment

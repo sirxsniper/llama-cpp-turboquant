@@ -1092,7 +1092,8 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
     if (hparams.ple_n_heads > 0) {
         ple_emb = build_inp_ple(mctx_hyb);
         // make sure ple_emb and build_inp_embd are in the same graph split
-        ggml_build_forward_expand(gf, ple_emb);
+        // [TAG_FN_L16_PLEGATE] a gated graph has the ticket here, and the rows come at the PLE layer
+        ggml_build_forward_expand(gf, ple_emb ? ple_emb : ple_gate.ticket);
     }
 
     // the wide residual starts as hc identical copies of the embedding
@@ -1132,6 +1133,15 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
         res->t_layer_inp[il] = res_hc;
 
         if (hparams.is_ple(il)) {
+            if (ple_gate.ticket) {
+                // [TAG_FN_L16_PLEGATE] the device waits here (bounded) for the rows the host fills meanwhile. The dependency
+                // is the graph's last node so far: it orders the wait after the nodes built so far and moves none (res_hc
+                // would pull the last combine in front of the PLE nodes); the wait lands right before their first use
+                ggml_tensor * dep = ggml_graph_n_nodes(gf) > 0 ? ggml_graph_node(gf, -1) : res_hc;
+                ple_emb = ggml_moe_host_wait(ctx0, ple_gate.ticket, dep, (int64_t) hparams.ple_head_dim*hparams.ple_n_heads,
+                        n_tokens, ple_gate.id, ple_gate.chan);
+                cb(ple_emb, "ple_embd", -1);
+            }
             res_hc = build_ple(inp->get_recr(), ple_emb, res_hc, il);
         }
 
@@ -2581,9 +2591,22 @@ struct llama_model_qwen4exp::ple_prefetcher {
     std::vector<uint8_t>    scratch;
     uint64_t                n_jobs = 0;
 
-    ple_prefetcher(std::shared_ptr<llama_ple_dio> d, const ggml_tensor * table) : dio(std::move(d)) {
-        fallback  = (const uint8_t *) table->data;
-        row_bytes = table->nb[1];
+    // [TAG_FN_L16_PLEGATE] a fill: the PLE rows of one gated decode graph (its idx, as set_input computes it), read and
+    // converted as set_input does, into the bridge's PLE channel under the graph's ticket
+    struct fill_job {
+        const llama_moe_bridge * br       = nullptr;
+        uint32_t                 ticket   = 0;
+        int64_t                  n_tokens = 0;
+        std::vector<int32_t>     idx;
+    };
+    const ggml_tensor *   table = nullptr;
+    std::vector<fill_job> fills;      // queued, guarded by mtx
+    std::vector<fill_job> fill_work;  // the worker's copy
+    std::vector<uint8_t>  fill_raw;
+
+    ple_prefetcher(std::shared_ptr<llama_ple_dio> d, const ggml_tensor * tbl) : dio(std::move(d)), table(tbl) {
+        fallback  = (const uint8_t *) tbl->data;
+        row_bytes = tbl->nb[1];
         th = std::thread([this]() { loop(); });
     }
 
@@ -2606,16 +2629,55 @@ struct llama_model_qwen4exp::ple_prefetcher {
         cv.notify_one();
     }
 
+    // [TAG_FN_L16_PLEGATE]
+    void post_fill(fill_job && f) {
+        {
+            std::lock_guard<std::mutex> lk(mtx);
+            fills.push_back(std::move(f));
+        }
+        cv.notify_one();
+    }
+
+    // [TAG_FN_L16_PLEGATE] the same read_rows and to_float as set_input, straight into the channel (no CUDA call here)
+    void run_fill(fill_job & f) {
+        struct fill_ctx {
+            ple_prefetcher * self;
+            fill_job *       job;
+        } c = { this, &f };
+        llama_moe_bridge_ple_fill(f.br, f.ticket, (int32_t) f.n_tokens, [](float * out, void * ud) -> bool {
+            auto * x = (fill_ctx *) ud;
+            try {
+                qwen4exp_rows_to_float_dio(*x->self->dio, x->self->table, x->job->idx.data(), (int64_t) x->job->idx.size(),
+                        x->job->n_tokens, x->self->fill_raw, out);
+            } catch (const std::exception & e) {
+                LLAMA_LOG_WARN("ple_prefetcher: [TAG_FN_L16_PLEGATE] PLE read failed (%s): the ubatch is computed again\n", e.what());
+                return false;
+            }
+            return true;
+        }, &c);
+    }
+
     void loop() {
         while (true) {
             {
                 std::unique_lock<std::mutex> lk(mtx);
-                cv.wait(lk, [this]() { return stop || !rows.empty(); });
-                if (stop) {
+                cv.wait(lk, [this]() { return stop || !rows.empty() || !fills.empty(); });
+                // [TAG_FN_L16_PLEGATE] a queued fill is answered even at the stop: a bridge waits for its tickets
+                if (stop && fills.empty()) {
                     return;
                 }
                 work.swap(rows);
                 rows.clear();
+                fill_work.swap(fills);
+                fills.clear();
+            }
+            // [TAG_FN_L16_PLEGATE] fills first: a running graph may wait for them; reads queued with them are for later
+            for (auto & f : fill_work) {
+                run_fill(f);
+            }
+            fill_work.clear();
+            if (work.empty() || stop) {
+                continue;
             }
             scratch.resize(work.size()*row_bytes);
             try {
@@ -2680,6 +2742,15 @@ void llama_ple_prefetch_ext(llama_context * ctx, llama_seq_id seq_id, llama_pos 
         pre = m->ple_pre;
     }
     pre->post(idx.data(), (int64_t) idx.size());
+}
+
+// [TAG_FN_L16_PLEGATE] the model's PLE prefetch thread, made here if no prefetch made it yet (the gate fills on it)
+static std::shared_ptr<llama_model_qwen4exp::ple_prefetcher> qwen4exp_ple_pre_get(const llama_model_qwen4exp & m) {
+    std::lock_guard<std::mutex> lk(m.ple_pre_mutex);
+    if (!m.ple_pre) {
+        m.ple_pre = std::make_shared<llama_model_qwen4exp::ple_prefetcher>(m.ple_dio, m.per_layer_tok_embd);
+    }
+    return m.ple_pre;
 }
 
 // [TAG_FN_PLE_HOST_GATHER] token rows as an f32 input; h is the MTP driver's hidden state input (nullptr in the trunk)
@@ -2766,6 +2837,9 @@ public:
 
     bool can_reuse(const llm_graph_params & params) override {
         mctx = static_cast<const llama_memory_hybrid_idx_context *>(params.mctx)->get_attn();
+        if (ticket) { // [TAG_FN_L16_PLEGATE]
+            return gate_tokens == (int64_t) params.ubatch.n_tokens && gate_br == params.moe_bridge;
+        }
         if (emb_host) { // [TAG_FN_PLE_HOST_GATHER]
             return emb_host->ne[1] == (int64_t) params.ubatch.n_tokens;
         }
@@ -2778,6 +2852,13 @@ public:
     ggml_tensor * emb_host = nullptr;
     std::vector<float> emb_buf;
     std::vector<uint8_t> dio_raw; // [TAG_FN_PLE_DIRECT_IO] raw rows from the file
+
+    // [TAG_FN_L16_PLEGATE] gated: I32 [1], the graph's ticket on the bridge's PLE channel, instead of emb_host; the
+    // prefetch thread reads the rows into the channel
+    ggml_tensor * ticket = nullptr;
+    const llama_moe_bridge * gate_br = nullptr;
+    int64_t gate_tokens = 0;
+    std::shared_ptr<llama_model_qwen4exp::ple_prefetcher> gate_pre;
 
     const llama_model & model;
 
@@ -2850,6 +2931,19 @@ void llm_graph_input_qwen4exp_ple::set_input(const llama_ubatch * ubatch) {
 
     // [TAG_FN_PLE_DIRECT_IO] with direct I/O the rows come from the file: the mapping is never read, so not prefetched
     const auto & ple_dio = static_cast<const llama_model_qwen4exp &>(model).ple_dio;
+
+    if (ticket) { // [TAG_FN_L16_PLEGATE] the same rows, read on the prefetch thread while the graph runs its first layers
+        GGML_ASSERT(ple_dio && gate_pre && gate_br && n_tokens == gate_tokens);
+        const uint32_t t = llama_moe_bridge_ple_ticket(gate_br);
+        ggml_backend_tensor_set(ticket, &t, 0, sizeof(t));
+        llama_model_qwen4exp::ple_prefetcher::fill_job f;
+        f.br       = gate_br;
+        f.ticket   = t;
+        f.n_tokens = n_tokens;
+        f.idx      = std::move(idx);
+        gate_pre->post_fill(std::move(f));
+        return;
+    }
 
     if (!ple_dio) {
         ggml_tensor * ple = model.per_layer_tok_embd;
@@ -2954,6 +3048,34 @@ ggml_tensor * llama_model_qwen4exp::graph::build_inp_ple(
 
     // the attention cells see every ubatch regardless of the layer types
     auto ple_inp = std::make_unique<llm_graph_input_qwen4exp_ple>(model, mctx_hyb->get_attn());
+
+    // [TAG_FN_L16_PLEGATE] LLAMA_FN_L16_PLE_GATE: a bridged decode graph (the bridge active, the ubatch fits it: the
+    // launch2_decode test) does not wait for its PLE rows before the launch; the PLE layer waits for them on the device.
+    // A paused bridge (a retried ubatch) has no moe_bridge in the graph parameters, so it keeps the input below
+    const auto & qm = static_cast<const llama_model_qwen4exp &>(model);
+    int32_t gate_id   = -1;
+    int32_t gate_chan = -1;
+    if (qm.ple_dio && moe_bridge && model.per_layer_tok_embd && model.per_layer_tok_embd->ne[0] == (int64_t) hparams.ple_head_dim &&
+            llama_moe_bridge_fits(moe_bridge, (int) n_tokens, (int) (ubatch.equal_seqs() ? ubatch.n_seq_tokens : ubatch.n_tokens)) &&
+            llama_fn_l3_flag(model, "LLAMA_FN_L16_PLE_GATE") &&
+            llama_moe_bridge_ple_chan(moe_bridge, (int64_t) hparams.ple_head_dim * n_heads, &gate_id, &gate_chan)) {
+        ple_inp->ticket = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 1);
+        ggml_set_input(ple_inp->ticket);
+        ple_inp->gate_br     = moe_bridge;
+        ple_inp->gate_tokens = n_tokens;
+        ple_inp->gate_pre    = qwen4exp_ple_pre_get(qm);
+        ple_gate.ticket = ple_inp->ticket;
+        ple_gate.id     = gate_id;
+        ple_gate.chan   = gate_chan;
+        cb(ple_gate.ticket, "ple_gate_ticket", -1);
+        res->add_input(std::move(ple_inp));
+        res->n_moe_bridge++; // the graph is bridged even if no layer posts: begin / end run, and a late fill fails it
+        static std::atomic<bool> noted{false};
+        if (!noted.exchange(true)) {
+            LLAMA_LOG_INFO("qwen4exp: [TAG_FN_L16_PLEGATE] bridged decode graphs take their PLE rows on the device, at the PLE layer\n");
+        }
+        return nullptr;
+    }
 
     // [TAG_FN_PLE_HOST_GATHER] the table rows arrive as an f32 input: no CPU GET_ROWS split
     // [TAG_FN_PLE_DIRECT_IO] always so with direct I/O: a GET_ROWS would read the rows through the mapping

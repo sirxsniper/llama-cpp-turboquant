@@ -8182,6 +8182,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_moe_bridge_test_seed") == 0) {
         return (void *)ggml_backend_cuda_moe_bridge_test_seed;
     }
+    if (strcmp(name, "ggml_backend_moe_bridge_host_take") == 0) { // [TAG_FN_L16_PLEGATE]
+        return (void *)ggml_backend_cuda_moe_bridge_host_take;
+    }
     // [TAG_FN_L3_HOST_POKE]
     if (strcmp(name, "ggml_backend_cuda_fn_set_poke") == 0) {
         return (void *)ggml_backend_cuda_fn_set_poke;

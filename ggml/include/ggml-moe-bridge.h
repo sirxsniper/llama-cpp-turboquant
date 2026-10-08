@@ -161,6 +161,15 @@ typedef const volatile int32_t * (*ggml_backend_moe_bridge_next_post_word_t)(str
 //                                      at g (nonzero), so a test crosses the 2^32 wrap of the ring stamps in a few posts
 typedef bool     (*ggml_backend_moe_bridge_test_seed_t)(struct ggml_moe_bridge * bridge, uint32_t g);
 
+// [TAG_FN_L16_PLEGATE]
+// "ggml_backend_moe_bridge_host_take": a job of chan that no device post makes (the graph only waits for ticket seq, e.g.
+//                                      the PLE gate): job gets the channel's out area for n_tokens rows, the job is owed
+//                                      (reset waits for it) and its wait now allows job_max_ms. Host memory only, no CUDA
+//                                      call, any thread; answer it with ggml_backend_moe_bridge_complete. false: bad chan,
+//                                      seq (0) or n_tokens, nothing changed
+typedef bool     (*ggml_backend_moe_bridge_host_take_t)(struct ggml_moe_bridge * bridge, int32_t chan, uint32_t seq,
+                                                        int32_t n_tokens, struct ggml_moe_bridge_job * job);
+
 // [TAG_FN_L3_CPU_DEVPRED]
 // "ggml_backend_moe_bridge_read_hint": the predicted ids the graph wrote after the post of job seq of chan
 //                                      (ggml_moe_host_hint): ids [n_tokens][k] by rank; false if that job's hint is not

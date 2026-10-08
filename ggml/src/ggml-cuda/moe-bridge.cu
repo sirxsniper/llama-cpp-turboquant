@@ -30,6 +30,9 @@
 // post: it copies the device's predicted ids of the next layer (the top-k of that layer's router on this layer's input)
 // into the channel's hint area under the post's ticket, seqlock style (seq 0, ids, fence, seq). The executor reads them
 // after the job (ggml_backend_moe_bridge_read_hint) and prefetches the next layer's experts without a router on the host.
+//
+// [TAG_FN_L16_PLEGATE] A channel can also carry jobs that no device post makes: the graph's ticket is an input, and a
+// host thread takes the job (host_take: owed, taken), writes out and completes it. The wait is the same k_mb_wait.
 
 #include "moe-bridge.cuh"
 #include "topk-moe.cuh" // [TAG_FN_L4_POST]
@@ -1384,6 +1387,34 @@ void ggml_backend_cuda_moe_bridge_complete(ggml_moe_bridge * b, const ggml_moe_b
     std::atomic_thread_fence(std::memory_order_release);
     *(volatile uint32_t *) &b->hdr[job->chan].done = job->seq;
     b->completed.fetch_add(1, std::memory_order_release);
+}
+
+// [TAG_FN_L16_PLEGATE] see ggml-moe-bridge.h
+bool ggml_backend_cuda_moe_bridge_host_take(ggml_moe_bridge * b, int32_t chan, uint32_t seq, int32_t n_tokens, ggml_moe_bridge_job * job) {
+#ifdef GGML_MOE_BRIDGE_DISABLED
+    GGML_UNUSED(b);
+    GGML_UNUSED(chan);
+    GGML_UNUSED(seq);
+    GGML_UNUSED(n_tokens);
+    GGML_UNUSED(job);
+    return false;
+#else
+    if (b == nullptr || job == nullptr || chan < 0 || chan >= b->params.n_chan || seq == 0 || n_tokens < 1 ||
+        n_tokens > b->params.max_tokens) {
+        return false;
+    }
+    char * p = b->data + (size_t) chan*b->dev.chan_bytes;
+    memset(job, 0, sizeof(*job));
+    job->chan     = chan;
+    job->seq      = seq;
+    job->n_tokens = n_tokens;
+    job->n_embd   = b->params.n_embd;
+    job->out      = (float *) (p + b->dev.off_out);
+    // owed as a polled job is: complete() counts it done, and reset() waits until it is
+    b->taken.fetch_add(1, std::memory_order_seq_cst);
+    mb_mark_taken(b, job);
+    return true;
+#endif
 }
 
 uint32_t ggml_backend_cuda_moe_bridge_error(const ggml_moe_bridge * b) {

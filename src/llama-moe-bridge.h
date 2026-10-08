@@ -143,3 +143,18 @@ bool llama_moe_bridge_end  (llama_moe_bridge * br);
 // ring's fills) wait here while a bridged graph runs, so its CPU experts get the DRAM bandwidth, and copy between
 // graphs. Returns at once when no bridge has the switch on; a wait ends after max_ms at the latest.
 void llama_moe_bridge_quiet_wait(int max_ms);
+
+// [TAG_FN_L16_PLEGATE] LLAMA_FN_L16_PLE_GATE (qwen4exp, spin waits): the bridge has one more channel that no layer posts
+// to. A bridged decode graph does not wait before its launch for the PLE rows of its tokens: it waits for them on the
+// device right before the PLE layer (ggml_moe_host_wait on this channel), and the PLE prefetch thread writes them there.
+// A late fill times out like a late job (zeros, the bridge error, the ubatch is computed again without the bridge).
+// LLAMA_FN_L16_PLE_GATE_SKIP=N (test): every Nth fill is never answered, so its wait times out.
+// false: no such channel (or another row width than n_embd)
+bool     llama_moe_bridge_ple_chan  (const llama_moe_bridge * br, int64_t n_embd, int32_t * id, int32_t * chan);
+// owner thread, the set_input of a gated graph: the channel's next ticket (never 0). Every ticket must reach
+// llama_moe_bridge_ple_fill: the bridge is not freed while a ticket is open
+uint32_t llama_moe_bridge_ple_ticket(const llama_moe_bridge * br);
+// any thread, no CUDA call: fill(out, ud) writes the ticket's rows (f32 [n_embd, n_tokens] in mapped memory) and returns
+// false on a failure (zeros and the bridge error then); then the device wait for the ticket may go on
+void     llama_moe_bridge_ple_fill  (const llama_moe_bridge * br, uint32_t ticket, int32_t n_tokens,
+                                     bool (*fill)(float * out, void * ud), void * ud);

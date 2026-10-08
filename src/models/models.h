@@ -2756,6 +2756,15 @@ struct llama_model_qwen4exp : public llama_model_base {
         ggml_tensor * build_inp_ple(
   const llama_memory_hybrid_idx_context * mctx_hyb);
 
+        // [TAG_FN_L16_PLEGATE] a bridged decode graph's PLE gate: build_inp_ple sets the ticket input (and returns nullptr
+        // instead of the rows), the PLE layer waits on the bridge's PLE channel for the rows
+        struct ple_gate_t {
+            ggml_tensor * ticket = nullptr;
+            int32_t       id     = -1;
+            int32_t       chan   = -1;
+        };
+        ple_gate_t ple_gate;
+
         // [TAG_FN_PLE_HOST_GATHER] token rows dequantized on the host into an f32 input, or nullptr when not usable
         ggml_tensor * build_inp_embd_host(
                     ggml_tensor * table,

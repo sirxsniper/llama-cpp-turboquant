@@ -131,6 +131,19 @@ struct llama_moe_bridge {
     ggml_backend_moe_bridge_chan_times_t   fn_chan_times   = nullptr;
     ggml_backend_moe_bridge_release_t      fn_release      = nullptr;
 
+    // [TAG_FN_L16_PLEGATE] the PLE gate's channel (-1: none). The tickets and the open count change on const bridges:
+    // the graph side holds a const pointer, and the fill runs on the PLE prefetch thread
+    ggml_backend_moe_bridge_host_take_t    fn_host_take    = nullptr;
+    int32_t                                ple_chan        = -1;
+    int                                    ple_skip        = 0;    // LLAMA_FN_L16_PLE_GATE_SKIP (test)
+    mutable std::atomic<uint32_t>          ple_seq{0};             // the last ticket
+    mutable std::atomic<int64_t>           ple_open{0};            // tickets not yet through llama_moe_bridge_ple_fill
+    mutable std::atomic<uint64_t>          ple_n{0};               // fills so far
+    uint32_t                               ple_seen    = 0;        // owner: the last ticket whose device wait was counted
+    int64_t                                ple_waits   = 0;        // owner: device waits counted, waited ns, ready at once
+    uint64_t                               ple_wait_ns = 0;
+    int64_t                                ple_ready   = 0;
+
     // CPU MoE pool, ggml-cpu.h
     pool_params_default_t pool_params_default = nullptr;
     pool_new_t            pool_new            = nullptr;
@@ -680,6 +693,15 @@ static void br_destroy(llama_moe_bridge * br) {
     if (br->gb && br->fn_release) {
         br->fn_release(br->gb); // [TAG_FN_R4_BRIDGE_DMA] no device wait or fetch of this bridge keeps spinning
     }
+    // [TAG_FN_L16_PLEGATE] an open PLE fill still writes the mapped channel and reads this object: let it end first (a
+    // disk read; it makes no CUDA call and needs nothing from this thread)
+    for (int64_t k = 1; br->ple_open.load(std::memory_order_acquire) > 0; ++k) {
+        if (k == 2000) {
+            LLAMA_LOG_WARN("%s: [TAG_FN_L16_PLEGATE] waiting for %" PRId64 " PLE fills before the bridge is freed\n", __func__,
+                    br->ple_open.load());
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
     if (br->quiet) { // [TAG_FN_L3_HOST_QUIET] no background copy waits for this bridge any more
         g_quiet_on.store(false);
         br_quiet_set(false);
@@ -971,9 +993,25 @@ llama_moe_bridge * llama_moe_bridge_create(const llama_model & model, int n_thre
         }
     }
 
+    // [TAG_FN_L16_PLEGATE] one more channel that no layer posts to: a gated decode graph waits on it for its PLE rows,
+    // which fill one channel's out area (n_embd floats per token). Spin waits only: in hostfunc mode a wait joins the
+    // event of its channel's post, and this channel has none
+    if (llama_fn_l3_flag(model, "LLAMA_FN_L16_PLE_GATE") && hparams.ple_n_heads > 0) {
+        const int64_t ple_w = (int64_t) hparams.ple_head_dim*hparams.ple_n_heads;
+        br->fn_host_take = (ggml_backend_moe_bridge_host_take_t) proc("ggml_backend_moe_bridge_host_take");
+        if (br->mode != GGML_MOE_BRIDGE_WAIT_SPIN || ple_w != br->n_embd || br->fn_host_take == nullptr) {
+            LLAMA_LOG_WARN("%s: [TAG_FN_L16_PLEGATE] LLAMA_FN_L16_PLE_GATE needs spin waits, PLE rows of n_embd (%" PRId64
+                    " vs %" PRId64 ") and the device's host_take: the PLE rows stay a graph input\n", __func__, ple_w, br->n_embd);
+            br->fn_host_take = nullptr;
+        } else {
+            br->ple_chan = (int32_t) br->chans.size();
+            br->ple_skip = std::max(0, env_int("LLAMA_FN_L16_PLE_GATE_SKIP", 0));
+        }
+    }
+
     ggml_moe_bridge_params bp = {};
     bp.device     = dev_index;
-    bp.n_chan     = (int) br->chans.size();
+    bp.n_chan     = (int) br->chans.size() + (br->ple_chan >= 0 ? 1 : 0); // [TAG_FN_L16_PLEGATE]
     bp.n_embd     = br->n_embd;
     bp.n_used     = br->n_used;
     bp.max_tokens = br->max_t;
@@ -1156,6 +1194,12 @@ llama_moe_bridge * llama_moe_bridge_create(const llama_model & model, int n_thre
         LLAMA_LOG_INFO("%s: [TAG_FN_L13_BRIDGE_SEQS] graphs of up to %d tokens with at most %d of one sequence (the ring each "
                 "sequence rolls back)\n", __func__, br->max_t, br->seq_t);
     }
+    if (br->ple_chan >= 0) {
+        LLAMA_LOG_INFO("%s: [TAG_FN_L16_PLEGATE] channel %d: bridged decode graphs launch without their PLE rows and wait for "
+                "them on the device before the PLE layer%s\n", __func__, br->ple_chan,
+                br->ple_skip > 0 ? format(" (LLAMA_FN_L16_PLE_GATE_SKIP=%d: every %dth fill is never answered)", br->ple_skip,
+                br->ple_skip).c_str() : "");
+    }
     if (br->pool_stats) {
         br->st_faults = br_page_faults();
         LLAMA_LOG_INFO("%s: [TAG_FN_L3_CPU_STATS] pool statistics every 256 bridged graphs\n", __func__);
@@ -1317,6 +1361,42 @@ bool llama_moe_bridge_last(const llama_moe_bridge * br, int32_t * n_tokens, uint
 
 int llama_moe_bridge_n_used(const llama_moe_bridge * br) {
     return br ? br->n_used : 0;
+}
+
+// [TAG_FN_L16_PLEGATE]
+bool llama_moe_bridge_ple_chan(const llama_moe_bridge * br, int64_t n_embd, int32_t * id, int32_t * chan) {
+    if (br == nullptr || br->ple_chan < 0 || n_embd != br->n_embd) {
+        return false;
+    }
+    *id   = br->bid;
+    *chan = br->ple_chan;
+    return true;
+}
+
+uint32_t llama_moe_bridge_ple_ticket(const llama_moe_bridge * br) {
+    uint32_t t = br->ple_seq.fetch_add(1, std::memory_order_relaxed) + 1u;
+    if (t == 0u) { // 0 is no ticket: its wait would return zeros without an error
+        t = br->ple_seq.fetch_add(1, std::memory_order_relaxed) + 1u;
+    }
+    br->ple_open.fetch_add(1, std::memory_order_acq_rel);
+    return t;
+}
+
+void llama_moe_bridge_ple_fill(const llama_moe_bridge * br, uint32_t ticket, int32_t n_tokens,
+        bool (*fill)(float * out, void * ud), void * ud) {
+    const uint64_t n = br->ple_n.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (br->ple_skip > 0 && n % (uint64_t) br->ple_skip == 0) {
+        // test: never answered, so the device wait times out and the ubatch is computed again
+        LLAMA_LOG_WARN("%s: [TAG_FN_L16_PLEGATE] LLAMA_FN_L16_PLE_GATE_SKIP: fill %" PRIu64 " (ticket %u) is not answered\n",
+                __func__, n, ticket);
+    } else {
+        ggml_moe_bridge_job job;
+        if (br->fn_host_take(br->gb, br->ple_chan, ticket, n_tokens, &job)) {
+            const bool ok = fill(job.out, ud);
+            br->fn_complete(br->gb, &job, ok);
+        }
+    }
+    br->ple_open.fetch_sub(1, std::memory_order_acq_rel); // the last use of br: br_destroy may go on now
 }
 
 bool llama_moe_bridge_layer(const llama_moe_bridge * br, const ggml_tensor * up_exps, int32_t * id, int32_t * chan) {
@@ -1543,6 +1623,26 @@ bool llama_moe_bridge_end(llama_moe_bridge * br) {
         llama_moe_dma_bridge_feedback(st);
     }
 
+    // [TAG_FN_L16_PLEGATE] how long the device waited at the PLE gate (0: the rows were there at the first look)
+    if (br->ple_chan >= 0 && (br->diag || br->stats) && br->fn_chan_times && err == GGML_MOE_BRIDGE_ERR_NONE) {
+        ggml_moe_bridge_chan_times t;
+        br->fn_chan_times(br->gb, br->ple_chan, &t);
+        if (t.seq != 0 && t.seq != br->ple_seen && t.seq == br->ple_seq.load(std::memory_order_relaxed)) {
+            br->ple_seen     = t.seq;
+            br->ple_waits   += 1;
+            br->ple_wait_ns += t.wait_ns;
+            br->ple_ready   += t.wait_ns == 0 ? 1 : 0;
+        }
+        if (br->ple_waits >= br->diag_every) {
+            LLAMA_LOG_INFO("%s: MoE bridge %d: [TAG_FN_L16_PLEGATE] PLE gate over %" PRId64 " graphs: device wait %.1f us avg, "
+                    "%.1f%% ready at the first look\n", __func__, br->bid, br->ple_waits, br->ple_wait_ns/1e3/br->ple_waits,
+                    100.0*br->ple_ready/br->ple_waits);
+            br->ple_waits   = 0;
+            br->ple_wait_ns = 0;
+            br->ple_ready   = 0;
+        }
+    }
+
     if (br->stats && (br->n_graphs % 256 == 0 || err != GGML_MOE_BRIDGE_ERR_NONE)) {
         ggml_moe_bridge_stats s;
         br->fn_get_stats(br->gb, &s);
@@ -1653,6 +1753,10 @@ bool llama_moe_bridge_end(llama_moe_bridge * br) {
     ggml_moe_bridge_stats s;
     br->fn_get_stats(br->gb, &s);
     const int il = s.error_chan >= 0 && s.error_chan < (int) br->chans.size() ? br->chans[s.error_chan].il : -1;
+    if (br->ple_chan >= 0 && s.error_chan == br->ple_chan) { // [TAG_FN_L16_PLEGATE] the layer below reads -1
+        LLAMA_LOG_WARN("%s: MoE bridge %d: [TAG_FN_L16_PLEGATE] the error is the PLE gate's (its rows came late or their read "
+                "failed)\n", __func__, br->bid);
+    }
     // [TAG_FN_R1_BRIDGE_RB] errors far apart are transient stalls whose ubatch was computed again: only 3 within 1024
     // bridged graphs turn the bridge off for the rest of the context (a host side that keeps failing)
     if (br->n_graphs - br->err_graph > 1024) {

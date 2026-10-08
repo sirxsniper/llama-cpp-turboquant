@@ -126,6 +126,9 @@ GGML_BACKEND_API void     ggml_backend_cuda_moe_bridge_release(struct ggml_moe_b
 GGML_BACKEND_API void     ggml_backend_cuda_moe_bridge_set_watch(struct ggml_moe_bridge * bridge, bool on);
 GGML_BACKEND_API const volatile int32_t * ggml_backend_cuda_moe_bridge_next_post_word(struct ggml_moe_bridge * bridge);
 GGML_BACKEND_API bool     ggml_backend_cuda_moe_bridge_test_seed(struct ggml_moe_bridge * bridge, uint32_t g);
+// [TAG_FN_L16_PLEGATE]
+GGML_BACKEND_API bool     ggml_backend_cuda_moe_bridge_host_take(struct ggml_moe_bridge * bridge, int32_t chan, uint32_t seq,
+                                                                 int32_t n_tokens, struct ggml_moe_bridge_job * job);
 
 // [TAG_FN_L3_HOST_POKE] on: an eager (non-graph) evaluation ends with a stream query, as a graph launch does with
 // GGML_CUDA_GRAPH_POKE, and ggml_backend_cuda_stream_poke flushes a backend's stream (helper threads that queue copies
