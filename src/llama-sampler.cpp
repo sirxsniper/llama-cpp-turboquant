@@ -1079,6 +1079,15 @@ static void llama_sampler_greedy_apply(struct llama_sampler * /*smpl*/, llama_to
     }
 }
 
+// [TAG_UPSTREAM_29797] LLAMA_GREEDY_TEMP0=0 restores the old greedy backend code (the argmax index without mapping)
+static bool llama_sampler_greedy_map_enabled() {
+    static const bool on = [] {
+        const char * e = std::getenv("LLAMA_GREEDY_TEMP0");
+        return e == nullptr || std::atoi(e) != 0;
+    }();
+    return on;
+}
+
 static bool llama_sampler_greedy_backend_init(
         struct llama_sampler       * smpl,
         ggml_backend_buffer_type_t   buft,
@@ -1105,6 +1114,14 @@ static void llama_sampler_greedy_backend_apply(
 
     struct ggml_tensor * curl = ggml_argmax(ctx, logits);
     ggml_set_name(curl, "greedy_argmax");
+
+    // [TAG_UPSTREAM_29797] an earlier sampler (top-k, temperature 0) left a candidate list: map the argmax index back to
+    // its vocab id, as dist does. Before, the index itself was returned (index 0 after temperature 0, i.e. token 0).
+    if (data->candidates != nullptr && llama_sampler_greedy_map_enabled()) {
+        struct ggml_tensor * candidates = ggml_reshape_2d(ctx, data->candidates, 1, ggml_nelements(data->candidates));
+        curl = ggml_get_rows(ctx, candidates, curl);
+        ggml_set_name(curl, "greedy_sampled_token");
+    }
 
     data->sampled = curl;
 }

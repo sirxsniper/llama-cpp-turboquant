@@ -417,6 +417,15 @@ static bool bs_lazy_grammar_enabled() {
     return on;
 }
 
+// [TAG_UPSTREAM_29797] LLAMA_GREEDY_TEMP0=0 restores dist as the last sampler of every mirostat-0 chain
+static bool greedy_temp0_enabled() {
+    static const bool on = [] {
+        const char * e = std::getenv("LLAMA_GREEDY_TEMP0");
+        return e == nullptr || std::atoi(e) != 0;
+    }();
+    return on;
+}
+
 bool common_sampler_backend_ok(const struct common_sampler * gsmpl) {
     if (gsmpl == nullptr || (!gsmpl->grmr && !gsmpl->rbudget)) {
         return true;
@@ -645,7 +654,15 @@ struct common_sampler * common_sampler_init(
             samplers.push_back(llama_sampler_init_adaptive_p(params.adaptive_target, params.adaptive_decay, params.seed));
         } else {
             // default: sample from distribution
-            samplers.push_back(llama_sampler_init_dist(params.seed));
+            // [TAG_UPSTREAM_29797] when the chain leaves only one possible token (temperature 0 last, or top-k 1 last),
+            // greedy selects the same token as dist and does not pay for it (on the backend: soft_max, cumsum and a
+            // synchronous upload of the random number per output row). Keep dist when callers request probabilities.
+            // Fork: the top-k 1 case also needs temp <= 0. At temp > 0 the speculative verifier (coupling, rejection,
+            // block) reads p, and only dist sets p = 1 for the single candidate.
+            const bool greedy = greedy_temp0_enabled() && params.n_probs == 0 && !params.samplers.empty() &&
+                ((params.samplers.back() == COMMON_SAMPLER_TYPE_TEMPERATURE && params.temp == 0.0f && params.dynatemp_range == 0.0f) ||
+                 (params.samplers.back() == COMMON_SAMPLER_TYPE_TOP_K && params.top_k == 1 && params.temp <= 0.0f));
+            samplers.push_back(greedy ? llama_sampler_init_greedy() : llama_sampler_init_dist(params.seed));
         }
     } else if (params.mirostat == 1) {
         samplers.push_back(llama_sampler_init_temp(params.temp));
