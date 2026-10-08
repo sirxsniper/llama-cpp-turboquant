@@ -31,7 +31,7 @@ code, 1 stream · 262K context · 4 slots
 **Qwen3.8-Flash-Next** · UD-Q4_K_XL (100+ GB MoE)
 
 ## 101 t/s
-real use at 32K · **89 t/s at 131K and 245K** · 103 / 93 / 91 with the MTPq3 files · a short new turn starts in 0.3–1.4 s instead of 3.4 s · **2 streams at 32K: 111–120 t/s total**
+real use at 32K · **89 t/s at 131K and 245K** · 103 / 93 / 91 with the MTPq3 files · a short new turn starts in 0.3–1.4 s instead of 3.4 s · **2 conversations at 32K: 62–66 t/s each**
 
 prompt reading **2,300 t/s** at 131K with the MTPq3 files (v0.20.0, +12 %)
 
@@ -151,15 +151,28 @@ Five GPU memory bugs found with compute-sanitizer and fixed; no GPU work left in
 - VRAM about 29.9 GB while generating (the expert hot set takes the free VRAM up to 2.1 GB below the card total, plus the part of the 262K KV cache a shorter context does not use yet; `LLAMA_FN_VRAM_KEEP_MIB=4096` keeps more free); the rest of the model stays memory-mapped.
 - Vision works: add `--mmproj mmproj-Qwen3.8-Flash-Next-F16.gguf`.
 
-**Two conversations at once** (v0.19.0, `--parallel 2 --kv-unified`, both sharing the 262K pool; standard MTP files, real-use sampling, 1,024-token answers at 32K, two runs):
+**Two conversations at once** (`--parallel 2 --kv-unified`, both sharing the 262K pool; real-use sampling, a 32K conversation on each, 2,048-token answers; each conversation's own speed):
 
-| | total | each stream |
+| Files | one conversation alone | **two at once, each** |
 |:--|--:|--:|
-| v0.18.0 | 75.2 / 75.5 t/s | ~38 t/s |
-| **v0.19.0** | **110.8 / 119.7 t/s** | **56–61 t/s** |
+| MTPq3 (v0.20.0: 3 runs, v0.20.1: 2 runs) | 94–102 t/s | **62–66 t/s** |
+| standard (v0.20.0, 3 runs) | 87–96 t/s | 59–65 t/s |
 
-- Both streams' verify rows now run as one bridged graph: the MoE bridge takes up to n_rs_seq tokens of each sequence, and sequences that draft together draft the same length, the longer one: both keep drafting while either passes the p_min rule (`SPEC_MTP_EQUAL_SEQS`, on in the Flash-Next profile). This gives most of the gain (81 -> 111–120 t/s total); acceptance per stream drops a little (0.76–0.79 -> 0.68–0.72).
-- One stream gives the same output: token-identical to v0.18.0 (identity checks with and without MTP). Without MTP, the last layer of a long prompt chunk now runs its CPU part synchronously, so a stall can no longer fail the request.
+- v0.18.0 gave about 38 t/s each, v0.19.0 56–61 t/s each (standard files, 1,024-token answers).
+- Since v0.19.0 both conversations' verify rows run as one bridged graph: the MoE bridge takes up to n_rs_seq tokens of each sequence, and sequences that draft together draft the same length, the longer one: both keep drafting while either passes the p_min rule (`SPEC_MTP_EQUAL_SEQS`, on in the Flash-Next profile). This gives most of the gain (about 40 -> 56–61 t/s each); acceptance per conversation drops a little (0.76–0.79 -> 0.68–0.72).
+- One conversation gives the same output as before (identity checks with and without MTP, every release since v0.18.0). Without MTP, the last layer of a long prompt chunk runs its CPU part synchronously, so a stall cannot fail the request.
+
+**A new prompt while the other conversation answers** (v0.20.1, MTPq3 files; conversation 1 answers, conversation 2 sends a new prompt):
+
+| | v0.20.0 | **v0.20.1** |
+|:--|--:|--:|
+| Conversation 1's answer while a 17K prompt is read (32K / 131K conversation) | 0.8–0.9 / 0.4 t/s | **26 / 19 t/s** |
+| The same, a 32K prompt that reads the model from the disk | 0.5–0.7 / 0.7 t/s | **13 / 8 t/s** |
+| Conversation 2's wait for its first token, 17K prompt (32K conversation) | 14–15 s | 21 s |
+| The same, 32K prompt from the disk (32K / 131K conversation) | 25–28 / 25 s | 33 / 40 s |
+
+- Before v0.20.1, an answering conversation got one step per 8K prompt chunk of the other (each chunk streams every expert, ~3.4 s), so it stopped for the whole prompt. Now, after each chunk, it decodes alone for half that chunk's time, at most 2 s (`LLAMA_SRV_GEN_SHARE=0.5` in the Flash-Next profile; `0` restores the old order). Once both answer, each runs at 47–60 t/s as before.
+- Fixed in v0.20.1: with two conversations, the prompt stream could give the first layer of its next chunk a wrong expert. The hot set could swap that expert into a slot after the stream had picked the slot and before its GPU copy ran (v0.20.0 only, found by code review). The stream now reads that layer from RAM. The two-conversation identity check (GPU copy on vs off) passes, and a compute-sanitizer run with two conversations reports 0 errors.
 
 **Prompt reading** (v0.20.0, MTPq3 files, same-session pairs, 2 rounds):
 
