@@ -47,16 +47,6 @@ static std::atomic<int64_t> g_warm_small_end_us{0};
 static int64_t fn_warm_now_us() {
     return std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
-#ifdef _WIN32
-// [TAG_FN_L15_WARMYIELD] the pass's gate (manual-reset event, signaled = its threads may read): an answer step closes it at
-// once, the pass's gatekeeper opens it after 50 ms without one. Each of the 16 threads polled with Sleep(2) before (8,000
-// wake-ups/s next to the MoE pool's cores while the pass was pending: answers ~6 % slower, l15 32K review). Made once, never
-// closed: a decode may reset it while a pass ends
-static HANDLE fn_warm_gate() {
-    static HANDLE h = CreateEventW(nullptr, TRUE, TRUE, nullptr);
-    return h;
-}
-#endif
 static std::atomic<size_t> g_warm_mark{0};
 static std::vector<size_t> g_warm_layer_end;
 
@@ -704,21 +694,19 @@ static void fn_warm(const llama_model & model, HANDLE stop) {
     g_warm_layer_end = layer_end;
     g_warm_mark.store(0);
     g_warm_running.store(true, std::memory_order_release);
-    HANDLE gate = fn_warm_gate();
     auto run = [&]() {
         SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST); // [TAG_FN_L15_WARMYIELD]
         for (size_t i = next.fetch_add(1); i < n_use; i = next.fetch_add(1)) {
             if (WaitForSingleObject(stop, 0) == WAIT_OBJECT_0) {
                 return;
             }
-            // [TAG_FN_L15_WARMYIELD] 2 MiB at a time, each through the gate (open after 50 ms without an answer step)
+            // [TAG_FN_L15_WARMYIELD] 2 MiB at a time, each after 50 ms without an answer step
             const size_t sub = (size_t) 2 << 20;
             for (size_t o0 = 0; o0 < rs[i].n; o0 += sub) {
-                if (gate != nullptr) {
-                    HANDLE hs[2] = { stop, gate };
-                    if (WaitForMultipleObjects(2, hs, FALSE, INFINITE) == WAIT_OBJECT_0) {
-                        return;
-                    }
+                while ((g_warm_small_decodes.load(std::memory_order_relaxed) > 0 ||
+                        fn_warm_now_us() - g_warm_small_end_us.load(std::memory_order_relaxed) < 50000) &&
+                       WaitForSingleObject(stop, 0) != WAIT_OBJECT_0) {
+                    Sleep(2);
                 }
                 const size_t n0 = std::min(sub, rs[i].n - o0);
                 WIN32_MEMORY_RANGE_ENTRY e = { (PVOID) (rs[i].p + o0), (SIZE_T) n0 };
@@ -739,23 +727,6 @@ static void fn_warm(const llama_model & model, HANDLE stop) {
         }
     };
     const auto t0 = std::chrono::steady_clock::now();
-    // [TAG_FN_L15_WARMYIELD] the gatekeeper: every 5 ms, open the gate after 50 ms without an answer step, close it otherwise
-    // (a step closes it itself when it begins, llama_fn_warm_small_decode)
-    std::atomic<bool> readers_left{true};
-    std::thread keeper;
-    if (gate != nullptr) {
-        keeper = std::thread([&]() {
-            while (readers_left.load(std::memory_order_acquire) && WaitForSingleObject(stop, 5) != WAIT_OBJECT_0) {
-                const bool busy = g_warm_small_decodes.load(std::memory_order_relaxed) > 0 ||
-                                  fn_warm_now_us() - g_warm_small_end_us.load(std::memory_order_relaxed) < 50000;
-                if (busy) {
-                    ResetEvent(gate);
-                } else {
-                    SetEvent(gate);
-                }
-            }
-        });
-    }
     std::vector<std::thread> ths;
     for (int k = 1; k < n_thr; ++k) {
         ths.emplace_back(run);
@@ -763,10 +734,6 @@ static void fn_warm(const llama_model & model, HANDLE stop) {
     run();
     for (auto & th : ths) {
         th.join();
-    }
-    readers_left.store(false, std::memory_order_release);
-    if (keeper.joinable()) {
-        keeper.join();
     }
     g_warm_running.store(false, std::memory_order_release);
     const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
@@ -942,9 +909,6 @@ void llama_fn_warm_small_decode(bool begin) {
 #ifdef _WIN32
     if (begin) {
         g_warm_small_decodes.fetch_add(1, std::memory_order_relaxed);
-        if (g_warm_running.load(std::memory_order_relaxed)) {
-            ResetEvent(fn_warm_gate()); // the pass's threads stop before their next 2 MiB
-        }
     } else {
         g_warm_small_end_us.store(fn_warm_now_us(), std::memory_order_relaxed);
         g_warm_small_decodes.fetch_sub(1, std::memory_order_relaxed);
