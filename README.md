@@ -151,6 +151,8 @@ Five GPU memory bugs found with compute-sanitizer and fixed; no GPU work left in
 - VRAM about 29.9 GB while generating (the expert hot set takes the free VRAM up to 2.1 GB below the card total, plus the part of the 262K KV cache a shorter context does not use yet; `LLAMA_FN_VRAM_KEEP_MIB=4096` keeps more free); the rest of the model stays memory-mapped.
 - Vision works: add `--mmproj mmproj-Qwen3.8-Flash-Next-F16.gguf`.
 
+**With vision** (`--mmproj mmproj-Qwen3.8-Flash-Next-F16.gguf`, v0.20.3, MTPq3, same session, 2 rounds): answers 96.1 / 87.7 / 85.5 t/s at 32K / 131K / 245K against 102.1 / 92.5 / 88.8 text only (about -5 %: the encoder takes 1.1 GiB of VRAM from the expert hot set); prompts unchanged (32K -2 %, 131K the same); needles at 131K and 245K pass with vision loaded.
+
 **Two conversations at once** (`--parallel 2 --kv-unified`, both sharing the 262K pool; real-use sampling, a 32K conversation on each, 2,048-token answers; each conversation's own speed):
 
 | Files | one conversation alone | **two at once, each** |
@@ -183,7 +185,8 @@ Five GPU memory bugs found with compute-sanitizer and fixed; no GPU work left in
 | 131K tokens | 2,298 t/s | 2,316 t/s |
 
 - The load used to prefetch the whole model file into the file cache. That left the routed experts (71.7 GiB) as the oldest cached pages, in the same order the first prompt reads the layers, so every page the prompt read pushed out a layer it had not reached yet: the first 8K chunk re-read 36-38 GB at 3-4 GB/s (17-37 s instead of ~3.5 s).
-- Now the experts stay out of that prefetch, and a background pass reads them into the server's working set right after the load (22-31 s on the 9950X3D; a first long prompt in that time shares the disk with it). It first raises the process's working-set maximum: the token-embedding lock had set it to ~0.74 GiB, which made Windows trim a filled working set back to 0.8 GiB. `LLAMA_FN_L15_WARM=0` restores the old load. Flash-Next on Windows only.
+- Now the experts stay out of that prefetch, and a background pass reads them into the server's working set (about 20-30 s on the 9950X3D). It first raises the process's working-set maximum: the token-embedding lock had set it to ~0.74 GiB, which made Windows trim a filled working set back to 0.8 GiB. `LLAMA_FN_L15_WARM=0` restores the old load. Flash-Next on Windows only.
+- v0.20.3: the pass starts once the server's warm-up run is done, so the server is ready after **6.6 s instead of 31-34 s** (after 38 GB of other files were read). A long prompt sent while the pass still runs waits behind it layer by layer; the standard benchmark's first 32K prompt finished 59 s after the start (v0.20.2: 62 s).
 - Answers: same-session A/B, 5 rounds: v0.20.2 is equal or slightly faster (paired mean +0.7 % over 2 rounds, +2.9 % over 3 more) and pages in at most 0.6 GB per answer instead of 0.3-2.4 GB. Output token-identical to v0.20.1.
 
 **Prompt reading** (v0.20.0, MTPq3 files, same-session pairs, 2 rounds):
