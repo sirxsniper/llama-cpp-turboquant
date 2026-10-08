@@ -618,6 +618,153 @@ static __global__ void lightning_indexer_kernel_vec_fn_l3_mq(
     GGML_UNUSED_VARS(nb2, nbw2, nbm2);
 }
 
+// [TAG_UPSTREAM_29901] the dot products of the tile kernel below. Node <STEP, J> adds the 4-element partials j = J, J + STEP,
+// J + 2*STEP, ... in the tree order that warp_reduce_sum gives to lane 0 (a node adds its two halves); a leaf is the partial
+// of lane j of the vector kernel. So every sum has the bits of the vector kernel's sum.
+template <int STEP, int J, int64_t N_HEAD, int KEYS_PER_THREAD, int K_STRIDE>
+static __device__ __forceinline__ void lightning_indexer_tile_dot(
+        float (&sum)[N_HEAD][KEYS_PER_THREAD], const float4 * k_row, const int k_swz, const float4 * q_row) {
+    if constexpr (STEP == WARP_SIZE) {
+        float4 k_vec[KEYS_PER_THREAD];
+#pragma unroll
+        for (int j = 0; j < KEYS_PER_THREAD; ++j) {
+            k_vec[j] = k_row[j*K_STRIDE + (J ^ k_swz)];
+        }
+#pragma unroll
+        for (int h = 0; h < N_HEAD; ++h) {
+            const float4 q_vec = q_row[h*WARP_SIZE + J];
+#pragma unroll
+            for (int j = 0; j < KEYS_PER_THREAD; ++j) {
+                float qk = 0.0f;
+                ggml_cuda_mad(qk, q_vec.x, k_vec[j].x);
+                ggml_cuda_mad(qk, q_vec.y, k_vec[j].y);
+                ggml_cuda_mad(qk, q_vec.z, k_vec[j].z);
+                ggml_cuda_mad(qk, q_vec.w, k_vec[j].w);
+                sum[h][j] = qk;
+            }
+        }
+    } else {
+        float sum_hi[N_HEAD][KEYS_PER_THREAD];
+        lightning_indexer_tile_dot<2*STEP, J,        N_HEAD, KEYS_PER_THREAD, K_STRIDE>(sum,    k_row, k_swz, q_row);
+        lightning_indexer_tile_dot<2*STEP, J + STEP, N_HEAD, KEYS_PER_THREAD, K_STRIDE>(sum_hi, k_row, k_swz, q_row);
+#pragma unroll
+        for (int h = 0; h < N_HEAD; ++h) {
+#pragma unroll
+            for (int j = 0; j < KEYS_PER_THREAD; ++j) {
+                sum[h][j] += sum_hi[h][j];
+            }
+        }
+    }
+}
+
+// [TAG_UPSTREAM_29901] lightning_indexer_kernel_vec_fn_l3 for a tile of K_VECS_PER_BLOCK keys x WARPS_PER_BLOCK tokens (the
+// tiling of upstream #29901): the keys are dequantized once into shared memory as f32, one warp scores one token, each
+// thread KEYS_PER_THREAD keys with no cross-thread reduction. Same dequantization, same sums (lightning_indexer_tile_dot),
+// same relu, weights and mask add, so the scores have the same bits. The vector kernel reads every key once per token.
+template <int WARPS_PER_BLOCK, int K_VECS_PER_BLOCK, int64_t N_EMBD, int64_t N_HEAD>
+static __global__ void __launch_bounds__(WARPS_PER_BLOCK*WARP_SIZE, 2) lightning_indexer_kernel_tile_fn_l3(
+        const float * Q, const char * K, const int32_t * rows, const float * W, const half * M, float * dst,
+        int64_t n_batch, int64_t n_kv, size_t nbk_row,
+        size_t nb1, size_t nb2, size_t nb3,
+        size_t nbq1, size_t nbq2, size_t nbq3,
+        size_t nbw1, size_t nbw2, size_t nbw3,
+        size_t nbm1, size_t nbm2, size_t nbm3,
+        int64_t nem3
+    ) {
+
+    constexpr int THREADS_PER_BLOCK = WARPS_PER_BLOCK * WARP_SIZE;
+    constexpr int TOKENS_PER_BLOCK  = WARPS_PER_BLOCK;
+    constexpr int KEYS_PER_THREAD   = K_VECS_PER_BLOCK / WARP_SIZE;
+    constexpr int N_EMBD_4          = N_EMBD / 4;
+
+    static_assert(N_EMBD == 4*WARP_SIZE, "a leaf of the sum tree is one lane of the vector kernel");
+    static_assert(K_VECS_PER_BLOCK % WARP_SIZE == 0, "the lanes must cover the key tile");
+    static_assert(WARP_SIZE % 8 == 0, "the keys of a thread must share the swizzle");
+
+    const int tid         = threadIdx.y * WARP_SIZE + threadIdx.x;
+    const int start_kv    = blockIdx.x * K_VECS_PER_BLOCK;
+    const int start_batch = blockIdx.y * TOKENS_PER_BLOCK;
+    const int i_stream    = blockIdx.z;
+
+    // float4 c of key row r is at c ^ (r & 7): the 8 lanes of one 128-bit access read 8 rows from distinct banks
+    __shared__ float4 k_shared[K_VECS_PER_BLOCK][N_EMBD_4];
+    __shared__ float4 q_shared[TOKENS_PER_BLOCK][N_HEAD][N_EMBD_4];
+
+    // phase 1 - dequantize the key tile, rows past n_kv are zero
+
+    constexpr dequantize_V_t dequantize_k = get_dequantize_V<GGML_TYPE_Q8_0, float, 4>();
+#pragma unroll
+    for (int i = tid; i < K_VECS_PER_BLOCK * N_EMBD_4; i += THREADS_PER_BLOCK) {
+        const int r = i / N_EMBD_4;
+        const int c = i % N_EMBD_4;
+        float4 v = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        if (start_kv + r < n_kv) {
+            const void * k_base = (const void *) (K + (int64_t) rows[start_kv + r]*nbk_row);
+            dequantize_k(k_base, &v, c * 4);
+        }
+        k_shared[r][c ^ (r & 7)] = v;
+    }
+
+    // phase 2 - Q of every head of the token tile, tokens past n_batch are zero
+
+#pragma unroll
+    for (int i = tid; i < TOKENS_PER_BLOCK * N_HEAD * N_EMBD_4; i += THREADS_PER_BLOCK) {
+        const int t = i / (N_HEAD * N_EMBD_4);
+        const int h = i / N_EMBD_4 % N_HEAD;
+        const int c = i % N_EMBD_4;
+        float4 v = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        if (start_batch + t < n_batch) {
+            v = *(const float4 *) ((const char *) Q + h*nbq1 + (start_batch + t)*nbq2 + i_stream*nbq3 + c*sizeof(float4));
+        }
+        q_shared[t][h][c] = v;
+    }
+
+    __syncthreads();
+
+    // phase 3 - scores of the warp's token, no barrier after this point
+
+    const int i_lane  = threadIdx.x;
+    const int i_batch = start_batch + threadIdx.y;
+    if (i_batch >= n_batch) {
+        return;
+    }
+
+    float qk[N_HEAD][KEYS_PER_THREAD];
+    lightning_indexer_tile_dot<1, 0, N_HEAD, KEYS_PER_THREAD, WARP_SIZE*N_EMBD_4>(
+        qk, &k_shared[i_lane][0], i_lane & 7, &q_shared[threadIdx.y][0][0]);
+
+    const float * w_base = (const float *) ((const char *) W + i_batch*nbw1 + i_stream*nbw3);
+
+    float score_k[KEYS_PER_THREAD] = { 0.0f };
+
+#pragma unroll
+    for (int i_head = 0; i_head < N_HEAD; ++i_head) {
+        const float w_val = w_base[i_head];
+#pragma unroll
+        for (int k = 0; k < KEYS_PER_THREAD; ++k) {
+            float sum = qk[i_head][k];
+
+            // ReLU, weight
+            sum = (sum > 0.0f) ? sum : 0.0f;
+            score_k[k] += sum * w_val;
+        }
+    }
+
+    // phase 4 - add the mask and write, consecutive lanes write consecutive keys
+
+    const half * m_base = (const half *) ((const char *) M + i_batch*nbm1 + (i_stream%nem3)*nbm3);
+    float * dst_base = (float *) ((char *) dst + i_batch*nb1 + i_stream*nb3);
+
+#pragma unroll
+    for (int k = 0; k < KEYS_PER_THREAD; ++k) {
+        const int i_kv = start_kv + i_lane + k*WARP_SIZE;
+        if (i_kv < n_kv) {
+            dst_base[i_kv] = score_k[k] + __half2float(m_base[i_kv]);
+        }
+    }
+    GGML_UNUSED_VARS(nb2, nbw2, nbm2);
+}
+
 // [TAG_FN_L3_GPU_IDXQ8] the launch of the kernel above for an indexer whose keys come from the gather g
 static void ggml_cuda_lightning_indexer_fn_l3(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const ggml_tensor * g) {
     const ggml_tensor * q = dst->src[0];
@@ -665,6 +812,36 @@ static void ggml_cuda_lightning_indexer_fn_l3(ggml_backend_cuda_context & ctx, g
         ggml_cuda_fn_l3_note(GGML_CUDA_FN_L3_PATH_IDXQ8, "IDXQ8: the lightning indexer reads the q8_0 pooled keys in place");
         return;
     }
+
+    // [TAG_UPSTREAM_29901] a prompt batch: the tile kernel reads each key once per WARPS_PER_BLOCK tokens, same bits.
+    // GGML_CUDA_FN_IDX_TILE=<n>: the smallest batch that uses it (default 16, so decode and verify batches keep the vector
+    // kernel), 0 = off (the vector kernel for every batch)
+    static const int tile_min = [] {
+        const char * e = getenv("GGML_CUDA_FN_IDX_TILE");
+        return e ? atoi(e) : 16;
+    }();
+    if (tile_min > 0 && n_batch >= tile_min) {
+        static bool tile_noted = false;
+        if (!tile_noted) {
+            tile_noted = true;
+            GGML_LOG_INFO("ggml_cuda: [TAG_UPSTREAM_29901] IDXQ8: the lightning indexer scores a %d-key x %d-token tile per block (batches >= %d)\n",
+                K_VECS_PER_BLOCK, WARPS_PER_BLOCK, tile_min);
+        }
+        const dim3 grid_tile(num_kv_blocks, (n_batch + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK, n_stream);
+        lightning_indexer_kernel_tile_fn_l3<WARPS_PER_BLOCK, K_VECS_PER_BLOCK, 128, 4><<<grid_tile, block, 0, ctx.stream()>>>(
+            (const float *) q->data, (const char *) kq->data, (const int32_t *) ki->data, (const float *) w->data,
+            (const half *) m->data, (float *) dst->data,
+            n_batch, n_kv, kq->nb[1],
+            nb1, nb2, nb3,
+            nbq1, nbq2, nbq3,
+            nbw1, nbw2, nbw3,
+            nbm1, nbm2, nbm3,
+            nem3);
+        CUDA_CHECK(cudaGetLastError());
+        ggml_cuda_fn_l3_note(GGML_CUDA_FN_L3_PATH_IDXQ8, "IDXQ8: the lightning indexer reads the q8_0 pooled keys in place");
+        return;
+    }
+
     const dim3 grid(num_kv_blocks, n_batch, n_stream);
 
     lightning_indexer_kernel_vec_fn_l3<WARPS_PER_BLOCK, K_VECS_PER_BLOCK, 128, 4><<<grid, block, 0, ctx.stream()>>>(

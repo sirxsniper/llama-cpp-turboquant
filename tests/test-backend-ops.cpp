@@ -15609,6 +15609,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_fn_l4_hc(t, true, true, true, true, true));
         test_cases.emplace_back(new test_fn_l4_hc(t, false, false, false, true));
     }
+    // [TAG_UPSTREAM_29901] the IDXQ8 tile kernel (batches >= 16): full and partial token tiles, a key count that is not a
+    // multiple of 64, a prompt chunk
+    for (int64_t t : { 16, 37, 512 }) {
+        test_cases.emplace_back(new test_fn_l3_idxq8(8192*4 + 3, 8192, t, true));
+        test_cases.emplace_back(new test_fn_l3_idxq8(1000*4 + 3, 1000, t, true));
+    }
     for (int64_t nb : { 1, 3 }) {
         test_cases.emplace_back(new test_flash_attn_ext_turbot(TURBOT_TW_NR2_Q8, 32768, nb, TURBOT_MIX_BAND64K, 3, false, 0.0f, false,
                 256, 2, 24, true));
@@ -16390,6 +16396,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
                 test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, { np, t, 1, 1 }, 512, false, true, m));
             }
         }
+        // [TAG_UPSTREAM_29901] batches near the tile threshold and a prompt chunk (TURBO_QSA_CHUNK=512): marked = the IDXQ8
+        // tile kernel (GGML_CUDA_FN_IDX_TILE=0: the IDXQ8 vector kernel)
+        for (int64_t t : { 16, 64, 512 }) {
+            for (int64_t np : { 8192, 32768, 61440 }) {
+                test_cases.emplace_back(new test_fn_l3_idxq8(np*4 + 3, np, t, m));
+            }
+        }
         for (int64_t kv : { 32768, 131072, 262144 }) {
             test_cases.emplace_back(new test_flash_attn_ext_turbot(TURBOT_TW_NR2_Q8, kv, 3, TURBOT_MIX_BAND64K, 3, false, 0.0f, true,
                     256, 2, 24, m));
@@ -16911,7 +16924,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // lightning_indexer
     for (int kv : { 256, 4096, 65536 }) {
         for (int bs : { 1, 512, 2048 }) {
-            for (int nh : { 32, 64 }) {
+            for (int nh : { 4, 32, 64 }) {
                 for (int ns : { 1, 4 }) {
                     for (ggml_type type_K : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q8_0, GGML_TYPE_Q5_1, GGML_TYPE_Q5_0, GGML_TYPE_Q4_1, GGML_TYPE_Q4_0, GGML_TYPE_IQ4_NL}) {
                         test_cases.emplace_back(new test_lightning_indexer(128, nh, kv, bs, ns, ns, type_K));
@@ -18635,6 +18648,19 @@ static bool run_fn_l3_gpu(ggml_backend_t backend, ggml_backend_t backend_ref, co
         }
         for (int64_t np : { 2048, 8192, 61440 }) {
             if (small && np > 2048) {
+                break;
+            }
+            cases.push_back({ [=](bool m) { return std::unique_ptr<test_case>(new test_fn_l3_idxq8(np*4 + 3, np, t, m)); }, false });
+        }
+    }
+    // [TAG_UPSTREAM_29901] the IDXQ8 tile kernel (batches >= 16) against the unmarked indexer: partial token tiles, a key count
+    // that is not a multiple of 64, a prompt chunk
+    for (int64_t t : { 16, 37, 512 }) {
+        if (cpu || (small && t > 37)) {
+            break;
+        }
+        for (int64_t np : { 1000, 8192, 61440 }) {
+            if (small && np > 1000) {
                 break;
             }
             cases.push_back({ [=](bool m) { return std::unique_ptr<test_case>(new test_fn_l3_idxq8(np*4 + 3, np, t, m)); }, false });
