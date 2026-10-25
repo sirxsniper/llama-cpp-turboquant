@@ -4773,8 +4773,9 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
             bool got_runtime_error = false;
             bool got_out_of_range = false;
             std::string error_msg;
+            common_chat_msg fb;
             try {
-                common_chat_peg_parse(arena, common_chat_input(bad_input), /*is_partial=*/false, pp);
+                fb = common_chat_peg_parse(arena, common_chat_input(bad_input), /*is_partial=*/false, pp);
             } catch (const std::out_of_range & e) {
                 got_out_of_range = true;
                 error_msg = e.what();
@@ -4783,7 +4784,9 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
                 error_msg = e.what();
             }
             GGML_ASSERT(!got_out_of_range && "throw path crashed with out_of_range (input.substr in effective_input space)");
-            GGML_ASSERT(got_runtime_error  && "throw path should produce std::runtime_error with parse position");
+            // [TAG_SYNC_CHAT_PARSE_NOTHROW] the fork returns the unparsed output as plain content instead of throwing
+            GGML_ASSERT(!got_runtime_error && "fork: the failed full parse falls back to plain content");
+            GGML_ASSERT(fb.content.find("<tool_call>get_weather") != std::string::npos && "fork: the fallback keeps the raw text");
         }
     }
 

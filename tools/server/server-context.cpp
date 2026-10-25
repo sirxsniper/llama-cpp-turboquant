@@ -8792,7 +8792,7 @@ private:
                         const std::vector<server_batch::token> rows(batch.tokens.begin() + n_tokens_prev, batch.tokens.end());
                         batch.clear(); // the batch is this slot's alone
                         for (const auto & r : rows) {
-                            batch.add(slot.id, r.tok_aux, r.pos, r.output, r.is_prompt);
+                            batch.add(slot.id, r.tok_aux, r.pos[0], r.output, r.is_prompt);
                         }
                         l22_end = -1;
                     }

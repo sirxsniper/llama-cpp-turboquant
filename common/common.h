@@ -1144,10 +1144,9 @@ struct common_batch {
         llama_seq_id seq_id; // the first sequence id, see add_seq()
         bool         output;
         llama_embd   embd; // non-owning view of the data passed to add_embd()/set_embd(), data == NULL if none
-        llama_embd   state; // non-owning view of the data passed to set_embd_state(), data == NULL if none
+        llama_embd   state; // non-owning view of the data passed to set_embd_state(), data == NULL if none [TAG_FN_L21_MTP_VISION]
         std::vector<llama_seq_id> seq_ids_extra; // see add_seq()
         int32_t      decision_order = 0; // see llama_batch_ext_set_decision_order()
-        llama_embd   state = { nullptr, 0, 0 }; // [TAG_FN_L21_MTP_VISION] set_embd_state() view, data == NULL if none
         llama_token  tok_aux = LLAMA_TOKEN_NULL;   // [TAG_FN_L22_IMGPASS] set_token_aux(), forwarded by get_sub_batch
     };
 

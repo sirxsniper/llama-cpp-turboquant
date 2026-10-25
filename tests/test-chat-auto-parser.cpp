@@ -2627,10 +2627,9 @@ static common_chat_templates_inputs flint_inputs() {
 }
 
 static common_chat_msg flint_parse(const common_chat_params & params, const std::string & output, bool is_partial = false) {
-    common_chat_parser_params pp(params);
-    pp.reasoning_format = COMMON_REASONING_FORMAT_DEEPSEEK;
-    pp.parser.load(params.parser);
-    return common_chat_parse(output, is_partial, pp);
+    common_chat_parser_params pp(params); // [TAG_SYNC_1025] upstream #30210: the reasoning format left the parser params
+    pp.parser = params.parser;
+    return common_chat_parse(common_chat_input(output), is_partial, pp);
 }
 
 static void test_flint_analysis(testing & t) {
