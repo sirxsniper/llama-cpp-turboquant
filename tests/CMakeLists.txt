@@ -446,6 +446,10 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     set_tests_properties(test-recurrent-state-rollback PROPERTIES FIXTURES_REQUIRED generate-models)
 endif()
 
+# [TAG_FUSED_BINBCAST_ALIAS] the CUDA multi-mul fusion with the last output placed over a src1 an earlier node read
+# (the MoE amax rescale chain). Built, not registered with ctest: it needs the GPU; without one it prints SKIPPED.
+llama_build(test-cuda-fused-mul-alias.cpp)
+
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model behavior")
 llama_build_and_test(test-autorelease.cpp       LABEL "model behavior")
 llama_build_and_test(test-backend-sampler.cpp   LABEL "model behavior backend")

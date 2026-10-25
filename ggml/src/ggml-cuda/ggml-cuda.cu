@@ -6845,6 +6845,35 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
         n_fuse++;
 
+        // [TAG_FUSED_BINBCAST_ALIAS] the fused kernel reads every src while it writes the output of the last node. The
+        // allocator only saw the unfused chain, so it can place that output over a src the chain no longer needed (a
+        // broadcast src1 freed after its node, e.g. the MoE amax rescale factor between the down projection's two MULs:
+        // Flint with one expert layer split by -fit, garbage at -ub 128). Shorten the chain until no src overlaps the
+        // output; src0 of the first node may be the output itself (in place: each element is read before it is written).
+        auto chain_alias_free = [&](int n) {
+            const ggml_tensor * out = cgraph->nodes[i + n - 1];
+            const char * o0 = (const char *) out->data;
+            const char * o1 = o0 + ggml_nbytes(out);
+            for (int j = 0; j < n; ++j) {
+                for (int k = j == 0 ? 0 : 1; k < 2; ++k) {
+                    const ggml_tensor * src = cgraph->nodes[i + j]->src[k];
+                    const char * s0 = (const char *) src->data;
+                    const char * s1 = s0 + ggml_nbytes(src);
+                    if (s1 <= o0 || o1 <= s0) {
+                        continue;
+                    }
+                    if (j == 0 && k == 0 && s0 == o0 && ggml_are_same_layout(src, out)) {
+                        continue;
+                    }
+                    return false;
+                }
+            }
+            return true;
+        };
+        while (n_fuse > 1 && !chain_alias_free(n_fuse)) {
+            n_fuse--;
+        }
+
         if (n_fuse > 1) {
             ggml_tensor fused_node;
             memcpy(&fused_node, node, sizeof(ggml_tensor));
