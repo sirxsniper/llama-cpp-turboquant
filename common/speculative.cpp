@@ -2630,11 +2630,12 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 ? std::atoi(lilicorr_meta) : 0;
         is_lilicorr = lilicorr_top_k > 0;
         if (is_lilicorr) {
-            // [TAG_SYNC_1025] upstream #30506 LiliCorr drafting is not merged into the fork's DFlash path (draft dists, chunked
-            // inject, sync rules): refuse the drafter instead of drafting with the wrong lattice
-            throw std::runtime_error("LiliCorr drafters are not supported by this build yet (upstream #30506): run without the drafter");
-        }
-        if (is_lilicorr) {
+            // [TAG_SYNC_LILICORR] upstream #30506 (Nemotron 3.5 LiliCorr drafters): the inject decodes keep each sequence's
+            // last block_size + 1 projected context rows in a ring, every drafting row carries the anchor's row as its state
+            // embedding, and the candidate lattice is walked like DFlash2's (lilicorr_top_k wide)
+            if (llama_model_n_embd_inp(model_dft) != n_embd_dec) {
+                throw std::runtime_error("LiliCorr drafter: state width (n_embd_inp) differs from the decoder width");
+            }
             lilicorr_rows = (size_t) block_size + 1;
             const size_t lilicorr_slots = (size_t) n_seq * lilicorr_rows;
             lilicorr_embd.resize(lilicorr_slots * (size_t) n_embd_dec);
@@ -2666,7 +2667,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         // -22 % sampled; adaptive 3/7/15 +2.9 % greedy (+1.3 % without looping texts), -7.5 % sampled. The single-prompt
         // "+43 %" was a repetitive text that the long block copies.
         trained_max = n_draft_max;
-        if (!is_dspark) {
+        if (!is_dspark && !is_lilicorr) { // [TAG_SYNC_LILICORR] the LiliCorr scorer runs on exactly block_size rows
             // opt-in only (SPEC_DFT_BLOCK_EXT=N, then --spec-draft-n-max up to N): on 24 prompts at 1 stream it lost
             const char * e = getenv("SPEC_DFT_BLOCK_EXT");
             const int32_t ext = (e && e[0]) ? std::min(atoi(e), 2*block_size - 1) : 0;
@@ -2687,6 +2688,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         labd_init();  // [TAG_DFL_LABD]
 
         batch        = llama_batch_init(llama_n_batch(ctx_dft), 0,          n_seq);
+        if (is_lilicorr) {
+            // [TAG_SYNC_LILICORR] token + embd rows: llama_batch_free releases embd too
+            batch.embd = (float *) malloc(sizeof(float) * (size_t) llama_n_batch(ctx_dft) * (size_t) n_embd_dec);
+        }
         batch_inject = llama_batch_init(llama_n_ubatch(ctx_dft), n_embd_enc, n_seq);
 
         // embd batches on an M-RoPE draft need 4 position rows per token
@@ -3081,6 +3086,21 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                         __func__, rc, (int) n_chunk, (int) offset);
                 return false;
             }
+            if (is_lilicorr) {
+                // [TAG_SYNC_LILICORR] the drafter's KV cache keeps K/V only; the scorer also needs the projected context row
+                // of the anchor, so each sequence keeps its last block_size + 1 rows (rows arrive in position order)
+                const float * projected = llama_get_embeddings_nextn(ctx_dft);
+                if (projected) {
+                    for (int32_t i = 0; i < n_chunk; ++i) {
+                        const llama_seq_id s_i  = batch_inject.seq_id[i][0];
+                        const llama_pos    pos  = batch_inject.pos[i];
+                        const size_t       slot = (size_t) s_i * lilicorr_rows + (size_t) pos % lilicorr_rows;
+                        std::memcpy(lilicorr_embd.data() + slot * (size_t) n_embd_dec,
+                                projected + (size_t) i * n_embd_dec, (size_t) n_embd_dec * sizeof(float));
+                        lilicorr_pos[slot] = pos;
+                    }
+                }
+            }
             // [TAG_SPEC_DFT_SYNC] The server may switch contexts before the next draft
             // decode, so this drains the drafter queue to be safe.
             //
@@ -3176,6 +3196,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         // record where each block starts and its size
         std::vector<int32_t> i_block_beg(n_seq, -1);
         std::vector<int32_t> n_block    (n_seq,  0);
+        std::vector<int32_t> n_walk     (n_seq,  0); // [TAG_SYNC_LILICORR] lattice rows to walk (LiliCorr: n_draft + 1 of the block)
 
         // [TAG_DFL_ADAPT] common length k for this step and the drafter block that serves it
         const int32_t k_adapt = ad.on ? (cx.on ? adapt_content(dparams) : adapt_choose(dparams)) : params.n_max;   // [TAG_DFL_ADAPT_CONTENT]
@@ -3208,11 +3229,27 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
             const int32_t n = (int32_t) dp.pos0;
 
-            const int32_t n_block_tokens = n_draft + (is_dspark && sample_from_anchor ? 0 : 1);
+            // [TAG_SYNC_LILICORR] LiliCorr scores a whole block; its anchor state is the projected row at pos0 - 1
+            size_t lili_slot = 0;
+            if (is_lilicorr) {
+                const llama_pos pos_anchor = dp.pos0 - 1;
+                lili_slot = (size_t) seq_id * lilicorr_rows + (size_t) std::max<llama_pos>(pos_anchor, 0) % lilicorr_rows;
+                if (pos_anchor < 0 || lilicorr_pos[lili_slot] != pos_anchor) {
+                    // the ring does not hold the anchor (nothing injected there yet, e.g. after a restore): no draft
+                    LOG_DBG("%s: LiliCorr seq %d has no context row at pos %d: no draft\n", __func__, seq_id, (int) pos_anchor);
+                    continue;
+                }
+            }
+            const int32_t n_block_tokens = is_lilicorr ? block_size : n_draft + (is_dspark && sample_from_anchor ? 0 : 1);
             i_block_beg[seq_id] = batch.n_tokens;
             n_block    [seq_id] = n_block_tokens;
+            n_walk     [seq_id] = is_lilicorr ? std::min(n_draft, block_size - 1) + 1 : n_block_tokens;
             for (int32_t i = 0; i < n_block_tokens; ++i) {
-                common_batch_add(batch, i == 0 ? dp.id_last : mask_token_id, n + i, { seq_id }, !is_dflash2);
+                if (is_lilicorr) {
+                    std::memcpy(batch.embd + (size_t) batch.n_tokens * n_embd_dec,
+                            lilicorr_embd.data() + lili_slot * (size_t) n_embd_dec, (size_t) n_embd_dec * sizeof(float));
+                }
+                common_batch_add(batch, i == 0 ? dp.id_last : mask_token_id, n + i, { seq_id }, !is_dflash2 && !is_lilicorr);
             }
         }
 
@@ -3252,10 +3289,12 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 dp.dists->clear();
             }
 
-            if (is_dflash2) {
+            if (is_dflash2 || is_lilicorr) {
+                // [TAG_SYNC_LILICORR] both walk a candidate lattice: row = top_k candidate ids, then top_k x top_k scores
+                const int32_t top_k = is_dflash2 ? selector_top_k : lilicorr_top_k;
                 GGML_ASSERT(dp.temp <= 0.0f || dp.dists);
                 const float * lattice = llama_get_embeddings_nextn(ctx_dft);
-                GGML_ASSERT(lattice && "DFlash2 selector produced no lattice");
+                GGML_ASSERT(lattice && "DFlash2 / LiliCorr selector produced no lattice");
 
                 if (dump) {
                     spec_dft_dump_rows(dump, lattice, n_embd_dec, selector_top_k, n_dump_call,
@@ -3272,18 +3311,17 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 }
 
                 int32_t predecessor = 0;
-                for (int32_t i = 1; i < (is_dflash2 ? n_block_tokens : params.n_max + 1); ++i) {
+                for (int32_t i = 1; i < n_walk[seq_id]; ++i) {
                     const float * row = lattice + (size_t) (beg + i) * n_embd_dec;
-                    const int32_t top_k = is_dflash2 ? selector_top_k : lilicorr_top_k;
                     const float * scores = row + top_k + (size_t) predecessor * top_k;
 
                     if (dp.temp > 0.0f) {
                         common_speculative_token_dist dist;
-                        dist.ids.resize(selector_top_k);
-                        dist.probs.resize(selector_top_k);
-                        const float max_score = *std::max_element(scores, scores + selector_top_k);
+                        dist.ids.resize(top_k);
+                        dist.probs.resize(top_k);
+                        const float max_score = *std::max_element(scores, scores + top_k);
                         float sum = 0.0f;
-                        for (int32_t k = 0; k < selector_top_k; ++k) {
+                        for (int32_t k = 0; k < top_k; ++k) {
                             dist.ids[k] = (llama_token) row[k];
                             dist.probs[k] = std::exp((scores[k] - max_score) / (dp.temp*dft_qtemp));
                             sum += dist.probs[k];
@@ -3303,7 +3341,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                         dp.dists->push_back(std::move(dist));
                     } else {
                         predecessor = (int32_t) std::distance(scores,
-                                std::max_element(scores, scores + selector_top_k));
+                                std::max_element(scores, scores + top_k));
                         // [TAG_SPEC_PMIN] NEGATIVE RESULT. Truncating a low-confidence
                         // draft here sounds like it should pay for itself twice - fewer
                         // tokens to verify, and a narrower batch through attention. It
@@ -3322,7 +3360,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                         if (params.p_min > 0.0f) {
                             // softmax(scores) at the argmax, i.e. 1 / sum(exp(s_k - s_max))
                             float sum = 0.0f;
-                            for (int32_t k = 0; k < selector_top_k; ++k) {
+                            for (int32_t k = 0; k < top_k; ++k) {
                                 sum += std::exp(scores[k] - scores[predecessor]);
                             }
                             if (1.0f / sum < params.p_min) {
