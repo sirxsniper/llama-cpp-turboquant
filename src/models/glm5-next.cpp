@@ -5,6 +5,10 @@
 // mHC residual streams, DeepSeek-style MoE.
 
 void llama_model_glm5_next::load_arch_hparams(llama_model_loader & ml) {
+    // [TAG_SYNC_1025] upstream's glm5-next graph needs upstream's k-pool selection inputs (sel_mask, #30480 / #30640 /
+    // #30965); the fork keeps its own llama-memory-hybrid-idx for qwen4exp, which does not fill them. Too big for the
+    // owner's PC anyway: compiled, but refused instead of computing garbage.
+    throw std::runtime_error("glm5-next is not supported by this build (the fork's k-pool context lacks upstream's selection inputs)");
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_EPS,     hparams.f_norm_eps, false);
     ml.get_key(LLM_KV_ATTENTION_KEY_LENGTH_MLA,    hparams.n_embd_head_k_mla_impl);
@@ -241,7 +245,8 @@ public:
 
     void set_input(const llama_ubatch * ubatch) override {
         mctx->get_idx()->set_input_k_idxs(k_idxs, ubatch);
-        mctx->set_input_kpool(pool_cells, pool_idxs, pool_mask, tail_idxs, sel_mask, new_pool_idxs, new_pool_rep, ubatch);
+        // [TAG_SYNC_1025] the fork's k-pool context has no sel_mask fill (upstream #30640 / #30965): this model is refused at load
+        mctx->set_input_kpool(pool_cells, pool_idxs, pool_mask, tail_idxs, nullptr, false, new_pool_idxs, new_pool_rep, ubatch);
     }
 
     bool can_reuse(const llm_graph_params & params) override {

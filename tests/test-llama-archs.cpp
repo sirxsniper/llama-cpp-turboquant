@@ -899,6 +899,9 @@ static bool arch_supported(const llm_arch arch) {
     if (arch == LLM_ARCH_GEMMA4 || arch == LLM_ARCH_GEMMA4_ASSISTANT) {
         return false; // FIXME @ngxson
     }
+    if (arch == LLM_ARCH_GLM5_NEXT) {
+        return false; // [TAG_SYNC_1025] refused at load: the fork's k-pool context lacks upstream's selection inputs
+    }
     if (arch == LLM_ARCH_GRANITE_SWITCH) {
         return false; // FIXME adapter fixture
     }

@@ -1274,7 +1274,6 @@ llama_kv_cache::llama_kv_cache(
                 attn_rot_v = false;
                 LLAMA_LOG_INFO("%s: turbot: upstream Hadamard off (quality was measured without it; LLAMA_TURBOT_ATTN_ROT=1 enables it)\n", __func__);
             }
-            }
         }
 
         if (attn_rot_k) {

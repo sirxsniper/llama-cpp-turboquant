@@ -174,6 +174,8 @@ static bool llama_launch2_apply(const llama_model & model, ggml_backend_sched_t 
                 "piece\n", __func__, cuts.c_str());
     }
     return decode;
+}
+
 // check that each folded weight in the graph gets its Hadamard transform, and each latent lookup gets the inverse
 // without this check, an arch that skips the transform helpers loads and computes wrong results
 static void llama_verify_hadamard_graph(

@@ -572,8 +572,7 @@ struct mtmd_context {
     // batching
     int32_t batch_max_tokens;
 
-    // [TAG_FN_L22] round 22 P2 switches (the text model's environment / profile)
-    const llama_model * text_model = nullptr;
+    // [TAG_FN_L22] round 22 P2 switches (the text model's environment / profile; text_model is upstream's member above)
     bool vlend_hold     = false; // LLAMA_FN_L22_VLEND_HOLD: mtmd_lend_hold counts holds
     int  imgdec_threads = 1;     // LLAMA_FN_L22_IMGDEC_THREADS: picture preprocessing threads in mtmd_tokenize
     mutable mtmd_l22_embd_cache      embd_cache; // LLAMA_FN_L22_IMGCACHE: encoder outputs by content
