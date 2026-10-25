@@ -4256,7 +4256,7 @@ private:
         if (!l22.imgpass_ok || media_async || !slot.mctx) {
             return -1;
         }
-        const int b_rule = l24_merged_batch_rule(batch.size(), batch.n_gen_rows, batch.has_embd, l22.excl && want_excl != nullptr);
+        const int b_rule = l24_merged_batch_rule(batch.size(), batch.n_gen_rows, batch.has_embd(), l22.excl && want_excl != nullptr);
         if (b_rule < 0) {
             return -1;
         }
@@ -7972,7 +7972,7 @@ private:
     }
 
     void process_tts_slots() {
-        iterate(slots, [&](server_slot & slot) {
+        iterate("tts", slots, [&](server_slot & slot) {
             if (!slot.is_processing() || slot.task->type != SERVER_TASK_TYPE_TTS) {
                 return;
             }
