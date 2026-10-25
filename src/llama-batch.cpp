@@ -1182,7 +1182,12 @@ void llama_batch_free(struct llama_batch batch) {
 // llama_batch_ext
 
 size_t llama_batch_ext_select_n_embd_inp(llama_context_type ctx_type, llm_arch arch, const llama_hparams & hparams) {
-    GGML_UNUSED(ctx_type);
+    // [TAG_SYNC_1025] the fork's MTP hook passes the hidden state as the embedding of a token row (common/speculative.cpp
+    // set_embd), so an MTP context takes embd rows at the hidden width (n_embd_out: hc_mult x n_embd on qwen4exp);
+    // upstream #30257 moved the hidden to embd_state and kept n_embd_inp here. Image rows still pass at n_embd_tok.
+    if (ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
+        return hparams.n_embd_out();
+    }
     if (arch == LLM_ARCH_DFLASH) {
         return hparams.n_embd_inp_enc();
     }
@@ -1448,27 +1453,7 @@ bool llama_batch_ext_set_embd_token(llama_batch_ext * batch, int32_t idx, llama_
     return batch->set_token_embd(idx, embd);
 }
 
-// [TAG_FN_L21_MTP_VISION] upstream #30257: the MTP hidden state of an entry, kept apart from its token embedding
-bool llama_batch_ext::set_token_state(int32_t idx, llama_embd state_in) {
-    if (idx < 0 || idx >= (int32_t) tokens.size() || !state_in.data || n_embd_state == 0) {
-        return false; // a context without a state input (only MTP contexts take one)
-    }
-    const size_t n_total = state_in.n_rows * state_in.n_embd;
-    if (n_total != n_embd_state) {
-        LLAMA_LOG_ERROR("%s: state size mismatch, got %zu rows x %zu = %zu, expected %zu\n",
-                __func__, state_in.n_rows, state_in.n_embd, n_total, n_embd_state);
-        return false;
-    }
-    token & t = tokens[idx];
-    if (t.has_state) {
-        LLAMA_LOG_ERROR("%s: state for token %d is already set\n", __func__, idx);
-        return false;
-    }
-    t.has_state = true;
-    t.state_off = state.size();
-    state.insert(state.end(), state_in.data, state_in.data + n_total);
-    return true;
-}
+// [TAG_FN_L21_MTP_VISION] llama_batch_ext::set_token_state: upstream's definition above (#30257, same checks)
 
 bool llama_batch_ext_set_embd_state(llama_batch_ext * batch, int32_t idx, llama_embd embd) {
     return batch->set_token_state(idx, embd);
