@@ -52,6 +52,7 @@
 #define GGML_CUDA_CC_VOLTA           700
 #define GGML_CUDA_CC_TURING          750
 #define GGML_CUDA_CC_AMPERE          800
+#define GGML_CUDA_CC_AMPERE_GA10X    860
 #define GGML_CUDA_CC_ORIN            870
 #define GGML_CUDA_CC_ADA_LOVELACE    890
 #define GGML_CUDA_CC_HOPPER          900
@@ -881,6 +882,7 @@ static __device__ __forceinline__ uint8_t ggml_cuda_fp32_to_ue4m3(float x) {
     const __nv_fp8_e4m3 xf(x);
     return xf.__x;
 #else
+     GGML_UNUSED(x);
      NO_DEVICE_CODE; // Used only for NVFP4 Scales for Activations, only for Blackwell
 #endif // defined(BLACKWELL_MMA_AVAILABLE)
 }
@@ -1276,6 +1278,8 @@ struct ggml_tensor_extra_gpu {
 
 struct ggml_cuda_graph {
 #ifdef USE_CUDA_GRAPH
+    // [TAG_SYNC_1025] the fork keeps one CUDA graph per ggml graph (GRAPH2 / GRAPHKEEP / graph keys); upstream #30804
+    // (a series of chunk graphs, GGML_CUDA_GRAPH_CHUNK_SIZE) is not taken in this sync
     ~ggml_cuda_graph() {
         if (instance != nullptr) {
             CUDA_CHECK(cudaGraphExecDestroy(instance));
@@ -1633,10 +1637,10 @@ struct ggml_backend_cuda_context {
     ggml_cuda_graph_key_memo graph_key_memo[GRAPH_KEY_MEMO_N];    // [TAG_GRAPH_KEY_MEMO]
     ggml_cuda_graph_host_probe graph_host_probe;    // [TAG_GRAPH_HOST_PROBE]
 
-    cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = { { nullptr } };
-    cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {nullptr};
-    void * cublas_workspaces[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {nullptr};
-    size_t cublas_workspace_sizes[GGML_CUDA_MAX_DEVICES] = {0};
+    cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {};
+    cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {};
+    void * cublas_workspaces[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {};
+    size_t cublas_workspace_sizes[GGML_CUDA_MAX_DEVICES] = {};
 
     int curr_stream_no = 0;
 

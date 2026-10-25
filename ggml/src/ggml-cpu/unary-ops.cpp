@@ -78,7 +78,7 @@ static inline float op_expm1(float x) {
 }
 
 static inline float op_softplus(float x) {
-    return (x > 20.0f) ? x : logf(1.0f + expf(x));
+    return (x > 20.0f) ? x : logf(1.0f + expf(x)); // [TAG_SYNC_1025] upstream #31086 log1pf changes the qwen35/qwen4exp GDN gate in the last bits: kept (KLD candidate)
 }
 
 static inline float op_floor(float x) {

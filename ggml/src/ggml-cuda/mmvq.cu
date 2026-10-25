@@ -295,9 +295,9 @@ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_rdna4(ggml_type
 
 // Host function: returns the max batch size for the current arch+type at runtime.
 int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
-    // NVIDIA: Volta, Ada Lovelace, and Blackwell always use MMVQ for MUL_MAT_ID.
+    // NVIDIA: P100, Volta, Ada Lovelace, and Blackwell always use MMVQ for MUL_MAT_ID.
     if (GGML_CUDA_CC_IS_NVIDIA(cc)) {
-        if (cc == GGML_CUDA_CC_VOLTA || cc >= GGML_CUDA_CC_ADA_LOVELACE) {
+        if (cc == GGML_CUDA_CC_PASCAL || cc == GGML_CUDA_CC_VOLTA || cc >= GGML_CUDA_CC_ADA_LOVELACE) {
             return MMVQ_MAX_BATCH_SIZE;
         }
         if (cc >= GGML_CUDA_CC_TURING) {
@@ -503,7 +503,7 @@ static constexpr __device__ int get_mmvq_mmid_max_batch_for_device() {
     return get_mmvq_mmid_max_batch_cdna(type);
 #elif defined(GCN)
     return get_mmvq_mmid_max_batch_gcn(type);
-#elif !defined(GGML_USE_MUSA) && (__CUDA_ARCH__ == GGML_CUDA_CC_VOLTA || __CUDA_ARCH__ >= GGML_CUDA_CC_ADA_LOVELACE)
+#elif !defined(GGML_USE_MUSA) && (__CUDA_ARCH__ == GGML_CUDA_CC_PASCAL || __CUDA_ARCH__ == GGML_CUDA_CC_VOLTA || __CUDA_ARCH__ >= GGML_CUDA_CC_ADA_LOVELACE)
     return MMVQ_MAX_BATCH_SIZE;
 #elif !defined(GGML_USE_MUSA) && __CUDA_ARCH__ >= GGML_CUDA_CC_TURING
     return get_mmvq_mmid_max_batch_turing_plus(type);
@@ -531,10 +531,12 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
     } else if (table_id == MMVQ_PARAMETERS_GCN) {
         switch (ncols_dst) {
             case 1:
+                return 2;
             case 2:
             case 3:
+                return type == GGML_TYPE_Q3_K ? 1 : 2;
             case 4:
-                return 2;
+                return type == GGML_TYPE_Q6_K? 1 : 2;
             case 5:
             case 6:
             case 7:
@@ -672,12 +674,32 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
     return 1;
 }
 
-static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int table_id, bool small_k = false, int nwarps = 1) {
+// Low bit types load few weight bytes per thread, a second row per block shares the q8_1 loads and adds memory parallelism.
+static constexpr __host__ __device__ bool mmvq_two_rows_ncols1(ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_Q1_0:
+        case GGML_TYPE_Q2_K:
+        case GGML_TYPE_Q3_K:
+        case GGML_TYPE_IQ1_S:
+        case GGML_TYPE_IQ1_M:
+            return true;
+        default:
+            return false;
+    }
+}
+
+static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int ncols_dst, int table_id, bool small_k = false, int nwarps = 1) {
     if (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_GCN || table_id == MMVQ_PARAMETERS_TURING || table_id == MMVQ_PARAMETERS_GB10 ||
         table_id == MMVQ_PARAMETERS_BLACKWELL) {
         switch (ncols_dst) {
             case 1:
-                return small_k ? nwarps : 1;
+                if (small_k) {
+                    return nwarps;
+                }
+                if (table_id == MMVQ_PARAMETERS_GB10) {
+                    return type == GGML_TYPE_IQ2_S || type == GGML_TYPE_IQ3_S ? 2 : 1;
+                }
+                return table_id == MMVQ_PARAMETERS_GENERIC && mmvq_two_rows_ncols1(type) ? 2 : 1;
             case 2:
             case 3:
             case 4:
@@ -714,7 +736,7 @@ static __global__ void mul_mat_vec_q(
     constexpr int vdr = get_vdr_mmvq(type);
     constexpr mmvq_parameter_table_id table_id = get_device_table_id();
     constexpr int nwarps = calc_nwarps(type, ncols_dst, table_id, small_k, halve_iters);
-    constexpr int rows_per_cuda_block = rows1 ? 1 : calc_rows_per_block(ncols_dst, table_id, small_k, nwarps); // [TAG_FN_L22_MMVQ_R1]
+    constexpr int rows_per_cuda_block = rows1 ? 1 : calc_rows_per_block(type, ncols_dst, table_id, small_k, nwarps); // [TAG_FN_L22_MMVQ_R1]
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 
     constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
@@ -826,7 +848,8 @@ static __global__ void mul_mat_vec_q(
 #if __CUDA_ARCH__ == GGML_CUDA_CC_DGX_SPARK
         // start the next iterations' weight loads early
         if constexpr (mmvq_should_prefetch(type)) {
-            constexpr int pf_dist = 2; // loop iterations, not blocks
+            // loop iterations, not blocks; q3_K and q6_K keep the distance in blocks they had with vdr 1
+            constexpr int pf_dist = type == GGML_TYPE_Q3_K || type == GGML_TYPE_Q6_K ? 1 : 2;
             const int kbx_pf = kbx + pf_dist*blocks_per_iter;
             if (kbx_pf < blocks_per_row_x) {
 #pragma unroll
@@ -1251,7 +1274,7 @@ static std::pair<dim3, dim3> calc_launch_params(
         const int warp_size, const mmvq_parameter_table_id table_id, const bool small_k = false, const bool halve_iters = false,
         const bool rows1 = false) {
     const int nwarps = calc_nwarps(type, ncols_dst, table_id, small_k, halve_iters);
-    const int rpb = rows1 ? 1 : calc_rows_per_block(ncols_dst, table_id, small_k, nwarps); // [TAG_FN_L22_MMVQ_R1]
+    const int rpb = rows1 ? 1 : calc_rows_per_block(type, ncols_dst, table_id, small_k, nwarps); // [TAG_FN_L22_MMVQ_R1]
     const int64_t nblocks = (nrows_x + rpb - 1) / rpb;
     const dim3 block_nums(nblocks, nchannels_dst, nsamples_or_ntokens);
     const dim3 block_dims(warp_size, nwarps, 1);
@@ -1545,7 +1568,6 @@ static void mul_mat_vec_q_switch_ncols_dst(
         } break;
         default:
             GGML_ABORT("fatal error");
-            break;
     }
 }
 static void mul_mat_vec_q_switch_type(
@@ -1697,7 +1719,6 @@ static void mul_mat_vec_q_switch_type(
             break;
         default:
             GGML_ABORT("fatal error");
-            break;
     }
 }
 
@@ -2125,7 +2146,7 @@ static __global__ void mul_mat_vec_q_fn_l3(
     constexpr int vdr = get_vdr_mmvq(type);
     constexpr mmvq_parameter_table_id table_id = get_device_table_id();
     constexpr int nwarps = calc_nwarps(type, ncols_dst, table_id);
-    constexpr int rows_per_cuda_block = calc_rows_per_block(ncols_dst, table_id, false, nwarps);
+    constexpr int rows_per_cuda_block = calc_rows_per_block(GGML_TYPE_COUNT /* [TAG_SYNC_1025] fork kernels keep the type-independent rows */, ncols_dst, table_id, false, nwarps);
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 
     constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
@@ -2253,7 +2274,7 @@ static __global__ void mul_mat_vec_q_fn_l3_smk(
     constexpr int qi  = ggml_cuda_type_traits<type>::qi;
     constexpr int vdr = get_vdr_mmvq(type);
     constexpr int nwarps = calc_nwarps(type, ncols_dst, MMVQ_PARAMETERS_GENERIC);
-    constexpr int rows_per_cuda_block = calc_rows_per_block(ncols_dst, MMVQ_PARAMETERS_GENERIC, false, nwarps);
+    constexpr int rows_per_cuda_block = calc_rows_per_block(GGML_TYPE_COUNT /* [TAG_SYNC_1025] fork kernels keep the type-independent rows */, ncols_dst, MMVQ_PARAMETERS_GENERIC, false, nwarps);
     constexpr int warp_size = 32;
     constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
     static_assert(nwarps == 4 && rows_per_cuda_block == 2, "fn_l3 smk: the 2..4 column launch of mul_mat_vec_q");
@@ -2537,7 +2558,7 @@ bool ggml_cuda_fn_l3_mul_mat_vec_q(ggml_backend_cuda_context & ctx, const ggml_t
     const uint32_t s1  = (uint32_t) (dst->nb[1] / sizeof(float));
 
     if (use_smk) {
-        const int      rpb     = calc_rows_per_block((int) ne11, MMVQ_PARAMETERS_GENERIC, false,
+        const int      rpb     = calc_rows_per_block(GGML_TYPE_COUNT /* [TAG_SYNC_1025] fork kernels keep the type-independent rows */, (int) ne11, MMVQ_PARAMETERS_GENERIC, false,
                                      calc_nwarps(GGML_TYPE_Q8_0, (int) ne11, MMVQ_PARAMETERS_GENERIC));
         const uint32_t nblocks = (uint32_t) ((ne01 + rpb - 1)/rpb);
         const ggml_cuda_kernel_launch_params lp(dim3((nblocks + 3)/4, 1, 1), dim3(32, 4, 1), 0, stream);
@@ -2614,7 +2635,7 @@ static __global__ void mul_mat_vec_q_fn_l4_multi(
     constexpr int vdr = get_vdr_mmvq(type);
     constexpr mmvq_parameter_table_id table_id = get_device_table_id();
     constexpr int nwarps = calc_nwarps(type, ncols_dst, table_id);
-    constexpr int rows_per_cuda_block = calc_rows_per_block(ncols_dst, table_id, false, nwarps);
+    constexpr int rows_per_cuda_block = calc_rows_per_block(GGML_TYPE_COUNT /* [TAG_SYNC_1025] fork kernels keep the type-independent rows */, ncols_dst, table_id, false, nwarps);
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 
     constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);

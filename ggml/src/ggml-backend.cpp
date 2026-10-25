@@ -1138,6 +1138,12 @@ struct ggml_backend_sched {
     ggml_backend_sched_eval_callback callback_eval;
     void * callback_eval_user_data;
 
+    ggml_backend_sched_copy_callback callback_copy;
+    void * callback_copy_user_data;
+
+    ggml_backend_sched_realloc_callback callback_realloc;
+    void * callback_realloc_user_data;
+
     char * context_buffer;
     size_t context_buffer_size;
 
@@ -1145,12 +1151,13 @@ struct ggml_backend_sched {
 
     int debug;
 
-    // used for debugging graph reallocations [GGML_SCHED_DEBUG_REALLOC]
+    // graph size of the current and the previous scheduling, used by the realloc callback and for debugging
+    // graph reallocations [GGML_SCHED_DEBUG_REALLOC]
     // ref: https://github.com/ggml-org/llama.cpp/pull/17617
-    int debug_realloc;
-    int debug_graph_size;
-    int debug_prev_graph_size;
+    int graph_size;
+    int prev_graph_size;
 
+    int debug_realloc;
     // [TAG_FN_L3_HOST_LAUNCH2] ggml_backend_sched_set_split_after: the cut node names, sorted by hash; 0 = off
     int      n_split_after;
     uint64_t split_after_hash[GGML_SCHED_MAX_CUTS];
@@ -1923,9 +1930,9 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     }
     int graph_size = std::max(graph->n_nodes, graph->n_leafs) + total_inputs * 2 * sched->n_copies + n_dep_nodes;
 
-    // remember the actual graph_size for performing reallocation checks later [GGML_SCHED_DEBUG_REALLOC]
-    sched->debug_prev_graph_size = sched->debug_graph_size;
-    sched->debug_graph_size = graph_size;
+    // remember the actual graph_size for performing reallocation checks later
+    sched->prev_graph_size = sched->graph_size;
+    sched->graph_size = graph_size;
 
     if (sched->graph.size < graph_size) {
         sched->graph.size = graph_size;
@@ -2082,19 +2089,26 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
             if (rl_on) {
                 ++rl_n;
                 GGML_LOG_INFO("%s: [TAG_FN_L21_REALLOC] graph re-reserve #%lld: nodes %d, leafs %d, size %d (prev %d), backend ids %s\n",
-                        __func__, (long long) rl_n, sched->graph.n_nodes, sched->graph.n_leafs, sched->debug_graph_size,
-                        sched->debug_prev_graph_size, backend_ids_changed ? "changed" : "same");
+                        __func__, (long long) rl_n, sched->graph.n_nodes, sched->graph.n_leafs, sched->graph_size,
+                        sched->prev_graph_size, backend_ids_changed ? "changed" : "same");
             }
+        }
+
+        // a reallocation with an unchanged graph size means that the previous reservation was not sufficient
+        const bool graph_size_changed = sched->prev_graph_size != sched->graph_size;
+
+        if (sched->callback_realloc != NULL) {
+            sched->callback_realloc(sched, &sched->graph, backend_ids_changed, graph_size_changed, sched->callback_realloc_user_data);
         }
 
         if (sched->debug_realloc > 0) {
             // we are interested only in situations where the graph was reallocated even though its size remained the same [GGML_SCHED_DEBUG_REALLOC]
             // example: https://github.com/ggml-org/llama.cpp/pull/17143
-            const bool unexpected = !backend_ids_changed && sched->debug_prev_graph_size == sched->debug_graph_size;
+            const bool unexpected = !backend_ids_changed && !graph_size_changed;
 
             if (unexpected || sched->debug_realloc > 1) {
                 GGML_ABORT("%s: unexpected graph reallocation (graph size = %d, nodes = %d, leafs = %d), debug_realloc = %d\n", __func__,
-                        sched->debug_graph_size, sched->graph.n_nodes, sched->graph.n_leafs, sched->debug_realloc);
+                        sched->graph_size, sched->graph.n_nodes, sched->graph.n_leafs, sched->debug_realloc);
             }
         }
 
@@ -2178,10 +2192,6 @@ static void ggml_backend_sched_batch_verify(ggml_backend_t backend, const std::v
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
-
-    ggml_tensor * prev_ids_tensor = nullptr;
-    std::vector<int32_t> ids;
-    std::vector<ggml_bitset_t> used_ids;
 
     int prev_backend_id = -1;
 
@@ -2588,8 +2598,8 @@ ggml_backend_sched_t ggml_backend_sched_new(
     sched->prev_node_backend_ids = (int *) calloc(nodes_size, sizeof(sched->prev_node_backend_ids[0]));
     sched->prev_leaf_backend_ids = (int *) calloc(nodes_size, sizeof(sched->prev_leaf_backend_ids[0]));
 
-    sched->debug_graph_size = 0;
-    sched->debug_prev_graph_size = 0;
+    sched->graph_size      = 0;
+    sched->prev_graph_size = 0;
 
     sched->context_buffer_size = ggml_sched_max_splits*GGML_SCHED_MAX_SPLIT_INPUTS*2*sizeof(struct ggml_tensor) + ggml_graph_overhead_custom(graph_size, false);
     sched->context_buffer = (char *) malloc(sched->context_buffer_size);
@@ -3007,6 +3017,18 @@ void ggml_backend_sched_set_split_after(ggml_backend_sched_t sched, const char *
     sched->n_split_after = n;
 }
 
+void ggml_backend_sched_set_copy_callback(ggml_backend_sched_t sched, ggml_backend_sched_copy_callback callback, void * user_data) {
+    GGML_ASSERT(sched);
+    sched->callback_copy = callback;
+    sched->callback_copy_user_data = user_data;
+}
+
+void ggml_backend_sched_set_realloc_callback(ggml_backend_sched_t sched, ggml_backend_sched_realloc_callback callback, void * user_data) {
+    GGML_ASSERT(sched);
+    sched->callback_realloc = callback;
+    sched->callback_realloc_user_data = user_data;
+}
+
 int ggml_backend_sched_get_n_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     return sched->n_splits;
@@ -3072,6 +3094,7 @@ bool ggml_op_alloc_size_may_expand(enum ggml_op op) {
         case GGML_OP_CUMSUM:
         case GGML_OP_ARGSORT:
         case GGML_OP_TOP_K:
+        case GGML_OP_ARGMAX:
             return true;
         default:
             return false;

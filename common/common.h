@@ -344,6 +344,8 @@ struct common_params_speculative_draft {
 
     int32_t n_gpu_layers = -1; // number of layers to store in VRAM for the draft model (-1 - use default)
 
+    int32_t n_ubatch = 0; // physical batch size of the draft context (0 - use the target's n_ubatch)
+
     ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
     ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
 
@@ -632,6 +634,7 @@ struct common_params {
     ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
 
     std::string kv_tier_plan = ""; // [TAG_TURBOT] turbot plan file (--kv-tier-plan), "" = env LLAMA_TURBOT_PLAN, else the built-in plan; "default" = built-in [TAG_TURBOT_EMBED_PLAN]; "auto" = automatic plan, "" also allows a verified <model>.turbot.plan sidecar [TAG_TURBOT_ANY_PLAN]
+    size_t moe_cache_size = 0; // GPU cache size in bytes for the MoE experts kept in the CPU, split among the GPUs like the layers
 
     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;
 
@@ -664,7 +667,7 @@ struct common_params {
     std::string cls_sep    = "\t";  // separator of classification sequences
 
     // server params
-    int32_t port                = 8080;          // server listens on this network port
+    int32_t port                = 9931;          // server listens on this network port
     bool    reuse_port          = false;         // allow multiple sockets to bind to the same port
     int32_t timeout_read        = 3600;          // http read timeout in seconds
     int32_t timeout_write       = timeout_read;  // http write timeout in seconds
@@ -679,6 +682,11 @@ struct common_params {
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
     bool    cache_ram_mib_set     = false; // [TAG_FN_RAM_FIT] --cache-ram was given: the RAM fit keeps it
     bool    n_ctx_checkpoints_set = false; // [TAG_FN_RAM_FIT] --ctx-checkpoints was given: the RAM fit keeps the checkpoints
+    bool    cache_ram_explicit  = false; // set by --cache-ram, decision models disable the cache otherwise
+
+    // llama-connect params
+    bool        server_connect      = false;
+    std::string server_connect_code = "";
 
     std::string public_path   = "";                                                                         // NOLINT
     std::string api_prefix    = "";                                                                         // NOLINT
@@ -999,6 +1007,7 @@ void fs_write_atomic(const std::filesystem::path & path, const std::string & dat
 
 // Auto-detect if colors can be enabled based on terminal and environment
 bool tty_can_use_colors();
+bool tty_enable_ansi(); // false when stdout or stderr is a console that cannot render ANSI sequences
 
 // Check if the given file is attached to a terminal
 bool common_is_tty(FILE * file);
@@ -1018,10 +1027,26 @@ enum common_decision_type {
     COMMON_DECISION_TYPE_NIMBLE,  // same as openjev, the prompt lists all the questions of the request
     COMMON_DECISION_TYPE_LAYA,    // score of one marker token per option, read from the embeddings output
     COMMON_DECISION_TYPE_CLEF,    // all questions in one prompt, score of option i read from the embeddings output at row i
+    COMMON_DECISION_TYPE_PPLX_DECIDER, // same as openjev, label codes of 1 or 2 letters
+    COMMON_DECISION_TYPE_VLLM_DECISION2, // score of each option read from the embeddings output, the options of a question are marked in the batch
+    COMMON_DECISION_TYPE_VLLM_D3, // same as pplx-decider, non-causal attention
+    COMMON_DECISION_TYPE_LFM2_D1, // same as openjev, the labels depend on the question type
+    COMMON_DECISION_TYPE_LFM2_D1_OMNI, // same as laya, other prompt layout
+    COMMON_DECISION_TYPE_GRANITE_SWITCH, // same as openjev, run by the decision aLoRA of granite switch
+    COMMON_DECISION_TYPE_H2O_LIGHTNING, // same as openjev, the labels are read after an answer prefill
     COMMON_DECISION_TYPE_UNKNOWN, // a decision model of a type that is not supported
 };
 
 common_decision_type common_get_decision_type(const struct llama_model * model);
+
+// metadata of a GGUF file, read without loading the model
+struct common_gguf_info {
+    common_decision_type decision_type = COMMON_DECISION_TYPE_UNKNOWN; // UNKNOWN if the file is missing, unreadable, or invalid
+    uint32_t             n_ctx_train   = 0;                            // 0 if unknown
+    bool                 has_chat_tmpl = false;                        // has the default tokenizer.chat_template
+};
+
+common_gguf_info common_get_gguf_info(const std::string & fname);
 
 // note: defines the model, context, samplers, ets. lifetimes
 struct common_init_result {
@@ -1119,6 +1144,7 @@ struct common_batch {
         llama_seq_id seq_id; // the first sequence id, see add_seq()
         bool         output;
         llama_embd   embd; // non-owning view of the data passed to add_embd()/set_embd(), data == NULL if none
+        llama_embd   state; // non-owning view of the data passed to set_embd_state(), data == NULL if none
         std::vector<llama_seq_id> seq_ids_extra; // see add_seq()
         int32_t      decision_order = 0; // see llama_batch_ext_set_decision_order()
         llama_embd   state = { nullptr, 0, 0 }; // [TAG_FN_L21_MTP_VISION] set_embd_state() view, data == NULL if none
@@ -1377,12 +1403,13 @@ struct common_prompt_checkpoint {
             llama_seq_id seq_id,
             llama_state_seq_flags flags);
 
-    void load_tgt(
+    // return false if the state could not be restored
+    bool load_tgt(
             llama_context * ctx,
             llama_seq_id seq_id,
             llama_state_seq_flags flags) const;
 
-    void load_dft(
+    bool load_dft(
             llama_context * ctx,
             llama_seq_id seq_id,
             llama_state_seq_flags flags) const;

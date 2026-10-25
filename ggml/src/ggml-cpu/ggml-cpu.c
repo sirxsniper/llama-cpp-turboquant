@@ -1505,7 +1505,7 @@ void ggml_compute_forward_mul_mat(
 
     const bool src1_cont = ggml_is_contiguous(src1);
 
-    if (src1_cont) {
+    if (!params->use_ref && src1_cont) {
         for (int64_t i13 = 0; i13 < ne13; i13++)
             for (int64_t i12 = 0; i12 < ne12; i12++)
                 if (!llamafile_sgemm(params,
@@ -1584,7 +1584,7 @@ UseGgmlGemm1:;
     ggml_barrier(params->threadpool);
 
 #if GGML_USE_LLAMAFILE
-    if (src1->type != vec_dot_type) {
+    if (!params->use_ref && src1->type != vec_dot_type) {
         const void* wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
         const size_t row_size = ggml_row_size(vec_dot_type, ne10);
 
@@ -1970,7 +1970,12 @@ static void ggml_compute_forward_mul_mat_id(
             for (int id = 0; id < n_ids; ++id) {
                 const int32_t i02 = *(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]);
 
-                assert(i02 >= 0 && i02 < n_as);
+                assert(i02 == -1 || (i02 >= 0 && i02 < n_as));
+
+                if (i02 == -1) {
+                    memset((char *) dst->data + id*nb1 + iid1*nb2, 0, ne0*sizeof(float));
+                    continue;
+                }
 
                 if (moe_tbl && moe_tbl[i02] != moe_dummy) {
                     memset((char *) dst->data + id*nb1 + iid1*nb2, 0, ne0*sizeof(float));
@@ -3855,6 +3860,11 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_moe_host_sum(params, tensor);
             } break;
+
+        case GGML_OP_TOP_K_MASK:
+            {
+                ggml_compute_forward_top_k_mask(params, tensor);
+            } break;
         case GGML_OP_MAP_CUSTOM1:
             {
                 ggml_compute_forward_map_custom1(params, tensor);
@@ -4040,6 +4050,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_DSV4_HC_PRE:
         case GGML_OP_DSV4_HC_POST:
         case GGML_OP_TURBO_WHT:
+        case GGML_OP_TOP_K_MASK:
             {
                 n_tasks = n_threads;
             } break;
@@ -4112,11 +4123,11 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_MUL_MAT:
         case GGML_OP_MUL_MAT_ID:
         case GGML_OP_OUT_PROD:
+        case GGML_OP_SET_ROWS:
             {
                 n_tasks = n_threads;
             } break;
         case GGML_OP_GET_ROWS:
-        case GGML_OP_SET_ROWS:
             {
                 // FIXME: get_rows can use additional threads, but the cost of launching additional threads
                 // decreases performance with GPU offloading
@@ -5514,6 +5525,12 @@ void ggml_cpu_fp32_to_fp16(const float * x, ggml_fp16_t * y, int64_t n) {
         vfloat32m2_t vx = __riscv_vle32_v_f32m2(&x[i], vl);
         vfloat16m1_t vy = __riscv_vfncvt_f_f_w_f16m1(vx, vl);
         __riscv_vse16_v_f16m1((_Float16 *)&y[i], vy, vl);
+    }
+#elif defined(__VXE__) || defined(__VXE2__)
+    for (; i + 7 < n; i += 8) {
+        const uint32x4_t v_yl = __lzs_f32cx4_to_f16(vec_xl(0, x + i + 0));
+        const uint32x4_t v_yh = __lzs_f32cx4_to_f16(vec_xl(0, x + i + 4));
+        vec_xst(vec_pack(v_yl, v_yh), 0, (uint16_t *)(y + i));
     }
 #endif
     for (; i < n; ++i) {

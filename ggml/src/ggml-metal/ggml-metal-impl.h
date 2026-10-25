@@ -14,7 +14,8 @@
 #define N_MM_SIMD_GROUP_X 2
 #define N_MM_SIMD_GROUP_Y 2
 
-#define N_MM_NPART_AMAX 256
+#define N_ARGMAX_NPART_MAX 256
+#define N_ARGMAX_CHUNK 4096
 
 // kernel parameters for mat-vec threadgroups
 //
@@ -126,6 +127,7 @@
 // [TAG_SYNC_METAL_FC] fork-only constant moved far from upstream's sequential ids: 1700 went to FC_NORM, then
 // 2100 to FC_PAD (upstream #29561). [TAG_SYNC_1004]
 #define FC_TURBO_WHT                   9100
+#define FC_MUL_MV_MMA                  2300
 
 // op-specific constants
 #define OP_FLASH_ATTN_EXT_NQPSG 8
@@ -218,6 +220,7 @@ typedef struct {
     uint64_t nb2;
     uint64_t nb3;
     int32_t  dim;
+    int32_t  nc0;
 } ggml_metal_kargs_concat;
 
 typedef struct {
@@ -561,7 +564,6 @@ typedef struct {
 } ggml_metal_kargs_mul_mv_ext;
 
 typedef struct {
-    int32_t  ne02;
     int32_t  ne10;
     int32_t  ne11;  // n_expert_used (bcast)
     uint64_t nb11;
@@ -572,12 +574,11 @@ typedef struct {
 } ggml_metal_kargs_mul_mm_id_map0;
 
 typedef struct {
-    int32_t  ne00;
-    int32_t  ne01;
-    int32_t  ne02;
-    uint64_t nb01;
-    uint64_t nb02;
-} ggml_metal_kargs_mul_mm_id_amax;
+    int32_t  ne0;
+    uint64_t nb1;
+    uint64_t nb2;
+    uint64_t nb21;
+} ggml_metal_kargs_mul_mm_id_zero;
 
 typedef struct {
     int32_t  ne00;
@@ -591,7 +592,6 @@ typedef struct {
     uint64_t nb12;
     uint64_t nb13;
     int32_t  ne20;
-    int32_t  ne21;
     int32_t  ne0;
     int32_t  ne1;
     int16_t  r2;
@@ -1387,8 +1387,10 @@ typedef struct {
 } ggml_metal_kargs_pool_1d;
 
 typedef struct {
-     int64_t ne00;
+    int64_t ne00;
     uint64_t nb01;
+    int64_t npart;
+    int64_t ne01;
 } ggml_metal_kargs_argmax;
 
 typedef struct {

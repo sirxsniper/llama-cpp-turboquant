@@ -26,8 +26,10 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <iomanip>
 #include <map>
+#include <cinttypes>
 #include <mutex>
 #include <random>
 #include <sstream>
@@ -1308,6 +1310,12 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     int32_t     trained_max   = 0;   // [TAG_DFL_BLOCK_EXT] longest draft of the trained block
     llama_token mask_token_id = 0;
 
+    bool    is_lilicorr    = false;
+    int32_t lilicorr_top_k = 0;
+    size_t lilicorr_rows = 0;
+    std::vector<float> lilicorr_embd;
+    std::vector<llama_pos> lilicorr_pos;
+
     bool    is_dflash2     = false;
     bool    is_mrope       = false;
     int32_t selector_top_k = 0;
@@ -1315,6 +1323,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     std::vector<bool> selector_reset;
 
     uint64_t n_dump_call = 0; // [TAG_SPEC_DFT_DUMP] draft() calls written so far
+
+    // DFlash2 probabilistic drafting: one generator per sequence and the seed it was last seeded with (-1: reseed)
+    std::vector<std::mt19937> dflash2_rng;
+    std::vector<int64_t>      dflash2_seed;
 
     // draft-dspark: the draft carries a Markov head and uses an anchor-first block layout
     const bool is_dspark;
@@ -2611,6 +2623,23 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         selector_top_k = llama_model_dflash_selector_top_k(model_dft);
         is_dflash2     = selector_top_k > 0;
+        dflash2_rng.resize(n_seq);
+        dflash2_seed.assign(n_seq, -1);
+        char lilicorr_meta[32] = {};
+        lilicorr_top_k = llama_model_meta_val_str(model_dft, "lilicorr.candidate_topk", lilicorr_meta, sizeof(lilicorr_meta)) >= 0
+                ? std::atoi(lilicorr_meta) : 0;
+        is_lilicorr = lilicorr_top_k > 0;
+        if (is_lilicorr) {
+            // [TAG_SYNC_1025] upstream #30506 LiliCorr drafting is not merged into the fork's DFlash path (draft dists, chunked
+            // inject, sync rules): refuse the drafter instead of drafting with the wrong lattice
+            throw std::runtime_error("LiliCorr drafters are not supported by this build yet (upstream #30506): run without the drafter");
+        }
+        if (is_lilicorr) {
+            lilicorr_rows = (size_t) block_size + 1;
+            const size_t lilicorr_slots = (size_t) n_seq * lilicorr_rows;
+            lilicorr_embd.resize(lilicorr_slots * (size_t) n_embd_dec);
+            lilicorr_pos.assign(lilicorr_slots, -1);
+        }
         mask_token_id = llama_vocab_mask(llama_model_get_vocab(model_dft));
 
         if (is_dspark && this->params.p_min > 0.0f) {
@@ -2681,7 +2710,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         // offload draft sampling to the backend
         backend_chains.assign(n_seq, nullptr);
-        if (this->params.backend_sampling && !is_dflash2) {
+        if (this->params.backend_sampling && !is_dflash2 && !is_lilicorr) {
             for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
                 llama_sampler * chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
                 llama_sampler_chain_add(chain, llama_sampler_init_top_k(10));
@@ -2701,7 +2730,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         }
 
         // DFlash2 reads its selector lattice from h_nextn and never consumes raw logits.
-        llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ !is_dflash2);
+        llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ !is_dflash2 && !is_lilicorr);
         llama_set_causal_attn(ctx_dft, causal_attn); // DFlash needs non-causal attention unless the model says otherwise
     }
 
@@ -2726,6 +2755,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
             return;
         }
+
+        // reseed per request rather than per round, or two identical requests differ
+        dflash2_seed[seq_id] = -1;
 
         const int32_t N = (int32_t) prompt.size();
         if (N <= 0) {
@@ -3240,9 +3272,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 }
 
                 int32_t predecessor = 0;
-                for (int32_t i = 1; i < n_block_tokens; ++i) {
+                for (int32_t i = 1; i < (is_dflash2 ? n_block_tokens : params.n_max + 1); ++i) {
                     const float * row = lattice + (size_t) (beg + i) * n_embd_dec;
-                    const float * scores = row + selector_top_k + (size_t) predecessor * selector_top_k;
+                    const int32_t top_k = is_dflash2 ? selector_top_k : lilicorr_top_k;
+                    const float * scores = row + top_k + (size_t) predecessor * top_k;
 
                     if (dp.temp > 0.0f) {
                         common_speculative_token_dist dist;
@@ -5648,9 +5681,6 @@ struct common_speculative_impl_ngram_cache : public common_speculative_impl {
 
     uint16_t n_draft;
 
-    bool save_dynamic;
-    bool save_static;
-
     struct seq_info {
         size_t cache_size = 0; // number of tokens in n-gram cache
 
@@ -5664,54 +5694,72 @@ struct common_speculative_impl_ngram_cache : public common_speculative_impl {
     common_speculative_impl_ngram_cache(
             const common_params_speculative & params,
             uint32_t n_seq,
-            uint16_t n_draft,
-            const std::string & path_static,
-            const std::string & path_dynamic,
-            bool save_dynamic,
-            bool save_static)
+            uint16_t n_draft)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_NGRAM_CACHE, n_seq, n_draft)
         , params(params.ngram_cache)
         , n_draft(n_draft)
-        , save_dynamic(save_dynamic)
-        , save_static(save_static)
     {
+        const auto & ngram = params.ngram_cache;
+
         SPC_TRC("%s", "adding speculative implementation 'ngram-cache'\n");
         SPC_TRC("- n_draft=%d, cache_static=%s, cache_dynamic=%s\n",
                 n_draft,
-                path_static.empty() ? "none" : path_static.c_str(),
-                path_dynamic.empty() ? "none" : path_dynamic.c_str());
+                ngram.lookup_cache_static.empty() ? "none" : ngram.lookup_cache_static.c_str(),
+                ngram.lookup_cache_dynamic.empty() ? "none" : ngram.lookup_cache_dynamic.c_str());
 
         sinfos.resize(n_seq);
 
-        if (!path_static.empty()) {
+        if (!ngram.lookup_cache_static.empty()) {
             try {
-                auto ngram_cache_static = common_ngram_cache_load(path_static);
+                auto ngram_cache_static = common_ngram_cache_load(ngram.lookup_cache_static);
 
                 for (auto & sinfo : sinfos) {
                     sinfo.ngram_cache_static = ngram_cache_static;
                 }
-            } catch (...) {
-                SPC_ERR("failed to open static lookup cache: %s", path_static.c_str());
+            } catch (const std::ifstream::failure &) {
+                SPC_ERR("failed to open static lookup cache: %s\n", ngram.lookup_cache_static.c_str());
                 GGML_ABORT("Couldn't read static lookup cache");
             }
         }
 
-        if (!path_dynamic.empty()) {
+        if (!ngram.lookup_cache_dynamic.empty()) {
             try {
-                auto ngram_cache_dynamic = common_ngram_cache_load(path_dynamic);
+                auto ngram_cache_dynamic = common_ngram_cache_load(ngram.lookup_cache_dynamic);
 
                 for (auto & sinfo : sinfos) {
                     sinfo.ngram_cache_dynamic = ngram_cache_dynamic;
                 }
-            } catch (...) {
-                SPC_ERR("failed to open dynamic lookup cache: %s", path_dynamic.c_str());
-                GGML_ABORT("Couldn't read dynamic lookup cache");
+            } catch (const std::ifstream::failure &) {
+                std::error_code ec;
+                const bool exists = std::filesystem::exists(ngram.lookup_cache_dynamic, ec);
+                if (!exists && !ec) {
+                    // missing file is created on destruction
+                    SPC_WRN("dynamic lookup cache file does not exist: %s, starting with empty cache\n",
+                            ngram.lookup_cache_dynamic.c_str());
+                } else {
+                    SPC_ERR("failed to open dynamic lookup cache: %s\n", ngram.lookup_cache_dynamic.c_str());
+                    GGML_ABORT("Couldn't read dynamic lookup cache");
+                }
             }
         }
     }
 
-    void begin(llama_seq_id /*seq_id*/, const llama_tokens & /*prompt*/) override {
-        // noop
+    ~common_speculative_impl_ngram_cache() override {
+        if (params.lookup_cache_dynamic.empty() || sinfos.empty()) {
+            return;
+        }
+
+        auto & dynamic_cache = sinfos.front().ngram_cache_dynamic;
+        for (auto & sinfo : sinfos) {
+            common_ngram_cache_merge(dynamic_cache, sinfo.ngram_cache_context);
+        }
+
+        SPC_INF("saving dynamic lookup cache at %s\n", params.lookup_cache_dynamic.c_str());
+        common_ngram_cache_save(dynamic_cache, params.lookup_cache_dynamic);
+    }
+
+    void begin(llama_seq_id seq_id, const llama_tokens & /*prompt*/) override {
+        sinfos[seq_id].cache_size = 0;
     }
 
     void draft_one(
@@ -5722,28 +5770,22 @@ struct common_speculative_impl_ngram_cache : public common_speculative_impl {
 
         const auto & prompt = *dparams.prompt;
 
-        if (sinfo.cache_size < prompt.size() + 1) {
-            llama_tokens tokens_new;
-            tokens_new.reserve(prompt.size() + 1 - sinfo.cache_size);
-            for (size_t j = sinfo.cache_size; j < prompt.size(); ++j) {
-                tokens_new.push_back(prompt[j]);
-            }
-            tokens_new.push_back(dparams.id_last); // add the last token
-
-            // Update context ngram cache with new dparams.prompt:
-            common_ngram_cache_update(
-                    sinfo.ngram_cache_context,
-                    LLAMA_NGRAM_MIN, LLAMA_NGRAM_MAX,
-                    tokens_new, tokens_new.size(), false);
-            sinfo.cache_size = prompt.size() + 1;
-        }
-
         llama_tokens inp;
         inp.reserve(prompt.size() + 1);
         for (size_t j = 0; j < prompt.size(); ++j) {
             inp.push_back(prompt[j]);
         }
         inp.push_back(dparams.id_last);
+
+        if (sinfo.cache_size < inp.size()) {
+            // Update context ngram cache with the full history so n-grams
+            // ending at the new tokens have their preceding context
+            common_ngram_cache_update(
+                    sinfo.ngram_cache_context,
+                    LLAMA_NGRAM_MIN, LLAMA_NGRAM_MAX,
+                    inp, inp.size() - sinfo.cache_size, false);
+            sinfo.cache_size = inp.size();
+        }
 
         result.push_back(dparams.id_last);
 
@@ -5805,20 +5847,12 @@ static common_ngram_map get_common_ngram_map(
     return common_ngram_map(size_key, size_value, key_only, min_hits);
 }
 
-static common_speculative_impl_ngram_cache create_state_ngram_cache(
+static std::unique_ptr<common_speculative_impl_ngram_cache> create_state_ngram_cache(
         const common_speculative_config & config,
-        uint32_t n_seq,
-        const std::string & path_static,
-        const std::string & path_dynamic) {
+        uint32_t n_seq) {
     uint16_t n_draft = 8; // TODO get from config?
 
-    // TODO bool param in common/common.h to set save_static/save_dynamic?
-    bool save_static = false;
-    bool save_dynamic = false;
-
-    common_speculative_impl_ngram_cache state(config.params, n_seq, n_draft, path_static, path_dynamic, save_static, save_dynamic);
-
-    return state;
+    return std::make_unique<common_speculative_impl_ngram_cache>(config.params, n_seq, n_draft);
 }
 
 std::string common_speculative_type_name_str(const std::vector<common_speculative_type> & types) {
@@ -6191,6 +6225,13 @@ common_params common_base_params_to_speculative(const common_params & params) {
     result.n_outputs_max = params.n_parallel;
     result.n_outputs_max_per_seq = 1;
 
+    if (params_spec.n_ubatch > 0) { // upstream #30459 --spec-draft-n-ubatch
+        result.n_ubatch = params_spec.n_ubatch;
+    }
+
+    // the MoE cache (upstream #29887) is only used by the target context
+    result.moe_cache_size = 0;
+
     // dflash/dspark decode every sequence's full noise block in one pass
     // TODO: refactor such properties to be announced by the speculative types
     //       something like `struct common_speculative_type_props common_speculative_type_get_props(...);`
@@ -6469,11 +6510,7 @@ common_speculative * common_speculative_init(common_params_speculative & params,
                 break;
             }
             case COMMON_SPECULATIVE_TYPE_NGRAM_CACHE: {
-                auto state = create_state_ngram_cache(
-                        config, n_seq,
-                        params.ngram_cache.lookup_cache_static,
-                        params.ngram_cache.lookup_cache_dynamic);
-                impls.push_back(std::make_unique<common_speculative_impl_ngram_cache>(state));
+                impls.push_back(create_state_ngram_cache(config, n_seq));
                 break;
             }
             default:

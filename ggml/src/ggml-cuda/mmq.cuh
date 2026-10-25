@@ -494,6 +494,7 @@ template <ggml_type type, int J, bool fallback, bool has_ids> static __device__ 
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
     constexpr int nwarps    = ggml_cuda_mmq_get_nthreads(type, J, fallback, has_ids) / warp_size;
     constexpr int I         = ggml_cuda_mmq_get_I(type, J, fallback, has_ids);
+    static_assert(I % warp_size == 0, "DP4A MMQ tile height must be a multiple of the physical warp size"); // upstream #30837
 
     const bool y_scale_used = y_scale != nullptr;
 

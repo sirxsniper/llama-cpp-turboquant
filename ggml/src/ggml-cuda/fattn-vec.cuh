@@ -553,7 +553,7 @@ static __global__ void flash_attn_ext_vec(
             }
         }
 
-        ggml_cuda_syncwarp();
+        ggml_cuda_syncwarp(); // Needed for KQ synchronization.
 
 #pragma unroll
         for (int k0 = 0; k0 < WARP_SIZE; k0 += V_cols_per_iter) {

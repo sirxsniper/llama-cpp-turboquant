@@ -29,6 +29,7 @@ set(LLAMA_CORE_SOURCES
     llama-kv-cache-dsv4.cpp
     llama-kv-tier.cpp        # [TAG_SYNC_CORE_SOURCES] fork-only: turbot tier
     llama-memory.cpp
+    llama-moe-cache.cpp
     llama-memory-hybrid.cpp
     llama-memory-hybrid-iswa.cpp
     llama-memory-hybrid-idx.cpp
