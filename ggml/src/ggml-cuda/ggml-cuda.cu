@@ -101,6 +101,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <thread>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
@@ -492,7 +493,7 @@ const ggml_cuda_device_info & ggml_cuda_info() {
 
 // [TAG_FN_L22_OOMHOOK] defined after ggml_cuda_lock_counter: the libllama OOM hook (pins), outside a capture
 static void ggml_cuda_fn_l22_oom_precheck(size_t need);
-static bool ggml_cuda_fn_l22_oom_retry(size_t need);
+static bool ggml_cuda_fn_l22_oom_retry(size_t need, int code = 1);
 
 // buffer pool for cuda (legacy)
 struct ggml_cuda_pool_leg : public ggml_cuda_pool {
@@ -719,7 +720,8 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
             ggml_cuda_fn_l22_oom_precheck(reserve_size); // [TAG_FN_L22_OOMHOOK]
             CUresult cr = cuMemCreate(&handle, reserve_size, &prop, 0);
-            if (cr == CUDA_ERROR_OUT_OF_MEMORY && ggml_cuda_fn_l22_oom_retry(reserve_size)) { // [TAG_FN_L22_OOMHOOK]
+            // [TAG_FN_L23_PINFIX] R-L23-6: a failed retry aborts here, so the hook gets two attempts (code 3, then 4)
+            for (int k = 0; k < 2 && cr == CUDA_ERROR_OUT_OF_MEMORY && ggml_cuda_fn_l22_oom_retry(reserve_size, 3 + k); ++k) { // [TAG_FN_L22_OOMHOOK]
                 cr = cuMemCreate(&handle, reserve_size, &prop, 0);
             }
             CU_CHECK(cr);
@@ -853,14 +855,15 @@ static void ggml_cuda_fn_l22_oom_precheck(size_t need) {
     }
 }
 
-static bool ggml_cuda_fn_l22_oom_retry(size_t need) {
+// code ([TAG_FN_L23_PINFIX] R-L23-6): 1 = device allocation, 2 = pinned host allocation, 3 / 4 = device allocation whose failed retry aborts (first / second attempt)
+static bool ggml_cuda_fn_l22_oom_retry(size_t need, int code) {
     const ggml_cuda_fn_l22_oom_fn_t fn = ggml_cuda_fn_l22_oom_fn.load();
     if (fn == nullptr || ggml_cuda_lock_counter.load(std::memory_order_relaxed) != 0) {
         return false;
     }
-    const bool freed = fn(need, 1, ggml_cuda_fn_l22_oom_ud.load());
-    GGML_LOG_WARN("ggml_cuda: [TAG_FN_L22_OOMHOOK] device allocation of %.1f MiB failed: the OOM hook %s, one retry\n",
-            need/1048576.0, freed ? "gave memory back" : "had nothing to give");
+    const bool freed = fn(need, code, ggml_cuda_fn_l22_oom_ud.load());
+    GGML_LOG_WARN("ggml_cuda: [TAG_FN_L22_OOMHOOK] %s allocation of %.1f MiB failed (code %d): the OOM hook %s\n", code == 2 ? "pinned host" : "device",
+            need/1048576.0, code, freed ? "gave memory back, retry" : "had nothing to give");
     return freed;
 }
 
@@ -1034,11 +1037,124 @@ static void ggml_backend_cuda_buffer_memset_tensor(ggml_backend_buffer_t buffer,
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
 
+// [TAG_FN_L23_PINFIX] a host -> device copy whose source starts inside a range registered with cudaHostRegister but runs
+// past its end is refused by CUDA (cudaErrorInvalidValue: nothing is queued, the error is not sticky). libllama registers
+// per-expert ranges of the mapped model ([TAG_FN_L22_PIN]) and now keeps them, so a caller that does not split its copy at
+// the registered edges (FAULT 2026-10-21 10:10: a hot-set refill slice of a lend-layer resident through the synchronous
+// set_tensor, LLAMA_FN_L22_REFILL=0) hit it. Such a copy goes again through a pinned bounce buffer (CPU copy, then DMA,
+// 32 MiB pieces, synchronous on the stream); any other error stays fatal. true: the bounce ran (the stream is idle)
+// [TAG_FN_L23_PINFIX] R-L23-8: one pinned bounce buffer for the whole process, allocated before the first pin (the first
+// registration asks for it), so a copy never needs new pinned memory when the page-lock budget is short
+static std::mutex g_fn_bounce_mtx;
+static void *     g_fn_bounce = nullptr;
+static bool       g_fn_bounce_tried = false;
+static constexpr size_t FN_BOUNCE_B = (size_t) 32 << 20;
+
+static void * ggml_cuda_fn_bounce_locked() {
+    if (g_fn_bounce == nullptr && !g_fn_bounce_tried) {
+        g_fn_bounce_tried = true;
+        if (cudaMallocHost(&g_fn_bounce, FN_BOUNCE_B) != cudaSuccess) {
+            (void) cudaGetLastError();
+            g_fn_bounce = nullptr;
+            GGML_LOG_WARN("ggml_cuda: [TAG_FN_L23_PINFIX] no pinned bounce buffer (%.0f MiB)\n", FN_BOUNCE_B/1048576.0);
+        }
+    }
+    return g_fn_bounce;
+}
+
+// a host copy through the bounce buffer, synchronous on the stream (CPU copy + DMA in 32 MiB pieces)
+static cudaError_t ggml_cuda_fn_copy_bounced(void * dst, const void * src, size_t size, cudaMemcpyKind kind, cudaStream_t stream) {
+    std::lock_guard<std::mutex> lk(g_fn_bounce_mtx);
+    if (g_fn_bounce == nullptr) {
+        g_fn_bounce_tried = false; // one more try: pins may have gone
+    }
+    void * bb = ggml_cuda_fn_bounce_locked();
+    if (bb == nullptr) {
+        return cudaErrorMemoryAllocation;
+    }
+    cudaError_t e = cudaStreamSynchronize(stream);
+    for (size_t o = 0; e == cudaSuccess && o < size; o += FN_BOUNCE_B) {
+        const size_t k = std::min(FN_BOUNCE_B, size - o);
+        if (kind == cudaMemcpyHostToDevice) {
+            memcpy(bb, (const char *) src + o, k);
+            e = cudaMemcpyAsync((char *) dst + o, bb, k, cudaMemcpyHostToDevice, stream);
+        } else {
+            e = cudaMemcpyAsync(bb, (const char *) src + o, k, cudaMemcpyDeviceToHost, stream);
+        }
+        if (e == cudaSuccess) {
+            e = cudaStreamSynchronize(stream);
+        }
+        if (e == cudaSuccess && kind == cudaMemcpyDeviceToHost) {
+            memcpy((char *) dst + o, bb, k);
+        }
+    }
+    return e;
+}
+
+// [TAG_FN_L23_PINFIX] R-L23-7 / R-L23-8: a copy with pageable host memory needs the driver's pinned staging, which fails with
+// out of memory when the page-lock budget is short (FAULTs 2026-10-21 15:20 and 15:58: a D2H get_tensor, the abort, the TDR).
+// It never aborts for that: the bounce buffer first, then the pins drop (hook code 2), then direct / bounce again while the
+// driver frees the pages (up to ~2 s)
+static cudaError_t ggml_cuda_memcpy_oom_retry(void * dst, const void * src, size_t size, cudaMemcpyKind kind, cudaStream_t stream) {
+    cudaError_t e = cudaMemcpyAsync(dst, src, size, kind, stream);
+    if (e != cudaErrorMemoryAllocation || size == 0) {
+        return e;
+    }
+    (void) cudaGetLastError();
+    static std::atomic<int> n_notes{0};
+    const int note = n_notes.fetch_add(1) + 1;
+    e = ggml_cuda_fn_copy_bounced(dst, src, size, kind, stream);
+    const char * how = "bounce";
+    if (e != cudaSuccess) {
+        (void) cudaGetLastError();
+        const bool freed = ggml_cuda_fn_l22_oom_retry(size, 2);
+        how = freed ? "pins dropped" : "retry";
+        for (int k = 0; k < 100; ++k) {
+            e = cudaMemcpyAsync(dst, src, size, kind, stream);
+            if (e == cudaSuccess) {
+                break;
+            }
+            (void) cudaGetLastError();
+            if (e != cudaErrorMemoryAllocation) {
+                return e;
+            }
+            e = ggml_cuda_fn_copy_bounced(dst, src, size, kind, stream);
+            if (e == cudaSuccess) {
+                break;
+            }
+            (void) cudaGetLastError();
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+    }
+    if (note <= 3 || note % 256 == 0) {
+        GGML_LOG_WARN("ggml_cuda: [TAG_FN_L23_PINFIX] a %s copy of %.2f MiB ran out of pinned staging: %s (%s, %d so far)\n",
+                kind == cudaMemcpyHostToDevice ? "H2D" : "D2H", size/1048576.0, e == cudaSuccess ? "done" : "FAILED", how, note);
+    }
+    return e;
+}
+
+static bool ggml_cuda_h2d_or_bounce(void * dst, const void * src, size_t size, cudaStream_t stream) {
+    const cudaError_t e = ggml_cuda_memcpy_oom_retry(dst, src, size, cudaMemcpyHostToDevice, stream);
+    if (e != cudaErrorInvalidValue || size == 0) {
+        CUDA_CHECK(e);
+        return false;
+    }
+    (void) cudaGetLastError();
+    static std::atomic<int> n_notes{0};
+    CUDA_CHECK(ggml_cuda_fn_copy_bounced(dst, src, size, cudaMemcpyHostToDevice, stream));
+    const int k = n_notes.fetch_add(1) + 1;
+    if (k <= 3 || k % 1024 == 0) {
+        GGML_LOG_WARN("ggml_cuda: [TAG_FN_L23_PINFIX] a host copy of %.2f MiB at %p crossed a registered host range's edge: sent "
+                "through the pinned bounce buffer (%d so far)\n", size/1048576.0, src, k);
+    }
+    return true;
+}
+
 static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
     ggml_cuda_set_device(ctx->device);
-    CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cudaStreamPerThread));
+    ggml_cuda_h2d_or_bounce((char *) tensor->data + offset, data, size, cudaStreamPerThread); // [TAG_FN_L23_PINFIX]
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
 
@@ -1046,7 +1162,7 @@ static void ggml_backend_cuda_buffer_get_tensor(ggml_backend_buffer_t buffer, co
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
     ggml_cuda_set_device(ctx->device);
-    CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cudaStreamPerThread));
+    CUDA_CHECK(ggml_cuda_memcpy_oom_retry(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cudaStreamPerThread)); // [TAG_FN_L23_PINFIX] R-L23-7
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
 
@@ -1733,6 +1849,11 @@ static void * ggml_cuda_host_malloc(size_t size) {
 
     void * ptr = nullptr;
     cudaError_t err = cudaMallocHost((void **) &ptr, size);
+    // [TAG_FN_L23_PINFIX] R-L23-5: pinned host memory short while libllama holds pins: they go first, one retry
+    if (err == cudaErrorMemoryAllocation && ggml_cuda_fn_l22_oom_retry(size, 2)) {
+        (void) cudaGetLastError();
+        err = cudaMallocHost((void **) &ptr, size);
+    }
     if (err != cudaSuccess) {
         // clear the error
         (void)cudaGetLastError();
@@ -3193,7 +3314,7 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
-    CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
+    ggml_cuda_h2d_or_bounce((char *) tensor->data + offset, data, size, cuda_ctx->stream()); // [TAG_FN_L23_PINFIX]
 }
 
 // [TAG_FN_L4_HOST_BATCHCPY] host -> device copies into whole device tensors as one cudaMemcpyBatchAsync on the backend's
@@ -3454,7 +3575,7 @@ static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend, const ggm
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
-    CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
+    CUDA_CHECK(ggml_cuda_memcpy_oom_retry(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cuda_ctx->stream())); // [TAG_FN_L23_PINFIX] R-L23-7
 }
 
 static void ggml_backend_cuda_set_tensor_2d_async(ggml_backend_t backend, struct ggml_tensor * tensor, const void * data,
@@ -3795,7 +3916,7 @@ static int32_t ggml_cuda_fn_l22_graph_maxrows() {
 }
 
 static bool ggml_cuda_fn_l22_hot(const ggml_cuda_graph & g) {
-    return g.instance != nullptr && g.n_replay >= 2;
+    return g.has_instance() && g.n_replay >= 2;
 }
 
 void ggml_cuda_fn_l22_evict_for_new(ggml_backend_cuda_context * ctx, const void * key) {
@@ -3823,9 +3944,9 @@ void ggml_cuda_fn_l22_evict_for_new(ggml_backend_cuda_context * ctx, const void 
 static int ggml_cuda_fn_l22_count_instances(const ggml_backend_cuda_context * ctx) {
     int n = 0;
     for (const auto & [k, g] : ctx->cuda_graphs) {
-        n += g->instance != nullptr ? 1 : 0;
+        n += g->has_instance() ? 1 : 0; // [TAG_UPSTREAM_30804] one per chunk list
         for (const auto & v : g->fn_l22_alt) {
-            n += v.instance != nullptr ? 1 : 0;
+            n += v.has_instance() ? 1 : 0;
         }
     }
     return n;
@@ -3851,11 +3972,11 @@ static bool ggml_cuda_fn_l22_drop_one_instance(ggml_backend_cuda_context * ctx, 
                 best_g = g; best_v = v; best_t = t; best_hot = hot;
             }
         };
-        if (g->instance != nullptr) {
+        if (g->has_instance()) {
             consider(-1, g->last_used_time, g->n_replay);
         }
         for (int v = 0; v < (int) g->fn_l22_alt.size(); ++v) {
-            if (g->fn_l22_alt[v].instance != nullptr) {
+            if (g->fn_l22_alt[v].has_instance()) {
                 consider(v, g->fn_l22_alt[v].last_used, g->fn_l22_alt[v].n_replay);
             }
         }
@@ -3887,29 +4008,39 @@ static void ggml_cuda_fn_l22_instance_cap(ggml_backend_cuda_context * ctx, const
     }
 }
 
-// cudaGraphInstantiate with the instance cap first and, on an out-of-memory error, the cold instances dropped and the
-// OOM hook asked once before one retry [TAG_FN_L22_OOMHOOK]
-static void ggml_cuda_fn_l22_instantiate(ggml_backend_cuda_context * ctx, ggml_cuda_graph * graph) {
-    ggml_cuda_fn_l22_instance_cap(ctx, graph);
+// cudaGraphInstantiate of one chunk of graph [TAG_UPSTREAM_30804] with the instance cap first (for the first chunk of an
+// object without instances: the cap counts chunk lists) and, on an out-of-memory error, the cold instances dropped and the
+// OOM hook asked once before one retry [TAG_FN_L22_OOMHOOK]. The OOM hook runs only outside a capture (the last chunk).
+static void ggml_cuda_fn_l22_instantiate(ggml_backend_cuda_context * ctx, ggml_cuda_graph * graph, cudaGraphExec_t * instance,
+                                         cudaGraph_t cuda_graph) {
+    if (!graph->has_instance()) {
+        ggml_cuda_fn_l22_instance_cap(ctx, graph);
+    }
     ggml_cuda_fn_l22_oom_precheck(64u*1024*1024); // [TAG_FN_L22_OOMHOOK] an instance of a large graph: tens of MiB
     const auto inst = [&]() {
         if (ctx->fn_l4_prio) { // [TAG_FN_L4_QSA_STREAMS]
-            return cudaGraphInstantiateWithFlags(&graph->instance, graph->graph, cudaGraphInstantiateFlagUseNodePriority);
+            return cudaGraphInstantiateWithFlags(instance, cuda_graph, cudaGraphInstantiateFlagUseNodePriority);
         }
-        return cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0);
+        return cudaGraphInstantiate(instance, cuda_graph, NULL, NULL, 0);
     };
     cudaError_t err = inst();
     if (err == cudaErrorMemoryAllocation) {
         (void) cudaGetLastError();
-        graph->instance = nullptr;
+        *instance = nullptr;
         int n_dropped = 0;
         while (ggml_cuda_fn_l22_drop_one_instance(ctx, graph, true)) {
             n_dropped++;
         }
-        const bool hook = ggml_cuda_fn_l22_oom_retry(256u*1024*1024);
+        const bool hook = ggml_cuda_fn_l22_oom_retry(256u*1024*1024, 3);
         GGML_LOG_WARN("ggml_cuda: [TAG_FN_L22_OOMHOOK] graph instantiate out of memory (%d nodes): %d cold instances dropped, "
                 "hook %d, one retry\n", (int) graph->node_props.size(), n_dropped, hook ? 1 : 0);
         err = inst();
+        // [TAG_FN_L23_PINFIX] R-L23-6: a second failure aborts below: the hook's second attempt first
+        if (err == cudaErrorMemoryAllocation && ggml_cuda_fn_l22_oom_retry(256u*1024*1024, 4)) {
+            (void) cudaGetLastError();
+            *instance = nullptr; // [TAG_FN_V0252_MERGE] the chunk's instance ([TAG_UPSTREAM_30804] has no graph->instance)
+            err = inst();
+        }
     }
     CUDA_CHECK(err);
 }
@@ -4008,7 +4139,7 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
     // [TAG_FN_L22_GRAPH2] an instance that replayed a few times and is about to change goes aside with its properties: a key
     // that alternates between two buffer layouts then swaps instances instead of re-warming at every switch. A graph
     // that replayed long (a KV bucket change) keeps the RECAP update in place.
-    const bool g2 = ggml_cuda_fn_l22_graph2() && graph->instance != nullptr && graph->n_replay_cap >= 1 &&
+    const bool g2 = ggml_cuda_fn_l22_graph2() && graph->has_instance() && graph->n_replay_cap >= 1 &&
         graph->n_replay_cap <= 32 && (int) graph->node_props.size() == cgraph->n_nodes;
     std::vector<ggml_cuda_graph::node_properties> g2_old;
 
@@ -4073,8 +4204,8 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
     // [TAG_FN_L22_GRAPH2] swap in a kept instance of this layout, else put the current one aside (at most 2 kept)
     if (res && !g2_old.empty()) {
         ggml_cuda_graph::fn_l22_variant cur;
-        cur.graph          = graph->graph;
-        cur.instance       = graph->instance;
+        cur.instances      = std::move(graph->instances); // [TAG_UPSTREAM_30804] the chunk list
+        graph->instances.clear();
         cur.node_props     = std::move(g2_old);
         cur.pool_top_known = graph->pool_top_known;
         memcpy(cur.pool_top, graph->pool_top, sizeof(cur.pool_top));
@@ -4083,8 +4214,7 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
 
         for (ggml_cuda_graph::fn_l22_variant & v : graph->fn_l22_alt) {
             if (ggml_cuda_fn_l22_props_equal(v.node_props, graph->node_props)) {
-                graph->graph          = v.graph;
-                graph->instance       = v.instance;
+                graph->instances      = std::move(v.instances);
                 graph->pool_top_known = v.pool_top_known;
                 memcpy(graph->pool_top, v.pool_top, sizeof(graph->pool_top));
                 graph->n_replay_cap    = 1;
@@ -4106,8 +4236,7 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
             graph->fn_l22_alt[oldest].destroy();
             graph->fn_l22_alt.erase(graph->fn_l22_alt.begin() + oldest);
         }
-        graph->graph                  = nullptr;
-        graph->instance               = nullptr;
+        graph->instances.clear();
         graph->replayed_since_capture = false;
         graph->n_replay_cap           = 0;
         graph->pool_top_known         = false;
@@ -4116,16 +4245,16 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
     return res;
 }
 
-static void ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_ctx, const void * graph_key) {
-    ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
-
+// [TAG_UPSTREAM_30804] update one chunk's executable from its new capture (re-instantiate when the topology changed)
+static void ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_ctx, ggml_cuda_graph * graph,
+                                              cudaGraphExec_t & instance, cudaGraph_t cuda_graph) {
 #if CUDART_VERSION >= 12000
     cudaGraphExecUpdateResultInfo result_info;
-    cudaError_t stat = cudaGraphExecUpdate(graph->instance, graph->graph, &result_info);
+    cudaError_t stat = cudaGraphExecUpdate(instance, cuda_graph, &result_info);
 #else
     cudaGraphNode_t errorNode;
     cudaGraphExecUpdateResult result_info;
-    cudaError_t stat = cudaGraphExecUpdate(graph->instance, graph->graph, &errorNode, &result_info);
+    cudaError_t stat = cudaGraphExecUpdate(instance, cuda_graph, &errorNode, &result_info);
 #endif // CUDART_VERSION >= 12000
 
     if (stat == cudaErrorGraphExecUpdateFailure) {
@@ -4136,11 +4265,54 @@ static void ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_c
         // The pre-existing graph exec cannot be updated due to violated constraints
         // so instead clear error and re-instantiate
         (void)cudaGetLastError();
-        CUDA_CHECK(cudaGraphExecDestroy(graph->instance));
-        graph->instance = nullptr;
-        ggml_cuda_fn_l22_instantiate(cuda_ctx, graph); // [TAG_FN_L22_GRAPHKEEP] instance cap, OOM hook
+        CUDA_CHECK(cudaGraphExecDestroy(instance));
+        instance = nullptr;
+        ggml_cuda_fn_l22_instantiate(cuda_ctx, graph, &instance, cuda_graph); // [TAG_FN_L22_GRAPHKEEP] OOM hook
     } else {
         GGML_ASSERT(stat == cudaSuccess);
+    }
+}
+
+// [TAG_UPSTREAM_30804] (#30804 + #31053) ggml nodes per CUDA graph chunk; 0 captures the whole ggml graph as one CUDA graph
+static int ggml_cuda_graph_chunk_size() {
+    static const int chunk_size = [] {
+        const char * env = getenv("GGML_CUDA_GRAPH_CHUNK_SIZE");
+        return env != nullptr ? atoi(env) : 512;
+    }();
+    return chunk_size;
+}
+
+// [TAG_UPSTREAM_30804] chunk idx of graph was captured into cuda_graph: update its executable (or create it) and launch it
+static void ggml_cuda_graph_exec_chunk(ggml_backend_cuda_context * cuda_ctx, ggml_cuda_graph * graph, size_t idx,
+                                       cudaGraph_t cuda_graph) {
+    if (idx < graph->instances.size()) {
+        ggml_cuda_graph_update_executable(cuda_ctx, graph, graph->instances[idx], cuda_graph);
+    } else {
+        GGML_ASSERT(idx == graph->instances.size());
+        cudaGraphExec_t instance = nullptr;
+        ggml_cuda_fn_l22_instantiate(cuda_ctx, graph, &instance, cuda_graph); // [TAG_FN_L22_GRAPHKEEP] cap, OOM hook
+        graph->instances.push_back(instance);
+    }
+    CUDA_CHECK(cudaGraphDestroy(cuda_graph));
+    CUDA_CHECK(cudaGraphLaunch(graph->instances[idx], cuda_ctx->stream()));
+}
+
+// [TAG_FN_R4_POKE] GGML_CUDA_GRAPH_POKE=1: one stream query right after a launch flushes WDDM's batched submission, so the
+// GPU starts the graph now rather than at the next driver call, and host work that should overlap it (a CPU split, the
+// MoE bridge's executor, the capture of the next chunk) does. Strata R4.2d measured 17 of 10,562 layers overlapped
+// without it and 9,190 with it. The query changes no result; "not ready" is its normal answer here. Never inside a capture.
+static void ggml_cuda_graph_poke(ggml_backend_cuda_context * cuda_ctx) {
+    static const bool graph_poke = [] {
+        const char * e = getenv("GGML_CUDA_GRAPH_POKE");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    if (graph_poke) {
+        const cudaError_t q = cudaStreamQuery(cuda_ctx->stream());
+        if (q == cudaErrorNotReady) {
+            (void) cudaGetLastError(); // not an error: clear it, as torch's stream query does
+        } else if (q != cudaSuccess) {
+            CUDA_CHECK(q);
+        }
     }
 }
 #endif // USE_CUDA_GRAPH
@@ -7315,6 +7487,16 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
     ggml_cuda_concurrent_event * concurrent_event           = nullptr;
     bool                         should_launch_concurrent_events = false;
 
+#ifdef USE_CUDA_GRAPH
+    // [TAG_UPSTREAM_30804] a capture ends a chunk every chunk_size nodes and launches it, so the GPU runs the first chunks
+    // while the rest is captured; a replay launches the chunks one after the other (same kernels, same order, one stream).
+    // Not with a hostfunc-mode MoE bridge: its post forks an aux stream that only a later wait node joins.
+    ggml_cuda_graph * chunk_graph = use_cuda_graph && cuda_graph_update_required ? cuda_ctx->cuda_graph(graph_key) : nullptr;
+    const int         chunk_size  = chunk_graph != nullptr && !ggml_cuda_moe_bridge_hostfunc_any() ? ggml_cuda_graph_chunk_size() : 0;
+    int               chunk_end   = chunk_size;
+    size_t            n_chunks    = 0;
+#endif // USE_CUDA_GRAPH
+
     const auto try_launch_concurrent_event = [&](const ggml_tensor * node) {
         if (stream_ctx.concurrent_events.find(node) != stream_ctx.concurrent_events.end()) {
             concurrent_event = &stream_ctx.concurrent_events[node];
@@ -7424,6 +7606,18 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
+#ifdef USE_CUDA_GRAPH
+                // [TAG_UPSTREAM_30804] fused nodes are skipped together, so a cut never splits a fusion; a concurrent region
+                // must join before its capture can end
+                if (chunk_size > 0 && i >= chunk_end && !is_concurrent_event_active) {
+                    cudaGraph_t cuda_graph = nullptr;
+                    CUDA_CHECK(cudaStreamEndCapture(cuda_ctx->stream(), &cuda_graph));
+                    ggml_cuda_graph_exec_chunk(cuda_ctx, chunk_graph, n_chunks++, cuda_graph);
+                    ggml_cuda_graph_poke(cuda_ctx); // [TAG_FN_R4_POKE] the chunk starts while the next one is captured
+                    CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed));
+                    chunk_end = i + chunk_size;
+                }
+#endif // USE_CUDA_GRAPH
                 if (!fn_l22_fused.empty() && fn_l22_fused[i]) { // [TAG_FN_L22_GLUQ8]
                     prev_i = i;
                     continue;
@@ -7552,19 +7746,26 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 #ifdef USE_CUDA_GRAPH
         ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
         if (use_cuda_graph && cuda_graph_update_required) { // End CUDA graph capture
-            if (graph->graph != nullptr) {
-                CUDA_CHECK(cudaGraphDestroy(graph->graph));
-                graph->graph = nullptr;
-            }
-
-            CUDA_CHECK(cudaStreamEndCapture(cuda_ctx->stream(), &graph->graph));
+            cudaGraph_t cuda_graph = nullptr;
+            CUDA_CHECK(cudaStreamEndCapture(cuda_ctx->stream(), &cuda_graph));
             graph_evaluated_or_captured = true; // CUDA graph has been captured
             ggml_cuda_fn_l22_cap_end(cuda_ctx, graph); // [TAG_FN_L22_GRAPHKEEP] the pool offsets this capture uses
 
-            std::lock_guard<std::mutex> lock(ggml_cuda_lock);
-            if (ggml_cuda_lock_counter.fetch_sub(1, std::memory_order_relaxed) == 1) {
-                ggml_cuda_lock_cv.notify_all();
+            {
+                std::lock_guard<std::mutex> lock(ggml_cuda_lock);
+                if (ggml_cuda_lock_counter.fetch_sub(1, std::memory_order_relaxed) == 1) {
+                    ggml_cuda_lock_cv.notify_all();
+                }
             }
+
+            // [TAG_UPSTREAM_30804] the last chunk (the only one when the graph has <= chunk_size nodes): update or create its
+            // executable outside the capture lock, as before (instance cap, OOM hook), and launch it; the earlier chunks
+            // were launched during the capture. Chunks left over from a capture with more chunks are dropped.
+            ggml_cuda_graph_exec_chunk(cuda_ctx, graph, n_chunks++, cuda_graph);
+            for (size_t c = n_chunks; c < graph->instances.size(); ++c) {
+                CUDA_CHECK(cudaGraphExecDestroy(graph->instances[c]));
+            }
+            graph->instances.resize(n_chunks);
         } else {
             graph_evaluated_or_captured = true; // ggml graph has been directly evaluated
         }
@@ -7582,32 +7783,16 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
     if (use_cuda_graph) {
         ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
-        if (graph->instance == nullptr) { // Create executable graph from captured graph.
-            // [TAG_FN_L4_QSA_STREAMS] the QSA side stream's kernels keep their high priority (instantiate flags);
-            // [TAG_FN_L22_GRAPHKEEP] the instance cap and the OOM retry
-            ggml_cuda_fn_l22_instantiate(cuda_ctx, graph);
-        }
-        if (cuda_graph_update_required) { // Update graph executable
-            ggml_cuda_graph_update_executable(cuda_ctx, graph_key);
-        }
-        // Launch graph
-        CUDA_CHECK(cudaGraphLaunch(graph->instance, cuda_ctx->stream()));
-        // [TAG_FN_R4_POKE] GGML_CUDA_GRAPH_POKE=1: one stream query right after the launch flushes WDDM's batched
-        // submission, so the GPU starts the graph now rather than at the next driver call, and host work that should
-        // overlap it (a CPU split, the MoE bridge's executor) does. Strata R4.2d measured 17 of 10,562 layers overlapped
-        // without it and 9,190 with it. The query changes no result; "not ready" is its normal answer here.
-        static const bool graph_poke = [] {
-            const char * e = getenv("GGML_CUDA_GRAPH_POKE");
-            return e != nullptr && atoi(e) != 0;
-        }();
-        if (graph_poke) {
-            const cudaError_t q = cudaStreamQuery(cuda_ctx->stream());
-            if (q == cudaErrorNotReady) {
-                (void) cudaGetLastError(); // not an error: clear it, as torch's stream query does
-            } else if (q != cudaSuccess) {
-                CUDA_CHECK(q);
+        // [TAG_UPSTREAM_30804] a capture launched its chunks already; a replay launches them here, in order
+        // ([TAG_FN_L4_QSA_STREAMS] the instantiate flags keep the QSA side stream's priority; [TAG_FN_L22_GRAPHKEEP] the
+        // instance cap and the OOM retry are in ggml_cuda_fn_l22_instantiate)
+        if (!cuda_graph_update_required) {
+            GGML_ASSERT(graph->has_instance());
+            for (cudaGraphExec_t instance : graph->instances) {
+                CUDA_CHECK(cudaGraphLaunch(instance, cuda_ctx->stream()));
             }
         }
+        ggml_cuda_graph_poke(cuda_ctx); // [TAG_FN_R4_POKE]
 #else
         GGML_UNUSED(graph_key);
         graph_evaluated_or_captured = true;
@@ -7619,7 +7804,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, const void * graph_key) {
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
 
-    if (graph->graph == nullptr) {
+    if (!graph->has_instance()) {
         if (ggml_cuda_info().devices[cuda_ctx->device].cc < GGML_CUDA_CC_VOLTA) {
             if (!graph->disable_due_to_gpu_arch) {
                 GGML_LOG_DEBUG("%s: disabling CUDA graphs due to GPU architecture\n", __func__);
@@ -7773,7 +7958,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                     recapture_safe = ggml_cuda_info().devices[device].vmm;
                 }
 #endif // defined(GGML_USE_VMM)
-                if (properties_changed && recapture_safe && graph->instance != nullptr && graph->replayed_since_capture &&
+                if (properties_changed && recapture_safe && graph->has_instance() && graph->replayed_since_capture &&
                         !nodes_changed) {
                     use_cuda_graph = true;
                     cuda_graph_update_required = true;
@@ -7784,7 +7969,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                     gp_reason = 3;
                 } else {
                     use_cuda_graph = true;
-                    cuda_graph_update_required = graph->instance == nullptr;
+                    cuda_graph_update_required = !graph->has_instance();
                 }
             }
         } else {
@@ -7900,7 +8085,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
             graph->n_replay++;
             graph->n_replay_cap++;
         } else if (use_cuda_graph) {
-            c[graph->instance != nullptr ? GGML_CUDA_FN_L22_CNT_RECAP : GGML_CUDA_FN_L22_CNT_CAPTURE]++;
+            c[graph->has_instance() ? GGML_CUDA_FN_L22_CNT_RECAP : GGML_CUDA_FN_L22_CNT_CAPTURE]++;
         } else if (gp_reason == 5) {
             c[GGML_CUDA_FN_L22_CNT_EAGER_ROWS]++;
         } else if (gp_reason == 3 || gp_reason == 4) {
@@ -8526,7 +8711,7 @@ size_t ggml_backend_cuda_pool_trim(ggml_backend_t backend, size_t keep) {
                         kept++;
                     }
                 }
-                if (g->instance == nullptr) {
+                if (!g->has_instance()) {
                     continue;
                 }
                 if (above(g->pool_top_known, g->pool_top)) {
@@ -8563,11 +8748,11 @@ static void ggml_backend_cuda_pool_mark(ggml_backend_t backend) {
         ggml_cuda_pool * p = ctx->pools[ctx->device][s].get();
         size_t m = p ? p->used_hwm() : 0;
         for (const auto & [k, g] : ctx->cuda_graphs) {
-            if (g->instance != nullptr && g->pool_top_known) {
+            if (g->has_instance() && g->pool_top_known) {
                 m = std::max(m, g->pool_top[s]);
             }
             for (const auto & v : g->fn_l22_alt) {
-                if (v.instance != nullptr && v.pool_top_known) {
+                if (v.has_instance() && v.pool_top_known) {
                     m = std::max(m, v.pool_top[s]);
                 }
             }
@@ -9629,10 +9814,59 @@ static bool ggml_backend_cuda_turbot_supports_geometry(ggml_backend_dev_t dev, i
     return ggml_cuda_turbot_geometry_supported(dev_ctx->device, head_dim, n_head_kv);
 }
 
+// [TAG_FN_L23_PINFIX] R-L23-8 backstop for our registrations (upstream #31122: the WDDM page-lock budget is about half the RAM
+// and unstable past it): the total stays under the cap libllama sets (0.4 x RAM), and the first refusal by the driver stops
+// every later registration of the process (no retry until a restart)
+static std::mutex                         g_fn_reg_mtx;
+static std::unordered_map<void *, size_t> g_fn_reg_map;
+static size_t                             g_fn_reg_total   = 0;
+static size_t                             g_fn_reg_cap     = 0;
+static bool                               g_fn_reg_refused = false;
+
+static void ggml_backend_cuda_fn_set_reg_cap(size_t cap) {
+    std::lock_guard<std::mutex> lk(g_fn_reg_mtx);
+    g_fn_reg_cap = cap;
+}
+
+static bool ggml_cuda_fn_reg_admit(size_t size) {
+    {
+        std::lock_guard<std::mutex> lk(g_fn_bounce_mtx);
+        (void) ggml_cuda_fn_bounce_locked(); // the bounce buffer exists before the first pin
+    }
+    std::lock_guard<std::mutex> lk(g_fn_reg_mtx);
+    if (g_fn_reg_refused) {
+        return false;
+    }
+    if (g_fn_reg_cap > 0 && g_fn_reg_total + size > g_fn_reg_cap) {
+        GGML_LOG_WARN("ggml_cuda: [TAG_FN_L23_PINFIX] %.0f MiB not registered: %.2f GiB registered, cap %.2f GiB\n", size/1048576.0,
+                g_fn_reg_total/1073741824.0, g_fn_reg_cap/1073741824.0);
+        return false;
+    }
+    return true;
+}
+
+static void ggml_cuda_fn_reg_done(void * buffer, size_t size, cudaError_t err) {
+    std::lock_guard<std::mutex> lk(g_fn_reg_mtx);
+    if (err != cudaSuccess) {
+        if (!g_fn_reg_refused) {
+            GGML_LOG_WARN("ggml_cuda: [TAG_FN_L23_PINFIX] the driver refused a registration (%.0f MiB, %.2f GiB registered: %s): no more "
+                    "registrations in this process\n", size/1048576.0, g_fn_reg_total/1073741824.0, cudaGetErrorString(err));
+        }
+        g_fn_reg_refused = true;
+        return;
+    }
+    g_fn_reg_map[buffer] = size;
+    g_fn_reg_total += size;
+}
+
 // [TAG_FN_L14_ARENA] the expert arena (locked host memory) registered for direct DMA, without the GGML_CUDA_REGISTER_HOST
 // switch the generic pair needs; false when the driver refuses (the caller keeps its staged copies then)
 static bool ggml_backend_cuda_fn_register_host(void * buffer, size_t size) {
+    if (!ggml_cuda_fn_reg_admit(size)) {
+        return false;
+    }
     cudaError_t err = cudaHostRegister(buffer, size, cudaHostRegisterPortable | cudaHostRegisterReadOnly);
+    ggml_cuda_fn_reg_done(buffer, size, err);
     if (err != cudaSuccess) {
         (void) cudaGetLastError();
         GGML_LOG_WARN("%s: %.0f MiB not registered: %s\n", __func__, size/1048576.0, cudaGetErrorString(err));
@@ -9645,6 +9879,12 @@ static void ggml_backend_cuda_fn_unregister_host(void * buffer) {
     if (cudaHostUnregister(buffer) != cudaSuccess) {
         (void) cudaGetLastError();
     }
+    std::lock_guard<std::mutex> lk(g_fn_reg_mtx);
+    auto it = g_fn_reg_map.find(buffer);
+    if (it != g_fn_reg_map.end()) {
+        g_fn_reg_total -= std::min(g_fn_reg_total, it->second);
+        g_fn_reg_map.erase(it);
+    }
 }
 
 // [TAG_FN_L22_PIN] R-P14-5: a host range registered with a device mapping (pinned DMA share reads it from kernels), and
@@ -9653,7 +9893,11 @@ static bool ggml_backend_cuda_fn_register_host_mapped(void * buffer, size_t size
     if (dev) {
         *dev = nullptr;
     }
+    if (!ggml_cuda_fn_reg_admit(size)) {
+        return false;
+    }
     cudaError_t err = cudaHostRegister(buffer, size, cudaHostRegisterPortable | cudaHostRegisterReadOnly | cudaHostRegisterMapped);
+    ggml_cuda_fn_reg_done(buffer, size, err);
     if (err != cudaSuccess) {
         (void) cudaGetLastError();
         GGML_LOG_WARN("%s: %.0f MiB not registered: %s\n", __func__, size/1048576.0, cudaGetErrorString(err));
@@ -9860,6 +10104,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_cuda_set_oom_hook") == 0) {
         return (void *)ggml_backend_cuda_set_oom_hook;
+    }
+    if (strcmp(name, "ggml_backend_cuda_fn_set_reg_cap") == 0) { // [TAG_FN_L23_PINFIX] R-L23-8
+        return (void *)ggml_backend_cuda_fn_set_reg_cap;
     }
     if (strcmp(name, "ggml_backend_cuda_limits") == 0) { // [TAG_FN_L3_VRAM_ACCOUNT]
         return (void *)ggml_backend_cuda_limits;

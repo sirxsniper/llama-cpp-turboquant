@@ -115,6 +115,59 @@ static inline double convstore_gdsf(double L, int64_t hits, int64_t n_tokens, ui
     return L + (1.0 + (double) (hits > 0 ? hits : 0)) * ((double) n_tokens + fixed_tokens) / gib;
 }
 
+// [TAG_FN_L24_KEEPVAL] Eviction by value: the re-read cost a restore saves (tokens + a fixed pass cost) times a capped
+// restore count, times recency (1 / (1 + age / half_s)). The default of before evicted the least recently stored entry,
+// so 3-4 one-shot side requests evicted the main conversation (owner 10-22: 48.6K re-read in 24.8 s); GDSF's inflation
+// value lets enough of them do the same. Here the biggest conversation used within active_s is kept against the count
+// limit (only the disk budget may take it, and last), and the others go by value.
+struct convstore_val_entry {
+    int64_t n_tokens = 0;
+    int64_t hits     = 0;     // restores it served
+    double  age_s    = 0.0;   // since it was stored or last restored
+    bool    keep     = false; // never evicted (the conversation the next prompt restores)
+};
+
+static inline double convstore_val(int64_t n_tokens, int64_t hits, double age_s, double fixed_tokens, double half_s) {
+    const double cost = (double) std::max<int64_t>(0, n_tokens) + std::max(0.0, fixed_tokens);
+    const double freq = 1.0 + (double) std::min<int64_t>(std::max<int64_t>(0, hits), 3);
+    const double rec  = half_s > 0.0 ? 1.0 / (1.0 + std::max(0.0, age_s) / half_s) : 1.0;
+    return cost * freq * rec;
+}
+
+// the protected entry: the most tokens among the entries used within active_s (keep entries count too); -1 when none
+static inline int convstore_val_protect(const std::vector<convstore_val_entry> & es, double active_s) {
+    int best = -1;
+    for (int i = 0; i < (int) es.size(); ++i) {
+        if (es[i].age_s <= active_s && (best < 0 || es[i].n_tokens > es[best].n_tokens)) {
+            best = i;
+        }
+    }
+    return best;
+}
+
+// the entry to evict: the lowest value, never a keep entry. budget = false (the count limit): never the protected entry;
+// budget = true (disk room): the protected entry only when nothing else is left. -1 when there is nothing to evict.
+static inline int convstore_val_victim(const std::vector<convstore_val_entry> & es, double fixed_tokens, double half_s,
+                                       double active_s, bool budget) {
+    const int prot = convstore_val_protect(es, active_s);
+    int    best   = -1;
+    double best_v = 0.0;
+    for (int i = 0; i < (int) es.size(); ++i) {
+        if (es[i].keep || i == prot) {
+            continue;
+        }
+        const double v = convstore_val(es[i].n_tokens, es[i].hits, es[i].age_s, fixed_tokens, half_s);
+        if (best < 0 || v < best_v) {
+            best   = i;
+            best_v = v;
+        }
+    }
+    if (best < 0 && budget && prot >= 0 && !es[prot].keep) {
+        best = prot;
+    }
+    return best;
+}
+
 // [TAG_FN_L19_CONVSTORE_SPILL] Checkpoints a full ring drops go to a file of the conversation instead of being lost.
 // A dropped checkpoint is written only when no kept one (in the ring or on disk) lies within min_gap tokens of it, and
 // a conversation keeps at most n_max on disk: past that the one closest to its predecessor goes (the newest stays).

@@ -1135,8 +1135,11 @@ void llama_memory_hybrid_idx_context::kpool_build_state(const llama_ubatch & uba
     auto & qs = mem->qsa_stats_mut();
     ++qs.ubatches;
     qs.pfx_kept += lay.pfx_safe ? 1 : 0;
+    // [TAG_FN_L24_SEQPOOLS_IMG] not for an M-RoPE embedding ubatch (a picture, or a merged picture turn: keyed positional
+    // vectors): listed, a 2-slot server's picture turns scored KLD 0.057-0.059 vs 0.0057 on 1 slot (img12, 1,024 forced tokens,
+    // v0.25.1 per-chunk and the merged pass alike); the full pool list (QSA_SEQPOOLS=0 for that ubatch) gave 0.0059
     if (mem->qsa_seqpools() != 0 && mem->qsa_seqpools_ok() && idx->get_n_stream() == 1 && ubatch.n_seqs_unq == 1 &&
-            ubatch.n_tokens > 0) {
+            ubatch.n_tokens > 0 && (ubatch.token != nullptr || !ubatch.is_pos_2d())) {
         const llama_seq_id s0 = ubatch.seq_id[0][0];
         bool one = s0 >= 0 && s0 < (llama_seq_id) LLAMA_MAX_SEQ;
         for (uint32_t i = 0; i < ubatch.n_tokens && one; ++i) {

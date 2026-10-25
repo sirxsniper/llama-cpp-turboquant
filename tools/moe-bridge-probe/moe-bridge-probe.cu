@@ -776,6 +776,13 @@ int main(int argc, char ** argv) {
     if (only.empty() || only == "bw")     { test_bw(pinned_mib, stream_mib, n_threads, mask, false, quick); }
     if (only.empty() || only == "bwcpu")  { test_bw(pinned_mib, stream_mib, n_threads, mask, true, quick); }
     if (only == "zc")                     { test_zc(zc_file, zc_mib, stream_mib, n_threads, mask, quick); } // [TAG_FN_L3_CPU_ZC]
+    if (only == "bounce") { // [TAG_FN_L23_PINFIX] a copy across a registered range's end
+        const int rc = moe_bridge_bounce_test(say);
+        if (g_log) {
+            fclose(g_log);
+        }
+        return rc;
+    }
     if (only == "pin") { // [TAG_FN_L22_PIN] test 7, only on request (the round-22 test's pin block)
         if (pin.files.empty()) {
             pin.files.push_back("D:/Projects/LocalAI/models/Qwen3.8-Flash-Next-UD-Q4_K_XL-MTPq3-00002-of-00005.gguf");

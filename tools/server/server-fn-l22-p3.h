@@ -248,3 +248,18 @@ static inline std::vector<int64_t> l22_prev_user_starts(const std::vector<int64_
 static inline bool l22_phase_gen(int64_t n_rows, int64_t n_prompt_rows) {
     return n_rows > 0 && n_prompt_rows == 0;
 }
+
+// [TAG_FN_L24_TTFT] E0: a merged image-turn batch on a multi-slot unified pool decodes alone, so it fits when the free cells hold
+// its rows and the answers' next step (margin); n_free < 0: the memory gives no count, no merged batch
+static inline bool l24_merged_fits(int64_t n_free, int64_t rows, int64_t margin) {
+    return n_free >= 0 && rows > 0 && n_free >= rows + std::max<int64_t>(0, margin);
+}
+
+// [TAG_FN_L24_TTFT] a merged batch and the rows already in the batch: 0 = merge now (empty batch), 1 = only answers' rows (sampled +
+// draft, no embedding rows) and the exclusive rule is on: ask for the next batch alone, -1 = no merged batch in this one
+static inline int l24_merged_batch_rule(int32_t n_batch_rows, int32_t n_gen_rows, bool has_embd, bool excl_on) {
+    if (n_batch_rows == 0) {
+        return 0;
+    }
+    return excl_on && !has_embd && n_gen_rows > 0 && n_batch_rows == n_gen_rows ? 1 : -1;
+}

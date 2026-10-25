@@ -217,6 +217,11 @@ __global__ void topk_moe_cuda(const float *         logits,
             const int expert = i + threadIdx.x;
             selection_wt[i / WARP_SIZE] =
                 (n_experts % WARP_SIZE == 0 || expert < n_experts) ? wt[i / WARP_SIZE] + bias[expert] : -INFINITY;
+            // [TAG_UPSTREAM_31005] a NaN bias (or inf + -inf) makes the selection weight NaN after the check above:
+            // sanitize again so the argmax still picks unique experts
+            if (__isnanf(selection_wt[i / WARP_SIZE])) {
+                selection_wt[i / WARP_SIZE] = -FLT_MAX;
+            }
         }
     }
 

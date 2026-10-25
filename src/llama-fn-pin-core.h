@@ -354,6 +354,126 @@ inline uint64_t oom_cap_bytes(uint64_t want, int64_t head0, bool by_bytes, doubl
     return cap >= 1.8e19 ? UINT64_MAX : std::max(want, (uint64_t) cap);
 }
 
+// [TAG_FN_L23_PINFIX] R-L23-1 (r22 T13): what an unpin can give an allocation. Unpinning frees host pages only: it raises
+// DXGI LOCAL headroom by the charge per registered byte that the registration measured (l_ratio). Without that charge
+// (< OOM_RATIO_MIN; this box: 0.000) it helps only an allocation whose part above the LOCAL headroom may land in shared
+// system memory (NON_LOCAL budget - usage < that part) or one short of commit (commit room < want; only arena chunks give
+// commit back: have_commit). Returns
+// the bytes to unpin: oom_cap_bytes with a LOCAL charge or when DXGI LOCAL cannot be read (as before), else the larger
+// NON_LOCAL / commit deficit + 256 MiB (at most want); 0 = an unpin cannot help, nothing goes (r22 T13: the 16K prompt
+// buffer's pre-check unpinned 7.9 GiB at the first prompt of every PIN run, LOCAL headroom 6.85 -> 6.85 GiB).
+struct oom_in {
+    bool     have_l      = false;
+    int64_t  l_head      = 0;
+    double   l_ratio     = 0.0;
+    bool     have_nl     = false;
+    uint64_t nl_budget   = 0;
+    uint64_t nl_usage    = 0;
+    bool     have_commit = false;
+    uint64_t commit_room = 0;
+};
+
+inline uint64_t oom_help_bytes(uint64_t want, const oom_in & o) {
+    if (!o.have_l) {
+        return want;
+    }
+    if (o.l_ratio >= OOM_RATIO_MIN) {
+        return oom_cap_bytes(want, o.l_head, o.l_head >= (int64_t) want, o.l_ratio);
+    }
+    uint64_t def = 0;
+    if (o.have_nl) {
+        // only the part LOCAL cannot hold may spill into system memory
+        const uint64_t spill = o.l_head > 0 ? (want > (uint64_t) o.l_head ? want - (uint64_t) o.l_head : 0) : want;
+        const uint64_t room  = o.nl_budget > o.nl_usage ? o.nl_budget - o.nl_usage : 0;
+        def = std::max<uint64_t>(def, spill > room ? spill - room : 0);
+    }
+    if (o.have_commit) {
+        def = std::max<uint64_t>(def, want > o.commit_room ? want - o.commit_room : 0);
+    }
+    return def == 0 ? 0 : std::min<uint64_t>(want, def + ((uint64_t) 256 << 20));
+}
+
+// [TAG_FN_L23_PINFIX] R-L23-6: can the pins be the cause of a failed allocation? A host (pinned / sysmem) allocation, a LOCAL
+// charge per pinned byte, NON_LOCAL unknown, NON_LOCAL room under the margin, or a spill past LOCAL that NON_LOCAL cannot hold.
+// AFR_NONE: a plain VRAM failure, the pins stay (l23p B6: a 640.9 MiB VRAM failure dropped all 55 GiB for the whole run)
+enum { AF_HOST = 0, AF_DEV = 1, AF_DEV_FATAL = 2 };
+enum { AFR_NONE = 0, AFR_HOST, AFR_LOCAL_CHARGE, AFR_NL_UNKNOWN, AFR_NL_ROOM, AFR_NL_SPILL };
+
+struct af_in {
+    int      kind      = AF_DEV;
+    double   l_ratio   = 0.0;
+    bool     have_l    = false;
+    int64_t  l_head    = 0;
+    bool     have_nl   = false;
+    uint64_t nl_room   = 0;
+    uint64_t nl_margin = 0;
+    uint64_t need      = 0;
+};
+
+inline int alloc_fail_reason(const af_in & a) {
+    if (a.kind == AF_HOST) {
+        return AFR_HOST;
+    }
+    if (a.l_ratio >= OOM_RATIO_MIN) {
+        return AFR_LOCAL_CHARGE;
+    }
+    if (!a.have_nl) {
+        return AFR_NL_UNKNOWN;
+    }
+    if (a.nl_room < a.nl_margin) {
+        return AFR_NL_ROOM;
+    }
+    const uint64_t spill = !a.have_l || a.l_head <= 0 ? a.need : (a.need > (uint64_t) a.l_head ? a.need - (uint64_t) a.l_head : 0);
+    return spill > a.nl_room ? AFR_NL_SPILL : AFR_NONE;
+}
+
+inline const char * af_reason_name(int r) {
+    switch (r) {
+        case AFR_HOST:         return "host";
+        case AFR_LOCAL_CHARGE: return "local_charge";
+        case AFR_NL_UNKNOWN:   return "nl_unknown";
+        case AFR_NL_ROOM:      return "nl_room";
+        case AFR_NL_SPILL:     return "nl_spill";
+        default:               return "none";
+    }
+}
+
+// [TAG_FN_L23_PINFIX] R-L23-2 (main session 10-21: pins may only ever add speed; under pressure behave exactly like NEW).
+// The gate of the pin thread, one sample per 2 s: with pins, the available RAM (free + standby) below `drop` for `drop_n`
+// samples in a row drops ALL pins (-1; no partial release, nothing leaves the working set: an unpin only unlocks). Without
+// pins (or with released units left), room >= `repin` for `hold_n` samples in a row, `hold_n` samples after the last drop,
+// lets resident units be pinned again (+1; the caller adds the bytes they would bring in to `repin` per unit).
+struct gate_state {
+    int     low       = 0;
+    int     high      = 0;
+    int64_t since_drop = INT64_MAX/2; // samples since the last drop
+};
+
+inline int gate_step(gate_state & g, uint64_t avail, bool pinned, bool repinnable, uint64_t drop, int drop_n, uint64_t repin, int hold_n) {
+    if (g.since_drop < INT64_MAX/2) {
+        g.since_drop++;
+    }
+    if (pinned && avail < drop) {
+        g.high = 0;
+        if (++g.low >= drop_n) {
+            g.low        = 0;
+            g.since_drop = 0;
+            return -1;
+        }
+        return 0;
+    }
+    g.low = 0;
+    if (repinnable && avail >= repin) {
+        if (++g.high >= hold_n && g.since_drop >= hold_n) {
+            g.high = 0;
+            return 1;
+        }
+        return 0;
+    }
+    g.high = 0;
+    return 0;
+}
+
 // the groups of the plan that fit in `bytes`, in plan order: a group that does not fit ends the list (whole experts,
 // the order kept)
 inline int plan_take(const plan & p, uint64_t bytes) {

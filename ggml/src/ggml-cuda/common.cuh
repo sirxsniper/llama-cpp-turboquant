@@ -1278,21 +1278,21 @@ struct ggml_tensor_extra_gpu {
 
 struct ggml_cuda_graph {
 #ifdef USE_CUDA_GRAPH
-    // [TAG_SYNC_1025] the fork keeps one CUDA graph per ggml graph (GRAPH2 / GRAPHKEEP / graph keys); upstream #30804
-    // (a series of chunk graphs, GGML_CUDA_GRAPH_CHUNK_SIZE) is not taken in this sync
+    // [TAG_SYNC_1025] the fork's graph object (GRAPH2 / GRAPHKEEP / graph keys) with the fork's own port of upstream
+    // #30804 / #31053 chunked capture (v0.25.2, below); upstream's version of the struct is not taken
     ~ggml_cuda_graph() {
-        if (instance != nullptr) {
+        for (cudaGraphExec_t instance : instances) {
             CUDA_CHECK(cudaGraphExecDestroy(instance));
-        }
-        if (graph != nullptr) {
-            CUDA_CHECK(cudaGraphDestroy(graph));
         }
         for (fn_l22_variant & v : fn_l22_alt) {
             v.destroy();
         }
     }
-    cudaGraph_t graph = nullptr;
-    cudaGraphExec_t instance = nullptr;
+    // [TAG_UPSTREAM_30804] the ggml graph is captured as a series of CUDA graphs (GGML_CUDA_GRAPH_CHUNK_SIZE nodes each),
+    // so the GPU runs one chunk while the next is captured or launched. The captured cudaGraph_t is destroyed once its
+    // executable exists. Empty: no instance (the keep / cap / trim logic counts one instance per chunk list).
+    std::vector<cudaGraphExec_t> instances;
+    bool has_instance() const { return !instances.empty(); }
     size_t num_nodes = 0;
     std::vector<cudaGraphNode_t> nodes;
     bool disable_due_to_gpu_arch = false;
@@ -1316,23 +1316,20 @@ struct ggml_cuda_graph {
 
     // [TAG_FN_L22_GRAPH2] an instance kept for another buffer layout of the same key (GGML_CUDA_FN_L22_GRAPH2)
     struct fn_l22_variant {
-        cudaGraph_t                  graph    = nullptr;
-        cudaGraphExec_t              instance = nullptr;
+        std::vector<cudaGraphExec_t> instances; // [TAG_UPSTREAM_30804] the chunks
         std::vector<node_properties> node_props;
         bool                         pool_top_known = false;
         size_t                       pool_top[GGML_CUDA_MAX_STREAMS] = {};
         uint64_t                     n_replay  = 0;
         int64_t                      last_used = 0;
 
+        bool has_instance() const { return !instances.empty(); }
+
         void destroy() {
-            if (instance != nullptr) {
+            for (cudaGraphExec_t instance : instances) {
                 CUDA_CHECK(cudaGraphExecDestroy(instance));
-                instance = nullptr;
             }
-            if (graph != nullptr) {
-                CUDA_CHECK(cudaGraphDestroy(graph));
-                graph = nullptr;
-            }
+            instances.clear();
         }
     };
     std::vector<fn_l22_variant> fn_l22_alt;
@@ -1340,14 +1337,10 @@ struct ggml_cuda_graph {
     // [TAG_FN_L22_GRAPHKEEP] give the instance back (instance cap, trim); node_props and the warm-up state stay, so the
     // next call with unchanged properties captures again at once
     void fn_l22_drop_instance() {
-        if (instance != nullptr) {
+        for (cudaGraphExec_t instance : instances) {
             CUDA_CHECK(cudaGraphExecDestroy(instance));
-            instance = nullptr;
         }
-        if (graph != nullptr) {
-            CUDA_CHECK(cudaGraphDestroy(graph));
-            graph = nullptr;
-        }
+        instances.clear();
         replayed_since_capture = false;
         n_replay_cap           = 0;
         pool_top_known         = false;
@@ -1711,7 +1704,7 @@ struct ggml_backend_cuda_context {
     // Check if any CUDA graph has an instance for this context
     bool any_cuda_graph_has_instance() const {
         for (const auto & [key, graph] : cuda_graphs) {
-            if (graph && graph->instance != nullptr) {
+            if (graph && graph->has_instance()) {
                 return true;
             }
         }

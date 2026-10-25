@@ -26,3 +26,6 @@ using pin_say_fn = void (*)(const char * fmt, ...);
 
 // 0: done (see the verdict line), 1: FAIL
 int moe_bridge_pin_test(const pin_probe_args & a, pin_say_fn say);
+
+// [TAG_FN_L23_PINFIX] --only bounce: 0 PASS, 1 FAIL
+int moe_bridge_bounce_test(pin_say_fn say);

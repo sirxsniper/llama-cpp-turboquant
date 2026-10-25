@@ -74,6 +74,8 @@ struct llama_context {
     void fn_ready();
     // [TAG_FN_L20_BIGPROMPT_UB] the caller's prompt tokens after the next decode's batch (-1: not known), read once by it
     void fn_prompt_after(int32_t n) { l20_prompt_after = n; }
+    // [TAG_FN_L24_ENDOVL1] the caller's busy sequences (in a prompt or an answer; -1: not known), kept until set again
+    void fn_seqs_busy(int32_t n) { l24_seqs_busy = n; }
     // [TAG_FN_L22_PHASE] the decode-phase flag (llama_set_decode_phase_ext): read by the next decode's graphs, PROMPT again
     // when that decode returns
     void    fn_set_phase(int32_t phase) { fn_phase = phase == LLAMA_FN_PHASE_GEN ? LLAMA_FN_PHASE_GEN : LLAMA_FN_PHASE_PROMPT; }
@@ -590,6 +592,7 @@ private:
     size_t   l20_base_need    = 0;  // tail bytes a FULL reserve at l20_base_ub needs given back
     size_t   l20_full_base_b  = 0;
     int32_t  l20_prompt_after = -1;
+    int32_t  l24_seqs_busy    = -1; // [TAG_FN_L24_ENDOVL1]
     // [TAG_FN_L22_PHASE] the decode-phase flag and the model's X levers (read at construction); graph_params folds both into
     // fn_gen / fn_x (plan 3.8)
     int32_t            fn_phase = LLAMA_FN_PHASE_PROMPT;
@@ -651,6 +654,10 @@ private:
     uint64_t l22_rw_n       = 0, l22_rw_n_nopin = 0;
     int      l22_rw_press   = -1; // [TAG_FN_L22_RWIDTH] pressure pin on (1) / off (0) / not read yet (-1)
     uint64_t l22_rw_n_press = 0;
+    bool     l24_pin_press  = false; // [TAG_FN_L24_PRESSLIFT] the pin is a pressure pin
+    int      l24_press_lift = -1;    // narrow batches that lift a pressure pin (LLAMA_FN_L24_PRESSLIFT; -1: not read yet)
+    uint64_t l24_n_lift     = 0;
+    bool     l24_endovl1    = false; // [TAG_FN_L24_ENDOVL1] ENDOVERLAP with one busy sequence of n_seq_max > 1
     // [TAG_FN_L22_ENDOVERLAP] a prompt ended in FULL without the eager switch: the next narrow batch goes SMALL, async
     bool     l22_end_pending = false;
     int      l22_first_n     = 0;    // decode calls still counted after a prompt's switch (first 8)

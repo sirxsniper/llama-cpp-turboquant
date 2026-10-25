@@ -2290,6 +2290,23 @@ static bool fn_l22_prior_ids(const ggml_tensor * ids) {
 }
 #endif
 
+// [TAG_UPSTREAM_30804] hostfunc-mode bridges fork the post onto their aux stream and join it at the wait, a later node:
+// a CUDA graph chunk must not end between the two (the capture would end with an unjoined stream), so ggml-cuda.cu
+// captures in one piece while such a bridge exists
+bool ggml_cuda_moe_bridge_hostfunc_any() {
+#ifdef GGML_MOE_BRIDGE_DISABLED
+    return false;
+#else
+    for (int id = 0; id < MB_MAX_BRIDGES; ++id) {
+        const ggml_moe_bridge * b = mb_get(id);
+        if (b != nullptr && b->params.wait_mode == GGML_MOE_BRIDGE_WAIT_HOSTFUNC) {
+            return true;
+        }
+    }
+    return false;
+#endif
+}
+
 bool ggml_cuda_moe_bridge_supports_op(int device, const ggml_tensor * op) {
 #ifdef GGML_MOE_BRIDGE_DISABLED
     GGML_UNUSED(device);

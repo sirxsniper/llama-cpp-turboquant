@@ -264,6 +264,94 @@ static void test_keep_from() {
     }
 }
 
+// [TAG_FN_L24_KEEPVAL] the store by value: the owner's 10-22 sequence (llama-1792637140:12212..12626), n_max 4
+static void test_keepval() {
+    struct ent { int64_t n; int64_t hits; double t_use; };
+    const double fixed = 2048.0, half = 900.0, active = 3600.0;
+    auto view = [&](const std::vector<ent> & st, double now, int keep) {
+        std::vector<convstore_val_entry> es;
+        for (int i = 0; i < (int) st.size(); ++i) {
+            es.push_back({ st[i].n, st[i].hits, now - st[i].t_use, i == keep });
+        }
+        return es;
+    };
+    // store one entry at time now: evict for the count first (as server_keepctx::save with val on)
+    auto store = [&](std::vector<ent> & st, ent e, double now, size_t n_max) {
+        while (st.size() >= n_max) {
+            const int v = convstore_val_victim(view(st, now, -1), fixed, half, active, false);
+            if (v < 0) {
+                break;
+            }
+            st.erase(st.begin() + v);
+        }
+        st.push_back(e);
+    };
+    auto has = [](const std::vector<ent> & st, int64_t n) {
+        for (const auto & e : st) {
+            if (e.n == n) {
+                return true;
+            }
+        }
+        return false;
+    };
+    {
+        std::vector<ent> st = { { 129130, 1, -600.0 }, { 15846, 0, -500.0 }, { 4329, 1, -400.0 } };
+        store(st, { 48656, 0, 0.0 }, 0.0, 4);       // the main design conversation
+        st[std::min<size_t>(2, st.size() - 1)].t_use = 1.0; // the 4329-token entry restored (kept) right after
+        store(st, { 17905, 0, 115.0 }, 115.0, 4);   // side conversations
+        store(st, { 16670, 0, 200.0 }, 200.0, 4);
+        store(st, { 17469, 0, 323.0 }, 323.0, 4);
+        store(st, { 5200, 0, 334.0 }, 334.0, 4);
+        TCHECK(has(st, 48656), "the main conversation survives 4 side stores");
+        TCHECK(st.size() == 4, "count %zu", st.size());
+    }
+    {
+        // the rule of before (least recently stored first, LLAMA_FN_L19_CONVSTORE_EVICT 0) lost it on the 4th side store
+        std::vector<int64_t> st = { 48656 };
+        for (int64_t n : { 17905, 16670, 17469, 5200 }) {
+            while (st.size() >= 4) {
+                st.erase(st.begin());
+            }
+            st.push_back(n);
+        }
+        TCHECK(std::find(st.begin(), st.end(), 48656) == st.end(), "the old rule was expected to evict the main conversation");
+    }
+    {
+        // 10 one-shot side requests in a row: the main conversation stays (protected while active)
+        std::vector<ent> st = { { 48656, 0, 0.0 } };
+        for (int i = 0; i < 10; ++i) {
+            store(st, { 20000 + i, 0, 30.0 * (i + 1) }, 30.0 * (i + 1), 4);
+        }
+        TCHECK(has(st, 48656), "the main conversation survives 10 bigger-than-usual side stores");
+        // the newest side requests stay, the oldest went first among equals by age
+        TCHECK(has(st, 20009) && !has(st, 20000), "lowest value = oldest side request");
+    }
+    {
+        // not used for 2 h: no longer protected, a recent bigger conversation is worth more
+        std::vector<convstore_val_entry> es = { { 48656, 0, 7200.0, false }, { 60000, 0, 10.0, false }, { 52000, 0, 20.0, false } };
+        TCHECK(convstore_val_protect(es, active) == 1, "the biggest active one");
+        TCHECK(convstore_val_victim(es, fixed, half, active, false) == 0, "the stale big conversation goes for the count");
+    }
+    {
+        // keep is never evicted; the count never takes the protected one; the budget does, last
+        std::vector<convstore_val_entry> es = { { 48656, 0, 60.0, false }, { 3000, 0, 5.0, true } };
+        TCHECK(convstore_val_victim(es, fixed, half, active, false) == -1, "count: only keep and protected");
+        TCHECK(convstore_val_victim(es, fixed, half, active, true) == 0, "budget: the protected one last");
+        es[0].keep = true;
+        TCHECK(convstore_val_victim(es, fixed, half, active, true) == -1, "budget: never keep");
+        std::vector<convstore_val_entry> es2 = { { 48656, 0, 60.0, false }, { 3000, 0, 5.0, false }, { 9000, 0, 5.0, false } };
+        TCHECK(convstore_val_victim(es2, fixed, half, active, true) == 1, "budget: the lowest value first");
+    }
+    {
+        // recency and restores
+        TCHECK(convstore_val(10000, 0, 900.0, 0.0, 900.0) == 5000.0, "half at half_s");
+        TCHECK(convstore_val(10000, 1, 0.0, 0.0, 900.0) == 20000.0, "one restore doubles");
+        TCHECK(convstore_val(10000, 99, 0.0, 0.0, 900.0) == 40000.0, "restores capped at 3");
+        TCHECK(convstore_val(-5, -1, -3.0, 2048.0, 900.0) == 2048.0, "negative inputs clamp");
+        TCHECK(convstore_val_protect({}, active) == -1 && convstore_val_victim({}, fixed, half, active, true) == -1, "empty");
+    }
+}
+
 int main() {
     test_victim_fixed();
     test_agent_loop();
@@ -271,6 +359,7 @@ int main() {
     test_gdsf();
     test_thin();
     test_keep_from();
+    test_keepval();
     printf("test-fn-convstore: %d checks, %d failed\n", g_checks, g_fail);
     return g_fail == 0 ? 0 : 1;
 }

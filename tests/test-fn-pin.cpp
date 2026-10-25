@@ -433,11 +433,95 @@ static void test_oom_cap() {
     TCHECK(fn_pin::oom_cap_bytes(4*G, -1*(int64_t) G, false, 2.0) >= 4*G, "negative headroom");
 }
 
+// [TAG_FN_L23_PINFIX] R-L23-1: the OOM hook unpins only what can raise the room; R-L23-2: the valve's room
+static void test_pinfix() {
+    const uint64_t M = 1ull << 20;
+    const uint64_t G = 1ull << 30;
+    fn_pin::oom_in o;
+    TCHECK(fn_pin::oom_help_bytes(8*G, o) == 8*G, "DXGI LOCAL unknown: want bytes (as before)");
+    // r22 T13: 7573 MiB + 512 MiB, LOCAL headroom 6.85 GiB, charge 0, NON_LOCAL 65.39 / 73.75 GiB: nothing helps
+    o.have_l = true; o.l_head = (int64_t) (6.85*(double) G); o.l_ratio = 0.0;
+    o.have_nl = true; o.nl_budget = (uint64_t) (73.75*(double) G); o.nl_usage = (uint64_t) (65.39*(double) G);
+    const uint64_t want = 7573*M + 512*M;
+    TCHECK(fn_pin::oom_help_bytes(want, o) == 0, "T13 case: no charge, NON_LOCAL holds the spill: no unpin");
+    o.have_nl = false;
+    TCHECK(fn_pin::oom_help_bytes(want, o) == 0, "no charge, NON_LOCAL unknown, no commit: no unpin");
+    // NON_LOCAL short of the spill: the deficit + 256 MiB, at most want
+    o.have_nl = true; o.nl_usage = o.nl_budget - 512*M;
+    const uint64_t spill = want - (uint64_t) o.l_head;
+    TCHECK(fn_pin::oom_help_bytes(want, o) == spill - 512*M + 256*M, "NON_LOCAL deficit + 256 MiB (%.0f MiB)",
+            fn_pin::oom_help_bytes(want, o)/(double) M);
+    o.l_head = -1;
+    o.nl_usage = o.nl_budget;
+    TCHECK(fn_pin::oom_help_bytes(want, o) == want, "no LOCAL room, NON_LOCAL full: want (capped)");
+    // the arena: commit short
+    o.l_head = 20*(int64_t) G; o.nl_usage = 0; o.have_commit = true; o.commit_room = 1*G;
+    TCHECK(fn_pin::oom_help_bytes(2*G, o) == 1*G + 256*M, "arena commit deficit + 256 MiB");
+    o.commit_room = 4*G;
+    TCHECK(fn_pin::oom_help_bytes(2*G, o) == 0, "arena with commit room: no unpin");
+    // a measured LOCAL charge: as oom_cap_bytes
+    o.have_commit = false; o.l_ratio = 0.5; o.l_head = 1*(int64_t) G;
+    TCHECK(fn_pin::oom_help_bytes(4*G, o) == fn_pin::oom_cap_bytes(4*G, 1*G, false, 0.5), "LOCAL charge: the R-REV-1 cap");
+    o.l_head = 5*(int64_t) G;
+    TCHECK(fn_pin::oom_help_bytes(4*G, o) == 4*G, "LOCAL charge, headroom shows room: want bytes");
+    // the gate: 3 samples under 4 GiB drop every pin; 30 samples (60 s) >= 10 GiB, 30 samples after the drop, re-pin
+    fn_pin::gate_state gs;
+    const uint64_t D = 4*G, P = 10*G;
+    TCHECK(fn_pin::gate_step(gs, 3*G, true, false, D, 3, P, 30) == 0, "1 sample under: nothing");
+    TCHECK(fn_pin::gate_step(gs, 3*G, true, false, D, 3, P, 30) == 0, "2 samples under: nothing");
+    TCHECK(fn_pin::gate_step(gs, 5*G, true, false, D, 3, P, 30) == 0, "back over: the count restarts");
+    TCHECK(fn_pin::gate_step(gs, 3*G, true, false, D, 3, P, 30) == 0, "1 again");
+    TCHECK(fn_pin::gate_step(gs, 3*G, true, false, D, 3, P, 30) == 0, "2 again");
+    TCHECK(fn_pin::gate_step(gs, 3*G, true, false, D, 3, P, 30) == -1, "3 samples under 4 GiB: drop all");
+    TCHECK(fn_pin::gate_step(gs, 1*G, false, true, D, 3, P, 30) == 0, "no pins: no drop under pressure");
+    int got = 0, k = 0;
+    for (k = 0; k < 29; ++k) {
+        got = fn_pin::gate_step(gs, 11*G, false, true, D, 3, P, 30);
+        TCHECK(got == 0, "room for %d samples: not yet", k + 1);
+    }
+    got = fn_pin::gate_step(gs, 11*G, false, true, D, 3, P, 30);
+    TCHECK(got == 1, "room for 30 samples, 30+ after the drop: re-pin");
+    for (k = 0; k < 10; ++k) {
+        got = fn_pin::gate_step(gs, 9*G, true, true, D, 3, P, 30);
+        TCHECK(got == 0, "between 4 and 10 GiB with pins: nothing (%d)", k);
+    }
+    TCHECK(fn_pin::gate_step(gs, 11*G, true, false, D, 3, P, 30) == 0, "nothing to re-pin: nothing");
+}
+
+// [TAG_FN_L23_PINFIX] R-L23-6: the pins go on a failed allocation only when they can be the cause
+static void test_alloc_fail_reason() {
+    const uint64_t M = 1ull << 20;
+    const uint64_t G = 1ull << 30;
+    fn_pin::af_in a;
+    // l23p B6 14:23:48: 640.9 MiB VRAM, no LOCAL charge, NON_LOCAL room ~16.2 GiB >= 16 GiB margin, LOCAL headroom 2.9 GiB
+    a.kind = fn_pin::AF_DEV; a.need = 641*M; a.have_l = true; a.l_head = (int64_t) (2.9*(double) G); a.l_ratio = 0.0;
+    a.have_nl = true; a.nl_room = (uint64_t) (16.2*(double) G); a.nl_margin = 16*G;
+    TCHECK(fn_pin::alloc_fail_reason(a) == fn_pin::AFR_NONE, "B6 case: plain VRAM failure, pins stay");
+    a.kind = fn_pin::AF_DEV_FATAL;
+    TCHECK(fn_pin::alloc_fail_reason(a) == fn_pin::AFR_NONE, "fatal site: reason none (the caller unpins partly)");
+    a.kind = fn_pin::AF_HOST;
+    TCHECK(fn_pin::alloc_fail_reason(a) == fn_pin::AFR_HOST, "pinned host allocation: pins can be the cause");
+    a.kind = fn_pin::AF_DEV; a.l_ratio = 0.2;
+    TCHECK(fn_pin::alloc_fail_reason(a) == fn_pin::AFR_LOCAL_CHARGE, "LOCAL charge per pinned byte");
+    a.l_ratio = 0.0; a.have_nl = false;
+    TCHECK(fn_pin::alloc_fail_reason(a) == fn_pin::AFR_NL_UNKNOWN, "NON_LOCAL unknown: drop (safe)");
+    // FAULT 12:48: NON_LOCAL room 8.36 GiB < 16 GiB margin
+    a.have_nl = true; a.nl_room = (uint64_t) (8.36*(double) G);
+    TCHECK(fn_pin::alloc_fail_reason(a) == fn_pin::AFR_NL_ROOM, "12:48 case: NON_LOCAL room under the margin");
+    // a spill past LOCAL that NON_LOCAL cannot hold (margin 0)
+    a.nl_margin = 0; a.nl_room = 1*G; a.need = 8*G; a.l_head = 2*(int64_t) G;
+    TCHECK(fn_pin::alloc_fail_reason(a) == fn_pin::AFR_NL_SPILL, "spill 6 GiB > NON_LOCAL room 1 GiB");
+    a.need = 2*G + 512*M;
+    TCHECK(fn_pin::alloc_fail_reason(a) == fn_pin::AFR_NONE, "spill 0.5 GiB fits NON_LOCAL room 1 GiB");
+}
+
 int main() {
+    test_alloc_fail_reason();
     test_unit();
     test_order();
     test_rules();
     test_oom_cap();
+    test_pinfix();
     test_registry();
     test_arena_copy();
     test_lifo();

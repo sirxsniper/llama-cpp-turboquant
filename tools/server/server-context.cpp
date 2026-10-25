@@ -1216,6 +1216,7 @@ private:
 };
 
 struct server_slot {
+    bool l23_busy = false; // [TAG_FN_L23_PINFIX] R-L23-8: counted in llama_fn_pin_server_busy from launch to release
     int id;
 
     llama_context * ctx_tgt = nullptr;
@@ -1337,6 +1338,10 @@ struct server_slot {
         int32_t n_merged    = 0;     // merged image-turn batches
         int32_t n_media     = 0;     // media chunks decoded
         int32_t n_media_rows = 0;
+        int32_t attach_n     = 0;    // [TAG_FN_L24_ATTACH] tokens taken from another slot's cells
+        int     attach_src   = -1;   // that slot
+        int     attach_how   = 0;    // 1 its checkpoint, 2 its whole content (live snapshot)
+        double  attach_ms    = 0.0;
         bool    logged_start = false;
     } l22_turn;
 
@@ -1391,6 +1396,9 @@ struct server_slot {
     // [TAG_FN_L22_ONEPROMPT] the claimers this slot's prompt gave way to (once per claiming task), and the last one
     int32_t l22_n_yield    = 0;
     int     l22_yield_task = -1;
+    // [TAG_FN_L24_GENCKPT] the answer tokens scanned for </think> / <tool_call>, and the markers seen
+    int64_t l24_scan = 0;
+    int     l24_mark = 0;
     // [TAG_FN_L22_PAUSE] the answer is left out of batches until this time (0 = not paused) or until task
     // l22_pause_by_task ends; pending = paused from the next step on that has no rows of this slot in flight
     int64_t l22_pause_until_us = 0;
@@ -1537,6 +1545,8 @@ struct server_slot {
         // [TAG_FN_L22_ONEPROMPT] [TAG_FN_L22_PAUSE] per request (l22_kv_shared describes the memory: prompt_clear)
         l22_n_yield        = 0;
         l22_yield_task     = -1;
+        l24_scan           = 0; // [TAG_FN_L24_GENCKPT]
+        l24_mark           = 0;
         l22_pause_until_us = 0;
         l22_pause_t0_us    = 0;
         l22_pause_by_task  = -1;
@@ -1777,6 +1787,10 @@ struct server_slot {
     }
 
     void release() {
+        if (l23_busy) { // [TAG_FN_L23_PINFIX] R-L23-8
+            l23_busy = false;
+            llama_fn_pin_server_busy(-1);
+        }
         if (is_processing()) {
             GGML_ASSERT(task);
 
@@ -2413,6 +2427,10 @@ private:
         int32_t     stream_min = 768;   // LLAMA_PREFILL_STREAM_MIN (the PASSLOG path label only)
         llama_token media_tok  = LLAMA_TOKEN_NULL;
         bool        logged_off = false; //   the one log line why a merged batch cannot run here
+        // [TAG_FN_L24_TTFT] LLAMA_FN_L24_IMGPASS2 (default 1): an answer's rows in the batch ask for the next batch alone
+        bool        excl       = false;
+        uint64_t    n_room     = 0;     //   merged batches the pool room check sent to the per-chunk path
+        uint64_t    n_excl     = 0;     //   batches the answers sat out for a merged pass
         // [TAG_FN_L22_PHASE] decodes by phase, and GEN decodes that held a prompt row (must stay 0)
         uint64_t    n_dec_gen    = 0;
         uint64_t    n_dec_prompt = 0;
@@ -2429,6 +2447,10 @@ private:
         int32_t pause_tok = 2048;    // LLAMA_FN_L22_PAUSE_TOKENS
         int64_t pause_us  = 8000000; // LLAMA_FN_L22_PAUSE_S
         bool    sharekv   = false;   // LLAMA_FN_L22_SHAREKV: the shared-prefix fan-out by seq_cp (needs --kv-unified)
+        bool    attach    = false;   // LLAMA_FN_L24_ATTACH: [TAG_FN_L24_ATTACH] start from another slot's cells (needs --kv-unified)
+        int32_t attach_min  = 512;   // LLAMA_FN_L24_ATTACH_MIN: at least this many tokens
+        int32_t attach_gain = 256;   // LLAMA_FN_L24_ATTACH_GAIN: and this many more than the slot keeps by itself
+        bool    attach_ckpt = false; // LLAMA_FN_L24_ATTACH_CKPT: also at a donor's checkpoint (default 0, see l24_attach_find)
     } l22two;
 
     // [TAG_FN_L22_SHAREKV] the last boundary a leader published: its slot, task and boundary
@@ -2444,6 +2466,22 @@ private:
     int32_t l22_cap_rows   = 0; // the batch cap of the last pre_decode (the log line)
     // [TAG_FN_L22_ONEPROMPT] the task that claimed the last prompt batch (for the log line on a change)
     int     l22_last_claim = -1;
+
+    // [TAG_FN_L24] round 24 switches, read once per model load by l24_init() (llama_model_fn_env; qwen4exp profile: on)
+    struct l24_cfg_t {
+        bool        genckpt   = false;            // LLAMA_FN_L24_GENCKPT: context checkpoints inside long answers
+        int32_t     gc_every  = 2048;             // _EVERY: one per this many answer tokens
+        int32_t     gc_gap    = 256;              // _GAP: none closer than this to the newest checkpoint
+        int32_t     gc_ram    = 2;                // _RAM: answer checkpoints of one request in the ring (older ones go to disk)
+        llama_token tok_think = LLAMA_TOKEN_NULL; // </think>: one right after it
+        llama_token tok_tool  = LLAMA_TOKEN_NULL; // <tool_call>: one right before it (or right after, when a draft held it)
+        bool        opfair    = false;            // LLAMA_FN_L24_OPFAIR: ONEPROMPT keeps the prompt in progress (2+ slots)
+        int32_t     op_near   = 0;                // _NEAR: a rest of at most this many text tokens finishes first (0: off)
+        double      op_frac   = 1.0;              // _FRAC: a prompt this far done finishes first (1: off)
+        bool        gscap     = false;            // LLAMA_FN_L24_GSCAP: the GENSHARE2 window cap follows the pass's rows
+        int32_t     gs_tail   = 64;               // _TAIL: no window while a prompt has at most this many rows left
+    } l24;
+    int l24_claim_task = -1; // [TAG_FN_L24_OPFAIR] the task that claimed the last prompt batch
 
     server_metrics metrics;
 
@@ -3093,6 +3131,7 @@ private:
 
         keepctx_init(); // [TAG_FN_L18_KEEPCTX] after the prompt cache: it stays off beside one
         l22two_init();  // [TAG_FN_L22] P9: after the slots and the prompt cache
+        l24_init();     // [TAG_FN_L24]
         if (const char * e = llama_model_fn_env(model_tgt, "LLAMA_FN_L19_TTFT_CKPT_TAIL"); e && *e) { // [TAG_FN_L19_TTFT_CKPT]
             ckpt_tail_min = std::max<long long>(0, strtoll(e, nullptr, 10));
             SRV_WRN("[TAG_FN_L19_TTFT_CKPT] a prompt batch of >= %lld tokens leaves its last 4 tokens to their own batch with a "
@@ -3535,11 +3574,19 @@ private:
             // restores only a stored conversation that gives more)
             server_slot * l22_leader = l22two.sharekv ? l22_sharekv_leader(task, *ret) : nullptr;
 
+            // [TAG_FN_L24_ATTACH] another slot (idle, in its prompt, answering) holds more of this prompt than the slot
+            // can keep: keepctx restores only a stored conversation that gives more
+            ret->l22_turn.attach_n   = 0;
+            ret->l22_turn.attach_src = -1;
+            ret->l22_turn.attach_how = 0;
+            ret->l22_turn.attach_ms  = 0.0;
+            const l24_attach_pick l24_pre = l22_leader ? l24_attach_pick() : l24_attach_find(task, *ret);
+
             // [TAG_FN_L18_KEEPCTX]
             if (keepctx && task.type == SERVER_TASK_TYPE_COMPLETION && !task.is_parent()) {
                 const int64_t t_kc0 = ggml_time_us();
                 ret->l22_turn.kc_what = 0;
-                keepctx_switch(*ret, task, l22_leader ? l22_share_src.n_shared : 0);
+                keepctx_switch(*ret, task, l22_leader ? l22_share_src.n_shared : l24_pre.n);
                 ret->l22_turn.kc_ms = (ggml_time_us() - t_kc0) / 1000.0; // [TAG_FN_L22_PASSLOG]
             }
 
@@ -3550,6 +3597,18 @@ private:
                 }
                 l22_sharekv_take(*l22_leader, *ret);
                 update_cache = false;
+            } else if (l24_pre.donor >= 0) {
+                // [TAG_FN_L24_ATTACH] again after keepctx (it may have restored more, or stored the slot's conversation)
+                const l24_attach_pick p = l24_attach_find(task, *ret);
+                if (p.donor >= 0) {
+                    if (prompt_cache && update_cache) {
+                        ret->prompt_save(*prompt_cache, &task.tokens);
+                        prompt_cache->update();
+                    }
+                    if (l24_attach_apply(*ret, p, task)) {
+                        update_cache = false;
+                    }
+                }
             }
 
             update_cache = update_cache && prompt_cache;
@@ -3648,6 +3707,10 @@ private:
         l22.ckpt_keep  = on("LLAMA_FN_L22_CKPT_KEEP");
         l22.ckpt_split = on("LLAMA_FN_L22_CKPT_SPLIT");
         l22.keeplend   = on("LLAMA_FN_L22_KEEPLEND");
+        {
+            const char * v = llama_model_fn_env(model_tgt, "LLAMA_FN_L24_IMGPASS2");
+            l22.excl = params_base.n_parallel > 1 && (v == nullptr || !*v || llama_fn_l22_switch_on(v));
+        }
         l22.stream_min = (int32_t) std::max<long long>(1, num("LLAMA_PREFILL_STREAM_MIN", 768));
         l22.spec_mtp   = !params_base.speculative.has_dft() &&
             std::find(params_base.speculative.types.begin(), params_base.speculative.types.end(),
@@ -3680,6 +3743,49 @@ private:
         }
     }
 
+    // [TAG_FN_L24] round 24's switches (l24_cfg_t)
+    void l24_init() {
+        l24            = l24_cfg_t();
+        l24_claim_task = -1;
+        auto num = [&](const char * name, double def) {
+            const char * e = llama_model_fn_env(model_tgt, name);
+            return e && *e ? atof(e) : def;
+        };
+        // a marker counts only when it is one token
+        auto one_tok = [&](const char * text) {
+            const llama_tokens t = common_tokenize(vocab, text, false, true);
+            return t.size() == 1 ? t[0] : LLAMA_TOKEN_NULL;
+        };
+        const bool fixed = ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL || ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS;
+        l24.genckpt = num("LLAMA_FN_L24_GENCKPT", 0.0) != 0.0 && params_base.n_ctx_checkpoints > 0 && fixed;
+        if (l24.genckpt) {
+            l24.gc_every  = (int32_t) std::clamp(num("LLAMA_FN_L24_GENCKPT_EVERY", 2048.0), 0.0, 1e9);
+            l24.gc_gap    = (int32_t) std::clamp(num("LLAMA_FN_L24_GENCKPT_GAP", 256.0), 1.0, 1e9);
+            l24.gc_ram    = (int32_t) std::clamp(num("LLAMA_FN_L24_GENCKPT_RAM", 2.0), 1.0, 64.0);
+            l24.tok_think = one_tok("</think>");
+            l24.tok_tool  = one_tok("<tool_call>");
+            SRV_INF("[TAG_FN_L24_GENCKPT] checkpoints inside answers: every %d tokens%s%s, at least %d apart, %d per answer in the ring\n",
+                    l24.gc_every, l24.tok_think != LLAMA_TOKEN_NULL ? ", after </think>" : "",
+                    l24.tok_tool != LLAMA_TOKEN_NULL ? ", before <tool_call>" : "", l24.gc_gap, l24.gc_ram);
+        }
+        if (slots.size() >= 2 && l22two.one) {
+            l24.opfair  = num("LLAMA_FN_L24_OPFAIR", 0.0) != 0.0;
+            // shortest remaining first (main session 10-25: the short request matters more than the prompt in progress)
+            l24.op_near = (int32_t) std::clamp(num("LLAMA_FN_L24_OPFAIR_NEAR", 0.0), 0.0, 1e9);
+            l24.op_frac = std::clamp(num("LLAMA_FN_L24_OPFAIR_FRAC", 1.0), 0.0, 1.0);
+        }
+        if (slots.size() >= 2 && l22two.gs2 > 0) {
+            l24.gscap   = num("LLAMA_FN_L24_GSCAP", 0.0) != 0.0;
+            l24.gs_tail = (int32_t) std::clamp(num("LLAMA_FN_L24_GSCAP_TAIL", 64.0), 0.0, 1e6);
+        }
+        if (l24.opfair || l24.gscap) {
+            SRV_INF("[TAG_FN_L24] two-connection rules: [TAG_FN_L24_OPFAIR] %d (shortest remaining first, a prompt gives way at most "
+                    "once per request and keeps the batch after; near-end exception: <= %d text tokens "
+                    "left or %.0f %% done), [TAG_FN_L24_GSCAP] %d (no window before a "
+                    "prompt tail of <= %d rows)\n", (int) l24.opfair, l24.op_near, l24.op_frac * 100.0, (int) l24.gscap, l24.gs_tail);
+        }
+    }
+
     // [TAG_FN_L22] P9's switches (l22two_cfg_t); every rule needs 2+ slots, so --parallel 1 runs today's code paths
     void l22two_init() {
         l22two         = l22two_cfg_t();
@@ -3708,6 +3814,32 @@ private:
         l22two.pause_us  = (int64_t) (std::clamp(num("LLAMA_FN_L22_PAUSE_S", 8.0), 0.0, 3600.0) * 1e6);
         const bool sharekv_sw = on("LLAMA_FN_L22_SHAREKV");
         l22two.sharekv   = sharekv_sw && params_base.kv_unified;
+        // [TAG_FN_L24_ATTACH] the cells are shared within one KV stream (--kv-unified); a shift (context shift, cache
+        // reuse) would move shared cells for every holder, SWA prunes cells a holder further back still needs, and LoRA
+        // adapters make another slot's cells differ
+        const bool attach_sw = on("LLAMA_FN_L24_ATTACH");
+        if (attach_sw) {
+            const bool can_shift = llama_memory_can_shift(llama_get_memory(ctx_tgt));
+            const char * why = nullptr;
+            if (!params_base.kv_unified) {
+                why = "needs --kv-unified";
+            } else if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
+                why = "the memory cannot remove a sequence's tail";
+            } else if (n_swa > 0) {
+                why = "SWA";
+            } else if (can_shift && (params_base.ctx_shift || params_base.n_cache_reuse > 0)) {
+                why = "context shift / cache reuse";
+            } else if (!params_base.lora_adapters.empty()) {
+                why = "LoRA adapters";
+            }
+            l22two.attach      = why == nullptr;
+            l22two.attach_min  = (int32_t) std::clamp(num("LLAMA_FN_L24_ATTACH_MIN", 512.0), 1.0, 1e9);
+            l22two.attach_gain = (int32_t) std::clamp(num("LLAMA_FN_L24_ATTACH_GAIN", 256.0), 0.0, 1e9);
+            l22two.attach_ckpt = on("LLAMA_FN_L24_ATTACH_CKPT");
+            SRV_INF("[TAG_FN_L24_ATTACH] a new prompt starts from another slot's cells (an idle slot's whole content; at a busy "
+                    "slot's checkpoint: %s): %s%s (at least %d tokens, %d more than the slot keeps)\n", l22two.attach_ckpt ? "on" : "off",
+                    l22two.attach ? "on" : "off: ", why ? why : "", l22two.attach_min, l22two.attach_gain);
+        }
         for (auto & s : slots) {
             s.l22_pause_json = l22two.pause;
         }
@@ -3777,6 +3909,154 @@ private:
             llama_fn_l22_log("turn", "two=sharekv dst=%d src=%d task=%d n=%d ms=%.1f", F.id, L.id, L.task ? L.task->id : -1, n_shared,
                              (ggml_time_us() - t0) / 1000.0);
         }
+    }
+
+    // [TAG_FN_L24_ATTACH] (upstream #30970 --slot-attach, automatic, with vision and MTP) A new prompt that shares a long
+    // prefix with another slot's tokens starts from that slot's cells, whatever the other slot does (idle, in its prompt,
+    // answering). The attention cells get the new slot's id too (seq_cp in the unified pool, no copy: turbot adopts the
+    // write-row counter, the QSA k-pools regroup); the recurrent (GDN) state, which cannot be cut back, comes from the
+    // donor's checkpoint at the attach point, or (an idle donor whose tokens the prompt continues in full) from a snapshot of
+    // its live state (state_write takes a pending RS rollback into account); the MTP draft state comes with it (the draft
+    // KV by the same seq_cp, the draft's partial state and the carry blob / #30141 state). Image chunks in the shared prefix
+    // are shared like text: the tokens keep their chunks (clone), a checkpoint never sits inside an image, and the cut
+    // after the attach point is at pos_next (M-RoPE positions).
+
+    // the donors' views for task (in slot F); own = what F keeps by itself (its tokens, up to its newest checkpoint)
+    l24_attach_pick l24_attach_find(const server_task & task, const server_slot & F, int32_t * own_out = nullptr) {
+        if (!l22two.attach || task.type != SERVER_TASK_TYPE_COMPLETION || task.is_parent() || task.is_child() ||
+                !task.params.cache_prompt || F.is_processing()) {
+            return l24_attach_pick();
+        }
+        const int32_t n_task = (int32_t) task.n_tokens();
+        if (n_task <= l22two.attach_min) {
+            return l24_attach_pick();
+        }
+        int32_t own = 0;
+        if (F.prompt.n_tokens() > 0) {
+            const int lcp = (int) F.prompt.tokens.get_common_prefix(task.tokens);
+            own = std::min<int32_t>(keepctx_usable(F.prompt, lcp, (cs.spill || cs.lazy) ? &F.kc_spill.list : nullptr), n_task - 1);
+        }
+        if (own_out) {
+            *own_out = own;
+        }
+        auto * mem = llama_get_memory(ctx_tgt);
+        std::vector<l24_donor_view> views;
+        for (const auto & D : slots) {
+            if (&D == &F || D.parked || D.prompt.n_tokens() == 0) {
+                continue;
+            }
+            const bool st_ok = D.state == SLOT_STATE_IDLE || D.state == SLOT_STATE_PROCESSING_PROMPT || D.state == SLOT_STATE_GENERATING;
+            if (!st_ok) {
+                continue;
+            }
+            l24_donor_view v;
+            v.id       = D.id;
+            v.usable   = true;
+            v.idle     = D.state == SLOT_STATE_IDLE;
+            v.n_tokens = (int32_t) D.prompt.n_tokens();
+            v.lcp      = (int32_t) D.prompt.tokens.get_common_prefix(task.tokens);
+            if (v.lcp <= std::max(own, l22two.attach_min)) {
+                continue; // it cannot give more than the slot keeps, or than the minimum
+            }
+            const llama_pos pmax = llama_memory_seq_pos_max(mem, D.id);
+            v.whole_ok = pmax >= 0 && pmax + 1 == D.prompt.tokens.pos_next();
+            // LLAMA_FN_L24_ATTACH_CKPT (default 0): the donor keeps its own cells after the checkpoint, so the new rows land at
+            // other cell indices than the donor's own restore would use, and the dense turbot FA is placement sensitive (l24s
+            // 10-25). The whole content of an idle donor is bitwise equal to its own continuation.
+            if (l22two.attach_ckpt) {
+                for (const auto & c : D.prompt.checkpoints) {
+                    const bool ok = !c.data_tgt.empty() && c.n_tokens > 0 && c.n_tokens <= v.n_tokens && c.pos_max <= pmax;
+                    v.ckpts.push_back(ok ? c.n_tokens : 0);
+                }
+            } else if (!(v.idle && v.whole_ok && v.lcp >= v.n_tokens)) {
+                continue;
+            }
+            views.push_back(std::move(v));
+        }
+        return l24_attach_best(views, n_task, own, l22two.attach_min, l22two.attach_gain);
+    }
+
+    // F takes the first p.n tokens of slot p.donor; false: F is left empty (the prompt is processed in full)
+    bool l24_attach_apply(server_slot & F, const l24_attach_pick & p, const server_task & task) {
+        const int64_t t0 = ggml_time_us();
+        server_slot & D = slots[p.donor];
+
+        const common_prompt_checkpoint * ck = nullptr;
+        if (p.ckpt >= 0) {
+            ck = &*std::next(D.prompt.checkpoints.begin(), p.ckpt);
+            GGML_ASSERT(ck->n_tokens == p.n);
+        }
+
+        // the donor's live state (an idle donor lent in full): taken before F is touched
+        common_prompt_checkpoint snap;
+        std::vector<uint8_t>     carry;
+        if (!ck) {
+            if (!F.ckpt_spare.empty()) {
+                snap.data_tgt = std::move(F.ckpt_spare); // [TAG_CKPT_BUFFER_REUSE] the same size: no fresh allocation
+                F.ckpt_spare  = std::vector<uint8_t>();
+            }
+            snap.update_tgt(ctx_tgt, D.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+            snap.update_dft(ctx_dft, D.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+            if (spec) {
+                common_speculative_get_carry(spec.get(), D.id, carry);
+            }
+        }
+        const double t_snap_ms = (ggml_time_us() - t0) / 1000.0;
+
+        F.prompt_clear();                    // an empty destination: turbot adopts the write-row counter, F's old cells are free
+        F.mem.seq_cp(D.id, F.id, -1, -1);    // every cell of D (target and draft memory) gets F's id; whole sequences only
+
+        // F's own recurrent state at the attach point: the load drops F from the recurrent cell it now shares with D (the
+        // donor keeps its state) and writes F's own cell
+        const common_prompt_checkpoint & src = ck ? *ck : snap;
+        src.load_tgt(ctx_tgt, F.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        src.load_dft(ctx_dft, F.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        bool carry_ok = true;
+        if (spec) {
+            if (ck) {
+                common_speculative_set_state(spec.get(), F.id, ck->data_spec); // what a checkpoint restore of D would set
+            } else {
+                carry_ok = common_speculative_set_carry(spec.get(), F.id, carry);
+            }
+        }
+
+        F.prompt.tokens = D.prompt.tokens.clone(); // the media chunks too
+        F.prompt.tokens.keep_first(p.n);
+
+        // drop F's id from D's cells after the attach point (a no-op for the recurrent cell, which ends before it)
+        const llama_pos p0 = F.prompt.tokens.pos_next();
+        bool rm_ok = llama_memory_seq_rm(llama_get_memory(ctx_tgt), F.id, p0, -1);
+        if (rm_ok && ctx_dft) {
+            rm_ok = llama_memory_seq_rm(llama_get_memory(ctx_dft), F.id, p0, -1);
+        }
+        if (!snap.data_tgt.empty() && F.ckpt_spare.empty()) {
+            F.ckpt_spare = std::move(snap.data_tgt);
+        }
+        if (!rm_ok) {
+            SLT_WRN(F, "[TAG_FN_L24_ATTACH] the cells of slot %d after the attach point could not be dropped, not attaching\n", D.id);
+            F.prompt_clear();
+            return false;
+        }
+
+        F.l22_kv_shared = true;  // [TAG_FN_L22_SHAREKV] park accounting
+        D.l22_kv_shared = true;
+        F.kc_conv.hits     = 0;
+        F.kc_conv.rerender = D.kc_conv.rerender; // [TAG_FN_L19_CONVSTORE_OPENER] the same client
+
+        const double ms = (ggml_time_us() - t0) / 1000.0;
+        F.l22_turn.attach_n   = p.n;
+        F.l22_turn.attach_src = D.id;
+        F.l22_turn.attach_how = ck ? 1 : 2;
+        F.l22_turn.attach_ms  = ms;
+        static const char * st_s[] = { "idle", "waiting", "starting", "in its prompt", "done with its prompt", "answering" };
+        SLT_INF(F, "[TAG_FN_L24_ATTACH] took %d of the prompt's %d tokens from slot %d (%s, task %d) by seq_cp, %s in %.1f ms%s\n",
+                p.n, (int) task.n_tokens(), D.id, st_s[std::clamp((int) D.state, 0, 5)], D.task ? D.task->id : -1,
+                ck ? "its checkpoint's recurrent state" : "a snapshot of its whole state", ms, carry_ok ? "" : " (the draft carry did not apply: acceptance only)");
+        if (llama_fn_l22_passlog_level() >= 1) {
+            llama_fn_l22_log("turn", "two=attach dst=%d src=%d src_state=%d task=%d n=%d n_task=%d how=%s snap_ms=%.1f ms=%.1f",
+                             F.id, D.id, (int) D.state, task.id, p.n, (int) task.n_tokens(), ck ? "checkpoint" : "whole", t_snap_ms, ms);
+        }
+        return true;
     }
 
     // [TAG_FN_L22_ONEPROMPT] [TAG_FN_L22_PAUSE] the prompt tokens a slot has left: exact once processing, an estimate from the
@@ -3968,8 +4248,16 @@ private:
 
     // [TAG_FN_L22_IMGPASS] where a merged image-turn batch from the slot's position ends (a task token index), or -1 for no
     // merged batch in this iteration (the per-chunk path runs as today)
-    int64_t l22_plan_merged(const server_slot & slot, int32_t n_batch, bool wait_shared) {
-        if (!l22.imgpass_ok || batch.size() != 0 || pool_preempt || media_async || !slot.mctx) {
+    // [TAG_FN_L24_TTFT] E0: a multi-slot unified pool (pool_preempt) refused every merged batch (0 of 24 image turns on the
+    // owner's 2-slot server, 410 of 410 on 1 slot): pool_abandon_tail cannot cut inside a picture. The merged batch decodes
+    // alone, so it runs when the pool's free cells hold its rows and the answers' next step; else the per-chunk path (its own
+    // room wait). With only answers' rows in the batch (want_excl set), it asks for the next batch alone
+    int64_t l22_plan_merged(const server_slot & slot, int32_t n_batch, bool wait_shared, bool * want_excl = nullptr) {
+        if (!l22.imgpass_ok || media_async || !slot.mctx) {
+            return -1;
+        }
+        const int b_rule = l24_merged_batch_rule(batch.size(), batch.n_gen_rows, batch.has_embd, l22.excl && want_excl != nullptr);
+        if (b_rule < 0) {
             return -1;
         }
         const server_task & t = *slot.task;
@@ -4045,7 +4333,25 @@ private:
             cap = std::min<int64_t>(cap, std::max<int64_t>(1, l22.mask_mib * 1024 * 1024 / (2 * n_kv)));
         }
         const int64_t rows = l22_media_plan(segs, W, cap);
-        return rows > 0 ? cur + rows : -1;
+        if (rows <= 0) {
+            return -1;
+        }
+        if (pool_preempt) {
+            const int64_t n_free = llama_memory_attn_n_free_ext(ctx_tgt, slot.id);
+            if (!l24_merged_fits(n_free, rows, pool_gen_rows_max)) {
+                if (l22.n_room++ < 8 || l22.n_room % 64 == 0) {
+                    SLT_WRN(slot, "[TAG_FN_L24_TTFT] merged batch of %lld rows: %lld free cells in the pool (+ %d answer rows): the "
+                            "per-chunk path (%llu)\n", (long long) rows, (long long) n_free, pool_gen_rows_max,
+                            (unsigned long long) l22.n_room);
+                }
+                return -1;
+            }
+        }
+        if (b_rule == 1) {
+            *want_excl = true;
+            return -1;
+        }
+        return cur + rows;
     }
 
     // [TAG_FN_L22_IMGPASS] the media chunk at the slot's position into the merged batch: encoder rows, 4 M-RoPE positions as
@@ -4093,12 +4399,16 @@ private:
         const int r = std::clamp(slot.l22_turn.restore, 0, 4);
         const int k = slot.l22_turn.kc_what;
         llama_fn_l22_log("turn", "slot=%d task=%d phase=start tokens=%d media=%zu template_ms=%.1f tokenize_ms=%.1f queue_ms=%.1f "
-                "keepctx_ms=%.1f keepctx=%s%s%s%s start_ms=%.1f common=%d kept=%d restore=%s at=%lld re_read=%d",
+                "keepctx_ms=%.1f keepctx=%s%s%s%s start_ms=%.1f common=%d kept=%d restore=%s at=%lld re_read=%d "
+                "attach=%d attach_src=%d attach_how=%s attach_ms=%.1f",
                 slot.id, t.id, (int) t.n_tokens(), l22_media_starts(t.tokens, 0).size(), ms(t.l22_t_req_us, t.l22_t_tmpl_us),
                 ms(t.l22_t_tmpl_us, t.l22_t_tok_us), ms(t.l22_t_tok_us, slot.l22_turn.t_launch_us), slot.l22_turn.kc_ms,
                 k == 0 ? "none" : "", k & 1 ? "stored," : "", k & 2 ? "restored," : "", k & 4 ? "disk-checkpoint" : "",
                 ms(slot.l22_turn.t_launch_us, now), slot.l22_turn.n_common, slot.l22_turn.n_past, restore_s[r],
-                (long long) (r == 2 ? slot.l22_turn.restore_n : -1), (int) t.n_tokens() - slot.l22_turn.n_past);
+                (long long) (r == 2 ? slot.l22_turn.restore_n : -1), (int) t.n_tokens() - slot.l22_turn.n_past,
+                slot.l22_turn.attach_n, slot.l22_turn.attach_src,
+                slot.l22_turn.attach_how == 1 ? "checkpoint" : slot.l22_turn.attach_how == 2 ? "whole" : "none",
+                slot.l22_turn.attach_ms);
     }
 
     // [TAG_FN_L22_PASSLOG] kind=turn at the prompt end (before the first token is sampled)
@@ -4216,6 +4526,18 @@ private:
             kp.gdsf         = env_ll("LLAMA_FN_L19_CONVSTORE_EVICT", 1) != 0;
             kp.fixed_tokens = (double) std::max<long long>(0, env_ll("LLAMA_FN_L19_CONVSTORE_FIXED", 2048));
         }
+        // [TAG_FN_L24_KEEPVAL] LLAMA_FN_L24_KEEPVAL=1 (qwen4exp profile: 1): evict by re-read cost x recency, keep the biggest
+        // conversation used within _ACTIVE_S against the count limit; _HALF_S the recency half time, _DISK_MIB the free disk
+        // space a store keeps (0: not checked)
+        kp.val = env_ll("LLAMA_FN_L24_KEEPVAL", 0) != 0;
+        if (kp.val) {
+            kp.val_half_s   = (double) std::max<long long>(1, env_ll("LLAMA_FN_L24_KEEPVAL_HALF_S", 900));
+            kp.val_active_s = (double) std::max<long long>(0, env_ll("LLAMA_FN_L24_KEEPVAL_ACTIVE_S", 3600));
+            kp.disk_margin  = (uint64_t) std::max<long long>(0, env_ll("LLAMA_FN_L24_KEEPVAL_DISK_MIB", 8192)) * 1024 * 1024;
+            if (!cs.on) {
+                kp.fixed_tokens = (double) std::max<long long>(0, env_ll("LLAMA_FN_L19_CONVSTORE_FIXED", 2048));
+            }
+        }
         kp.verify   = env_ll("LLAMA_FN_L18_KEEPCTX_VERIFY", 0) != 0;
         kp.hot      = env_ll("LLAMA_FN_L18_KEEPCTX_HOT", 0) != 0;
         // [TAG_FN_L20_CONVFIX_IO] [TAG_FN_L20_CONVFIX_TRACE]
@@ -4236,6 +4558,7 @@ private:
         cs.lazy = kp.lazy;
         SRV_INF("[TAG_FN_L18_KEEPCTX] on: conversations replaced by another prompt are stored in '%s' (up to %d, %.0f MiB, "
                 "from %d tokens%s%s%s%s%s)\n", kp.dir.c_str(), kp.n_max, kp.budget / 1048576.0, keepctx_min, kp.hot ? ", with the hot-set counts" : "",
+                kp.val ? ", [TAG_FN_L24_KEEPVAL] re-read cost x recency, the biggest active one kept" :
                 kp.gdsf ? ", [TAG_FN_L19_CONVSTORE_EVICT] value per byte" : "",
                 kp.io_reuse ? ", [TAG_FN_L20_CONVFIX_IO] memory reused" : "", kp.trace ? ", [TAG_FN_L20_CONVFIX_TRACE]" : "",
                 kp.lazy ? ", [TAG_FN_L20_CONVFIX_LAZY] restores leave the checkpoints on disk" : "");
@@ -4611,6 +4934,9 @@ private:
     int      pool_n_parked         = 0;
     int      pool_no_progress      = 0;
     int      pool_want_room        = -1;       // slot whose next image does not fit, set by the prompt pass
+    int32_t  pool_gen_rows_max     = 0;        // [TAG_FN_L24_TTFT] sampled + draft rows of every slot in one step
+    int      l24_excl_slot         = -1;       // [TAG_FN_L24_TTFT] the slot whose merged pass wants the next batch alone
+    bool     l24_excl_held         = false;    //   the answers sat out this batch
 
     // [TAG_FN_L15_GENSHARE] after a batch with prompt rows and generating rows, the prompt rows wait until this time, so
     // the generating slots get decode-only steps for LLAMA_SRV_GEN_SHARE x the batch's time (0 = off)
@@ -4632,6 +4958,7 @@ private:
         };
         const int32_t n_gen_max = params_base.n_parallel * (1 + (spec ? common_speculative_n_max(spec.get()) : 0));
         const int32_t n_free    = llama_memory_attn_n_free_ext(ctx_tgt, 0);
+        pool_gen_rows_max = n_gen_max;
         pool_preempt = params_base.kv_unified && params_base.n_parallel > 1
                     && env_i64("TURBO_POOL_PREEMPT", 1) != 0
                     && n_free >= 0 && n_gen_max <= llama_n_batch(ctx_tgt);
@@ -4873,6 +5200,20 @@ private:
             }
         }
         pool_fail_one("no slot could be parked");
+    }
+
+    // [TAG_FN_L24_TTFT] room for the rest of a merged batch: park a slot other than its own (false: none could be parked)
+    bool l24_park_for_merged() {
+        const int id = batch.l22_slot;
+        if (id < 0 || id >= (int) slots.size()) {
+            return false;
+        }
+        for (server_slot * v : pool_victims(ggml_time_us(), &slots[id])) {
+            if (pool_park(*v, "merged image pass")) {
+                return true;
+            }
+        }
+        return false;
     }
 
     bool pool_park(server_slot & s, const char * why) {
@@ -5324,6 +5665,10 @@ private:
     }
 
     bool launch_slot_with_task(server_slot & slot, server_task && task) {
+        if (!slot.l23_busy) { // [TAG_FN_L23_PINFIX] R-L23-8: no pin registers from here to release()
+            slot.l23_busy = true;
+            llama_fn_pin_server_busy(1);
+        }
         slot.l22_turn.t_launch_us  = ggml_time_us(); // [TAG_FN_L22_PASSLOG]
         slot.l22_turn.logged_start = false;
 
@@ -6634,6 +6979,84 @@ private:
         return n_read;
     }
 
+    // [TAG_FN_L24_GENCKPT] A client that sends the last answer back re-rendered (other whitespace or tokens late in the
+    // answer: owner 10-21..24, 15 generation-count cuts re-read 65,775 tokens) made the server go back to the checkpoint at
+    // the answer's start. A checkpoint every gc_every answer tokens, right after </think> and right before <tool_call>
+    // bounds that re-read. The ring holds at most gc_ram of one answer's checkpoints (the older ones go to disk with the
+    // keeping rule's spill, else they are dropped), so the RAM stays as before. Answers are unchanged (state copies only).
+    void l24_gen_checkpoint(server_slot & slot) {
+        if (!slot.task || slot.task->type != SERVER_TASK_TYPE_COMPLETION || slot.spec_is_replay) {
+            return;
+        }
+        const int64_t n_prompt = slot.task->n_tokens();
+        const int64_t n_now    = slot.prompt.n_tokens();
+        if (n_now <= n_prompt) {
+            return;
+        }
+        for (int64_t i = std::max(slot.l24_scan, n_prompt); i < n_now; ++i) {
+            const llama_token t = slot.prompt.tokens[i];
+            if (t != LLAMA_TOKEN_NULL && t == l24.tok_think) {
+                slot.l24_mark |= 1;
+            }
+            if (t != LLAMA_TOKEN_NULL && t == l24.tok_tool) {
+                slot.l24_mark |= 2;
+            }
+        }
+        slot.l24_scan = n_now;
+        const bool before_tool = l24.tok_tool != LLAMA_TOKEN_NULL && slot.sampled == l24.tok_tool;
+
+        int64_t n_last = 0;
+        int     n_own  = 0;
+        for (const auto & c : slot.prompt.checkpoints) {
+            n_last = std::max(n_last, c.n_tokens);
+            n_own += c.id_task == slot.task->id && c.n_tokens > n_prompt ? 1 : 0;
+        }
+        const int64_t step   = n_now - n_last;
+        const bool    every  = l24.gc_every > 0 && step >= l24.gc_every;
+        const int     why    = every ? 4 : (before_tool ? 8 : slot.l24_mark);
+        slot.l24_mark = 0;
+        if (why == 0 || step < l24.gc_gap) {
+            return;
+        }
+        const llama_pos pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
+        const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
+        if (pos_min < 0 || pos_max + 1 != slot.prompt.tokens.pos_next()) {
+            static int n_warn = 0;
+            if (n_warn++ < 4) {
+                SLT_WRN(slot, "[TAG_FN_L24_GENCKPT] no answer checkpoint: the memory holds [%d, %d], the tokens end at %d\n",
+                        pos_min, pos_max, (int) slot.prompt.tokens.pos_next());
+            }
+            return;
+        }
+        // this answer's oldest checkpoint in the ring makes room (to disk when the spill is on)
+        while (n_own >= l24.gc_ram) {
+            auto old = slot.prompt.checkpoints.end();
+            for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end(); ++it) {
+                if (it->id_task == slot.task->id && it->n_tokens > n_prompt && (old == slot.prompt.checkpoints.end() || it->n_tokens < old->n_tokens)) {
+                    old = it;
+                }
+            }
+            if (old == slot.prompt.checkpoints.end()) {
+                break;
+            }
+            convstore_spill(slot, *old, n_now);
+            if (slot.ckpt_spare.empty()) {
+                slot.ckpt_spare = std::move(old->data_tgt);
+            }
+            slot.prompt.checkpoints.erase(old);
+            if (slot.ckpt_spare.empty() && keepctx) {
+                keepctx->take_spare(slot.ckpt_spare);
+            }
+            n_own--;
+        }
+        const int64_t t0 = ggml_time_us();
+        create_checkpoint(slot, 0, pos_min, pos_max);
+        SLT_INF(slot, "[TAG_FN_L24_GENCKPT] answer checkpoint at n_tokens = %lld (%lld answer tokens, %s, %.1f ms, ring %zu)\n",
+                (long long) n_now, (long long) (n_now - n_prompt),
+                why & 4 ? "periodic" : why & 8 ? "before <tool_call>" : why & 2 ? "after <tool_call>" : "after </think>",
+                (ggml_time_us() - t0) / 1000.0, slot.prompt.checkpoints.size());
+    }
+
     // returns false to decline the task, it is offered again after the decode is done
     bool process_single_task(server_task && task, bool is_yielding) {
         // while yielding, an encode / decode is running and only reading the server state is safe
@@ -7397,6 +7820,11 @@ private:
                     // [TAG_POOL_PREEMPT] the pool cannot take even the smallest valid view: undo the tail, make room, rebuild
                     if (pool_exhausted) {
                         pool_exhausted = false;
+                        // [TAG_FN_L24_TTFT] a merged batch whose first views ran cannot be cut (a picture does not split, the
+                        // recurrent state moved on): another slot is parked and the view runs again (the room check makes this rare)
+                        if (batch.l22_slot >= 0 && off > 0 && l24_park_for_merged()) {
+                            continue;
+                        }
                         try {
                             pool_handle_exhausted(off, nullptr);
                         } catch (const std::exception & e) {
@@ -7446,7 +7874,15 @@ private:
         } else if (batch.size() > batch.n_gen_rows) {
             l22_win_first = false;
         }
-        if (batch.n_gen_rows > 0 && (batch.size() > batch.n_gen_rows || l22_media_win)) {
+        // [TAG_FN_L24_TTFT] a merged pass the answers sat out opens their window as a batch with their rows does; not when only a
+        // short tail of that prompt is left (the 4 rows after the last picture waited the whole 2 s window before the first token):
+        // the tail goes with the answers' next step, and that batch opens the window
+        const bool l24_win = l24_excl_held && batch.l22_slot >= 0 && batch.l22_slot < (int) slots.size() && batch.n_gen_rows == 0 &&
+                             l22_prompt_left(slots[batch.l22_slot]) > 512;
+        if (l24_excl_held && batch.l22_slot >= 0) {
+            l22.n_excl++;
+        }
+        if ((batch.n_gen_rows > 0 && (batch.size() > batch.n_gen_rows || l22_media_win)) || l24_win) {
             static const double share = [] {
                 const char * e = getenv("LLAMA_SRV_GEN_SHARE");
                 return e ? std::max(0.0, atof(e)) : 0.0;
@@ -7459,14 +7895,33 @@ private:
                 const int64_t t1 = ggml_time_us();
                 if (l22two.gs2 > 0) {
                     const int64_t rows    = (int64_t) (batch.size() - batch.n_gen_rows) + l22_media_rows;
-                    const int64_t cap_eff = l22_window_cap_us(cap_us, rows, l22two.gs2);
+                    const int64_t cap_eff = l24.gscap ? l24_window_cap_us(cap_us, rows) // [TAG_FN_L24_GSCAP]
+                                                      : l22_window_cap_us(cap_us, rows, l22two.gs2);
                     const int64_t base    = (t1 - t_batch0) + l22_media_us;
                     gen_share_until_us = t1 + (int64_t) (share*(double) std::min(base, cap_eff));
                     l22_win_first      = true; // [TAG_FN_L22_GENSHARE2] the next answer-only decode moves the end
+                    // [TAG_FN_L24_GSCAP] a prompt left with a few rows (the 4-token assistant-turn tail of a split prompt) runs
+                    // them now: the window held that ~0.1 s batch, and the prompt's first token, for 2-3 s (l24c 3b)
+                    int32_t tail_left = 0;
+                    if (l24.gscap && l24.gs_tail > 0) {
+                        for (const auto & s : slots) {
+                            if ((s.state == SLOT_STATE_STARTED || s.state == SLOT_STATE_PROCESSING_PROMPT) && s.task && !s.parked) {
+                                const int32_t left = l22_prompt_left(s);
+                                if (left > 0 && left <= l24.gs_tail) {
+                                    tail_left = left;
+                                }
+                            }
+                        }
+                        if (tail_left > 0) {
+                            gen_share_until_us = 0;
+                            l22_win_first      = false;
+                        }
+                    }
                     if (llama_fn_l22_passlog_level() >= 1) {
                         llama_fn_l22_log("turn", "two=genshare2 rows=%lld cap_rows=%d gen_rows=%d window_ms=%.0f pass_ms=%.0f media_ms=%.0f "
-                                         "cap_ms=%.0f", (long long) rows, l22_cap_rows, batch.n_gen_rows, (gen_share_until_us - t1) / 1000.0,
-                                         base / 1000.0, l22_media_us / 1000.0, cap_eff / 1000.0);
+                                         "cap_ms=%.0f%s", (long long) rows, l22_cap_rows, batch.n_gen_rows,
+                                         tail_left > 0 ? 0.0 : (gen_share_until_us - t1) / 1000.0, base / 1000.0, l22_media_us / 1000.0,
+                                         cap_eff / 1000.0, tail_left > 0 ? " (a prompt tail runs first)" : "");
                     }
                 } else {
                     gen_share_until_us = t1 + (int64_t) (share*(double) std::min(t1 - t_batch0, cap_us));
@@ -7683,11 +8138,24 @@ private:
         std::vector<server_slot *> generating;
         std::vector<server_slot *> drafting;
 
+        // [TAG_FN_L24_TTFT] a merged image pass asked for this batch alone: the answers sit out one batch, as paused ones
+        bool l24_excl = false;
+        l24_excl_held = false;
+        if (l24_excl_slot >= 0) {
+            const int id = l24_excl_slot;
+            l24_excl_slot = -1;
+            l24_excl = id < (int) slots.size() && slots[id].state == SLOT_STATE_PROCESSING_PROMPT && slots[id].task && !slots[id].parked;
+        }
+
         // determine which slots are generating and drafting
         iterate("slots_3291", slots, [&](server_slot & slot) {
             // [TAG_FN_L22_PAUSE] a paused answer is left out like a parked one (its cells stay in the pool)
             if (slot.state != SLOT_STATE_GENERATING || slot.parked || slot.l22_pause_until_us != 0 ||
                     (slot.task && slot.task->type == SERVER_TASK_TYPE_TTS)) {
+                return;
+            }
+            if (l24_excl) {
+                l24_excl_held = true;
                 return;
             }
 
@@ -7778,6 +8246,14 @@ private:
                 }
             }
         });
+
+        // [TAG_FN_L24_GENCKPT] checkpoints inside long answers, before the drafts (the memory holds exactly the slot's tokens:
+        // the accepted rows are decoded, the sampled token is not)
+        if (l24.genckpt) {
+            iterate("l24_genckpt", generating, [&](server_slot & slot) {
+                l24_gen_checkpoint(slot);
+            });
+        }
 
         // generate the actual drafts (if any)
         if (!drafting.empty()) {
@@ -7929,15 +8405,32 @@ private:
             int32_t l22_claim_left = 0;
             if (l22two.one) {
                 std::vector<l22_prompt_cand> cand;
+                std::vector<l24_prompt_cand> cand24; // [TAG_FN_L24_OPFAIR]
                 std::vector<char>            is_cand(slots.size(), 0);
                 for (const auto & s : slots) {
                     if ((s.state == SLOT_STATE_STARTED || s.state == SLOT_STATE_PROCESSING_PROMPT) && s.task && !s.parked) {
-                        cand.push_back({ s.id, l22_prompt_left(s), s.l22_n_yield });
+                        const int32_t left = l22_prompt_left(s);
+                        cand.push_back({ s.id, left, s.l22_n_yield });
                         is_cand[s.id] = 1;
+                        if (l24.opfair) {
+                            l24_prompt_cand c24;
+                            c24.id      = s.id;
+                            c24.left    = left;
+                            c24.n_yield = s.l22_n_yield;
+                            c24.claimer = s.task->id == l24_claim_task && s.state == SLOT_STATE_PROCESSING_PROMPT;
+                            if (c24.claimer) {
+                                const size_t n_at       = (size_t) s.prompt.n_tokens();
+                                const bool   media_left = (n_at < s.task->tokens.size() && s.task->tokens[n_at] == LLAMA_TOKEN_NULL) ||
+                                                          s.task->tokens.find_next_media_chunk(n_at).first != nullptr;
+                                c24.near_end = l24_prompt_near_end(left, (int32_t) s.task->n_tokens() - s.l22_turn.n_past, media_left,
+                                                                   l24.op_near, l24.op_frac);
+                            }
+                            cand24.push_back(c24);
+                        }
                     }
                 }
                 if (cand.size() >= 2) {
-                    for (const int id : l22_oneprompt_order(cand)) {
+                    for (const int id : l24.opfair ? l24_oneprompt_order(cand24) : l22_oneprompt_order(cand)) {
                         l22_order.push_back(&slots[id]);
                     }
                     for (auto & s : slots) {
@@ -8482,9 +8975,18 @@ private:
                         if (l22two.gs2 > 0 && batch.n_gen_rows > 0) {
                             l22_media_us += ggml_time_us() - l22_t_enc0;
                         }
-                        l22_end = l22_plan_merged(slot, n_batch, wait_shared);
+                        bool want_excl = false;
+                        l22_end = l22_plan_merged(slot, n_batch, wait_shared, &want_excl);
                         if (l22_end >= 0) {
                             batch.l22_slot = slot.id;
+                        } else if (want_excl) {
+                            // [TAG_FN_L24_TTFT] the answers' rows decode alone now; the next batch is this merged pass alone
+                            l24_excl_slot = slot.id;
+                            if (llama_fn_l22_passlog_level() >= 1) {
+                                llama_fn_l22_log("turn", "two=imgexcl slot=%d task=%d gen_rows=%d (the next batch is the merged pass alone)",
+                                                 slot.id, slot.task->id, batch.n_gen_rows);
+                            }
+                            return;
                         }
                     }
 
@@ -8795,6 +9297,11 @@ private:
                             batch.add(slot.id, r.tok_aux, r.pos[0], r.output, r.is_prompt);
                         }
                         l22_end = -1;
+                        // [TAG_FN_L24_TTFT] the answers sat out this batch for it (e.g. the break at the last user message, 10
+                        // rows before the first picture): the next batch is the merged pass alone too, without a GENSHARE window first
+                        if (l24_excl_held && l22.excl) {
+                            l24_excl_slot = slot.id;
+                        }
                     }
                     if (l22_end >= 0) {
                         if (!l22_fail && !batch.fill_text_rows(model_tgt)) {
@@ -8896,6 +9403,10 @@ private:
                         l22_claim      = slot.task->id;
                         l22_claim_slot = slot.id;
                         l22_claim_left = l22_prompt_left(slot);
+                    }
+                    // [TAG_FN_L24_OPFAIR] the prompt in progress: the last one that added prompt rows (also when it ran alone)
+                    if (l24.opfair && (n_tokens_cur > 0 || has_mtmd)) {
+                        l24_claim_task = slot.task->id;
                     }
                 }
 
@@ -9064,6 +9575,12 @@ private:
                 }
             }
             llama_fn_prompt_after_ext(ctx_tgt, n_after_all);
+            // [TAG_FN_L24_ENDOVL1] busy slots (a prompt or an answer; paused ones count): one lets ENDOVERLAP run on 2+ slots
+            int32_t n_busy = 0;
+            for (const auto & slot : slots) {
+                n_busy += slot.is_processing() && !slot.parked ? 1 : 0;
+            }
+            llama_fn_seqs_busy_ext(ctx_tgt, n_busy);
 
             // [TAG_FN_L20_BIGPROMPT_PLEPRE] LLAMA_FN_L20_BIGPROMPT_PLEPRE (qwen4exp profile or environment, default off): the next
             // prompt batch's text tokens (up to the first media chunk) for the PLE read-ahead during this batch
@@ -9975,6 +10492,12 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             task_response_type res_type,
             const common_chat_session & chat_session) {
     GGML_ASSERT(type == SERVER_TASK_TYPE_COMPLETION || type == SERVER_TASK_TYPE_INFILL);
+
+    // [TAG_FN_L23_PINFIX] R-L23-8: a request is busy from here (template, tokens, pictures) until the slot takes it
+    struct l23_busy_mark {
+        l23_busy_mark()  { llama_fn_pin_server_busy(1); }
+        ~l23_busy_mark() { llama_fn_pin_server_busy(-1); }
+    } l23_busy;
 
     // [TAG_FN_L22_PASSLOG] request -> here = the body parse and the chat template; here -> tokenized = the pictures too
     const int64_t l22_t_tmpl = ggml_time_us();

@@ -11,6 +11,7 @@
 //   l22_pause_should_resume    when a paused answer goes on                             [TAG_FN_L22_PAUSE]
 //   l22_sharekv_usable         a follower may take the leader's prefix by seq_cp        [TAG_FN_L22_SHAREKV]
 //   l22_park_cells             the cells a parked slot needs again                      [TAG_FN_L22_SHAREKV]
+//   l24_attach_best            the other slot whose cells a new prompt starts from      [TAG_FN_L24_ATTACH]
 
 #include <algorithm>
 #include <cstdint>
@@ -42,6 +43,82 @@ static inline std::vector<int> l22_oneprompt_order(std::vector<l22_prompt_cand> 
         out.push_back(x.id);
     }
     return out;
+}
+
+// [TAG_FN_L24_OPFAIR] one slot with prompt tokens left, with what the fair order needs
+struct l24_prompt_cand {
+    int     id       = -1;
+    int32_t left     = 0;
+    int32_t n_yield  = 0;
+    bool    claimer  = false; // its task claimed the last prompt batch (the prompt in progress)
+    bool    near_end = false; // its rest is short or most of it is done: it finishes first
+};
+
+// whether a prompt is near its end: a text-only rest of at most near tokens, or at least frac of its turn done
+static inline bool l24_prompt_near_end(int32_t left, int32_t turn_rows, bool media_left, int32_t near, double frac) {
+    if (left <= 0) {
+        return true;
+    }
+    if (!media_left && left <= near) {
+        return true;
+    }
+    return turn_rows > 0 && (double) (turn_rows - left) >= frac * (double) turn_rows;
+}
+
+// The visit order with the prompt in progress kept (owner 10-24: a new prompt took the batch from one with 15.5K left,
+// which then waited ~45 s). Shortest remaining first, with limits: the claimer goes first unless a challenger has fewer
+// tokens left, the claimer never gave way in this request and is not near its end (the near-end rule is off by default:
+// the short request matters more). The pre-emptor then keeps the batch (no ping-pong). Without a claimer, a slot that
+// gave way goes first, then the fewest tokens left (l22_oneprompt_order with n_force 1). Every slot of c is in the result once.
+static inline std::vector<int> l24_oneprompt_order(const std::vector<l24_prompt_cand> & c) {
+    std::vector<l22_prompt_cand> base;
+    for (const auto & x : c) {
+        base.push_back({ x.id, x.left, x.n_yield });
+    }
+    std::vector<int> order = l22_oneprompt_order(base, 1);
+    int k = -1;
+    for (int i = 0; i < (int) c.size(); ++i) {
+        if (c[i].claimer && c[i].left > 0) {
+            k = i;
+            break;
+        }
+    }
+    if (k < 0) {
+        return order;
+    }
+    const auto & cl = c[k];
+    int best = -1; // the first challenger in the base order
+    for (const int id : order) {
+        if (id != cl.id) {
+            best = id;
+            break;
+        }
+    }
+    int32_t best_left = 0;
+    for (const auto & x : c) {
+        if (x.id == best) {
+            best_left = x.left;
+        }
+    }
+    const bool preempt = best >= 0 && !cl.near_end && cl.n_yield == 0 && best_left < cl.left;
+    std::vector<int> out;
+    out.reserve(order.size());
+    if (preempt) {
+        out.push_back(best);
+    }
+    out.push_back(cl.id);
+    for (const int id : order) {
+        if (id != cl.id && !(preempt && id == best)) {
+            out.push_back(id);
+        }
+    }
+    return out;
+}
+
+// [TAG_FN_L24_GSCAP] l22_window_cap_us with the rows counted in fractions of 8K: a 16,381-row pass got the 8K cap (4 s),
+// so its window was 2.0 s of a 6.6 s pass (share 0.30, the answer ~21 t/s) instead of half the pass
+static inline int64_t l24_window_cap_us(int64_t cap_us, int64_t prompt_rows) {
+    return (int64_t) ((double) cap_us * std::max(1.0, (double) prompt_rows / 8192.0));
 }
 
 // the slot gave way to claimer_task in this batch: counts once per claiming task (a long prompt gives way to a shorter
@@ -117,4 +194,56 @@ static inline bool l22_sharekv_usable(const l22_share_view & v) {
 // a park of a slot that shares cells with another sequence frees only its own cells, but the resume writes all of them
 static inline int32_t l22_park_cells(int32_t freed, int32_t n_tokens, bool shared) {
     return shared ? std::max(freed, n_tokens) : freed;
+}
+
+// [TAG_FN_L24_ATTACH] (upstream #30970 --slot-attach, automatic) another slot (the donor) as get_available_slot sees it
+// for a new task: a donor that is idle, still in its prompt or answering lends the task's slot its cells (seq_cp, no copy)
+// up to a point where the recurrent state is known exactly: one of its checkpoints, or (idle only) its whole content
+struct l24_donor_view {
+    int     id       = -1;
+    bool    usable   = false;    // not parked, IDLE / PROCESSING_PROMPT / GENERATING, not the task's slot
+    bool    idle     = false;    // IDLE: its current state is final, the whole content may be lent (a live snapshot)
+    bool    whole_ok = false;    // its memory ends exactly at its last token (seq_pos_max + 1 == pos_next)
+    int32_t n_tokens = 0;        // its tokens
+    int32_t lcp      = 0;        // common prefix of its tokens and the task's tokens
+    std::vector<int64_t> ckpts;  // n_tokens of its checkpoints that hold data and lie within its memory
+};
+
+// what to lend: the donor's id (-1: nothing), the tokens, and which state (-1: the donor's live state, else ckpts[ckpt])
+struct l24_attach_pick {
+    int     donor = -1;
+    int32_t n     = 0;
+    int     ckpt  = -1;
+};
+
+// The longest prefix any donor can lend: its whole content (idle, the task continues all of it) or its newest checkpoint
+// within the shared part; at most n_task - 1 tokens (one prompt token is always evaluated [TAG_PROMPT_LOGITS]). A
+// checkpoint wins a tie (one host->device copy instead of a snapshot and a copy). Taken only with at least n_min tokens
+// and gain tokens more than own (what the task's slot keeps by itself).
+static inline l24_attach_pick l24_attach_best(const std::vector<l24_donor_view> & donors, int32_t n_task, int32_t own,
+                                              int32_t n_min, int32_t gain) {
+    l24_attach_pick best;
+    const int32_t n_max = n_task - 1;
+    if (n_max <= 0) {
+        return best;
+    }
+    for (const auto & d : donors) {
+        if (!d.usable || d.id < 0) {
+            continue;
+        }
+        const int32_t lim = std::min(d.lcp, n_max);
+        for (size_t k = 0; k < d.ckpts.size(); ++k) {
+            const int64_t c = d.ckpts[k];
+            if (c > 0 && c <= lim && (c > best.n || (c == best.n && best.ckpt < 0 && best.donor >= 0))) {
+                best = { d.id, (int32_t) c, (int) k };
+            }
+        }
+        if (d.idle && d.whole_ok && d.n_tokens > 0 && d.lcp >= d.n_tokens && d.n_tokens <= n_max && d.n_tokens > best.n) {
+            best = { d.id, d.n_tokens, -1 };
+        }
+    }
+    if (best.donor < 0 || best.n < std::max<int32_t>(1, n_min) || best.n < (int64_t) own + std::max<int32_t>(0, gain)) {
+        return l24_attach_pick();
+    }
+    return best;
 }

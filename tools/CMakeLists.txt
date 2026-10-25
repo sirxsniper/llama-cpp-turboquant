@@ -46,7 +46,8 @@ else()
         add_subdirectory(tuning)
     endif()
     add_subdirectory(results)
-    if (GGML_CUDA)
+    # [TAG_FN_V0252_LINUXBUILD] the probe is Windows-only (Win32 APIs): a Linux build (Docker / NAS) skips it
+    if (GGML_CUDA AND WIN32)
         add_subdirectory(moe-bridge-probe) # [TAG_FN_BRIDGE_PROBE]
     endif()
 endif()

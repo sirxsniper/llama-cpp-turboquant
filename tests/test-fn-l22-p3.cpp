@@ -230,10 +230,29 @@ static void test_l22_victim() {
     TCHECK(!l22_phase_gen(0, 0), "empty");
 }
 
+static void test_l24_merged() {
+    // the owner's 2-slot pool: 262,144 cells, 6 answer rows per step
+    TCHECK(l24_merged_fits(262144 - 120000, 16384, 6), "room: idle slot with 120K cells");
+    TCHECK(!l24_merged_fits(10000, 16384, 6), "no room: per-chunk path");
+    TCHECK(!l24_merged_fits(16384, 16384, 6), "rows fit, the answers' next step does not");
+    TCHECK(l24_merged_fits(16390, 16384, 6), "exactly rows + margin");
+    TCHECK(!l24_merged_fits(-1, 100, 0), "no count from the memory");
+    TCHECK(!l24_merged_fits(1000, 0, 0), "no rows");
+    TCHECK(l24_merged_fits(100, 100, -5), "negative margin counts as 0");
+    TCHECK(l24_merged_batch_rule(0, 0, false, false) == 0, "empty batch: merge (switch off)");
+    TCHECK(l24_merged_batch_rule(0, 0, false, true) == 0, "empty batch: merge");
+    TCHECK(l24_merged_batch_rule(3, 3, false, true) == 1, "answer rows only: next batch alone");
+    TCHECK(l24_merged_batch_rule(3, 3, false, false) == -1, "answer rows only, switch off: per-chunk");
+    TCHECK(l24_merged_batch_rule(500, 3, false, true) == -1, "prompt rows in the batch: per-chunk");
+    TCHECK(l24_merged_batch_rule(500, 0, false, true) == -1, "another prompt claimed the batch");
+    TCHECK(l24_merged_batch_rule(500, 0, true, true) == -1, "another merged batch");
+}
+
 int main() {
     test_l22_media_plan();
     test_l22_anchor();
     test_l22_victim();
+    test_l24_merged();
     printf("test-fn-l22-p3: %d checks, %d failed\n", g_checks, g_fail);
     return g_fail == 0 ? 0 : 1;
 }

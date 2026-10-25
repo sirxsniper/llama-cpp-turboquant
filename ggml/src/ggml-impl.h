@@ -57,6 +57,12 @@ uint64_t ggml_graph_next_uid(void);
     #endif
 #endif
 
+// [TAG_UPSTREAM_30969] ticks of a freq Hz counter in 1/unit s, split at whole seconds: ticks * 1e6 overflowed int64 after
+// ~10.7 days at a 10 MHz QueryPerformanceCounter (a server then saw time go backwards)
+static inline int64_t ggml_time_ticks_scale(int64_t ticks, int64_t freq, int64_t unit) {
+    return (ticks / freq) * unit + (ticks % freq) * unit / freq;
+}
+
 static inline int ggml_up32(int n) {
     return (n + 31) & ~31;
 }

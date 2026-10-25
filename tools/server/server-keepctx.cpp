@@ -179,6 +179,7 @@ public:
     // [TAG_FN_L20_CONVFIX_IO] ext_mem: KC_NBUF blocks the caller owns (kc_alloc_blocks), else the pipe allocates its own
     kc_pipe(server_keepctx_file & file, bool writing, uint64_t n_read, uint64_t base = 0, uint8_t * ext_mem = nullptr) :
             file(file), writing(writing), n_read(kc_round_up(n_read)), base(base) {
+        llama_fn_pin_server_busy(1); // [TAG_FN_L23_PINFIX] R-L23-8: a keepctx copy is busy (the destructor ends it)
         if (ext_mem) {
             mem     = ext_mem;
             own_mem = false;
@@ -196,6 +197,7 @@ public:
     }
 
     ~kc_pipe() {
+        llama_fn_pin_server_busy(-1); // [TAG_FN_L23_PINFIX] R-L23-8
         {
             std::lock_guard<std::mutex> lk(mu);
             stop = true;
@@ -823,8 +825,45 @@ bool server_keepctx::spill_read(const server_keepctx_spilled & s, common_prompt_
     return true;
 }
 
+// [TAG_FN_L24_KEEPVAL] steady-clock seconds
+static double kc_now_s() {
+    return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
 // [TAG_FN_L19_CONVSTORE_EVICT]
-bool server_keepctx::evict_one(const server_keepctx_entry * keep) {
+bool server_keepctx::evict_one(const server_keepctx_entry * keep, bool budget, uint64_t * freed) {
+    // [TAG_FN_L24_KEEPVAL]
+    if (params_.val) {
+        const double now = kc_now_s();
+        std::vector<convstore_val_entry> es;
+        std::vector<std::list<server_keepctx_entry>::iterator> its;
+        for (auto it = entries.begin(); it != entries.end(); ++it) {
+            convstore_val_entry v;
+            v.n_tokens = it->prompt.n_tokens();
+            v.hits     = it->conv.hits;
+            v.age_s    = now - it->t_use;
+            v.keep     = &*it == keep;
+            es.push_back(v);
+            its.push_back(it);
+        }
+        const int vi = convstore_val_victim(es, params_.fixed_tokens, params_.val_half_s, params_.val_active_s, budget);
+        if (vi < 0) {
+            return false;
+        }
+        const int prot = convstore_val_protect(es, params_.val_active_s);
+        LOG_INF("[TAG_FN_L24_KEEPVAL] evicted a stored conversation of %lld tokens (value %.0f, %.0f s since used, %lld restores) "
+                "for the %s%s\n", (long long) es[vi].n_tokens,
+                convstore_val(es[vi].n_tokens, es[vi].hits, es[vi].age_s, params_.fixed_tokens, params_.val_half_s), es[vi].age_s,
+                (long long) es[vi].hits, budget ? "disk budget" : "count limit",
+                vi == prot ? " (the protected one: nothing else left)" :
+                (prot >= 0 ? string_format(", kept the biggest active one (%lld tokens)", (long long) es[prot].n_tokens).c_str() : ""));
+        if (freed) {
+            *freed = its[vi]->n_bytes_all();
+        }
+        n_evicted_gdsf++;
+        entries.erase(its[vi]);
+        return true;
+    }
     auto victim = entries.end();
     for (auto it = entries.begin(); it != entries.end(); ++it) {
         if (&*it == keep) {
@@ -844,6 +883,9 @@ bool server_keepctx::evict_one(const server_keepctx_entry * keep) {
     if (params_.gdsf) {
         gdsf_L_ = std::max(gdsf_L_, victim->value);
         n_evicted_gdsf++;
+    }
+    if (freed) {
+        *freed = victim->n_bytes_all();
     }
     entries.erase(victim);
     return true;
@@ -922,12 +964,45 @@ bool server_keepctx::save(const server_prompt & prompt, llama_context * ctx_tgt,
     // room: older states of this conversation, then the oldest entries (or [TAG_FN_L19_CONVSTORE_EVICT] the lowest
     // value per byte), never `keep`
     int n_evicted = drop_prefixes_of(prompt.tokens, keep, supersede_tol);
-    while ((n_bytes() + need + need_spilled > params_.budget || (int32_t) entries.size() >= params_.n_max) && evict_one(keep)) {
-        n_evicted++;
-    }
-    if (n_bytes() + need + need_spilled > params_.budget || (int32_t) entries.size() >= params_.n_max) {
-        info = string_format("no room beside the conversation the next prompt restores (%.1f MiB needed)", need/1048576.0);
-        return false;
+    if (params_.val) {
+        // [TAG_FN_L24_KEEPVAL] the disk first (budget and free space, the protected entry last), then the count (never the
+        // protected entry: the count may then pass n_max by the protected and the keep entry)
+        // the margin only drives evictions; the store fails on the disk only when the bytes do not fit at all
+        int64_t disk_short = 0;
+        int64_t disk_full  = 0;
+        if (params_.disk_margin > 0) {
+            std::error_code ec;
+            const auto sp = std::filesystem::space(params_.dir, ec);
+            if (!ec) {
+                disk_full  = (int64_t) (need + need_spilled) - (int64_t) sp.available;
+                disk_short = disk_full + (int64_t) params_.disk_margin;
+            }
+        }
+        while (n_bytes() + need + need_spilled > params_.budget || disk_short > 0) {
+            uint64_t freed = 0;
+            if (!evict_one(keep, true, &freed)) {
+                break;
+            }
+            disk_short -= (int64_t) freed;
+            disk_full  -= (int64_t) freed;
+            n_evicted++;
+        }
+        while ((int32_t) entries.size() >= params_.n_max && evict_one(keep, false)) {
+            n_evicted++;
+        }
+        if (n_bytes() + need + need_spilled > params_.budget || disk_full > 0 || (int32_t) entries.size() >= params_.n_max + 2) {
+            info = string_format("no room beside the conversation the next prompt restores (%.1f MiB needed%s)", need/1048576.0,
+                                 disk_full > 0 ? ", the disk is full" : "");
+            return false;
+        }
+    } else {
+        while ((n_bytes() + need + need_spilled > params_.budget || (int32_t) entries.size() >= params_.n_max) && evict_one(keep)) {
+            n_evicted++;
+        }
+        if (n_bytes() + need + need_spilled > params_.budget || (int32_t) entries.size() >= params_.n_max) {
+            info = string_format("no room beside the conversation the next prompt restores (%.1f MiB needed)", need/1048576.0);
+            return false;
+        }
     }
 
     e.id = ++n_next_;
@@ -1017,13 +1092,18 @@ bool server_keepctx::save(const server_prompt & prompt, llama_context * ctx_tgt,
     // [TAG_FN_L19_CONVSTORE_EVICT]
     e.value = convstore_gdsf(gdsf_L_, e.conv.hits, prompt.n_tokens(), e.n_bytes_all(), params_.fixed_tokens,
                              params_.budget / (uint64_t) std::max(1, params_.n_max));
+    // [TAG_FN_L24_KEEPVAL]
+    e.t_use = kc_now_s();
+    if (params_.val) {
+        e.value = convstore_val(prompt.n_tokens(), e.conv.hits, 0.0, params_.fixed_tokens, params_.val_half_s);
+    }
 
     const double ms = kc_ms_since(t0);
     info = string_format("%d tokens, %u checkpoints, %.1f MiB (target %.1f, draft %.1f) in %.0f ms = %.2f GB/s, %d older evicted, "
                          "store %zu conversations / %.1f MiB", prompt.n_tokens(), (unsigned) prompt.checkpoints.size(),
                          need/1048576.0, e.size_tgt/1048576.0, e.size_dft/1048576.0, ms, need/(ms*1e6), n_evicted,
                          entries.size() + 1, (n_bytes() + e.n_bytes_all())/1048576.0);
-    if (!e.spilled.empty() || params_.gdsf) {
+    if (!e.spilled.empty() || params_.gdsf || params_.val) {
         info += string_format(" [TAG_FN_L19_CONVSTORE] %zu checkpoints on disk (%.1f MiB), restores %lld, value %.0f, system block %d",
                               e.spilled.size(), need_spilled/1048576.0, (long long) e.conv.hits, e.value, (int) e.conv.sys_end);
     }
@@ -1195,6 +1275,7 @@ bool server_keepctx::load(std::list<server_keepctx_entry>::iterator it, server_p
         e.conv.hits++;
         e.value = convstore_gdsf(gdsf_L_, e.conv.hits, e.prompt.n_tokens(), e.n_bytes_all(), params_.fixed_tokens,
                                  params_.budget / (uint64_t) std::max(1, params_.n_max));
+        e.t_use = kc_now_s(); // [TAG_FN_L24_KEEPVAL]
     }
 
     const double ms = kc_ms_since(t0);

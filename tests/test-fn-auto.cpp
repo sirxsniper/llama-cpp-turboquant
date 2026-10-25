@@ -132,7 +132,7 @@ static void test_profile_opts() {
         { "LLAMA_FN_L16_PLE_GATE", "1" }, // [TAG_FN_L16_PLEGATE]
         { "LLAMA_FN_L17_START_PRE", "2048" }, { "LLAMA_FN_L17_START_NT", "1" }, { "LLAMA_FN_L17_START_BURST", "64" }, { "LLAMA_FN_L17_VISION", "1" }, // [TAG_FN_L17_ADOPT]
         { "LLAMA_FN_L18_KEEPCTX", "1" }, { "LLAMA_FN_L18_FIRSTANS_PIN", "1" }, { "LLAMA_FN_L18_FIRSTANS_FIT", "1" }, { "LLAMA_FN_L18_FIRSTANS_WARMLATE", "1" }, { "LLAMA_FN_L18_FIRSTANS_STATE", "1" }, { "LLAMA_MOE_HOT_STATE", "cache" }, { "LLAMA_FN_L17_START_STATE", "60" }, { "LLAMA_FN_L18_FIRSTANS_ONCE", "1" }, { "LLAMA_FN_L18_FIRSTANS_WARM", "1" }, { "LLAMA_MOE_HOT_UP_PIPE", "1" }, { "LLAMA_FN_L18_CHURN_LAYERS", "auto" }, { "GGML_CUDA_FN_L18_HCUP", "1" }, { "LLAMA_FN_L18_GF_GDNOUT", "1" }, { "LLAMA_FN_L18_GF_QKVZ", "1" }, // [TAG_FN_L18_ADOPT]
-        { "LLAMA_FN_L19_TTFT_HUSH", "3" }, { "LLAMA_FN_L19_TTFT_HUSH_MS", "10000" }, { "LLAMA_FN_L19_TTFT_EARLY", "256" }, { "LLAMA_FN_L19_TTFT_PHOT", "1" }, { "LLAMA_FN_L4_PROMPT", "160" }, { "LLAMA_FN_L19_TTFT_TAILFULL", "512" }, { "LLAMA_FN_L19_CONVSTORE", "1" }, { "LLAMA_FN_L19_CONVSTORE_N", "4" }, { "LLAMA_FN_L19_CONVSTORE_EVICT", "0" }, { "LLAMA_FN_L19_CONVSTORE_CKPT", "0" }, { "LLAMA_FN_L19_CONVSTORE_SYS", "0" }, { "LLAMA_PREFILL_STREAM_MIN", "768" }, { "GGML_OP_OFFLOAD_MIN_BATCH", "768" }, // [TAG_FN_L19_ADOPT]
+        { "LLAMA_FN_L19_TTFT_HUSH", "3" }, { "LLAMA_FN_L19_TTFT_HUSH_MS", "10000" }, { "LLAMA_FN_L19_TTFT_EARLY", "256" }, { "LLAMA_FN_L19_TTFT_PHOT", "1" }, { "LLAMA_FN_L4_PROMPT", "160" }, { "LLAMA_FN_L19_TTFT_TAILFULL", "512" }, { "LLAMA_FN_L19_CONVSTORE", "1" }, { "LLAMA_FN_L19_CONVSTORE_N", "8" }, { "LLAMA_FN_L19_CONVSTORE_EVICT", "0" }, { "LLAMA_FN_L19_CONVSTORE_CKPT", "0" }, { "LLAMA_FN_L19_CONVSTORE_SYS", "0" }, { "LLAMA_PREFILL_STREAM_MIN", "768" }, { "GGML_OP_OFFLOAD_MIN_BATCH", "768" }, // [TAG_FN_L19_ADOPT]
         { "LLAMA_FN_L20_BIGPROMPT_UB", "16384" }, { "LLAMA_FN_L21_BIGUB", "1" }, // [TAG_FN_L20_ADOPT] [TAG_FN_L21_BIGUB]
     };
     for (const auto & w : want) {
@@ -232,7 +232,7 @@ static const l22_row k_l22_rows[] = {
     { "LLAMA_FN_L22_SSDTIER_IO", "8", false },
     { "LLAMA_FN_L22_PIN", "0", false },
     { "LLAMA_FN_L22_PIN_UNIT", "ranges", false },
-    { "LLAMA_FN_L22_PIN_MARGIN_MIB", "8192", false },
+    { "LLAMA_FN_L22_PIN_MARGIN_MIB", "16384", false },
     { "LLAMA_FN_L22_PIN_LOCAL_MARGIN_MIB", "1024", false },
     { "LLAMA_FN_L22_PIN_FLOOR_MIB", "6144", false },
     { "LLAMA_FN_L22_PIN_ARENA_MIB", "16384", false },
@@ -263,6 +263,8 @@ static const l22_row k_l22_rows[] = {
     { "LLAMA_FN_L22_PAUSE_S", "8", false },
     { "LLAMA_FN_L22_SHAREKV", "1", false },
     { "LLAMA_FN_L22_DRAFT2", "0", false },
+    { "LLAMA_FN_L24_ATTACH", "1", false }, // [TAG_FN_L24_ATTACH]
+    { "LLAMA_FN_L24_ATTACH_CKPT", "0", false }, // [TAG_FN_L24_ATTACH]
     { "LLAMA_FN_L22_STAGERS", "auto", false },
     { "LLAMA_FN_L22_XOVER", "1", false },
     { "LLAMA_FN_L22_UBPLAN", "1", false },
@@ -284,6 +286,10 @@ static const l22_row k_l22_rows[] = {
     { "LLAMA_FN_L22_CPUSHARE", "0", false },
     { "LLAMA_FN_L22_CPUSHARE_MAX", "3072", false },
     { "LLAMA_FN_L22_CPUSHARE_ROWS", "8", false },
+    { "LLAMA_FN_L24_KEEPVAL", "1", false }, // [TAG_FN_L24]
+    { "LLAMA_FN_L24_GENCKPT", "1", false },
+    { "LLAMA_FN_L24_OPFAIR", "1", false },
+    { "LLAMA_FN_L24_GSCAP", "1", false },
 };
 static const size_t k_n_l22_rows = sizeof(k_l22_rows)/sizeof(k_l22_rows[0]);
 const size_t k_n_l22_rows_decl = k_n_l22_rows;

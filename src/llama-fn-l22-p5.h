@@ -33,6 +33,9 @@ bool llama_fn_p5_ready(const llama_model & model);
 // the table drives the warm pass (RESSET)
 bool llama_fn_p5_resset(const llama_model & model);
 
+// [TAG_FN_L23_PINFIX] the warm pass has ended (llama_fn_p5_after_warm ran), or there is no table: the pin thread waits for it
+bool llama_fn_p5_warm_done(const llama_model & model);
+
 // the warm pass's floor of available RAM (LLAMA_FN_L15_WARM_FREE_MIB, raised to LLAMA_FN_L22_PIN_FLOOR_MIB + 1 GiB while
 // pins are planned, R-P6-3); 0 when no table
 size_t llama_fn_p5_floor(const llama_model & model);

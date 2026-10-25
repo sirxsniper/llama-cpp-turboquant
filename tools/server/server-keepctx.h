@@ -38,6 +38,13 @@ struct server_keepctx_params {
     bool        gdsf         = false;
     double      fixed_tokens = 0.0;   // the fixed prefill cost of a restore's alternative, in tokens
 
+    // [TAG_FN_L24_KEEPVAL] evict by re-read cost x recency (convstore_val, before gdsf) and keep the biggest active
+    // conversation against the count limit; the disk budget and the free disk space (disk_margin kept) still bind
+    bool        val          = false;
+    double      val_half_s   = 900.0;  // recency: an entry this old counts half
+    double      val_active_s = 3600.0; // the biggest entry used within this is protected
+    uint64_t    disk_margin  = 0;      // free bytes kept on the store's disk (0: not checked)
+
     // [TAG_FN_L20_CONVFIX_IO] a store and a restore reuse their memory: the pipe's blocks are allocated once, and a
     // restore puts the stored checkpoints into the outgoing ring's buffers (no fresh, zero-filled 112.6 MiB allocation
     // per checkpoint and no free of the old ones while the next prompt streams the experts). The bytes are the same.
@@ -119,6 +126,7 @@ struct server_keepctx_entry {
     std::vector<server_keepctx_spilled> spilled;
     server_keepctx_conv                 conv;
     double                              value = 0.0;
+    double                              t_use = 0.0; // [TAG_FN_L24_KEEPVAL] steady-clock seconds of the store or the last restore
 
     uint64_t n_bytes_all() const;       // n_bytes + the spilled checkpoints' bytes
 };
@@ -198,7 +206,9 @@ struct server_keepctx {
 private:
     bool selftest(std::string & err);
     // drop the entry of the lowest value (or the oldest), never keep; false when only keep is left
-    bool evict_one(const server_keepctx_entry * keep);
+    // [TAG_FN_L24_KEEPVAL] budget: the room is for the disk (the protected entry may go, last), else for the count;
+    // freed: the bytes of the evicted entry
+    bool evict_one(const server_keepctx_entry * keep, bool budget = true, uint64_t * freed = nullptr);
 
     // [TAG_FN_L19_CONVSTORE_SPILL] the writer thread and a checkpoint's bytes on their way to disk
     struct spill_job {

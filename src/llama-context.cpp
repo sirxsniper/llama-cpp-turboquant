@@ -3957,9 +3957,9 @@ static void llama_probe_ubatch_add(const llama_context * ctx, const char * arch,
 }
 
 // [TAG_FN_L3_VRAM_CBUF] [TAG_FN_L22_RWIDTH] narrow batches in a row that lift the thrash pin: 256, or 16 for a pin at the
-// 16K width (UBPLAN: its borrow keeps hot slots out of the answer steps)
-static uint64_t llama_fn_l22_pin_narrow_max(bool big_pin) {
-    return big_pin ? 16 : 256;
+// 16K width (UBPLAN: its borrow keeps hot slots out of the answer steps); [TAG_FN_L24_PRESSLIFT] press_lift (> 0) for a pressure pin
+static uint64_t llama_fn_l22_pin_narrow_max(bool big_pin, int press_lift) {
+    return big_pin ? 16 : press_lift > 0 ? (uint64_t) press_lift : 256;
 }
 
 int llama_context::decode(const llama_batch_ext & batch_inp) {
@@ -4190,6 +4190,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                 if (w > w_now) {
                     const bool was_pinned = cbuf_pinned;
                     cbuf_pinned     = false;
+                    l24_pin_press   = false; // [TAG_FN_L24_PRESSLIFT]
                     cbuf_full_at.clear();
                     cbuf_narrow_run = 0;
                     const int64_t t_rw = ggml_time_us();
@@ -4216,13 +4217,25 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             if (cbuf_state == CBUF_SMALL) {
                 cbuf_note_full(); // may pin FULL (LLAMA_FN_CBUF_THRASH)
             }
-        } else if (cbuf_pinned && ++cbuf_narrow_run >= llama_fn_l22_pin_narrow_max(l22p.ubplan && l20_base_ub > 0 &&
-                   cbuf_state == CBUF_FULL && cbuf_full_t > l20_base_ub)) {
+        } else if (cbuf_pinned && (++cbuf_narrow_run >= llama_fn_l22_pin_narrow_max(l22p.ubplan && l20_base_ub > 0 &&
+                   cbuf_state == CBUF_FULL && cbuf_full_t > l20_base_ub, l24_pin_press ? l24_press_lift : 0) ||
+                   (l24_pin_press && l24_press_lift > 0 && cbuf_narrow_run == 1 && llama_fn_p5_ssd_bytes(model) == 0))) {
             // [TAG_FN_L22_RWIDTH] a pin at the 16K width (UBPLAN): its borrow keeps hot slots out of every answer step
             // (decode 24-63 t/s in the bands under the 8 GiB eater, v0.24.0's 16K pin 21-88, ~100 at the base width), so an
             // answer of more than 16 steps lifts it; short answers between prompts keep it (no 16K reserve per prompt: the
             // switches to and from 16K stalled 3-8 s under the eater)
-            if (l22_rw_n_nopin++ < 3 && cbuf_narrow_run < 256) {
+            // [TAG_FN_L24_PRESSLIFT] a pressure pin at the 8K width lifts the same way (it held FULL for 256 steps: the first
+            // ~10 s of the owner's answers ran at 41-56 t/s), and at the answer's first step when the SSD set is empty
+            const bool was_press = l24_pin_press;
+            if (was_press) {
+                l24_pin_press = false;
+                if (l24_n_lift++ < 4 || l24_n_lift % 64 == 0) {
+                    LLAMA_LOG_WARN("%s: [TAG_FN_L24_PRESSLIFT] lift %llu: the pressure pin goes after %llu narrow batches%s\n", __func__,
+                            (unsigned long long) l24_n_lift, (unsigned long long) cbuf_narrow_run,
+                            cbuf_narrow_run == 1 ? " (no SSD set now)" : "");
+                }
+            }
+            if (!was_press && l22_rw_n_nopin++ < 3 && cbuf_narrow_run < 256) {
                 LLAMA_LOG_INFO("%s: [TAG_FN_L22_RWIDTH] %llu narrow batches in a row under the 16K pin: the lend switches again\n",
                         __func__, (unsigned long long) cbuf_narrow_run);
             }
@@ -4234,7 +4247,10 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         // [TAG_FN_L19_TTFT_TAILFULL] the last part of a split short prompt keeps FULL (no switch before the first token)
         // [TAG_FN_L22_ENDOVERLAP] for every prompt size (M3.5): the answer's first step makes the switch. One sequence only
         // (R-REV-13): with more, the prompt's end keeps the eager switch, so the tail keeps today's placement too
-        const bool     endovl     = l22.endoverlap && cparams.n_seq_max == 1;
+        // [TAG_FN_L24_ENDOVL1] with n_seq_max > 1 when the caller has one busy sequence (the other slots idle or parked): a 2-slot
+        // server paid the switch before the first token (to=small p50 532 ms vs 155 ms after it on 1 slot). Another sequence
+        // that starts during the answer's first step makes the switch at that step (a wide batch keeps FULL), as R-REV-13 says
+        const bool     endovl     = l22.endoverlap && (cparams.n_seq_max == 1 || (l24_endovl1 && l24_seqs_busy == 1));
         const uint32_t tailfull_n = endovl ? UINT32_MAX : l19_tailfull;
         const bool tail_full = !wide && llama_fn_cbuf_tail_full(tailfull_n, cbuf_state == CBUF_FULL, cbuf_short, n_tokens_all,
                 n_outputs_all, cbuf_prev_n, cbuf_prev_out, cbuf_small_t);
@@ -4280,6 +4296,13 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                 full_w = l20_base_ub;
             }
             keep_full = llama_fn_l20_keep_full(l20_base_ub, wide, cbuf_short, cbuf_state == CBUF_FULL, after);
+            // [TAG_FN_L23_PINFIX] R-L23-3: an answer-only batch (every row an output: another slot's answer steps in a
+            // GENSHARE2 window while a prompt waits) leaves the FULL reserve: the answer gets the hot set's tail back (~5 GiB of
+            // experts on the GPU), as the staged stream's windows did. With pins FULL stayed through every window of a 30K
+            // prompt and the other answer read 21.8 vs 30.9 t/s (l23p sess4)
+            if (keep_full && n_outputs_all > 0 && n_outputs_all == n_tokens_all) {
+                keep_full = false;
+            }
             if (keep_full && l20_n_keep++ < 3) {
                 LLAMA_LOG_INFO("%s: [TAG_FN_L20_BIGPROMPT_UB] a %d-token part of a prompt with %d tokens after it stays FULL\n",
                         __func__, (int) n_tokens_all, (int) after);
@@ -4642,7 +4665,13 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             const int64_t left = (int64_t) n_tokens_all - n_tokens_prev - (int64_t) ubatch.n_tokens;
             l22_last_ub = left <= 0 && l22_after >= 0 && l22_after <= (int64_t) cbuf_small_t;
             if (l22.keeplend || l22.endoverlap) {
-                llama_prefill_stream_l22_set_after(this, std::max<int64_t>(0, l22_after) + std::max<int64_t>(0, left), l22_tail);
+                // [TAG_FN_L23_PINFIX] R-L23-3: an answer-only batch (every row an output: another slot's answer steps in a
+                // GENSHARE2 window while a prompt waits) does not keep the banks (KEEPLEND): the answer decodes on the whole hot
+                // set, as the staged stream's windows did. With pins the stream kept them through every window (keeps=219) and
+                // the other answer fell from 27.5 to 17.7 t/s while a 30K prompt was read (l23p two-connection run)
+                const bool ans_only = n_outputs_all > 0 && n_outputs_all == n_tokens_all && l22_after > 0;
+                llama_prefill_stream_l22_set_after(this, ans_only ? 0 : std::max<int64_t>(0, l22_after) + std::max<int64_t>(0, left),
+                        l22_tail);
             }
         }
         // [TAG_FN_L22_XOVER] [TAG_FN_L22_UBPLAN] a prompt ubatch of a FULL period is observed (host time, the stream's record)
@@ -4884,7 +4913,8 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     const bool prompt_end = !fa18_once || n_outputs_all > 0;
     // [TAG_FN_L22_ENDOVERLAP] a prompt's last batch (it asks for an output) keeps FULL and the banks: the caller samples and
     // sends the first token now, and the answer's first step makes the switch, with the refills on the upload worker
-    if (l22.endoverlap && cbuf_state == CBUF_FULL && n_outputs_all > 0 && !cbuf_pinned && prompt_end && cparams.n_seq_max == 1) {
+    if (l22.endoverlap && cbuf_state == CBUF_FULL && n_outputs_all > 0 && !cbuf_pinned && prompt_end &&
+        (cparams.n_seq_max == 1 || (l24_endovl1 && l24_seqs_busy == 1))) { // [TAG_FN_L24_ENDOVL1]
         l22_end_pending = true;
         // the MTP draft's graphs run before the answer's first step: the lent layers stay hidden from their hot chains
         llama_prefill_stream_l22_hold(this, sched.get());
@@ -7707,11 +7737,15 @@ void llama_context::cbuf_note_full() {
     if (l22_rw_press < 0) {
         l22_rw_press = (l22p.ubplan && model.arch == LLM_ARCH_QWEN4EXP &&
                         llama_fn_l3_int(model, "LLAMA_FN_L22_RWIDTH_PRESS", 1) != 0) ? 1 : 0;
+        // [TAG_FN_L24_PRESSLIFT] narrow batches that lift a pressure pin (0 or >= 256: the thrash pin's 256, the old rule)
+        const int lift = llama_fn_l3_int(model, "LLAMA_FN_L24_PRESSLIFT", 16);
+        l24_press_lift = lift > 0 && lift < 256 ? lift : 0;
     }
     if (l22_rw_press == 1) {
         const size_t ssd = llama_fn_p5_ssd_bytes(model);
         if (ssd > 0) {
             cbuf_pinned     = true;
+            l24_pin_press   = true; // [TAG_FN_L24_PRESSLIFT]
             cbuf_narrow_run = 0;
             cbuf_full_at.clear();
             if (l22_rw_n_press++ < 4 || l22_rw_n_press % 64 == 0) {
@@ -7728,6 +7762,7 @@ void llama_context::cbuf_note_full() {
     }
     if ((int) cbuf_full_at.size() >= cbuf_thrash) {
         cbuf_pinned     = true;
+        l24_pin_press   = false; // [TAG_FN_L24_PRESSLIFT] the thrash pin keeps its 256
         cbuf_narrow_run = 0;
         LLAMA_LOG_WARN("%s: [TAG_FN_L3_VRAM_CBUF] %zu FULL switches within 64 batches (steps wider than %u tokens): the FULL "
                 "reserve stays and the hot set's tail stays out until 256 narrow batches in a row (LLAMA_FN_CBUF_THRASH=%d)\n",
@@ -7823,6 +7858,8 @@ void llama_context::l22_init() {
         l22.lendclass  = on("LLAMA_FN_L22_LENDCLASS");
         l22.keeplend   = on("LLAMA_FN_L22_KEEPLEND");
         l22.endoverlap = on("LLAMA_FN_L22_ENDOVERLAP");
+        // [TAG_FN_L24_ENDOVL1] default on (LLAMA_FN_L24_ENDOVL1=0: one slot only, the old rule)
+        l24_endovl1    = l22.endoverlap && cparams.n_seq_max > 1 && llama_fn_l3_int(model, "LLAMA_FN_L24_ENDOVL1", 1) != 0;
         l22.refill     = on("LLAMA_FN_L22_REFILL");
         l22.readahead  = on("LLAMA_FN_L22_READAHEAD");
         l22.ssdtier    = std::max(0, std::min(2, num("LLAMA_FN_L22_SSDTIER", 0)));
@@ -7858,7 +7895,7 @@ void llama_context::l22_init() {
     if (l22.lendclass || l22.keeplend || l22.endoverlap || l22.refill || l22.schedbuf || l22.sampstatic) {
         LLAMA_LOG_INFO("%s: [TAG_FN_L22_P4] round 22:%s%s%s%s%s%s%s\n", __func__, l22.lendclass ? " LENDCLASS" : "",
                 l22.keeplend ? " KEEPLEND" : "",
-                l22.endoverlap ? (cparams.n_seq_max == 1 ? " ENDOVERLAP" : " ENDOVERLAP(off: one slot only)") : "",
+                l22.endoverlap ? (cparams.n_seq_max == 1 ? " ENDOVERLAP" : l24_endovl1 ? " ENDOVERLAP(one busy slot)" : " ENDOVERLAP(off: one slot only)") : "",
                 l22.refill ? " REFILL" : "",
                 l22.schedbuf ? " SCHEDBUF" : "", l22.sampstatic ? " SAMPSTATIC" : "", l22.graphkeep ? " GRAPHKEEP-marks" : "");
     }
@@ -7942,7 +7979,7 @@ bool llama_context::l22_oom_retry(size_t need) {
     if (!llama_fn_pin_active()) {
         return false;
     }
-    const bool freed = llama_fn_pin_on_oom(need > 0 ? need : (size_t) 1 << 30);
+    const bool freed = llama_fn_pin_on_alloc_fail(need > 0 ? need : (size_t) 1 << 30); // [TAG_FN_L23_PINFIX] R-L23-5: all pins go
     llama_fn_l22_log("pin", "what=oom_retry need_mib=%.0f freed=%d", need/1048576.0, freed ? 1 : 0);
     return freed;
 }
@@ -9272,6 +9309,12 @@ bool llama_context::dft_set_wide(bool wide) {
 void llama_fn_prompt_after_ext(llama_context * ctx, int32_t n_after) {
     if (ctx) {
         ctx->fn_prompt_after(n_after); // [TAG_FN_L20_BIGPROMPT_UB]
+    }
+}
+
+void llama_fn_seqs_busy_ext(llama_context * ctx, int32_t n_busy) {
+    if (ctx) {
+        ctx->fn_seqs_busy(n_busy); // [TAG_FN_L24_ENDOVL1]
     }
 }
 

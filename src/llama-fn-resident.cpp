@@ -1354,8 +1354,11 @@ bool llama_fn_p5_ready(const llama_model & model) {
     // the pin planner starts (its own thread): it marks its experts PIN, the warm pass skips them
     llama_fn_pin_on_ready(&model);
     // R-P6-3: with pins planned (PIN-marked experts, or pins already active) the warm, SSD and re-warm floors stay at least
-    // LLAMA_FN_L22_PIN_FLOOR_MIB + 1 GiB of available RAM: the pin valve unpins below its floor and never registers again
-    if (pin) {
+    // LLAMA_FN_L22_PIN_FLOOR_MIB + 1 GiB of available RAM: the pin valve unpins below its floor and never registers again.
+    // [TAG_FN_L23_PINFIX] not any more: pins lock resident pages only and all go under 4 GiB available, so they add no RAM
+    // demand; the higher floors put ~10 GiB of the streamed set on the SSD tier (l23p two-connection run). Floors as
+    // without pins (LLAMA_FN_L23_PIN_FLOOR_RAISE=1 restores the raise)
+    if (pin && llama_fn_l3_int(model, "LLAMA_FN_L23_PIN_FLOOR_RAISE", 0) != 0) {
         bool marked = llama_fn_pin_active();
         for (size_t li = 0; li < t->L.size() && !marked; ++li) {
             for (int e = 0; e < t->L[li].n_exp && !marked; ++e) {
@@ -1389,6 +1392,11 @@ bool llama_fn_p5_resset(const llama_model & model) {
 size_t llama_fn_p5_floor(const llama_model & model) {
     res_ref r(&model);
     return r.t != nullptr ? r.t->floor_b : 0;
+}
+
+bool llama_fn_p5_warm_done(const llama_model & model) {
+    res_ref r(&model);
+    return r.t == nullptr || r.t->warm_done.load();
 }
 
 size_t llama_fn_p5_ssd_bytes(const llama_model & model) {

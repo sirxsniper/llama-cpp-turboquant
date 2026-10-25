@@ -131,11 +131,15 @@ LLAMA_API bool llama_fn_pin_query(const void * p, size_t n, llama_fn_pin_seg * s
 LLAMA_API void llama_fn_pin_release(int32_t ticket);
 // a device allocation of need_bytes is about to fail: unpin enough (synchronized) and return true to retry. Stub: false
 LLAMA_API bool llama_fn_pin_on_oom(size_t need_bytes);
+// [TAG_FN_L23_PINFIX] R-L23-5: an allocation failed while pins were held: every pin goes (true: some did), the caller retries once
+LLAMA_API bool llama_fn_pin_on_alloc_fail(size_t need_bytes);
 LLAMA_API bool llama_fn_pin_active(void);
 // DXGI QueryVideoMemoryInfo of the adapter with this LUID (non_local 0: LOCAL, 1: NON_LOCAL). Stub: false
 LLAMA_API bool llama_fn_dxgi_query(uint64_t luid, int non_local, uint64_t * budget, uint64_t * usage);
 // P6 R1: llama_context::decode marks its begin (true) and end (false) on every context (stub: no-op)
 LLAMA_API void llama_fn_pin_decode_mark(bool in_decode);
+// [TAG_FN_L23_PINFIX] R-L23-8: the server marks a request (+1 / -1; 0 = time stamp only): pins register only while idle
+LLAMA_API void llama_fn_pin_server_busy(int delta);
 // P6 R2: a device reserve / lend / grow size a package may need after ready, for the watcher's LOCAL reserve (stub: no-op)
 enum llama_fn_pin_need {
     LLAMA_FN_PIN_NEED_FULL_EXTRA = 0, // the FULL compute reserve above SMALL (P4, P10)
