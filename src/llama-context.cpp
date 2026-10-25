@@ -1541,6 +1541,13 @@ llama_context::llama_context(
     cparams.op_offload     = params.op_offload;
     cparams.kv_unified     = params.kv_unified;
     cparams.moe_cache_size = params.moe_cache_size;
+    if (cparams.moe_cache_size > 0) {
+        // [TAG_SYNC_1025] upstream #29887 fills the MoE cache from the scheduler's copy callback (#29943); the fork's
+        // ggml_backend_sched_compute_splits keeps its own expert upload and never calls it, so the cache would stay empty
+        LLAMA_LOG_WARN("%s: --moe-cache-size is not supported by this build (the fork's scheduler loop does not run the "
+                "copy callback): MoE cache off\n", __func__);
+        cparams.moe_cache_size = 0;
+    }
 
     // initialized later
     cparams.pipeline_parallel = false;

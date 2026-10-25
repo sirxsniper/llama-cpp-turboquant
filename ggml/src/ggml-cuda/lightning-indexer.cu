@@ -866,6 +866,8 @@ static void ggml_cuda_lightning_indexer_fn_l3(ggml_backend_cuda_context & ctx, g
         nem3);
     CUDA_CHECK(cudaGetLastError());
     ggml_cuda_fn_l3_note(GGML_CUDA_FN_L3_PATH_IDXQ8, "IDXQ8: the lightning indexer reads the q8_0 pooled keys in place");
+}
+
 // one block scores a tile of K_VECS_PER_BLOCK keys against TOKENS_PER_BLOCK tokens: the keys are
 // staged in half precision and the queries of every head in float, each thread owns KEYS_PER_THREAD
 // keys for one token, a warp shares its token so the query reads are broadcasts, and every key

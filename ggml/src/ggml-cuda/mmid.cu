@@ -170,6 +170,7 @@ static __global__ void mm_ids_helper(
                 n_rows += __shfl_sync(0xFFFFFFFF, incl, warp_size - 1, warp_size);
             }
         } else {
+            constexpr int neu_padded = mm_ids_pow2<n_expert_used_template>::value; // [TAG_SYNC_1025] upstream #29940 scope
             for (int it0 = 0; it0 < n_tokens; it0 += warp_size/neu_padded) {
                 const int it  = it0 + threadIdx.x / neu_padded;
                 const int iex = threadIdx.x % neu_padded;

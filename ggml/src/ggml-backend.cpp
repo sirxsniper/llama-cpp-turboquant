@@ -2193,6 +2193,13 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
 
+    // [TAG_SYNC_1025] the fork keeps the inline used-experts copy (with the [TAG_FN_L16_UPLOAD] batch flush before the ids
+    // read); upstream #29943 moved it into llama's copy callback, which this loop does not call (see llama_context: the
+    // MoE cache, the callback's other user, is refused)
+    ggml_tensor * prev_ids_tensor = nullptr;
+    std::vector<int32_t> ids;
+    std::vector<ggml_bitset_t> used_ids;
+
     int prev_backend_id = -1;
 
     // [TAG_FN_SCHED_SPLIT_ASYNC] backends with a queued host -> device input copy: its host source must not be written
