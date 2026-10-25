@@ -14529,6 +14529,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, type, {1024, 4, 4, 4}));
         test_cases.emplace_back(new test_cpy(type, GGML_TYPE_F32, {1024, 4, 4, 4}));
         test_cases.emplace_back(new test_cpy(type, GGML_TYPE_F16, {2048, 3, 2, 1}));
+    }
     for (ggml_type type : {GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K,
                           GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S}) {
         test_cases.emplace_back(new test_get_rows_after_mul_mat(type));
@@ -15668,6 +15669,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         for (int n : {20, 29}) {
             test_cases.emplace_back(new test_mul_mat(ta, GGML_TYPE_F32, 42240, n,  768, {1, 1}, {1, 1}));
             test_cases.emplace_back(new test_mul_mat(ta, GGML_TYPE_F32,  2048, n, 5120, {1, 1}, {1, 1}, {0, 1, 2, 3}, 5376));
+        }
+    }
+
     // few src1 rows (speculative verify): odd m, a single K block, long K, every tile width, broadcast batches
     for (int64_t n : {2, 3, 5, 8, 9, 13, 16}) {
         for (auto [m, k] : std::vector<std::pair<int64_t, int64_t>>{{40, 32}, {100, 96}, {1000, 5120}, {3000, 1024}, {6144, 5120}, {17408, 512}}) {
