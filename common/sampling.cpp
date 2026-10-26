@@ -556,24 +556,30 @@ common_pretrim_cfg common_sampler_pretrim_cfg(const common_params_sampling & par
     }
 
     // a positive (or NaN) bias raises a token from below the trim; a token listed twice gets only its first bias once
-    // the candidates are no longer in id order (llama_sampler_logit_bias_apply), so both keep the full pass
+    // the candidates are no longer in id order (llama_sampler_logit_bias_apply), so both keep the full pass.
+    // [TAG_V0261_PRETRIM] a zero bias counts as a listing too: {t, 0} before {t, -x} (a user zero bias before the
+    // ignore_eos -inf or a suppress token's -inf) gives t only the +0 in the trimmed pass and the -x in the full pass.
+    // Only the negative ones can lower a logit, so only they join the touched set.
     std::vector<llama_token> fixed;
+    std::vector<llama_token> listed;
     for (const auto & lb : params.logit_bias) {
-        if (lb.bias == 0.0f) {
-            continue;
-        }
-        if (!(lb.bias < 0.0f)) {
+        if (!(lb.bias <= 0.0f)) {
             return cfg;
         }
-        fixed.push_back(lb.token);
+        listed.push_back(lb.token);
+        if (lb.bias < 0.0f) {
+            fixed.push_back(lb.token);
+        }
     }
     for (int32_t i = 0; i < n_suppress; ++i) {
+        listed.push_back(suppress[i]);
         fixed.push_back(suppress[i]);
     }
-    std::sort(fixed.begin(), fixed.end());
-    if (std::adjacent_find(fixed.begin(), fixed.end()) != fixed.end()) {
+    std::sort(listed.begin(), listed.end());
+    if (std::adjacent_find(listed.begin(), listed.end()) != listed.end()) {
         return cfg;
     }
+    std::sort(fixed.begin(), fixed.end());
 
     cfg.top_k  = params.top_k;
     cfg.width  = width;

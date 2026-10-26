@@ -4,6 +4,7 @@
 // whenever common_sampler_pretrim_exact accepts a trim, the top-k set (ids and logits) equals the full pass; when it
 // refuses, the count of untouched valid tokens is short. Also: the touched set covers every token the samplers moved,
 // the v0.25.5 gate gets cases wrong that the new gate refuses, the second wider trim, and the gates of the three modes.
+// A token listed twice in the logit bias, a zero bias first, gets a different logit in the trimmed pass: refused.
 // CPU only, no model.
 
 #include "sampling.h"
@@ -277,6 +278,11 @@ static void test_gates() {
             { "positive bias",        [](common_params_sampling & p) { p.logit_bias.push_back({ 5, 2.0f }); } },
             { "NaN bias",             [](common_params_sampling & p) { p.logit_bias.push_back({ 5, NAN }); } },
             { "duplicate bias",       [](common_params_sampling & p) { p.logit_bias.push_back({ 5, -1.0f }); p.logit_bias.push_back({ 5, -2.0f }); } },
+            // [TAG_V0261_PRETRIM] a zero bias still counts as a listing (test_zero_bias_duplicate)
+            { "zero bias, then -inf", [](common_params_sampling & p) { p.logit_bias.push_back({ 5, 0.0f }); p.logit_bias.push_back({ 5, -INFINITY }); } },
+            { "zero bias, then -2",   [](common_params_sampling & p) { p.logit_bias.push_back({ 5, 0.0f }); p.logit_bias.push_back({ 5, -2.0f }); } },
+            { "-2, then zero bias",   [](common_params_sampling & p) { p.logit_bias.push_back({ 5, -2.0f }); p.logit_bias.push_back({ 5, 0.0f }); } },
+            { "zero bias twice",      [](common_params_sampling & p) { p.logit_bias.push_back({ 5, 0.0f }); p.logit_bias.push_back({ 5, -0.0f }); } },
             { "repeat penalty < 1",   [](common_params_sampling & p) { p.penalty_repeat = 0.9f; } },
             { "negative frequency",   [](common_params_sampling & p) { p.penalty_freq = -0.1f; } },
             { "negative presence",    [](common_params_sampling & p) { p.penalty_present = -1.0f; } },
@@ -303,6 +309,10 @@ static void test_gates() {
         p.logit_bias.push_back({ 9, -3.0f });
         const llama_token sup[1] = { 9 };
         check(common_sampler_pretrim_cfg(p, sup, 1, n_vocab, 1).top_k == 0, "bias on a suppress token", i);
+        // a zero user bias on a suppress token: the merged list puts the suppress -inf after it
+        p = base_params();
+        p.logit_bias.push_back({ 9, 0.0f });
+        check(common_sampler_pretrim_cfg(p, sup, 1, n_vocab, 1).top_k == 0, "zero bias on a suppress token", i);
         // a trim as wide as the vocabulary
         check(common_sampler_pretrim_cfg(base_params(), nullptr, 0, 1000, 1).top_k == 0, "width >= n_vocab", i + 1);
     }
@@ -373,9 +383,86 @@ static void test_adversarial() {
     }
 }
 
+// [TAG_V0261_PRETRIM] the case the zero-bias listing check refuses: {t, 0} then {t, -inf} (a user zero bias before the
+// ignore_eos -inf). The full array is in id order, so libllama's logit bias applies both entries to t; the trimmed array
+// is not, so both go to its search loop, which applies the first match only and t keeps its raw logit there
+static void test_zero_bias_duplicate() {
+    const int n_vocab = 3000;
+    const llama_token t = 2000; // past the trim width, so not in place in the trimmed array either
+    auto p = base_params();
+    p.top_k = 5;
+    std::vector<float> x(n_vocab);
+    for (int i = 0; i < n_vocab; ++i) {
+        x[i] = -0.001f * (float) i;
+    }
+    x[t] = 1.0f; // the best raw token
+    const std::vector<char> valid(n_vocab, 1);
+
+    const auto full_of = [&](const common_params_sampling & q) {
+        llama_sampler * chain = make_chain(q, {}, n_vocab, true);
+        std::vector<llama_token_data> cur = raw_array(x);
+        llama_token_data_array a = { cur.data(), cur.size(), -1, false };
+        apply_mask(&a, valid);
+        llama_sampler_apply(chain, &a);
+        llama_sampler_free(chain);
+        return result_of(a);
+    };
+    const auto trimmed_of = [&](const common_params_sampling & q, size_t width) {
+        llama_sampler * chain = make_chain(q, {}, n_vocab, true);
+        std::vector<llama_token_data> cur = trimmed(x, width, valid);
+        llama_token_data_array a = { cur.data(), cur.size(), -1, false };
+        llama_sampler_apply(chain, &a);
+        llama_sampler_free(chain);
+        return result_of(a);
+    };
+    const auto has = [](const std::vector<llama_token_data> & r, llama_token id) {
+        for (const auto & d : r) {
+            if (d.id == id && d.logit != -INFINITY) {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    // the -inf alone: trimmed, exact and the same as the full pass
+    {
+        auto q = p;
+        q.logit_bias = { { t, -INFINITY } };
+        const auto cfg = common_sampler_pretrim_cfg(q, nullptr, 0, n_vocab, 1);
+        check(cfg.top_k == 5 && cfg.fixed == std::vector<llama_token>({ t }), "lone -inf bias trims", 200);
+        const auto tr = trimmed_of(q, cfg.width);
+        check(!has(full_of(q), t) && same_result(tr, full_of(q)), "lone -inf bias: trimmed equals full", 200);
+    }
+    // zero first: the trimmed pass would keep t (the ban lost), so the cfg must refuse
+    {
+        auto q = p;
+        q.logit_bias = { { t, 0.0f }, { t, -INFINITY } };
+        const auto tr = trimmed_of(q, 1024);
+        check(!has(full_of(q), t), "zero then -inf: the full pass bans t", 201);
+        check(has(tr, t), "zero then -inf: the trimmed pass keeps t (libllama search path)", 201);
+        check(common_sampler_pretrim_cfg(q, nullptr, 0, n_vocab, 1).top_k == 0, "zero then -inf: refused", 201);
+    }
+    // the same through a suppress token: the user's zero bias comes before the appended suppress -inf
+    {
+        auto q = p;
+        q.logit_bias = { { t, 0.0f } };
+        const llama_token sup[1] = { t };
+        check(common_sampler_pretrim_cfg(q, sup, 1, n_vocab, 1).top_k == 0, "zero bias on a suppress token: refused", 202);
+    }
+    // a lone zero bias changes nothing: trimmed and exact
+    {
+        auto q = p;
+        q.logit_bias = { { t, 0.0f } };
+        const auto cfg = common_sampler_pretrim_cfg(q, nullptr, 0, n_vocab, 1);
+        check(cfg.top_k == 5 && cfg.fixed.empty(), "lone zero bias trims, touches nothing", 203);
+        check(has(full_of(q), t) && same_result(trimmed_of(q, cfg.width), full_of(q)), "lone zero bias: trimmed equals full", 203);
+    }
+}
+
 int main() {
     test_gates();
     test_adversarial();
+    test_zero_bias_duplicate();
 
     std::mt19937 rng(20261026);
     const int   sizes[]    = { 3000, 4096, 12000, 20000 };
@@ -415,11 +502,12 @@ int main() {
         }
         std::partial_sort(order.begin(), order.begin() + 300, order.end(), [&](int a, int b) { return x[a] > x[b]; });
 
-        // negative biases and suppress tokens among the best raw tokens (now and then the same token twice)
+        // negative and zero biases and suppress tokens among the best raw tokens (now and then the same token twice)
         std::vector<llama_token> suppress;
         const int n_bias = (int) (rng() % 6);
         for (int i = 0; i < n_bias; ++i) {
-            const float b = (rng() % 3 == 0) ? -INFINITY : -(float) (1 + rng() % 10);
+            const unsigned r = rng() % 6;
+            const float b = r < 2 ? -INFINITY : r == 2 ? 0.0f : -(float) (1 + rng() % 10);
             p.logit_bias.push_back({ order[rng() % 100], b });
         }
         const int n_sup = (int) (rng() % 4);
