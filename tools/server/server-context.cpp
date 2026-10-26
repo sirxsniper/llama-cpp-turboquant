@@ -3234,8 +3234,14 @@ private:
                         SRV_WRN("%s", "[TAG_IDLE_SLOT_LAZY] off: needs the unified pool's preemption policy ([TAG_POOL_PREEMPT] on)\n");
                     }
                 }
+                // [TAG_V0262_IDLELAZY] the fixes on top of PR #2 (same-chat edits not saved, least recently used idle slot
+                // cleared first, room for a slot restore, idle cells count as room for a merged image batch); =0: PR #2 as merged
+                if (const char * e = getenv("TURBO_IDLE_SLOT_LAZY_FIX"); e && *e) {
+                    idle_lazy_fix = atoi(e) != 0;
+                }
                 if (idle_slot_lazy) {
-                    SRV_INF("%s", "[TAG_IDLE_SLOT_LAZY] on: idle slots keep their cells until the pool needs the room or a new prompt drops their tokens (saved first)\n");
+                    SRV_INF("[TAG_IDLE_SLOT_LAZY] on: idle slots keep their cells until the pool needs the room or a new prompt drops their tokens (saved first); [TAG_V0262_IDLELAZY] fixes %s\n",
+                            idle_lazy_fix ? "on" : "off (TURBO_IDLE_SLOT_LAZY_FIX=0)");
                 } else if (params_base.kv_unified) {
                     SRV_TRC("%s", "idle slots will be saved to prompt cache and cleared upon starting a new task\n");
                 } else {
@@ -3697,7 +3703,8 @@ private:
                             SLT_WRN(*ret, "__TEST_TAG_POOL_LOAD_GIVEUP__ task %d waited %.1f s, processing the prompt instead\n",
                                     task.id, (now - w->second) / 1e6);
                         }
-                        for (auto & o : slots) {
+                        for (server_slot * op : idle_clear_order()) { // [TAG_V0262_IDLELAZY] least recently used first with the lazy switch
+                            server_slot & o = *op;
                             if (room() >= need) {
                                 break;
                             }
@@ -4378,7 +4385,23 @@ private:
             return -1;
         }
         if (pool_preempt) {
-            const int64_t n_free = llama_memory_attn_n_free_ext(ctx_tgt, slot.id);
+            int64_t n_free = llama_memory_attn_n_free_ext(ctx_tgt, slot.id);
+            // [TAG_V0262_IDLELAZY] with the lazy switch idle slots keep their cells until the pool needs the room: they count
+            // as room, and when the merged batch needs them they are saved and cleared now (least recently used first), as
+            // every exhaustion path does, instead of the per-chunk path or a park
+            if (idle_slot_lazy && idle_lazy_fix && n_free >= 0 && !l24_merged_fits(n_free, rows, pool_gen_rows_max)) {
+                int64_t idle = 0;
+                for (const auto & o : slots) {
+                    if (&o != &slot && !o.is_processing()) {
+                        idle += (int64_t) o.prompt.n_tokens();
+                    }
+                }
+                if (l24_merged_fits(n_free + idle, rows, pool_gen_rows_max)) {
+                    while (!l24_merged_fits(n_free, rows, pool_gen_rows_max) && try_clear_idle_slots(0)) {
+                        n_free = llama_memory_attn_n_free_ext(ctx_tgt, slot.id);
+                    }
+                }
+            }
             if (!l24_merged_fits(n_free, rows, pool_gen_rows_max)) {
                 if (l22.n_room++ < 8 || l22.n_room % 64 == 0) {
                     SLT_WRN(slot, "[TAG_FN_L24_TTFT] merged batch of %lld rows: %lld free cells in the pool (+ %d answer rows): the "
@@ -4928,13 +4951,22 @@ private:
         if (slot.is_processing() || slot.prompt.tokens.empty()) {
             return false;
         }
-        const bool reuse = task.params.cache_prompt && task.type != SERVER_TASK_TYPE_EMBEDDING && task.type != SERVER_TASK_TYPE_RERANK;
+        const bool reuse = task.params.cache_prompt && !task.is_stateless();
         if (!reuse) {
             return true;
         }
         const size_t lcp = slot.prompt.tokens.get_common_prefix(task.tokens);
         if (lcp >= slot.prompt.tokens.size()) {
             return false;
+        }
+        // [TAG_V0262_IDLELAZY] the slot holds the same conversation (its system block and first user message) and the
+        // prompt edits a later message or re-renders an answer: not saved, as without the switch. Another chat that only
+        // shares the system block is saved. No chat spans (a raw prompt): the rules below
+        if (idle_lazy_fix) {
+            const size_t u_end = idle_first_user_end(task.params.message_spans);
+            if (u_end > 0 && lcp >= u_end) {
+                return false;
+            }
         }
         if (slot.task_prev) {
             const size_t n_prev = slot.task_prev->tokens.size();
@@ -4945,9 +4977,36 @@ private:
         return true;
     }
 
+    // [TAG_V0262_IDLELAZY] the end of the prompt's first user message (0: no chat spans)
+    static size_t idle_first_user_end(const common_chat_msg_spans & spans) {
+        for (const auto & sp : spans.spans) {
+            if (sp.role == COMMON_CHAT_ROLE_USER) {
+                return sp.pos + sp.len;
+            }
+        }
+        return 0;
+    }
+
+    // [TAG_V0262_IDLELAZY] the order idle slots are saved and cleared in when the pool needs room: with the lazy switch the
+    // least recently used first (idle slots then hold conversations that may come back), else slot order as before
+    std::vector<server_slot *> idle_clear_order() {
+        std::vector<server_slot *> order;
+        order.reserve(slots.size());
+        for (auto & slot : slots) {
+            order.push_back(&slot);
+        }
+        if (idle_slot_lazy && idle_lazy_fix) {
+            std::stable_sort(order.begin(), order.end(), [](const server_slot * a, const server_slot * b) {
+                return a->t_last_used < b->t_last_used;
+            });
+        }
+        return order;
+    }
+
     // return true if at least one slot has been cleared
     // [TAG_POOL_PREEMPT] with the pool policy on, an idle slot is saved to the prompt cache before it is purged, and a
     // slot that still has rows in the undecoded part of the batch (at or after `off`) is never purged.
+    // [TAG_V0262_IDLELAZY] with the lazy switch the least recently used idle slot goes first (before: the lowest slot id)
     bool try_clear_idle_slots(int32_t off = -1) {
         bool res = false;
 
@@ -4955,7 +5014,8 @@ private:
             return res;
         }
 
-        for (auto & slot : slots) {
+        for (server_slot * sp : idle_clear_order()) {
+            server_slot & slot = *sp;
             if (slot.is_processing() || slot.prompt.n_tokens() == 0) {
                 continue;
             }
@@ -5002,6 +5062,7 @@ private:
     //
     bool     pool_preempt          = false;
     bool     idle_slot_lazy        = false;    // [TAG_IDLE_SLOT_LAZY] TURBO_IDLE_SLOT_LAZY=1 with the pool policy on (see init)
+    bool     idle_lazy_fix         = true;     // [TAG_V0262_IDLELAZY] TURBO_IDLE_SLOT_LAZY_FIX=0: PR #2's lazy rules as merged
     bool     pool_exhausted        = false;
     bool     pool_handled_iter     = false;
     int32_t  pool_park_margin      = 8192;
@@ -5281,6 +5342,8 @@ private:
     }
 
     // [TAG_FN_L24_TTFT] room for the rest of a merged batch: park a slot other than its own (false: none could be parked)
+    // [TAG_V0262_IDLELAZY] idle slots are already saved and cleared by then: decode() runs try_clear_idle_slots(off) before
+    // it reports the pool exhausted
     bool l24_park_for_merged() {
         const int id = batch.l22_slot;
         if (id < 0 || id >= (int) slots.size()) {
@@ -7209,14 +7272,8 @@ private:
                             queue_tasks.defer(std::move(task));
                             break;
                         }
-                        // [TAG_IDLE_SLOT_LAZY] a child takes over its slot's cells: save what the slot held first
-                        if (idle_slot_lazy) {
-                            for (size_t i = 0; i < n_child_tasks; ++i) {
-                                if (idle_slot_drops(*child_slots[i], task.child_tasks[i]) && child_slots[i]->prompt_save(*prompt_cache)) {
-                                    prompt_cache->update();
-                                }
-                            }
-                        }
+                        // [TAG_V0262_IDLELAZY] a child takes over its slot's cells: launch_slots_with_parent_task saves what
+                        // each child slot held (upstream's sync), so PR #2's lazy save here is not needed
                         if (!launch_slots_with_parent_task(*slot, child_slots, std::move(task))) {
                             SRV_ERR("failed to launch slot with parent task, id_task = %d\n", id_task);
                             break; // drop the task
@@ -7481,6 +7538,21 @@ private:
                         if (nread != 0) {
                             packed.resize(std::max<size_t>(1, n_packed));
                             nread = llama_state_seq_load_file(ctx_tgt, filepath.c_str(), slot->id, packed.data(), packed.size(), &n_packed);
+                            // [TAG_V0262_IDLELAZY] no room: with the lazy switch idle slots keep their cells. Save and clear them
+                            // (least recently used first) until the file's tokens fit, then load once more
+                            if (nread == 0 && idle_slot_lazy && idle_lazy_fix) {
+                                slot->prompt_clear(); // the failed load dropped its cells; what it held was saved above
+                                const int64_t need = (int64_t) n_packed;
+                                int n_cleared = 0;
+                                while ((int64_t) llama_memory_attn_n_free_ext(ctx_tgt, slot->id) < need && try_clear_idle_slots()) {
+                                    n_cleared++;
+                                }
+                                if (n_cleared > 0) {
+                                    SLT_INF(*slot, "[TAG_V0262_IDLELAZY] slot restore: %d idle slot(s) saved and cleared for %zu tokens, loading again\n",
+                                            n_cleared, n_packed);
+                                    nread = llama_state_seq_load_file(ctx_tgt, filepath.c_str(), slot->id, packed.data(), packed.size(), &n_packed);
+                                }
+                            }
                         }
                         if (nread == 0) {
                             throw std::runtime_error("No available space in KV cache or invalid slot save file");
