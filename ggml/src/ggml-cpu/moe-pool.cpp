@@ -31,6 +31,7 @@
 #    include <pthread.h>
 #    include <sched.h>
 #    include <sys/mman.h> // [TAG_FN_L22_JOBPF] madvise
+#    include <sys/resource.h> // [TAG_FN_L7_FAULTS] getrusage
 #    include <unistd.h>
 #endif
 
@@ -75,7 +76,9 @@ uint64_t moe_proc_faults() {
     pmc.cb = sizeof(pmc);
     return K32GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc)) ? (uint64_t) pmc.PageFaultCount : 0;
 #else
-    return 0;
+    struct rusage ru;
+    memset(&ru, 0, sizeof(ru));
+    return getrusage(RUSAGE_SELF, &ru) == 0 ? (uint64_t) ru.ru_minflt + (uint64_t) ru.ru_majflt : 0;
 #endif
 }
 
@@ -1297,6 +1300,7 @@ struct ggml_cpu_moe_pool * ggml_cpu_moe_pool_new(const struct ggml_cpu_moe_pool_
             list.push_back(i);
         }
     }
+    const bool user_mask = !list.empty();
     if (list.empty()) {
         list = physical_core_cpus();
     }
@@ -1313,6 +1317,12 @@ struct ggml_cpu_moe_pool * ggml_cpu_moe_pool_new(const struct ggml_cpu_moe_pool_
         list.erase(std::remove(list.begin(), list.end(), cc), list.end());
         list.insert(list.begin(), cc);
         p->n_threads = std::min<int>(pp->n_threads, (int) list.size());
+    }
+    // a worker past the end of a given mask would run unpinned and spin on the CPUs of the others
+    if (user_mask && p->n_threads > (int) list.size()) {
+        GGML_LOG_WARN("%s: the CPU mask has %d CPUs for %d threads: the pool runs %d threads\n", __func__,
+                (int) list.size(), p->n_threads, (int) list.size());
+        p->n_threads = (int) list.size();
     }
     // worker 0 is the caller: if it is pinned to one CPU of the list now (the ggml threadpool of a GGML_OPENMP=OFF build
     // pins the main thread to the last CPU of its mask), that CPU moves to the front so no worker shares it

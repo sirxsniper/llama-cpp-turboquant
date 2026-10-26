@@ -226,9 +226,9 @@ struct common_sampler {
     struct llama_sampler * rbudget;
     struct llama_sampler * chain;
 
-    // top-k pre-trim used only on the grammar-rejection resample path (see
-    // common_sampler_sample). null when params.top_k <= 0, which disables the
-    // optimisation and keeps the original full-vocabulary behaviour.
+    // top-k pre-trim used by the grammar passes (see common_sampler_sample). null unless
+    // the chain's first top-k sees the raw logits (see common_sampler_init), which keeps
+    // the original full-vocabulary behaviour.
     struct llama_sampler * grmr_pretrim;
 
     ring_buffer<llama_token> prev;
@@ -705,27 +705,14 @@ struct common_sampler * common_sampler_init(
         LOG_DBG("%s: backend sampling kept until the lazy grammar triggers or the reasoning budget forces\n", __func__);
     }
 
-    // Pre-trim for the grammar-rejection resample path. Sized well above params.top_k so the
-    // trimmed set almost always still contains top_k grammar-valid candidates, which is the
-    // condition under which the trim is exact rather than an approximation.
-    struct llama_sampler * pretrim = nullptr;
-    if (grmr && params.top_k > 0) {
-        pretrim = llama_sampler_init_top_k(std::max(params.top_k * 32, 1024));
-    }
-
-    // [TAG_FN_L4_HOST_TOPK] the fast candidate path: every sampler before the first top-k is a no-op for these
-    // parameters (penalties, dry, top-n-sigma disabled; no user logit bias), no grammar, no reasoning budget, no mirostat,
-    // no token probabilities to report, 1 <= top_k <= 128 (the std::partial_sort branch of the top-k sampler)
-    int fast_k = 0;
-    std::vector<llama_token> fast_excl;
-    if (llama_fn_l4_host_flag(model, "LLAMA_FN_L4_HOST_TOPK") && params.mirostat == 0 && grmr == nullptr &&
-            rbudget == nullptr && params.logit_bias.empty() && params.n_probs == 0 && params.top_k >= 1 &&
-            params.top_k <= 128 &&
+    // the chain's first top-k sees the raw logits: every sampler before it is a no-op for these parameters (penalties,
+    // dry, top-n-sigma disabled; no user logit bias; no mirostat), apart from the model's suppress tokens
+    bool first_top_k = false;
+    if (params.mirostat == 0 && params.logit_bias.empty() && params.top_k >= 1 &&
             (params.penalty_last_n == 0 ||
              (params.penalty_repeat == 1.0f && params.penalty_freq == 0.0f && params.penalty_present == 0.0f)) &&
             (params.dry_multiplier == 0.0f || params.dry_base < 1.0f || params.dry_penalty_last_n == 0) &&
             params.top_n_sigma <= 0.0f) {
-        bool first_top_k = false;
         for (const auto t : params.samplers) {
             if (t == COMMON_SAMPLER_TYPE_TOP_K) {
                 first_top_k = true;
@@ -735,13 +722,27 @@ struct common_sampler * common_sampler_init(
                 break;
             }
         }
-        if (first_top_k) {
-            fast_k = params.top_k;
-            int32_t n_suppress = 0;
-            const llama_token * suppress = llama_vocab_get_suppress_tokens(vocab, &n_suppress);
-            fast_excl.assign(suppress, suppress + n_suppress);
-            std::sort(fast_excl.begin(), fast_excl.end());
-        }
+    }
+
+    // Pre-trim for the grammar passes. Sized well above params.top_k so the
+    // trimmed set almost always still contains top_k grammar-valid candidates, which is the
+    // condition under which the trim is exact rather than an approximation.
+    struct llama_sampler * pretrim = nullptr;
+    if (grmr && first_top_k) {
+        pretrim = llama_sampler_init_top_k(std::max(params.top_k * 32, 1024));
+    }
+
+    // [TAG_FN_L4_HOST_TOPK] the fast candidate path: the chain's first top-k sees the raw logits, no grammar, no
+    // reasoning budget, no token probabilities to report, 1 <= top_k <= 128 (the std::partial_sort branch of the top-k sampler)
+    int fast_k = 0;
+    std::vector<llama_token> fast_excl;
+    if (llama_fn_l4_host_flag(model, "LLAMA_FN_L4_HOST_TOPK") && first_top_k && grmr == nullptr &&
+            rbudget == nullptr && params.n_probs == 0 && params.top_k <= 128) {
+        fast_k = params.top_k;
+        int32_t n_suppress = 0;
+        const llama_token * suppress = llama_vocab_get_suppress_tokens(vocab, &n_suppress);
+        fast_excl.assign(suppress, suppress + n_suppress);
+        std::sort(fast_excl.begin(), fast_excl.end());
     }
 
     // Keep verifier randomness independent from both target and draft sampling.
@@ -1032,6 +1033,7 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
         // grammar-valid candidates survive, the chain's own top_k selects exactly the set
         // it would have selected from the full vocabulary. When fewer survive, that
         // guarantee does not hold and we redo the full pass.
+        // common_sampler_init only creates the trim when nothing before the chain's top_k changes the logits.
         bool grammar_applied = false;
 
         if (gsmpl->grmr_pretrim) {
@@ -1045,7 +1047,11 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
                 }
             }
 
-            grammar_applied = n_valid >= (size_t) gsmpl->params.top_k;
+            // the model's suppress tokens are only masked later, by the chain's logit bias
+            int32_t n_suppress = 0;
+            llama_vocab_get_suppress_tokens(llama_model_get_vocab(llama_get_model(ctx)), &n_suppress);
+
+            grammar_applied = n_valid >= (size_t) gsmpl->params.top_k + (size_t) n_suppress;
 
             if (!grammar_applied) {
                 // not enough survived to guarantee exactness - restore and do it properly
@@ -1095,6 +1101,7 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     // it, so the chain's own top-k selects the same set either way and every subsequent sampler
     // (top_p / min_p / temp / dist) sees an identical candidate set and an identical
     // normalisation. When fewer survive that guarantee does not hold, so we redo the full pass.
+    // common_sampler_init only creates the trim when nothing before the chain's top-k changes the logits.
     bool resampled = false;
 
     if (gsmpl->grmr_pretrim && grammar_should_apply(gsmpl)) {
@@ -1111,7 +1118,11 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
             }
         }
 
-        if (n_valid >= (size_t) gsmpl->params.top_k) {
+        // the model's suppress tokens are only masked later, by the chain's logit bias
+        int32_t n_suppress = 0;
+        llama_vocab_get_suppress_tokens(llama_model_get_vocab(llama_get_model(ctx)), &n_suppress);
+
+        if (n_valid >= (size_t) gsmpl->params.top_k + (size_t) n_suppress) {
             llama_sampler_apply(chain, &cur_p);
             resampled = true;
         }
@@ -1239,7 +1250,8 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(
             }
         }
 
-        if (q_draft > 0.0f && uniform(gsmpl->rng) * q_draft <= p_draft) {
+        // strict: uniform() can return 0, and a token the target gives p == 0 must never be accepted
+        if (q_draft > 0.0f && uniform(gsmpl->rng) * q_draft < p_draft) {
             common_sampler_accept(gsmpl, draft[i], true);
             result.push_back(draft[i]);
             common_sampler_eog_trace(gsmpl, ctx, draft[i], "couple-accept", q_draft); // [TAG_FN_R2_EOG_TRACE]

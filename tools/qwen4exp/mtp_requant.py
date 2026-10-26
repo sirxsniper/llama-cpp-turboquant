@@ -4,14 +4,15 @@
 # the trunk's mix (UD-Q4_K_XL: gate/up q4_K, down q5_1) holds them in 1.46 GiB, so ~1.0 GiB of VRAM moves to the hot
 # set. Only the drafts can change: the target verifies every token with its own (unchanged) weights.
 #
-#   python tools/qwen4exp/mtp_requant.py --head D:/Projects/LocalAI/models/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf \
-#       --trunk D:/Projects/LocalAI/models/Qwen3.8-Flash-Next-UD-Q4_K_XL-MTP-00001-of-00005.gguf \
-#       --out D:/Projects/LocalAI/models/mtp-Qwen3.8-Flash-Next-shared-trunkmix.gguf [--dry-run]
+#   python tools/qwen4exp/mtp_requant.py --head models/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf \
+#       --trunk models/Qwen3.8-Flash-Next-UD-Q4_K_XL-MTP-00001-of-00005.gguf \
+#       --out models/mtp-Qwen3.8-Flash-Next-shared-trunkmix.gguf [--dry-run]
 #
 # - The mix: --mix gate,up,down (type names), or the most common (gate, up, down) of the trunk's expert layers (--trunk,
 #   a header read of every shard; the MTP block blk.<n_layer> is left out of the count).
-# - The quantizer is ggml's own (ggml_quantize_chunk from ggml-base, --ggml <bin dir>), one expert matrix at a time on
-#   --threads threads, without an importance matrix (the Unsloth imatrix has no entries for the MTP block).
+# - The quantizer is ggml's own (ggml_quantize_chunk from ggml-base, --ggml <bin dir>, by default build/bin or
+#   build/bin/Release of this checkout), one expert matrix at a time on --threads threads, without an importance matrix
+#   (the Unsloth imatrix has no entries for the MTP block).
 # - Sources q8_0 / f16 / bf16 / f32 are dequantized here (q8_0: d x q, exact).
 # - After writing, the output header is read back: the same tensors and shapes, the planned types, aligned offsets, the
 #   untouched tensors sha1-equal to the head file, and the requantized experts dequantized again (gguf-py) for their
@@ -85,6 +86,11 @@ def trunk_mix(first, mtp_layer):
 
 def load_ggml(bin_dir):
     names = ["ggml-base.dll", "libggml-base.so", "libggml-base.dylib"]
+    if not bin_dir:
+        # build/bin of this checkout (build/bin/Release with a multi-config generator such as Visual Studio)
+        root = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
+        dirs = [os.path.join(root, "build", "bin"), os.path.join(root, "build", "bin", "Release")]
+        bin_dir = next((d for d in dirs if any(os.path.exists(os.path.join(d, nm)) for nm in names)), dirs[0])
     for nm in names:
         p = os.path.join(bin_dir, nm)
         if os.path.exists(p):
@@ -99,7 +105,7 @@ def load_ggml(bin_dir):
             lib.ggml_quantize_requires_imatrix.restype = ctypes.c_bool
             lib.ggml_quantize_requires_imatrix.argtypes = [ctypes.c_int]
             return lib, p
-    raise SystemExit("no ggml-base library in %s (--ggml)" % bin_dir)
+    raise SystemExit("no ggml-base library in %s: give --ggml <the folder with %s>" % (bin_dir, " / ".join(names)))
 
 
 def to_f32(raw, tt, n):
@@ -165,7 +171,7 @@ def main():
     ap.add_argument("--out", default="")
     ap.add_argument("--trunk", default="", help="shard 1 of the trunk set: its most common expert mix is the target")
     ap.add_argument("--mix", default="", help="gate,up,down type names, e.g. q4_K,q4_K,q5_1 (instead of --trunk)")
-    ap.add_argument("--ggml", default=r"D:/Projects/LocalAI/source-build/wt-fsync/build-fsync/bin")
+    ap.add_argument("--ggml", default="", help="folder with ggml-base (default: build/bin or build/bin/Release)")
     ap.add_argument("--threads", type=int, default=8)
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--tt-out", default="", help="write a llama-quantize --tensor-type-file for the same plan")
@@ -217,7 +223,8 @@ def main():
         return 0
     if not a.out:
         raise SystemExit("--out is required")
-    if os.path.abspath(a.out) == os.path.abspath(a.head):
+    # by file identity, not by path string: another letter case, a symlink or a junction still names the head
+    if os.path.exists(a.out) and os.path.samefile(a.out, a.head):
         raise SystemExit("--out would overwrite the head")
     if os.path.exists(a.out) and not a.force:
         raise SystemExit("%s exists (use --force)" % a.out)

@@ -60,7 +60,7 @@ Ryzen 9950X3D, 96 GB RAM, file A = Qwen3.8-Flash-Next UD-Q4_K_XL with the Q8_0 M
 | `LLAMA_MOE_HOT_ADAPT` | `1` | adaptive admission |
 | `LLAMA_MOE_HOT_ADMIT` | `2/32` | admit after 2 sightings in 32 decode steps |
 | `LLAMA_MOE_HOT_HEADROOM_MIB` | `1280` | VRAM fit margin (the 768 default went over 28,500 MiB at depth) |
-| `LLAMA_MOE_HOT_DECAY` / `LLAMA_MOE_HOT_SEED` | `0.92` / `0.03` | the decayed hot set |
+| `LLAMA_MOE_HOT_DECAY` / `LLAMA_MOE_HOT_SEED` | `0.95` / `0.03` | the decayed hot set (decay 0.92 until lever round 3) |
 | `LLAMA_PLE_DIO_FILE` | `<model>.ple` | the unmapped copy of the PLE table that `LLAMA_PLE_DIRECT_IO` reads. It is made once, on the first load (28.8 GB for file A), when its volume keeps 16 GiB free beyond it; otherwise the table is read through the mapping as without the lever. Set the variable to put the copy elsewhere (a second drive) |
 | `LLAMA_RAM_FIT` | `1` | the RAM fit below |
 
@@ -73,8 +73,11 @@ Ryzen 9950X3D, 96 GB RAM, file A = Qwen3.8-Flash-Next UD-Q4_K_XL with the Q8_0 M
 | host trims | `GGML_SCHED_SPLIT_ASYNC=1`, `LLAMA_GRAPH_PER_WIDTH=1`, `GGML_CUDA_GRAPH_POKE=1`, `LLAMA_NO_ECOQOS=1` |
 | PLE | `LLAMA_PLE_HOST_GATHER=1`, `LLAMA_PLE_DIRECT_IO=1` |
 | QSA attention | `LLAMA_QSA_POS_MASK=1`, `LLAMA_QSA_POS_CHUNK=512`, `TURBO_QSA_CHUNK=512`, `TURBO_QSA_SPARSE=1`, `TURBO_QSA_TOPK_UNORDERED=1` |
-| MTP | `SPEC_MTP_COST=1`, `LLAMA_MTP_ATTN_WINDOW=32768`, `LLAMA_MTP_HEAD_ROWS=98304`, `SPEC_DFT_UBATCH=128` |
+| MTP | `SPEC_MTP_COST=0` (1 until lever round 3), `LLAMA_MTP_ATTN_WINDOW=32768`, `LLAMA_MTP_HEAD_ROWS=98304`, `SPEC_DFT_UBATCH=128` |
 | prefill stream | `LLAMA_PREFILL_STREAM=1`, `LLAMA_PREFILL_STREAM_LEND=1`, `LLAMA_PREFILL_STREAM_THREADS=16` |
+
+The table holds the levers of rounds 1 and 2. Later rounds added many more (among them `LLAMA_FN_CBUF=1`,
+`SPEC_MTP_BLOCK_VERIFY=1` and `LLAMA_FN_VRAM_KEEP_MIB=2100`); `k_items` in `src/llama-fn-auto.cpp` is the full list.
 
 Evidence (E:/turbot-gates/flashnext/test/history.md, lever round 1): all of them together against the hot set alone, same
 binary, 2 interleaved rounds at -c 262144: real use +38.6 %, benchmark code +24.8 %, decode KLD in the placement band
@@ -106,15 +109,16 @@ context is created after it; without MTP at the first decode, at the latest at t
 caches (turbot pool, indexer cache), the compute buffers (the QSA temporaries grow with `-ub`) and the draft context are
 allocated. Budget = min(free - margin, ceiling - used - margin):
 
-- ceiling: `LLAMA_MOE_HOT_CAP_MIB`, default total - max(1536 MiB, total / 8), rounded down to 256 MiB: 28,416 MiB on a
-  32 GB card (under the 28,500 MiB the 5090 is run at);
+- ceiling: `LLAMA_MOE_HOT_CAP_MIB`, else total - max(1536 MiB, `LLAMA_FN_VRAM_KEEP_MIB`) when that is set (2100 MiB in
+  the qwen4exp profile: 30,464 MiB on a 32 GB card), else total - max(1536 MiB, total / 8) (28,416 MiB); both rounded
+  down to 256 MiB;
 - margin: `LLAMA_MOE_HOT_HEADROOM_MIB`, 1280 MiB in the qwen4exp profile, 768 MiB otherwise (CUDA graphs, pool growth,
   lazily loaded kernels).
 
 The log prints the breakdown (`moe-hot: VRAM fit ...`). Works at any `-c`, including 262144. `LLAMA_MOE_HOT_FIT=1`
 enables the same for any model that uses `LLAMA_MOE_HOT_MIB=auto`.
 
-## Compute-buffer lend `[TAG_FN_L3_VRAM_CBUF]` (lever round 3, off by default)
+## Compute-buffer lend `[TAG_FN_L3_VRAM_CBUF]` (lever round 3, on in the qwen4exp profile)
 
 `LLAMA_FN_CBUF=1` (qwen4exp only, the hot set's owner context, needs CUDA virtual memory management): the trunk's
 compute buffer is sized for a `-ub 8192` prompt (3.7 GB at 262K) and idle in every decode step. With the switch the
@@ -129,7 +133,7 @@ hot set keeps the difference as extra slots:
   below the tail, as before).
 - The next narrow batch: the stream's banks come back, the FULL compute buffer is freed, the trunk backend's pools give
   back what the prompt grew (`[TAG_FN_L3_VRAM_TRIM]`), the tail is mapped again at the same addresses and cleared, its
-  resident experts come back (through the upload worker by default, see `LLAMA_FN_CBUF_ASYNC`), and the SMALL reserve is
+  resident experts come back (synchronously unless `LLAMA_FN_CBUF_ASYNC=1`), and the SMALL reserve is
   allocated. The device use never passes the larger of the two states'; the log prints it at each switch
   (`cbuf_set: [TAG_FN_L3_VRAM_CBUF] -> FULL / SMALL`).
 - Layers past the trunk (an MTP block, when its experts are on the host) are placed below the tail, so the tail never
@@ -146,12 +150,12 @@ hot set keeps the difference as extra slots:
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `LLAMA_FN_CBUF` | 0 | the compute-buffer lend |
+| `LLAMA_FN_CBUF` | 0 (1 in the qwen4exp profile) | the compute-buffer lend |
 | `LLAMA_FN_CBUF_SMALL_T` | 31 | widest graph of the SMALL reserve (clamped to 1 .. `GGML_OP_OFFLOAD_MIN_BATCH` - 1, a multiple of the sequences); below 8 the 4..8-token graphs run with FULL and without the tail's hot chain (3 = the MTP verify of n_max 2: the smallest SMALL reserve at 262K, whose attention temporaries grow with the width) |
 | `LLAMA_FN_CBUF_POOL_MIB` | 0 | N MiB more for the hot set and N MiB more in its tail: between prompts the experts use the room that a prompt's pool growth takes while the tail is out (the pools are trimmed at each return to SMALL). The FULL-state device use does not change; the SMALL state's grows by N - keep N at or below the measured pool growth of a FULL period (the `-> SMALL` line prints it) or the room under the 28,500 MiB peak |
 | `LLAMA_FN_CBUF_TRIM` | 1 | trim the trunk backend's pools at each return to SMALL |
 | `LLAMA_FN_CBUF_EAGER` | 1 | return to SMALL at the end of a FULL batch that did not fill `-b` (the last batch of a prompt with one stream), so the switch belongs to the prompt and the tail's refill starts before the first decode step; 0 = at the first narrow batch. Batches of exactly `-b` tokens stay FULL (KLD runs, multi-batch prompts) |
-| `LLAMA_FN_CBUF_ASYNC` | 1 | with the adaptive hot set the tail's resident experts come back through its upload worker and are published as they land (the host computes them until then), so the first decode step after a prompt does not wait for the refill; 0 = a synchronous refill before that step (also the path of a static hot set) |
+| `LLAMA_FN_CBUF_ASYNC` | 0 | 1 = with the adaptive hot set the tail's resident experts come back through its upload worker and are published as they land (the host computes them until then), so the first decode step after a prompt does not wait for the refill; 0 = a synchronous refill before that step (also the path of a static hot set) |
 | `LLAMA_FN_CBUF_THRASH` | 8 | that many FULL switches within 64 batches (steps wider than the SMALL reserve, e.g. several streams drafting 8 tokens each) pin the FULL state: the tail stays out until 256 narrow batches in a row; 0 = never |
 | `LLAMA_FN_CBUF_DRAFT_TRIM` | 1 | `[TAG_FN_L3_VRAM_TRIM]` with `LLAMA_FN_CBUF=1`, the MTP draft context gives its pools' prompt growth back at its first batch of <= 64 tokens after a wider one (its own backends, after its own synchronize). It gains hot-set room only with `LLAMA_FN_CBUF_EAGER=0` (the trunk then returns to SMALL after the draft's prompt pass) and `LLAMA_FN_CBUF_POOL_MIB` set to the measured growth (the `draft prompt` / `draft decode` account lines and the trim line) |
 | `LLAMA_FN_CBUF_REFILL_THREADS` | 8 | copy threads of the synchronous refill (mmap -> pinned halves -> device) |
@@ -171,13 +175,13 @@ cache. `--cache-ram`, `--ctx-checkpoints` and `LLAMA_CTX_CHECKPOINT_BUDGET_MIB` 
 `LLAMA_RAM_FIT=1` enables it for any model, `=0` disables it; `LLAMA_RAM_FIT_PCT` (85) and `LLAMA_RAM_FIT_CKPT_MIB`
 (512) tune it.
 
-## MTP draft switches of lever round 3 (`[TAG_FN_L3_MTP_*]`, off by default, not in any profile)
+## MTP draft switches of lever round 3 (`[TAG_FN_L3_MTP_*]`, off by default; the profile turns on `SPEC_MTP_BLOCK_VERIFY`)
 
-For A/B runs on qwen4exp only; every other model ignores them (a warning says so).
+For qwen4exp only; every other model ignores them (a warning says so).
 
 | Variable | Values | What it does |
 |---|---|---|
-| `SPEC_MTP_COST` | `2` | the draft length v2 (`[TAG_FN_L3_MTP_COST2]`, common/speculative-mtp-cost2.h): a verify row is priced by the cold experts the MoE bridge counts per step (k us per cold expert-layer, measured from the step-to-step variation at one width) plus a per-width row cost; a token is kept when its expected tokens pay for its row at the realized rate, and a further draft decode only when the expected next token pays for the decode. `1` is version 1 unchanged (the profile's value), `0` the fixed n_max / p_min rule. `SPEC_MTP_COST2_LOG=1` prints a summary every 256 policy steps and at the end |
+| `SPEC_MTP_COST` | `2` | the draft length v2 (`[TAG_FN_L3_MTP_COST2]`, common/speculative-mtp-cost2.h): a verify row is priced by the cold experts the MoE bridge counts per step (k us per cold expert-layer, measured from the step-to-step variation at one width) plus a per-width row cost; a token is kept when its expected tokens pay for its row at the realized rate, and a further draft decode only when the expected next token pays for the decode. `1` is version 1 unchanged (the profile's value until lever round 3), `0` the fixed n_max / p_min rule (the profile's value now). `SPEC_MTP_COST2_LOG=1` prints a summary every 256 policy steps and at the end |
 | `SPEC_MTP_PMIN_POS` | `p1,p2,...` | the p_min rule per draft position, the last value for the rest (`[TAG_FN_L3_MTP_CHAIN]`), e.g. `0.5,0.5,0.85` with `--spec-draft-n-max 3`: a third draft only when the drafter is confident. Applies wherever the rule decides (no cost policy, and the warm-up and probe steps of the policies) |
 | `LLAMA_MTP_HEAD_PROMPT` | `<n>` | with `LLAMA_MTP_HEAD_IDS` (or `_ROWS`): the drafts also score n more rows (`[TAG_FN_L3_MTP_HEADPROMPT]`, full head rows): each request's prompt tokens that the draft vocabulary leaves out, most frequent first, then the next ids outside the vocabulary in id order (all distinct). 1024 costs ~10 MiB of the draft context's compute buffer; verify is unchanged |
 | `SPEC_MTP_BLOCK_VERIFY` | `1` | sampled drafts (`--spec-draft-sampling probabilistic`, temp > 0) verified as a block (`[TAG_FN_L3_MTP_BLOCK]`, common/speculative-block.h, Sun et al. 2024 Algorithm 2): the target's distribution as with the per-token min(1, p/q) rule, at least as many tokens kept (exact enumeration: +0.7-1.5 % tokens per step with 2 drafts, +2-4 % with 3). Requests with a grammar, a reasoning budget, token probabilities or backend-sampled rows keep the per-token rule. Costs one more target sampling pass for the rows after an early rejection |

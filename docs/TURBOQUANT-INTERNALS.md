@@ -5,25 +5,30 @@ you only want to use turbo KV (`--cache-type-k turbo4 --cache-type-v turbo4`),
 the README is enough. Read this if you intend to modify the kernels, port
 to a new architecture, or debug a perf regression.
 
-> Method paper: *TurboQuant: KV Cache Compression via PolarQuant + QJL*,
-> [arXiv 2504.19874](https://arxiv.org/abs/2504.19874) (ICLR 2026).
+This map covers the original turbo2/turbo3/turbo4 types only. turbo4p,
+turbo5p, turbo5p512 and the turbot tiered cache are not described here;
+turbot is specified in [docs/turbot/SPEC.md](turbot/SPEC.md).
+
+> Method paper: *TurboQuant: Online Vector Quantization with Near-optimal
+> Distortion Rate*, [arXiv 2504.19874](https://arxiv.org/abs/2504.19874) (ICLR 2026).
 
 ---
 
 ## 1. GGML type-id allocation
 
-Three types are added to `enum ggml_type` (in `ggml/include/ggml.h`):
+The original three types in `enum ggml_type` (in `ggml/include/ggml.h`):
 
 | ID | Name | Description |
 |---|---|---|
-| 42 | `GGML_TYPE_TURBO3_0` | 3-bit KV: 2-bit PolarQuant + 1-bit QJL |
-| 43 | `GGML_TYPE_TURBO4_0` | 4-bit KV: 3-bit PolarQuant + 1-bit QJL |
+| 45 | `GGML_TYPE_TURBO3_0` | 3-bit KV: 3-bit PolarQuant (2-bit plane + 1-bit high plane, no QJL) |
+| 43 | `GGML_TYPE_TURBO4_0` | 4-bit KV: 4-bit PolarQuant (3-bit + 1-bit QJL only with `TURBO4_USE_4BIT=0`) |
 | 44 | `GGML_TYPE_TURBO2_0` | 2-bit KV: PolarQuant only (no QJL) |
 
 These IDs are post-2026-05 values. They were 41/42/43 in the previous
 public snapshot and got renumbered when upstream's b9008 added
 `GGML_TYPE_Q1_0 = 41`. The git history (May 2026) has the
-migration note.
+migration note. turbo3 later moved from 42 to 45 when upstream's b9913
+took 42 for `GGML_TYPE_Q2_0`.
 
 The corresponding `ggml_ftype` values are not allocated. Turbo is intended
 for live KV cache, not on-disk model weights, so it's fine that no GGUF

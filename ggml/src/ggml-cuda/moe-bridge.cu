@@ -16,6 +16,7 @@
 // Bounded: a wait gives up after timeout_ms if the host has not taken the job, or after job_max_ms if it has (a slow
 // job, e.g. page faults on cold experts), sets the sticky error and writes zeros. Later posts of the graph then skip and
 // later waits return zeros at once, so a stalled host costs one timeout per graph and never a driver watchdog reset.
+// Spin waits only: in hostfunc mode the stream first joins the host function's event, so it only sees finished jobs.
 //
 // [TAG_FN_R4_BRIDGE_DMA] The PCIe share: a job posted with GGML_MOE_BRIDGE_JOB_DMA carries a plan area (mapped). The
 // host writes the plan (ring offsets and bank slots of the experts the GPU takes, and the bank slot of every routed

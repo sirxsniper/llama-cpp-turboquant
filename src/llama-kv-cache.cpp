@@ -782,6 +782,24 @@ llama_kv_cache::llama_kv_cache(
         }
     }
 
+    // layer-adaptive mode (see below), per cache: a draft or SWA cache can have another type_v
+    const int adaptive_mode = [&]() {
+        const char * env = getenv("TURBO_LAYER_ADAPTIVE");
+        if (env) {
+            int mode = atoi(env);
+            if (mode > 0) {
+                LLAMA_LOG_INFO("llama_kv_cache: layer-adaptive mode %d enabled (env)\n", mode);
+            }
+            return mode;
+        }
+        // Auto-enable Boundary V (mode 7) when V is turbo2
+        if (type_v == GGML_TYPE_TURBO2_0 && hparams.n_layer() >= 8) {
+            LLAMA_LOG_INFO("llama_kv_cache: Boundary V auto-enabled for turbo2-V (opt-out: TURBO_LAYER_ADAPTIVE=0)\n");
+            return 7;
+        }
+        return 0;
+    }();
+
     for (uint32_t il = 0; il < n_layer; il++) {
         if (!hparams.has_kv(il)) {
             LLAMA_LOG_DEBUG("%s: layer %3d: does not have KV cache\n", __func__, il);
@@ -874,22 +892,6 @@ llama_kv_cache::llama_kv_cache(
         ggml_type layer_type_k = type_k;
         ggml_type layer_type_v = type_v;
         {
-            static const int adaptive_mode = [&]() {
-                const char * env = getenv("TURBO_LAYER_ADAPTIVE");
-                if (env) {
-                    int mode = atoi(env);
-                    if (mode > 0) {
-                        LLAMA_LOG_INFO("llama_kv_cache: layer-adaptive mode %d enabled (env)\n", mode);
-                    }
-                    return mode;
-                }
-                // Auto-enable Boundary V (mode 7) when V is turbo2
-                if (type_v == GGML_TYPE_TURBO2_0 && hparams.n_layer() >= 8) {
-                    LLAMA_LOG_INFO("llama_kv_cache: Boundary V auto-enabled for turbo2-V (opt-out: TURBO_LAYER_ADAPTIVE=0)\n");
-                    return 7;
-                }
-                return 0;
-            }();
             const bool is_turbo = llama_type_is_turbo(type_k);
             const bool v_is_turbo = llama_type_is_turbo(type_v);
             const uint32_t n_layer = hparams.n_layer();
@@ -1574,8 +1576,9 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
 // [TAG_FN_L21_KV_ZERO] LLAMA_FN_L21_KV_ZERO (default 1, every model): when a seq_rm empties the whole cache (every stream),
 // the base K/V tensors are zeroed (the mapped part of a KV-lend region). Free cells are still read by the attention
 // inside its window (masked: P = 0, and 0 * NaN = NaN), so a sequence whose state went NaN (the NaN guard drops it) could
-// poison the next one or another slot. Only the base K/V data: the cells, tiers, rotations and calibration scales stay.
-// Runs when a slot's prompt is replaced from token 0 with no other sequence in the cache (one memset per K/V tensor).
+// poison the next one or another slot. Only the base K/V data and the turbot young pools (a young tile reads every cell
+// through its pool row, empty ones too, and a freed slot keeps its rows): the cells, tier state, rotations and calibration
+// scales stay. Runs when a slot's prompt is replaced from token 0 with no other sequence in the cache (one memset per tensor).
 void llama_kv_cache::l21_zero_if_empty(bool had_used) {
     static const bool on = [] { const char * e = getenv("LLAMA_FN_L21_KV_ZERO"); return !(e && e[0] && atoi(e) == 0); }();
     if (!on || !had_used) {
@@ -1597,6 +1600,12 @@ void llama_kv_cache::l21_zero_if_empty(bool had_used) {
                     ggml_backend_tensor_memset(t, 0, 0, ggml_nbytes(t));
                 }
             }
+        }
+    }
+    // the young pools stay mapped in a KV-lend buffer, so they are cleared whole in either case
+    for (const auto & l : layers) {
+        if (l.pool != nullptr && l.pool->buffer != nullptr && l.pool->view_src == nullptr) {
+            ggml_backend_tensor_memset(l.pool, 0, 0, ggml_nbytes(l.pool));
         }
     }
 }
@@ -5079,16 +5088,17 @@ bool llama_kv_cache_context::apply() {
     kv->apply_ubatch(sinfos[i_cur], ubatches[i_cur]);
     n_kv = kv->get_n_kv(sinfos[i_cur]);
 
+    // [TAG_TURBOT] every row of this ubatch lands in a young granule before compute (SPEC 9.6). prepare() and
+    // state_read_meta() call apply_ubatch() directly and never reach this. Before the map below, so that a failed map
+    // rolls back like a failed compute (abort, then the tail seq_rm reads the stamps of this ubatch's rows).
+    if (kv->is_turbot()) {
+        kv->turbot_begin_ubatch(sinfos[i_cur], ubatches[i_cur]);
+    }
+
     // [TAG_FN_L8_KVLEND] every cell up to n_kv mapped before a graph reads or writes one
     if (!kv->kvl_update(n_kv)) {
         LLAMA_LOG_ERROR("%s: [TAG_FN_L8_KVLEND] %u KV cells are not mapped - the ubatch fails\n", __func__, n_kv);
         return false;
-    }
-
-    // [TAG_TURBOT] every row of this ubatch lands in a young granule before compute (SPEC 9.6). prepare() and
-    // state_read_meta() call apply_ubatch() directly and never reach this.
-    if (kv->is_turbot()) {
-        kv->turbot_begin_ubatch(sinfos[i_cur], ubatches[i_cur]);
     }
 
     // InnerQ: check if CUDA calibration finalized and tensor needs update

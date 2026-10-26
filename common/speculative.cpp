@@ -3332,11 +3332,13 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                         if (dft_qtrunc) {
                             dfl_qtrunc(dist.probs, dp.top_k, dp.top_p, dp.min_p);
                         }
-                        std::discrete_distribution<int32_t> sample(dist.probs.begin(), dist.probs.end());
-                        predecessor = sample(selector_rng[seq_id]);
-                        if (dist.probs[predecessor] < params.p_min) {
+                        // p_min gates on the proposal's top probability, not on the drawn token: the verifier
+                        // corrects for the whole proposal, so a stop that depends on the draw biases the output
+                        if (params.p_min > 0.0f && *std::max_element(dist.probs.begin(), dist.probs.end()) < params.p_min) {
                             break;
                         }
+                        std::discrete_distribution<int32_t> sample(dist.probs.begin(), dist.probs.end());
+                        predecessor = sample(selector_rng[seq_id]);
                         result.push_back(dist.ids[predecessor]);
                         dp.dists->push_back(std::move(dist));
                     } else {

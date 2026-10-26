@@ -30,6 +30,7 @@
 #include <winioctl.h> // [TAG_FN_V0254_STORE] the disk of a volume, its seek penalty
 #else
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #endif
 
@@ -141,7 +142,15 @@ public:
             return nullptr;
         }
 #else
-        f->fd = open(path.string().c_str(), O_RDWR | O_CREAT | O_TRUNC, 0600);
+        // always a new file: an existing name (a planted file or link) fails instead of being reused
+        int flags = O_RDWR | O_CREAT | O_EXCL;
+#ifdef O_NOFOLLOW
+        flags |= O_NOFOLLOW;
+#endif
+#ifdef O_CLOEXEC
+        flags |= O_CLOEXEC;
+#endif
+        f->fd = open(path.string().c_str(), flags, 0600);
         if (f->fd < 0) {
             err = std::string("open failed: ") + strerror(errno);
             return nullptr;
@@ -540,11 +549,22 @@ static bool kc_read_cb(void * dst, size_t size, void * ud) {
 
 server_keepctx::server_keepctx(const server_keepctx_params & params) : params_(params) {
     std::error_code ec;
+#if !defined(_WIN32)
+    mkdir(params_.dir.c_str(), 0700); // a store folder made here (its parent exists) is accessible to this user only
+#endif
     std::filesystem::create_directories(params_.dir, ec);
     if (!std::filesystem::is_directory(params_.dir, ec)) {
         SRV_ERR("[TAG_FN_L18_KEEPCTX] the store folder '%s' cannot be created\n", params_.dir.c_str());
         return;
     }
+#if !defined(_WIN32)
+    // the file names are predictable: another user must not be able to put files or links in the folder
+    struct stat st = {};
+    if (lstat(params_.dir.c_str(), &st) != 0 || S_ISLNK(st.st_mode) || st.st_uid != geteuid()) {
+        SRV_ERR("[TAG_FN_L18_KEEPCTX] the store folder '%s' is a symbolic link or belongs to another user\n", params_.dir.c_str());
+        return;
+    }
+#endif
     // files of a process that ended without closing them (power loss): a file still open elsewhere cannot be removed
     for (const auto & de : std::filesystem::directory_iterator(params_.dir, ec)) {
         const std::string name = de.path().filename().string();
@@ -1567,6 +1587,7 @@ std::string keepctx_default_dir(const std::string & model_path, uint64_t need_fr
     (void) model_path;
     (void) need_free;
     why = "the TEMP folder";
-    return tmp_dir.string();
+    // one folder per user: the store refuses a folder another user owns (a shared /tmp)
+    return tmp_dir.string() + string_format("-%lu", (unsigned long) geteuid());
 #endif
 }

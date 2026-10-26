@@ -10,7 +10,8 @@
 #     head file carries the block's indexer tensors). --mtp-ratio 0 makes the old layout: a dense MTP block, as the
 #     2026-09-29 file A and the Unsloth head file itself have it (the loader runs a ratio 0 block dense, without the
 #     indexer cache, and only a dense block takes LLAMA_MTP_ATTN_WINDOW).
-#   - the tensor shards 2..N are hardlinked under the new names (no copy; the loader checks only split.no there)
+#   - the tensor shards 2..N are hardlinked under the new names (no copy; the loader checks only split.no there), or
+#     copied when the output is on another volume or on a filesystem without hard links (FAT32, exFAT)
 #   - one new shard at split.no = N holds the head's tensors (the "shared" head has no token_embd / output)
 #
 # Safety:
@@ -20,14 +21,14 @@
 #     and the sha1 of every head tensor against the head file. Any mismatch exits non-zero.
 #   - source files are never modified. Existing outputs are replaced only with --force.
 #
-# Example (file A of E:/turbot-gates/flashnext/PLAN.md 7.3; this exact set exists with --mtp-ratio 0):
+# Example (file A, a dense MTP block, --mtp-ratio 0):
 #   python tools/qwen4exp/merge_mtp.py \
-#       --src-pattern D:/Projects/LocalAI/models/Qwen3.8-Flash-Next-UD-Q4_K_XL-%05d-of-00004.gguf --n-src 4 \
-#       --head D:/Projects/LocalAI/models/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf \
-#       --out-pattern D:/Projects/LocalAI/models/Qwen3.8-Flash-Next-UD-Q4_K_XL-MTP-%05d-of-00005.gguf --mtp-ratio 0
+#       --src-pattern models/Qwen3.8-Flash-Next-UD-Q4_K_XL-%05d-of-00004.gguf --n-src 4 \
+#       --head models/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf \
+#       --out-pattern models/Qwen3.8-Flash-Next-UD-Q4_K_XL-MTP-%05d-of-00005.gguf --mtp-ratio 0
 # The same trunk with the MTP block as a QSA layer (upstream's layout) next to it, for the dense/QSA A/B (only shard 1
 # differs; shards 2-4 are hardlinks again, shard 5 is a 2.8 GB copy of the head):
-#   python tools/qwen4exp/merge_mtp.py ... --out-pattern D:/Projects/LocalAI/models/Qwen3.8-Flash-Next-UD-Q4_K_XL-MTPQ-%05d-of-00005.gguf
+#   python tools/qwen4exp/merge_mtp.py ... --out-pattern models/Qwen3.8-Flash-Next-UD-Q4_K_XL-MTPQ-%05d-of-00005.gguf
 #   python tools/qwen4exp/merge_mtp.py --verify-only --out-pattern ... --n-out 5 --head ...
 from __future__ import annotations
 
@@ -35,6 +36,7 @@ import argparse
 import hashlib
 import io
 import os
+import shutil
 import struct
 import sys
 
@@ -191,6 +193,24 @@ def write_gguf(path, ver, kv, tensors, src=None, src_data_start=0, align=32):
     return os.path.getsize(path)
 
 
+def link_or_copy(src, dst):
+    """hardlink src as dst, or copy it when that fails (another volume, a filesystem without hard links)"""
+    try:
+        os.link(src, dst)
+        return "hardlinked"
+    except OSError as e:
+        print("cannot hardlink %s (%s), copying it instead" % (dst, e))
+    tmp = dst + ".part"
+    try:
+        shutil.copyfile(src, tmp)
+        os.replace(tmp, dst)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        raise
+    return "copied"
+
+
 def sha1_of(path, data_start, off, n):
     h = hashlib.sha1()
     with io.open(path, "rb") as f:
@@ -291,11 +311,15 @@ def main():
     for s in srcs + [a.head]:
         if not os.path.exists(s):
             raise SystemExit("missing input %s" % s)
-    for o in outs:
-        if os.path.abspath(o) in [os.path.abspath(s) for s in srcs + [a.head]]:
-            raise SystemExit("output %s would overwrite an input" % o)
-        if os.path.exists(o) and not a.force:
-            raise SystemExit("output %s exists (use --force)" % o)
+    for i, o in enumerate(outs):
+        if os.path.exists(o):
+            # by file identity, not by path string (another letter case, a symlink or a junction); a tensor shard
+            # that already is a hardlink of its own source is left as it is below
+            same = [s for s in srcs + [a.head] if os.path.samefile(o, s)]
+            if same and not (0 < i < a.n_src and same == [srcs[i]]):
+                raise SystemExit("output %s would overwrite an input (%s)" % (o, same[0]))
+            if not a.force:
+                raise SystemExit("output %s exists (use --force)" % o)
 
     h1 = Header(srcs[0])
     if h1.tensors:
@@ -346,26 +370,42 @@ def main():
     h1.set("split.count", T_U16, n_out)
     h1.set("split.no", T_U16, 0)
     h1.set("split.tensors.count", T_I32, new_total)
-    sz = write_gguf(outs[0], h1.ver, h1.kv, [], align=h1.align)
-    print("wrote %s (%.1f MB)" % (outs[0], sz / 1e6))
 
-    for i in range(1, a.n_src):
-        if os.path.exists(outs[i]):
-            os.remove(outs[i])
-        os.link(srcs[i], outs[i])
-        print("hardlinked %s -> %s (%.1f GB, no copy)" % (outs[i], srcs[i], os.path.getsize(outs[i]) / 1e9))
+    made = []  # outputs written by this run, removed again when a later step fails
+    try:
+        if os.path.exists(outs[0]):
+            os.remove(outs[0])  # an old shard 1 would name shards that are replaced or removed below
+        for i in range(1, a.n_src):
+            if os.path.exists(outs[i]) and os.path.samefile(outs[i], srcs[i]):
+                print("%s is already a hardlink of %s" % (outs[i], srcs[i]))
+                continue
+            if os.path.exists(outs[i]):
+                os.remove(outs[i])
+            how = link_or_copy(srcs[i], outs[i])
+            made.append(outs[i])
+            print("%s %s from %s (%.1f GB)" % (how, outs[i], srcs[i], os.path.getsize(outs[i]) / 1e9))
 
-    align = hh.align
-    tensors, off = [], 0
-    for name, dims, tt, src_off in hh.tensors:
-        n = nbytes(dims, tt)
-        off = (off + align - 1) // align * align
-        tensors.append([name, dims, tt, off, src_off, n])
-        off += n
-    kv_last = [("split.no", T_U16, a.n_src), ("split.count", T_U16, n_out), ("split.tensors.count", T_I32, new_total),
-               ("general.alignment", T_U32, align)]
-    sz = write_gguf(outs[-1], hh.ver, kv_last, tensors, src=a.head, src_data_start=hh.data_start, align=align)
-    print("wrote %s (%.2f GB)" % (outs[-1], sz / 1e9))
+        align = hh.align
+        tensors, off = [], 0
+        for name, dims, tt, src_off in hh.tensors:
+            n = nbytes(dims, tt)
+            off = (off + align - 1) // align * align
+            tensors.append([name, dims, tt, off, src_off, n])
+            off += n
+        kv_last = [("split.no", T_U16, a.n_src), ("split.count", T_U16, n_out),
+                   ("split.tensors.count", T_I32, new_total), ("general.alignment", T_U32, align)]
+        sz = write_gguf(outs[-1], hh.ver, kv_last, tensors, src=a.head, src_data_start=hh.data_start, align=align)
+        made.append(outs[-1])
+        print("wrote %s (%.2f GB)" % (outs[-1], sz / 1e9))
+
+        # shard 1 last: it names all the other shards, so it is only written once they are in place
+        sz = write_gguf(outs[0], h1.ver, h1.kv, [], align=h1.align)
+        print("wrote %s (%.1f MB)" % (outs[0], sz / 1e6))
+    except BaseException:
+        for o in made:
+            if os.path.exists(o):
+                os.remove(o)
+        raise
     return verify(a.out_pattern, n_out, a.head)
 
 

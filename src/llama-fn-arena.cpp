@@ -39,6 +39,7 @@ struct llama_fn_arena {
     std::vector<ggml_backend_buffer_t> bufs;
     void (*unreg)(void *) = nullptr;
     const llama_model * model = nullptr; // [TAG_FN_L22_PIN] for the pin shutdown in the deleter
+    size_t ws_add = 0; // the working-set minimum raised for the locked chunks, lowered again by the deleter
 };
 
 // the registered chunks of every arena, for llama_fn_arena_pinned
@@ -85,6 +86,20 @@ bool llama_fn_arena_pinned_any() {
     return g_fn_arena_n_pinned.load(std::memory_order_acquire) > 0;
 }
 
+#ifdef _WIN32
+// the working-set minimum lowered by b bytes (not below 1 MiB)
+static void fn_arena_ws_sub(size_t b) {
+    SIZE_T mn = 0;
+    SIZE_T mx = 0;
+    DWORD  fl = 0;
+    if (b == 0 || !GetProcessWorkingSetSizeEx(GetCurrentProcess(), &mn, &mx, &fl)) {
+        return;
+    }
+    const SIZE_T nmn = std::max<SIZE_T>(mn > b ? mn - b : 0, (SIZE_T) 1 << 20);
+    SetProcessWorkingSetSizeEx(GetCurrentProcess(), nmn, std::max<SIZE_T>(mx, nmn), fl);
+}
+#endif
+
 void llama_fn_arena_deleter::operator()(llama_fn_arena * a) const {
     if (a == nullptr) {
         return;
@@ -116,6 +131,7 @@ void llama_fn_arena_deleter::operator()(llama_fn_arena * a) const {
         }
         VirtualFree(c.p, 0, MEM_RELEASE);
     }
+    fn_arena_ws_sub(a->ws_add);
 #endif
     delete a;
 }
@@ -397,6 +413,9 @@ static llama_fn_arena_ptr fn_arena_build_l14(llama_model & model, llama_model_lo
             moved += ggml_nbytes(x.t);
         }
     }
+    // the minimum keeps only the locked layers (one that was not allocated or locked gives its share back)
+    fn_arena_ws_sub(want - locked_bytes);
+    arena->ws_add = locked_bytes + slack;
 
     // [TAG_FN_L14_ARENA] chunks registered for direct device copies (the prefill stream reads them without its staging
     // ring), at most LLAMA_FN_L14_ARENA_PIN_MIB (default 0: none). Registering all 58 GiB made the context's device

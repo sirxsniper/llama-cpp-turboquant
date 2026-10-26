@@ -5035,6 +5035,10 @@ void hot_state_queue(moe_cache * mc) {
             if (!mc->stop && (ls.cb_lent || ls.kv_lent) && !sl_o) {
                 ls.slot_expert[j.slot]   = j.expert;
                 ls.expert_slot[j.expert] = j.slot;
+                if (ls.slot_dirty.size() < ls.slot_expert.size()) {
+                    ls.slot_dirty.resize(ls.slot_expert.size(), 0);
+                }
+                ls.slot_dirty[j.slot] = 1; // named, not uploaded: the restore refills it
             } else if (ls.pool >= 0) {
                 mc->pools[ls.pool].slot_layer[j.slot] = -1;
             }

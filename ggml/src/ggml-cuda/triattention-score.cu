@@ -209,24 +209,8 @@ static __global__ void triattention_score_kernel(
 
     // ---- Step 2: Inverse WHT rotation (turbo2/turbo3 only) ----
     if constexpr (NEED_WHT_INV) {
-        // Process in 128-element blocks
-        for (uint32_t b = 0; b < padded_hd; b += 128) {
-            // Remap thread to work on this 128-elem block
-            if (f < 64) {
-                float * block = k_smem + b;
-                // Signs2 → FWHT → Signs1 (inverse rotation)
-                // Note: for f < 64, thread handles elements [f*2, f*2+1] within block
-                // But we need to handle the case where padded_hd > 128 (multiple blocks)
-                // For simplicity with 64 threads and 128 elements per block, each thread
-                // handles 2 elements
-            }
-        }
-        // For head_dim = 128 (standard case), single block:
-        if (padded_hd == 128 && f < 64) {
-            inverse_wht_rotation_128(k_smem, f);
-        }
-        // For head_dim > 128, we'd need multiple passes.
-        // Most turbo models use head_dim=128, so this covers the primary case.
+        // One 64-thread group per 128-element block (head_dim % 128 == 0 is checked at init), all threads reach every barrier
+        inverse_wht_rotation_128(k_smem + (f / 64) * 128, f % 64);
     }
 
     // ---- Step 3: Inverse RoPE ----
@@ -304,10 +288,11 @@ static __global__ void triattention_score_kernel(
     score_smem[f] = total_score;
     __syncthreads();
 
-    // Tree reduction
-    for (int stride = freq_count / 2; stride > 0; stride >>= 1) {
-        if (f < stride) {
-            score_smem[f] += score_smem[f + stride];
+    // Tree reduction, also correct when freq_count is not a power of two
+    for (int n = (int) freq_count; n > 1; n = (n + 1) / 2) {
+        const int half = (n + 1) / 2;
+        if (f < n - half) {
+            score_smem[f] += score_smem[f + half];
         }
         __syncthreads();
     }
@@ -386,6 +371,7 @@ static void launch_score_kernel(
                 break;
         }
     }
+    CUDA_CHECK(cudaGetLastError());
 
     #undef LAUNCH_KERNEL
 }
@@ -402,6 +388,19 @@ triattention_gpu_state * triattention_gpu_init(
     const float * offsets,
     void * stream_ptr)
 {
+    // Only the K types launch_score_kernel handles; anything else returns nullptr and the caller scores on the CPU
+    const ggml_type k_type = config->k_type;
+    const bool wht_type = k_type == GGML_TYPE_TURBO2_0 || k_type == GGML_TYPE_TURBO3_0 || k_type == GGML_TYPE_TURBO4_0;
+    if (!wht_type && k_type != GGML_TYPE_Q8_0 && k_type != GGML_TYPE_F16 && k_type != GGML_TYPE_F32) {
+        fprintf(stderr, "[TriAttention GPU] unsupported K type %d\n", (int) k_type);
+        return nullptr;
+    }
+    // The inverse WHT works on whole 128-element blocks
+    if (wht_type && config->head_dim % 128 != 0) {
+        fprintf(stderr, "[TriAttention GPU] head_dim %u is not a multiple of 128\n", config->head_dim);
+        return nullptr;
+    }
+
     cudaStream_t stream = (cudaStream_t)stream_ptr;
     triattention_gpu_state * state = new triattention_gpu_state();
     state->cfg = *config;

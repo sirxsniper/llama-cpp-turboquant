@@ -1707,6 +1707,10 @@ llama_moe_bridge * llama_moe_bridge_create(const llama_model & model, int n_thre
             "taken), spin %d us, up to %d pool threads, prio %d\n", __func__, br->bid, ggml_backend_dev_name(dev), (size_t) br->n_chan0,
             n_skipped, br->max_t, br->mode == GGML_MOE_BRIDGE_WAIT_SPIN ? "spin" : "hostfunc", br->timeout_ms, br->job_max_ms,
             br->spin_us, br->pool_params.n_threads, br->pool_params.prio);
+    if (br->mode == GGML_MOE_BRIDGE_WAIT_HOSTFUNC) {
+        LLAMA_LOG_WARN("%s: hostfunc wait: the device waits for each host job to end, so the timeouts (and the rollback of a "
+                "stalled step) apply to spin waits only\n", __func__);
+    }
     if (br->seq_t > 0) {
         LLAMA_LOG_INFO("%s: [TAG_FN_L13_BRIDGE_SEQS] graphs of up to %d tokens with at most %d of one sequence (the ring each "
                 "sequence rolls back)\n", __func__, br->max_t, br->seq_t);

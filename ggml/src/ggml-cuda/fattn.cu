@@ -226,15 +226,16 @@ static int ggml_cuda_fattn_turbot_rows_ncols1(const int cc, const ggml_tensor * 
         return 0;
     }
 
-    return Q->ne[1] <= 4 ? 4 : 8;
+    // Turing has no ncols > 32 instance, as in the dense ladder
+    return (Q->ne[1] <= 4 || ggml_cuda_highest_compiled_arch(cc) == GGML_CUDA_CC_TURING) ? 4 : 8;
 }
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 
 // [TAG_FN_TURBOT_SPARSE] The query-tile width of the sparse turbot FA for dst, or 0 for the dense turbot FA. A turbot FA
 // goes sparse when the graph set n_kv_max (models/qwen4exp.cpp build_attn_qsa does, under TURBO_QSA_SPARSE) and the
 // gather beats a dense walk: D 256, GQA > 4 (ncols2 8), an explicit mask, no ALiBi and no softcap, and at least twice
-// the cells a query tile can gather. <4, 8> takes Q <= 4, <8, 8> the rest. GGML_CUDA_TURBOT_SPARSE=0 keeps every
-// turbot FA dense (A/B on one binary).
+// the cells a query tile can gather. <4, 8> takes Q <= 4 (every Q on Turing), <8, 8> the rest.
+// GGML_CUDA_TURBOT_SPARSE=0 keeps every turbot FA dense (A/B on one binary).
 static int ggml_cuda_fattn_turbot_sparse_ncols1(const int cc, const ggml_tensor * dst) {
 #if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
     GGML_UNUSED_VARS(cc, dst);
@@ -272,7 +273,7 @@ static int ggml_cuda_fattn_turbot_sparse_ncols1(const int cc, const ggml_tensor 
         return 0;
     }
 
-    const int     ncols1   = Q->ne[1] <= 4 ? 4 : 8;
+    const int     ncols1   = (Q->ne[1] <= 4 || ggml_cuda_highest_compiled_arch(cc) == GGML_CUDA_CC_TURING) ? 4 : 8;
     const int64_t n_gather = std::min<int64_t>(Q->ne[1], ncols1) * (int64_t) n_kv_max;
     // [TAG_FN_V0254_SEQFA] a multi-sequence QSA attention always walks the lists: the n_kv gate below counts the cells of
     // every sequence, so the other slot's prompt switched a fresh read between the dense and the sparse sums

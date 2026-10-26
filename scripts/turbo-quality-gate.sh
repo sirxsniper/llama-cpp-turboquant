@@ -2,18 +2,23 @@
 # TurboQuant quality + speed gate — run BEFORE pushing any changes
 # Checks: (1) perplexity within 5% of q8_0, (2) context scaling ratio > 0.95
 #
-# Usage: bash scripts/turbo-quality-gate.sh
+# Usage: MODEL=model.gguf bash scripts/turbo-quality-gate.sh   (optional: LLAMA=<bin dir>, WIKI=<wiki.test.raw>)
 # Exit 0 = PASS, Exit 1 = FAIL
 
 set -e
 
-LLAMA=${LLAMA:-~/local_llms/llama.cpp/build-turbo/bin}
-MODEL=${MODEL:-~/local_llms/models/Qwen3.5-35B-A3B-Q8_0.gguf}
-WIKI=${WIKI:-~/local_llms/llama.cpp/wikitext-2-raw/wiki.test.raw}
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
+LLAMA=${LLAMA:-$ROOT/build/bin}
+MODEL=${MODEL:?set MODEL to the GGUF to test, e.g. Qwen3.5-35B-A3B-Q8_0.gguf}
+WIKI=${WIKI:-$ROOT/wikitext-2-raw/wiki.test.raw}
 
 if [ ! -f "$WIKI" ]; then
     echo "Downloading wikitext-2..."
-    bash ~/local_llms/llama.cpp/scripts/get-wikitext-2.sh
+    (cd "$ROOT" && bash scripts/get-wikitext-2.sh) || true
+fi
+if [ ! -f "$WIKI" ]; then
+    echo "  FAIL: $WIKI not found (run scripts/get-wikitext-2.sh in $ROOT, or set WIKI)"
+    exit 1
 fi
 
 FAIL=0
@@ -25,13 +30,15 @@ echo ""
 
 # --- Test 1: Perplexity ---
 echo "[1/2] Running perplexity check (8 chunks)..."
-PPL_TURBO=$($LLAMA/llama-perplexity -m $MODEL -f $WIKI -c 512 -ctk turbo3 -ctv turbo3 -fa on --chunks 8 -ngl 99 2>&1 | grep "Final" | grep -oE 'PPL = [0-9.]+' | grep -oE '[0-9.]+')
+# '|| true': a failed run leaves the value empty and is reported below instead of ending the script (set -e)
+PPL_TURBO=$("$LLAMA/llama-perplexity" -m "$MODEL" -f "$WIKI" -c 512 -ctk turbo3 -ctv turbo3 -fa on --chunks 8 -ngl 99 2>&1 | grep "Final" | grep -oE 'PPL = [0-9.]+' | grep -oE '[0-9.]+' || true)
+BASELINE_PPL=$("$LLAMA/llama-perplexity" -m "$MODEL" -f "$WIKI" -c 512 -ctk q8_0 -ctv q8_0 -fa on --chunks 8 -ngl 99 2>&1 | grep "Final" | grep -oE 'PPL = [0-9.]+' | grep -oE '[0-9.]+' || true)
 
-if [ -z "$PPL_TURBO" ]; then
-    echo "  FAIL: Could not get turbo3 perplexity (crash or timeout)"
+if [ -z "$PPL_TURBO" ] || [ -z "$BASELINE_PPL" ]; then
+    echo "  FAIL: Could not get perplexity (crash or timeout)"
+    echo "  turbo3=$PPL_TURBO q8_0=$BASELINE_PPL"
     FAIL=1
 else
-    BASELINE_PPL=6.111
     MAX_PPL=$(echo "$BASELINE_PPL * 1.05" | bc)
     PPL_OK=$(echo "$PPL_TURBO < $MAX_PPL" | bc)
     if [ "$PPL_OK" -eq 1 ]; then
@@ -45,8 +52,8 @@ echo ""
 
 # --- Test 2: Context Scaling ---
 echo "[2/2] Running context scaling check (4K prefill)..."
-TURBO_TPS=$($LLAMA/llama-perplexity -m $MODEL -f $WIKI -c 4096 -ctk turbo3 -ctv turbo3 -fa on --chunks 4 -ngl 99 2>&1 | grep "prompt eval" | grep -oE '[0-9.]+ tokens per second' | grep -oE '[0-9.]+')
-Q8_TPS=$($LLAMA/llama-perplexity -m $MODEL -f $WIKI -c 4096 -ctk q8_0 -ctv q8_0 -fa on --chunks 4 -ngl 99 2>&1 | grep "prompt eval" | grep -oE '[0-9.]+ tokens per second' | grep -oE '[0-9.]+')
+TURBO_TPS=$("$LLAMA/llama-perplexity" -m "$MODEL" -f "$WIKI" -c 4096 -ctk turbo3 -ctv turbo3 -fa on --chunks 4 -ngl 99 2>&1 | grep "prompt eval" | grep -oE '[0-9.]+ tokens per second' | grep -oE '[0-9.]+' || true)
+Q8_TPS=$("$LLAMA/llama-perplexity" -m "$MODEL" -f "$WIKI" -c 4096 -ctk q8_0 -ctv q8_0 -fa on --chunks 4 -ngl 99 2>&1 | grep "prompt eval" | grep -oE '[0-9.]+ tokens per second' | grep -oE '[0-9.]+' || true)
 
 if [ -z "$TURBO_TPS" ] || [ -z "$Q8_TPS" ]; then
     echo "  FAIL: Could not measure speed (crash or timeout)"

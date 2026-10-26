@@ -66,9 +66,9 @@ prompt reading **2,350 t/s** at 131K and 245K with vision (v0.20.4: +5 % / +8 %)
 
 ### turbot — a tiered KV cache
 
-The newest tokens stay exact, the middle of the context is kept at 6–8 bits, the oldest at a per-head budget. A full 262K context fits next to the weights on one 32 GB card at **q8-level quality** (KLD vs f16 on Qwen3.8-27B: 0.0011 code / 0.0019 prose).
+The newest tokens of each sequence are kept at up to 8 bits (the young tier), the rest of the context at a per-head bit budget (the old tier); no token is kept at f16. A full 262K context fits next to the weights on one 32 GB card at a **KLD vs f16 of 0.0011 code / 0.0019 prose** on Qwen3.8-27B (turbo5p: 0.0016 / 0.0026).
 
-The plan is built into the binary and chosen per model automatically: turbot → turbo5p → turbo5p512 → turbo4 → q8_0, with one log line saying why. The server never refuses to start because of a KV type.
+The plan is built into the binary and chosen per model automatically. When turbot cannot serve a model or setting, the type steps down turbot -> turbo5p (turbo5p512 for 512-element KV rows) -> turbo4 -> q8_0 -> f16 (Flash-Next goes straight to q8_0), with one log line saying why. The server never refuses to start because of a KV type (unless `LLAMA_KV_RESOLVE=0`).
 
 </td>
 <td width="50%" valign="top">
@@ -210,6 +210,8 @@ Five GPU memory bugs found with compute-sanitizer and fixed; no GPU work left in
 2. Unzip `cudart-cuda13.1-win-x64.zip` from the same release into that folder (or install the CUDA 13.1 toolkit).
 3. Start `llama-server.exe` with one of the configurations below and open `http://localhost:8080`.
 
+The commands below listen on this machine only. To serve other machines, use `--host 0.0.0.0` together with `--api-key <key>`: the server allows CORS requests from every origin by default.
+
 Requirements: an RTX 50-series GPU (the release binary is built for `sm_120a`), an NVIDIA driver with CUDA 13.1 support, and a CPU with AVX-512 (Zen 4 / Zen 5) — or [build from source](#build-from-source) for anything else.
 
 ---
@@ -224,7 +226,7 @@ UD-Q5_K_XL with the DFlash2-Q8_0 drafter and vision, 262K context, 4 slots.
 set GGML_DISABLE_VULKAN=1
 set SPEC_DFT_UBATCH=128
 
-llama-server.exe --model Qwen3.8-27B-UD-Q5_K_XL.gguf --host 0.0.0.0 --port 8080 ^
+llama-server.exe --model Qwen3.8-27B-UD-Q5_K_XL.gguf --host 127.0.0.1 --port 8080 ^
   --n-gpu-layers 99 --device CUDA0 --ctx-size 262144 ^
   --cache-type-k turbot --cache-type-v turbot --flash-attn on --kv-unified ^
   --batch-size 2048 --ubatch-size 1024 --parallel 4 --threads 16 ^
@@ -243,7 +245,7 @@ llama-server.exe --model Qwen3.8-27B-UD-Q5_K_XL.gguf --host 0.0.0.0 --port 8080 
 
 | Flag | Why |
 |:--|:--|
-| `--cache-type-k/v turbot` | the tiered KV cache: a full 262K context at q8-level quality |
+| `--cache-type-k/v turbot` | the tiered KV cache: a full 262K context at a lower KLD than turbo5p |
 | `--kv-unified --parallel 4` | four slots share one KV pool; every slot can use the whole context |
 | `--spec-type draft-dflash --spec-draft-n-max 7 --spec-rs-seq 7` | DFlash2 block drafting; keep `--spec-rs-seq` equal to `n-max` (never `0`) |
 | `-bs` | sampling on the GPU (it steps aside by itself while a tool-call grammar is active) |
@@ -271,7 +273,7 @@ python tools/qwen4exp/merge_mtp.py --src-pattern Qwen3.8-Flash-Next-UD-Q4_K_XL-%
 ```bat
 set GGML_DISABLE_VULKAN=1
 
-llama-server.exe --model Qwen3.8-Flash-Next-UD-Q4_K_XL-MTP-00001-of-00005.gguf --host 0.0.0.0 --port 8080 ^
+llama-server.exe --model Qwen3.8-Flash-Next-UD-Q4_K_XL-MTP-00001-of-00005.gguf --host 127.0.0.1 --port 8080 ^
   --device CUDA0 -ngl 99 -fit off --ctx-size 262144 ^
   --cache-type-k turbot --cache-type-v turbot --flash-attn on ^
   --threads 16 --cpu-mask 55555555 --cpu-strict 1 --prio 2 --parallel 1 --cache-ram 0 ^
@@ -298,6 +300,8 @@ llama-server.exe --model Qwen3.8-Flash-Next-UD-Q4_K_XL-MTP-00001-of-00005.gguf -
 - **Keep the model memory-mapped**: never `--load-mode none` / `--no-mmap` — it is larger than RAM.
 - The first one or two answers after a load are slower while the GPU expert set fills.
 - **Recommended:** the `...-MTPq3-*` shard set (the same model with a 1.3 GB instead of 2.8 GB draft head): the freed VRAM holds ~10 more experts per layer, real use +6 % (103 / 93 / 91 t/s at 32K / 131K / 245K). The main model checks every token either way, so the output quality is the same. Make it once from the shipped head: `python tools/qwen4exp/mtp_requant.py --head mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf --mix q3_K,q3_K,q4_0 --out mtp-q3.gguf`, then the `merge_mtp.py` line above with `--head mtp-q3.gguf --out-pattern Qwen3.8-Flash-Next-UD-Q4_K_XL-MTPq3-%05d-of-00005.gguf`.
+- `--cpu-mask 55555555` assumes Windows numbering, where logical CPUs 2k and 2k+1 share a core. Linux usually numbers the two threads of a core 16 apart on a 16-core CPU (`lscpu -e` shows it); there `ffff` gives one thread per core.
+- **Disk use**: the first load writes an unmapped copy of the per-layer embedding table next to the model (`<first shard>.ple`, ~29 GB per shard set, made only when its drive keeps 16 GiB free beyond it; `LLAMA_PLE_DIRECT_IO=0` skips it, `LLAMA_PLE_DIO_FILE=<path>` puts it elsewhere). With `--cache-ram 0`, a conversation that another prompt replaces is stored on disk, beside the model or in TEMP, up to 32 GiB in all (`LLAMA_FN_L18_KEEPCTX=0` turns it off, `LLAMA_FN_L18_KEEPCTX_DIR` / `LLAMA_FN_L18_KEEPCTX_DISK_MIB` move or cap it). The learned expert set is saved under `%LOCALAPPDATA%\llama.cpp\hotstate` (`LLAMA_MOE_HOT_STATE=0` turns it off).
 - `LLAMA_FLASHNEXT_PROFILE=off` turns the whole engine off (for comparison).
 
 </details>
@@ -311,7 +315,7 @@ llama-server.exe --model Qwen3.8-Flash-Next-UD-Q4_K_XL-MTP-00001-of-00005.gguf -
 
 <br>
 
-turbot keeps three tiers per attention layer: the newest tokens exact, a middle tier at 6–8 bits, and an old tier at a per-head bit budget. The quantized tiers sit behind a Walsh-Hadamard rotation with Lloyd-Max centroids (the TurboQuant method), and the attention kernels read every tier natively — no f16 copy of the cache is ever made. A built-in plan picks the tier widths per model; models it does not fit fall back to turbo5p, turbo5p512, turbo4 or q8_0 automatically.
+turbot keeps two quantized tiers per attention layer: a young tier for the newest tokens of each sequence (up to 8 bits; 7 in the built-in plan) and an old tier at a per-head bit budget (2-6 bits); there is no exact tier. Both tiers sit behind a Walsh-Hadamard rotation with Lloyd-Max centroids (the TurboQuant method), and the attention kernels read both natively: no f16 copy of the cache is ever made. A built-in plan picks the tier widths per model (Flash-Next gets a quality plan, old 6 / young 8 bits); a model or setting turbot cannot serve falls back to turbo5p, turbo5p512, turbo4, q8_0 or f16 automatically (Flash-Next to q8_0).
 
 </details>
 
@@ -320,13 +324,13 @@ turbot keeps three tiers per attention layer: the newest tokens exact, a middle 
 
 <br>
 
-Flash-Next has 48 layers of 512 experts (10 active per token) — about 72 GB of expert weights at Q4, more than the VRAM and more than the RAM next to it. A decode step is split per layer:
+Flash-Next has 48 layers of 512 experts (10 active per token): about 72 GiB of expert weights at Q4, more than the VRAM, and with the rest of the model (105 GB in all) more than the RAM next to it. A decode step is split per layer:
 
 1. The GPU runs attention (linear GDN layers and sparse QSA layers with a lightning indexer) and the router, and posts the token's cold experts to the CPU through mapped memory.
 2. While the CPU expert pool computes those cold experts at the RAM limit (~69 GB/s), the GPU computes the hot experts from its VRAM hot set and the shared expert, and prefetches the next layer's weights into L2.
 3. A device-side hint tells the CPU which experts the next layer will probably need, so the pool pulls them into cache ahead of time.
 
-The hot set adapts to the conversation and borrows the idle prompt buffer while generating; prompts stream all experts over PCIe Gen5 instead. The step ends in one CUDA graph per decode width. Everything is exact: the CPU and GPU paths compute the same values, and a stalled CPU job rolls the step back instead of corrupting it.
+The hot set adapts to the conversation and borrows the idle prompt buffer while generating; prompts stream all experts over PCIe Gen5 instead. The step ends in one CUDA graph per decode width. A stalled CPU job rolls the step back instead of corrupting it. The CPU and GPU expert kernels do not round identically, so the logits can move slightly with the expert placement.
 
 </details>
 
@@ -386,7 +390,7 @@ Every verified speed round is pushed to `main` and published under [Releases](ht
 - **reliability**: the GPU memory and race fixes found with compute-sanitizer, the clean-shutdown work, slot checkpoints, the vision device selection;
 - the Windows CUDA build, the InnerQ cross-DLL ABI, and every upstream merge from `b8650` on.
 
-**Prior work this fork builds on** (attribution follows the commit history; see [CREDITS.md](CREDITS.md)):
+**Prior work this fork builds on** (attribution follows the commit history):
 
 - the CPU TurboQuant implementation — **TheTom** (March 2026);
 - the original CUDA port of the turbo formats — **Gabe Ortiz** (March 2026);

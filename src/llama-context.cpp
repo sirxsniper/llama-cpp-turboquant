@@ -1283,7 +1283,7 @@ llama_context::llama_context(
     {
         const char * eb = getenv("LLAMA_MOE_BRIDGE");
         const char * er = getenv("LLAMA_MOE_BRIDGE_RB");
-        if (cparams.n_rs_seq > 0 && eb && atoi(eb) > 0 && !(er && er[0] == '0')) {
+        if (cparams.n_rs_seq > 0 && eb && atoi(eb) > 0 && !(er && er[0] == '0') && llama_moe_bridge_wanted(model)) {
             cparams.n_rs_seq += 1;
             bridge_rb = true;
         } else if (cparams.n_rs_seq == 0 && params.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && !(er && er[0] == '0') &&
@@ -4545,6 +4545,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         // [TAG_FN_L4_HOST_EARLYOUT] the output copies of this ubatch: LLAMA_FN_L4_HOST_EARLYOUT queues them behind a bridged
         // graph before its synchronize (the same copies, one wait less); otherwise after process_ubatch, as before
         bool outputs_queued = false;
+        const size_t n_batch_idxs_prev = embd_batch_idxs.size();
         auto extract_outputs = [&](const llm_graph_result * res) {
             outputs_queued = true;
 
@@ -4751,6 +4752,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                         "; [TAG_FN_R2_BRIDGE_SYNC] its layers run the host job as a CPU op: the bridged values" : "");
                 gf_res_prev_active = nullptr; // never reuse the bridged graph
                 outputs_queued = false; // [TAG_FN_L4_HOST_EARLYOUT] the failed graph's copies are overwritten below
+                embd_batch_idxs.resize(n_batch_idxs_prev); // drop the batch indices the failed graph's copies appended
                 res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
             } else {
                 LLAMA_LOG_WARN("%s: [TAG_FN_R1_BRIDGE_RETRY] the bridge failed this ubatch of %u tokens and the memory "

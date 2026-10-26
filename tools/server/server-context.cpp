@@ -1505,7 +1505,7 @@ struct server_slot {
     // not in server_slot_stats to avoid copying to every task result
     std::vector<uint64_t> n_accepted_per_pos;
 
-    std::function<void(int /* id_slot */)>   callback_on_release;
+    std::function<void(int /* id_slot */, bool /* wake_all */)> callback_on_release;
     std::function<void(const server_slot &)> callback_on_reset; // called before reset()
 
     // [TAG_BS_LAZY_GRAMMAR] the target context currently holds this slot's backend sampler
@@ -1831,9 +1831,12 @@ struct server_slot {
 
             callback_on_reset(*this);
 
+            // [TAG_SHARED_PREFIX_FANOUT] a leader released before its boundary never publishes: wake all its followers
+            const bool share_unpublished = share_prefix_stop != 0;
+
             reset();
 
-            callback_on_release(id);
+            callback_on_release(id, share_unpublished);
         }
     }
 
@@ -3056,8 +3059,15 @@ private:
 
             SLT_TRC(slot, "new slot, n_ctx = %d\n", slot.n_ctx);
 
-            slot.callback_on_release = [this](int id_slot) {
+            slot.callback_on_release = [this](int id_slot, bool wake_all) {
                 queue_tasks.pop_deferred_task(id_slot);
+
+                // [TAG_SHARED_PREFIX_FANOUT] wake everything parked on the prefix, as share_prefix_publish_ready does
+                if (wake_all) {
+                    for (size_t i = 1; i < slots.size(); ++i) {
+                        queue_tasks.pop_deferred_task(-1);
+                    }
+                }
             };
 
             slot.callback_on_reset = [this](const server_slot & slot) {
@@ -5676,6 +5686,13 @@ private:
             slot.l23_busy = true;
             llama_fn_pin_server_busy(1);
         }
+        // a failed launch leaves the slot idle, and nothing releases an idle slot: give the busy count back
+        auto l23_unbusy = [&slot]() {
+            if (slot.l23_busy) {
+                slot.l23_busy = false;
+                llama_fn_pin_server_busy(-1);
+            }
+        };
         slot.l22_turn.t_launch_us  = ggml_time_us(); // [TAG_FN_L22_PASSLOG]
         slot.l22_turn.logged_start = false;
 
@@ -5712,6 +5729,7 @@ private:
             // only the last one, or reject if multiple are found.
             if (enabled_ids.size() != 1) {
                 send_error(task, "Cannot run multiple aLoRAs in a single request", ERROR_TYPE_INVALID_REQUEST);
+                l23_unbusy();
                 return false;
             }
             const auto & lora = slot.lora[enabled_ids[0]].ptr;
@@ -5752,6 +5770,7 @@ private:
 
         if (!task.tokens.validate(ctx_tgt)) {
             send_error(task, "Prompt contains invalid tokens", ERROR_TYPE_INVALID_REQUEST);
+            l23_unbusy();
             return false;
         }
 
@@ -5778,6 +5797,7 @@ private:
             } catch (std::exception & e) {
                 std::string err_msg = std::string("Failed to initialize samplers: ") + e.what();
                 send_error(task, err_msg, ERROR_TYPE_INVALID_REQUEST);
+                l23_unbusy();
                 return false;
             }
 
@@ -10196,7 +10216,7 @@ private:
             // (llama-vocab.cpp:3150, :3698), so an id outside [0, n_vocab) throws
             // "invalid vector subscript" and the whole request dies with an HTTP 500. That is
             // what has been happening on roughly 1 in 40 long reasoning generations, in stock
-            // llama.cpp as well as here. Report the actual value and stop cleanly instead.
+            // llama.cpp as well as here. Report the actual value and end the request with an error instead.
             const int n_vocab_tgt =
                 llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(slot.ctx_tgt)));
 
@@ -10210,16 +10230,13 @@ private:
                 if (result.tok < 0 || result.tok >= n_vocab_tgt) {
                     SLT_ERR(slot, "[TAG_BAD_TOKEN_GUARD] speculative accept produced token id %d, "
                             "outside [0, %d) - position %zu of %zu accepted, n_draft = %zu, "
-                            "replay = %d. Dropping it and ending this generation cleanly rather "
+                            "replay = %d. Dropping it and ending this request with an error rather "
                             "than throwing.\n",
                             (int) result.tok, n_vocab_tgt, i, ids.size(), n_draft,
                             (int) slot.spec_is_replay);
 
-                    slot.stop           = STOP_TYPE_EOS;
-                    slot.has_next_token = false;
-
                     slot.print_timings();
-                    send_final_response(slot);
+                    send_error(slot, "speculative decoding produced an invalid token id, please retry", ERROR_TYPE_SERVER);
                     slot.release();
 
                     return;

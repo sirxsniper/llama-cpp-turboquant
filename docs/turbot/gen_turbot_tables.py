@@ -1,7 +1,7 @@
 # [TAG_TURBOT] Generator for ggml/include/ggml-turbot-tables.h (the codebook tables of the turbot KV format).
 #
-# CPU only (python + numpy), deterministic, data independent. Writes the header with CRLF line endings like the
-# rest of the working tree.
+# CPU only (python + numpy), deterministic, data independent. Keeps the line endings of the header on disk (CRLF in
+# a Windows checkout with core.autocrlf, LF otherwise), and --check compares with CR removed.
 #
 #   python docs/turbot/gen_turbot_tables.py            # (re)write ggml/include/ggml-turbot-tables.h
 #   python docs/turbot/gen_turbot_tables.py --check    # exit 1 if the checked-in header differs from a fresh run
@@ -276,14 +276,15 @@ def render():
 def main():
     here = os.path.dirname(os.path.abspath(__file__))
     path = os.path.normpath(os.path.join(here, "..", "..", "ggml", "include", "ggml-turbot-tables.h"))
-    text = render().replace("\n", "\r\n")
+    text = render()
+    cur = open(path, "rb").read().decode("utf-8", errors="replace") if os.path.exists(path) else ""
     if "--check" in sys.argv:
-        cur = open(path, "rb").read().decode("utf-8") if os.path.exists(path) else ""
-        same = cur == text
+        same = cur.replace("\r", "") == text
         print("ggml-turbot-tables.h %s" % ("matches" if same else "DIFFERS from a fresh generation"))
         return 0 if same else 1
+    eol = "\r\n" if "\r\n" in cur else "\n"
     with open(path, "wb") as f:
-        f.write(text.encode("utf-8"))
+        f.write(text.replace("\n", eol).encode("utf-8"))
     print("wrote %s" % path)
     return 0
 

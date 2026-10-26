@@ -141,7 +141,8 @@ int keepctx_spill_validate(const server_tokens & tokens, std::vector<server_keep
 // the next prompt waits for: the drive of TEMP is the system drive, which also holds the page file (busy exactly when RAM
 // is short) and may be a slow-under-load drive (the owner's: 3.5 GB/s with 1-6 s stalls at ~0.1-0.4 GB/s after a few GB,
 // O8). So the folder goes beside the model (<model folder>/llama-keepctx) when that is on another physical disk, a fixed
-// SSD, writable, with at least need_free bytes free; else <TEMP>/llama-keepctx as before. why: the reason, for the log
+// SSD, writable, with at least need_free bytes free; else <TEMP>/llama-keepctx as before (<TEMP>/llama-keepctx-<uid> outside
+// Windows). why: the reason, for the log
 std::string keepctx_default_dir(const std::string & model_path, uint64_t need_free, std::string & why);
 
 // [TAG_FN_L19_CONVSTORE_SPILL] the checkpoints of a slot's conversation that its ring dropped, each in its own file (shared
