@@ -444,6 +444,10 @@ endif()
 # sort the top-k sampler runs: identical candidates or a fallback, never a different result. CPU only, no model.
 llama_build_and_test(test-fn-l4-host.cpp)
 
+# [TAG_V0261_PRETRIM] the exact grammar pre-trim rule of the sampler (common/sampling.cpp) against the full pass with
+# penalties, DRY, negative biases and suppress tokens: the same top-k set or a fallback. CPU only, no model.
+llama_build_and_test(test-v0261-pretrim.cpp)
+
 # [TAG_FN_L3_VRAM_CBUF] [TAG_FN_L3_VRAM_TRIM] CUDA virtual-memory buffers (a tail given back and mapped again under the hot
 # set's MUL_MAT_ID chain) and the pool trim between CUDA-graph runs. Built, not registered with ctest: it needs the GPU (run
 # it under compute-sanitizer memcheck first); without one it prints SKIPPED.

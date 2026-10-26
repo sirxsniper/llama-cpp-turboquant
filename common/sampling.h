@@ -153,6 +153,31 @@ llama_token common_sampler_last(const struct common_sampler * gsmpl);
 bool common_sampler_fn_l4_topk_row(const float * x, int n, int K, const std::vector<llama_token> & excl,
         std::vector<llama_token_data> & out);
 
+// [TAG_V0261_PRETRIM] the grammar pre-trim of common_sampler_sample: the grammar runs over the top raw candidates only.
+// The samplers before the chain's top-k can only lower logits there (penalties, DRY, negative bias, suppress tokens), so
+// the chain's top-k set is the full-vocabulary one when the trim keeps top_k grammar-valid tokens they do not touch.
+// LLAMA_V0261_PRETRIM: 1 (default) this rule, 0 the PR #1 gate (no trim while such a sampler is on), 2 the v0.25.5 gate.
+struct common_pretrim_cfg {
+    int32_t top_k     = 0; // the chain's top-k, 0: no trim
+    size_t  width     = 0; // width of the first trim (the v0.25.5 width)
+    size_t  width_max = 0; // width of the second trim, used when the first keeps too few; 0: none
+    size_t  n_extra   = 0; // added to the need (mode 0: the suppress tokens)
+    int32_t last_n    = 0; // history window the penalties and DRY read, 0: neither lowers logits
+    std::vector<llama_token> fixed; // sorted: the suppress tokens and the negative user biases
+};
+
+common_pretrim_cfg common_sampler_pretrim_cfg(const common_params_sampling & params, const llama_token * suppress,
+        int32_t n_suppress, int32_t n_vocab, int mode);
+
+// the tokens the chain may lower at this position, sorted into touched. hist: the newest accepted tokens, oldest first;
+// hist_all: no token was accepted before hist[0]. Returns how many more it may lower, known only as a bound.
+size_t common_sampler_pretrim_touched(const common_pretrim_cfg & cfg, const std::vector<llama_token> & hist,
+        bool hist_all, std::vector<llama_token> & touched);
+
+// true when the trimmed candidates, grammar applied, keep top_k + n_extra + n_bound valid tokens outside touched
+bool common_sampler_pretrim_exact(const common_pretrim_cfg & cfg, const llama_token_data_array * cur_p,
+        const std::vector<llama_token> & touched, size_t n_bound);
+
 // print the sampler chain into a string
 std::string common_sampler_print(const struct common_sampler * gsmpl);
 

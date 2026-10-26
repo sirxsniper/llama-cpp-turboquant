@@ -226,9 +226,9 @@ struct common_sampler {
     struct llama_sampler * rbudget;
     struct llama_sampler * chain;
 
-    // top-k pre-trim used by the grammar passes (see common_sampler_sample). null unless
-    // the chain's first top-k sees the raw logits (see common_sampler_init), which keeps
-    // the original full-vocabulary behaviour.
+    // top-k pre-trim used by the grammar passes (see common_sampler_sample). null when
+    // common_sampler_pretrim_cfg finds no exact trim for these parameters, which keeps
+    // the original full-vocabulary behaviour. [TAG_V0261_PRETRIM]
     struct llama_sampler * grmr_pretrim;
 
     ring_buffer<llama_token> prev;
@@ -383,6 +383,13 @@ struct common_sampler {
 
     // [TAG_FN_L21_NANGUARD] rows seen with NaN / +inf logits since the last take (last: the aggregate inits above)
     uint32_t n_nonfinite = 0;
+
+    // [TAG_V0261_PRETRIM] the wider second trim (null: none), the trim rule, and per-position scratch
+    struct llama_sampler *   grmr_pretrim_wide = nullptr;
+    common_pretrim_cfg       pretrim;
+    std::vector<llama_token> pretrim_hist;
+    std::vector<llama_token> pretrim_touched;
+    size_t                   pretrim_bound = 0;
 };
 
 std::string common_params_sampling::print() const {
@@ -443,6 +450,181 @@ bool common_sampler_backend_ok(const struct common_sampler * gsmpl) {
         return false;   // the budget is overwriting logits with its forced end sequence
     }
     return true;
+}
+
+// [TAG_V0261_PRETRIM] LLAMA_V0261_PRETRIM: 1 (default) the exact trim rule, 0 the PR #1 gate, 2 the v0.25.5 gate
+static int v0261_pretrim_mode() {
+    static const int mode = [] {
+        const char * e = std::getenv("LLAMA_V0261_PRETRIM");
+        if (e == nullptr || e[0] == '\0') {
+            return 1;
+        }
+        const int v = std::atoi(e);
+        return v == 0 || v == 2 ? v : 1;
+    }();
+    return mode;
+}
+
+// the chain's first top-k sees the raw logits: every sampler before it is a no-op for these parameters (penalties,
+// dry, top-n-sigma disabled; no user logit bias; no mirostat), apart from the model's suppress tokens
+static bool common_sampler_first_top_k_raw(const common_params_sampling & params) {
+    if (params.mirostat == 0 && params.logit_bias.empty() && params.top_k >= 1 &&
+            (params.penalty_last_n == 0 ||
+             (params.penalty_repeat == 1.0f && params.penalty_freq == 0.0f && params.penalty_present == 0.0f)) &&
+            (params.dry_multiplier == 0.0f || params.dry_base < 1.0f || params.dry_penalty_last_n == 0) &&
+            params.top_n_sigma <= 0.0f) {
+        for (const auto t : params.samplers) {
+            if (t == COMMON_SAMPLER_TYPE_TOP_K) {
+                return true;
+            }
+            if (t != COMMON_SAMPLER_TYPE_PENALTIES && t != COMMON_SAMPLER_TYPE_DRY && t != COMMON_SAMPLER_TYPE_TOP_N_SIGMA) {
+                break;
+            }
+        }
+    }
+    return false;
+}
+
+// [TAG_V0261_PRETRIM] see sampling.h. Mode 1: the logit bias, penalties and DRY may run before the chain's top-k as long
+// as they only lower logits; the need grows by the tokens they can touch, and so does the width of the second trim.
+common_pretrim_cfg common_sampler_pretrim_cfg(const common_params_sampling & params, const llama_token * suppress,
+        int32_t n_suppress, int32_t n_vocab, int mode) {
+    common_pretrim_cfg cfg;
+    if (params.top_k <= 0) {
+        return cfg;
+    }
+    // the v0.25.5 width, 32 x top_k and at least 1024
+    const size_t width = (size_t) std::min<int64_t>(std::max<int64_t>((int64_t) params.top_k * 32, 1024), INT32_MAX);
+
+    if (mode == 2) {
+        cfg.top_k = params.top_k;
+        cfg.width = width;
+        return cfg;
+    }
+    if (mode == 0) {
+        if (common_sampler_first_top_k_raw(params)) {
+            cfg.top_k   = params.top_k;
+            cfg.width   = width;
+            cfg.n_extra = (size_t) std::max(n_suppress, 0);
+        }
+        return cfg;
+    }
+
+    // a trim as wide as the vocabulary saves nothing
+    if (params.mirostat != 0 || width >= (size_t) std::max(n_vocab, 0)) {
+        return cfg;
+    }
+
+    // the samplers before the first top-k: only penalties, DRY and an inactive top-n-sigma
+    bool pen_before = false;
+    bool dry_before = false;
+    bool have_top_k = false;
+    for (const auto t : params.samplers) {
+        if (t == COMMON_SAMPLER_TYPE_TOP_K) {
+            have_top_k = true;
+            break;
+        }
+        if (t == COMMON_SAMPLER_TYPE_PENALTIES) {
+            pen_before = true;
+        } else if (t == COMMON_SAMPLER_TYPE_DRY) {
+            dry_before = true;
+        } else if (t != COMMON_SAMPLER_TYPE_TOP_N_SIGMA || !(params.top_n_sigma <= 0.0f)) {
+            return cfg;
+        }
+    }
+    if (!have_top_k) {
+        return cfg;
+    }
+
+    // active as llama_sampler_init_penalties / llama_sampler_init_dry decide it (a negative window counts as 0)
+    int32_t last_n = 0;
+    const bool pen_on = std::max(params.penalty_last_n, 0) != 0 &&
+        !(params.penalty_repeat == 1.0f && params.penalty_freq == 0.0f && params.penalty_present == 0.0f);
+    if (pen_before && pen_on) {
+        // repeat < 1 or a negative frequency / presence penalty raises logits
+        if (!(params.penalty_repeat >= 1.0f && params.penalty_freq >= 0.0f && params.penalty_present >= 0.0f)) {
+            return cfg;
+        }
+        last_n = params.penalty_last_n;
+    }
+    const bool dry_on = params.dry_multiplier != 0.0f && params.dry_base >= 1.0f && std::max(params.dry_penalty_last_n, 0) != 0;
+    if (dry_before && dry_on) {
+        if (!(params.dry_multiplier > 0.0f)) {
+            return cfg;
+        }
+        last_n = std::max(last_n, params.dry_penalty_last_n);
+    }
+
+    // a positive (or NaN) bias raises a token from below the trim; a token listed twice gets only its first bias once
+    // the candidates are no longer in id order (llama_sampler_logit_bias_apply), so both keep the full pass
+    std::vector<llama_token> fixed;
+    for (const auto & lb : params.logit_bias) {
+        if (lb.bias == 0.0f) {
+            continue;
+        }
+        if (!(lb.bias < 0.0f)) {
+            return cfg;
+        }
+        fixed.push_back(lb.token);
+    }
+    for (int32_t i = 0; i < n_suppress; ++i) {
+        fixed.push_back(suppress[i]);
+    }
+    std::sort(fixed.begin(), fixed.end());
+    if (std::adjacent_find(fixed.begin(), fixed.end()) != fixed.end()) {
+        return cfg;
+    }
+
+    cfg.top_k  = params.top_k;
+    cfg.width  = width;
+    cfg.last_n = last_n;
+    cfg.fixed  = std::move(fixed);
+
+    // the second trim: the v0.25.5 rule (32 x the valid tokens needed) for the largest need, at most 1/8 of the vocabulary
+    const int64_t need_max = (int64_t) cfg.top_k + (int64_t) cfg.fixed.size() + (int64_t) last_n;
+    const int64_t wide     = std::min<int64_t>(std::min<int64_t>(need_max * 32, (int64_t) n_vocab / 8), INT32_MAX);
+    cfg.width_max = wide > (int64_t) width ? (size_t) wide : 0;
+
+    return cfg;
+}
+
+// [TAG_V0261_PRETRIM] the penalties and DRY lower only tokens of their own window, the last last_n accepted tokens
+size_t common_sampler_pretrim_touched(const common_pretrim_cfg & cfg, const std::vector<llama_token> & hist,
+        bool hist_all, std::vector<llama_token> & touched) {
+    touched.assign(cfg.fixed.begin(), cfg.fixed.end());
+    size_t n_bound = 0;
+    if (cfg.last_n > 0) {
+        const size_t w = (size_t) cfg.last_n;
+        const size_t n = std::min(w, hist.size());
+        touched.insert(touched.end(), hist.end() - (std::ptrdiff_t) n, hist.end());
+        if (w > hist.size() && !hist_all) {
+            n_bound = w - hist.size();
+        }
+        std::sort(touched.begin(), touched.end());
+        touched.erase(std::unique(touched.begin(), touched.end()), touched.end());
+    }
+    return n_bound;
+}
+
+// [TAG_V0261_PRETRIM] every token outside the trim has a raw logit at or below every token inside it, and the samplers
+// before the chain's top-k only lower logits, so top_k valid tokens inside it that they leave alone keep every token
+// outside it out of the chain's top-k set
+bool common_sampler_pretrim_exact(const common_pretrim_cfg & cfg, const llama_token_data_array * cur_p,
+        const std::vector<llama_token> & touched, size_t n_bound) {
+    if (cfg.top_k <= 0) {
+        return false;
+    }
+    size_t n_ok = 0;
+    for (size_t i = 0; i < cur_p->size; ++i) {
+        if (cur_p->data[i].logit == -INFINITY) {
+            continue;
+        }
+        if (!touched.empty() && std::binary_search(touched.begin(), touched.end(), cur_p->data[i].id)) {
+            continue;
+        }
+        ++n_ok;
+    }
+    return n_ok >= (size_t) cfg.top_k + cfg.n_extra + n_bound;
 }
 
 struct common_sampler * common_sampler_init(
@@ -705,31 +887,25 @@ struct common_sampler * common_sampler_init(
         LOG_DBG("%s: backend sampling kept until the lazy grammar triggers or the reasoning budget forces\n", __func__);
     }
 
-    // the chain's first top-k sees the raw logits: every sampler before it is a no-op for these parameters (penalties,
-    // dry, top-n-sigma disabled; no user logit bias; no mirostat), apart from the model's suppress tokens
-    bool first_top_k = false;
-    if (params.mirostat == 0 && params.logit_bias.empty() && params.top_k >= 1 &&
-            (params.penalty_last_n == 0 ||
-             (params.penalty_repeat == 1.0f && params.penalty_freq == 0.0f && params.penalty_present == 0.0f)) &&
-            (params.dry_multiplier == 0.0f || params.dry_base < 1.0f || params.dry_penalty_last_n == 0) &&
-            params.top_n_sigma <= 0.0f) {
-        for (const auto t : params.samplers) {
-            if (t == COMMON_SAMPLER_TYPE_TOP_K) {
-                first_top_k = true;
-                break;
-            }
-            if (t != COMMON_SAMPLER_TYPE_PENALTIES && t != COMMON_SAMPLER_TYPE_DRY && t != COMMON_SAMPLER_TYPE_TOP_N_SIGMA) {
-                break;
-            }
-        }
-    }
+    const bool first_top_k = common_sampler_first_top_k_raw(params);
 
     // Pre-trim for the grammar passes. Sized well above params.top_k so the
-    // trimmed set almost always still contains top_k grammar-valid candidates, which is the
+    // trimmed set almost always still contains enough grammar-valid candidates, which is the
     // condition under which the trim is exact rather than an approximation.
-    struct llama_sampler * pretrim = nullptr;
-    if (grmr && first_top_k) {
-        pretrim = llama_sampler_init_top_k(std::max(params.top_k * 32, 1024));
+    // [TAG_V0261_PRETRIM] the rule and the widths: common_sampler_pretrim_cfg
+    common_pretrim_cfg     pretrim_cfg;
+    struct llama_sampler * pretrim      = nullptr;
+    struct llama_sampler * pretrim_wide = nullptr;
+    if (grmr) {
+        int32_t n_suppress = 0;
+        const llama_token * suppress = llama_vocab_get_suppress_tokens(vocab, &n_suppress);
+        pretrim_cfg = common_sampler_pretrim_cfg(params, suppress, n_suppress, llama_vocab_n_tokens(vocab), v0261_pretrim_mode());
+        if (pretrim_cfg.top_k > 0) {
+            pretrim = llama_sampler_init_top_k((int32_t) pretrim_cfg.width);
+            if (pretrim_cfg.width_max > 0) {
+                pretrim_wide = llama_sampler_init_top_k((int32_t) pretrim_cfg.width_max);
+            }
+        }
     }
 
     // [TAG_FN_L4_HOST_TOPK] the fast candidate path: the chain's first top-k sees the raw logits, no grammar, no
@@ -761,6 +937,8 @@ struct common_sampler * common_sampler_init(
     };
     result->fast_k    = fast_k; // [TAG_FN_L4_HOST_TOPK]
     result->fast_excl = std::move(fast_excl);
+    result->grmr_pretrim_wide = pretrim_wide; // [TAG_V0261_PRETRIM]
+    result->pretrim           = std::move(pretrim_cfg);
 
     return result;
 }
@@ -774,6 +952,7 @@ void common_sampler_free(struct common_sampler * gsmpl) {
     llama_sampler_free(gsmpl->rbudget);
     llama_sampler_free(gsmpl->chain);
     llama_sampler_free(gsmpl->grmr_pretrim);
+    llama_sampler_free(gsmpl->grmr_pretrim_wide); // [TAG_V0261_PRETRIM]
 
     if (gsmpl->blk) {
         common_sampler_free(gsmpl->blk); // [TAG_FN_L3_MTP_BLOCK]
@@ -869,6 +1048,8 @@ struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
     res->cur_p.data = gsmpl->cur_p.data ? res->cur.data() : nullptr; // re-point to the clone's buffer
     res->fast_k     = gsmpl->fast_k;    // [TAG_FN_L4_HOST_TOPK]
     res->fast_excl  = gsmpl->fast_excl;
+    res->grmr_pretrim_wide = gsmpl->grmr_pretrim_wide ? llama_sampler_clone(gsmpl->grmr_pretrim_wide) : nullptr; // [TAG_V0261_PRETRIM]
+    res->pretrim           = gsmpl->pretrim;
 
     return res;
 }
@@ -949,6 +1130,58 @@ struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl) {
     }
 
     return gsmpl->chain;
+}
+
+// [TAG_V0261_PRETRIM] the tokens the chain may lower at this position, from the accepted history (prev holds every
+// token since the last reset while it is not full); false when no trim can keep enough of the others
+static bool common_sampler_pretrim_prepare(struct common_sampler * gsmpl) {
+    const auto & cfg  = gsmpl->pretrim;
+    const auto & prev = gsmpl->prev;
+    auto & hist = gsmpl->pretrim_hist;
+
+    const size_t n = std::min((size_t) std::max(cfg.last_n, 0), prev.size());
+    hist.resize(n);
+    for (size_t i = 0; i < n; ++i) {
+        hist[n - 1 - i] = prev.rat(i);
+    }
+    const bool hist_all = n == prev.size() && prev.size() < prev.capacity;
+
+    gsmpl->pretrim_bound = common_sampler_pretrim_touched(cfg, hist, hist_all, gsmpl->pretrim_touched);
+
+    return (size_t) cfg.top_k + cfg.n_extra + gsmpl->pretrim_bound <= std::max(cfg.width, cfg.width_max);
+}
+
+// [TAG_V0261_PRETRIM] the grammar over the top raw candidates only, the wider trim second. cur_p: the full set after the
+// reasoning budget. True: exact, cur_p holds the trimmed set with the grammar applied. False: cur_p is spent.
+static bool common_sampler_pretrim_grammar(struct common_sampler * gsmpl, struct llama_context * ctx, int idx) {
+    const auto & cfg = gsmpl->pretrim;
+    auto & cur_p = gsmpl->cur_p;
+
+    const size_t need = (size_t) cfg.top_k + cfg.n_extra + gsmpl->pretrim_bound;
+    bool spent = false;
+    for (int pass = 0; pass < 2; ++pass) {
+        struct llama_sampler * trim = pass == 0 ? gsmpl->grmr_pretrim : gsmpl->grmr_pretrim_wide;
+        if (trim == nullptr || need > (pass == 0 ? cfg.width : cfg.width_max)) {
+            continue;
+        }
+        if (spent) {
+            gsmpl->set_logits(ctx, idx);
+            llama_sampler_apply(gsmpl->rbudget, &cur_p);
+        }
+        spent = true;
+
+        llama_sampler_apply(trim,        &cur_p);
+        llama_sampler_apply(gsmpl->grmr, &cur_p);
+
+        // the trim leaves the candidates sorted; a lazy grammar that has not triggered keeps that flag and so does the
+        // logit bias, and the chain's top-k would then cut without sorting again
+        cur_p.sorted = false;
+
+        if (common_sampler_pretrim_exact(cfg, &cur_p, gsmpl->pretrim_touched, gsmpl->pretrim_bound)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first) {
@@ -1033,25 +1266,12 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
         // grammar-valid candidates survive, the chain's own top_k selects exactly the set
         // it would have selected from the full vocabulary. When fewer survive, that
         // guarantee does not hold and we redo the full pass.
-        // common_sampler_init only creates the trim when nothing before the chain's top_k changes the logits.
+        // [TAG_V0261_PRETRIM] the samplers before the chain's top_k may lower logits: the survivors they can touch do
+        // not count (common_sampler_pretrim_exact), and a wider second trim runs before the full pass.
         bool grammar_applied = false;
 
-        if (gsmpl->grmr_pretrim) {
-            llama_sampler_apply(gsmpl->grmr_pretrim, &cur_p);
-            llama_sampler_apply(grmr,                &cur_p);
-
-            size_t n_valid = 0;
-            for (size_t i = 0; i < cur_p.size; ++i) {
-                if (cur_p.data[i].logit != -INFINITY) {
-                    ++n_valid;
-                }
-            }
-
-            // the model's suppress tokens are only masked later, by the chain's logit bias
-            int32_t n_suppress = 0;
-            llama_vocab_get_suppress_tokens(llama_model_get_vocab(llama_get_model(ctx)), &n_suppress);
-
-            grammar_applied = n_valid >= (size_t) gsmpl->params.top_k + (size_t) n_suppress;
+        if (gsmpl->grmr_pretrim && common_sampler_pretrim_prepare(gsmpl)) {
+            grammar_applied = common_sampler_pretrim_grammar(gsmpl, ctx, idx);
 
             if (!grammar_applied) {
                 // not enough survived to guarantee exactness - restore and do it properly
@@ -1101,28 +1321,16 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     // it, so the chain's own top-k selects the same set either way and every subsequent sampler
     // (top_p / min_p / temp / dist) sees an identical candidate set and an identical
     // normalisation. When fewer survive that guarantee does not hold, so we redo the full pass.
-    // common_sampler_init only creates the trim when nothing before the chain's top-k changes the logits.
+    // [TAG_V0261_PRETRIM] with samplers that lower logits before the chain's top-k: common_sampler_pretrim_exact.
     bool resampled = false;
 
-    if (gsmpl->grmr_pretrim && grammar_should_apply(gsmpl)) {
+    if (gsmpl->grmr_pretrim && grammar_should_apply(gsmpl) && common_sampler_pretrim_prepare(gsmpl)) {
         gsmpl->set_logits(ctx, idx);
 
-        llama_sampler_apply(rbudget,             &cur_p);
-        llama_sampler_apply(gsmpl->grmr_pretrim, &cur_p);  // keep the top-K by logit
-        llama_sampler_apply(grmr,                &cur_p);  // grammar over K, not n_vocab
+        llama_sampler_apply(rbudget, &cur_p);
 
-        size_t n_valid = 0;
-        for (size_t i = 0; i < cur_p.size; ++i) {
-            if (cur_p.data[i].logit != -INFINITY) {
-                ++n_valid;
-            }
-        }
-
-        // the model's suppress tokens are only masked later, by the chain's logit bias
-        int32_t n_suppress = 0;
-        llama_vocab_get_suppress_tokens(llama_model_get_vocab(llama_get_model(ctx)), &n_suppress);
-
-        if (n_valid >= (size_t) gsmpl->params.top_k + (size_t) n_suppress) {
+        // keep the top-K by logit, grammar over K, not n_vocab
+        if (common_sampler_pretrim_grammar(gsmpl, ctx, idx)) {
             llama_sampler_apply(chain, &cur_p);
             resampled = true;
         }
