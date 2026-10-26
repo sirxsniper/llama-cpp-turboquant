@@ -98,13 +98,15 @@ static constexpr __host__ __device__ int get_vdr_mmvq(ggml_type type, bool vdr_u
 }
 
 // [TAG_SYNC_MMVQ_VDR] q2_K / q3_K / q6_K have a second vdr (upstream #30517, see vecdotq.cuh); the kernels below take it as
-// the vdr_up template flag. Default off: the vdr-1 kernels (v0.25.5 answers). GGML_CUDA_MMVQ_VDR2=1 launches upstream's vdr 2.
+// the vdr_up template flag. Default ON (owner 10-26: upstream's vdr 2, measured equal quality): GGML_CUDA_MMVQ_VDR2 unset or
+// non-zero launches the vdr-2 kernels; GGML_CUDA_MMVQ_VDR2=0 launches the vdr-1 kernels (v0.25.5 answers bit for bit, for
+// identity gates against v0.25.x).
 static constexpr __host__ __device__ bool mmvq_has_vdr_up(ggml_type type) {
     return type == GGML_TYPE_Q2_K || type == GGML_TYPE_Q3_K || type == GGML_TYPE_Q6_K;
 }
 
 static bool ggml_cuda_mmvq_vdr2() {
-    static const bool on = [] { const char * e = getenv("GGML_CUDA_MMVQ_VDR2"); return e != nullptr && atoi(e) != 0; }();
+    static const bool on = [] { const char * e = getenv("GGML_CUDA_MMVQ_VDR2"); return e == nullptr || e[0] == '\0' || atoi(e) != 0; }();
     return on;
 }
 
