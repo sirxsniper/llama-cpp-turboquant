@@ -174,9 +174,10 @@ common_pretrim_cfg common_sampler_pretrim_cfg(const common_params_sampling & par
 size_t common_sampler_pretrim_touched(const common_pretrim_cfg & cfg, const std::vector<llama_token> & hist,
         bool hist_all, std::vector<llama_token> & touched);
 
-// true when the trimmed candidates, grammar applied, keep top_k + n_extra + n_bound valid tokens outside touched
+// true when the trimmed candidates, grammar applied, keep top_k + n_extra + n_bound valid tokens outside touched.
+// n_valid (optional): the finite candidates; the full count when it returns false (the scan stops at the need)
 bool common_sampler_pretrim_exact(const common_pretrim_cfg & cfg, const llama_token_data_array * cur_p,
-        const std::vector<llama_token> & touched, size_t n_bound);
+        const std::vector<llama_token> & touched, size_t n_bound, size_t * n_valid = nullptr);
 
 // print the sampler chain into a string
 std::string common_sampler_print(const struct common_sampler * gsmpl);

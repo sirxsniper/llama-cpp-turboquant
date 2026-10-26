@@ -465,6 +465,16 @@ static int v0261_pretrim_mode() {
     return mode;
 }
 
+// [TAG_V0261_PRETRIM] LLAMA_V0261_PRETRIM_NARROW=1: the second trim also runs after a first trim that kept fewer valid
+// tokens than the top-k (c9b6c373c); default 0: the full pass right away there, as v0.25.5
+static bool v0261_pretrim_narrow() {
+    static const bool on = [] {
+        const char * e = std::getenv("LLAMA_V0261_PRETRIM_NARROW");
+        return e != nullptr && std::atoi(e) == 1;
+    }();
+    return on;
+}
+
 // the chain's first top-k sees the raw logits: every sampler before it is a no-op for these parameters (penalties,
 // dry, top-n-sigma disabled; no user logit bias; no mirostat), apart from the model's suppress tokens
 static bool common_sampler_first_top_k_raw(const common_params_sampling & params) {
@@ -614,23 +624,33 @@ size_t common_sampler_pretrim_touched(const common_pretrim_cfg & cfg, const std:
 
 // [TAG_V0261_PRETRIM] every token outside the trim has a raw logit at or below every token inside it, and the samplers
 // before the chain's top-k only lower logits, so top_k valid tokens inside it that they leave alone keep every token
-// outside it out of the chain's top-k set
+// outside it out of the chain's top-k set. The scan stops at the need (the trim leaves the best first, so usually
+// within the first few dozen); n_valid gets the finite candidates, the full count only when it returns false.
 bool common_sampler_pretrim_exact(const common_pretrim_cfg & cfg, const llama_token_data_array * cur_p,
-        const std::vector<llama_token> & touched, size_t n_bound) {
-    if (cfg.top_k <= 0) {
-        return false;
-    }
-    size_t n_ok = 0;
+        const std::vector<llama_token> & touched, size_t n_bound, size_t * n_valid) {
+    // without a top-k nothing passes: the scan then counts every finite candidate
+    const size_t need = cfg.top_k > 0 ? (size_t) cfg.top_k + cfg.n_extra + n_bound : SIZE_MAX;
+    size_t n_ok  = 0;
+    size_t n_fin = 0;
     for (size_t i = 0; i < cur_p->size; ++i) {
         if (cur_p->data[i].logit == -INFINITY) {
             continue;
         }
+        ++n_fin;
         if (!touched.empty() && std::binary_search(touched.begin(), touched.end(), cur_p->data[i].id)) {
             continue;
         }
-        ++n_ok;
+        if (++n_ok >= need) {
+            if (n_valid) {
+                *n_valid = n_fin;
+            }
+            return true;
+        }
     }
-    return n_ok >= (size_t) cfg.top_k + cfg.n_extra + n_bound;
+    if (n_valid) {
+        *n_valid = n_fin;
+    }
+    return false;
 }
 
 struct common_sampler * common_sampler_init(
@@ -1183,8 +1203,15 @@ static bool common_sampler_pretrim_grammar(struct common_sampler * gsmpl, struct
         // logit bias, and the chain's top-k would then cut without sorting again
         cur_p.sorted = false;
 
-        if (common_sampler_pretrim_exact(cfg, &cur_p, gsmpl->pretrim_touched, gsmpl->pretrim_bound)) {
+        size_t n_valid = 0;
+        if (common_sampler_pretrim_exact(cfg, &cur_p, gsmpl->pretrim_touched, gsmpl->pretrim_bound, &n_valid)) {
             return true;
+        }
+        // [TAG_V0261_PRETRIM] fewer valid tokens than the top-k at all: a narrow grammar position (a name, a closing tag,
+        // a bool / enum value) that the wider trim does not fill either, and where v0.25.5 also took the full pass. The
+        // second trim is for a shortfall from the touched tokens only. LLAMA_V0261_PRETRIM_NARROW=1: run it there too.
+        if (pass == 0 && n_valid < (size_t) cfg.top_k + cfg.n_extra && !v0261_pretrim_narrow()) {
+            break;
         }
     }
     return false;

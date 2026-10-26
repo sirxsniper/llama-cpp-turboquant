@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
 #include <cstdio>
 #include <random>
 #include <vector>
@@ -140,6 +141,8 @@ struct stats {
     int n_refused     = 0;
     int n_old_wrong   = 0; // v0.25.5 gate passed on the first trim, the result differed from the full pass
     int n_bound_cases = 0;
+    int n_skip2       = 0; // [TAG_V0261_PRETRIM] first trim kept fewer than top_k valid tokens: no second trim
+    int n_skip2_lost  = 0; // of those, the second trim would have been exact (speed only, the full pass is exact too)
 };
 
 // one case: the full pass against both trims; returns false when the parameters disable the trim
@@ -204,9 +207,12 @@ static bool run_case(const common_params_sampling & p, const std::vector<float> 
         }
         std::vector<llama_token_data> cur = trimmed(x, width, valid);
         llama_token_data_array a = { cur.data(), cur.size(), -1, false };
-        const bool exact = common_sampler_pretrim_exact(cfg, &a, touched, n_bound);
+        size_t n_valid = SIZE_MAX;
+        const bool exact = common_sampler_pretrim_exact(cfg, &a, touched, n_bound, &n_valid);
         const size_t n_ok = count_ok(cur, touched);
         check(exact == (n_ok >= need), "exact does not match the count of untouched valid tokens", it);
+        // the scan stops at the need: the valid count is complete only on a refusal
+        check(exact ? n_valid <= count_valid(cur) : n_valid == count_valid(cur), "n_valid of the exact check", it);
         // the coarse form of the rule (n_valid >= top_k + every token that may be touched) always passes the gate
         if (count_valid(cur) >= need + touched.size()) {
             check(exact, "refused although n_valid >= top_k + n_touch", it);
@@ -225,6 +231,15 @@ static bool run_case(const common_params_sampling & p, const std::vector<float> 
                 st.n_old_wrong++;
                 check(!exact, "new gate accepted a wrong result", it);
             }
+        }
+        // [TAG_V0261_PRETRIM] common_sampler_pretrim_grammar: the second trim runs only when the first kept at least
+        // top_k valid tokens (LLAMA_V0261_PRETRIM_NARROW unset)
+        if (pass == 0 && !exact && n_valid < (size_t) cfg.top_k + cfg.n_extra && cfg.width_max > 0) {
+            st.n_skip2++;
+            std::vector<llama_token_data> cur2 = trimmed(x, cfg.width_max, valid);
+            llama_token_data_array a2 = { cur2.data(), cur2.size(), -1, false };
+            st.n_skip2_lost += common_sampler_pretrim_exact(cfg, &a2, touched, n_bound) ? 1 : 0;
+            break;
         }
     }
     st.n_refused += done ? 0 : 1;
@@ -380,6 +395,29 @@ static void test_adversarial() {
         } else {
             check(st.n_refused == 1, "no second trim at 3000 tokens: full pass", n_vocab);
         }
+        check(st.n_skip2 == 0, "10 valid tokens in the first trim: the second trim runs", n_vocab);
+    }
+    // [TAG_V0261_PRETRIM] a narrow position: the first trim keeps 3 valid tokens, fewer than top_k 5. The second trim
+    // would be exact here, but such positions (names, closing tags, enum values) almost never fill it: full pass
+    {
+        const int n_vocab = 40000;
+        auto p = base_params();
+        p.top_k = 5;
+        std::vector<float> x(n_vocab);
+        for (int i = 0; i < n_vocab; ++i) {
+            x[i] = -0.001f * (float) i;
+        }
+        std::vector<char> valid(n_vocab, 0);
+        for (int i = 0; i < 3; ++i) {
+            valid[i] = 1;
+        }
+        for (int i = 1500; i < n_vocab; ++i) {
+            valid[i] = 1;
+        }
+        stats st;
+        check(run_case(p, x, valid, {}, {}, 64, 150, st), "narrow case disabled", 150);
+        check(st.n_skip2 == 1 && st.n_skip2_lost == 1 && st.n_refused == 1 && st.n_exact1 == 0 && st.n_exact2 == 0,
+                "narrow first trim: no second trim, full pass", 150);
     }
 }
 
@@ -551,8 +589,9 @@ int main() {
     }
 
     printf("%d cases (%d disabled): first trim exact %d, second trim exact %d, full pass %d, history bound in %d; "
-           "v0.25.5 gate wrong in %d\n", st.n_cases, n_disabled, st.n_exact1, st.n_exact2, st.n_refused,
-           st.n_bound_cases, st.n_old_wrong);
+           "v0.25.5 gate wrong in %d; second trim skipped (narrow) %d, of which it would have been exact %d\n",
+           st.n_cases, n_disabled, st.n_exact1, st.n_exact2, st.n_refused, st.n_bound_cases, st.n_old_wrong,
+           st.n_skip2, st.n_skip2_lost);
     check(st.n_exact1 > 0 && st.n_refused > 0, "both outcomes taken", -1);
     printf("%s\n", n_fail == 0 ? "PASS" : "FAILED");
     return n_fail == 0 ? 0 : 1;
