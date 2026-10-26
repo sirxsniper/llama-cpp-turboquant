@@ -29,6 +29,10 @@ struct common_speculative;
 
 struct server_keepctx_params {
     std::string dir;          // folder of the store files
+    // [TAG_V0261_KEEPCTX_DIR] outside Windows: a folder that is a symbolic link or belongs to another user turns the store
+    // off; false (a folder the user set, LLAMA_FN_L18_KEEPCTX_DIR): only a warning, the files are still created with
+    // O_EXCL | O_NOFOLLOW
+    bool        dir_strict = true;
     uint64_t    budget = 0;   // bytes on disk for all conversations
     int32_t     n_max  = 4;   // conversations kept
     bool        verify = false; // after a restore, compare a hash of the restored states with the stored bytes (tests)
@@ -144,6 +148,9 @@ int keepctx_spill_validate(const server_tokens & tokens, std::vector<server_keep
 // SSD, writable, with at least need_free bytes free; else <TEMP>/llama-keepctx as before (<TEMP>/llama-keepctx-<uid> outside
 // Windows). why: the reason, for the log
 std::string keepctx_default_dir(const std::string & model_path, uint64_t need_free, std::string & why);
+
+// [TAG_V0261_KEEPCTX_DIR] <TEMP>/llama-keepctx; per_user: <TEMP>/llama-keepctx-<euid> outside Windows (a shared /tmp)
+std::string keepctx_temp_dir(bool per_user);
 
 // [TAG_FN_L19_CONVSTORE_SPILL] the checkpoints of a slot's conversation that its ring dropped, each in its own file (shared
 // with the stored conversations that hold it, deleted with its last holder, so the disk holds only the ones kept). They

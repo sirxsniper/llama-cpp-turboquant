@@ -4439,7 +4439,11 @@ private:
     // prefix replaces a slot's conversation, the conversation goes to a store on disk; a later prompt that continues a
     // stored conversation further than the slot content gets it back (server-keepctx.h). Off beside the RAM prompt cache
     // (--cache-ram), which keeps conversations itself.
-    //   LLAMA_FN_L18_KEEPCTX_DIR       folder of the store files (default: <temp>/llama-keepctx)
+    //   LLAMA_FN_L18_KEEPCTX_DIR       folder of the store files (default: <temp>/llama-keepctx, outside Windows
+    //                                  <temp>/llama-keepctx-<euid>). [TAG_V0261_KEEPCTX_DIR] A set folder that is a symbolic
+    //                                  link or belongs to another user is used with a warning, the default one is refused;
+    //                                  LLAMA_V0261_KEEPCTX_DIR=0 refuses both and gives LLAMA_FN_V0254_STORE_DIR=0 the
+    //                                  shared <temp>/llama-keepctx again (PR #1)
     //   LLAMA_FN_L18_KEEPCTX_DISK_MIB  disk budget of all stored conversations (default 32768)
     //   LLAMA_FN_L18_KEEPCTX_N         conversations kept (default 4)
     //   LLAMA_FN_L18_KEEPCTX_MIN       tokens a conversation must lose to be stored, and gain to be restored (default 512)
@@ -4522,15 +4526,17 @@ private:
         server_keepctx_params kp;
         kp.budget   = (uint64_t) std::max<long long>(0, env_ll("LLAMA_FN_L18_KEEPCTX_DISK_MIB", 32768)) * 1024 * 1024;
         std::string dir_why = "LLAMA_FN_L18_KEEPCTX_DIR";
+        const bool v0261_dir = env_ll("LLAMA_V0261_KEEPCTX_DIR", 1) != 0; // [TAG_V0261_KEEPCTX_DIR]
         if (const char * d = llama_model_fn_env(model_tgt, "LLAMA_FN_L18_KEEPCTX_DIR"); d && *d) {
-            kp.dir = d;
+            kp.dir        = d;
+            kp.dir_strict = !v0261_dir;
         } else if (env_ll("LLAMA_FN_V0254_STORE_DIR", 1) != 0) {
             // [TAG_FN_V0254_STORE] beside the model when it is on another fixed SSD (O8: the TEMP drive stalled the stores)
             kp.dir = keepctx_default_dir(params_base.model.path, kp.budget + ((uint64_t) 8 << 30), dir_why);
         } else {
-            std::error_code ec;
-            const auto tmp = std::filesystem::temp_directory_path(ec);
-            kp.dir = ((ec ? std::filesystem::path(".") : tmp) / "llama-keepctx").string();
+            // <temp>/llama-keepctx; outside Windows one folder per user like keepctx_default_dir, since the store refuses
+            // a default folder another user owns
+            kp.dir = keepctx_temp_dir(v0261_dir);
             dir_why = "the TEMP folder (LLAMA_FN_V0254_STORE_DIR=0)";
         }
         kp.n_max    = (int32_t) std::max<long long>(1, env_ll("LLAMA_FN_L18_KEEPCTX_N", 4));

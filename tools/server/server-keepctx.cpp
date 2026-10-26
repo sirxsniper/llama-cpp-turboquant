@@ -561,8 +561,14 @@ server_keepctx::server_keepctx(const server_keepctx_params & params) : params_(p
     // the file names are predictable: another user must not be able to put files or links in the folder
     struct stat st = {};
     if (lstat(params_.dir.c_str(), &st) != 0 || S_ISLNK(st.st_mode) || st.st_uid != geteuid()) {
-        SRV_ERR("[TAG_FN_L18_KEEPCTX] the store folder '%s' is a symbolic link or belongs to another user\n", params_.dir.c_str());
-        return;
+        // [TAG_V0261_KEEPCTX_DIR] refused for the default folder only: a folder the user set may be a link to a cache
+        // drive or a mount another uid owns, and O_EXCL | O_NOFOLLOW keeps the writes off planted names there
+        if (params_.dir_strict) {
+            SRV_ERR("[TAG_FN_L18_KEEPCTX] the store folder '%s' is a symbolic link or belongs to another user\n", params_.dir.c_str());
+            return;
+        }
+        SRV_WRN("[TAG_V0261_KEEPCTX_DIR] the store folder '%s' is a symbolic link or belongs to another user; used because "
+                "it was set (LLAMA_FN_L18_KEEPCTX_DIR)\n", params_.dir.c_str());
     }
 #endif
     // files of a process that ended without closing them (power loss): a file still open elsewhere cannot be removed
@@ -1535,6 +1541,20 @@ static bool kc_volume_info(const std::filesystem::path & p, std::wstring & vol, 
     return ok_dn && ok_sp;
 }
 #endif
+
+std::string keepctx_temp_dir(bool per_user) {
+    std::error_code ec;
+    const auto tmp = std::filesystem::temp_directory_path(ec);
+    std::string dir = ((ec ? std::filesystem::path(".") : tmp) / "llama-keepctx").string();
+#if !defined(_WIN32)
+    if (per_user) {
+        dir += string_format("-%lu", (unsigned long) geteuid());
+    }
+#else
+    (void) per_user;
+#endif
+    return dir;
+}
 
 std::string keepctx_default_dir(const std::string & model_path, uint64_t need_free, std::string & why) {
     std::error_code ec;
