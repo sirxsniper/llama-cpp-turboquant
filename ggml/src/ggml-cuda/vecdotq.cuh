@@ -363,9 +363,10 @@ static __device__ __forceinline__ float vec_dot_nvfp4_q8_1(
 // [TAG_SYNC_MMVQ_VDR] upstream #30517 raised the MMVQ vdr of q2_K / q3_K / q6_K from 1 to 2: each thread sums two ints of
 // a row in int32 before the float multiply and the K loop hands the threads other blocks, so the float sums are grouped
 // differently (other last bits: 27B Q5_K_XL plain decode KLD 4.0e-4 vs vdr 1, PPL equal within noise; Flash-Next MTP
-// drafts, Flint Q4 and Muse-Glimmer answers moved). The fork keeps vdr 1 = the v0.25.5 answers bit for bit (the integer
-// sums are exact at either vdr, the vdr-1 instance of upstream's code gives KLD 0 vs v0.25.5); GGML_CUDA_MMVQ_VDR2=1 runs
-// upstream's vdr 2 (mmvq.cu launches the _UP instance; plain decode of Q6_K-heavy models ~2 % faster).
+// drafts, Flint Q4 and Muse-Glimmer answers moved). Both instances are kept: VDR_*_MMVQ = 1 (the v0.25.5 answers bit for
+// bit; the integer sums are exact at either vdr, the vdr-1 instance of upstream's code gives KLD 0 vs v0.25.5) and
+// VDR_*_MMVQ_UP = 2 (upstream). Since v0.26.0 mmvq.cu launches the _UP instance by DEFAULT (owner 10-26; plain decode of
+// Q6_K-heavy models ~2 % faster, PPL / KLD equal within noise); GGML_CUDA_MMVQ_VDR2=0 switches back to vdr 1.
 #define VDR_Q2_K_Q8_1_MMVQ    1
 #define VDR_Q2_K_Q8_1_MMVQ_UP 2
 #define VDR_Q2_K_Q8_1_MMQ  4
