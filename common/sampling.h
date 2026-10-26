@@ -158,6 +158,31 @@ llama_token common_sampler_last(const struct common_sampler * gsmpl);
 bool common_sampler_fn_l4_topk_row(const float * x, int n, int K, const std::vector<llama_token> & excl,
         std::vector<llama_token_data> & out);
 
+// [TAG_R28_PENFAST] the fast candidate path with penalties and a logit bias before the chain's top-k: those samplers move
+// only the tokens of the penalty windows and the biased tokens, so the chain's top-k set lies inside {the top_k best raw
+// tokens outside them} U {them}. The unchanged chain runs over that set; exact when the top-k order there is unique, else
+// the full path. Raising penalties and positive biases are covered too (the moved tokens are all in the set).
+// LLAMA_R28_PENFAST=0: off (v0.26.3).
+struct common_penfast_cfg {
+    int32_t top_k   = 0;              // the chain's top-k, 0: off
+    int32_t i_top_k = -1;             // index of the chain's first top-k sampler
+    std::vector<int32_t>     i_pen;   // indices of the penalties samplers before it
+    std::vector<llama_token> fixed;   // sorted, unique, in the vocabulary: the tokens the logit bias lists
+};
+
+// the configuration for this chain, built by common_sampler_init from params; top_k == 0 when the path is not exact for
+// it (mirostat, n_probs, top_k outside 1..128, a token listed twice in the logit bias, a sampler other than the logit
+// bias, penalties or a no-op before the top-k). Grammar, reasoning budget and the switch are the caller's.
+common_penfast_cfg common_sampler_penfast_cfg(const common_params_sampling & params, struct llama_sampler * chain,
+        const llama_token * suppress, int32_t n_suppress, int32_t n_vocab);
+
+// the chain over the candidate set of one logits row. True: cur_p is the chain's result (after_top_k: the state right
+// after its top-k, for tests). False: not exact here, nothing with state has run, the caller takes the full path.
+// excl and cur are scratch; cur_p points into cur.
+bool common_sampler_penfast_apply(const common_penfast_cfg & cfg, struct llama_sampler * chain, const float * logits,
+        int n_vocab, bool after_top_k, std::vector<llama_token> & excl, std::vector<llama_token_data> & cur,
+        llama_token_data_array & cur_p);
+
 // [TAG_V0261_PRETRIM] the grammar pre-trim of common_sampler_sample: the grammar runs over the top raw candidates only.
 // The samplers before the chain's top-k can only lower logits there (penalties, DRY, negative bias, suppress tokens), so
 // the chain's top-k set is the full-vocabulary one when the trim keeps top_k grammar-valid tokens they do not touch.

@@ -336,6 +336,16 @@ LLAMA_API bool llama_fn_l4_host_flag(const struct llama_model * model, const cha
 // [TAG_FN_L4_HOST] the value of one switch only (no umbrella): def unless the model is qwen4exp and the switch is set
 LLAMA_API int llama_fn_l4_int(const struct llama_model * model, const char * name, int def);
 
+// [TAG_R28_PENFAST] the window of a penalties sampler: the distinct tokens its next apply moves, i.e. every token with a
+// non-zero count among the last penalty_last_n accepted ones. Writes at most cap of them to out (out may be null when cap
+// is 0) and returns how many there are; -1 when smpl is not an active penalties sampler.
+LLAMA_API int32_t llama_sampler_penalties_window(const struct llama_sampler * smpl, llama_token * out, int32_t cap);
+
+// [TAG_R28_PENFAST] llama_sampler_apply(chain, cur_p) restricted to the samplers [i0, i1) of the chain, with the chain's own
+// rule for samplers the backend already ran (skipped while every sampler before them was one too): applying [0, i) and
+// then [i, n) is one apply of the chain.
+LLAMA_API void llama_sampler_chain_apply_range(struct llama_sampler * chain, llama_token_data_array * cur_p, int32_t i0, int32_t i1);
+
 // [TAG_FN_L4_HOST_PLEPRE] LLAMA_FN_L4_HOST_PLEPRE (qwen4exp with PLE direct I/O): a helper thread reads the PLE rows of
 // toks[i_first..n), which a coming decode of seq_id holds at positions pos0 + i, into the row cache (predecessors: the
 // earlier toks, else the KV cells). A hint only: the decode computes and reads its own rows as before. No-op otherwise.

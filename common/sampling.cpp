@@ -15,7 +15,9 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <random>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -123,6 +125,154 @@ bool common_sampler_fn_l4_topk_row(const float * x, int n, int K, const std::vec
         return false;
     }
     out.assign(top, top + K);
+    return true;
+}
+
+// [TAG_R28_PENFAST] LLAMA_R28_PENFAST: 1 (default) the fast candidate path with penalties / a logit bias, 0 off (v0.26.3)
+static bool r28_penfast_enabled() {
+    static const bool on = [] {
+        const char * e = std::getenv("LLAMA_R28_PENFAST");
+        return !(e != nullptr && e[0] != 0 && std::atoi(e) == 0);
+    }();
+    return on;
+}
+
+// [TAG_R28_PENFAST] the most moved tokens (penalty windows + biased tokens) the fast path takes; penalty_last_n is 64 by default
+static constexpr size_t R28_PENFAST_MAX_MOVED = 1024;
+
+// [TAG_R28_PENFAST] see sampling.h
+common_penfast_cfg common_sampler_penfast_cfg(const common_params_sampling & params, struct llama_sampler * chain,
+        const llama_token * suppress, int32_t n_suppress, int32_t n_vocab) {
+    // mirostat builds no top-k; token probabilities to report read more than the chain leaves; top_k <= 128: the
+    // std::partial_sort branch of the top-k sampler and the limit of common_sampler_fn_l4_topk_row
+    if (chain == nullptr || params.mirostat != 0 || params.n_probs != 0 || params.top_k < 1 || params.top_k > 128 ||
+            n_vocab <= params.top_k) {
+        return common_penfast_cfg();
+    }
+
+    // the logit bias as common_sampler_init merges it (user biases + suppress tokens). A token listed twice gets only its
+    // first bias once the candidates are not in id order (llama_sampler_logit_bias_apply): full path.
+    std::vector<llama_token> fixed;
+    fixed.reserve(params.logit_bias.size() + (size_t) std::max(n_suppress, 0));
+    for (const auto & lb : params.logit_bias) {
+        fixed.push_back(lb.token);
+    }
+    for (int32_t i = 0; i < n_suppress; ++i) {
+        fixed.push_back(suppress[i]);
+    }
+    std::sort(fixed.begin(), fixed.end());
+    if (std::adjacent_find(fixed.begin(), fixed.end()) != fixed.end()) {
+        return common_penfast_cfg();
+    }
+    // ids outside the vocabulary match no candidate in either pass
+    fixed.erase(std::remove_if(fixed.begin(), fixed.end(), [n_vocab](llama_token t) { return t < 0 || t >= n_vocab; }),
+            fixed.end());
+    if (fixed.size() > R28_PENFAST_MAX_MOVED) {
+        return common_penfast_cfg();
+    }
+
+    // the samplers before the first top-k: the logit bias, penalties, and samplers that are no-ops for these parameters
+    // (llama_sampler_init_empty names them "?..."). Anything else before it (DRY, top-n-sigma, typical, XTC,
+    // temperature, top-p, min-p, infill) keeps the full path; after it every sampler sees identical candidates.
+    std::vector<int32_t> i_pen;
+    const int32_t n = llama_sampler_chain_n(chain);
+    for (int32_t i = 0; i < n; ++i) {
+        const char * nm = llama_sampler_name(llama_sampler_chain_get(chain, i));
+        std::string s = nm != nullptr ? nm : "";
+        if (!s.empty() && (s[0] == '+' || s[0] == '-')) {
+            s.erase(0, 1); // the backend's support marker
+        }
+        if (s == "top-k") {
+            common_penfast_cfg cfg;
+            cfg.top_k   = params.top_k;
+            cfg.i_top_k = i;
+            cfg.i_pen   = std::move(i_pen);
+            cfg.fixed   = std::move(fixed);
+            return cfg;
+        }
+        if (s == "penalties") {
+            i_pen.push_back(i);
+            continue;
+        }
+        if (s == "logit-bias" || s == "?penalties" || s == "?dry" || s == "?top-n-sigma") {
+            continue;
+        }
+        break;
+    }
+    return common_penfast_cfg();
+}
+
+// [TAG_R28_PENFAST] see sampling.h. Exactness: the samplers before the top-k move only the tokens in excl, so every token
+// outside the candidate set keeps its raw logit, which common_sampler_fn_l4_topk_row leaves strictly below the K-th of
+// the K best raw logits outside excl; those K are in the set, unmoved. The chain's top-k set over the full row is then
+// inside the set, and when the K best logits of the set are strictly ordered and strictly above the rest of it, the
+// top-k sampler leaves the same K candidates in the same order in both passes; every sampler after it (top-p, min-p,
+// temperature, dist with its RNG) then sees identical input.
+bool common_sampler_penfast_apply(const common_penfast_cfg & cfg, struct llama_sampler * chain, const float * logits,
+        int n_vocab, bool after_top_k, std::vector<llama_token> & excl, std::vector<llama_token_data> & cur,
+        llama_token_data_array & cur_p) {
+    if (cfg.top_k <= 0 || cfg.i_top_k < 0 || chain == nullptr || logits == nullptr || n_vocab <= cfg.top_k) {
+        return false;
+    }
+
+    // the tokens the samplers before the top-k may move: the biased ones and every penalty window
+    excl.assign(cfg.fixed.begin(), cfg.fixed.end());
+    for (const int32_t i : cfg.i_pen) {
+        const llama_sampler * pen = llama_sampler_chain_get(chain, i);
+        const int32_t nw = llama_sampler_penalties_window(pen, nullptr, 0);
+        if (nw < 0 || excl.size() + (size_t) nw > R28_PENFAST_MAX_MOVED) {
+            return false;
+        }
+        const size_t at = excl.size();
+        excl.resize(at + (size_t) nw);
+        if (nw > 0 && llama_sampler_penalties_window(pen, excl.data() + at, nw) != nw) {
+            return false;
+        }
+    }
+    std::sort(excl.begin(), excl.end());
+    excl.erase(std::unique(excl.begin(), excl.end()), excl.end());
+    excl.erase(std::remove_if(excl.begin(), excl.end(), [n_vocab](llama_token t) { return t < 0 || t >= n_vocab; }),
+            excl.end());
+
+    // the K best raw logits outside excl, strictly descending, no tie at the K-th place, no NaN anywhere in the row
+    if (!common_sampler_fn_l4_topk_row(logits, n_vocab, cfg.top_k, excl, cur)) {
+        return false;
+    }
+    // a +inf raw logit: the full path (where the NaN guard of common_sampler_sample sees the row)
+    if (std::isinf(cur[0].logit)) {
+        return false;
+    }
+    cur.reserve(cur.size() + excl.size());
+    for (const llama_token t : excl) {
+        const float v = logits[t];
+        if (std::isnan(v) || (std::isinf(v) && v > 0.0f)) {
+            return false;
+        }
+        cur.push_back(llama_token_data{ t, v, 0.0f });
+    }
+    cur_p = { cur.data(), cur.size(), -1, false };
+
+    // the logit bias, the penalties and the no-ops before the top-k; their apply changes no state
+    llama_sampler_chain_apply_range(chain, &cur_p, 0, cfg.i_top_k);
+
+    // the top-k order over the set is unique: the K best strictly descending, the K-th strictly above the next
+    const size_t K = (size_t) cfg.top_k;
+    std::vector<float> v(cur_p.size);
+    for (size_t i = 0; i < cur_p.size; ++i) {
+        v[i] = cur_p.data[i].logit;
+        if (std::isnan(v[i])) {
+            return false;
+        }
+    }
+    const size_t m = std::min(K + 1, v.size());
+    std::partial_sort(v.begin(), v.begin() + (std::ptrdiff_t) m, v.end(), std::greater<float>());
+    for (size_t j = 1; j < m; ++j) {
+        if (!(v[j - 1] > v[j])) {
+            return false;
+        }
+    }
+
+    llama_sampler_chain_apply_range(chain, &cur_p, cfg.i_top_k, after_top_k ? cfg.i_top_k + 1 : INT32_MAX);
     return true;
 }
 
@@ -366,6 +516,21 @@ struct common_sampler {
         return true;
     }
 
+    // [TAG_R28_PENFAST] the fast candidate path with penalties / a logit bias, the chain included. True: cur_p is the
+    // chain's result (the caller does not apply it again). False: nothing with state ran; set_logits() + the chain.
+    bool sample_penfast(struct llama_context * ctx, int idx) {
+        if (llama_get_sampled_probs_ith(ctx, idx) != nullptr || llama_get_sampled_logits_ith(ctx, idx) != nullptr ||
+                llama_get_sampled_token_ith(ctx, idx) != LLAMA_TOKEN_NULL) {
+            return false;
+        }
+        const float * logits = llama_get_logits_ith(ctx, idx);
+        if (logits == nullptr) {
+            return false;
+        }
+        const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx)));
+        return common_sampler_penfast_apply(penfast, chain, logits, n_vocab, false, penfast_excl, cur, cur_p);
+    }
+
     common_time_meas tm() {
         return common_time_meas(t_total_us, params.no_perf);
     }
@@ -380,6 +545,10 @@ struct common_sampler {
     // logit-bias sampler sets to -inf (sorted)
     int                      fast_k = 0;
     std::vector<llama_token> fast_excl;
+
+    // [TAG_R28_PENFAST] the fast candidate path with penalties / a logit bias (top_k 0: off) and its scratch
+    common_penfast_cfg       penfast;
+    std::vector<llama_token> penfast_excl;
 
     // [TAG_FN_L21_NANGUARD] rows seen with NaN / +inf logits since the last take (last: the aggregate inits above)
     uint32_t n_nonfinite = 0;
@@ -947,6 +1116,16 @@ struct common_sampler * common_sampler_init(
         std::sort(fast_excl.begin(), fast_excl.end());
     }
 
+    // [TAG_R28_PENFAST] penalties (Kyro's presence penalty 1.5) or a user logit bias switch the path above off: the full
+    // 248K array, the penalties over all of it and a partial sort per sample (srv.sample 1.7 ms vs 0.1 ms on Flash-Next).
+    // This path is exact (common_sampler_penfast_apply), so all models; no grammar, no reasoning budget.
+    common_penfast_cfg penfast;
+    if (fast_k == 0 && r28_penfast_enabled() && grmr == nullptr && rbudget == nullptr) {
+        int32_t n_suppress = 0;
+        const llama_token * suppress = llama_vocab_get_suppress_tokens(vocab, &n_suppress);
+        penfast = common_sampler_penfast_cfg(params, chain, suppress, n_suppress, llama_vocab_n_tokens(vocab));
+    }
+
     // Keep verifier randomness independent from both target and draft sampling.
     const uint32_t speculative_seed = llama_sampler_get_seed(chain) ^ 0x9e3779b9U;
     auto * result = new common_sampler {
@@ -963,6 +1142,7 @@ struct common_sampler * common_sampler_init(
     };
     result->fast_k    = fast_k; // [TAG_FN_L4_HOST_TOPK]
     result->fast_excl = std::move(fast_excl);
+    result->penfast   = std::move(penfast); // [TAG_R28_PENFAST]
     result->grmr_pretrim_wide = pretrim_wide; // [TAG_V0261_PRETRIM]
     result->pretrim           = std::move(pretrim_cfg);
 
@@ -1074,6 +1254,7 @@ struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
     res->cur_p.data = gsmpl->cur_p.data ? res->cur.data() : nullptr; // re-point to the clone's buffer
     res->fast_k     = gsmpl->fast_k;    // [TAG_FN_L4_HOST_TOPK]
     res->fast_excl  = gsmpl->fast_excl;
+    res->penfast    = gsmpl->penfast;   // [TAG_R28_PENFAST]
     res->grmr_pretrim_wide = gsmpl->grmr_pretrim_wide ? llama_sampler_clone(gsmpl->grmr_pretrim_wide) : nullptr; // [TAG_V0261_PRETRIM]
     res->pretrim           = gsmpl->pretrim;
 
@@ -1102,6 +1283,7 @@ void common_sampler_copy(const common_sampler * src, common_sampler * dst) {
     dst->t_total_us = src->t_total_us;
     dst->fast_k     = src->fast_k;    // [TAG_FN_L4_HOST_TOPK]
     dst->fast_excl  = src->fast_excl;
+    dst->penfast    = src->penfast;   // [TAG_R28_PENFAST]
 }
 
 void common_perf_print(const struct llama_context * ctx, const struct common_sampler * gsmpl) {
@@ -1231,7 +1413,13 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     auto & cur_p = gsmpl->cur_p; // initialized by set_logits
 
     // [TAG_FN_L4_HOST_TOPK] the K candidates straight from the row when that is exact, else the full array
-    if (gsmpl->fast_k <= 0 || !gsmpl->set_logits_fast(ctx, idx)) {
+    // [TAG_R28_PENFAST] with penalties / a logit bias: the whole chain over the candidate set when that is exact
+    bool chain_done = false;
+    if (gsmpl->fast_k > 0 && gsmpl->set_logits_fast(ctx, idx)) {
+        // cur_p: the state the chain's top-k leaves
+    } else if (gsmpl->penfast.top_k > 0 && gsmpl->sample_penfast(ctx, idx)) {
+        chain_done = true;
+    } else {
         gsmpl->set_logits(ctx, idx);
     }
 
@@ -1240,7 +1428,8 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     // masked logit, so only NaN and +inf count. The caller takes the count (common_sampler_take_nonfinite) and reacts.
     {
         static const bool l21_nanguard = [] { const char * e = getenv("LLAMA_FN_L21_NANGUARD"); return !(e && e[0] && atoi(e) == 0); }();
-        if (l21_nanguard && cur_p.size > 0) {
+        // [TAG_R28_PENFAST] chain_done: the row has no NaN and no +inf (checked), the full path counts nothing either
+        if (l21_nanguard && cur_p.size > 0 && !chain_done) {
             const size_t n = cur_p.size;
             bool bad = false;
             for (int k = 0; k < 9 && !bad; ++k) {
@@ -1318,7 +1507,9 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
         }
     }
 
-    llama_sampler_apply(chain, &cur_p);
+    if (!chain_done) { // [TAG_R28_PENFAST]
+        llama_sampler_apply(chain, &cur_p);
+    }
 
     id = cur_p.data[cur_p.selected].id;
 

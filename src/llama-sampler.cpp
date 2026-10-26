@@ -992,6 +992,34 @@ void llama_sampler_chain_add(struct llama_sampler * chain, struct llama_sampler 
     });
 }
 
+// [TAG_R28_PENFAST] see llama-ext.h: the loop of llama_sampler_chain_apply, applying only the samplers in [i0, i1)
+void llama_sampler_chain_apply_range(struct llama_sampler * chain, llama_token_data_array * cur_p, int32_t i0, int32_t i1) {
+    GGML_ASSERT(chain != nullptr && chain->iface == &llama_sampler_chain_i);
+    auto * ctx = (llama_sampler_chain *) chain->ctx;
+
+    time_meas tm(ctx->t_sample_us, ctx->params.no_perf);
+
+    const int32_t n = (int32_t) ctx->samplers.size();
+    i1 = std::min(i1, n);
+
+    bool is_backend = ctx->is_init;
+
+    for (int32_t i = 0; i < i1; ++i) {
+        auto & smpl = ctx->samplers[i];
+        if (is_backend && smpl.is_backend) {
+            continue;
+        }
+
+        is_backend = false;
+
+        if (i < i0 || smpl.ptr->iface->apply == nullptr) {
+            continue;
+        }
+
+        llama_sampler_apply(smpl.ptr, cur_p);
+    }
+}
+
 struct llama_sampler * llama_sampler_chain_get(struct llama_sampler * chain, int32_t i) {
     if (chain == nullptr) {
         return nullptr;
@@ -3285,6 +3313,25 @@ struct llama_sampler * llama_sampler_init_penalties(
             penalty_freq,
             penalty_present)
     );
+}
+
+// [TAG_R28_PENFAST] see llama-ext.h
+int32_t llama_sampler_penalties_window(const struct llama_sampler * smpl, llama_token * out, int32_t cap) {
+    if (smpl == nullptr || smpl->iface != &llama_sampler_penalties_i) {
+        return -1;
+    }
+    const auto * ctx = (const llama_sampler_penalties *) smpl->ctx;
+    if (ctx->is_disabled()) {
+        return -1;
+    }
+    int32_t n = 0;
+    for (const auto & it : ctx->token_count) {
+        if (out != nullptr && n < cap) {
+            out[n] = it.first;
+        }
+        n++;
+    }
+    return n;
 }
 
 // top-n-sigma
