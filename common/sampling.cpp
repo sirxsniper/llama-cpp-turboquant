@@ -137,6 +137,15 @@ static bool r28_penfast_enabled() {
     return on;
 }
 
+// [TAG_R29_GRAMFAST] LLAMA_R29_GRAMFAST: 1 (default) the candidate-set path with a grammar / a reasoning budget, 0 off (v0.26.4)
+static bool r29_gramfast_enabled() {
+    static const bool on = [] {
+        const char * e = std::getenv("LLAMA_R29_GRAMFAST");
+        return !(e != nullptr && e[0] != 0 && std::atoi(e) == 0);
+    }();
+    return on;
+}
+
 // [TAG_R28_PENFAST] the most moved tokens (penalty windows + biased tokens) the fast path takes; penalty_last_n is 64 by default
 static constexpr size_t R28_PENFAST_MAX_MOVED = 1024;
 
@@ -202,20 +211,10 @@ common_penfast_cfg common_sampler_penfast_cfg(const common_params_sampling & par
     return common_penfast_cfg();
 }
 
-// [TAG_R28_PENFAST] see sampling.h. Exactness: the samplers before the top-k move only the tokens in excl, so every token
-// outside the candidate set keeps its raw logit, which common_sampler_fn_l4_topk_row leaves strictly below the K-th of
-// the K best raw logits outside excl; those K are in the set, unmoved. The chain's top-k set over the full row is then
-// inside the set, and when the K best logits of the set are strictly ordered and strictly above the rest of it, the
-// top-k sampler leaves the same K candidates in the same order in both passes; every sampler after it (top-p, min-p,
-// temperature, dist with its RNG) then sees identical input.
-bool common_sampler_penfast_apply(const common_penfast_cfg & cfg, struct llama_sampler * chain, const float * logits,
-        int n_vocab, bool after_top_k, std::vector<llama_token> & excl, std::vector<llama_token_data> & cur,
-        llama_token_data_array & cur_p) {
-    if (cfg.top_k <= 0 || cfg.i_top_k < 0 || chain == nullptr || logits == nullptr || n_vocab <= cfg.top_k) {
-        return false;
-    }
-
-    // the tokens the samplers before the top-k may move: the biased ones and every penalty window
+// [TAG_R28_PENFAST] the tokens the samplers before the top-k may move: the biased ones and every penalty window; sorted,
+// unique, in the vocabulary. False: more than R28_PENFAST_MAX_MOVED of them or a window that cannot be read
+static bool penfast_moved(const common_penfast_cfg & cfg, struct llama_sampler * chain, int n_vocab,
+        std::vector<llama_token> & excl) {
     excl.assign(cfg.fixed.begin(), cfg.fixed.end());
     for (const int32_t i : cfg.i_pen) {
         const llama_sampler * pen = llama_sampler_chain_get(chain, i);
@@ -233,6 +232,26 @@ bool common_sampler_penfast_apply(const common_penfast_cfg & cfg, struct llama_s
     excl.erase(std::unique(excl.begin(), excl.end()), excl.end());
     excl.erase(std::remove_if(excl.begin(), excl.end(), [n_vocab](llama_token t) { return t < 0 || t >= n_vocab; }),
             excl.end());
+    return true;
+}
+
+// [TAG_R28_PENFAST] see sampling.h. Exactness: the samplers before the top-k move only the tokens in excl, so every token
+// outside the candidate set keeps its raw logit, which common_sampler_fn_l4_topk_row leaves strictly below the K-th of
+// the K best raw logits outside excl; those K are in the set, unmoved. The chain's top-k set over the full row is then
+// inside the set, and when the K best logits of the set are strictly ordered and strictly above the rest of it, the
+// top-k sampler leaves the same K candidates in the same order in both passes; every sampler after it (top-p, min-p,
+// temperature, dist with its RNG) then sees identical input.
+bool common_sampler_penfast_apply(const common_penfast_cfg & cfg, struct llama_sampler * chain, const float * logits,
+        int n_vocab, bool after_top_k, std::vector<llama_token> & excl, std::vector<llama_token_data> & cur,
+        llama_token_data_array & cur_p) {
+    if (cfg.top_k <= 0 || cfg.i_top_k < 0 || chain == nullptr || logits == nullptr || n_vocab <= cfg.top_k) {
+        return false;
+    }
+
+    // the tokens the samplers before the top-k may move: the biased ones and every penalty window
+    if (!penfast_moved(cfg, chain, n_vocab, excl)) {
+        return false;
+    }
 
     // the K best raw logits outside excl, strictly descending, no tie at the K-th place, no NaN anywhere in the row
     if (!common_sampler_fn_l4_topk_row(logits, n_vocab, cfg.top_k, excl, cur)) {
@@ -274,6 +293,277 @@ bool common_sampler_penfast_apply(const common_penfast_cfg & cfg, struct llama_s
 
     llama_sampler_chain_apply_range(chain, &cur_p, cfg.i_top_k, after_top_k ? cfg.i_top_k + 1 : INT32_MAX);
     return true;
+}
+
+// [TAG_R29_GRAMFAST] the widths of the two candidate sets: 4 x top_k (at least 128), then the v0.25.5 pre-trim width
+static size_t r29_width(int32_t top_k, int pass) {
+    return pass == 0 ? std::max<size_t>(128, 4 * (size_t) top_k) : std::max<size_t>(1024, 32 * (size_t) top_k);
+}
+
+// [TAG_R29_GRAMFAST] every token outside excl (sorted) whose raw logit is at least theta, the M-th largest of them, in no
+// order. All ties at theta are taken, so every other token outside excl lies strictly below theta. False on a NaN or +inf
+// anywhere in the row, with fewer than M tokens outside excl, theta == -inf, or more than 4 x M tokens at or above theta.
+static bool r29_select_row(const float * x, int n, size_t M, const std::vector<llama_token> & excl,
+        std::vector<llama_token_data> & out, float & theta) {
+    out.clear();
+    if (M == 0 || n <= 0 || (size_t) n < M) {
+        return false;
+    }
+    // a min-heap of the M best so far, front() the smallest
+    const auto heap_cmp = [](const llama_token_data & a, const llama_token_data & b) { return a.logit > b.logit; };
+    out.reserve(M);
+    float  thr      = -INFINITY; // front().logit once the heap is full
+    bool   full     = false;
+    float  tie      = -INFINITY; // the largest value outside excl dropped while equal to or below the M-th of that time
+    bool   have_tie = false;
+    bool   bad      = false;
+    size_t ie       = 0;         // excl walks along with the ascending ids
+
+    auto note_tie = [&](float v) {
+        if (!have_tie || v > tie) {
+            tie      = v;
+            have_tie = true;
+        }
+    };
+    auto consider = [&](int i, float v) {
+        if (v != v || v == INFINITY) {
+            bad = true;
+            return;
+        }
+        if (full && v < thr) {
+            return;
+        }
+        while (ie < excl.size() && excl[ie] < i) {
+            ++ie;
+        }
+        if (ie < excl.size() && excl[ie] == i) {
+            return;
+        }
+        if (!full) {
+            out.push_back(llama_token_data{ (llama_token) i, v, 0.0f });
+            std::push_heap(out.begin(), out.end(), heap_cmp);
+            if (out.size() == M) {
+                full = true;
+                thr  = out.front().logit;
+            }
+            return;
+        }
+        if (v == thr) {
+            note_tie(v);
+            return;
+        }
+        // v > thr: the smallest kept one drops out
+        note_tie(out.front().logit);
+        std::pop_heap(out.begin(), out.end(), heap_cmp);
+        out.back() = llama_token_data{ (llama_token) i, v, 0.0f };
+        std::push_heap(out.begin(), out.end(), heap_cmp);
+        thr = out.front().logit;
+    };
+
+    int i = 0;
+    for (; i < n && !full && !bad; ++i) {
+        consider(i, x[i]);
+    }
+#if defined(FN_L4_TOPK_SSE2)
+    __m128 vt = _mm_set1_ps(thr);
+    for (; i + 16 <= n && !bad; i += 16) {
+        const __m128 a = _mm_loadu_ps(x + i);
+        const __m128 b = _mm_loadu_ps(x + i + 4);
+        const __m128 c = _mm_loadu_ps(x + i + 8);
+        const __m128 d = _mm_loadu_ps(x + i + 12);
+        // at or above the M-th, or unordered (NaN)
+        const int mask = _mm_movemask_ps(_mm_or_ps(_mm_cmpge_ps(a, vt), _mm_cmpunord_ps(a, a))) |
+                         _mm_movemask_ps(_mm_or_ps(_mm_cmpge_ps(b, vt), _mm_cmpunord_ps(b, b))) << 4 |
+                         _mm_movemask_ps(_mm_or_ps(_mm_cmpge_ps(c, vt), _mm_cmpunord_ps(c, c))) << 8 |
+                         _mm_movemask_ps(_mm_or_ps(_mm_cmpge_ps(d, vt), _mm_cmpunord_ps(d, d))) << 12;
+        if (mask != 0) {
+            for (int k = 0; k < 16; ++k) {
+                if (mask & (1 << k)) {
+                    consider(i + k, x[i + k]);
+                }
+            }
+            vt = _mm_set1_ps(thr);
+        }
+    }
+#endif
+    for (; i < n && !bad; ++i) {
+        consider(i, x[i]);
+    }
+    if (bad || !full || thr == -INFINITY) {
+        return false;
+    }
+    theta = thr;
+    if (have_tie && tie == theta) {
+        // more tokens at theta than the heap holds: take them all
+        out.clear();
+        ie = 0;
+        for (int j = 0; j < n; ++j) {
+            if (!(x[j] >= theta)) {
+                continue;
+            }
+            while (ie < excl.size() && excl[ie] < j) {
+                ++ie;
+            }
+            if (ie < excl.size() && excl[ie] == j) {
+                continue;
+            }
+            if (out.size() >= 4 * M) {
+                return false;
+            }
+            out.push_back(llama_token_data{ (llama_token) j, x[j], 0.0f });
+        }
+    }
+    return true;
+}
+
+// [TAG_R29_GRAMFAST] the chain's top-k over the whole row keeps the same tokens in the same order as over cur_p: the K best
+// of cur_p strictly descending, the K-th strictly above the next one of cur_p and at or above theta (every token outside
+// cur_p lies strictly below theta, or at -inf after the grammar)
+static bool r29_top_k_exact(const llama_token_data_array & cur_p, size_t K, float theta, std::vector<float> & v) {
+    if (K == 0 || cur_p.size < K) {
+        return false;
+    }
+    v.resize(cur_p.size);
+    for (size_t i = 0; i < cur_p.size; ++i) {
+        v[i] = cur_p.data[i].logit;
+        if (std::isnan(v[i])) {
+            return false;
+        }
+    }
+    const size_t m = std::min(K + 1, v.size());
+    std::partial_sort(v.begin(), v.begin() + (std::ptrdiff_t) m, v.end(), std::greater<float>());
+    for (size_t j = 1; j < m; ++j) {
+        if (!(v[j - 1] > v[j])) {
+            return false;
+        }
+    }
+    return v[K - 1] >= theta;
+}
+
+static size_t r29_count_finite(const llama_token_data * d, size_t n) {
+    size_t c = 0;
+    for (size_t i = 0; i < n; ++i) {
+        c += d[i].logit != -INFINITY ? 1 : 0;
+    }
+    return c;
+}
+
+// [TAG_R29_GRAMFAST] see sampling.h. The candidate array is [first set outside E | E | rest of the second set]: the second
+// width appends its extra tokens and runs the grammar over them only, the samplers before the top-k move no token outside E.
+bool common_sampler_gramfast_apply(const common_penfast_cfg & cfg, struct llama_sampler * chain, struct llama_sampler * grmr,
+        const float * logits, int n_vocab, bool after_top_k, common_gramfast_scratch & sc,
+        std::vector<llama_token_data> & cur, llama_token_data_array & cur_p) {
+    sc.width  = 0;
+    sc.n_fin  = SIZE_MAX;
+    sc.n_pass = 0;
+    if (cfg.top_k <= 0 || cfg.i_top_k < 0 || chain == nullptr || logits == nullptr || n_vocab <= cfg.top_k) {
+        return false;
+    }
+    if (!penfast_moved(cfg, chain, n_vocab, sc.excl)) {
+        return false;
+    }
+    const size_t K  = (size_t) cfg.top_k;
+    const size_t ne = sc.excl.size();
+    const size_t w1 = r29_width(cfg.top_k, 0);
+    const size_t w2 = r29_width(cfg.top_k, 1);
+    // a set of more than half the tokens outside E saves little
+    if ((size_t) n_vocab < ne || 2 * w2 > (size_t) n_vocab - ne) {
+        return false;
+    }
+
+    float theta2 = -INFINITY;
+    if (!r29_select_row(logits, n_vocab, w2, sc.excl, sc.top, theta2)) {
+        return false;
+    }
+    // the first set: the w1 best of them, ties at its theta all taken (every other token outside E lies below it)
+    const size_t nt = sc.top.size();
+    sc.v.resize(nt);
+    for (size_t i = 0; i < nt; ++i) {
+        sc.v[i] = sc.top[i].logit;
+    }
+    std::nth_element(sc.v.begin(), sc.v.begin() + (std::ptrdiff_t) (w1 - 1), sc.v.end(), std::greater<float>());
+    const float theta1 = sc.v[w1 - 1];
+    const size_t n1 = (size_t) (std::partition(sc.top.begin(), sc.top.end(),
+            [theta1](const llama_token_data & d) { return d.logit >= theta1; }) - sc.top.begin());
+
+    cur.resize(nt + ne);
+    std::copy(sc.top.begin(), sc.top.begin() + (std::ptrdiff_t) n1, cur.begin());
+    for (size_t j = 0; j < ne; ++j) {
+        const llama_token t = sc.excl[j];
+        cur[n1 + j] = llama_token_data{ t, logits[t], 0.0f }; // finite or -inf: r29_select_row saw the whole row
+    }
+    std::copy(sc.top.begin() + (std::ptrdiff_t) n1, sc.top.end(), cur.begin() + (std::ptrdiff_t) (n1 + ne));
+
+    // the first set: the grammar, then the logit bias, the penalties and the no-ops before the top-k (no state changes)
+    cur_p = { cur.data(), n1 + ne, -1, false };
+    llama_sampler_apply(grmr, &cur_p);
+    size_t n_fin = r29_count_finite(cur_p.data, cur_p.size);
+    sc.width = nt > n1 ? w1 : w2; // the first set is the second one when its theta is theta2
+    sc.n_fin = n_fin;
+    llama_sampler_chain_apply_range(chain, &cur_p, 0, cfg.i_top_k);
+
+    int pass = 0;
+    if (r29_top_k_exact(cur_p, K, theta1, sc.v)) {
+        pass = 1;
+    } else if (nt > n1) {
+        // the second set: the grammar over the appended tokens only
+        llama_token_data_array rest = { cur.data() + n1 + ne, nt - n1, -1, false };
+        llama_sampler_apply(grmr, &rest);
+        n_fin += r29_count_finite(rest.data, rest.size);
+        sc.width = w2;
+        sc.n_fin = n_fin;
+        cur_p = { cur.data(), nt + ne, -1, false };
+        if (r29_top_k_exact(cur_p, K, theta2, sc.v)) {
+            pass = 2;
+        }
+    }
+    if (pass == 0) {
+        return false;
+    }
+    sc.n_pass = pass;
+    llama_sampler_chain_apply_range(chain, &cur_p, cfg.i_top_k, after_top_k ? cfg.i_top_k + 1 : INT32_MAX);
+    return true;
+}
+
+// [TAG_R29_GRAMFAST] see sampling.h: the steps of common_sampler_sample, each over a candidate set
+common_gramfast_result common_sampler_gramfast_sample(const common_penfast_cfg & cfg, struct llama_sampler * chain,
+        struct llama_sampler * grmr, bool grammar_first, bool use_grammar, const float * logits, int n_vocab,
+        common_gramfast_scratch & sc, std::vector<llama_token_data> & cur, llama_token_data_array & cur_p, llama_token * id) {
+    sc.width  = 0;
+    sc.n_fin  = SIZE_MAX;
+    sc.n_pass = 0;
+    const bool constrain = use_grammar && grmr != nullptr;
+    if (grammar_first && constrain) {
+        if (!common_sampler_gramfast_apply(cfg, chain, grmr, logits, n_vocab, false, sc, cur, cur_p)) {
+            return COMMON_GRAMFAST_NONE;
+        }
+        *id = cur_p.data[cur_p.selected].id;
+        return COMMON_GRAMFAST_DONE;
+    }
+
+    // the chain alone, then the sampled token against the grammar
+    if (!common_sampler_penfast_apply(cfg, chain, logits, n_vocab, false, sc.excl, cur, cur_p)) {
+        return COMMON_GRAMFAST_NONE;
+    }
+    *id = cur_p.data[cur_p.selected].id;
+    if (grammar_first || !constrain) {
+        return COMMON_GRAMFAST_DONE;
+    }
+    {
+        llama_token_data       single     = { *id, 1.0f, 0.0f };
+        llama_token_data_array single_arr = { &single, 1, -1, false };
+        llama_sampler_apply(grmr, &single_arr);
+        if (single.logit != -INFINITY) {
+            return COMMON_GRAMFAST_DONE;
+        }
+    }
+
+    // rejected: the grammar first, then the chain again
+    if (common_sampler_gramfast_apply(cfg, chain, grmr, logits, n_vocab, false, sc, cur, cur_p)) {
+        *id = cur_p.data[cur_p.selected].id;
+        return COMMON_GRAMFAST_DONE;
+    }
+    return COMMON_GRAMFAST_RESAMPLE;
 }
 
 // the ring buffer works similarly to std::deque, but with a fixed capacity
@@ -547,8 +837,12 @@ struct common_sampler {
     std::vector<llama_token> fast_excl;
 
     // [TAG_R28_PENFAST] the fast candidate path with penalties / a logit bias (top_k 0: off) and its scratch
+    // [TAG_R29_GRAMFAST] with a grammar and/or a reasoning budget penfast drives the candidate-set path instead
     common_penfast_cfg       penfast;
     std::vector<llama_token> penfast_excl;
+
+    // [TAG_R29_GRAMFAST] the candidate-set path's scratch, and what its last run saw
+    common_gramfast_scratch  gramfast_sc;
 
     // [TAG_FN_L21_NANGUARD] rows seen with NaN / +inf logits since the last take (last: the aggregate inits above)
     uint32_t n_nonfinite = 0;
@@ -1119,8 +1413,10 @@ struct common_sampler * common_sampler_init(
     // [TAG_R28_PENFAST] penalties (Kyro's presence penalty 1.5) or a user logit bias switch the path above off: the full
     // 248K array, the penalties over all of it and a partial sort per sample (srv.sample 1.7 ms vs 0.1 ms on Flash-Next).
     // This path is exact (common_sampler_penfast_apply), so all models; no grammar, no reasoning budget.
+    // [TAG_R29_GRAMFAST] with a grammar and/or a reasoning budget the same configuration drives the candidate-set path of
+    // common_sampler_sample (tool requests: the grammar over ~150 tokens instead of 248K); LLAMA_R29_GRAMFAST=0: v0.26.4
     common_penfast_cfg penfast;
-    if (fast_k == 0 && r28_penfast_enabled() && grmr == nullptr && rbudget == nullptr) {
+    if (fast_k == 0 && r28_penfast_enabled() && ((grmr == nullptr && rbudget == nullptr) || r29_gramfast_enabled())) {
         int32_t n_suppress = 0;
         const llama_token * suppress = llama_vocab_get_suppress_tokens(vocab, &n_suppress);
         penfast = common_sampler_penfast_cfg(params, chain, suppress, n_suppress, llama_vocab_n_tokens(vocab));
@@ -1399,6 +1695,97 @@ static bool common_sampler_pretrim_grammar(struct common_sampler * gsmpl, struct
     return false;
 }
 
+// [TAG_R29_GRAMFAST] the candidate-set path of common_sampler_sample (penfast is set with a grammar / a reasoning budget only
+// under LLAMA_R29_GRAMFAST): plain logits rows, and a reasoning budget that does not force (its apply is then a no-op)
+static common_gramfast_result common_sampler_sample_gramfast(struct common_sampler * gsmpl, struct llama_context * ctx,
+        int idx, bool grammar_first, llama_token * id) {
+    auto & sc = gsmpl->gramfast_sc;
+    sc.width  = 0;
+    sc.n_fin  = SIZE_MAX;
+    sc.n_pass = 0;
+    if (llama_get_sampled_probs_ith(ctx, idx) != nullptr || llama_get_sampled_logits_ith(ctx, idx) != nullptr ||
+            llama_get_sampled_token_ith(ctx, idx) != LLAMA_TOKEN_NULL) {
+        return COMMON_GRAMFAST_NONE;
+    }
+    if (gsmpl->rbudget != nullptr && common_reasoning_budget_get_state(gsmpl->rbudget) == REASONING_BUDGET_FORCING) {
+        return COMMON_GRAMFAST_NONE;
+    }
+    const float * logits = llama_get_logits_ith(ctx, idx);
+    if (logits == nullptr) {
+        return COMMON_GRAMFAST_NONE;
+    }
+    const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx)));
+    return common_sampler_gramfast_sample(gsmpl->penfast, gsmpl->chain, gsmpl->grmr, grammar_first,
+            grammar_should_apply(gsmpl), logits, n_vocab, sc, gsmpl->cur, gsmpl->cur_p, id);
+}
+
+// [TAG_R29_GRAMFAST] true when the pre-trim's first trim would run and keep fewer valid tokens than the top-k, so that it
+// breaks to the full pass: the candidate-set path's widest set held every token of that trim (its width is at least the
+// trim's, its theta at most the trim's) and kept fewer finite ones after the grammar. Then the full pass right away.
+static bool common_sampler_gramfast_narrow(struct common_sampler * gsmpl) {
+    const auto & sc  = gsmpl->gramfast_sc;
+    const auto & cfg = gsmpl->pretrim;
+    if (gsmpl->grmr_pretrim == nullptr || cfg.top_k <= 0 || sc.n_fin == SIZE_MAX || sc.width < cfg.width ||
+            sc.n_fin >= (size_t) cfg.top_k + cfg.n_extra || v0261_pretrim_narrow()) {
+        return false;
+    }
+    return common_sampler_pretrim_prepare(gsmpl) && (size_t) cfg.top_k + cfg.n_extra + gsmpl->pretrim_bound <= cfg.width;
+}
+
+// resampling:
+// the sampled token violated the grammar, so sample again with the grammar applied first.
+//
+// llama_grammar_apply_impl is O(n_vocab): it decodes every candidate and walks it against
+// the grammar stacks. Running that over the full ~151K-token vocabulary on every rejection
+// is the dominant cost of tool-call generation under stochastic sampling - measured on
+// Qwen3.8-27B, tool arguments stream at 8-17 chunks/s with default sampling versus 60-148
+// under greedy, where the top token is nearly always grammar-valid so this path never runs.
+//
+// Pre-trimming to the top-K candidates by logit makes it ~150x cheaper, and it is EXACT
+// rather than an approximation whenever at least params.top_k grammar-valid candidates
+// survive the trim: every token outside the top-K has a lower logit than every token inside
+// it, so the chain's own top-k selects the same set either way and every subsequent sampler
+// (top_p / min_p / temp / dist) sees an identical candidate set and an identical
+// normalisation. When fewer survive that guarantee does not hold, so we redo the full pass.
+// [TAG_V0261_PRETRIM] with samplers that lower logits before the chain's top-k: common_sampler_pretrim_exact.
+// [TAG_R29_GRAMFAST] skip_pretrim: common_sampler_gramfast_narrow() said the pre-trim takes the full pass anyway
+static llama_token common_sampler_resample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool skip_pretrim) {
+    auto & grmr    = gsmpl->grmr;
+    auto & rbudget = gsmpl->rbudget;
+    auto & chain   = gsmpl->chain;
+    auto & cur_p   = gsmpl->cur_p;
+
+    bool resampled = false;
+
+    if (!skip_pretrim && gsmpl->grmr_pretrim && grammar_should_apply(gsmpl) && common_sampler_pretrim_prepare(gsmpl)) {
+        gsmpl->set_logits(ctx, idx);
+
+        llama_sampler_apply(rbudget, &cur_p);
+
+        // keep the top-K by logit, grammar over K, not n_vocab
+        if (common_sampler_pretrim_grammar(gsmpl, ctx, idx)) {
+            llama_sampler_apply(chain, &cur_p);
+            resampled = true;
+        }
+    }
+
+    if (!resampled) {
+        gsmpl->set_logits(ctx, idx);
+
+        llama_sampler_apply(rbudget,  &cur_p);
+
+        if (grammar_should_apply(gsmpl)) {
+            llama_sampler_apply(grmr,  &cur_p);
+        }
+
+        llama_sampler_apply(chain, &cur_p);
+    }
+
+    GGML_ASSERT(cur_p.selected != -1 && "no selected token during sampling - check your sampling configuration");
+
+    return cur_p.data[cur_p.selected].id;
+}
+
 llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first) {
     llama_synchronize(ctx);
 
@@ -1412,12 +1799,26 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     auto & chain = gsmpl->chain;
     auto & cur_p = gsmpl->cur_p; // initialized by set_logits
 
+    // [TAG_R29_GRAMFAST] a grammar and/or a reasoning budget: the steps below over candidate sets when that is exact. NONE:
+    // nothing with state ran, the full path below; RESAMPLE: the chain sampled once, the grammar rejected the token.
+    bool skip_pretrim = false;
+    if (gsmpl->penfast.top_k > 0 && (grmr != nullptr || rbudget != nullptr)) {
+        const common_gramfast_result r = common_sampler_sample_gramfast(gsmpl, ctx, idx, grammar_first, &id);
+        if (r == COMMON_GRAMFAST_DONE) {
+            return id;
+        }
+        skip_pretrim = common_sampler_gramfast_narrow(gsmpl);
+        if (r == COMMON_GRAMFAST_RESAMPLE) {
+            return common_sampler_resample(gsmpl, ctx, idx, skip_pretrim);
+        }
+    }
+
     // [TAG_FN_L4_HOST_TOPK] the K candidates straight from the row when that is exact, else the full array
     // [TAG_R28_PENFAST] with penalties / a logit bias: the whole chain over the candidate set when that is exact
     bool chain_done = false;
     if (gsmpl->fast_k > 0 && gsmpl->set_logits_fast(ctx, idx)) {
         // cur_p: the state the chain's top-k leaves
-    } else if (gsmpl->penfast.top_k > 0 && gsmpl->sample_penfast(ctx, idx)) {
+    } else if (gsmpl->penfast.top_k > 0 && grmr == nullptr && rbudget == nullptr && gsmpl->sample_penfast(ctx, idx)) {
         chain_done = true;
     } else {
         gsmpl->set_logits(ctx, idx);
@@ -1490,9 +1891,10 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
         // guarantee does not hold and we redo the full pass.
         // [TAG_V0261_PRETRIM] the samplers before the chain's top_k may lower logits: the survivors they can touch do
         // not count (common_sampler_pretrim_exact), and a wider second trim runs before the full pass.
+        // [TAG_R29_GRAMFAST] skip_pretrim: common_sampler_gramfast_narrow() said the pre-trim takes the full pass anyway
         bool grammar_applied = false;
 
-        if (gsmpl->grmr_pretrim && common_sampler_pretrim_prepare(gsmpl)) {
+        if (!skip_pretrim && gsmpl->grmr_pretrim && common_sampler_pretrim_prepare(gsmpl)) {
             grammar_applied = common_sampler_pretrim_grammar(gsmpl, ctx, idx);
 
             if (!grammar_applied) {
@@ -1530,53 +1932,8 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
         }
     }
 
-    // resampling:
-    // the sampled token violated the grammar, so sample again with the grammar applied first.
-    //
-    // llama_grammar_apply_impl is O(n_vocab): it decodes every candidate and walks it against
-    // the grammar stacks. Running that over the full ~151K-token vocabulary on every rejection
-    // is the dominant cost of tool-call generation under stochastic sampling - measured on
-    // Qwen3.8-27B, tool arguments stream at 8-17 chunks/s with default sampling versus 60-148
-    // under greedy, where the top token is nearly always grammar-valid so this path never runs.
-    //
-    // Pre-trimming to the top-K candidates by logit makes it ~150x cheaper, and it is EXACT
-    // rather than an approximation whenever at least params.top_k grammar-valid candidates
-    // survive the trim: every token outside the top-K has a lower logit than every token inside
-    // it, so the chain's own top-k selects the same set either way and every subsequent sampler
-    // (top_p / min_p / temp / dist) sees an identical candidate set and an identical
-    // normalisation. When fewer survive that guarantee does not hold, so we redo the full pass.
-    // [TAG_V0261_PRETRIM] with samplers that lower logits before the chain's top-k: common_sampler_pretrim_exact.
-    bool resampled = false;
-
-    if (gsmpl->grmr_pretrim && grammar_should_apply(gsmpl) && common_sampler_pretrim_prepare(gsmpl)) {
-        gsmpl->set_logits(ctx, idx);
-
-        llama_sampler_apply(rbudget, &cur_p);
-
-        // keep the top-K by logit, grammar over K, not n_vocab
-        if (common_sampler_pretrim_grammar(gsmpl, ctx, idx)) {
-            llama_sampler_apply(chain, &cur_p);
-            resampled = true;
-        }
-    }
-
-    if (!resampled) {
-        gsmpl->set_logits(ctx, idx);
-
-        llama_sampler_apply(rbudget,  &cur_p);
-
-        if (grammar_should_apply(gsmpl)) {
-            llama_sampler_apply(grmr,  &cur_p);
-        }
-
-        llama_sampler_apply(chain, &cur_p);
-    }
-
-    GGML_ASSERT(cur_p.selected != -1 && "no selected token during sampling - check your sampling configuration");
-
-    id = cur_p.data[cur_p.selected].id;
-
-    return id;
+    // resampling: the sampled token violated the grammar, sample again with the grammar applied first
+    return common_sampler_resample(gsmpl, ctx, idx, skip_pretrim);
 }
 
 // [TAG_BS_LAZY_GRAMMAR] true when the backend sampler touched this output row. A fully offloaded chain leaves a sampled

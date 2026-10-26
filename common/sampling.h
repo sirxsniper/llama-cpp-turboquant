@@ -183,6 +183,45 @@ bool common_sampler_penfast_apply(const common_penfast_cfg & cfg, struct llama_s
         int n_vocab, bool after_top_k, std::vector<llama_token> & excl, std::vector<llama_token_data> & cur,
         llama_token_data_array & cur_p);
 
+// [TAG_R29_GRAMFAST] the candidate-set path for a sampler with a grammar and/or a reasoning budget (tool requests carry both),
+// on the chain of [TAG_R28_PENFAST]. The grammar runs over a candidate set, not the whole vocabulary: every token outside the
+// moved set E (penalty windows + biased tokens) whose raw logit is at least theta, the w-th largest of them (ties at theta
+// all taken), plus E. A token outside the set keeps its raw logit, strictly below theta, and the grammar can only make it
+// -inf. So when the top_k best of the set (grammar, bias and penalties applied) are strictly ordered, strictly above the next
+// one of the set and at or above theta, the chain's top-k over the full row keeps the same tokens in the same order, and the
+// rest of the chain (top-p, min-p, temperature, dist) sees the same input. Two widths: 4 x top_k (at least 128), then 32 x
+// top_k (at least 1024, the v0.25.5 pre-trim width); else the full path. A lazy grammar that waits for its trigger and a
+// reasoning budget that does not force change no logit, the same on both paths.
+// LLAMA_R29_GRAMFAST=0: off (v0.26.4); LLAMA_R28_PENFAST=0 also switches it off.
+struct common_gramfast_scratch {
+    std::vector<llama_token>      excl;     // E, sorted
+    std::vector<llama_token_data> top;      // the tokens outside E at or above theta of the second width
+    std::vector<float>            v;        // logits for the order checks
+    size_t width  = 0;                      // out: the widest set the grammar ran over (its w), 0: none
+    size_t n_fin  = SIZE_MAX;               // out: finite candidates of that set after the grammar, SIZE_MAX: not known
+    int    n_pass = 0;                      // out: the width that was exact (1 or 2), 0: none
+};
+
+// the grammar (null: none) and the chain over the candidate set of one logits row. True: cur_p is the chain's result
+// (after_top_k: the state right after its top-k, for tests). False: not exact here; nothing with state has run (the
+// grammar's apply keeps none), the caller takes the full path. cur is scratch; cur_p points into it.
+bool common_sampler_gramfast_apply(const common_penfast_cfg & cfg, struct llama_sampler * chain, struct llama_sampler * grmr,
+        const float * logits, int n_vocab, bool after_top_k, common_gramfast_scratch & sc,
+        std::vector<llama_token_data> & cur, llama_token_data_array & cur_p);
+
+enum common_gramfast_result {
+    COMMON_GRAMFAST_NONE     = 0, // nothing with state ran: the caller takes the full path from the start
+    COMMON_GRAMFAST_DONE     = 1, // *id is the sampled token, cur_p the chain's result
+    COMMON_GRAMFAST_RESAMPLE = 2, // the chain ran once and sampled a token the grammar rejects, the fast resample is not
+                                  // exact: the caller resamples the full way
+};
+
+// one position of common_sampler_sample over a plain logits row, as the full path does it: grammar_first as there,
+// use_grammar is grammar_should_apply(). The grammar and the reasoning budget are the caller's (the budget must not force).
+common_gramfast_result common_sampler_gramfast_sample(const common_penfast_cfg & cfg, struct llama_sampler * chain,
+        struct llama_sampler * grmr, bool grammar_first, bool use_grammar, const float * logits, int n_vocab,
+        common_gramfast_scratch & sc, std::vector<llama_token_data> & cur, llama_token_data_array & cur_p, llama_token * id);
+
 // [TAG_V0261_PRETRIM] the grammar pre-trim of common_sampler_sample: the grammar runs over the top raw candidates only.
 // The samplers before the chain's top-k can only lower logits there (penalties, DRY, negative bias, suppress tokens), so
 // the chain's top-k set is the full-vocabulary one when the trim keeps top_k grammar-valid tokens they do not touch.

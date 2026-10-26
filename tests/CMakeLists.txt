@@ -452,6 +452,10 @@ llama_build_and_test(test-v0261-pretrim.cpp)
 # the real samplers: the same candidates after the top-k, the same chain result and sampled token, or a fallback. CPU only.
 llama_build_and_test(test-r28-penfast.cpp)
 
+# [TAG_R29_GRAMFAST] the candidate-set path with a grammar (common/sampling.cpp) against the full path with the real samplers:
+# a stand-in grammar over random vocabularies, then a real GBNF tool-call grammar over the Qwen3.5 vocabulary. CPU only.
+llama_build_and_test(test-r29-gramfast.cpp ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-qwen35.gguf)
+
 # [TAG_FN_L3_VRAM_CBUF] [TAG_FN_L3_VRAM_TRIM] CUDA virtual-memory buffers (a tail given back and mapped again under the hot
 # set's MUL_MAT_ID chain) and the pool trim between CUDA-graph runs. Built, not registered with ctest: it needs the GPU (run
 # it under compute-sanitizer memcheck first); without one it prints SKIPPED.
