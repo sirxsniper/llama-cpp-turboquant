@@ -9,8 +9,19 @@
 #include "llama-model.h"
 #include "llama-fn-auto.h" // [TAG_FN_SHIP1] llama_fn_env
 
+#ifdef _WIN32 // [TAG_FN_R25_PIN] the CPU topology and the copy workers' affinity
+#    ifndef NOMINMAX
+#        define NOMINMAX
+#    endif
+#    ifndef WIN32_LEAN_AND_MEAN
+#        define WIN32_LEAN_AND_MEAN
+#    endif
+#    include <windows.h>
+#endif
+
 #include <algorithm>
 #include <atomic>
+#include <chrono> // [TAG_FN_R25_STAGE]
 #include <cstdlib>
 #include <cstring>
 
@@ -152,18 +163,131 @@ static void part_range(size_t n, int idx, int parts, size_t & off, size_t & len)
     len = std::min(n, u1 * unit) - off;
 }
 
+void copy_pool::set_mode(bool temporal_, bool prefetch_, int spin_us_) {
+    temporal = temporal_;
+    prefetch = prefetch_;
+    spin_us  = std::max(0, spin_us_);
+}
+
+void copy_pool::set_affinities(const std::vector<cpu_mask> & affs_) {
+    affs = affs_;
+}
+
+void copy_pool::set_grain(size_t bytes) {
+    grain = bytes == 0 ? 0 : std::max<size_t>(4096, bytes / 4096 * 4096);
+}
+
+static void copy_segs_part(const copy_seg * sg, int n_sg, size_t off, size_t len, bool temporal, bool prefetch);
+
+void copy_pool::copy_units(const copy_seg * segs, int n_sg, size_t n) {
+    const size_t units = (n + grain - 1) / grain;
+    for (;;) {
+        const size_t u = next_unit.fetch_add(1, std::memory_order_relaxed);
+        if (u >= units) {
+            return;
+        }
+        const size_t off = u*grain;
+        copy_segs_part(segs, n_sg, off, std::min(grain, n - off), temporal, prefetch);
+    }
+}
+
+// [TAG_FN_R25_PIN] the calling thread on the CPUs of a
+static void pin_this_thread(const cpu_mask & a) {
+#ifdef _WIN32
+    GROUP_AFFINITY ga = {};
+    ga.Group = (WORD) a.group;
+    ga.Mask  = (KAFFINITY) a.mask;
+    SetThreadGroupAffinity(GetCurrentThread(), &ga, nullptr);
+#else
+    (void) a;
+#endif
+}
+
+std::vector<cpu_mask> copy_affinities(int mode) {
+    std::vector<cpu_mask> out;
+#ifdef _WIN32
+    if (mode <= 0) {
+        return out;
+    }
+    DWORD len = 0;
+    GetLogicalProcessorInformationEx(RelationAll, nullptr, &len);
+    if (len == 0) {
+        return out;
+    }
+    std::vector<uint8_t> buf(len);
+    if (!GetLogicalProcessorInformationEx(RelationAll, (PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX) buf.data(), &len)) {
+        return out;
+    }
+    std::vector<cpu_mask> l3;    // the L3 domains
+    std::vector<cpu_mask> cores; // the physical cores
+    for (DWORD o = 0; o + 2*sizeof(DWORD) <= len; ) {
+        auto * p = (PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX) (buf.data() + o);
+        if (p->Size == 0) {
+            break;
+        }
+        if (p->Relationship == RelationCache && p->Cache.Level == 3 && p->Cache.GroupMask.Mask != 0) {
+            l3.push_back({ (int) p->Cache.GroupMask.Group, (uint64_t) p->Cache.GroupMask.Mask });
+        } else if (p->Relationship == RelationProcessorCore && p->Processor.GroupCount >= 1 && p->Processor.GroupMask[0].Mask != 0) {
+            cores.push_back({ (int) p->Processor.GroupMask[0].Group, (uint64_t) p->Processor.GroupMask[0].Mask });
+        }
+        o += p->Size;
+    }
+    if (mode == 2) {
+        return l3.size() >= 2 ? l3 : out; // one domain: nothing to spread, the scheduler as before
+    }
+    const size_t n_dom = std::max<size_t>(1, l3.size());
+    std::vector<std::vector<cpu_mask>> by_dom(n_dom);
+    for (const auto & c : cores) {
+        int last = 63;
+        while (last > 0 && !(c.mask & ((uint64_t) 1 << last))) {
+            --last;
+        }
+        size_t dom = 0;
+        for (size_t d = 0; d < l3.size(); ++d) {
+            if (l3[d].group == c.group && (l3[d].mask & c.mask) != 0) {
+                dom = d;
+                break;
+            }
+        }
+        by_dom[dom].push_back({ c.group, (uint64_t) 1 << last });
+    }
+    for (size_t i = 0; ; ++i) { // in turn from each domain
+        bool any = false;
+        for (const auto & d : by_dom) {
+            if (i < d.size()) {
+                out.push_back(d[i]);
+                any = true;
+            }
+        }
+        if (!any) {
+            break;
+        }
+    }
+#else
+    (void) mode;
+#endif
+    return out;
+}
+
 void copy_pool::start(int n_threads) {
     stop();
-    quit = false;
+    quit.store(false, std::memory_order_relaxed);
     for (int i = 1; i < n_threads; ++i) {
-        workers.emplace_back([this, i]() { llama_fn_thread_name("gen5-copy", i); run(i); }); // [TAG_FN_L18_FIRSTANS_STALL] name
+        const cpu_mask a = affs.empty() ? cpu_mask() : affs[(size_t) (i - 1) % affs.size()]; // [TAG_FN_R25_PIN]
+        workers.emplace_back([this, i, a]() {
+            llama_fn_thread_name("gen5-copy", i); // [TAG_FN_L18_FIRSTANS_STALL] name
+            if (a.mask != 0) {
+                pin_this_thread(a);
+            }
+            run(i);
+        });
     }
 }
 
 void copy_pool::stop() {
     {
         std::lock_guard<std::mutex> lk(mtx);
-        quit = true;
+        quit.store(true, std::memory_order_relaxed);
     }
     cv_go.notify_all();
     for (auto & t : workers) {
@@ -215,14 +339,75 @@ static void copy_nt(uint8_t * dst, const uint8_t * src, size_t n) {
 #endif
 }
 
-static void copy_segs_part(const copy_seg * sg, int n_sg, size_t off, size_t len) {
+// [TAG_FN_R25_STAGE] a copy with plain (cached) stores into a ring that stays in the L3: the DMA reads the lines from the
+// cache, so a staged byte costs one DRAM read (the source) instead of three (source read, ring write, DMA read). The CRT
+// memcpy switches to non-temporal stores for large sizes, so the loop is explicit. prefetch: the source lines 1 KiB ahead
+// with the NTA hint (they pass the caches without evicting the ring). A prefetch never faults, also past the source's end.
+static void copy_tmp(uint8_t * dst, const uint8_t * src, size_t n, bool prefetch) {
+#if defined(LLAMA_GEN5_NT_AVX)
+#if !defined(__AVX__)
+    static const bool has_avx = [] {
+        int r[4];
+        __cpuid(r, 1);
+        return (r[2] & (1 << 27)) != 0 && (r[2] & (1 << 28)) != 0 && (_xgetbv(0) & 6) == 6;
+    }();
+    if (!has_avx) {
+        memcpy(dst, src, n);
+        return;
+    }
+#endif
+    size_t i = 0;
+    const size_t head = std::min(n, (size_t) ((32 - ((uintptr_t) dst & 31)) & 31));
+    if (head) {
+        memcpy(dst, src, head);
+        i = head;
+    }
+    if (prefetch) {
+        for (; i + 128 <= n; i += 128) {
+            _mm_prefetch((const char *) (src + i + 1024), _MM_HINT_NTA);
+            _mm_prefetch((const char *) (src + i + 1088), _MM_HINT_NTA);
+            const __m256i a = _mm256_loadu_si256((const __m256i *) (src + i));
+            const __m256i b = _mm256_loadu_si256((const __m256i *) (src + i + 32));
+            const __m256i c = _mm256_loadu_si256((const __m256i *) (src + i + 64));
+            const __m256i d = _mm256_loadu_si256((const __m256i *) (src + i + 96));
+            _mm256_store_si256((__m256i *) (dst + i),      a);
+            _mm256_store_si256((__m256i *) (dst + i + 32), b);
+            _mm256_store_si256((__m256i *) (dst + i + 64), c);
+            _mm256_store_si256((__m256i *) (dst + i + 96), d);
+        }
+    } else {
+        for (; i + 128 <= n; i += 128) {
+            const __m256i a = _mm256_loadu_si256((const __m256i *) (src + i));
+            const __m256i b = _mm256_loadu_si256((const __m256i *) (src + i + 32));
+            const __m256i c = _mm256_loadu_si256((const __m256i *) (src + i + 64));
+            const __m256i d = _mm256_loadu_si256((const __m256i *) (src + i + 96));
+            _mm256_store_si256((__m256i *) (dst + i),      a);
+            _mm256_store_si256((__m256i *) (dst + i + 32), b);
+            _mm256_store_si256((__m256i *) (dst + i + 64), c);
+            _mm256_store_si256((__m256i *) (dst + i + 96), d);
+        }
+    }
+    if (i < n) {
+        memcpy(dst + i, src + i, n - i);
+    }
+#else
+    (void) prefetch;
+    memcpy(dst, src, n);
+#endif
+}
+
+static void copy_segs_part(const copy_seg * sg, int n_sg, size_t off, size_t len, bool temporal, bool prefetch) {
     for (int i = 0; i < n_sg && len > 0; ++i) {
         if (off >= sg[i].n) {
             off -= sg[i].n;
             continue;
         }
         const size_t n = std::min(len, sg[i].n - off);
-        copy_nt(sg[i].dst + off, sg[i].src + off, n);
+        if (temporal) {
+            copy_tmp(sg[i].dst + off, sg[i].src + off, n, prefetch); // [TAG_FN_R25_STAGE]
+        } else {
+            copy_nt(sg[i].dst + off, sg[i].src + off, n);
+        }
         len -= n;
         off  = 0;
     }
@@ -231,33 +416,58 @@ static void copy_segs_part(const copy_seg * sg, int n_sg, size_t off, size_t len
 #endif
 }
 
+// [TAG_FN_R25_STAGE] poll done() for up to us microseconds (the clock is read every 64 pauses, ~1 us)
+template <typename F>
+static void spin_until(F done, int us) {
+    const auto t_end = std::chrono::steady_clock::now() + std::chrono::microseconds(us);
+    for (int i = 0; !done(); ++i) {
+#if defined(_M_X64) || defined(__x86_64__)
+        _mm_pause();
+#endif
+        if ((i & 63) == 63 && std::chrono::steady_clock::now() >= t_end) {
+            return;
+        }
+    }
+}
+
 void copy_pool::run(int idx) {
     uint64_t seen = 0;
     for (;;) {
         const copy_seg * sg;
         int n_sg;
         size_t n;
+        int base;
+        int parts;
+        if (spin_us > 0) { // [TAG_FN_R25_STAGE] during a pass the next chunk comes within a few us
+            spin_until([&]() { return gen.load(std::memory_order_acquire) != seen || quit.load(std::memory_order_relaxed); },
+                       spin_us);
+        }
         {
             std::unique_lock<std::mutex> lk(mtx);
-            cv_go.wait(lk, [&]() { return quit || gen != seen; });
-            if (quit) {
+            cv_go.wait(lk, [&]() { return quit.load(std::memory_order_relaxed) || gen.load(std::memory_order_relaxed) != seen; });
+            if (quit.load(std::memory_order_relaxed)) {
                 return;
             }
-            seen = gen;
-            sg   = segs_p;
-            n_sg = n_segs;
-            n    = n_bytes;
+            seen  = gen.load(std::memory_order_relaxed);
+            sg    = segs_p;
+            n_sg  = n_segs;
+            n     = n_bytes;
+            base  = job_base;
+            parts = job_parts;
         }
-        size_t off, len;
-        part_range(n, idx, size(), off, len);
-        if (len > 0) {
-            copy_segs_part(sg, n_sg, off, len);
-        }
-        {
-            std::lock_guard<std::mutex> lk(mtx);
-            if (--pending == 0) {
-                cv_done.notify_one();
+        if (grain > 0) {
+            copy_units(sg, n_sg, n); // [TAG_FN_R25_PIN]
+        } else {
+            size_t off, len;
+            part_range(n, idx - base, parts, off, len);
+            if (len > 0) {
+                copy_segs_part(sg, n_sg, off, len, temporal, prefetch);
             }
+        }
+        // the caller reads 0 under mtx before it sleeps, and the last worker notifies under mtx: no lost wakeup
+        if (pending.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+            std::lock_guard<std::mutex> lk(mtx);
+            cv_done.notify_one();
         }
     }
 }
@@ -274,25 +484,66 @@ void copy_pool::copy_list(const copy_seg * segs, int n_sg) {
     }
     const int parts = size();
     if (parts == 1 || n < (1u << 20)) {
-        copy_segs_part(segs, n_sg, 0, n);
+        copy_segs_part(segs, n_sg, 0, n, temporal, prefetch);
         return;
     }
     {
         std::lock_guard<std::mutex> lk(mtx);
-        segs_p  = segs;
-        n_segs  = n_sg;
-        n_bytes = n;
-        pending = parts - 1;
-        gen++;
+        segs_p    = segs;
+        n_segs    = n_sg;
+        n_bytes   = n;
+        job_base  = 0;
+        job_parts = parts;
+        next_unit.store(0, std::memory_order_relaxed);
+        pending.store(parts - 1, std::memory_order_relaxed);
+        gen.fetch_add(1, std::memory_order_release);
     }
     cv_go.notify_all();
-    size_t off, len;
-    part_range(n, 0, parts, off, len);
-    if (len > 0) {
-        copy_segs_part(segs, n_sg, off, len);
+    if (grain > 0) {
+        copy_units(segs, n_sg, n); // [TAG_FN_R25_PIN]
+    } else {
+        size_t off, len;
+        part_range(n, 0, parts, off, len);
+        if (len > 0) {
+            copy_segs_part(segs, n_sg, off, len, temporal, prefetch);
+        }
     }
-    std::unique_lock<std::mutex> lk(mtx);
-    cv_done.wait(lk, [&]() { return pending == 0; });
+    wait();
+}
+
+// [TAG_FN_R25_STAGE]
+void copy_pool::submit(const copy_seg * segs, int n_sg) {
+    size_t n = 0;
+    for (int i = 0; i < n_sg; ++i) {
+        n += segs[i].n;
+    }
+    const int parts = size() - 1;
+    if (parts < 1 || n < (1u << 20)) {
+        copy_segs_part(segs, n_sg, 0, n, temporal, prefetch); // pending stays 0: wait() returns at once
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lk(mtx);
+        segs_p    = segs;
+        n_segs    = n_sg;
+        n_bytes   = n;
+        job_base  = 1;
+        job_parts = parts;
+        next_unit.store(0, std::memory_order_relaxed);
+        pending.store(parts, std::memory_order_relaxed);
+        gen.fetch_add(1, std::memory_order_release);
+    }
+    cv_go.notify_all();
+}
+
+void copy_pool::wait() {
+    if (spin_us > 0) { // [TAG_FN_R25_STAGE]
+        spin_until([&]() { return pending.load(std::memory_order_acquire) == 0; }, spin_us);
+    }
+    if (pending.load(std::memory_order_acquire) != 0) {
+        std::unique_lock<std::mutex> lk(mtx);
+        cv_done.wait(lk, [&]() { return pending.load(std::memory_order_acquire) == 0; });
+    }
 }
 
 } // namespace gen5

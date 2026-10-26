@@ -3241,7 +3241,10 @@ static void launch_fattn_turbot(
         GGML_ASSERT(mask != nullptr && kv_pos_t == nullptr && mask->ne[2] == 1);
         const int32_t n_kv_max_query = ggml_get_op_params_i32(KQV, 4);
         GGML_ASSERT(n_kv_max_query > 0);
-        n_kv_list = std::min<int64_t>(K->ne[1], std::min<int64_t>(Q->ne[1], ncols1)*n_kv_max_query);
+        // [TAG_FN_V0254_SEQFA] min(n_kv, min(Q, ncols1) * n_kv_max), or the uncapped budget for a multi-sequence QSA FA: the
+        // list length sets ntiles_KV and so the stream-k blocks, stripes and seams, which must not follow n_kv (the cell
+        // span of every sequence). The entries past the count are -1 (zero contribution) and a block skips them.
+        n_kv_list = ggml_fn_l4_qsa_fa_list_len(KQV, ncols1);
         GGML_ASSERT(n_kv_list > 0 && n_kv_list <= INT32_MAX);
 
         const size_t n_lists = (size_t) ntiles_x * (size_t) mask->ne[3];

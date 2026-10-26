@@ -4173,6 +4173,37 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                         (int) n_tokens_all, cbuf_short_max, cbuf_small_t);
             }
         }
+        // [TAG_FN_V0254_NARROWFULL] a multi-sequence context: a narrow part of a prompt that goes on past the SMALL reserve (the
+        // server's split at a context checkpoint, e.g. a 14-token system part before 9K rows) starts the FULL period now, as
+        // a wide batch would. Under FULL a narrow ubatch runs without the tail layers' hot experts (the bridge / CPU computes
+        // them), under SMALL with them: on 2 slots such a part ran FULL when the other slot's prompt had left FULL open and
+        // SMALL when that slot was idle, so a fresh read scored KLD 0.008 (9.2K) / 0.006 (1.5K) against itself (l24p, after
+        // [TAG_FN_V0254_SEQFA]). Now it always runs FULL (the banks are not lent before the prompt's first wide ubatch, as
+        // after the other prompt's return). One sequence keeps the old order.
+        // OFF by default since v0.25.4 (LLAMA_FN_V0254_NARROWFULL=1 turns it on): on the owner's 2-slot command the short
+        // follow-ups after a prompt it had started FULL read +10-11 % slower (sp254: 172 / 316 / 161 rows, prompt ms median
+        // 1191 v0.25.3, 1322 NARROWFULL on, 1199 off, 1189 both v0.25.4 switches off; E:/turbot-gates/flashnext/test/v0254),
+        // although the follow-ups themselves never took the rule. [TAG_FN_V0254_SEQFA] stays on (it costs nothing there).
+        static const bool v0254_narrowfull = [] {
+            const char * e = getenv("LLAMA_FN_V0254_NARROWFULL");
+            return e && e[0] == '1';
+        }();
+        static uint32_t v0254_n_narrowfull = 0; // log lines (the main context's decode thread only)
+        // The rest of the prompt is judged alone, as its batch will be: only a rest that takes the FULL (not the short) path
+        // starts FULL here. v0254-drift compared the whole prompt (this part + the rest) with max(small_t, short_max): 20 rows
+        // + 150 rows went FULL (to FULL 256-625 ms, back 622-886 ms) where v0.25.3 ran both SMALL (the 150 rows are short).
+        // An answer-only batch (another slot's prompt waits) stays as it was (R-L23-3).
+        if (!wide && v0254_narrowfull && cparams.n_seq_max > 1 && cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP &&
+            cbuf_state == CBUF_SMALL && !cbuf_pinned && !cbuf_short && l20_base_ub > 0 &&
+            llama_fn_v0254_narrow_full(n_tokens_all, n_outputs_all, l20_prompt_after, cparams.n_batch, cbuf_small_t,
+                    cbuf_short_max, l19_early, l19_early > 0 && llama_fn_warm_running())) {
+            wide = true;
+            if (v0254_n_narrowfull++ < 3) {
+                LLAMA_LOG_INFO("%s: [TAG_FN_V0254_NARROWFULL] a %d-token part of a prompt with %lld rows after it starts FULL "
+                        "(%u sequences): it runs as under a FULL period another slot's prompt opened\n", __func__,
+                        (int) n_tokens_all, (long long) l20_prompt_after, cparams.n_seq_max);
+            }
+        }
         // [TAG_FN_L22_RWIDTH] a prompt that starts while FULL stays (the thrash pin after 8 prompts within 64 batches, e.g.
         // short answers; or a prompt that ended without an answer step, as a follow-up's priming request) ran at the width
         // FULL had: under an 8K FULL a 10K prompt took two passes where the switch from SMALL plans one 16K pass, 32K four
@@ -6027,11 +6058,24 @@ private:
 // memory of the tensor's device when it has one (device copies at full speed), else plain host memory
 static constexpr size_t LLAMA_IO_STREAM_PIECE = 32u*1024*1024;
 
+// [TAG_FN_V0254_STORE] the parts of one streamed state read / write (LLAMA_FN_L20_CONVFIX_TRACE=1), in us
+struct llama_io_stream_stats {
+    int64_t  n_dev    = 0; // device tensor reads / writes
+    uint64_t b_dev    = 0;
+    int64_t  us_dev   = 0; // in ggml_backend_tensor_get / set
+    int64_t  n_cb     = 0; // callback calls
+    int64_t  us_cb    = 0; // in the callback (the store's pipe)
+    int64_t  us_alloc = 0; // the piece's allocation
+    int64_t  us_free  = 0; // the piece's release (the stream's end)
+    int64_t  us_sync  = 0; // the context's synchronize before the stream
+    bool     pinned   = false;
+};
+
 class llama_io_stream_piece {
 public:
     // [TAG_FN_L20_CONVFIX_IO] keep (may be null): a pinned piece that outlives this stream (the context's), used and,
     // when empty, filled instead of a piece of this stream's own
-    explicit llama_io_stream_piece(ggml_backend_buffer_ptr * keep = nullptr) : keep(keep) {}
+    explicit llama_io_stream_piece(ggml_backend_buffer_ptr * keep = nullptr, llama_io_stream_stats * st = nullptr) : st(st), keep(keep) {}
 
     uint8_t * get(const ggml_tensor * tensor, size_t n) {
         ggml_backend_buffer_ptr & pin = keep ? *keep : pinned;
@@ -6040,7 +6084,14 @@ public:
             ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(tensor->buffer));
             ggml_backend_buffer_type_t hbuft = dev ? ggml_backend_dev_host_buffer_type(dev) : nullptr;
             if (hbuft && (!pin || ggml_backend_buffer_get_type(pin.get()) != hbuft)) {
+                const int64_t t0 = st ? ggml_time_us() : 0;
                 pin.reset(ggml_backend_buft_alloc_buffer(hbuft, LLAMA_IO_STREAM_PIECE));
+                if (st) {
+                    st->us_alloc += ggml_time_us() - t0;
+                }
+            }
+            if (st) {
+                st->pinned = pin && ggml_backend_buffer_get_type(pin.get()) == hbuft;
             }
         }
         if (pin && n <= LLAMA_IO_STREAM_PIECE) {
@@ -6051,6 +6102,7 @@ public:
     }
 
 private:
+    llama_io_stream_stats *   st = nullptr;
     bool                      pinned_tried = false;
     ggml_backend_buffer_ptr   pinned;
     ggml_backend_buffer_ptr * keep = nullptr;
@@ -6059,12 +6111,18 @@ private:
 
 class llama_io_write_stream : public llama_io_write_i {
 public:
-    llama_io_write_stream(const std::function<bool(const void *, size_t)> & fn, ggml_backend_buffer_ptr * keep = nullptr) :
-            fn(fn), piece(keep) {}
+    llama_io_write_stream(const std::function<bool(const void *, size_t)> & fn, ggml_backend_buffer_ptr * keep = nullptr,
+                          llama_io_stream_stats * st = nullptr) :
+            fn(fn), piece(keep, st), st(st) {}
 
     void write(const void * src, size_t size) override {
+        const int64_t t0 = st && size >= 65536 ? ggml_time_us() : 0;
         if (size > 0 && !fn(src, size)) {
             throw std::runtime_error("state stream write failed");
+        }
+        if (t0) {
+            st->us_cb += ggml_time_us() - t0;
+            st->n_cb++;
         }
         size_written += size;
     }
@@ -6073,7 +6131,13 @@ public:
         for (size_t done = 0; done < size;) {
             const size_t n = std::min(LLAMA_IO_STREAM_PIECE, size - done);
             uint8_t * buf = piece.get(tensor, n);
+            const int64_t t0 = st ? ggml_time_us() : 0;
             ggml_backend_tensor_get(tensor, buf, offset + done, n);
+            if (st) {
+                st->us_dev += ggml_time_us() - t0;
+                st->n_dev++;
+                st->b_dev += n;
+            }
             write(buf, n);
             done += n;
         }
@@ -6087,16 +6151,23 @@ private:
     const std::function<bool(const void *, size_t)> & fn;
     size_t size_written = 0;
     llama_io_stream_piece piece;
+    llama_io_stream_stats * st = nullptr;
 };
 
 class llama_io_read_stream : public llama_io_read_i {
 public:
-    llama_io_read_stream(const std::function<bool(void *, size_t)> & fn, ggml_backend_buffer_ptr * keep = nullptr) :
-            fn(fn), piece(keep) {}
+    llama_io_read_stream(const std::function<bool(void *, size_t)> & fn, ggml_backend_buffer_ptr * keep = nullptr,
+                         llama_io_stream_stats * st = nullptr) :
+            fn(fn), piece(keep, st), st(st) {}
 
     void read(void * dst, size_t size) override {
+        const int64_t t0 = st && size >= 65536 ? ggml_time_us() : 0;
         if (size > 0 && !fn(dst, size)) {
             throw std::runtime_error("state stream read failed");
+        }
+        if (t0) {
+            st->us_cb += ggml_time_us() - t0;
+            st->n_cb++;
         }
         size_read += size;
     }
@@ -6106,7 +6177,13 @@ public:
             const size_t n = std::min(LLAMA_IO_STREAM_PIECE, size - done);
             uint8_t * buf = piece.get(tensor, n);
             read(buf, n);
+            const int64_t t0 = st ? ggml_time_us() : 0;
             ggml_backend_tensor_set(tensor, buf, offset + done, n);
+            if (st) {
+                st->us_dev += ggml_time_us() - t0;
+                st->n_dev++;
+                st->b_dev += n;
+            }
             done += n;
         }
     }
@@ -6119,6 +6196,7 @@ private:
     const std::function<bool(void *, size_t)> & fn;
     size_t size_read = 0;
     llama_io_stream_piece piece;
+    llama_io_stream_stats * st = nullptr;
 };
 
 class llama_io_write_device : public llama_io_write_i {
@@ -6680,16 +6758,46 @@ size_t llama_context::state_seq_write_stream(llama_seq_id seq_id, llama_state_se
     if (l20_io < 0) {
         l20_io = llama_fn_l3_int(model, "LLAMA_FN_L20_CONVFIX_IO", 0) != 0 ? 1 : 0; // [TAG_FN_L20_CONVFIX_IO]
     }
-    llama_io_write_stream io(fn, l20_io > 0 ? &io_stream_pinned : nullptr);
-    try {
-        io.write(&io_magic, sizeof(io_magic));
-        io.write(&seq_id, sizeof(seq_id));
+    // [TAG_FN_V0254_STORE] the parts of the stream in the log (LLAMA_FN_L20_CONVFIX_TRACE=1)
+    llama_io_stream_stats st;
+    st.us_sync = l25_stream_sync_us;
+    llama_io_stream_stats * stp = l25_stream_trace() ? &st : nullptr;
+    const int64_t t0 = ggml_time_us();
+    size_t res = 0;
+    int64_t t_end = 0;
+    {
+        llama_io_write_stream io(fn, l20_io > 0 ? &io_stream_pinned : nullptr, stp);
+        try {
+            io.write(&io_magic, sizeof(io_magic));
+            io.write(&seq_id, sizeof(seq_id));
 
-        return state_seq_write_data(io, seq_id, flags);
-    } catch (const std::exception & err) {
-        LLAMA_LOG_ERROR("%s: error saving state: %s\n", __func__, err.what());
-        return 0;
+            res = state_seq_write_data(io, seq_id, flags);
+        } catch (const std::exception & err) {
+            LLAMA_LOG_ERROR("%s: error saving state: %s\n", __func__, err.what());
+            res = 0;
+        }
+        t_end = ggml_time_us();
     }
+    if (stp) {
+        st.us_free = ggml_time_us() - t_end;
+        l25_stream_log("write", seq_id, res, ggml_time_us() - t0, st);
+    }
+    return res;
+}
+
+// [TAG_FN_V0254_STORE]
+bool llama_context::l25_stream_trace() {
+    if (l25_trace < 0) {
+        l25_trace = llama_fn_l3_int(model, "LLAMA_FN_L20_CONVFIX_TRACE", 0) != 0 ? 1 : 0;
+    }
+    return l25_trace > 0;
+}
+
+void llama_context::l25_stream_log(const char * what, llama_seq_id seq_id, size_t n, int64_t us, const llama_io_stream_stats & st) const {
+    LLAMA_LOG_INFO("%s: [TAG_FN_V0254_STORE] %s seq %d: %.1f MiB in %.1f ms; sync %.1f, %s piece alloc %.1f, device %lld x %.1f MiB "
+            "in %.1f, callback %lld x in %.1f, piece release %.1f ms\n", __func__, what, seq_id, n/1048576.0, us/1000.0,
+            st.us_sync/1000.0, st.pinned ? "pinned" : "pageable", st.us_alloc/1000.0, (long long) st.n_dev, st.b_dev/1048576.0,
+            st.us_dev/1000.0, (long long) st.n_cb, st.us_cb/1000.0, st.us_free/1000.0);
 }
 
 size_t llama_context::state_seq_read_stream(llama_seq_id seq_id, llama_state_seq_flags flags, const std::function<bool(void *, size_t)> & fn) {
@@ -6700,22 +6808,37 @@ size_t llama_context::state_seq_read_stream(llama_seq_id seq_id, llama_state_seq
     if (l20_io < 0) {
         l20_io = llama_fn_l3_int(model, "LLAMA_FN_L20_CONVFIX_IO", 0) != 0 ? 1 : 0; // [TAG_FN_L20_CONVFIX_IO]
     }
-    llama_io_read_stream io(fn, l20_io > 0 ? &io_stream_pinned : nullptr);
-    try {
-        uint32_t magic_read;
-        io.read(&magic_read, sizeof(magic_read));
-        if (io_magic != magic_read) {
-            throw std::runtime_error("wrong sequence state magic");
+    // [TAG_FN_V0254_STORE]
+    llama_io_stream_stats st;
+    st.us_sync = l25_stream_sync_us;
+    llama_io_stream_stats * stp = l25_stream_trace() ? &st : nullptr;
+    const int64_t t0 = ggml_time_us();
+    size_t res = 0;
+    int64_t t_end = 0;
+    {
+        llama_io_read_stream io(fn, l20_io > 0 ? &io_stream_pinned : nullptr, stp);
+        try {
+            uint32_t magic_read;
+            io.read(&magic_read, sizeof(magic_read));
+            if (io_magic != magic_read) {
+                throw std::runtime_error("wrong sequence state magic");
+            }
+
+            llama_seq_id seq_id_read;
+            io.read(&seq_id_read, sizeof(seq_id_read));
+
+            res = state_seq_read_data(io, seq_id, flags);
+        } catch (const std::exception & err) {
+            LLAMA_LOG_ERROR("%s: error loading state: %s\n", __func__, err.what());
+            res = 0;
         }
-
-        llama_seq_id seq_id_read;
-        io.read(&seq_id_read, sizeof(seq_id_read));
-
-        return state_seq_read_data(io, seq_id, flags);
-    } catch (const std::exception & err) {
-        LLAMA_LOG_ERROR("%s: error loading state: %s\n", __func__, err.what());
-        return 0;
+        t_end = ggml_time_us();
     }
+    if (stp) {
+        st.us_free = ggml_time_us() - t_end;
+        l25_stream_log("read", seq_id, res, ggml_time_us() - t0, st);
+    }
+    return res;
 }
 
 size_t llama_context::state_write_data(llama_io_write_i & io) {
@@ -7550,12 +7673,14 @@ bool llama_context::cbuf_set(bool full, uint32_t width, uint32_t cls) {
         const bool async = l22.endoverlap && l22_end_pending;
         l22_end_pending  = false;
         l22_class        = 0; // [TAG_FN_L22_LENDCLASS]
+        const int64_t t_r25 = ggml_time_us(); // [TAG_FN_R25_REFILL]
         if (async) {
             llama_prefill_stream_l22_async_return(this, true);
         }
         // the stream's banks come back while FULL is still there (no VRAM moves), then FULL goes, then the tail returns
         llama_moe_gen5_before_ubatch(this, sched.get(), 0);
         llama_prefill_stream_l22_async_return(this, false);
+        r25_sw_ms[0] = (ggml_time_us() - t_r25)/1000.0;
         if (!cbuf_to_small(dev, trimmed, restored, async)) {
             return false;
         }
@@ -7585,6 +7710,12 @@ bool llama_context::cbuf_set(bool full, uint32_t width, uint32_t cls) {
                 c1.avail_ram/MiB, cbuf_full_t, l22p_est_base, l22p_est_big, (long long) l22p_rows_plan, l22p_why, l22p_big_ms,
                 l22p_stream_min() == INT32_MAX ? 0 : l22p_stream_min(), l22p.smallkeep > 0 ? l22_sk_last : 0,
                 l22p.smallkeep > 0 ? l22_sk_why : "off", (full && l22_sk_parked ? l22_sk_bytes : 0)/MiB);
+        if (!full) {
+            // [TAG_FN_R25_REFILL] where the switch's time went
+            llama_fn_l22_log("switch", "what=small_parts ret_ms=%.1f free_ms=%.1f trim_ms=%.1f restore_ms=%.1f unborrow_ms=%.1f "
+                    "reserve_ms=%.1f", r25_sw_ms[0], r25_sw_ms[1], r25_sw_ms[2], r25_sw_ms[3], r25_sw_ms[4], r25_sw_ms[5]);
+            r25_sw_ms[0] = 0.0;
+        }
         if (full) {
             l22_rec_begin();
             l22_rec_cur.full_ms = ms;
@@ -7646,11 +7777,21 @@ bool llama_context::cbuf_to_small(ggml_backend_dev_t dev, size_t & trimmed, bool
     } else if (sk_keep) {
         l22_sk_why = "swap";
     }
+    int64_t t_r25 = ggml_time_us(); // [TAG_FN_R25_REFILL] the parts of the switch
+    auto r25_part = [&](int i) {
+        const int64_t t = ggml_time_us();
+        r25_sw_ms[i] = (t - t_r25)/1000.0;
+        t_r25 = t;
+    };
+    for (int i = 1; i < 6; ++i) {
+        r25_sw_ms[i] = 0.0;
+    }
     if (sk_keep) {
         l22_sk_free_full();
     } else {
         cbuf_free_compute();
     }
+    r25_part(1);
     if (cbuf_trim) {
         // [TAG_FN_L3_VRAM_TRIM] the temporaries of the prompt's kernels: the decode needs a fraction of them
         for (auto & backend : backends) {
@@ -7665,8 +7806,10 @@ bool llama_context::cbuf_to_small(ggml_backend_dev_t dev, size_t & trimmed, bool
             }
         }
     }
+    r25_part(2);
     // [TAG_FN_L22_ENDOVERLAP] async_refill: the tail's residents through the upload worker (LLAMA_FN_CBUF_ASYNC's path)
     restored = async_refill ? llama_moe_hot_cbuf_restore_ex(this, true) : llama_moe_hot_cbuf_restore(this);
+    r25_part(3);
     if (l21_extra > 0) {
         const int64_t t_ub = ggml_time_us();
         llama_moe_hot_cb_unborrow(this); // [TAG_FN_L21_BIGUB] after the tail: mapped, cleared, its residents queued
@@ -7674,12 +7817,15 @@ bool llama_context::cbuf_to_small(ggml_backend_dev_t dev, size_t & trimmed, bool
             l22p_big_ms += (ggml_time_us() - t_ub)/1000.0; // [TAG_FN_L22_UBPLAN]
         }
     }
+    r25_part(4);
     if (sk_keep) {
         l22_sk_swap_in(restored); // [TAG_FN_L22_SMALLKEEP] no SMALL reserve
+        r25_part(5);
         return true;
     }
     try {
         sched_reserve();
+        r25_part(5);
         return true;
     } catch (const std::exception & err) {
         // the tail took VRAM the SMALL reserve needs (another process grew): give it back, its layers sit out
@@ -9793,7 +9939,9 @@ size_t llama_state_seq_write_stream_ext(llama_context * ctx, llama_seq_id seq_id
     if (fn == nullptr) {
         return 0;
     }
+    const int64_t t_sync = ggml_time_us();
     ctx->synchronize();
+    ctx->l25_stream_sync_us = ggml_time_us() - t_sync; // [TAG_FN_V0254_STORE]
 
     const std::function<bool(const void *, size_t)> cb = [fn, user_data](const void * src, size_t size) {
         return fn(src, size, user_data);
@@ -9806,7 +9954,9 @@ size_t llama_state_seq_read_stream_ext(llama_context * ctx, llama_seq_id seq_id,
     if (fn == nullptr) {
         return 0;
     }
+    const int64_t t_sync = ggml_time_us();
     ctx->synchronize();
+    ctx->l25_stream_sync_us = ggml_time_us() - t_sync; // [TAG_FN_V0254_STORE]
 
     const std::function<bool(void *, size_t)> cb = [fn, user_data](void * dst, size_t size) {
         return fn(dst, size, user_data);

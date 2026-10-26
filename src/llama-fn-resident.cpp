@@ -37,6 +37,8 @@ using namespace fn_res;
 constexpr size_t GIB   = (size_t) 1 << 30;
 constexpr size_t BLOCK = (size_t) 2 << 20; // the re-warm's sample and read unit
 
+std::atomic<uint64_t> g_res_touched{0}; // [TAG_FN_V0254_STORE] bytes the service thread touched (re-warm, probe, eviction)
+
 struct res_layer {
     int                                      il      = -1;
     const ggml_tensor *                      t[3]    = {}; // up, gate, down
@@ -659,6 +661,7 @@ bool res_touch(const std::vector<range> & rs, size_t page, int64_t act0, size_t 
                 (void) *(volatile const char *) x;
             }
             *done += (size_t) (q - p);
+            g_res_touched.fetch_add((uint64_t) (q - p), std::memory_order_relaxed); // [TAG_FN_V0254_STORE]
         }
     }
     return true;
@@ -1540,4 +1543,9 @@ void llama_fn_p5_free(const llama_model & model) {
         delete t;
     }
     llama_fn_p5_dio_free(model);
+}
+
+// [TAG_FN_V0254_STORE] see llama-ext.h
+uint64_t llama_fn_res_touched_ext(void) {
+    return g_res_touched.load(std::memory_order_relaxed);
 }

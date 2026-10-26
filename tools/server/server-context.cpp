@@ -4510,14 +4510,19 @@ private:
             return;
         }
         server_keepctx_params kp;
+        kp.budget   = (uint64_t) std::max<long long>(0, env_ll("LLAMA_FN_L18_KEEPCTX_DISK_MIB", 32768)) * 1024 * 1024;
+        std::string dir_why = "LLAMA_FN_L18_KEEPCTX_DIR";
         if (const char * d = llama_model_fn_env(model_tgt, "LLAMA_FN_L18_KEEPCTX_DIR"); d && *d) {
             kp.dir = d;
+        } else if (env_ll("LLAMA_FN_V0254_STORE_DIR", 1) != 0) {
+            // [TAG_FN_V0254_STORE] beside the model when it is on another fixed SSD (O8: the TEMP drive stalled the stores)
+            kp.dir = keepctx_default_dir(params_base.model.path, kp.budget + ((uint64_t) 8 << 30), dir_why);
         } else {
             std::error_code ec;
             const auto tmp = std::filesystem::temp_directory_path(ec);
             kp.dir = ((ec ? std::filesystem::path(".") : tmp) / "llama-keepctx").string();
+            dir_why = "the TEMP folder (LLAMA_FN_V0254_STORE_DIR=0)";
         }
-        kp.budget   = (uint64_t) std::max<long long>(0, env_ll("LLAMA_FN_L18_KEEPCTX_DISK_MIB", 32768)) * 1024 * 1024;
         kp.n_max    = (int32_t) std::max<long long>(1, env_ll("LLAMA_FN_L18_KEEPCTX_N", 4));
         // [TAG_FN_L19_CONVSTORE]
         if (cs.on) {
@@ -4556,11 +4561,13 @@ private:
         }
         keepctx = std::move(kc);
         cs.lazy = kp.lazy;
+        std::string st_extra = ", [TAG_FN_V0254_STORE] folder: " + dir_why;
+        st_extra += kp.trace ? ", [TAG_FN_L20_CONVFIX_TRACE]" : "";
         SRV_INF("[TAG_FN_L18_KEEPCTX] on: conversations replaced by another prompt are stored in '%s' (up to %d, %.0f MiB, "
                 "from %d tokens%s%s%s%s%s)\n", kp.dir.c_str(), kp.n_max, kp.budget / 1048576.0, keepctx_min, kp.hot ? ", with the hot-set counts" : "",
                 kp.val ? ", [TAG_FN_L24_KEEPVAL] re-read cost x recency, the biggest active one kept" :
                 kp.gdsf ? ", [TAG_FN_L19_CONVSTORE_EVICT] value per byte" : "",
-                kp.io_reuse ? ", [TAG_FN_L20_CONVFIX_IO] memory reused" : "", kp.trace ? ", [TAG_FN_L20_CONVFIX_TRACE]" : "",
+                kp.io_reuse ? ", [TAG_FN_L20_CONVFIX_IO] memory reused" : "", st_extra.c_str(),
                 kp.lazy ? ", [TAG_FN_L20_CONVFIX_LAZY] restores leave the checkpoints on disk" : "");
     }
 
@@ -10394,6 +10401,10 @@ void server_context::start_loop() {
 
 void server_context::terminate() {
     impl->queue_tasks.terminate();
+}
+
+void server_context::stop_requests() {
+    impl->queue_results.stop_waiters();
 }
 
 llama_context * server_context::get_llama_context() const {

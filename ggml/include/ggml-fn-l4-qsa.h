@@ -58,6 +58,24 @@ static inline void ggml_fn_l4_qsa_set_fa_cells(struct ggml_tensor * t, int32_t c
 #define GGML_FN_L4_QSA_FA_LIST   0x1000
 #define GGML_FN_L4_QSA_FA_LISTOK 0x2000 // backend: its QSA_MASK writes the lists (graph_optimize matched the two)
 
+// [TAG_FN_V0254_SEQFA] on a QSA layer's FLASH_ATTN_EXT of a multi-sequence unified cache (--parallel N --kv-unified):
+// the sums must not depend on what the other sequences hold. The attention then always takes the sparse (list) walk, and
+// its index lists are min(Q, ncols1) * n_kv_max entries long whatever n_kv is: the visible cells in cell order, -1 after
+// the count. Without the bit the dense / sparse choice and the list length follow n_kv, the cell span of EVERY sequence,
+// and so do the stream-k blocks and seams (a fresh read in slot 1 scored KLD 0.021 when slot 0 held a 3.3K prompt).
+#define GGML_FN_L4_QSA_FA_SEQ    0x4000
+
+// [TAG_FN_V0254_SEQFA] the index-list length of the sparse turbot FA fa with query-tile width ncols1 (launch_fattn_turbot
+// and the QSA_MASK list writer must agree): min(n_kv, min(Q, ncols1) * n_kv_max), or the uncapped budget with FA_SEQ
+static inline int64_t ggml_fn_l4_qsa_fa_list_len(const struct ggml_tensor * fa, int ncols1) {
+    const int64_t n_q    = fa->src[0]->ne[1] < ncols1 ? fa->src[0]->ne[1] : (int64_t) ncols1;
+    const int64_t budget = n_q * (int64_t) fa->op_params[4];   // op_params[4]: n_kv_max (ggml_flash_attn_ext_set_n_kv_max)
+    if (ggml_fn_l4_qsa_get(fa) & GGML_FN_L4_QSA_FA_SEQ) {
+        return budget;
+    }
+    return fa->src[1]->ne[1] < budget ? fa->src[1]->ne[1] : budget;
+}
+
 #ifdef __cplusplus
 }
 #endif

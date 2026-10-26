@@ -1655,6 +1655,7 @@ struct ggml_backend_cuda_context {
     uint64_t        fn_l22_win_base[GGML_CUDA_FN_L22_CNT_COUNT] = {};
 
     uint64_t        pool_flush_seen = 0; // [TAG_UPSTREAM_26771]
+    uint32_t        mb_gen_seen     = 0; // [TAG_FN_BRIDGE_GRAPHGEN]
 
     ggml_cuda_graph * cuda_graph(const void * first_node_ptr) {
         const int64_t time_now = ggml_time_us();

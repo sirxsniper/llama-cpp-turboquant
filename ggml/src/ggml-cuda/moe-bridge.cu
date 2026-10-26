@@ -213,6 +213,11 @@ struct ggml_moe_bridge {
 
 static std::mutex                       g_mb_mtx;
 static std::atomic<ggml_moe_bridge *>   g_mb[MB_MAX_BRIDGES];
+static std::atomic<uint32_t>            g_mb_gen{0}; // [TAG_FN_BRIDGE_GRAPHGEN]
+
+uint32_t ggml_cuda_moe_bridge_generation() {
+    return g_mb_gen.load(std::memory_order_acquire);
+}
 
 static ggml_moe_bridge * mb_get(int32_t id) {
     if (id < 0 || id >= MB_MAX_BRIDGES) {
@@ -1637,6 +1642,7 @@ static void mb_destroy(ggml_moe_bridge * b) {
     if (b->id >= 0) {
         std::lock_guard<std::mutex> lk(g_mb_mtx);
         g_mb[b->id].store(nullptr, std::memory_order_release);
+        g_mb_gen.fetch_add(1, std::memory_order_acq_rel); // [TAG_FN_BRIDGE_GRAPHGEN] the id and the memory can go to a new bridge
     }
     if (b->glob) {
         // [TAG_FN_R4_BRIDGE_DMA] no device wait or fetch of this bridge spins past this point
@@ -2018,6 +2024,7 @@ bool ggml_backend_cuda_moe_bridge_set_ring(ggml_moe_bridge * b, void * host_ptr,
     }
     b->dev.dma_ring      = (const char *) dptr;
     b->dev.dma_ring_size = (unsigned long long) size;
+    g_mb_gen.fetch_add(1, std::memory_order_acq_rel); // [TAG_FN_BRIDGE_GRAPHGEN] captured kernels hold the old device view
     GGML_LOG_INFO("%s: bridge %d: fetches read a %.0f MiB pinned ring\n", __func__, b->id, size/1048576.0);
     return true;
 #endif

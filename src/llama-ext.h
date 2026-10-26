@@ -381,6 +381,8 @@ LLAMA_API int32_t llama_get_decode_phase_ext(const struct llama_context * ctx);
 LLAMA_API bool llama_fn_pin_on_oom_ext(const struct llama_model * model, size_t need_bytes);
 // [TAG_FN_L23_PINFIX] R-L23-8: the server marks a request (+1 / -1; 0 = time stamp only): pins register only while idle
 LLAMA_API void llama_fn_pin_server_busy(int delta);
+// [TAG_FN_V0254_STORE] see llama-fn-l22.h
+LLAMA_API uint64_t llama_fn_res_touched_ext(void);
 // [TAG_FN_L22_PIN] (P2b request 3) llama_fn_pin_active (P6) for code outside libllama
 LLAMA_API bool llama_fn_pin_active_ext(void);
 

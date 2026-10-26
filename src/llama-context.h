@@ -47,6 +47,8 @@ struct llama_memory_buffer {
 
 using llama_memory_buffers = std::map<ggml_backend_buffer_type_t, llama_memory_buffer>;
 
+struct llama_io_stream_stats; // [TAG_FN_V0254_STORE]
+
 struct llama_context {
     // init scheduler and compute buffers, reserve worst-case graphs
     llama_context(
@@ -220,6 +222,13 @@ struct llama_context {
     // [TAG_FN_L18_KEEPCTX] the bytes of state_seq_get_data / state_seq_set_data, passed through a callback in pieces
     size_t state_seq_write_stream(llama_seq_id seq_id, llama_state_seq_flags flags, const std::function<bool(const void *, size_t)> & fn);
     size_t state_seq_read_stream (llama_seq_id seq_id, llama_state_seq_flags flags, const std::function<bool(void *, size_t)> & fn);
+
+    // [TAG_FN_V0254_STORE] LLAMA_FN_L20_CONVFIX_TRACE=1: the parts of each streamed state in the log; the synchronize
+    // before the stream (us)
+    int64_t l25_stream_sync_us = 0;
+    int     l25_trace          = -1;
+    bool    l25_stream_trace();
+    void    l25_stream_log(const char * what, llama_seq_id seq_id, size_t n, int64_t us, const llama_io_stream_stats & st) const;
 
     //
     // perf
@@ -662,6 +671,9 @@ private:
     bool     l22_end_pending = false;
     int      l22_first_n     = 0;    // decode calls still counted after a prompt's switch (first 8)
     int64_t  l22_first_t0    = 0;
+    // [TAG_FN_R25_REFILL] the parts of the last switch to SMALL (ms): stream return + unlend, compute free, pool trim, tail
+    // restore, borrow return, reserve / swap
+    double   r25_sw_ms[6]    = { 0, 0, 0, 0, 0, 0 };
     // [TAG_FN_L22_PASSLOG] one record per prompt (FULL period, or a short-path batch); P10 reads l22_rec / l22_rec_seq
     struct l22_pass_rec {
         uint64_t rows = 0, batches = 0, ubatches = 0;

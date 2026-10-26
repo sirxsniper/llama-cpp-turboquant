@@ -7941,6 +7941,21 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         }
     }
 
+    // [TAG_FN_BRIDGE_GRAPHGEN] a MoE bridge was freed or changed its device view: a captured graph would replay the old
+    // bridge's posts and waits (a new bridge with the same id and the same tensors passes the property check), so capture
+    // them again
+    {
+        const uint32_t mb_gen = ggml_cuda_moe_bridge_generation();
+        if (mb_gen != cuda_ctx->mb_gen_seen) {
+            cuda_ctx->mb_gen_seen = mb_gen;
+            if (!cuda_ctx->cuda_graphs.empty()) {
+                GGML_LOG_INFO("%s: [TAG_FN_BRIDGE_GRAPHGEN] a MoE bridge was freed or changed: %zu CUDA graphs captured again\n",
+                        __func__, cuda_ctx->cuda_graphs.size());
+                cuda_ctx->cuda_graphs.clear();
+            }
+        }
+    }
+
     ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
 
     const bool gd_new_key = cuda_ctx->cuda_graphs.find(graph_key) == cuda_ctx->cuda_graphs.end(); // [TAG_FN_L7_GDIFF]

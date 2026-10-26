@@ -148,6 +148,14 @@ LLAMA_API uint32_t llama_fn_l21_full_width(uint32_t base_ub, uint32_t n_ubatch, 
 // [TAG_FN_L20_BIGPROMPT_UB] a narrow batch (no wider than the SMALL reserve) keeps the FULL state when the switch is on
 // (base_ub > 0), the state is FULL, it is not on the short path and its prompt goes on after it (after > 0)
 LLAMA_API bool     llama_fn_l20_keep_full(uint32_t base_ub, bool wide, bool short_path, bool state_full, int64_t after);
+// [TAG_FN_V0254_NARROWFULL] a narrow batch of a multi-sequence context starts the FULL period early: it is no wider than
+// small_t, has prompt rows (n_outputs < n_tokens), its prompt goes on (after > 0), and the rest's next batch (min(after,
+// n_batch) rows; n_batch 0: after) would itself take the FULL path: wider than small_t and not on the short path
+// (llama_fn_cbuf_short_max(short_max, early, warm_running) for those rows). A rest that stays SMALL keeps this part SMALL
+// too (20 rows + 150 rows with short_max 160: both SMALL, as v0.25.3), so the guard judges the rest batch alone, as the
+// short path does, not the whole prompt
+LLAMA_API bool     llama_fn_v0254_narrow_full(uint32_t n_tokens, uint32_t n_outputs, int64_t after, uint32_t n_batch,
+        uint32_t small_t, uint32_t short_max, uint32_t early, bool warm_running);
 // the hot-set budget with the lend: the fit's budget plus pool_extra (LLAMA_FN_CBUF_POOL_MIB, also in the tail), never
 // above budget_max nor above free - 256 MiB (unless the fit's budget already is)
 LLAMA_API size_t   llama_fn_cbuf_budget(size_t budget, size_t pool_extra, size_t free, size_t budget_max);

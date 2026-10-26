@@ -7,6 +7,7 @@
 #include "fattn-turbot-decl.cuh"   // [TAG_TURBOT] host declarations only, never turbot-tables.cuh
 #include "turbot-set-rows.cuh"     // [TAG_TURBOT_ANY_ROUTE] ggml_cuda_turbot_any_on, host declarations only
 #include "ggml-turbot.h"
+#include "ggml-fn-l4-qsa.h"         // [TAG_FN_V0254_SEQFA] GGML_FN_L4_QSA_FA_SEQ
 
 #include <set>
 
@@ -273,6 +274,11 @@ static int ggml_cuda_fattn_turbot_sparse_ncols1(const int cc, const ggml_tensor 
 
     const int     ncols1   = Q->ne[1] <= 4 ? 4 : 8;
     const int64_t n_gather = std::min<int64_t>(Q->ne[1], ncols1) * (int64_t) n_kv_max;
+    // [TAG_FN_V0254_SEQFA] a multi-sequence QSA attention always walks the lists: the n_kv gate below counts the cells of
+    // every sequence, so the other slot's prompt switched a fresh read between the dense and the sparse sums
+    if (ggml_fn_l4_qsa_get(dst) & GGML_FN_L4_QSA_FA_SEQ) {
+        return ncols1;
+    }
     return K->ne[1] >= std::max<int64_t>(4096, 2*n_gather) ? ncols1 : 0;
 #endif // defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
 }

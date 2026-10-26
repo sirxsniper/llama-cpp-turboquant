@@ -14,8 +14,11 @@
 #include "log.h"
 
 #include <atomic>
+#include <chrono>
 #include <clocale>
+#include <cstdlib>
 #include <exception>
+#include <future>
 #include <signal.h>
 #include <thread> // for std::thread::hardware_concurrency
 
@@ -631,6 +634,9 @@ static int server_run_instance(common_params & params, server_role & role, commo
         server_stream_session_manager_stop();
         ctx_http.stop();
         ctx_server.terminate();
+        // [TAG_FN_V0254_STOP] a request in flight waits for a result the ended loop never sends: answer it with an
+        // error, so its HTTP worker returns and the join below does not hang
+        ctx_server.stop_requests();
         mcp_mgr.shutdown();
         llama_backend_free();
     };
@@ -690,7 +696,30 @@ static int server_run_instance(common_params & params, server_role & role, commo
     ctx_server.start_loop();
 
     clean_up();
-    ctx_http.join();
+    // [TAG_FN_V0254_STOP] the workers return at once now (clean_up answered every waiting request); one stuck
+    // elsewhere, e.g. on a client that does not read, must not keep the process alive. LLAMA_SERVER_STOP_JOIN_S (5)
+    {
+        const char * js = getenv("LLAMA_SERVER_STOP_JOIN_S");
+        const int join_s = js ? std::max(1, atoi(js)) : 5;
+        std::promise<void> joined;
+        std::future<void>  joined_f = joined.get_future();
+        std::thread joiner([&ctx_http, &joined] {
+            ctx_http.join();
+            joined.set_value();
+        });
+        if (joined_f.wait_for(std::chrono::seconds(join_s)) != std::future_status::ready) {
+            SRV_WRN("%s: [TAG_FN_V0254_STOP] HTTP workers still busy %d s after the stop: exiting without joining them\n",
+                    __func__, join_s);
+            if (llama_context * lc = ctx_server.get_llama_context()) {
+                llama_synchronize(lc);
+            }
+            common_log_flush(common_log_main());
+            fflush(stdout);
+            fflush(stderr);
+            std::_Exit(0);
+        }
+        joiner.join();
+    }
     if (monitor_thread.joinable()) {
         monitor_thread.join();
     }

@@ -776,12 +776,10 @@ struct fn_l4_list_layout {
 // the layout launch_fattn_turbot gives the lists of a sparse FA with query-tile width ncols1
 static fn_l4_list_layout fn_l4_list_layout_of(const ggml_tensor * fa, const int ncols1) {
     const ggml_tensor * Q    = fa->src[0];
-    const ggml_tensor * K    = fa->src[1];
     const ggml_tensor * mask = fa->src[3];
-    const int32_t n_kv_max   = ggml_get_op_params_i32(fa, 4);
     fn_l4_list_layout lo;
     lo.ncols1    = ncols1;
-    lo.n_kv_list = std::min<int64_t>(K->ne[1], std::min<int64_t>(Q->ne[1], ncols1)*(int64_t) n_kv_max);
+    lo.n_kv_list = ggml_fn_l4_qsa_fa_list_len(fa, ncols1);   // [TAG_FN_V0254_SEQFA] the length launch_fattn_turbot uses
     lo.n_lists   = ((Q->ne[1] + ncols1 - 1)/ncols1)*mask->ne[3];
     return lo;
 }

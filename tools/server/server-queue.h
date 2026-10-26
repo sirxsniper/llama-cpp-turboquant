@@ -154,6 +154,7 @@ private:
 struct server_response {
 private:
     bool running = true;
+    bool stopping = false; // [TAG_FN_V0254_STOP] stop_waiters() was called (guarded by mutex_results)
 
     // for keeping track of all tasks waiting for the result
     std::unordered_set<int> waiting_task_ids;
@@ -195,6 +196,10 @@ public:
 
     // terminate the waiting loop
     void terminate();
+
+    // [TAG_FN_V0254_STOP] the server stops: every waiting recv (and every later one) returns an error result instead of
+    // waiting for a task that the stopped loop never finishes, so its HTTP worker returns
+    void stop_waiters();
 };
 
 // RAII wrapper to make working with server_queue and server_response easier

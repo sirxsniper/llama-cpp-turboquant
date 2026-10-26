@@ -11019,6 +11019,7 @@ struct test_flash_attn_ext_turbot : public test_case {
     const int64_t            hkv;
     const int64_t            hq;
     const bool               fn_l3;          // [TAG_FN_L3_GPU_COMPACT] the qwen4exp mark on the FA node
+    const bool               fa_seq;         // [TAG_FN_V0254_SEQFA] the multi-sequence mark: list walk, list of min(nb, ncols1) x n_kv_max
     turbot_test_cache        cache;
 
     bool default_geom() const {
@@ -11031,7 +11032,7 @@ struct test_flash_attn_ext_turbot : public test_case {
 
     std::string vars() override {
         return std::string(perf ? "turbot_perf=" : "turbot=") + wname + "," + geom_vars() + VARS_TO_STR6(kv, nb, mix, mask_mode, sinks, logit_softcap) +
-               (fn_l3 ? ",fn_l3=1" : "");
+               (fn_l3 ? ",fn_l3=1" : "") + (fa_seq ? ",fa_seq=1" : "");
     }
 
     double max_nmse_err() override {
@@ -11045,10 +11046,10 @@ struct test_flash_attn_ext_turbot : public test_case {
 
     test_flash_attn_ext_turbot(turbot_test_widths widths, int64_t kv, int64_t nb, turbot_test_mix mix_id, int mask_mode,
                                bool sinks, float logit_softcap, bool perf, int64_t d = 256, int64_t hkv = 4, int64_t hq = 24,
-                               bool fn_l3 = false)
+                               bool fn_l3 = false, bool fa_seq = false)
         : widths(widths), kv(kv), nb(nb), mix_id(mix_id), mask_mode(mask_mode), sinks(sinks), logit_softcap(logit_softcap),
           perf(perf), wname(turbot_test_widths_name(widths)), mix(turbot_test_mix_name(mix_id)), d(d), hkv(hkv), hq(hq),
-          fn_l3(fn_l3) {}
+          fn_l3(fn_l3), fa_seq(fa_seq) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         cache.layer   = turbot_test_layer_geom(widths, turbot_test_flags(d, hkv));
@@ -11100,6 +11101,9 @@ struct test_flash_attn_ext_turbot : public test_case {
         ggml_flash_attn_ext_set_turbot(out, pool, gtab, &p);
         if (fn_l3) {
             ggml_fn_l3_set(out, GGML_FN_L3_COMPACT);
+        }
+        if (fa_seq) {
+            ggml_fn_l4_qsa_add(out, GGML_FN_L4_QSA_FA_SEQ);   // [TAG_FN_V0254_SEQFA] as build_attn_qsa marks it on 2+ slots
         }
         ggml_set_name(out, "out");
 
@@ -17275,6 +17279,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         for (int64_t nb : { 3, 32, 64, 128 }) {
             test_cases.emplace_back(new test_flash_attn_ext_turbot(TURBOT_TW_NR2_Q8, 65536, nb, TURBOT_MIX_BAND16K, 3, false, 0.0f, false, 256, 2, 24));
         }
+        // [TAG_FN_V0254_SEQFA] the multi-sequence mark (2 slots, --kv-unified): the list walk at every kv, also below the
+        // n_kv gate (kv < 2 x min(nb, ncols1) x 2051, which ran dense), with lists longer than the cache (-1 past the count):
+        // decode / verify (1, 3), the 8-row tile, a 26-row prompt tail and a 512-row prompt chunk (fn_l3: the COMPACT lists).
+        // -p "fa_seq=1"
+        for (int64_t kv : { 256, 2048, 4096, 9216 }) {
+            for (int64_t nb : { 1, 3, 8, 26, 512 }) {
+                test_cases.emplace_back(new test_flash_attn_ext_turbot(TURBOT_TW_NR2_Q8, kv, nb, TURBOT_MIX_YOUNG, 3, false, 0.0f, false, 256, 2, 24,
+                                                                       nb >= 26, true));
+            }
+        }
+        test_cases.emplace_back(new test_flash_attn_ext_turbot(TURBOT_TW_NR2_Q8, 32768, 3, TURBOT_MIX_BAND16K, 3, false, 0.0f, false, 256, 2, 24, false, true));
+        test_cases.emplace_back(new test_flash_attn_ext_turbot(TURBOT_TW_NR2_Q8, 32768, 64, TURBOT_MIX_BAND16K, 3, false, 0.0f, false, 256, 2, 24, true, true));
         // the other NR 2 widths (float old path b 6, the int8 old paths) through the gather loader
         for (turbot_test_widths w : { TURBOT_TW_NR2_A, TURBOT_TW_NR2_B, TURBOT_TW_NR2_L }) {
             test_cases.emplace_back(new test_flash_attn_ext_turbot(w, 65536, 2, TURBOT_MIX_ALT, 3, false, 0.0f, false, 256, 2, 24));
@@ -20869,12 +20885,24 @@ static bool run_moe_bridge(ggml_backend_t backend, ggml_backend_t backend_ref, c
                     ggml_backend_tensor_set(x, xv.data(), 0, xv.size() * sizeof(float));
                     ggml_backend_tensor_set(ids_full, ids_fv.data(), 0, ids_fv.size() * sizeof(int32_t));
                     ggml_backend_tensor_set(w, wv.data(), 0, wv.size() * sizeof(float));
+                    const auto t_run = std::chrono::steady_clock::now();
                     if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) {
                         printf("  FAIL moe bridge %s T=%" PRId64 ": graph compute failed\n", mname, T);
                         return false;
                     }
                     std::vector<float> got((size_t) c.n_embd * T);
                     ggml_backend_tensor_get(out, got.data(), 0, got.size() * sizeof(float));
+                    const double run_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_run).count();
+                    // [TAG_FN_BRIDGE_GRAPHGEN] a bridge error is not a wrong sum (its wait wrote zeros): name it
+                    if (expect_ok && br_error(br) != GGML_MOE_BRIDGE_ERR_NONE) {
+                        ggml_moe_bridge_stats es;
+                        br_stats(br, &es);
+                        printf("  FAIL moe bridge %s %s/%s/%s T=%" PRId64 " table=%d %s run %d: bridge error %u (%s) on channel %d, the graph took %.1f ms\n",
+                               mname, ggml_type_name(c.tu), ggml_type_name(c.tg), ggml_type_name(c.td), T, (int) with_tbl, what, r,
+                               es.error, es.error == GGML_MOE_BRIDGE_ERR_TIMEOUT ? "a wait timed out" : "a host job failed",
+                               es.error_chan, run_ms);
+                        return false;
+                    }
 
                     std::vector<float> expect((size_t) c.n_embd * T, 0.0f);
                     if (expect_ok) {
@@ -20910,8 +20938,8 @@ static bool run_moe_bridge(ggml_backend_t backend, ggml_backend_t backend_ref, c
                 return ok;
             };
 
-            for (int64_t T = 1; T <= 8; T++) {
-                for (int with_tbl = 0; with_tbl < 2; with_tbl++) {
+            for (int64_t T = 1; T <= 8 && br_error(br) == GGML_MOE_BRIDGE_ERR_NONE; T++) {
+                for (int with_tbl = 0; with_tbl < 2 && br_error(br) == GGML_MOE_BRIDGE_ERR_NONE; with_tbl++) {
                     n_run++;
                     const bool ok = run_case(T, with_tbl != 0, 3, true, "") && br_error(br) == GGML_MOE_BRIDGE_ERR_NONE;
                     n_fail += ok ? 0 : 1;
@@ -20977,6 +21005,169 @@ static bool run_moe_bridge(ggml_backend_t backend, ggml_backend_t backend_ref, c
                 exec.join();
             }
             br_free(br);
+            pool_free(run.pool);
+        }
+
+        // [TAG_FN_BRIDGE_GRAPHGEN] one graph (the same tensors in the same buffer) on a spin bridge, then a hostfunc bridge,
+        // then a spin bridge, each freed before the next is made: the new bridge gets the same id, so every node property
+        // matches the graph captured on the old bridge. That capture (the old wait mode, no host node or a host node of a
+        // freed bridge) must not replay. v0.25.3: the spin capture replayed on the hostfunc bridge, its wait timed out.
+        {
+            const int64_t T = 2;
+            ggml_init_params params = { ggml_tensor_overhead()*16 + ggml_graph_overhead(), NULL, true };
+            ggml_context_ptr ctx(ggml_init(params));
+            ggml_tensor * x   = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, c.n_embd, T);
+            ggml_tensor * ids = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, c.n_used, T);
+            ggml_tensor * w   = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, c.n_used, T);
+            ggml_tensor * out = nullptr;
+            ggml_backend_buffer_ptr buf;
+            ggml_cgraph * gf = nullptr;
+
+            moe_bridge_test_runner run;
+            run.pool_run = pool_run;
+            ggml_cpu_moe_pool_params pp = pp_def(4);
+            pp.spin_us = 50;
+            run.pool      = pool_new(&pp);
+            run.layer     = { a_u, a_g, a_d, nullptr, 0 };
+            run.layer_tbl = { a_u, a_g, a_d, tbl.data(), c.n_exp };
+
+            const int modes[3] = { GGML_MOE_BRIDGE_WAIT_SPIN, GGML_MOE_BRIDGE_WAIT_HOSTFUNC, GGML_MOE_BRIDGE_WAIT_SPIN };
+            int32_t bid = -1;
+            int n_exact = 0;
+            bool reuse_ok = true;
+            for (int k = 0; k < 3 && reuse_ok; k++) {
+                const int mode = modes[k];
+                const char * mname = mode == GGML_MOE_BRIDGE_WAIT_SPIN ? "spin" : "hostfunc";
+                const char * prev  = k == 0 ? "none" : modes[k - 1] == GGML_MOE_BRIDGE_WAIT_SPIN ? "spin" : "hostfunc";
+                ggml_moe_bridge_params bp = {};
+                bp.device     = dev_index;
+                bp.n_chan     = 2;
+                bp.n_embd     = c.n_embd;
+                bp.n_used     = c.n_used;
+                bp.max_tokens = 8;
+                bp.wait_mode  = mode;
+                bp.timeout_ms = 100;
+                bp.job_max_ms = 1000;
+                ggml_moe_bridge * br = dev_index >= 0 ? br_new(&bp) : nullptr;
+                n_run++;
+                if (br == nullptr) {
+                    printf("  FAIL moe bridge graph reuse %s: the backend could not create a bridge\n", mname);
+                    n_fail++;
+                    break;
+                }
+                if (bid < 0) {
+                    bid = br_id(br);
+                    ggml_tensor * ticket = ggml_moe_host_post(ctx.get(), x, ids, w, bid, 0, 0);
+                    ggml_tensor * dep    = ggml_scale(ctx.get(), ggml_sqr(ctx.get(), x), 0.25f);
+                    out = ggml_moe_host_wait(ctx.get(), ticket, dep, c.n_embd, T, bid, 0);
+                    buf.reset(ggml_backend_alloc_ctx_tensors(ctx.get(), backend));
+                    gf = ggml_new_graph(ctx.get());
+                    ggml_build_forward_expand(gf, out);
+                } else if (br_id(br) != bid) {
+                    printf("  note: moe bridge graph reuse: the %s bridge got id %d, not %d: no stale capture to check\n", mname, br_id(br), bid);
+                    n_run--;
+                    br_free(br);
+                    break;
+                }
+                if (buf == nullptr) {
+                    printf("  FAIL moe bridge graph reuse: allocation failed\n");
+                    n_fail++;
+                    br_free(br);
+                    break;
+                }
+                std::atomic<bool> stop{false};
+                std::thread exec;
+                if (mode == GGML_MOE_BRIDGE_WAIT_SPIN) {
+                    exec = std::thread([&]() {
+                        while (!stop.load()) {
+                            ggml_moe_bridge_job job;
+                            if (br_poll(br, &job)) {
+                                br_complete(br, &job, moe_bridge_test_run(&job, &run));
+                            } else {
+                                std::this_thread::yield();
+                            }
+                        }
+                    });
+                } else {
+                    br_runner(br, moe_bridge_test_run, &run);
+                }
+                // run 0 direct (or captured again), run 1 captured, run 2 replayed: the next bridge finds this capture
+                for (int r = 0; r < 3 && reuse_ok; r++) {
+                    std::vector<float> xv((size_t) c.n_embd * T);
+                    for (float & v : xv) {
+                        v = uni(gen);
+                    }
+                    std::vector<int32_t> ids_v;
+                    std::vector<int32_t> experts(c.n_exp);
+                    for (int i = 0; i < c.n_exp; i++) {
+                        experts[i] = i;
+                    }
+                    for (int64_t t = 0; t < T; t++) {
+                        std::shuffle(experts.begin(), experts.end(), gen);
+                        ids_v.insert(ids_v.end(), experts.begin(), experts.begin() + c.n_used);
+                    }
+                    std::vector<float> wv((size_t) c.n_used * T);
+                    for (float & v : wv) {
+                        v = 0.5f + 0.5f * uni(gen);
+                    }
+                    ggml_backend_tensor_set(x, xv.data(), 0, xv.size() * sizeof(float));
+                    ggml_backend_tensor_set(ids, ids_v.data(), 0, ids_v.size() * sizeof(int32_t));
+                    ggml_backend_tensor_set(w, wv.data(), 0, wv.size() * sizeof(float));
+                    const auto t_run = std::chrono::steady_clock::now();
+                    if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) {
+                        printf("  FAIL moe bridge graph reuse %s after %s run %d: graph compute failed\n", mname, prev, r);
+                        reuse_ok = false;
+                        break;
+                    }
+                    std::vector<float> got((size_t) c.n_embd * T);
+                    ggml_backend_tensor_get(out, got.data(), 0, got.size() * sizeof(float));
+                    const double run_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_run).count();
+                    if (br_error(br) != GGML_MOE_BRIDGE_ERR_NONE) {
+                        printf("  FAIL moe bridge graph reuse %s after %s run %d: bridge error %u (%s), the graph took %.1f ms\n",
+                               mname, prev, r, br_error(br), br_error(br) == GGML_MOE_BRIDGE_ERR_TIMEOUT ? "a wait timed out" : "a host job failed", run_ms);
+                        reuse_ok = false;
+                        break;
+                    }
+                    const std::vector<float> ref = cpu_fn_moe_graph(backend_ref, c, T, wu, wg, wd, xv, ids_v, nullptr, c.n_exp);
+                    if (ref.empty()) {
+                        printf("  FAIL moe bridge graph reuse: the CPU reference failed\n");
+                        reuse_ok = false;
+                        break;
+                    }
+                    std::vector<float> expect((size_t) c.n_embd * T, 0.0f);
+                    for (int64_t t = 0; t < T; t++) {
+                        for (int64_t row = 0; row < c.n_embd; row++) {
+                            float sum = 0.0f;
+                            for (int slot = 0; slot < c.n_used; slot++) {
+                                sum += wv[slot + (size_t) c.n_used * t] * ref[((size_t) t * c.n_used + slot) * c.n_embd + row];
+                            }
+                            expect[(size_t) t * c.n_embd + row] = sum;
+                        }
+                    }
+                    size_t n_diff = 0;
+                    for (size_t i = 0; i < got.size(); i++) {
+                        n_diff += memcmp(&got[i], &expect[i], sizeof(float)) != 0;
+                    }
+                    const double err = nmse(expect.data(), got.data(), got.size());
+                    if (n_diff > 0 && err > 1e-10) {
+                        printf("  FAIL moe bridge graph reuse %s after %s run %d: %zu values differ, NMSE %g\n", mname, prev, r, n_diff, err);
+                        reuse_ok = false;
+                        break;
+                    }
+                    n_exact++;
+                }
+                ggml_backend_synchronize(backend);
+                stop = true;
+                if (exec.joinable()) {
+                    exec.join();
+                }
+                br_free(br);
+                n_fail += reuse_ok ? 0 : 1;
+            }
+            if (reuse_ok && bid >= 0) {
+                printf("  moe bridge graph reuse %s/%s/%s: spin, hostfunc, spin bridges with id %d on one graph, %d runs exact\n",
+                       ggml_type_name(c.tu), ggml_type_name(c.tg), ggml_type_name(c.td), bid, n_exact);
+            }
             pool_free(run.pool);
         }
     }

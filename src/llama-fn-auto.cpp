@@ -96,6 +96,11 @@ const fn_item k_items[] = {
     { "LLAMA_PREFILL_STREAM",         "1",     P_ALL },
     { "LLAMA_PREFILL_STREAM_LEND",    "1",     P_ALL },
     { "LLAMA_PREFILL_STREAM_THREADS", "16",    P_ALL },
+    // [TAG_FN_R25_STAGE] round 25: the stream's ring copies with plain stores into a 4 x 8 MiB ring that stays in the L3 (the
+    // DMA reads it there): a staged byte crosses DRAM once instead of three times (E:/turbot-gates/flashnext/test/r25/stream)
+    { "LLAMA_PREFILL_STREAM_CACHED",  "1",     P_ALL },
+    // [TAG_FN_R25_PIN] the copy workers in turn on the two CCDs (left free they stayed on the cache CCD)
+    { "LLAMA_PREFILL_STREAM_PIN",     "2",     P_ALL },
     // [TAG_FN_L3_ADOPT] lever round 3 (flashnext/int-l3): ALL-ON against the shipped default at -c 262144, turbot, MTP,
     // 2 interleaved rounds: real use +19.5 % (70.5 vs 59.0 t/s, the SHIP round without a stall; +30.7 % over both rounds); see
     // E:/turbot-gates/flashnext/test/l3/int/REPORT.md
@@ -344,6 +349,10 @@ const fn_item k_items[] = {
     { "LLAMA_FN_L24_GENCKPT",               "1",       P_ALL }, // [TAG_FN_L24_GENCKPT] checkpoints inside long answers (exact: state copies)
     { "LLAMA_FN_L24_OPFAIR",                "1",       P_ALL }, // [TAG_FN_L24_OPFAIR] ONEPROMPT shortest remaining first, a prompt gives way at most once per request (2+ slots)
     { "LLAMA_FN_L24_GSCAP",                 "1",       P_ALL }, // [TAG_FN_L24_GSCAP] GENSHARE2 window cap per row fraction (2+ slots)
+    { "LLAMA_FN_R25_REFILL",                "1",       P_ALL }, // [TAG_FN_R25_REFILL] sync refills through the cache-resident copy pool (exact: same bytes)
+    { "LLAMA_FN_R25_REFILL_THREADS",        "8",       P_ALL }, // R25 copy threads (own stream each)
+    { "LLAMA_FN_R25_REFILL_HALF_KIB",       "2048",    P_ALL }, // R25 pinned half per thread (two each)
+    { "LLAMA_FN_R25_SBSYNC_MIB",            "1024",    P_ALL }, // R25 a borrow return up to this size lands at once (0: upload worker)
     { "LLAMA_FN_L22_DMASHARE",              "0",       P_ALL }, // P14 [TAG_FN_L22_DMASHARE] D11, the pin block sets 1; owner
     { "LLAMA_FN_L22_DMASHARE_SLOTS",        "4",       P_ALL }, // P14
     { "LLAMA_FN_L22_X_PRIOR",               "0",       P_ALL }, // P12 [TAG_FN_L22_X_PRIOR] changes answers: owner
@@ -882,6 +891,20 @@ uint32_t llama_fn_l21_full_width(uint32_t base_ub, uint32_t n_ubatch, uint32_t n
 
 bool llama_fn_l20_keep_full(uint32_t base_ub, bool wide, bool short_path, bool state_full, int64_t after) {
     return base_ub > 0 && !wide && !short_path && state_full && after > 0;
+}
+
+bool llama_fn_v0254_narrow_full(uint32_t n_tokens, uint32_t n_outputs, int64_t after, uint32_t n_batch,
+        uint32_t small_t, uint32_t short_max, uint32_t early, bool warm_running) {
+    if (n_tokens == 0 || n_tokens > small_t || n_outputs >= n_tokens || after <= 0) {
+        return false; // a wide batch (its own rule), an answer-only batch (R-L23-3) or the prompt's last part
+    }
+    const int64_t rest = n_batch > 0 ? std::min<int64_t>(after, (int64_t) n_batch) : after;
+    if (rest <= (int64_t) small_t) {
+        return false; // a narrow rest: SMALL
+    }
+    const uint32_t r    = (uint32_t) std::min<int64_t>(rest, (int64_t) UINT32_MAX);
+    const uint32_t smax = llama_fn_cbuf_short_max(short_max, early, warm_running, r, small_t);
+    return !(smax > 0 && r <= smax); // a rest on the short path stays SMALL, so does this part
 }
 
 bool llama_fn_cbuf_fits(size_t budget, size_t tail, size_t stream_lend) {

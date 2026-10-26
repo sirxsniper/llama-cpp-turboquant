@@ -140,6 +140,8 @@ LLAMA_API bool llama_fn_dxgi_query(uint64_t luid, int non_local, uint64_t * budg
 LLAMA_API void llama_fn_pin_decode_mark(bool in_decode);
 // [TAG_FN_L23_PINFIX] R-L23-8: the server marks a request (+1 / -1; 0 = time stamp only): pins register only while idle
 LLAMA_API void llama_fn_pin_server_busy(int delta);
+// [TAG_FN_V0254_STORE] bytes the residency service thread touched since the start (a trace counter)
+LLAMA_API uint64_t llama_fn_res_touched_ext(void);
 // P6 R2: a device reserve / lend / grow size a package may need after ready, for the watcher's LOCAL reserve (stub: no-op)
 enum llama_fn_pin_need {
     LLAMA_FN_PIN_NEED_FULL_EXTRA = 0, // the FULL compute reserve above SMALL (P4, P10)

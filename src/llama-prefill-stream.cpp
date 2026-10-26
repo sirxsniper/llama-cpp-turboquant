@@ -48,6 +48,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <string> // [TAG_FN_R25_PIN]
 #include <thread>
 #include <vector>
 
@@ -201,6 +202,14 @@ struct pfs_state {
 
     // [TAG_FN_L22_P10] round 22, package P10 (all off unless the context turned them on)
     int            n_threads_max = 8;     // LLAMA_PREFILL_STREAM_THREADS: the pool at init
+    // [TAG_FN_R25_STAGE] the copy pool's mode (every pool made for this state, also a stagers restart)
+    bool           cp_tmp  = false;       // LLAMA_PREFILL_STREAM_CACHED: plain stores into an L3-sized ring
+    bool           cp_pf   = false;       // LLAMA_PREFILL_STREAM_CACHED_PF: NTA prefetch of the source
+    int            cp_spin = 0;           // LLAMA_PREFILL_STREAM_SPIN_US
+    bool           cp_async = false;      // LLAMA_PREFILL_STREAM_ASYNC: a chunk is dispatched while the next one is copied
+    int            cp_pin   = 0;          // [TAG_FN_R25_PIN] LLAMA_PREFILL_STREAM_PIN: 0 free, 1 one core each, 2 one CCD each
+    std::vector<gen5::cpu_mask> cp_affs;  // [TAG_FN_R25_PIN] the copy workers' affinities (empty: free)
+    size_t         cp_grain = 0;          // [TAG_FN_R25_PIN] LLAMA_PREFILL_STREAM_GRAIN_KIB (0: fixed parts)
     int            stagers_mode  = 0;     // [TAG_FN_L22_STAGERS] 0 off, -1 auto, n >= 2 fixed
     double         stg_share     = -1.0;  // EWMA (alpha 0.5) of staged / host bytes per pass (-1: none since a pin change)
     bool           stg_pin       = false; // pins were live at the last lend
@@ -558,6 +567,7 @@ void pfs_run(pfs_state * s) {
     std::vector<std::pair<size_t, size_t>>   ranges;
     std::vector<gen5::copy_seg>              segs;
     std::vector<item>                        pieces;
+    std::vector<item>                        pend; // [TAG_FN_R25_STAGE] the pieces of the chunk copied last (async)
     std::vector<void *>                      d2d_dst;
     std::vector<const void *>                d2d_src;
     std::vector<size_t>                      d2d_len;
@@ -737,6 +747,31 @@ void pfs_run(pfs_state * s) {
                 }
             }
         };
+        // the pieces pcs of one ring slot are copied: dispatch them (the bank is owned) or stage them until it is free
+        auto settle = [&](std::vector<item> & pcs) {
+            if (pcs.empty()) {
+                return;
+            }
+            s->chunk_state[pcs.front().slot] = 1;
+            for (const item & it : pcs) {
+                if (dispatching) {
+                    dispatch(it);
+                } else {
+                    staged.push_back(it);
+                }
+            }
+            pcs.clear();
+            if (!dispatching) {
+                bool free_now;
+                {
+                    std::lock_guard<std::mutex> lk(s->mtx);
+                    free_now = B.consumed;
+                }
+                if (free_now && !flush()) {
+                    cancelled = true;
+                }
+            }
+        };
         // the byte ranges rr of tensor k from the host: through the ring, a slot filled by one copy of its pieces
         // [TAG_FN_L22_SSDTIER] the experts of dio are read into the slot by direct I/O instead (a refusal: the mapped read)
         auto stream_ring = [&](int k, const std::vector<std::pair<size_t, size_t>> & rr) {
@@ -744,6 +779,7 @@ void pfs_run(pfs_state * s) {
             const size_t    nb  = L.src[k]->nb[2];
             size_t ri = 0;
             size_t ro = rr.empty() ? 0 : rr[0].first;
+            pend.clear();
             while (ri < rr.size() && !cancelled) {
                 const int slot = next_slot;
                 next_slot = (next_slot + 1) % s->n_chunks;
@@ -792,6 +828,21 @@ void pfs_run(pfs_state * s) {
                         ro = rr[ri].first;
                     }
                 }
+                // [TAG_FN_R25_STAGE] async (a chunk without direct I/O): the workers copy this chunk while the last chunk's
+                // pieces are dispatched; every submit is waited for in its own iteration, so no copy runs past it
+                if (s->cp_async && dio_req.empty()) {
+                    if (!segs.empty()) {
+                        s->pool->submit(segs.data(), (int) segs.size());
+                    }
+                    settle(pend);
+                    s->pool->wait();
+                    pend.swap(pieces);
+                    if (!alive()) {
+                        cancelled = true;
+                    }
+                    continue;
+                }
+                settle(pend); // a direct-I/O chunk after async ones: the pending pieces first
                 int dio_tk = -1;
                 if (!dio_req.empty()) {
                     dio_tk = llama_fn_dio_submit(s->model, dio_req.data(), (int) dio_req.size());
@@ -821,26 +872,19 @@ void pfs_run(pfs_state * s) {
                         s->pool->copy_list(segs.data(), (int) segs.size());
                     }
                 }
-                s->chunk_state[slot] = 1;
-                for (const item & it : pieces) {
-                    if (dispatching) {
-                        dispatch(it);
-                    } else {
-                        staged.push_back(it);
-                    }
-                }
-                if (!dispatching) {
-                    bool free_now;
-                    {
-                        std::lock_guard<std::mutex> lk(s->mtx);
-                        free_now = B.consumed;
-                    }
-                    if (free_now && !flush()) {
-                        cancelled = true;
-                    }
-                }
+                settle(pieces);
                 if (!alive()) {
                     cancelled = true;
+                }
+            }
+            // [TAG_FN_R25_STAGE] the last async chunk: dispatched / staged, or (cancelled) staged so the job's end frees it
+            if (!pend.empty()) {
+                if (!cancelled) {
+                    settle(pend);
+                } else {
+                    s->chunk_state[pend.front().slot] = 1;
+                    staged.insert(staged.end(), pend.begin(), pend.end());
+                    pend.clear();
                 }
             }
         };
@@ -1442,6 +1486,9 @@ static void pfs_stagers_apply(pfs_state * s) {
         return;
     }
     auto np = std::make_unique<gen5::copy_pool>();
+    np->set_mode(s->cp_tmp, s->cp_pf, s->cp_spin); // [TAG_FN_R25_STAGE]
+    np->set_affinities(s->cp_affs);                // [TAG_FN_R25_PIN]
+    np->set_grain(s->cp_grain);
     np->start(target);
     s->pool.swap(np); // the old pool's workers stop and join here (~1-3 ms)
     s->stg_restarts++;
@@ -1573,8 +1620,37 @@ bool llama_prefill_stream_init_layers(const std::vector<llama_moe_gen5_layer_des
     s->chunk      = (size_t) gen5::env_int("LLAMA_PREFILL_STREAM_CHUNK_MIB", 32, 1, 256) << 20;
     s->lend       = gen5::env_int("LLAMA_PREFILL_STREAM_LEND", 0, 0, 1) != 0; // [TAG_FN_R1_PFS_LEND]
     s->ahead      = gen5::env_int("LLAMA_PREFILL_STREAM_AHEAD", 2, 0, 8); // [TAG_FN_L15_PFSAHEAD]
-    const size_t ring_bytes = (size_t) gen5::env_int("LLAMA_PREFILL_STREAM_RING_MIB", 512, 2, 4096) << 20;
+    size_t       ring_bytes = (size_t) gen5::env_int("LLAMA_PREFILL_STREAM_RING_MIB", 512, 2, 4096) << 20;
     const int    n_threads  = gen5::env_int("LLAMA_PREFILL_STREAM_THREADS", 8, 1, 64);
+    // [TAG_FN_R25_STAGE] LLAMA_PREFILL_STREAM_CACHED=1: the copy threads write the ring with plain stores and the ring is
+    // small enough to stay in the L3 (default 4 x 8 MiB), so the DMA reads the staged lines from the cache. With
+    // non-temporal stores into the 512 MiB ring every staged byte crossed DRAM three times (source read, ring write, DMA
+    // read): the stream pass ran at ~22 GB/s against a measured DRAM copy ceiling of ~31 GB/s (r25 probe). An explicit
+    // LLAMA_PREFILL_STREAM_RING_MIB / _CHUNK_MIB still wins over the cached sizes
+    s->cp_tmp = gen5::env_int("LLAMA_PREFILL_STREAM_CACHED", 0, 0, 1) != 0;
+    if (s->cp_tmp) {
+        const char * er = getenv("LLAMA_PREFILL_STREAM_RING_MIB");
+        const char * ec = getenv("LLAMA_PREFILL_STREAM_CHUNK_MIB");
+        if (!er || !er[0]) {
+            ring_bytes = (size_t) gen5::env_int("LLAMA_PREFILL_STREAM_CACHED_RING_MIB", 32, 2, 512) << 20;
+        }
+        if (!ec || !ec[0]) {
+            s->chunk = (size_t) gen5::env_int("LLAMA_PREFILL_STREAM_CACHED_CHUNK_MIB", 8, 1, 64) << 20;
+        }
+        s->cp_pf = gen5::env_int("LLAMA_PREFILL_STREAM_CACHED_PF", 1, 0, 1) != 0;
+    }
+    s->cp_spin = gen5::env_int("LLAMA_PREFILL_STREAM_SPIN_US", s->cp_tmp ? 200 : 0, 0, 10000);
+    // [TAG_FN_R25_STAGE] LLAMA_PREFILL_STREAM_ASYNC=1: the streamer dispatches a chunk's DMA while the copy threads fill the
+    // next slot (the streamer no longer copies a part itself). Default on with the cached ring: the r25 probe (copy + DMA,
+    // workers one CCD each) 30.1 GB/s synchronous, 31.2 GB/s async; the r25 GPU test ran cached + async + PIN 2
+    s->cp_async = gen5::env_int("LLAMA_PREFILL_STREAM_ASYNC", s->cp_tmp ? 1 : 0, 0, 1) != 0;
+    // [TAG_FN_R25_PIN] LLAMA_PREFILL_STREAM_PIN: 1 each copy worker on its own physical core, the cores in turn from each L3
+    // domain; 2 the workers in turn on the whole CCDs (the scheduler still moves a worker inside its CCD). Left to the
+    // scheduler the 16 copy threads ran on the cache CCD (r25 probe: 22.2 GB/s copy + DMA; one per core across both CCDs
+    // 29.6 GB/s; 32 free threads 22.6 GB/s)
+    s->cp_pin  = gen5::env_int("LLAMA_PREFILL_STREAM_PIN", 0, 0, 2);
+    s->cp_affs = gen5::copy_affinities(s->cp_pin);
+    s->cp_grain = (size_t) gen5::env_int("LLAMA_PREFILL_STREAM_GRAIN_KIB", 0, 0, 65536) << 10;
     if (s->min_tokens > 32 && !s->lend) { // [TAG_FN_R1_PFS_LEND] a lending stream reserves with the op offload
         LLAMA_LOG_WARN("prefill-stream: LLAMA_PREFILL_STREAM_MIN=%" PRId64 " > 32: ubatches of 32..%" PRId64 " tokens keep the "
                 "op-offload copies, which the compute buffer was not reserved for\n", s->min_tokens, s->min_tokens - 1);
@@ -1777,6 +1853,9 @@ bool llama_prefill_stream_init_layers(const std::vector<llama_moe_gen5_layer_des
     }
 
     s->pool = std::make_unique<gen5::copy_pool>();
+    s->pool->set_mode(s->cp_tmp, s->cp_pf, s->cp_spin); // [TAG_FN_R25_STAGE]
+    s->pool->set_affinities(s->cp_affs);                // [TAG_FN_R25_PIN]
+    s->pool->set_grain(s->cp_grain);
     s->pool->start(n_threads);
     s->n_threads_max = s->pool->size(); // [TAG_FN_L22_STAGERS]
     s->thr = std::thread(pfs_run, s);
@@ -1788,6 +1867,21 @@ bool llama_prefill_stream_init_layers(const std::vector<llama_moe_gen5_layer_des
             s->ring.pinned ? "pinned" : (need_ring ? "plain" : "no"), (size_t) s->n_chunks,
             s->chunk >> 20, s->pool->size(), s->wrap ? "on" : "off",
             s->d2d ? ", the hot set's experts slot -> bank on the device [TAG_FN_L14_PFSD2D]" : "");
+    LLAMA_LOG_INFO("prefill-stream: [TAG_FN_R25_STAGE] ring copies %s%s, copy threads spin %d us before they sleep%s\n",
+            s->cp_tmp ? "with plain stores (the ring stays in the L3, the DMA reads it there)" : "non-temporal (through DRAM)",
+            s->cp_pf ? ", source prefetch NTA" : "", s->cp_spin,
+            s->cp_async ? ", a chunk's DMA is queued while the next chunk is copied" : "");
+    if (s->cp_pin > 0) { // [TAG_FN_R25_PIN]
+        std::string al;
+        for (size_t i = 0; i < s->cp_affs.size() && i < 16; ++i) {
+            char b[40];
+            snprintf(b, sizeof(b), "%s%d:0x%llx", al.empty() ? "" : ",", s->cp_affs[i].group, (unsigned long long) s->cp_affs[i].mask);
+            al += b;
+        }
+        LLAMA_LOG_INFO("prefill-stream: [TAG_FN_R25_PIN] copy workers pinned (mode %d: %s): %s\n", s->cp_pin,
+                s->cp_pin == 1 ? "one physical core each, the L3 domains in turn" : "one CCD each, in turn",
+                al.empty() ? "no topology - not pinned" : al.c_str());
+    }
     if (s->cps_mode > 0) {
         LLAMA_LOG_INFO("prefill-stream: [TAG_FN_L22_CPUSHARE] share mode %d: late experts after each layer's plan (wait <= %d ms)%s\n",
                 s->cps_mode, s->cps_wait_ms, s->zexp ? ", a zero expert behind every layer in the banks" : "");

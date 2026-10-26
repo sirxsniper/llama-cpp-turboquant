@@ -76,6 +76,9 @@ struct server_context {
     // terminate main loop (will unblock start_loop)
     void terminate();
 
+    // [TAG_FN_V0254_STOP] after the loop ended: every request still waiting for a result gets an error result
+    void stop_requests();
+
     // get the underlaying llama_context, can return nullptr if sleeping
     // not thread-safe, should only be used from the main thread
     llama_context * get_llama_context() const;

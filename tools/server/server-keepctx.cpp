@@ -26,6 +26,8 @@
 #   define NOMINMAX
 #endif
 #include <windows.h>
+#include <psapi.h> // [TAG_FN_V0254_STORE] page faults, working set (the K32 functions of kernel32)
+#include <winioctl.h> // [TAG_FN_V0254_STORE] the disk of a volume, its seek penalty
 #else
 #include <fcntl.h>
 #include <unistd.h>
@@ -54,6 +56,66 @@ static uint64_t kc_hash(uint64_t h, const void * data, size_t n) {
 }
 
 static constexpr uint64_t KC_HASH_SEED = 0xcbf29ce484222325ull;
+
+// [TAG_FN_V0254_STORE] one moment of the server thread for the trace: wall clock, the thread's CPU time (user, kernel)
+// and the process's page faults. A part whose wall time is far above its CPU time waited (disk, paging, device).
+struct kc_mark {
+    std::chrono::steady_clock::time_point t;
+    uint64_t user_100ns = 0;
+    uint64_t kern_100ns = 0;
+    uint64_t pf         = 0;
+
+    static kc_mark now() {
+        kc_mark m;
+        m.t = std::chrono::steady_clock::now();
+#if defined(_WIN32)
+        FILETIME c, e, k, u;
+        if (GetThreadTimes(GetCurrentThread(), &c, &e, &k, &u)) {
+            m.user_100ns = ((uint64_t) u.dwHighDateTime << 32) | u.dwLowDateTime;
+            m.kern_100ns = ((uint64_t) k.dwHighDateTime << 32) | k.dwLowDateTime;
+        }
+        PROCESS_MEMORY_COUNTERS pmc = {};
+        if (K32GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc))) {
+            m.pf = pmc.PageFaultCount;
+        }
+#endif
+        return m;
+    }
+};
+
+// "wall/user/kernel ms, faults" of the part from a to b
+static std::string kc_part(const kc_mark & a, const kc_mark & b) {
+    return string_format("%.0f/%.0f/%.0f ms %llu pf", std::chrono::duration<double, std::milli>(b.t - a.t).count(),
+                         (b.user_100ns - a.user_100ns)/1e4, (b.kern_100ns - a.kern_100ns)/1e4, (unsigned long long) (b.pf - a.pf));
+}
+
+// [TAG_FN_V0254_STORE] the bytes of [p, p + n) outside the process's working set (sampled per page)
+static uint64_t kc_nonresident(const void * p, size_t n) {
+#if defined(_WIN32)
+    if (p == nullptr || n == 0) {
+        return 0;
+    }
+    const uintptr_t lo = (uintptr_t) p & ~(uintptr_t) (KC_ALIGN - 1);
+    const uintptr_t hi = (uintptr_t) p + n;
+    std::vector<PSAPI_WORKING_SET_EX_INFORMATION> ws;
+    for (uintptr_t a = lo; a < hi; a += KC_ALIGN) {
+        PSAPI_WORKING_SET_EX_INFORMATION e = {};
+        e.VirtualAddress = (PVOID) a;
+        ws.push_back(e);
+    }
+    if (!K32QueryWorkingSetEx(GetCurrentProcess(), ws.data(), (DWORD) (ws.size()*sizeof(ws[0])))) {
+        return 0;
+    }
+    uint64_t out = 0;
+    for (const auto & e : ws) {
+        out += e.VirtualAttributes.Valid ? 0 : KC_ALIGN;
+    }
+    return out;
+#else
+    (void) p; (void) n;
+    return 0;
+#endif
+}
 
 static unsigned long kc_pid() {
 #if defined(_WIN32)
@@ -177,8 +239,9 @@ class kc_pipe {
 public:
     // [TAG_FN_L19_CONVSTORE_SPILL] base: where in the file the pipe starts (a multiple of KC_ALIGN)
     // [TAG_FN_L20_CONVFIX_IO] ext_mem: KC_NBUF blocks the caller owns (kc_alloc_blocks), else the pipe allocates its own
-    kc_pipe(server_keepctx_file & file, bool writing, uint64_t n_read, uint64_t base = 0, uint8_t * ext_mem = nullptr) :
-            file(file), writing(writing), n_read(kc_round_up(n_read)), base(base) {
+    kc_pipe(server_keepctx_file & file, bool writing, uint64_t n_read, uint64_t base = 0, uint8_t * ext_mem = nullptr,
+            bool trace = false) :
+            trace(trace), file(file), writing(writing), n_read(kc_round_up(n_read)), base(base) {
         llama_fn_pin_server_busy(1); // [TAG_FN_L23_PINFIX] R-L23-8: a keepctx copy is busy (the destructor ends it)
         if (ext_mem) {
             mem     = ext_mem;
@@ -213,6 +276,19 @@ public:
 
     bool     hashing = false;
     uint64_t hash    = KC_HASH_SEED;
+
+    // [TAG_FN_V0254_STORE] trace: the caller's wait for a block (write: the disk is behind; read: not read yet), its
+    // copies of big pieces, and the thread's file I/O (sum, longest, count), in us
+    const bool           trace;
+    int64_t              us_wait = 0;
+    int64_t              us_copy = 0;
+    std::atomic<int64_t> us_io{0};
+    std::atomic<int64_t> us_io_max{0};
+    std::atomic<int64_t> n_io{0};
+    std::string stats() const {
+        return string_format("pipe wait %.1f, copy %.1f, file I/O %lld x in %.1f (longest %.1f) ms", us_wait/1000.0, us_copy/1000.0,
+                             (long long) n_io.load(), us_io.load()/1000.0, us_io_max.load()/1000.0);
+    }
 
     // [TAG_FN_L20_CONVFIX_LAZY] the logical bytes so far (the file offset of the next byte, from base)
     uint64_t logical() const { return n_logical; }
@@ -253,7 +329,11 @@ public:
                 return false;
             }
             const size_t k = std::min(n, KC_BLOCK - cur_off);
+            const auto t0 = trace && k >= 65536 ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
             std::memcpy(mem + (size_t) cur*KC_BLOCK + cur_off, p, k);
+            if (trace && k >= 65536) {
+                us_copy += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
+            }
             cur_off += k; p += k; n -= k; n_logical += k;
             if (cur_off == KC_BLOCK) {
                 give(q_full, KC_BLOCK);
@@ -288,7 +368,11 @@ public:
                 return false;
             }
             const size_t k = std::min(n, len[cur] - cur_off);
+            const auto t0 = trace && k >= 65536 ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
             std::memcpy(p, mem + (size_t) cur*KC_BLOCK + cur_off, k);
+            if (trace && k >= 65536) {
+                us_copy += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
+            }
             cur_off += k; p += k; n -= k; n_logical += k;
             if (cur_off == len[cur]) {
                 give(q_free, 0);
@@ -306,6 +390,11 @@ private:
     // the caller waits for a block of q
     bool take(std::deque<int> & q) {
         std::unique_lock<std::mutex> lk(mu);
+        if (trace && q.empty() && !err) {
+            const auto t0 = std::chrono::steady_clock::now();
+            cv.wait(lk, [&]() { return !q.empty() || err; });
+            us_wait += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
+        }
         cv.wait(lk, [&]() { return !q.empty() || err; });
         if (q.empty()) {
             return false;
@@ -314,6 +403,15 @@ private:
         cur_off = 0;
         q.pop_front();
         return true;
+    }
+
+    void io_note(std::chrono::steady_clock::time_point t0) {
+        const int64_t us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
+        us_io += us;
+        n_io++;
+        if (us > us_io_max.load()) {
+            us_io_max = us;
+        }
     }
 
     void give(std::deque<int> & q, size_t n) {
@@ -342,7 +440,11 @@ private:
                 b = q_full.front();
                 q_full.pop_front();
             }
+            const auto t0 = std::chrono::steady_clock::now();
             const bool ok = file.pwrite(mem + (size_t) b*KC_BLOCK, len[b], off);
+            if (trace) {
+                io_note(t0);
+            }
             off += len[b];
             {
                 std::lock_guard<std::mutex> lk(mu);
@@ -372,7 +474,11 @@ private:
                 q_free.pop_front();
             }
             const size_t n  = (size_t) std::min<uint64_t>(KC_BLOCK, n_read - off);
+            const auto   t0 = std::chrono::steady_clock::now();
             const bool   ok = file.pread(mem + (size_t) b*KC_BLOCK, n, base + off);
+            if (trace) {
+                io_note(t0);
+            }
             off += n;
             {
                 std::lock_guard<std::mutex> lk(mu);
@@ -912,6 +1018,7 @@ bool server_keepctx::save(const server_prompt & prompt, llama_context * ctx_tgt,
                           std::string & info, const server_keepctx_spill * spill, const server_keepctx_conv * conv,
                           int32_t supersede_tol) {
     const auto t0 = std::chrono::steady_clock::now();
+    const kc_mark mk_s = params_.trace ? kc_mark::now() : kc_mark(); // [TAG_FN_V0254_STORE]
 
     server_keepctx_entry e;
     e.size_tgt = llama_state_seq_get_size_ext(ctx_tgt, seq_id, LLAMA_STATE_SEQ_FLAGS_NONE);
@@ -1026,17 +1133,41 @@ bool server_keepctx::save(const server_prompt & prompt, llama_context * ctx_tgt,
         tr_t = now;
     };
     tr_pre = kc_ms_since(t0);
+    // [TAG_FN_V0254_STORE] trace: CPU time and page faults of each part, the checkpoint bytes outside the working set,
+    // the residency service's touches meanwhile
+    kc_mark mk[5];
+    mk[0] = params_.trace ? kc_mark::now() : kc_mark();
+    const kc_mark mk_p = mk[0];
+    uint64_t ck_bytes = 0, ck_out = 0;
+    double   ck_q_ms  = 0.0;
+    const uint64_t res0 = params_.trace ? llama_fn_res_touched_ext() : 0;
+    if (params_.trace) {
+        const auto q0 = std::chrono::steady_clock::now();
+        for (const auto & c : prompt.checkpoints) {
+            ck_bytes += c.data_tgt.size() + c.data_dft.size() + c.data_spec.size();
+            ck_out   += kc_nonresident(c.data_tgt.data(), c.data_tgt.size()) + kc_nonresident(c.data_dft.data(), c.data_dft.size()) +
+                        kc_nonresident(c.data_spec.data(), c.data_spec.size());
+        }
+        ck_q_ms = kc_ms_since(q0);
+    }
+    if (params_.trace) {
+        mk[0] = kc_mark::now();
+        tr_t  = mk[0].t;
+    }
+    std::string pipe_st;
     {
-        kc_pipe pipe(*e.file, true, 0, 0, io_mem_);
+        kc_pipe pipe(*e.file, true, 0, 0, io_mem_, params_.trace);
         pipe.hashing = params_.verify;
         ok = ok && llama_state_seq_write_stream_ext(ctx_tgt, seq_id, LLAMA_STATE_SEQ_FLAGS_NONE, kc_write_cb, &pipe) == e.size_tgt;
         tr_lap(tr_tgt);
+        mk[1] = params_.trace ? kc_mark::now() : kc_mark();
         e.hash_tgt = pipe.hash;
         pipe.hash  = KC_HASH_SEED;
         if (ok && ctx_dft) {
             ok = llama_state_seq_write_stream_ext(ctx_dft, seq_id, LLAMA_STATE_SEQ_FLAGS_NONE, kc_write_cb, &pipe) == e.size_dft;
         }
         tr_lap(tr_dft);
+        mk[2] = params_.trace ? kc_mark::now() : kc_mark();
         e.hash_dft   = pipe.hash;
         pipe.hashing = false;
         for (const auto & c : prompt.checkpoints) {
@@ -1062,11 +1193,16 @@ bool server_keepctx::save(const server_prompt & prompt, llama_context * ctx_tgt,
             e.ckpt_sizes.push_back(c.data_spec.size());
         }
         tr_lap(tr_ckpt);
+        mk[3] = params_.trace ? kc_mark::now() : kc_mark();
         uint64_t n_written = 0;
         ok = pipe.finish(n_written) && ok;
         e.n_bytes = n_written;
+        if (params_.trace) {
+            pipe_st = pipe.stats();
+        }
     }
     tr_lap(tr_fin);
+    mk[4] = params_.trace ? kc_mark::now() : kc_mark();
     if (!ok || e.n_bytes != need) {
         info = string_format("writing '%s' failed (%.1f of %.1f MiB)", path.string().c_str(), e.n_bytes/1048576.0, need/1048576.0);
         return false;
@@ -1110,6 +1246,12 @@ bool server_keepctx::save(const server_prompt & prompt, llama_context * ctx_tgt,
     if (params_.trace) {
         info += string_format(" [TAG_FN_L20_CONVFIX_TRACE] pre %.1f, target %.1f, draft %.1f, checkpoints %.1f, finish %.1f ms",
                               tr_pre, tr_tgt, tr_dft, tr_ckpt, tr_fin);
+        // [TAG_FN_V0254_STORE]
+        info += string_format(" [TAG_FN_V0254_STORE] wall/user/kernel, faults: pre %s, target %s, draft %s, checkpoints %s, finish %s; "
+                              "checkpoint bytes out of the working set %.1f of %.1f MiB (%.1f ms to look); %s; residency service "
+                              "touched %.1f MiB", kc_part(mk_s, mk_p).c_str(), kc_part(mk[0], mk[1]).c_str(), kc_part(mk[1], mk[2]).c_str(),
+                              kc_part(mk[2], mk[3]).c_str(), kc_part(mk[3], mk[4]).c_str(), ck_out/1048576.0, ck_bytes/1048576.0,
+                              ck_q_ms, pipe_st.c_str(), (llama_fn_res_touched_ext() - res0)/1048576.0);
     }
     entries.push_back(std::move(e));
     return true;
@@ -1198,14 +1340,24 @@ bool server_keepctx::load(std::list<server_keepctx_entry>::iterator it, server_p
             lazy_refs.clear();
         }
     }
+    // [TAG_FN_V0254_STORE] trace: CPU time and page faults of each part
+    kc_mark mk[4];
+    std::string pipe_st;
+    const uint64_t res0 = params_.trace ? llama_fn_res_touched_ext() : 0;
+    if (params_.trace) {
+        mk[0] = kc_mark::now();
+        tr_t  = mk[0].t;
+    }
     {
-        kc_pipe pipe(*e.file, false, lazy ? e.size_tgt + e.size_dft : e.n_bytes, 0, io_mem_);
+        kc_pipe pipe(*e.file, false, lazy ? e.size_tgt + e.size_dft : e.n_bytes, 0, io_mem_, params_.trace);
         ok = ok && llama_state_seq_read_stream_ext(ctx_tgt, seq_id, LLAMA_STATE_SEQ_FLAGS_NONE, kc_read_cb, &pipe) == e.size_tgt;
         tr_lap(tr_tgt);
+        mk[1] = params_.trace ? kc_mark::now() : kc_mark();
         if (ok && ctx_dft) {
             ok = llama_state_seq_read_stream_ext(ctx_dft, seq_id, LLAMA_STATE_SEQ_FLAGS_NONE, kc_read_cb, &pipe) == e.size_dft;
         }
         tr_lap(tr_dft);
+        mk[2] = params_.trace ? kc_mark::now() : kc_mark();
         size_t k = 0;
         size_t i = 0;
         for (const auto & m : e.prompt.checkpoints) {
@@ -1242,7 +1394,11 @@ bool server_keepctx::load(std::list<server_keepctx_entry>::iterator it, server_p
             tr_lap(tr_ckpt);
             ckpts.push_back(std::move(c));
         }
+        if (params_.trace) {
+            pipe_st = pipe.stats();
+        }
     }
+    mk[3] = params_.trace ? kc_mark::now() : kc_mark();
     if (!ok) {
         return fail("reading the stored state failed");
     }
@@ -1316,9 +1472,101 @@ bool server_keepctx::load(std::list<server_keepctx_entry>::iterator it, server_p
     if (params_.trace) {
         info += string_format(" [TAG_FN_L20_CONVFIX_TRACE] target %.1f, draft %.1f, checkpoint buffers %.1f (%d reused), "
                               "checkpoints %.1f ms", tr_tgt, tr_dft, tr_alloc, n_reused, tr_ckpt);
+        // [TAG_FN_V0254_STORE]
+        info += string_format(" [TAG_FN_V0254_STORE] wall/user/kernel, faults: target %s, draft %s, checkpoints %s; %s; residency "
+                              "service touched %.1f MiB", kc_part(mk[0], mk[1]).c_str(), kc_part(mk[1], mk[2]).c_str(),
+                              kc_part(mk[2], mk[3]).c_str(), pipe_st.c_str(), (llama_fn_res_touched_ext() - res0)/1048576.0);
     }
     if (keep) {
         entries.splice(entries.end(), entries, it); // the most recently used
     }
     return true;
+}
+
+// [TAG_FN_V0254_STORE] the volume of a path ("D:\"), its physical disk number, its drive type and whether it is an SSD (no
+// seek penalty); false when any of it is unknown (a mount folder, a spanned volume, a network path)
+#if defined(_WIN32)
+static bool kc_volume_info(const std::filesystem::path & p, std::wstring & vol, DWORD & disk, UINT & type, bool & ssd) {
+    wchar_t v[MAX_PATH + 1] = {};
+    if (!GetVolumePathNameW(p.wstring().c_str(), v, MAX_PATH)) {
+        return false;
+    }
+    vol = v;
+    if (vol.size() != 3 || vol[1] != L':') {
+        return false;
+    }
+    type = GetDriveTypeW(vol.c_str());
+    const std::wstring dev = L"\\\\.\\" + vol.substr(0, 2); // "\\.\D:"
+    HANDLE h = CreateFileW(dev.c_str(), 0, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (h == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+    DWORD got = 0;
+    STORAGE_DEVICE_NUMBER dn = {};
+    const bool ok_dn = DeviceIoControl(h, IOCTL_STORAGE_GET_DEVICE_NUMBER, nullptr, 0, &dn, sizeof(dn), &got, nullptr) != 0;
+    STORAGE_PROPERTY_QUERY q = {};
+    q.PropertyId = StorageDeviceSeekPenaltyProperty;
+    q.QueryType  = PropertyStandardQuery;
+    DEVICE_SEEK_PENALTY_DESCRIPTOR sp = {};
+    const bool ok_sp = DeviceIoControl(h, IOCTL_STORAGE_QUERY_PROPERTY, &q, sizeof(q), &sp, sizeof(sp), &got, nullptr) != 0;
+    CloseHandle(h);
+    disk = dn.DeviceNumber;
+    ssd  = ok_sp && !sp.IncursSeekPenalty;
+    return ok_dn && ok_sp;
+}
+#endif
+
+std::string keepctx_default_dir(const std::string & model_path, uint64_t need_free, std::string & why) {
+    std::error_code ec;
+    const auto tmp = std::filesystem::temp_directory_path(ec);
+    const auto tmp_dir = (ec ? std::filesystem::path(".") : tmp) / "llama-keepctx";
+#if defined(_WIN32)
+    if (ec || model_path.empty()) {
+        why = "the TEMP folder (no model path)";
+        return tmp_dir.string();
+    }
+    const auto mdir = std::filesystem::absolute(std::filesystem::u8path(model_path), ec).parent_path();
+    std::wstring vm, vt;
+    DWORD dm = 0, dt = 0;
+    UINT  tm = 0, tt = 0;
+    bool  sm = false, st = false;
+    if (ec || !kc_volume_info(mdir, vm, dm, tm, sm) || !kc_volume_info(tmp, vt, dt, tt, st)) {
+        why = "the TEMP folder (the drives are not known)";
+        return tmp_dir.string();
+    }
+    if (dm == dt) {
+        why = "the TEMP folder (the model is on the same disk)";
+        return tmp_dir.string();
+    }
+    if (tm != DRIVE_FIXED || !sm) {
+        why = "the TEMP folder (the model's drive is not a fixed SSD)";
+        return tmp_dir.string();
+    }
+    const auto space = std::filesystem::space(mdir, ec);
+    if (ec || space.available < need_free) {
+        why = string_format("the TEMP folder (the model's drive has %.1f GiB free, the store wants %.1f GiB)",
+                            ec ? 0.0 : space.available/1073741824.0, need_free/1073741824.0);
+        return tmp_dir.string();
+    }
+    const auto dir = mdir / "llama-keepctx";
+    std::filesystem::create_directories(dir, ec);
+    HANDLE h = INVALID_HANDLE_VALUE;
+    if (std::filesystem::is_directory(dir, ec)) {
+        const auto probe = dir / string_format("keepctx-%lu-probe.kc", kc_pid());
+        h = CreateFileW(probe.wstring().c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                        FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE | FILE_FLAG_NO_BUFFERING, nullptr);
+    }
+    if (h == INVALID_HANDLE_VALUE) {
+        why = "the TEMP folder (the model's folder is not writable)";
+        return tmp_dir.string();
+    }
+    CloseHandle(h);
+    why = string_format("beside the model (disk %lu, a fixed SSD; TEMP is on disk %lu)", (unsigned long) dm, (unsigned long) dt);
+    return dir.string();
+#else
+    (void) model_path;
+    (void) need_free;
+    why = "the TEMP folder";
+    return tmp_dir.string();
+#endif
 }

@@ -9,6 +9,9 @@ struct ggml_cuda_topk_moe_args; // topk-moe.cuh
 
 bool ggml_cuda_moe_bridge_supports_op(int device, const ggml_tensor * op);
 bool ggml_cuda_moe_bridge_hostfunc_any(); // [TAG_UPSTREAM_30804] a hostfunc-mode bridge exists (no graph chunk cuts)
+// [TAG_FN_BRIDGE_GRAPHGEN] goes up when a bridge is freed or its device view changes: CUDA graphs captured before hold
+// the old bridge's kernel arguments and host nodes, and a new bridge can get the same id and memory
+uint32_t ggml_cuda_moe_bridge_generation();
 
 // [TAG_FN_L22_DMASHARE] R-P14-2 (a): the device views a fetch of channel chan reads (P14's fetch from pinned pages waits
 // and fails exactly as the ring fetch does). false: no such bridge / channel, another device, or no plan areas

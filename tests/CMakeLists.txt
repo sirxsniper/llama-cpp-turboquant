@@ -432,6 +432,14 @@ llama_build_and_test(test-fn-l24-time.cpp)
 # [TAG_FN_L24_TOPK_TIES] the bitonic argsort rule on rows with ties (ggml-cuda/fn-bitonic-rule.h). CPU only, no model.
 llama_build_and_test(test-fn-l24-topk.cpp)
 
+# [TAG_FN_V0254_STOP] a server stop while requests wait for their results (tools/server/server-queue.cpp): every waiting
+# reader gets the shutdown error at once. CPU only, no model.
+if (LLAMA_BUILD_TOOLS AND LLAMA_BUILD_SERVER AND NOT EMSCRIPTEN)
+    llama_build_and_test(test-server-stop.cpp)
+    target_include_directories(test-server-stop PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
+    target_link_libraries(test-server-stop PRIVATE server-context)
+endif()
+
 # [TAG_FN_L4_HOST_TOPK] the fast candidate path of the sampler (common/sampling.cpp) against the full-vocabulary partial
 # sort the top-k sampler runs: identical candidates or a fallback, never a different result. CPU only, no model.
 llama_build_and_test(test-fn-l4-host.cpp)

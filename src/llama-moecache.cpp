@@ -452,6 +452,16 @@ struct moe_cache {
     // [TAG_FN_L22_LENDCLASS] the tail is out with fewer bytes unmapped than layers hidden (a narrow FULL class): the
     // restore refills only the slots that reach into the unmapped part, and the dirty ones
     bool                  l22_part      = false;
+
+    // [TAG_FN_R25_REFILL] LLAMA_FN_R25_REFILL: synchronous refills through the cache-resident copy pool (g_r25)
+    bool                  r25_on        = false;
+    int                   r25_threads   = 8;          // LLAMA_FN_R25_REFILL_THREADS
+    size_t                r25_half      = 2u << 20;   // LLAMA_FN_R25_REFILL_HALF_KIB
+    int                   r25_verify    = 0;          // LLAMA_FN_R25_VERIFY=<k>: every k-th piece read back and compared
+    size_t                r25_sb_max    = 1u << 30;   // LLAMA_FN_R25_SBSYNC_MIB: a borrow return up to this size lands at once
+    uint64_t              r25_bad       = 0;          // verify mismatches
+    uint64_t              r25_sb_sync   = 0;
+    const void *          r25_owner     = nullptr;    // the context that stops the pool (llama_moe_hot_stop)
 };
 
 moe_cache * g_cache = nullptr;
@@ -3116,6 +3126,15 @@ bool llama_moe_hot_init(const llama_model & model, const void * owner, size_t bu
     mc->hot       = true;
     mc->hot_max_t = max_t;
     mc->sl_req    = sl_req; // [TAG_FN_L10_SLOTLEND]
+    // [TAG_FN_R25_REFILL] the cache-resident copy pool for the synchronous refills (static and adaptive sets)
+    mc->r25_on    = llama_fn_l3_flag(model, "LLAMA_FN_R25_REFILL");
+    mc->r25_owner = owner;
+    if (mc->r25_on) {
+        mc->r25_threads = std::max(1, std::min(32, llama_fn_l3_int(model, "LLAMA_FN_R25_REFILL_THREADS", 8)));
+        mc->r25_half    = (size_t) std::max(256, std::min(65536, llama_fn_l3_int(model, "LLAMA_FN_R25_REFILL_HALF_KIB", 2048))) << 10;
+        mc->r25_verify  = std::max(0, llama_fn_l3_int(model, "LLAMA_FN_R25_VERIFY", 0));
+        mc->r25_sb_max  = (size_t) std::max(0, llama_fn_l3_int(model, "LLAMA_FN_R25_SBSYNC_MIB", 1024)) << 20;
+    }
     // [TAG_FN_L4_MEM_PROMPT] the short path's ubatches (<= 31 tokens, LLAMA_FN_L4_PROMPT) build the hot chain as well, so
     // the CPU computes only the cold experts of a short prompt; the decode accounting (prompt seed above max_t) is unchanged
     if (llama_fn_l3_flag(model, "LLAMA_FN_L4_PROMPT_HOT")) {
@@ -4039,7 +4058,25 @@ void hot_sb_restore(moe_cache * mc, const void * owner) {
     }
     size_t n_up  = 0;
     size_t bytes = 0;
-    if (mc->adapt) {
+    // [TAG_FN_R25_REFILL] a small borrow return lands here at once (the copy pool), so the answer's first steps find the whole
+    // set instead of the CPU computing these experts while the upload worker brings them back
+    bool sb_sync = !mc->adapt;
+    if (mc->adapt && mc->r25_on && mc->r25_sb_max > 0 && mc->pools.empty()) {
+        size_t need = 0;
+        for (const auto & r : mc->sb_res) {
+            const layer_state & ls = mc->layers[(size_t) r[0]];
+            const int32_t sl = r[1];
+            const int32_t e  = r[2];
+            if (ls.slot_out[(size_t) sl] || ls.slot_expert[sl] >= 0 || ls.slot_in_flight[sl] || ls.expert_slot[e] >= 0 ||
+                ls.expert_in_flight[e]) {
+                continue;
+            }
+            need += ls.pub.up_src->nb[2] + ls.pub.gate_src->nb[2] + ls.pub.down_src->nb[2];
+        }
+        sb_sync = need <= mc->r25_sb_max;
+        mc->r25_sb_sync += sb_sync ? 1 : 0;
+    }
+    if (!sb_sync) {
         std::lock_guard<std::mutex> lk(mc->wmtx);
         for (const auto & r : mc->sb_res) {
             layer_state & ls = mc->layers[(size_t) r[0]];
@@ -4069,6 +4106,9 @@ void hot_sb_restore(moe_cache * mc, const void * owner) {
             if (ls.slot_out[(size_t) sl] || ls.slot_expert[sl] >= 0 || ls.expert_slot[e] >= 0) {
                 continue;
             }
+            if (mc->adapt && (ls.slot_in_flight[sl] || ls.expert_in_flight[e])) {
+                continue; // [TAG_FN_R25_REFILL]
+            }
             ggml_tensor *       dsts[3] = { ls.pub.up_c,   ls.pub.gate_c,   ls.pub.down_c   };
             const ggml_tensor * srcs[3] = { ls.pub.up_src, ls.pub.gate_src, ls.pub.down_src };
             bool fit = true;
@@ -4085,6 +4125,9 @@ void hot_sb_restore(moe_cache * mc, const void * owner) {
             }
             ls.slot_expert[sl] = e;
             ls.expert_slot[e]  = sl;
+            if ((size_t) sl < ls.slot_dirty.size()) {
+                ls.slot_dirty[sl] = 0; // [TAG_FN_R25_REFILL] refilled below
+            }
             touched[(size_t) r[0]] = 1;
             n_up++;
         }
@@ -4096,14 +4139,14 @@ void hot_sb_restore(moe_cache * mc, const void * owner) {
         }
     }
     mc->sb_res.clear();
-    if (mc->adapt && n_up > 0) {
+    if (!sb_sync && n_up > 0) {
         mc->wcv.notify_one();
     }
     const double ms = (ggml_time_us() - t0)/1000.0;
     mc->sb_res_ms += ms;
     if (mc->sb_n <= 3 || mc->sb_n % 32 == 0) {
         LLAMA_LOG_INFO("moe-hot: [TAG_FN_L21_BIGUB] borrow %" PRIu64 " back in %.1f ms: %zu residents (%.2f GiB) %s\n", mc->sb_n, ms,
-                n_up, bytes/1073741824.0, mc->adapt ? "queued for the upload worker" : "refilled");
+                n_up, bytes/1073741824.0, !sb_sync ? "queued for the upload worker" : mc->adapt ? "refilled at once [TAG_FN_R25_REFILL]" : "refilled");
     }
 }
 
@@ -4127,6 +4170,248 @@ hot_lend_state g_lend;
 
 constexpr int    REFILL_THREADS = 8;
 constexpr size_t REFILL_HALF    = 128u << 20;
+
+// [TAG_FN_R25_REFILL] the synchronous refills through persistent copy threads, each with its own CUDA stream and two small
+// pinned halves that stay in the CPU caches: the DMA reads the halves from the caches, so DRAM sees only the source reads.
+// The 128 MiB halves with non-temporal stores cost DRAM three passes (source read, staging write, DMA read): ~19 GiB/s for
+// the 7.9 GiB of a 16K prompt's switch (0.44 s of the 0.6 s between the first and the second token). Same bytes, same
+// slots, every copy landed before the call returns.
+struct fn_r25_pool {
+    struct piece { ggml_tensor * dst; size_t off; const uint8_t * src; size_t size; };
+
+    bool                              tried   = false;
+    bool                              ok      = false;
+    int                               n_th    = 0;
+    size_t                            half    = 0;
+    bool                              prio    = false; // [TAG_FN_L22_REFILL] M2.4 memory priority low
+    ggml_backend_buffer_t             stage   = nullptr;
+    uint8_t *                         stage_p = nullptr;
+    std::vector<ggml_backend_t>       be;
+    std::vector<ggml_backend_event_t> ev;
+    std::vector<std::thread>          th;
+
+    std::mutex              call_mtx; // one refill at a time
+    std::mutex              mtx;
+    std::condition_variable cv_go;
+    std::condition_variable cv_done;
+    uint64_t                gen  = 0;
+    int                     left = 0;
+    bool                    stop = false;
+
+    std::vector<piece>  pieces; // the running refill: pieces of at most one half
+    std::atomic<size_t> next{0};
+
+    uint64_t n_runs = 0;
+    uint64_t n_logs = 0;
+
+    void worker(int t) {
+        llama_fn_thread_name("hot-refill-r25", t);
+        if (prio) {
+            fn_l22_mem_prio_low();
+        }
+        uint64_t seen = 0;
+        struct staged { ggml_tensor * dst; size_t off; size_t so; size_t size; };
+        std::vector<staged> st;
+        for (;;) {
+            {
+                std::unique_lock<std::mutex> lk(mtx);
+                cv_go.wait(lk, [&]() { return stop || gen != seen; });
+                if (stop) {
+                    return;
+                }
+                seen = gen;
+            }
+            ggml_backend_t       b       = be[(size_t) t];
+            ggml_backend_event_t e[2]    = { ev[2*(size_t) t], ev[2*(size_t) t + 1] };
+            bool                 rec[2]  = { false, false };
+            int                  h       = 0;
+            size_t               used    = 0;
+            auto hp = [&](int i) { return stage_p + (2*(size_t) t + (size_t) i)*half; };
+            auto flush = [&]() {
+                if (st.empty()) {
+                    return;
+                }
+                for (const auto & x : st) {
+                    ggml_backend_tensor_set_async(b, x.dst, hp(h) + x.so, x.off, x.size);
+                }
+                ggml_backend_event_record(e[h], b);
+                rec[h] = true;
+                st.clear();
+                used = 0;
+                h ^= 1;
+                if (rec[h]) {
+                    ggml_backend_event_synchronize(e[h]); // the DMA has read this half's previous bytes
+                    rec[h] = false;
+                }
+            };
+            for (;;) {
+                const size_t i = next.fetch_add(1, std::memory_order_relaxed);
+                if (i >= pieces.size()) {
+                    break;
+                }
+                const piece & p = pieces[i];
+                size_t o = 0;
+                while (o < p.size) {
+                    if (used == half) {
+                        flush();
+                    }
+                    const size_t k = std::min(p.size - o, half - used);
+                    memcpy(hp(h) + used, p.src + o, k); // plain stores: the half stays in the caches for the DMA
+                    st.push_back({ p.dst, p.off + o, used, k });
+                    used += k;
+                    o    += k;
+                }
+            }
+            flush();
+            ggml_backend_synchronize(b);
+            std::lock_guard<std::mutex> lk(mtx);
+            if (--left == 0) {
+                cv_done.notify_all();
+            }
+        }
+    }
+
+    bool init(ggml_backend_dev_t dev, int n, size_t half_b, bool prio_low) {
+        tried = true;
+        ggml_backend_buffer_type_t hb = dev ? ggml_backend_dev_host_buffer_type(dev) : nullptr;
+        if (!hb || n < 1 || half_b < (64u << 10)) {
+            return false;
+        }
+        n_th = n;
+        half = half_b;
+        prio = prio_low;
+        stage = ggml_backend_buft_alloc_buffer(hb, 2*(size_t) n*half);
+        if (!stage) {
+            return false;
+        }
+        stage_p = (uint8_t *) ggml_backend_buffer_get_base(stage);
+        for (int t = 0; t < n; ++t) {
+            ggml_backend_t b = ggml_backend_dev_init(dev, nullptr);
+            ggml_backend_event_t e0 = b ? ggml_backend_event_new(dev) : nullptr;
+            ggml_backend_event_t e1 = e0 ? ggml_backend_event_new(dev) : nullptr;
+            if (b) { be.push_back(b); }
+            if (e0) { ev.push_back(e0); }
+            if (e1) { ev.push_back(e1); }
+            if (!b || !e0 || !e1) {
+                release();
+                return false;
+            }
+        }
+        for (int t = 0; t < n; ++t) {
+            th.emplace_back([this, t]() { worker(t); });
+        }
+        ok = true;
+        return true;
+    }
+
+    void release() { // only before the threads start, or after they stopped
+        for (auto * e : ev) { ggml_backend_event_free(e); }
+        for (auto * b : be) { ggml_backend_free(b); }
+        ev.clear();
+        be.clear();
+        if (stage) {
+            ggml_backend_buffer_free(stage);
+            stage   = nullptr;
+            stage_p = nullptr;
+        }
+        ok = false;
+    }
+
+    void shutdown() {
+        std::lock_guard<std::mutex> call(call_mtx);
+        if (th.empty()) {
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> lk(mtx);
+            stop = true;
+        }
+        cv_go.notify_all();
+        for (auto & x : th) {
+            x.join();
+        }
+        th.clear();
+        release();
+    }
+
+    ~fn_r25_pool() {
+        for (auto & x : th) {
+            if (x.joinable()) {
+                x.detach(); // process exit: never wait inside the loader lock
+            }
+        }
+    }
+
+    // false: not usable (the caller copies its own way)
+    bool run(moe_cache * mc, const std::vector<refill_job> & jobs, size_t & bytes);
+};
+fn_r25_pool g_r25;
+
+bool fn_r25_pool::run(moe_cache * mc, const std::vector<refill_job> & jobs, size_t & bytes) {
+    std::lock_guard<std::mutex> call(call_mtx);
+    if (!tried) {
+        ggml_backend_dev_t dev = mc->up_backend ? ggml_backend_get_device(mc->up_backend) : nullptr;
+        if (!dev && jobs[0].dst->buffer) {
+            dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(jobs[0].dst->buffer));
+        }
+        const bool good = init(dev, mc->r25_threads, mc->r25_half, mc->l22_refill);
+        LLAMA_LOG_INFO("moe-hot: [TAG_FN_R25_REFILL] copy pool %s: %d threads, each with its own stream and 2 x %zu KiB pinned "
+                "halves (%.0f MiB in all)\n", good ? "ready" : "NOT available (the old refill path)", mc->r25_threads,
+                mc->r25_half >> 10, good ? 2.0*mc->r25_threads*mc->r25_half/1048576.0 : 0.0);
+    }
+    if (!ok || stop) {
+        return false;
+    }
+    const int64_t t0 = ggml_time_us();
+    pieces.clear();
+    bytes = 0;
+    for (const auto & j : jobs) {
+        for (size_t o = 0; o < j.size; o += half) {
+            pieces.push_back({ j.dst, j.off + o, (const uint8_t *) j.src + o, std::min(half, j.size - o) });
+        }
+        bytes += j.size;
+    }
+    if (pieces.empty()) {
+        return true;
+    }
+    next.store(0, std::memory_order_relaxed);
+    {
+        std::lock_guard<std::mutex> lk(mtx);
+        left = n_th;
+        gen++;
+    }
+    cv_go.notify_all();
+    {
+        std::unique_lock<std::mutex> lk(mtx);
+        cv_done.wait(lk, [&]() { return left == 0; });
+    }
+    const double ms = (ggml_time_us() - t0)/1000.0;
+    n_runs++;
+    // [TAG_FN_R25_REFILL] LLAMA_FN_R25_VERIFY=<k>: every k-th piece read back (test runs only)
+    uint64_t bad = 0, checked = 0;
+    if (mc->r25_verify > 0) {
+        std::vector<uint8_t> tmp;
+        for (size_t i = 0; i < pieces.size(); i += (size_t) mc->r25_verify) {
+            const piece & p = pieces[i];
+            tmp.resize(p.size);
+            ggml_backend_tensor_get(p.dst, tmp.data(), p.off, p.size);
+            bad += memcmp(tmp.data(), p.src, p.size) != 0;
+            checked++;
+        }
+        mc->r25_bad += bad;
+        if (bad > 0 || n_logs < 4) {
+            LLAMA_LOG_WARN("moe-hot: [TAG_FN_R25_REFILL] verify: %llu of %llu pieces differ from their source (%llu so far)\n",
+                    (unsigned long long) bad, (unsigned long long) checked, (unsigned long long) mc->r25_bad);
+        }
+    }
+    if (n_logs < 6 || n_runs % 64 == 0) {
+        n_logs++;
+        LLAMA_LOG_INFO("moe-hot: [TAG_FN_R25_REFILL] refill %llu: %.2f GiB (%zu pieces) in %.1f ms (%.1f GiB/s, %d threads)\n",
+                (unsigned long long) n_runs, bytes/1073741824.0, pieces.size(), ms, ms > 0 ? bytes/1073741824.0/(ms/1000.0) : 0.0,
+                n_th);
+    }
+    return true;
+}
 
 // the resident experts of the lent layers whose bytes the stream may have overwritten: through the pinned halves when
 // the hot set has an upload stream, else one synchronous copy per slice. Returns the bytes uploaded.
@@ -4175,6 +4460,12 @@ size_t hot_refill(moe_cache * mc, const std::vector<refill_job> & jobs, int n_th
 
 size_t hot_refill_staged(moe_cache * mc, const std::vector<refill_job> & jobs, int n_threads) {
     llama_fn_stall_scope st_scope("hot refill begins (jobs, threads)", "hot refill ends", (int64_t) jobs.size(), n_threads); // [TAG_FN_L18_FIRSTANS_STALL]
+    if (mc->r25_on && !jobs.empty()) {
+        size_t b = 0;
+        if (g_r25.run(mc, jobs, b)) { // [TAG_FN_R25_REFILL]
+            return b;
+        }
+    }
     n_threads = std::max(1, std::min(64, n_threads));
     size_t bytes = 0;
     ggml_backend_dev_t dev = mc->up_backend ? ggml_backend_get_device(mc->up_backend) : nullptr;
@@ -5737,6 +6028,9 @@ void llama_moe_hot_idle(const void * owner) {
 
 void llama_moe_hot_stop(const void * owner) {
     moe_cache * mc = g_cache;
+    if (mc && owner == mc->r25_owner) {
+        g_r25.shutdown(); // [TAG_FN_R25_REFILL] the copy threads end; later refills take the old path
+    }
     if (!mc || !mc->adapt || owner != mc->owner || !mc->worker.joinable()) {
         return;
     }

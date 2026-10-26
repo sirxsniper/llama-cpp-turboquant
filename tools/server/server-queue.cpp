@@ -124,7 +124,7 @@ void server_queue::wait_until_no_sleep() {
         }
         QUE_DBG("%s", "waiting until no sleep\n");
         condition_tasks.wait(lock, [&]{
-            return !sleeping;
+            return !sleeping || !running; // [TAG_FN_V0254_STOP] a loop that ended asleep never wakes
         });
     }
 }
@@ -414,6 +414,15 @@ void server_queue::cleanup_pending_task(int id_target) {
 // server_response
 //
 
+// [TAG_FN_V0254_STOP] what a recv returns once the server stops
+static server_task_result_ptr server_response_stop_error(const std::unordered_set<int> & id_tasks) {
+    auto res = std::make_unique<server_task_result_error>();
+    res->id       = id_tasks.empty() ? -1 : *id_tasks.begin();
+    res->err_type = ERROR_TYPE_UNAVAILABLE;
+    res->err_msg  = "the server is shutting down";
+    return res;
+}
+
 void server_response::add_waiting_task_id(int id_task) {
     RES_DBG("add task %d to waiting list. current waiting = %d (before add)\n", id_task, (int) waiting_task_ids.size());
 
@@ -470,7 +479,7 @@ server_task_result_ptr server_response::recv(const std::unordered_set<int> & id_
                 RES_DBG("%s : queue result stop\n", "recv");
                 std::terminate(); // we cannot return here since the caller is HTTP code
             }
-            return !queue_results.empty();
+            return !queue_results.empty() || stopping;
         });
 
         for (size_t i = 0; i < queue_results.size(); i++) {
@@ -479,6 +488,9 @@ server_task_result_ptr server_response::recv(const std::unordered_set<int> & id_
                 queue_results.erase(queue_results.begin() + i);
                 return res;
             }
+        }
+        if (stopping) {
+            return server_response_stop_error(id_tasks); // [TAG_FN_V0254_STOP]
         }
     }
 
@@ -496,6 +508,9 @@ server_task_result_ptr server_response::recv_with_timeout(const std::unordered_s
                 queue_results.erase(queue_results.begin() + i);
                 return res;
             }
+        }
+        if (stopping) {
+            return server_response_stop_error(id_tasks); // [TAG_FN_V0254_STOP]
         }
 
         std::cv_status cr_res = condition_results.wait_until(lock, deadline);
@@ -544,6 +559,12 @@ void server_response::broadcast(server_task_result_ptr && result) {
 
 void server_response::terminate() {
     running = false;
+    condition_results.notify_all();
+}
+
+void server_response::stop_waiters() {
+    std::unique_lock<std::mutex> lock(mutex_results);
+    stopping = true;
     condition_results.notify_all();
 }
 

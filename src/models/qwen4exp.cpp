@@ -2337,6 +2337,47 @@ static void qwen4exp_l4_mark_fa_list(ggml_tensor * t, bool on) {
     }
 }
 
+// [TAG_FN_V0254_SEQFA] 2-slot rounding drift (v0.25.3, l24p harness): on a --parallel 2 --kv-unified server a fresh read in
+// slot 1 scored KLD 0.021 (9.2K) / 0.027 (1.5K) when slot 0 held a 3.3K prompt, and a checkpoint restore 0.011 when the
+// other slot held cells after it, with the same cells, selection and inputs. The turbot attention of the QSA layers sized
+// its work from n_kv, the cell span of EVERY sequence: the dense / sparse switch (n_kv >= 2 x Q x n_sel), the sparse list
+// length (min(n_kv, Q x n_sel)) and the dense stream-k blocks / seams all moved with the other slot's cells, so the same
+// sums were added in another order. A multi-sequence unified cache marks its QSA attentions FA_SEQ: the list walk always,
+// with lists of min(Q, ncols1) x n_sel entries (CUDA: ggml_fn_l4_qsa_fa_list_len), so the order depends only on the
+// sequence's own visible cells. One sequence (--parallel 1) keeps every path as it was (bit-identical).
+// LLAMA_FN_V0254_SEQFA=0 turns it off (A/B on one binary).
+static bool qwen4exp_seqfa_on(const llama_model & model, const llama_cparams & cparams) {
+    static const bool sw = [&model] {
+        const char * v = llama_model_fn_env(&model, "LLAMA_FN_V0254_SEQFA");
+        return !(v && v[0] == '0');
+    }();
+    const bool on = sw && cparams.kv_unified && cparams.n_seq_max > 1;
+    static std::atomic<int> logged{-1};
+    const int key = (on ? 1 : 0) | (sw ? 2 : 0) | (cparams.kv_unified ? 4 : 0) | ((int) std::min<uint32_t>(cparams.n_seq_max, 255) << 3);
+    if (cparams.n_seq_max > 1 && logged.exchange(key) != key) {
+        LLAMA_LOG_INFO("qwen4exp: [TAG_FN_V0254_SEQFA] %u sequences, %s cache: QSA attention %s\n", cparams.n_seq_max,
+                cparams.kv_unified ? "unified" : "per-stream",
+                on ? "walks fixed-length cell lists (sums independent of the other sequences' cells)" :
+                     !sw ? "sized from n_kv (LLAMA_FN_V0254_SEQFA=0)" : "sized from its own stream's n_kv");
+    }
+    return on;
+}
+
+// [TAG_FN_V0254_SEQFA] the FLASH_ATTN_EXT under the reshape / inverse WHT of build_attn_mha_kv, as qwen4exp_l4_mark_fa_list
+static void qwen4exp_mark_fa_seq(ggml_tensor * t, bool on) {
+    for (int i = 0; on && t != nullptr && i < 8; ++i) {
+        if (t->op == GGML_OP_FLASH_ATTN_EXT) {
+            ggml_fn_l4_qsa_add(t, GGML_FN_L4_QSA_FA_SEQ);
+            return;
+        }
+        if (t->op != GGML_OP_RESHAPE && t->op != GGML_OP_VIEW && t->op != GGML_OP_PERMUTE &&
+            t->op != GGML_OP_CONT && t->op != GGML_OP_TURBO_WHT) {
+            return;
+        }
+        t = t->src[0];
+    }
+}
+
 // Dense GQA self-attention over the cells that the QSA mask keeps.
 ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
         llm_graph_input_attn_kv * inp,
@@ -2413,12 +2454,15 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
         return e && e[0] == '1';
     }();
     const int64_t n_kv_max = !mctx_cur->is_turbot() || qsa_sparse_turbot ? n_sel : 0;
+    // [TAG_FN_V0254_SEQFA] a multi-sequence unified cache: the attention's sums from this sequence's cells only
+    const bool seq_fa = n_kv_max > 0 && qwen4exp_seqfa_on(model, cparams);
     ggml_tensor * cur = nullptr;
     if (mask) {
         cur = build_attn_mha_kv(mctx_cur, q, k, v, nullptr, mask, nullptr, nullptr, kq_scale, il,
                 nullptr, nullptr, inp->self_turbot_gtab, n_kv_max);
         qwen4exp_l3_mark_fa(cur, l3.compact);
         qwen4exp_l4_mark_fa(cur, l4qsa.fasplit); // [TAG_FN_L4_QSA_FASPLIT]
+        qwen4exp_mark_fa_seq(cur, seq_fa);       // [TAG_FN_V0254_SEQFA]
     } else {
         // [TAG_FN_R4_QSA_POS] the mask from the positional vectors, the selection and the picked scores: one f16 [n_kv, n]
         // buffer instead of the explicit KQ mask input, the -inf fill, the scatter and the sum (each about n_kv x n_ubatch).
@@ -2450,6 +2494,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
             qwen4exp_l3_mark_fa(out_c, l3.compact); // [TAG_FN_L3_GPU_COMPACT]
             qwen4exp_l4_mark_fa(out_c, l4qsa.fasplit); // [TAG_FN_L4_QSA_FASPLIT]
             qwen4exp_l4_mark_fa_list(out_c, l4_list);  // [TAG_FN_L4_QSA_LIST]
+            qwen4exp_mark_fa_seq(out_c, seq_fa);       // [TAG_FN_V0254_SEQFA]
             cur = cur ? ggml_concat(ctx0, cur, out_c, 1) : out_c;
         }
     }
