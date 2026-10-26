@@ -6691,32 +6691,7 @@ struct test_mul_mat_id_dup : public test_mul_mat_id {
     }
 };
 
-// [TAG_FN_L21_DUPID] upstream #29998: MUL_MAT_ID with expert ids repeated within a token's row, mostly expert 0 (the
-// pattern of PHOT's zero slot); the last row also routes to the last expert
-struct test_mul_mat_id_dup : public test_mul_mat_id {
-    using test_mul_mat_id::test_mul_mat_id;
-    std::string vars() override { return test_mul_mat_id::vars() + ",dup=1"; }
-    void initialize_tensors(ggml_context * ctx) override {
-        std::default_random_engine rng(1234);
-        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
-            if (t->type == GGML_TYPE_I32) {
-                if (ggml_is_view_op(t->op)) { continue; }
-                for (int64_t r = 0; r < ggml_nrows(t); r++) {
-                    std::vector<int32_t> data(t->ne[0]);
-                    for (int i = 0; i < t->ne[0]; i++) {
-                        data[i] = (rng() % 4 == 0) ? (int32_t) (rng() % n_mats) : 0; // repeated ids, mostly expert 0
-                    }
-                    if (r == ggml_nrows(t) - 1) {
-                        data[0] = n_mats - 1;
-                    }
-                    ggml_backend_tensor_set(t, data.data(), r * t->nb[1], t->ne[0] * sizeof(int32_t));
-                }
-            } else {
-                init_tensor_uniform(t);
-            }
-        }
-    }
-};
+// [TAG_FN_L21_DUPID] upstream #29998 test_mul_mat_id_dup (above, with ids_offset) serves the fork's repeated-id cases
 
 // [TAG_FN_L21_Q8CLAMP] activations of ~2048: each 32-value q8_1 partial sum is >= 65520, an fp16 inf before the clamp
 // (inf times the K-quant min gave inf / NaN). The CPU reference (Q8_K: float d, int16 sums) stays finite; after the

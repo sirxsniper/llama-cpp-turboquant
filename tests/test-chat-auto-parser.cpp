@@ -2654,10 +2654,11 @@ static void test_flint_analysis(testing & t) {
     const auto params = common_chat_templates_apply(tmpls.get(), inputs);
 
     t.test("prompt", [&](testing & t) {
-        t.assert_true("tools block in a <|system|> turn", params.prompt.find("<|system|>\n# Tools") == 0);
-        t.assert_true("user turn", params.prompt.find("<|user|>Fix the off-by-one in src/ring.c") != std::string::npos);
-        t.assert_true("ends with the assistant token", params.prompt.size() >= 13 &&
-                params.prompt.compare(params.prompt.size() - 13, 13, "<|assistant|>") == 0);
+        const std::string prompt = params.prompt.str(); // [TAG_SYNC_1025] upstream #30210: common_chat_prompt
+        t.assert_true("tools block in a <|system|> turn", prompt.find("<|system|>\n# Tools") == 0);
+        t.assert_true("user turn", prompt.find("<|user|>Fix the off-by-one in src/ring.c") != std::string::npos);
+        t.assert_true("ends with the assistant token", prompt.size() >= 13 &&
+                prompt.compare(prompt.size() - 13, 13, "<|assistant|>") == 0);
         t.assert_true("lazy grammar", params.grammar_lazy && !params.grammar.empty());
         t.assert_true("trigger <tool_call>", !params.grammar_triggers.empty() && params.grammar_triggers[0].value == "<tool_call>");
         t.assert_equal("thinking start", "<think>", params.thinking_start_tag);
