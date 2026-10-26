@@ -288,7 +288,7 @@ json json_get_nested_values(const std::vector<std::string> & paths, const json &
 llama_tokens tokenize_mixed(const llama_vocab * vocab, const json & json_prompt, bool add_special, bool parse_special);
 
 // [TAG_FN_L22] round 22 P2: read the model's switches for the server-side text tools once (LLAMA_FN_L22_JSONFLOAT ->
-// the jinja float output, _TOKCACHE / _TOKCACHE_VERIFY -> the prompt tokenizer cache, _PASSLOG -> timing lines). Call it
+// the jinja float output, _TOKCACHE / _TOKCACHE_VERIFY -> the prompt tokenizer cache, on unless =0 [TAG_V0262_TOKCACHE], _PASSLOG -> timing lines). Call it
 // after the model is loaded and BEFORE the chat templates are initialised. Not called: the environment only.
 // Called by server_context_impl::l22_init (server-context.cpp, P3) after the model and projector load (R-P3-1).
 void server_fn_l22_init(const llama_model * model);

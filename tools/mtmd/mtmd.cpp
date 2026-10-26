@@ -736,9 +736,11 @@ struct mtmd_context {
         if (!no_alloc) {
             embd_cache.n_max = (size_t) std::max(0L, std::min(l22_int("LLAMA_FN_L22_IMGCACHE", 0), 1024L));
             imgdec_threads   = (int) std::max(1L, std::min(l22_int("LLAMA_FN_L22_IMGDEC_THREADS", 1), 32L));
-            if (vocab && llama_fn_l22_switch_on(l22_env("LLAMA_FN_L22_TOKCACHE"))) {
+            // [TAG_V0262_TOKCACHE] unset or empty = on (exact for every arch), =0 off
+            auto on_by_default = [](const char * v) { return v == nullptr || *v == '\0' || llama_fn_l22_switch_on(v); };
+            if (vocab && on_by_default(l22_env("LLAMA_FN_L22_TOKCACHE"))) {
                 tokcache = std::make_unique<common_tokcache>(96, (size_t) 64 << 20, 256);
-                tokcache->n_verify.store(llama_fn_l22_switch_on(l22_env("LLAMA_FN_L22_TOKCACHE_VERIFY")) ? 32 : 0);
+                tokcache->n_verify.store(on_by_default(l22_env("LLAMA_FN_L22_TOKCACHE_VERIFY")) ? 32 : 0);
             }
             llama_fn_l22_log("switch", "mtmd: VLEND_HOLD=%d VLEND_SIZE=%d (largest lend %.0f MiB) IMGCACHE=%zu IMGDEC_THREADS=%d "
                     "IMG_MAXROWS=%ld VLRESIZE=%d TOKCACHE=%d", vlend_hold ? 1 : 0,
@@ -1557,6 +1559,9 @@ struct mtmd_tokenizer {
                 llama_fn_l22_log("media", "[TAG_FN_L22_TOKCACHE] text part %zu bytes -> %zu ids in %.2f ms (%s, re-used %zu ids%s%s)",
                         txt.size(), tokens.size(), ms, paths[std::min(std::max(st.path, 0), 3)], st.reused_ids,
                         st.verified ? ", verified" : "", st.mismatch ? ", MISMATCH: the cache is off from now on" : "");
+            }
+            if (st.mismatch) {
+                LOG_WRN("%s: [TAG_V0262_TOKCACHE] tokenizer cache: a re-used prefix gave other ids than a full encode, the cache is off from now on\n", __func__);
             }
             add_text(tokens);
             return;

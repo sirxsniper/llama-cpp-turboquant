@@ -1009,9 +1009,14 @@ struct server_l22_cfg {
 server_l22_cfg  g_l22;
 common_tokcache g_l22_tokcache(4, (size_t) 64 << 20, 4096); // [TAG_FN_L22_TOKCACHE] the last 4 prompts of 4 KB or more
 
+// [TAG_V0262_TOKCACHE] unset or empty = on (exact for every arch), =0 off
+bool server_l22_on_by_default(const char * v) {
+    return v == nullptr || *v == '\0' || llama_fn_l22_switch_on(v);
+}
+
 void server_l22_apply(const llama_model * model, bool with_jsonfloat) {
-    const bool tc = llama_fn_l22_switch_on(llama_model_fn_env(model, "LLAMA_FN_L22_TOKCACHE"));
-    const bool vf = llama_fn_l22_switch_on(llama_model_fn_env(model, "LLAMA_FN_L22_TOKCACHE_VERIFY"));
+    const bool tc = server_l22_on_by_default(llama_model_fn_env(model, "LLAMA_FN_L22_TOKCACHE"));
+    const bool vf = server_l22_on_by_default(llama_model_fn_env(model, "LLAMA_FN_L22_TOKCACHE_VERIFY"));
     const char * pl = llama_model_fn_env(model, "LLAMA_FN_L22_PASSLOG");
     g_l22.tokcache.store(tc);
     g_l22.passlog.store(pl ? std::atoi(pl) : 0);
@@ -1033,6 +1038,7 @@ void server_l22_env_once() {
 } // namespace
 
 void server_fn_l22_init(const llama_model * model) {
+    g_l22_tokcache.clear(); // [TAG_V0262_TOKCACHE] a model (re)load: no ids from an earlier vocabulary
     server_l22_apply(model, true);
     g_l22.set.store(true);
     llama_fn_l22_log("switch", "server text tools: JSONFLOAT=%d TOKCACHE=%d TOKCACHE_VERIFY=%d PASSLOG=%d",
@@ -1057,6 +1063,10 @@ static llama_tokens server_tokenize_text(const llama_vocab * vocab, const std::s
         llama_fn_l22_log("turn", "[TAG_FN_L22_TOKCACHE] tokenize %zu bytes -> %zu ids in %.2f ms (%s, re-used %zu ids / %zu bytes%s%s)",
                 s.size(), res.size(), ms, paths[std::min(std::max(st.path, 0), 3)], st.reused_ids, st.reused_bytes,
                 st.verified ? ", verified" : "", st.mismatch ? ", MISMATCH: the cache is off from now on" : "");
+    }
+    if (st.mismatch) {
+        // [TAG_V0262_TOKCACHE] on by default now: say it without PASSLOG too (the full encode was used)
+        LOG_WRN("[TAG_V0262_TOKCACHE] tokenizer cache: a re-used prefix gave other ids than a full encode, the cache is off from now on\n");
     }
     return res;
 }
