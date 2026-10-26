@@ -115,6 +115,7 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_block(struct common_
 
 // [TAG_SPEC_DFL_BLOCK] the same for a draft whose q comes as dists (DFlash2, draft-mtp with TURBO_MTP_DISTS). It also takes a block
 // the backend sampler sampled whole when the chain keeps no history; empty: take the maximal-coupling overload above
+// [TAG_V0262_BLOCKVERIFY] also empty with top_k <= 0 or a row of more than COMMON_SPEC_BLOCK_MAX_CAND (4096) candidates
 std::vector<llama_token> common_sampler_sample_and_accept_n_block(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, const std::vector<common_speculative_token_dist> & dists);
 
 // assume idxs == [ 0, 1, 2, ..., draft.size() ]

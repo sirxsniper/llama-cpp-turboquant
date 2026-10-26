@@ -29,6 +29,25 @@ struct common_spec_block_dist {
     size_t                   size = 0;
 };
 
+// [TAG_V0262_BLOCKVERIFY] the rule reads every candidate of every row and the excess is |p| x |q|: a sampled draft whose
+// rows hold more candidates than this (top_k <= 0, a large top_k, a full-vocabulary proposal) takes the per-token rule
+static constexpr size_t COMMON_SPEC_BLOCK_MAX_CAND = 4096;
+
+// [TAG_V0262_BLOCKVERIFY] a proposal given as parallel id / probability arrays (a dists entry) as one candidate per id, in
+// first-seen order; a token listed twice gets the sum, as the per-token rule reads it
+static inline void common_spec_block_q_from_ids(const llama_token * ids, const float * probs, size_t n,
+        std::vector<llama_token_data> & out) {
+    out.clear();
+    for (size_t j = 0; j < n; ++j) {
+        auto it = std::find_if(out.begin(), out.end(), [&](const llama_token_data & e) { return e.id == ids[j]; });
+        if (it != out.end()) {
+            it->p += probs[j];
+        } else {
+            out.push_back({ ids[j], 0.0f, probs[j] });
+        }
+    }
+}
+
 static inline double common_spec_block_prob(const common_spec_block_dist & d, llama_token id) {
     for (size_t k = 0; k < d.size; ++k) {
         if (d.data[k].id == id) {

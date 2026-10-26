@@ -1803,6 +1803,10 @@ static std::vector<llama_token> block_accept_n(struct common_sampler * gsmpl, st
     for (int i = 0; i < gamma; ++i) {
         common_sampler_sample(s, ctx, idxs[i], false);
         const auto * cur_p = common_sampler_get_candidates(s, false);
+        if (dfl && cur_p->size > COMMON_SPEC_BLOCK_MAX_CAND) {
+            s->n_nonfinite = nf0;
+            return {}; // [TAG_V0262_BLOCKVERIFY] a long row (no top_k in the chain): the per-token rule, no full-vocab copies
+        }
         p[i].assign(cur_p->data, cur_p->data + cur_p->size);
         if (dfl && s->n_nonfinite != nf0) {
             s->n_nonfinite = nf0;
@@ -1898,20 +1902,23 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_block(struct common_
         const std::vector<int> & idxs, const llama_tokens & draft, const std::vector<common_speculative_token_dist> & dists) {
     GGML_ASSERT(dists.size() == draft.size() && "dists must have one entry per draft token");
 
+    // [TAG_V0262_BLOCKVERIFY] the refusals that need no row first; top_k <= 0 leaves full-vocabulary rows, and a long
+    // proposal makes the excess sums |p| x |q|: the per-token rule
+    if (draft.size() < 2 || gsmpl->grmr || gsmpl->rbudget || gsmpl->params.top_k <= 0) {
+        return {};
+    }
+    for (const auto & d : dists) {
+        if (d.ids.size() > COMMON_SPEC_BLOCK_MAX_CAND) {
+            return {};
+        }
+    }
+
     static thread_local std::vector<std::vector<llama_token_data>> q;
     q.resize(dists.size());
     for (size_t i = 0; i < dists.size(); ++i) {
         const auto & d = dists[i];
         GGML_ASSERT(d.ids.size() == d.probs.size());
-        q[i].clear();
-        for (size_t j = 0; j < d.ids.size(); ++j) {
-            auto it = std::find_if(q[i].begin(), q[i].end(), [&](const llama_token_data & e) { return e.id == d.ids[j]; });
-            if (it != q[i].end()) {
-                it->p += d.probs[j];
-            } else {
-                q[i].push_back({ d.ids[j], 0.0f, d.probs[j] });
-            }
-        }
+        common_spec_block_q_from_ids(d.ids.data(), d.probs.data(), d.ids.size(), q[i]);
     }
 
     return block_accept_n(gsmpl, ctx, idxs, draft, q, true);
