@@ -3781,6 +3781,19 @@ void hot_drain_out(moe_cache * mc) {
         hot_set_yield(mc);
     }
     hot_adapt_publish(mc);
+    // [TAG_FN_V0255_TBLSYNC] the publish wrote the host tables at once and the device table only to the mirror. The callers
+    // rewrite the tables of the layers they take out, but a graph can run before the next step uploads the rest (the vision
+    // lend before a short prompt part): the CPU then skipped the newly hot experts and the hot chain read the zero slot for
+    // them, so their share of every routed token was lost (2-slot img12: the saved state landing before the picture turn,
+    // KLD 0.06 instead of 0.006). Upload the mirror here, as the step does. LLAMA_FN_V0255_TBLSYNC=0: the old order
+    static const bool tblsync = [] {
+        const char * e = getenv("LLAMA_FN_V0255_TBLSYNC");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    if (tblsync && mc->tbl_dirty && mc->tbl_all) {
+        ggml_backend_tensor_set(mc->tbl_all, mc->tbl_mirror.data(), 0, mc->tbl_mirror.size()*sizeof(int32_t));
+        mc->tbl_dirty = false;
+    }
 }
 
 // [TAG_FN_L10_SLOTLEND] which lend slots of the layer touch a segment that is out (the slot's bytes in each of its tensors
