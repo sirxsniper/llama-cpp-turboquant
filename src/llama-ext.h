@@ -366,6 +366,10 @@ LLAMA_API int32_t     llama_fn_imgpass_mask_mode(const struct llama_model * mode
 // n_ubatch
 LLAMA_API int32_t llama_fn_prompt_ubatch_width_ext(struct llama_context * ctx);
 
+// [TAG_V0261_RING_ACCESSOR] true when the context raised n_rs_seq by one for the MoE bridge's ring ([TAG_FN_R1_BRIDGE_RB]):
+// a speculative caller can roll back n_rs_seq - 1 drafts
+LLAMA_API bool llama_fn_bridge_rb_ext(const struct llama_context * ctx);
+
 // [TAG_FN_L22_PHASE] P0: the decode-phase flag (plan 3.8). The caller sets GEN before a decode whose batch holds only
 // generation / verify rows; every other decode runs as PROMPT. The flag goes back to PROMPT when the decode returns.
 // Only the answer-changing levers (LLAMA_FN_L22_X_*) read it, and only in ubatches whose rows are all output rows.

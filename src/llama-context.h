@@ -82,6 +82,8 @@ struct llama_context {
     // when that decode returns
     void    fn_set_phase(int32_t phase) { fn_phase = phase == LLAMA_FN_PHASE_GEN ? LLAMA_FN_PHASE_GEN : LLAMA_FN_PHASE_PROMPT; }
     int32_t fn_get_phase() const { return fn_phase; }
+    // [TAG_V0261_RING_ACCESSOR] n_rs_seq holds one more token for the MoE bridge (llama_fn_bridge_rb_ext)
+    bool    fn_bridge_rb() const { return fn_bridge_rb_spec; }
     // [TAG_FN_L22_GENSHARE2] the width of the next prompt ubatch given the current hint (llama_fn_prompt_ubatch_width_ext)
     uint32_t fn_prompt_ubatch_width() const;
     // [TAG_FN_L20_BIGPROMPT_PLEPRE] the next prompt batch's tokens (with up to 16 before them for the n-gram context): their
@@ -605,6 +607,7 @@ private:
     // [TAG_FN_L22_PHASE] the decode-phase flag and the model's X levers (read at construction); graph_params folds both into
     // fn_gen / fn_x (plan 3.8)
     int32_t            fn_phase = LLAMA_FN_PHASE_PROMPT;
+    bool               fn_bridge_rb_spec = false; // [TAG_V0261_RING_ACCESSOR] [TAG_FN_R1_BRIDGE_RB] raised n_rs_seq by one
     llama_fn_l22_x_cfg fn_l22_x;
     uint8_t            fn_l22_hooks = 0; // [TAG_FN_L22] llama_fn_l22_hook bits, read at construction
     // [TAG_FN_L20_BIGPROMPT_PLEPRE] the pending read-ahead (empty toks: none)

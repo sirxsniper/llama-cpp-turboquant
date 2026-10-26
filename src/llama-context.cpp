@@ -1504,6 +1504,8 @@ llama_context::llama_context(
             bridge_off_ub    = true;
         }
     }
+    // [TAG_V0261_RING_ACCESSOR] what the speculative draft length reads (the nospec ring has no drafts to cover)
+    fn_bridge_rb_spec = bridge_rb && !bridge_rb_nospec;
     if (bridge_rb) {
         llama_rs_set_nw_full(true);
         if (bridge_rb_nospec) {
@@ -9475,6 +9477,11 @@ void llama_set_decode_phase_ext(llama_context * ctx, int32_t phase) {
 
 int32_t llama_get_decode_phase_ext(const llama_context * ctx) {
     return ctx ? ctx->fn_get_phase() : LLAMA_FN_PHASE_PROMPT;
+}
+
+// [TAG_V0261_RING_ACCESSOR] see llama-ext.h
+bool llama_fn_bridge_rb_ext(const llama_context * ctx) {
+    return ctx != nullptr && ctx->fn_bridge_rb();
 }
 
 // [TAG_FN_L22_GENSHARE2] round 22 P4: the width the context will use for its next prompt ubatch given the current hint

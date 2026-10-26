@@ -3994,9 +3994,15 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 ad.cut  = std::max<int>(0, (int) llama_fn_l4_int(llama_get_model(ctx_dft), "LLAMA_FN_L19_DRAFT_ADAPT_CUT", ad.cut));
                 // the ring the target rolls back must cover kmax drafts: n_rs_seq, which the MoE bridge raised by one (it
                 // takes graphs of at most n_rs_seq rows, llama-context.cpp [TAG_FN_R1_BRIDGE_RB])
-                const char * eb  = getenv("LLAMA_MOE_BRIDGE");
-                const char * er  = getenv("LLAMA_MOE_BRIDGE_RB");
-                const int    lim = (int) n_rs - ((eb && atoi(eb) > 0 && !(er && er[0] == '0')) ? 1 : 0);
+                // [TAG_V0261_RING_ACCESSOR] the context says whether it raised the ring (only when the model wants the
+                // bridge); LLAMA_V0261_RING_ACCESSOR=0: the old guess from the environment
+                bool ring_bridge = llama_fn_bridge_rb_ext(ctx_tgt);
+                if (const char * ev = getenv("LLAMA_V0261_RING_ACCESSOR"); ev && ev[0] == '0') {
+                    const char * eb = getenv("LLAMA_MOE_BRIDGE");
+                    const char * er = getenv("LLAMA_MOE_BRIDGE_RB");
+                    ring_bridge = eb && atoi(eb) > 0 && !(er && er[0] == '0');
+                }
+                const int    lim = (int) n_rs - (ring_bridge ? 1 : 0);
                 if (n_rs > 0 && lim < ad.kmax) {
                     LOG_WRN("%s: [TAG_FN_L19_DRAFT_ADAPT] the target rolls back %d drafts: cap %d -> %d\n", __func__, lim,
                             ad.kmax, std::max(1, lim));
