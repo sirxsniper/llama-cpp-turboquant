@@ -1,4 +1,5 @@
 #include "argsort.cuh"
+#include "fn-bitonic-rule.h"   // [TAG_FN_L24_TOPK_TIES]
 
 #ifdef GGML_CUDA_USE_CUB
 #    include <cub/cub.cuh>
@@ -174,19 +175,18 @@ static inline __device__ void bitonic_step(const float * x_row, int * dst_row, c
     if (ixj <= col) {
         return;
     }
+    // [TAG_FN_L24_TOPK_TIES] equal values order by index (fn-bitonic-rule.h)
     if ((col & k) == 0) {
         if (dst_row[col] >= ncols ||
-            (dst_row[ixj] < ncols && (order == GGML_SORT_ORDER_ASC ?
-                x_row[dst_row[col]] > x_row[dst_row[ixj]] :
-                x_row[dst_row[col]] < x_row[dst_row[ixj]]))
+            (dst_row[ixj] < ncols && ggml_fn_bitonic_swap<order == GGML_SORT_ORDER_ASC>(
+                x_row[dst_row[col]], x_row[dst_row[ixj]], dst_row[col], dst_row[ixj], true))
         ) {
             ggml_cuda_swap(dst_row[col], dst_row[ixj]);
         }
     } else {
         if (dst_row[ixj] >= ncols ||
-            (dst_row[col] < ncols && (order == GGML_SORT_ORDER_ASC ?
-                x_row[dst_row[col]] < x_row[dst_row[ixj]] :
-                x_row[dst_row[col]] > x_row[dst_row[ixj]]))
+            (dst_row[col] < ncols && ggml_fn_bitonic_swap<order == GGML_SORT_ORDER_ASC>(
+                x_row[dst_row[col]], x_row[dst_row[ixj]], dst_row[col], dst_row[ixj], false))
         ) {
             ggml_cuda_swap(dst_row[col], dst_row[ixj]);
         }
