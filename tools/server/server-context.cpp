@@ -5792,6 +5792,7 @@ private:
             task.tts_inp.data.seq_id = slot.id;
             if (slot.tts.ctx.set_input(task.tts_inp.get()) != 0) {
                 send_error(task, "failed to process TTS prompt", ERROR_TYPE_SERVER);
+                l23_unbusy(); // [TAG_V0261_TTS_UNBUSY] the upstream TTS return (sync-1025) came after PR #1's unbusy fixes
                 return false;
             }
         }
