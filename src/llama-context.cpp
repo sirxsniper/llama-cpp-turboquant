@@ -10149,6 +10149,36 @@ int32_t llama_memory_attn_n_free_ext(llama_context * ctx, llama_seq_id seq_id) {
     return (int32_t) (cells.size() - cells.get_used());
 }
 
+// [TAG_V0262_IDLELAZY] see llama-ext.h
+int32_t llama_memory_attn_n_free_without_ext(llama_context * ctx, const llama_seq_id * seqs, int32_t n_seqs) {
+    llama_memory_i * mem = ctx ? ctx->get_memory() : nullptr;
+    llama_kv_cache * kv  = dynamic_cast<llama_kv_cache *>(mem);
+    if (kv == nullptr) {
+        if (auto * hyb = dynamic_cast<llama_memory_hybrid *>(mem)) {
+            kv = hyb->get_mem_attn();
+        }
+    }
+    if (kv == nullptr || n_seqs < 0 || (n_seqs > 0 && seqs == nullptr)) {
+        return -1;
+    }
+    llama_kv_cells::seq_set_t drop;
+    for (int32_t k = 0; k < n_seqs; ++k) {
+        if (seqs[k] < 0 || seqs[k] >= LLAMA_MAX_SEQ) {
+            return -1;
+        }
+        drop.set(seqs[k]);
+    }
+    const llama_kv_cells & cells = kv->get_cells(n_seqs > 0 ? seqs[0] : 0);
+    const llama_kv_cells::seq_set_t keep = ~drop;
+    int32_t n = 0;
+    for (uint32_t i = 0; i < cells.size(); ++i) {
+        if (cells.is_empty(i) || (cells.seq_get_all(i) & keep).none()) {
+            n++;
+        }
+    }
+    return n;
+}
+
 // [TAG_FN_L3_MTP_COST2]
 bool llama_moe_bridge_track_ext(llama_context * ctx, bool on) {
     llama_moe_bridge * br = ctx ? ctx->get_moe_bridge() : nullptr;

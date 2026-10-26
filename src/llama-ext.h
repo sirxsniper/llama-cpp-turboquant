@@ -177,6 +177,12 @@ LLAMA_API void llama_sampler_chain_backend_detach(struct llama_sampler * smpl);
 // places every ubatch row in any empty cell of the stream. -1 for any other memory type.
 LLAMA_API int32_t llama_memory_attn_n_free_ext(struct llama_context * ctx, llama_seq_id seq_id);
 
+// [TAG_V0262_IDLELAZY] What llama_memory_attn_n_free_ext would return after removing every sequence in seqs (n_seqs ids,
+// all writing to one stream, as with --kv-unified): the empty cells plus the cells that only those sequences hold. A cell
+// another sequence also holds (seq_cp: a parent and its children, an attach donor, a shared prefix) stays used. One pass
+// over the stream's cells. -1 for any other memory type or an invalid id.
+LLAMA_API int32_t llama_memory_attn_n_free_without_ext(struct llama_context * ctx, const llama_seq_id * seqs, int32_t n_seqs);
+
 // [TAG_FN_MTP_ATTN_WINDOW] The sliding window of the context's attention cache (llama_kv_cache, or the attention half of
 // llama_memory_hybrid), 0 for none or for any other memory type. A qwen4exp MTP draft context gets one from
 // LLAMA_MTP_ATTN_WINDOW (llama-model.cpp).

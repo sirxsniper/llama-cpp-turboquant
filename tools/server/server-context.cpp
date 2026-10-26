@@ -3672,6 +3672,7 @@ private:
                 // while two others waited 75 s behind it. Room held by idle slots is taken first (saved, nothing is
                 // lost). Room held by busy slots is waited for: the task is deferred, retried whenever a slot releases,
                 // and after TURBO_POOL_LOAD_WAIT_MS (default 60000) it falls back to processing the prompt.
+                bool load_skip = false; // [TAG_V0262_IDLELAZY]
                 if (pool_preempt && params_base.kv_unified) {
                     const auto it = prompt_cache->find(ret->prompt, task.tokens);
                     if (it != prompt_cache->states.end()) {
@@ -3680,16 +3681,20 @@ private:
                             return (e ? (int64_t) atoll(e) : (int64_t) 60000) * 1000;
                         }();
                         const int64_t need = (int64_t) it->prompt.tokens.size();
+                        // [TAG_V0262_IDLELAZY] pool_free_after_clear: with the lazy switch a cell this slot shares with
+                        // another slot is not counted as freed (else: the free cells plus the slots' tokens, as before)
                         const auto    room = [&]() {
-                            return (int64_t) llama_memory_attn_n_free_ext(ctx_tgt, 0) + (int64_t) ret->prompt.tokens.size();
+                            return pool_free_after_clear({ ret }, need);
                         };
                         int64_t idle = 0;
+                        std::vector<const server_slot *> ret_and_idle = { ret };
                         for (const auto & o : slots) {
                             if (&o != ret && !o.is_processing()) {
                                 idle += (int64_t) o.prompt.tokens.size();
+                                ret_and_idle.push_back(&o);
                             }
                         }
-                        if (room() + idle < need) {
+                        if (pool_free_after_clear(ret_and_idle, need) < need) {
                             if (pool_load_wait_t0.size() > 256) {
                                 pool_load_wait_t0.clear();   // tasks cancelled while deferred
                             }
@@ -3716,6 +3721,14 @@ private:
                             o.prompt_save(*prompt_cache, &task.tokens);
                             o.prompt_clear();
                         }
+                        // [TAG_V0262_IDLELAZY] still no room (the wait gave up, or busy slots hold the cells): the restore
+                        // would fail after this slot's cells are gone and erase the entry. Keep the entry, and process the
+                        // prompt from what the slot keeps, as the give-up line says
+                        if (idle_slot_lazy && idle_lazy_fix && room() < need) {
+                            SLT_WRN(*ret, "[TAG_V0262_IDLELAZY] task %d: cached prompt of %" PRId64 " cells, %" PRId64 " free with this slot "
+                                    "after clearing the idle slots: not restored, the entry is kept\n", task.id, need, room());
+                            load_skip = true;
+                        }
                     }
                     pool_load_wait_t0.erase(task.id);
                 }
@@ -3724,7 +3737,7 @@ private:
 
                 ret->prompt_save(*prompt_cache, &task.tokens);
 
-                if (!ret->prompt_load(*prompt_cache, task.tokens)) {
+                if (!load_skip && !ret->prompt_load(*prompt_cache, task.tokens)) {
                     ret->prompt_clear();
                 }
 
@@ -4390,13 +4403,14 @@ private:
             // as room, and when the merged batch needs them they are saved and cleared now (least recently used first), as
             // every exhaustion path does, instead of the per-chunk path or a park
             if (idle_slot_lazy && idle_lazy_fix && n_free >= 0 && !l24_merged_fits(n_free, rows, pool_gen_rows_max)) {
-                int64_t idle = 0;
+                std::vector<const server_slot *> idle;
                 for (const auto & o : slots) {
                     if (&o != &slot && !o.is_processing()) {
-                        idle += (int64_t) o.prompt.n_tokens();
+                        idle.push_back(&o);
                     }
                 }
-                if (l24_merged_fits(n_free + idle, rows, pool_gen_rows_max)) {
+                // what clearing them frees: a cell they share with a busy slot stays used (pool_free_after_clear)
+                if (l24_merged_fits(pool_free_after_clear(idle, rows + std::max<int64_t>(0, pool_gen_rows_max)), rows, pool_gen_rows_max)) {
                     while (!l24_merged_fits(n_free, rows, pool_gen_rows_max) && try_clear_idle_slots(0)) {
                         n_free = llama_memory_attn_n_free_ext(ctx_tgt, slot.id);
                     }
@@ -4959,12 +4973,14 @@ private:
         if (lcp >= slot.prompt.tokens.size()) {
             return false;
         }
-        // [TAG_V0262_IDLELAZY] the slot holds the same conversation (its system block and first user message) and the
-        // prompt edits a later message or re-renders an answer: not saved, as without the switch. Another chat that only
-        // shares the system block is saved. No chat spans (a raw prompt): the rules below
-        if (idle_lazy_fix) {
-            const size_t u_end = idle_first_user_end(task.params.message_spans);
-            if (u_end > 0 && lcp >= u_end) {
+        // [TAG_V0262_IDLELAZY] the prompt keeps everything the slot's last prompt held before its last user message: it
+        // edits that message or re-renders its answer, and only that turn is dropped (not saved, as without the switch).
+        // Any earlier drop is saved: another chat that shares the system block and the first user message (a fork, the
+        // same question in a new chat, agents started with one task) would otherwise drop the slot's later turns, which
+        // under the lazy switch exist nowhere else. No chat spans (a raw prompt) or a last user message at 0: the rules below
+        if (idle_lazy_fix && slot.task_prev) {
+            const int32_t p_last = slot.task_prev->params.message_spans.last_user_message_pos();
+            if (idle_same_turn(lcp, p_last, slot.prompt.tokens.get_common_prefix(slot.task_prev->tokens))) {
                 return false;
             }
         }
@@ -4977,14 +4993,11 @@ private:
         return true;
     }
 
-    // [TAG_V0262_IDLELAZY] the end of the prompt's first user message (0: no chat spans)
-    static size_t idle_first_user_end(const common_chat_msg_spans & spans) {
-        for (const auto & sp : spans.spans) {
-            if (sp.role == COMMON_CHAT_ROLE_USER) {
-                return sp.pos + sp.len;
-            }
-        }
-        return 0;
+    // [TAG_V0262_IDLELAZY] lcp: what the new prompt keeps of the idle slot; p_last: where the slot's last prompt put its
+    // last user message (-1: no chat spans); n_held: how much of that last prompt the slot still holds. True when the new
+    // prompt keeps all of it up to that message, so it edits the last message or re-renders its answer
+    static bool idle_same_turn(size_t lcp, int32_t p_last, size_t n_held) {
+        return p_last > 0 && n_held >= (size_t) p_last && lcp >= (size_t) p_last;
     }
 
     // [TAG_V0262_IDLELAZY] the order idle slots are saved and cleared in when the pool needs room: with the lazy switch the
@@ -5001,6 +5014,30 @@ private:
             });
         }
         return order;
+    }
+
+    // [TAG_V0262_IDLELAZY] the pool's empty cells once every slot in `clear` is cleared, to compare with `need`. Without the
+    // lazy switch (or with TURBO_IDLE_SLOT_LAZY_FIX=0): the empty cells plus those slots' tokens, as before. With it idle
+    // slots keep their cells, and some are shared (seq_cp: an attach donor, a sharekv leader, a parent and its children):
+    // clearing one holder frees none of those. Else a cached prompt is restored into a pool that cannot hold it, the restore
+    // fails after the slot's own cells are gone, and the entry is erased ([TAG_PROMPT_CACHE_POISON]). The exact count is one
+    // pass over the pool's cells, so it runs only when the token count says the need may fit
+    int64_t pool_free_after_clear(const std::vector<const server_slot *> & clear, int64_t need) const {
+        int64_t n_tok = 0;
+        std::vector<llama_seq_id> ids;
+        ids.reserve(clear.size());
+        for (const server_slot * s : clear) {
+            n_tok += (int64_t) s->prompt.tokens.size();
+            ids.push_back(s->id);
+        }
+        const int64_t est = (int64_t) llama_memory_attn_n_free_ext(ctx_tgt, 0) + n_tok;
+        if (idle_slot_lazy && idle_lazy_fix && est >= need) {
+            const int32_t n = llama_memory_attn_n_free_without_ext(ctx_tgt, ids.data(), (int32_t) ids.size());
+            if (n >= 0) {
+                return n;
+            }
+        }
+        return est;
     }
 
     // return true if at least one slot has been cleared
@@ -5561,13 +5598,15 @@ private:
             const int64_t need     = (int64_t) s->park_cells + (n_active > 0 ? pool_park_margin : 0);
             int64_t       free_now = llama_memory_attn_n_free_ext(ctx_tgt, 0);
             if (free_now < need) {
-                int64_t idle = 0;
+                // [TAG_V0262_IDLELAZY] pool_free_after_clear: free_now plus the idle slots' tokens, or with the lazy switch
+                // exactly what clearing them frees (a cell they share with a busy slot stays used)
+                std::vector<const server_slot *> idle;
                 for (auto & o : slots) {
                     if (!o.is_processing()) {
-                        idle += (int64_t) o.prompt.tokens.size();
+                        idle.push_back(&o);
                     }
                 }
-                if (free_now + idle >= need) {
+                if (pool_free_after_clear(idle, need) >= need) {
                     while (llama_memory_attn_n_free_ext(ctx_tgt, 0) < need && try_clear_idle_slots()) {}
                     free_now = llama_memory_attn_n_free_ext(ctx_tgt, 0);
                 }
@@ -7539,18 +7578,33 @@ private:
                             packed.resize(std::max<size_t>(1, n_packed));
                             nread = llama_state_seq_load_file(ctx_tgt, filepath.c_str(), slot->id, packed.data(), packed.size(), &n_packed);
                             // [TAG_V0262_IDLELAZY] no room: with the lazy switch idle slots keep their cells. Save and clear them
-                            // (least recently used first) until the file's tokens fit, then load once more
-                            if (nread == 0 && idle_slot_lazy && idle_lazy_fix) {
+                            // (least recently used first) until the file's cells fit, then load once more. The file's tokens
+                            // are read before its state, so packed holds them: n_packed counts the packed words (an image
+                            // chunk carries its pixels), the cells are the deserialized tokens. A file this build cannot
+                            // read, or one whose cells already fit, did not fail for room: nothing is cleared
+                            if (nread == 0 && idle_slot_lazy && idle_lazy_fix && n_packed > 0 && n_packed <= packed.size()) {
                                 slot->prompt_clear(); // the failed load dropped its cells; what it held was saved above
-                                const int64_t need = (int64_t) n_packed;
+                                int64_t need = -1;
+                                try {
+                                    const llama_tokens head(packed.begin(), packed.begin() + (ptrdiff_t) n_packed);
+                                    need = (int64_t) server_tokens::deserialize(head, mctx != nullptr).size();
+                                } catch (const std::exception &) {
+                                    need = -1;
+                                }
+                                const int64_t n_free0 = llama_memory_attn_n_free_ext(ctx_tgt, slot->id);
                                 int n_cleared = 0;
-                                while ((int64_t) llama_memory_attn_n_free_ext(ctx_tgt, slot->id) < need && try_clear_idle_slots()) {
-                                    n_cleared++;
+                                if (need > 0 && n_free0 >= 0 && n_free0 < need) {
+                                    while ((int64_t) llama_memory_attn_n_free_ext(ctx_tgt, slot->id) < need && try_clear_idle_slots()) {
+                                        n_cleared++;
+                                    }
                                 }
                                 if (n_cleared > 0) {
-                                    SLT_INF(*slot, "[TAG_V0262_IDLELAZY] slot restore: %d idle slot(s) saved and cleared for %zu tokens, loading again\n",
-                                            n_cleared, n_packed);
+                                    SLT_INF(*slot, "[TAG_V0262_IDLELAZY] slot restore: %d idle slot(s) saved and cleared for %lld cells "
+                                            "(%lld were free), loading again\n", n_cleared, (long long) need, (long long) n_free0);
                                     nread = llama_state_seq_load_file(ctx_tgt, filepath.c_str(), slot->id, packed.data(), packed.size(), &n_packed);
+                                } else {
+                                    SLT_WRN(*slot, "[TAG_V0262_IDLELAZY] slot restore failed with %lld cells needed and %lld free: not a room "
+                                            "failure, or no idle slot to clear\n", (long long) need, (long long) n_free0);
                                 }
                             }
                         }
