@@ -731,6 +731,7 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
         // [TAG_4C_POSMASK_MS] one row describes one sequence only: never reuse it for several (allow_reuse already
         // requires the same n_seqs_unq; this keeps the leak guard local)
         res &= self_kv_pos->ne[1] == (params.ubatch.n_seqs_unq > 1 ? 2 : 1);
+        res &= mctx->get_turbot_n_stream() == 1;   // [TAG_SYNC_POSMASK_STREAMS]
     }
 
     res &= can_reuse_turbot(this, mctx, params.ubatch);   // [TAG_TURBOT]
@@ -1393,6 +1394,7 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
         res &= inp_attn->self_kv_pos->ne[0] == mctx->get_attn()->get_n_kv();
         res &= inp_attn->self_q_pos->ne[0]  == params.ubatch.n_tokens;
         res &= inp_attn->self_kv_pos->ne[1] == (params.ubatch.n_seqs_unq > 1 ? 2 : 1);   // [TAG_4C_POSMASK_MS]
+        res &= mctx->get_attn()->get_turbot_n_stream() == 1;   // [TAG_SYNC_POSMASK_STREAMS]
     }
     // [TAG_FN_L22_IMGPASS_MASK] keyed vectors only for a ubatch the keys can describe, and the reverse
     res &= inp_attn->fn_imgkeys == llm_fn_l22_imgkeys_want(params.arch, params.cparams, params.ubatch, mctx->get_attn());
@@ -4336,8 +4338,12 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
         }();
         const bool pos_mask_ms = pos_mask_ms_env && cparams.kv_unified && ubatch.n_seqs_unq > 1 &&
             ubatch.n_seqs_unq <= 32 && (ubatch.token != nullptr || !ubatch.is_pos_2d());
+        // [TAG_SYNC_POSMASK_STREAMS] both vectors describe ONE KV stream, and build_attn_mha splits q over the streams of the
+        // K view. A one-sequence ubatch on a view of several streams (non-unified cache, init_full reserve: the n_seqs = 1
+        // diag-decay reserve of MINIMAX_01 / KIMI_LINEAR) takes the explicit mask, which broadcasts over the streams.
+        const bool one_kv_stream = mctx_cur->get_turbot_n_stream() == 1;
         const bool use_pos_mask = pos_mask_env && cparams.flash_attn && cparams.causal_attn &&
-            hparams.f_max_alibi_bias == 0.0f && (ubatch.n_seqs_unq == 1 || pos_mask_ms) &&
+            hparams.f_max_alibi_bias == 0.0f && (ubatch.n_seqs_unq == 1 || pos_mask_ms) && one_kv_stream &&
             (!has_sparse_attn_indexer || indexer_pos);
         if (use_pos_mask) {
             const auto n_kv = mctx_cur->get_n_kv();

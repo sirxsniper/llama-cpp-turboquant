@@ -1284,7 +1284,7 @@ static void test_compat(testing & t) {
 }
 
 static void test_mtp_embd_width(testing & t) {
-    t.test("mtp_keeps_n_embd_inp_and_takes_state_at_n_embd_out", [&](testing & t) {
+    t.test("mtp_takes_embd_and_state_at_n_embd_out", [&](testing & t) {
         llama_hparams hparams = {};
         hparams.n_embd             = 64;
         hparams.n_deepstack_layers = 2;   // makes n_embd_inp() = 64 + 64*2 = 192
@@ -1293,8 +1293,10 @@ static void test_mtp_embd_width(testing & t) {
         t.assert_equal("default context uses n_embd_inp (deepstack-aware)",
                 (size_t) 192, llama_batch_ext_select_n_embd_inp(LLAMA_CONTEXT_TYPE_DEFAULT, LLM_ARCH_LLAMA, hparams));
 
-        t.assert_equal("MTP context keeps n_embd_inp for the token embeddings",
-                (size_t) 192, llama_batch_ext_select_n_embd_inp(LLAMA_CONTEXT_TYPE_MTP, LLM_ARCH_LLAMA, hparams));
+        // [TAG_SYNC_1025] fork: the MTP hook passes the hidden with set_embd, so an MTP context takes embd rows at n_embd_out
+        // (upstream #30257: n_embd_inp, hidden in embd_state); its image rows pass at n_embd_tok = n_embd_inp (MERGES.md)
+        t.assert_equal("MTP context takes embd rows at the hidden width (fork)",
+                (size_t) 96, llama_batch_ext_select_n_embd_inp(LLAMA_CONTEXT_TYPE_MTP, LLM_ARCH_LLAMA, hparams));
 
         t.assert_equal("MTP context takes the target hidden state at n_embd_out",
                 (size_t) 96, llama_batch_ext_select_n_embd_state(LLAMA_CONTEXT_TYPE_MTP, hparams));

@@ -1185,11 +1185,12 @@ size_t llama_batch_ext_select_n_embd_inp(llama_context_type ctx_type, llm_arch a
     // [TAG_SYNC_1025] the fork's MTP hook passes the hidden state as the embedding of a token row (common/speculative.cpp
     // set_embd), so an MTP context takes embd rows at the hidden width (n_embd_out: hc_mult x n_embd on qwen4exp);
     // upstream #30257 moved the hidden to embd_state and kept n_embd_inp here. Image rows still pass at n_embd_tok.
-    if (ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
-        return hparams.n_embd_out();
-    }
+    // DFlash keeps its encoder width for every context type (upstream's rule; the fork makes no MTP context on it).
     if (arch == LLM_ARCH_DFLASH) {
         return hparams.n_embd_inp_enc();
+    }
+    if (ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
+        return hparams.n_embd_out();
     }
     return hparams.n_embd_inp();
 }
