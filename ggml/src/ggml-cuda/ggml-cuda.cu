@@ -5467,6 +5467,13 @@ static bool ggml_cuda_try_resid_norm_fusion(const ggml_cgraph * cgraph, int i) {
         !ggml_are_same_shape(add, x) || !ggml_are_same_shape(add, y) || ggml_is_empty(add)) {
         return false;
     }
+    // [TAG_SYNC_RESID_GRID] the fused kernel maps rows / channels / samples straight to gridDim.x / y / z (no grid-stride
+    // loops), and gridDim.y / z stop at 65535: upstream's #27901 case RMS_NORM_MUL_ADD {4, 1, 65536, 1} failed the launch
+    // (CUDA error: invalid argument, test-backend-ops crash). Such shapes take the unfused add + rms_norm_mul path, which
+    // loops over the grid since #28175. Real model shapes (channels = tokens of a ubatch <= 8192) are unchanged.
+    if (add->ne[1] > INT_MAX || add->ne[2] > 65535 || add->ne[3] > 65535) {
+        return false;
+    }
     // the norm -> mul pair must be fusable on its own (single use of the norm output, F32 everywhere)
     if (!ggml_cuda_can_fuse(cgraph, i + 1, { GGML_OP_RMS_NORM, GGML_OP_MUL }, {})) {
         return false;
