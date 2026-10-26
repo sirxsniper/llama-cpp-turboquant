@@ -225,6 +225,8 @@ UD-Q5_K_XL with the DFlash2-Q8_0 drafter and vision, 262K context, 4 slots.
 ```bat
 set GGML_DISABLE_VULKAN=1
 set SPEC_DFT_UBATCH=128
+set LLAMA_FN_L22_TOKCACHE=1
+set LLAMA_FN_L22_TOKCACHE_VERIFY=1
 
 llama-server.exe --model Qwen3.8-27B-UD-Q5_K_XL.gguf --host 127.0.0.1 --port 8080 ^
   --n-gpu-layers 99 --device CUDA0 --ctx-size 262144 ^
@@ -252,6 +254,7 @@ llama-server.exe --model Qwen3.8-27B-UD-Q5_K_XL.gguf --host 127.0.0.1 --port 808
 | `--load-mode none` | weights read fully into memory (replaces the deprecated `--no-mmap`) |
 | `--cache-ram 45056 --ctx-checkpoints 32 --cache-idle-slots` | the prompt cache in RAM, so returning to a conversation does not re-read it |
 | `SPEC_DFT_UBATCH=128` | a smaller drafter batch: about 1.2 GB VRAM back, same output |
+| `LLAMA_FN_L22_TOKCACHE=1` | a follow-up turn reuses the token ids of the prefix it shares with a recent prompt instead of tokenizing the whole conversation again, same ids (on in the Flash-Next profile); `_VERIFY=1` compares the first reuses with a full encode and turns the cache off on a mismatch |
 | `GGML_DISABLE_VULKAN=1` | skip the Vulkan backend when you do not need it |
 
 The same command works for **UD-Q4_K_XL** with the `DFlash2-Q4_K_M` drafter.

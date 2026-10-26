@@ -1752,8 +1752,9 @@ static void block_eog_trace(const struct llama_context * ctx, llama_token id, co
 // (the penalties see the same history as with the per-token rule); the real sampler then accepts the kept drafts and the
 // token after them. The scratch sampler and the buffers are kept between steps: a step allocates nothing (a clone per
 // step copied the 248K-entry candidate buffer into fresh pages, ~0.5 ms on Windows).
-std::vector<llama_token> common_sampler_sample_and_accept_n_block(struct common_sampler * gsmpl, struct llama_context * ctx,
-        const std::vector<int> & idxs, const llama_tokens & draft, const std::vector<std::vector<llama_token_data>> & draft_q) {
+// [TAG_SPEC_DFL_BLOCK] dfl: a sampled draft with dists (DFlash2, draft-mtp with TURBO_MTP_DISTS) under SPEC_DFL_BLOCK_VERIFY
+static std::vector<llama_token> block_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx,
+        const std::vector<int> & idxs, const llama_tokens & draft, const std::vector<std::vector<llama_token_data>> & draft_q, bool dfl) {
     GGML_ASSERT(idxs.size()    == draft.size() + 1 && "idxs.size() must be draft.size() + 1");
     GGML_ASSERT(draft_q.size() == draft.size() && "draft_q must have one entry per draft token");
 
@@ -1761,31 +1762,63 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_block(struct common_
     if (gamma < 2 || gsmpl->grmr || gsmpl->rbudget) {
         return {};
     }
+    const auto & sp = gsmpl->params;
+    // [TAG_SPEC_DFL_BLOCK] samplers that move with their own draws (mirostat, adaptive-p, an active XTC) stay on the per-token
+    // rule: the scratch copy replays their streams every step
+    if (dfl && (sp.mirostat != 0 ||
+            std::find(sp.samplers.begin(), sp.samplers.end(), COMMON_SAMPLER_TYPE_ADAPTIVE_P) != sp.samplers.end() ||
+            (sp.xtc_probability > 0.0f && sp.xtc_threshold <= 0.5f &&
+             std::find(sp.samplers.begin(), sp.samplers.end(), COMMON_SAMPLER_TYPE_XTC) != sp.samplers.end()))) {
+        return {};
+    }
+    // [TAG_SPEC_DFL_BLOCK] a block the backend sampler sampled whole: each row's probs are the target's distribution there
+    // (what the per-token rule reads), exact only while the chain keeps no history (no penalties, no DRY)
+    const bool bs = dfl && bs_row_on_backend(ctx, idxs[0]) &&
+        (sp.penalty_last_n == 0 || (sp.penalty_repeat == 1.0f && sp.penalty_freq == 0.0f && sp.penalty_present == 0.0f)) &&
+        (sp.dry_multiplier == 0.0f || sp.dry_base < 1.0f || sp.dry_penalty_last_n == 0);
     for (int i = 0; i <= gamma; ++i) {
-        if (bs_row_on_backend(ctx, idxs[i])) {
+        if (bs ? llama_get_sampled_token_ith(ctx, idxs[i]) == LLAMA_TOKEN_NULL : bs_row_on_backend(ctx, idxs[i])) {
             return {};
         }
     }
 
     // the scratch sampler: a clone the first time, then the chain's state (penalty counts, RNG, ...) and the history
     // copied in; its candidate buffer stays allocated
-    if (gsmpl->blk == nullptr) {
+    if (bs) {
+        // [TAG_SPEC_DFL_BLOCK] no CPU chain runs on these rows: they are read through the sampler itself, nothing accepted
+    } else if (gsmpl->blk == nullptr) {
         gsmpl->blk = common_sampler_clone(gsmpl);
     } else {
         llama_sampler_copy(gsmpl->chain, gsmpl->blk->chain);
         gsmpl->blk->prev = gsmpl->prev;
     }
-    common_sampler * s = gsmpl->blk;
+    common_sampler * s = bs ? gsmpl : gsmpl->blk;
 
     // the target's distribution at rows 0..gamma-1, each after the drafts before it
     static thread_local std::vector<std::vector<llama_token_data>> p;
     if (p.size() < (size_t) gamma) {
         p.resize((size_t) gamma);
     }
+    const uint32_t nf0 = s->n_nonfinite;
     for (int i = 0; i < gamma; ++i) {
         common_sampler_sample(s, ctx, idxs[i], false);
         const auto * cur_p = common_sampler_get_candidates(s, false);
         p[i].assign(cur_p->data, cur_p->data + cur_p->size);
+        if (dfl && s->n_nonfinite != nf0) {
+            s->n_nonfinite = nf0;
+            return {}; // [TAG_SPEC_DFL_BLOCK] a non-finite row: the per-token rule decides and counts the rows it reads
+        }
+        if (bs) {
+            // [TAG_SPEC_DFL_BLOCK] a row whose backend arrays did not line up came back as plain logits (p = 0); NaN fails too
+            double sum = 0.0;
+            for (const auto & e : p[i]) {
+                sum += e.p;
+            }
+            if (!(std::fabs(sum - 1.0) <= 1e-3)) {
+                return {};
+            }
+            continue;
+        }
         common_sampler_accept(s, draft[i], true);
     }
 
@@ -1853,6 +1886,35 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_block(struct common_
     result.push_back(id);
 
     return result;
+}
+
+std::vector<llama_token> common_sampler_sample_and_accept_n_block(struct common_sampler * gsmpl, struct llama_context * ctx,
+        const std::vector<int> & idxs, const llama_tokens & draft, const std::vector<std::vector<llama_token_data>> & draft_q) {
+    return block_accept_n(gsmpl, ctx, idxs, draft, draft_q, false);
+}
+
+// [TAG_SPEC_DFL_BLOCK] q per draft token from its dists entry, a token listed twice summed as the per-token rule sums it
+std::vector<llama_token> common_sampler_sample_and_accept_n_block(struct common_sampler * gsmpl, struct llama_context * ctx,
+        const std::vector<int> & idxs, const llama_tokens & draft, const std::vector<common_speculative_token_dist> & dists) {
+    GGML_ASSERT(dists.size() == draft.size() && "dists must have one entry per draft token");
+
+    static thread_local std::vector<std::vector<llama_token_data>> q;
+    q.resize(dists.size());
+    for (size_t i = 0; i < dists.size(); ++i) {
+        const auto & d = dists[i];
+        GGML_ASSERT(d.ids.size() == d.probs.size());
+        q[i].clear();
+        for (size_t j = 0; j < d.ids.size(); ++j) {
+            auto it = std::find_if(q[i].begin(), q[i].end(), [&](const llama_token_data & e) { return e.id == d.ids[j]; });
+            if (it != q[i].end()) {
+                it->p += d.probs[j];
+            } else {
+                q[i].push_back({ d.ids[j], 0.0f, d.probs[j] });
+            }
+        }
+    }
+
+    return block_accept_n(gsmpl, ctx, idxs, draft, q, true);
 }
 
 std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const llama_tokens & draft, bool grammar_first) {

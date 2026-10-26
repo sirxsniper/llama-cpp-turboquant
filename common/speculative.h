@@ -84,6 +84,7 @@ struct common_speculative_draft_params {
 
     // optional sparse proposal distributions, one per draft token: the drafters that sample their own proposal
     // (DFlash2, draft-mtp with TURBO_MTP_DISTS) fill it at temp > 0 and the server verifies by maximal coupling
+    // ([TAG_SPEC_DFL_BLOCK] or as a block with SPEC_DFL_BLOCK_VERIFY=1, which reads every entry, not just up to a rejection)
     std::vector<common_speculative_token_dist> * dists = nullptr;
 
     // upstream #27694: candidate distribution per drafted token; set it to make draft-simple and draft-mtp sample
