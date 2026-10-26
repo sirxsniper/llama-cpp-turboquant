@@ -1009,7 +1009,7 @@ struct server_l22_cfg {
 server_l22_cfg  g_l22;
 common_tokcache g_l22_tokcache(4, (size_t) 64 << 20, 4096); // [TAG_FN_L22_TOKCACHE] the last 4 prompts of 4 KB or more
 
-// [TAG_V0262_TOKCACHE] unset or empty = on (exact for every arch), =0 off
+// [TAG_V0262_TOKCACHE] unset or empty = on for every arch (exact where the vocabulary passes the fragment probe in tokcache.h, else a full encode), =0 off
 bool server_l22_on_by_default(const char * v) {
     return v == nullptr || *v == '\0' || llama_fn_l22_switch_on(v);
 }

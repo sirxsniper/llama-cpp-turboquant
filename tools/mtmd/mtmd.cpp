@@ -736,7 +736,7 @@ struct mtmd_context {
         if (!no_alloc) {
             embd_cache.n_max = (size_t) std::max(0L, std::min(l22_int("LLAMA_FN_L22_IMGCACHE", 0), 1024L));
             imgdec_threads   = (int) std::max(1L, std::min(l22_int("LLAMA_FN_L22_IMGDEC_THREADS", 1), 32L));
-            // [TAG_V0262_TOKCACHE] unset or empty = on (exact for every arch), =0 off
+            // [TAG_V0262_TOKCACHE] unset or empty = on for every arch (exact where the vocabulary passes the fragment probe in tokcache.h, else a full encode), =0 off
             auto on_by_default = [](const char * v) { return v == nullptr || *v == '\0' || llama_fn_l22_switch_on(v); };
             if (vocab && on_by_default(l22_env("LLAMA_FN_L22_TOKCACHE"))) {
                 tokcache = std::make_unique<common_tokcache>(96, (size_t) 64 << 20, 256);

@@ -11,6 +11,10 @@
 // Guards: BPE vocabularies only (no space prefix per fragment), not with add_special when the vocabulary adds EOS / SEP,
 // and boundaries only where the ids' pieces reproduce the text byte for byte (a stripped space around a special token,
 // or any non-lossless piece, leaves the entry without boundaries: exact re-use only).
+// [TAG_V0262_TOKCACHE] The argument needs every fragment to encode the same wherever it sits. A tokenizer rule that looks
+// at the fragment's place in the input breaks it: upstream #23343 (metaspace prepend_scheme "first") puts U+2581 in front
+// of the input's first raw fragment only, so text[b:] encoded alone gets one that the full encode has not. get_info probes
+// this once per vocabulary (fragment_local) and leaves a vocabulary that fails it without the cache.
 //
 // Header only and llama.h only, so libmtmd can use it without linking common.
 
@@ -70,6 +74,8 @@ namespace common_tokcache_impl {
 // per vocabulary: the pieces (special = true) of every token, which tokens end a fragment, the longest special text
 struct vocab_info {
     const llama_vocab *   vocab = nullptr;
+    int32_t               n_vocab = 0;                     // [TAG_V0262_TOKCACHE] with type and two pieces: same_vocab
+    int                   type    = LLAMA_VOCAB_TYPE_NONE;
     bool                  ok    = false;
     std::string           pieces;  // all pieces back to back
     std::vector<uint32_t> off;     // n_tokens + 1 offsets into pieces
@@ -101,17 +107,86 @@ inline std::vector<llama_token> tokenize_plain(const llama_vocab * vocab, const 
     return res;
 }
 
-inline const vocab_info & get_info(const llama_vocab * vocab) {
-    static std::mutex mu;
-    static std::vector<std::unique_ptr<vocab_info>> all; // a process holds one or two vocabularies
-    std::lock_guard<std::mutex> lk(mu);
-    for (const auto & v : all) {
-        if (v->vocab == vocab) {
-            return *v;
+inline std::string piece_of(const llama_vocab * vocab, llama_token id) {
+    std::vector<char> buf(256);
+    int32_t k = llama_token_to_piece(vocab, id, buf.data(), (int32_t) buf.size(), 0, true);
+    if (k < 0) {
+        buf.resize((size_t) -k);
+        k = llama_token_to_piece(vocab, id, buf.data(), (int32_t) buf.size(), 0, true);
+    }
+    return k > 0 ? std::string(buf.data(), (size_t) k) : std::string();
+}
+
+// [TAG_V0262_TOKCACHE] the text after a special token encodes alone as it does inside the whole text (see the top): a
+// probe with the special token's piece s, "a" + s + tail against "a" + s and tail encoded apart. tok: text -> ids
+template <typename Tok>
+inline bool fragment_local(const std::string & s, const Tok & tok) {
+    for (const char * tail : { "b c", " b\n" }) {
+        const std::vector<llama_token> joint = tok("a" + s + tail);
+        std::vector<llama_token>       parts = tok("a" + s);
+        const std::vector<llama_token> rest  = tok(std::string(tail));
+        parts.insert(parts.end(), rest.begin(), rest.end());
+        if (joint != parts) {
+            return false;
         }
     }
-    auto vi = std::make_unique<vocab_info>();
+    return true;
+}
+
+// [TAG_V0262_TOKCACHE] the registry entry still describes this vocabulary: a freed one's address can come back for another
+inline bool same_vocab(const vocab_info & vi, const llama_vocab * vocab) {
+    if (vi.vocab != vocab || vi.n_vocab != llama_vocab_n_tokens(vocab) || vi.type != (int) llama_vocab_type(vocab)) {
+        return false;
+    }
+    if (vi.off.empty() || vi.n_vocab <= 0) {
+        return true;
+    }
+    for (const llama_token id : { vi.n_vocab - 1, vi.n_vocab / 2 }) {
+        if (piece_of(vocab, id) != vi.pieces.substr(vi.off[id], vi.off[id + 1] - vi.off[id])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// [TAG_V0262_TOKCACHE] the tables of the last few vocabularies, least recently used first. A model reload in the same
+// process (--sleep-idle-seconds) gives a new vocabulary address: the old entry is dropped after VOCAB_INFO_MAX others
+// instead of being kept for the life of the process. A caller holds its shared_ptr for the call.
+constexpr size_t VOCAB_INFO_MAX = 4;
+
+struct vocab_registry {
+    std::mutex                                     mu;
+    std::vector<std::shared_ptr<const vocab_info>> all;
+};
+
+inline vocab_registry & registry() {
+    static vocab_registry r; // one per module: common and libmtmd each have their own
+    return r;
+}
+
+inline size_t registry_size() {
+    vocab_registry & r = registry();
+    std::lock_guard<std::mutex> lk(r.mu);
+    return r.all.size();
+}
+
+inline std::shared_ptr<const vocab_info> get_info(const llama_vocab * vocab) {
+    vocab_registry & r = registry();
+    std::lock_guard<std::mutex> lk(r.mu);
+    for (auto it = r.all.begin(); it != r.all.end(); ++it) {
+        if ((*it)->vocab == vocab) {
+            if (same_vocab(**it, vocab)) {
+                std::rotate(it, it + 1, r.all.end()); // most recently used last
+                return r.all.back();
+            }
+            r.all.erase(it);
+            break;
+        }
+    }
+    auto vi = std::make_shared<vocab_info>();
     vi->vocab   = vocab;
+    vi->n_vocab = llama_vocab_n_tokens(vocab);
+    vi->type    = (int) llama_vocab_type(vocab);
     vi->add_bos = llama_vocab_get_add_bos(vocab);
     vi->add_eos = llama_vocab_get_add_eos(vocab);
     vi->add_sep = llama_vocab_get_add_sep(vocab);
@@ -143,9 +218,33 @@ inline const vocab_info & get_info(const llama_vocab * vocab) {
         }
         vi->off[n] = (uint32_t) vi->pieces.size();
         vi->ok = true;
+        // [TAG_V0262_TOKCACHE] the first and the last boundary token must pass the fragment probe (no boundary token:
+        // entries keep no boundaries, exact re-use only)
+        int32_t first = -1, last = -1;
+        for (int32_t id = 0; id < n; ++id) {
+            if (vi->bound[id]) {
+                first = first < 0 ? id : first;
+                last  = id;
+            }
+        }
+        try {
+            const auto tok = [&](const std::string & t) {
+                return tokenize_plain(vocab, t.data(), t.size(), false, true);
+            };
+            for (const int32_t id : { first, last }) {
+                if (id >= 0 && !fragment_local(vi->pieces.substr(vi->off[id], vi->off[id + 1] - vi->off[id]), tok)) {
+                    vi->ok = false;
+                }
+            }
+        } catch (const std::exception &) {
+            vi->ok = false;
+        }
     }
-    all.push_back(std::move(vi));
-    return *all.back();
+    r.all.push_back(vi);
+    while (r.all.size() > VOCAB_INFO_MAX) {
+        r.all.erase(r.all.begin());
+    }
+    return vi;
 }
 
 // boundaries of ids[i0..] that encode text[b0..]: false (out cleared) unless the pieces reproduce those bytes exactly
@@ -200,7 +299,8 @@ inline std::vector<llama_token> common_tokcache_tokenize(common_tokcache & c, co
         s.path = 3;
         return tokenize_plain(vocab, text.data(), text.size(), add_special, parse_special);
     }
-    const vocab_info & vi = get_info(vocab);
+    const std::shared_ptr<const vocab_info> vip = get_info(vocab); // [TAG_V0262_TOKCACHE] held for the call
+    const vocab_info & vi = *vip;
     if (!vi.ok || (add_special && (vi.add_eos || vi.add_sep))) {
         s.path = 3;
         return tokenize_plain(vocab, text.data(), text.size(), add_special, parse_special);

@@ -3,6 +3,8 @@
 //     random texts (real vocabulary: models/ggml-vocab-qwen35.gguf, found from the exe or the working directory, or
 //     argv[1]; skipped when absent)
 //   - tools/mtmd/mtmd-l22.h: parallel_for, the content hash, the encoder output cache, the lend size estimate
+//   - [TAG_V0262_TOKCACHE] the fragment probe (a toy tokenizer with and without the metaspace "first" rule) and the
+//     vocabulary registry (one entry per vocabulary, at most VOCAB_INFO_MAX, a held entry stays valid)
 
 #include "llama.h"
 #include "common.h"
@@ -121,6 +123,14 @@ static void test_tokcache(const std::string & path) {
         n_prefix += st.path == 2 ? 1 : 0;
     }
     CHECK(n_prefix >= 10, "prefix re-use on appended turns: %d of 12", n_prefix);
+
+    // [TAG_V0262_TOKCACHE] this vocabulary passes the fragment probe, and one registry entry serves every call
+    {
+        const auto a = common_tokcache_impl::get_info(vocab);
+        const auto b = common_tokcache_impl::get_info(vocab);
+        CHECK(a && a->ok, "the qwen35 vocabulary passes the fragment probe");
+        CHECK(a == b, "one registry entry per vocabulary");
+    }
 
     // the same text again: exact re-use
     {
@@ -243,7 +253,71 @@ static void test_tokcache(const std::string & path) {
         CHECK(diffs.load() == 0, "threaded lookups: %d differ", diffs.load());
     }
 
+    // [TAG_V0262_TOKCACHE] reloads in one process (--sleep-idle-seconds) give new vocabulary addresses: the registry keeps
+    // at most VOCAB_INFO_MAX entries, an entry a caller still holds stays valid, and a dropped vocabulary is built again
+    {
+        const auto held = common_tokcache_impl::get_info(vocab);
+        std::vector<llama_model *> more;
+        llama_model_params mp2 = llama_model_default_params();
+        mp2.vocab_only = true;
+        for (size_t k = 0; k < common_tokcache_impl::VOCAB_INFO_MAX + 1; ++k) {
+            llama_model * m = llama_model_load_from_file(path.c_str(), mp2);
+            if (m == nullptr) {
+                break;
+            }
+            more.push_back(m);
+            CHECK(common_tokcache_impl::get_info(llama_model_get_vocab(m))->ok, "reload %zu: tables built", k);
+        }
+        CHECK(more.size() == common_tokcache_impl::VOCAB_INFO_MAX + 1, "reloads: %zu", more.size());
+        CHECK(common_tokcache_impl::registry_size() <= common_tokcache_impl::VOCAB_INFO_MAX, "registry size %zu",
+              common_tokcache_impl::registry_size());
+        CHECK(held->vocab == vocab && held->ok && !held->pieces.empty(), "a held entry stays valid after it is dropped");
+        common_tokcache again(4, (size_t) 64 << 20, 64);
+        const std::string tx = chat_turn("system", body(rng, 20)) + chat_turn("user", body(rng, 4));
+        CHECK(same_as_full(vocab, again, tx, false), "the first vocabulary after its entry was dropped");
+        for (llama_model * m : more) {
+            llama_model_free(m);
+        }
+    }
+
     llama_model_free(model);
+}
+
+// [TAG_V0262_TOKCACHE] a toy tokenizer: "<S>" is a special token (id 1000), every other byte is its own id. With `first`
+// a raw fragment at the start of the input that does not start with a space gets id 999 in front, as upstream's
+// metaspace prepend_scheme "first" does with U+2581
+static std::vector<llama_token> toy_tokenize(const std::string & t, bool first) {
+    std::vector<llama_token> out;
+    size_t i = 0;
+    while (i < t.size()) {
+        if (t.compare(i, 3, "<S>") == 0) {
+            out.push_back(1000);
+            i += 3;
+            continue;
+        }
+        size_t j = t.find("<S>", i);
+        j = j == std::string::npos ? t.size() : j;
+        if (first && i == 0 && t[0] != ' ') {
+            out.push_back(999);
+        }
+        for (; i < j; ++i) {
+            out.push_back((llama_token) (unsigned char) t[i]);
+        }
+    }
+    return out;
+}
+
+static void test_tokcache_probe() {
+    const auto plain = [](const std::string & t) { return toy_tokenize(t, false); };
+    const auto first = [](const std::string & t) { return toy_tokenize(t, true); };
+    CHECK(common_tokcache_impl::fragment_local("<S>", plain), "probe: fragments encode alone as in the whole text");
+    CHECK(!common_tokcache_impl::fragment_local("<S>", first), "probe: the metaspace \"first\" rule is found");
+    // what the probe guards: text after the special token, encoded alone, differs from the full encode there
+    const std::string full = "x<S>Assistant\nhi";
+    std::vector<llama_token> cut = first("x<S>");
+    const auto rest = first("Assistant\nhi");
+    cut.insert(cut.end(), rest.begin(), rest.end());
+    CHECK(cut != first(full), "probe: the \"first\" rule changes a cut encode");
 }
 
 //
@@ -359,6 +433,7 @@ int main(int argc, char ** argv) {
     test_hash();
     test_embd_cache();
     test_lend_size();
+    test_tokcache_probe();
     test_tokcache(find_vocab(argc, argv));
 
     llama_backend_free();
