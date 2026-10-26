@@ -2734,7 +2734,7 @@ static void test_flint_analysis(testing & t) {
             "<tool_call>read<arg_key>path</arg_key><arg_value>src/ring.c</arg_value>"
             "<arg_key>limit</arg_key><arg_value>200</arg_value></tool_call>"
             "<|observation|><tool_response>int ring_push(...)</tool_response><|assistant|>";
-        t.assert_true("rendered history: " + p2.prompt, p2.prompt.find(want) != std::string::npos);
+        t.assert_true("rendered history: " + p2.prompt.str(), p2.prompt.str().find(want) != std::string::npos);
     });
 
     // upstream issue #31000: the tool call written inside reasoning that never closed, then EOG (<|observation|>)
