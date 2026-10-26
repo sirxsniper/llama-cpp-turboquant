@@ -355,7 +355,8 @@ static void test_server_pipe(testing & t) {
         server_pipe<int> p;
         std::thread producer([&]() {
             for (int i = 0; i < n; i++) {
-                p.write(int(i));
+                int item = i; // [TAG_SYNC_1025] MSVC took int(i) here for an lvalue (C2664 against write(T &&))
+                p.write(std::move(item));
             }
             p.close_write();
         });
