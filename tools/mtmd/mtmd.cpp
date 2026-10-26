@@ -3337,6 +3337,7 @@ void mtmd_r27_tokverify_bg(mtmd_context * ctx, bool on) {
     ctx->tokcache->drain();
     ctx->tokcache->verify_mode.store(on ? ctx->tokverify_mode : COMMON_TOKCACHE_VERIFY_SYNC);
     ctx->tokcache->verify_first.store(true);
+    ctx->tokcache->reopen_verify();
 }
 
 void mtmd_r27_tokverify_drain(mtmd_context * ctx) {

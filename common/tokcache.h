@@ -46,15 +46,21 @@ struct common_tokcache_stats {
 // a reset_verify on the caller and the rest on a background thread, 2 every verify on the background thread
 enum common_tokcache_verify_mode { COMMON_TOKCACHE_VERIFY_SYNC = 0, COMMON_TOKCACHE_VERIFY_FIRST = 1, COMMON_TOKCACHE_VERIFY_BG = 2 };
 
-// [TAG_R27_TOKVERIFY] LLAMA_R27_TOKVERIFY: unset, empty or 1 = first, "bg" / 2 = bg, 0 = sync (v0.26.2)
+// [TAG_R27_TOKVERIFY] LLAMA_R27_TOKVERIFY: "0" / "off" / "sync" / "false" / "no" = sync (v0.26.2), "2" / "bg" = bg, anything
+// else (unset, empty, 1, first, on, ...) = first
 inline int common_tokcache_verify_mode_from(const char * v) {
-    if (v == nullptr || *v == '\0' || std::strcmp(v, "1") == 0 || std::strcmp(v, "first") == 0) {
+    if (v == nullptr || *v == '\0') {
         return COMMON_TOKCACHE_VERIFY_FIRST;
+    }
+    for (const char * s : { "0", "off", "sync", "false", "no" }) {
+        if (std::strcmp(v, s) == 0) {
+            return COMMON_TOKCACHE_VERIFY_SYNC;
+        }
     }
     if (std::strcmp(v, "2") == 0 || std::strcmp(v, "bg") == 0) {
         return COMMON_TOKCACHE_VERIFY_BG;
     }
-    return COMMON_TOKCACHE_VERIFY_SYNC;
+    return COMMON_TOKCACHE_VERIFY_FIRST;
 }
 
 struct common_tokcache {
@@ -96,6 +102,7 @@ struct common_tokcache {
     std::mutex        vmu;
     std::thread       vthr;
     std::atomic<bool> vbusy{false};
+    bool              vclosed = false; // under vmu: drain() ran, no new verify starts until reset_verify / reopen_verify
 
     void clear() {
         std::lock_guard<std::mutex> lk(mu);
@@ -108,11 +115,28 @@ struct common_tokcache {
         n_verify.store(n);
         verify_mode.store(mode);
         verify_first.store(true);
+        reopen_verify();
     }
 
-    // wait for a running verify (it reads the vocabulary)
+    // background verifies may start again after a drain()
+    void reopen_verify() {
+        std::lock_guard<std::mutex> lk(vmu);
+        vclosed = false;
+    }
+
+    // wait for a running verify; later verifies still start
+    void wait_verify() {
+        std::lock_guard<std::mutex> lk(vmu);
+        if (vthr.joinable()) {
+            vthr.join();
+        }
+    }
+
+    // wait for a running verify (it reads the vocabulary) and start no new one until reset_verify / reopen_verify: call
+    // it before the vocabulary is freed (a caller that tokenizes after it skips the background verify)
     void drain() {
         std::lock_guard<std::mutex> lk(vmu);
+        vclosed = true;
         if (vthr.joinable()) {
             vthr.join();
         }
@@ -339,7 +363,7 @@ inline size_t common_prefix(const std::string & a, const std::string & b) {
 // requests after it (the caller already has e's ids). false: the thread is busy or draining, nothing started
 inline bool verify_bg(common_tokcache & c, const llama_vocab * vocab, std::shared_ptr<const common_tokcache::entry> e) {
     std::unique_lock<std::mutex> lk(c.vmu, std::try_to_lock);
-    if (!lk.owns_lock() || c.vbusy.load()) {
+    if (!lk.owns_lock() || c.vclosed || c.vbusy.load()) {
         return false;
     }
     if (c.vthr.joinable()) {

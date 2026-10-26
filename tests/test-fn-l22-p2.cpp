@@ -223,7 +223,7 @@ static void test_tokcache(const std::string & path) {
             CHECK(same_as_full(vocab, v, s, false, &st), "mode %d, step %d", mode, k);
             n_sync += st.verified ? 1 : 0;
             n_bg   += st.verify_bg ? 1 : 0;
-            v.drain();
+            v.wait_verify();
         }
         CHECK(n_sync == (mode == COMMON_TOKCACHE_VERIFY_FIRST ? 1 : 0), "mode %d: %d verifies on the caller", mode, n_sync);
         CHECK(n_bg >= 4 && v.n_bg_done.load() == n_bg, "mode %d: %d verifies on the thread, %d done", mode, n_bg, v.n_bg_done.load());
@@ -238,7 +238,7 @@ static void test_tokcache(const std::string & path) {
         s += chat_turn("user", body(rng, 5));
         common_tokcache_stats st;
         const auto got = common_tokcache_tokenize(v, vocab, s, false, true, &st);
-        v.drain();
+        v.wait_verify();
         CHECK(st.verify_bg && got != common_tokenize(vocab, s, false, true), "mode %d: the corrupted prefix was used", mode);
         CHECK(v.off.load() && v.n_bg_mismatch.load() == 1, "mode %d: the thread found the mismatch", mode);
         CHECK(same_as_full(vocab, v, s, false, &st) && st.path == 3, "mode %d: cache off after the mismatch", mode);
@@ -285,6 +285,34 @@ static void test_tokcache(const std::string & path) {
             }
         });
         CHECK(diffs.load() == 0, "threaded lookups: %d differ", diffs.load());
+    }
+
+    // [TAG_R27_TOKVERIFY] review: drain() closes the thread (a tokenize after it, before the model is freed, starts no verify)
+    // and reset_verify opens it again; the switch values
+    {
+        common_tokcache v(4, (size_t) 64 << 20, 64);
+        v.reset_verify(8, COMMON_TOKCACHE_VERIFY_BG);
+        std::string s = chat_turn("system", body(rng, 40));
+        s += chat_turn("user", body(rng, 5));
+        CHECK(same_as_full(vocab, v, s, false), "drain: first encode");
+        v.drain();
+        s += chat_turn("user", body(rng, 5));
+        common_tokcache_stats st;
+        CHECK(same_as_full(vocab, v, s, false, &st) && st.path == 2 && !st.verify_bg && !st.verified,
+              "drain: no verify after drain (path %d bg %d)", st.path, st.verify_bg ? 1 : 0);
+        v.reset_verify(8, COMMON_TOKCACHE_VERIFY_BG);
+        s += chat_turn("user", body(rng, 5));
+        CHECK(same_as_full(vocab, v, s, false, &st) && st.verify_bg, "drain: reset_verify opens the thread again");
+        v.drain();
+        CHECK(v.n_bg_done.load() == 1 && !v.off.load(), "drain: one verify done (%d)", v.n_bg_done.load());
+        for (const char * x : { "0", "off", "sync", "false", "no" }) {
+            CHECK(common_tokcache_verify_mode_from(x) == COMMON_TOKCACHE_VERIFY_SYNC, "mode '%s' = sync", x);
+        }
+        for (const char * x : { "", "1", "first", "on", "true", "yes", "ON" }) {
+            CHECK(common_tokcache_verify_mode_from(x) == COMMON_TOKCACHE_VERIFY_FIRST, "mode '%s' = first", x);
+        }
+        CHECK(common_tokcache_verify_mode_from(nullptr) == COMMON_TOKCACHE_VERIFY_FIRST, "mode unset = first");
+        CHECK(common_tokcache_verify_mode_from("bg") == COMMON_TOKCACHE_VERIFY_BG && common_tokcache_verify_mode_from("2") == COMMON_TOKCACHE_VERIFY_BG, "mode bg");
     }
 
     // [TAG_R27_TOKVERIFY] threads with the background verify: callers race on the one verify thread (busy: skipped)
