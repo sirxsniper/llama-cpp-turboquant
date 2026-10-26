@@ -528,6 +528,11 @@ MTMD_API void mtmd_lend_suspend(mtmd_context * ctx);
 // [TAG_FN_L22_IMGDEC] (P2): threads for picture decoding / preprocessing (LLAMA_FN_L22_IMGDEC_THREADS, 1 = serial)
 MTMD_API int32_t mtmd_l22_imgdec_threads(const mtmd_context * ctx);
 
+// [TAG_R27_TOKVERIFY]: on = the text tokenizer cache may verify on a background thread (LLAMA_R27_TOKVERIFY mode); the
+// host must then call mtmd_r27_tokverify_drain before the text model is freed. Off (the default): every verify on the caller
+MTMD_API void mtmd_r27_tokverify_bg(mtmd_context * ctx, bool on);
+MTMD_API void mtmd_r27_tokverify_drain(mtmd_context * ctx);
+
 #ifdef __cplusplus
 } // extern "C"
 #endif

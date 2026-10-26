@@ -2525,6 +2525,10 @@ private:
 
         keepctx.reset(); // [TAG_FN_L18_KEEPCTX] its states belong to these contexts
 
+        // [TAG_R27_TOKVERIFY] the tokenizer caches' verify threads read the vocabulary
+        server_fn_l22_drain();
+        mtmd_r27_tokverify_drain(mctx);
+
         spec.reset();
         spec_init.reset();
 
@@ -3793,6 +3797,7 @@ private:
             mtmd_set_lend_oom(mctx, [](void * ud, size_t bytes) {
                 return llama_fn_pin_on_oom_ext((const llama_model *) ud, bytes);
             }, (void *) model_tgt);
+            mtmd_r27_tokverify_bg(mctx, true); // [TAG_R27_TOKVERIFY] destroy() drains it before the model is freed
         }
         // [TAG_FN_L22] P2's server_fn_l22_init (server-common) reads the jinja / tokenizer switches from the profile
         server_fn_l22_init(model_tgt);

@@ -1020,7 +1020,8 @@ void server_l22_apply(const llama_model * model, bool with_jsonfloat) {
     const char * pl = llama_model_fn_env(model, "LLAMA_FN_L22_PASSLOG");
     g_l22.tokcache.store(tc);
     g_l22.passlog.store(pl ? std::atoi(pl) : 0);
-    g_l22_tokcache.n_verify.store(tc && vf ? 32 : 0);
+    // [TAG_R27_TOKVERIFY] LLAMA_R27_TOKVERIFY=0: every verify on the request's path (v0.26.2)
+    g_l22_tokcache.reset_verify(tc && vf ? 32 : 0, common_tokcache_verify_mode_from(llama_model_fn_env(model, "LLAMA_R27_TOKVERIFY")));
     if (with_jsonfloat) {
         jinja::set_l22_jsonfloat(llama_fn_l22_switch_on(llama_model_fn_env(model, "LLAMA_FN_L22_JSONFLOAT")));
     }
@@ -1037,13 +1038,30 @@ void server_l22_env_once() {
 
 } // namespace
 
+// [TAG_R27_TOKVERIFY] the result of a background verify (the cache's thread)
+static void server_l22_bg_result(bool ok, size_t bytes, size_t ids, double ms) {
+    if (!ok) {
+        llama_fn_l22_log("turn", "[TAG_FN_L22_TOKCACHE] background verify %zu bytes -> %zu ids in %.2f ms: MISMATCH: the cache is off from now on",
+                bytes, ids, ms);
+        LOG_WRN("[TAG_R27_TOKVERIFY] tokenizer cache: a re-used prefix gave other ids than a full encode (background verify), the cache is off from now on\n");
+    } else {
+        llama_fn_l22_log("turn", "[TAG_FN_L22_TOKCACHE] background verify %zu bytes -> %zu ids in %.2f ms: same ids", bytes, ids, ms);
+    }
+}
+
 void server_fn_l22_init(const llama_model * model) {
+    g_l22_tokcache.drain();
     g_l22_tokcache.clear(); // [TAG_V0262_TOKCACHE] a model (re)load: no ids from an earlier vocabulary
+    g_l22_tokcache.on_bg_result = server_l22_bg_result;
     server_l22_apply(model, true);
     g_l22.set.store(true);
-    llama_fn_l22_log("switch", "server text tools: JSONFLOAT=%d TOKCACHE=%d TOKCACHE_VERIFY=%d PASSLOG=%d",
+    llama_fn_l22_log("switch", "server text tools: JSONFLOAT=%d TOKCACHE=%d TOKCACHE_VERIFY=%d TOKVERIFY_MODE=%d PASSLOG=%d",
             jinja::l22_jsonfloat() ? 1 : 0, g_l22.tokcache.load() ? 1 : 0, g_l22_tokcache.n_verify.load() > 0 ? 1 : 0,
-            g_l22.passlog.load());
+            g_l22_tokcache.verify_mode.load(), g_l22.passlog.load());
+}
+
+void server_fn_l22_drain() {
+    g_l22_tokcache.drain();
 }
 
 // [TAG_FN_L22_TOKCACHE] the prompt text through the tokenizer cache when it is on; a timing line for long texts or slow
@@ -1060,9 +1078,10 @@ static llama_tokens server_tokenize_text(const llama_vocab * vocab, const std::s
     const double ms = (ggml_time_us() - t0)/1000.0;
     if (s.size() >= 65536 || ms >= 5.0 || st.mismatch) {
         static const char * paths[] = { "full encode", "same text", "prefix re-use", "cache off" };
-        llama_fn_l22_log("turn", "[TAG_FN_L22_TOKCACHE] tokenize %zu bytes -> %zu ids in %.2f ms (%s, re-used %zu ids / %zu bytes%s%s)",
+        llama_fn_l22_log("turn", "[TAG_FN_L22_TOKCACHE] tokenize %zu bytes -> %zu ids in %.2f ms (%s, re-used %zu ids / %zu bytes%s%s%s)",
                 s.size(), res.size(), ms, paths[std::min(std::max(st.path, 0), 3)], st.reused_ids, st.reused_bytes,
-                st.verified ? ", verified" : "", st.mismatch ? ", MISMATCH: the cache is off from now on" : "");
+                st.verified ? ", verified" : "", st.verify_bg ? ", verify in background" : "",
+                st.mismatch ? ", MISMATCH: the cache is off from now on" : "");
     }
     if (st.mismatch) {
         // [TAG_V0262_TOKCACHE] on by default now: say it without PASSLOG too (the full encode was used)

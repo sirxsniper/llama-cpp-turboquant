@@ -293,6 +293,9 @@ llama_tokens tokenize_mixed(const llama_vocab * vocab, const json & json_prompt,
 // Called by server_context_impl::l22_init (server-context.cpp, P3) after the model and projector load (R-P3-1).
 void server_fn_l22_init(const llama_model * model);
 
+// [TAG_R27_TOKVERIFY] wait for the tokenizer cache's background verify: call it before the model is freed
+void server_fn_l22_drain();
+
 // return the last index of character that can form a valid string
 // if the last character is potentially cut in half, return the index before the cut
 // if validate_utf8(text) == text.size(), then the whole text is valid utf8

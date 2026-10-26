@@ -577,6 +577,17 @@ struct mtmd_context {
     int  imgdec_threads = 1;     // LLAMA_FN_L22_IMGDEC_THREADS: picture preprocessing threads in mtmd_tokenize
     mutable mtmd_l22_embd_cache      embd_cache; // LLAMA_FN_L22_IMGCACHE: encoder outputs by content
     std::unique_ptr<common_tokcache> tokcache;   // LLAMA_FN_L22_TOKCACHE: the text parts of mtmd_tokenize
+    int tokverify_mode = COMMON_TOKCACHE_VERIFY_SYNC; // [TAG_R27_TOKVERIFY] LLAMA_R27_TOKVERIFY
+
+    static void tokverify_bg_result(bool ok, size_t bytes, size_t ids, double ms) {
+        if (!ok) {
+            llama_fn_l22_log("media", "[TAG_FN_L22_TOKCACHE] background verify %zu bytes -> %zu ids in %.2f ms: MISMATCH: the cache is off from now on",
+                    bytes, ids, ms);
+            LOG_WRN("[TAG_R27_TOKVERIFY] tokenizer cache: a re-used prefix gave other ids than a full encode (background verify), the cache is off from now on\n");
+        } else {
+            llama_fn_l22_log("media", "[TAG_FN_L22_TOKCACHE] background verify %zu bytes -> %zu ids in %.2f ms: same ids", bytes, ids, ms);
+        }
+    }
     // [TAG_FN_L22_VLBATCH] round 22 P2b: same-size Qwen3-VL stills share one encoder graph up to this many rows (0: off)
     int32_t fn_vlbatch_cap   = 0;
     bool    fn_vlbatch_check = false; // LLAMA_FN_L22_VLBATCH=check: also encode each picture alone and log the difference
@@ -741,6 +752,9 @@ struct mtmd_context {
             if (vocab && on_by_default(l22_env("LLAMA_FN_L22_TOKCACHE"))) {
                 tokcache = std::make_unique<common_tokcache>(96, (size_t) 64 << 20, 256);
                 tokcache->n_verify.store(on_by_default(l22_env("LLAMA_FN_L22_TOKCACHE_VERIFY")) ? 32 : 0);
+                // [TAG_R27_TOKVERIFY] the mode takes effect when the host allows the thread (mtmd_r27_tokverify_bg)
+                tokverify_mode = common_tokcache_verify_mode_from(l22_env("LLAMA_R27_TOKVERIFY"));
+                tokcache->on_bg_result = tokverify_bg_result;
             }
             llama_fn_l22_log("switch", "mtmd: VLEND_HOLD=%d VLEND_SIZE=%d (largest lend %.0f MiB) IMGCACHE=%zu IMGDEC_THREADS=%d "
                     "IMG_MAXROWS=%ld VLRESIZE=%d TOKCACHE=%d", vlend_hold ? 1 : 0,
@@ -1556,9 +1570,10 @@ struct mtmd_tokenizer {
             const double ms = (ggml_time_us() - t0)/1000.0;
             if (txt.size() >= 65536 || ms >= 5.0 || st.mismatch) {
                 static const char * paths[] = { "full encode", "same text", "prefix re-use", "cache off" };
-                llama_fn_l22_log("media", "[TAG_FN_L22_TOKCACHE] text part %zu bytes -> %zu ids in %.2f ms (%s, re-used %zu ids%s%s)",
+                llama_fn_l22_log("media", "[TAG_FN_L22_TOKCACHE] text part %zu bytes -> %zu ids in %.2f ms (%s, re-used %zu ids%s%s%s)",
                         txt.size(), tokens.size(), ms, paths[std::min(std::max(st.path, 0), 3)], st.reused_ids,
-                        st.verified ? ", verified" : "", st.mismatch ? ", MISMATCH: the cache is off from now on" : "");
+                        st.verified ? ", verified" : "", st.verify_bg ? ", verify in background" : "",
+                        st.mismatch ? ", MISMATCH: the cache is off from now on" : "");
             }
             if (st.mismatch) {
                 LOG_WRN("%s: [TAG_V0262_TOKCACHE] tokenizer cache: a re-used prefix gave other ids than a full encode, the cache is off from now on\n", __func__);
@@ -3312,6 +3327,22 @@ void mtmd_set_lend_oom(mtmd_context * ctx, mtmd_lend_oom_fn fn, void * user_data
 // [TAG_FN_L22_IMGDEC]
 int32_t mtmd_l22_imgdec_threads(const mtmd_context * ctx) {
     return ctx != nullptr ? ctx->imgdec_threads : 1;
+}
+
+// [TAG_R27_TOKVERIFY]
+void mtmd_r27_tokverify_bg(mtmd_context * ctx, bool on) {
+    if (ctx == nullptr || !ctx->tokcache) {
+        return;
+    }
+    ctx->tokcache->drain();
+    ctx->tokcache->verify_mode.store(on ? ctx->tokverify_mode : COMMON_TOKCACHE_VERIFY_SYNC);
+    ctx->tokcache->verify_first.store(true);
+}
+
+void mtmd_r27_tokverify_drain(mtmd_context * ctx) {
+    if (ctx != nullptr && ctx->tokcache) {
+        ctx->tokcache->drain();
+    }
 }
 
 void mtmd_log_set(ggml_log_callback log_callback, void * user_data) {

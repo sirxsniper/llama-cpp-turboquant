@@ -210,6 +210,40 @@ static void test_tokcache(const std::string & path) {
         CHECK(st.path == 3, "short text bypasses the cache (path %d)", st.path);
     }
 
+    // [TAG_R27_TOKVERIFY] mode first: the first verify on the caller, the rest on the thread; a corrupted entry is found
+    // by the thread and turns the cache off for the requests after it
+    for (const int mode : { (int) COMMON_TOKCACHE_VERIFY_FIRST, (int) COMMON_TOKCACHE_VERIFY_BG }) {
+        common_tokcache v(4, (size_t) 64 << 20, 64);
+        v.reset_verify(8, mode);
+        std::string s = chat_turn("system", body(rng, 40));
+        int n_sync = 0, n_bg = 0;
+        for (int k = 0; k < 6; ++k) {
+            s += chat_turn("user", body(rng, 5));
+            common_tokcache_stats st;
+            CHECK(same_as_full(vocab, v, s, false, &st), "mode %d, step %d", mode, k);
+            n_sync += st.verified ? 1 : 0;
+            n_bg   += st.verify_bg ? 1 : 0;
+            v.drain();
+        }
+        CHECK(n_sync == (mode == COMMON_TOKCACHE_VERIFY_FIRST ? 1 : 0), "mode %d: %d verifies on the caller", mode, n_sync);
+        CHECK(n_bg >= 4 && v.n_bg_done.load() == n_bg, "mode %d: %d verifies on the thread, %d done", mode, n_bg, v.n_bg_done.load());
+        CHECK(!v.off.load() && v.n_bg_mismatch.load() == 0, "mode %d: no mismatch", mode);
+
+        {
+            std::lock_guard<std::mutex> lk(v.mu);
+            auto bad = std::make_shared<common_tokcache::entry>(*v.lru.front());
+            bad->ids[1] = bad->ids[1] == 0 ? 1 : 0;
+            v.lru.front() = bad;
+        }
+        s += chat_turn("user", body(rng, 5));
+        common_tokcache_stats st;
+        const auto got = common_tokcache_tokenize(v, vocab, s, false, true, &st);
+        v.drain();
+        CHECK(st.verify_bg && got != common_tokenize(vocab, s, false, true), "mode %d: the corrupted prefix was used", mode);
+        CHECK(v.off.load() && v.n_bg_mismatch.load() == 1, "mode %d: the thread found the mismatch", mode);
+        CHECK(same_as_full(vocab, v, s, false, &st) && st.path == 3, "mode %d: cache off after the mismatch", mode);
+    }
+
     // a long conversation (~100K+ tokens) re-sent with one more turn: equal ids, and the time of both paths
     {
         common_tokcache big(4, (size_t) 64 << 20, 4096);

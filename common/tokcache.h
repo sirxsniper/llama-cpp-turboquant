@@ -23,11 +23,13 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -37,7 +39,23 @@ struct common_tokcache_stats {
     size_t reused_bytes = 0;
     bool   verified     = false; // compared with a full encode
     bool   mismatch     = false; // the comparison failed: the full encode was returned and the cache is off
+    bool   verify_bg    = false; // [TAG_R27_TOKVERIFY] the full encode to compare runs on the cache's verify thread
 };
+
+// [TAG_R27_TOKVERIFY] where the verify encode runs: 0 on the caller for every verify (v0.26.2), 1 the first verify after
+// a reset_verify on the caller and the rest on a background thread, 2 every verify on the background thread
+enum common_tokcache_verify_mode { COMMON_TOKCACHE_VERIFY_SYNC = 0, COMMON_TOKCACHE_VERIFY_FIRST = 1, COMMON_TOKCACHE_VERIFY_BG = 2 };
+
+// [TAG_R27_TOKVERIFY] LLAMA_R27_TOKVERIFY: unset, empty or 1 = first, "bg" / 2 = bg, 0 = sync (v0.26.2)
+inline int common_tokcache_verify_mode_from(const char * v) {
+    if (v == nullptr || *v == '\0' || std::strcmp(v, "1") == 0 || std::strcmp(v, "first") == 0) {
+        return COMMON_TOKCACHE_VERIFY_FIRST;
+    }
+    if (std::strcmp(v, "2") == 0 || std::strcmp(v, "bg") == 0) {
+        return COMMON_TOKCACHE_VERIFY_BG;
+    }
+    return COMMON_TOKCACHE_VERIFY_SYNC;
+}
 
 struct common_tokcache {
     struct entry {
@@ -52,6 +70,11 @@ struct common_tokcache {
     explicit common_tokcache(size_t n_max = 4, size_t bytes_max = (size_t) 64 << 20, size_t min_bytes = 256)
         : n_max(n_max), bytes_max(bytes_max), min_bytes(min_bytes) {}
 
+    ~common_tokcache() { drain(); }
+
+    common_tokcache(const common_tokcache &) = delete;
+    common_tokcache & operator=(const common_tokcache &) = delete;
+
     size_t n_max;
     size_t bytes_max;
     size_t min_bytes;         // shorter texts are encoded directly and not stored
@@ -62,10 +85,37 @@ struct common_tokcache {
     std::vector<std::shared_ptr<const entry>> lru; // most recent first
     size_t bytes = 0;
 
+    // [TAG_R27_TOKVERIFY] background verify. The vocabulary must outlive the thread: call drain() before the model is freed
+    std::atomic<int>  verify_mode{COMMON_TOKCACHE_VERIFY_SYNC};
+    std::atomic<bool> verify_first{true}; // the next verify runs on the caller (mode FIRST)
+    std::atomic<int>  n_bg_done{0};
+    std::atomic<int>  n_bg_skipped{0};    // a verify was due while the thread was busy
+    std::atomic<int>  n_bg_mismatch{0};
+    void (*on_bg_result)(bool ok, size_t bytes, size_t ids, double ms) = nullptr; // set before use; nullptr: stderr on mismatch
+
+    std::mutex        vmu;
+    std::thread       vthr;
+    std::atomic<bool> vbusy{false};
+
     void clear() {
         std::lock_guard<std::mutex> lk(mu);
         lru.clear();
         bytes = 0;
+    }
+
+    // the verify count and mode for a new model; the first verify runs on the caller again
+    void reset_verify(int n, int mode) {
+        n_verify.store(n);
+        verify_mode.store(mode);
+        verify_first.store(true);
+    }
+
+    // wait for a running verify (it reads the vocabulary)
+    void drain() {
+        std::lock_guard<std::mutex> lk(vmu);
+        if (vthr.joinable()) {
+            vthr.join();
+        }
     }
 };
 
@@ -285,6 +335,51 @@ inline size_t common_prefix(const std::string & a, const std::string & b) {
     return (size_t) (mm.first - a.data());
 }
 
+// [TAG_R27_TOKVERIFY] compare e's ids with a full encode on the cache's thread. A mismatch turns the cache off for the
+// requests after it (the caller already has e's ids). false: the thread is busy or draining, nothing started
+inline bool verify_bg(common_tokcache & c, const llama_vocab * vocab, std::shared_ptr<const common_tokcache::entry> e) {
+    std::unique_lock<std::mutex> lk(c.vmu, std::try_to_lock);
+    if (!lk.owns_lock() || c.vbusy.load()) {
+        return false;
+    }
+    if (c.vthr.joinable()) {
+        c.vthr.join(); // done: vbusy is false
+    }
+    c.vbusy.store(true);
+    try {
+        c.vthr = std::thread([&c, vocab, e]() {
+            const int64_t t0 = llama_time_us();
+            bool ok = true;
+            try {
+                ok = tokenize_plain(vocab, e->text.data(), e->text.size(), e->add_special, e->parse_special) == e->ids;
+            } catch (...) {
+                // no verdict
+            }
+            const double ms = (llama_time_us() - t0)/1000.0;
+            if (!ok) {
+                c.off.store(true);
+                c.clear();
+                c.n_bg_mismatch.fetch_add(1);
+            }
+            c.n_bg_done.fetch_add(1);
+            try {
+                if (c.on_bg_result) {
+                    c.on_bg_result(ok, e->text.size(), e->ids.size(), ms);
+                } else if (!ok) {
+                    fprintf(stderr, "[TAG_R27_TOKVERIFY] tokenizer cache: background verify MISMATCH (%zu bytes): the cache is off from now on\n",
+                            e->text.size());
+                }
+            } catch (...) {
+            }
+            c.vbusy.store(false);
+        });
+    } catch (...) {
+        c.vbusy.store(false);
+        return false;
+    }
+    return true;
+}
+
 } // namespace common_tokcache_impl
 
 // the ids of llama_tokenize(vocab, text, add_special, parse_special), through the cache when it can help
@@ -376,7 +471,17 @@ inline std::vector<llama_token> common_tokcache_tokenize(common_tokcache & c, co
         s.path         = 2;
         s.reused_ids   = idx;
         s.reused_bytes = b;
-        if (c.n_verify.load(std::memory_order_relaxed) > 0) {
+        // [TAG_R27_TOKVERIFY] off the caller's path unless the mode says so; a busy thread skips this one
+        const int vmode = c.verify_mode.load(std::memory_order_relaxed);
+        if (c.n_verify.load(std::memory_order_relaxed) > 0 && vmode != COMMON_TOKCACHE_VERIFY_SYNC &&
+                !(vmode == COMMON_TOKCACHE_VERIFY_FIRST && c.verify_first.exchange(false))) {
+            if (verify_bg(c, vocab, ne)) {
+                c.n_verify.fetch_sub(1);
+                s.verify_bg = true;
+            } else {
+                c.n_bg_skipped.fetch_add(1);
+            }
+        } else if (c.n_verify.load(std::memory_order_relaxed) > 0) {
             c.n_verify.fetch_sub(1);
             s.verified = true;
             std::vector<llama_token> full = tokenize_plain(vocab, text.data(), text.size(), add_special, parse_special);
