@@ -350,7 +350,13 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_memory_hybrid_idx::memory_bre
 }
 
 void llama_memory_hybrid_idx::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
-    llama_memory_hybrid::state_write(io, seq_id, flags);
+    // [TAG_SYNC_HYBRID_IDX_PARTIAL] mirror state_read: PARTIAL_ONLY holds the recurrent part only. Upstream's
+    // llama_memory_hybrid::state_write now always calls the attention cache, which writes under PARTIAL_ONLY when it is
+    // SWA (the windowed MTP draft cache): state_read below skipped that section and read it as recurrent state.
+    if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
+        get_mem_attn()->state_write(io, seq_id, flags);
+    }
+    get_mem_recr()->state_write(io, seq_id, flags);
 
     // [TAG_HYBRID_IDX_STATE] the indexer section goes last, so it is a pure suffix: an old reader stops early instead of misparsing it
     // The indexer mirrors the attention cache, so it uses the same PARTIAL_ONLY gate.
