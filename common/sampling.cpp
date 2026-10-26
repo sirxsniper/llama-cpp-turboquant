@@ -1412,7 +1412,7 @@ struct common_sampler * common_sampler_init(
 
     // [TAG_R28_PENFAST] penalties (Kyro's presence penalty 1.5) or a user logit bias switch the path above off: the full
     // 248K array, the penalties over all of it and a partial sort per sample (srv.sample 1.7 ms vs 0.1 ms on Flash-Next).
-    // This path is exact (common_sampler_penfast_apply), so all models; no grammar, no reasoning budget.
+    // This path is exact (common_sampler_penfast_apply), so all models; requests without a grammar or reasoning budget use it directly.
     // [TAG_R29_GRAMFAST] with a grammar and/or a reasoning budget the same configuration drives the candidate-set path of
     // common_sampler_sample (tool requests: the grammar over ~150 tokens instead of 248K); LLAMA_R29_GRAMFAST=0: v0.26.4
     common_penfast_cfg penfast;
