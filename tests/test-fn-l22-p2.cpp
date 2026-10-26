@@ -287,6 +287,30 @@ static void test_tokcache(const std::string & path) {
         CHECK(diffs.load() == 0, "threaded lookups: %d differ", diffs.load());
     }
 
+    // [TAG_R27_TOKVERIFY] threads with the background verify: callers race on the one verify thread (busy: skipped)
+    {
+        common_tokcache mt(4, (size_t) 64 << 20, 64);
+        mt.reset_verify(1000, COMMON_TOKCACHE_VERIFY_BG);
+        std::vector<std::string> texts;
+        std::string s = chat_turn("system", body(rng, 50));
+        for (int k = 0; k < 16; ++k) {
+            s += chat_turn("user", body(rng, 4));
+            texts.push_back(s);
+        }
+        std::atomic<int> diffs{0};
+        mtmd_l22_parallel_for(64, 8, [&](int i) {
+            const std::string & tx = texts[(size_t) i % texts.size()];
+            if (common_tokcache_tokenize(mt, vocab, tx, false, true) != common_tokenize(vocab, tx, false, true)) {
+                diffs++;
+            }
+        });
+        mt.drain();
+        CHECK(diffs.load() == 0, "threaded lookups, background verify: %d differ", diffs.load());
+        CHECK(!mt.off.load() && mt.n_bg_mismatch.load() == 0, "threaded background verify: no mismatch");
+        CHECK(mt.n_bg_done.load() > 0, "threaded background verify: %d done, %d skipped", mt.n_bg_done.load(), mt.n_bg_skipped.load());
+        printf("tokcache: threaded background verify: %d done, %d skipped\n", mt.n_bg_done.load(), mt.n_bg_skipped.load());
+    }
+
     // [TAG_V0262_TOKCACHE] reloads in one process (--sleep-idle-seconds) give new vocabulary addresses: the registry keeps
     // at most VOCAB_INFO_MAX entries, an entry a caller still holds stays valid, and a dropped vocabulary is built again
     {
