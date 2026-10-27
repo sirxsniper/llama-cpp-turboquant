@@ -115,6 +115,14 @@ static void test_pause() {
     TCHECK(l22_pause_should_resume(until, until, true), "at the timeout");
     TCHECK(l22_pause_should_resume(until + 5, until, true), "after the timeout");
     TCHECK(l22_pause_should_resume(10, until, false), "the short request is gone");
+
+    // [TAG_R32_PAUSE_END] the pause ends at the short request's first token; off = at its end (v0.26.5)
+    TCHECK(r32_pause_by_holds(true, true, true), "prompt running: holds");
+    TCHECK(!r32_pause_by_holds(true, false, true), "first token: released");
+    TCHECK(!r32_pause_by_holds(false, false, true), "gone: released");
+    TCHECK(r32_pause_by_holds(true, false, false), "off: holds through the answer");
+    TCHECK(!r32_pause_by_holds(false, false, false), "off: gone releases");
+    TCHECK(l22_pause_should_resume(10, until, r32_pause_by_holds(true, false, true)), "first token resumes before the timeout");
 }
 
 // [TAG_FN_L22_SHAREKV] the follower predicate

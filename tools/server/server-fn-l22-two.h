@@ -9,6 +9,7 @@
 //   l22_window_cap_us          the decode window cap of a stream pass                   [TAG_FN_L22_GENSHARE2]
 //   l22_pause_eligible         a short request may pause an answer                      [TAG_FN_L22_PAUSE]
 //   l22_pause_should_resume    when a paused answer goes on                             [TAG_FN_L22_PAUSE]
+//   r32_pause_by_holds         the pausing request still holds the pause                [TAG_R32_PAUSE_END]
 //   l22_sharekv_usable         a follower may take the leader's prefix by seq_cp        [TAG_FN_L22_SHAREKV]
 //   l22_park_cells             the cells a parked slot needs again                      [TAG_FN_L22_SHAREKV]
 //   l24_attach_best            the other slot whose cells a new prompt starts from      [TAG_FN_L24_ATTACH]
@@ -165,6 +166,12 @@ static inline bool l22_pause_eligible(int32_t work, int32_t max_tok, int32_t n_p
 // a paused answer (until != 0) goes on at its timeout or when the request that paused it is gone
 static inline bool l22_pause_should_resume(int64_t now, int64_t until, bool by_alive) {
     return until != 0 && (now >= until || !by_alive);
+}
+
+// [TAG_R32_PAUSE_END] the request that paused an answer still holds the pause: found = a slot runs it, prompting = it has
+// no first token yet. end_at_first: the pause ends at its first token; false: at its end (v0.26.5, LLAMA_R32_PAUSE_END=0)
+static inline bool r32_pause_by_holds(bool found, bool prompting, bool end_at_first) {
+    return found && (prompting || !end_at_first);
 }
 
 // [TAG_FN_L22_SHAREKV] what get_available_slot knows when a follower arrives (the leader L, the published record, the

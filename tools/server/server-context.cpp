@@ -2452,6 +2452,7 @@ private:
         bool    pause     = false;   // LLAMA_FN_L22_PAUSE: a short request pauses a long answer
         int32_t pause_tok = 2048;    // LLAMA_FN_L22_PAUSE_TOKENS
         int64_t pause_us  = 8000000; // LLAMA_FN_L22_PAUSE_S
+        bool    pause_end = true;    // LLAMA_R32_PAUSE_END: [TAG_R32_PAUSE_END] 1 = a pause ends at the pausing request's first token, 0 = at its end (v0.26.5)
         bool    sharekv   = false;   // LLAMA_FN_L22_SHAREKV: the shared-prefix fan-out by seq_cp (needs --kv-unified)
         bool    attach    = false;   // LLAMA_FN_L24_ATTACH: [TAG_FN_L24_ATTACH] start from another slot's cells (needs --kv-unified)
         int32_t attach_min  = 512;   // LLAMA_FN_L24_ATTACH_MIN: at least this many tokens
@@ -3878,6 +3879,7 @@ private:
         l22two.pause     = on("LLAMA_FN_L22_PAUSE");
         l22two.pause_tok = (int32_t) std::clamp(num("LLAMA_FN_L22_PAUSE_TOKENS", 2048.0), 0.0, 1e9);
         l22two.pause_us  = (int64_t) (std::clamp(num("LLAMA_FN_L22_PAUSE_S", 8.0), 0.0, 3600.0) * 1e6);
+        l22two.pause_end = num("LLAMA_R32_PAUSE_END", 1.0) != 0.0; // [TAG_R32_PAUSE_END]
         const bool sharekv_sw = on("LLAMA_FN_L22_SHAREKV");
         l22two.sharekv   = sharekv_sw && params_base.kv_unified;
         // [TAG_FN_L24_ATTACH] the cells are shared within one KV stream (--kv-unified); a shift (context shift, cache
@@ -3911,9 +3913,10 @@ private:
         }
         if (l22two.one || l22two.gs2 || l22two.pause || sharekv_sw) {
             SRV_INF("[TAG_FN_L22] P9 two-connection rules (%zu slots): [TAG_FN_L22_ONEPROMPT] %d, [TAG_FN_L22_GENSHARE2] %d%s, "
-                    "[TAG_FN_L22_PAUSE] %d (<= %d tokens, %.1f s), [TAG_FN_L22_SHAREKV] %d%s\n", slots.size(), (int) l22two.one,
-                    l22two.gs2, l22two.gs2_all ? " (also without an answer)" : "", (int) l22two.pause, l22two.pause_tok,
-                    l22two.pause_us / 1e6, (int) l22two.sharekv, sharekv_sw && !l22two.sharekv ? " (off: needs --kv-unified)" : "");
+                    "[TAG_FN_L22_PAUSE] %d (<= %d tokens, %.1f s, [TAG_R32_PAUSE_END] ends at %s), [TAG_FN_L22_SHAREKV] %d%s\n",
+                    slots.size(), (int) l22two.one, l22two.gs2, l22two.gs2_all ? " (also without an answer)" : "", (int) l22two.pause,
+                    l22two.pause_tok, l22two.pause_us / 1e6, l22two.pause_end ? "the first token" : "the end",
+                    (int) l22two.sharekv, sharekv_sw && !l22two.sharekv ? " (off: needs --kv-unified)" : "");
         }
     }
 
@@ -4155,12 +4158,35 @@ private:
     }
 
     // [TAG_FN_L22_PAUSE] at the top of pre_decode: pending pauses start where the slot has no rows in flight, paused
-    // answers go on at the timeout or when the request that paused them is gone
+    // answers go on at the timeout or when the request that paused them is gone ([TAG_R32_PAUSE_END]: or has its first token)
     void l22_pause_update() {
         const int64_t now = ggml_time_us();
         for (auto & g : slots) {
+            if (!g.l22_pause_pending && g.l22_pause_until_us == 0) {
+                continue;
+            }
+            // [TAG_R32_PAUSE_END] the pausing request: a slot runs it, and it has no first token yet
+            bool by_found     = false;
+            bool by_prompting = false;
+            for (const auto & o : slots) {
+                if (&o != &g && o.is_processing() && o.task && o.task->id == g.l22_pause_by_task) {
+                    by_found     = true;
+                    by_prompting = o.state == SLOT_STATE_STARTED || o.state == SLOT_STATE_PROCESSING_PROMPT ||
+                                   o.state == SLOT_STATE_DONE_PROMPT;
+                    break;
+                }
+            }
+            const bool by_holds = r32_pause_by_holds(by_found, by_prompting, l22two.pause_end);
             if (g.l22_pause_pending) {
                 if (g.state != SLOT_STATE_GENERATING || !g.task) {
+                    g.l22_pause_pending = false;
+                    g.l22_pause_by_task = -1;
+                } else if (l22two.pause_end && !by_holds) {
+                    // [TAG_R32_PAUSE_END] the pausing request has its first token (or is gone) before the pause started
+                    if (llama_fn_l22_passlog_level() >= 1) {
+                        llama_fn_l22_log("turn", "two=pause-skip slot=%d task=%d by=%d why=%s", g.id, g.task->id,
+                                         g.l22_pause_by_task, by_found ? "first-token" : "end");
+                    }
                     g.l22_pause_pending = false;
                     g.l22_pause_by_task = -1;
                 } else if (g.i_batch == -1 && g.spec_i_batch.empty() && !g.parked) {
@@ -4178,18 +4204,8 @@ private:
                 }
                 continue;
             }
-            if (g.l22_pause_until_us == 0) {
-                continue;
-            }
-            bool by_alive = false;
-            for (const auto & o : slots) {
-                if (&o != &g && o.is_processing() && o.task && o.task->id == g.l22_pause_by_task) {
-                    by_alive = true;
-                    break;
-                }
-            }
             const bool timeout = now >= g.l22_pause_until_us;
-            if (g.state != SLOT_STATE_GENERATING || l22_pause_should_resume(now, g.l22_pause_until_us, by_alive)) {
+            if (g.state != SLOT_STATE_GENERATING || l22_pause_should_resume(now, g.l22_pause_until_us, by_holds)) {
                 // the pause is not decode time (as a park); a park inside it counts itself (pool_restore moves t0)
                 const int64_t end    = g.parked ? g.t_park_us : now;
                 const int64_t paused = std::max<int64_t>(0, end - g.l22_pause_t0_us);
@@ -4201,7 +4217,7 @@ private:
                 }
                 if (llama_fn_l22_passlog_level() >= 1) {
                     llama_fn_l22_log("turn", "two=resume slot=%d task=%d why=%s paused_ms=%.0f", g.id, g.task ? g.task->id : -1,
-                                     timeout ? "timeout" : (by_alive ? "state" : "end"), paused / 1000.0);
+                                     timeout ? "timeout" : (by_holds ? "state" : (by_found ? "first-token" : "end")), paused / 1000.0);
                 }
                 g.l22_pause_until_us = 0;
                 g.l22_pause_t0_us    = 0;
