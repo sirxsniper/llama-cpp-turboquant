@@ -238,6 +238,9 @@ llama-server.exe --model Qwen3.8-27B-UD-Q5_K_XL.gguf --host 127.0.0.1 --port 808
   --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0 --repeat-penalty 1 --metrics
 ```
 
+- **Sampling** = the creator's thinking-mode values from the [Qwen3.8-27B model card](https://huggingface.co/Qwen/Qwen3.8-27B): temperature 1.0, top-p 0.95, top-k 20, min-p 0, presence penalty 0 (the server default), repetition penalty 1.0; thinking on.
+- **Draft length** `--spec-draft-n-max 7` is measured on an RTX 5090 (10-27): chat and tool-call requests with vision on, 1 connection, the sampling above, 2 passes: n-max 7 175.9 t/s, n-max 5 162.3 t/s, n-max 3 141.1 t/s. The draft settings (n-max, p-min) only change speed: the model verifies every drafted token, so the output distribution stays the same.
+
 <details>
 <summary><b>What the important flags do</b></summary>
 
@@ -247,7 +250,7 @@ llama-server.exe --model Qwen3.8-27B-UD-Q5_K_XL.gguf --host 127.0.0.1 --port 808
 |:--|:--|
 | `--cache-type-k/v turbot` | the tiered KV cache: a full 262K context at a lower KLD than turbo5p |
 | `--kv-unified --parallel 4` | four slots share one KV pool; every slot can use the whole context |
-| `--spec-type draft-dflash --spec-draft-n-max 7 --spec-rs-seq 7` | DFlash2 block drafting; keep `--spec-rs-seq` equal to `n-max` (never `0`) |
+| `--spec-type draft-dflash --spec-draft-n-max 7 --spec-rs-seq 7` | DFlash2 block drafting, n-max 7 measured on an RTX 5090 (10-27), speed only; keep `--spec-rs-seq` equal to `n-max` (never `0`) |
 | `-bs` | sampling on the GPU (it steps aside by itself while a tool-call grammar is active) |
 | `--load-mode none` | weights read fully into memory (replaces the deprecated `--no-mmap`) |
 | `--cache-ram 45056 --ctx-checkpoints 32 --cache-idle-slots` | the prompt cache in RAM, so returning to a conversation does not re-read it |
@@ -279,10 +282,13 @@ llama-server.exe --model Qwen3.8-Flash-Next-UD-Q4_K_XL-MTP-00001-of-00005.gguf -
   --cache-type-k turbot --cache-type-v turbot --flash-attn on ^
   --threads 16 --cpu-mask 55555555 --cpu-strict 1 --prio 2 --parallel 1 --cache-ram 0 ^
   --n-cpu-moe 48 --batch-size 8192 --ubatch-size 8192 ^
-  --spec-type draft-mtp --spec-draft-n-max 2 --spec-draft-p-min 0.5 --spec-draft-sampling probabilistic ^
+  --spec-type draft-mtp --spec-draft-n-max 2 --spec-draft-p-min 0.2 --spec-draft-sampling probabilistic ^
   --jinja --reasoning-format deepseek --reasoning-budget -1 --no-context-shift --n-predict -1 ^
   --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0 --repeat-penalty 1 --metrics
 ```
+
+- **Sampling** = the creator's thinking-mode values from the [Qwen3.8-Flash-Next model card](https://huggingface.co/Qwen/Qwen3.8-Flash-Next): temperature 1.0, top-p 0.95, top-k 20, min-p 0, presence penalty 0 (the server default), repetition penalty 1.0; thinking on.
+- **Draft settings** `--spec-draft-n-max 2 --spec-draft-p-min 0.2` are measured on an RTX 5090 (10-27): MTPq3 files, vision on, 262K, 1 connection, chat and tool-call requests, the sampling above, 2 passes: p-min 0.2 / n-max 2 98.9 t/s; 0 / 2 97.4; 0.5 / 3 96.9; 0.5 / 2 96.2; 0 / 3 94.6; 0.2 / 3 94.1 (pass-to-pass noise about 3 t/s: n-max 2 beats 3, p-min barely matters). They only change speed: the model verifies every drafted token, so the output distribution stays the same.
 
 <details>
 <summary><b>What the important flags do</b></summary>
@@ -295,7 +301,7 @@ llama-server.exe --model Qwen3.8-Flash-Next-UD-Q4_K_XL-MTP-00001-of-00005.gguf -
 | `--batch-size 8192 --ubatch-size 8192` | large prompt batches, so prompt reading streams experts over PCIe at 1.5–2.3K t/s |
 | `--cpu-mask 55555555 --cpu-strict 1 --threads 16` | one CPU worker per physical core for the CPU expert pool |
 | `--cache-ram 0` | the model already uses most of the RAM |
-| `--spec-type draft-mtp --spec-draft-n-max 2 --spec-draft-p-min 0.5` | drafting with the model's own MTP head (draft length 3 measured slower) |
+| `--spec-type draft-mtp --spec-draft-n-max 2 --spec-draft-p-min 0.2` | drafting with the model's own MTP head; n-max 2 / p-min 0.2 measured fastest on an RTX 5090 (10-27), speed only |
 | `-fit off` | the engine sizes VRAM itself (hot set, borrowed prompt buffer) |
 
 - **Keep the model memory-mapped**: never `--load-mode none` / `--no-mmap` — it is larger than RAM.
