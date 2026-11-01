@@ -434,8 +434,7 @@ struct case_rollback_bound : ctx_test {
                         "rollback " + std::to_string(r_acc) + " after a " + std::to_string(n) + "-token ubatch: replay at position " +
                         std::to_string(pos) + " differs, nmse " + std::to_string(diff.nmse()));
             }
-            TLOG_INF("%s: n %u: rollback %u accepted (upstream bound %u), replay exact
-", __func__, n, r_acc, r_up);
+            TLOG_INF("%s: n %u: rollback %u accepted (upstream bound %u), replay exact\n", __func__, n, r_acc, r_up);
         }
 
         TLOG_INF("%s: rollback bounds hold for ubatches of 1, 2, %u and %u tokens\n", __func__, n_rs_seq + 1, n_rs_seq + 2);
