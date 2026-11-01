@@ -24,6 +24,39 @@ static inline ggml_tensor * build_gdn_l2_norm(ggml_context * ctx, ggml_tensor * 
     return ggml_scale(ctx, ggml_rms_norm(ctx, x, eps/n), 1.0f/sqrtf(n));
 }
 
+// [TAG_R34_GDNQK] LLAMA_R34_GDNQK: 1 (default) the GDN q and k l2 norms of small ubatches in one launch, 0 two (v0.26.6)
+static inline bool llama_r34_gdnqk_enabled() {
+    static const bool on = [] {
+        const char * e = getenv("LLAMA_R34_GDNQK");
+        return !(e && e[0] == '0');
+    }();
+    return on;
+}
+
+// [TAG_R34_GDNQK] q and k of a GDN layer are adjacent views of the conv output (k starts right after q's num_k_heads rows
+// in every token row, same strides). One rms_norm + scale over the [head_k_dim, 2 * num_k_heads, T, S] view gives every
+// row the bits it gets from its own launch (each row is normalised alone; the CUDA block size depends on ncols only), so
+// the pair costs one (fused) launch instead of two. q and k become views of that output: same shape and strides, k at
+// num_k_heads rows. Only with the fused GDN op and for ubatches of at most 16 tokens per sequence (decode, MTP and DFlash2
+// verify): the views' token stride is 2 x num_k_heads rows, which the chunked prefill kernels refuse (they need packed
+// tokens; their thresholds are >= 16 prefix tokens), so a prompt ubatch keeps the two launches and its kernels.
+// False: nothing was built, the caller norms q and k itself.
+static inline bool build_gdn_l2_norm_qk(ggml_context * ctx, ggml_tensor * conv_qkv_mix, int64_t head_k_dim,
+        int64_t num_k_heads, int64_t n_seq_tokens, int64_t n_seqs, size_t nb1_qkv, float eps, bool fused_gdn,
+        ggml_tensor *& q, ggml_tensor *& k) {
+    if (!fused_gdn || n_seq_tokens > 16 || !llama_r34_gdnqk_enabled() || conv_qkv_mix->type != GGML_TYPE_F32) {
+        return false;
+    }
+    const size_t row = ggml_row_size(GGML_TYPE_F32, head_k_dim);
+    ggml_tensor * qk = ggml_view_4d(ctx, conv_qkv_mix, head_k_dim, 2 * num_k_heads, n_seq_tokens, n_seqs,
+            row, nb1_qkv, nb1_qkv * n_seq_tokens, 0);
+    qk = build_gdn_l2_norm(ctx, qk, eps);
+    q = ggml_view_4d(ctx, qk, head_k_dim, num_k_heads, n_seq_tokens, n_seqs, qk->nb[1], qk->nb[2], qk->nb[3], 0);
+    k = ggml_view_4d(ctx, qk, head_k_dim, num_k_heads, n_seq_tokens, n_seqs, qk->nb[1], qk->nb[2], qk->nb[3],
+            (size_t) num_k_heads * qk->nb[1]);
+    return true;
+}
+
 //
 // base classes
 //
