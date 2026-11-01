@@ -17016,19 +17016,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     // [TAG_R34_D] the Flint geometry: hs 128 x 4 KV heads = one turbo5p512 block per KV position, GQA 8, per-head sinks,
     // decode (nb 1: VEC), verify widths (2, 8) and prompt batches (64, 512: MMA); F16 K/V as the control.
-    // [TAG_R34_D_T5X] with GGML_CUDA_R34_T5X=1 (exact codebook at decode) turbo5p512 at hs 128 must match the CPU reference
-    // at the MMA level at EVERY width (5e-6; measured 1.4e-7..1.7e-6). The default decode kernel reads the int8 LUT
-    // (measured 3.9e-5 / 5.1e-5 at nb 1), so without the switch these cases keep the fixture's 5e-4. The F16 cases always
-    // keep 5e-4 (the CPU F16 path itself is about 4e-5 from the CUDA one).
-    {
-        const char * t5x_env = getenv("GGML_CUDA_R34_T5X");
-        const bool   t5x_on  = t5x_env && t5x_env[0] && atoi(t5x_env) != 0;
-        for (ggml_type t : { GGML_TYPE_TURBO5P512_0, GGML_TYPE_F16 }) {
-            for (bool snk : { false, true }) {
-                for (int64_t nb : { 1, 2, 8, 64, 512 }) {
-                    test_cases.emplace_back(new test_flash_attn_ext_split_plane(t, 128, 4, 8, 2048, nb, 1, 0.0f, snk,
-                                                                                t == GGML_TYPE_F16 || !t5x_on ? 5e-4 : 5e-6));
-                }
+    // turbo5p512 at hs 128 vs the CPU reference: the batched widths (nb >= 2) read the float centroids and must stay at
+    // that level (1e-5; measured 1.3e-7..1.6e-6 on sm_120). Decode (nb 1) reads the int8 LUT of the 5-bit codebook
+    // (measured 3.9e-5 / 5.1e-5) and keeps the fixture's 5e-4; an opt-in near-exact decode (int8 residual table,
+    // f2fd41350) was measured and dropped: no quality gain on Flint, decode -1..-2 %. The F16 cases keep 5e-4 (the CPU
+    // F16 path itself is about 4e-5 from the CUDA one).
+    for (ggml_type t : { GGML_TYPE_TURBO5P512_0, GGML_TYPE_F16 }) {
+        for (bool snk : { false, true }) {
+            for (int64_t nb : { 1, 2, 8, 64, 512 }) {
+                test_cases.emplace_back(new test_flash_attn_ext_split_plane(t, 128, 4, 8, 2048, nb, 1, 0.0f, snk,
+                                                                            t == GGML_TYPE_TURBO5P512_0 && nb > 1 ? 1e-5 : 5e-4));
             }
         }
     }

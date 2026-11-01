@@ -590,11 +590,6 @@ struct turbo5_int8_lut {
         w0 = TURBO_C5_LUT_W0; w1 = TURBO_C5_LUT_W1; w2 = TURBO_C5_LUT_W2; w3 = TURBO_C5_LUT_W3;
         w4 = TURBO_C5_LUT_W4; w5 = TURBO_C5_LUT_W5; w6 = TURBO_C5_LUT_W6; w7 = TURBO_C5_LUT_W7;
     }
-    // [TAG_R34_D_T5X] the residual table: entry i is round((centroid_i*127/0.271948 - LUT_i)*256)
-    __device__ __forceinline__ void init_residual() {
-        w0 = TURBO_C5R_LUT_W0; w1 = TURBO_C5R_LUT_W1; w2 = TURBO_C5R_LUT_W2; w3 = TURBO_C5R_LUT_W3;
-        w4 = TURBO_C5R_LUT_W4; w5 = TURBO_C5R_LUT_W5; w6 = TURBO_C5R_LUT_W6; w7 = TURBO_C5R_LUT_W7;
-    }
     __device__ __forceinline__ uint32_t gather4(uint32_t nib, uint32_t hi4) const {
         const uint32_t sel = nib & 0x7777u;
         const uint32_t l0 = __byte_perm(w0, w1, sel);   // 0..7
@@ -1001,9 +996,7 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_turbo5p_0_int(
     return sum;
 }
 
-// [TAG_R34_D_T5X] exact = true: K is hi + r/256 (the residual LUT, one more gather4 and dp4a per 4 elements), i.e. the
-// codebook values the MMA path's f16 conversion and the CPU reference use; false = the int8 LUT alone (v0.26.6)
-template <int D, int nthreads, bool exact = false>
+template <int D, int nthreads>
 static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_turbo5p512_0_int(
     const char * __restrict__ K_c, const int row_elem0, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
     // K_c is the BLOCK base for this KV position, not the head's row - see
@@ -1077,15 +1070,7 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_turbo5p512_0_int(
         const int v_packed = (int) lut.gather4((uint32_t) qs_pair, ((uint32_t) qhw >> (4*slot)) & 0xFu);
 
         const int   sumi = ggml_cuda_dp4a(v_packed, Q_q8[slot], 0);
-        if constexpr (exact) {
-            turbo5_int8_lut lutr;
-            lutr.init_residual();
-            const int r_packed = (int) lutr.gather4((uint32_t) qs_pair, ((uint32_t) qhw >> (4*slot)) & 0xFu);
-            const int sumr     = ggml_cuda_dp4a(r_packed, Q_q8[slot], 0);
-            sum += (float(sumi) + float(sumr) * (1.0f/256.0f)) * norm_scaled * Q_ds[slot].x;
-        } else {
-            sum += float(sumi) * norm_scaled * Q_ds[slot].x;
-        }
+        sum += float(sumi) * norm_scaled * Q_ds[slot].x;
     }
 
     return sum;
@@ -2238,8 +2223,7 @@ static __device__ __forceinline__ void dequantize_V_turbo5p_0(const void * __res
     }
 }
 
-// [TAG_R34_D_T5X] exact = true: hi + r/256 per element (see vec_dot_fattn_vec_KQ_turbo5p512_0_int)
-template <typename T, int ne, bool exact = false>
+template <typename T, int ne>
 static __device__ __forceinline__ void dequantize_V_turbo5p512_0(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
     const block_turbo5p512_0 * x = (const block_turbo5p512_0 *) vx;
 
@@ -2287,24 +2271,6 @@ static __device__ __forceinline__ void dequantize_V_turbo5p512_0(const void * __
             s[4*q + 2] = (float) (int8_t) (g[q] >> 16) * nscale;
             s[4*q + 3] = (float) (int8_t) (g[q] >> 24) * nscale;
         }
-        if constexpr (exact) {   // [TAG_R34_D_T5X]
-            turbo5_int8_lut lutr;
-            lutr.init_residual();
-            const float rscale = nscale * (1.0f/256.0f);
-            const int r[4] = {
-                (int) lutr.gather4( qs_lo        & 0xFFFFu, ((uint32_t) qhw >>  0) & 0xFu),
-                (int) lutr.gather4((qs_lo >> 16) & 0xFFFFu, ((uint32_t) qhw >>  4) & 0xFu),
-                (int) lutr.gather4( qs_hi        & 0xFFFFu, ((uint32_t) qhw >>  8) & 0xFu),
-                (int) lutr.gather4((qs_hi >> 16) & 0xFFFFu, ((uint32_t) qhw >> 12) & 0xFu),
-            };
-#pragma unroll
-            for (int q = 0; q < 4; ++q) {
-                s[4*q + 0] += (float) (int8_t) (r[q]      ) * rscale;
-                s[4*q + 1] += (float) (int8_t) (r[q] >>  8) * rscale;
-                s[4*q + 2] += (float) (int8_t) (r[q] >> 16) * rscale;
-                s[4*q + 3] += (float) (int8_t) (r[q] >> 24) * rscale;
-            }
-        }
 
 #ifdef FP16_AVAILABLE
         if constexpr (std::is_same_v<T, half>) {
@@ -2350,21 +2316,6 @@ static __device__ __forceinline__ void dequantize_V_turbo5p512_0(const void * __
         s[5] = (float) (int8_t) (g1 >>  8) * nscale;
         s[6] = (float) (int8_t) (g1 >> 16) * nscale;
         s[7] = (float) (int8_t) (g1 >> 24) * nscale;
-        if constexpr (exact) {   // [TAG_R34_D_T5X]
-            turbo5_int8_lut lutr;
-            lutr.init_residual();
-            const float rscale = nscale * (1.0f/256.0f);
-            const int r0 = (int) lutr.gather4( qs_word        & 0xFFFFu,  qh8       & 0xFu);
-            const int r1 = (int) lutr.gather4((qs_word >> 16) & 0xFFFFu, (qh8 >> 4) & 0xFu);
-            s[0] += (float) (int8_t) (r0      ) * rscale;
-            s[1] += (float) (int8_t) (r0 >>  8) * rscale;
-            s[2] += (float) (int8_t) (r0 >> 16) * rscale;
-            s[3] += (float) (int8_t) (r0 >> 24) * rscale;
-            s[4] += (float) (int8_t) (r1      ) * rscale;
-            s[5] += (float) (int8_t) (r1 >>  8) * rscale;
-            s[6] += (float) (int8_t) (r1 >> 16) * rscale;
-            s[7] += (float) (int8_t) (r1 >> 24) * rscale;
-        }
 
 #ifdef FP16_AVAILABLE
         if constexpr (std::is_same_v<T, half>) {
@@ -2411,16 +2362,6 @@ static __device__ __forceinline__ void dequantize_V_turbo5p512_0(const void * __
         s[1] = (float) (int8_t) (g0 >>  8) * nscale;
         s[2] = (float) (int8_t) (g0 >> 16) * nscale;
         s[3] = (float) (int8_t) (g0 >> 24) * nscale;
-        if constexpr (exact) {   // [TAG_R34_D_T5X]
-            turbo5_int8_lut lutr;
-            lutr.init_residual();
-            const float rscale = nscale * (1.0f/256.0f);
-            const int r0 = (int) lutr.gather4((uint32_t) qs_pair, qh4);
-            s[0] += (float) (int8_t) (r0      ) * rscale;
-            s[1] += (float) (int8_t) (r0 >>  8) * rscale;
-            s[2] += (float) (int8_t) (r0 >> 16) * rscale;
-            s[3] += (float) (int8_t) (r0 >> 24) * rscale;
-        }
 
 #ifdef FP16_AVAILABLE
         if constexpr (std::is_same_v<T, half>) {
@@ -2441,7 +2382,7 @@ static __device__ __forceinline__ void dequantize_V_turbo5p512_0(const void * __
     }
 }
 
-template <ggml_type type_K, int D, int nthreads, bool t5x = false>
+template <ggml_type type_K, int D, int nthreads>
 constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
     if constexpr (type_K == GGML_TYPE_F16) {
         return vec_dot_fattn_vec_KQ_f16<D, nthreads>;
@@ -2478,14 +2419,14 @@ constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
     } else if constexpr (type_K == GGML_TYPE_TURBO5P_0) {
         return vec_dot_fattn_vec_KQ_turbo5p_0_int<D, nthreads>;
     } else if constexpr (type_K == GGML_TYPE_TURBO5P512_0) {
-        return vec_dot_fattn_vec_KQ_turbo5p512_0_int<D, nthreads, t5x>;   // [TAG_R34_D_T5X]
+        return vec_dot_fattn_vec_KQ_turbo5p512_0_int<D, nthreads>;
     } else {
         static_assert(type_K == -1, "bad type");
         return nullptr;
     }
 }
 
-template <ggml_type type_V, typename T, int ne, bool t5x = false>
+template <ggml_type type_V, typename T, int ne>
 constexpr __device__ dequantize_V_t get_dequantize_V() {
     if constexpr (type_V == GGML_TYPE_F16) {
         return dequantize_V_f16<T, ne>;
@@ -2512,7 +2453,7 @@ constexpr __device__ dequantize_V_t get_dequantize_V() {
     } else if constexpr (type_V == GGML_TYPE_TURBO5P_0) {
         return dequantize_V_turbo5p_0<T, ne>;
     } else if constexpr (type_V == GGML_TYPE_TURBO5P512_0) {
-        return dequantize_V_turbo5p512_0<T, ne, t5x>;   // [TAG_R34_D_T5X]
+        return dequantize_V_turbo5p512_0<T, ne>;
     } else {
         static_assert(type_V == -1, "bad type");
         return nullptr;
