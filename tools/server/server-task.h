@@ -681,9 +681,14 @@ struct server_prompt {
     }
 };
 
+// [TAG_R34_NOINIT] the state blobs skip the zero fill of a resize (each is filled by llama_state_seq_get_data_ext at once,
+// and a short read drops it); LLAMA_R34_NOINIT=0 zero-fills them as v0.26.6 did
+bool server_r34_noinit();
+void server_state_resize(common_state_data & v, size_t n);
+
 struct server_prompt_data {
-    std::vector<uint8_t> main;
-    std::vector<uint8_t> drft;
+    common_state_data main;
+    common_state_data drft;
 
     size_t size() const {
         return main.size() + drft.size();
@@ -736,7 +741,10 @@ struct server_prompt_cache {
     // tokens_next: the prompt that load() will be asked for right after this save. The entry
     // that load would restore is protected from the eviction that makes room for this state.
     // [TAG_PROMPT_CACHE_KEEP_NEXT]
-    server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft, const server_tokens * tokens_next = nullptr, bool shared = false);
+    // [TAG_R34_CKPTMOVE] ckpt_src = &prompt.checkpoints when the caller clears the slot right after the save: the kept
+    // checkpoints are moved into the entry instead of copied (only once the entry is created)
+    server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft, const server_tokens * tokens_next = nullptr, bool shared = false,
+                                      std::list<common_prompt_checkpoint> * ckpt_src = nullptr);
 
     // the entry load() would restore for tokens_new while the slot holds prompt, or states.end()
     std::list<server_prompt_cache_state>::iterator find(const server_prompt & prompt, const server_tokens & tokens_new);

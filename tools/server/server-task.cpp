@@ -1789,7 +1789,24 @@ size_t server_prompt_cache::n_tokens() const {
     return res;
 }
 
-server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & prompt, size_t state_size_tgt, size_t state_size_dft, const server_tokens * tokens_next, bool shared) {
+// [TAG_R34_NOINIT]
+bool server_r34_noinit() {
+    static const bool v = [] {
+        const char * e = getenv("LLAMA_R34_NOINIT");
+        return !(e && e[0] == '0');
+    }();
+    return v;
+}
+
+void server_state_resize(common_state_data & v, size_t n) {
+    v.resize(n);
+    if (!server_r34_noinit()) {
+        std::fill(v.begin(), v.end(), (uint8_t) 0);
+    }
+}
+
+server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & prompt, size_t state_size_tgt, size_t state_size_dft, const server_tokens * tokens_next, bool shared,
+                                                       std::list<common_prompt_checkpoint> * ckpt_src) {
     // first check if the current state is contained fully in the cache
     //
     // [TAG_PROMPT_CACHE_SHARED_ENTRY] A `shared` entry is exempt. It sits on a prefix boundary that
@@ -1899,13 +1916,13 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         }
     }
 
-    std::vector<uint8_t> state_data_tgt;
-    std::vector<uint8_t> state_data_dft;
+    common_state_data state_data_tgt;
+    common_state_data state_data_dft;
 
     // check if we can allocate enough memory for the new state
     try {
-        state_data_tgt.resize(state_size_tgt);
-        state_data_dft.resize(state_size_dft);
+        server_state_resize(state_data_tgt, state_size_tgt); // [TAG_R34_NOINIT]
+        server_state_resize(state_data_dft, state_size_dft);
     } catch (const std::bad_alloc & e) {
         SRV_ERR("failed to allocate memory for prompt cache state: %s\n", e.what());
 
@@ -1918,10 +1935,18 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         return nullptr;
     }
 
+    // [TAG_R34_CKPTMOVE] the slot is cleared right after this save: move its kept checkpoints instead of copying them
+    std::list<common_prompt_checkpoint> ckpts;
+    if (ckpt_src != nullptr && ckpt_src == &prompt.checkpoints) {
+        ckpts.splice(ckpts.end(), *ckpt_src, std::next(ckpt_src->begin(), ckpt_src->size() - n_ckpt), ckpt_src->end());
+    } else {
+        ckpts.assign(it_ckpt0, prompt.checkpoints.end());
+    }
+
     states.push_back({
         /*.prompt =*/ {
             /*.tokens      =*/ prompt.tokens.clone(),
-            /*.checkpoints =*/ std::list<common_prompt_checkpoint>(it_ckpt0, prompt.checkpoints.end()),
+            /*.checkpoints =*/ std::move(ckpts),
         },
         /*.data   =*/ {
             /*.main =*/ std::move(state_data_tgt),
