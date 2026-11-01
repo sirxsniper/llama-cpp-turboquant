@@ -459,6 +459,17 @@ static_assert(TURBO_C5_LUT_W5 == 0x251F1914u, "turbo5 LUT w5 changed");
 static_assert(TURBO_C5_LUT_W6 == 0x423A322Bu, "turbo5 LUT w6 changed");
 static_assert(TURBO_C5_LUT_W7 == 0x7F68584Cu, "turbo5 LUT w7 changed");
 #define TURBO_INT8_5BIT_SCALE_REVERSE (0.271948f / 127.0f)
+// [TAG_R34_D_T5X] residual of the int8 5-bit LUT above: centroid*127/0.271948 = hi + r/256 with hi the LUT entry and r an
+// int8, so hi + r/256 is within 4.2e-6 of every centroid (hi alone: up to 1.04e-3 off, 4.4 % of the 0.022390 level).
+// Read with the same gather4 as the LUT (turbo5_int8_lut::init_residual).
+static constexpr uint32_t TURBO_C5R_LUT_W0 = 0x8F9E3900u;
+static constexpr uint32_t TURBO_C5R_LUT_W1 = 0xEDEC2E84u;
+static constexpr uint32_t TURBO_C5R_LUT_W2 = 0xFBCB4455u;
+static constexpr uint32_t TURBO_C5R_LUT_W3 = 0x05EB8BE6u;
+static constexpr uint32_t TURBO_C5R_LUT_W4 = 0x1A7515FBu;
+static constexpr uint32_t TURBO_C5R_LUT_W5 = 0xABBC3505u;
+static constexpr uint32_t TURBO_C5R_LUT_W6 = 0x7CD21413u;
+static constexpr uint32_t TURBO_C5R_LUT_W7 = 0x00C76271u;
 
 // ---- Midpoints for nearest 4-bit centroid lookup ----
 

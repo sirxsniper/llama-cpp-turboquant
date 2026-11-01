@@ -16,7 +16,7 @@ static constexpr __device__ int ggml_cuda_fattn_vec_get_nthreads_device() {
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wpass-failed"
 #endif // __clang__
-template<int D, int ncols, int ncols2, ggml_type type_K, ggml_type type_V, bool use_logit_softcap> // D == head size
+template<int D, int ncols, int ncols2, ggml_type type_K, ggml_type type_V, bool use_logit_softcap, bool t5x = false> // D == head size
 // PERF: bumped min_blocks_per_sm 2 → 4. With nthreads_V=16 fix the VKQ register
 // footprint per thread halved (4 entries vs 8), freeing room for higher occupancy.
 // Memory-latency-bound at depth — more in-flight blocks hide DRAM/L2 stalls better.
@@ -208,12 +208,12 @@ static __global__ void flash_attn_ext_vec(
     (void)type_V_is_turbo;
     constexpr int V_cols_per_iter   = WARP_SIZE / nthreads_V;
 
-    constexpr vec_dot_KQ_t vec_dot_KQ = get_vec_dot_KQ<type_K, D, nthreads_KQ>();
+    constexpr vec_dot_KQ_t vec_dot_KQ = get_vec_dot_KQ<type_K, D, nthreads_KQ, t5x>();   // [TAG_R34_D_T5X]
     constexpr bool Q_q8_1 = !K_is_unquantized;
 #ifdef V_DOT2_F32_F16_AVAILABLE
-    constexpr dequantize_V_t dequantize_V = get_dequantize_V<type_V, half,  V_rows_per_thread>();
+    constexpr dequantize_V_t dequantize_V = get_dequantize_V<type_V, half,  V_rows_per_thread, t5x>();
 #else
-    constexpr dequantize_V_t dequantize_V = get_dequantize_V<type_V, float, V_rows_per_thread>();
+    constexpr dequantize_V_t dequantize_V = get_dequantize_V<type_V, float, V_rows_per_thread, t5x>();
 #endif // V_DOT2_F32_F16_AVAILABLE
 
     // [TAG_FA_VEC_GQA] ncols2 = query heads packed into one block, ncols1 = tokens.
@@ -825,14 +825,14 @@ static __global__ void flash_attn_ext_vec(
 #pragma clang diagnostic pop
 #endif // __clang__
 
-template <int D, int ncols1, int ncols2, ggml_type type_K, ggml_type type_V, bool use_logit_softcap>
+template <int D, int ncols1, int ncols2, ggml_type type_K, ggml_type type_V, bool use_logit_softcap, bool t5x = false>
 void ggml_cuda_flash_attn_ext_vec_case_impl(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
 
     constexpr int cols_per_block = ncols1*ncols2;
     const int nthreads = ggml_cuda_fattn_vec_get_nthreads_host(cc);
     const int nwarps   = nthreads / WARP_SIZE;
-    fattn_kernel_t fattn_kernel = flash_attn_ext_vec<D, cols_per_block, ncols2, type_K, type_V, use_logit_softcap>;
+    fattn_kernel_t fattn_kernel = flash_attn_ext_vec<D, cols_per_block, ncols2, type_K, type_V, use_logit_softcap, t5x>;
     const bool need_f16_K = type_K == GGML_TYPE_F16;
     const bool need_f16_V = type_V == GGML_TYPE_F16;
     constexpr size_t nbytes_shared = 0;
@@ -901,6 +901,20 @@ static int ggml_cuda_fattn_vec_ncols2(const ggml_tensor * dst) {
     return 1;
 }
 
+// [TAG_R34_D_T5X] decode (VEC) of a turbo5p512 cache at D = 128 reads the codebook values exactly (int8 LUT + int8
+// residual LUT, |error| <= 4.2e-6) instead of the int8 LUT alone (up to 4.4 % off one level). At D = 128 the MMA path
+// (verify / prompt batches) converts the cache to f16 with the float centroids, so decode now computes with the same
+// values as the batched path and the CPU reference: FLASH_ATTN_EXT NMSE vs CPU at Flint's 4 x 128 geometry 3.9e-5 ->
+// 1.7e-6 (batched path 1.4e-7..1.6e-6). D = 256 keeps the int8 LUT on both paths (its native MMA tile loader uses it too).
+// OPT-IN (GGML_CUDA_R34_T5X=1): measured on Flint (wiki.test 4 x 2048) the model-level effect stays inside Flint's
+// turbo-KV noise floor (decode PPL Q4 20.11 -> 19.52, NVFP4 19.09 -> 19.36; KLD vs the batched path 0.152 -> 0.158 and
+// 0.094 -> 0.102, all within one standard error) while decode costs 1.0 % at depth 0 and 2.1 % at 16K. Unset / 0 =
+// v0.26.6 (int8 LUT at decode).
+static inline bool ggml_cuda_r34_t5x_on() {
+    static const bool on = [] { const char * e = getenv("GGML_CUDA_R34_T5X"); return e && e[0] && atoi(e) != 0; }();
+    return on;
+}
+
 template <int D, ggml_type type_K, ggml_type type_V>
 void ggml_cuda_flash_attn_ext_vec_case(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * KQV = dst;
@@ -908,6 +922,29 @@ void ggml_cuda_flash_attn_ext_vec_case(ggml_backend_cuda_context & ctx, ggml_ten
 
     float logit_softcap;
     memcpy(&logit_softcap, (const float *) KQV->op_params + 2, sizeof(float));
+
+    // [TAG_R34_D_T5X] the no-softcap variants (Flint-shaped models); a softcap turbo5p512 model keeps the int8 LUT
+    if constexpr (D == 128 && (type_K == GGML_TYPE_TURBO5P512_0 || type_V == GGML_TYPE_TURBO5P512_0)) {
+        if (logit_softcap == 0.0f && ggml_cuda_r34_t5x_on()) {
+            if (Q->ne[1] == 1) {
+                const int ncols2 = ggml_cuda_fattn_vec_ncols2(dst);
+                if (ncols2 == 6) {
+                    ggml_cuda_flash_attn_ext_vec_case_impl<D, 1, 6, type_K, type_V, false, true>(ctx, dst);
+                } else if (ncols2 == 4) {
+                    ggml_cuda_flash_attn_ext_vec_case_impl<D, 1, 4, type_K, type_V, false, true>(ctx, dst);
+                } else if (ncols2 == 3) {
+                    ggml_cuda_flash_attn_ext_vec_case_impl<D, 1, 3, type_K, type_V, false, true>(ctx, dst);
+                } else if (ncols2 == 2) {
+                    ggml_cuda_flash_attn_ext_vec_case_impl<D, 1, 2, type_K, type_V, false, true>(ctx, dst);
+                } else {
+                    ggml_cuda_flash_attn_ext_vec_case_impl<D, 1, 1, type_K, type_V, false, true>(ctx, dst);
+                }
+            } else {
+                ggml_cuda_flash_attn_ext_vec_case_impl<D, 2, 1, type_K, type_V, false, true>(ctx, dst);
+            }
+            return;
+        }
+    }
 
     if (Q->ne[1] == 1) {
         const int ncols2 = ggml_cuda_fattn_vec_ncols2(dst);
