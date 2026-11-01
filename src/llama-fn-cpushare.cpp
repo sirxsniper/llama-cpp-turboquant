@@ -1094,7 +1094,7 @@ int llama_fn_cpushare_configure_cfg(const llama_fn_cps_cfg & cfg, const llama_mo
 }
 
 int llama_fn_cpushare_configure(const llama_model & model, const void * owner) {
-    if (model.arch != LLM_ARCH_QWEN4EXP || model.hparams.no_alloc) {
+    if (model.arch != LLM_ARCH_QWEN4EXP || model.no_alloc()) {
         return 0;
     }
     const char * v = llama_fn_env(model, "LLAMA_FN_L22_CPUSHARE");

@@ -390,6 +390,8 @@ extern "C" {
     GGML_API void        ggml_fp32_to_bf16_row_ref(const float *, ggml_bf16_t *, int64_t);
     GGML_API void        ggml_fp32_to_bf16_row(const float *, ggml_bf16_t *, int64_t);
 
+    typedef struct { uint8_t bits; } ggml_fp8_e4m3_t;
+
     struct ggml_object;
     struct ggml_context;
     struct ggml_cgraph;
@@ -439,10 +441,13 @@ extern "C" {
         GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
         GGML_TYPE_Q1_0    = 41,
         GGML_TYPE_Q2_0    = 42,
-        GGML_TYPE_TURBO4_0 = 43, // TurboQuant 4-bit KV cache: 3-bit PolarQuant + 1-bit QJL
+        GGML_TYPE_F8_E4M3 = 43, // upstream #27512 (OCP FP8 E4M3)
+        // [TAG_R34_SYNC_TYPEIDS] upstream claimed 43 for F8_E4M3 (#27512): TURBO4_0 moved 43 -> 72 (appended), as TURBO3_0
+        // moved 42 -> 45 when upstream claimed 42 for Q2_0 (b9913). Model GGUFs carry upstream ids, so they win; the fork's
+        // ids only appear in KV state files, whose reader compares types and rejects an old turbo4 file (re-prefill).
         GGML_TYPE_TURBO2_0 = 44, // TurboQuant 2-bit KV cache: 2-bit PolarQuant (no QJL)
         // NOTE: TURBO3_0 moved 42 -> 45; upstream claimed 42 for Q2_0 (b9913).
-        // turbo4/turbo2 ids are deliberately left untouched to keep existing KV state files valid.
+        // turbo2 id is deliberately left untouched to keep existing KV state files valid.
         GGML_TYPE_TURBO3_0 = 45, // TurboQuant 3-bit KV cache: 2-bit PolarQuant + 1-bit QJL
         GGML_TYPE_TURBO4P_0 = 46, // TurboQuant 4-bit, split-plane layout (see block_turbo4p_0)
         GGML_TYPE_TURBO5P_0 = 47, // TurboQuant 5-bit, split-plane: turbo4p low plane + 1-bit high plane
@@ -480,7 +485,8 @@ extern "C" {
         GGML_TYPE_TURBOT_S5  = 69,
         GGML_TYPE_TURBOT_S6  = 70,
         GGML_TYPE_TURBOT_S7  = 71,
-        GGML_TYPE_COUNT   = 72,
+        GGML_TYPE_TURBO4_0 = 72, // TurboQuant 4-bit KV cache: 3-bit PolarQuant + 1-bit QJL ([TAG_R34_SYNC_TYPEIDS] was 43)
+        GGML_TYPE_COUNT   = 73,
     };
 
     // [TAG_GGML_PREC]
@@ -536,6 +542,7 @@ extern "C" {
         GGML_FTYPE_MOSTLY_NVFP4   = 26, // except 1d tensors
         GGML_FTYPE_MOSTLY_Q1_0    = 27, // except 1d tensors
         GGML_FTYPE_MOSTLY_Q2_0    = 28, // except 1d tensors
+        GGML_FTYPE_MOSTLY_F8_E4M3 = 29, // except 1d tensors
     };
 
     // available tensor operations:

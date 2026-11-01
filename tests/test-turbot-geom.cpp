@@ -629,7 +629,7 @@ static void test_types() {
     TCHECK((int) GGML_TYPE_TURBOT_S8 == 49 && (int) GGML_TYPE_TURBOT_S24 == 65, "S8..S24 ids moved");
     TCHECK((int) GGML_TYPE_TURBOT_S2 == 66 && (int) GGML_TYPE_TURBOT_S3 == 67 && (int) GGML_TYPE_TURBOT_S4 == 68 &&
            (int) GGML_TYPE_TURBOT_S5 == 69 && (int) GGML_TYPE_TURBOT_S6 == 70 && (int) GGML_TYPE_TURBOT_S7 == 71, "S2..S7 ids");
-    TCHECK((int) GGML_TYPE_COUNT == 72, "GGML_TYPE_COUNT %d, expected 72", (int) GGML_TYPE_COUNT);
+    TCHECK((int) GGML_TYPE_COUNT == 73, "GGML_TYPE_COUNT %d, expected 73", (int) GGML_TYPE_COUNT); // [TAG_R34_SYNC_TYPEIDS] F8_E4M3 43, turbo4 72
     TCHECK(ggml_turbot_type_of_s(2) == GGML_TYPE_TURBOT_S2 && ggml_turbot_type_of_s(7) == GGML_TYPE_TURBOT_S7 &&
            ggml_turbot_type_of_s(8) == GGML_TYPE_TURBOT_S8 && ggml_turbot_type_of_s(24) == GGML_TYPE_TURBOT_S24, "type_of_s end points");
 
