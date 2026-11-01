@@ -1444,6 +1444,9 @@ struct server_slot {
     // last took off it: what a slot save with "recall" brings back
     mutable server_tokens recall_tokens;
     uint64_t              recall_kc_id = 0;
+    // the slot holds what a "slot_recall": false request left (a side request, a job): neither of the two above is updated
+    // when it goes, so two side requests in turn never make the second one's predecessor the slot's recall
+    bool                  recall_side  = false;
 
     bool prompt_save(server_prompt_cache & prompt_cache, const server_tokens * tokens_next = nullptr,
                      bool shared = false) const {
@@ -1476,7 +1479,7 @@ struct server_slot {
         }
 
         // [TAG_R34_KYROCACHE]
-        if (slot_save_recall_enabled()) {
+        if (slot_save_recall_enabled() && !recall_side) {
             recall_tokens = prompt.tokens.clone();
         }
 
@@ -4888,6 +4891,7 @@ private:
                     }
                     SLT_INF(slot, "[TAG_R34_KYROCACHE] recalled %d tokens from the conversation store for the slot save (%zu checkpoints): %s\n",
                             slot.prompt.n_tokens(), slot.prompt.checkpoints.size(), info.c_str());
+                    slot.recall_side = false;
                     return (size_t) slot.prompt.n_tokens();
                 }
                 SLT_WRN(slot, "[TAG_R34_KYROCACHE] recalling the stored conversation failed (%s)\n", info.c_str());
@@ -4901,6 +4905,7 @@ private:
             if (slot.prompt_load(*prompt_cache, want) && slot.prompt.n_tokens() > 0) {
                 SLT_INF(slot, "[TAG_R34_KYROCACHE] recalled %d of the %zu tokens the slot last put in the RAM prompt cache for the slot save (%zu checkpoints)\n",
                         slot.prompt.n_tokens(), want.size(), slot.prompt.checkpoints.size());
+                slot.recall_side = false;
                 return (size_t) slot.prompt.n_tokens();
             }
             SLT_WRN(slot, "[TAG_R34_KYROCACHE] the %zu tokens the slot last cached are no longer in the RAM prompt cache\n", want.size());
@@ -4970,7 +4975,7 @@ private:
                               cs.on ? &slot.kc_spill : nullptr, &slot.kc_conv, cs.on ? keepctx_min : 0)) {
                 SLT_INF(slot, "[TAG_FN_L18_KEEPCTX] stored the outgoing conversation (the new prompt shares %d of its %d tokens%s): %s\n",
                         lcp_cur, n_cur, lose_most ? "" : ", [TAG_FN_L19_CONVSTORE_SYS] only its system block", info.c_str());
-                if (slot_save_recall_enabled() && !keepctx->entries.empty()) {
+                if (slot_save_recall_enabled() && !slot.recall_side && !keepctx->entries.empty()) {
                     slot.recall_kc_id = keepctx->entries.back().id; // [TAG_R34_KYROCACHE] save() appends the new entry
                 }
                 slot.l22_turn.kc_what |= 1; // [TAG_FN_L22_PASSLOG]
@@ -6131,6 +6136,9 @@ private:
 
         // the per-request limit takes priority over the global one
         slot.n_predict_max = task.params.n_predict != -1 ? task.params.n_predict : params_base.n_predict;
+
+        // [TAG_R34_KYROCACHE] what the slot held is already stored or cached (get_available_slot): from here it holds this task's
+        slot.recall_side = task.recall_side;
 
         slot.task = std::make_unique<const server_task>(std::move(task));
 
@@ -7768,6 +7776,7 @@ private:
 
                         slot->prompt.clear();
                         slot->prompt.tokens = std::move(restored);
+                        slot->recall_side   = false; // [TAG_R34_KYROCACHE] a restored file is a conversation Kyro kept
                     } catch (const std::exception & err) {
                         slot->prompt_clear();
                         send_error(task, std::string("Unable to restore slot: ") + err.what(), ERROR_TYPE_INVALID_REQUEST);
@@ -10948,6 +10957,8 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             task.apply_chat_session(chat_session);
 
             task.id_slot = json_value(data, "id_slot", -1);
+            // [TAG_R34_KYROCACHE] Kyro marks its side requests and jobs (LLAMA_SLOT_SAVE_RECALL=0: ignored)
+            task.recall_side = slot_save_recall_enabled() && !json_value(data, "slot_recall", true);
             sse_ping_interval = task.params.sse_ping_interval;
 
             // OAI-compat

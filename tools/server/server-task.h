@@ -159,6 +159,10 @@ struct server_task {
     int id_target = -1;
     int id_slot   = -1;
 
+    // [TAG_R34_KYROCACHE] "slot_recall": false on the request (Kyro's side requests and jobs): what it leaves in the slot is
+    // not what a slot save with "recall" brings back
+    bool recall_side = false;
+
     // used by parallel sampling (multiple completions from same prompt)
     int id_parent  = -1;
     // temporary store of child tasks for scheduling
