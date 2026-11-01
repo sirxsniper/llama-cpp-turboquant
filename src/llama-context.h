@@ -673,6 +673,7 @@ private:
     // [TAG_R34_NP2COST] LLAMA_R34_NP2_TURN (default 1; 0 = v0.26.6): the hot set's prompt-end pass ([TAG_FN_L17_START_PRE],
     // [TAG_FN_L18_FIRSTANS_ONCE]) also on a multi-slot server while the caller reports one busy sequence
     bool     r34_np2_turn   = false;
+    bool     r34_prev_one   = false; // the last decode ran with one busy sequence (r34_one_seq)
     bool r34_one_seq() const { return cparams.n_seq_max == 1 || (r34_np2_turn && l24_seqs_busy == 1); }
     // [TAG_FN_L22_ENDOVERLAP] a prompt ended in FULL without the eager switch: the next narrow batch goes SMALL, async
     bool     l22_end_pending = false;

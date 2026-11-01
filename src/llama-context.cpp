@@ -4394,7 +4394,10 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     // [TAG_FN_L18_FIRSTANS_ONCE] the last part of a split prompt is no wider than an answer step: the batches before it left
     // their routing for the pass (they had no output), which runs now, after its SMALL switch, before its graphs (its routing then counts
     // as an answer step's, as without the split)
-    if (fa18_once && r34_one_seq() && n_outputs_all > 0 && (int) n_tokens_all <= llama_moe_hot_max_t() && // [TAG_R34_NP2COST]
+    // [TAG_R34_NP2COST] n_seq_max > 1: only when the batch before ran with one busy sequence too (the earlier part of this
+    // prompt), so the seeds of another request's prompt that ended beside an answer never start a pass inside that answer
+    if (fa18_once && r34_one_seq() && (cparams.n_seq_max == 1 || r34_prev_one) && n_outputs_all > 0 &&
+        (int) n_tokens_all <= llama_moe_hot_max_t() &&
         llama_moe_hot_adapt_owner() == this && llama_moe_hot_turn_start_on()) {
         step_join();
         if (llama_moe_hot_turn_pending()) {
@@ -4991,6 +4994,8 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                     cbuf_ms_short/(double) cbuf_n_short);
         }
     }
+
+    r34_prev_one = r34_one_seq(); // [TAG_R34_NP2COST]
 
     return 0;
 }
