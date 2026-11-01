@@ -6870,18 +6870,19 @@ static bool clip_vistrim_wanted(clip_ctx * ctx) {
            clip_backend_proc(ctx->backend, "ggml_backend_pool_trim") != nullptr;
 }
 
-// [TAG_R34_F_VISTRIM] the pools' bytes a picture of n patches needs: the warm-up's, scaled with the patches (the pools hold
-// per-row temporaries: half-precision copies of the activations, attention partials)
+// [TAG_R34_F_VISTRIM] the pools' bytes an encode of n patches takes with it: the most the pools held at a park so far (the
+// warm-up only reserves its graph, so the first real encode sets it; until then its growth comes from free VRAM, as in
+// v0.26.6), and the warm-up's pools scaled with the patches when the warm-up ran a graph (per-row temporaries)
 static size_t clip_lend_pool_need(const clip_ctx * ctx, int64_t n) {
     const auto & L = ctx->lend;
-    if (!L.trim || L.pool == 0) {
+    if (!L.trim) {
         return 0;
     }
-    if (!L.sz.on || L.sz.n_w <= 0 || n <= L.sz.n_w) {
-        return L.pool;
+    size_t b = L.pool_max;
+    if (L.pool > 0 && L.sz.on && L.sz.n_w > 0 && n > L.sz.n_w) {
+        b = std::max(b, GGML_PAD((size_t) ((double) L.pool * (double) n / (double) L.sz.n_w), (size_t) 2 << 20));
     }
-    const double b = (double) L.pool * (double) n / (double) L.sz.n_w;
-    return GGML_PAD((size_t) b, (size_t) 2 << 20);
+    return b;
 }
 
 // frees the device weight buffer (the tensors keep their shapes, no data) and the compute buffers (a new scheduler)
@@ -7103,7 +7104,8 @@ static size_t clip_lend_need(const clip_ctx * ctx, const clip_image_f32_batch * 
     const auto & L = ctx->lend;
     ne = nx = ny = 0;
     if (!L.sz.on || imgs == nullptr || imgs->entries.empty()) {
-        return L.bytes;
+        const size_t pn = clip_lend_pool_need(ctx, 0); // [TAG_R34_F_VISTRIM] bytes holds the warm-up's pools already
+        return L.bytes + (pn > L.pool ? pn - L.pool : 0);
     }
     const int ps = std::max(1, ctx->model.hparams.patch_size);
     int64_t n = 0;
