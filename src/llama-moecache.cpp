@@ -2514,6 +2514,9 @@ int    g_kv_n_trunk = 0;
 // [TAG_FN_L21_BIGUB] the bytes the next hot set init puts in the borrow group of the slot lend (0: none)
 size_t g_kv_borrow  = 0;
 bool   g_kv_borrow_1seq = false; // [TAG_FN_L22_BIGUB2] the borrow is the 1-sequence big reserve's extra
+// [TAG_R34_F_VISFLAT] the parked projector's part of g_kv_want for the next hot set init (llama_moe_hot_set_vis_part): with the
+// slot lend its slots come out of the lend layers' own counts instead of lying on top of a base cut for them
+size_t g_vis_part   = 0;
 
 // [TAG_FN_L10_SLOTLEND] a usable slot keeps this many bytes after it mapped (a kernel that reads a little past a slot's end
 // never reaches a segment the KV cache holds)
@@ -3203,6 +3206,10 @@ bool llama_moe_hot_init(const llama_model & model, const void * owner, size_t bu
             std::vector<int> sl_layers;
             int32_t          sl_e = 0;
             int32_t          sl_bx = 0; // [TAG_FN_L21_BIGUB]
+            // [TAG_R34_F_VISFLAT] the projector's slots per lend layer taken from its own count: the counts per layer are those
+            // of a hot set without the projector's share (the weighted spread kept), only more of the lend layers' slots can go
+            int32_t          sl_ev = 0;
+            size_t           sl_per = 0; // one slot of every lend layer, in bytes
             if (sl_req) {
                 std::vector<int> trunk;
                 for (int li = 0; li < (int) layers.size(); ++li) {
@@ -3211,7 +3218,9 @@ bool llama_moe_hot_init(const llama_model & model, const void * owner, size_t bu
                     }
                 }
                 std::sort(trunk.begin(), trunk.end(), [&](int a, int b) { return layers[a].il < layers[b].il; });
-                const std::vector<int32_t> n0 = slots_for(budget_slots > g_kv_want ? budget_slots - g_kv_want : 0);
+                // [TAG_R34_F_VISFLAT] the projector's part is not cut from the counts (its slots come out of the lend layers')
+                const size_t n0_cut = g_vis_part > 0 && g_vis_part < g_kv_want ? g_kv_want - g_vis_part : g_kv_want;
+                const std::vector<int32_t> n0 = slots_for(budget_slots > n0_cut ? budget_slots - n0_cut : 0);
                 // one more layer: the final even count may come out a little lower than n0
                 const size_t need_above = tail_bytes + g_kv_keep + 4*vmm_gran +
                     (trunk.empty() ? 0 : (size_t) (n0[trunk.back()] + 1)*layers[trunk.back()].bytes);
@@ -3226,11 +3235,15 @@ bool llama_moe_hot_init(const llama_model & model, const void * owner, size_t bu
                     sl_layers.push_back(trunk[i]);
                     per += layers[trunk[i]].bytes;
                 }
+                sl_per = per; // [TAG_R34_F_VISFLAT]
                 if (per > 0) {
                     // about one granule per tensor stays mapped at its segment ends (the start's slack, the zero slot's
                     // granule); a placement that comes out short asks for one slot more (sl_extra)
                     const size_t waste = sl_layers.size()*3*(vmm_gran + SL_SLACK);
                     sl_e = (int32_t) ((g_kv_want + waste + per - 1)/per) + mc->sl_extra;
+                    if (g_vis_part > 0 && g_vis_part < g_kv_want) {
+                        sl_ev = std::min<int32_t>((int32_t) (g_vis_part/per), sl_e); // [TAG_R34_F_VISFLAT]
+                    }
                     if (g_kv_borrow > 0) {
                         // [TAG_FN_L21_BIGUB] the borrow: that many of each lend layer's base slots more lie over segments
                         // of their own (the slots per layer stay as they are: the learned set and the routing see no change)
@@ -3240,7 +3253,8 @@ bool llama_moe_hot_init(const llama_model & model, const void * owner, size_t bu
             }
             // the base slots from the budget without the KV cache's unmapped bytes: what a fit with the KV cache mapped
             // whole would give (the lend's few granules of waste come out of the headroom)
-            const size_t sl_base_cut = sl_e > 0 ? g_kv_want : 0;
+            // [TAG_R34_F_VISFLAT] without the projector's carved slots: the cut and the counts are those of its hot set without them
+            const size_t sl_base_cut = sl_e > 0 ? g_kv_want - (size_t) sl_ev*sl_per : 0;
             const std::vector<int32_t> nv = slots_for(budget_slots > sl_base_cut ? budget_slots - sl_base_cut : 0);
             for (size_t li = 0; li < layers.size(); ++li) {
                 n_slots_of[li] = nv[li];
@@ -3248,12 +3262,16 @@ bool llama_moe_hot_init(const llama_model & model, const void * owner, size_t bu
             }
             if (sl_e > 0) {
                 for (int li : sl_layers) {
-                    const int32_t e = std::min<int32_t>(sl_e, (int32_t) layers[li].l->ffn_up_exps->ne[2] - nv[li]);
+                    // [TAG_R34_F_VISFLAT] ev of the layer's own slots can go too: e - ev on top of its count, the base ev lower
+                    const int32_t ev = std::min<int32_t>(sl_ev, nv[li] - 1);
+                    const int32_t e  = std::min<int32_t>(sl_e - std::max<int32_t>(ev, 0),
+                                                         (int32_t) layers[li].l->ffn_up_exps->ne[2] - nv[li]);
                     if (e <= 0 || nv[li] <= 0) {
                         continue;
                     }
-                    sl_base_of[li]  = nv[li];
-                    sl_bbase_of[li] = sl_bx > 0 && nv[li] > sl_bx ? nv[li] - sl_bx : -1; // [TAG_FN_L21_BIGUB]
+                    const int32_t base = nv[li] - std::max<int32_t>(ev, 0);
+                    sl_base_of[li]  = base;
+                    sl_bbase_of[li] = sl_bx > 0 && base > sl_bx ? base - sl_bx : -1; // [TAG_FN_L21_BIGUB]
                     n_slots_of[li] += e;
                     used += (size_t) e*layers[li].bytes;
                 }
@@ -5763,6 +5781,10 @@ void llama_moe_hot_set_kv_lend(size_t want, size_t keep, int n_trunk) {
 
 void llama_moe_hot_set_cb_borrow(size_t bytes) { // [TAG_FN_L21_BIGUB]
     g_kv_borrow = bytes;
+}
+
+void llama_moe_hot_set_vis_part(size_t bytes) { // [TAG_R34_F_VISFLAT]
+    g_vis_part = bytes;
 }
 
 // [TAG_FN_L22_BIGUB2] see llama-moecache.h
