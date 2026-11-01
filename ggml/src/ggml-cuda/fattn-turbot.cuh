@@ -3233,6 +3233,9 @@ static void launch_fattn_turbot(
     const int nsm = ggml_cuda_info().devices[id].nsm;
 
     ggml_cuda_pool_alloc<int>    KV_max(pool);
+    // [TAG_R34_C_LIVEBM] declared here, before dst_tmp / dst_tmp_meta / balance_buf: the pool is a stack, so the buffers
+    // must be freed (destroyed) in the reverse order of their allocation, and the bitmap is allocated before those
+    ggml_cuda_pool_alloc<uint32_t> live_bm(pool);
     const int *                  KV_max_lists = nullptr;   // [TAG_FN_L4_QSA_LIST] the lists the QSA_MASK wrote
     ggml_cuda_pool_alloc<float>  dst_tmp(pool);
     ggml_cuda_pool_alloc<float2> dst_tmp_meta(pool);
@@ -3333,7 +3336,6 @@ static void launch_fattn_turbot(
     // [TAG_R34_C_LIVEBM] Same gate as the positional bounds walk below, which it replaces: a live-tile bitmap per query
     // tile (flash_attn_pos_to_live_bm, one parallel pass) and no KV_max bounds; the kernel skips the dead tiles of its own
     // walk. LLAMA_R34_C_LIVEBM=0 keeps the walk.
-    ggml_cuda_pool_alloc<uint32_t> live_bm(pool);
     int live_nwords = 0;
     if (!use_sparse && kv_pos_t && K->ne[1] % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || kvmax_worth_it) &&
             ggml_cuda_fattn_r34_livebm_on()) {
