@@ -1702,7 +1702,7 @@ std::string server_task_result_metrics::to_metrics() {
 //
 json server_task_result_slot_save_load::to_json() {
     if (is_save) {
-        return json {
+        json res = json {
             { "id_slot",   id_slot },
             { "filename",  filename },
             { "n_saved",   n_tokens },
@@ -1711,6 +1711,10 @@ json server_task_result_slot_save_load::to_json() {
                 { "save_ms", t_ms }
             }},
         };
+        if (n_recalled >= 0) {
+            res["n_recalled"] = n_recalled; // [TAG_R34_KYROCACHE]
+        }
+        return res;
     }
 
     return json {

@@ -190,6 +190,8 @@ struct server_task {
         int id_slot;
         std::string filename;
         std::string filepath;
+        // [TAG_R34_KYROCACHE] save only: "" (as before), "empty" or "replace" (see SERVER_TASK_TYPE_SLOT_SAVE)
+        std::string recall;
     };
     slot_action slot_action;
 
@@ -621,6 +623,9 @@ struct server_task_result_slot_save_load : server_task_result {
     size_t n_tokens;
     size_t n_bytes;
     double t_ms;
+
+    // [TAG_R34_KYROCACHE] a save asked to recall: the tokens brought back into the slot before it was written (-1: not asked)
+    int64_t n_recalled = -1;
 
     virtual json to_json() override;
 };
