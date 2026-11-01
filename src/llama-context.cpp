@@ -2221,11 +2221,15 @@ void llama_context::sched_reserve() {
     }
 
     sched_need_reserve = false;
-    sched_smpl_dirty   = false; // [TAG_R34_SMPLRES] the full reserve drops the graphs too
+    // [TAG_R34_SMPLRES] the full reserve drops the graphs too. A sampler change it consumes while the SMALL scheduler is parked
+    // makes the kept one stale even when the reserve runs inside the cbuf code (a class upgrade, a switch): its graphs hold the
+    // old sampler set (always false with LLAMA_R34_SMPLRES=0)
+    const bool smpl_was_dirty = sched_smpl_dirty;
+    sched_smpl_dirty   = false;
 
     // [TAG_FN_L22_SMALLKEEP] a reserve outside the cbuf code while the SMALL scheduler is parked (adapters, embeddings,
     // causal attention, ...): the kept one is not swapped back in
-    if (l22_sk_parked && !l22_sk_in_cbuf) {
+    if (l22_sk_parked && (!l22_sk_in_cbuf || smpl_was_dirty)) {
         l22_sk_stale = true;
     }
 
@@ -8600,7 +8604,11 @@ void llama_context::l22p_period_end() {
 // FULL reserve, the owner's graphs synchronized. false: today's path (l22_sk_why)
 bool llama_context::l22_sk_park(ggml_backend_dev_t dev, size_t expect_full) {
     l22_sk_last = 0;
-    if (l22_sk_parked || !sched || sched_need_reserve || !gf_res_reserve) {
+    // [TAG_R34_SMPLRES] a pending sampler change (sched_smpl_dirty) counts as a pending reserve, as in v0.26.6 (where it set
+    // sched_need_reserve): the SMALL graphs hold the old sampler set, and the FULL reserve that clears the flag runs inside the
+    // cbuf code, so nothing would mark them stale before cbuf_to_small swaps them back in (a new sampler at the freed one's
+    // address would then pass the reuse check)
+    if (l22_sk_parked || !sched || sched_need_reserve || sched_smpl_dirty || !gf_res_reserve) {
         l22_sk_why = "noreserve";
         return false;
     }
