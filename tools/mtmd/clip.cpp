@@ -245,6 +245,7 @@ struct clip_ctx {
         std::vector<uint8_t>    stage_vec;
         uint8_t *               stage      = nullptr;
         size_t                  stage_half = 0;
+        bool                    file_err   = false; // the last unpark failed on the file, not on the allocation
     } lend;
 
     void make_sched() {
@@ -6851,7 +6852,8 @@ static bool clip_encode_on_cpu_twin(const clip_ctx * ctx, clip_ctx * twin, struc
 
 // [TAG_R34_F_VISFILE] -----------------------------------------------------------------------------------------------------
 // off by default (measured 11-01: each take reads the 862 MiB again, weights up 393 ms instead of 26 ms per image turn; the
-// first answer after a start 85.5 -> 90.6 t/s, steady decode unchanged): LLAMA_R34_VISFILE=1 turns it on
+// first answer after a start showed no gain over the old build in the same session (90.6 vs 91.4 t/s), steady decode
+// unchanged): LLAMA_R34_VISFILE=1 turns it on
 static bool clip_visfile_wanted() {
     const char * e = std::getenv("LLAMA_R34_VISFILE");
     return e != nullptr && strcmp(e, "1") == 0;
@@ -6986,7 +6988,9 @@ static void clip_lend_free_device(clip_ctx * ctx) {
 }
 
 // a new device weight buffer (the same allocation as at load), the weights uploaded from host
-static bool clip_lend_unpark_once(clip_ctx * ctx) {
+// [TAG_R34_F_VISFILE_ERR] returns 0: weights up; 1: the weight buffer could not be allocated; 2: the projector file could not
+// be read (memory was not what failed: no OOM hook)
+static int clip_lend_unpark_once(clip_ctx * ctx) {
     ggml_backend_buffer_t b = ggml_backend_alloc_ctx_tensors_from_buft(ctx->ctx_data.get(), ctx->lend.buft);
     if (b == nullptr) {
         // tensors placed before the failure point into the freed buffer: no data again
@@ -6994,7 +6998,7 @@ static bool clip_lend_unpark_once(clip_ctx * ctx) {
             t->data   = nullptr;
             t->buffer = nullptr;
         }
-        return false;
+        return 1;
     }
     ctx->buf.reset(b);
     ggml_backend_buffer_set_usage(b, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
@@ -7012,25 +7016,36 @@ static bool clip_lend_unpark_once(clip_ctx * ctx) {
             t->data   = nullptr;
             t->buffer = nullptr;
         }
-        return false;
+        return 2; // [TAG_R34_F_VISFILE_ERR]
     }
     ctx->lend.parked = false;
-    return true;
+    return 0;
 }
 
 // [TAG_FN_L22_OOMHOOK] a failed weight buffer allocation asks the OOM hook once (e.g. pins give memory back), then retries
 static bool clip_lend_unpark(clip_ctx * ctx, size_t need) {
-    if (clip_lend_unpark_once(ctx)) {
+    auto & L = ctx->lend;
+    L.file_err = false;
+    const int r = clip_lend_unpark_once(ctx);
+    if (r == 0) {
         return true;
     }
-    auto & L = ctx->lend;
+    if (r == 2) {
+        L.file_err = true; // [TAG_R34_F_VISFILE_ERR] a file error: no OOM hook, no retry (the read logged why)
+        return false;
+    }
     if (L.oom == nullptr) {
         return false;
     }
     const bool freed = L.oom(L.oom_ud, need);
     LOG_WRN("%s: [TAG_FN_L22_OOMHOOK] the weight buffer could not be allocated, the OOM hook %s (%.1f MiB)\n", __func__,
             freed ? "released memory: retrying once" : "released nothing", need/1048576.0);
-    return freed && clip_lend_unpark_once(ctx);
+    if (!freed) {
+        return false;
+    }
+    const int r2 = clip_lend_unpark_once(ctx);
+    L.file_err = r2 == 2; // [TAG_R34_F_VISFILE_ERR]
+    return r2 == 0;
 }
 
 // [TAG_FN_L22_VLEND_SIZE] at park, while the weights are still on the device: the compute buffer of the largest picture
@@ -7293,7 +7308,10 @@ struct clip_lend_scope {
         ok = clip_lend_unpark(ctx, need);
         L.fresh = ok;
         t_up = ggml_time_us();
-        if (!ok) {
+        if (!ok && L.file_err) {
+            LOG_ERR("%s: [TAG_R34_F_VISFILE_ERR] the projector's weights could not be read from its file: this encode fails\n",
+                    __func__);
+        } else if (!ok) {
             LOG_ERR("%s: [TAG_FN_L17_VISION_LEND] the weight buffer (%.1f MiB) could not be allocated: this encode fails\n", __func__,
                     need/1048576.0);
         } else if (need > L.bytes) {
