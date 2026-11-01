@@ -2565,21 +2565,48 @@ static __global__ void flash_attn_pos_to_KV_max(
 // exactly as they were, and every live tile lies inside the walk's [KV_min, KV_max): the output is the same bits.
 // has_seq: the two-row form ([TAG_4C_POSMASK_MS] sequence sets in kv_seq / q_seq); without it they are unused.
 // No __restrict__ on the pointers: the kernel may be launched with PDL (see GGML_CUDA_RESTRICT in common.cuh).
-template <bool has_seq>
+// Latency: every load the block needs is in flight at once - the 4 tiles of each warp (and their sequence sets) are loaded
+// before the query rows, whose ncols1 loads are unrolled - so one block costs about one memory round trip, like the
+// first iteration of the walk it replaces.
+template <int ncols1, bool has_seq>
 static __global__ void __launch_bounds__(256, 1) flash_attn_pos_to_live_bm(
         const int32_t * kv_pos, const int32_t * q_pos, const int32_t * kv_seq, const int32_t * q_seq,
-        uint32_t * live_bm, const int ncols1, const int ntiles_kv, const int nwords, const uint3 ne01) {
+        uint32_t * live_bm, const int ntiles_kv, const int nwords, const uint3 ne01) {
+    static_assert(FATTN_KQ_STRIDE == 8*WARP_SIZE, "live bitmap: one tile = 8 cells per lane");
+    constexpr int ntw = 4;   // tiles per warp, 8 warps: the 32 tiles of one word
     const int jt   = blockIdx.x;
     const int word = blockIdx.y;
     const int warp = threadIdx.x / WARP_SIZE;
     const int lane = threadIdx.x % WARP_SIZE;
-    __shared__ uint32_t bits;
-    if (threadIdx.x == 0) {
-        bits = 0;
-    }
+    __shared__ uint32_t wbits[256/WARP_SIZE];
     ggml_cuda_pdl_sync();
+
+    int4 p[2*ntw];
+    [[maybe_unused]] int4 s[2*ntw];   // sequence sets, has_seq only
+#pragma unroll
+    for (int t = 0; t < ntw; ++t) {
+        const int tile = word*32 + warp*ntw + t;
+        if (tile < ntiles_kv) {   // warp-uniform
+            const int64_t i0 = int64_t(tile)*FATTN_KQ_STRIDE + 8*lane;
+            p[2*t + 0] = *((const int4 *) (kv_pos + i0) + 0);
+            p[2*t + 1] = *((const int4 *) (kv_pos + i0) + 1);
+            if constexpr (has_seq) {
+                s[2*t + 0] = *((const int4 *) (kv_seq + i0) + 0);
+                s[2*t + 1] = *((const int4 *) (kv_seq + i0) + 1);
+            }
+        } else {
+            p[2*t + 0] = make_int4(-1, -1, -1, -1);   // empty cells: never visible
+            p[2*t + 1] = make_int4(-1, -1, -1, -1);
+            if constexpr (has_seq) {
+                s[2*t + 0] = make_int4(0, 0, 0, 0);
+                s[2*t + 1] = make_int4(0, 0, 0, 0);
+            }
+        }
+    }
+
     int      q_max = -1;
     uint32_t q_set = 0;
+#pragma unroll
     for (int j = 0; j < ncols1; ++j) {
         const int jq = fastmodulo(jt*ncols1 + j, ne01);
         q_max = max(q_max, q_pos[jq]);
@@ -2587,26 +2614,17 @@ static __global__ void __launch_bounds__(256, 1) flash_attn_pos_to_live_bm(
             q_set |= (uint32_t) q_seq[jq];
         }
     }
-    __syncthreads();
-    static_assert(FATTN_KQ_STRIDE == 8*WARP_SIZE, "live bitmap: one tile = 8 cells per lane");
+
+    uint32_t bits = 0;
 #pragma unroll
-    for (int t = 0; t < 4; ++t) {
-        const int tile = word*32 + warp*4 + t;
-        if (tile >= ntiles_kv) {
-            break;   // warp-uniform
-        }
-        const int64_t i0 = int64_t(tile)*FATTN_KQ_STRIDE + 8*lane;
-        const int4 p0 = *((const int4 *) (kv_pos + i0) + 0);
-        const int4 p1 = *((const int4 *) (kv_pos + i0) + 1);
-        const int c[8] = { p0.x, p0.y, p0.z, p0.w, p1.x, p1.y, p1.z, p1.w };
+    for (int t = 0; t < ntw; ++t) {
+        const int c[8] = { p[2*t].x, p[2*t].y, p[2*t].z, p[2*t].w, p[2*t + 1].x, p[2*t + 1].y, p[2*t + 1].z, p[2*t + 1].w };
         bool vis = false;
         if constexpr (has_seq) {
-            const int4 s0 = *((const int4 *) (kv_seq + i0) + 0);
-            const int4 s1 = *((const int4 *) (kv_seq + i0) + 1);
-            const int s[8] = { s0.x, s0.y, s0.z, s0.w, s1.x, s1.y, s1.z, s1.w };
+            const int q[8] = { s[2*t].x, s[2*t].y, s[2*t].z, s[2*t].w, s[2*t + 1].x, s[2*t + 1].y, s[2*t + 1].z, s[2*t + 1].w };
 #pragma unroll
             for (int k = 0; k < 8; ++k) {
-                vis = vis || (c[k] >= 0 && c[k] <= q_max && ((uint32_t) s[k] & q_set) != 0);
+                vis = vis || (c[k] >= 0 && c[k] <= q_max && ((uint32_t) q[k] & q_set) != 0);
             }
         } else {
 #pragma unroll
@@ -2614,13 +2632,19 @@ static __global__ void __launch_bounds__(256, 1) flash_attn_pos_to_live_bm(
                 vis = vis || (c[k] >= 0 && c[k] <= q_max);
             }
         }
-        if (__any_sync(0xFFFFFFFF, vis) && lane == 0) {
-            atomicOr(&bits, 1u << (warp*4 + t));
-        }
+        bits |= __any_sync(0xFFFFFFFF, vis) ? 1u << (warp*ntw + t) : 0u;
+    }
+    if (lane == 0) {
+        wbits[warp] = bits;
     }
     __syncthreads();
     if (threadIdx.x == 0) {
-        live_bm[int64_t(jt)*nwords + word] = bits;
+        uint32_t w = 0;
+#pragma unroll
+        for (int i = 0; i < 256/WARP_SIZE; ++i) {
+            w |= wbits[i];
+        }
+        live_bm[int64_t(jt)*nwords + word] = w;
     }
 }
 

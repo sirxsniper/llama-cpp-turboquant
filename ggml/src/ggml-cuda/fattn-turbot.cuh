@@ -3348,13 +3348,13 @@ static void launch_fattn_turbot(
         if (pos_ms) {
             const int32_t * kv_seq_d = (const int32_t *) ((const char *) kv_pos_t->data + kv_pos_t->nb[1]);
             const int32_t * q_seq_d  = (const int32_t *) ((const char *) q_pos_t->data  + q_pos_t->nb[1]);
-            ggml_cuda_kernel_launch(flash_attn_pos_to_live_bm<true>, launch_params,
+            ggml_cuda_kernel_launch(flash_attn_pos_to_live_bm<ncols1, true>, launch_params,
                 (const int32_t *) kv_pos_t->data, (const int32_t *) q_pos_t->data, kv_seq_d, q_seq_d, live_bm.ptr,
-                ncols1, ntiles_kv, live_nwords, ne01_pos);
+                ntiles_kv, live_nwords, ne01_pos);
         } else {
-            ggml_cuda_kernel_launch(flash_attn_pos_to_live_bm<false>, launch_params,
+            ggml_cuda_kernel_launch(flash_attn_pos_to_live_bm<ncols1, false>, launch_params,
                 (const int32_t *) kv_pos_t->data, (const int32_t *) q_pos_t->data, (const int32_t *) nullptr, (const int32_t *) nullptr,
-                live_bm.ptr, ncols1, ntiles_kv, live_nwords, ne01_pos);
+                live_bm.ptr, ntiles_kv, live_nwords, ne01_pos);
         }
         CUDA_CHECK(cudaGetLastError());
         kv_scan = pos_ms ? "livebm-ms" : "livebm";
