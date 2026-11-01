@@ -8,10 +8,14 @@
 
 struct llama_model_saver {
     struct gguf_context * gguf_ctx = nullptr;
+    const bool gguf_ctx_owned = true;
     const struct llama_model * model;
     const struct LLM_KV llm_kv;
 
     llama_model_saver(const struct llama_model * model);
+    // [TAG_R34_SYNC] kept for the fork's MTP fixtures in test-llama-archs (upstream #30880 dropped it with its test-side
+    // writer): writes arch-resolved keys into gguf_ctx (not owned), or into an own context when gguf_ctx is null
+    llama_model_saver(enum llm_arch arch, struct gguf_context * gguf_ctx);
     ~llama_model_saver();
 
     void add_kv(enum llm_kv key, uint32_t     value);
@@ -36,4 +40,5 @@ struct llama_model_saver {
     void add_tensors_from_model();
 
     void save(const std::string & path_model);
+    void save(FILE * file); // [TAG_R34_SYNC] see above
 };

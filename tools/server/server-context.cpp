@@ -8317,7 +8317,7 @@ private:
 
     // realtime conversations (SERVER_TASK_TYPE_REALTIME) drive their own decode loop, see server_realtime_slot
     void process_realtime_slots() {
-        iterate(slots, [&](server_slot & slot) {
+        iterate("slots_realtime", slots, [&](server_slot & slot) { // [TAG_R34_SYNC] the fork's named iterate
             if (!slot.is_processing() || !slot.rt) {
                 return;
             }

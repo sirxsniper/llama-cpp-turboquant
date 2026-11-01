@@ -19,8 +19,13 @@ llama_model_saver::llama_model_saver(const struct llama_model * model) :
     GGML_ASSERT(llama_arch_supports_save(model->arch));
 }
 
+llama_model_saver::llama_model_saver(enum llm_arch arch, struct gguf_context * gguf_ctx) :
+        gguf_ctx(gguf_ctx == nullptr ? gguf_init_empty() : gguf_ctx), gguf_ctx_owned(gguf_ctx == nullptr), model(nullptr), llm_kv(arch) {}
+
 llama_model_saver::~llama_model_saver() {
-    gguf_free(gguf_ctx);
+    if (gguf_ctx_owned) {
+        gguf_free(gguf_ctx);
+    }
 }
 
 void llama_model_saver::add_kv(const enum llm_kv key, const uint32_t value) {
@@ -564,4 +569,8 @@ void llama_model_saver::add_tensors_from_model() {
 
 void llama_model_saver::save(const std::string & path_model) {
     gguf_write_to_file(gguf_ctx, path_model.c_str(), false);
+}
+
+void llama_model_saver::save(FILE * file) {
+    gguf_write_to_file_ptr(gguf_ctx, file, false);
 }
