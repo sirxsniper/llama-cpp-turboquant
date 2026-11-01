@@ -2169,12 +2169,54 @@ void llama_context::sched_new(size_t max_nodes, bool parallel) {
     ggml_backend_sched_set_realloc_callback(sched.get(), sched_graph_realloc, this);
 }
 
+// [TAG_R34_SMPLRES] LLAMA_R34_SMPLRES=0: every attach / detach of a backend sampler reserves the scheduler again (v0.26.6).
+// llama-server attaches the request's chain at launch and detaches it at release (and when a lazy grammar triggers), so
+// each request paid two full reserves (a new scheduler, the compute buffers freed and allocated again, the pp and tg
+// graphs built and planned), and the reserve stalls every other slot's decode too. The graphs that hold the old sampler
+// set are still dropped (a sampler allocated at the freed one's address must not pass the reuse check); the compute
+// buffers keep their size and grow through the scheduler's own re-reserve if a graph with the new set needs more.
+static bool llama_r34_smplres_on() {
+    static const bool v = [] {
+        const char * e = getenv("LLAMA_R34_SMPLRES");
+        return !(e && e[0] == '0');
+    }();
+    return v;
+}
+
+void llama_context::sched_smpl_changed() {
+    if (llama_r34_smplres_on()) {
+        sched_smpl_dirty = true;
+    } else {
+        sched_need_reserve = true;
+    }
+}
+
 void llama_context::sched_reserve() {
     if (!sched_need_reserve) {
+        if (sched_smpl_dirty) { // [TAG_R34_SMPLRES]
+            sched_smpl_dirty = false;
+            const int64_t t0 = ggml_time_us();
+            synchronize();
+            step_join();
+            for (auto & res : gf_res_prev) {
+                res.reset();
+            }
+            for (auto & res : gf_res_width) { // [TAG_FN_GRAPH_PER_WIDTH]
+                res.reset();
+            }
+            gf_res_prev_active = nullptr;
+            if (l22_sk_parked) {
+                l22_sk_stale = true; // [TAG_FN_L22_SMALLKEEP] the kept SMALL graphs hold the old sampler set too
+            }
+            LLAMA_LOG_DEBUG("%s: [TAG_R34_SMPLRES] sampler set changed: graphs dropped, no reserve (%.2f ms)
+", __func__,
+                    (ggml_time_us() - t0)/1000.0);
+        }
         return;
     }
 
     sched_need_reserve = false;
+    sched_smpl_dirty   = false; // [TAG_R34_SMPLRES] the full reserve drops the graphs too
 
     // [TAG_FN_L22_SMALLKEEP] a reserve outside the cbuf code while the SMALL scheduler is parked (adapters, embeddings,
     // causal attention, ...): the kept one is not swapped back in
@@ -3174,7 +3216,7 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
             warned = true;
         }
         if (sampling.samplers.count(seq_id) > 0) {
-            sched_need_reserve = true;
+            sched_smpl_changed(); // [TAG_R34_SMPLRES]
         }
         sampling.samplers.erase(seq_id);
         return false;
@@ -3193,7 +3235,7 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
 
         sampling.samplers[seq_id] = sampler;
 
-        sched_need_reserve = true;
+        sched_smpl_changed(); // [TAG_R34_SMPLRES]
 
         return true;
     }
@@ -3202,7 +3244,7 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
         LLAMA_LOG_WARN("%s: sampler '%s' for seq_id = %d, cannot be offloaded to the backend\n", __func__, llama_sampler_name(sampler), seq_id);
 
         if (sampling.samplers.count(seq_id) > 0) {
-            sched_need_reserve = true;
+            sched_smpl_changed(); // [TAG_R34_SMPLRES]
         }
 
         sampling.samplers.erase(seq_id);
@@ -3212,7 +3254,7 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
 
     sampling.samplers.erase(seq_id);
 
-    sched_need_reserve = true;
+    sched_smpl_changed(); // [TAG_R34_SMPLRES]
 
     return true;
 }
