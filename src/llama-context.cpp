@@ -2198,11 +2198,17 @@ void llama_context::sched_reserve() {
             const int64_t t0 = ggml_time_us();
             synchronize();
             step_join();
+            // cleared in place (params too, so nothing passes the reuse check): the rebuilt graphs keep their meta buffer,
+            // so the CUDA graph of a width keeps its key and is updated instead of warmed up and captured again
             for (auto & res : gf_res_prev) {
-                res.reset();
+                if (res) {
+                    res->reset();
+                }
             }
             for (auto & res : gf_res_width) { // [TAG_FN_GRAPH_PER_WIDTH]
-                res.reset();
+                if (res) {
+                    res->reset();
+                }
             }
             gf_res_prev_active = nullptr;
             if (l22_sk_parked) {
