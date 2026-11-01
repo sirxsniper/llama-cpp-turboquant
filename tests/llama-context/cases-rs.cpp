@@ -344,7 +344,7 @@ struct case_rollback_bound : ctx_test {
     const char * name() const override { return "rollback_bound"; }
 
     const char * description() const override {
-        return "seq_rm accepts exactly the rollbacks whose snapshots the last ubatch wrote";
+        return "seq_rm accepts the rollbacks whose snapshots the last ubatch wrote, and the deepest one replays exactly";
     }
 
     case_result run(model_run & mr) const override {
@@ -380,7 +380,8 @@ struct case_rollback_bound : ctx_test {
         }
 
         for (const uint32_t n : { 1u, 2u, n_rs_seq + 1, n_rs_seq + 2 }) {
-            const uint32_t r_max = from_ubatch_start ? std::min(n, n_rs_seq) : (n <= n_rs_seq + 1 ? n - 1 : 0);
+            // upstream #31368's bound: the snapshots ggml_gated_delta_net writes for a ubatch of n <= n_rs_seq + 1 tokens
+            const uint32_t r_up = from_ubatch_start ? std::min(n, n_rs_seq) : (n <= n_rs_seq + 1 ? n - 1 : 0);
 
             ctx = make_ctx();
             if (!ctx) {
@@ -393,15 +394,48 @@ struct case_rollback_bound : ctx_test {
                         decode_gen(ctx.get(), n_vocab, 0, n_prefix, pos_end),
                     "the prefix / ubatch decode failed");
 
-            for (uint32_t r = n_rs_seq + 1; r > r_max; --r) {
-                CTX_REQUIRE(!llama_memory_seq_rm(llama_get_memory(ctx.get()), 0, pos_end - (llama_pos) r, -1),
-                        "rollback " + std::to_string(r) + " after a " + std::to_string(n) + "-token ubatch was accepted");
+            // [TAG_R34_SYNC] the fork keeps deeper rollbacks exact ([TAG_RS_SNAP_DEPTH]: the graph also writes the state before
+            // the ubatch; [TAG_4C_GDN_REPLAY]: the committed state plus a ring of the last min(n - 1, n_rs_seq) tokens), so its
+            // bound is at least upstream's and at most the ubatch / n_rs_seq. A refused seq_rm leaves the memory unchanged:
+            // the first accepted depth from the top is the bound.
+            uint32_t r_acc = 0;
+            for (uint32_t r = n_rs_seq + 1; r > 0; --r) {
+                if (llama_memory_seq_rm(llama_get_memory(ctx.get()), 0, pos_end - (llama_pos) r, -1)) {
+                    r_acc = r;
+                    break;
+                }
+            }
+            CTX_REQUIRE(r_acc >= r_up,
+                    "rollback " + std::to_string(r_up) + " after a " + std::to_string(n) + "-token ubatch was refused");
+            CTX_REQUIRE(r_acc <= std::min(n, n_rs_seq),
+                    "rollback " + std::to_string(r_acc) + " after a " + std::to_string(n) + "-token ubatch was accepted");
+
+            if (r_acc == 0) {
+                continue;
             }
 
-            if (r_max > 0) {
-                CTX_REQUIRE(llama_memory_seq_rm(llama_get_memory(ctx.get()), 0, pos_end - (llama_pos) r_max, -1),
-                        "rollback " + std::to_string(r_max) + " after a " + std::to_string(n) + "-token ubatch was refused");
+            // the deepest accepted rollback must replay like a context that never decoded the rolled-back tokens
+            llama_context_ptr ref = make_ctx();
+            if (!ref) {
+                return case_result::fail();
             }
+            const llama_pos pos_rb = pos_end - (llama_pos) r_acc;
+            CTX_REQUIRE(decode_gen(ref.get(), n_vocab, 0, 0, n_prefix) &&
+                        (pos_rb == n_prefix || decode_gen(ref.get(), n_vocab, 0, n_prefix, pos_rb)),
+                    "the reference decode failed");
+            for (llama_pos pos = pos_rb; pos < pos_end; ++pos) {
+                const llama_token tok = gen_token(n_vocab, 0, pos);
+                CTX_REQUIRE(decode_one(ctx.get(), tok, pos) && decode_one(ref.get(), tok, pos), "the replay decode failed");
+                const float * lr = llama_get_logits_ith(ctx.get(), 0);
+                const float * lf = llama_get_logits_ith(ref.get(), 0);
+                CTX_REQUIRE(lr != nullptr && lf != nullptr, "missing replay logits");
+                const logits_diff diff = compare_logits(lr, lf, n_vocab);
+                CTX_REQUIRE(diff.nmse() <= 1e-6,
+                        "rollback " + std::to_string(r_acc) + " after a " + std::to_string(n) + "-token ubatch: replay at position " +
+                        std::to_string(pos) + " differs, nmse " + std::to_string(diff.nmse()));
+            }
+            TLOG_INF("%s: n %u: rollback %u accepted (upstream bound %u), replay exact
+", __func__, n, r_acc, r_up);
         }
 
         TLOG_INF("%s: rollback bounds hold for ubatches of 1, 2, %u and %u tokens\n", __func__, n_rs_seq + 1, n_rs_seq + 2);
