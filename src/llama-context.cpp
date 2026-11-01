@@ -1902,6 +1902,14 @@ llama_context::llama_context(
             fa18_fit  = llama_fn_l3_flag(model, "LLAMA_FN_L18_FIRSTANS_FIT");
             fa18_ovl  = llama_fn_l3_flag(model, "LLAMA_FN_L18_FIRSTANS_OVERLAP");
             fa18_warm = llama_fn_l3_flag(model, "LLAMA_FN_L18_FIRSTANS_WARM");
+            // [TAG_R34_NP2COST] the prompt-end pass with one busy sequence of n_seq_max > 1 (as [TAG_FN_L24_ENDOVL1] does for the
+            // switch): a --parallel 2 server ran no pass at all, so every answer started on the last turn's hot set
+            r34_np2_turn = cparams.n_seq_max > 1 && llama_fn_l3_int(model, "LLAMA_R34_NP2_TURN", 1) != 0;
+            if (cparams.n_seq_max > 1 && (fa18_once || llama_fn_l3_int(model, "LLAMA_FN_L17_START_PRE", 0) > 0)) {
+                LLAMA_LOG_INFO("%s: [TAG_R34_NP2COST] the hot set's prompt-end pass on %u slots: %s\n", __func__, cparams.n_seq_max,
+                        r34_np2_turn ? "while one sequence is busy (LLAMA_R34_NP2_TURN=0: never, as v0.26.6)" :
+                                       "never (LLAMA_R34_NP2_TURN=0)");
+            }
             l19_hush  = llama_fn_l3_int(model, "LLAMA_FN_L19_TTFT_HUSH", 0); // [TAG_FN_L19_TTFT_HUSH]
             l19_early = (uint32_t) std::max(0, llama_fn_l3_int(model, "LLAMA_FN_L19_TTFT_EARLY", 0)); // [TAG_FN_L19_TTFT_EARLY]
             l19_tailfull = (uint32_t) std::max(0, llama_fn_l3_int(model, "LLAMA_FN_L19_TTFT_TAILFULL", 0)); // [TAG_FN_L19_TTFT_TAILFULL]
@@ -4386,7 +4394,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     // [TAG_FN_L18_FIRSTANS_ONCE] the last part of a split prompt is no wider than an answer step: the batches before it left
     // their routing for the pass (they had no output), which runs now, after its SMALL switch, before its graphs (its routing then counts
     // as an answer step's, as without the split)
-    if (fa18_once && cparams.n_seq_max == 1 && n_outputs_all > 0 && (int) n_tokens_all <= llama_moe_hot_max_t() &&
+    if (fa18_once && r34_one_seq() && n_outputs_all > 0 && (int) n_tokens_all <= llama_moe_hot_max_t() && // [TAG_R34_NP2COST]
         llama_moe_hot_adapt_owner() == this && llama_moe_hot_turn_start_on()) {
         step_join();
         if (llama_moe_hot_turn_pending()) {
@@ -4968,7 +4976,8 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     // [TAG_FN_L17_START_PRE] a prompt batch ends: the experts its routing names land before the answer's first decode step
     // (prompt time); after the tail came back above, so its layers take part. One sequence only: with more, a prompt batch
     // can carry another answer's decode tokens, which would wait for the pass
-    if (hot_owner && cparams.n_seq_max == 1 && (int) n_tokens_all > llama_moe_hot_max_t() && prompt_end && llama_moe_hot_turn_start_on()) {
+    // [TAG_R34_NP2COST] one busy sequence of n_seq_max > 1 (the caller's count, set before this batch) carries no other answer
+    if (hot_owner && r34_one_seq() && (int) n_tokens_all > llama_moe_hot_max_t() && prompt_end && llama_moe_hot_turn_start_on()) {
         step_join();
         llama_fn_stall_scope st_scope("prompt-end pass begins (tokens)", "prompt-end pass ends", n_tokens_all); // [TAG_FN_L18_FIRSTANS_STALL]
         llama_moe_hot_turn_start(this);
