@@ -1485,6 +1485,22 @@ static __device__ __forceinline__ void flash_attn_ext_turbot_process_tile(
         KQ_max[col] = -FLT_MAX/2.0f;
     }
 
+    // [TAG_R34_C_LIVEBM] [TAG_R34_C_LIVEREG] The bitmap words this block walks, one word per lane (lane i: word
+    // live_w0 + i), loaded here so the load overlaps the Q load, the Q_B load and the LUT copy. The tile loop then reads
+    // no memory per KV tile: a word change is one shuffle, and only words past the lane window (a walk spanning more than
+    // warp_size*32 bitmap tiles, 262144 cells at warp size 32) are read from global memory when the walk reaches them.
+    // Same words, same bits as reading live_bm at every tile (the first version), without its per-tile load stall.
+    const bool have_live_bm = !use_sparse && live_bm != nullptr;
+    const int  live_w0      = ((kb0_start*nbatch_fa)/FATTN_KQ_STRIDE) >> 5;
+    uint32_t   live_lane_w  = 0;
+    if (have_live_bm) {
+        const int wl    = live_w0 + int(threadIdx.x);
+        const int wlast = ((ne11 - 1)/FATTN_KQ_STRIDE) >> 5;   // the query tile's last word (ne11 % FATTN_KQ_STRIDE == 0)
+        if (wl <= wlast) {
+            live_lane_w = live_bm[wl];
+        }
+    }
+
     // Load Q data into tile_Q, either temporarily or permanently.
     // Q in registers is faster, but register pressure is the biggest bottleneck.
     // The loading is done with decreasing granularity for D for better memory bandwidth.
@@ -1591,12 +1607,23 @@ static __device__ __forceinline__ void flash_attn_ext_turbot_process_tile(
     // tile sees any of its cells (mask -INF throughout), so the iteration would leave KQ_max, KQ_rowsum and VKQ_C exactly
     // as they are: skip it. kb0 is block-uniform, so every thread takes the same branch (no barrier divergence).
     static_assert(FATTN_KQ_STRIDE % nbatch_fa == 0, "live bitmap: a KV tile must lie inside one bitmap tile");
+    // [TAG_R34_C_LIVEREG] the current word in a register; kb only grows (kb0_start, then += kb0_stride), so wi >= live_w0
+    // and the word changes at most once per 32 bitmap tiles. wi is block-uniform: every lane of every warp takes the
+    // shuffle together (full mask).
+    int      live_wi = live_w0;
+    uint32_t live_w  = have_live_bm ? __shfl_sync(0xFFFFFFFF, live_lane_w, 0, warp_size) : 0u;
     auto tile_live = [&](const int kb) -> bool {
-        if (use_sparse || live_bm == nullptr) {
+        if (!have_live_bm) {
             return true;
         }
-        const int t = (kb*nbatch_fa) / FATTN_KQ_STRIDE;
-        return ((live_bm[t >> 5] >> (t & 31)) & 1u) != 0;
+        const int t  = (kb*nbatch_fa) / FATTN_KQ_STRIDE;
+        const int wi = t >> 5;
+        if (wi != live_wi) {
+            const int d = wi - live_w0;
+            live_w  = d < warp_size ? __shfl_sync(0xFFFFFFFF, live_lane_w, d, warp_size) : live_bm[wi];
+            live_wi = wi;
+        }
+        return ((live_w >> (t & 31)) & 1u) != 0;
     };
 
     // kb0_start is always < kb0_stop so the last iter can be executed unconditionally.
