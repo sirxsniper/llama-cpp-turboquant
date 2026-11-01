@@ -75,4 +75,6 @@ jobs:
 
       - name: Server smoke (binary runs)
         run: |
-          ./build/bin/llama-server --help | grep -E -- '--spec-type|turbot' | head -5
+          ./build/bin/llama-server --help > server-help.txt 2>&1
+          ./build/bin/llama-server --version 2>&1 | tail -n 2
+          grep -c -E -- 'turbot|draft-dflash|draft-mtp' server-help.txt
