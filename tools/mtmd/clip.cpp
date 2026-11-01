@@ -234,17 +234,9 @@ struct clip_ctx {
         bool               size_on = false;
         size_t             w       = 0; // weight buffer bytes
         mtmd_l22_lend_size sz;
-        // [TAG_R34_F_VISTRIM] the encoder backend's temporary-memory pools (CUDA) give their device memory back at every park,
-        // with the weights and the compute buffer, and their bytes ride in each take: between encodes the hot set holds
-        // them too, and a big picture's pool growth is not kept for the rest of the run. LLAMA_R34_VISTRIM=0: the pools
-        // keep their memory (v0.26.6)
-        bool   trim     = false;
-        size_t pool     = 0; // the pools' mapped bytes after the warm-up encode (at park), part of bytes
-        size_t pool_max = 0; // the most the pools held at any park
-        size_t pool_out = 0; // given back by the last park
         // [TAG_R34_F_VISFILE] the weights whose bytes equal the projector file's wait in the file (the OS file cache: reclaimable
         // RAM, not a locked or committed copy) and are read again at each take; the rest (none for a plain projector) keeps
-        // the host copy. LLAMA_R34_VISFILE=0: every weight in the host copy, pinned if possible (v0.26.6)
+        // the host copy. LLAMA_R34_VISFILE=1 turns it on; unset / 0: every weight in the host copy, pinned if possible (v0.26.6)
         std::vector<uint64_t> foff;            // per offs entry: its file offset, UINT64_MAX = in the host copy
         size_t                file_bytes = 0;  // read from the file at each take
         uintmax_t             file_size  = 0;  // the file as parked: a change fails the take (no silent other weights)
@@ -6858,9 +6850,11 @@ static bool clip_encode_on_cpu_twin(const clip_ctx * ctx, clip_ctx * twin, struc
 // [TAG_FN_L17_VISION_LEND] ------------------------------------------------------------------------------------------------
 
 // [TAG_R34_F_VISFILE] -----------------------------------------------------------------------------------------------------
+// off by default (measured 11-01: each take reads the 862 MiB again, weights up 393 ms instead of 26 ms per image turn; the
+// first answer after a start 85.5 -> 90.6 t/s, steady decode unchanged): LLAMA_R34_VISFILE=1 turns it on
 static bool clip_visfile_wanted() {
     const char * e = std::getenv("LLAMA_R34_VISFILE");
-    return !(e != nullptr && strcmp(e, "0") == 0);
+    return e != nullptr && strcmp(e, "1") == 0;
 }
 
 static bool clip_file_stamp(const std::string & fname, uintmax_t & size, int64_t & time) {
@@ -6979,47 +6973,6 @@ static bool clip_lend_read_file(clip_ctx * ctx) {
     return true;
 }
 
-// [TAG_R34_F_VISTRIM] the CUDA backend's pool procs (nullptr for other backends)
-static void * clip_backend_proc(ggml_backend_t be, const char * name) {
-    ggml_backend_dev_t dev = be ? ggml_backend_get_device(be) : nullptr;
-    ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
-    return reg ? ggml_backend_reg_get_proc_address(reg, name) : nullptr;
-}
-
-static size_t clip_pool_reserved(clip_ctx * ctx) {
-    auto * f = (void (*)(ggml_backend_t, size_t *, size_t *)) clip_backend_proc(ctx->backend, "ggml_backend_pool_stats");
-    size_t r = 0;
-    size_t h = 0;
-    if (f != nullptr) {
-        f(ctx->backend, &r, &h);
-    }
-    return r;
-}
-
-static bool clip_vistrim_wanted(clip_ctx * ctx) {
-    const char * e = std::getenv("LLAMA_R34_VISTRIM");
-    if (e != nullptr && strcmp(e, "0") == 0) {
-        return false;
-    }
-    return clip_backend_proc(ctx->backend, "ggml_backend_pool_stats") != nullptr &&
-           clip_backend_proc(ctx->backend, "ggml_backend_pool_trim") != nullptr;
-}
-
-// [TAG_R34_F_VISTRIM] the pools' bytes an encode of n patches takes with it: the most the pools held at a park so far (the
-// warm-up only reserves its graph, so the first real encode sets it; until then its growth comes from free VRAM, as in
-// v0.26.6), and the warm-up's pools scaled with the patches when the warm-up ran a graph (per-row temporaries)
-static size_t clip_lend_pool_need(const clip_ctx * ctx, int64_t n) {
-    const auto & L = ctx->lend;
-    if (!L.trim) {
-        return 0;
-    }
-    size_t b = L.pool_max;
-    if (L.pool > 0 && L.sz.on && L.sz.n_w > 0 && n > L.sz.n_w) {
-        b = std::max(b, GGML_PAD((size_t) ((double) L.pool * (double) n / (double) L.sz.n_w), (size_t) 2 << 20));
-    }
-    return b;
-}
-
 // frees the device weight buffer (the tensors keep their shapes, no data) and the compute buffers (a new scheduler)
 static void clip_lend_free_device(clip_ctx * ctx) {
     ggml_backend_synchronize(ctx->backend);
@@ -7029,18 +6982,6 @@ static void clip_lend_free_device(clip_ctx * ctx) {
         t->buffer = nullptr;
     }
     ctx->make_sched();
-    // [TAG_R34_F_VISTRIM] the pools' memory goes back with the buffers (before the give); not while pins are active (their
-    // pool growth is avoided: the VLBATCH rule keeps the high-water mark, as in v0.26.6)
-    if (ctx->lend.trim && !llama_fn_pin_active()) {
-        auto * trim = (size_t (*)(ggml_backend_t, size_t)) clip_backend_proc(ctx->backend, "ggml_backend_pool_trim");
-        const size_t r = clip_pool_reserved(ctx);
-        ctx->lend.pool_max = std::max(ctx->lend.pool_max, r);
-        ctx->lend.pool_out = trim != nullptr ? trim(ctx->backend, 0) : 0;
-        if (ctx->lend.on && ctx->lend.pool_out > 0) {
-            LOG_INF("%s: [TAG_R34_F_VISTRIM] the encoder's pools gave back %.1f MiB (the most at a park %.1f MiB)\n", __func__,
-                    ctx->lend.pool_out/1048576.0, ctx->lend.pool_max/1048576.0);
-        }
-    }
     ctx->lend.parked = true;
 }
 
@@ -7235,21 +7176,14 @@ size_t clip_lend_park(struct clip_ctx * ctx, clip_lend_take_fn take, clip_lend_g
     const size_t w = ggml_backend_buffer_get_size(ctx->buf.get());
     const size_t c = ggml_backend_sched_get_buffer_size(ctx->sched.get(), ctx->backend);
     L.w = w;
-    // [TAG_R34_F_VISTRIM] the pools after the warm-up encode: given back below, taken again by each encode
-    L.trim = clip_vistrim_wanted(ctx);
-    L.pool = L.trim ? clip_pool_reserved(ctx) : 0;
     clip_lend_probe_sizes(ctx, c); // [TAG_FN_L22_VLEND_SIZE]
     L.buft  = buft;
     L.take  = take;
     L.give  = give;
     L.ud    = ud;
-    L.bytes = w + c + L.pool; // [TAG_R34_F_VISTRIM]
+    L.bytes = w + c;
     L.on    = true;
     clip_lend_free_device(ctx);
-    if (L.trim) {
-        LOG_INF("%s: [TAG_R34_F_VISTRIM] the encoder's pools gave back %.1f MiB (%.1f MiB mapped after the warm-up), part of "
-                "each take\n", __func__, L.pool_out/1048576.0, L.pool/1048576.0);
-    }
     if (L.file_bytes > 0) {
         size_t n_file = 0;
         for (const auto fo : L.foff) {
@@ -7302,8 +7236,7 @@ static size_t clip_lend_need(const clip_ctx * ctx, const clip_image_f32_batch * 
     const auto & L = ctx->lend;
     ne = nx = ny = 0;
     if (!L.sz.on || imgs == nullptr || imgs->entries.empty()) {
-        const size_t pn = clip_lend_pool_need(ctx, 0); // [TAG_R34_F_VISTRIM] bytes holds the warm-up's pools already
-        return L.bytes + (pn > L.pool ? pn - L.pool : 0);
+        return L.bytes;
     }
     const int ps = std::max(1, ctx->model.hparams.patch_size);
     int64_t n = 0;
@@ -7313,7 +7246,7 @@ static size_t clip_lend_need(const clip_ctx * ctx, const clip_image_f32_batch * 
     ne = (int) imgs->entries.size();
     nx = imgs->entries[0].nx();
     ny = imgs->entries[0].ny();
-    return std::max(L.bytes, L.w + L.sz.estimate(n, L.sz.find(ne, nx, ny)) + clip_lend_pool_need(ctx, n)); // [TAG_R34_F_VISTRIM]
+    return std::max(L.bytes, L.w + L.sz.estimate(n, L.sz.find(ne, nx, ny)));
 }
 
 // around one encode of a parked context: VRAM back, weights up; at scope exit both freed again and the VRAM returned.
@@ -7440,7 +7373,7 @@ size_t clip_lend_max_bytes(const struct clip_ctx * ctx) {
     const auto & L = ctx->lend;
     size_t m = L.bytes;
     if (L.sz.on && L.sz.n_max > 0) {
-        m = std::max(m, L.w + L.sz.estimate(L.sz.n_max, nullptr) + clip_lend_pool_need(ctx, L.sz.n_max)); // [TAG_R34_F_VISTRIM]
+        m = std::max(m, L.w + L.sz.estimate(L.sz.n_max, nullptr));
     }
     return m;
 }
