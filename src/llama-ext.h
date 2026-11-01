@@ -346,6 +346,10 @@ LLAMA_API int32_t llama_sampler_penalties_window(const struct llama_sampler * sm
 // then [i, n) is one apply of the chain.
 LLAMA_API void llama_sampler_chain_apply_range(struct llama_sampler * chain, llama_token_data_array * cur_p, int32_t i0, int32_t i1);
 
+// [TAG_R34_PENGUARD] true when chain is a sampler chain whose backend part is initialised for the current sampling graph
+// (-bs): its apply then skips the backend samplers at the front of the chain, also for a row the backend did not sample
+LLAMA_API bool llama_sampler_chain_backend_inited(const struct llama_sampler * chain);
+
 // [TAG_FN_L4_HOST_PLEPRE] LLAMA_FN_L4_HOST_PLEPRE (qwen4exp with PLE direct I/O): a helper thread reads the PLE rows of
 // toks[i_first..n), which a coming decode of seq_id holds at positions pos0 + i, into the row cache (predecessors: the
 // earlier toks, else the KV cells). A hint only: the decode computes and reads its own rows as before. No-op otherwise.

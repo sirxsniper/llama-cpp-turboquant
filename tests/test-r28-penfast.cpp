@@ -14,11 +14,13 @@
 
 #include "sampling.h"
 #include "../src/llama-ext.h"
+#include "ggml-backend.h" // [TAG_R34_PENGUARD]
 
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <random>
 #include <set>
@@ -372,9 +374,56 @@ static void test_cases() {
     }
 }
 
+// [TAG_R34_PENGUARD] a chain whose backend part is initialised (-bs) never takes the candidate-set path (its range apply would
+// skip the backend top-k over the set); detached it takes it again. LLAMA_R34_PENGUARD=0 (v0.26.6): no check.
+static void test_backend_guard() {
+    const char * e   = getenv("LLAMA_R34_PENGUARD");
+    const bool guard = !(e != nullptr && e[0] != 0 && atoi(e) == 0);
+    const int n_vocab = 20000;
+    common_params_sampling p = kyro_params();
+    llama_sampler * chain = make_chain(p, {}, n_vocab);
+    const common_penfast_cfg cfg = common_sampler_penfast_cfg(p, chain, nullptr, 0, n_vocab);
+    check(cfg.top_k > 0, "guard: Kyro's chain takes the fast path", 0);
+    check(!llama_sampler_chain_backend_inited(chain), "guard: a new chain is not backend-initialised", 0);
+
+    std::mt19937 g(77u);
+    std::normal_distribution<float> nd(0.0f, 3.0f);
+    std::vector<float> x(n_vocab);
+    for (auto & v : x) {
+        v = nd(g);
+    }
+    std::vector<llama_token>      excl;
+    std::vector<llama_token_data> cur;
+    llama_token_data_array        a;
+    check(common_sampler_penfast_apply(cfg, chain, x.data(), n_vocab, true, excl, cur, a), "guard: fast path before init", 0);
+
+    ggml_backend_dev_t cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    if (cpu == nullptr) {
+        ggml_backend_load_all();
+        cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    }
+    if (cpu == nullptr) {
+        printf("guard: no CPU backend device - backend-init part skipped\n");
+        llama_sampler_free(chain);
+        return;
+    }
+    chain->iface->backend_init(chain, ggml_backend_dev_buffer_type(cpu), 1);
+    check(llama_sampler_chain_backend_inited(chain), "guard: backend_init marks the chain", 0);
+    const bool fast_init = common_sampler_penfast_apply(cfg, chain, x.data(), n_vocab, true, excl, cur, a);
+    check(fast_init == !guard, guard ? "guard: no fast path while backend-initialised" : "guard off: fast path as v0.26.6", 0);
+
+    llama_sampler_chain_backend_detach(chain);
+    check(!llama_sampler_chain_backend_inited(chain), "guard: detach clears the mark", 0);
+    check(common_sampler_penfast_apply(cfg, chain, x.data(), n_vocab, true, excl, cur, a), "guard: fast path after detach", 0);
+    printf("guard (LLAMA_R34_PENGUARD %s): fast path before init 1, while backend-initialised %d, after detach 1\n",
+            guard ? "on" : "off", fast_init ? 1 : 0);
+    llama_sampler_free(chain);
+}
+
 int main() {
     test_cfg();
     test_cases();
+    test_backend_guard();
 
     int n_steps = 0, n_fast = 0, n_untied = 0, n_untied_fast = 0;
     const int n_cases = 120;

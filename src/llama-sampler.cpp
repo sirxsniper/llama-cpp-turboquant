@@ -1020,6 +1020,14 @@ void llama_sampler_chain_apply_range(struct llama_sampler * chain, llama_token_d
     }
 }
 
+// [TAG_R34_PENGUARD] see llama-ext.h
+bool llama_sampler_chain_backend_inited(const struct llama_sampler * chain) {
+    if (chain == nullptr || chain->iface != &llama_sampler_chain_i) {
+        return false;
+    }
+    return ((const llama_sampler_chain *) chain->ctx)->is_init;
+}
+
 struct llama_sampler * llama_sampler_chain_get(struct llama_sampler * chain, int32_t i) {
     if (chain == nullptr) {
         return nullptr;
