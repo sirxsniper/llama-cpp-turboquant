@@ -404,7 +404,11 @@ llama_build_and_test(test-fn-auto.cpp)
 llama_build_and_test(test-fn-l22-batch.cpp)
 
 # [TAG_FN_L22_IMGPASS_MASK] round 22 P1: keyed positional masks and the PLE predecessor rule. CPU only, no model.
-llama_build_and_test(test-fn-l22-mask.cpp)
+# [TAG_R34_LINUXCI] it computes graphs with ggml_graph_compute_with_ctx (the CPU backend directly): static backends only,
+# like the other round 22 tests (with GGML_BACKEND_DL, e.g. the Docker images, the link failed)
+if (NOT GGML_BACKEND_DL AND GGML_CPU)
+    llama_build_and_test(test-fn-l22-mask.cpp)
+endif()
 
 # [TAG_FN_L22] round 22 package tests (requests R-P11-1, R-P12-3, R-P13-3, R-P14-6, R-P15-2, R-D5-2, P5, P6 R5, P8, P9 R2):
 # every tests/test-fn-l22-*.cpp besides the two above, and tests/test-fn-pin.cpp, is built and registered, CPU only, no

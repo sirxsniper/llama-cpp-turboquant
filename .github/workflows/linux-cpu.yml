@@ -78,3 +78,40 @@ jobs:
           ./build/bin/llama-server --help > server-help.txt 2>&1
           ./build/bin/llama-server --version 2>&1 | tail -n 2
           grep -c -E -- 'turbot|draft-dflash|draft-mtp' server-help.txt
+
+  # the Docker images' configuration without CUDA (shared libraries, dynamic backends, every CPU variant): the link of
+  # every target and the named fork tests that build there
+  ubuntu-cpu-dl:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Clone
+        uses: actions/checkout@v6
+
+      - name: ccache
+        uses: ggml-org/ccache-action@v1.2.24
+        with:
+          key: linux-cpu-fork-dl
+          max-size: 2G
+          evict-old-files: job
+
+      - name: Build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake libssl-dev python3
+
+      - name: Configure
+        run: |
+          cmake -B build             -DCMAKE_BUILD_TYPE=Release             -DGGML_CUDA=OFF             -DGGML_NATIVE=OFF             -DGGML_BACKEND_DL=ON             -DGGML_CPU_ALL_VARIANTS=ON             -DBUILD_SHARED_LIBS=ON             -DLLAMA_BUILD_TESTS=ON             -DLLAMA_BUILD_SERVER=ON             -DCMAKE_EXE_LINKER_FLAGS=-Wl,--allow-shlib-undefined
+
+      - name: Build (all targets)
+        run: |
+          time cmake --build build --config Release -j $(nproc)
+          ls build/bin/ | grep -E 'libggml-cpu|llama-server'
+
+      - name: Fork unit tests (the ones registered here)
+        run: |
+          cd build
+          ctest -N -R '^(test-r28-penfast|test-r29-gramfast|test-v0261-pretrim|test-fn-.*|test-sampling|test-spec-block|test-mtp-.*|test-moe-.*|test-turbo.*|test-kv-resolve|test-server-stop|test-recurrent-state-rollback)$'
+          ctest --output-on-failure --timeout 900             -R '^(test-r28-penfast|test-r29-gramfast|test-v0261-pretrim|test-fn-.*|test-sampling|test-spec-block|test-mtp-.*|test-moe-.*|test-turbo.*|test-kv-resolve|test-server-stop|test-recurrent-state-rollback)$'
