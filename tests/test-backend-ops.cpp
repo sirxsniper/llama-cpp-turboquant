@@ -10480,16 +10480,18 @@ struct test_flash_attn_ext_split_plane : public test_case {
     const int64_t   nb;            // queries
     const int       mask_mode;     // 1 explicit F16 mask, 2 positional mask (kv_pos / q_pos)
     const float     logit_softcap;
+    const bool      sinks;         // [TAG_R34_D] per-head attention sinks (Flint, gpt-oss)
+    const double    nmse_max;      // [TAG_R34_D] 5e-4 by default; the Flint turbo5p512 cases ask for the MMA level
 
     // [TAG_TURBO5P512_MMA] -p filters on vars(), not on the struct name, so the "split_plane=" prefix is what makes
     // `test-backend-ops -o FLASH_ATTN_EXT -p split_plane` select exactly these cases (turbot uses "turbot=" the same way)
     std::string vars() override {
         return std::string("split_plane=") + ggml_type_name(type_KV) + "," +
-               VARS_TO_STR7(hs, nh, nr2, kv, nb, mask_mode, logit_softcap);
+               VARS_TO_STR7(hs, nh, nr2, kv, nb, mask_mode, logit_softcap) + (sinks ? ",sinks=1" : "");
     }
 
     double max_nmse_err() override {
-        return 5e-4;
+        return nmse_max;
     }
 
     uint64_t op_flops(ggml_tensor * t) override {
@@ -10497,9 +10499,19 @@ struct test_flash_attn_ext_split_plane : public test_case {
         return 2 * nh*nr2 * nb * (hs + hs) * kv;
     }
 
+    // [TAG_R34_D] TBO_PRINT_NMSE=1 prints every case's NMSE (not only the failures): the VEC / MMA error levels side by side
+    double err(const float * a, const float * b, size_t n) override {
+        const double e = nmse(a, b, n);
+        if (getenv("TBO_PRINT_NMSE") != nullptr) {
+            printf("    [nmse %.3e] split_plane %s\n", e, vars().c_str());
+        }
+        return e;
+    }
+
     test_flash_attn_ext_split_plane(ggml_type type_KV, int64_t hs, int64_t nh, int64_t nr2, int64_t kv, int64_t nb,
-                                    int mask_mode, float logit_softcap = 0.0f)
-        : type_KV(type_KV), hs(hs), nh(nh), nr2(nr2), kv(kv), nb(nb), mask_mode(mask_mode), logit_softcap(logit_softcap) {}
+                                    int mask_mode, float logit_softcap = 0.0f, bool sinks = false, double nmse_max = 5e-4)
+        : type_KV(type_KV), hs(hs), nh(nh), nr2(nr2), kv(kv), nb(nb), mask_mode(mask_mode), logit_softcap(logit_softcap),
+          sinks(sinks), nmse_max(nmse_max) {}
 
     // the llama_kv_cache::get_k view: [hs, nh, n_kv] with the fractional-block head stride, then the FA permute
     static ggml_tensor * head_view(ggml_context * ctx, ggml_tensor * cache, int64_t d_head, int64_t n_head, int64_t n_kv) {
@@ -10532,6 +10544,11 @@ struct test_flash_attn_ext_split_plane : public test_case {
         }
 
         ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, m, 1.0f/sqrtf((float) hs), 0.0f, logit_softcap);
+        if (sinks) {
+            ggml_tensor * s = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, nh*nr2);
+            ggml_set_name(s, "s");
+            ggml_flash_attn_ext_add_sinks(out, s);
+        }
         if (mask_mode == 2) {
             ggml_tensor * kv_pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, kv);
             ggml_set_name(kv_pos, "kv_pos");
@@ -16996,6 +17013,24 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // If these pass and a turbo5p512 case fails, the fault is in the turbo5p512 path, not in the harness.
     for (int64_t nb : { 1, 4, 64 }) {
         test_cases.emplace_back(new test_flash_attn_ext_split_plane(GGML_TYPE_TURBO5P_0, 256, 4, 6, 4096, nb, 1));
+    }
+    // [TAG_R34_D] the Flint geometry: hs 128 x 4 KV heads = one turbo5p512 block per KV position, GQA 8, per-head sinks,
+    // decode (nb 1: VEC), verify widths (2, 8) and prompt batches (64, 512: MMA); F16 K/V as the control.
+    // [TAG_R34_D_T5X] with GGML_CUDA_R34_T5X=1 (exact codebook at decode) turbo5p512 at hs 128 must match the CPU reference
+    // at the MMA level at EVERY width (5e-6; measured 1.4e-7..1.7e-6). The default decode kernel reads the int8 LUT
+    // (measured 3.9e-5 / 5.1e-5 at nb 1), so without the switch these cases keep the fixture's 5e-4. The F16 cases always
+    // keep 5e-4 (the CPU F16 path itself is about 4e-5 from the CUDA one).
+    {
+        const char * t5x_env = getenv("GGML_CUDA_R34_T5X");
+        const bool   t5x_on  = t5x_env && t5x_env[0] && atoi(t5x_env) != 0;
+        for (ggml_type t : { GGML_TYPE_TURBO5P512_0, GGML_TYPE_F16 }) {
+            for (bool snk : { false, true }) {
+                for (int64_t nb : { 1, 2, 8, 64, 512 }) {
+                    test_cases.emplace_back(new test_flash_attn_ext_split_plane(t, 128, 4, 8, 2048, nb, 1, 0.0f, snk,
+                                                                                t == GGML_TYPE_F16 || !t5x_on ? 5e-4 : 5e-6));
+                }
+            }
+        }
     }
     // ==== [TAG_TURBO5P512_MMA] (end) ====================================================================================
 
