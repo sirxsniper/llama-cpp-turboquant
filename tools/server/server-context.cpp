@@ -10377,7 +10377,8 @@ private:
                     (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS &&
                      // [TAG_SPEC_CKPT_OFF_BY_ONE] n_draft, NOT n_draft + 1. The consumer below
                      // tests n_rollback > n_rs_seq, and n_rollback = n_draft + 1 - accepted.size()
-                     // with accepted.size() >= 1, so n_rollback <= n_draft. Hoisting n_draft + 1
+                     // with accepted.size() >= 1, so n_rollback <= n_draft (with LLAMA_R34_SPEC_CKPT_DRAFT=1
+                     // it tests upstream #31350's n_draft > n_rs_seq: this same predicate). Hoisting n_draft + 1
                      // was one too many and made this true on every full-width step at the shipped
                      // default (n_rs_seq == n_max == 7 gives 8 > 7), which is precisely the case the
                      // comment above says should never clone.
@@ -10464,10 +10465,20 @@ private:
 
                 const uint32_t n_rollback = slot.spec_draft.size() + 1 - accepted.size();
 
-                // the recurrent snapshots are only guaranteed for batches of up to n_rs_seq + 1 tokens, so a longer draft uses its checkpoint
+                // [TAG_R34_SYNC] upstream #31350 restores the checkpoint for every partial rejection of a draft longer than
+                // n_rs_seq (n_draft > n_rs_seq): upstream's recurrent snapshots only cover batches of up to n_rs_seq + 1 tokens.
+                // The fork's recurrent memory keeps the last min(T - 1, n_rs_seq) tokens of any T-token batch rollback-exact
+                // ([TAG_4C_GDN_REPLAY] / [TAG_RS_SNAP_DEPTH] cell.n_rb; test-llama-context rollback_bound checks the bound and
+                // the replay), so only a rollback deeper than n_rs_seq needs the checkpoint: the v0.26.6 rule, kept by default
+                // (no restore + re-decode when --spec-rs-seq < n_max). LLAMA_R34_SPEC_CKPT_DRAFT=1 takes upstream's condition.
+                static const bool r34_ckpt_draft = [] {
+                    const char * e = getenv("LLAMA_R34_SPEC_CKPT_DRAFT");
+                    return e != nullptr && atoi(e) != 0;
+                }();
                 const bool use_ckpt_tgt =
                     ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
-                    (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && n_draft > llama_n_rs_seq(ctx_tgt));
+                    (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS &&
+                     (r34_ckpt_draft ? (uint32_t) n_draft : n_rollback) > llama_n_rs_seq(ctx_tgt));
 
                 // check for partial draft acceptance
                 if (n_rollback > 0) {

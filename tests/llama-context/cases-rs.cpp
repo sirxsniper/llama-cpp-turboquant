@@ -409,6 +409,13 @@ struct case_rollback_bound : ctx_test {
                     "rollback " + std::to_string(r_up) + " after a " + std::to_string(n) + "-token ubatch was refused");
             CTX_REQUIRE(r_acc <= std::min(n, n_rs_seq),
                     "rollback " + std::to_string(r_acc) + " after a " + std::to_string(n) + "-token ubatch was accepted");
+            // [TAG_R34_SYNC] the server's rule (use_ckpt_tgt, v0.26.6; upstream #31350 only with LLAMA_R34_SPEC_CKPT_DRAFT=1):
+            // a verify batch of n tokens restores its checkpoint only for a rollback deeper than n_rs_seq, so every rollback
+            // up to min(n - 1, n_rs_seq) must be accepted - also after a batch longer than n_rs_seq + 1 (a refusal aborts)
+            const uint32_t r_srv = std::min(n - 1, n_rs_seq);
+            CTX_REQUIRE(r_acc >= r_srv,
+                    "rollback " + std::to_string(r_srv) + " after a " + std::to_string(n) +
+                    "-token ubatch was refused (the server's checkpoint rule needs it)");
 
             if (r_acc == 0) {
                 continue;
