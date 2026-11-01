@@ -1,0 +1,78 @@
+# [TAG_R34_LINUXCI] fork-only Linux compile check: a CPU-only build of the whole tree (llama-server, tools, tests)
+# on ubuntu-latest, then the fork's own CPU unit tests. Runs on pushes to the fork's CI branches only (and by hand),
+# so upstream's workflows (push to master, pull requests) are untouched.
+name: Linux CPU (fork)
+
+on:
+  workflow_dispatch: # allows manual triggering
+  push:
+    branches:
+      - 'flashnext/r34-linuxci'
+      - 'ci/linux-*'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  ubuntu-cpu:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Clone
+        uses: actions/checkout@v6
+
+      - name: ccache
+        uses: ggml-org/ccache-action@v1.2.24
+        with:
+          key: linux-cpu-fork
+          max-size: 2G
+          evict-old-files: job
+
+      - name: Build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake libssl-dev python3
+
+      - name: Configure
+        run: |
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DGGML_CUDA=OFF \
+            -DGGML_NATIVE=OFF \
+            -DGGML_BACKEND_DL=OFF \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DLLAMA_BUILD_TESTS=ON \
+            -DLLAMA_BUILD_SERVER=ON \
+            -DLLAMA_FATAL_WARNINGS=OFF
+
+      - name: Build (all targets)
+        run: |
+          time cmake --build build --config Release -j $(nproc) 2>&1 | tee build.log
+          test ${PIPESTATUS[0]} -eq 0
+          ls -la build/bin/llama-server
+
+      - name: Fork unit tests (named set)
+        run: |
+          cd build
+          ctest --output-on-failure --timeout 900 \
+            -R '^(test-r28-penfast|test-r29-gramfast|test-v0261-pretrim|test-fn-l22-two|test-fn-l22-p2|test-sampling|test-spec-block|test-fn-l4-host)$'
+          # every named test must exist in this build (a test that silently stopped building would pass the line above)
+          for t in test-r28-penfast test-r29-gramfast test-v0261-pretrim test-fn-l22-two test-fn-l22-p2 test-sampling test-spec-block test-fn-l4-host; do
+            ctest -N -R "^${t}\$" | grep -q "Total Tests: 1" || { echo "missing test: $t"; exit 1; }
+          done
+
+      - name: Fork unit tests (all other CPU-only fork tests)
+        run: |
+          cd build
+          ctest --output-on-failure --timeout 900 \
+            -R '^(test-fn-.*|test-mtp-.*|test-moe-.*|test-qsa-pos|test-kv-resolve|test-turbo.*|test-server-stop|test-recurrent-state-rollback)$' \
+            -E '^(test-fn-l22-two|test-fn-l22-p2|test-fn-l4-host)$'
+
+      - name: Server smoke (binary runs)
+        run: |
+          ./build/bin/llama-server --help | grep -E -- '--spec-type|turbot' | head -5
