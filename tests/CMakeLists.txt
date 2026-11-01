@@ -225,6 +225,10 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
 
 endif()
 
+# [TAG_R34_SYNC] upstream #30880 builds test-llama-archs everywhere (it no longer links internal symbols); the fork's copy
+# keeps its MTP / QSA fixtures on internal symbols (llama_model_saver, LLM_KV), so it and the tests that use its generated
+# models stay static / non-Windows only, as before the sync
+if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
 llama_build(test-llama-archs.cpp)
 if (GGML_CPU AND (NOT WIN32 OR NOT BUILD_SHARED_LIBS))
     llama_build(test-fp8.cpp)
@@ -282,6 +286,7 @@ set_tests_properties(test-llama-context PROPERTIES
     FIXTURES_REQUIRED generate-models
     ENVIRONMENT "GGML_SCHED_DEBUG_REALLOC=1"
 )
+endif() # [TAG_R34_SYNC] test-llama-archs block
 
 llama_build(test-fusion.cpp)
 
