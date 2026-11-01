@@ -6893,7 +6893,9 @@ static void clip_lend_free_device(clip_ctx * ctx) {
         t->buffer = nullptr;
     }
     ctx->make_sched();
-    if (ctx->lend.trim) { // [TAG_R34_F_VISTRIM] the pools' memory goes back with the buffers (before the give)
+    // [TAG_R34_F_VISTRIM] the pools' memory goes back with the buffers (before the give); not while pins are active (their
+    // pool growth is avoided: the VLBATCH rule keeps the high-water mark, as in v0.26.6)
+    if (ctx->lend.trim && !llama_fn_pin_active()) {
         auto * trim = (size_t (*)(ggml_backend_t, size_t)) clip_backend_proc(ctx->backend, "ggml_backend_pool_trim");
         const size_t r = clip_pool_reserved(ctx);
         ctx->lend.pool_max = std::max(ctx->lend.pool_max, r);
