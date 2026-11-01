@@ -872,6 +872,15 @@ static void ggml_backend_cuda_set_oom_hook(ggml_cuda_fn_l22_oom_fn_t fn, void * 
     ggml_cuda_fn_l22_oom_fn.store(fn);
 }
 
+// [TAG_R34_SWEEPKEEP] GGML_CUDA_R34_SWEEPKEEP=0: the 10 s graph sweep may evict the graph being requested (v0.26.6)
+bool ggml_cuda_r34_sweep_keep(void) {
+    static const bool v = [] {
+        const char * e = getenv("GGML_CUDA_R34_SWEEPKEEP");
+        return !(e && e[0] == '0');
+    }();
+    return v;
+}
+
 // [TAG_FN_L22_GRAPHKEEP] [TAG_FN_L22_GRAPH2] switches read once, at the first graph (after a model profile set them)
 int ggml_cuda_fn_l22_graph_keep(void) {
     static const int v = [] {
