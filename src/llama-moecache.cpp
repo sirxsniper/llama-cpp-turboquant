@@ -3254,8 +3254,32 @@ bool llama_moe_hot_init(const llama_model & model, const void * owner, size_t bu
             // the base slots from the budget without the KV cache's unmapped bytes: what a fit with the KV cache mapped
             // whole would give (the lend's few granules of waste come out of the headroom)
             // [TAG_R34_F_VISFLAT] without the projector's carved slots: the cut and the counts are those of its hot set without them
-            const size_t sl_base_cut = sl_e > 0 ? g_kv_want - (size_t) sl_ev*sl_per : 0;
-            const std::vector<int32_t> nv = slots_for(budget_slots > sl_base_cut ? budget_slots - sl_base_cut : 0);
+            size_t               sl_base_cut = 0;
+            std::vector<int32_t> nv;
+            for (int pass = 0; pass < 2; ++pass) {
+                sl_base_cut = sl_e > 0 ? g_kv_want - (size_t) sl_ev*sl_per : 0;
+                nv = slots_for(budget_slots > sl_base_cut ? budget_slots - sl_base_cut : 0);
+                if (sl_ev <= 0) {
+                    break;
+                }
+                // [TAG_R34_F_VISFLAT_FIT] the cut above counts sl_ev of every lend layer's own slots as lent: a layer that cannot
+                // give them all (its count <= sl_ev, or every expert of it hot: nothing to lend) keeps them, and the hot set would
+                // lie over its budget by those slots (a small card's VRAM margin). Then this hot set lays the projector's share on
+                // top of a base cut for it, as v0.26.6 does
+                size_t short_b = 0;
+                for (int li : sl_layers) {
+                    const int32_t ne2 = (int32_t) layers[li].l->ffn_up_exps->ne[2];
+                    const int32_t can = nv[li] >= ne2 ? 0 : std::max<int32_t>(0, std::min<int32_t>(sl_ev, nv[li] - 1));
+                    short_b += (size_t) (sl_ev - can)*layers[li].bytes;
+                }
+                if (short_b == 0) {
+                    break;
+                }
+                LLAMA_LOG_WARN("moe-hot: [TAG_R34_F_VISFLAT_FIT] a lend layer cannot give %d of its own slots (the hot set would "
+                        "lie %.0f MiB over its budget): the projector's share lies on top of a base cut for it (v0.26.6 layout)\n",
+                        sl_ev, short_b/1048576.0);
+                sl_ev = 0;
+            }
             for (size_t li = 0; li < layers.size(); ++li) {
                 n_slots_of[li] = nv[li];
                 used += (size_t) nv[li]*layers[li].bytes;
