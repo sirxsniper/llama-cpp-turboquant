@@ -2550,6 +2550,89 @@ static __global__ void flash_attn_pos_to_KV_max(
     }
 }
 
+// [TAG_R34_C_LIVEBM] Live-tile bitmap of a positional mask, the replacement of flash_attn_pos_to_KV_max for the turbot
+// FA (LLAMA_R34_C_LIVEBM=0 keeps the walk above). Bit t of query tile jt's words is set iff KV tile t (FATTN_KQ_STRIDE
+// cells) holds a cell that some query of the tile can see: the walk's hidden() test negated, with the same q_max / q_set
+// over the same (wrapped) query rows. Grid (ntiles_x, nwords), 256 threads: 8 warps x 4 tiles = the 32 tiles of one
+// word, every warp reads its tile with two int4 loads per lane - one load round for the whole window instead of the
+// walk's one-tile-per-iteration loop.
+//
+// Why: with --kv-unified an idle slot's cells stay in the pool when TURBO_IDLE_SLOT_LAZY=1, so the active slot's cells
+// start deep in the pool (the walk's KV_min loop then runs one serial iteration with two block barriers per 256 cells
+// of the idle slot, for every attention layer) or have the idle slot's cells (or empty cells) between them, which the
+// walk's [KV_min, KV_max) range cannot skip. The turbot kernel skips every tile whose bit is clear. A skipped tile is
+// one whose mask is -INF for every query of the tile, i.e. one whose processing leaves KQ_max, KQ_rowsum and VKQ
+// exactly as they were, and every live tile lies inside the walk's [KV_min, KV_max): the output is the same bits.
+// has_seq: the two-row form ([TAG_4C_POSMASK_MS] sequence sets in kv_seq / q_seq); without it they are unused.
+// No __restrict__ on the pointers: the kernel may be launched with PDL (see GGML_CUDA_RESTRICT in common.cuh).
+template <bool has_seq>
+static __global__ void __launch_bounds__(256, 1) flash_attn_pos_to_live_bm(
+        const int32_t * kv_pos, const int32_t * q_pos, const int32_t * kv_seq, const int32_t * q_seq,
+        uint32_t * live_bm, const int ncols1, const int ntiles_kv, const int nwords, const uint3 ne01) {
+    const int jt   = blockIdx.x;
+    const int word = blockIdx.y;
+    const int warp = threadIdx.x / WARP_SIZE;
+    const int lane = threadIdx.x % WARP_SIZE;
+    __shared__ uint32_t bits;
+    if (threadIdx.x == 0) {
+        bits = 0;
+    }
+    ggml_cuda_pdl_sync();
+    int      q_max = -1;
+    uint32_t q_set = 0;
+    for (int j = 0; j < ncols1; ++j) {
+        const int jq = fastmodulo(jt*ncols1 + j, ne01);
+        q_max = max(q_max, q_pos[jq]);
+        if constexpr (has_seq) {
+            q_set |= (uint32_t) q_seq[jq];
+        }
+    }
+    __syncthreads();
+    static_assert(FATTN_KQ_STRIDE == 8*WARP_SIZE, "live bitmap: one tile = 8 cells per lane");
+#pragma unroll
+    for (int t = 0; t < 4; ++t) {
+        const int tile = word*32 + warp*4 + t;
+        if (tile >= ntiles_kv) {
+            break;   // warp-uniform
+        }
+        const int64_t i0 = int64_t(tile)*FATTN_KQ_STRIDE + 8*lane;
+        const int4 p0 = *((const int4 *) (kv_pos + i0) + 0);
+        const int4 p1 = *((const int4 *) (kv_pos + i0) + 1);
+        const int c[8] = { p0.x, p0.y, p0.z, p0.w, p1.x, p1.y, p1.z, p1.w };
+        bool vis = false;
+        if constexpr (has_seq) {
+            const int4 s0 = *((const int4 *) (kv_seq + i0) + 0);
+            const int4 s1 = *((const int4 *) (kv_seq + i0) + 1);
+            const int s[8] = { s0.x, s0.y, s0.z, s0.w, s1.x, s1.y, s1.z, s1.w };
+#pragma unroll
+            for (int k = 0; k < 8; ++k) {
+                vis = vis || (c[k] >= 0 && c[k] <= q_max && ((uint32_t) s[k] & q_set) != 0);
+            }
+        } else {
+#pragma unroll
+            for (int k = 0; k < 8; ++k) {
+                vis = vis || (c[k] >= 0 && c[k] <= q_max);
+            }
+        }
+        if (__any_sync(0xFFFFFFFF, vis) && lane == 0) {
+            atomicOr(&bits, 1u << (warp*4 + t));
+        }
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        live_bm[int64_t(jt)*nwords + word] = bits;
+    }
+}
+
+// [TAG_R34_C_LIVEBM] LLAMA_R34_C_LIVEBM=0: the turbot FA keeps the serial KV bounds walk (v0.26.6); default on.
+static inline bool ggml_cuda_fattn_r34_livebm_on() {
+    static const bool on = [] {
+        const char * e = getenv("LLAMA_R34_C_LIVEBM");
+        return !(e != nullptr && e[0] == '0' && e[1] == '\0');
+    }();
+    return on;
+}
+
 template <int ncols1>
 __launch_bounds__(FATTN_KQ_STRIDE/2, 1)
 static __global__ void flash_attn_mask_to_KV_max(

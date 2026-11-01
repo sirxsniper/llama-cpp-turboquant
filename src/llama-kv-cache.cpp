@@ -3106,7 +3106,7 @@ void llama_kv_cache::set_input_kv_pos(ggml_tensor * dst, const llama_ubatch * ub
         const char * e = getenv("TURBO_MASK_PROBE");
         return e != nullptr && atoi(e) != 0;
     }();
-    const int64_t t_start = pos_probe ? ggml_time_us() : 0;
+    const int64_t t_start = ggml_time_us();   // [TAG_R34_C_KVDIAG] (was taken only for TURBO_MASK_PROBE)
     if (fn_keys) {
         // [TAG_FN_L22_IMGPASS_MASK] an image ubatch: keys pos * 4096 + raster rank (the graph was built for them, so the
         // plan holds: same cells, same ubatch)
@@ -3161,6 +3161,43 @@ void llama_kv_cache::set_input_kv_pos(ggml_tensor * dst, const llama_ubatch * ub
             }
             data[j] = set != 0 ? cells.pos_get(j) : -1;
             seqs[j] = (int32_t) set;
+        }
+    }
+    // [TAG_R34_C_KVDIAG] LLAMA_R34_C_KVDIAG=<N>: every N-th fill, the layout the attention sees - the window, the first and
+    // last visible cell, the visible cells, and how many FATTN_KQ_STRIDE (256-cell) tiles of [first, last] hold one (the
+    // tiles the [TAG_R34_C_LIVEBM] turbot FA computes) against all of them (the walk's [KV_min, KV_max) range). Diagnostic
+    // only; nothing changes without the variable.
+    static const int r34_kvdiag = [] {
+        const char * e = getenv("LLAMA_R34_C_KVDIAG");
+        return e ? atoi(e) : 0;
+    }();
+    if (r34_kvdiag > 0) {
+        static int64_t n_calls = 0;
+        static int64_t acc_us  = 0;
+        const int64_t t_fill = ggml_time_us() - t_start;
+        acc_us += t_fill;
+        if (++n_calls % r34_kvdiag == 0) {
+            int64_t first = -1, last = -1, n_vis = 0, live = 0, prev_t = -1;
+            for (int64_t j = 0; j < n_kv; ++j) {
+                if (data[j] >= 0) {
+                    if (first < 0) {
+                        first = j;
+                    }
+                    last = j;
+                    ++n_vis;
+                    if (j / 256 != prev_t) {
+                        ++live;
+                        prev_t = j / 256;
+                    }
+                }
+            }
+            const int64_t span = first >= 0 ? last/256 - first/256 + 1 : 0;
+            LLAMA_LOG_INFO("%s: [TAG_R34_C_KVDIAG] call %lld rows %lld n_tokens %u seqs %u: n_kv %lld used %u used_max_p1 %u, "
+                    "visible %lld in [%lld, %lld], tiles live %lld of span %lld (%.1f %%), fill %lld us (avg %.1f us)\n",
+                    __func__, (long long) n_calls, (long long) n_rows, ubatch->n_tokens, ubatch->n_seqs_unq, (long long) n_kv,
+                    v_cells[seq_to_stream[ubatch->seq_id_unq[0]]].get_used(), v_cells[seq_to_stream[ubatch->seq_id_unq[0]]].used_max_p1(),
+                    (long long) n_vis, (long long) first, (long long) last, (long long) live, (long long) span,
+                    span ? 100.0*live/span : 0.0, (long long) t_fill, (double) acc_us / n_calls);
         }
     }
     if (pos_probe) {
