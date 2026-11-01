@@ -2214,8 +2214,7 @@ void llama_context::sched_reserve() {
             if (l22_sk_parked) {
                 l22_sk_stale = true; // [TAG_FN_L22_SMALLKEEP] the kept SMALL graphs hold the old sampler set too
             }
-            LLAMA_LOG_DEBUG("%s: [TAG_R34_SMPLRES] sampler set changed: graphs dropped, no reserve (%.2f ms)
-", __func__,
+            LLAMA_LOG_DEBUG("%s: [TAG_R34_SMPLRES] sampler set changed: graphs dropped, no reserve (%.2f ms)\n", __func__,
                     (ggml_time_us() - t0)/1000.0);
         }
         return;
