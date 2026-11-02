@@ -1212,7 +1212,11 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
                     if (turbo_K && want_mma && K->ne[1] >= 4096) {
                         // fall through to MMA (previous behaviour)
-                    } else if (Q->ne[1] == 1 || (Q->ne[1] <= 2 && !vec_q2_to_mma(gqa_ratio))) {
+                    } else if ((Q->ne[1] == 1 || (Q->ne[1] <= 2 && !vec_q2_to_mma(gqa_ratio))) &&
+                               // [TAG_R35_MTPWIN] LLAMA_FN_R35_MTPWIN=2: the single-row D=256 q8_0 GQA > 4 call (the
+                               // qwen4exp MTP draft 2) goes to MMA like the multi-row drafts (A/B of the compact VEC)
+                               !(ggml_cuda_r35_mtpwin() == 2 && Q->ne[1] == 1 && Q->ne[0] == 256 && V->ne[0] == 256 &&
+                                 K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q8_0 && gqa_ratio > 4 && gqa_opt_applies)) {
                         // [TAG_FA_VEC_Q2] VEC is instantiated for cols_per_block 1 and 2
                         // only, and its two-column instance is <ncols1=2, ncols2=1> - no
                         // GQA packing at all, so it reads the cache gqa_ratio times. At
