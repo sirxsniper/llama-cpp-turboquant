@@ -462,6 +462,28 @@ struct moe_cache {
     uint64_t              r25_bad       = 0;          // verify mismatches
     uint64_t              r25_sb_sync   = 0;
     const void *          r25_owner     = nullptr;    // the context that stops the pool (llama_moe_hot_stop)
+    // [TAG_R35_X_PPH] LLAMA_FN_R35_SBBG (fn-auto default 1; 0 = v0.27.0): a borrow return above LLAMA_FN_R25_SBSYNC_MIB
+    // ([TAG_FN_L21_BIGUB]: ~3.4-4 GiB, ~1200 residents after a prompt above 16K) is copied by the R25 pool on the prompt-end
+    // pass's thread ([TAG_FN_L18_FIRSTANS_OVERLAP]) while the answer goes on, its experts named at the first step boundary
+    // after they landed - instead of trickling back through the upload worker while the CPU computes them
+    bool                  r35_sbbg      = false;
+    int                   fa18_kind     = 0;          // the job on fa18_th: 0 the prompt-end pass, 1 a borrow return
+    uint64_t              r35_sbbg_n    = 0;
+    double                r35_sbbg_ms   = 0.0;        // copy time of the background borrow returns
+    double                r35_sbbg_wait = 0.0;        // ... of it waited for (a join that could not skip)
+    // [TAG_R35_X_PPH] LLAMA_FN_R35_POSTLOG=<steps> (diagnostic, off): one line per owner step for that many decode steps
+    // after a prompt - wall time since the step before, cold / routed (token, expert) pairs, the upload queue, the borrow /
+    // tail / lend state
+    int                   r35_postlog   = 0;
+    int                   r35_post_left = 0;          // > 0: steps still logged; -1: a prompt ran, the next decode opens
+    uint64_t              r35_post_i    = 0;
+    uint64_t              r35_post_n    = 0;          // windows opened
+    int64_t               r35_post_t    = 0;
+    double                r35_post_ms   = 0.0;        // the window's sum
+    uint64_t              r35_post_c    = 0;
+    uint64_t              r35_post_r    = 0;
+    std::atomic<uint64_t> r35_cold      { 0 };        // routed (token, expert) pairs not hot in decode graphs (observer)
+    std::atomic<uint64_t> r35_tot       { 0 };
 };
 
 moe_cache * g_cache = nullptr;
@@ -1040,6 +1062,12 @@ void hot_obs_cb(const char * name, const struct ggml_tensor * ids, void * ud) {
                 if (stats) {
                     g_hot_stats.tot[il]++;
                     g_hot_stats.hit[il] += tbl[e] != ls->pub.n_slots;
+                }
+                if (mc->r35_post_left != 0) { // [TAG_R35_X_PPH] LLAMA_FN_R35_POSTLOG (-1: the first decode graph after a prompt)
+                    mc->r35_tot.fetch_add(1, std::memory_order_relaxed);
+                    if (tbl[e] == ls->pub.n_slots) {
+                        mc->r35_cold.fetch_add(1, std::memory_order_relaxed);
+                    }
                 }
                 // [TAG_FN_MOE_HOT_ADAPT] one sighting per expert and step
                 if (mc->adapt && !ls->cur_seen.empty() && !ls->cur_seen[e]) {
@@ -1927,7 +1955,8 @@ void hot_adapt_publish(moe_cache * mc) {
 // windows, then evict and queue new uploads (byte-capped). Nothing here runs while a graph of this context runs.
 void hot_adapt_step_impl(moe_cache * mc) {
     // [TAG_FN_L4_EXIT] the owner computes again: an idle pause ends (paused changes under step_mtx and wmtx)
-    if (mc->paused) {
+    // [TAG_R35_X_PPH] not while a background borrow return copies (hot_turn_join lets the worker go on)
+    if (mc->paused && !(mc->fa18_kind == 1 && mc->fa18_busy.load(std::memory_order_acquire))) {
         std::lock_guard<std::mutex> lk(mc->wmtx);
         mc->paused = false;
         hot_set_yield(mc);
@@ -2073,10 +2102,71 @@ void hot_adapt_step_impl(moe_cache * mc) {
     }
 }
 
+// [TAG_R35_X_PPH] LLAMA_FN_R35_POSTLOG: a step without decode routing (a prompt graph) arms the window, the next decode
+// steps are logged (owner's step boundary, before the step's own work; step_mtx held)
+static void hot_r35_postlog(moe_cache * mc) {
+    bool any = false;
+    for (const auto & ls : mc->layers) {
+        any = any || !ls.cur_ids.empty();
+    }
+    const int64_t now = ggml_time_us();
+    if (!any) {
+        if (mc->r35_post_left > 0 && mc->r35_post_i > 0) {
+            LLAMA_LOG_WARN("moe-hot: [TAG_R35_X_PPH] post %" PRIu64 ": cut after %" PRIu64 " steps by a prompt graph\n", mc->r35_post_n,
+                    mc->r35_post_i);
+        }
+        mc->r35_post_left = -1;
+        mc->r35_post_t    = now;
+        mc->r35_cold.store(0, std::memory_order_relaxed);
+        mc->r35_tot.store(0, std::memory_order_relaxed);
+        return;
+    }
+    if (mc->r35_post_left == -1) {
+        // the first decode step after the prompt (its time runs from the prompt's last step boundary: the first token's
+        // sampling, the draft context's pass and the checkpoint are in it)
+        mc->r35_post_left = mc->r35_postlog;
+        mc->r35_post_i    = 0;
+        mc->r35_post_n++;
+        mc->r35_post_ms   = 0.0;
+        mc->r35_post_c    = 0;
+        mc->r35_post_r    = 0;
+    }
+    if (mc->r35_post_left <= 0) {
+        return;
+    }
+    const uint64_t c = mc->r35_cold.exchange(0, std::memory_order_relaxed);
+    const uint64_t r = mc->r35_tot.exchange(0, std::memory_order_relaxed);
+    size_t q = 0;
+    {
+        std::lock_guard<std::mutex> lk(mc->wmtx);
+        q = mc->todo.size();
+    }
+    const double ms = (now - mc->r35_post_t)/1000.0;
+    mc->r35_post_ms += ms;
+    mc->r35_post_c  += c;
+    mc->r35_post_r  += r;
+    LLAMA_LOG_WARN("moe-hot: [TAG_R35_X_PPH] post %" PRIu64 " step %" PRIu64 ": %.2f ms, cold %" PRIu64 " of %" PRIu64 " routed, "
+            "queue %zu, borrow out %.0f MiB, tail out %d, lent %d, bg %d\n", mc->r35_post_n, mc->r35_post_i, ms, c, r, q,
+            mc->sb_out/1048576.0, mc->cb_out ? 1 : 0, mc->lent_any ? 1 : 0,
+            mc->fa18_busy.load(std::memory_order_relaxed) ? mc->fa18_kind + 1 : 0);
+    mc->r35_post_i++;
+    mc->r35_post_t = now;
+    if (--mc->r35_post_left == 0) {
+        LLAMA_LOG_WARN("moe-hot: [TAG_R35_X_PPH] post %" PRIu64 " done: %" PRIu64 " steps, %.2f ms per step, cold %.3f of routed\n",
+                mc->r35_post_n, mc->r35_post_i, mc->r35_post_ms/std::max<uint64_t>(1, mc->r35_post_i),
+                mc->r35_post_r ? (double) mc->r35_post_c/mc->r35_post_r : 0.0);
+    }
+}
+
 // [TAG_FN_L3_POLICY] LLAMA_MOE_HOT_STATS: the step's host time (it runs between two graphs, so it adds to the step)
 void hot_adapt_step(moe_cache * mc) {
     std::lock_guard<std::mutex> slk(mc->step_mtx); // [TAG_FN_L3_POLICY_STATE]
-    hot_turn_join(mc, mc->fa18_ovl < 2); // [TAG_FN_L18_FIRSTANS_OVERLAP] a pass in flight lands first (2: once its copies did)
+    // [TAG_FN_L18_FIRSTANS_OVERLAP] a pass in flight lands first (2: once its copies did); [TAG_R35_X_PPH] a background
+    // borrow return only once its copies did (never a wait here)
+    hot_turn_join(mc, mc->fa18_kind == 1 ? false : mc->fa18_ovl < 2);
+    if (mc->r35_postlog > 0) {
+        hot_r35_postlog(mc); // [TAG_R35_X_PPH]
+    }
     if (!mc->ad_stats) {
         hot_adapt_step_impl(mc);
         return;
@@ -3137,7 +3227,9 @@ bool llama_moe_hot_init(const llama_model & model, const void * owner, size_t bu
         mc->r25_half    = (size_t) std::max(256, std::min(65536, llama_fn_l3_int(model, "LLAMA_FN_R25_REFILL_HALF_KIB", 2048))) << 10;
         mc->r25_verify  = std::max(0, llama_fn_l3_int(model, "LLAMA_FN_R25_VERIFY", 0));
         mc->r25_sb_max  = (size_t) std::max(0, llama_fn_l3_int(model, "LLAMA_FN_R25_SBSYNC_MIB", 1024)) << 20;
+        mc->r35_sbbg    = llama_fn_l3_flag(model, "LLAMA_FN_R35_SBBG"); // [TAG_R35_X_PPH]
     }
+    mc->r35_postlog = std::max(0, llama_fn_l3_int(model, "LLAMA_FN_R35_POSTLOG", 0)); // [TAG_R35_X_PPH]
     // [TAG_FN_L4_MEM_PROMPT] the short path's ubatches (<= 31 tokens, LLAMA_FN_L4_PROMPT) build the hot chain as well, so
     // the CPU computes only the cold experts of a short prompt; the decode accounting (prompt seed above max_t) is unchanged
     if (llama_fn_l3_flag(model, "LLAMA_FN_L4_PROMPT_HOT")) {
@@ -4080,6 +4172,80 @@ size_t hot_sb_release(moe_cache * mc, const void * owner) {
 
 // [TAG_FN_L21_BIGUB] the borrow group comes back (the compute reserve is gone): mapped, cleared, its remembered residents
 // uploaded again (through the upload worker with the adaptive set, else here) unless they are resident elsewhere now
+// [TAG_R35_X_PPH] the borrow return's copies on the pass thread (fa18_th, kind 1): the residents are in flight in the
+// bookkeeping (no table names them, no pass picks their slots or them) until hot_turn_join names them at a step boundary
+// after the copies landed; every other user of the slots or of the copy pool (lend, restore, release, idle, stop, the
+// prompt-end pass) joins first and waits for them. The upload worker is put down meanwhile (the copy pool's fallback
+// shares its stream). Caller: hot_sb_restore, step_mtx held, after hot_turn_join (nothing in flight).
+static bool hot_sb_restore_bg(moe_cache * mc, size_t & n_up, size_t & bytes) {
+    std::vector<refill_job>           jobs;
+    std::vector<llama_moe_decay_swap> taken;
+    size_t b = 0;
+    for (const auto & r : mc->sb_res) {
+        layer_state & ls = mc->layers[(size_t) r[0]];
+        const int32_t sl = r[1];
+        const int32_t e  = r[2];
+        if (ls.slot_out[(size_t) sl] || ls.slot_expert[sl] >= 0 || ls.slot_in_flight[sl] || ls.expert_slot[e] >= 0 ||
+            ls.expert_in_flight[e]) {
+            continue;
+        }
+        ggml_tensor *       dsts[3] = { ls.pub.up_c,   ls.pub.gate_c,   ls.pub.down_c   };
+        const ggml_tensor * srcs[3] = { ls.pub.up_src, ls.pub.gate_src, ls.pub.down_src };
+        bool fit = true;
+        for (int k = 0; k < 3; ++k) {
+            const size_t sz = srcs[k]->nb[2];
+            fit = fit && (size_t) sl*dsts[k]->nb[2] + sz <= ggml_nbytes(dsts[k]) && (size_t) (e + 1)*sz <= ggml_nbytes(srcs[k]);
+        }
+        if (!fit) {
+            continue;
+        }
+        for (int k = 0; k < 3; ++k) {
+            const size_t sz = srcs[k]->nb[2];
+            jobs.push_back({ dsts[k], (size_t) sl*dsts[k]->nb[2], (const char *) srcs[k]->data + (size_t) e*sz, sz });
+            b += sz;
+        }
+        ls.slot_in_flight[sl]  = true;
+        ls.expert_in_flight[e] = true;
+        llama_moe_decay_swap w = {};
+        w.layer  = (int) r[0];
+        w.expert = e;
+        w.slot   = sl;
+        w.victim = -1;
+        w.gain   = 0.0f;
+        taken.push_back(w);
+    }
+    n_up  = taken.size();
+    bytes = b;
+    if (jobs.empty()) {
+        return true;
+    }
+    {
+        std::unique_lock<std::mutex> lk(mc->wmtx);
+        mc->paused = true;
+        hot_set_yield(mc);
+        mc->wcv.notify_all();
+        mc->wcv_idle.wait(lk, [mc]() { return !mc->worker_busy; });
+    }
+    const int64_t t0 = ggml_time_us();
+    mc->fa18_jobs     = std::move(jobs);
+    mc->fa18_taken    = std::move(taken);
+    mc->fa18_bytes    = b;
+    mc->fa18_kind     = 1;
+    mc->fa18_t0       = t0;
+    mc->fa18_t_idle   = t0;
+    mc->fa18_t_launch = t0;
+    mc->fa18_t_done   = t0;
+    mc->fa18_done.store(false, std::memory_order_relaxed);
+    mc->fa18_busy.store(true, std::memory_order_release);
+    mc->fa18_th = std::thread([mc]() {
+        llama_fn_thread_name("hot-sbbg");
+        (void) hot_refill(mc, mc->fa18_jobs, 8);
+        mc->fa18_t_done = ggml_time_us();
+        mc->fa18_done.store(true, std::memory_order_release);
+    });
+    return true;
+}
+
 void hot_sb_restore(moe_cache * mc, const void * owner) {
     if (!mc->sl_on || mc->sl_n_kv >= mc->sl_grp.size() || mc->sl_given[mc->sl_n_kv] == 0 || !mc->cb_buf ||
         (mc->adapt && owner != mc->owner)) {
@@ -4138,7 +4304,12 @@ void hot_sb_restore(moe_cache * mc, const void * owner) {
         sb_sync = need <= mc->r25_sb_max;
         mc->r25_sb_sync += sb_sync ? 1 : 0;
     }
-    if (!sb_sync) {
+    // [TAG_R35_X_PPH] above the R25 cap: the same copies on the pass thread, named at a step boundary once they landed
+    bool sb_bg = false;
+    if (!sb_sync && mc->adapt && mc->r35_sbbg && mc->r25_on && mc->pools.empty() && !mc->fa18_busy.load(std::memory_order_acquire)) {
+        sb_bg = hot_sb_restore_bg(mc, n_up, bytes);
+    }
+    if (!sb_sync && !sb_bg) {
         std::lock_guard<std::mutex> lk(mc->wmtx);
         for (const auto & r : mc->sb_res) {
             layer_state & ls = mc->layers[(size_t) r[0]];
@@ -4201,14 +4372,15 @@ void hot_sb_restore(moe_cache * mc, const void * owner) {
         }
     }
     mc->sb_res.clear();
-    if (!sb_sync && n_up > 0) {
+    if (!sb_sync && !sb_bg && n_up > 0) {
         mc->wcv.notify_one();
     }
     const double ms = (ggml_time_us() - t0)/1000.0;
     mc->sb_res_ms += ms;
     if (mc->sb_n <= 3 || mc->sb_n % 32 == 0) {
         LLAMA_LOG_INFO("moe-hot: [TAG_FN_L21_BIGUB] borrow %" PRIu64 " back in %.1f ms: %zu residents (%.2f GiB) %s\n", mc->sb_n, ms,
-                n_up, bytes/1073741824.0, !sb_sync ? "queued for the upload worker" : mc->adapt ? "refilled at once [TAG_FN_R25_REFILL]" : "refilled");
+                n_up, bytes/1073741824.0, sb_bg ? "copied in the background [TAG_R35_X_PPH]" : !sb_sync ? "queued for the upload worker" :
+                mc->adapt ? "refilled at once [TAG_FN_R25_REFILL]" : "refilled");
     }
 }
 
@@ -5358,13 +5530,17 @@ void hot_turn_join(moe_cache * mc, bool wait) {
         mc->fa18_th.join();
     }
     const int64_t tw = ggml_time_us();
+    const int kind = mc->fa18_kind; // [TAG_R35_X_PPH]
     for (const auto & w : mc->fa18_taken) {
         layer_state & ls = mc->layers[w.layer];
         ls.slot_expert[w.slot]        = w.expert;
         ls.expert_slot[w.expert]      = w.slot;
         ls.slot_in_flight[w.slot]     = false;
         ls.expert_in_flight[w.expert] = false;
-        hot_adapt_set_entry(mc, ls, w.expert, w.slot);
+        if (kind == 1 && (size_t) w.slot < ls.slot_dirty.size()) {
+            ls.slot_dirty[w.slot] = 0; // [TAG_R35_X_PPH] its bytes landed ([TAG_FN_L22_LENDCLASS])
+        }
+        hot_adapt_set_entry(mc, ls, w.expert, kind == 1 && ls.out() ? ls.pub.n_slots : w.slot);
     }
     if (mc->tbl_dirty) {
         ggml_backend_tensor_set(mc->tbl_all, mc->tbl_mirror.data(), 0, mc->tbl_mirror.size()*sizeof(int32_t));
@@ -5380,6 +5556,26 @@ void hot_turn_join(moe_cache * mc, bool wait) {
     const double copy_ms = (mc->fa18_t_done - mc->fa18_t_launch)/1000.0;
     const double hid_ms  = std::max(0.0, copy_ms - wait_ms);
     const double ms      = (mc->fa18_t_launch - mc->fa18_t0)/1000.0 + wait_ms; // the time the callers waited for
+    if (kind == 1) { // [TAG_R35_X_PPH] a background borrow return: its own counters, not the prompt-end pass's
+        mc->r35_sbbg_n++;
+        mc->r35_sbbg_ms   += copy_ms;
+        mc->r35_sbbg_wait += wait_ms;
+        if (mc->r35_sbbg_n <= 3 || mc->r35_sbbg_n % 32 == 0) {
+            LLAMA_LOG_INFO("moe-hot: [TAG_R35_X_PPH] borrow return %" PRIu64 ": %zu residents (%.2f GiB) copied in %.1f ms (%.1f GiB/s) "
+                    "beside the answer, named %.1f ms after the return (%.1f ms of it waited for); %.1f ms copy, %.1f ms waited per "
+                    "return so far\n", mc->r35_sbbg_n, mc->fa18_taken.size(), mc->fa18_bytes/1073741824.0, copy_ms,
+                    copy_ms > 0 ? mc->fa18_bytes/1073741824.0/(copy_ms/1000.0) : 0.0, (tw - mc->fa18_t0)/1000.0, wait_ms,
+                    mc->r35_sbbg_ms/mc->r35_sbbg_n, mc->r35_sbbg_wait/mc->r35_sbbg_n);
+        }
+        llama_fn_stall_mark("background borrow return joined (wait us, copy us)", (int64_t) (wait_ms*1000), (int64_t) (copy_ms*1000));
+        mc->fa18_jobs.clear();
+        mc->fa18_taken.clear();
+        mc->fa18_bytes = 0;
+        mc->fa18_kind  = 0;
+        mc->fa18_done.store(false, std::memory_order_relaxed);
+        mc->fa18_busy.store(false, std::memory_order_release);
+        return;
+    }
     mc->fa18_wait_ms += wait_ms;
     mc->fa18_hid_ms  += hid_ms;
     mc->fa18_n++;
