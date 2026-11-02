@@ -2657,6 +2657,32 @@ static inline bool ggml_cuda_fattn_r34_livebm_on() {
     return on;
 }
 
+// [TAG_R35_MTPWIN] LLAMA_FN_R35_MTPWIN: the single-row (MTP draft) attention on a D=256 q8_0 cache with GQA > 4.
+//   1 (default) the compact VEC instance (fattn-vec.cuh, same bits); LLAMA_FN_R35_MTPWIN_UNROLL=<1|2|4> (default 2) sets
+//     its per-tile unroll (a measurement knob)
+//   2 route that call to the MMA kernel instead (an F16 copy of the cache, as the multi-row drafts do; not the same bits)
+//   0 the v0.27.0 fully unrolled VEC instance
+static inline int ggml_cuda_r35_mtpwin() {
+    static const int v = [] {
+        const char * e = getenv("LLAMA_FN_R35_MTPWIN");
+        if (e == nullptr || e[0] == '\0') {
+            return 1;
+        }
+        const int x = atoi(e);
+        return x >= 0 && x <= 2 ? x : 1;
+    }();
+    return v;
+}
+
+static inline int ggml_cuda_r35_mtpwin_unroll() {
+    static const int v = [] {
+        const char * e = getenv("LLAMA_FN_R35_MTPWIN_UNROLL");
+        const int    x = e ? atoi(e) : 2;
+        return x == 1 || x == 4 ? x : 2;
+    }();
+    return v;
+}
+
 template <int ncols1>
 __launch_bounds__(FATTN_KQ_STRIDE/2, 1)
 static __global__ void flash_attn_mask_to_KV_max(

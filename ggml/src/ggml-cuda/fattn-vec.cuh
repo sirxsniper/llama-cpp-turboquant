@@ -16,7 +16,10 @@ static constexpr __device__ int ggml_cuda_fattn_vec_get_nthreads_device() {
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wpass-failed"
 #endif // __clang__
-template<int D, int ncols, int ncols2, ggml_type type_K, ggml_type type_V, bool use_logit_softcap> // D == head size
+// [TAG_R35_MTPWIN] vec_unroll: the unroll count of the two per-tile loops below (the KQ cells and the V cells). The default
+// 32 is >= the trip count of both loops for every instance, i.e. a full unroll as before; the compact instance
+// (ggml_cuda_flash_attn_ext_vec_case) passes 1, 2 or 4.
+template<int D, int ncols, int ncols2, ggml_type type_K, ggml_type type_V, bool use_logit_softcap, int vec_unroll = 32> // D == head size
 // PERF: bumped min_blocks_per_sm 2 → 4. With nthreads_V=16 fix the VKQ register
 // footprint per thread halved (4 entries vs 8), freeing room for higher occupancy.
 // Memory-latency-bound at depth — more in-flight blocks hide DRAM/L2 stalls better.
@@ -486,7 +489,7 @@ static __global__ void flash_attn_ext_vec(
             KQ_max_new[j] = KQ_max[j];
         }
 
-#pragma unroll
+#pragma unroll (vec_unroll)
         for (int i_KQ_0 = 0; i_KQ_0 < nthreads_KQ; ++i_KQ_0) {
             const int i_KQ = threadIdx.y*WARP_SIZE + (nthreads_KQ == WARP_SIZE ? 0 : (threadIdx.x & ~(nthreads_KQ-1))) + i_KQ_0;
 
@@ -555,7 +558,7 @@ static __global__ void flash_attn_ext_vec(
 
         ggml_cuda_syncwarp(); // Needed for KQ synchronization.
 
-#pragma unroll
+#pragma unroll (vec_unroll)
         for (int k0 = 0; k0 < WARP_SIZE; k0 += V_cols_per_iter) {
             const int k = threadIdx.y*WARP_SIZE + k0 + (nthreads_V == WARP_SIZE ? 0 : threadIdx.x / nthreads_V);
 
@@ -825,14 +828,14 @@ static __global__ void flash_attn_ext_vec(
 #pragma clang diagnostic pop
 #endif // __clang__
 
-template <int D, int ncols1, int ncols2, ggml_type type_K, ggml_type type_V, bool use_logit_softcap>
+template <int D, int ncols1, int ncols2, ggml_type type_K, ggml_type type_V, bool use_logit_softcap, int vec_unroll = 32>
 void ggml_cuda_flash_attn_ext_vec_case_impl(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
 
     constexpr int cols_per_block = ncols1*ncols2;
     const int nthreads = ggml_cuda_fattn_vec_get_nthreads_host(cc);
     const int nwarps   = nthreads / WARP_SIZE;
-    fattn_kernel_t fattn_kernel = flash_attn_ext_vec<D, cols_per_block, ncols2, type_K, type_V, use_logit_softcap>;
+    fattn_kernel_t fattn_kernel = flash_attn_ext_vec<D, cols_per_block, ncols2, type_K, type_V, use_logit_softcap, vec_unroll>;
     const bool need_f16_K = type_K == GGML_TYPE_F16;
     const bool need_f16_V = type_V == GGML_TYPE_F16;
     constexpr size_t nbytes_shared = 0;
@@ -914,6 +917,24 @@ void ggml_cuda_flash_attn_ext_vec_case(ggml_backend_cuda_context & ctx, ggml_ten
         if (logit_softcap == 0.0f) {
             constexpr bool use_logit_softcap = false;
             if (ncols2 == 6) {
+                // [TAG_R35_MTPWIN] LLAMA_FN_R35_MTPWIN=1 (default): the compact instance of the six-way D=256 q8_0 decode
+                // (the qwen4exp MTP draft's single-row attention, GQA 12; also any GQA 6/12 model on a q8_0 cache).
+                // Fully unrolled, this instance is 12.7K SASS instructions (~200 KB) with a 256-byte spill stack:
+                // its per-tile loop does not fit the SM instruction cache, so each block streams its code from
+                // L2 / DRAM twice per call (every block runs ~2 tiles at any depth: parallel_blocks follows n_kv).
+                // nsys (r35 M, owner setup): 133 us for 28 blocks at a short context, 150-400 us at 32K and
+                // 0.7-1.5 ms at 131K (same n_kv 32768, same grid; slower when L2 / DRAM are busy), against
+                // ~40 us for draft 1's 4-row MMA over the same cache. Same blocks, same split, same order of
+                // arithmetic: only the two per-tile loops are unrolled less, so the result is the same bits.
+                if constexpr (D == 256 && type_K == GGML_TYPE_Q8_0 && type_V == GGML_TYPE_Q8_0) {
+                    if (ggml_cuda_r35_mtpwin() == 1) {
+                        switch (ggml_cuda_r35_mtpwin_unroll()) {
+                            case 1:  ggml_cuda_flash_attn_ext_vec_case_impl<D, 1, 6, type_K, type_V, use_logit_softcap, 1>(ctx, dst); return;
+                            case 4:  ggml_cuda_flash_attn_ext_vec_case_impl<D, 1, 6, type_K, type_V, use_logit_softcap, 4>(ctx, dst); return;
+                            default: ggml_cuda_flash_attn_ext_vec_case_impl<D, 1, 6, type_K, type_V, use_logit_softcap, 2>(ctx, dst); return;
+                        }
+                    }
+                }
                 ggml_cuda_flash_attn_ext_vec_case_impl<D, 1, 6, type_K, type_V, use_logit_softcap>(ctx, dst);
             } else if (ncols2 == 4) {
                 ggml_cuda_flash_attn_ext_vec_case_impl<D, 1, 4, type_K, type_V, use_logit_softcap>(ctx, dst);
