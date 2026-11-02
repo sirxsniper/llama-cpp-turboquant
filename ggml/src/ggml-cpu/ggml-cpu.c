@@ -4969,6 +4969,86 @@ static int ggml_cpu_try_fuse_ops(
     return 0;
 }
 
+// [TAG_R34_OPPROF] GGML_CPU_R34_OPPROF=<ms>: a diagnostic. Thread 0 times every node of a CPU graph from its start to the
+// barrier after it (all threads done) and, for graphs of at least <ms> ms, accumulates the time per op (MUL_MAT_ID per
+// name: gate / up / down) and logs the table of every 16 such graphs (then starts a new window). Off (unset): no timing.
+#define R34_OPPROF_KEYS (GGML_OP_COUNT + 8)
+static int r34_opprof_ms(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char * e = getenv("GGML_CPU_R34_OPPROF");
+        v = e ? atoi(e) : 0;
+        if (v < 0) {
+            v = 0;
+        }
+    }
+    return v;
+}
+static int r34_opprof_key(const struct ggml_tensor * node) {
+    if (node->op == GGML_OP_MUL_MAT_ID) {
+        if (strstr(node->name, "gate")) { return GGML_OP_COUNT + 0; }
+        if (strstr(node->name, "up"))   { return GGML_OP_COUNT + 1; }
+        if (strstr(node->name, "down")) { return GGML_OP_COUNT + 2; }
+        return GGML_OP_COUNT + 3;
+    }
+    if (node->op == GGML_OP_MUL_MAT) {
+        return GGML_OP_COUNT + 4;
+    }
+    return (int) node->op;
+}
+static const char * r34_opprof_name(int k) {
+    static const char * extra[8] = { "MUL_MAT_ID(gate)", "MUL_MAT_ID(up)", "MUL_MAT_ID(down)", "MUL_MAT_ID(other)",
+                                     "MUL_MAT", "?", "?", "?" };
+    return k >= GGML_OP_COUNT ? extra[k - GGML_OP_COUNT] : ggml_op_name((enum ggml_op) k);
+}
+static void r34_opprof_graph(const struct ggml_cgraph * cgraph, const int64_t * t_key, int64_t t_all, int nth) {
+    static int64_t acc[R34_OPPROF_KEYS];
+    static int64_t acc_all = 0;
+    static int64_t n_graphs = 0;
+    static int64_t tok = 0;
+    if (t_all < (int64_t) r34_opprof_ms() * 1000) {
+        return;
+    }
+    for (int k = 0; k < R34_OPPROF_KEYS; ++k) {
+        acc[k] += t_key[k];
+    }
+    acc_all += t_all;
+    n_graphs++;
+    // the widest MUL_MAT_ID's token count, as a hint of the ubatch
+    int64_t nt = 0;
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        if (cgraph->nodes[i]->op == GGML_OP_MUL_MAT_ID && cgraph->nodes[i]->ne[2] > nt) {
+            nt = cgraph->nodes[i]->ne[2];
+        }
+    }
+    tok += nt;
+    if (n_graphs % 16 != 0) {
+        return;
+    }
+    char buf[2048];
+    int  o = snprintf(buf, sizeof(buf), "[TAG_R34_OPPROF] %lld CPU graphs >= %d ms (%d threads, ~%lld rows each): %.2f ms per graph:",
+            (long long) n_graphs, r34_opprof_ms(), nth, (long long) (tok / n_graphs), acc_all / 1000.0 / n_graphs);
+    for (int r = 0; r < 10 && o < (int) sizeof(buf) - 64; ++r) {
+        int best = -1;
+        for (int k = 0; k < R34_OPPROF_KEYS; ++k) {
+            if (acc[k] > 0 && (best < 0 || acc[k] > acc[best])) {
+                best = k;
+            }
+        }
+        if (best < 0) {
+            break;
+        }
+        o += snprintf(buf + o, sizeof(buf) - o, " %s %.2f (%.0f%%)", r34_opprof_name(best), acc[best] / 1000.0 / n_graphs,
+                100.0 * acc[best] / (acc_all > 0 ? acc_all : 1));
+        acc[best] = -acc[best]; // printed (the window ends below)
+    }
+    GGML_LOG_INFO("%s\n", buf);
+    memset(acc, 0, sizeof(acc));
+    acc_all  = 0;
+    n_graphs = 0;
+    tok      = 0;
+}
+
 static thread_ret_t ggml_graph_compute_thread(void * data) {
     struct ggml_compute_state * state = (struct ggml_compute_state *) data;
     struct ggml_threadpool    * tp    = state->threadpool;
@@ -4997,6 +5077,15 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
     GGML_PRINT_DEBUG("thread #%d compute-start cplan %p last-graph %d\n", state->ith, (const void *)cplan, state->last_graph);
 #endif
 
+    // [TAG_R34_OPPROF] thread 0 only, and only when the diagnostic is on
+    const bool r34_prof = state->ith == 0 && r34_opprof_ms() > 0;
+    int64_t r34_t_key[R34_OPPROF_KEYS];
+    int64_t r34_t0 = 0, r34_tg = 0;
+    if (r34_prof) {
+        memset(r34_t_key, 0, sizeof(r34_t_key));
+        r34_tg = ggml_time_us();
+    }
+
     for (int node_n = 0; node_n < cgraph->n_nodes && atomic_load_explicit(&tp->abort, memory_order_relaxed) != node_n; node_n++) {
         struct ggml_tensor * node = cgraph->nodes[node_n];
 
@@ -5007,6 +5096,10 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
 
         if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
             continue;
+        }
+
+        if (r34_prof) {
+            r34_t0 = ggml_time_us();
         }
 
         // TODO: move fused-op detection into ggml_graph_plan so fusion decisions are made once at planning time
@@ -5027,6 +5120,14 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         if (node_n + 1 < cgraph->n_nodes) {
             ggml_barrier(state->threadpool);
         }
+
+        if (r34_prof) {
+            r34_t_key[r34_opprof_key(node)] += ggml_time_us() - r34_t0;
+        }
+    }
+
+    if (r34_prof) {
+        r34_opprof_graph(cgraph, r34_t_key, ggml_time_us() - r34_tg, params.nth);
     }
 
 #ifdef GGML_USE_OPENMP

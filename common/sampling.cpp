@@ -146,6 +146,17 @@ static bool r29_gramfast_enabled() {
     return on;
 }
 
+// [TAG_R34_PENGUARD] LLAMA_R34_PENGUARD: 1 (default) the candidate-set paths ([TAG_R28_PENFAST], [TAG_R29_GRAMFAST]) are not
+// taken while the chain's backend part is initialised (-bs): its range apply would skip the backend samplers (top-k among
+// them) over the candidate set, where the full path's apply skips them over the whole row. 0: v0.26.6 (no check)
+static bool r34_chain_backend_guard(const struct llama_sampler * chain) {
+    static const bool on = [] {
+        const char * e = std::getenv("LLAMA_R34_PENGUARD");
+        return !(e != nullptr && e[0] != 0 && std::atoi(e) == 0);
+    }();
+    return on && llama_sampler_chain_backend_inited(chain);
+}
+
 // [TAG_R28_PENFAST] the most moved tokens (penalty windows + biased tokens) the fast path takes; penalty_last_n is 64 by default
 static constexpr size_t R28_PENFAST_MAX_MOVED = 1024;
 
@@ -245,6 +256,9 @@ bool common_sampler_penfast_apply(const common_penfast_cfg & cfg, struct llama_s
         int n_vocab, bool after_top_k, std::vector<llama_token> & excl, std::vector<llama_token_data> & cur,
         llama_token_data_array & cur_p) {
     if (cfg.top_k <= 0 || cfg.i_top_k < 0 || chain == nullptr || logits == nullptr || n_vocab <= cfg.top_k) {
+        return false;
+    }
+    if (r34_chain_backend_guard(chain)) { // [TAG_R34_PENGUARD]
         return false;
     }
 
@@ -457,6 +471,9 @@ bool common_sampler_gramfast_apply(const common_penfast_cfg & cfg, struct llama_
     sc.n_fin  = SIZE_MAX;
     sc.n_pass = 0;
     if (cfg.top_k <= 0 || cfg.i_top_k < 0 || chain == nullptr || logits == nullptr || n_vocab <= cfg.top_k) {
+        return false;
+    }
+    if (r34_chain_backend_guard(chain)) { // [TAG_R34_PENGUARD]
         return false;
     }
     if (!penfast_moved(cfg, chain, n_vocab, sc.excl)) {

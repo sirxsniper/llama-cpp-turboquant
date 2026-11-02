@@ -4,6 +4,9 @@
 #include "convert.cuh"
 #include "fn-l3.cuh"   // [TAG_FN_L3_GPU_IDXQ8]
 
+#include <atomic>  // [TAG_R34_IDXQ1]
+#include <cstring>
+
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 #if defined(TURING_MMA_AVAILABLE)
 
@@ -398,7 +401,10 @@ static __global__ void lightning_indexer_kernel_vec(
 // (row stride nbk_row) instead of from row i of a gathered copy. The gather (GET_ROWS, dequantize_q8_0) writes d*q as
 // f32 and the F32 instance loads those floats; this kernel dequantizes the same rows with dequantize_V_q8_0 (d*q in
 // f32) and runs the same score code, so the scores have the same bits. Only for the indexer the qwen4exp graph marks.
-template <int WARPS_PER_BLOCK, int K_VECS_PER_BLOCK, int64_t N_EMBD, int64_t N_HEAD>
+// [TAG_R34_IDXQ1] N_HEAD_INNER: the heads whose Q one pass stages in shared memory. N_HEAD / 4 (v0.26.6): one head per pass,
+// two barriers each; N_HEAD (GGML_CUDA_R34_IDXQ1, default): every head's Q staged once, one pass. The heads are still
+// summed in the same order with the same expressions, so the scores have the same bits.
+template <int WARPS_PER_BLOCK, int K_VECS_PER_BLOCK, int64_t N_EMBD, int64_t N_HEAD, int N_HEAD_INNER = N_HEAD / 4>
 static __global__ void lightning_indexer_kernel_vec_fn_l3(
         const float * Q, const char * K, const int32_t * rows, const float * W, const half * M, float * dst,
         int64_t n_batch, int64_t n_kv, size_t nbk_row,
@@ -440,7 +446,7 @@ static __global__ void lightning_indexer_kernel_vec_fn_l3(
 
     float score_k[K_VECS_PER_WARP] = { 0.0f };
 
-    constexpr int N_HEAD_INNER = N_HEAD / 4;
+    static_assert(N_HEAD % N_HEAD_INNER == 0, "N_HEAD_INNER must divide N_HEAD");
 
     for (int i_head_0 = 0; i_head_0 < N_HEAD; i_head_0 += N_HEAD_INNER) {
         __shared__ float  w_shared[N_HEAD_INNER];
@@ -486,7 +492,10 @@ static __global__ void lightning_indexer_kernel_vec_fn_l3(
             }
         }
 
-        __syncthreads();
+        // [TAG_R34_IDXQ1] one pass: the shared Q is not staged again, so no barrier before the scores' own
+        if (N_HEAD_INNER < N_HEAD) {
+            __syncthreads();
+        }
     }
 
     __shared__ float dst_shared[K_VECS_PER_BLOCK];
@@ -855,16 +864,79 @@ static void ggml_cuda_lightning_indexer_fn_l3(ggml_backend_cuda_context & ctx, g
 
     const dim3 grid(num_kv_blocks, n_batch, n_stream);
 
-    lightning_indexer_kernel_vec_fn_l3<WARPS_PER_BLOCK, K_VECS_PER_BLOCK, 128, 4><<<grid, block, 0, ctx.stream()>>>(
-        (const float *) q->data, (const char *) kq->data, (const int32_t *) ki->data, (const float *) w->data,
-        (const half *) m->data, (float *) dst->data,
-        n_batch, n_kv, kq->nb[1],
-        nb1, nb2, nb3,
-        nbq1, nbq2, nbq3,
-        nbw1, nbw2, nbw3,
-        nbm1, nbm2, nbm3,
-        nem3);
-    CUDA_CHECK(cudaGetLastError());
+    // [TAG_R34_IDXQ1] GGML_CUDA_R34_IDXQ1: 1 (default) every head's Q staged once per block, 0 one head per pass (v0.26.6),
+    // 2 = check: both kernels, the old one into a scratch buffer, and a bitwise compare of every written score (host sync:
+    // only outside a CUDA graph capture, so run the check with GGML_CUDA_DISABLE_GRAPHS=1)
+    static const int idxq1 = [] {
+        const char * e = getenv("GGML_CUDA_R34_IDXQ1");
+        const int v = e ? atoi(e) : 1;
+        if (v != 1) {
+            GGML_LOG_INFO("ggml_cuda: [TAG_R34_IDXQ1] GGML_CUDA_R34_IDXQ1=%d\n", v);
+        }
+        return v;
+    }();
+    cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+    if (idxq1 == 2) {
+        CUDA_CHECK(cudaStreamIsCapturing(ctx.stream(), &capture));
+    }
+    const bool check = idxq1 == 2 && capture == cudaStreamCaptureStatusNone;
+    ggml_cuda_pool_alloc<char> old_dst(ctx.pool());
+    if (idxq1 == 0 || check) {
+        char * out = (char *) dst->data;
+        if (check) {
+            out = old_dst.alloc(ggml_nbytes(dst));
+        }
+        lightning_indexer_kernel_vec_fn_l3<WARPS_PER_BLOCK, K_VECS_PER_BLOCK, 128, 4><<<grid, block, 0, ctx.stream()>>>(
+            (const float *) q->data, (const char *) kq->data, (const int32_t *) ki->data, (const float *) w->data,
+            (const half *) m->data, (float *) out,
+            n_batch, n_kv, kq->nb[1],
+            nb1, nb2, nb3,
+            nbq1, nbq2, nbq3,
+            nbw1, nbw2, nbw3,
+            nbm1, nbm2, nbm3,
+            nem3);
+        CUDA_CHECK(cudaGetLastError());
+    }
+    if (idxq1 != 0) {
+        lightning_indexer_kernel_vec_fn_l3<WARPS_PER_BLOCK, K_VECS_PER_BLOCK, 128, 4, 4><<<grid, block, 0, ctx.stream()>>>(
+            (const float *) q->data, (const char *) kq->data, (const int32_t *) ki->data, (const float *) w->data,
+            (const half *) m->data, (float *) dst->data,
+            n_batch, n_kv, kq->nb[1],
+            nb1, nb2, nb3,
+            nbq1, nbq2, nbq3,
+            nbw1, nbw2, nbw3,
+            nbm1, nbm2, nbm3,
+            nem3);
+        CUDA_CHECK(cudaGetLastError());
+    }
+    if (check) {
+        const size_t nbytes = ggml_nbytes(dst);
+        std::vector<char> h_new(nbytes), h_old(nbytes);
+        CUDA_CHECK(cudaMemcpyAsync(h_new.data(), dst->data, nbytes, cudaMemcpyDeviceToHost, ctx.stream()));
+        CUDA_CHECK(cudaMemcpyAsync(h_old.data(), old_dst.get(), nbytes, cudaMemcpyDeviceToHost, ctx.stream()));
+        CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
+        int64_t n_diff = 0, n_cmp = 0;
+        for (int64_t s = 0; s < n_stream; ++s) {
+            for (int64_t b = 0; b < n_batch; ++b) {
+                const size_t off = b*nb1 + s*nb3;
+                uint32_t xn, xo;
+                for (int64_t i = 0; i < n_kv; ++i) {
+                    memcpy(&xn, h_new.data() + off + i*sizeof(float), sizeof(xn));
+                    memcpy(&xo, h_old.data() + off + i*sizeof(float), sizeof(xo));
+                    n_diff += xn != xo;
+                }
+                n_cmp += n_kv;
+            }
+        }
+        static std::atomic<int64_t> calls{0}, diffs{0}, cmps{0};
+        const int64_t c = ++calls;
+        diffs += n_diff;
+        cmps  += n_cmp;
+        if (n_diff != 0 || c <= 4 || (c & (c - 1)) == 0) {
+            GGML_LOG_INFO("ggml_cuda: [TAG_R34_IDXQ1] check call %lld: batch %d kv %d: %lld of %lld scores differ (all calls: %lld of %lld)\n",
+                (long long) c, n_batch, n_kv, (long long) n_diff, (long long) n_cmp, (long long) diffs.load(), (long long) cmps.load());
+        }
+    }
     ggml_cuda_fn_l3_note(GGML_CUDA_FN_L3_PATH_IDXQ8, "IDXQ8: the lightning indexer reads the q8_0 pooled keys in place");
 }
 
