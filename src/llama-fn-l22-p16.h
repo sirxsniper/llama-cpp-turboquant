@@ -7,7 +7,9 @@
 //   1  experts with 1.._ROWS rows of a layer whose bytes the stream copies late run on the CPU (graph threads, during the
 //      gate wait) while pins are active; the device reads a zero expert for them; the stream also skips late experts that
 //      no row routes to (exact)
-//   2  only the skip of the late experts that no row routes to (exact, bit-identical outputs)
+//   2  only the skip of the late experts that no row routes to (exact, bit-identical outputs). [TAG_R35_ROUTED] with
+//      LLAMA_R35_CPS_NOWAIT (default 1) the stream never waits for a plan and skips any expert it has not copied yet that
+//      no row routes to (late or not); LLAMA_R35_CPS_NOWAIT=0 is the v0.27.0 rule (late experts wait <= _WAIT_MS)
 // A share layer: plan op (CPU: late set at the first layer, row counts, CPU set, skip publish, remapped ids + token list),
 // share op (CPU, all threads: the CPU experts' rows, per token sums C), share gate (waits for the bank), the device
 // MUL_MAT_IDs on the zero-expert aliases with the remapped ids, then moe_out rows of the CPU tokens += C (set_rows).
@@ -39,6 +41,21 @@ struct llama_fn_cps_cfg {
     int late_rows = 16;   // _LATE: experts predicted to get at most this many rows are copied after the layer's plan
     int early_kib = -1;   // _EARLY_KIB: early bytes kept per layer; -1 = measured plan delay x copy rate (so the copy
                           // engine has early work while the plan forms)
+    // [TAG_R35_ROUTED] LLAMA_R35_CPS_NOWAIT (mode 2 only; 0 = the v0.27.0 rule): the streamer never waits for a layer's
+    // plan. It copies the layer's experts in pieces of about one ring chunk (the early ones, then the late ones) and looks
+    // the plan up before each piece; once it is published, every expert not copied yet that no row of the ubatch routes to
+    // is skipped (Strata #4283's rule: never wait, skip what the routing shows is unused)
+    int nowait    = 1;
+    // [TAG_R35_ROUTED] LLAMA_R35_CPS_PHASES (no-wait rule only): 0 (default) = one pass over the layer's host experts in id
+    // order; 1 = the early experts, then the late ones. The split interleaves by id, so both phases came in runs of 1-2
+    // experts (~257 runs per tensor and layer): 24 % fewer bytes but only 3 % less pass time (r35 port turn 1)
+    int phases    = 0;
+    // [TAG_R35_CPSGUARD] LLAMA_R35_CPS_GUARD_KIB (0 = the v0.27.0 copies): a share job that leaves an expert out still
+    // writes the first KiB of it (its own host bytes) after every expert it does write. The batched kernels (MMQ) read
+    // past the last row of an expert into the next one (the last K iteration loads ITER_K/qk blocks against zero-padded
+    // activations); a skipped expert's slot holds an older layer's bytes, and a NaN / Inf scale there times 0 made the
+    // routed expert's last output feature NaN (r34 port: CPUSHARE=2, 1511 rows, 50 GiB skipped, then the NaN guard)
+    int guard_kib = 4;
 };
 
 // the owner context (qwen4exp, not the MTP draft) before the stream exists; reads the switches through the profile.
@@ -123,6 +140,7 @@ struct llama_fn_cps_pick_in {
     double           dma_bpu   = 40000.0; // late copy bytes per us
     double           frac      = 0.8;
     std::function<bool(int)> accept;      // or empty: called once per expert before it joins the CPU set
+    bool             skip_all  = false;   // [TAG_R35_ROUTED] skip every expert no row routes to, not only the late ones
 };
 
 struct llama_fn_cps_pick_out {
@@ -212,5 +230,10 @@ struct llama_pfs_share_counters {
     double   plan_wait_ms = 0.0; // streamer time spent waiting for plans
     double   plan_us_ewma = -1.0; // job start -> plan arrival (EWMA)
     double   dma_bpu_ewma = -1.0; // bytes per us of share passes (EWMA)
+    // [TAG_R35_ROUTED] [TAG_R35_CPSGUARD]
+    uint64_t skip_early   = 0;    // early (not late) bytes the published plan let the stream skip (no-wait rule)
+    uint64_t noplan_late  = 0;    // jobs whose late experts began before the plan was there (no-wait rule)
+    uint64_t noplan       = 0;    // jobs that ended before the plan was there (no-wait rule)
+    uint64_t guard_bytes  = 0;    // head bytes written after the written experts (guard)
 };
 LLAMA_API llama_pfs_share_counters llama_prefill_stream_share_counters();

@@ -1297,6 +1297,11 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     llama_batch batch;        // noise tokens
     llama_batch batch_inject; // target features for KV cache injection
 
+    // [TAG_R35_DFLDEV] (upstream #31506) the injection reads the target features from the target's layer input device
+    // buffer by row (LLAMA_DFLASH_DEV=0: the v0.27.0 host copies)
+    bool         use_dev_features = false;
+    common_batch batch_inject_rows;
+
     std::vector<common_sampler_ptr> smpls;
 
     // backend sampler chain per seq, attached to ctx_dft
@@ -2734,6 +2739,26 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             llama_set_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k], true);
         }
 
+        // [TAG_R35_DFLDEV] the device buffer keeps layers in ascending id order, the fc input expects target_layer_ids order
+        {
+            const char * env = getenv("LLAMA_DFLASH_DEV");
+            const bool ascending = std::adjacent_find(target_layer_ids, target_layer_ids + target_layer_ids_n,
+                    [](int32_t a, int32_t b) { return a >= b; }) == target_layer_ids + target_layer_ids_n;
+
+            use_dev_features = !is_lilicorr && ascending && (env == nullptr || atoi(env) != 0);
+            if (use_dev_features) {
+                llama_set_embeddings_layer_inp_dev(ctx_tgt, true);
+                use_dev_features = llama_supports_embd_row(ctx_dft);
+                if (!use_dev_features) {
+                    llama_set_embeddings_layer_inp_dev(ctx_tgt, false);
+                }
+            }
+            LOG_INF("%s: [TAG_R35_DFLDEV] DFlash target features via %s\n", __func__, use_dev_features ? "device buffer" : "host copies");
+            if (use_dev_features) {
+                batch_inject_rows = common_batch(ctx_dft);
+            }
+        }
+
         // DFlash2 reads its selector lattice from h_nextn and never consumes raw logits.
         llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ !is_dflash2 && !is_lilicorr);
         llama_set_causal_attn(ctx_dft, causal_attn); // DFlash needs non-causal attention unless the model says otherwise
@@ -3049,38 +3074,55 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         for (int32_t offset = 0; offset < n_rows; offset += n_ubatch) {
             const int32_t n_chunk = std::min(n_ubatch, n_rows - offset);
 
-            batch_inject.n_tokens = n_chunk;
-            for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
-                const float * layer = llama_get_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k]);
-                if (!layer) {
-                    GGML_ABORT("DFlash: target layer %d input not extracted.", target_layer_ids[k]);
-                }
+            // [TAG_R35_DFLDEV] (upstream #31506) with the target features in the target's layer input device buffer the
+            // batch names their rows (no device-to-host copy, no host gather, no upload); LLAMA_DFLASH_DEV=0: host copies
+            int32_t rc = 0;
+            if (use_dev_features) {
+                batch_inject_rows.clear();
                 for (int32_t i = 0; i < n_chunk; ++i) {
-                    float       * dst = batch_inject.embd + (size_t) i * n_embd_enc + k * (size_t) n_embd_tgt;
-                    const float * src = layer + (size_t) row_at(offset + i) * n_embd_tgt;
-                    std::memcpy(dst, src, (size_t) n_embd_tgt * sizeof(float));
+                    const int32_t j = row_at(offset + i);
+                    GGML_ASSERT(batch_in.n_seq_id[j] == 1);
+                    const llama_seq_id seq_id = batch_in.seq_id[j][0];
+                    GGML_ASSERT(seq_id >= 0 && seq_id < (llama_seq_id) n_seq);
+                    const llama_pos p          = batch_in.pos[j];
+                    const llama_pos pos_arr[4] = { p, p, p, 0 }; // an M-RoPE draft takes 4 position rows
+                    batch_inject_rows.add_embd_row(j, pos_arr, seq_id, false);
                 }
-            }
-
-            for (int32_t i = 0; i < n_chunk; ++i) {
-                const int32_t j = row_at(offset + i);
-                GGML_ASSERT(batch_in.n_seq_id[j] == 1);
-                const llama_seq_id seq_id = batch_in.seq_id[j][0];
-                GGML_ASSERT(seq_id >= 0 && seq_id < (llama_seq_id) n_seq);
-                const llama_pos p = batch_in.pos[j];
-                batch_inject.pos[i] = p;
-                if (is_mrope) {
-                    // embd batches on an M-RoPE draft need 4 position rows per token
-                    batch_inject.pos[1 * n_chunk + i] = p;
-                    batch_inject.pos[2 * n_chunk + i] = p;
-                    batch_inject.pos[3 * n_chunk + i] = 0;
+                rc = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch_inject_rows.get());
+            } else {
+                batch_inject.n_tokens = n_chunk;
+                for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
+                    const float * layer = llama_get_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k]);
+                    if (!layer) {
+                        GGML_ABORT("DFlash: target layer %d input not extracted.", target_layer_ids[k]);
+                    }
+                    for (int32_t i = 0; i < n_chunk; ++i) {
+                        float       * dst = batch_inject.embd + (size_t) i * n_embd_enc + k * (size_t) n_embd_tgt;
+                        const float * src = layer + (size_t) row_at(offset + i) * n_embd_tgt;
+                        std::memcpy(dst, src, (size_t) n_embd_tgt * sizeof(float));
+                    }
                 }
-                batch_inject.n_seq_id[i]  = 1;
-                batch_inject.seq_id[i][0] = seq_id;
-                batch_inject.logits[i]    = false;
-            }
 
-            int32_t rc = llama_decode(ctx_dft, batch_inject);
+                for (int32_t i = 0; i < n_chunk; ++i) {
+                    const int32_t j = row_at(offset + i);
+                    GGML_ASSERT(batch_in.n_seq_id[j] == 1);
+                    const llama_seq_id seq_id = batch_in.seq_id[j][0];
+                    GGML_ASSERT(seq_id >= 0 && seq_id < (llama_seq_id) n_seq);
+                    const llama_pos p = batch_in.pos[j];
+                    batch_inject.pos[i] = p;
+                    if (is_mrope) {
+                        // embd batches on an M-RoPE draft need 4 position rows per token
+                        batch_inject.pos[1 * n_chunk + i] = p;
+                        batch_inject.pos[2 * n_chunk + i] = p;
+                        batch_inject.pos[3 * n_chunk + i] = 0;
+                    }
+                    batch_inject.n_seq_id[i]  = 1;
+                    batch_inject.seq_id[i][0] = seq_id;
+                    batch_inject.logits[i]    = false;
+                }
+
+                rc = llama_decode(ctx_dft, batch_inject);
+            }
             if (rc != 0) {
                 LOG_ERR("%s: llama_decode(ctx_dft) failed rc=%d (n_tokens=%d, offset=%d)\n",
                         __func__, rc, (int) n_chunk, (int) offset);

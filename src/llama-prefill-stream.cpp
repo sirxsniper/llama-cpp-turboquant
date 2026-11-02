@@ -224,6 +224,10 @@ struct pfs_state {
     int                      cps_mode    = 0;     // the configured share mode (0 off)
     bool                     zexp        = false; // the banks carry a zero expert behind every layer (mode 1)
     int                      cps_wait_ms = 100;   // the most a share job waits for its layer's plan
+    bool                     cps_nowait  = false; // [TAG_R35_ROUTED] mode 2: no wait, skip what the plan shows unused
+    size_t                   cps_guard   = 0;     // [TAG_R35_CPSGUARD] head bytes written after each written expert
+    bool                     cps_phases  = false; // [TAG_R35_ROUTED] no wait: early then late experts (else one id-ordered pass)
+    bool                     one_poke    = true;  // [TAG_R35_ONEPOKE] LLAMA_R35_PFS_ONEPOKE: one event + flush per ring slot
     int64_t                  n_exp_max   = 0;     // mask stride
     uint64_t                 share_gen   = 0;     // the generation whose jobs have a late phase (0: none)
     std::vector<uint8_t>     late;                // [n_pos][n_exp_max] under mtx
@@ -578,6 +582,7 @@ void pfs_run(pfs_state * s) {
     // [TAG_FN_L22_CPUSHARE]
     std::vector<uint8_t>                     late_l;
     std::vector<uint8_t>                     skip_l;
+    std::vector<uint8_t>                     wr[3]; // [TAG_R35_CPSGUARD] the experts of tensor k a share job writes from the host
 
     for (;;) {
         pfs_job job;
@@ -610,8 +615,9 @@ void pfs_run(pfs_state * s) {
             s->cur_gen = job.gen;
             s->cur_pos = job.pos;
             // [TAG_FN_L22_CPUSHARE] a job of a share ubatch (never layer 0: a new ubatch keeps bank 0's copy)
+            // [TAG_R35_ROUTED] the no-wait rule also skips early experts: a share job even without late ones
             if (s->cps_mode > 0 && s->share_gen != 0 && job.gen == s->share_gen && !job.wrap && job.pos > 0 &&
-                s->late_any[job.pos] != 0 && s->layers[job.pos].exp_ok) {
+                (s->cps_nowait || s->late_any[job.pos] != 0) && s->layers[job.pos].exp_ok) {
                 const int64_t ne = s->layers[job.pos].src[0]->ne[2];
                 const uint8_t * m = s->late.data() + (size_t) job.pos*s->n_exp_max;
                 late_l.assign(m, m + ne);
@@ -710,15 +716,21 @@ void pfs_run(pfs_state * s) {
             dispatching = true;
             return true;
         };
-        auto dispatch = [&](const item & it) {
+        // [TAG_R35_ONEPOKE] fin: the last piece of its ring slot (or a direct copy). With LLAMA_R35_PFS_ONEPOKE (default 1) a
+        // slot's event and the copy stream's flush (a WDDM stream query, ~20 us) follow its last piece only; the routed
+        // stream cuts a slot into many pieces (~23K per pass: bytes -21 % but pass time -2 % with a flush per piece)
+        auto dispatch = [&](const item & it, bool fin) {
             ggml_backend_tensor_set_async(s->copy, B.raw, it.src, it.dst, it.n);
+            fin = fin || !s->one_poke;
             if (it.slot >= 0) {
-                gen5::ev_record(s->chunk_ev[it.slot], s->copy);
-                s->chunk_state[it.slot] = 2;
+                if (fin) {
+                    gen5::ev_record(s->chunk_ev[it.slot], s->copy);
+                    s->chunk_state[it.slot] = 2;
+                }
             } else {
                 bytes_pin += it.n;
             }
-            if (s->poke) {
+            if (s->poke && fin) {
                 s->poke(s->copy); // [TAG_FN_L3_HOST_POKE] the copy starts now, while this thread stages the next chunk
             }
             bytes += it.n;
@@ -727,8 +739,8 @@ void pfs_run(pfs_state * s) {
             if (!dispatching && !begin()) {
                 return false;
             }
-            for (const item & it : staged) {
-                dispatch(it);
+            for (size_t i = 0; i < staged.size(); ++i) {
+                dispatch(staged[i], i + 1 == staged.size() || staged[i + 1].slot != staged[i].slot);
             }
             staged.clear();
             return true;
@@ -743,7 +755,7 @@ void pfs_run(pfs_state * s) {
                         cancelled = true;
                         break;
                     }
-                    dispatch({ -1, src + o, s->off[k] + o, std::min(s->chunk, r.second - o) });
+                    dispatch({ -1, src + o, s->off[k] + o, std::min(s->chunk, r.second - o) }, true);
                 }
             }
         };
@@ -753,11 +765,11 @@ void pfs_run(pfs_state * s) {
                 return;
             }
             s->chunk_state[pcs.front().slot] = 1;
-            for (const item & it : pcs) {
+            for (size_t i = 0; i < pcs.size(); ++i) {
                 if (dispatching) {
-                    dispatch(it);
+                    dispatch(pcs[i], i + 1 == pcs.size());
                 } else {
-                    staged.push_back(it);
+                    staged.push_back(pcs[i]);
                 }
             }
             pcs.clear();
@@ -928,7 +940,7 @@ void pfs_run(pfs_state * s) {
                             }
                             continue;
                         }
-                        dispatch({ -1, (const uint8_t *) seg.src, s->off[k] + o, seg.len });
+                        dispatch({ -1, (const uint8_t *) seg.src, s->off[k] + o, seg.len }, true);
                         if (seg.ticket >= 0) {
                             job_tk.push_back(seg.ticket);
                         }
@@ -978,10 +990,37 @@ void pfs_run(pfs_state * s) {
                       L.src[k]->nb[2]*(size_t) n_exp == L.nbytes[k];
             }
         }
+        // [TAG_FN_L22_CPUSHARE] share job sums
+        bool     skipped_any  = false;
+        uint64_t b_skip       = 0;
+        uint64_t b_late       = 0;
+        uint64_t b_skip_early = 0; // [TAG_R35_ROUTED]
+        uint64_t b_guard      = 0; // [TAG_R35_CPSGUARD]
+        // [TAG_R35_CPSGUARD] in a share job a run of experts also writes the head of the expert after it (that expert's own
+        // host bytes: finite scales), so a kernel that reads past the run's last row never meets an older layer's bytes in a
+        // slot this job leaves out; wr[k] marks the experts the job writes from the host
+        const size_t guard = share ? s->cps_guard : 0;
+        if (guard > 0) {
+            for (int k = 0; k < 3; ++k) {
+                wr[k].assign((size_t) n_exp, 0);
+            }
+        }
+        auto push_run = [&](int k, int64_t e0, int64_t e1) {
+            const size_t nb = L.src[k]->nb[2];
+            size_t hi = (size_t) e1*nb;
+            if (guard > 0) {
+                std::fill(wr[k].begin() + e0, wr[k].begin() + e1, (uint8_t) 1);
+                if (e1 < n_exp) {
+                    const size_t g = std::min(guard, nb);
+                    hi = std::min(L.nbytes[k], hi + g);
+                    b_guard += g;
+                }
+            }
+            ranges.push_back({ (size_t) e0*nb, hi });
+        };
         // [TAG_FN_L22_CPUSHARE] the runs of experts for which pred(e) holds, as byte ranges of tensor k
         auto ranges_where = [&](int k, const auto & pred) {
             ranges.clear();
-            const size_t nb = L.src[k]->nb[2];
             for (int64_t e = 0; e < n_exp; ) {
                 if (!pred(e)) {
                     ++e;
@@ -991,8 +1030,64 @@ void pfs_run(pfs_state * s) {
                 while (e1 < n_exp && pred(e1)) {
                     ++e1;
                 }
-                ranges.push_back({ (size_t) e*nb, (size_t) e1*nb });
+                push_run(k, e, e1);
                 e = e1;
+            }
+        };
+        // [TAG_R35_ROUTED] the no-wait rule: the layer's plan, looked up without waiting (got_plan: skip_l holds its mask)
+        const bool nowait   = share && s->cps_nowait;
+        bool       got_plan = false;
+        bool       noplan_late = false;
+        auto poll_plan = [&]() {
+            if (!nowait || got_plan) {
+                return;
+            }
+            std::lock_guard<std::mutex> lk(s->mtx);
+            if (s->pub_gen[job.pos] == job.gen) {
+                got_plan = true;
+                const uint8_t * m = s->skip.data() + (size_t) job.pos*s->n_exp_max;
+                skip_l.assign(m, m + n_exp);
+                const double plan_us = (double) std::max<int64_t>(0, s->pub_us[job.pos] - t_job0);
+                s->sctr.plan_us_ewma = s->sctr.plan_us_ewma < 0 ? plan_us : 0.8*s->sctr.plan_us_ewma + 0.2*plan_us;
+            }
+        };
+        // [TAG_R35_ROUTED] the experts of tensor k for which pred(e) holds, in id order, in pieces of about one ring chunk;
+        // before each piece the plan is looked up, and once it is here the experts it skips (no row routes to them) are left
+        // out. Nothing waits for the plan: a piece copied before it arrived stays copied
+        auto stream_routed = [&](int k, const auto & pred, bool late_phase) {
+            const size_t nb    = L.src[k]->nb[2];
+            const size_t piece = std::max(s->chunk, nb);
+            int64_t e = 0;
+            while (e < n_exp && !cancelled) {
+                poll_plan();
+                ranges.clear();
+                size_t acc = 0;
+                while (e < n_exp && acc < piece) {
+                    if (!pred(e)) {
+                        ++e;
+                        continue;
+                    }
+                    if (got_plan && skip_l[e] != 0) {
+                        (late_phase ? b_skip : b_skip_early) += nb;
+                        skipped_any = true;
+                        ++e;
+                        continue;
+                    }
+                    int64_t e1 = e + 1;
+                    while (e1 < n_exp && pred(e1) && !(got_plan && skip_l[e1] != 0) &&
+                           acc + (size_t) (e1 + 1 - e)*nb <= piece) {
+                        ++e1;
+                    }
+                    push_run(k, e, e1);
+                    acc += (size_t) (e1 - e)*nb;
+                    if (late_phase) {
+                        b_late += (uint64_t) (e1 - e)*nb;
+                    }
+                    e = e1;
+                }
+                if (!ranges.empty()) {
+                    stream_ranges(k);
+                }
             }
         };
         if (!share) {
@@ -1003,6 +1098,14 @@ void pfs_run(pfs_state * s) {
                     ranges.assign(1, { (size_t) 0, L.nbytes[k] });
                 }
                 stream_ranges(k);
+            }
+        } else if (nowait) {
+            // [TAG_R35_ROUTED] the host experts not in a hot slot, in pieces: the plan usually arrives while the first ones
+            // copy, and from then on the unrouted ones are left out. LLAMA_R35_CPS_PHASES=1: the early (not late) ones here,
+            // the late ones after the slot copies
+            const bool phases = s->cps_phases;
+            for (int k = 0; k < 3 && !cancelled; ++k) {
+                stream_routed(k, [&](int64_t e) { return !(d2d && hot_slot[e] >= 0) && (!phases || late_l[e] == 0); }, false);
             }
         } else {
             // [TAG_FN_L22_CPUSHARE] the early experts first: host experts that are neither in a hot slot nor late
@@ -1046,10 +1149,17 @@ void pfs_run(pfs_state * s) {
             }
         }
         // [TAG_FN_L22_CPUSHARE] the late experts: wait (bounded) for the layer's plan, then copy the ones it does not skip
-        bool     skipped_any = false;
-        uint64_t b_skip      = 0;
-        uint64_t b_late      = 0;
-        if (share && !cancelled) {
+        if (nowait && !cancelled && s->cps_phases) {
+            // [TAG_R35_ROUTED] no wait: the late experts in pieces, the plan looked up before each
+            poll_plan();
+            noplan_late = !got_plan;
+            for (int k = 0; k < 3 && !cancelled; ++k) {
+                stream_routed(k, [&](int64_t e) { return !(d2d && hot_slot[e] >= 0) && late_l[e] != 0; }, true);
+            }
+            if (!cancelled && !flush()) {
+                cancelled = true;
+            }
+        } else if (share && !nowait && !cancelled) {
             const int64_t tw0 = ggml_time_us();
             bool got = false;
             bool timed_out = false;
@@ -1086,6 +1196,27 @@ void pfs_run(pfs_state * s) {
             for (int k = 0; k < 3 && !cancelled; ++k) {
                 ranges_where(k, [&](int64_t e) { return !(d2d && hot_slot[e] >= 0) && late_l[e] != 0 && skip_l[e] == 0; });
                 stream_ranges(k);
+            }
+            if (!cancelled && !flush()) {
+                cancelled = true;
+            }
+        }
+        // [TAG_R35_CPSGUARD] an expert after one the hot set's slots gave (device copy: no head of the next expert) that this
+        // job did not write from the host: its head, so the slot expert's over-read finds finite bytes
+        if (share && guard > 0 && d2d && !cancelled) {
+            for (int k = 0; k < 3 && !cancelled; ++k) {
+                const size_t nb = L.src[k]->nb[2];
+                const size_t g  = std::min(guard, nb);
+                ranges.clear();
+                for (int64_t e = 1; e < n_exp; ++e) {
+                    if (hot_slot[e - 1] >= 0 && hot_slot[e] < 0 && wr[k][e] == 0) {
+                        ranges.push_back({ (size_t) e*nb, (size_t) e*nb + g });
+                        b_guard += g;
+                    }
+                }
+                if (!ranges.empty()) {
+                    stream_ranges(k);
+                }
             }
             if (!cancelled && !flush()) {
                 cancelled = true;
@@ -1155,8 +1286,14 @@ void pfs_run(pfs_state * s) {
                 if (share) { // [TAG_FN_L22_CPUSHARE]
                     B.partial = skipped_any;
                     s->sctr.jobs++;
-                    s->sctr.skip_bytes += b_skip;
+                    s->sctr.skip_bytes += b_skip + b_skip_early; // [TAG_R35_ROUTED] early skips too
                     s->sctr.late_bytes += b_late;
+                    s->sctr.skip_early  += b_skip_early;
+                    s->sctr.guard_bytes += b_guard; // [TAG_R35_CPSGUARD]
+                    if (nowait) {
+                        s->sctr.noplan_late += noplan_late ? 1 : 0;
+                        s->sctr.noplan      += got_plan ? 0 : 1;
+                    }
                 }
                 s->ctr.jobs++;
                 s->ctr.bytes += bytes;
@@ -1651,6 +1788,7 @@ bool llama_prefill_stream_init_layers(const std::vector<llama_moe_gen5_layer_des
     s->cp_pin  = gen5::env_int("LLAMA_PREFILL_STREAM_PIN", 0, 0, 2);
     s->cp_affs = gen5::copy_affinities(s->cp_pin);
     s->cp_grain = (size_t) gen5::env_int("LLAMA_PREFILL_STREAM_GRAIN_KIB", 0, 0, 65536) << 10;
+    s->one_poke = gen5::env_int("LLAMA_R35_PFS_ONEPOKE", 1, 0, 1) != 0; // [TAG_R35_ONEPOKE] 0: a flush per piece (v0.27.0)
     if (s->min_tokens > 32 && !s->lend) { // [TAG_FN_R1_PFS_LEND] a lending stream reserves with the op offload
         LLAMA_LOG_WARN("prefill-stream: LLAMA_PREFILL_STREAM_MIN=%" PRId64 " > 32: ubatches of 32..%" PRId64 " tokens keep the "
                 "op-offload copies, which the compute buffer was not reserved for\n", s->min_tokens, s->min_tokens - 1);
@@ -1664,6 +1802,9 @@ bool llama_prefill_stream_init_layers(const std::vector<llama_moe_gen5_layer_des
         s->cps_mode    = cps->mode;
         s->zexp        = cps->mode == 1;
         s->cps_wait_ms = std::max(1, cps->wait_ms);
+        s->cps_nowait  = cps->mode == 2 && cps->nowait != 0;      // [TAG_R35_ROUTED]
+        s->cps_guard   = (size_t) std::max(0, cps->guard_kib) << 10; // [TAG_R35_CPSGUARD]
+        s->cps_phases  = cps->phases != 0;                              // [TAG_R35_ROUTED]
     }
     ggml_context * zctx = nullptr; // the zero-expert shapes, only to ask the buffer type for their alloc size
     if (s->zexp) {
@@ -1883,8 +2024,15 @@ bool llama_prefill_stream_init_layers(const std::vector<llama_moe_gen5_layer_des
                 al.empty() ? "no topology - not pinned" : al.c_str());
     }
     if (s->cps_mode > 0) {
-        LLAMA_LOG_INFO("prefill-stream: [TAG_FN_L22_CPUSHARE] share mode %d: late experts after each layer's plan (wait <= %d ms)%s\n",
-                s->cps_mode, s->cps_wait_ms, s->zexp ? ", a zero expert behind every layer in the banks" : "");
+        if (s->cps_nowait) {
+            LLAMA_LOG_INFO("prefill-stream: [TAG_R35_ROUTED] share mode %d, no wait: every expert not copied yet that no row "
+                    "routes to is skipped once the layer's plan is published (%s); [TAG_R35_CPSGUARD] guard %zu KiB\n", s->cps_mode,
+                    s->cps_phases ? "early experts first, then the late ones" : "one pass in expert order", s->cps_guard >> 10);
+        } else {
+            LLAMA_LOG_INFO("prefill-stream: [TAG_FN_L22_CPUSHARE] share mode %d: late experts after each layer's plan (wait <= %d ms)%s; "
+                    "[TAG_R35_CPSGUARD] guard %zu KiB\n", s->cps_mode, s->cps_wait_ms,
+                    s->zexp ? ", a zero expert behind every layer in the banks" : "", s->cps_guard >> 10);
+        }
     }
     return true;
 }

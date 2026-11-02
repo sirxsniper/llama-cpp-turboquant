@@ -480,6 +480,8 @@ void cps_plan_op(ggml_tensor * dst, int ith, int nth, void * ud) {
         in.dma_bpu = sc.dma_bpu_ewma > 0 ? std::min(60000.0, std::max(5000.0, sc.dma_bpu_ewma)) : 40000.0;
     }
     in.frac = 0.8;
+    // [TAG_R35_ROUTED] the no-wait rule: the stream may skip any expert it has not copied yet that no row routes to
+    in.skip_all = g->cfg.mode == 2 && g->cfg.nowait != 0;
     std::vector<cps_slice> slices((size_t) ne);
     uint64_t dropped = 0;
     if (cpu_on) {
@@ -885,7 +887,7 @@ void llama_fn_cps_pick(const llama_fn_cps_pick_in & in, llama_fn_cps_pick_out & 
             out.table[e] = ne;
             out.skip[e]  = 1;
             out.skip_cpu += in.bytes ? in.bytes[e] : 0;
-        } else if (in.late[e] && out.rows[e] == 0) {
+        } else if ((in.late[e] || in.skip_all) && out.rows[e] == 0) { // [TAG_R35_ROUTED] skip_all: late or not
             out.skip[e]  = 1;
             out.skip_unr += in.bytes ? in.bytes[e] : 0;
         }
@@ -1084,12 +1086,17 @@ int llama_fn_cpushare_configure_cfg(const llama_fn_cps_cfg & cfg, const llama_mo
         LLAMA_LOG_WARN("%s: [TAG_FN_L22_CPUSHARE] the CPU backend has no kernel lookup: mode 2 (skip only)\n", __func__);
         g->cfg.mode = 2;
     }
+    const bool nowait = g->cfg.mode == 2 && g->cfg.nowait != 0; // [TAG_R35_ROUTED]
     LLAMA_LOG_INFO("%s: [TAG_FN_L22_CPUSHARE] mode %d (%s): ubatches <= %d rows, late experts <= %d predicted rows, CPU experts "
-            "1..%d rows, %d tokens, k %d, plan wait <= %d ms, multi-row kernels %s\n", __func__, g->cfg.mode,
-            g->cfg.mode == 1 ? "CPU share while pins are active + skip of unrouted late experts" : "skip of unrouted late experts",
-            g->cfg.max_t, g->cfg.late_rows, g->cfg.rows, g->cfg.cap, g->cfg.k_fixed, g->cfg.wait_ms, g->mr_get ? "on" : "off");
-    llama_fn_l22_log("switch", "sub=cps mode=%d max=%d rows=%d late=%d cap=%d k=%d wait_ms=%d", g->cfg.mode, g->cfg.max_t,
-            g->cfg.rows, g->cfg.late_rows, g->cfg.cap, g->cfg.k_fixed, g->cfg.wait_ms);
+            "1..%d rows, %d tokens, k %d, plan wait <= %d ms, multi-row kernels %s; [TAG_R35_CPSGUARD] guard %d KiB\n", __func__,
+            g->cfg.mode, g->cfg.mode == 1 ? "CPU share while pins are active + skip of unrouted late experts" :
+            (nowait ? "[TAG_R35_ROUTED] no wait: skip of every expert not copied yet that no row routes to" :
+                      "skip of unrouted late experts"),
+            g->cfg.max_t, g->cfg.late_rows, g->cfg.rows, g->cfg.cap, g->cfg.k_fixed, nowait ? 0 : g->cfg.wait_ms,
+            g->mr_get ? "on" : "off", g->cfg.guard_kib);
+    llama_fn_l22_log("switch", "sub=cps mode=%d max=%d rows=%d late=%d cap=%d k=%d wait_ms=%d nowait=%d phases=%d guard_kib=%d",
+            g->cfg.mode, g->cfg.max_t, g->cfg.rows, g->cfg.late_rows, g->cfg.cap, g->cfg.k_fixed, g->cfg.wait_ms, nowait ? 1 : 0,
+            g->cfg.phases, g->cfg.guard_kib);
     return g->cfg.mode;
 }
 
@@ -1115,6 +1122,9 @@ int llama_fn_cpushare_configure(const llama_model & model, const void * owner) {
     c.wait_ms   = num("LLAMA_FN_L22_CPUSHARE_WAIT_MS", 100, 1, 10000);
     c.late_rows = num("LLAMA_FN_L22_CPUSHARE_LATE", 16, 0, 4096);
     c.early_kib = num("LLAMA_FN_L22_CPUSHARE_EARLY_KIB", -1, -1, 1 << 22);
+    c.nowait    = num("LLAMA_R35_CPS_NOWAIT", 1, 0, 1);       // [TAG_R35_ROUTED] 0: the v0.27.0 rule
+    c.phases    = num("LLAMA_R35_CPS_PHASES", 0, 0, 1);       // [TAG_R35_ROUTED] 1: early then late experts
+    c.guard_kib = num("LLAMA_R35_CPS_GUARD_KIB", 4, 0, 1024); // [TAG_R35_CPSGUARD] 0: the v0.27.0 copies
     return llama_fn_cpushare_configure_cfg(c, &model, owner);
 }
 

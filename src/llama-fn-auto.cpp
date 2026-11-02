@@ -264,7 +264,7 @@ const fn_item k_items[] = {
     { "LLAMA_FN_L21_BIGUB",             "1",      P_ALL }, // [TAG_FN_L21_BIGUB]
     // [TAG_FN_L22] round 22 (E:/turbot-gates/flashnext/test/r22/PLAN.md section 6): the build defaults of the test's NEW
     // arm, one row per switch (package, tag). Code default of every new switch = off; the answer-changing X levers, PIN,
-    // DMASHARE and CPUSHARE stay 0 here (owner calls). No row: LLAMA_FN_L22_LOGITDUMP (unset) and _PIN_MAX_MIB (no value).
+    // DMASHARE stays 0 here (owner call; CPUSHARE: 2 since r35, see its row). No row: LLAMA_FN_L22_LOGITDUMP (unset) and _PIN_MAX_MIB (no value).
     { "LLAMA_FN_L22_PASSLOG",               "1",       P_ALL }, // P0 [TAG_FN_L22_PASSLOG] per-pass / switch / residency / pin / media / turn lines (0/1/2)
     { "LLAMA_FN_L22_IMGPASS",               "1",       P_ALL }, // P1 P3 [TAG_FN_L22_IMGPASS] one prompt pass per image turn
     { "LLAMA_FN_L22_IMGPASS_MASK",          "auto",    P_ALL }, // P1 [TAG_FN_L22_IMGPASS_MASK] auto = keys | keys | explicit
@@ -358,7 +358,9 @@ const fn_item k_items[] = {
     { "LLAMA_FN_L22_X_PRIOR",               "0",       P_ALL }, // P12 [TAG_FN_L22_X_PRIOR] changes answers: owner
     { "LLAMA_FN_L22_X_PRIOR_STATS",         "raw",     P_ALL }, // P12
     { "LLAMA_FN_L22_X_RESIDENT",            "0",       P_ALL }, // P12 changes answers: owner
-    { "LLAMA_FN_L22_CPUSHARE",              "0",       P_ALL }, // P16 [TAG_FN_L22_CPUSHARE] M11, the pin block sets 1; owner
+    // [TAG_R35_ROUTED] round 35: mode 2 (skip only, exact: token-identical with the static hot set) with the no-wait rule and
+    // the over-read guard; LLAMA_FN_L22_CPUSHARE=0 restores v0.27.0. Mode 1 (the CPU share) stays an owner call
+    { "LLAMA_FN_L22_CPUSHARE",              "2",       P_ALL }, // P16 [TAG_FN_L22_CPUSHARE] M11, the pin block sets 1; [TAG_R35_ROUTED] 2
     { "LLAMA_FN_L22_CPUSHARE_MAX",          "3072",    P_ALL }, // P16
     { "LLAMA_FN_L22_CPUSHARE_ROWS",         "8",       P_ALL }, // P16
 };
