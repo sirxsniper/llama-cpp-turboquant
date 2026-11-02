@@ -86,6 +86,12 @@ set_target_properties(llama PROPERTIES
 set_source_files_properties(${LLAMA_CORE_SOURCES} ../include/llama.h unicode.h
     PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON)
 
+# [TAG_R34_FPCONTRACT] the CPU share op and its vec_dot reference (llama-fn-cpushare.cpp) without FP contraction, like the
+# CPU backend (GGML_CPU_FP_CONTRACT_OFF, ggml/CMakeLists.txt): its weighted sums must round the same on both paths
+if (GGML_CPU_FP_CONTRACT_OFF AND NOT MSVC AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    set_source_files_properties(llama-fn-cpushare.cpp PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
+endif()
+
 configure_file(llama-version.h.in ${CMAKE_CURRENT_BINARY_DIR}/llama-version.h @ONLY)
 
 # [TAG_TURBOT_EMBED_PLAN] The built-in turbot plan is compiled in from the checked-in llama-turbot-default-plan.h, which

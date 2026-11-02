@@ -151,6 +151,11 @@ message(DEBUG "INS_ENB             : ${INS_ENB}")
 option(GGML_CPU_HBM          "ggml: use memkind for CPU HBM" OFF)
 option(GGML_CPU_REPACK       "ggml: use runtime weight conversion of Q4_0 to Q4_X_X" ON)
 option(GGML_CPU_KLEIDIAI     "ggml: use KleidiAI optimized kernels if applicable" OFF)
+# [TAG_R34_FPCONTRACT] GCC / Clang (not MSVC, which never contracts): the CPU backend without floating-point contraction.
+# The fork's fused CPU paths (multi-row dot products, the MoE pool's weighted sum, the CPU share op) are bitwise equal to
+# their references only when every multiply and add rounds on its own; GCC's default -ffp-contract=fast fuses them at
+# some call sites and not at others (test-fn-l22-cpushare, test-fn-l22-pool on Linux). OFF: the compiler default (v0.26.6).
+option(GGML_CPU_FP_CONTRACT_OFF "ggml: build the CPU backend with -ffp-contract=off (GCC/Clang)" ON)
 option(GGML_SSE42            "ggml: enable SSE 4.2"          ${INS_ENB})
 option(GGML_AVX              "ggml: enable AVX"              ${INS_ENB})
 option(GGML_AVX_VNNI         "ggml: enable AVX-VNNI"         OFF)
