@@ -65,6 +65,10 @@ struct llama_context {
     //   - etc.
     void sched_reserve();
 
+    // [TAG_R34_SMPLRES] a backend sampler was attached or detached: with LLAMA_R34_SMPLRES (default on) the next decode
+    // drops the graphs that hold the old sampler set instead of a full scheduler reserve; =0 restores the v0.26.6 reserve
+    void sched_smpl_changed();
+
     void synchronize();
 
     // [TAG_FN_L4_EXIT] the caller has no work for now: the graphs, the host step after the last one and the hot set's
@@ -432,6 +436,7 @@ private:
     ggml_backend_sched_ptr sched;
 
     bool sched_need_reserve = true;
+    bool sched_smpl_dirty   = false; // [TAG_R34_SMPLRES]
 
     // whether the reserve graph has a logits tensor, set in sched_reserve()
     // true until then, because the first output_reserve() runs before any graph is reserved

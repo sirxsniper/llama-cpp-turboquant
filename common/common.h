@@ -10,6 +10,8 @@
 
 #include <array>
 #include <list>
+#include <memory>  // [TAG_R34_NOINIT] std::allocator
+#include <utility> // [TAG_R34_NOINIT] std::forward
 #include <set>
 #include <sstream>
 #include <string>
@@ -1373,6 +1375,21 @@ enum ggml_opt_optimizer_type common_opt_get_optimizer(const char *);
 //
 // prompt utils
 //
+
+// [TAG_R34_NOINIT] (upstream #30137) leave default-inserted elements uninitialized; callers must fill them before use
+template <typename T>
+struct common_no_init_allocator : std::allocator<T> {
+    template <typename U> struct rebind { using other = common_no_init_allocator<U>; };
+
+    common_no_init_allocator() = default;
+    template <typename U> common_no_init_allocator(const common_no_init_allocator<U> &) {}
+
+    template <typename U> void construct(U * p) { ::new ((void *) p) U; }
+    template <typename U, typename... Args> void construct(U * p, Args &&... args) { ::new ((void *) p) U(std::forward<Args>(args)...); }
+};
+
+// sequence state data, filled by llama_state_seq_get_data_ext() right after the allocation
+using common_state_data = std::vector<uint8_t, common_no_init_allocator<uint8_t>>;
 
 struct common_prompt_checkpoint {
     int64_t n_tokens;

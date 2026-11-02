@@ -1569,6 +1569,7 @@ struct ggml_cuda_graph_key_memo {
 #define GGML_CUDA_FN_L22_EAGER_KEY ((const void *) (uintptr_t) 2)
 struct ggml_backend_cuda_context;
 int  ggml_cuda_fn_l22_graph_keep(void);
+bool ggml_cuda_r34_sweep_keep(void); // [TAG_R34_SWEEPKEEP]
 void ggml_cuda_fn_l22_evict_for_new(ggml_backend_cuda_context * ctx, const void * key);
 
 // [TAG_FN_L22_GRAPHKEEP] per-context counters (index = ggml_backend_cuda_graph_counters order)
@@ -1679,10 +1680,21 @@ struct ggml_backend_cuda_context {
         const bool keep = ggml_cuda_fn_l22_graph_keep() >= 1;
 
         // sweep every 5s, evicting cuda graphs unused for >=10s
+        // [TAG_R34_SWEEPKEEP] (upstream #30662) never the graph this call is about to use, and the age of a graph counts from
+        // the latest use of any graph of this context, so a pause between two turns ages nothing: the graphs of a turn after a
+        // pause of more than 10 s were evicted and warmed up / captured again (GGML_CUDA_R34_SWEEPKEEP=0: v0.26.6)
         if (!keep && time_now - last_graph_eviction_sweep >= 5'000'000) {
             last_graph_eviction_sweep = time_now;
+            const bool skip_req = ggml_cuda_r34_sweep_keep();
+            int64_t    t_ref    = time_now;
+            if (skip_req) {
+                t_ref = 0;
+                for (const auto & g : cuda_graphs) {
+                    t_ref = std::max(t_ref, g.second->last_used_time);
+                }
+            }
             for (auto it = cuda_graphs.begin(); it != cuda_graphs.end(); ) {
-                if (time_now - it->second->last_used_time >= 10'000'000) {
+                if (!(skip_req && it->first == first_node_ptr) && t_ref - it->second->last_used_time >= 10'000'000) {
                     it = cuda_graphs.erase(it);
                 } else {
                     ++it;

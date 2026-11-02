@@ -1449,8 +1449,18 @@ struct server_slot {
     // when it goes, so two side requests in turn never make the second one's predecessor the slot's recall
     bool                  recall_side  = false;
 
+    // [TAG_R34_CKPTMOVE] the caller clears the slot right after this save (idle-slot clear, pool room, purge): the kept
+    // checkpoints move into the cache entry instead of a copy (149-178 MiB each on the 27B); LLAMA_R34_CKPTMOVE=0 copies
+    bool prompt_save_moving(server_prompt_cache & prompt_cache, const server_tokens * tokens_next = nullptr) {
+        static const bool on = [] {
+            const char * e = getenv("LLAMA_R34_CKPTMOVE");
+            return !(e && e[0] == '0');
+        }();
+        return prompt_save(prompt_cache, tokens_next, false, on ? &prompt.checkpoints : nullptr);
+    }
+
     bool prompt_save(server_prompt_cache & prompt_cache, const server_tokens * tokens_next = nullptr,
-                     bool shared = false) const {
+                     bool shared = false, std::list<common_prompt_checkpoint> * ckpt_src = nullptr) const {
         if (prompt.tokens.size() == 0) {
             return false;
         }
@@ -1463,7 +1473,7 @@ struct server_slot {
         SRV_TRC(" - saving prompt with length %d, total state size = %.3f MiB (draft: %.3f MiB)\n",
                 (int) prompt.tokens.size(), cur_size / (1024.0 * 1024.0), cur_size_dft / (1024.0 * 1024.0));
 
-        auto * cur = prompt_cache.alloc(prompt, cur_size_tgt, cur_size_dft, tokens_next, shared);
+        auto * cur = prompt_cache.alloc(prompt, cur_size_tgt, cur_size_dft, tokens_next, shared, ckpt_src);
     if (cur != nullptr) {
         cur->shared = shared;
     }
@@ -1560,7 +1570,7 @@ struct server_slot {
     // context, and every other field (task, sampler, grammar, sampled token, draft, stats, generated text, stream) is
     // untouched until resume.
     bool                 parked          = false;
-    std::vector<uint8_t> park_tgt;
+    common_state_data    park_tgt; // [TAG_R34_NOINIT] moves into a prompt-cache entry
     int32_t              park_cells      = 0;      // attention cells the park freed, needed again to resume
     size_t               park_n_tokens   = 0;      // prompt.tokens.size() at park, verified on resume
     slot_state           park_state      = SLOT_STATE_IDLE;
@@ -3787,7 +3797,7 @@ private:
                             }
                             SLT_INF(o, "__TEST_TAG_POOL_LOAD_ROOM__ saving and clearing %zu tokens for a cached prompt of %" PRId64 " cells\n",
                                     o.prompt.tokens.size(), need);
-                            o.prompt_save(*prompt_cache, &task.tokens);
+                            o.prompt_save_moving(*prompt_cache, &task.tokens); // [TAG_R34_CKPTMOVE]
                             o.prompt_clear();
                         }
                         // [TAG_V0262_IDLELAZY] still no room (the wait gave up, or busy slots hold the cells): the restore
@@ -5217,7 +5227,7 @@ private:
                 if (off >= 0 && batch_has_rows(slot.id, off)) {
                     continue;
                 }
-                if (prompt_cache && slot.prompt_save(*prompt_cache)) {
+                if (prompt_cache && slot.prompt_save_moving(*prompt_cache)) { // [TAG_R34_CKPTMOVE] purged below
                     prompt_cache->update();
                     SLT_INF(slot, "__TEST_TAG_POOL_IDLE_SAVED__ %zu tokens\n", slot.prompt.tokens.size());
                 } else {
@@ -5582,13 +5592,13 @@ private:
             }
         }
 
-        std::vector<uint8_t> bt;
+        common_state_data bt; // [TAG_R34_NOINIT] filled by the state read below (a short read does not park)
         for (;;) {
             try {
-                bt.resize(n_tgt);
+                server_state_resize(bt, n_tgt);
                 break;
             } catch (const std::bad_alloc &) {
-                bt = std::vector<uint8_t>();
+                bt = common_state_data();
                 if (!prompt_cache || prompt_cache->states.empty()) {
                     SLT_ERR(s, "[TAG_POOL_PREEMPT] not parking (%s): cannot allocate %.1f MiB of host memory\n",
                             why, n_tgt / 1048576.0);
@@ -5679,7 +5689,7 @@ private:
         if (prompt_cache) {
             prompt_cache->reserved -= std::min(prompt_cache->reserved, s.park_tgt.size());
         }
-        s.park_tgt = std::vector<uint8_t>();
+        s.park_tgt = common_state_data();
         s.parked   = false;
         s.t_run_us = now;
         pool_n_parked--;
@@ -5709,7 +5719,7 @@ private:
                 if (auto * cur = prompt_cache->alloc(s.prompt, 0, n_dft)) {
                     cur->data.main = std::move(s.park_tgt);
                     if (n_dft > 0 && llama_state_seq_get_data_ext(ctx_dft, cur->data.drft.data(), n_dft, s.id, LLAMA_STATE_SEQ_FLAGS_NONE) != n_dft) {
-                        cur->data.drft = std::vector<uint8_t>();   // restored later with an empty drafter window: acceptance only
+                        cur->data.drft = common_state_data();   // restored later with an empty drafter window: acceptance only
                     }
                 }
             }
@@ -5719,7 +5729,7 @@ private:
             llama_memory_seq_rm(llama_get_memory(ctx_dft), s.id, -1, -1);
         }
         SLT_WRN(s, "__TEST_TAG_POOL_PARK_DROP__ to_cache = %d, n_tokens = %zu\n", (int) to_cache, s.prompt.tokens.size());
-        s.park_tgt = std::vector<uint8_t>();
+        s.park_tgt = common_state_data();
         s.parked   = false;
         pool_n_parked--;
         s.prompt.clear();
@@ -7522,7 +7532,8 @@ private:
                             if (!slot.is_processing()) {
                                 SLT_TRC(slot, "%s", "saving idle slot to prompt cache\n");
 
-                                if (slot.prompt_save(*prompt_cache)) {
+                                // [TAG_R34_CKPTMOVE] with a unified pool the slot is cleared right below
+                                if (params_base.kv_unified ? slot.prompt_save_moving(*prompt_cache) : slot.prompt_save(*prompt_cache)) {
                                     SLT_DBG(slot, "%s", "__TEST_TAG_CACHE_IDLE_SLOT__\n");
                                     prompt_cache->update();
                                 }
