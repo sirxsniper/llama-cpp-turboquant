@@ -46,6 +46,10 @@ struct llama_fn_cps_cfg {
     // the plan up before each piece; once it is published, every expert not copied yet that no row of the ubatch routes to
     // is skipped (Strata #4283's rule: never wait, skip what the routing shows is unused)
     int nowait    = 1;
+    // [TAG_R35_ROUTED] LLAMA_R35_CPS_PHASES (no-wait rule only): 0 (default) = one pass over the layer's host experts in id
+    // order; 1 = the early experts, then the late ones. The split interleaves by id, so both phases came in runs of 1-2
+    // experts (~257 runs per tensor and layer): 24 % fewer bytes but only 3 % less pass time (r35 port turn 1)
+    int phases    = 0;
     // [TAG_R35_CPSGUARD] LLAMA_R35_CPS_GUARD_KIB (0 = the v0.27.0 copies): a share job that leaves an expert out still
     // writes the first KiB of it (its own host bytes) after every expert it does write. The batched kernels (MMQ) read
     // past the last row of an expert into the next one (the last K iteration loads ITER_K/qk blocks against zero-padded

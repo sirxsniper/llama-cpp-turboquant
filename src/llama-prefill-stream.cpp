@@ -226,6 +226,7 @@ struct pfs_state {
     int                      cps_wait_ms = 100;   // the most a share job waits for its layer's plan
     bool                     cps_nowait  = false; // [TAG_R35_ROUTED] mode 2: no wait, skip what the plan shows unused
     size_t                   cps_guard   = 0;     // [TAG_R35_CPSGUARD] head bytes written after each written expert
+    bool                     cps_phases  = false; // [TAG_R35_ROUTED] no wait: early then late experts (else one id-ordered pass)
     int64_t                  n_exp_max   = 0;     // mask stride
     uint64_t                 share_gen   = 0;     // the generation whose jobs have a late phase (0: none)
     std::vector<uint8_t>     late;                // [n_pos][n_exp_max] under mtx
@@ -1092,10 +1093,12 @@ void pfs_run(pfs_state * s) {
                 stream_ranges(k);
             }
         } else if (nowait) {
-            // [TAG_R35_ROUTED] the early experts first (host experts neither in a hot slot nor late), in pieces: the plan
-            // usually arrives while they copy, and from then on their unrouted ones are left out too
+            // [TAG_R35_ROUTED] the host experts not in a hot slot, in pieces: the plan usually arrives while the first ones
+            // copy, and from then on the unrouted ones are left out. LLAMA_R35_CPS_PHASES=1: the early (not late) ones here,
+            // the late ones after the slot copies
+            const bool phases = s->cps_phases;
             for (int k = 0; k < 3 && !cancelled; ++k) {
-                stream_routed(k, [&](int64_t e) { return !(d2d && hot_slot[e] >= 0) && late_l[e] == 0; }, false);
+                stream_routed(k, [&](int64_t e) { return !(d2d && hot_slot[e] >= 0) && (!phases || late_l[e] == 0); }, false);
             }
         } else {
             // [TAG_FN_L22_CPUSHARE] the early experts first: host experts that are neither in a hot slot nor late
@@ -1139,7 +1142,7 @@ void pfs_run(pfs_state * s) {
             }
         }
         // [TAG_FN_L22_CPUSHARE] the late experts: wait (bounded) for the layer's plan, then copy the ones it does not skip
-        if (nowait && !cancelled) {
+        if (nowait && !cancelled && s->cps_phases) {
             // [TAG_R35_ROUTED] no wait: the late experts in pieces, the plan looked up before each
             poll_plan();
             noplan_late = !got_plan;
@@ -1149,7 +1152,7 @@ void pfs_run(pfs_state * s) {
             if (!cancelled && !flush()) {
                 cancelled = true;
             }
-        } else if (share && !cancelled) {
+        } else if (share && !nowait && !cancelled) {
             const int64_t tw0 = ggml_time_us();
             bool got = false;
             bool timed_out = false;
@@ -1793,6 +1796,7 @@ bool llama_prefill_stream_init_layers(const std::vector<llama_moe_gen5_layer_des
         s->cps_wait_ms = std::max(1, cps->wait_ms);
         s->cps_nowait  = cps->mode == 2 && cps->nowait != 0;      // [TAG_R35_ROUTED]
         s->cps_guard   = (size_t) std::max(0, cps->guard_kib) << 10; // [TAG_R35_CPSGUARD]
+        s->cps_phases  = cps->phases != 0;                              // [TAG_R35_ROUTED]
     }
     ggml_context * zctx = nullptr; // the zero-expert shapes, only to ask the buffer type for their alloc size
     if (s->zexp) {
@@ -2014,8 +2018,8 @@ bool llama_prefill_stream_init_layers(const std::vector<llama_moe_gen5_layer_des
     if (s->cps_mode > 0) {
         if (s->cps_nowait) {
             LLAMA_LOG_INFO("prefill-stream: [TAG_R35_ROUTED] share mode %d, no wait: every expert not copied yet that no row "
-                    "routes to is skipped once the layer's plan is published (early experts first, then the late ones); "
-                    "[TAG_R35_CPSGUARD] guard %zu KiB\n", s->cps_mode, s->cps_guard >> 10);
+                    "routes to is skipped once the layer's plan is published (%s); [TAG_R35_CPSGUARD] guard %zu KiB\n", s->cps_mode,
+                    s->cps_phases ? "early experts first, then the late ones" : "one pass in expert order", s->cps_guard >> 10);
         } else {
             LLAMA_LOG_INFO("prefill-stream: [TAG_FN_L22_CPUSHARE] share mode %d: late experts after each layer's plan (wait <= %d ms)%s; "
                     "[TAG_R35_CPSGUARD] guard %zu KiB\n", s->cps_mode, s->cps_wait_ms,

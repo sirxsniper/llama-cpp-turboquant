@@ -1094,9 +1094,9 @@ int llama_fn_cpushare_configure_cfg(const llama_fn_cps_cfg & cfg, const llama_mo
                       "skip of unrouted late experts"),
             g->cfg.max_t, g->cfg.late_rows, g->cfg.rows, g->cfg.cap, g->cfg.k_fixed, nowait ? 0 : g->cfg.wait_ms,
             g->mr_get ? "on" : "off", g->cfg.guard_kib);
-    llama_fn_l22_log("switch", "sub=cps mode=%d max=%d rows=%d late=%d cap=%d k=%d wait_ms=%d nowait=%d guard_kib=%d", g->cfg.mode,
-            g->cfg.max_t, g->cfg.rows, g->cfg.late_rows, g->cfg.cap, g->cfg.k_fixed, g->cfg.wait_ms, nowait ? 1 : 0,
-            g->cfg.guard_kib);
+    llama_fn_l22_log("switch", "sub=cps mode=%d max=%d rows=%d late=%d cap=%d k=%d wait_ms=%d nowait=%d phases=%d guard_kib=%d",
+            g->cfg.mode, g->cfg.max_t, g->cfg.rows, g->cfg.late_rows, g->cfg.cap, g->cfg.k_fixed, g->cfg.wait_ms, nowait ? 1 : 0,
+            g->cfg.phases, g->cfg.guard_kib);
     return g->cfg.mode;
 }
 
@@ -1123,6 +1123,7 @@ int llama_fn_cpushare_configure(const llama_model & model, const void * owner) {
     c.late_rows = num("LLAMA_FN_L22_CPUSHARE_LATE", 16, 0, 4096);
     c.early_kib = num("LLAMA_FN_L22_CPUSHARE_EARLY_KIB", -1, -1, 1 << 22);
     c.nowait    = num("LLAMA_R35_CPS_NOWAIT", 1, 0, 1);       // [TAG_R35_ROUTED] 0: the v0.27.0 rule
+    c.phases    = num("LLAMA_R35_CPS_PHASES", 0, 0, 1);       // [TAG_R35_ROUTED] 1: early then late experts
     c.guard_kib = num("LLAMA_R35_CPS_GUARD_KIB", 4, 0, 1024); // [TAG_R35_CPSGUARD] 0: the v0.27.0 copies
     return llama_fn_cpushare_configure_cfg(c, &model, owner);
 }
