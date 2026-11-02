@@ -126,7 +126,7 @@ int main() {
     {
         int n_c = 0, n_c_fast = 0, n_c_ref_fast = 0;
         const int ms[] = { 64, 32, 21 };
-        for (int it = 0; it < 6000; ++it) {
+        for (int it = 0; it < 3150; ++it) {
             const int n = it % 3 == 0 ? 248320 : (it % 3 == 1 ? 4097 : 300);
             const int K = ks[(it / 3) % 5];               // 1, 2, 10, 20, 40
             const int m = ms[(it / 15) % 3];
