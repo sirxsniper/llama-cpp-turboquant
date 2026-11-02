@@ -92,6 +92,7 @@
 #include <charconv>
 #include <chrono>
 #include <cinttypes>
+#include <cmath>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -896,6 +897,18 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
 
     if (copy_event != nullptr) {
         CUDA_CHECK(cudaEventDestroy(copy_event));
+    }
+    if (r35_diag != nullptr) { // [TAG_R35_CHUNKMERGE]
+        ggml_cuda_set_device(device);
+        for (int k = 0; k < ggml_cuda_r35_diag::N; ++k) {
+            if (r35_diag->ev0[k] != nullptr) {
+                CUDA_CHECK(cudaEventSynchronize(r35_diag->ev1[k]));
+                CUDA_CHECK(cudaEventDestroy(r35_diag->ev0[k]));
+                CUDA_CHECK(cudaEventDestroy(r35_diag->ev1[k]));
+            }
+        }
+        delete r35_diag;
+        r35_diag = nullptr;
     }
     for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
         for (int j = 0; j < GGML_CUDA_MAX_STREAMS; ++j) {
@@ -4320,6 +4333,12 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
         ggml_cuda_graph::fn_l22_variant cur;
         cur.instances      = std::move(graph->instances); // [TAG_UPSTREAM_30804] the chunk list
         graph->instances.clear();
+        cur.r35_graphs     = std::move(graph->r35_graphs); // [TAG_R35_CHUNKMERGE] its captures and merged executable
+        graph->r35_graphs.clear();
+        cur.r35_merged     = graph->r35_merged;
+        graph->r35_merged  = nullptr;
+        cur.r35_failed     = graph->r35_failed;
+        graph->r35_failed  = false;
         cur.node_props     = std::move(g2_old);
         cur.pool_top_known = graph->pool_top_known;
         memcpy(cur.pool_top, graph->pool_top, sizeof(cur.pool_top));
@@ -4329,6 +4348,11 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
         for (ggml_cuda_graph::fn_l22_variant & v : graph->fn_l22_alt) {
             if (ggml_cuda_fn_l22_props_equal(v.node_props, graph->node_props)) {
                 graph->instances      = std::move(v.instances);
+                graph->r35_graphs     = std::move(v.r35_graphs); // [TAG_R35_CHUNKMERGE]
+                v.r35_graphs.clear();
+                graph->r35_merged     = v.r35_merged;
+                v.r35_merged          = nullptr;
+                graph->r35_failed     = v.r35_failed;
                 graph->pool_top_known = v.pool_top_known;
                 memcpy(graph->pool_top, v.pool_top, sizeof(graph->pool_top));
                 graph->n_replay_cap    = 1;
@@ -4396,6 +4420,31 @@ static int ggml_cuda_graph_chunk_size() {
     return chunk_size;
 }
 
+// [TAG_R35_CHUNKMERGE] 0 = v0.27.0 (chunk lists only), 1 = merged executables for replays (default), 2 = diagnostic (replays
+// alternate merged / chunk list with a CUDA event span each, a summary line every 256 spans). CUDA only.
+static int ggml_cuda_r35_chunkmerge() {
+    static const int v = [] {
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+        return 0;
+#else
+        const char * e = getenv("GGML_CUDA_R35_CHUNKMERGE");
+        const int    r = e != nullptr ? atoi(e) : 1;
+        return r < 0 ? 0 : r > 2 ? 1 : r;
+#endif
+    }();
+    return v;
+}
+
+// [TAG_R35_CHUNKMERGE] unchanged replays of a chunk list (since its capture) before its merge (GGML_CUDA_R35_CHUNKMERGE_AFTER)
+static uint32_t ggml_cuda_r35_chunkmerge_after() {
+    static const uint32_t v = [] {
+        const char * e = getenv("GGML_CUDA_R35_CHUNKMERGE_AFTER");
+        const int    r = e != nullptr ? atoi(e) : 4;
+        return (uint32_t) (r < 1 ? 1 : r);
+    }();
+    return v;
+}
+
 // [TAG_UPSTREAM_30804] chunk idx of graph was captured into cuda_graph: update its executable (or create it) and launch it
 static void ggml_cuda_graph_exec_chunk(ggml_backend_cuda_context * cuda_ctx, ggml_cuda_graph * graph, size_t idx,
                                        cudaGraph_t cuda_graph) {
@@ -4407,8 +4456,181 @@ static void ggml_cuda_graph_exec_chunk(ggml_backend_cuda_context * cuda_ctx, ggm
         ggml_cuda_fn_l22_instantiate(cuda_ctx, graph, &instance, cuda_graph); // [TAG_FN_L22_GRAPHKEEP] cap, OOM hook
         graph->instances.push_back(instance);
     }
-    CUDA_CHECK(cudaGraphDestroy(cuda_graph));
+    if (ggml_cuda_r35_chunkmerge() > 0) {
+        // [TAG_R35_CHUNKMERGE] the capture stays for a merge (instances[idx] now runs exactly this graph); a new capture of
+        // any chunk retires the merged executable
+        graph->r35_drop_merged();
+        graph->r35_failed = false;
+        if (graph->r35_graphs.size() <= idx) {
+            graph->r35_graphs.resize(idx + 1, nullptr);
+        }
+        if (graph->r35_graphs[idx] != nullptr) {
+            CUDA_CHECK(cudaGraphDestroy(graph->r35_graphs[idx]));
+        }
+        graph->r35_graphs[idx] = cuda_graph;
+    } else {
+        CUDA_CHECK(cudaGraphDestroy(cuda_graph));
+    }
     CUDA_CHECK(cudaGraphLaunch(graph->instances[idx], cuda_ctx->stream()));
+}
+
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+// [TAG_R35_CHUNKMERGE] what the merges did (one log line at the first merge and every 256 merges after it)
+static std::atomic<uint64_t> g_ggml_cuda_r35_n_built{0};
+static std::atomic<uint64_t> g_ggml_cuda_r35_n_failed{0};
+static std::atomic<uint64_t> g_ggml_cuda_r35_build_us{0};
+
+// [TAG_R35_CHUNKMERGE] one executable of graph's chunk captures: a parent graph with one child graph node per chunk (the child
+// graph is cloned into its node), each node depending on the one before, instantiated with the chunks' flags. On any error
+// the chunk list stays in use (r35_failed) until the next capture.
+static void ggml_cuda_r35_build(ggml_backend_cuda_context * ctx, ggml_cuda_graph * graph) {
+    const size_t n = graph->instances.size();
+    bool ok = graph->r35_graphs.size() == n;
+    for (size_t i = 0; ok && i < n; ++i) {
+        ok = graph->r35_graphs[i] != nullptr;
+    }
+    if (!ok) {
+        graph->r35_failed = true;
+        return;
+    }
+    const int64_t t0 = ggml_time_us();
+    size_t free0 = 0, free1 = 0, total = 0;
+    const bool    log_this = g_ggml_cuda_r35_n_built.load(std::memory_order_relaxed) % 256 == 0;
+    if (log_this) {
+        (void) cudaMemGetInfo(&free0, &total);
+    }
+    cudaGraph_t     parent = nullptr;
+    cudaError_t     err    = cudaGraphCreate(&parent, 0);
+    cudaGraphNode_t prev   = nullptr;
+    for (size_t i = 0; err == cudaSuccess && i < n; ++i) {
+        cudaGraphNode_t node = nullptr;
+        err  = cudaGraphAddChildGraphNode(&node, parent, prev != nullptr ? &prev : nullptr, prev != nullptr ? 1 : 0,
+                                          graph->r35_graphs[i]);
+        prev = node;
+    }
+    cudaGraphExec_t merged = nullptr;
+    if (err == cudaSuccess) {
+        // [TAG_FN_L4_QSA_STREAMS] the chunks' instantiate flags (node priorities of the QSA side stream)
+        err = cudaGraphInstantiateWithFlags(&merged, parent, ctx->fn_l4_prio ? cudaGraphInstantiateFlagUseNodePriority : 0);
+    }
+    if (parent != nullptr) {
+        CUDA_CHECK(cudaGraphDestroy(parent));
+    }
+    if (err != cudaSuccess) {
+        (void) cudaGetLastError();
+        graph->r35_failed = true;
+        const uint64_t nf = g_ggml_cuda_r35_n_failed.fetch_add(1, std::memory_order_relaxed);
+        if (nf < 4) {
+            GGML_LOG_WARN("ggml_cuda: [TAG_R35_CHUNKMERGE] merge of %zu chunks (%zu ggml nodes) failed: %s - the chunk list "
+                    "replays as before\n", n, graph->node_props.size(), cudaGetErrorString(err));
+        }
+        return;
+    }
+    graph->r35_merged = merged;
+    const int64_t  us = ggml_time_us() - t0;
+    const uint64_t nb = g_ggml_cuda_r35_n_built.fetch_add(1, std::memory_order_relaxed) + 1;
+    const uint64_t tu = g_ggml_cuda_r35_build_us.fetch_add((uint64_t) us, std::memory_order_relaxed) + (uint64_t) us;
+    if (log_this) {
+        (void) cudaMemGetInfo(&free1, &total);
+        GGML_LOG_WARN("ggml_cuda: [TAG_R35_CHUNKMERGE] merged executable %" PRIu64 ": %zu chunks (%zu ggml nodes) in %.2f ms "
+                "(mean %.2f ms), free VRAM %.1f -> %.1f MiB, failed so far %" PRIu64 "\n", nb, n, graph->node_props.size(),
+                us / 1000.0, tu / 1000.0 / nb, free0 / 1048576.0, free1 / 1048576.0,
+                g_ggml_cuda_r35_n_failed.load(std::memory_order_relaxed));
+    }
+}
+
+// [TAG_R35_CHUNKMERGE] GGML_CUDA_R35_CHUNKMERGE=2: the spans of finished replays into the sums (non-blocking)
+static void ggml_cuda_r35_diag_harvest(ggml_cuda_r35_diag & d) {
+    for (int k = 0; k < ggml_cuda_r35_diag::N; ++k) {
+        if (d.kind[k] < 0) {
+            continue;
+        }
+        const cudaError_t q = cudaEventQuery(d.ev1[k]);
+        if (q == cudaErrorNotReady) {
+            (void) cudaGetLastError();
+            continue;
+        }
+        CUDA_CHECK(q);
+        float ms = 0.0f;
+        CUDA_CHECK(cudaEventElapsedTime(&ms, d.ev0[k], d.ev1[k]));
+        const int b = d.kind[k];
+        d.n[b]++;
+        d.ms[b]  += ms;
+        d.ms2[b] += (double) ms * ms;
+        d.kind[k] = -1;
+    }
+    const uint64_t n_all = d.n[0] + d.n[1];
+    if (n_all >= d.n_print + 256) {
+        d.n_print = n_all;
+        double mean[2], sd[2];
+        for (int b = 0; b < 2; ++b) {
+            mean[b] = d.n[b] > 0 ? d.ms[b] / d.n[b] : 0.0;
+            sd[b]   = d.n[b] > 1 ? sqrt(std::max(0.0, (d.ms2[b] - d.ms[b] * mean[b]) / (d.n[b] - 1))) : 0.0;
+        }
+        const double se = (d.n[0] > 0 && d.n[1] > 0) ? sqrt(sd[0] * sd[0] / d.n[0] + sd[1] * sd[1] / d.n[1]) : 0.0;
+        GGML_LOG_WARN("ggml_cuda: [TAG_R35_CHUNKMERGE] diag spans: chunk list %.4f ms (sd %.3f, n %" PRIu64 "), merged %.4f ms "
+                "(sd %.3f, n %" PRIu64 "): chunk list - merged = %.4f ms (se %.4f)\n", mean[0], sd[0], d.n[0], mean[1], sd[1],
+                d.n[1], mean[0] - mean[1], se);
+    }
+}
+#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+
+// [TAG_R35_CHUNKMERGE] a replay of a multi-chunk graph: launch its merged executable (built here once the chunk list has replayed
+// GGML_CUDA_R35_CHUNKMERGE_AFTER times since its capture). false: the caller launches the chunk list as before.
+static bool ggml_cuda_r35_replay(ggml_backend_cuda_context * ctx, ggml_cuda_graph * graph) {
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+    GGML_UNUSED(ctx);
+    GGML_UNUSED(graph);
+    return false;
+#else
+    const int mode = ggml_cuda_r35_chunkmerge();
+    if (mode <= 0 || graph->instances.size() < 2) {
+        return false;
+    }
+    if (graph->r35_merged == nullptr) {
+        if (graph->r35_failed || graph->n_replay_cap < ggml_cuda_r35_chunkmerge_after()) {
+            return false;
+        }
+        ggml_cuda_r35_build(ctx, graph);
+        if (graph->r35_merged == nullptr) {
+            return false;
+        }
+    }
+    if (mode == 2) {
+        if (ctx->r35_diag == nullptr) {
+            ctx->r35_diag = new ggml_cuda_r35_diag();
+            for (int k = 0; k < ggml_cuda_r35_diag::N; ++k) {
+                CUDA_CHECK(cudaEventCreateWithFlags(&ctx->r35_diag->ev0[k], cudaEventDefault));
+                CUDA_CHECK(cudaEventCreateWithFlags(&ctx->r35_diag->ev1[k], cudaEventDefault));
+                ctx->r35_diag->kind[k] = -1;
+            }
+        }
+        ggml_cuda_r35_diag & d = *ctx->r35_diag;
+        ggml_cuda_r35_diag_harvest(d);
+        const int kind = (int) (d.flip++ & 1); // 0: chunk list, 1: merged
+        int slot = -1;
+        for (int k = 0; k < ggml_cuda_r35_diag::N && slot < 0; ++k) {
+            slot = d.kind[k] < 0 ? k : -1;
+        }
+        if (slot >= 0) {
+            CUDA_CHECK(cudaEventRecord(d.ev0[slot], ctx->stream()));
+        }
+        if (kind == 1) {
+            CUDA_CHECK(cudaGraphLaunch(graph->r35_merged, ctx->stream()));
+        } else {
+            for (cudaGraphExec_t instance : graph->instances) {
+                CUDA_CHECK(cudaGraphLaunch(instance, ctx->stream()));
+            }
+        }
+        if (slot >= 0) {
+            CUDA_CHECK(cudaEventRecord(d.ev1[slot], ctx->stream()));
+            d.kind[slot] = kind;
+        }
+        return true;
+    }
+    CUDA_CHECK(cudaGraphLaunch(graph->r35_merged, ctx->stream()));
+    return true;
+#endif
 }
 
 // [TAG_FN_R4_POKE] GGML_CUDA_GRAPH_POKE=1: one stream query right after a launch flushes WDDM's batched submission, so the
@@ -7921,6 +8143,16 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 CUDA_CHECK(cudaGraphExecDestroy(graph->instances[c]));
             }
             graph->instances.resize(n_chunks);
+            // [TAG_R35_CHUNKMERGE] keep the captures of this chunk list only, none of a one-chunk graph (nothing to merge)
+            if (ggml_cuda_r35_chunkmerge() > 0) {
+                const size_t keep = n_chunks > 1 ? n_chunks : 0;
+                for (size_t c = keep; c < graph->r35_graphs.size(); ++c) {
+                    if (graph->r35_graphs[c] != nullptr) {
+                        CUDA_CHECK(cudaGraphDestroy(graph->r35_graphs[c]));
+                    }
+                }
+                graph->r35_graphs.resize(std::min(keep, graph->r35_graphs.size()));
+            }
         } else {
             graph_evaluated_or_captured = true; // ggml graph has been directly evaluated
         }
@@ -7943,18 +8175,20 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         // instance cap and the OOM retry are in ggml_cuda_fn_l22_instantiate)
         if (!cuda_graph_update_required) {
             GGML_ASSERT(graph->has_instance());
-            // [TAG_R35_HOSTCHAIN] GGML_CUDA_R35_POKE1=1 (the Flash-Next profile; unset = v0.27.0): a replay of several chunks
-            // flushes WDDM's batched submission right after the first chunk's launch, as a capture does after every chunk
-            // ([TAG_FN_R4_POKE]), so the GPU runs chunk 0 while the host launches the others (same kernels, same order)
-            static const bool r35_poke1 = [] {
-                const char * e = getenv("GGML_CUDA_R35_POKE1");
-                return e != nullptr && atoi(e) != 0;
-            }();
-            const size_t n_inst = graph->instances.size();
-            for (size_t c = 0; c < n_inst; ++c) {
-                CUDA_CHECK(cudaGraphLaunch(graph->instances[c], cuda_ctx->stream()));
-                if (c == 0 && n_inst > 1 && r35_poke1) {
-                    ggml_cuda_stream_query_flush(cuda_ctx->stream());
+            if (!ggml_cuda_r35_replay(cuda_ctx, graph)) { // [TAG_R35_CHUNKMERGE] the merged executable, when there is one
+                // [TAG_R35_HOSTCHAIN] GGML_CUDA_R35_POKE1=1 (the Flash-Next profile; unset = v0.27.0): a replay of several chunks
+                // flushes WDDM's batched submission right after the first chunk's launch, as a capture does after every chunk
+                // ([TAG_FN_R4_POKE]), so the GPU runs chunk 0 while the host launches the others (same kernels, same order)
+                static const bool r35_poke1 = [] {
+                    const char * e = getenv("GGML_CUDA_R35_POKE1");
+                    return e != nullptr && atoi(e) != 0;
+                }();
+                const size_t n_inst = graph->instances.size();
+                for (size_t c = 0; c < n_inst; ++c) {
+                    CUDA_CHECK(cudaGraphLaunch(graph->instances[c], cuda_ctx->stream()));
+                    if (c == 0 && n_inst > 1 && r35_poke1) {
+                        ggml_cuda_stream_query_flush(cuda_ctx->stream());
+                    }
                 }
             }
         }
