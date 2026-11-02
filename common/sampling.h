@@ -158,6 +158,15 @@ llama_token common_sampler_last(const struct common_sampler * gsmpl);
 bool common_sampler_fn_l4_topk_row(const float * x, int n, int K, const std::vector<llama_token> & excl,
         std::vector<llama_token_data> & out);
 
+// [TAG_R35_HOSTCHAIN] the same result from the row's m device candidates (its exact top m, any order), or false when the
+// candidates cannot decide it exactly (ties at the K-th place or with the candidates' minimum, a NaN, too few)
+bool common_sampler_r35_topk_cands(const float * vals, const llama_token * ids, int m, int K,
+        const std::vector<llama_token> & excl, std::vector<llama_token_data> & out);
+
+// [TAG_R35_HOSTCHAIN] K of the [TAG_FN_L4_HOST_TOPK] fast candidate path (the chain's first top-k on raw logits, no grammar,
+// no reasoning budget, no token probabilities), 0 when the sampler does not take it
+int32_t common_sampler_fast_k(const struct common_sampler * gsmpl);
+
 // [TAG_R28_PENFAST] the fast candidate path with penalties and a logit bias before the chain's top-k: those samplers move
 // only the tokens of the penalty windows and the biased tokens, so the chain's top-k set lies inside {the top_k best raw
 // tokens outside them} U {them}. The unchanged chain runs over that set; exact when the top-k order there is unique, else

@@ -1583,6 +1583,11 @@ void llm_graph_result::reset() {
     t_sampled_logits.clear();
     t_candidates.clear();
 
+    t_fn_topk_ids  = nullptr; // [TAG_R35_HOSTCHAIN]
+    t_fn_topk_vals = nullptr;
+    t_fn_topk_sums = nullptr;
+    fn_topk_nsum   = 0;
+
     build_state.clear(); // [TAG_FN_GRAPH_PER_WIDTH]
     build_nodes.clear();
     build_pins.clear();
@@ -1866,7 +1871,8 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     moe_bridge_sync  (params.moe_bridge_sync),   // [TAG_FN_R2_BRIDGE_SYNC]
     fn_gen           (params.fn_gen),            // [TAG_FN_L22_PHASE]
     fn_x             (params.fn_x),
-    fn_hooks         (params.fn_hooks) {         // [TAG_FN_L22]
+    fn_hooks         (params.fn_hooks),          // [TAG_FN_L22]
+    fn_topk          (params.fn_topk) {          // [TAG_R35_HOSTCHAIN]
         res->set_params(params);
     }
 
@@ -5598,6 +5604,48 @@ void llm_graph_context::build_logits() const {
     if (res->t_logits != nullptr) {
         ggml_build_forward_expand(gf, res->t_logits);
     }
+}
+
+// [TAG_R35_HOSTCHAIN] the device side of LLAMA_FN_R35_HOSTCHAIN bit 1: for every output row of the logits, its top m
+// (ggml_top_k: the exact top m under value desc / index asc; the CUDA backend's [TAG_TOPK_SPLIT] two-stage select for a few
+// wide rows), their values, and nsum partial sums of the row (nsum | n_vocab, at most 64: chunk sums on many blocks). The
+// host builds the sampler chain's top-k from the candidates when that is provably the full row's (common_sampler_r35_
+// topk_cands), else reads the row (llama_context::fn_r35_fetch_row). The logits tensor itself is unchanged and stays an
+// output. Only for a contiguous f32 logits tensor of a few wide rows; otherwise the graph has no such nodes.
+void llm_graph_context::build_fn_r35_topk() const {
+    ggml_tensor * lg = res->t_logits;
+    if (fn_topk == 0 || lg == nullptr || !samplers.empty()) {
+        return;
+    }
+    const int64_t nv = lg->ne[0];
+    const int64_t nr = lg->ne[1];
+    if (lg->type != GGML_TYPE_F32 || !ggml_is_contiguous(lg) || lg->ne[2] != 1 || lg->ne[3] != 1 || nv < 16384 ||
+            nv < (int64_t) fn_topk || nr < 1 || nr > 64) {
+        return;
+    }
+    int32_t nsum = 64;
+    while (nv % nsum != 0) {
+        nsum--;
+    }
+
+    ggml_tensor * ids = ggml_top_k(ctx0, lg, fn_topk);
+    ggml_set_name(ids, "fn_r35_topk_ids");
+    ggml_tensor * vals = ggml_get_rows(ctx0, ggml_reshape_3d(ctx0, lg, 1, nv, nr), ids);
+    ggml_set_name(vals, "fn_r35_topk_vals");
+    ggml_tensor * sums = ggml_sum_rows(ctx0, ggml_reshape_2d(ctx0, lg, nv / nsum, nsum * nr));
+    ggml_set_name(sums, "fn_r35_topk_sums");
+
+    ggml_set_output(ids);
+    ggml_set_output(vals);
+    ggml_set_output(sums);
+    ggml_build_forward_expand(gf, ids);
+    ggml_build_forward_expand(gf, vals);
+    ggml_build_forward_expand(gf, sums);
+
+    res->t_fn_topk_ids  = ids;
+    res->t_fn_topk_vals = vals;
+    res->t_fn_topk_sums = sums;
+    res->fn_topk_nsum   = nsum;
 }
 
 void llm_graph_context::build_sampling() const {

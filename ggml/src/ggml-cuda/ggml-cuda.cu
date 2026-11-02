@@ -3553,13 +3553,19 @@ static bool ggml_cuda_upload_slot_alloc(ggml_cuda_upload_slot & s, size_t cap) {
 // one unpack kernel. All on the backend's stream, before the split's graph. A slot is reused only after the event behind
 // its last unpack. The same bytes reach the same tensors. Without a slot: the cudaMemcpyBatchAsync batch (mode 1), else
 // false (nothing queued).
-static bool ggml_backend_cuda_set_tensors_pack_async(ggml_backend_t backend, int n, ggml_tensor * const * tensors,
-        const void * const * data, const size_t * sizes) {
+// [TAG_R35_HOSTCHAIN] *staged: true when every source was read before the call returned (every copy went through the
+// pinned slot: none as a plain cudaMemcpyAsync from the caller's memory, no mode-1 batch), so the caller may reuse its host
+// memory right away; the stream still orders the copies before the split's graph
+static bool ggml_backend_cuda_pack_async_impl(ggml_backend_t backend, int n, ggml_tensor * const * tensors,
+        const void * const * data, const size_t * sizes, bool * staged) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    *staged = false;
     if (n <= 0) {
+        *staged = true;
         return true;
     }
     size_t n_small = 0;
+    int    n_plain = 0; // [TAG_R35_HOSTCHAIN] copies this call sent plain
     for (int i = 0; i < n; ++i) {
         const ggml_tensor * t = tensors[i];
         ggml_backend_buffer_t buf = t->view_src ? t->view_src->buffer : t->buffer;
@@ -3596,12 +3602,14 @@ static bool ggml_backend_cuda_set_tensors_pack_async(ggml_backend_t backend, int
         if (sizes[i] > GGML_CUDA_UPLOAD_BIG) {
             CUDA_CHECK(cudaMemcpyAsync(tensors[i]->data, data[i], sizes[i], cudaMemcpyHostToDevice, stream));
             cuda_ctx->upload_n_plain++;
+            n_plain++;
         }
     }
     if (n_small == 0) {
         if (note) {
             note_line();
         }
+        *staged = n_plain == 0;
         return true;
     }
 
@@ -3623,6 +3631,7 @@ static bool ggml_backend_cuda_set_tensors_pack_async(ggml_backend_t backend, int
         if (pos + sz > s.cap) {
             CUDA_CHECK(cudaMemcpyAsync(tensors[i]->data, data[i], sz, cudaMemcpyHostToDevice, stream)); // the slot is full
             cuda_ctx->upload_n_plain++;
+            n_plain++;
             continue;
         }
         memcpy(s.host + pos, data[i], sz);
@@ -3637,6 +3646,7 @@ static bool ggml_backend_cuda_set_tensors_pack_async(ggml_backend_t backend, int
         if (note) {
             note_line();
         }
+        *staged = n_plain == 0;
         return true;
     }
 
@@ -3652,7 +3662,25 @@ static bool ggml_backend_cuda_set_tensors_pack_async(ggml_backend_t backend, int
     if (note) {
         note_line();
     }
+    *staged = n_plain == 0;
     return true;
+}
+
+static bool ggml_backend_cuda_set_tensors_pack_async(ggml_backend_t backend, int n, ggml_tensor * const * tensors,
+        const void * const * data, const size_t * sizes) {
+    bool staged = false;
+    return ggml_backend_cuda_pack_async_impl(backend, n, tensors, data, sizes, &staged);
+}
+
+// [TAG_R35_HOSTCHAIN] the pack for scheduler mode 3: -1 nothing queued (refused), 0 queued with copies that read the
+// sources later, 1 queued and every source already read
+static int ggml_backend_cuda_set_tensors_pack_async_staged(ggml_backend_t backend, int n, ggml_tensor * const * tensors,
+        const void * const * data, const size_t * sizes) {
+    bool staged = false;
+    if (!ggml_backend_cuda_pack_async_impl(backend, n, tensors, data, sizes, &staged)) {
+        return -1;
+    }
+    return staged ? 1 : 0;
 }
 
 static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
@@ -10121,6 +10149,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_set_tensors_pack_async") == 0) { // [TAG_FN_L16_UPLOAD]
         return (void *)ggml_backend_cuda_set_tensors_pack_async;
+    }
+    if (strcmp(name, "ggml_backend_set_tensors_pack_async_staged") == 0) { // [TAG_R35_HOSTCHAIN]
+        return (void *)ggml_backend_cuda_set_tensors_pack_async_staged;
     }
     if (strcmp(name, "ggml_backend_copy_d2d_batch_async") == 0) { // [TAG_FN_L14_PFSD2D]
         return (void *)ggml_backend_cuda_copy_d2d_batch_async;

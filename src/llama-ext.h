@@ -361,6 +361,17 @@ LLAMA_API bool llama_fn_l4_host_flag(const struct llama_model * model, const cha
 // [TAG_FN_L4_HOST] the value of one switch only (no umbrella): def unless the model is qwen4exp and the switch is set
 LLAMA_API int llama_fn_l4_int(const struct llama_model * model, const char * name, int def);
 
+// [TAG_R35_HOSTCHAIN] LLAMA_FN_R35_HOSTCHAIN bit 1 (qwen4exp target context): the caller states that every output row of
+// its next decodes is sampled by a chain whose first sampler is a top-k of at most top_k (0: rows are read some other
+// way). While 0 < top_k < llama_fn_r35_logits_topk_cap(), a decode of a few rows that are all outputs selects each row's
+// top cap logits on the device and copies only those; llama_get_logits(_ith) still return the whole row (it is copied
+// from the device on first access), so any reader stays exact. The cap is 0 when the switch is off for this context.
+LLAMA_API void    llama_fn_r35_set_logits_topk(struct llama_context * ctx, int32_t top_k);
+LLAMA_API int32_t llama_fn_r35_logits_topk_cap(const struct llama_context * ctx);
+// the device candidates of output i: their count (0: none, read llama_get_logits_ith), values and token ids (any order;
+// the row's exact top count under value desc / index asc). A row whose device chunk sums were not all finite has none.
+LLAMA_API int32_t llama_fn_r35_topk_ith(struct llama_context * ctx, int32_t i, const float ** vals, const llama_token ** ids);
+
 // [TAG_R28_PENFAST] the window of a penalties sampler: the distinct tokens its next apply moves, i.e. every token with a
 // non-zero count among the last penalty_last_n accepted ones. Writes at most cap of them to out (out may be null when cap
 // is 0) and returns how many there are; -1 when smpl is not an active penalties sampler.

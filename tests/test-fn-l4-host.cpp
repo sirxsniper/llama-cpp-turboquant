@@ -120,6 +120,101 @@ int main() {
     }
     printf("%d cases, %d on the fast path, %d failures\n", n_cases, n_fast, n_fail);
 
+    // [TAG_R35_HOSTCHAIN] common_sampler_r35_topk_cands from the row's exact top m (value desc, index asc: what ggml_top_k
+    // selects), shuffled: when it decides, the row's fast path must decide too and give the same entries; the device gives
+    // no candidates for a row with a NaN or an inf (its chunk sums are not finite), so those rows are not asked
+    {
+        int n_c = 0, n_c_fast = 0, n_c_ref_fast = 0;
+        const int ms[] = { 64, 32, 21 };
+        for (int it = 0; it < 6000; ++it) {
+            const int n = it % 3 == 0 ? 248320 : (it % 3 == 1 ? 4097 : 300);
+            const int K = ks[(it / 3) % 5];               // 1, 2, 10, 20, 40
+            const int m = ms[(it / 15) % 3];
+            const int mode = (it / 45) % 7; // 0 normal, 1 coarse (ties), 2 excluded ids, 3 all equal, 4 ties at the m-th place,
+                                            // 5 very coarse, 6 many excluded among the best
+            std::vector<float> x(n);
+            std::normal_distribution<float> nd(0.0f, 4.0f);
+            for (auto & v : x) {
+                v = nd(rng);
+                if (mode == 1) {
+                    v = std::round(v * 2.0f) / 2.0f;
+                }
+                if (mode == 5) {
+                    v = std::round(v / 4.0f);
+                }
+                if (mode == 3) {
+                    v = 1.5f;
+                }
+            }
+            std::vector<int> idx(n);
+            for (int i = 0; i < n; ++i) {
+                idx[i] = i;
+            }
+            std::sort(idx.begin(), idx.end(), [&](int a, int b) { return x[a] > x[b] || (x[a] == x[b] && a < b); });
+            if (mode == 4 && n > m + 2 && K + 1 < m) {
+                // the K-th best equals the m-th best: undecidable from the candidates
+                const float v = x[idx[K - 1]];
+                for (int j = K - 1; j <= m + 1; ++j) {
+                    x[idx[j]] = v;
+                }
+                std::sort(idx.begin(), idx.end(), [&](int a, int b) { return x[a] > x[b] || (x[a] == x[b] && a < b); });
+            }
+            std::vector<llama_token> excl;
+            if (mode == 2 || mode == 6) {
+                const int ne = mode == 2 ? 3 : std::min(m - 1, K + 8);
+                for (int i = 0; i < ne && i < n; ++i) {
+                    excl.push_back(idx[mode == 2 ? std::min(n - 1, i * 2) : i]);
+                }
+                std::sort(excl.begin(), excl.end());
+                excl.erase(std::unique(excl.begin(), excl.end()), excl.end());
+            }
+            if (m > n) {
+                continue;
+            }
+            std::vector<float>       cv(m);
+            std::vector<llama_token> ci(m);
+            std::vector<int>         perm(m);
+            for (int j = 0; j < m; ++j) {
+                perm[j] = j;
+            }
+            std::shuffle(perm.begin(), perm.end(), rng);
+            for (int j = 0; j < m; ++j) {
+                ci[j] = idx[perm[j]];
+                cv[j] = x[ci[j]];
+            }
+            std::vector<llama_token_data> c_out, r_out;
+            const bool c_ok = common_sampler_r35_topk_cands(cv.data(), ci.data(), m, K, excl, c_out);
+            const bool r_ok = common_sampler_fn_l4_topk_row(x.data(), n, K, excl, r_out);
+            n_c++;
+            n_c_fast     += c_ok ? 1 : 0;
+            n_c_ref_fast += r_ok ? 1 : 0;
+            if (c_ok) {
+                bool same = r_ok && r_out.size() == c_out.size();
+                for (size_t j = 0; same && j < r_out.size(); ++j) {
+                    same = r_out[j].id == c_out[j].id && r_out[j].logit == c_out[j].logit && c_out[j].p == 0.0f;
+                }
+                check(same, "r35 candidates decided a row the row path decides differently (or refuses)", it);
+                const auto ref = ref_topk(x, K, excl);
+                bool same_ref = ref.size() == c_out.size();
+                for (size_t j = 0; same_ref && j < ref.size(); ++j) {
+                    same_ref = ref[j].id == c_out[j].id && ref[j].logit == c_out[j].logit;
+                }
+                check(same_ref, "r35 candidates differ from the partial sort", it);
+            } else if (mode == 0 && r_ok && K < m - 1) {
+                check(false, "r35 candidates refused a continuous row with room", it);
+            }
+        }
+        // NaN among the candidates refuses
+        {
+            float v[4] = { 3.0f, NAN, 1.0f, 0.5f };
+            llama_token t[4] = { 7, 8, 9, 10 };
+            std::vector<llama_token_data> o;
+            check(!common_sampler_r35_topk_cands(v, t, 4, 2, {}, o), "r35 candidates with a NaN decided", -1);
+        }
+        printf("r35 candidates: %d rows, %d decided from the candidates, %d by the row path, %d failures so far\n",
+                n_c, n_c_fast, n_c_ref_fast, n_fail);
+    }
+
     // timing at the Flash-Next vocabulary (248320), K 20: the fast path vs set_logits + partial sort
     {
         const int n = 248320, K = 20;

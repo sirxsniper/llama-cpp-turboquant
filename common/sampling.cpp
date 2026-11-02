@@ -128,6 +128,53 @@ bool common_sampler_fn_l4_topk_row(const float * x, int n, int K, const std::vec
     return true;
 }
 
+// [TAG_R35_HOSTCHAIN] common_sampler_fn_l4_topk_row's result from the row's m device candidates (vals / ids: the row's exact
+// top m under value desc / index asc, any order; llama_fn_r35_topk_ith). Every value of the row outside them is <= their
+// minimum, so the K largest non-excluded candidates are the row's K largest non-excluded values in the same strictly
+// descending order when: they are strictly decreasing, the K-th is strictly above the next non-excluded candidate (no tie
+// at the K-th place) and strictly above the candidates' minimum (nothing outside can equal it). A NaN among them refuses;
+// llama_fn_r35_topk_ith gives no candidates for a row whose device chunk sums were not finite (a NaN or inf anywhere).
+// False: not decided here, the caller reads the whole row.
+bool common_sampler_r35_topk_cands(const float * vals, const llama_token * ids, int m, int K,
+        const std::vector<llama_token> & excl, std::vector<llama_token_data> & out) {
+    if (K <= 0 || K > 128 || m <= K || m > 256 || vals == nullptr || ids == nullptr) {
+        return false;
+    }
+    llama_token_data c[256];
+    int   n  = 0;
+    float mn = INFINITY;
+    for (int j = 0; j < m; ++j) {
+        const float v = vals[j];
+        if (v != v) {
+            return false;
+        }
+        mn = std::min(mn, v);
+        if (!excl.empty() && std::binary_search(excl.begin(), excl.end(), ids[j])) {
+            continue;
+        }
+        c[n++] = llama_token_data{ ids[j], v, 0.0f };
+    }
+    if (n < K) {
+        return false;
+    }
+    std::sort(c, c + n, [](const llama_token_data & a, const llama_token_data & b) {
+        return a.logit > b.logit || (a.logit == b.logit && a.id < b.id);
+    });
+    for (int j = 1; j < K; ++j) {
+        if (!(c[j - 1].logit > c[j].logit)) {
+            return false;
+        }
+    }
+    if (n > K && !(c[K - 1].logit > c[K].logit)) {
+        return false;
+    }
+    if (!(c[K - 1].logit > mn)) {
+        return false;
+    }
+    out.assign(c, c + K);
+    return true;
+}
+
 // [TAG_R28_PENFAST] LLAMA_R28_PENFAST: 1 (default) the fast candidate path with penalties / a logit bias, 0 off (v0.26.3)
 static bool r28_penfast_enabled() {
     static const bool on = [] {
@@ -810,6 +857,16 @@ struct common_sampler {
                 llama_get_sampled_token_ith(ctx, idx) != LLAMA_TOKEN_NULL) {
             return false;
         }
+        // [TAG_R35_HOSTCHAIN] the row's device candidates when they decide it (no row copy, no row scan); else the row
+        {
+            const float *       cv = nullptr;
+            const llama_token * ci = nullptr;
+            const int32_t       cm = llama_fn_r35_topk_ith(ctx, idx, &cv, &ci);
+            if (cm > 0 && common_sampler_r35_topk_cands(cv, ci, cm, fast_k, fast_excl, cur)) {
+                cur_p = { cur.data(), cur.size(), -1, true };
+                return true;
+            }
+        }
         const float * logits = llama_get_logits_ith(ctx, idx);
         if (logits == nullptr) {
             return false;
@@ -914,6 +971,11 @@ static bool greedy_temp0_enabled() {
         return e == nullptr || std::atoi(e) != 0;
     }();
     return on;
+}
+
+// [TAG_R35_HOSTCHAIN] see sampling.h
+int32_t common_sampler_fast_k(const struct common_sampler * gsmpl) {
+    return gsmpl != nullptr ? gsmpl->fast_k : 0;
 }
 
 bool common_sampler_backend_ok(const struct common_sampler * gsmpl) {

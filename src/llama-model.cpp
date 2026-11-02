@@ -3472,6 +3472,9 @@ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
     llm->build_sampling();
     llm->build_post_sampling();
 
+    // [TAG_R35_HOSTCHAIN] the device top m of the logits rows (only when the context asked for it in params.fn_topk)
+    llm->build_fn_r35_topk();
+
     // if the gguf model was converted with --sentence-transformers-dense-modules
     // there will be two additional dense projection layers
     // dense linear projections are applied after pooling

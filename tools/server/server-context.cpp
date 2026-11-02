@@ -8261,6 +8261,26 @@ private:
             llama_set_embeddings(ctx_tgt, slot_batched->need_embd());
         }
 
+        // [TAG_R35_HOSTCHAIN] LLAMA_FN_R35_HOSTCHAIN bit 1: the target's small all-output decodes copy each row's device top-m
+        // candidates instead of the row when every busy slot samples through the fast candidate path with top_k < m and no
+        // backend sampler (the max top_k of them; 0: whole rows). Any other reader of a row still gets the whole row.
+        if (llama_fn_r35_logits_topk_cap(ctx_tgt) > 0) {
+            const int32_t cap  = llama_fn_r35_logits_topk_cap(ctx_tgt);
+            int32_t       want = 0;
+            for (auto & slot : slots) {
+                if (!slot.is_processing()) {
+                    continue;
+                }
+                const int32_t k = common_sampler_fast_k(slot.smpl.get());
+                if (k <= 0 || k >= cap || slot.bs_attached) {
+                    want = 0;
+                    break;
+                }
+                want = std::max(want, k);
+            }
+            llama_fn_r35_set_logits_topk(ctx_tgt, want);
+        }
+
         const int64_t t_batch0 = ggml_time_us(); // [TAG_FN_L15_GENSHARE]
 
         int32_t off_next = 0;
