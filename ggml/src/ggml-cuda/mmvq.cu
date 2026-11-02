@@ -1272,6 +1272,356 @@ static void mul_mat_vec_q_moe_fn_l3_launch(
     }
 }
 
+// [TAG_R35_MOEGRP] round 35: the ZSKIP expert chains (mul_mat_vec_q_moe_fn_l3) with every distinct slot read once per
+// pass. The grid and the block are the same: one block per (row pair, slot position k), one warp per token. A warp whose
+// (token, k) pair is the first one (token-major order: p = token*n_used + k) routed to its slot computes every pair routed
+// to that slot, R35_GRP_G pairs per pass over the weights; the other warps of that slot return at once. Per (token, row)
+// the lane -> kbx mapping, the order of the partial sums, the warp reduction and the SWIGLU are mul_mat_vec_q_moe_fn_l3's,
+// so every output has the same bits; only the loads of the weights (and the x half of vec_dot_q_cuda) are shared between
+// the pairs, as in mul_mat_vec_q's ncols_dst loop. Zero-slot pairs write 0 as before. NVIDIA only (32-lane ballots).
+// GGML_CUDA_R35_MOEGRP: 0 = mul_mat_vec_q_moe_fn_l3 (v0.27.0), 1 = grouped (default), 2 = verify: grouped into dst, the
+// v0.27.0 kernel into a scratch buffer, a bitwise compare that prints mismatches and (every 4096 launches) the share of
+// distinct slots among the hot pairs.
+#define R35_GRP_G    3 // pairs per pass over the weights
+#define R35_GRP_MAXW 4 // ballot words: up to 128 (token, k) pairs (MMVQ_MAX_BATCH_SIZE tokens x 16 experts)
+
+static int ggml_cuda_r35_moegrp() {
+    static const int mode = [] {
+        const char * e = getenv("GGML_CUDA_R35_MOEGRP");
+        return e == nullptr || e[0] == '\0' ? 1 : atoi(e);
+    }();
+    return mode;
+}
+
+// verify-mode counters: launches, hot pairs, distinct hot slots, zero-slot pairs (block row 0 of each launch), mismatches
+static __device__ unsigned long long r35_grp_dev[5];
+
+// GGML_CUDA_R35_MOEGRP_LB=4: the kernels built for 4 blocks of 256 threads per SM (<= 64 registers), else for 1 (as
+// mul_mat_vec_q_moe_fn_l3); an occupancy A/B on one binary
+static int ggml_cuda_r35_moegrp_lb() {
+    static const int lb = [] {
+        const char * e = getenv("GGML_CUDA_R35_MOEGRP_LB");
+        return e != nullptr && atoi(e) == 4 ? 4 : 1;
+    }();
+    return lb;
+}
+
+// GGML_CUDA_R35_MOEGRP_R=4: 4 rows per block (each row still one warp's lane mapping and reduction: same bits), for row
+// counts that are a multiple of 4; else 2 (as mul_mat_vec_q_moe_fn_l3)
+static int ggml_cuda_r35_moegrp_rows() {
+    static const int r = [] {
+        const char * e = getenv("GGML_CUDA_R35_MOEGRP_R");
+        return e != nullptr && atoi(e) == 4 ? 4 : 2;
+    }();
+    return r;
+}
+
+template <ggml_type type, int c_rows_per_block, bool has_fusion, bool vdr_up = false, int min_blocks = 1>
+__launch_bounds__(get_mmvq_mmid_max_batch_for_device<type>()*ggml_cuda_get_physical_warp_size(), min_blocks)
+static __global__ void mul_mat_vec_q_moe_r35_grp(
+        const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion,
+        float * dst_ptr,
+        const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t nrows_x,
+        const uint32_t stride_row_x, const uint32_t stride_col_y, uint32_t stride_col_dst,
+        const uint32_t stride_channel_x, const uint32_t stride_channel_y, const uint32_t stride_channel_dst,
+        const uint32_t ncols_dst, const uint32_t ids_stride, const uint32_t zero_x, const bool stats) {
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+    GGML_UNUSED_VARS(vx_ptr, vy_ptr, ids_ptr, fusion, dst_ptr, ncols_x, nchannels_y, nrows_x, stride_row_x, stride_col_y,
+        stride_col_dst, stride_channel_x, stride_channel_y, stride_channel_dst, ncols_dst, ids_stride, zero_x, stats);
+    NO_DEVICE_CODE;
+#else
+    const void    * GGML_CUDA_RESTRICT vx  = vx_ptr;
+    const void    * GGML_CUDA_RESTRICT vy  = vy_ptr;
+    const int32_t * GGML_CUDA_RESTRICT ids = ids_ptr;
+    float         * GGML_CUDA_RESTRICT dst = dst_ptr;
+
+    constexpr int qk  = ggml_cuda_type_traits<type>::qk;
+    constexpr int qi  = ggml_cuda_type_traits<type>::qi;
+    constexpr int vdr = get_vdr_mmvq(type, vdr_up);
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    static_assert(warp_size == 32, "R35_MOEGRP: 32-lane ballots");
+
+    constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type, vdr_up);
+
+    const void * vgate = nullptr;
+    if constexpr (has_fusion) {
+        vgate = fusion.gate;
+    }
+
+    const uint32_t token_idx   = threadIdx.y;
+    const int      row0        = c_rows_per_block*blockIdx.x;
+    const int      blocks_per_row_x = ncols_x / qk;
+    constexpr int  blocks_per_iter  = vdr * warp_size / qi;
+
+    const uint32_t channel_dst = blockIdx.y;
+    const uint32_t n_used      = gridDim.y;
+
+    if (token_idx >= ncols_dst) {
+        return;
+    }
+
+    ggml_cuda_pdl_sync();
+    const uint32_t channel_x = ids[channel_dst + token_idx * ids_stride];
+
+    if (channel_x == zero_x) {
+        ggml_cuda_pdl_lc();
+        if (stats && blockIdx.x == 0 && threadIdx.x == 0) {
+            atomicAdd(&r35_grp_dev[3], 1ull);
+        }
+        float * dst_row = dst + channel_dst*stride_channel_dst + token_idx*stride_col_dst + row0;
+        if (threadIdx.x < c_rows_per_block && (c_rows_per_block == 1 || uint32_t(row0 + threadIdx.x) < nrows_x)) {
+            dst_row[threadIdx.x] = 0.0f;
+        }
+        return;
+    }
+
+    // the (token, k) pairs routed to channel_x: bit p%32 of word p/32 for p = token*n_used + k (the host checks
+    // ncols_dst*n_used <= 32*R35_GRP_MAXW)
+    const uint32_t n_pairs = ncols_dst*n_used;
+    const uint32_t me      = token_idx*n_used + channel_dst;
+    uint32_t rem[R35_GRP_MAXW];
+#pragma unroll
+    for (int w = 0; w < R35_GRP_MAXW; ++w) {
+        const uint32_t p = w*warp_size + threadIdx.x;
+        bool hit = false;
+        if (p < n_pairs) {
+            const uint32_t t = p / n_used;
+            hit = (uint32_t) ids[(p - t*n_used) + t*ids_stride] == channel_x;
+        }
+        rem[w] = __ballot_sync(0xFFFFFFFF, hit);
+    }
+    uint32_t first = me;
+#pragma unroll
+    for (int w = R35_GRP_MAXW - 1; w >= 0; --w) {
+        if (rem[w] != 0) {
+            first = w*warp_size + __ffs(rem[w]) - 1;
+        }
+    }
+    if (first != me) {
+        // an earlier pair of this slot computes this one
+        ggml_cuda_pdl_lc();
+        return;
+    }
+    if (stats && blockIdx.x == 0 && threadIdx.x == 0) {
+        uint32_t n = 0;
+#pragma unroll
+        for (int w = 0; w < R35_GRP_MAXW; ++w) {
+            n += __popc(rem[w]);
+        }
+        atomicAdd(&r35_grp_dev[1], (unsigned long long) n);
+        atomicAdd(&r35_grp_dev[2], 1ull);
+    }
+
+    const block_q8_1 * y0 = (const block_q8_1 *) vy;
+    const int kbx_offset  = channel_x*stride_channel_x + row0*stride_row_x;
+
+    while (true) {
+        // the next (up to) R35_GRP_G pairs of the slot, lowest first; pj[0] is valid on every pass that runs
+        int pj[R35_GRP_G];
+#pragma unroll
+        for (int j = 0; j < R35_GRP_G; ++j) {
+            int p = -1;
+#pragma unroll
+            for (int w = 0; w < R35_GRP_MAXW; ++w) {
+                if (p < 0 && rem[w] != 0) {
+                    p = w*warp_size + __ffs(rem[w]) - 1;
+                    rem[w] &= rem[w] - 1;
+                }
+            }
+            pj[j] = p;
+        }
+        if (pj[0] < 0) {
+            break;
+        }
+
+        const block_q8_1 * yj[R35_GRP_G];
+        uint32_t           dj[R35_GRP_G];
+#pragma unroll
+        for (int j = 0; j < R35_GRP_G; ++j) {
+            const uint32_t p = (uint32_t) (pj[j] < 0 ? pj[0] : pj[j]); // an unused entry aliases the first
+            const uint32_t t = p / n_used;
+            const uint32_t k = p - t*n_used;
+            yj[j] = y0 + fastmodulo(k, nchannels_y)*stride_channel_y + t*stride_col_y;
+            dj[j] = k*stride_channel_dst + t*stride_col_dst + row0;
+        }
+
+        // partial sums for each pair and row, each in mul_mat_vec_q_moe_fn_l3's order
+        float tmp[R35_GRP_G][c_rows_per_block];
+        float tmp_gate[R35_GRP_G][c_rows_per_block];
+#pragma unroll
+        for (int j = 0; j < R35_GRP_G; ++j) {
+#pragma unroll
+            for (int i = 0; i < c_rows_per_block; ++i) {
+                tmp[j][i]      = 0.0f;
+                tmp_gate[j][i] = 0.0f;
+            }
+        }
+
+        for (int kbx = threadIdx.x / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
+            const int kby = kbx * (qk/QK8_1);
+            const int kqs = vdr * (threadIdx.x % (qi/vdr));
+
+#pragma unroll
+            for (int i = 0; i < c_rows_per_block; ++i) {
+#pragma unroll
+                for (int j = 0; j < R35_GRP_G; ++j) {
+                    if (j == 0 || pj[j] >= 0) {
+                        tmp[j][i] += vec_dot_q_cuda(vx, &yj[j][kby], kbx_offset + i*stride_row_x + kbx, kqs);
+                        if constexpr (has_fusion) {
+                            tmp_gate[j][i] += vec_dot_q_cuda(vgate, &yj[j][kby], kbx_offset + i*stride_row_x + kbx, kqs);
+                        }
+                    }
+                }
+            }
+        }
+
+        ggml_cuda_pdl_lc();
+
+#pragma unroll
+        for (int j = 0; j < R35_GRP_G; ++j) {
+            if (j == 0 || pj[j] >= 0) {
+#pragma unroll
+                for (int i = 0; i < c_rows_per_block; ++i) {
+                    tmp[j][i] = warp_reduce_sum<warp_size>(tmp[j][i]);
+                    if constexpr (has_fusion) {
+                        tmp_gate[j][i] = warp_reduce_sum<warp_size>(tmp_gate[j][i]);
+                    }
+                }
+            }
+        }
+
+        if (threadIdx.x < c_rows_per_block && (c_rows_per_block == 1 || uint32_t(row0 + threadIdx.x) < nrows_x)) {
+#pragma unroll
+            for (int j = 0; j < R35_GRP_G; ++j) {
+                if (j == 0 || pj[j] >= 0) {
+                    float result = tmp[j][threadIdx.x];
+                    if constexpr (has_fusion) {
+                        const float gate_value = tmp_gate[j][threadIdx.x];
+                        result *= ggml_cuda_op_silu_single(gate_value);
+                    }
+                    dst[dj[j] + threadIdx.x] = result;
+                }
+            }
+        }
+    }
+
+    if constexpr (!has_fusion) {
+        GGML_UNUSED_VARS(vgate, fusion);
+    }
+#endif // defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+}
+
+// [TAG_R35_MOEGRP] verify mode: bitwise compare of the grouped outputs with the v0.27.0 kernel's (the rows of every
+// (token, k) pair), mismatches printed (the first 16), one summary line on launches 1..4 and every 4096 launches
+static __global__ void k_r35_grp_cmp(const float * a, const float * ref, const uint32_t nrows, const uint32_t stride_channel_dst,
+        const uint32_t stride_col_dst) {
+    const uint32_t row = blockIdx.x*blockDim.x + threadIdx.x;
+    const uint32_t k   = blockIdx.y;
+    const uint32_t t   = blockIdx.z;
+    if (row < nrows) {
+        const uint32_t o = k*stride_channel_dst + t*stride_col_dst + row;
+        if (__float_as_uint(a[o]) != __float_as_uint(ref[o])) {
+            const unsigned long long n = atomicAdd(&r35_grp_dev[4], 1ull);
+            if (n < 16) {
+                printf("[TAG_R35_MOEGRP] verify MISMATCH: token %u k %u row %u: grouped %.9g (0x%08x) v0.27.0 %.9g (0x%08x)\n",
+                    t, k, row, a[o], __float_as_uint(a[o]), ref[o], __float_as_uint(ref[o]));
+            }
+        }
+    }
+    if (blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 && threadIdx.x == 0) {
+        const unsigned long long l = atomicAdd(&r35_grp_dev[0], 1ull) + 1;
+        if (l <= 4 || l % 4096 == 0) {
+            const unsigned long long hot = r35_grp_dev[1], dist = r35_grp_dev[2], zero = r35_grp_dev[3], mis = r35_grp_dev[4];
+            printf("[TAG_R35_MOEGRP] verify: %llu launches, %llu hot pairs, %llu distinct hot slots (%.3f per pair), %llu zero "
+                "pairs, %llu mismatching values\n", l, hot, dist, hot ? (double) dist / (double) hot : 0.0, zero, mis);
+        }
+    }
+}
+
+template<ggml_type type, bool vdr_up = false>
+static void mul_mat_vec_q_moe_r35_grp_launch(
+        const void * vx, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
+        const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t nrows_x,
+        const uint32_t stride_row_x, const uint32_t stride_col_y, const uint32_t stride_col_dst,
+        const uint32_t stride_channel_x, const uint32_t stride_channel_y, const uint32_t stride_channel_dst,
+        const uint32_t ncols_dst, const uint32_t ids_stride, const uint32_t zero_x,
+        const int warp_size, const int nchannels_dst, const bool stats, cudaStream_t stream) {
+    // 2 rows per block as mul_mat_vec_q_moe_fn_l3_launch; GGML_CUDA_R35_MOEGRP_R=4: 4 (row counts that are a multiple of 4)
+    const int rows_per_block = ggml_cuda_r35_moegrp_rows() == 4 && nrows_x % 4 == 0 ? 4 : 2;
+    const int64_t nblocks_rows = (nrows_x + rows_per_block - 1) / rows_per_block;
+    const dim3 block_nums(nblocks_rows, nchannels_dst);
+    const dim3 block_dims(warp_size, ncols_dst);
+    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, 0, stream);
+
+#define R35_GRP_KLAUNCH(rows, fus, lb) ggml_cuda_kernel_launch(mul_mat_vec_q_moe_r35_grp<type, rows, fus, vdr_up, lb>, \
+        launch_params, vx, vy, ids, fusion, dst, ncols_x, nchannels_y, nrows_x, stride_row_x, stride_col_y, stride_col_dst, \
+        stride_channel_x, stride_channel_y, stride_channel_dst, ncols_dst, ids_stride, zero_x, stats)
+    const bool lb4 = ggml_cuda_r35_moegrp_lb() == 4;
+    const bool fus = fusion.gate != nullptr;
+    if (rows_per_block == 4) {
+        if (fus) {
+            R35_GRP_KLAUNCH(4, true, 1);
+        } else {
+            R35_GRP_KLAUNCH(4, false, 1);
+        }
+    } else if (lb4) {
+        if (fus) {
+            R35_GRP_KLAUNCH(2, true, 4);
+        } else {
+            R35_GRP_KLAUNCH(2, false, 4);
+        }
+    } else {
+        if (fus) {
+            R35_GRP_KLAUNCH(2, true, 1);
+        } else {
+            R35_GRP_KLAUNCH(2, false, 1);
+        }
+    }
+#undef R35_GRP_KLAUNCH
+}
+
+// [TAG_R35_MOEGRP] the ZSKIP launch: grouped (mode 1), v0.27.0 (mode 0, other vendors, more than 128 pairs) or both with
+// the bitwise compare (mode 2)
+template<ggml_type type, bool vdr_up = false>
+static void mul_mat_vec_q_moe_zskip_launch(
+        ggml_backend_cuda_context & ctx,
+        const void * vx, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
+        const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t nrows_x,
+        const uint32_t stride_row_x, const uint32_t stride_col_y, const uint32_t stride_col_dst,
+        const uint32_t stride_channel_x, const uint32_t stride_channel_y, const uint32_t stride_channel_dst,
+        const uint32_t ncols_dst, const uint32_t ids_stride, const uint32_t zero_x,
+        const int warp_size, const int nchannels_dst, const int64_t dst_nelements, cudaStream_t stream) {
+    const int mode = ggml_cuda_r35_moegrp();
+    const int cc   = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    const bool grp = mode != 0 && GGML_CUDA_CC_IS_NVIDIA(cc) && warp_size == 32 &&
+        (int64_t) ncols_dst*nchannels_dst <= 32*R35_GRP_MAXW;
+    if (!grp) {
+        mul_mat_vec_q_moe_fn_l3_launch<type, vdr_up>(vx, vy, ids, fusion, dst, ncols_x, nchannels_y, nrows_x,
+            stride_row_x, stride_col_y, stride_col_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+            ncols_dst, ids_stride, zero_x, warp_size, nchannels_dst, stream);
+        return;
+    }
+    if (mode != 2) {
+        mul_mat_vec_q_moe_r35_grp_launch<type, vdr_up>(vx, vy, ids, fusion, dst, ncols_x, nchannels_y, nrows_x,
+            stride_row_x, stride_col_y, stride_col_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+            ncols_dst, ids_stride, zero_x, warp_size, nchannels_dst, false, stream);
+        ggml_cuda_fn_l3_note(GGML_CUDA_R35_PATH_MOEGRP, "[TAG_R35_MOEGRP] ZSKIP expert chains read each distinct slot once");
+        return;
+    }
+    ggml_cuda_pool_alloc<float> ref(ctx.pool(), dst_nelements);
+    mul_mat_vec_q_moe_fn_l3_launch<type, vdr_up>(vx, vy, ids, fusion, ref.get(), ncols_x, nchannels_y, nrows_x,
+        stride_row_x, stride_col_y, stride_col_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+        ncols_dst, ids_stride, zero_x, warp_size, nchannels_dst, stream);
+    mul_mat_vec_q_moe_r35_grp_launch<type, vdr_up>(vx, vy, ids, fusion, dst, ncols_x, nchannels_y, nrows_x,
+        stride_row_x, stride_col_y, stride_col_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+        ncols_dst, ids_stride, zero_x, warp_size, nchannels_dst, true, stream);
+    const dim3 cmp_blocks((nrows_x + 255)/256, nchannels_dst, ncols_dst);
+    k_r35_grp_cmp<<<cmp_blocks, 256, 0, stream>>>(dst, ref.get(), nrows_x, stride_channel_dst, stride_col_dst);
+    CUDA_CHECK(cudaGetLastError());
+    ggml_cuda_fn_l3_note(GGML_CUDA_R35_PATH_MOEGRP_VERIFY,
+        "[TAG_R35_MOEGRP] verify: grouped ZSKIP expert chains compared bit for bit with the v0.27.0 kernel");
+}
+
 // [TAG_FN_L22_MMVQ_R1] (Strata S5) GGML_CUDA_FN_L22_MMVQ_R1=1: dense Q8_0 at 2..4 columns with >= 2048 rows on Blackwell
 // runs one row per block (default off until a kernel bench decides)
 static bool ggml_cuda_fn_l22_mmvq_rows1(const int cc, const int64_t nrows_x) {
@@ -2103,11 +2453,11 @@ void ggml_cuda_mul_mat_vec_q(
         const int    warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
         const uint3  nch_y_fd  = init_fastdiv_values((uint32_t) nchannels_y);
         bool launched = true;
-#define FN_L3_ZSKIP_LAUNCH(t, up) mul_mat_vec_q_moe_fn_l3_launch<t, up>(src0->data, src1_q8, ids_d, fusion_local, dst_d,   \
-                    (uint32_t) ne00, nch_y_fd,                                                                            \
+#define FN_L3_ZSKIP_LAUNCH(t, up) mul_mat_vec_q_moe_zskip_launch<t, up>(ctx, src0->data, src1_q8, ids_d, fusion_local, /* [TAG_R35_MOEGRP] */ \
+                    dst_d, (uint32_t) ne00, nch_y_fd,                                                                     \
                     (uint32_t) ne01, (uint32_t) s01, (uint32_t) stride_col_y, (uint32_t) stride_col_dst, (uint32_t) s02,    \
                     (uint32_t) stride_channel_y, (uint32_t) stride_channel_dst, (uint32_t) ncols_dst, (uint32_t) ids_stride, \
-                    (uint32_t) (ne02 - 1), warp_size, (int) nchannels_dst, stream)
+                    (uint32_t) (ne02 - 1), warp_size, (int) nchannels_dst, ggml_nelements(dst), stream)
 #define FN_L3_ZSKIP_CASE(t) case t:                                                                                       \
             if (mmvq_has_vdr_up(t) && ggml_cuda_mmvq_vdr2()) { /* [TAG_SYNC_MMVQ_VDR] */                                  \
                 FN_L3_ZSKIP_LAUNCH(t, mmvq_has_vdr_up(t));                                                                \

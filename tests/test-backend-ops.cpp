@@ -14199,26 +14199,59 @@ struct test_fn_l18_gdnout : public test_case {
 // [TAG_FN_L3_GPU_ZSKIP] the expert chain of the hot set / a DMA bank (build_slot_chain): up and gate MUL_MAT_IDs, SWIGLU,
 // down, over slot tensors whose last slot is all zeros; the ids route some (token, slot) pairs there (every third, and all
 // of the last token when zero_all). marked = ZSKIP on the ids.
+// [TAG_R35_MOEGRP] pattern > 0: Flash-Next widths (10 of 40 slots per token) for the grouped kernel, which computes all the
+// pairs of a slot in one warp: 1 = overlapping routing at other k positions (+ zero-slot pairs), 2 = every token routes the
+// same slots, 3 = as 1 with a slot routed twice by one token, 4 = 20 of 40 slots (more than 128 pairs at 8 tokens: the
+// v0.27.0 kernel)
 struct test_fn_l3_zskip : public test_case {
     const ggml_type type_ud;
     const ggml_type type_down;
     const int64_t   n_tokens;
     const bool      zero_all;
     const bool      marked;
+    const int       pattern;
+    const int64_t   n_slots;
+    const int64_t   n_used;
 
     std::string op_desc(ggml_tensor *) override { return "FN_L3_GPU"; }
-    std::string vars() override { return "zskip," + VARS_TO_STR5(type_ud, type_down, n_tokens, zero_all, marked); }
+    std::string vars() override {
+        return "zskip," + VARS_TO_STR5(type_ud, type_down, n_tokens, zero_all, marked) +
+            (pattern ? "," + VAR_TO_STR(pattern) : std::string());
+    }
     bool run_whole_graph() override { return true; }
     double max_nmse_err() override { return 5e-4; }
 
     test_fn_l3_zskip(ggml_type type_ud = GGML_TYPE_Q4_K, ggml_type type_down = GGML_TYPE_Q5_1, int64_t n_tokens = 3,
-            bool zero_all = false, bool marked = true)
-        : type_ud(type_ud), type_down(type_down), n_tokens(n_tokens), zero_all(zero_all), marked(marked) {}
+            bool zero_all = false, bool marked = true, int pattern = 0)
+        : type_ud(type_ud), type_down(type_down), n_tokens(n_tokens), zero_all(zero_all), marked(marked), pattern(pattern),
+          n_slots(pattern ? 40 : 6), n_used(pattern == 4 ? 20 : pattern ? 10 : 4) {}
 
     static constexpr int64_t n_embd  = 2560;
     static constexpr int64_t n_ff    = 640;
-    static constexpr int64_t n_slots = 6;
-    static constexpr int64_t n_used  = 4;
+
+    // [TAG_R35_MOEGRP] the slot of pair (tok, k)
+    int32_t slot_of(int64_t tok, int64_t k) const {
+        const int64_t i = tok*n_used + k;
+        if (pattern == 0) {
+            return (i % 3 == 2) || (zero_all && tok == n_tokens - 1) ? (int32_t) n_slots : (int32_t) ((i*5 + 1) % n_slots);
+        }
+        if (zero_all && tok == n_tokens - 1) {
+            return (int32_t) n_slots;
+        }
+        switch (pattern) {
+            case 2:  return (int32_t) (5 + 3*k);
+            case 4:  return (int32_t) ((11*tok + 3*k) % n_slots);
+            default: break;
+        }
+        if (pattern == 3 && ((tok == 0 && (k == 1 || k == 4)) || (tok == 1 && k == 2))) {
+            return 13; // routed twice by token 0 (and once by token 1)
+        }
+        if (i % 7 == 3) {
+            return (int32_t) n_slots;
+        }
+        // 10 distinct slots per token; token t + 1's set is token t's shifted by 3 places (7 of 10 shared), at other k
+        return (int32_t) ((7*(3*tok + (3*k + tok) % 10)) % n_slots);
+    }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * up_c   = ggml_new_tensor_3d(ctx, type_ud,   n_embd, n_ff, n_slots + 1);
@@ -14252,8 +14285,7 @@ struct test_fn_l3_zskip : public test_case {
             if (name == "slot_ids") {
                 std::vector<int32_t> v(n_used*n_tokens);
                 for (int64_t i = 0; i < (int64_t) v.size(); ++i) {
-                    const int64_t tok = i / n_used;
-                    v[i] = (i % 3 == 2) || (zero_all && tok == n_tokens - 1) ? (int32_t) n_slots : (int32_t) ((i*5 + 1) % n_slots);
+                    v[i] = slot_of(i / n_used, i % n_used); // [TAG_R35_MOEGRP]
                 }
                 ggml_backend_tensor_set(t, v.data(), 0, v.size()*sizeof(int32_t));
                 continue;
@@ -17338,6 +17370,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
         test_cases.emplace_back(new test_fn_l3_zskip(GGML_TYPE_Q4_K, GGML_TYPE_Q5_1, t, false, true)); // [TAG_FN_L3_GPU_ZSKIP]
         test_cases.emplace_back(new test_fn_l3_zskip(GGML_TYPE_Q5_K, GGML_TYPE_Q8_0, t, true, true));
+        for (int pat : { 1, 2, 3, 4 }) { // [TAG_R35_MOEGRP]
+            test_cases.emplace_back(new test_fn_l3_zskip(GGML_TYPE_Q4_K, GGML_TYPE_Q5_1, t, false, true, pat));
+        }
         test_cases.emplace_back(new test_fn_l3_gdnab(t, true)); // [TAG_FN_L3_GPU_GDNAB]
         test_cases.emplace_back(new test_fn_l3_hcmix(t, true)); // [TAG_FN_L3_GPU]
         test_cases.emplace_back(new test_fn_l4_hc(t, true, true, true, true));   // [TAG_FN_L4_HC]
@@ -18318,6 +18353,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
                 test_cases.emplace_back(new test_fn_l3_q8f(mode, t, m)); // [TAG_FN_L3_GPU_Q8F]
             }
             test_cases.emplace_back(new test_fn_l3_zskip(GGML_TYPE_Q4_K, GGML_TYPE_Q5_1, t, false, m)); // [TAG_FN_L3_GPU_ZSKIP]
+            test_cases.emplace_back(new test_fn_l3_zskip(GGML_TYPE_Q4_K, GGML_TYPE_Q5_1, t, false, m, 1)); // [TAG_R35_MOEGRP]
             test_cases.emplace_back(new test_fn_l3_gdnab(t, m)); // [TAG_FN_L3_GPU_GDNAB]
             test_cases.emplace_back(new test_fn_l18_gdnout(t, m)); // [TAG_FN_L18_GPUFLOOR_GDNOUT]
             test_cases.emplace_back(new test_fn_l3_hcmix(t, m)); // [TAG_FN_L3_GPU]
@@ -20637,6 +20673,19 @@ static bool run_fn_l3_gpu(ggml_backend_t backend, ggml_backend_t backend_ref, co
                 const ggml_type tu = tt[0];
                 const ggml_type td = tt[1];
                 cases.push_back({ [=](bool m) { return std::unique_ptr<test_case>(new test_fn_l3_zskip(tu, td, t, za, m)); }, false });
+            }
+        }
+        // [TAG_R35_MOEGRP] the grouped kernel (all pairs of a slot in one warp): Flash-Next widths, shared slots at other k,
+        // every token on the same slots, a slot routed twice by one token, more than 128 pairs (v0.27.0 kernel)
+        if (t >= 2) {
+            for (int pat : { 1, 2, 3, 4 }) {
+                for (const auto & tt : zskip_types) {
+                    const ggml_type tu = tt[0];
+                    const ggml_type td = tt[1];
+                    cases.push_back({ [=](bool m) { return std::unique_ptr<test_case>(new test_fn_l3_zskip(tu, td, t, false, m, pat)); }, false });
+                }
+                cases.push_back({ [=](bool m) {
+                    return std::unique_ptr<test_case>(new test_fn_l3_zskip(GGML_TYPE_Q4_K, GGML_TYPE_Q5_1, t, true, m, pat)); }, false });
             }
         }
         // [TAG_FN_L3_GPU_GDNAB] the GDN gate inputs in one launch
