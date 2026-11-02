@@ -1604,6 +1604,23 @@ llama_context::llama_context(
                     upload_verify ? ", every batch read back and compared (LLAMA_FN_UPLOAD_VERIFY)" : "");
         }
 
+        // [TAG_R35_HOSTCHAIN] LLAMA_FN_R35_HOSTCHAIN (qwen4exp, bit mask; unset / 0 = v0.27.0): bit 1 the target context
+        // copies the device top-64 of each output row of a small all-output decode instead of the row (the row comes on first
+        // access); bit 2 the packed input uploads (mode 2) skip the split's input synchronize when every copy was staged in
+        // the pinned slot (the host sources are free once the call returns)
+        {
+            const int r35 = model.arch == LLM_ARCH_QWEN4EXP ? std::max(0, llama_fn_l3_int(model, "LLAMA_FN_R35_HOSTCHAIN", 0)) : 0;
+            fn_r35.on = (r35 & 1) != 0 && cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP && !cparams.embeddings;
+            if ((r35 & 2) != 0 && batch_inputs_mode == 2) {
+                batch_inputs_mode = 3;
+            }
+            if (r35 != 0) {
+                LLAMA_LOG_INFO("%s: [TAG_R35_HOSTCHAIN] LLAMA_FN_R35_HOSTCHAIN=%d: device top-%d candidates %s, staged uploads without "
+                        "the input synchronize %s\n", __func__, r35, fn_r35.m, fn_r35.on ? "on" : "off",
+                        batch_inputs_mode == 3 ? "on" : "off");
+            }
+        }
+
         // [TAG_FN_L16_MTP_ASYNC] the qwen4exp MTP draft context only: the target is bridged and keeps its tail synchronize
         mtp_async_on = cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && llama_fn_l3_flag(model, "LLAMA_FN_L16_MTP_ASYNC");
         if (mtp_async_on) {
@@ -2205,6 +2222,7 @@ void llama_context::sched_smpl_changed() {
 }
 
 void llama_context::sched_reserve() {
+    fn_r35_flush(); // [TAG_R35_HOSTCHAIN] a reserve may move the compute buffer: the device rows to the host first
     if (!sched_need_reserve) {
         if (sched_smpl_dirty) { // [TAG_R34_SMPLRES]
             sched_smpl_dirty = false;
@@ -2835,6 +2853,7 @@ enum llama_pooling_type llama_context::pooling_type() const {
 
 float * llama_context::get_logits() {
     output_reorder();
+    fn_r35_flush(); // [TAG_R35_HOSTCHAIN] every row on the host
 
     return logits.data;
 }
@@ -2877,6 +2896,9 @@ float * llama_context::get_logits_ith(int32_t i) {
         }
 
         const int64_t j = output_resolve_row(i);
+        if (fn_r35.n_rows > 0) {
+            fn_r35_fetch_row(j); // [TAG_R35_HOSTCHAIN] the row is on the device until its first read
+        }
         return logits.data + j*model.vocab.n_tokens();
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: invalid logits id %d, reason: %s\n", __func__, i, err.what());
@@ -2892,6 +2914,63 @@ float * llama_context::get_embeddings() {
     output_reorder();
 
     return embd.data;
+}
+
+// [TAG_R35_HOSTCHAIN] output row j (after output_reorder) still on the device: copy it into logits.data once. The decode's
+// logits tensor is alive until the next graph of this context (a new decode drops the state first; the next ubatch, a cbuf
+// switch, a reserve and an encode flush first).
+void llama_context::fn_r35_fetch_row(int64_t j) {
+    if (j < 0 || j >= fn_r35.n_rows || fn_r35.dev_row[j] < 0 || fn_r35.t_logits == nullptr || logits.data == nullptr) {
+        return;
+    }
+    const int64_t n_vocab = model.vocab.n_tokens();
+    ggml_backend_sched_synchronize(sched.get());
+    ggml_backend_tensor_get(fn_r35.t_logits, logits.data + j*n_vocab, (size_t) fn_r35.dev_row[j]*fn_r35.t_logits->nb[1],
+            (size_t) n_vocab*sizeof(float));
+    fn_r35.dev_row[j] = -1;
+    fn_r35.n_fetch++;
+}
+
+void llama_context::fn_r35_flush() {
+    for (int32_t j = 0; j < fn_r35.n_rows; ++j) {
+        if (fn_r35.dev_row[j] >= 0) {
+            fn_r35_fetch_row(j);
+        }
+    }
+}
+
+// [TAG_R35_HOSTCHAIN] the candidates of output i (the caller synchronized): count m, or 0 when the row has none (no device
+// candidates in this decode, or a chunk sum that is not finite: a NaN / inf row takes the whole-row path)
+int32_t llama_context::fn_r35_topk_ith(int32_t i, const float ** vals, const llama_token ** ids) {
+    if (fn_r35.n_rows <= 0) {
+        return 0;
+    }
+    output_reorder();
+    int64_t j = -1;
+    try {
+        j = output_resolve_row(i);
+    } catch (const std::exception &) {
+        return 0;
+    }
+    if (j < 0 || j >= fn_r35.n_rows || fn_r35.bad[j] == 1) {
+        return 0;
+    }
+    if (fn_r35.bad[j] == 2) {
+        const float * s = fn_r35.sums + j*64;
+        bool ok = fn_r35.nsum > 0;
+        for (int32_t k = 0; k < fn_r35.nsum && ok; ++k) {
+            ok = std::isfinite(s[k]);
+        }
+        fn_r35.bad[j] = ok ? 0 : 1;
+        if (!ok) {
+            fn_r35.n_bad++;
+            return 0;
+        }
+    }
+    *vals = fn_r35.vals + j*fn_r35.m;
+    *ids  = fn_r35.ids  + j*fn_r35.m;
+    fn_r35.n_row++;
+    return fn_r35.m;
 }
 
 llama_token * llama_context::get_sampled_tokens()  const{
@@ -3815,6 +3894,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 }
 
 int llama_context::encode(const llama_batch_ext & batch_inp) {
+    fn_r35_flush(); // [TAG_R35_HOSTCHAIN] before anything can move the compute buffer
+    fn_r35.n_rows = 0;
     if (batch_inp.tokens.empty()) {
         LLAMA_LOG_ERROR("%s: n_tokens == 0\n", __func__);
         return -1;
@@ -4229,6 +4310,11 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     if (fa18_ovl) {
         llama_moe_hot_turn_finish(this); // [TAG_FN_L18_FIRSTANS_OVERLAP] the last prompt-end pass's experts are in the tables (2: once landed)
     }
+
+    // [TAG_R35_HOSTCHAIN] a new decode: the last one's outputs (candidates and rows) are gone
+    fn_r35.n_rows   = 0;
+    fn_r35.t_logits = nullptr;
+    fn_r35_cur      = 0;
 
     if (batch_inp.tokens.empty()) {
         LLAMA_LOG_ERROR("%s: n_tokens == 0\n", __func__);
@@ -4697,6 +4783,42 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         llama_sampler_backend_begin(entry.second);
     }
 
+    // [TAG_R35_HOSTCHAIN] device candidates for this decode: a few rows, every one an output (a verify batch or one answer
+    // token per sequence), no backend sampler, a caller top-k bound below m, and the compute buffer not in its prompt state
+    // (a cbuf switch at the end of this decode would move the logits tensor; cbuf_set flushes anyway)
+    if (fn_r35.on && fn_r35.req > 0 && fn_r35.req < fn_r35.m && n_outputs_all > 0 && n_outputs_all == n_tokens_all &&
+            n_outputs_all <= (uint32_t) R35_TOPK_ROWS && !has_samplers && !output_all && logits.data != nullptr &&
+            cbuf_state != CBUF_FULL) {
+        if (!fn_r35.buf) {
+            const size_t per_row = (size_t) fn_r35.m*sizeof(int32_t) + (size_t) fn_r35.m*sizeof(float) + 64*sizeof(float);
+            auto * buft = ggml_backend_cpu_buffer_type();
+            auto * dev_out = model.dev_output();
+            auto * dev_host_buft = dev_out ? ggml_backend_dev_host_buffer_type(dev_out) : nullptr;
+            if (dev_host_buft) {
+                buft = dev_host_buft;
+            }
+            fn_r35.buf.reset(ggml_backend_buft_alloc_buffer(buft, per_row*R35_TOPK_ROWS));
+            if (fn_r35.buf) {
+                uint8_t * b = (uint8_t *) ggml_backend_buffer_get_base(fn_r35.buf.get());
+                fn_r35.ids  = (int32_t *) b;
+                fn_r35.vals = (float *) (b + (size_t) R35_TOPK_ROWS*fn_r35.m*sizeof(int32_t));
+                fn_r35.sums = (float *) (b + (size_t) R35_TOPK_ROWS*fn_r35.m*(sizeof(int32_t) + sizeof(float)));
+            } else {
+                LLAMA_LOG_WARN("%s: [TAG_R35_HOSTCHAIN] no host buffer for the candidates: whole rows from now on\n", __func__);
+                fn_r35.on = false;
+            }
+        }
+        if (fn_r35.on) {
+            fn_r35_cur = (uint8_t) fn_r35.m;
+            fn_r35.n_dec++;
+            if (fn_r35.n_dec == 1 || fn_r35.n_dec % 1024 == 0) {
+                LLAMA_LOG_INFO("%s: [TAG_R35_HOSTCHAIN] %" PRIu64 " decodes with device top-%d candidates: %" PRIu64 " rows sampled "
+                        "from them, %" PRIu64 " whole rows read (ties, other readers), %" PRIu64 " rows not finite\n", __func__,
+                        fn_r35.n_dec, fn_r35.m, fn_r35.n_row, fn_r35.n_fetch, fn_r35.n_bad);
+            }
+        }
+    }
+
     int64_t n_outputs_prev = 0;
     int64_t n_tokens_prev  = 0;
     uint32_t n_ubatch_done = 0; // [TAG_4C_PROBE]
@@ -4727,6 +4849,11 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
     do {
         const auto & ubatch = mctx->get_ubatch();
+
+        // [TAG_R35_HOSTCHAIN] the last ubatch's rows to the host before this ubatch's graph reuses its compute buffer
+        if (n_ubatch_done > 0) {
+            fn_r35_flush();
+        }
 
         // count the outputs in this ubatch
         {
@@ -4761,8 +4888,35 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                 t_embd = res->get_embd_pooled();
             }
 
+            // [TAG_R35_HOSTCHAIN] this ubatch's rows as device candidates: ids, values and chunk sums; the rows stay on the device
+            // (sums: nsum per row, packed; nsum == 64 for a vocabulary divisible by 64, the rows are then 64 floats apart)
+            const bool r35_rows = fn_r35_cur > 0 && t_logits && n_outputs > 0 && res->t_fn_topk_ids != nullptr &&
+                                  res->t_fn_topk_vals != nullptr && res->t_fn_topk_sums != nullptr &&
+                                  t_logits->ne[0] == n_vocab && res->t_fn_topk_ids->ne[0] == fn_r35.m &&
+                                  res->fn_topk_nsum == 64 && n_outputs_prev + n_outputs <= R35_TOPK_ROWS;
+            if (fn_r35_cur > 0 && n_outputs > 0 && n_outputs_prev + n_outputs <= R35_TOPK_ROWS) {
+                if (r35_rows) {
+                    ggml_backend_t be_i = ggml_backend_sched_get_tensor_backend(sched.get(), res->t_fn_topk_ids);
+                    ggml_backend_t be_v = ggml_backend_sched_get_tensor_backend(sched.get(), res->t_fn_topk_vals);
+                    ggml_backend_t be_s = ggml_backend_sched_get_tensor_backend(sched.get(), res->t_fn_topk_sums);
+                    GGML_ASSERT(be_i != nullptr && be_v != nullptr && be_s != nullptr);
+                    const int64_t m = fn_r35.m;
+                    ggml_backend_tensor_get_async(be_i, res->t_fn_topk_ids,  fn_r35.ids  + n_outputs_prev*m, 0, n_outputs*m*sizeof(int32_t));
+                    ggml_backend_tensor_get_async(be_v, res->t_fn_topk_vals, fn_r35.vals + n_outputs_prev*m, 0, n_outputs*m*sizeof(float));
+                    ggml_backend_tensor_get_async(be_s, res->t_fn_topk_sums, fn_r35.sums + n_outputs_prev*64, 0, n_outputs*64*sizeof(float));
+                    fn_r35.nsum     = res->fn_topk_nsum;
+                    fn_r35.t_logits = t_logits;
+                    fn_r35.row0     = (int32_t) n_outputs_prev;
+                }
+                for (int64_t r = 0; r < n_outputs; ++r) {
+                    fn_r35.dev_row[n_outputs_prev + r] = r35_rows ? (int32_t) r : -1;
+                    fn_r35.bad    [n_outputs_prev + r] = r35_rows ? 2 : 1;
+                }
+                fn_r35.n_rows = (int32_t) (n_outputs_prev + n_outputs);
+            }
+
             // extract logits
-            if (logits.data && t_logits && n_outputs > 0 && needs_raw_logits(ubatch, sampling.samplers)) {
+            if (logits.data && t_logits && n_outputs > 0 && needs_raw_logits(ubatch, sampling.samplers) && !r35_rows) {
                 ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched.get(), t_logits);
                 GGML_ASSERT(backend_res != nullptr);
                 GGML_ASSERT(logits.data != nullptr);
@@ -5047,6 +5201,8 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             synchronize();
         }
     }
+
+    fn_r35_cur = 0; // [TAG_R35_HOSTCHAIN] graphs built outside a decode (reserve) have no candidate nodes
 
     // [TAG_FN_L16_MTP_ASYNC] other graphs of this scheduler (a K-shift) keep the tail synchronize; synchronize() clears the mark
     if (tail_async) {
@@ -5488,6 +5644,20 @@ void llama_context::output_reorder() {
             }
         }
 
+        // [TAG_R35_HOSTCHAIN] the candidate rows and their device rows follow the output rows
+        if (fn_r35.n_rows > 0 && i0 < (uint64_t) fn_r35.n_rows && i1 < (uint64_t) fn_r35.n_rows) {
+            const uint64_t m = (uint64_t) fn_r35.m;
+            for (uint64_t k = 0; k < m; k++) {
+                std::swap(fn_r35.ids [i0*m + k], fn_r35.ids [i1*m + k]);
+                std::swap(fn_r35.vals[i0*m + k], fn_r35.vals[i1*m + k]);
+            }
+            for (uint64_t k = 0; k < 64; k++) {
+                std::swap(fn_r35.sums[i0*64 + k], fn_r35.sums[i1*64 + k]);
+            }
+            std::swap(fn_r35.dev_row[i0], fn_r35.dev_row[i1]);
+            std::swap(fn_r35.bad[i0],     fn_r35.bad[i1]);
+        }
+
         if (embd.size > 0) {
             for (uint64_t k = 0; k < n_embd_out; k++) {
                 std::swap(embd.data[i0*n_embd_out + k], embd.data[i1*n_embd_out + k]);
@@ -5892,6 +6062,7 @@ llm_graph_params llama_context::graph_params(
         /*.fn_gen      =*/ fn_gen, // [TAG_FN_L22_PHASE]
         /*.fn_x        =*/ llama_fn_l22_x_bits(fn_l22_x, fn_gen, ubatch.n_seqs_unq),
         /*.fn_hooks    =*/ fn_l22_hooks,
+        /*.fn_topk     =*/ fn_r35_cur, // [TAG_R35_HOSTCHAIN]
     };
 }
 
@@ -7800,6 +7971,7 @@ bool llama_context::cbuf_set(bool full, uint32_t width, uint32_t cls) {
     if (cbuf_state == CBUF_OFF || cbuf_state == want) {
         return true;
     }
+    fn_r35_flush(); // [TAG_R35_HOSTCHAIN] the compute buffer moves: the device rows to the host first
     llama_l22_flag_scope sk_scope(l22_sk_in_cbuf); // [TAG_FN_L22_SMALLKEEP]
     llama_fn_stall_scope st_scope(full ? "cbuf -> FULL begins" : "cbuf -> SMALL begins", "cbuf switch ends"); // [TAG_FN_L18_FIRSTANS_STALL]
     constexpr double MiB = 1024.0*1024.0;
@@ -9815,6 +9987,25 @@ float * llama_get_logits(llama_context * ctx) {
     ctx->synchronize();
 
     return ctx->get_logits();
+}
+
+// [TAG_R35_HOSTCHAIN]
+void llama_fn_r35_set_logits_topk(llama_context * ctx, int32_t top_k) {
+    if (ctx) {
+        ctx->fn_r35_set_req(top_k);
+    }
+}
+
+int32_t llama_fn_r35_logits_topk_cap(const llama_context * ctx) {
+    return ctx ? ctx->fn_r35_cap() : 0;
+}
+
+int32_t llama_fn_r35_topk_ith(llama_context * ctx, int32_t i, const float ** vals, const llama_token ** ids) {
+    if (ctx == nullptr || vals == nullptr || ids == nullptr || ctx->fn_r35_n_rows() <= 0) {
+        return 0; // no candidates in the last decode: nothing to wait for here
+    }
+    ctx->synchronize();
+    return ctx->fn_r35_topk_ith(i, vals, ids);
 }
 
 float * llama_get_logits_ith(llama_context * ctx, int32_t i) {

@@ -405,6 +405,11 @@ extern "C" {
     // verify (debug): after each batch, read back every copied tensor and abort if it differs from its source.
     typedef bool (*ggml_backend_set_tensors_batch_async_t)(ggml_backend_t backend, int n, struct ggml_tensor * const * tensors,
             const void * const * data, const size_t * sizes);
+    // [TAG_R35_HOSTCHAIN] mode 3: mode 2 through "ggml_backend_set_tensors_pack_async_staged" (-1 refused, 0 queued, 1 queued
+    // with every source already read); a split whose input copies were all staged that way skips its input synchronize
+    // (the host sources are free; the stream orders the copies before the graph)
+    typedef int (*ggml_backend_set_tensors_staged_async_t)(ggml_backend_t backend, int n, struct ggml_tensor * const * tensors,
+            const void * const * data, const size_t * sizes);
     GGML_API void                 ggml_backend_sched_set_batch_inputs(ggml_backend_sched_t sched, int mode, bool verify);
 
     // [TAG_FN_L16_MTP_ASYNC] on: the input synchronize of a split also clears that backend's queued split-async uploads,

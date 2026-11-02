@@ -900,6 +900,10 @@ struct llm_graph_params {
     uint8_t fn_x   = 0;
     // [TAG_FN_L22] graph hooks the context turned on (llama_fn_l22_hook), 0 with every switch unset
     uint8_t fn_hooks = 0;
+    // [TAG_R35_HOSTCHAIN] m > 0: the graph also selects each output row's top m logits on the device (ids, values) and m
+    // partial sums of the row (a non-finite sum marks a NaN / inf row), so the host reads those instead of the whole row
+    // (LLAMA_FN_R35_HOSTCHAIN bit 1, llama_context::fn_r35); 0 = the graph of v0.27.0
+    uint8_t fn_topk = 0;
 
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
@@ -979,7 +983,8 @@ struct llm_graph_params {
             cross == other.cross &&
             moe_bridge == other.moe_bridge &&       // [TAG_MOE_BRIDGE] a paused bridge rebuilds without its ops
             moe_bridge_sync == other.moe_bridge_sync && // [TAG_FN_R2_BRIDGE_SYNC]
-            fn_gen == other.fn_gen && fn_x == other.fn_x && fn_hooks == other.fn_hooks; // [TAG_FN_L22_PHASE]
+            fn_gen == other.fn_gen && fn_x == other.fn_x && fn_hooks == other.fn_hooks && // [TAG_FN_L22_PHASE]
+            fn_topk == other.fn_topk; // [TAG_R35_HOSTCHAIN]
     }
 };
 
@@ -1054,6 +1059,13 @@ public:
     std::vector<ggml_tensor *> t_sampled_probs;
     std::vector<ggml_tensor *> t_sampled_logits;
     std::vector<ggml_tensor *> t_candidates;
+
+    // [TAG_R35_HOSTCHAIN] llm_graph_context::build_fn_r35_topk: per output row the top m logit ids [m, n_out] i32 and values
+    // [1, m, n_out] f32, and fn_topk_nsum partial sums [1, nsum*n_out] f32 (all outputs); null when the graph has none
+    ggml_tensor * t_fn_topk_ids  = nullptr;
+    ggml_tensor * t_fn_topk_vals = nullptr;
+    ggml_tensor * t_fn_topk_sums = nullptr;
+    int32_t       fn_topk_nsum   = 0;
 
     // [TAG_FN_MOE_TRACE] routing capture per MoE layer, only built when llama_moe_trace_active(); aligned vectors
     std::vector<int>             t_moe_il;
@@ -1202,6 +1214,7 @@ struct llm_graph_context {
     const uint8_t fn_gen = 0;
     const uint8_t fn_x   = 0;
     const uint8_t fn_hooks = 0; // [TAG_FN_L22]
+    const uint8_t fn_topk  = 0; // [TAG_R35_HOSTCHAIN] see llm_graph_params
     // [TAG_UPSTREAM_29510] build_attn_mha_kv: the layer's const llama_kv_cache_context * while it builds the attention
     // (llama_fn_kvrows_args::mctx), null otherwise
     mutable const void * fn_attn_kv_mctx = nullptr;
@@ -1696,6 +1709,9 @@ struct llm_graph_context {
     void build_layer_inp_dev() const;
 
     virtual void build_post_sampling() const {}
+
+    // [TAG_R35_HOSTCHAIN] fn_topk > 0: the device top m of every logits row (llm_graph_result::t_fn_topk_*)
+    void build_fn_r35_topk() const;
 
     //
     // dense (out)

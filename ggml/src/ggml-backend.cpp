@@ -1438,6 +1438,7 @@ struct ggml_backend_sched {
     bool                                    batch_verify; // [TAG_FN_L16_UPLOAD] LLAMA_FN_UPLOAD_VERIFY
     bool                                    batch_fn_tried[GGML_SCHED_MAX_BACKENDS];
     ggml_backend_set_tensors_batch_async_t  batch_fn[GGML_SCHED_MAX_BACKENDS];
+    ggml_backend_set_tensors_staged_async_t staged_fn[GGML_SCHED_MAX_BACKENDS]; // [TAG_R35_HOSTCHAIN] mode 3
 
     bool tail_async; // [TAG_FN_L16_MTP_ASYNC] ggml_backend_sched_set_tail_async
 
@@ -2505,6 +2506,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
         // copy the input tensors to the split backend
         int n_inputs_async = 0;
+        // [TAG_R35_HOSTCHAIN] mode 3: every input copy of this split so far was staged (its host source already read)
+        bool inputs_staged = true;
+        ggml_backend_set_tensors_staged_async_t staged_fn = nullptr;
         // [TAG_FN_L4_HOST_BATCHCPY] the batch function of this split's backend, if the scheduler batches
         ggml_backend_set_tensors_batch_async_t batch_fn = nullptr;
         if (sched->batch_inputs) {
@@ -2512,6 +2516,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 sched->batch_fn_tried[split_backend_id] = true;
                 ggml_backend_dev_t dev = ggml_backend_get_device(split_backend);
                 ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+                if (reg && sched->batch_inputs >= 3) { // [TAG_R35_HOSTCHAIN]
+                    sched->staged_fn[split_backend_id] = (ggml_backend_set_tensors_staged_async_t)
+                        ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_tensors_pack_async_staged");
+                }
                 ggml_backend_set_tensors_batch_async_t fn = nullptr;
                 if (reg && sched->batch_inputs >= 2) { // [TAG_FN_L16_UPLOAD] the packed copy, else the plain batch
                     fn = (ggml_backend_set_tensors_batch_async_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_tensors_pack_async");
@@ -2521,7 +2529,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 }
                 sched->batch_fn[split_backend_id] = fn;
             }
-            batch_fn = sched->batch_fn[split_backend_id];
+            batch_fn  = sched->batch_fn[split_backend_id];
+            staged_fn = batch_fn != nullptr ? sched->staged_fn[split_backend_id] : nullptr; // [TAG_R35_HOSTCHAIN]
             batch_t.clear();
             batch_d.clear();
             batch_s.clear();
@@ -2531,7 +2540,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             if (batch_t.empty()) {
                 return;
             }
-            if (!batch_fn(split_backend, (int) batch_t.size(), batch_t.data(), batch_d.data(), batch_s.data())) {
+            // [TAG_R35_HOSTCHAIN] mode 3: the same pack, and whether it staged every source
+            const int st = staged_fn != nullptr ?
+                staged_fn(split_backend, (int) batch_t.size(), batch_t.data(), batch_d.data(), batch_s.data()) :
+                (batch_fn(split_backend, (int) batch_t.size(), batch_t.data(), batch_d.data(), batch_s.data()) ? 0 : -1);
+            if (st != 1) {
+                inputs_staged = false;
+            }
+            if (st < 0) {
                 for (size_t k = 0; k < batch_t.size(); ++k) {
                     ggml_backend_tensor_set_async(split_backend, batch_t[k], batch_d[k], 0, batch_s[k]);
                 }
@@ -2573,6 +2589,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         }
                     } else {
                         ggml_backend_tensor_set_async(split_backend, input_cpy, input->data, 0, ggml_nbytes(input));
+                        inputs_staged = false; // [TAG_R35_HOSTCHAIN] reads its source later
                     }
                     n_inputs_async++;
                 } else {
@@ -2742,7 +2759,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         prof(GGML_SCHED_PROF_SYNC); // [TAG_FN_L4_HOST]
 
         // [TAG_SCHED_INPUT_BATCH] one synchronize for every input queued above
-        if (n_inputs_async > 0) {
+        // [TAG_R35_HOSTCHAIN] mode 3: none when every input copy was staged (the sources are free, the stream orders the
+        // copies before the graph) and no split-async upload of this backend waits for it ([TAG_FN_L16_MTP_ASYNC] clears
+        // those here; they keep the synchronize)
+        const bool skip_input_sync = staged_fn != nullptr && inputs_staged && !sched->batch_verify &&
+                                     (pending_h2d & (1u << split_backend_id)) == 0;
+        if (n_inputs_async > 0 && !skip_input_sync) {
             ggml_backend_synchronize(split_backend);
             // [TAG_FN_L16_MTP_ASYNC] this also waited for the split-async uploads queued on this backend so far
             if (sched->tail_async) {
@@ -3122,6 +3144,7 @@ void ggml_backend_sched_set_batch_inputs(ggml_backend_sched_t sched, int mode, b
         for (int b = 0; b < GGML_SCHED_MAX_BACKENDS; b++) {
             sched->batch_fn_tried[b] = false;
             sched->batch_fn[b]       = nullptr;
+            sched->staged_fn[b]      = nullptr; // [TAG_R35_HOSTCHAIN]
         }
     }
     sched->batch_inputs = mode;

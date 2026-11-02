@@ -3553,13 +3553,19 @@ static bool ggml_cuda_upload_slot_alloc(ggml_cuda_upload_slot & s, size_t cap) {
 // one unpack kernel. All on the backend's stream, before the split's graph. A slot is reused only after the event behind
 // its last unpack. The same bytes reach the same tensors. Without a slot: the cudaMemcpyBatchAsync batch (mode 1), else
 // false (nothing queued).
-static bool ggml_backend_cuda_set_tensors_pack_async(ggml_backend_t backend, int n, ggml_tensor * const * tensors,
-        const void * const * data, const size_t * sizes) {
+// [TAG_R35_HOSTCHAIN] *staged: true when every source was read before the call returned (every copy went through the
+// pinned slot: none as a plain cudaMemcpyAsync from the caller's memory, no mode-1 batch), so the caller may reuse its host
+// memory right away; the stream still orders the copies before the split's graph
+static bool ggml_backend_cuda_pack_async_impl(ggml_backend_t backend, int n, ggml_tensor * const * tensors,
+        const void * const * data, const size_t * sizes, bool * staged) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    *staged = false;
     if (n <= 0) {
+        *staged = true;
         return true;
     }
     size_t n_small = 0;
+    int    n_plain = 0; // [TAG_R35_HOSTCHAIN] copies this call sent plain
     for (int i = 0; i < n; ++i) {
         const ggml_tensor * t = tensors[i];
         ggml_backend_buffer_t buf = t->view_src ? t->view_src->buffer : t->buffer;
@@ -3596,12 +3602,14 @@ static bool ggml_backend_cuda_set_tensors_pack_async(ggml_backend_t backend, int
         if (sizes[i] > GGML_CUDA_UPLOAD_BIG) {
             CUDA_CHECK(cudaMemcpyAsync(tensors[i]->data, data[i], sizes[i], cudaMemcpyHostToDevice, stream));
             cuda_ctx->upload_n_plain++;
+            n_plain++;
         }
     }
     if (n_small == 0) {
         if (note) {
             note_line();
         }
+        *staged = n_plain == 0;
         return true;
     }
 
@@ -3623,6 +3631,7 @@ static bool ggml_backend_cuda_set_tensors_pack_async(ggml_backend_t backend, int
         if (pos + sz > s.cap) {
             CUDA_CHECK(cudaMemcpyAsync(tensors[i]->data, data[i], sz, cudaMemcpyHostToDevice, stream)); // the slot is full
             cuda_ctx->upload_n_plain++;
+            n_plain++;
             continue;
         }
         memcpy(s.host + pos, data[i], sz);
@@ -3637,6 +3646,7 @@ static bool ggml_backend_cuda_set_tensors_pack_async(ggml_backend_t backend, int
         if (note) {
             note_line();
         }
+        *staged = n_plain == 0;
         return true;
     }
 
@@ -3652,7 +3662,25 @@ static bool ggml_backend_cuda_set_tensors_pack_async(ggml_backend_t backend, int
     if (note) {
         note_line();
     }
+    *staged = n_plain == 0;
     return true;
+}
+
+static bool ggml_backend_cuda_set_tensors_pack_async(ggml_backend_t backend, int n, ggml_tensor * const * tensors,
+        const void * const * data, const size_t * sizes) {
+    bool staged = false;
+    return ggml_backend_cuda_pack_async_impl(backend, n, tensors, data, sizes, &staged);
+}
+
+// [TAG_R35_HOSTCHAIN] the pack for scheduler mode 3: -1 nothing queued (refused), 0 queued with copies that read the
+// sources later, 1 queued and every source already read
+static int ggml_backend_cuda_set_tensors_pack_async_staged(ggml_backend_t backend, int n, ggml_tensor * const * tensors,
+        const void * const * data, const size_t * sizes) {
+    bool staged = false;
+    if (!ggml_backend_cuda_pack_async_impl(backend, n, tensors, data, sizes, &staged)) {
+        return -1;
+    }
+    return staged ? 1 : 0;
 }
 
 static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
@@ -7915,8 +7943,19 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         // instance cap and the OOM retry are in ggml_cuda_fn_l22_instantiate)
         if (!cuda_graph_update_required) {
             GGML_ASSERT(graph->has_instance());
-            for (cudaGraphExec_t instance : graph->instances) {
-                CUDA_CHECK(cudaGraphLaunch(instance, cuda_ctx->stream()));
+            // [TAG_R35_HOSTCHAIN] GGML_CUDA_R35_POKE1=1 (the Flash-Next profile; unset = v0.27.0): a replay of several chunks
+            // flushes WDDM's batched submission right after the first chunk's launch, as a capture does after every chunk
+            // ([TAG_FN_R4_POKE]), so the GPU runs chunk 0 while the host launches the others (same kernels, same order)
+            static const bool r35_poke1 = [] {
+                const char * e = getenv("GGML_CUDA_R35_POKE1");
+                return e != nullptr && atoi(e) != 0;
+            }();
+            const size_t n_inst = graph->instances.size();
+            for (size_t c = 0; c < n_inst; ++c) {
+                CUDA_CHECK(cudaGraphLaunch(graph->instances[c], cuda_ctx->stream()));
+                if (c == 0 && n_inst > 1 && r35_poke1) {
+                    ggml_cuda_stream_query_flush(cuda_ctx->stream());
+                }
             }
         }
         ggml_cuda_graph_poke(cuda_ctx); // [TAG_FN_R4_POKE]
@@ -10121,6 +10160,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_set_tensors_pack_async") == 0) { // [TAG_FN_L16_UPLOAD]
         return (void *)ggml_backend_cuda_set_tensors_pack_async;
+    }
+    if (strcmp(name, "ggml_backend_set_tensors_pack_async_staged") == 0) { // [TAG_R35_HOSTCHAIN]
+        return (void *)ggml_backend_cuda_set_tensors_pack_async_staged;
     }
     if (strcmp(name, "ggml_backend_copy_d2d_batch_async") == 0) { // [TAG_FN_L14_PFSD2D]
         return (void *)ggml_backend_cuda_copy_d2d_batch_async;

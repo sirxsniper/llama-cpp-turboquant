@@ -367,6 +367,10 @@ const fn_item k_items[] = {
     { "LLAMA_FN_L22_CPUSHARE_MAX",          "3072",    P_ALL }, // P16
     { "LLAMA_FN_L22_CPUSHARE_ROWS",         "8",       P_ALL }, // P16
     { "LLAMA_FN_R35_SLOTBAL",               "0",       P_ALL }, // [TAG_R35_SLOTBAL] 1 = wait-aware layout (0 = v0.27.0)
+    // [TAG_R35_HOSTCHAIN] round 35 X-host-chain (exact): 1 device top-64 candidates of the target's output rows instead of
+    // the rows, 2 no input synchronize for a split whose uploads were all staged; 0 = v0.27.0
+    { "LLAMA_FN_R35_HOSTCHAIN",             "3",       P_ALL },
+    { "GGML_CUDA_R35_POKE1",                "1",       P_ALL }, // [TAG_R35_HOSTCHAIN] flush after the first chunk of a replay
 };
 
 } // namespace

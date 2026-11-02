@@ -120,6 +120,12 @@ struct llama_context {
     float * get_logits();
     float * get_logits_ith(int32_t i);
 
+    // [TAG_R35_HOSTCHAIN] see llama_fn_r35_set_logits_topk / llama_fn_r35_topk_ith (src/llama-ext.h)
+    void    fn_r35_set_req(int32_t top_k) { fn_r35.req = top_k; }
+    int32_t fn_r35_cap() const { return fn_r35.on ? fn_r35.m : 0; }
+    int32_t fn_r35_n_rows() const { return fn_r35.n_rows; }
+    int32_t fn_r35_topk_ith(int32_t i, const float ** vals, const llama_token ** ids);
+
     float * get_embeddings();
     float * get_embeddings_ith(int32_t i);
     float * get_embeddings_seq(llama_seq_id seq_id);
@@ -519,6 +525,33 @@ private:
     bool   early_out_on = false;
 
     int    batch_inputs_mode = 0;     // [TAG_FN_L4_HOST_BATCHCPY] LLAMA_FN_L4_HOST_BATCHCPY (qwen4exp): 0 off, 1 batch, 2 packed
+                                      // [TAG_R35_HOSTCHAIN] 3: packed, no input synchronize when every copy was staged
+
+    // [TAG_R35_HOSTCHAIN] LLAMA_FN_R35_HOSTCHAIN bit 1: the device top m of each output row instead of the row (decode of
+    // at most R35_TOPK_ROWS rows, all outputs, one ubatch per row set, no backend sampler); the rows themselves are read
+    // from the device on first access (fn_r35_fetch_row) while the decode's logits tensor is alive, flushed before
+    // anything can move the compute buffer (fn_r35_flush: next ubatch, cbuf switch, reserve, encode)
+    static constexpr int32_t R35_TOPK_ROWS = 16;
+    struct fn_r35_state {
+        bool           on     = false;   // the switch, this context (qwen4exp target)
+        int32_t        m      = 64;      // candidates per row ([TAG_TOPK_SPLIT]: k <= 64)
+        int32_t        req    = 0;       // the caller's top-k bound (llama_fn_r35_set_logits_topk), 0: rows
+        int32_t        n_rows = 0;       // output rows of the last decode that have candidates (0: none)
+        int32_t        nsum   = 0;       // chunk sums per row
+        bool           synced = false;   // the candidate copies are on the host
+        ggml_backend_buffer_ptr buf;     // host (pinned when the device has a host buffer type): ids | vals | sums
+        int32_t *      ids    = nullptr;
+        float *        vals   = nullptr;
+        float *        sums   = nullptr;
+        ggml_tensor *  t_logits = nullptr; // the decode's logits tensor (last ubatch), read by fn_r35_fetch_row
+        int32_t        row0   = 0;         // the first output row of that ubatch
+        int32_t        dev_row[R35_TOPK_ROWS] = {}; // output row -> row of t_logits, -1: on the host already
+        uint8_t        bad[R35_TOPK_ROWS]     = {}; // 1: a chunk sum was not finite (no candidates), 2: not checked yet
+        uint64_t       n_dec = 0, n_row = 0, n_fetch = 0, n_bad = 0;
+    } fn_r35;
+    uint8_t fn_r35_cur = 0;                // the m of the decode being built (graph_params), 0: none
+    void    fn_r35_fetch_row(int64_t j);   // the device row of output row j into logits.data (once)
+    void    fn_r35_flush();                // every output row on the host, candidates dropped
     bool   upload_verify     = false; // [TAG_FN_L16_UPLOAD] LLAMA_FN_UPLOAD_VERIFY (qwen4exp, debug)
     bool   mtp_async_on      = false; // [TAG_FN_L16_MTP_ASYNC] LLAMA_FN_L16_MTP_ASYNC (qwen4exp MTP draft context)
     bool   mtp_tail_live     = false; // [TAG_FN_L16_MTP_ASYNC] the last decode returned before its graph ended; synchronize() clears it
