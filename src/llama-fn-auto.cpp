@@ -353,6 +353,9 @@ const fn_item k_items[] = {
     { "LLAMA_FN_R25_REFILL_THREADS",        "8",       P_ALL }, // R25 copy threads (own stream each)
     { "LLAMA_FN_R25_REFILL_HALF_KIB",       "2048",    P_ALL }, // R25 pinned half per thread (two each)
     { "LLAMA_FN_R25_SBSYNC_MIB",            "1024",    P_ALL }, // R25 a borrow return up to this size lands at once (0: upload worker)
+    // [TAG_R35_X_PPH] round 35: a larger borrow return (~3.4-4 GiB after a prompt above 16K) is copied by the R25 pool in the
+    // background and named at a step boundary once landed, instead of trickling in through the upload worker (0 = v0.27.0)
+    { "LLAMA_FN_R35_SBBG",                  "1",       P_ALL }, // [TAG_R35_X_PPH]
     { "LLAMA_FN_L22_DMASHARE",              "0",       P_ALL }, // P14 [TAG_FN_L22_DMASHARE] D11, the pin block sets 1; owner
     { "LLAMA_FN_L22_DMASHARE_SLOTS",        "4",       P_ALL }, // P14
     { "LLAMA_FN_L22_X_PRIOR",               "0",       P_ALL }, // P12 [TAG_FN_L22_X_PRIOR] changes answers: owner
