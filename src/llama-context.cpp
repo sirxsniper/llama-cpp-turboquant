@@ -7563,6 +7563,7 @@ void llama_context::moe_hot_fit_try() {
             h.take = r35_hook_take;
             h.give = r35_hook_give;
             h.sync = r35_hook_sync;
+            h.idle = r35_hook_idle;
             h.user = this;
             if (r35_mem->r35_start(h, 0)) {
                 r35_rs_fit = r35_mem->r35_parked_bytes();
@@ -7868,6 +7869,11 @@ void llama_context::r35_hook_sync(void * user) {
         }
     }
     c->step_join(); // [TAG_FN_L3_HOST_STEP] the hot set's step is done before a cell or a group moves
+}
+
+bool llama_context::r35_hook_idle(void * user) {
+    // the caller's count of the other busy slots (the server sets it before each batch and at each slot launch)
+    return ((const llama_context *) user)->l24_seqs_busy == 0;
 }
 
 bool llama_context::r35_small_set(bool one, bool settle) {

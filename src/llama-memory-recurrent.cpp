@@ -2192,9 +2192,12 @@ bool llama_memory_recurrent::r35_ensure(const std::vector<uint32_t> & need) cons
                 b_need += r35_cells[c].parked ? r35_cell_bytes(c) : 0;
             }
         }
+        // a kept cell (the sequence of the last batch) swaps out only while no other sequence is busy: a new request on the
+        // other slot beside a running answer maps its cell with VRAM from the hot set and leaves the answer's cell alone
+        const bool idle_all = r35_h.idle && r35_h.idle(r35_h.user);
         bool synced = false;
         for (uint32_t c = 0; c < size && b_need > 0; ++c) {
-            if (!in[c] && !r35_cells[c].parked && !r35_cells[c].kept && !r35_cells[c].grans.empty()) {
+            if (!in[c] && !r35_cells[c].parked && (!r35_cells[c].kept || idle_all) && !r35_cells[c].grans.empty()) {
                 if (!synced && r35_h.sync) {
                     r35_h.sync(r35_h.user);
                     synced = true;

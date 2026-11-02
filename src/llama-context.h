@@ -749,6 +749,7 @@ private:
     static size_t r35_hook_take(void * user, size_t bytes);
     static void   r35_hook_give(void * user, size_t bytes);
     static void   r35_hook_sync(void * user);
+    static bool   r35_hook_idle(void * user);
     // [TAG_FN_L22_ENDOVERLAP] a prompt ended in FULL without the eager switch: the next narrow batch goes SMALL, async
     bool     l22_end_pending = false;
     int      l22_first_n     = 0;    // decode calls still counted after a prompt's switch (first 8)

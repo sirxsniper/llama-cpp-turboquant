@@ -161,6 +161,7 @@ public:
         size_t (*take)(void * user, size_t bytes) = nullptr; // `bytes` more VRAM from the hot set before a map
         void   (*give)(void * user, size_t bytes) = nullptr; // settle the hot set's side to the cells parked now
         void   (*sync)(void * user)               = nullptr; // the owner's graphs are done (before an unmap)
+        bool   (*idle)(void * user)               = nullptr; // no other sequence is busy (a kept cell may swap out)
         void *  user                              = nullptr;
     };
     bool     r35_parkable() const { return r35_vmm; }      // the layout is there (switch on, VMM, >= 2 cells)
