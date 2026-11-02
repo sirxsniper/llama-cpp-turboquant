@@ -6478,7 +6478,7 @@ size_t llama_moe_hot_np2_hold(const void * owner, size_t target) {
     (up ? mc->np2_take_ms : mc->np2_give_ms) += ms;
     const uint64_t n = ++(up ? mc->np2_n_take : mc->np2_n_give);
     if (n <= 4 || n % 64 == 0 || mc->np2_out < target) {
-        LLAMA_LOG_INFO("moe-hot: [TAG_R35_NP2PARK] %s %" PRIu64 ": the idle slot's share holds %.0f MiB (wanted %.0f, was %.0f) after %.1f "
+        LLAMA_LOG_WARN("moe-hot: [TAG_R35_NP2PARK] %s %" PRIu64 ": the idle slot's share holds %.0f MiB (wanted %.0f, was %.0f) after %.1f "
                 "ms; %.0f of %.0f MiB of the lend out%s\n", up ? "take" : "give", n, mc->np2_out/1048576.0, target/1048576.0,
                 before/1048576.0, ms, mc->kv_out/1048576.0, mc->kv_bytes/1048576.0,
                 mc->np2_out < target ? ": the rest comes from free VRAM" : "");

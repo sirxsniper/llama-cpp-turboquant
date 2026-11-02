@@ -2093,7 +2093,9 @@ bool llama_memory_recurrent::r35_park_cell(uint32_t c, bool give) const {
     const int64_t t0 = ggml_time_us();
     const size_t  g  = r35_g;
     const size_t  n  = pc.grans.size();
-    pc.host.resize(n*g);
+    if (pc.host.size() != n*g) {
+        pc.host.resize(n*g); // [TAG_R36_NP2] once: the buffer stays for the next park (no 288 MiB fault + zero fill per park)
+    }
     r35_copy_out(pc);
     size_t done = 0;
     bool   ok   = true;
@@ -2167,8 +2169,7 @@ bool llama_memory_recurrent::r35_unpark_cell(uint32_t c, bool take) const {
         return false;
     }
     r35_copy_in(pc);
-    std::vector<uint8_t>().swap(pc.host);
-    pc.parked = false;
+    pc.parked = false; // [TAG_R36_NP2] the host buffer stays (the next park reuses it)
     r35_n_unpark++;
     r35_unpark_ms += (ggml_time_us() - t0)/1000.0;
     return true;
@@ -2213,7 +2214,7 @@ bool llama_memory_recurrent::r35_ensure(const std::vector<uint32_t> & need) cons
             const bool m = r35_unpark_cell(c, true);
             ok = ok && m;
             if (++n_demand <= 3 || n_demand % 64 == 0) {
-                LLAMA_LOG_INFO("%s: [TAG_R35_NP2PARK] cell %u mapped again on demand (%llu so far, %u parked now): %s\n",
+                LLAMA_LOG_WARN("%s: [TAG_R35_NP2PARK] cell %u mapped again on demand (%llu so far, %u parked now): %s\n",
                         __func__, c, (unsigned long long) n_demand, r35_n_parked(), m ? "ok" : "FAILED");
             }
         }
@@ -2347,7 +2348,7 @@ void llama_memory_recurrent::r35_park_except(const std::vector<llama_seq_id> & k
     }
     static uint64_t n_sw = 0;
     if (++n_sw <= 4 || n_sw % 64 == 0) {
-        LLAMA_LOG_INFO("%s: [TAG_R35_NP2PARK] switch %llu: %zu cells parked, %zu mapped again (%.0f MiB to the hot set, net) in "
+        LLAMA_LOG_WARN("%s: [TAG_R35_NP2PARK] switch %llu: %zu cells parked, %zu mapped again (%.0f MiB to the hot set, net) in "
                 "%.1f ms; %u parked now (parks %.1f ms, maps %.1f ms on average)\n", __func__, (unsigned long long) n_sw,
                 to_park.size(), to_map.size(), back/1048576.0, (ggml_time_us() - t0)/1000.0, r35_n_parked(),
                 r35_n_park ? r35_park_ms/(double) r35_n_park : 0.0, r35_n_unpark ? r35_unpark_ms/(double) r35_n_unpark : 0.0);

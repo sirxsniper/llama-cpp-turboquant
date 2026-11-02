@@ -7831,8 +7831,18 @@ size_t llama_context::r35_target() const {
 
 void llama_context::r35_settle() {
     if (r35_on && r35_carry) {
-        (void) llama_moe_hot_np2_hold(this, r35_target());
+        (void) r35_hold(r35_target());
     }
+}
+
+// [TAG_R36_NP2] a hold that moves hot-set groups unmaps VRAM a graph in flight may still read (the main context's last
+// step, the MTP draft, the hot set's step): every owner graph is done first. Nothing to move: no sync (the per-batch settle)
+size_t llama_context::r35_hold(size_t target) {
+    if (target == llama_moe_hot_np2_out()) {
+        return target;
+    }
+    r35_hook_sync(this);
+    return llama_moe_hot_np2_hold(this, target);
 }
 
 size_t llama_context::r35_hook_take(void * user, size_t bytes) {
@@ -7850,7 +7860,7 @@ size_t llama_context::r35_hook_take(void * user, size_t bytes) {
     }
     const size_t want   = rs + (c->r35_small_one ? 0 : c->r35_small_extra);
     const size_t before = llama_moe_hot_np2_out();
-    const size_t after  = llama_moe_hot_np2_hold(c, std::max(before, want));
+    const size_t after  = c->r35_hold(std::max(before, want)); // [TAG_R36_NP2] synced first
     return after > before ? after - before : 0;
 }
 
@@ -7898,7 +7908,7 @@ bool llama_context::r35_small_set(bool one, bool settle) {
     }
     const uint64_t n = ++(one ? r35_n_narrow : r35_n_wide);
     if (n <= 3 || n % 64 == 0) {
-        LLAMA_LOG_INFO("%s: [TAG_R35_NP2PARK] SMALL reserve for %u sequence(s) from this batch on (%.1f ms, %" PRIu64 " times; the hot "
+        LLAMA_LOG_WARN("%s: [TAG_R35_NP2PARK] SMALL reserve for %u sequence(s) from this batch on (%.1f ms, %" PRIu64 " times; the hot "
                 "set holds %.0f MiB less for the idle slots now)\n", __func__, one ? 1u : cparams.n_seq_max,
                 (ggml_time_us() - t0)/1000.0, n, llama_moe_hot_np2_out()/1048576.0);
     }
@@ -7928,7 +7938,7 @@ void llama_context::r35_before_batch() {
             // one pass of the hot set for both: the wide SMALL part and every parked cell, then the maps
             (void) r35_small_set(false, false);
             if (r35_carry) {
-                (void) llama_moe_hot_np2_hold(this, r35_target() + (r35_mem ? r35_mem->r35_parked_bytes() : 0));
+                (void) r35_hold(r35_target() + (r35_mem ? r35_mem->r35_parked_bytes() : 0)); // [TAG_R36_NP2] synced first
             }
             if (r35_mem) {
                 r35_mem->r35_unpark_all();
@@ -7936,7 +7946,7 @@ void llama_context::r35_before_batch() {
             r35_settle();
             static uint64_t n_w = 0;
             if (++n_w <= 3 || n_w % 64 == 0) {
-                LLAMA_LOG_INFO("%s: [TAG_R35_NP2PARK] %d busy sequences (%zu in this batch): the idle slots' share is back (%.1f ms, "
+                LLAMA_LOG_WARN("%s: [TAG_R35_NP2PARK] %d busy sequences (%zu in this batch): the idle slots' share is back (%.1f ms, "
                         "%" PRIu64 " times)\n", __func__, busy, seqs.size(), (ggml_time_us() - now)/1000.0, n_w);
             }
         }
@@ -8125,7 +8135,13 @@ size_t llama_context::cbuf_prepare(ggml_backend_dev_t dev) {
             r35_hold_us = (int64_t) atoi(h)*1000;
         }
     }
-    if (r35_want) {
+    // [TAG_R36_NP2] LLAMA_R36_NP2_SMALL (default 1 = r35): 0 keeps the SMALL reserve at n_seq_max sequences (only the
+    // recurrent cells are lent): a second request then takes back no compute reserve (no SMALL re-reserve at its arrival)
+    static const bool r36_small_lend = [] {
+        const char * e = getenv("LLAMA_R36_NP2_SMALL");
+        return !(e && e[0] == '0' && e[1] == '\0');
+    }();
+    if (r35_want && r36_small_lend) {
         r35_small_one = true;
         cbuf_free_compute();
         sched_reserve();

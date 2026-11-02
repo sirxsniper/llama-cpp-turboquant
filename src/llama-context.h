@@ -742,6 +742,7 @@ private:
     llama_memory_recurrent * r35_mem = nullptr;
     size_t   r35_target() const;        // the share the hot set should hold now
     void     r35_settle();              // the hot set holds r35_target()
+    size_t   r35_hold(size_t target);   // [TAG_R36_NP2] llama_moe_hot_np2_hold after every owner graph is done
     // the SMALL reserve for one / n_seq_max sequences from this batch on (settle: the hot set's side now; VRAM first when it
     // grows); false settle: the caller settles once for this and the cells
     bool     r35_small_set(bool one, bool settle = true);
