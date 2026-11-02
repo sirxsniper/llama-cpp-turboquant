@@ -7943,8 +7943,19 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         // instance cap and the OOM retry are in ggml_cuda_fn_l22_instantiate)
         if (!cuda_graph_update_required) {
             GGML_ASSERT(graph->has_instance());
-            for (cudaGraphExec_t instance : graph->instances) {
-                CUDA_CHECK(cudaGraphLaunch(instance, cuda_ctx->stream()));
+            // [TAG_R35_HOSTCHAIN] GGML_CUDA_R35_POKE1=1 (the Flash-Next profile; unset = v0.27.0): a replay of several chunks
+            // flushes WDDM's batched submission right after the first chunk's launch, as a capture does after every chunk
+            // ([TAG_FN_R4_POKE]), so the GPU runs chunk 0 while the host launches the others (same kernels, same order)
+            static const bool r35_poke1 = [] {
+                const char * e = getenv("GGML_CUDA_R35_POKE1");
+                return e != nullptr && atoi(e) != 0;
+            }();
+            const size_t n_inst = graph->instances.size();
+            for (size_t c = 0; c < n_inst; ++c) {
+                CUDA_CHECK(cudaGraphLaunch(graph->instances[c], cuda_ctx->stream()));
+                if (c == 0 && n_inst > 1 && r35_poke1) {
+                    ggml_cuda_stream_query_flush(cuda_ctx->stream());
+                }
             }
         }
         ggml_cuda_graph_poke(cuda_ctx); // [TAG_FN_R4_POKE]

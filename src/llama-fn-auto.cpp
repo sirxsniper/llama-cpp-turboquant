@@ -364,6 +364,7 @@ const fn_item k_items[] = {
     // [TAG_R35_HOSTCHAIN] round 35 X-host-chain (exact): 1 device top-64 candidates of the target's output rows instead of
     // the rows, 2 no input synchronize for a split whose uploads were all staged; 0 = v0.27.0
     { "LLAMA_FN_R35_HOSTCHAIN",             "3",       P_ALL },
+    { "GGML_CUDA_R35_POKE1",                "1",       P_ALL }, // [TAG_R35_HOSTCHAIN] flush after the first chunk of a replay
 };
 
 } // namespace
