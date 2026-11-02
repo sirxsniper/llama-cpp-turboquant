@@ -8220,7 +8220,8 @@ void llama_context::l22_cps_log(ggml_backend_sched_t s0, const std::vector<size_
     llama_fn_l22_log("pass", "sub=cps mode=%d rows=%lld ubatches=%llu layers=%llu cpu_experts=%llu cpu_pairs=%llu cpu_tokens=%llu "
             "k_mean=%.2f skip_cpu_mib=%.0f skip_unrouted_mib=%.0f late_mib=%.0f cpu_ms=%.1f dropped=%llu cut_cap=%llu pins_off=%llu "
             "stream_jobs=%llu stream_skip_mib=%.0f stream_late_mib=%.0f plan_wait_ms=%.1f timeouts=%llu invalidated=%llu "
-            "plan_us=%.0f dma_gbs=%.1f rls_e=%.1f rls_r=%.2f grow=%llu", l22_cps_mode, (long long) cs.rows,
+            "plan_us=%.0f dma_gbs=%.1f rls_e=%.1f rls_r=%.2f grow=%llu stream_skip_early_mib=%.0f noplan_late=%llu noplan=%llu "
+            "guard_kib=%.0f", l22_cps_mode, (long long) cs.rows,
             (unsigned long long) cs.ubatches, (unsigned long long) cs.layers, (unsigned long long) cs.cpu_experts,
             (unsigned long long) cs.cpu_pairs, (unsigned long long) cs.cpu_tokens, cs.budget_k/(double) cs.layers,
             cs.skip_cpu/MiB, cs.skip_unr/MiB, cs.late_bytes/MiB, cs.cpu_ms, (unsigned long long) cs.dropped,
@@ -8228,7 +8229,9 @@ void llama_context::l22_cps_log(ggml_backend_sched_t s0, const std::vector<size_
             (sc.skip_bytes - p.skip_bytes)/MiB, (sc.late_bytes - p.late_bytes)/MiB, sc.plan_wait_ms - p.plan_wait_ms,
             (unsigned long long) (sc.timeouts - p.timeouts), (unsigned long long) (sc.invalidated - p.invalidated),
             sc.plan_us_ewma, sc.dma_bpu_ewma > 0 ? sc.dma_bpu_ewma*1e6/1e9 : 0.0, cs.rls_e, cs.rls_r,
-            (unsigned long long) l22_cps_n_grow);
+            (unsigned long long) l22_cps_n_grow, (sc.skip_early - p.skip_early)/MiB, // [TAG_R35_ROUTED]
+            (unsigned long long) (sc.noplan_late - p.noplan_late), (unsigned long long) (sc.noplan - p.noplan),
+            (sc.guard_bytes - p.guard_bytes)/1024.0); // [TAG_R35_CPSGUARD]
     l22_cps_sc0 = sc;
 }
 
