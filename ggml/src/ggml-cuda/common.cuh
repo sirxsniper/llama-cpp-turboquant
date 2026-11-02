@@ -1294,6 +1294,7 @@ struct ggml_cuda_graph {
         for (cudaGraphExec_t instance : instances) {
             CUDA_CHECK(cudaGraphExecDestroy(instance));
         }
+        r35_drop_all(); // [TAG_R35_CHUNKMERGE]
         for (fn_l22_variant & v : fn_l22_alt) {
             v.destroy();
         }
@@ -1303,6 +1304,32 @@ struct ggml_cuda_graph {
     // executable exists. Empty: no instance (the keep / cap / trim logic counts one instance per chunk list).
     std::vector<cudaGraphExec_t> instances;
     bool has_instance() const { return !instances.empty(); }
+    // [TAG_R35_CHUNKMERGE] GGML_CUDA_R35_CHUNKMERGE (default 1): while the chunk list has more than one chunk, the captured
+    // cudaGraph_t of each chunk is kept (host memory) instead of destroyed, and after a few unchanged replays the chunks are
+    // put into ONE executable (one child graph node per chunk, in chunk order, each depending on the one before) that a replay
+    // launches instead of the chunk list: the same kernels with the same parameters in the same order, without the GPU's
+    // switch between executables at every chunk boundary (16 per Flash-Next step, ~21 us each). Captures and updates still
+    // run chunk by chunk (overlapped as before); any new capture of a chunk retires the merged executable, and a merge that
+    // fails leaves the chunk list in use until the next capture. 0: v0.27.0 (captures destroyed, chunks launched one by one).
+    std::vector<cudaGraph_t> r35_graphs;            // [i] = the capture instances[i] was instantiated / updated from
+    cudaGraphExec_t          r35_merged = nullptr;  // the merged executable of r35_graphs (null: not built)
+    bool                     r35_failed = false;    // the merge of this chunk list failed: chunks until the next capture
+    void r35_drop_merged() {
+        if (r35_merged != nullptr) {
+            CUDA_CHECK(cudaGraphExecDestroy(r35_merged));
+            r35_merged = nullptr;
+        }
+    }
+    void r35_drop_all() {
+        r35_drop_merged();
+        for (cudaGraph_t g : r35_graphs) {
+            if (g != nullptr) {
+                CUDA_CHECK(cudaGraphDestroy(g));
+            }
+        }
+        r35_graphs.clear();
+        r35_failed = false;
+    }
     size_t num_nodes = 0;
     std::vector<cudaGraphNode_t> nodes;
     bool disable_due_to_gpu_arch = false;
@@ -1332,6 +1359,9 @@ struct ggml_cuda_graph {
         size_t                       pool_top[GGML_CUDA_MAX_STREAMS] = {};
         uint64_t                     n_replay  = 0;
         int64_t                      last_used = 0;
+        std::vector<cudaGraph_t>     r35_graphs;            // [TAG_R35_CHUNKMERGE] the chunks' captures and their merge
+        cudaGraphExec_t              r35_merged = nullptr;  // (they go aside and come back with the chunk list)
+        bool                         r35_failed = false;
 
         bool has_instance() const { return !instances.empty(); }
 
@@ -1340,6 +1370,17 @@ struct ggml_cuda_graph {
                 CUDA_CHECK(cudaGraphExecDestroy(instance));
             }
             instances.clear();
+            if (r35_merged != nullptr) { // [TAG_R35_CHUNKMERGE]
+                CUDA_CHECK(cudaGraphExecDestroy(r35_merged));
+                r35_merged = nullptr;
+            }
+            for (cudaGraph_t g : r35_graphs) {
+                if (g != nullptr) {
+                    CUDA_CHECK(cudaGraphDestroy(g));
+                }
+            }
+            r35_graphs.clear();
+            r35_failed = false;
         }
     };
     std::vector<fn_l22_variant> fn_l22_alt;
@@ -1351,6 +1392,7 @@ struct ggml_cuda_graph {
             CUDA_CHECK(cudaGraphExecDestroy(instance));
         }
         instances.clear();
+        r35_drop_all(); // [TAG_R35_CHUNKMERGE] the captures and the merge of the dropped chunk list
         replayed_since_capture = false;
         n_replay_cap           = 0;
         pool_top_known         = false;
@@ -1611,10 +1653,25 @@ struct ggml_cuda_upload_slot {
     bool        busy = false; // done was recorded since the slot was last waited for
 };
 
+// [TAG_R35_CHUNKMERGE] GGML_CUDA_R35_CHUNKMERGE=2 (diagnostic): replays of multi-chunk graphs alternate between the merged
+// executable and the chunk list, each between two timing events; the GPU spans are summed per kind (index 0 chunks, 1 merged)
+struct ggml_cuda_r35_diag {
+    static constexpr int N = 16;
+    cudaEvent_t ev0[N]  = {};
+    cudaEvent_t ev1[N]  = {};
+    int         kind[N] = {}; // -1 free, 0 chunk list, 1 merged
+    uint64_t    flip    = 0;
+    uint64_t    n[2]    = {};
+    double      ms[2]   = {};
+    double      ms2[2]  = {};
+    uint64_t    n_print = 0;
+};
+
 struct ggml_backend_cuda_context {
     int device;
     std::string name;
     cudaEvent_t copy_event = nullptr;
+    ggml_cuda_r35_diag * r35_diag = nullptr; // [TAG_R35_CHUNKMERGE] GGML_CUDA_R35_CHUNKMERGE=2 only
 
     // [TAG_FN_L16_UPLOAD] two slots used in turn; upload_off: a slot could not be allocated, mode 1 from then on
     ggml_cuda_upload_slot upload_slot[2];
