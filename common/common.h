@@ -1157,6 +1157,7 @@ struct common_batch {
         std::vector<llama_seq_id> seq_ids_extra; // see add_seq()
         int32_t      decision_order = 0; // see llama_batch_ext_set_decision_order()
         llama_token  tok_aux = LLAMA_TOKEN_NULL;   // [TAG_FN_L22_IMGPASS] set_token_aux(), forwarded by get_sub_batch
+        int32_t      embd_row = -1; // [TAG_R35_DFLDEV] see add_embd_row(), -1 if none
     };
 
     std::vector<token> tokens; // mirror of the entries, tokens[i] describes batch index i
@@ -1201,6 +1202,10 @@ struct common_batch {
     // add an embedding-only entry (no token id)
     // pos points to n_pos positions
     int32_t add_embd(llama_embd embd, const llama_pos * pos, llama_seq_id seq_id, bool output);
+
+    // add an entry whose embedding is row `row` of the layer input device buffer of the context's ctx_other
+    // pos points to n_pos positions
+    int32_t add_embd_row(int32_t row, const llama_pos * pos, llama_seq_id seq_id, bool output);
 
     int32_t size() const { return (int32_t) tokens.size(); }
 };
