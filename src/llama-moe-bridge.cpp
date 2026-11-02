@@ -191,6 +191,14 @@ struct llama_moe_bridge {
     // line every diag_every graphs (N > 1, else 64)
     bool                 diag = false;
     bool                 quiet = false; // [TAG_FN_L3_HOST_QUIET] LLAMA_FN_HOST_QUIET
+    // [TAG_R35_SLOTBAL] LLAMA_FN_R35_SLOTBAL_STATS=N (qwen4exp): the device's bridge wait per layer over N bridged graphs (mean
+    // per graph, share of jobs that waited > 20 us), one line per window; owner fields (end() after the graph synced)
+    int                   r35_stats  = 0;
+    int64_t               r35_graphs = 0;
+    std::vector<uint32_t> r35_seq;
+    std::vector<uint64_t> r35_ns;
+    std::vector<uint32_t> r35_n;
+    std::vector<uint32_t> r35_nw;
     // [TAG_FN_L14_PROBE] LLAMA_FN_L14_PROBE=1 (qwen4exp): per layer, where the time from the device's post to its resume
     // goes (host and device clocks aligned once at creation); a line every diag_every graphs
     bool                 probe     = false;
@@ -1671,6 +1679,10 @@ llama_moe_bridge * llama_moe_bridge_create(const llama_model & model, int n_thre
         br->diag_every = dv > 1 ? dv : 64;
         LLAMA_LOG_INFO("%s: [TAG_FN_L3_HOST_DIAG] bridge host timing every %" PRId64 " bridged graphs\n", __func__, br->diag_every);
     }
+    if (const int sv = llama_fn_l3_int(model, "LLAMA_FN_R35_SLOTBAL_STATS", 0); sv > 0 && br->fn_chan_times) { // [TAG_R35_SLOTBAL]
+        br->r35_stats = sv;
+        LLAMA_LOG_INFO("%s: [TAG_R35_SLOTBAL] bridge wait per layer every %d bridged graphs\n", __func__, sv);
+    }
     if (llama_fn_l3_flag(model, "LLAMA_FN_HOST_QUIET")) { // [TAG_FN_L3_HOST_QUIET]
         br->quiet = true;
         g_quiet_on.store(true);
@@ -2123,6 +2135,51 @@ bool llama_moe_bridge_end(llama_moe_bridge * br) {
     br->n_graphs++;
     const uint32_t err = br->fn_error(br->gb);
     llama_fn_stall_mark("bridge graph ends (err)", err); // [TAG_FN_L18_FIRSTANS_STALL]
+    if (br->r35_stats > 0 && err == GGML_MOE_BRIDGE_ERR_NONE) {
+        // [TAG_R35_SLOTBAL] each layer channel's last device wait, once per job (its seq)
+        const size_t nc = br->chans.size();
+        if (br->r35_seq.size() != nc) {
+            br->r35_seq.assign(nc, 0);
+            br->r35_ns.assign(nc, 0);
+            br->r35_n.assign(nc, 0);
+            br->r35_nw.assign(nc, 0);
+        }
+        int n_new = 0;
+        for (size_t ch = 0; ch < nc; ++ch) {
+            ggml_moe_bridge_chan_times t;
+            br->fn_chan_times(br->gb, (int32_t) ch, &t);
+            if (t.seq == 0 || t.seq == br->r35_seq[ch]) {
+                continue;
+            }
+            br->r35_seq[ch] = t.seq;
+            br->r35_ns[ch] += t.wait_ns;
+            br->r35_n[ch]++;
+            br->r35_nw[ch] += t.wait_ns > 20000 ? 1 : 0;
+            n_new++;
+        }
+        if (n_new > 0 && ++br->r35_graphs >= br->r35_stats) {
+            std::vector<std::pair<int, size_t>> by_il;
+            for (size_t ch = 0; ch < nc; ++ch) {
+                if (br->r35_n[ch] > 0) {
+                    by_il.push_back({ br->chans[ch].il, ch });
+                }
+            }
+            std::sort(by_il.begin(), by_il.end());
+            double tot = 0.0;
+            std::string s;
+            for (const auto & [il, ch] : by_il) {
+                const double m = br->r35_ns[ch]/1e3/br->r35_n[ch];
+                tot += m;
+                s += format(" %d:%.0f/%.2f", il, m, (double) br->r35_nw[ch]/br->r35_n[ch]);
+            }
+            LLAMA_LOG_WARN("%s: MoE bridge %d: [TAG_R35_SLOTBAL] %" PRId64 " graphs: device wait %.1f us per graph; per layer (us, "
+                    "share > 20 us):%s\n", __func__, br->bid, br->r35_graphs, tot, s.c_str());
+            br->r35_graphs = 0;
+            std::fill(br->r35_ns.begin(), br->r35_ns.end(), 0);
+            std::fill(br->r35_n.begin(), br->r35_n.end(), 0);
+            std::fill(br->r35_nw.begin(), br->r35_nw.end(), 0);
+        }
+    }
     if (br->l22_dmashare) {
         // [TAG_FN_L22_DMASHARE] R-P14-7: mean device wait of this graph's fetching layers (no gen5 state; -1 when none)
         double wait_us = -1.0;
