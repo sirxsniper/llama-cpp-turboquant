@@ -198,6 +198,33 @@ static std::vector<llama_token> server_sample_and_accept_synth(
 // so a file written by a server with a larger budget never puts more checkpoint RAM into the slot than a live ring.
 //
 
+//
+// [TAG_R34_KYROCACHE] Recall on a slot save (/slots/{id}?action=save with "recall").
+//
+// Kyro saves the slots before it stops the server for a song, a picture or a video and restores them after the reload, so
+// the next message does not read the whole conversation again (2026-11-01 log: every message after a song re-read
+// 11-27K tokens, 10-50 s). The slot that holds a conversation is often empty by then: with --kv-unified
+// --cache-idle-slots every task launch saves the idle slots to the RAM prompt cache and clears them, and on one slot the
+// conversation store (keepctx) takes the conversation off the slot when a side request (the song's lyrics) takes it. A
+// plain save of such a slot writes nothing.
+//
+// "recall": "empty" brings back, into an empty slot, what this slot held before: the conversation the store took off it,
+// else the state it last put in the RAM prompt cache (its tokens are remembered at that save). "replace" does the same
+// when the slot holds something else (the side request that came after), which is then dropped: the server is about to
+// stop. The state is loaded by the same code a request uses (the store's restore, the prompt cache load), so the file
+// holds what a live slot would hold: the state, its checkpoints and the draft state. Nothing changes for a save without
+// "recall", nor for any request.
+//
+// LLAMA_SLOT_SAVE_RECALL=0 restores v0.26.6: "recall" is ignored and nothing is remembered.
+//
+static bool slot_save_recall_enabled() {
+    static const bool on = [] {
+        const char * e = getenv("LLAMA_SLOT_SAVE_RECALL");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    return on;
+}
+
 static bool slot_file_ckpt_enabled() {
     static const bool on = [] {
         const char * e = getenv("LLAMA_SLOT_FILE_CKPT");
@@ -1414,6 +1441,14 @@ struct server_slot {
 
     server_prompt prompt;
 
+    // [TAG_R34_KYROCACHE] what this slot last put in the RAM prompt cache, and the store entry of the conversation the store
+    // last took off it: what a slot save with "recall" brings back
+    mutable server_tokens recall_tokens;
+    uint64_t              recall_kc_id = 0;
+    // the slot holds what a "slot_recall": false request left (a side request, a job): neither of the two above is updated
+    // when it goes, so two side requests in turn never make the second one's predecessor the slot's recall
+    bool                  recall_side  = false;
+
     bool prompt_save(server_prompt_cache & prompt_cache, const server_tokens * tokens_next = nullptr,
                      bool shared = false) const {
         if (prompt.tokens.size() == 0) {
@@ -1442,6 +1477,11 @@ struct server_slot {
             SLT_WRN(*this, "%s", "prompt save read fewer bytes than the state size, entry dropped\n");
             prompt_cache.states.pop_back();   // alloc() pushed this entry last
             return false;
+        }
+
+        // [TAG_R34_KYROCACHE]
+        if (slot_save_recall_enabled() && !recall_side) {
+            recall_tokens = prompt.tokens.clone();
         }
 
         return true;
@@ -4830,6 +4870,74 @@ private:
     // [TAG_FN_L18_KEEPCTX] slot is idle and about to take the task's prompt (cache_prompt: it reuses what the slot holds)
     // l22_share_n: [TAG_FN_L22_SHAREKV] the slot takes that many tokens from a leader's cells right after, so only a stored
     // conversation that gives more is restored (0 = no share)
+    // [TAG_R34_KYROCACHE] bring back into the slot what it held before (see slot_save_recall_enabled): the conversation the
+    // store took off it, else the state it last put in the RAM prompt cache. The slot's current content is dropped. Returns
+    // the tokens recalled (0: nothing to recall or the load failed; the slot is then empty).
+    size_t slot_recall(server_slot & slot) {
+        if (keepctx && slot.recall_kc_id != 0) {
+            auto it = keepctx->entries.begin();
+            while (it != keepctx->entries.end() && it->id != slot.recall_kc_id) {
+                ++it;
+            }
+            if (it != keepctx->entries.end()) {
+                slot.prompt_clear();
+                std::string info;
+                // keep: the entry stays stored, as for a prompt that continues only a part of it
+                const bool loaded = keepctx->load(it, slot.prompt, ctx_tgt, ctx_dft, spec.get(), slot.id, /*keep =*/ true, info,
+                                                  cs.on ? &slot.kc_spill : nullptr, cs.on ? &slot.kc_conv : nullptr);
+                if (loaded && slot.prompt.n_tokens() > 0) {
+                    // checkpoints a restore left on disk ([TAG_FN_L20_CONVFIX_LAZY], [TAG_FN_L19_CONVSTORE_SPILL]) go into the
+                    // ring, the newest four past the ring's own, so the file carries the resume points a live slot has
+                    if ((cs.spill || cs.lazy) && !slot.kc_spill.list.empty()) {
+                        int64_t ring_last = 0;
+                        for (const auto & ck : slot.prompt.checkpoints) {
+                            ring_last = std::max<int64_t>(ring_last, ck.n_tokens);
+                        }
+                        int n_read = 0;
+                        for (auto sp = slot.kc_spill.list.rbegin(); sp != slot.kc_spill.list.rend() && n_read < 4; ++sp) {
+                            if (sp->n_tokens <= ring_last || sp->n_tokens > slot.prompt.n_tokens()) {
+                                continue;
+                            }
+                            common_prompt_checkpoint ck;
+                            std::string why;
+                            if (!keepctx->spill_read(*sp, ck, why)) {
+                                SLT_WRN(slot, "[TAG_R34_KYROCACHE] a checkpoint on disk (n_tokens = %lld) was not read: %s\n",
+                                        (long long) sp->n_tokens, why.c_str());
+                                continue;
+                            }
+                            auto pos = slot.prompt.checkpoints.begin();
+                            while (pos != slot.prompt.checkpoints.end() && pos->n_tokens < ck.n_tokens) {
+                                ++pos;
+                            }
+                            slot.prompt.checkpoints.insert(pos, std::move(ck));
+                            n_read++;
+                        }
+                    }
+                    SLT_INF(slot, "[TAG_R34_KYROCACHE] recalled %d tokens from the conversation store for the slot save (%zu checkpoints): %s\n",
+                            slot.prompt.n_tokens(), slot.prompt.checkpoints.size(), info.c_str());
+                    slot.recall_side = false;
+                    return (size_t) slot.prompt.n_tokens();
+                }
+                SLT_WRN(slot, "[TAG_R34_KYROCACHE] recalling the stored conversation failed (%s)\n", info.c_str());
+                slot.prompt_clear();
+            }
+        }
+        if (prompt_cache && slot.recall_tokens.size() > 0) {
+            slot.prompt_clear();
+            // an empty slot: the cached state that holds the most of the remembered tokens wins
+            const server_tokens want = slot.recall_tokens.clone();
+            if (slot.prompt_load(*prompt_cache, want) && slot.prompt.n_tokens() > 0) {
+                SLT_INF(slot, "[TAG_R34_KYROCACHE] recalled %d of the %zu tokens the slot last put in the RAM prompt cache for the slot save (%zu checkpoints)\n",
+                        slot.prompt.n_tokens(), want.size(), slot.prompt.checkpoints.size());
+                slot.recall_side = false;
+                return (size_t) slot.prompt.n_tokens();
+            }
+            SLT_WRN(slot, "[TAG_R34_KYROCACHE] the %zu tokens the slot last cached are no longer in the RAM prompt cache\n", want.size());
+            slot.prompt_clear();
+        }
+        return 0;
+    }
+
     void keepctx_switch(server_slot & slot, const server_task & task, int32_t l22_share_n = 0) {
         const server_tokens & tokens       = task.tokens;
         const bool            cache_prompt = task.params.cache_prompt;
@@ -4891,6 +4999,9 @@ private:
                               cs.on ? &slot.kc_spill : nullptr, &slot.kc_conv, cs.on ? keepctx_min : 0)) {
                 SLT_INF(slot, "[TAG_FN_L18_KEEPCTX] stored the outgoing conversation (the new prompt shares %d of its %d tokens%s): %s\n",
                         lcp_cur, n_cur, lose_most ? "" : ", [TAG_FN_L19_CONVSTORE_SYS] only its system block", info.c_str());
+                if (slot_save_recall_enabled() && !slot.recall_side && !keepctx->entries.empty()) {
+                    slot.recall_kc_id = keepctx->entries.back().id; // [TAG_R34_KYROCACHE] save() appends the new entry
+                }
                 slot.l22_turn.kc_what |= 1; // [TAG_FN_L22_PASSLOG]
             } else {
                 SLT_WRN(slot, "[TAG_FN_L18_KEEPCTX] the outgoing conversation (%d tokens) is not stored: %s\n", n_cur, info.c_str());
@@ -6066,6 +6177,9 @@ private:
 
         // the per-request limit takes priority over the global one
         slot.n_predict_max = task.params.n_predict != -1 ? task.params.n_predict : params_base.n_predict;
+
+        // [TAG_R34_KYROCACHE] what the slot held is already stored or cached (get_available_slot): from here it holds this task's
+        slot.recall_side = task.recall_side;
 
         slot.task = std::make_unique<const server_task>(std::move(task));
 
@@ -7582,6 +7696,16 @@ private:
                     std::string filename = task.slot_action.filename;
                     std::string filepath = task.slot_action.filepath;
 
+                    // [TAG_R34_KYROCACHE] "empty": an empty slot gets back what it held before it was cleared; "replace":
+                    // also a slot that holds something else
+                    int64_t n_recalled = -1;
+                    if (!task.slot_action.recall.empty() && slot_save_recall_enabled()) {
+                        n_recalled = 0;
+                        if (slot->prompt.n_tokens() == 0 || task.slot_action.recall == "replace") {
+                            n_recalled = (int64_t) slot_recall(*slot);
+                        }
+                    }
+
                     std::vector<char> packed;
                     try {
                         packed = slot->prompt.tokens.serialize();
@@ -7631,6 +7755,7 @@ private:
                     res->n_tokens = slot->prompt.tokens.size();
                     res->n_bytes  = nwrite + n_section; // [TAG_SLOT_FILE_CKPT] the whole file
                     res->t_ms     = t_save_ms;
+                    res->n_recalled = n_recalled; // [TAG_R34_KYROCACHE]
                     queue_results.send(std::move(res));
                 } break;
             case SERVER_TASK_TYPE_SLOT_RESTORE:
@@ -7724,6 +7849,7 @@ private:
 
                         slot->prompt.clear();
                         slot->prompt.tokens = std::move(restored);
+                        slot->recall_side   = false; // [TAG_R34_KYROCACHE] a restored file is a conversation Kyro kept
                     } catch (const std::exception & err) {
                         slot->prompt_clear();
                         send_error(task, std::string("Unable to restore slot: ") + err.what(), ERROR_TYPE_INVALID_REQUEST);
@@ -10968,6 +11094,8 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             task.apply_chat_session(chat_session);
 
             task.id_slot = json_value(data, "id_slot", -1);
+            // [TAG_R34_KYROCACHE] Kyro marks its side requests and jobs (LLAMA_SLOT_SAVE_RECALL=0: ignored)
+            task.recall_side = slot_save_recall_enabled() && !json_value(data, "slot_recall", true);
             sse_ping_interval = task.params.sse_ping_interval;
 
             // OAI-compat
@@ -12367,6 +12495,17 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_save(const ser
     }
     std::string filepath = params.slot_save_path + filename;
 
+    // [TAG_R34_KYROCACHE] "recall": true / "empty" / "replace" (anything else, or false: a plain save)
+    std::string recall;
+    if (request_data.contains("recall")) {
+        const json & r = request_data.at("recall");
+        if (r.is_boolean() && r.get<bool>()) {
+            recall = "empty";
+        } else if (r.is_string() && (r.get<std::string>() == "empty" || r.get<std::string>() == "replace")) {
+            recall = r.get<std::string>();
+        }
+    }
+
     auto & rd = res->rd;
     {
         server_task task(SERVER_TASK_TYPE_SLOT_SAVE);
@@ -12374,6 +12513,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_save(const ser
         task.slot_action.id_slot  = id_slot;
         task.slot_action.filename = filename;
         task.slot_action.filepath = filepath;
+        task.slot_action.recall   = recall;
         rd.post_task(std::move(task));
     }
 
