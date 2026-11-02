@@ -174,6 +174,16 @@ size_t llama_moe_hot_vis_bytes();
 size_t llama_moe_hot_vis_take(size_t bytes);
 void   llama_moe_hot_vis_give();
 
+// [TAG_R35_NP2PARK] the idle slot's VRAM (parked recurrent cells, the wide SMALL reserve of a multi-slot context) rides on
+// the same lend: the fit adds it to `want`. _np2_hold (the owner's graphs synchronized): the share holds at least `target`
+// bytes out (whole groups from the bottom, kept apart from the KV cache's and the projector's), groups it no longer needs
+// come back (cleared, their slots fill from the routing); returns what it holds. The KV cache's hooks see the lend
+// without this share (_kv_release_kvside / _kv_restore_kvside add it to their absolute need).
+size_t llama_moe_hot_np2_hold(const void * owner, size_t target);
+size_t llama_moe_hot_np2_out();
+size_t llama_moe_hot_kv_release_kvside(const void * owner, size_t need);
+size_t llama_moe_hot_kv_restore_kvside(const void * owner, size_t keep);
+
 // [TAG_FN_AUTO] a hot set is configured for this model (LLAMA_MOE_HOT_PROFILE names a file or "even")
 bool llama_moe_hot_wanted(const llama_model & model);
 

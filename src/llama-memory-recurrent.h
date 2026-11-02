@@ -37,7 +37,7 @@ public:
                      uint32_t   n_rs_seq,
         const layer_filter_cb & filter);
 
-    ~llama_memory_recurrent() = default;
+    ~llama_memory_recurrent();
 
     //
     // llama_memory_i
@@ -153,6 +153,37 @@ public:
     // [TAG_4C_GDN_REPLAY] per layer ring of token inputs, F32 [n_rs_seq*slot, mem_size], only when replay
     std::vector<ggml_tensor *> ring_l;
 
+    // [TAG_R35_NP2PARK] a multi-slot qwen4exp context keeps its recurrent rows on CUDA virtual memory: the whole granules
+    // that hold one cell's rows only can leave the device (their bytes wait in host RAM, the addresses stay valid on a
+    // shared alias granule) while that cell's sequence is idle, and the hot expert set holds the VRAM meanwhile (design
+    // note in the .cpp). The owner context drives it; every read or write of a cell's data maps the cell first.
+    struct r35_hooks {
+        size_t (*take)(void * user, size_t bytes) = nullptr; // `bytes` more VRAM from the hot set before a map
+        void   (*give)(void * user, size_t bytes) = nullptr; // settle the hot set's side to the cells parked now
+        void   (*sync)(void * user)               = nullptr; // the owner's graphs are done (before an unmap)
+        void *  user                              = nullptr;
+    };
+    bool     r35_parkable() const { return r35_vmm; }      // the layout is there (switch on, VMM, >= 2 cells)
+    bool     r35_active()   const { return r35_on; }       // parking runs (after r35_start)
+    size_t   r35_cell_bytes(uint32_t c) const;              // the bytes a parked cell gives back
+    size_t   r35_parked_bytes() const;                      // the bytes all parked cells give back now
+    uint32_t r35_n_parked() const;
+    // the fit: park every cell but `keep` (they are empty there; their VRAM is free for the fit, the hot set lends it), then
+    // later parks / maps take and give through `h`. false: nothing parked (the layout cannot)
+    bool     r35_start(const r35_hooks & h, uint32_t keep);
+    void     r35_stop();                                    // every cell mapped again, parking off
+    // before a batch: the cells of `keep_seqs` stay (a sequence without a cell: nothing parks now), every other cell parks
+    void     r35_park_except(const std::vector<llama_seq_id> & keep_seqs);
+    void     r35_unpark_all();
+    // the guard: every cell in `need` mapped before its data is read or written (a parked one maps, VRAM from the hot set);
+    // false: a map failed (the cell stays on its alias granule)
+    bool     r35_ensure(const std::vector<uint32_t> & need) const;
+    // a reserve's full context covers this many cells (0: all): the owner's one-sequence SMALL reserve sets 1 while it
+    // reserves (a one-sequence ubatch uses one cell; the n_seq_max-cell reserve gathered an extra cell's states)
+    uint32_t r35_full_n = 0;
+    // the owner holds one busy sequence (a cell mapped on demand then swaps with a mapped cell nothing needs)
+    void     r35_set_one(bool one);
+
 private:
     //const llama_model & model;
     const llama_hparams & hparams;
@@ -181,6 +212,39 @@ private:
     bool state_read_data(llama_io_read_i & io, uint32_t cell_count);
 
     void state_clear(llama_seq_id seq_id, uint32_t cell_head, uint32_t cell_count);
+
+    // [TAG_R35_NP2PARK] the parking layout and state (mutable: the const state_write maps a parked cell before it reads)
+    struct r35_gran {
+        ggml_tensor * t     = nullptr; // the tensor whose row holds the granule
+        size_t        off_t = 0;       // the granule's offset in that tensor
+        size_t        off_b = 0;       // and in the buffer
+    };
+    struct r35_cell {
+        std::vector<r35_gran> grans;   // the whole granules that hold this cell's rows only
+        bool                  parked = false;
+        bool                  kept   = false;  // the owner's last batch start kept it (a busy sequence's): no swap parks it
+        std::vector<uint8_t>  host;    // their bytes while parked
+    };
+    ggml_backend_buffer_t        r35_stage = nullptr;      // pinned host staging for the copies (r35_stage_n granules)
+    size_t                       r35_stage_n = 0;
+    void r35_copy_out(const r35_cell & pc) const;          // the cell's granules -> pc.host (through the staging)
+    void r35_copy_in(const r35_cell & pc) const;           // pc.host -> the cell's granules
+    bool                         r35_vmm = false;
+    mutable bool                 r35_on  = false;
+    bool                         r35_one = false;
+    ggml_backend_buffer_t        r35_buf = nullptr;
+    size_t                       r35_g   = 0;
+    bool (*r35_fmap)(ggml_backend_buffer_t, size_t, size_t)   = nullptr;
+    bool (*r35_funmap)(ggml_backend_buffer_t, size_t, size_t) = nullptr;
+    bool (*r35_falias)(ggml_backend_buffer_t, size_t, size_t) = nullptr;
+    mutable std::vector<r35_cell> r35_cells;
+    r35_hooks                    r35_h;
+    mutable uint64_t             r35_n_park = 0, r35_n_unpark = 0;
+    mutable double               r35_park_ms = 0.0, r35_unpark_ms = 0.0;
+
+    ggml_backend_buffer_t r35_alloc(const llama_model & model, ggml_context * ctx, ggml_backend_buffer_type_t buft);
+    bool r35_park_cell(uint32_t c, bool give) const;
+    bool r35_unpark_cell(uint32_t c, bool take) const;
 };
 
 class llama_memory_recurrent_context : public llama_memory_context_i {

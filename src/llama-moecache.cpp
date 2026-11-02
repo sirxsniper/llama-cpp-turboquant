@@ -332,6 +332,9 @@ struct moe_cache {
     std::vector<std::vector<std::pair<size_t, size_t>>> sl_grp; // per group: [lo, hi) byte ranges of the buffer
     std::vector<size_t>   sl_grp_bytes;
     std::vector<size_t>   sl_given;        // per group: bytes given to the KV cache now (0: mapped)
+    // [TAG_R35_NP2PARK] per KV group: 1 while the idle slot's share holds it (taken from the bottom; the KV cache's and the
+    // projector's restores skip it). Empty until that share takes a group (then every old path is as before)
+    std::vector<uint8_t>  sl_np2;
     // [TAG_FN_L21_BIGUB] the groups [0, sl_n_kv) go to the KV cache; group sl_n_kv (when there is one) is the borrow group:
     // its sb_bytes go to the compute reserve of a 16K prompt ubatch (sb_out: out now), its residents come back after it
     size_t                sl_n_kv  = 0;
@@ -346,6 +349,10 @@ struct moe_cache {
     size_t                vis_out   = 0;
     uint64_t              vis_n     = 0;
     double                vis_take_ms = 0.0, vis_give_ms = 0.0;
+    // [TAG_R35_NP2PARK] the idle-slot share of the KV lend (parked recurrent cells, the wide SMALL reserve): held out now
+    size_t                np2_out   = 0;
+    uint64_t              np2_n_take = 0, np2_n_give = 0;
+    double                np2_take_ms = 0.0, np2_give_ms = 0.0;
     // [TAG_FN_L4_MEM_UPLOAD] LLAMA_FN_L4_UPLOAD=1 (qwen4exp): the tail's refill first (no swap is queued behind it for up to
     // l4_hold_ms after a restore), and the pinned halves (LLAMA_MOE_HOT_UP_PIPE) unless the environment says otherwise
     bool                  l4_upload  = false;
@@ -4114,6 +4121,9 @@ size_t hot_sl_restore(moe_cache * mc, const void * owner, size_t keep) {
         if (mc->sl_given[g] == 0) {
             continue;
         }
+        if (!mc->sl_np2.empty() && mc->sl_np2[g]) {
+            continue; // [TAG_R35_NP2PARK] the idle slot's share holds it (its own hold gives it back)
+        }
         const size_t b = mc->sl_given[g];
         if (mc->kv_out < keep + b) {
             break;
@@ -6318,6 +6328,181 @@ void llama_moe_hot_vis_give() {
             "%.1f ms on average)\n", mc->vis_n, (mc->vis_out > left ? mc->vis_out - left : 0)/1048576.0, ms,
             mc->vis_take_ms/(double) mc->vis_n, mc->vis_give_ms/(double) mc->vis_n);
     mc->vis_out = 0;
+}
+
+// [TAG_R35_NP2PARK] -------------------------------------------------------------------------------------------------
+// The idle slot's share of the lend: whole KV groups taken from the bottom and kept apart (sl_np2), while the KV cache and
+// the projector take from the top and skip them when they give back, so no user maps a group another one still holds
+// the VRAM of. The KV cache's hooks pass an absolute need: the kvside wrappers add this share's bytes to it, so a KV growth
+// or shrink never counts them as the KV cache's. Without a slot lend (layer lend only) the share counts bytes on top.
+
+// hold(target): whole KV groups taken from the bottom while the share holds less than `target` (the KV cache and the
+// projector take from the top and give their lowest back first, skipping these), its highest groups given back while it
+// holds at least that group more than `target`. The release and the restore of a group run as in hot_sl_release /
+// hot_sl_restore (the owner's graphs synchronized; slots out, residents evicted, tables written; a group mapped again is
+// cleared and its slots fill from the routing).
+static size_t hot_sl_np2_hold(moe_cache * mc, const void * owner, size_t target) {
+    if (!mc->cb_buf || (mc->adapt && owner != mc->owner)) {
+        return mc->np2_out;
+    }
+    std::lock_guard<std::mutex> slk(mc->step_mtx);
+    hot_turn_join(mc); // [TAG_FN_L18_FIRSTANS_OVERLAP] a pass in flight lands first
+    if (mc->sl_np2.size() != mc->sl_n_kv) {
+        mc->sl_np2.assign(mc->sl_n_kv, 0);
+    }
+    if (mc->np2_out < target) {
+        std::vector<size_t> rel;
+        size_t held = mc->np2_out;
+        for (size_t g = 0; g < mc->sl_n_kv && held < target; ++g) {
+            if (mc->sl_given[g] == 0 && mc->sl_grp_bytes[g] > 0) {
+                mc->sl_given[g] = mc->sl_grp_bytes[g];
+                mc->sl_np2[g]   = 1;
+                rel.push_back(g);
+                held += mc->sl_grp_bytes[g];
+            }
+        }
+        if (rel.empty()) {
+            return mc->np2_out;
+        }
+        for (auto & ls : mc->layers) {
+            if (ls.sl_base >= 0) {
+                hot_sl_slots(mc, ls);
+            }
+        }
+        hot_drain_out(mc);
+        for (auto & ls : mc->layers) {
+            if (ls.sl_base < 0) {
+                continue;
+            }
+            bool changed = false;
+            for (int32_t s = ls.sl_base; s < ls.pub.n_slots; ++s) {
+                if (!ls.slot_out[(size_t) s]) {
+                    continue;
+                }
+                const int32_t e = ls.slot_expert[s];
+                if (e >= 0) {
+                    ls.expert_slot[e] = -1;
+                    ls.slot_expert[s] = -1;
+                    changed = true;
+                }
+            }
+            if (changed) {
+                hot_write_tables(mc, ls);
+            }
+        }
+        if (mc->up_backend) {
+            ggml_backend_synchronize(mc->up_backend);
+        }
+        for (size_t g : rel) {
+            bool ok = true;
+            for (const auto & r : mc->sl_grp[g]) {
+                ok = mc->cb_unmap(mc->cb_buf, r.first, r.second - r.first) && ok;
+            }
+            if (!ok) {
+                LLAMA_LOG_WARN("moe-hot: [TAG_R35_NP2PARK] group %zu could not give all of its VRAM back\n", g);
+                mc->sl_given[g] = 1; // out, a token amount (its restore maps it again)
+            }
+            mc->kv_out  += mc->sl_given[g];
+            mc->np2_out += mc->sl_given[g];
+        }
+        return mc->np2_out;
+    }
+    size_t n_res = 0;
+    for (size_t g = mc->sl_n_kv; g-- > 0; ) {
+        if (!mc->sl_np2[g] || mc->sl_given[g] == 0) {
+            continue;
+        }
+        const size_t b = mc->sl_given[g];
+        if (mc->np2_out < target + b) {
+            continue;
+        }
+        bool   ok   = true;
+        size_t done = 0;
+        for (const auto & r : mc->sl_grp[g]) {
+            (void) mc->cb_unmap(mc->cb_buf, r.first, r.second - r.first); // a failed release may have left it mapped
+            if (!mc->cb_map(mc->cb_buf, r.first, r.second - r.first)) {
+                ok = false;
+                break;
+            }
+            done++;
+        }
+        if (!ok) {
+            for (size_t i = 0; i < done; ++i) {
+                const auto & r = mc->sl_grp[g][i];
+                (void) mc->cb_unmap(mc->cb_buf, r.first, r.second - r.first);
+            }
+            LLAMA_LOG_WARN("moe-hot: [TAG_R35_NP2PARK] mapping group %zu again failed: it stays out until the next try\n", g);
+            break;
+        }
+        for (const auto & r : mc->sl_grp[g]) {
+            ggml_backend_tensor_memset(mc->sl_raw, 0, r.first, r.second - r.first);
+        }
+        mc->sl_given[g] = 0;
+        mc->sl_np2[g]   = 0;
+        mc->kv_out  -= b;
+        mc->np2_out -= b;
+        n_res++;
+    }
+    if (n_res > 0) {
+        for (auto & ls : mc->layers) {
+            if (ls.sl_base >= 0) {
+                hot_sl_slots(mc, ls);
+            }
+        }
+    }
+    return mc->np2_out;
+}
+
+size_t llama_moe_hot_np2_hold(const void * owner, size_t target) {
+    moe_cache * mc = g_cache;
+    if (!mc || mc->kv_bytes == 0 || target == mc->np2_out) {
+        return mc ? mc->np2_out : 0;
+    }
+    const int64_t t0     = ggml_time_us();
+    const size_t  before = mc->np2_out;
+    if (mc->sl_on) {
+        (void) hot_sl_np2_hold(mc, owner, target);
+    } else if (target > mc->np2_out) {
+        // the layer lend (no slot groups): bytes on top of what is out
+        const size_t k0 = mc->kv_out;
+        const size_t k1 = llama_moe_hot_kv_release(owner, k0 + (target - mc->np2_out));
+        mc->np2_out += k1 > k0 ? k1 - k0 : 0;
+    } else {
+        const size_t d  = mc->np2_out - target;
+        const size_t k0 = mc->kv_out;
+        const size_t k1 = llama_moe_hot_kv_restore(owner, k0 > d ? k0 - d : 0);
+        mc->np2_out -= std::min(d, k0 > k1 ? k0 - k1 : 0);
+    }
+    const bool up = mc->np2_out > before;
+    const double ms = (ggml_time_us() - t0)/1000.0;
+    (up ? mc->np2_take_ms : mc->np2_give_ms) += ms;
+    const uint64_t n = ++(up ? mc->np2_n_take : mc->np2_n_give);
+    if (n <= 4 || n % 64 == 0 || mc->np2_out < target) {
+        LLAMA_LOG_INFO("moe-hot: [TAG_R35_NP2PARK] %s %" PRIu64 ": the idle slot's share holds %.0f MiB (wanted %.0f, was %.0f) after %.1f "
+                "ms; %.0f of %.0f MiB of the lend out%s\n", up ? "take" : "give", n, mc->np2_out/1048576.0, target/1048576.0,
+                before/1048576.0, ms, mc->kv_out/1048576.0, mc->kv_bytes/1048576.0,
+                mc->np2_out < target ? ": the rest comes from free VRAM" : "");
+    }
+    return mc->np2_out;
+}
+
+size_t llama_moe_hot_np2_out() {
+    const moe_cache * mc = g_cache;
+    return mc ? mc->np2_out : 0;
+}
+
+size_t llama_moe_hot_kv_release_kvside(const void * owner, size_t need) {
+    const moe_cache * mc = g_cache;
+    const size_t np2 = mc ? mc->np2_out : 0;
+    const size_t out = llama_moe_hot_kv_release(owner, need + np2);
+    return out > np2 ? out - np2 : 0;
+}
+
+size_t llama_moe_hot_kv_restore_kvside(const void * owner, size_t keep) {
+    const moe_cache * mc = g_cache;
+    const size_t np2 = mc ? mc->np2_out : 0;
+    const size_t out = llama_moe_hot_kv_restore(owner, keep + np2);
+    return out > np2 ? out - np2 : 0;
 }
 
 // [TAG_FN_L4_EXIT] ---------------------------------------------------------------------------------------------------
