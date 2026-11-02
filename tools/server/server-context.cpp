@@ -9407,6 +9407,20 @@ private:
                             llama_fn_prompt_after_ext(ctx_tgt, std::max<int32_t>(0, n_after));
                         }
 
+                        // [TAG_R34_NP2COST] this chunk's own llama_decode calls get the busy count now: decode() sets it only before
+                        // the main batch, so they read the last iteration's. A stale 1 (a second request whose first new chunk is
+                        // a picture, beside another answer) let the picture start the prompt-end pass inside that answer with
+                        // LLAMA_FN_L18_FIRSTANS_ONCE=0; a stale 2 (the other answer ended in the last batch) kept a lone request's
+                        // short text tail after a picture from its pass. Batches without outputs read the count nowhere else, so
+                        // LLAMA_R34_NP2_TURN=0 keeps v0.26.6
+                        {
+                            int32_t n_busy_media = 0;
+                            for (const auto & other : slots) {
+                                n_busy_media += other.is_processing() && !other.parked ? 1 : 0;
+                            }
+                            llama_fn_seqs_busy_ext(ctx_tgt, n_busy_media);
+                        }
+
                         // process the mtmd chunk
                         // note: it submits its own decode, potentially be async
                         //       so the timing is queued and flushed on the next sync
