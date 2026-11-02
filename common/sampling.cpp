@@ -175,6 +175,60 @@ bool common_sampler_r35_topk_cands(const float * vals, const llama_token * ids, 
     return true;
 }
 
+// [TAG_R35_HOSTCHAIN] LLAMA_FN_R35_VERIFY=1 (test only): every row decided from the device candidates is checked against the
+// whole row (copied from the device): the candidates must be the row's exact top m under (value desc, index asc) and the row
+// path must give the same K entries. Mismatches are logged (first 8) and counted; a summary every 1024 checks.
+static bool r35_verify_on() {
+    static const bool on = [] {
+        const char * e = std::getenv("LLAMA_FN_R35_VERIFY");
+        return e != nullptr && std::atoi(e) != 0;
+    }();
+    return on;
+}
+
+static void r35_verify_row(struct llama_context * ctx, int idx, const float * cv, const llama_token * ci, int cm, int K,
+        const std::vector<llama_token> & excl, const std::vector<llama_token_data> & got) {
+    static uint64_t n_chk = 0, n_bad_set = 0, n_bad_res = 0;
+    const float * row = llama_get_logits_ith(ctx, idx);
+    if (row == nullptr) {
+        return;
+    }
+    const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx)));
+    // the row's exact top cm
+    std::vector<int> ix(n_vocab);
+    for (int i = 0; i < n_vocab; ++i) {
+        ix[i] = i;
+    }
+    std::partial_sort(ix.begin(), ix.begin() + cm, ix.end(), [&](int a, int b) {
+        return row[a] > row[b] || (row[a] == row[b] && a < b);
+    });
+    std::vector<int> want(ix.begin(), ix.begin() + cm);
+    std::vector<int> have(ci, ci + cm);
+    std::sort(want.begin(), want.end());
+    std::sort(have.begin(), have.end());
+    bool set_ok = want == have;
+    for (int j = 0; j < cm && set_ok; ++j) {
+        set_ok = ci[j] >= 0 && ci[j] < n_vocab && row[ci[j]] == cv[j];
+    }
+    std::vector<llama_token_data> ref;
+    const bool ok = common_sampler_fn_l4_topk_row(row, n_vocab, K, excl, ref);
+    bool res_ok = ok && ref.size() == got.size();
+    for (size_t j = 0; res_ok && j < ref.size(); ++j) {
+        res_ok = ref[j].id == got[j].id && ref[j].logit == got[j].logit;
+    }
+    n_chk++;
+    n_bad_set += set_ok ? 0 : 1;
+    n_bad_res += res_ok ? 0 : 1;
+    if ((!set_ok || !res_ok) && n_bad_set + n_bad_res <= 8) {
+        LOG_WRN("[TAG_R35_HOSTCHAIN] VERIFY mismatch at row %d: candidate set %s, result %s (row path %s, K %d, m %d)\n", idx,
+                set_ok ? "ok" : "WRONG", res_ok ? "ok" : "WRONG", ok ? "decides" : "refuses", K, cm);
+    }
+    if (n_chk == 1 || n_chk % 1024 == 0) {
+        LOG_INF("[TAG_R35_HOSTCHAIN] VERIFY: %llu rows checked, %llu wrong candidate sets, %llu wrong results\n",
+                (unsigned long long) n_chk, (unsigned long long) n_bad_set, (unsigned long long) n_bad_res);
+    }
+}
+
 // [TAG_R28_PENFAST] LLAMA_R28_PENFAST: 1 (default) the fast candidate path with penalties / a logit bias, 0 off (v0.26.3)
 static bool r28_penfast_enabled() {
     static const bool on = [] {
@@ -863,6 +917,9 @@ struct common_sampler {
             const llama_token * ci = nullptr;
             const int32_t       cm = llama_fn_r35_topk_ith(ctx, idx, &cv, &ci);
             if (cm > 0 && common_sampler_r35_topk_cands(cv, ci, cm, fast_k, fast_excl, cur)) {
+                if (r35_verify_on()) {
+                    r35_verify_row(ctx, idx, cv, ci, cm, fast_k, fast_excl, cur);
+                }
                 cur_p = { cur.data(), cur.size(), -1, true };
                 return true;
             }
