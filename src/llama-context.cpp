@@ -7266,11 +7266,20 @@ void llama_context::moe_hot_fit_try() {
     if (lend_want > 0) {
         llama_moe_hot_set_kv_lend(lend_want, llama_prefill_stream_lend_bytes(this), (int) model.hparams.n_layer());
         llama_moe_hot_set_cb_borrow(cbuf_tail > 0 ? l21_extra : 0); // [TAG_FN_L21_BIGUB]
+        // [TAG_R34_F_VISFLAT] the projector's slots out of the lend layers' own counts (LLAMA_R34_VISFLAT=0: on top, v0.26.6)
+        const char * vf = getenv("LLAMA_R34_VISFLAT");
+        const bool   flat = vis_want > 0 && kv_want > 0 && !(vf && strcmp(vf, "0") == 0);
+        llama_moe_hot_set_vis_part(flat ? vis_want : 0);
+        if (flat) {
+            LLAMA_LOG_INFO("moe-hot: [TAG_R34_F_VISFLAT] the projector's %.0f MiB come out of the lend layers' own slots (the counts "
+                    "per layer as without it)\n", vis_want/MiB);
+        }
     }
     bool hot_ok = budget > 0 && llama_moe_hot_init(model, this, budget, cbuf_tail);
     if (lend_want > 0) {
         llama_moe_hot_set_kv_lend(0, 0, 0);
         llama_moe_hot_set_cb_borrow(0); // [TAG_FN_L21_BIGUB]
+        llama_moe_hot_set_vis_part(0); // [TAG_R34_F_VISFLAT]
         if (hot_ok && llama_moe_hot_kv_bytes() >= kv_want) {
             if (kv_want > 0) {
                 llama_kv_lend_set_hooks(llama_moe_hot_kv_release, llama_moe_hot_kv_restore, this);

@@ -166,6 +166,10 @@ void     llama_moe_hot_generation_bump();
 // _vis_set(bytes) after an init that holds them all. _vis_take (the owner's graphs synchronized): `bytes` more go out
 // the same way as for the KV cache (top first); returns the bytes given back. _vis_give: maps them again (empty slots).
 void   llama_moe_hot_vis_set(size_t bytes);
+// [TAG_R34_F_VISFLAT] before the init (with _set_kv_lend, whose want includes them): the projector's bytes of the lend. With the
+// slot lend they come out of the lend layers' own slots (more of them can go), so the counts per layer are those of the hot
+// set without the projector's share; 0 (default, or LLAMA_R34_VISFLAT=0 at the caller): on top of a base cut for them (v0.26.6)
+void   llama_moe_hot_set_vis_part(size_t bytes);
 size_t llama_moe_hot_vis_bytes();
 size_t llama_moe_hot_vis_take(size_t bytes);
 void   llama_moe_hot_vis_give();

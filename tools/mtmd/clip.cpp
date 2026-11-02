@@ -17,7 +17,9 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem> // [TAG_R34_F_VISFILE]
 #include <fstream>
+#include <system_error>
 #include <map>
 #include <random>
 #include <tuple>
@@ -232,6 +234,18 @@ struct clip_ctx {
         bool               size_on = false;
         size_t             w       = 0; // weight buffer bytes
         mtmd_l22_lend_size sz;
+        // [TAG_R34_F_VISFILE] the weights whose bytes equal the projector file's wait in the file (the OS file cache: reclaimable
+        // RAM, not a locked or committed copy) and are read again at each take; the rest (none for a plain projector) keeps
+        // the host copy. LLAMA_R34_VISFILE=1 turns it on; unset / 0: every weight in the host copy, pinned if possible (v0.26.6)
+        std::vector<uint64_t> foff;            // per offs entry: its file offset, UINT64_MAX = in the host copy
+        size_t                file_bytes = 0;  // read from the file at each take
+        uintmax_t             file_size  = 0;  // the file as parked: a change fails the take (no silent other weights)
+        int64_t               file_time  = 0;
+        ggml_backend_buffer_ptr stage_buf;     // 2 staging halves for the file reads (pinned when possible)
+        std::vector<uint8_t>    stage_vec;
+        uint8_t *               stage      = nullptr;
+        size_t                  stage_half = 0;
+        bool                    file_err   = false; // the last unpark failed on the file, not on the allocation
     } lend;
 
     void make_sched() {
@@ -7221,6 +7235,131 @@ static bool clip_encode_on_cpu_twin(const clip_ctx * ctx, clip_ctx * twin, struc
 
 // [TAG_FN_L17_VISION_LEND] ------------------------------------------------------------------------------------------------
 
+// [TAG_R34_F_VISFILE] -----------------------------------------------------------------------------------------------------
+// off by default (measured 11-01: each take reads the 862 MiB again, weights up 393 ms instead of 26 ms per image turn; the
+// first answer after a start showed no gain over the old build in the same session (90.6 vs 91.4 t/s), steady decode
+// unchanged): LLAMA_R34_VISFILE=1 turns it on
+static bool clip_visfile_wanted() {
+    const char * e = std::getenv("LLAMA_R34_VISFILE");
+    return e != nullptr && strcmp(e, "1") == 0;
+}
+
+static bool clip_file_stamp(const std::string & fname, uintmax_t & size, int64_t & time) {
+    std::error_code ec;
+#ifdef _WIN32
+    const std::filesystem::path fp(std::filesystem::u8path(fname));
+#else
+    const std::filesystem::path fp(fname);
+#endif
+    size = std::filesystem::file_size(fp, ec);
+    if (ec) {
+        return false;
+    }
+    const auto t = std::filesystem::last_write_time(fp, ec);
+    if (ec) {
+        return false;
+    }
+    time = (int64_t) t.time_since_epoch().count();
+    return true;
+}
+
+// at park, while the weights are on the device: every weight whose file bytes (by name, same size) equal its device bytes
+// gets its file offset; returns the bytes found
+static size_t clip_lend_map_file(clip_ctx * ctx) {
+    auto & L = ctx->lend;
+    L.foff.assign(L.offs.size(), UINT64_MAX);
+    L.file_bytes = 0;
+    if (ctx->fname.empty() || !clip_file_stamp(ctx->fname, L.file_size, L.file_time)) {
+        return 0;
+    }
+    gguf_init_params gp = { /*.no_alloc = */ true, /*.ctx = */ nullptr };
+    gguf_context * g = gguf_init_from_file(ctx->fname.c_str(), gp);
+    if (g == nullptr) {
+        return 0;
+    }
+    auto fin = open_ifstream_binary(ctx->fname);
+    if (!fin) {
+        gguf_free(g);
+        return 0;
+    }
+    const size_t doff = gguf_get_data_offset(g);
+    const size_t CH   = (size_t) 16 << 20;
+    std::vector<uint8_t> a, b;
+    for (size_t i = 0; i < L.offs.size(); ++i) {
+        ggml_tensor * t  = L.offs[i].first;
+        const int64_t id = gguf_find_tensor(g, ggml_get_name(t));
+        const size_t  nb = ggml_nbytes(t);
+        if (id < 0 || gguf_get_tensor_size(g, id) != nb) {
+            continue;
+        }
+        const uint64_t fo = (uint64_t) doff + (uint64_t) gguf_get_tensor_offset(g, id);
+        bool same = true;
+        for (size_t p = 0; p < nb && same; p += CH) {
+            const size_t k = std::min(CH, nb - p);
+            a.resize(k);
+            b.resize(k);
+            ggml_backend_tensor_get(t, a.data(), p, k);
+            fin.seekg((std::streamoff) (fo + p), std::ios::beg);
+            fin.read(reinterpret_cast<char *>(b.data()), (std::streamsize) k);
+            same = (bool) fin && memcmp(a.data(), b.data(), k) == 0;
+        }
+        if (!same) {
+            fin.clear();
+            continue;
+        }
+        L.foff[i]     = fo;
+        L.file_bytes += nb;
+    }
+    gguf_free(g);
+    return L.file_bytes;
+}
+
+// at each take: the file-backed weights from the file, through the two staging halves (one is read while the other copies)
+static bool clip_lend_read_file(clip_ctx * ctx) {
+    auto & L = ctx->lend;
+    if (L.file_bytes == 0) {
+        return true;
+    }
+    uintmax_t sz = 0;
+    int64_t   tm = 0;
+    if (!clip_file_stamp(ctx->fname, sz, tm) || sz != L.file_size || tm != L.file_time) {
+        LOG_ERR("%s: [TAG_R34_F_VISFILE] the projector file %s changed or is gone since the start: this encode fails (restart the "
+                "server)\n", __func__, ctx->fname.c_str());
+        return false;
+    }
+    auto fin = open_ifstream_binary(ctx->fname);
+    if (!fin) {
+        LOG_ERR("%s: [TAG_R34_F_VISFILE] cannot open %s: this encode fails\n", __func__, ctx->fname.c_str());
+        return false;
+    }
+    int half = 0;
+    for (size_t i = 0; i < L.offs.size(); ++i) {
+        if (L.foff[i] == UINT64_MAX) {
+            continue;
+        }
+        ggml_tensor * t  = L.offs[i].first;
+        const size_t  nb = ggml_nbytes(t);
+        for (size_t p = 0; p < nb; p += L.stage_half) {
+            const size_t k = std::min(L.stage_half, nb - p);
+            uint8_t * dst = L.stage + (size_t) half*L.stage_half;
+            fin.seekg((std::streamoff) (L.foff[i] + p), std::ios::beg);
+            fin.read(reinterpret_cast<char *>(dst), (std::streamsize) k);
+            if (!fin) {
+                ggml_backend_synchronize(ctx->backend);
+                LOG_ERR("%s: [TAG_R34_F_VISFILE] reading %s failed: this encode fails\n", __func__, ctx->fname.c_str());
+                return false;
+            }
+            ggml_backend_tensor_set_async(ctx->backend, t, dst, p, k);
+            half ^= 1;
+            if (half == 0) {
+                ggml_backend_synchronize(ctx->backend); // both halves queued: the next read reuses the first
+            }
+        }
+    }
+    ggml_backend_synchronize(ctx->backend);
+    return true;
+}
+
 // frees the device weight buffer (the tensors keep their shapes, no data) and the compute buffers (a new scheduler)
 static void clip_lend_free_device(clip_ctx * ctx) {
     ggml_backend_synchronize(ctx->backend);
@@ -7234,7 +7373,9 @@ static void clip_lend_free_device(clip_ctx * ctx) {
 }
 
 // a new device weight buffer (the same allocation as at load), the weights uploaded from host
-static bool clip_lend_unpark_once(clip_ctx * ctx) {
+// [TAG_R34_F_VISFILE_ERR] returns 0: weights up; 1: the weight buffer could not be allocated; 2: the projector file could not
+// be read (memory was not what failed: no OOM hook)
+static int clip_lend_unpark_once(clip_ctx * ctx) {
     ggml_backend_buffer_t b = ggml_backend_alloc_ctx_tensors_from_buft(ctx->ctx_data.get(), ctx->lend.buft);
     if (b == nullptr) {
         // tensors placed before the failure point into the freed buffer: no data again
@@ -7242,31 +7383,54 @@ static bool clip_lend_unpark_once(clip_ctx * ctx) {
             t->data   = nullptr;
             t->buffer = nullptr;
         }
-        return false;
+        return 1;
     }
     ctx->buf.reset(b);
     ggml_backend_buffer_set_usage(b, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
-    for (const auto & [t, off] : ctx->lend.offs) {
-        ggml_backend_tensor_set_async(ctx->backend, t, ctx->lend.host + off, 0, ggml_nbytes(t));
+    const auto & L = ctx->lend;
+    for (size_t i = 0; i < L.offs.size(); ++i) {
+        if (i < L.foff.size() && L.foff[i] != UINT64_MAX) {
+            continue; // [TAG_R34_F_VISFILE] from the file below
+        }
+        ggml_backend_tensor_set_async(ctx->backend, L.offs[i].first, L.host + L.offs[i].second, 0, ggml_nbytes(L.offs[i].first));
     }
     ggml_backend_synchronize(ctx->backend);
+    if (!clip_lend_read_file(ctx)) { // [TAG_R34_F_VISFILE] parked again: no weights on the device
+        ctx->buf.reset();
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx->ctx_data.get()); t != nullptr; t = ggml_get_next_tensor(ctx->ctx_data.get(), t)) {
+            t->data   = nullptr;
+            t->buffer = nullptr;
+        }
+        return 2; // [TAG_R34_F_VISFILE_ERR]
+    }
     ctx->lend.parked = false;
-    return true;
+    return 0;
 }
 
 // [TAG_FN_L22_OOMHOOK] a failed weight buffer allocation asks the OOM hook once (e.g. pins give memory back), then retries
 static bool clip_lend_unpark(clip_ctx * ctx, size_t need) {
-    if (clip_lend_unpark_once(ctx)) {
+    auto & L = ctx->lend;
+    L.file_err = false;
+    const int r = clip_lend_unpark_once(ctx);
+    if (r == 0) {
         return true;
     }
-    auto & L = ctx->lend;
+    if (r == 2) {
+        L.file_err = true; // [TAG_R34_F_VISFILE_ERR] a file error: no OOM hook, no retry (the read logged why)
+        return false;
+    }
     if (L.oom == nullptr) {
         return false;
     }
     const bool freed = L.oom(L.oom_ud, need);
     LOG_WRN("%s: [TAG_FN_L22_OOMHOOK] the weight buffer could not be allocated, the OOM hook %s (%.1f MiB)\n", __func__,
             freed ? "released memory: retrying once" : "released nothing", need/1048576.0);
-    return freed && clip_lend_unpark_once(ctx);
+    if (!freed) {
+        return false;
+    }
+    const int r2 = clip_lend_unpark_once(ctx);
+    L.file_err = r2 == 2; // [TAG_R34_F_VISFILE_ERR]
+    return r2 == 0;
 }
 
 // [TAG_FN_L22_VLEND_SIZE] at park, while the weights are still on the device: the compute buffer of the largest picture
@@ -7335,23 +7499,40 @@ size_t clip_lend_park(struct clip_ctx * ctx, clip_lend_take_fn take, clip_lend_g
     auto & L = ctx->lend;
     size_t n = 0;
     L.offs.clear();
+    size_t n_all = 0;
     for (ggml_tensor * t = ggml_get_first_tensor(ctx->ctx_data.get()); t != nullptr; t = ggml_get_next_tensor(ctx->ctx_data.get(), t)) {
         if (t->view_src != nullptr || t->data == nullptr) {
             continue;
         }
-        const size_t off = GGML_PAD(n, 64);
-        L.offs.push_back({ t, off });
-        n = off + ggml_nbytes(t);
+        L.offs.push_back({ t, 0 });
+        n_all += ggml_nbytes(t);
     }
-    if (n == 0) {
+    if (n_all == 0) {
         return 0;
+    }
+    const int64_t t0 = ggml_time_us();
+    // [TAG_R34_F_VISFILE] the weights the file holds byte for byte stay there; only the others get a host copy
+    L.foff.assign(L.offs.size(), UINT64_MAX);
+    L.file_bytes = 0;
+    if (clip_visfile_wanted()) {
+        clip_lend_map_file(ctx);
+    }
+    for (size_t i = 0; i < L.offs.size(); ++i) {
+        if (L.foff[i] != UINT64_MAX) {
+            continue;
+        }
+        const size_t off = GGML_PAD(n, 64);
+        L.offs[i].second = off;
+        n = off + ggml_nbytes(L.offs[i].first);
     }
     ggml_backend_dev_t dev = ggml_backend_get_device(ctx->backend);
     ggml_backend_buffer_type_t hbt = dev ? ggml_backend_dev_host_buffer_type(dev) : nullptr;
-    if (hbt != nullptr) {
+    if (n > 0 && hbt != nullptr) {
         L.host_buf.reset(ggml_backend_buft_alloc_buffer(hbt, n));
     }
-    if (L.host_buf) {
+    if (n == 0) {
+        L.host = nullptr;
+    } else if (L.host_buf) {
         L.host = (uint8_t *) ggml_backend_buffer_get_base(L.host_buf.get());
     } else {
         try {
@@ -7359,13 +7540,38 @@ size_t clip_lend_park(struct clip_ctx * ctx, clip_lend_take_fn take, clip_lend_g
         } catch (const std::exception & e) {
             LOG_WRN("%s: [TAG_FN_L17_VISION_LEND] no host memory for the weights (%s): not parked\n", __func__, e.what());
             L.offs.clear();
+            L.foff.clear();
             return 0;
         }
         L.host = L.host_vec.data();
     }
-    const int64_t t0 = ggml_time_us();
-    for (const auto & [t, off] : L.offs) {
-        ggml_backend_tensor_get(t, L.host + off, 0, ggml_nbytes(t));
+    if (L.file_bytes > 0) {
+        // [TAG_R34_F_VISFILE] two staging halves of 16 MiB for the reads (pinned when the device has a host buffer type)
+        L.stage_half = (size_t) 16 << 20;
+        if (hbt != nullptr) {
+            L.stage_buf.reset(ggml_backend_buft_alloc_buffer(hbt, 2*L.stage_half));
+        }
+        if (L.stage_buf) {
+            L.stage = (uint8_t *) ggml_backend_buffer_get_base(L.stage_buf.get());
+        } else {
+            try {
+                L.stage_vec.resize(2*L.stage_half);
+                L.stage = L.stage_vec.data();
+            } catch (const std::exception &) {
+                L.file_bytes = 0; // no staging: not parked (the host copy path would need the bytes again)
+                L.offs.clear();
+                L.foff.clear();
+                L.host_buf.reset();
+                L.host_vec.clear();
+                LOG_WRN("%s: [TAG_R34_F_VISFILE] no staging memory: not parked\n", __func__);
+                return 0;
+            }
+        }
+    }
+    for (size_t i = 0; i < L.offs.size(); ++i) {
+        if (L.foff[i] == UINT64_MAX) {
+            ggml_backend_tensor_get(L.offs[i].first, L.host + L.offs[i].second, 0, ggml_nbytes(L.offs[i].first));
+        }
     }
     const size_t w = ggml_backend_buffer_get_size(ctx->buf.get());
     const size_t c = ggml_backend_sched_get_buffer_size(ctx->sched.get(), ctx->backend);
@@ -7378,9 +7584,18 @@ size_t clip_lend_park(struct clip_ctx * ctx, clip_lend_take_fn take, clip_lend_g
     L.bytes = w + c;
     L.on    = true;
     clip_lend_free_device(ctx);
-    LOG_INF("%s: [TAG_FN_L17_VISION_LEND] weights (%.1f MiB, %zu tensors) wait in %s host memory, %.1f MiB of %s freed until "
-            "an encode (%.1f ms)\n", __func__, n/1048576.0, L.offs.size(), L.host_buf ? "pinned" : "pageable", L.bytes/1048576.0,
-            ggml_backend_name(ctx->backend), (ggml_time_us() - t0)/1000.0);
+    if (L.file_bytes > 0) {
+        size_t n_file = 0;
+        for (const auto fo : L.foff) {
+            n_file += fo != UINT64_MAX ? 1 : 0;
+        }
+        LOG_INF("%s: [TAG_R34_F_VISFILE] %.1f MiB of weights (%zu of %zu tensors) wait in the projector file, read again at each "
+                "take; %.1f MiB in a host copy\n", __func__, L.file_bytes/1048576.0, n_file, L.offs.size(), n/1048576.0);
+    }
+    LOG_INF("%s: [TAG_FN_L17_VISION_LEND] weights (%.1f MiB, %zu tensors) wait in %s, %.1f MiB of %s freed until "
+            "an encode (%.1f ms)\n", __func__, n_all/1048576.0, L.offs.size(),
+            L.file_bytes == n_all ? "the projector file" : L.host_buf ? "pinned host memory" : "pageable host memory",
+            L.bytes/1048576.0, ggml_backend_name(ctx->backend), (ggml_time_us() - t0)/1000.0);
     return L.bytes;
 }
 
@@ -7478,7 +7693,10 @@ struct clip_lend_scope {
         ok = clip_lend_unpark(ctx, need);
         L.fresh = ok;
         t_up = ggml_time_us();
-        if (!ok) {
+        if (!ok && L.file_err) {
+            LOG_ERR("%s: [TAG_R34_F_VISFILE_ERR] the projector's weights could not be read from its file: this encode fails\n",
+                    __func__);
+        } else if (!ok) {
             LOG_ERR("%s: [TAG_FN_L17_VISION_LEND] the weight buffer (%.1f MiB) could not be allocated: this encode fails\n", __func__,
                     need/1048576.0);
         } else if (need > L.bytes) {

@@ -2514,6 +2514,9 @@ int    g_kv_n_trunk = 0;
 // [TAG_FN_L21_BIGUB] the bytes the next hot set init puts in the borrow group of the slot lend (0: none)
 size_t g_kv_borrow  = 0;
 bool   g_kv_borrow_1seq = false; // [TAG_FN_L22_BIGUB2] the borrow is the 1-sequence big reserve's extra
+// [TAG_R34_F_VISFLAT] the parked projector's part of g_kv_want for the next hot set init (llama_moe_hot_set_vis_part): with the
+// slot lend its slots come out of the lend layers' own counts instead of lying on top of a base cut for them
+size_t g_vis_part   = 0;
 
 // [TAG_FN_L10_SLOTLEND] a usable slot keeps this many bytes after it mapped (a kernel that reads a little past a slot's end
 // never reaches a segment the KV cache holds)
@@ -3203,57 +3206,103 @@ bool llama_moe_hot_init(const llama_model & model, const void * owner, size_t bu
             std::vector<int> sl_layers;
             int32_t          sl_e = 0;
             int32_t          sl_bx = 0; // [TAG_FN_L21_BIGUB]
-            if (sl_req) {
-                std::vector<int> trunk;
-                for (int li = 0; li < (int) layers.size(); ++li) {
-                    if (layers[li].il < g_kv_n_trunk) {
-                        trunk.push_back(li);
-                    }
-                }
-                std::sort(trunk.begin(), trunk.end(), [&](int a, int b) { return layers[a].il < layers[b].il; });
-                const std::vector<int32_t> n0 = slots_for(budget_slots > g_kv_want ? budget_slots - g_kv_want : 0);
-                // one more layer: the final even count may come out a little lower than n0
-                const size_t need_above = tail_bytes + g_kv_keep + 4*vmm_gran +
-                    (trunk.empty() ? 0 : (size_t) (n0[trunk.back()] + 1)*layers[trunk.back()].bytes);
-                size_t above = 0;
-                int    top   = (int) trunk.size();
-                while (top > 0 && above < need_above) {
-                    --top;
-                    above += (size_t) (n0[trunk[top]] + 1)*layers[trunk[top]].bytes;
-                }
-                size_t per = 0;
-                for (int i = 0; i < top; ++i) {
-                    sl_layers.push_back(trunk[i]);
-                    per += layers[trunk[i]].bytes;
-                }
-                if (per > 0) {
-                    // about one granule per tensor stays mapped at its segment ends (the start's slack, the zero slot's
-                    // granule); a placement that comes out short asks for one slot more (sl_extra)
-                    const size_t waste = sl_layers.size()*3*(vmm_gran + SL_SLACK);
-                    sl_e = (int32_t) ((g_kv_want + waste + per - 1)/per) + mc->sl_extra;
-                    if (g_kv_borrow > 0) {
-                        // [TAG_FN_L21_BIGUB] the borrow: that many of each lend layer's base slots more lie over segments
-                        // of their own (the slots per layer stay as they are: the learned set and the routing see no change)
-                        sl_bx = (int32_t) ((g_kv_borrow + waste + sl_layers.size()*3*vmm_gran + per - 1)/per) + mc->sl_extra;
-                    }
-                }
-            }
+            // [TAG_R34_F_VISFLAT] the projector's slots per lend layer taken from its own count: the counts per layer are those
+            // of a hot set without the projector's share (the weighted spread kept), only more of the lend layers' slots can go
+            int32_t          sl_ev = 0;
+            size_t           sl_per = 0; // one slot of every lend layer, in bytes
+            // [TAG_R34_F_VISFLAT_FIT] the projector's part for this sizing: 0 after a fallback (then all of it is v0.26.6's)
+            size_t           vis_part = g_vis_part;
             // the base slots from the budget without the KV cache's unmapped bytes: what a fit with the KV cache mapped
             // whole would give (the lend's few granules of waste come out of the headroom)
-            const size_t sl_base_cut = sl_e > 0 ? g_kv_want : 0;
-            const std::vector<int32_t> nv = slots_for(budget_slots > sl_base_cut ? budget_slots - sl_base_cut : 0);
+            size_t               sl_base_cut = 0;
+            std::vector<int32_t> nv;
+            for (int pass = 0; pass < 2; ++pass) {
+                sl_layers.clear();
+                sl_e   = 0;
+                sl_bx  = 0;
+                sl_ev  = 0;
+                sl_per = 0;
+                if (sl_req) {
+                    std::vector<int> trunk;
+                    for (int li = 0; li < (int) layers.size(); ++li) {
+                        if (layers[li].il < g_kv_n_trunk) {
+                            trunk.push_back(li);
+                        }
+                    }
+                    std::sort(trunk.begin(), trunk.end(), [&](int a, int b) { return layers[a].il < layers[b].il; });
+                    // [TAG_R34_F_VISFLAT] the projector's part is not cut from the counts (its slots come out of the lend layers')
+                    const size_t n0_cut = vis_part > 0 && vis_part < g_kv_want ? g_kv_want - vis_part : g_kv_want;
+                    const std::vector<int32_t> n0 = slots_for(budget_slots > n0_cut ? budget_slots - n0_cut : 0);
+                    // one more layer: the final even count may come out a little lower than n0
+                    const size_t need_above = tail_bytes + g_kv_keep + 4*vmm_gran +
+                        (trunk.empty() ? 0 : (size_t) (n0[trunk.back()] + 1)*layers[trunk.back()].bytes);
+                    size_t above = 0;
+                    int    top   = (int) trunk.size();
+                    while (top > 0 && above < need_above) {
+                        --top;
+                        above += (size_t) (n0[trunk[top]] + 1)*layers[trunk[top]].bytes;
+                    }
+                    size_t per = 0;
+                    for (int i = 0; i < top; ++i) {
+                        sl_layers.push_back(trunk[i]);
+                        per += layers[trunk[i]].bytes;
+                    }
+                    sl_per = per; // [TAG_R34_F_VISFLAT]
+                    if (per > 0) {
+                        // about one granule per tensor stays mapped at its segment ends (the start's slack, the zero slot's
+                        // granule); a placement that comes out short asks for one slot more (sl_extra)
+                        const size_t waste = sl_layers.size()*3*(vmm_gran + SL_SLACK);
+                        sl_e = (int32_t) ((g_kv_want + waste + per - 1)/per) + mc->sl_extra;
+                        if (vis_part > 0 && vis_part < g_kv_want) {
+                            sl_ev = std::min<int32_t>((int32_t) (vis_part/per), sl_e); // [TAG_R34_F_VISFLAT]
+                        }
+                        if (g_kv_borrow > 0) {
+                            // [TAG_FN_L21_BIGUB] the borrow: that many of each lend layer's base slots more lie over segments
+                            // of their own (the slots per layer stay as they are: the learned set and the routing see no change)
+                            sl_bx = (int32_t) ((g_kv_borrow + waste + sl_layers.size()*3*vmm_gran + per - 1)/per) + mc->sl_extra;
+                        }
+                    }
+                }
+                // [TAG_R34_F_VISFLAT] without the projector's carved slots: the cut and the counts are those of its hot set without them
+                sl_base_cut = sl_e > 0 ? g_kv_want - (size_t) sl_ev*sl_per : 0;
+                nv = slots_for(budget_slots > sl_base_cut ? budget_slots - sl_base_cut : 0);
+                if (sl_ev <= 0) {
+                    break;
+                }
+                // [TAG_R34_F_VISFLAT_FIT] the cut above counts sl_ev of every lend layer's own slots as lent: a layer that cannot give
+                // them all (its count <= sl_ev, or every expert of it hot: nothing to lend) keeps them, and the hot set would lie
+                // over its budget by those slots (a small card's VRAM margin). Then this hot set is sized again exactly as v0.26.6
+                // sizes it (the lend layers chosen from counts with the projector's share cut, its share on top)
+                size_t short_b = 0;
+                for (int li : sl_layers) {
+                    const int32_t ne2 = (int32_t) layers[li].l->ffn_up_exps->ne[2];
+                    const int32_t can = nv[li] >= ne2 ? 0 : std::max<int32_t>(0, std::min<int32_t>(sl_ev, nv[li] - 1));
+                    short_b += (size_t) (sl_ev - can)*layers[li].bytes;
+                }
+                if (short_b == 0) {
+                    break;
+                }
+                LLAMA_LOG_WARN("moe-hot: [TAG_R34_F_VISFLAT_FIT] a lend layer cannot give %d of its own slots (the hot set would lie "
+                        "%.0f MiB over its budget): this hot set is sized as v0.26.6 sizes it (the projector's share on top)\n",
+                        sl_ev, short_b/1048576.0);
+                vis_part = 0;
+            }
             for (size_t li = 0; li < layers.size(); ++li) {
                 n_slots_of[li] = nv[li];
                 used += (size_t) nv[li]*layers[li].bytes;
             }
             if (sl_e > 0) {
                 for (int li : sl_layers) {
-                    const int32_t e = std::min<int32_t>(sl_e, (int32_t) layers[li].l->ffn_up_exps->ne[2] - nv[li]);
+                    // [TAG_R34_F_VISFLAT] ev of the layer's own slots can go too: e - ev on top of its count, the base ev lower
+                    const int32_t ev = std::min<int32_t>(sl_ev, nv[li] - 1);
+                    const int32_t e  = std::min<int32_t>(sl_e - std::max<int32_t>(ev, 0),
+                                                         (int32_t) layers[li].l->ffn_up_exps->ne[2] - nv[li]);
                     if (e <= 0 || nv[li] <= 0) {
                         continue;
                     }
-                    sl_base_of[li]  = nv[li];
-                    sl_bbase_of[li] = sl_bx > 0 && nv[li] > sl_bx ? nv[li] - sl_bx : -1; // [TAG_FN_L21_BIGUB]
+                    const int32_t base = nv[li] - std::max<int32_t>(ev, 0);
+                    sl_base_of[li]  = base;
+                    sl_bbase_of[li] = sl_bx > 0 && base > sl_bx ? base - sl_bx : -1; // [TAG_FN_L21_BIGUB]
                     n_slots_of[li] += e;
                     used += (size_t) e*layers[li].bytes;
                 }
@@ -5763,6 +5812,10 @@ void llama_moe_hot_set_kv_lend(size_t want, size_t keep, int n_trunk) {
 
 void llama_moe_hot_set_cb_borrow(size_t bytes) { // [TAG_FN_L21_BIGUB]
     g_kv_borrow = bytes;
+}
+
+void llama_moe_hot_set_vis_part(size_t bytes) { // [TAG_R34_F_VISFLAT]
+    g_vis_part = bytes;
 }
 
 // [TAG_FN_L22_BIGUB2] see llama-moecache.h
