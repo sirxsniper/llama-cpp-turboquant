@@ -4,6 +4,8 @@
 #include "llama-model.h"
 #include "llama-context.h"
 
+#include <cstdlib>
+
 //
 // llama_memory_hybrid
 //
@@ -63,7 +65,26 @@ llama_memory_hybrid::llama_memory_hybrid(
         filter_recr == nullptr ?
             [&](int32_t il) { return hparams.is_recr(il); }
             : filter_recr
-    )) {}
+    )) {
+    // [TAG_R34_C_SEQRM] seq_rm of one sequence from the sequence's (pos, cell) index ([TAG_FN_L16_SEQRM], until now only
+    // for qwen4exp) instead of a walk over every used cell: the same cells in the same (ascending) order, and more than
+    // 4096 cells fall back to the walk, so the cache ends up exactly as before. Every speculative step removes its
+    // rejected draft rows this way, and with the unified pool the walk covers every slot's cells: with
+    // TURBO_IDLE_SLOT_LAZY=1 the idle chats' cells as well. Models with an indexer keep their own rule
+    // (llama_memory_hybrid_idx, LLAMA_FN_L16_SEQRM). LLAMA_R34_C_SEQRM=0: the walk (v0.26.6); LLAMA_SEQ_RM_VERIFY=1 checks
+    // every removal against the walk (aborts on a difference).
+    static const bool r34_seqrm = [] {
+        const char * e = getenv("LLAMA_R34_C_SEQRM");
+        return !(e != nullptr && e[0] == '0' && e[1] == '\0');
+    }();
+    if (r34_seqrm && model.hparams.indexer_n_head == 0) {
+        const char * v      = getenv("LLAMA_SEQ_RM_VERIFY");
+        const bool   verify = v != nullptr && atoi(v) != 0;
+        mem_attn->set_seq_rm_indexed(true, verify);
+        LLAMA_LOG_INFO("%s: [TAG_R34_C_SEQRM] seq_rm from the sequence index (attention cache)%s\n", __func__,
+                verify ? ", checked against the walk (LLAMA_SEQ_RM_VERIFY)" : "");
+    }
+}
 
 llama_memory_context_ptr llama_memory_hybrid::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
     do {

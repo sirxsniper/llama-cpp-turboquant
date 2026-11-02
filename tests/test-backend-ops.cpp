@@ -17005,6 +17005,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_flash_attn_ext_pos_ms(tkv, tb, kv,  1, 2, false));
         }
     }
+    // [TAG_R34_C_LIVEREG] turbot live-tile bitmap across words: kv 20480 is 80 bitmap tiles in 3 words, and the last
+    // sequence's query tiles see only the last tiles, so their walk skips two dead words and changes word twice (the
+    // lane-register shuffle). kv 270336 is 1056 tiles in 33 words: sequence 1 of 2 sees the shared head and the late
+    // tail only, so its walk reaches word 32, past the 32-word lane window (the global-memory fallback).
+    for (int64_t nb : { 4, 64 }) {
+        test_cases.emplace_back(new test_flash_attn_ext_pos_ms(GGML_TYPE_F16, true, 20480, nb, 4, false));
+    }
+    test_cases.emplace_back(new test_flash_attn_ext_pos_ms(GGML_TYPE_F16, true, 270336, 4, 2, false));
     // [TAG_UPSTREAM_29510] per-sequence cell lists of the turbot FA (test_flash_attn_ext_kv_rows): 1 to 8 queries per slot
     // (decode, verify; <4, 8> up to 4, <8, 8> above), 1 to 4 slots, kv 1000 (a partial last tile) to 16384, with and
     // without foreign cells in the lists
