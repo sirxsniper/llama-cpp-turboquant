@@ -2093,9 +2093,7 @@ bool llama_memory_recurrent::r35_park_cell(uint32_t c, bool give) const {
     const int64_t t0 = ggml_time_us();
     const size_t  g  = r35_g;
     const size_t  n  = pc.grans.size();
-    if (pc.host.size() != n*g) {
-        pc.host.resize(n*g); // [TAG_R36_NP2] once: the buffer stays for the next park (no 288 MiB fault + zero fill per park)
-    }
+    pc.host.resize(n*g);
     r35_copy_out(pc);
     size_t done = 0;
     bool   ok   = true;
@@ -2169,7 +2167,9 @@ bool llama_memory_recurrent::r35_unpark_cell(uint32_t c, bool take) const {
         return false;
     }
     r35_copy_in(pc);
-    pc.parked = false; // [TAG_R36_NP2] the host buffer stays (the next park reuses it)
+    // [TAG_R36_NP2] freed again (a kept buffer saved ~15 ms per park but cost 288 MiB per cell: the 2-slot server is short of RAM)
+    std::vector<uint8_t>().swap(pc.host);
+    pc.parked = false;
     r35_n_unpark++;
     r35_unpark_ms += (ggml_time_us() - t0)/1000.0;
     return true;
