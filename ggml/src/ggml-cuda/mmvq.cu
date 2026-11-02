@@ -1306,6 +1306,16 @@ static int ggml_cuda_r35_moegrp_lb() {
     return lb;
 }
 
+// GGML_CUDA_R35_MOEGRP_R=4: 4 rows per block (each row still one warp's lane mapping and reduction: same bits), for row
+// counts that are a multiple of 4; else 2 (as mul_mat_vec_q_moe_fn_l3)
+static int ggml_cuda_r35_moegrp_rows() {
+    static const int r = [] {
+        const char * e = getenv("GGML_CUDA_R35_MOEGRP_R");
+        return e != nullptr && atoi(e) == 4 ? 4 : 2;
+    }();
+    return r;
+}
+
 template <ggml_type type, int c_rows_per_block, bool has_fusion, bool vdr_up = false, int min_blocks = 1>
 __launch_bounds__(get_mmvq_mmid_max_batch_for_device<type>()*ggml_cuda_get_physical_warp_size(), min_blocks)
 static __global__ void mul_mat_vec_q_moe_r35_grp(
@@ -1536,27 +1546,35 @@ static void mul_mat_vec_q_moe_r35_grp_launch(
         const uint32_t stride_channel_x, const uint32_t stride_channel_y, const uint32_t stride_channel_dst,
         const uint32_t ncols_dst, const uint32_t ids_stride, const uint32_t zero_x,
         const int warp_size, const int nchannels_dst, const bool stats, cudaStream_t stream) {
-    constexpr int rows_per_block = 2; // as mul_mat_vec_q_moe_fn_l3_launch
+    // 2 rows per block as mul_mat_vec_q_moe_fn_l3_launch; GGML_CUDA_R35_MOEGRP_R=4: 4 (row counts that are a multiple of 4)
+    const int rows_per_block = ggml_cuda_r35_moegrp_rows() == 4 && nrows_x % 4 == 0 ? 4 : 2;
     const int64_t nblocks_rows = (nrows_x + rows_per_block - 1) / rows_per_block;
     const dim3 block_nums(nblocks_rows, nchannels_dst);
     const dim3 block_dims(warp_size, ncols_dst);
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, 0, stream);
 
-#define R35_GRP_KLAUNCH(fus, lb) ggml_cuda_kernel_launch(mul_mat_vec_q_moe_r35_grp<type, rows_per_block, fus, vdr_up, lb>, \
+#define R35_GRP_KLAUNCH(rows, fus, lb) ggml_cuda_kernel_launch(mul_mat_vec_q_moe_r35_grp<type, rows, fus, vdr_up, lb>, \
         launch_params, vx, vy, ids, fusion, dst, ncols_x, nchannels_y, nrows_x, stride_row_x, stride_col_y, stride_col_dst, \
         stride_channel_x, stride_channel_y, stride_channel_dst, ncols_dst, ids_stride, zero_x, stats)
     const bool lb4 = ggml_cuda_r35_moegrp_lb() == 4;
-    if (fusion.gate != nullptr) {
-        if (lb4) {
-            R35_GRP_KLAUNCH(true, 4);
+    const bool fus = fusion.gate != nullptr;
+    if (rows_per_block == 4) {
+        if (fus) {
+            R35_GRP_KLAUNCH(4, true, 1);
         } else {
-            R35_GRP_KLAUNCH(true, 1);
+            R35_GRP_KLAUNCH(4, false, 1);
+        }
+    } else if (lb4) {
+        if (fus) {
+            R35_GRP_KLAUNCH(2, true, 4);
+        } else {
+            R35_GRP_KLAUNCH(2, false, 4);
         }
     } else {
-        if (lb4) {
-            R35_GRP_KLAUNCH(false, 4);
+        if (fus) {
+            R35_GRP_KLAUNCH(2, true, 1);
         } else {
-            R35_GRP_KLAUNCH(false, 1);
+            R35_GRP_KLAUNCH(2, false, 1);
         }
     }
 #undef R35_GRP_KLAUNCH
