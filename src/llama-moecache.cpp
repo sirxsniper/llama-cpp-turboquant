@@ -3147,6 +3147,37 @@ bool llama_moe_hot_init(const llama_model & model, const void * owner, size_t bu
         }
     }
 
+    // [TAG_R35_SLOTBAL] LLAMA_FN_R35_SLOTBAL=1 (qwen4exp, even slots; 0 = v0.27.0), the layout: each layer's base slots so that
+    // its slots at an empty context (base + KV-lend slots) follow a wait-aware weight, in the same bytes - item M measured the
+    // longest bridge waits in blk 0-2 and the late layers while the lend layers blk 3..22 held more slots than their waits
+    // pay for at an empty context (llama_fn_r35_slotbal_weights; LLAMA_FN_R35_SLOTBAL_W=w0,w1,... by il overrides it). The KV
+    // lend itself is unchanged (the same share of every lend layer: a lend concentrated on the lowest-wait layers modelled
+    // worse). Placement only: the values are not touched.
+    const int r35_sb = even && model.arch == LLM_ARCH_QWEN4EXP ? llama_fn_l3_int(model, "LLAMA_FN_R35_SLOTBAL", 0) : 0;
+    constexpr int32_t R35_MAX_MOVE  = 64; // slots a layer may gain or lose against the layout without it
+    constexpr int32_t R35_MIN_SLOTS = 8;
+    std::vector<float> r35_w; // by candidate layer
+    bool r35_fits = model.hparams.n_layer() == 48 && model.hparams.n_expert == 512;
+    for (const auto & c : layers) {
+        r35_fits = r35_fits && c.l->ffn_up_exps->ne[2] == 512;
+    }
+    if (r35_sb & 1) {
+        std::vector<float> by_il;
+        if (const char * e = llama_fn_env(model, "LLAMA_FN_R35_SLOTBAL_W"); e && e[0]) {
+            by_il = llama_fn_parse_weights(e);
+        } else if (r35_fits) {
+            by_il = llama_fn_r35_slotbal_weights();
+        }
+        if (by_il.empty()) {
+            LLAMA_LOG_WARN("moe-hot: [TAG_R35_SLOTBAL] LLAMA_FN_R35_SLOTBAL=%d: no wait-aware weights for this model - the layout "
+                    "stays as without it\n", r35_sb);
+        } else {
+            for (const auto & c : layers) {
+                r35_w.push_back(c.il >= 0 && c.il < (int) by_il.size() ? by_il[c.il] : 1.0f);
+            }
+        }
+    }
+
     // budget
     size_t budget = budget_bytes; // [TAG_FN_VRAM_FIT] the caller's fit, logged there
     if (budget == 0) {
@@ -3308,6 +3339,7 @@ bool llama_moe_hot_init(const llama_model & model, const void * owner, size_t bu
             // whole would give (the lend's few granules of waste come out of the headroom)
             size_t               sl_base_cut = 0;
             std::vector<int32_t> nv;
+            std::vector<int32_t> r35_nv0; // [TAG_R35_SLOTBAL] the counts without it
             for (int pass = 0; pass < 2; ++pass) {
                 sl_layers.clear();
                 sl_e   = 0;
@@ -3358,6 +3390,23 @@ bool llama_moe_hot_init(const llama_model & model, const void * owner, size_t bu
                 // [TAG_R34_F_VISFLAT] without the projector's carved slots: the cut and the counts are those of its hot set without them
                 sl_base_cut = sl_e > 0 ? g_kv_want - (size_t) sl_ev*sl_per : 0;
                 nv = slots_for(budget_slots > sl_base_cut ? budget_slots - sl_base_cut : 0);
+                if (!r35_w.empty()) {
+                    // [TAG_R35_SLOTBAL] base + lend slots by the wait-aware weights, the same bytes; a lend layer keeps the
+                    // projector's share of its own slots and its 16K-ubatch borrow slots below its lend range
+                    std::vector<int32_t> ext(layers.size(), 0);
+                    std::vector<int32_t> lo_min(layers.size(), R35_MIN_SLOTS);
+                    for (int li : sl_layers) {
+                        if (sl_e <= 0) {
+                            break;
+                        }
+                        const int32_t ne2 = (int32_t) layers[li].l->ffn_up_exps->ne[2];
+                        const int32_t ev  = std::max<int32_t>(0, std::min<int32_t>(sl_ev, nv[li] - 1));
+                        ext[li]    = std::max<int32_t>(0, std::min<int32_t>(sl_e - ev, ne2 - nv[li]));
+                        lo_min[li] = std::max<int32_t>(R35_MIN_SLOTS, sl_ev + 2 + (sl_bx > 0 ? sl_bx + 1 : 0));
+                    }
+                    r35_nv0 = nv;
+                    nv = llama_fn_r35_slotbal_counts(bytes, nv, ext, r35_w, n_exp_min, R35_MAX_MOVE, lo_min);
+                }
                 if (sl_ev <= 0) {
                     break;
                 }
@@ -3399,10 +3448,20 @@ bool llama_moe_hot_init(const llama_model & model, const void * owner, size_t bu
                     used += (size_t) e*layers[li].bytes;
                 }
             }
+            if (!r35_nv0.empty() && r35_nv0.size() == nv.size()) {
+                std::string s;
+                int moved = 0;
+                for (size_t li = 0; li < layers.size(); ++li) {
+                    s += format(" %d:%d%+d", layers[li].il, nv[li], nv[li] - r35_nv0[li]);
+                    moved += std::max(0, nv[li] - r35_nv0[li]);
+                }
+                LLAMA_LOG_INFO("moe-hot: [TAG_R35_SLOTBAL] base slots by the wait-aware weights (%d moved; the KV-lend layers' lend "
+                        "slots on top as before):%s\n", moved, s.c_str());
+            }
             if (!l18_w.empty()) {
                 std::string s;
                 for (size_t li = 0; li < layers.size(); ++li) {
-                    s += format(" %d:%d", layers[li].il, nv[li]);
+                    s += format(" %d:%d", layers[li].il, r35_nv0.size() == nv.size() ? r35_nv0[li] : nv[li]);
                 }
                 LLAMA_LOG_INFO("moe-hot: [TAG_FN_L18_CHURN_LAYERS] slots by layer weight (even %d):%s\n",
                         llama_fn_even_slots(bytes, budget_slots > sl_base_cut ? budget_slots - sl_base_cut : 0, n_exp_min), s.c_str());

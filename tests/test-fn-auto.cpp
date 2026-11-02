@@ -295,6 +295,7 @@ static const l22_row k_l22_rows[] = {
     { "LLAMA_FN_R25_REFILL_THREADS", "8", false },
     { "LLAMA_FN_R25_REFILL_HALF_KIB", "2048", false },
     { "LLAMA_FN_R25_SBSYNC_MIB", "1024", false },
+    { "LLAMA_FN_R35_SLOTBAL", "0", false }, // [TAG_R35_SLOTBAL] off by default (v0.27.0)
 };
 static const size_t k_n_l22_rows = sizeof(k_l22_rows)/sizeof(k_l22_rows[0]);
 const size_t k_n_l22_rows_decl = k_n_l22_rows;
@@ -479,6 +480,72 @@ static void test_vram_fit() {
 }
 
 // [TAG_FN_AUTO] even slots at Flash-Next UD-Q4_K_XL
+// [TAG_R35_SLOTBAL] the wait-aware base counts: same bytes, base + extra by the weights, bounds kept, bad input -> base
+static void test_r35_slotbal() {
+    const std::vector<size_t> bytes = flash_next_expert_bytes();
+    const size_t n = bytes.size();
+    TCHECK(n == 48, "48 Flash-Next layers (%zu)", n);
+    std::vector<int32_t> base(n, 120), extra(n, 0), lo_min(n, 8);
+    for (size_t i = 0; i < 23 && i < n; ++i) {
+        extra[i] = 46;
+        lo_min[i] = 78;
+    }
+    auto bytes_of = [&](const std::vector<int32_t> & c) {
+        size_t b = 0;
+        for (size_t i = 0; i < n; ++i) {
+            b += ((size_t) c[i] + 1)*bytes[i];
+        }
+        return b;
+    };
+    // equal weights: base + extra equal where the bounds allow, the bytes never above the old ones
+    const std::vector<float> w1(n, 1.0f);
+    const auto r1 = llama_fn_r35_slotbal_counts(bytes, base, extra, w1, 512, 64, lo_min);
+    TCHECK(r1.size() == n, "one count per layer");
+    TCHECK(bytes_of(r1) <= bytes_of(base), "same bytes or fewer (%zu <= %zu)", bytes_of(r1), bytes_of(base));
+    TCHECK(bytes_of(base) - bytes_of(r1) < 4*bytes[0], "the rest given out (%zu bytes left)", bytes_of(base) - bytes_of(r1));
+    bool bounds = true, flat = true;
+    for (size_t i = 0; i < n; ++i) {
+        bounds = bounds && r1[i] >= std::max(lo_min[i], base[i] - 64) && r1[i] <= base[i] + 64 && r1[i] + extra[i] <= 512;
+        flat = flat && std::abs((r1[i] + extra[i]) - (r1[0] + extra[0])) <= 1;
+    }
+    TCHECK(bounds, "every count inside its bounds");
+    TCHECK(flat, "equal weights: base + extra equal (+-1): %d + 46 vs %d", r1[0], r1[n - 1]);
+    TCHECK(r1[0] < 120 && r1[n - 1] > 120, "the lend layers give base slots to the others (%d, %d)", r1[0], r1[n - 1]);
+    // the lower bound holds: a lend layer never below lo_min
+    std::vector<float> w2(n, 1.0f);
+    w2[5] = 0.05f;
+    const auto r2 = llama_fn_r35_slotbal_counts(bytes, base, extra, w2, 512, 64, lo_min);
+    TCHECK(r2[5] == 78, "a tiny weight stops at the lower bound (%d)", r2[5]);
+    // max_move 0: the base back
+    const auto r3 = llama_fn_r35_slotbal_counts(bytes, base, extra, w1, 512, 0, lo_min);
+    TCHECK(r3 == base, "max_move 0 keeps the base");
+    // bad input: the base back
+    std::vector<float> wbad(n, 1.0f);
+    wbad[3] = 0.0f;
+    TCHECK(llama_fn_r35_slotbal_counts(bytes, base, extra, wbad, 512, 64, lo_min) == base, "a zero weight gives the base back");
+    TCHECK(llama_fn_r35_slotbal_counts(bytes, base, extra, std::vector<float>(n - 1, 1.0f), 512, 64, lo_min) == base,
+           "a short weight list gives the base back");
+    // deterministic
+    TCHECK(llama_fn_r35_slotbal_counts(bytes, base, extra, w1, 512, 64, lo_min) == r1, "the same input, the same counts");
+    // the table: 48 entries, finite, > 0
+    const auto & tw = llama_fn_r35_slotbal_weights();
+    bool tw_ok = tw.size() == 48;
+    for (float x : tw) {
+        tw_ok = tw_ok && std::isfinite(x) && x > 0.0f;
+    }
+    TCHECK(tw_ok, "the weight table: 48 finite weights > 0");
+    // the table on the v0.27.0 counts at the owner's fit: the bytes kept, every layer within 64 of its old count
+    const std::vector<int32_t> nv = { 167, 142, 149, 117, 114, 118, 141, 134, 119, 116, 128, 119, 158, 132, 126, 87, 102, 130, 122, 116,
+                                      117, 118, 146, 98, 125, 126, 118, 122, 137, 125, 115, 87, 96, 114, 128, 107, 106, 128, 157, 86,
+                                      87, 113, 132, 95, 123, 105, 115, 109 };
+    const auto r4 = llama_fn_r35_slotbal_counts(bytes, nv, extra, tw, 512, 64, lo_min);
+    bool b4 = bytes_of(r4) <= bytes_of(nv);
+    for (size_t i = 0; i < n; ++i) {
+        b4 = b4 && std::abs(r4[i] - nv[i]) <= 64 && r4[i] >= lo_min[i];
+    }
+    TCHECK(b4, "the table at the owner's fit: same bytes, every layer within its bounds");
+}
+
 static void test_even_slots() {
     const size_t b = ((size_t) 32607 * MiB - ((size_t) 32607 * MiB) / 8) - (size_t) 15607 * MiB - 768 * MiB;
     // even slots at Flash-Next UD-Q4_K_XL: 43 layers q4_K/q4_K/q5_1 (3,072,000 B), 5 layers with q8_0 down (3,584,000 B)
@@ -974,6 +1041,7 @@ int main() {
     test_lookup();
     test_inject();
     test_even_slots();
+    test_r35_slotbal(); // [TAG_R35_SLOTBAL]
     test_weighted_slots();
     test_vram_fit();
     test_cbuf();

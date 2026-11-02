@@ -108,6 +108,17 @@ LLAMA_API std::vector<int32_t> llama_fn_weighted_slots(const std::vector<size_t>
 // "w0,w1,..." -> the weights; empty on any bad item (not a number, <= 0)
 LLAMA_API std::vector<float> llama_fn_parse_weights(const char * s);
 
+// [TAG_R35_SLOTBAL] base slots per layer so that base + extra (a KV-lend layer's lend slots on top of its own count at an
+// empty context) follow `weights` (one per layer, > 0), inside the bytes the counts `base` take now (every layer's zero slot
+// included); each layer within [max(lo_min, base - max_move), min(n_expert - extra, base + max_move)] (base itself always
+// allowed); the rest of the bytes one slot at a time to the layers furthest below their share. Wrong input gives `base` back
+LLAMA_API std::vector<int32_t> llama_fn_r35_slotbal_counts(const std::vector<size_t> & bytes_per_expert,
+        const std::vector<int32_t> & base, const std::vector<int32_t> & extra, const std::vector<float> & weights,
+        int32_t n_expert, int32_t max_move, const std::vector<int32_t> & lo_min);
+// [TAG_R35_SLOTBAL] the Qwen3.8-Flash-Next trunk table (48 layers x 512 experts), by layer: the wait-aware weight of a layer's
+// slots at an empty context (base + lend)
+LLAMA_API const std::vector<float> & llama_fn_r35_slotbal_weights();
+
 // [TAG_FN_VRAM_FIT] default device-use ceiling: total - max(1536 MiB, total/8), rounded down to 256 MiB;
 // 28416 MiB on a 32607 MiB card (the 5090 limit is 28500 MiB)
 LLAMA_API size_t llama_fn_vram_ceiling_default(size_t total);

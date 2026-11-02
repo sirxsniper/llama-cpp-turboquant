@@ -366,6 +366,7 @@ const fn_item k_items[] = {
     { "LLAMA_FN_L22_CPUSHARE",              "2",       P_ALL }, // P16 [TAG_FN_L22_CPUSHARE] M11, the pin block sets 1; [TAG_R35_ROUTED] 2
     { "LLAMA_FN_L22_CPUSHARE_MAX",          "3072",    P_ALL }, // P16
     { "LLAMA_FN_L22_CPUSHARE_ROWS",         "8",       P_ALL }, // P16
+    { "LLAMA_FN_R35_SLOTBAL",               "0",       P_ALL }, // [TAG_R35_SLOTBAL] 1 = wait-aware layout (0 = v0.27.0)
 };
 
 } // namespace
@@ -810,6 +811,98 @@ std::vector<float> llama_fn_parse_weights(const char * s) {
         }
     }
     return out;
+}
+
+// [TAG_R35_SLOTBAL] -----------------------------------------------------------------------------------------------------
+
+std::vector<int32_t> llama_fn_r35_slotbal_counts(const std::vector<size_t> & bytes_per_expert, const std::vector<int32_t> & base,
+        const std::vector<int32_t> & extra, const std::vector<float> & weights, int32_t n_expert, int32_t max_move,
+        const std::vector<int32_t> & lo_min) {
+    const size_t n = base.size();
+    bool ok = n > 0 && bytes_per_expert.size() == n && extra.size() == n && weights.size() == n && lo_min.size() == n &&
+              n_expert > 0 && max_move >= 0;
+    for (size_t i = 0; ok && i < n; ++i) {
+        ok = std::isfinite(weights[i]) && weights[i] > 0.0f && bytes_per_expert[i] > 0 && base[i] >= 0 && extra[i] >= 0;
+    }
+    if (!ok) {
+        return base;
+    }
+    size_t budget = 0;
+    std::vector<int32_t> lo(n), hi(n);
+    for (size_t i = 0; i < n; ++i) {
+        budget += ((size_t) base[i] + 1)*bytes_per_expert[i];
+        lo[i] = std::min(base[i], std::max<int32_t>(std::max<int32_t>(0, lo_min[i]), base[i] - max_move));
+        hi[i] = std::max(base[i], std::min<int32_t>(n_expert - extra[i], base[i] + max_move));
+    }
+    // n_l(lam) = clamp(floor(lam * w_l) - extra_l, lo_l, hi_l), nondecreasing in lam: the largest lam that fits the budget
+    auto counts = [&](double lam, std::vector<int32_t> & out) {
+        size_t used = 0;
+        for (size_t i = 0; i < n; ++i) {
+            const double x = std::floor(lam * (double) weights[i]) - (double) extra[i];
+            out[i] = (int32_t) std::min<double>((double) hi[i], std::max<double>((double) lo[i], x));
+            used += ((size_t) out[i] + 1)*bytes_per_expert[i];
+        }
+        return used;
+    };
+    std::vector<int32_t> res(n, 0);
+    std::vector<int32_t> tmp(n, 0);
+    float w_min = weights[0];
+    int32_t e_max = 0;
+    for (size_t i = 0; i < n; ++i) {
+        w_min = std::min(w_min, weights[i]);
+        e_max = std::max(e_max, extra[i]);
+    }
+    if (counts(0.0, res) > budget) {
+        return base; // cannot happen (lo <= base), kept as a guard
+    }
+    double l0 = 0.0;
+    double l1 = ((double) n_expert + (double) e_max + 1.0) / (double) w_min + 1.0;
+    for (int it = 0; it < 64; ++it) {
+        const double mid = 0.5*(l0 + l1);
+        if (counts(mid, tmp) <= budget) {
+            l0 = mid;
+        } else {
+            l1 = mid;
+        }
+    }
+    size_t used = counts(l0, res);
+    for (;;) {
+        size_t best = n;
+        double best_def = 0.0;
+        for (size_t i = 0; i < n; ++i) {
+            if (res[i] >= hi[i] || used + bytes_per_expert[i] > budget) {
+                continue;
+            }
+            const double def = l0 * (double) weights[i] - (double) extra[i] - (double) res[i];
+            if (best == n || def > best_def) {
+                best = i;
+                best_def = def;
+            }
+        }
+        if (best == n) {
+            break;
+        }
+        res[best]++;
+        used += bytes_per_expert[best];
+    }
+    return res;
+}
+
+// [TAG_R35_SLOTBAL] r35 item X (E:/turbot-gates/flashnext/test/r35/x-slot-balance/sim): the l18 replay of the owner-like
+// sessions t1 / t2 and the l3 long answers over the v0.27.0 layout +- d slots per layer, a hinge cost per layer
+// (max(0, 41.5 us x cold experts - overlap_l), overlap_l fit to item M's measured bridge waits per layer at short / 32K /
+// 131K, shrunk 50 % to the median), the slots moved greedily to the steepest wait drop (the lend layers keep their 16K
+// borrow slots). Weight = the layer's slots at an empty context / their mean. Held out (allocated on two traces, modelled
+// on the third): -0.159 / -0.148 / -0.182 ms of bridge wait per step (t1 / t2 / l3real); direct replay: short -0.161, 32K
+// -0.140, 131K -0.093, 262K +0.135 ms (the lend layers give their lend slots at depth); hit 0.7832 -> 0.7861
+const std::vector<float> & llama_fn_r35_slotbal_weights() {
+    static const std::vector<float> w = {
+        1.751f, 1.533f, 1.456f, 0.872f, 0.999f, 1.280f, 1.357f, 1.308f, 0.992f, 0.886f, 1.181f, 0.907f,
+        1.224f, 1.378f, 0.956f, 0.872f, 0.872f, 0.984f, 1.266f, 0.886f, 0.977f, 1.195f, 1.308f, 0.774f,
+        0.963f, 0.830f, 0.999f, 0.816f, 1.090f, 1.090f, 0.851f, 0.527f, 0.619f, 0.928f, 1.153f, 0.795f,
+        0.872f, 1.153f, 1.231f, 0.605f, 0.570f, 0.738f, 1.013f, 0.626f, 0.823f, 0.781f, 0.851f, 0.865f,
+    };
+    return w;
 }
 
 // [TAG_FN_VRAM_FIT] -----------------------------------------------------------------------------------------------
