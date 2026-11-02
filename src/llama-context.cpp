@@ -2276,7 +2276,25 @@ void llama_context::sched_reserve() {
 
     const int64_t t_start_us = ggml_time_us();
 
-    const uint32_t n_seqs = cparams.n_seq_max;
+    // [TAG_R35_NP2PARK] the SMALL reserve for one sequence while one is busy (its pp and its tg graph)
+    const uint32_t n_seqs = r35_small_one && cbuf_state == CBUF_SMALL ? 1 : cparams.n_seq_max;
+    // and its graphs over one recurrent cell (the n_seq_max-cell full context gathered the other cell's states as an extra)
+    struct r35_full_scope {
+        llama_memory_recurrent * m = nullptr;
+        ~r35_full_scope() {
+            if (m) {
+                m->r35_full_n = 0;
+            }
+        }
+    } r35_fs;
+    if (n_seqs == 1 && cparams.n_seq_max >= 2) {
+        if (auto * hyb = dynamic_cast<llama_memory_hybrid *>(memory.get())) {
+            r35_fs.m = hyb->get_mem_recr();
+            if (r35_fs.m) {
+                r35_fs.m->r35_full_n = 1;
+            }
+        }
+    }
     const uint32_t n_tokens = reserve_n_tokens(); // [TAG_FN_L3_VRAM_CBUF] n_ubatch, or the SMALL width between prompts
     // [TAG_FN_L22_BIGUB2] D3: the big FULL reserve's prompt graphs for one sequence (one prompt at a time; a batch with two
     // prompts splits at the base width); the decode graphs keep n_seq_max
@@ -2311,7 +2329,10 @@ void llama_context::sched_reserve() {
     llama_memory_context_ptr mctx;
     if (memory) {
         LLAMA_LOG_DEBUG("%s: reserving full memory module\n", __func__);
-        llama_fn_kpool_reserve_seqs(l22_1seq && l23_bg2pools ? 1 : 0); // [TAG_FN_L23_TWOSLOT]
+        // [TAG_R35_NP2PARK] the one-sequence SMALL reserve sizes the indexer's k-pools for one sequence too, as the 1-seq big
+        // FULL reserve does ([TAG_FN_L23_TWOSLOT]): a one-sequence ubatch lists only its sequence's pools ([TAG_FN_L22_QSA_SEQPOOLS])
+        const bool r35_pool1 = r35_fs.m != nullptr;
+        llama_fn_kpool_reserve_seqs((l22_1seq && l23_bg2pools) || r35_pool1 ? 1 : 0); // [TAG_FN_L23_TWOSLOT]
         mctx = memory->init_full();
         llama_fn_kpool_reserve_seqs(0);
         if (!mctx) {
@@ -4415,6 +4436,11 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     // [TAG_FN_VRAM_FIT] size the deferred hot set now that the model's other contexts exist
     if (moe_hot_pending) {
         moe_hot_fit_try();
+    }
+
+    // [TAG_R35_NP2PARK] one busy sequence: the idle slots' cells and the wide SMALL part go to the hot set; more: back first
+    if (r35_on) {
+        r35_before_batch();
     }
 
     // [TAG_FN_L3_VRAM_CBUF] a batch wider than the SMALL reserve runs with the FULL one (the hot set's tail gives its VRAM
@@ -7524,6 +7550,27 @@ void llama_context::moe_hot_fit_try() {
         cbuf_tail = cbuf_prepare(dev);
         vram_account("fit SMALL");
     }
+    // [TAG_R35_NP2PARK] the recurrent cells of the other slots park before the fit measures: their VRAM is free for it, and
+    // the hot set lends it back when a batch needs those cells (with the compute lend below)
+    r35_rs_fit = 0;
+    r35_mem    = nullptr;
+    if (r35_want && cbuf_tail > 0) {
+        if (auto * hyb = dynamic_cast<llama_memory_hybrid *>(memory.get())) {
+            r35_mem = hyb->get_mem_recr();
+        }
+        if (r35_mem && r35_mem->r35_parkable()) {
+            llama_memory_recurrent::r35_hooks h;
+            h.take = r35_hook_take;
+            h.give = r35_hook_give;
+            h.sync = r35_hook_sync;
+            h.idle = r35_hook_idle;
+            h.user = this;
+            if (r35_mem->r35_start(h, 0)) {
+                r35_rs_fit = r35_mem->r35_parked_bytes();
+            }
+            vram_account("fit RS parked");
+        }
+    }
     size_t mem_free = 0, mem_total = 0;
     fn_l21_dev_memory(&model, dev, &mem_free, &mem_total); // [TAG_FN_L21_VRAM_DXGI] the hot set's fit
 
@@ -7638,7 +7685,10 @@ void llama_context::moe_hot_fit_try() {
     if (vis_want == 0) {
         budget = vis_cut(budget);
     }
-    const size_t lend_want = kv_want + vis_want;
+    // [TAG_R35_NP2PARK] the idle slots' share (recurrent cells parked above, the SMALL reserve's part for n_seq_max sequences)
+    // is free VRAM in the fit too: it rides on the same lend
+    const size_t np2_want  = r35_want && cbuf_tail > 0 ? r35_rs_fit + r35_small_extra : 0;
+    const size_t lend_want = kv_want + vis_want + np2_want;
     if (lend_want > 0) {
         llama_moe_hot_set_kv_lend(lend_want, llama_prefill_stream_lend_bytes(this), (int) model.hparams.n_layer());
         llama_moe_hot_set_cb_borrow(cbuf_tail > 0 ? l21_extra : 0); // [TAG_FN_L21_BIGUB]
@@ -7690,6 +7740,39 @@ void llama_context::moe_hot_fit_try() {
         budget = vis_cut(std::min(budget_max, llama_fn_vram_fit_budget(mem_total, mem_free, ceiling, margin)));
         hot_ok = budget > 0 && llama_moe_hot_init(model, this, budget, 0);
     }
+    // [TAG_R35_NP2PARK] the share goes on when the hot set holds it with the KV cache's want; else everything maps again (the
+    // VRAM then comes from the headroom, as v0.27.0 had it allocated)
+    if (r35_rs_fit > 0 || r35_small_one) {
+        const bool carry = np2_want > 0 && hot_ok && cbuf_state != CBUF_OFF && llama_moe_hot_kv_bytes() >= kv_want + np2_want;
+        // LLAMA_R35_NP2PARK=2 (tests): the parking runs even when the hot set does not carry it (the VRAM is just free)
+        const char * fe    = getenv("LLAMA_R35_NP2PARK");
+        const bool   force = fe && fe[0] == '2' && cbuf_state != CBUF_OFF;
+        if (carry || force) {
+            r35_on    = true;
+            r35_carry = carry;
+            r35_all = false;
+            if (kv_want > 0 && hot_ok && llama_moe_hot_kv_bytes() >= kv_want) {
+                llama_kv_lend_set_hooks(llama_moe_hot_kv_release_kvside, llama_moe_hot_kv_restore_kvside, this);
+            }
+            if (!carry) {
+                LLAMA_LOG_WARN("moe-hot: [TAG_R35_NP2PARK] LLAMA_R35_NP2PARK=2: parking without the hot set's lend (test mode)\n");
+            }
+            LLAMA_LOG_INFO("moe-hot: [TAG_R35_NP2PARK] the idle slots' %.0f MiB (recurrent cells %.0f + SMALL reserve for %u sequences "
+                    "%.0f) are hot slots while one sequence is busy; a batch with more takes them back first, %.1f s of one busy "
+                    "sequence parks again (LLAMA_R35_NP2PARK=0: off)\n", np2_want/MiB, r35_rs_fit/MiB, cparams.n_seq_max,
+                    r35_small_extra/MiB, r35_hold_us/1e6);
+        } else {
+            LLAMA_LOG_WARN("moe-hot: [TAG_R35_NP2PARK] the hot set does not carry the idle slots' %.0f MiB (lend %.0f MiB, KV %.0f): "
+                    "every recurrent cell maps again and SMALL holds %u sequences\n", np2_want/MiB, llama_moe_hot_kv_bytes()/MiB,
+                    kv_want/MiB, cparams.n_seq_max);
+            r35_on = false;
+            if (r35_mem) {
+                r35_mem->r35_stop();
+            }
+            r35_rs_fit = 0;
+            r35_small_set(false, false);
+        }
+    }
     if (l21_extra > 0) {
         // [TAG_FN_L21_BIGUB] no borrow placed: the command's width for every prompt (the tail fits only that)
         const size_t bb = hot_ok && cbuf_tail > 0 ? llama_moe_hot_cb_borrow_bytes() : 0;
@@ -7732,6 +7815,160 @@ struct llama_perf_hold {
         t = t0;
     }
 };
+
+// [TAG_R35_NP2PARK] ---------------------------------------------------------------------------------------------------
+// The share the hot set lends to the idle slots: the recurrent cells mapped beyond the ones parked at the fit, and the
+// SMALL reserve's part for n_seq_max sequences while it holds them. take before a map, settle after a park or a shrink.
+
+size_t llama_context::r35_target() const {
+    size_t rs = 0;
+    if (r35_mem) {
+        const size_t p = r35_mem->r35_parked_bytes();
+        rs = r35_rs_fit > p ? r35_rs_fit - p : 0;
+    }
+    return rs + (r35_small_one ? 0 : r35_small_extra);
+}
+
+void llama_context::r35_settle() {
+    if (r35_on && r35_carry) {
+        (void) r35_hold(r35_target());
+    }
+}
+
+// [TAG_R36_NP2] a hold that moves hot-set groups unmaps VRAM a graph in flight may still read (the main context's last
+// step, the MTP draft, the hot set's step): every owner graph is done first. Nothing to move: no sync (the per-batch settle)
+size_t llama_context::r35_hold(size_t target) {
+    if (target == llama_moe_hot_np2_out()) {
+        return target;
+    }
+    r35_hook_sync(this);
+    return llama_moe_hot_np2_hold(this, target);
+}
+
+size_t llama_context::r35_hook_take(void * user, size_t bytes) {
+    auto * c = (llama_context *) user;
+    if (!c->r35_on || !c->r35_carry || bytes == 0) {
+        return 0;
+    }
+    // the share covers the cells mapped once `bytes` more of the parked ones map (a swap that parked others first needs
+    // nothing; a hold taken before for the same maps is not taken twice); bytes past every parked byte: that much more
+    const size_t parked = c->r35_mem ? c->r35_mem->r35_parked_bytes() : 0;
+    const size_t left   = parked > bytes ? parked - bytes : 0;
+    size_t       rs     = c->r35_rs_fit > left ? c->r35_rs_fit - left : 0;
+    if (bytes > parked) {
+        rs += bytes - parked;
+    }
+    const size_t want   = rs + (c->r35_small_one ? 0 : c->r35_small_extra);
+    const size_t before = llama_moe_hot_np2_out();
+    const size_t after  = c->r35_hold(std::max(before, want)); // [TAG_R36_NP2] synced first
+    return after > before ? after - before : 0;
+}
+
+void llama_context::r35_hook_give(void * user, size_t bytes) {
+    GGML_UNUSED(bytes);
+    ((llama_context *) user)->r35_settle();
+}
+
+void llama_context::r35_hook_sync(void * user) {
+    auto * c = (llama_context *) user;
+    llama_perf_hold hold(c->n_queued_tokens, c->t_compute_start_us);
+    c->synchronize();
+    for (const auto & o : llama_fn_ctx_list(c->model)) {
+        if (o.first != c) {
+            o.first->synchronize(); // no graph of the model reads a hot slot or a cell while its VRAM moves
+        }
+    }
+    c->step_join(); // [TAG_FN_L3_HOST_STEP] the hot set's step is done before a cell or a group moves
+}
+
+bool llama_context::r35_hook_idle(void * user) {
+    // the caller's count of the other busy slots (the server sets it before each batch and at each slot launch)
+    return ((const llama_context *) user)->l24_seqs_busy == 0;
+}
+
+bool llama_context::r35_small_set(bool one, bool settle) {
+    if (r35_small_extra == 0 || one == r35_small_one) {
+        return true;
+    }
+    r35_hook_sync(this);
+    llama_perf_hold hold(n_queued_tokens, t_compute_start_us);
+    const int64_t t0 = ggml_time_us();
+    r35_small_one = one;
+    if (!one && settle) {
+        r35_settle(); // the VRAM first: the wide reserve is allocated by this batch's reserve
+    }
+    l22_sk_drop(); // [TAG_FN_L22_SMALLKEEP] a kept SMALL scheduler of the other width goes
+    if (cbuf_state == CBUF_SMALL) {
+        // the reserve is left to this batch: SMALL reserves at the new width in decode(), a wide batch goes FULL first
+        // (no SMALL reserve is made for nothing; SMALLKEEP keeps nothing while a reserve is pending)
+        cbuf_free_compute();
+    }
+    if (one && settle) {
+        r35_settle(); // the wide reserve's part back to the hot set (its buffers went above, or at the FULL switch)
+    }
+    const uint64_t n = ++(one ? r35_n_narrow : r35_n_wide);
+    if (n <= 3 || n % 64 == 0) {
+        LLAMA_LOG_WARN("%s: [TAG_R35_NP2PARK] SMALL reserve for %u sequence(s) from this batch on (%.1f ms, %" PRIu64 " times; the hot "
+                "set holds %.0f MiB less for the idle slots now)\n", __func__, one ? 1u : cparams.n_seq_max,
+                (ggml_time_us() - t0)/1000.0, n, llama_moe_hot_np2_out()/1048576.0);
+    }
+    return true;
+}
+
+void llama_context::r35_before_batch() {
+    if (!r35_on) {
+        return;
+    }
+    std::vector<llama_seq_id> seqs;
+    for (uint32_t s = 0; s < cparams.n_seq_max && s < LLAMA_MAX_SEQ; ++s) {
+        if (balloc->seq_pos_min((llama_seq_id) s) >= 0) {
+            seqs.push_back((llama_seq_id) s);
+        }
+    }
+    const int32_t busy = l24_seqs_busy;
+    const bool    wide = busy < 0 || busy >= 2 || seqs.size() != 1;
+    const int64_t now  = ggml_time_us();
+    if (wide) {
+        r35_one_since = 0;
+        if (!r35_all) {
+            r35_all = true;
+            if (r35_mem) {
+                r35_mem->r35_set_one(false);
+            }
+            // one pass of the hot set for both: the wide SMALL part and every parked cell, then the maps
+            (void) r35_small_set(false, false);
+            if (r35_carry) {
+                (void) r35_hold(r35_target() + (r35_mem ? r35_mem->r35_parked_bytes() : 0)); // [TAG_R36_NP2] synced first
+            }
+            if (r35_mem) {
+                r35_mem->r35_unpark_all();
+            }
+            r35_settle();
+            static uint64_t n_w = 0;
+            if (++n_w <= 3 || n_w % 64 == 0) {
+                LLAMA_LOG_WARN("%s: [TAG_R35_NP2PARK] %d busy sequences (%zu in this batch): the idle slots' share is back (%.1f ms, "
+                        "%" PRIu64 " times)\n", __func__, busy, seqs.size(), (ggml_time_us() - now)/1000.0, n_w);
+            }
+        }
+        return;
+    }
+    if (r35_all) {
+        if (r35_one_since == 0) {
+            r35_one_since = now;
+        }
+        if (now - r35_one_since < r35_hold_us) {
+            return; // the hold: a second request soon after keeps everything mapped
+        }
+        r35_all       = false;
+        r35_one_since = 0;
+    }
+    (void) r35_small_set(true, false);
+    if (r35_mem) {
+        r35_mem->r35_park_except(seqs);
+        r35_mem->r35_set_one(true);
+    }
+    r35_settle(); // one pass of the hot set for the SMALL part and the parked cells (nothing when nothing changed)
+}
 
 bool llama_context::cbuf_wanted() const {
     if (model.arch != LLM_ARCH_QWEN4EXP || cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP || model.no_alloc()) {
@@ -7805,6 +8042,8 @@ void llama_context::cbuf_off() {
         cbuf_free_compute();
     }
     cbuf_state         = CBUF_OFF;
+    r35_small_one      = false; // [TAG_R35_NP2PARK] no SMALL reserve, no share for it
+    r35_small_extra    = 0;
     sched_need_reserve = true;
     sched_reserve();
 }
@@ -7884,7 +8123,41 @@ size_t llama_context::cbuf_prepare(ggml_backend_dev_t dev) {
     cbuf_state         = CBUF_SMALL;
     sched_need_reserve = true;
     sched_reserve();
-    const size_t small = cbuf_compute_bytes(dev);
+    size_t small = cbuf_compute_bytes(dev);
+    // [TAG_R35_NP2PARK] a multi-slot context reserves SMALL for one sequence while one is busy: the tail and the fit see the
+    // one-sequence reserve, the hot set lends the difference to the n_seq_max-sequence reserve when more run
+    r35_small_one   = false;
+    r35_small_extra = 0;
+    {
+        const char * e = getenv("LLAMA_R35_NP2PARK");
+        r35_want = !(e && e[0] == '0' && e[1] == '\0') && cparams.n_seq_max >= 2;
+        if (const char * h = getenv("LLAMA_R35_NP2PARK_HOLD_MS"); h && atoi(h) >= 0) {
+            r35_hold_us = (int64_t) atoi(h)*1000;
+        }
+    }
+    // [TAG_R36_NP2] LLAMA_R36_NP2_SMALL (default 1 = r35): 0 keeps the SMALL reserve at n_seq_max sequences (only the
+    // recurrent cells are lent): a second request then takes back no compute reserve (no SMALL re-reserve at its arrival)
+    static const bool r36_small_lend = [] {
+        const char * e = getenv("LLAMA_R36_NP2_SMALL");
+        return !(e && e[0] == '0' && e[1] == '\0');
+    }();
+    if (r35_want && r36_small_lend) {
+        r35_small_one = true;
+        cbuf_free_compute();
+        sched_reserve();
+        const size_t small_1 = cbuf_compute_bytes(dev);
+        if (small_1 + ((size_t) 16 << 20) < small) {
+            r35_small_extra = (small - small_1 + gran - 1)/gran*gran + ((size_t) 32 << 20);
+            LLAMA_LOG_INFO("%s: [TAG_R35_NP2PARK] SMALL reserve %.0f MiB for one sequence, %.0f MiB for %u: the hot set lends %.0f MiB "
+                    "while more than one sequence is busy (LLAMA_R35_NP2PARK=0: always %u)\n", __func__, small_1/MiB, small/MiB,
+                    cparams.n_seq_max, r35_small_extra/MiB, cparams.n_seq_max);
+            small = small_1;
+        } else {
+            r35_small_one = false;
+            cbuf_free_compute();
+            sched_reserve();
+        }
+    }
     // [TAG_FN_L22_SMALLKEEP] SMALLKEEP=2: the tail holds the kept SMALL reserve too (more tail layers out in a FULL period)
     const size_t small_tail = l22p.smallkeep >= 2 ? 0 : small;
     if (l20_base_ub > 0) {

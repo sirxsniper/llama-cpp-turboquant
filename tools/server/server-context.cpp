@@ -3703,6 +3703,21 @@ private:
             ret->l22_turn.attach_ms  = 0.0;
             const l24_attach_pick l24_pre = l22_leader ? l24_attach_pick() : l24_attach_find(task, *ret);
 
+            // [TAG_R35_NP2PARK] the state reads of this launch (keepctx store / restore, checkpoints) see how many other slots
+            // are busy: with none, the launching slot's parked recurrent cell maps by swapping with the idle one (nothing
+            // from the hot set); beside a running answer it leaves that answer's cell alone. Decode sets the count again
+            static const bool r35_np2park = [] {
+                const char * e = getenv("LLAMA_R35_NP2PARK");
+                return !(e && e[0] == '0' && e[1] == '\0');
+            }();
+            if (r35_np2park && ctx_tgt) {
+                int32_t n_busy_other = 0;
+                for (const auto & other : slots) {
+                    n_busy_other += &other != ret && other.is_processing() && !other.parked ? 1 : 0;
+                }
+                llama_fn_seqs_busy_ext(ctx_tgt, n_busy_other);
+            }
+
             // [TAG_FN_L18_KEEPCTX]
             if (keepctx && task.type == SERVER_TASK_TYPE_COMPLETION && !task.is_parent()) {
                 const int64_t t_kc0 = ggml_time_us();

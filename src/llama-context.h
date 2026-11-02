@@ -24,6 +24,7 @@ struct llama_model;
 class llama_batch_allocr;
 struct llama_ubatch;
 class llama_moe_cache;
+class llama_memory_recurrent; // [TAG_R35_NP2PARK]
 
 class llama_io_read_i;
 class llama_io_write_i;
@@ -724,6 +725,32 @@ private:
     bool     r34_np2_turn   = false;
     bool     r34_prev_one   = false; // the last decode ran with one busy sequence (r34_one_seq)
     bool r34_one_seq() const { return cparams.n_seq_max == 1 || (r34_np2_turn && l24_seqs_busy == 1); }
+    // [TAG_R35_NP2PARK] LLAMA_R35_NP2PARK (default 1; 0 = v0.27.0): a multi-slot qwen4exp context lends the VRAM of what only
+    // the other slots need to the hot set while one sequence is busy - their recurrent cells (parked in host RAM, see
+    // llama-memory-recurrent.cpp) and the SMALL compute reserve's part for n_seq_max sequences (reserved for one) - and takes
+    // it back before a batch with more (after LLAMA_R35_NP2PARK_HOLD_MS of one busy sequence it parks again)
+    bool     r35_want        = false;   // the switch, qwen4exp main context, n_seq_max >= 2 (cbuf_prepare decides)
+    bool     r35_on          = false;   // parking runs (after the fit)
+    bool     r35_carry       = false;   // the hot set carries the share (LLAMA_R35_NP2PARK=2 parks without it: tests)
+    bool     r35_small_one   = false;   // the SMALL reserve holds one sequence now (sched_reserve reads it)
+    bool     r35_all         = false;   // the last batch ran with more than one sequence busy (everything mapped)
+    size_t   r35_small_extra = 0;       // the n_seq_max-sequence SMALL reserve's bytes above the one-sequence one (+ slack)
+    size_t   r35_rs_fit      = 0;       // the recurrent bytes parked at the fit
+    int64_t  r35_one_since   = 0;       // since when one sequence is busy after a wider period (us; 0: not counting)
+    int64_t  r35_hold_us     = 3000000;
+    uint64_t r35_n_wide = 0, r35_n_narrow = 0;
+    llama_memory_recurrent * r35_mem = nullptr;
+    size_t   r35_target() const;        // the share the hot set should hold now
+    void     r35_settle();              // the hot set holds r35_target()
+    size_t   r35_hold(size_t target);   // [TAG_R36_NP2] llama_moe_hot_np2_hold after every owner graph is done
+    // the SMALL reserve for one / n_seq_max sequences from this batch on (settle: the hot set's side now; VRAM first when it
+    // grows); false settle: the caller settles once for this and the cells
+    bool     r35_small_set(bool one, bool settle = true);
+    void     r35_before_batch();        // before each batch of the main context (decode)
+    static size_t r35_hook_take(void * user, size_t bytes);
+    static void   r35_hook_give(void * user, size_t bytes);
+    static void   r35_hook_sync(void * user);
+    static bool   r35_hook_idle(void * user);
     // [TAG_FN_L22_ENDOVERLAP] a prompt ended in FULL without the eager switch: the next narrow batch goes SMALL, async
     bool     l22_end_pending = false;
     int      l22_first_n     = 0;    // decode calls still counted after a prompt's switch (first 8)

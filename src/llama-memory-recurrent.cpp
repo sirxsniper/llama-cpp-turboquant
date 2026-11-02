@@ -179,6 +179,12 @@ static constexpr uint32_t LLAMA_RS_STATE_FMT_RING = 2;
 // llama_memory_recurrent
 //
 
+llama_memory_recurrent::~llama_memory_recurrent() {
+    if (r35_stage) {
+        ggml_backend_buffer_free(r35_stage); // [TAG_R35_NP2PARK]
+    }
+}
+
 llama_memory_recurrent::llama_memory_recurrent(
         const llama_model & model,
                  bool   no_alloc,
@@ -307,7 +313,16 @@ llama_memory_recurrent::llama_memory_recurrent(
 
     // allocate the tensors and initialize the buffers to avoid NaNs in the padding
     for (auto & [buft, ctx] : ctx_map) {
-        ggml_backend_buffer_t buf = ctxs_bufs.emplace(std::move(ctx), buft, "rs cache");
+        // [TAG_R35_NP2PARK] one device buffer of a multi-slot qwen4exp context: on virtual memory, cleared there
+        ggml_backend_buffer_t buf = nullptr;
+        if (!ctxs_bufs.no_alloc && ctx_map.size() == 1) {
+            buf = r35_alloc(model, ctx.get(), buft);
+        }
+        if (buf) {
+            ctxs_bufs.emplace_buf(std::move(ctx), buf);
+        } else {
+            buf = ctxs_bufs.emplace(std::move(ctx), buft, "rs cache");
+        }
 
         LLAMA_LOG_INFO("%s: %10s RS buffer size = %8.2f MiB\n", __func__, ggml_backend_buffer_name(buf), ggml_backend_buffer_get_size(buf)/1024.0/1024.0);
     }
@@ -352,8 +367,15 @@ void llama_memory_recurrent::clear(bool data) {
     used = 0;
 
     if (data) {
+        // [TAG_R35_NP2PARK] a VMM buffer clears its mapped ranges only (not the alias granules); a parked cell's bytes
+        // wait in host RAM and are cleared there
         for (auto & [_, buf] : ctxs_bufs) {
             ggml_backend_buffer_clear(buf.get(), 0);
+        }
+        for (auto & pc : r35_cells) {
+            if (pc.parked) {
+                std::fill(pc.host.begin(), pc.host.end(), (uint8_t) 0);
+            }
         }
     }
 
@@ -1181,6 +1203,21 @@ void llama_memory_recurrent::state_write_data(llama_io_write_i & io, const std::
     const uint32_t s_trans = 0;
     const uint32_t n_layer = hparams.n_layer();
 
+    // [TAG_R35_NP2PARK] the cells this state reads are mapped first (a parked one comes back from host RAM)
+    if (r35_on) {
+        std::vector<uint32_t> need;
+        for (const auto * rs : { &cell_ranges, &cell_ranges0 }) {
+            for (const auto & range : *rs) {
+                for (uint32_t i = range.first; i < range.second && i < size; ++i) {
+                    need.push_back(i);
+                }
+            }
+        }
+        if (!r35_ensure(need)) {
+            throw std::runtime_error("[TAG_R35_NP2PARK] a parked recurrent cell could not be mapped for a state save");
+        }
+    }
+
     // [TAG_4C_GDN_REPLAY] the ring format takes the s_trans word, so a reader without replay rejects it
     const uint32_t s_fmt = replay ? LLAMA_RS_STATE_FMT_RING : s_trans;
 
@@ -1414,6 +1451,18 @@ bool llama_memory_recurrent::state_read_data(llama_io_read_i & io, uint32_t cell
     if (cell_count > size) {
         LLAMA_LOG_ERROR("%s: not enough cells in kv cache to restore state (%u > %u)\n", __func__, cell_count, size);
         return false;
+    }
+
+    // [TAG_R35_NP2PARK] the cells the state lands in are mapped first
+    if (r35_on) {
+        std::vector<uint32_t> need;
+        for (uint32_t i = head; i < head + cell_count && i < size; ++i) {
+            need.push_back(i);
+        }
+        if (!r35_ensure(need)) {
+            LLAMA_LOG_ERROR("%s: [TAG_R35_NP2PARK] a parked recurrent cell could not be mapped for the restore\n", __func__);
+            return false;
+        }
     }
 
     // [TAG_4C_GDN_REPLAY] ring format: live ring counts here, the rings after the S rows
@@ -1672,6 +1721,25 @@ bool llama_memory_recurrent_context::apply() {
 
     mem->find_slot(ubatches[i_next]);
 
+    // [TAG_R35_NP2PARK] every cell the graph reads or writes is mapped first: the range, the sources and the zeroed cell
+    if (mem->r35_active()) {
+        std::vector<uint32_t> need;
+        for (uint32_t i = mem->head; i < mem->head + mem->n && i < mem->size; ++i) {
+            need.push_back(i);
+            const int32_t s0 = mem->cells[i].src0;
+            if (s0 >= 0 && (uint32_t) s0 < mem->size) {
+                need.push_back((uint32_t) s0);
+            }
+        }
+        if (mem->rs_z >= 0 && (uint32_t) mem->rs_z < mem->size) {
+            need.push_back((uint32_t) mem->rs_z);
+        }
+        if (!mem->r35_ensure(need)) {
+            LLAMA_LOG_ERROR("%s: [TAG_R35_NP2PARK] a parked recurrent cell of this ubatch could not be mapped again\n", __func__);
+            return false;
+        }
+    }
+
     return true;
 }
 
@@ -1686,6 +1754,10 @@ const llama_ubatch & llama_memory_recurrent_context::get_ubatch() const {
 }
 
 uint32_t llama_memory_recurrent_context::get_n_rs() const {
+    // [TAG_R35_NP2PARK] a reserve of one sequence's graphs covers one cell (r35_full_n while the owner reserves)
+    if (is_full && mem->r35_full_n > 0 && mem->r35_full_n < mem->size) {
+        return mem->r35_full_n;
+    }
     return is_full ? mem->size : mem->n;
 }
 
@@ -1800,4 +1872,485 @@ int32_t llama_memory_recurrent_context::s_copy_plane(int i, uint32_t plane) cons
     GGML_ASSERT(src0 >= 0 && (uint32_t) src0 < mem->size);
 
     return (int32_t)(plane * mem->size) + src0;
+}
+
+// [TAG_R35_NP2PARK] ---------------------------------------------------------------------------------------------------
+// Design note. A Flash-Next (qwen4exp) server with --parallel 2 keeps one recurrent cell per slot: 450 MiB of GDN rows
+// each (36 recurrent layers x 4 snapshot groups x a 3 MiB S row, plus the small conv rows). While one slot answers, the
+// other cell's rows sit in VRAM the hot expert set could use (round 34: the 2-slot hot set was ~1 GB smaller than the
+// 1-slot one, worth ~4 % ms/step).
+// Layout: the rows are plane-major (row = group*size + cell; the graphs write n_seqs consecutive cells per group), so a
+// cell's rows are not contiguous. A tensor whose rows reach a granule starts on a granule here, so every 3 MiB S row holds
+// exactly one whole 2 MiB granule that belongs to its cell alone (288 MiB per cell at Flash-Next). The buffer lives on
+// CUDA virtual memory: each such granule is a map of its own, the rest is mapped in runs, padding stays unmapped.
+// Park: the owner's graphs are done, the granules' bytes go to host RAM, the granules are unmapped and their addresses
+// mapped onto the device's one shared alias granule (a read or write by mistake hits that granule, never an unmapped
+// address), then the owner gives the VRAM to the hot set. Map again: VRAM back from the hot set, the alias goes, new VRAM
+// is mapped and the bytes are copied back. The cell's bytes outside those granules never move. Exact: the data is back
+// bit for bit before anything reads it.
+// Guards (each read or write of cell data maps the cell first): apply() of every ubatch (its range, the sources and the
+// zeroed cell), state_write_data / state_read_data (slot save / restore, checkpoints, the conversation store); clear()
+// zeroes the host bytes. The owner parks at batch starts only (r35_park_except) and drives the hot set side.
+// LLAMA_R35_NP2PARK=0: one plain buffer as in v0.27.0.
+
+ggml_backend_buffer_t llama_memory_recurrent::r35_alloc(const llama_model & model, ggml_context * ctx, ggml_backend_buffer_type_t buft) {
+    const char * e = getenv("LLAMA_R35_NP2PARK");
+    if ((e && e[0] == '0' && e[1] == '\0') || model.arch != LLM_ARCH_QWEN4EXP || size < 2 || ggml_backend_buft_is_host(buft)) {
+        return nullptr;
+    }
+    ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+    ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+    if (!reg) {
+        return nullptr;
+    }
+    using fgran_t  = size_t (*)(ggml_backend_buffer_type_t);
+    using falloc_t = ggml_backend_buffer_t (*)(ggml_backend_buffer_type_t, size_t);
+    using fmap_t   = bool (*)(ggml_backend_buffer_t, size_t, size_t);
+    const auto fgran  = (fgran_t)  ggml_backend_reg_get_proc_address(reg, "ggml_backend_vmm_granularity");
+    const auto falloc = (falloc_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_vmm_buffer_alloc");
+    const auto fmap   = (fmap_t)   ggml_backend_reg_get_proc_address(reg, "ggml_backend_vmm_buffer_map");
+    const auto funmap = (fmap_t)   ggml_backend_reg_get_proc_address(reg, "ggml_backend_vmm_buffer_unmap");
+    const auto falias = (fmap_t)   ggml_backend_reg_get_proc_address(reg, "ggml_backend_vmm_buffer_map_alias");
+    const size_t gran = fgran ? fgran(buft) : 0;
+    if (!falloc || !fmap || !funmap || !falias || gran == 0) {
+        return nullptr;
+    }
+    const size_t align = std::max<size_t>(1, ggml_backend_buft_get_alignment(buft));
+    auto rup = [](size_t x, size_t g) { return (x + g - 1)/g*g; };
+
+    // placement: the tensors with rows below a granule packed first, then each one whose rows reach a granule on a granule
+    // of its own (each such row then holds a whole granule; at Flash-Next 24 MiB S tensors back to back, no padding)
+    std::vector<std::pair<ggml_tensor *, size_t>> place;
+    size_t off = 0;
+    for (int big = 0; big < 2; ++big) {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->view_src != nullptr || ((size_t) t->nb[1] >= gran) != (big == 1)) {
+                continue;
+            }
+            off = big ? rup(off, gran) : rup(off, align);
+            place.push_back({ t, off });
+            off += ggml_backend_buft_get_alloc_size(buft, t);
+        }
+    }
+    if (place.empty()) {
+        return nullptr;
+    }
+    const size_t total  = rup(off, gran);
+    const size_t n_gran = total/gran;
+    std::vector<int32_t> owner(n_gran, -2); // -2: no tensor byte (stays unmapped), -1: shared, c >= 0: cell c's rows only
+    std::vector<std::vector<r35_gran>> grans(size);
+    for (const auto & [t, o] : place) {
+        const size_t asz = ggml_backend_buft_get_alloc_size(buft, t);
+        for (size_t g = o/gran; g < rup(o + asz, gran)/gran; ++g) {
+            owner[g] = -1;
+        }
+    }
+    size_t n_excl = 0;
+    for (const auto & [t, o] : place) {
+        const int64_t rows = t->ne[1];
+        if (!ggml_is_contiguous(t) || rows <= 0 || rows % (int64_t) size != 0 || t->ne[2] != 1 || t->ne[3] != 1) {
+            continue;
+        }
+        const size_t row = t->nb[1];
+        for (int64_t r = 0; r < rows; ++r) {
+            const uint32_t c  = (uint32_t) (r % (int64_t) size); // plane-major: row = group*size + cell
+            const size_t   rs = o + (size_t) r*row;
+            for (size_t g = rup(rs, gran)/gran; g < (rs + row)/gran; ++g) {
+                owner[g] = (int32_t) c;
+                grans[c].push_back({ t, g*gran - o, g*gran });
+                n_excl++;
+            }
+        }
+    }
+    if (n_excl == 0) {
+        LLAMA_LOG_INFO("%s: [TAG_R35_NP2PARK] no recurrent row holds a whole %.0f MiB granule: one plain buffer\n", __func__,
+                gran/1048576.0);
+        return nullptr;
+    }
+
+    ggml_backend_buffer_t buf = falloc(buft, total);
+    if (!buf) {
+        return nullptr;
+    }
+    auto fail = [&](const char * why) -> ggml_backend_buffer_t {
+        LLAMA_LOG_WARN("%s: [TAG_R35_NP2PARK] the virtual-memory RS buffer failed (%s): one plain buffer\n", __func__, why);
+        ggml_backend_buffer_free(buf);
+        return nullptr;
+    };
+    size_t mapped = 0;
+    for (size_t g = 0; g < n_gran; ) {
+        if (owner[g] == -2) {
+            ++g;
+            continue;
+        }
+        size_t h = g + 1; // a cell's granule maps alone (it unmaps alone), shared ones in runs
+        if (owner[g] == -1) {
+            while (h < n_gran && owner[h] == -1) {
+                ++h;
+            }
+        }
+        if (!fmap(buf, g*gran, (h - g)*gran)) {
+            return fail("map");
+        }
+        mapped += (h - g)*gran;
+        g = h;
+    }
+    uint8_t * p0 = (uint8_t *) ggml_backend_buffer_get_base(buf);
+    for (const auto & [t, o] : place) {
+        if (ggml_backend_tensor_alloc(buf, t, p0 + o) != GGML_STATUS_SUCCESS) {
+            return fail("tensor placement");
+        }
+    }
+    for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+        if (t->view_src != nullptr && t->buffer == nullptr && ggml_backend_view_init(t) != GGML_STATUS_SUCCESS) {
+            return fail("view");
+        }
+    }
+    for (const auto & [t, o] : place) {
+        ggml_backend_tensor_memset(t, 0, 0, ggml_nbytes(t));
+    }
+
+    r35_vmm    = true;
+    r35_buf    = buf;
+    r35_g      = gran;
+    r35_fmap   = fmap;
+    r35_funmap = funmap;
+    r35_falias = falias;
+    r35_cells.assign(size, r35_cell());
+    for (uint32_t c = 0; c < size; ++c) {
+        r35_cells[c].grans = std::move(grans[c]);
+    }
+    // the copies go through 32 MiB of pinned host memory (a direct DMA each way) instead of pageable memory, where the driver
+    // stages every 2 MiB copy itself (75-95 ms a cell parked, 55-65 ms mapped again at Flash-Next on the first build)
+    if (ggml_backend_buffer_type_t hb = ggml_backend_dev_host_buffer_type(dev)) {
+        r35_stage = ggml_backend_buft_alloc_buffer(hb, 16*gran);
+        r35_stage_n = r35_stage ? 16 : 0;
+    }
+    LLAMA_LOG_INFO("%s: [TAG_R35_NP2PARK] RS on virtual memory: %.0f MiB mapped of %.0f MiB of addresses; %u cells can each "
+            "give %.0f MiB (whole granules of their rows only) to the hot set while their sequence is idle "
+            "(LLAMA_R35_NP2PARK=0: one plain buffer)\n", __func__, mapped/1048576.0, total/1048576.0, size,
+            r35_cell_bytes(1)/1048576.0);
+    return buf;
+}
+
+void llama_memory_recurrent::r35_copy_out(const r35_cell & pc) const {
+    const size_t g = r35_g;
+    const size_t n = pc.grans.size();
+    uint8_t * st = r35_stage ? (uint8_t *) ggml_backend_buffer_get_base(r35_stage) : nullptr;
+    for (size_t k0 = 0; k0 < n; ) {
+        const size_t k1 = st ? std::min(n, k0 + r35_stage_n) : n;
+        for (size_t k = k0; k < k1; ++k) {
+            ggml_backend_tensor_get(pc.grans[k].t, st ? st + (k - k0)*g : (uint8_t *) pc.host.data() + k*g, pc.grans[k].off_t, g);
+        }
+        if (st) {
+            memcpy((uint8_t *) pc.host.data() + k0*g, st, (k1 - k0)*g);
+        }
+        k0 = k1;
+    }
+}
+
+void llama_memory_recurrent::r35_copy_in(const r35_cell & pc) const {
+    const size_t g = r35_g;
+    const size_t n = pc.grans.size();
+    uint8_t * st = r35_stage ? (uint8_t *) ggml_backend_buffer_get_base(r35_stage) : nullptr;
+    for (size_t k0 = 0; k0 < n; ) {
+        const size_t k1 = st ? std::min(n, k0 + r35_stage_n) : n;
+        if (st) {
+            memcpy(st, pc.host.data() + k0*g, (k1 - k0)*g);
+        }
+        for (size_t k = k0; k < k1; ++k) {
+            ggml_backend_tensor_set(pc.grans[k].t, st ? st + (k - k0)*g : pc.host.data() + k*g, pc.grans[k].off_t, g);
+        }
+        k0 = k1;
+    }
+}
+
+size_t llama_memory_recurrent::r35_cell_bytes(uint32_t c) const {
+    return c < r35_cells.size() ? r35_cells[c].grans.size()*r35_g : 0;
+}
+
+size_t llama_memory_recurrent::r35_parked_bytes() const {
+    size_t b = 0;
+    for (uint32_t c = 0; c < r35_cells.size(); ++c) {
+        b += r35_cells[c].parked ? r35_cell_bytes(c) : 0;
+    }
+    return b;
+}
+
+uint32_t llama_memory_recurrent::r35_n_parked() const {
+    uint32_t n = 0;
+    for (const auto & pc : r35_cells) {
+        n += pc.parked ? 1 : 0;
+    }
+    return n;
+}
+
+bool llama_memory_recurrent::r35_park_cell(uint32_t c, bool give) const {
+    r35_cell & pc = r35_cells[c];
+    if (pc.parked || pc.grans.empty()) {
+        return pc.parked;
+    }
+    const int64_t t0 = ggml_time_us();
+    const size_t  g  = r35_g;
+    const size_t  n  = pc.grans.size();
+    pc.host.resize(n*g);
+    r35_copy_out(pc);
+    size_t done = 0;
+    bool   ok   = true;
+    static int n_warn_alias = 0;
+    for (; done < n; ++done) {
+        if (!r35_funmap(r35_buf, pc.grans[done].off_b, g)) {
+            ok = false;
+            break;
+        }
+        if (!r35_falias(r35_buf, pc.grans[done].off_b, g) && n_warn_alias++ < 3) {
+            LLAMA_LOG_WARN("%s: [TAG_R35_NP2PARK] a parked granule has no alias (its addresses are unmapped)\n", __func__);
+        }
+    }
+    if (!ok) {
+        // what went comes back as it was (the bytes are in host RAM)
+        for (size_t k = 0; k < done; ++k) {
+            (void) r35_funmap(r35_buf, pc.grans[k].off_b, g);
+            if (r35_fmap(r35_buf, pc.grans[k].off_b, g)) {
+                ggml_backend_tensor_set(pc.grans[k].t, pc.host.data() + k*g, pc.grans[k].off_t, g);
+            }
+        }
+        std::vector<uint8_t>().swap(pc.host);
+        LLAMA_LOG_WARN("%s: [TAG_R35_NP2PARK] cell %u could not park (unmap failed): it stays mapped\n", __func__, c);
+        return false;
+    }
+    pc.parked = true;
+    r35_n_park++;
+    r35_park_ms += (ggml_time_us() - t0)/1000.0;
+    if (give && r35_h.give) {
+        r35_h.give(r35_h.user, n*g);
+    }
+    return true;
+}
+
+bool llama_memory_recurrent::r35_unpark_cell(uint32_t c, bool take) const {
+    r35_cell & pc = r35_cells[c];
+    if (!pc.parked) {
+        return true;
+    }
+    const int64_t t0 = ggml_time_us();
+    const size_t  g  = r35_g;
+    const size_t  n  = pc.grans.size();
+    if (take && r35_h.take) {
+        (void) r35_h.take(r35_h.user, n*g);
+    }
+    if (r35_h.sync) {
+        r35_h.sync(r35_h.user);
+    }
+    size_t done = 0;
+    bool   ok   = true;
+    for (; done < n; ++done) {
+        (void) r35_funmap(r35_buf, pc.grans[done].off_b, g); // the alias goes
+        bool m = r35_fmap(r35_buf, pc.grans[done].off_b, g);
+        for (int k = 0; !m && k < 8 && r35_h.take; ++k) {
+            // the hot set gives 64 MiB more each time while the map fails (on top of this cell's bytes)
+            (void) r35_h.take(r35_h.user, n*g + (size_t) (k + 1)*((size_t) 64 << 20));
+            m = r35_fmap(r35_buf, pc.grans[done].off_b, g);
+        }
+        if (!m) {
+            ok = false;
+            break;
+        }
+    }
+    if (!ok) {
+        // back on the alias: the cell stays parked, its bytes stay in host RAM
+        for (size_t k = 0; k <= done && k < n; ++k) {
+            (void) r35_funmap(r35_buf, pc.grans[k].off_b, g);
+            (void) r35_falias(r35_buf, pc.grans[k].off_b, g);
+        }
+        LLAMA_LOG_ERROR("%s: [TAG_R35_NP2PARK] cell %u could not be mapped again (no VRAM): it stays parked\n", __func__, c);
+        return false;
+    }
+    r35_copy_in(pc);
+    // [TAG_R36_NP2] freed again (a kept buffer saved ~15 ms per park but cost 288 MiB per cell: the 2-slot server is short of RAM)
+    std::vector<uint8_t>().swap(pc.host);
+    pc.parked = false;
+    r35_n_unpark++;
+    r35_unpark_ms += (ggml_time_us() - t0)/1000.0;
+    return true;
+}
+
+bool llama_memory_recurrent::r35_ensure(const std::vector<uint32_t> & need) const {
+    if (!r35_on) {
+        return true;
+    }
+    bool ok = true;
+    static uint64_t n_demand = 0;
+    // one busy sequence (the owner's state): a mapped cell nothing here needs parks first, so a cell that maps on demand (a
+    // checkpoint or the first ubatch of the other slot's turn) swaps with it instead of taking VRAM from the hot set and
+    // giving it back at the next batch start
+    if (r35_one) {
+        std::vector<bool> in(size, false);
+        size_t b_need = 0;
+        for (const uint32_t c : need) {
+            if (c < size && !in[c]) {
+                in[c] = true;
+                b_need += r35_cells[c].parked ? r35_cell_bytes(c) : 0;
+            }
+        }
+        // a kept cell (the sequence of the last batch) swaps out only while no other sequence is busy: a new request on the
+        // other slot beside a running answer maps its cell with VRAM from the hot set and leaves the answer's cell alone
+        const bool idle_all = r35_h.idle && r35_h.idle(r35_h.user);
+        bool synced = false;
+        for (uint32_t c = 0; c < size && b_need > 0; ++c) {
+            if (!in[c] && !r35_cells[c].parked && (!r35_cells[c].kept || idle_all) && !r35_cells[c].grans.empty()) {
+                if (!synced && r35_h.sync) {
+                    r35_h.sync(r35_h.user);
+                    synced = true;
+                }
+                if (r35_park_cell(c, false)) {
+                    b_need -= std::min(b_need, r35_cell_bytes(c));
+                }
+            }
+        }
+    }
+    for (const uint32_t c : need) {
+        if (c < r35_cells.size() && r35_cells[c].parked) {
+            const bool m = r35_unpark_cell(c, true);
+            ok = ok && m;
+            if (++n_demand <= 3 || n_demand % 64 == 0) {
+                LLAMA_LOG_WARN("%s: [TAG_R35_NP2PARK] cell %u mapped again on demand (%llu so far, %u parked now): %s\n",
+                        __func__, c, (unsigned long long) n_demand, r35_n_parked(), m ? "ok" : "FAILED");
+            }
+        }
+    }
+    if (r35_one && r35_h.give) {
+        r35_h.give(r35_h.user, 0); // settle: a swap needs nothing from the hot set
+    }
+    return ok;
+}
+
+void llama_memory_recurrent::r35_set_one(bool one) {
+    r35_one = one;
+}
+
+bool llama_memory_recurrent::r35_start(const r35_hooks & h, uint32_t keep) {
+    if (!r35_vmm) {
+        return false;
+    }
+    r35_h  = h;
+    r35_on = true;
+    if (r35_h.sync) {
+        r35_h.sync(r35_h.user);
+    }
+    const int64_t t0 = ggml_time_us();
+    for (uint32_t c = 0; c < size; ++c) {
+        if (c != keep) {
+            (void) r35_park_cell(c, false); // the fit counts this VRAM as free (the hot set lends it from here on)
+        }
+    }
+    LLAMA_LOG_INFO("%s: [TAG_R35_NP2PARK] %u of %u recurrent cells parked at the fit (%.0f MiB for the hot set, %.1f ms); a "
+            "sequence's cell maps again before its next batch or state read\n", __func__, r35_n_parked(), size,
+            r35_parked_bytes()/1048576.0, (ggml_time_us() - t0)/1000.0);
+    return r35_n_parked() > 0;
+}
+
+void llama_memory_recurrent::r35_unpark_all() {
+    if (!r35_on) {
+        return;
+    }
+    const size_t b = r35_parked_bytes();
+    if (b == 0) {
+        return;
+    }
+    if (r35_h.take) {
+        (void) r35_h.take(r35_h.user, b);
+    }
+    for (uint32_t c = 0; c < size; ++c) {
+        (void) r35_unpark_cell(c, false);
+    }
+    if (r35_h.give) {
+        r35_h.give(r35_h.user, 0); // settle (a map that failed leaves its cell parked)
+    }
+}
+
+void llama_memory_recurrent::r35_stop() {
+    r35_unpark_all();
+    r35_on = false;
+    r35_h  = r35_hooks();
+}
+
+void llama_memory_recurrent::r35_park_except(const std::vector<llama_seq_id> & keep_seqs) {
+    if (!r35_on) {
+        return;
+    }
+    std::vector<bool> keep(size, false);
+    // a sequence without a cell of its own gets the empty cell find_slot will pick (from head, after its reset rule)
+    uint32_t h = head > used + 2*(uint32_t) keep_seqs.size() ? 0 : head;
+    for (const llama_seq_id s : keep_seqs) {
+        if (s < 0 || (uint32_t) s >= size) {
+            return; // not known: nothing parks now
+        }
+        const int32_t t = cells[s].tail;
+        if (t >= 0) {
+            keep[t] = true;
+            if (cells[t].seq_id.size() == 1) {
+                continue;
+            }
+        }
+        bool found = false;
+        for (uint32_t i = 0; i < size; ++i) {
+            const uint32_t c = (h + i) % size;
+            if (cells[c].is_empty() && !keep[c]) {
+                keep[c] = true;
+                h       = c;
+                found   = true;
+                break;
+            }
+        }
+        if (!found) {
+            return;
+        }
+    }
+    std::vector<uint32_t> to_park, to_map;
+    size_t b_park = 0, b_map = 0;
+    for (uint32_t c = 0; c < size; ++c) {
+        r35_cells[c].kept = keep[c];
+        if (r35_cells[c].grans.empty()) {
+            continue;
+        }
+        if (!keep[c] && !r35_cells[c].parked) {
+            to_park.push_back(c);
+            b_park += r35_cell_bytes(c);
+        } else if (keep[c] && r35_cells[c].parked) {
+            to_map.push_back(c);
+            b_map += r35_cell_bytes(c);
+        }
+    }
+    if (to_park.empty() && to_map.empty()) {
+        return;
+    }
+    const int64_t t0     = ggml_time_us();
+    const size_t  before = r35_parked_bytes();
+    const size_t  pre    = b_map > b_park ? b_map - b_park : 0;
+    if (pre > 0 && r35_h.take) {
+        (void) r35_h.take(r35_h.user, pre);
+    }
+    if (r35_h.sync) {
+        r35_h.sync(r35_h.user);
+    }
+    for (const uint32_t c : to_park) {
+        (void) r35_park_cell(c, false);
+    }
+    for (const uint32_t c : to_map) {
+        (void) r35_unpark_cell(c, false);
+    }
+    const size_t after = r35_parked_bytes();
+    // the owner settles the hot set's side to what is parked now (the share it holds follows the mapped cells)
+    const int64_t back = (int64_t) after - (int64_t) before;
+    if (r35_h.give) {
+        r35_h.give(r35_h.user, 0);
+    }
+    static uint64_t n_sw = 0;
+    if (++n_sw <= 4 || n_sw % 64 == 0) {
+        LLAMA_LOG_WARN("%s: [TAG_R35_NP2PARK] switch %llu: %zu cells parked, %zu mapped again (%.0f MiB to the hot set, net) in "
+                "%.1f ms; %u parked now (parks %.1f ms, maps %.1f ms on average)\n", __func__, (unsigned long long) n_sw,
+                to_park.size(), to_map.size(), back/1048576.0, (ggml_time_us() - t0)/1000.0, r35_n_parked(),
+                r35_n_park ? r35_park_ms/(double) r35_n_park : 0.0, r35_n_unpark ? r35_unpark_ms/(double) r35_n_unpark : 0.0);
+    }
 }

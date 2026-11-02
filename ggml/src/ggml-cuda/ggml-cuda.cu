@@ -969,6 +969,9 @@ struct ggml_backend_cuda_buffer_context {
     size_t vmm_size = 0;
     size_t vmm_gran = 0;
     std::vector<std::pair<size_t, size_t>> vmm_segs;
+    // [TAG_R35_NP2PARK] granules mapped onto the device's one shared alias granule (ggml_backend_cuda_vmm_buffer_map_alias):
+    // addresses that stay valid while their own VRAM is gone, no physical memory of their own, never cleared or counted
+    std::vector<size_t> vmm_alias;
 
     ggml_backend_cuda_buffer_context(int device, void * dev_ptr) :
         device(device), dev_ptr(dev_ptr),
@@ -985,6 +988,9 @@ struct ggml_backend_cuda_buffer_context {
         CUDA_CHECK(cudaDeviceSynchronize()); // cudaFree would wait for the device too
         for (const auto & s : vmm_segs) {
             CU_CHECK(cuMemUnmap((CUdeviceptr) dev_ptr + s.first, s.second));
+        }
+        for (const size_t a : vmm_alias) { // [TAG_R35_NP2PARK]
+            CU_CHECK(cuMemUnmap((CUdeviceptr) dev_ptr + a, vmm_gran));
         }
         CU_CHECK(cuMemAddressFree((CUdeviceptr) dev_ptr, vmm_size));
 #endif
@@ -1505,6 +1511,11 @@ bool ggml_backend_cuda_vmm_buffer_map(ggml_backend_buffer_t buffer, size_t offse
             return false; // a part is mapped already
         }
     }
+    for (const size_t a : ctx->vmm_alias) { // [TAG_R35_NP2PARK] an alias granule is mapped too (unmap it first)
+        if (a < offset + size && offset < a + gran) {
+            return false;
+        }
+    }
     ggml_cuda_set_device(ctx->device);
     const int phys = ggml_cuda_get_physical_device(ctx->device);
     CUmemAllocationProp prop = {};
@@ -1600,7 +1611,115 @@ bool ggml_backend_cuda_vmm_buffer_unmap(ggml_backend_buffer_t buffer, size_t off
             ++it;
         }
     }
+    // [TAG_R35_NP2PARK] the alias granules in the range go too (none in a buffer without map_alias calls)
+    for (auto it = ctx->vmm_alias.begin(); it != ctx->vmm_alias.end(); ) {
+        if (*it >= offset && *it + ctx->vmm_gran <= offset + size) {
+            const CUresult r = cuMemUnmap((CUdeviceptr) ctx->dev_ptr + *it, ctx->vmm_gran);
+            if (r != CUDA_SUCCESS) {
+                const char * s = nullptr;
+                cuGetErrorString(r, &s);
+                GGML_LOG_WARN("%s: unmapping the alias granule at +%.1f MiB failed: %s\n", __func__, *it/1048576.0, s ? s : "?");
+                ok = false;
+                ++it;
+                continue;
+            }
+            it = ctx->vmm_alias.erase(it);
+        } else {
+            ++it;
+        }
+    }
     return ok;
+#else
+    GGML_UNUSED(buffer);
+    GGML_UNUSED(offset);
+    GGML_UNUSED(size);
+    return false;
+#endif
+}
+
+// [TAG_R35_NP2PARK] maps every granule of [offset, offset + size) (nothing mapped there) onto one alias granule of the
+// device (created once, 2 MiB at the usual granularity, never freed): the addresses stay valid without VRAM of their own.
+// A kernel or copy that touches them by mistake reads or writes that shared granule instead of faulting on an unmapped
+// address. _unmap takes them away again (whole granules); _mapped and _clear ignore them.
+bool ggml_backend_cuda_vmm_buffer_map_alias(ggml_backend_buffer_t buffer, size_t offset, size_t size) {
+#ifdef GGML_CUDA_VMM_BUFFERS
+    if (!buffer || !ggml_backend_buffer_is_cuda(buffer)) {
+        return false;
+    }
+    auto * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
+    const size_t gran = ctx->vmm_gran;
+    if (ctx->vmm_size == 0 || size == 0 || offset % gran != 0 || size % gran != 0 || offset + size > ctx->vmm_size) {
+        return false;
+    }
+    for (const auto & s : ctx->vmm_segs) {
+        if (s.first < offset + size && offset < s.first + s.second) {
+            return false;
+        }
+    }
+    for (const size_t a : ctx->vmm_alias) {
+        if (a < offset + size && offset < a + gran) {
+            return false;
+        }
+    }
+    static std::mutex                   alias_mtx;
+    static CUmemGenericAllocationHandle alias_h[GGML_CUDA_MAX_DEVICES] = {};
+    static size_t                       alias_g[GGML_CUDA_MAX_DEVICES] = {};
+    ggml_cuda_set_device(ctx->device);
+    const int phys = ggml_cuda_get_physical_device(ctx->device);
+    CUmemGenericAllocationHandle h = 0;
+    {
+        std::lock_guard<std::mutex> lk(alias_mtx);
+        if (alias_g[ctx->device] == 0) {
+            CUmemAllocationProp prop = {};
+            prop.type          = CU_MEM_ALLOCATION_TYPE_PINNED;
+            prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+            prop.location.id   = phys;
+            const CUresult r = cuMemCreate(&alias_h[ctx->device], gran, &prop, 0);
+            if (r != CUDA_SUCCESS) {
+                const char * s = nullptr;
+                cuGetErrorString(r, &s);
+                GGML_LOG_WARN("%s: the alias granule on device %d could not be created: %s\n", __func__, ctx->device, s ? s : "?");
+                return false;
+            }
+            alias_g[ctx->device] = gran;
+        }
+        if (alias_g[ctx->device] != gran) {
+            return false;
+        }
+        h = alias_h[ctx->device];
+    }
+    CUmemAccessDesc acc = {};
+    acc.location.type  = CU_MEM_LOCATION_TYPE_DEVICE;
+    acc.location.id    = phys;
+    acc.flags          = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+    std::vector<size_t> done;
+    bool ok = true;
+    for (size_t o = offset; o < offset + size; o += gran) {
+        const CUdeviceptr p = (CUdeviceptr) ctx->dev_ptr + o;
+        CUresult r = cuMemMap(p, gran, 0, h, 0);
+        if (r == CUDA_SUCCESS) {
+            r = cuMemSetAccess(p, gran, &acc, 1);
+            if (r != CUDA_SUCCESS) {
+                (void) cuMemUnmap(p, gran);
+            }
+        }
+        if (r != CUDA_SUCCESS) {
+            const char * s = nullptr;
+            cuGetErrorString(r, &s);
+            GGML_LOG_WARN("%s: aliasing the granule at +%.1f MiB failed: %s\n", __func__, o/1048576.0, s ? s : "?");
+            ok = false;
+            break;
+        }
+        done.push_back(o);
+    }
+    if (!ok) {
+        for (const size_t o : done) {
+            (void) cuMemUnmap((CUdeviceptr) ctx->dev_ptr + o, gran);
+        }
+        return false;
+    }
+    ctx->vmm_alias.insert(ctx->vmm_alias.end(), done.begin(), done.end());
+    return true;
 #else
     GGML_UNUSED(buffer);
     GGML_UNUSED(offset);
@@ -10483,6 +10602,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_vmm_buffer_mapped") == 0) {
         return (void *)ggml_backend_cuda_vmm_buffer_mapped;
+    }
+    if (strcmp(name, "ggml_backend_vmm_buffer_map_alias") == 0) { // [TAG_R35_NP2PARK]
+        return (void *)ggml_backend_cuda_vmm_buffer_map_alias;
     }
     if (strcmp(name, "ggml_backend_pool_stats") == 0) {
         return (void *)ggml_backend_cuda_pool_stats;

@@ -144,6 +144,9 @@ GGML_BACKEND_API ggml_backend_buffer_t ggml_backend_cuda_vmm_buffer_alloc(ggml_b
 GGML_BACKEND_API bool                  ggml_backend_cuda_vmm_buffer_map(ggml_backend_buffer_t buffer, size_t offset, size_t size);
 GGML_BACKEND_API bool                  ggml_backend_cuda_vmm_buffer_unmap(ggml_backend_buffer_t buffer, size_t offset, size_t size);
 GGML_BACKEND_API size_t                ggml_backend_cuda_vmm_buffer_mapped(ggml_backend_buffer_t buffer);
+// [TAG_R35_NP2PARK] granules mapped onto one shared alias granule of the device (valid addresses without VRAM of their own;
+// get_proc_address: ggml_backend_vmm_buffer_map_alias); _unmap takes them away like any other map
+GGML_BACKEND_API bool                  ggml_backend_cuda_vmm_buffer_map_alias(ggml_backend_buffer_t buffer, size_t offset, size_t size);
 
 // [TAG_FN_L3_VRAM_TRIM] a CUDA backend's temporary-memory pools (get_proc_address: ggml_backend_pool_stats / _trim)
 GGML_BACKEND_API void   ggml_backend_cuda_pool_stats(ggml_backend_t backend, size_t * reserved, size_t * hwm);
