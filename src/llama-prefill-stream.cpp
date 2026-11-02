@@ -227,6 +227,7 @@ struct pfs_state {
     bool                     cps_nowait  = false; // [TAG_R35_ROUTED] mode 2: no wait, skip what the plan shows unused
     size_t                   cps_guard   = 0;     // [TAG_R35_CPSGUARD] head bytes written after each written expert
     bool                     cps_phases  = false; // [TAG_R35_ROUTED] no wait: early then late experts (else one id-ordered pass)
+    bool                     one_poke    = true;  // [TAG_R35_ONEPOKE] LLAMA_R35_PFS_ONEPOKE: one event + flush per ring slot
     int64_t                  n_exp_max   = 0;     // mask stride
     uint64_t                 share_gen   = 0;     // the generation whose jobs have a late phase (0: none)
     std::vector<uint8_t>     late;                // [n_pos][n_exp_max] under mtx
@@ -715,15 +716,21 @@ void pfs_run(pfs_state * s) {
             dispatching = true;
             return true;
         };
-        auto dispatch = [&](const item & it) {
+        // [TAG_R35_ONEPOKE] fin: the last piece of its ring slot (or a direct copy). With LLAMA_R35_PFS_ONEPOKE (default 1) a
+        // slot's event and the copy stream's flush (a WDDM stream query, ~20 us) follow its last piece only; the routed
+        // stream cuts a slot into many pieces (~23K per pass: bytes -21 % but pass time -2 % with a flush per piece)
+        auto dispatch = [&](const item & it, bool fin) {
             ggml_backend_tensor_set_async(s->copy, B.raw, it.src, it.dst, it.n);
+            fin = fin || !s->one_poke;
             if (it.slot >= 0) {
-                gen5::ev_record(s->chunk_ev[it.slot], s->copy);
-                s->chunk_state[it.slot] = 2;
+                if (fin) {
+                    gen5::ev_record(s->chunk_ev[it.slot], s->copy);
+                    s->chunk_state[it.slot] = 2;
+                }
             } else {
                 bytes_pin += it.n;
             }
-            if (s->poke) {
+            if (s->poke && fin) {
                 s->poke(s->copy); // [TAG_FN_L3_HOST_POKE] the copy starts now, while this thread stages the next chunk
             }
             bytes += it.n;
@@ -732,8 +739,8 @@ void pfs_run(pfs_state * s) {
             if (!dispatching && !begin()) {
                 return false;
             }
-            for (const item & it : staged) {
-                dispatch(it);
+            for (size_t i = 0; i < staged.size(); ++i) {
+                dispatch(staged[i], i + 1 == staged.size() || staged[i + 1].slot != staged[i].slot);
             }
             staged.clear();
             return true;
@@ -748,7 +755,7 @@ void pfs_run(pfs_state * s) {
                         cancelled = true;
                         break;
                     }
-                    dispatch({ -1, src + o, s->off[k] + o, std::min(s->chunk, r.second - o) });
+                    dispatch({ -1, src + o, s->off[k] + o, std::min(s->chunk, r.second - o) }, true);
                 }
             }
         };
@@ -758,11 +765,11 @@ void pfs_run(pfs_state * s) {
                 return;
             }
             s->chunk_state[pcs.front().slot] = 1;
-            for (const item & it : pcs) {
+            for (size_t i = 0; i < pcs.size(); ++i) {
                 if (dispatching) {
-                    dispatch(it);
+                    dispatch(pcs[i], i + 1 == pcs.size());
                 } else {
-                    staged.push_back(it);
+                    staged.push_back(pcs[i]);
                 }
             }
             pcs.clear();
@@ -933,7 +940,7 @@ void pfs_run(pfs_state * s) {
                             }
                             continue;
                         }
-                        dispatch({ -1, (const uint8_t *) seg.src, s->off[k] + o, seg.len });
+                        dispatch({ -1, (const uint8_t *) seg.src, s->off[k] + o, seg.len }, true);
                         if (seg.ticket >= 0) {
                             job_tk.push_back(seg.ticket);
                         }
@@ -1781,6 +1788,7 @@ bool llama_prefill_stream_init_layers(const std::vector<llama_moe_gen5_layer_des
     s->cp_pin  = gen5::env_int("LLAMA_PREFILL_STREAM_PIN", 0, 0, 2);
     s->cp_affs = gen5::copy_affinities(s->cp_pin);
     s->cp_grain = (size_t) gen5::env_int("LLAMA_PREFILL_STREAM_GRAIN_KIB", 0, 0, 65536) << 10;
+    s->one_poke = gen5::env_int("LLAMA_R35_PFS_ONEPOKE", 1, 0, 1) != 0; // [TAG_R35_ONEPOKE] 0: a flush per piece (v0.27.0)
     if (s->min_tokens > 32 && !s->lend) { // [TAG_FN_R1_PFS_LEND] a lending stream reserves with the op offload
         LLAMA_LOG_WARN("prefill-stream: LLAMA_PREFILL_STREAM_MIN=%" PRId64 " > 32: ubatches of 32..%" PRId64 " tokens keep the "
                 "op-offload copies, which the compute buffer was not reserved for\n", s->min_tokens, s->min_tokens - 1);
