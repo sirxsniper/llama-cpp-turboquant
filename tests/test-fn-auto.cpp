@@ -284,7 +284,7 @@ static const l22_row k_l22_rows[] = {
     { "LLAMA_FN_L22_X_PRIOR", "0", false },
     { "LLAMA_FN_L22_X_PRIOR_STATS", "raw", false },
     { "LLAMA_FN_L22_X_RESIDENT", "0", false },
-    { "LLAMA_FN_L22_CPUSHARE", "0", false },
+    { "LLAMA_FN_L22_CPUSHARE", "2", false }, // [TAG_R35_ROUTED] mode 2 (skip only, exact) since v0.28.0
     { "LLAMA_FN_L22_CPUSHARE_MAX", "3072", false },
     { "LLAMA_FN_L22_CPUSHARE_ROWS", "8", false },
     { "LLAMA_FN_L24_KEEPVAL", "1", false }, // [TAG_FN_L24]
@@ -296,6 +296,9 @@ static const l22_row k_l22_rows[] = {
     { "LLAMA_FN_R25_REFILL_HALF_KIB", "2048", false },
     { "LLAMA_FN_R25_SBSYNC_MIB", "1024", false },
     { "LLAMA_FN_R35_SLOTBAL", "0", false }, // [TAG_R35_SLOTBAL] off by default (v0.27.0)
+    { "LLAMA_FN_R35_SBBG", "1", false }, // [TAG_R35_X_PPH]
+    { "LLAMA_FN_R35_HOSTCHAIN", "3", false }, // [TAG_R35_HOSTCHAIN]
+    { "GGML_CUDA_R35_POKE1", "1", false }, // [TAG_R35_HOSTCHAIN]
 };
 static const size_t k_n_l22_rows = sizeof(k_l22_rows)/sizeof(k_l22_rows[0]);
 const size_t k_n_l22_rows_decl = k_n_l22_rows;
@@ -327,7 +330,7 @@ static void test_l22_rows() {
         }
     }
     const char * off_names[] = { "LLAMA_FN_L22_X_TAILSKIP", "LLAMA_FN_L22_X_DEFER", "LLAMA_FN_L22_X_PRIOR", "LLAMA_FN_L22_X_RESIDENT",
-                                 "LLAMA_FN_L22_PIN", "LLAMA_FN_L22_DMASHARE", "LLAMA_FN_L22_CPUSHARE", "LLAMA_FN_L22_IMG_MAXROWS" };
+                                 "LLAMA_FN_L22_PIN", "LLAMA_FN_L22_DMASHARE", "LLAMA_FN_L22_IMG_MAXROWS" };
     for (const char * n : off_names) {
         const llama_fn_opt * o = find_opt(safe, n);
         TCHECK(o && o->value == "0", "%s stays 0 (owner)", n);

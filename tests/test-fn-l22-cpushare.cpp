@@ -587,6 +587,7 @@ static void run_scen(t_model & m, const scen & sc) {
     cfg.wait_ms   = 2000;
     cfg.late_rows = 16;
     cfg.early_kib = 0;
+    cfg.nowait    = 0; // [TAG_R35_ROUTED] these scenarios check the v0.27.0 wait rule (LLAMA_R35_CPS_NOWAIT=0)
     TCHECK(llama_fn_cpushare_configure_cfg(cfg, nullptr, owner) == sc.mode, "[%s] configure", sc.name);
     TCHECK(llama_fn_cpushare_zero_expert() == (sc.mode == 1), "[%s] zero expert iff mode 1", sc.name);
     const bool ok = llama_prefill_stream_init_layers(descs(m), cpu_device(m), owner);
@@ -751,6 +752,7 @@ static void test_no_plan(t_model & m, bool free_while_waiting) {
     llama_fn_cps_cfg cfg;
     cfg.mode    = 2;
     cfg.wait_ms = free_while_waiting ? 60000 : 30;
+    cfg.nowait  = 0; // [TAG_R35_ROUTED] the v0.27.0 wait rule (a late layer times out)
     TCHECK(llama_fn_cpushare_configure_cfg(cfg, nullptr, owner) == 2, "[%s] configure", name);
     if (!llama_prefill_stream_init_layers(descs(m), cpu_device(m), owner)) {
         TCHECK(false, "[%s] stream init", name);
