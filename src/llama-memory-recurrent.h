@@ -50,6 +50,53 @@ inline void llama_rs_write_tensor_host(llama_io_write_i & io, ggml_tensor * t, s
     }
 }
 
+// [TAG_R35_NP2PARK] a whole granule that holds rows of one cell only, and a cell's parking state (r35_alloc builds them)
+struct llama_rs_park_gran {
+    ggml_tensor * t     = nullptr; // the tensor whose row holds the granule
+    size_t        off_t = 0;       // the granule's offset in that tensor
+    size_t        off_b = 0;       // and in the buffer
+};
+
+struct llama_rs_park_cell {
+    std::vector<llama_rs_park_gran> grans;          // the whole granules that hold this cell's rows only
+    bool                            parked = false;
+    bool                            kept   = false; // the owner's last batch start kept it (a busy sequence's): no swap parks it
+    std::vector<uint8_t>            host;           // their bytes while parked (granule k at k * granule)
+};
+
+// [TAG_NP2PARK_HOSTREAD] io.write_tensor for a state save: the granules of a parked cell come from its host copy. Row r of
+// t belongs to cell r % cells.size() (row = group*size + cell), and only a row of a granule or more holds whole granules
+inline void llama_rs_write_tensor_parked(llama_io_write_i & io, ggml_tensor * t, size_t off, size_t n,
+        const std::vector<llama_rs_park_cell> & cells, size_t gran) {
+    std::vector<llama_rs_host_span> host;
+    const size_t row = t->nb[1];
+    if (!cells.empty() && gran > 0 && row >= gran) {
+        for (size_t r = off/row; r*row < off + n; ++r) {
+            const llama_rs_park_cell & pc = cells[r % cells.size()];
+            if (!pc.parked) {
+                continue;
+            }
+            for (size_t k = 0; k < pc.grans.size(); ++k) {
+                const llama_rs_park_gran & gr = pc.grans[k];
+                if (gr.t == t && gr.off_t >= r*row && gr.off_t < (r + 1)*row) {
+                    host.push_back({ gr.off_t, gran, pc.host.data() + k*gran });
+                }
+            }
+        }
+    }
+    llama_rs_write_tensor_host(io, t, off, n, host);
+}
+
+// [TAG_NP2PARK_HOSTREAD] the cells of the rows in `ranges` (row = group*size + cell), appended to `cells`
+inline void llama_rs_cells_of_rows(std::vector<uint32_t> & cells, const std::vector<std::pair<uint32_t, uint32_t>> & ranges,
+        uint32_t size) {
+    for (const auto & range : ranges) {
+        for (uint32_t i = range.first; i < range.second; ++i) {
+            cells.push_back(i % size);
+        }
+    }
+}
+
 //
 // llama_memory_recurrent
 //
@@ -249,17 +296,8 @@ private:
     void state_clear(llama_seq_id seq_id, uint32_t cell_head, uint32_t cell_count);
 
     // [TAG_R35_NP2PARK] the parking layout and state (mutable: the const state_write maps a parked cell for an on-device save)
-    struct r35_gran {
-        ggml_tensor * t     = nullptr; // the tensor whose row holds the granule
-        size_t        off_t = 0;       // the granule's offset in that tensor
-        size_t        off_b = 0;       // and in the buffer
-    };
-    struct r35_cell {
-        std::vector<r35_gran> grans;   // the whole granules that hold this cell's rows only
-        bool                  parked = false;
-        bool                  kept   = false;  // the owner's last batch start kept it (a busy sequence's): no swap parks it
-        std::vector<uint8_t>  host;    // their bytes while parked
-    };
+    using r35_gran = llama_rs_park_gran;
+    using r35_cell = llama_rs_park_cell;
     ggml_backend_buffer_t        r35_stage = nullptr;      // pinned host staging for the copies (r35_stage_n granules)
     size_t                       r35_stage_n = 0;
     void r35_copy_out(const r35_cell & pc) const;          // the cell's granules -> pc.host (through the staging)
@@ -280,8 +318,6 @@ private:
     ggml_backend_buffer_t r35_alloc(const llama_model & model, ggml_context * ctx, ggml_backend_buffer_type_t buft);
     bool r35_park_cell(uint32_t c, bool give) const;
     bool r35_unpark_cell(uint32_t c, bool take) const;
-    // [TAG_NP2PARK_HOSTREAD] io.write_tensor for a state save: the granules of a parked cell come from its host copy
-    void r35_write_tensor(llama_io_write_i & io, ggml_tensor * t, size_t off, size_t n) const;
 };
 
 class llama_memory_recurrent_context : public llama_memory_context_i {

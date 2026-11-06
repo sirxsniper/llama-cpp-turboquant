@@ -1202,27 +1202,22 @@ void llama_memory_recurrent::state_write_data(llama_io_write_i & io, const std::
     const uint32_t s_trans = 0;
     const uint32_t n_layer = hparams.n_layer();
 
-    // [TAG_NP2PARK_HOSTREAD] a parked cell stays parked: a save reads its granules from its host copy (r35_write_tensor). An
-    // on-device save maps the cells first. A row id is group*size + cell (a pending rollback reads a snapshot group). A
-    // size query reads no data, so it maps nothing.
+    // [TAG_NP2PARK_HOSTREAD] a parked cell stays parked: a save reads its granules from its host copy
+    // (llama_rs_write_tensor_parked). An on-device save maps the cells first. A row id is group*size + cell (a pending
+    // rollback reads a snapshot group). A size query reads no data, so it maps nothing.
     const bool on_device = (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) != 0;
     const bool r35_host  = r35_on && !on_device && io.reads_tensors();
     if (r35_on && on_device && io.reads_tensors()) {
         std::vector<uint32_t> need;
-        for (const auto * rs : { &cell_ranges, &cell_ranges0 }) {
-            for (const auto & range : *rs) {
-                for (uint32_t i = range.first; i < range.second; ++i) {
-                    need.push_back(i % size);
-                }
-            }
-        }
+        llama_rs_cells_of_rows(need, cell_ranges,  size);
+        llama_rs_cells_of_rows(need, cell_ranges0, size);
         if (!r35_ensure(need)) {
             throw std::runtime_error("[TAG_R35_NP2PARK] a parked recurrent cell could not be mapped for a state save");
         }
     }
     auto write_tensor = [&](ggml_tensor * t, size_t off, size_t n) {
         if (r35_host) {
-            r35_write_tensor(io, t, off, n);
+            llama_rs_write_tensor_parked(io, t, off, n, r35_cells, r35_g);
         } else {
             io.write_tensor(t, off, n);
         }
@@ -2075,27 +2070,6 @@ void llama_memory_recurrent::r35_copy_in(const r35_cell & pc) const {
         }
         k0 = k1;
     }
-}
-
-void llama_memory_recurrent::r35_write_tensor(llama_io_write_i & io, ggml_tensor * t, size_t off, size_t n) const {
-    std::vector<llama_rs_host_span> host;
-    const size_t row = t->nb[1];
-    // only a row of a granule or more holds a whole granule, and it holds only granules of its cell (row % size)
-    if (row >= r35_g) {
-        for (size_t r = off/row; r*row < off + n; ++r) {
-            const r35_cell & pc = r35_cells[r % size];
-            if (!pc.parked) {
-                continue;
-            }
-            for (size_t k = 0; k < pc.grans.size(); ++k) {
-                const r35_gran & gr = pc.grans[k];
-                if (gr.t == t && gr.off_t >= r*row && gr.off_t < (r + 1)*row) {
-                    host.push_back({ gr.off_t, r35_g, pc.host.data() + k*r35_g });
-                }
-            }
-        }
-    }
-    llama_rs_write_tensor_host(io, t, off, n, host);
 }
 
 size_t llama_memory_recurrent::r35_cell_bytes(uint32_t c) const {
