@@ -70,7 +70,7 @@ jobs:
         run: |
           cd build
           ctest --output-on-failure --timeout 900 \
-            -R '^(test-fn-.*|test-mtp-.*|test-moe-.*|test-qsa-pos|test-kv-resolve|test-turbo.*|test-server-stop|test-recurrent-state-rollback)$' \
+            -R '^(test-fn-.*|test-mtp-.*|test-moe-.*|test-qsa-pos|test-kv-resolve|test-turbo.*|test-server-stop|test-recurrent-state-rollback|test-np2park-hostread)$' \
             -E '^(test-fn-l22-two|test-fn-l22-p2|test-fn-l4-host)$'
 
       - name: Server smoke (binary runs)
@@ -113,5 +113,5 @@ jobs:
       - name: Fork unit tests (the ones registered here)
         run: |
           cd build
-          ctest -N -R '^(test-r28-penfast|test-r29-gramfast|test-v0261-pretrim|test-fn-.*|test-sampling|test-spec-block|test-mtp-.*|test-moe-.*|test-turbo.*|test-kv-resolve|test-server-stop|test-recurrent-state-rollback)$'
-          ctest --output-on-failure --timeout 900             -R '^(test-r28-penfast|test-r29-gramfast|test-v0261-pretrim|test-fn-.*|test-sampling|test-spec-block|test-mtp-.*|test-moe-.*|test-turbo.*|test-kv-resolve|test-server-stop|test-recurrent-state-rollback)$'
+          ctest -N -R '^(test-r28-penfast|test-r29-gramfast|test-v0261-pretrim|test-fn-.*|test-sampling|test-spec-block|test-mtp-.*|test-moe-.*|test-turbo.*|test-kv-resolve|test-server-stop|test-recurrent-state-rollback|test-np2park-hostread)$'
+          ctest --output-on-failure --timeout 900             -R '^(test-r28-penfast|test-r29-gramfast|test-v0261-pretrim|test-fn-.*|test-sampling|test-spec-block|test-mtp-.*|test-moe-.*|test-turbo.*|test-kv-resolve|test-server-stop|test-recurrent-state-rollback|test-np2park-hostread)$'

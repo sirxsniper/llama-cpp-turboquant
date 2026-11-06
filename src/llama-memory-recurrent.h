@@ -2,8 +2,10 @@
 
 #include "llama-batch.h"
 #include "llama-graph.h"
+#include "llama-io.h"
 #include "llama-memory.h"
 
+#include <algorithm>
 #include <map>
 #include <set>
 #include <vector>
@@ -17,6 +19,36 @@ uint32_t llama_rs_n_w(uint32_t n_seq_tokens, uint32_t n_rs_seq);
 // T - 1), so a ubatch of up to n_rs_seq tokens can be rolled back whole (the MoE bridge's retry after a failed ubatch).
 // Set by the llama_context constructor before any memory or graph exists; GDN_NW_CAP=0 has the same effect.
 void llama_rs_set_nw_full(bool full);
+
+// [TAG_NP2PARK_HOSTREAD] host bytes that stand for tensor bytes [off, off + n)
+struct llama_rs_host_span {
+    size_t          off;
+    size_t          n;
+    const uint8_t * data;
+};
+
+// [TAG_NP2PARK_HOSTREAD] io.write_tensor of tensor bytes [off, off + n), but the parts inside `host` (sorted by off, not
+// overlapping) come from their host bytes: the same bytes in the same order as one io.write_tensor
+inline void llama_rs_write_tensor_host(llama_io_write_i & io, ggml_tensor * t, size_t off, size_t n,
+        const std::vector<llama_rs_host_span> & host) {
+    const size_t end = off + n;
+    size_t cur = off;
+    for (const auto & h : host) {
+        const size_t a = std::max(h.off, cur);
+        const size_t b = std::min(h.off + h.n, end);
+        if (a >= b) {
+            continue;
+        }
+        if (a > cur) {
+            io.write_tensor(t, cur, a - cur);
+        }
+        io.write(h.data + (a - h.off), b - a);
+        cur = b;
+    }
+    if (end > cur) {
+        io.write_tensor(t, cur, end - cur);
+    }
+}
 
 //
 // llama_memory_recurrent
@@ -156,7 +188,8 @@ public:
     // [TAG_R35_NP2PARK] a multi-slot qwen4exp context keeps its recurrent rows on CUDA virtual memory: the whole granules
     // that hold one cell's rows only can leave the device (their bytes wait in host RAM, the addresses stay valid on a
     // shared alias granule) while that cell's sequence is idle, and the hot expert set holds the VRAM meanwhile (design
-    // note in the .cpp). The owner context drives it; every read or write of a cell's data maps the cell first.
+    // note in the .cpp). The owner context drives it; every read or write of a cell's data maps the cell first, except a
+    // state save, which reads a parked cell's granules from host RAM ([TAG_NP2PARK_HOSTREAD]).
     struct r35_hooks {
         size_t (*take)(void * user, size_t bytes) = nullptr; // `bytes` more VRAM from the hot set before a map
         void   (*give)(void * user, size_t bytes) = nullptr; // settle the hot set's side to the cells parked now
@@ -207,14 +240,15 @@ private:
     void state_write_meta(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges, llama_seq_id seq_id = -1) const;
     // [TAG_4C_GDN_REPLAY] cell_ranges0 (group-0 rows) and ring_live are used only with replay
     void state_write_data(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges,
-            const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges0, const std::vector<uint32_t> & ring_live) const;
+            const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges0, const std::vector<uint32_t> & ring_live,
+            llama_state_seq_flags flags) const;
 
     bool state_read_meta(llama_io_read_i & io, uint32_t cell_count, llama_seq_id dest_seq_id = -1);
     bool state_read_data(llama_io_read_i & io, uint32_t cell_count);
 
     void state_clear(llama_seq_id seq_id, uint32_t cell_head, uint32_t cell_count);
 
-    // [TAG_R35_NP2PARK] the parking layout and state (mutable: the const state_write maps a parked cell before it reads)
+    // [TAG_R35_NP2PARK] the parking layout and state (mutable: the const state_write maps a parked cell for an on-device save)
     struct r35_gran {
         ggml_tensor * t     = nullptr; // the tensor whose row holds the granule
         size_t        off_t = 0;       // the granule's offset in that tensor
@@ -246,6 +280,8 @@ private:
     ggml_backend_buffer_t r35_alloc(const llama_model & model, ggml_context * ctx, ggml_backend_buffer_type_t buft);
     bool r35_park_cell(uint32_t c, bool give) const;
     bool r35_unpark_cell(uint32_t c, bool take) const;
+    // [TAG_NP2PARK_HOSTREAD] io.write_tensor for a state save: the granules of a parked cell come from its host copy
+    void r35_write_tensor(llama_io_write_i & io, ggml_tensor * t, size_t off, size_t n) const;
 };
 
 class llama_memory_recurrent_context : public llama_memory_context_i {

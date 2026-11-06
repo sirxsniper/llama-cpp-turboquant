@@ -496,6 +496,10 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     set_tests_properties(test-recurrent-state-rollback PROPERTIES FIXTURES_REQUIRED generate-models)
 endif()
 
+# [TAG_NP2PARK_HOSTREAD] a state save of a parked recurrent cell reads the cell's granules from its host copy: the bytes and
+# the order of one tensor read, also for the rows of a snapshot group (llama_rs_write_tensor_host). CPU only, no model.
+llama_build_and_test(test-np2park-hostread.cpp)
+
 # [TAG_FUSED_BINBCAST_ALIAS] the CUDA multi-mul fusion with the last output placed over a src1 an earlier node read
 # (the MoE amax rescale chain). Built, not registered with ctest: it needs the GPU; without one it prints SKIPPED.
 llama_build(test-cuda-fused-mul-alias.cpp)
