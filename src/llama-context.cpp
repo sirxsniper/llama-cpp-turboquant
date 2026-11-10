@@ -3598,7 +3598,11 @@ void llama_context::set_nextn_layer_offset(int32_t offset) {
 void llama_context::set_causal_attn(bool value) {
     LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
 
-    // no scheduler reserve needed because graph shapes must not depend on causal_attn, a flip only rebuilds the graph
+    // [TAG_R38_SYNC] upstream #29730 dropped the early return (its setter never reserves); the fork re-reserves on a flip
+    // with flash attention (below), so a call that changes nothing must not ask for a reserve
+    if (cparams.causal_attn == value) {
+        return;
+    }
 
     cparams.causal_attn = value;
 
