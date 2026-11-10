@@ -6,9 +6,9 @@
 extern "C" {
 #endif
 
-#define RPC_PROTO_MAJOR_VERSION    8
+#define RPC_PROTO_MAJOR_VERSION    9
 #define RPC_PROTO_MINOR_VERSION    0
-#define RPC_PROTO_PATCH_VERSION    1
+#define RPC_PROTO_PATCH_VERSION    0
 
 #ifdef  __cplusplus
 static_assert(GGML_OP_COUNT == 110, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");  // upstream 102 + 8 fork ops (TURBO_WHT, TURBOT_SET_ROWS, GATED_DELTA_NET_REPLAY, MOE_HOST_POST/WAIT/FETCH/SUM, QSA_MASK)
