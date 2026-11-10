@@ -269,6 +269,10 @@ extern "C" {
     GGML_BACKEND_API void                           ggml_cpu_moe_pool_wake(struct ggml_cpu_moe_pool * pool);
     // [TAG_MOE_BRIDGE] true if ggml_cpu_moe_run takes jobs of this layer (weight types and shapes)
     GGML_BACKEND_API bool                           ggml_cpu_moe_layer_supported(const struct ggml_cpu_moe_layer * layer);
+    // [TAG_R38_E2] per-expert f32 scales ([n_expert] each, host memory that outlives every job) of the layer whose gate
+    // weight is gate: the fused MoE kernels multiply the up / gate outputs before the GLU and the down outputs before the
+    // weighted sum, as the graph's ggml_mul of the scale rows (ModelOpt NVFP4 weight_scale_2). false: table full.
+    GGML_BACKEND_API bool                           ggml_cpu_fn_moe_set_scales(const struct ggml_tensor * gate, const float * s_up, const float * s_gate, const float * s_down);
 
     // [TAG_FN_R2_BRIDGE_PF] next-layer prefetch, for the idle time between two jobs of a GPU/CPU doorbell: the workers
     // predict the experts of the next MoE layer (top-k of its router logits on the current layer's input, per token),

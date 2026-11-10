@@ -2896,9 +2896,22 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // NaN (CPUSHARE=2 PPL -nan; r22 end test T2, FAULT 2026-10-18 23:21:22). Pinned to the
     // stream's device here; the gate before the router (no CPUSHARE) leaves the scheduler's choice unchanged
     ggml_backend_t cs_dev = cs_defer_gate && sched ? llama_prefill_stream_device() : nullptr;
+    // [TAG_R38_E2] a matmul with per-expert scales comes back from build_lora_mm_id as MUL(MUL_MAT_ID, scale rows): the
+    // pin and the skip table belong on the MUL_MAT_ID too (v0.28.1 pinned only the MUL, so the matmul took the CPU after
+    // the deferred gate split and read the bank over device-to-host copies: a fresh 32K prompt ran at ~55 t/s)
+    const bool r38_mmid = llama_r38_fp4s() && (up_exps_s || gate_exps_s || down_exps_s);
+    auto r38_inner_mmid = [&](ggml_tensor * t) -> ggml_tensor * {
+        if (r38_mmid && t && t->op == GGML_OP_MUL && t->src[0] && t->src[0]->op == GGML_OP_MUL_MAT_ID) {
+            return t->src[0];
+        }
+        return nullptr;
+    };
     auto pin_cs_dev = [&](ggml_tensor * t) {
         if (cs_dev && t) {
             ggml_backend_sched_set_tensor_backend(sched, t, cs_dev);
+            if (ggml_tensor * mm = r38_inner_mmid(t)) {
+                ggml_backend_sched_set_tensor_backend(sched, mm, cs_dev);
+            }
         }
     };
 
@@ -2911,9 +2924,14 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     const int hot_max_t = llama_moe_hot_max_t();
     const llama_moe_cache_layer * mcache = nullptr;
     ggml_tensor * mc_slot_ids = nullptr;
+    // [TAG_R38_E2] per-expert output scales (an NVFP4 checkpoint's weight_scale_2, all three, no biases) take the speed
+    // paths too: the device chains multiply their up / gate / down outputs by the scale rows (r38_scale_rows below), the
+    // host bridge's pool by the same values (registered at the bridge's creation); LLAMA_R38_FP4S=0: v0.28.1
+    const bool r38_scaled = llama_r38_fp4s() && up_exps_s && gate_exps_s && down_exps_s && !gate_up_exps &&
+        !up_exps_b && !gate_exps_b && !down_exps_b;
     const bool slot_chain_ok = !gate_up_exps && gate_exps && down_exps &&
         !up_exps_b && !gate_exps_b && !down_exps_b &&
-        !up_exps_s && !gate_exps_s && !down_exps_s &&
+        (r38_scaled || (!up_exps_s && !gate_exps_s && !down_exps_s)) &&
         type_op == LLM_FFN_SILU && !weight_before_ffn && loras->empty();
     // [TAG_FN_L4_MEM_PROMPT] llama_moe_hot_graph_max_t: also the short prompt path's ubatches with LLAMA_FN_L4_PROMPT_HOT
     if ((n_tokens == 1 || n_tokens <= hot_max_t || (hot_max_t > 0 && n_tokens <= llama_moe_hot_graph_max_t())) && slot_chain_ok) {
@@ -2958,7 +2976,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     if (br_any && il >= 0 && llama_moe_bridge_fits(br_any, (int) n_tokens, 1) &&
         n_expert_used <= llama_moe_bridge_n_used(br_any) &&
         !gate_up_exps && gate_exps && down_exps && !up_exps_b && !gate_exps_b && !down_exps_b &&
-        !up_exps_s && !gate_exps_s && !down_exps_s && type_op == LLM_FFN_SILU && !weight_before_ffn &&
+        (r38_scaled || (!up_exps_s && !gate_exps_s && !down_exps_s)) && type_op == LLM_FFN_SILU && !weight_before_ffn &&
         loras->empty() && !(hparams.swiglu_clamp_exp[il] > 1e-6f) &&
         llama_moe_bridge_layer(br_any, up_exps, &br_id, &br_chan) &&
         // [TAG_FN_L22_TBO] a chain's posts go to its own channel set (the sync op of a paused bridge needs none)
@@ -3078,7 +3096,27 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // device-side chain over the cached experts, mirroring the LLM_FFN_SILU activation below (the only type_op the
     // cache path is enabled for); uncached ids map to the zero slot
     // [TAG_MOE_DMA_SHARE] the same chain over the DMA bank (dma = true)
-    auto build_slot_chain = [&](ggml_tensor * up_c, ggml_tensor * gate_c, ggml_tensor * down_c, ggml_tensor * slot_ids, bool dma) -> ggml_tensor * {
+    // [TAG_R38_E2] the scale rows of every routed (slot, token), by expert id: [1, n_expert_used*n_tokens] each (up, gate,
+    // down); a chain over tokens [t0, t0 + nt) takes the matching contiguous piece, shaped like its outputs' dims 1 and 2
+    ggml_tensor * r38_rows[3] = { nullptr, nullptr, nullptr };
+    if (r38_scaled) {
+        ggml_tensor * ids_e = ggml_reshape_1d(ctx0, ggml_cont(ctx0, selected_experts), n_expert_used*n_tokens);
+        ggml_tensor * ss[3] = { up_exps_s, gate_exps_s, down_exps_s };
+        for (int k = 0; k < 3; ++k) {
+            r38_rows[k] = ggml_get_rows(ctx0, ggml_reshape_2d(ctx0, ss[k], 1, n_expert), ids_e); // [1, n_used*n_tokens]
+        }
+        cb(r38_rows[1], "ffn_moe_r38_gate_s", il);
+    }
+    auto r38_scale_rows = [&](ggml_tensor * x, int k, int64_t t0) -> ggml_tensor * {
+        // x: [n, a, b] with a*b rows of the routed (slot, token) pairs t0*n_used ... in order
+        const int64_t n_rows = x->ne[1]*x->ne[2];
+        ggml_tensor * r = ggml_view_3d(ctx0, r38_rows[k], 1, x->ne[1], x->ne[2], sizeof(float), x->ne[1]*sizeof(float),
+                (size_t) t0*n_expert_used*sizeof(float));
+        GGML_ASSERT(t0*n_expert_used + n_rows <= n_expert_used*n_tokens);
+        return ggml_mul(ctx0, x, r);
+    };
+    auto build_slot_chain = [&](ggml_tensor * up_c, ggml_tensor * gate_c, ggml_tensor * down_c, ggml_tensor * slot_ids, bool dma,
+            int64_t r38_t0 = 0) -> ggml_tensor * {
         // [TAG_FN_L3_GPU_ZSKIP] an arch's mark for the slot ids: the last slot of the slot tensors is the zero slot
         if (moe_zskip_mark != 0 && up_c->ne[2] == gate_c->ne[2] && up_c->ne[2] == down_c->ne[2]) {
             ggml_fn_l3_set(slot_ids, moe_zskip_mark);
@@ -3087,6 +3125,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         ggml_tensor * gate_g = ggml_mul_mat_id(ctx0, gate_c, mc_inp, slot_ids);
         cb(up_g,   dma ? "ffn_moe_dma_up"   : "ffn_moe_cache_up",   il);
         cb(gate_g, dma ? "ffn_moe_dma_gate" : "ffn_moe_cache_gate", il);
+        if (r38_scaled) { // [TAG_R38_E2]
+            up_g   = r38_scale_rows(up_g,   0, r38_t0);
+            gate_g = r38_scale_rows(gate_g, 1, r38_t0);
+        }
 
         ggml_tensor * act_g = nullptr;
         {
@@ -3108,6 +3150,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         }
 
         ggml_tensor * down_g = ggml_mul_mat_id(ctx0, down_c, act_g, slot_ids);
+        if (r38_scaled) { // [TAG_R38_E2]
+            down_g = r38_scale_rows(down_g, 2, r38_t0);
+        }
         cb(down_g, dma ? "ffn_moe_dma_down" : "ffn_moe_cache_down", il);
         return down_g;
     };
@@ -3131,7 +3176,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                 ggml_tensor * rep = ggml_repeat_4d(ctx0, inp, inp_all->ne[0], nu, nt, 1); // [n_embd, k, nt]
                 mc_inp = ggml_reshape_3d(ctx0, rep, inp_all->ne[0], 1, nu*nt);
                 ggml_tensor * ids = ggml_reshape_2d(ctx0, sid, 1, nu*nt);
-                ggml_tensor * d   = build_slot_chain(mcache->up_c, mcache->gate_c, mcache->down_c, ids, false); // [n_embd, 1, k*nt]
+                ggml_tensor * d   = build_slot_chain(mcache->up_c, mcache->gate_c, mcache->down_c, ids, false, t0); // [n_embd, 1, k*nt]
                 d   = ggml_reshape_3d(ctx0, d, d->ne[0], nu, nt);
                 out = out ? ggml_concat(ctx0, out, d, 2) : d;
             }
@@ -3151,7 +3196,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                         t0*inp_all->nb[2]);
                 ggml_tensor * ids = ggml_view_2d(ctx0, mc_slot_ids, mc_slot_ids->ne[0], nt, mc_slot_ids->nb[1],
                         t0*mc_slot_ids->nb[1]);
-                ggml_tensor * d = build_slot_chain(mcache->up_c, mcache->gate_c, mcache->down_c, ids, false);
+                ggml_tensor * d = build_slot_chain(mcache->up_c, mcache->gate_c, mcache->down_c, ids, false, t0);
                 out = out ? ggml_concat(ctx0, out, d, 2) : d;
             }
             mc_inp = inp_all;
@@ -3161,6 +3206,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     };
     // expert skip table of the CPU MUL_MAT_IDs: the DMA plan's (hot + DMA) or the hot set's
     auto set_skip = [&](ggml_tensor * t) {
+        if (ggml_tensor * mm = r38_inner_mmid(t)) { // [TAG_R38_E2] the skip table is the MUL_MAT_ID's (src[3])
+            t = mm;
+        }
         if (dma_tbl) {
             t->src[3] = dma_tbl;
             t->op_params[0] = 0;

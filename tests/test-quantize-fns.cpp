@@ -579,6 +579,7 @@ static int test_fn_mmid_mr(bool verbose) {
         { GGML_TYPE_Q5_1,   2, { 32, 96, 640, 672, 2560 } }, // d, m
         { GGML_TYPE_Q8_0,   1, { 32, 96, 640, 672, 2560 } }, // d
         { GGML_TYPE_IQ4_NL, 1, { 32, 96, 640, 672, 2560 } }, // d
+        { GGML_TYPE_NVFP4,  0, { 64, 192, 640, 2560 } },     // [TAG_R38_E2] raw UE4M3 sub-block scales
     };
 
     const int saved_mr   = ggml_cpu_fn_get_switch(GGML_CPU_FN_MMID_MR);

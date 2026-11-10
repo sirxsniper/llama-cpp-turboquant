@@ -1,4 +1,7 @@
 #include "llama-moe-bridge.h"
+#include <array>
+#include <map>
+#include <mutex>
 #include "llama-fn-l22.h" // [TAG_FN_L22_DMASHARE] round 22 hooks
 #include "llama-fn-prior.h" // [TAG_FN_L22_X_PRIOR]
 #include "llama-fn-tbo.h" // [TAG_FN_L22_TBO] two-chain decode: the channel layout
@@ -1131,6 +1134,46 @@ bool llama_moe_bridge_wanted(const llama_model & model) {
     return false;
 }
 
+
+// [TAG_R38_E2] LLAMA_R38_FP4S: see llama-moe-bridge.h
+bool llama_r38_fp4s() {
+    static const bool on = [] {
+        const char * e = getenv("LLAMA_R38_FP4S");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    return on;
+}
+
+// [TAG_R38_E2] host copies of a scaled layer's per-expert scales (they may live in device memory), registered with the CPU
+// MoE kernels under the layer's gate weight. Kept for the process's life (a few KiB per layer), so a job never reads freed
+// memory whichever context made the bridge.
+static bool br_r38_register_scales(ggml_backend_reg_t cpu_reg, const llama_layer & l, int il) {
+    using set_scales_t = bool (*)(const ggml_tensor *, const float *, const float *, const float *);
+    static std::mutex mtx;
+    static std::map<const ggml_tensor *, std::array<std::vector<float>, 3>> store;
+    auto set_scales = (set_scales_t) ggml_backend_reg_get_proc_address(cpu_reg, "ggml_cpu_fn_moe_set_scales");
+    const int64_t n_expert = l.ffn_up_exps->ne[2];
+    const ggml_tensor * ss[3] = { l.ffn_up_exps_s, l.ffn_gate_exps_s, l.ffn_down_exps_s };
+    for (const ggml_tensor * t : ss) {
+        if (set_scales == nullptr || t == nullptr || t->type != GGML_TYPE_F32 || ggml_nelements(t) != n_expert || t->buffer == nullptr) {
+            LLAMA_LOG_WARN("%s: layer %d: per-expert scales the CPU MoE pool cannot take (%s), the layer keeps its CPU split\n",
+                    __func__, il, set_scales == nullptr ? "no ggml_cpu_fn_moe_set_scales" : "type / shape / buffer");
+            return false;
+        }
+    }
+    std::lock_guard<std::mutex> lk(mtx);
+    auto & st = store[l.ffn_gate_exps];
+    for (int k = 0; k < 3; ++k) {
+        st[k].resize((size_t) n_expert);
+        ggml_backend_tensor_get(ss[k], st[k].data(), 0, (size_t) n_expert*sizeof(float));
+    }
+    if (!set_scales(l.ffn_gate_exps, st[0].data(), st[1].data(), st[2].data())) {
+        LLAMA_LOG_WARN("%s: layer %d: the CPU MoE scale table is full, the layer keeps its CPU split\n", __func__, il);
+        return false;
+    }
+    return true;
+}
+
 llama_moe_bridge * llama_moe_bridge_create(const llama_model & model, int n_threads, int max_t_cap, int seq_t_cap, int n_chains) {
     if (env_int("LLAMA_MOE_BRIDGE", 0) <= 0) {
         return nullptr;
@@ -1180,7 +1223,12 @@ llama_moe_bridge * llama_moe_bridge_create(const llama_model & model, int n_thre
             continue;
         }
         if (l.ffn_up_exps_b || l.ffn_gate_exps_b || l.ffn_down_exps_b || l.ffn_up_exps_s || l.ffn_gate_exps_s || l.ffn_down_exps_s) {
-            continue;
+            // [TAG_R38_E2] per-expert scales without biases: the pool applies them (registered below)
+            const bool scaled_ok = llama_r38_fp4s() && !l.ffn_up_exps_b && !l.ffn_gate_exps_b && !l.ffn_down_exps_b &&
+                l.ffn_up_exps_s && l.ffn_gate_exps_s && l.ffn_down_exps_s;
+            if (!scaled_ok) {
+                continue;
+            }
         }
         const ggml_tensor * ws[3] = { l.ffn_up_exps, l.ffn_gate_exps, l.ffn_down_exps };
         bool host = true;
@@ -1200,6 +1248,10 @@ llama_moe_bridge * llama_moe_bridge_create(const llama_model & model, int n_thre
         if (!layer_supported(&cl)) {
             LLAMA_LOG_WARN("%s: layer %zu: the CPU MoE pool does not take up %s / gate %s / down %s, the layer keeps its CPU split\n",
                     __func__, il, ggml_type_name(cl.up->type), ggml_type_name(cl.gate->type), ggml_type_name(cl.down->type));
+            n_skipped++;
+            continue;
+        }
+        if (l.ffn_gate_exps_s && !br_r38_register_scales(cpu_reg, l, (int) il)) { // [TAG_R38_E2]
             n_skipped++;
             continue;
         }

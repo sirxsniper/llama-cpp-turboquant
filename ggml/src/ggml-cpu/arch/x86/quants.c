@@ -5204,4 +5204,66 @@ void ggml_vec_dot_iq4_nl_q8_0_mr(int n, float * GGML_RESTRICT s, size_t bs, cons
     GGML_FN_MR_ROWS(block_iq4_nl, block_q8_0, QK4_NL, ggml_fn_iq4_nl_row_avx2);
 }
 
+// [TAG_R38_E2] NVFP4 x q8_0 for up to 4 columns per weight row: the E2M1 codes of a block are decoded once for all
+// columns; every column runs the exact steps of ggml_vec_dot_nvfp4_q8_0's AVX2 body (same products, same scales, same
+// fma order, same final hsum), so each value is bitwise equal to that vec_dot.
+static GGML_FN_INLINE void ggml_fn_nvfp4_col_avx2(const __m256i q4_01, const __m256i q4_23, const float d0, const float d1,
+        const float d2, const float d3, const block_q8_0 * GGML_RESTRICT y, const int ib, const __m256i mone, __m256 * acc) {
+    const __m256i q8_01 = _mm256_loadu_si256((const __m256i *) y[2*ib + 0].qs);
+    const __m256i q8_23 = _mm256_loadu_si256((const __m256i *) y[2*ib + 1].qs);
+    const __m256i p_1 = _mm256_madd_epi16(mul_add_epi8(q4_01, q8_01), mone);
+    const __m256i p_2 = _mm256_madd_epi16(mul_add_epi8(q4_23, q8_23), mone);
+    const float dy0 = GGML_CPU_FP16_TO_FP32(y[2*ib].d);
+    const float dy1 = GGML_CPU_FP16_TO_FP32(y[2*ib+1].d);
+    const float s0 = d0 * dy0;
+    const float s1 = d1 * dy0;
+    const float s2 = d2 * dy1;
+    const float s3 = d3 * dy1;
+    const __m256 scales01 = _mm256_set_m128(_mm_set1_ps(s1), _mm_set1_ps(s0));
+    const __m256 scales23 = _mm256_set_m128(_mm_set1_ps(s3), _mm_set1_ps(s2));
+    *acc = _mm256_fmadd_ps(scales01, _mm256_cvtepi32_ps(p_1), *acc);
+    *acc = _mm256_fmadd_ps(scales23, _mm256_cvtepi32_ps(p_2), *acc);
+}
+
+static GGML_FN_INLINE void ggml_fn_nvfp4_row_avx2(const int nb, const block_nvfp4 * GGML_RESTRICT x,
+        const block_q8_0 * y0, const block_q8_0 * y1, const block_q8_0 * y2, const block_q8_0 * y3,
+        const int nc, float * GGML_RESTRICT s, const size_t bs) {
+    const __m128i values128 = _mm_loadu_si128((const __m128i *) kvalues_fp4);
+    const __m128i m4b  = _mm_set1_epi8(0x0f);
+    const __m256i mone = _mm256_set1_epi16(1);
+    __m256 a0 = _mm256_setzero_ps();
+    __m256 a1 = a0;
+    __m256 a2 = a0;
+    __m256 a3 = a0;
+    for (int ib = 0; ib < nb; ++ib) {
+        const __m128i q4bits_01 = _mm_loadu_si128((const __m128i *) (x[ib].qs + 0));
+        const __m128i q4bits_23 = _mm_loadu_si128((const __m128i *) (x[ib].qs + 16));
+        const __m128i q4_01_lo = _mm_shuffle_epi8(values128, _mm_and_si128(q4bits_01, m4b));
+        const __m128i q4_01_hi = _mm_shuffle_epi8(values128, _mm_and_si128(_mm_srli_epi16(q4bits_01, 4), m4b));
+        const __m128i q4_23_lo = _mm_shuffle_epi8(values128, _mm_and_si128(q4bits_23, m4b));
+        const __m128i q4_23_hi = _mm_shuffle_epi8(values128, _mm_and_si128(_mm_srli_epi16(q4bits_23, 4), m4b));
+        const __m256i q4_01 = MM256_SET_M128I(_mm_unpackhi_epi64(q4_01_lo, q4_01_hi), _mm_unpacklo_epi64(q4_01_lo, q4_01_hi));
+        const __m256i q4_23 = MM256_SET_M128I(_mm_unpackhi_epi64(q4_23_lo, q4_23_hi), _mm_unpacklo_epi64(q4_23_lo, q4_23_hi));
+        const float d0 = GGML_CPU_UE4M3_TO_FP32(x[ib].d[0]);
+        const float d1 = GGML_CPU_UE4M3_TO_FP32(x[ib].d[1]);
+        const float d2 = GGML_CPU_UE4M3_TO_FP32(x[ib].d[2]);
+        const float d3 = GGML_CPU_UE4M3_TO_FP32(x[ib].d[3]);
+        ggml_fn_nvfp4_col_avx2(q4_01, q4_23, d0, d1, d2, d3, y0, ib, mone, &a0);
+        if (nc > 1) { ggml_fn_nvfp4_col_avx2(q4_01, q4_23, d0, d1, d2, d3, y1, ib, mone, &a1); }
+        if (nc > 2) { ggml_fn_nvfp4_col_avx2(q4_01, q4_23, d0, d1, d2, d3, y2, ib, mone, &a2); }
+        if (nc > 3) { ggml_fn_nvfp4_col_avx2(q4_01, q4_23, d0, d1, d2, d3, y3, ib, mone, &a3); }
+    }
+    s[0] = hsum_float_8(a0);
+    if (nc > 1) { s[1*bs] = hsum_float_8(a1); }
+    if (nc > 2) { s[2*bs] = hsum_float_8(a2); }
+    if (nc > 3) { s[3*bs] = hsum_float_8(a3); }
+}
+
+void ggml_vec_dot_nvfp4_q8_0_mr(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, int nr,
+                                const void * const * GGML_RESTRICT vy, int nc) {
+    assert(n % QK_NVFP4 == 0);
+    assert(nc >= 1 && nc <= GGML_CPU_FN_MR_MAX_NC);
+    GGML_FN_MR_ROWS(block_nvfp4, block_q8_0, QK_NVFP4, ggml_fn_nvfp4_row_avx2);
+}
+
 #endif // GGML_CPU_FN_X86

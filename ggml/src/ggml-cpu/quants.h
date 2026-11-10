@@ -81,6 +81,7 @@ void ggml_vec_dot_q5_K_q8_K_mr  (int n, float * GGML_RESTRICT s, size_t bs, cons
 void ggml_vec_dot_q5_1_q8_1_mr  (int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, int nr, const void * const * GGML_RESTRICT vy, int nc);
 void ggml_vec_dot_q8_0_q8_0_mr  (int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, int nr, const void * const * GGML_RESTRICT vy, int nc);
 void ggml_vec_dot_iq4_nl_q8_0_mr(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, int nr, const void * const * GGML_RESTRICT vy, int nc);
+void ggml_vec_dot_nvfp4_q8_0_mr(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, int nr, const void * const * GGML_RESTRICT vy, int nc); // [TAG_R38_E2]
 #endif
 
 void ggml_vec_dot_mxfp4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
