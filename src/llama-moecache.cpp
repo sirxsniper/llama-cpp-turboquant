@@ -6486,6 +6486,23 @@ size_t llama_moe_hot_np2_hold(const void * owner, size_t target) {
     return mc->np2_out;
 }
 
+// [TAG_R38_E3] see llama-moecache.h; read on the decode thread, as _np2_hold's callers do
+bool llama_moe_hot_np2_settled(size_t target) {
+    const moe_cache * mc = g_cache;
+    if (!mc || mc->kv_bytes == 0 || target == mc->np2_out) {
+        return true;
+    }
+    if (!mc->sl_on || mc->np2_out < target) {
+        return false; // a take, or the layer lend's byte path
+    }
+    for (size_t g = 0; g < mc->sl_np2.size() && g < mc->sl_given.size(); ++g) {
+        if (mc->sl_np2[g] && mc->sl_given[g] > 0 && mc->np2_out >= target + mc->sl_given[g]) {
+            return false; // this group can go back
+        }
+    }
+    return true;
+}
+
 size_t llama_moe_hot_np2_out() {
     const moe_cache * mc = g_cache;
     return mc ? mc->np2_out : 0;

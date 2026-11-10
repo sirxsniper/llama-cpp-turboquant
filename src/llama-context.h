@@ -739,6 +739,21 @@ private:
     int64_t  r35_one_since   = 0;       // since when one sequence is busy after a wider period (us; 0: not counting)
     int64_t  r35_hold_us     = 3000000;
     uint64_t r35_n_wide = 0, r35_n_narrow = 0;
+    // [TAG_R38_E3] LLAMA_R38_NP2LOG (default 1; 0 = the v0.28.1 lines): what the idle slot's share gives the hot set NOW
+    // (the switch line printed the parked bytes' net change, 0 for a swap), and a summary per 10 minutes of batches:
+    // the time-weighted MiB lent, the share of the time with all of it lent, the moves. LLAMA_R38_NP2SETTLE (default 1;
+    // 0 = v0.28.1): a settle that would move nothing (the share's whole groups are coarser than its target) skips the
+    // synchronize of every context before it
+    int      r38_log         = -1;      // -1: not read yet
+    int      r38_settle_skip = -1;
+    int64_t  r38_t_prev      = 0;       // the last batch start (us)
+    int64_t  r38_t_rep       = 0;       // the last summary (us)
+    double   r38_mib_s       = 0.0;     // integral of the MiB lent over the period (MiB x s)
+    double   r38_full_s      = 0.0;     // seconds with all of the fit's share lent
+    double   r38_span_s      = 0.0;     // seconds counted (gaps between batches capped at 60 s)
+    uint64_t r38_n_skip      = 0;       // settles that skipped the synchronize
+    int64_t  r35_lent_now() const;      // [TAG_R38_E3] the share's bytes the hot set holds now (the fit's want - the share out)
+    void     r38_account(int64_t now);  // [TAG_R38_E3] the period's integral and the summary line
     llama_memory_recurrent * r35_mem = nullptr;
     size_t   r35_target() const;        // the share the hot set should hold now
     void     r35_settle();              // the hot set holds r35_target()

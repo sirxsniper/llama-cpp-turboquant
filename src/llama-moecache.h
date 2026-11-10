@@ -181,6 +181,9 @@ void   llama_moe_hot_vis_give();
 // without this share (_kv_release_kvside / _kv_restore_kvside add it to their absolute need).
 size_t llama_moe_hot_np2_hold(const void * owner, size_t target);
 size_t llama_moe_hot_np2_out();
+// [TAG_R38_E3] true when _np2_hold(target) would move nothing: the share holds at least `target` and none of its groups can
+// go back without dropping below it (a whole group is coarser than the target: 2 x 261 MiB held for a 288 MiB cell)
+bool   llama_moe_hot_np2_settled(size_t target);
 size_t llama_moe_hot_kv_release_kvside(const void * owner, size_t need);
 size_t llama_moe_hot_kv_restore_kvside(const void * owner, size_t keep);
 
