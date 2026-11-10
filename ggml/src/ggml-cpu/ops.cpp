@@ -9935,8 +9935,8 @@ void ggml_compute_forward_flash_attn_ext(
         ggml_compute_forward_flash_attn_ext_split_plane(params, dst);
         return;
     }
-    switch (dst->op_params[3]) {
-        case GGML_PREC_DEFAULT:
+    switch (ggml_prec_get_acc(dst)) {
+        case GGML_PREC_UNDEFINED:
         case GGML_PREC_F32:
         case GGML_PREC_BF16:
             {

@@ -1069,6 +1069,7 @@ public:
 
     // [TAG_MOE_BRIDGE] MoE layers of this graph that post to the host bridge
     int n_moe_bridge = 0;
+    std::vector<ggml_tensor *> t_sampling_all;
 
     std::vector<llm_graph_input_ptr> inputs;
     std::vector<llm_graph_fused_node> fused_nodes;
