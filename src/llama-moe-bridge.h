@@ -210,3 +210,8 @@ uint32_t llama_moe_bridge_ple_ticket(const llama_moe_bridge * br);
 // false on a failure (zeros and the bridge error then); then the device wait for the ticket may go on
 void     llama_moe_bridge_ple_fill  (const llama_moe_bridge * br, uint32_t ticket, int32_t n_tokens,
                                      bool (*fill)(float * out, void * ud), void * ud);
+
+// [TAG_R38_E2] LLAMA_R38_FP4S (default 1): MoE layers with per-expert output scales (ModelOpt NVFP4 checkpoints,
+// blk.N.ffn_*_exps.scale) take the Flash-Next speed paths (hot set, host bridge, DMA bank) with the scales applied there;
+// 0 = v0.28.1 (those layers run the plain mul_mat_id + ggml_mul path only, the scale tensors follow the -ot/--n-cpu-moe rules)
+bool llama_r38_fp4s();

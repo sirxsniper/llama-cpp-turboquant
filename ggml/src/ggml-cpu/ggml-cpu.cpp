@@ -811,6 +811,9 @@ static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const ch
     if (strcmp(name, "ggml_cpu_moe_pool_wake") == 0) {
         return (void *)ggml_cpu_moe_pool_wake;
     }
+    if (strcmp(name, "ggml_cpu_fn_moe_set_scales") == 0) { // [TAG_R38_E2]
+        return (void *)ggml_cpu_fn_moe_set_scales;
+    }
     if (strcmp(name, "ggml_cpu_moe_layer_supported") == 0) {
         return (void *)ggml_cpu_moe_layer_supported;
     }

@@ -2243,7 +2243,53 @@ struct ggml_fn_moe_ctx {
     int               stag;      // [TAG_FN_L22_POOL_STAGGER] G of a split >= 1 job, else 0
     int               rot;       // [TAG_FN_L22_POOL_STAGGER] this thread's first act position (0: none)
     const uint8_t *   tsk;       // [TAG_FN_L22_X_TAILSKIP] or NULL: [n_expert], 1 = the tail rule drops the expert
+    const float *     s_u;       // [TAG_R38_E2] or NULL: [n_expert] f32 scale of the up / gate / down outputs (an NVFP4
+    const float *     s_g;       //              checkpoint's per-expert global scale), applied as the graph's ggml_mul of
+    const float *     s_d;       //              the scale rows: up / gate before the GLU, down before the weighted sum
 };
+
+// [TAG_R38_E2] per-expert scales of the host MoE layers, keyed by the gate weight: set once by the bridge (llama) at its
+// creation, before any job; read by ggml_fn_moe_compute (pool jobs and the MOE_HOST_SUM sync op). LLAMA_R38_FP4S=0 never
+// registers one, so every job runs as in v0.28.1.
+#define GGML_FN_MOE_SCALES_MAX 256
+static struct ggml_fn_moe_scales_ent {
+    const struct ggml_tensor * gate;
+    const float * s_u;
+    const float * s_g;
+    const float * s_d;
+} ggml_fn_moe_scales[GGML_FN_MOE_SCALES_MAX];
+static atomic_int ggml_fn_moe_scales_n = 0;
+
+bool ggml_cpu_fn_moe_set_scales(const struct ggml_tensor * gate, const float * s_u, const float * s_g, const float * s_d) {
+    const int n = atomic_load(&ggml_fn_moe_scales_n);
+    for (int i = 0; i < n; ++i) {
+        if (ggml_fn_moe_scales[i].gate == gate) {
+            ggml_fn_moe_scales[i].s_u = s_u;
+            ggml_fn_moe_scales[i].s_g = s_g;
+            ggml_fn_moe_scales[i].s_d = s_d;
+            return true;
+        }
+    }
+    if (n >= GGML_FN_MOE_SCALES_MAX) {
+        return false;
+    }
+    ggml_fn_moe_scales[n].gate = gate;
+    ggml_fn_moe_scales[n].s_u  = s_u;
+    ggml_fn_moe_scales[n].s_g  = s_g;
+    ggml_fn_moe_scales[n].s_d  = s_d;
+    atomic_store(&ggml_fn_moe_scales_n, n + 1);
+    return true;
+}
+
+static const struct ggml_fn_moe_scales_ent * ggml_fn_moe_scales_get(const struct ggml_tensor * gate) {
+    const int n = atomic_load_explicit(&ggml_fn_moe_scales_n, memory_order_acquire);
+    for (int i = 0; i < n; ++i) {
+        if (ggml_fn_moe_scales[i].gate == gate) {
+            return &ggml_fn_moe_scales[i];
+        }
+    }
+    return NULL;
+}
 
 // [TAG_FN_L22_POOL_STAGGER] the first act position of thread t's walk
 static inline int ggml_fn_moe_rot(const struct ggml_fn_moe_ctx * c, int t) {
@@ -2309,6 +2355,16 @@ static size_t ggml_fn_moe_piece_gu(const struct ggml_fn_moe_ctx * c, int kk, int
         }
         ggml_fn_moe_dots(c->dot_g, c->mr_g, c->n_embd, gv, (size_t) c->pr, wg_e, c->wg->nb[1], nr, cg, nc);
         ggml_fn_moe_dots(c->dot_u, c->mr_u, c->n_embd, uv, (size_t) c->pr, wu_e, c->wu->nb[1], nr, cu, nc);
+        if (c->s_g) { // [TAG_R38_E2]
+            const float sg = c->s_g[ak[0]];
+            const float su = c->s_u[ak[0]];
+            for (int q = 0; q < nc; ++q) {
+                for (int64_t i = 0; i < nr; ++i) {
+                    gv[q*c->pr + i] *= sg;
+                    uv[q*c->pr + i] *= su;
+                }
+            }
+        }
         for (int q = 0; q < nc; ++q) {
             ggml_vec_swiglu_f32((int) nr, hv, gv + q*c->pr, uv + q*c->pr);
             char * hrow = c->hq + (size_t) sl[q]*c->rs_d; // sl = slot + n_used*t: the row of (slot, t)
@@ -2345,6 +2401,14 @@ static size_t ggml_fn_moe_piece_down(const struct ggml_fn_moe_ctx * c, int kk, i
             cd[q] = c->hq + (size_t) sl[q]*c->rs_d;
         }
         ggml_fn_moe_dots(c->dot_d, c->mr_d, c->n_ff, dv, (size_t) pd, wd_e, c->wd->nb[1], nr, cd, nc);
+        if (c->s_d) { // [TAG_R38_E2]
+            const float sd = c->s_d[ak[0]];
+            for (int q = 0; q < nc; ++q) {
+                for (int64_t i = 0; i < nr; ++i) {
+                    dv[q*pd + i] *= sd;
+                }
+            }
+        }
         for (int q = 0; q < nc; ++q) {
             const int slot = sl[q] % c->n_used;
             const int t    = sl[q]/c->n_used;
@@ -2802,6 +2866,12 @@ void ggml_fn_moe_compute(const struct ggml_fn_moe_args * a, int ith, int nth, vo
     c.stag   = a->split >= 1 && a->stagger > 0 ? MIN(a->stagger, 64) : 0; // [TAG_FN_L22_POOL_STAGGER]
     c.rot    = ggml_fn_moe_rot(&c, ith);
     c.tsk    = tsk; // [TAG_FN_L22_X_TAILSKIP]
+    { // [TAG_R38_E2]
+        const struct ggml_fn_moe_scales_ent * se = ggml_fn_moe_scales_get(wg);
+        c.s_u = se && se->s_u && se->s_g && se->s_d ? se->s_u : NULL;
+        c.s_g = c.s_u ? se->s_g : NULL;
+        c.s_d = c.s_u ? se->s_d : NULL;
+    }
     GGML_ASSERT(c.pr <= 256);
     if (wh) { // [TAG_FN_L22_POOLDIAG]
         int64_t asum = 0;
@@ -3263,6 +3333,9 @@ static bool ggml_fn_moe_match_at(const struct ggml_cgraph * cgraph, int i, struc
         return false;
     }
     memcpy(m->idx, idx, sizeof(idx));
+    if (ggml_fn_moe_scales_get(gate->src[0]) != NULL) {
+        return false; // [TAG_R38_E2] a scaled layer's graph carries its own ggml_mul of the scales: never fuse it
+    }
     m->up   = up;
     m->gate = gate;
     m->down = down;

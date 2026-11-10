@@ -1,5 +1,7 @@
 #include "llama-model-loader.h"
 
+bool llama_r38_fp4s(); // [TAG_R38_E2] llama-moe-bridge.cpp
+
 #include "ggml-alloc.h"
 #include "ggml.h"
 #include "gguf.h"
@@ -1263,8 +1265,13 @@ struct ggml_tensor * llama_model_loader::create_tensor(
 
         ggml_backend_buffer_type_t buft = nullptr;
 
+        // [TAG_R38_E2] the per-expert scales of a scaled MoE layer ([n_expert] f32) stay with the layer's device: the device
+        // chains read them every step (a host copy would split the graph); the bridge keeps its own host copy
+        const bool r38_dev_scale = llama_r38_fp4s() && tn.str().size() > 11 &&
+            tn.str().compare(tn.str().size() - 11, 11, "_exps.scale") == 0;
+
         // check overrides
-        if (tensor_buft_overrides) {
+        if (tensor_buft_overrides && !r38_dev_scale) {
             std::string tensor_name = tn.str();
             for (const auto * overrides = tensor_buft_overrides; overrides->pattern != nullptr; ++overrides) {
                 std::regex pattern(overrides->pattern);
@@ -1293,7 +1300,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
 
         // [TAG_FN_AUTO] qwen4exp automatic placement: every trunk layer's routed experts on the host; the hot set moves the
         // hot ones to VRAM. An override that matched above keeps its choice.
-        if (!buft && fn_host_experts_n_layer > 0 && tn.bid >= 0 && tn.bid < fn_host_experts_n_layer &&
+        if (!buft && !r38_dev_scale && fn_host_experts_n_layer > 0 && tn.bid >= 0 && tn.bid < fn_host_experts_n_layer &&
                 (tn.tensor == LLM_TENSOR_FFN_UP_EXPS   || tn.tensor == LLM_TENSOR_FFN_GATE_EXPS ||
                  tn.tensor == LLM_TENSOR_FFN_DOWN_EXPS || tn.tensor == LLM_TENSOR_FFN_GATE_UP_EXPS)) {
             buft = select_weight_buft(hparams, t_meta, op, buft_list_cpu);
