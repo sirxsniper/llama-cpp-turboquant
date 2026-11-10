@@ -7214,7 +7214,7 @@ private:
         if (slot.prompt.checkpoints.empty()) {
             return true;
         }
-        std::ofstream ofs(std::filesystem::u8path(filepath), std::ios::binary | std::ios::app);
+        std::ofstream ofs(filepath, std::ios::binary | std::ios::app);
         if (!ofs) {
             SLT_WRN(slot, "failed to append context checkpoints to '%s'\n", filepath.c_str());
             return false;
@@ -7245,7 +7245,7 @@ private:
 
     // returns the number of bytes consumed, 0 if there is no usable appendix
     size_t load_slot_checkpoints(const std::string & filepath, size_t offset, server_slot & slot) const {
-        std::ifstream ifs(std::filesystem::u8path(filepath), std::ios::binary | std::ios::ate);
+        std::ifstream ifs(filepath, std::ios::binary | std::ios::ate);
         const size_t file_size = ifs ? (size_t) ifs.tellg() : 0;
         if (!ifs || file_size < offset || !ifs.seekg(offset)) {
             return 0;
@@ -7320,7 +7320,7 @@ private:
         if (data_dft.empty() && data_spec.empty()) {
             return true;
         }
-        std::ofstream ofs(std::filesystem::u8path(filepath), std::ios::binary | std::ios::app);
+        std::ofstream ofs(filepath, std::ios::binary | std::ios::app);
         if (!ofs) {
             SLT_WRN(slot, "failed to append the draft state to '%s'\n", filepath.c_str());
             return false;
@@ -7346,7 +7346,7 @@ private:
         if (ctx_dft != nullptr) {
             llama_memory_seq_rm(llama_get_memory(ctx_dft), slot.id, -1, -1);
         }
-        std::ifstream ifs(std::filesystem::u8path(filepath), std::ios::binary | std::ios::ate);
+        std::ifstream ifs(filepath, std::ios::binary | std::ios::ate);
         const size_t file_size = ifs ? (size_t) ifs.tellg() : 0;
         if (!ifs || file_size < offset || !ifs.seekg(offset)) {
             return 0;
@@ -8039,30 +8039,44 @@ private:
                 slot.task ? slot.task->id : -1);
     }
 
+    // [TAG_R38_SYNC] upstream #30779: parent slots first, then the child slots (n_cmpl > 1) that wait for them; without
+    // child tasks the first pass visits every slot in the old order
     void iterate(const char * where, std::vector<server_slot> & slots,
                  std::function<void(server_slot &)> callback) {
-        for (auto & slot : slots) {
-            try {
-                callback(slot);
-            } catch (const std::exception & e) {
-                std::string msg;
-                iterate_report(slot, where, e, msg);
-                send_error(slot, msg, ERROR_TYPE_SERVER);
-                slot.release();
+        for (int pass = 0; pass < 2; ++pass) {
+            for (auto & slot : slots) {
+                const bool is_child = slot.is_processing() && slot.task->is_child();
+                if (is_child != (pass == 1)) {
+                    continue;
+                }
+                try {
+                    callback(slot);
+                } catch (const std::exception & e) {
+                    std::string msg;
+                    iterate_report(slot, where, e, msg);
+                    send_error(slot, msg, ERROR_TYPE_SERVER);
+                    slot.release();
+                }
             }
         }
     }
 
     void iterate(const char * where, std::vector<server_slot *> & slots,
                  std::function<void(server_slot &)> callback) {
-        for (auto & slot : slots) {
-            try {
-                callback(*slot);
-            } catch (const std::exception & e) {
-                std::string msg;
-                iterate_report(*slot, where, e, msg);
-                send_error(*slot, msg, ERROR_TYPE_SERVER);
-                slot->release();
+        for (int pass = 0; pass < 2; ++pass) {
+            for (auto & slot : slots) {
+                const bool is_child = slot->is_processing() && slot->task->is_child();
+                if (is_child != (pass == 1)) {
+                    continue;
+                }
+                try {
+                    callback(*slot);
+                } catch (const std::exception & e) {
+                    std::string msg;
+                    iterate_report(*slot, where, e, msg);
+                    send_error(*slot, msg, ERROR_TYPE_SERVER);
+                    slot->release();
+                }
             }
         }
     }
@@ -9004,6 +9018,7 @@ private:
                 // check if this is a child slot
                 if (slot.state == SLOT_STATE_WAIT_OTHER) {
                     SLT_DBG(slot, "%s", "waiting for parent slot to complete\n");
+                    SLT_DBG(slot, "%s", "__TEST_TAG_WAIT_PARENT_SLOT__\n");
                     return;
                 }
 
@@ -10979,6 +10994,13 @@ server_context_meta server_context::get_meta() const {
 
     const char * ftype_name = llama_ftype_name(llama_model_ftype(impl->model_tgt));
 
+    std::vector<std::string> tts_voices;
+    if (impl->mctx) {
+        for (int32_t i = 0; i < mtmd_gen_audio_get_info(impl->mctx).n_voices; i++) {
+            tts_voices.push_back(mtmd_gen_audio_voice_name(impl->mctx, i));
+        }
+    }
+
     return server_context_meta {
         /* build_info              */ std::string(llama_build_info()),
         /* model_name              */ impl->model_name,
@@ -10993,6 +11015,7 @@ server_context_meta server_context::get_meta() const {
         /* has_cap_chat            */ impl->has_cap_chat(),
         /* has_cap_tts             */ impl->has_cap_tts(),
         /* has_audio_stream        */ impl->mtmd_cap.audio_stream,
+        /* tts_voices              */ std::move(tts_voices),
         /* json_ui_settings        */ impl->json_ui_settings,
         /* slot_n_ctx              */ impl->n_ctx_slot(),
         /* pooling_type            */ llama_pooling_type(impl->ctx_tgt),
@@ -11473,6 +11496,9 @@ static json get_res_props(const server_context_meta & meta, const common_params 
 
     if (!params.server_connect_code.empty()) {
         props["connect_code"] = params.server_connect_code;
+    }
+    if (!meta.tts_voices.empty()) {
+        props["voices"] = meta.tts_voices;
     }
     if (params.use_jinja) {
         if (!tmpl_tools.empty()) {
@@ -12255,9 +12281,17 @@ void server_routes::init_routes() {
         const std::string lang       = json_value(body, "lang", std::string());
         const std::string voice      = json_value(body, "voice", std::string());
         const std::string tts_prompt = common_chat_get_tts_prompt(meta->chat_params.tmpls.get(), prompt, lang, voice);
+        // a model with predefined voices only speaks with one of them
+        mtmd::bitmap_ptr voice_ref;
+        if (!voice.empty() && info.n_voices > 0) {
+            voice_ref.reset(mtmd_gen_audio_get_voice(ctx_server.mctx, voice.c_str()));
+            if (!voice_ref) {
+                res->error(format_error_response("unknown voice \"" + voice + "\", see \"voices\" in GET /props", ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+        }
         task.tts_inp.set_prompt(tts_prompt.empty() ? prompt : tts_prompt);
         task.tts_inp.set_lang(lang);
-        task.tts_inp.set_voice(voice);
         task.tts_inp.data.stream    = stream;
         task.tts_inp.data.out_type  = response_format == "pcm"
             ? MTMD_HELPER_GEN_AUDIO_OUTTYPE_PCM
@@ -12296,12 +12330,27 @@ void server_routes::init_routes() {
         }
 
         if (speaker_ref_len > 0) {
+            if (voice_ref) {
+                res->error(format_error_response("\"voice\" and \"speaker_ref\" cannot be used together", ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+            if (!mtmd_support_audio(ctx_server.mctx)) {
+                res->error(format_error_response("this model has no voice encoder, \"speaker_ref\" cannot be used", ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
             auto wrapper = mtmd_helper_bitmap_init_from_buf(ctx_server.mctx, speaker_ref_data, speaker_ref_len, false, ctx_server.init_opt);
             if (!wrapper.bitmap) {
                 res->error(format_error_response("failed to decode \"speaker_ref\"", ERROR_TYPE_INVALID_REQUEST));
                 return res;
             }
             task.tts_inp.set_speaker_ref(mtmd::bitmap_ptr(wrapper.bitmap));
+        } else if (voice_ref) {
+            task.tts_inp.set_speaker_ref(std::move(voice_ref));
+        } else if (info.n_voices > 0) {
+            // without a voice prompt the model produces near silence: the first voice is the default
+            const char * first = mtmd_gen_audio_voice_name(ctx_server.mctx, 0);
+            SRV_WRN("no voice given, speaking with \"%s\"\n", first);
+            task.tts_inp.set_speaker_ref(mtmd::bitmap_ptr(mtmd_gen_audio_get_voice(ctx_server.mctx, first)));
         } else {
             SRV_WRN("%s", "no speaker reference provided, the model may behave randomly\n");
         }

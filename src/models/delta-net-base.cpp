@@ -487,11 +487,6 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
         int64_t              conv_kernel_size,
         int64_t              conv_channels,
         int                  il) {
-    const auto * mctx_cur = inp->mctx;
-
-    const auto kv_head  = mctx_cur->get_head();
-    const auto mem_size = mctx_cur->get_size();
-
     const int64_t n_seqs = ubatch.n_seqs;
 
     ggml_tensor * conv_states = build_rs(inp, conv_states_all, hparams.n_embd_r(), n_seqs);

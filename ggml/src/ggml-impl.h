@@ -71,6 +71,14 @@ static inline int ggml_up32(int n) {
 //    return (n + 63) & ~63;
 //}
 
+// [TAG_R38_SYNC_FAROWS] upstream #29510 stores the K/V row lists of ggml_flash_attn_ext_rows in src[5], where the fork's
+// positional mask keeps kv_pos ([TAG_FA_POS_MASK], ggml_flash_attn_ext_set_pos). The two never meet: the row lists need the
+// explicit mask (src[3]), the positional mask replaces it. Backends read the row lists through this, so a kv_pos is never
+// taken for one.
+static inline const struct ggml_tensor * ggml_flash_attn_ext_kv_rows(const struct ggml_tensor * fa) {
+    return fa->src[3] != NULL ? fa->src[5] : NULL;
+}
+
 static inline int ggml_up(int n, int m) {
     // assert m is a power of 2
     GGML_ASSERT((m & (m - 1)) == 0);
@@ -113,6 +121,13 @@ static inline bool ggml_impl_is_view(const struct ggml_tensor * t) {
 static inline float ggml_compute_softplus_f32(float input) {
     return (input > 20.0f) ? input : logf(1 + expf(input));
 }
+
+// compute correction dims for YaRN RoPE scaling
+GGML_API void ggml_rope_yarn_corr_dims(
+    int n_dims, int n_ctx_orig, float freq_base, float beta_fast, float beta_slow, bool truncate, float dims[2]);
+
+GGML_API bool ggml_rope_get_truncate(const struct ggml_tensor * a);
+
 //
 // logging
 //

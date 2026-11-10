@@ -35,3 +35,10 @@ struct mtmd_fn_l22_vlb_info {
     int  n_tokens    = 0;
 };
 int32_t mtmd_fn_l22_vlbatch_admit(const mtmd_fn_l22_vlb_info & first, const mtmd_fn_l22_vlb_info & next, int32_t n_tokens_now, int32_t cap);
+
+struct mtmd_image_preprocessor;
+
+// mtmd_get_video_config() for a given template, without a context
+mtmd_video_config mtmd_video_config_init(mtmd_video_template tmpl, const mtmd_image_preprocessor * preproc,
+                                         int32_t src_width, int32_t src_height,
+                                         int32_t src_n_frames, float src_fps);

@@ -186,6 +186,13 @@ bool llama_batch_allocr::init(
     }
 
 
+    if (has_row) {
+        embd_row_vec.resize(n_tok);
+        for (int32_t i = 0; i < n_tok; ++i) {
+            embd_row_vec[i] = batch_inp.tokens[i].embd_row;
+        }
+    }
+
     //
     // build flat pos array, section-major: pos[j*n_tok + i] = section j of entry i
     // token entry: [p, p, p, 0] (M-RoPE text position)
@@ -992,6 +999,10 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
         }
 
         if (has_row) { // [TAG_R35_DFLDEV]
+            udata->embd_row[i] = embd_row_vec[idxs[i]];
+        }
+
+        if (has_row) {
             udata->embd_row[i] = embd_row_vec[idxs[i]];
         }
 

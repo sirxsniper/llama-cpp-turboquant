@@ -123,7 +123,9 @@ public:
         const  layer_reuse_cb & reuse,
         const  layer_share_cb & share,
         // a model can hold more than one cache, so the tensor names have to stay unique
-                 const char *   name_tag = "");
+                 const char *   name_tag = "",
+        // lightning indexer keys are rotated with the indexer RoPE parameters
+                       bool   is_indexer = false);
 
     ~llama_kv_cache();
 
@@ -202,8 +204,8 @@ public:
             llama_io_read_i & io,
                llama_seq_id   seq_id,
       llama_state_seq_flags   flags,
-          slot_info_vec_t *   sinfos_out,
-    const slot_info_vec_t *   sinfos_in);
+            slot_info_vec_t * sinfos_out,
+      const slot_info_vec_t * sinfos_in);
 
     // undo a state_read() of seq_id (-1 for the whole cache) that another memory module failed to complete
     void state_clear(llama_seq_id seq_id);
@@ -213,6 +215,15 @@ public:
     //
 
     uint32_t get_n_kv(const slot_info & sinfo) const;
+
+    // attention over the cells of each sequence of the ubatch instead of the whole cache (see ggml_flash_attn_ext_rows)
+    // the ubatch splits into n_slices groups of tokens with one sequence each
+    // if it cannot (f.ex. interleaved or coupled sequences), it is a single slice over the cells of all its sequences
+    // TODO: allow slices with coupled sequences
+    static uint32_t get_n_kv_slices(const llama_ubatch & ubatch);
+
+    // padded length of the longest cell list of the slices; 0 if kv_rows are not used (multiple streams)
+    uint32_t get_n_kv_rows(const llama_ubatch & ubatch) const;
 
     // get views of the current state of the cache
     ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
@@ -277,6 +288,7 @@ public:
     // that fn_imgkeys_ok() accepted when its graph was built
     void set_input_kv_pos    (ggml_tensor * dst, const llama_ubatch * ubatch, bool fn_keys = false) const;   // [TAG_FA_POS_MASK] per-cell position, -1 if not visible
     void set_input_q_pos     (ggml_tensor * dst, const llama_ubatch * ubatch, bool fn_keys = false) const;   // [TAG_4C_POSMASK_MS] query positions (+ sequence bits)
+    void set_input_attn_mask (const llm_attn_mask & attn_mask, const llama_ubatch * ubatch, bool causal_attn) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     // [TAG_FN_L22_IMGPASS_MASK] LLAMA_FN_L22_IMGPASS_MASK=auto|keys: an embedding ubatch with 2-D positions may take the
@@ -386,6 +398,8 @@ private:
     // SWA
     const uint32_t n_swa = 0;
 
+    const bool is_indexer = false;
+
     // env: LLAMA_ATTN_ROT_DISABLE
     uint32_t n_rot_k = 0;
     uint32_t n_rot_v = 0;
@@ -479,12 +493,9 @@ private:
     ggml_tensor * build_rope_shift(
             const llama_cparams & cparams,
                    ggml_context * ctx,
-                    ggml_tensor * cur,
+                    ggml_tensor * k,
                     ggml_tensor * shift,
                     ggml_tensor * rot,
-                    ggml_tensor * factors,
-                          float   freq_base,
-                          float   freq_scale,
                        uint32_t   il) const;
 
     ggml_cgraph * build_graph_shift(
@@ -553,6 +564,7 @@ public:
     //
 
     uint32_t get_n_kv() const;
+    uint32_t get_n_kv_rows() const;
 
     // [TAG_FN_R4_QSA_POS] the sliding window the cache applies (llama_kv_cache::get_swa_window), 0 for none
     uint32_t get_swa_window() const;
@@ -600,6 +612,7 @@ public:
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
     void set_input_kv_pos    (ggml_tensor * dst, const llama_ubatch * ubatch, bool fn_keys = false) const;   // [TAG_FA_POS_MASK] per-cell position, -1 if not visible
     void set_input_q_pos     (ggml_tensor * dst, const llama_ubatch * ubatch, bool fn_keys = false) const;   // [TAG_4C_POSMASK_MS] query positions (+ sequence bits)
+    void set_input_attn_mask (const llm_attn_mask & attn_mask, const llama_ubatch * ubatch, bool causal_attn) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     // [TAG_FN_L22_IMGPASS_MASK] see llama_kv_cache
@@ -657,6 +670,9 @@ private:
     // a heuristic, to avoid attending the full cache if it is not yet utilized
     // as the cache gets filled, the benefit from this heuristic disappears
     int32_t n_kv;
+
+    // see llama_kv_cache::get_n_kv_rows
+    uint32_t n_kv_rows = 0;
 };
 
 // [TAG_FN_L8_KVLEND] the lend of the process's qwen4exp KV cache (one): the bytes of its cells not mapped now; the hot
