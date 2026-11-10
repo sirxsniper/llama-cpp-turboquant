@@ -10232,6 +10232,51 @@ static bool ggml_backend_fn_event_done(ggml_backend_event_t event) {
 #endif
 }
 
+// [TAG_R38_E1] diagnostics (proc "ggml_backend_fn_gpu_timer"): timing events on a CUDA backend's stream. op 0: record
+// slot a on the backend's stream; op 1: the ms from slot a to slot b, without blocking (-1 while either is pending, was
+// never recorded, or on an error). Slots 0..255, created on first use. Nothing a graph computes reads them.
+static float ggml_backend_cuda_fn_gpu_timer(ggml_backend_t backend, int op, int a, int b) {
+#ifdef GGML_CUDA_NO_PEER_COPY
+    GGML_UNUSED(backend); GGML_UNUSED(op); GGML_UNUSED(a); GGML_UNUSED(b);
+    return -1.0f;
+#else
+    constexpr int N = 256;
+    static std::mutex  mtx;
+    static cudaEvent_t ev[N]  = {};
+    static bool        rec[N] = {};
+    if (backend == nullptr || a < 0 || a >= N || (op == 1 && (b < 0 || b >= N))) {
+        return -1.0f;
+    }
+    std::lock_guard<std::mutex> lk(mtx);
+    ggml_backend_cuda_context * ctx = (ggml_backend_cuda_context *) backend->context;
+    if (op == 0) {
+        ggml_cuda_set_device(ctx->device);
+        if (ev[a] == nullptr && cudaEventCreate(&ev[a]) != cudaSuccess) {
+            (void) cudaGetLastError();
+            ev[a] = nullptr;
+            return -1.0f;
+        }
+        if (cudaEventRecord(ev[a], ctx->stream()) != cudaSuccess) {
+            (void) cudaGetLastError();
+            rec[a] = false;
+            return -1.0f;
+        }
+        rec[a] = true;
+        return 0.0f;
+    }
+    if (!rec[a] || !rec[b] || cudaEventQuery(ev[a]) != cudaSuccess || cudaEventQuery(ev[b]) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return -1.0f;
+    }
+    float ms = -1.0f;
+    if (cudaEventElapsedTime(&ms, ev[a], ev[b]) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return -1.0f;
+    }
+    return ms;
+#endif
+}
+
 static void ggml_backend_cuda_device_event_free(ggml_backend_dev_t dev, ggml_backend_event_t event) {
     GGML_UNUSED(dev);
 
@@ -10639,6 +10684,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_fn_event_done") == 0) { // [TAG_FN_L22_PIN] R-REV-3
         return (void *)ggml_backend_fn_event_done;
+    }
+    if (strcmp(name, "ggml_backend_fn_gpu_timer") == 0) { // [TAG_R38_E1]
+        return (void *)ggml_backend_cuda_fn_gpu_timer;
     }
     if (strcmp(name, "ggml_backend_cuda_set_passlog_level") == 0) { // [TAG_FN_L22_PASSLOG] R-REV-11
         return (void *)ggml_backend_cuda_set_passlog_level;

@@ -128,6 +128,23 @@ struct pfs_state {
     std::mutex       tk_mtx;
     std::atomic<int> tk_banks{0};
 
+    // [TAG_R38_E1] slow-pass diagnostics (LLAMA_R38_E1_DIAG, default 1; 0 = v0.28.1): host time per layer from one gate to the
+    // next on the decode thread, GPU time per layer from timing events on the compute stream (gate: the bank is ready,
+    // release: the layer's work), and once a pass runs slow, one line with where the time went and the memory picture.
+    // Log only: nothing a graph computes changes.
+    struct r38_diag {
+        bool    on      = false;
+        int     slow_ms = 1000; // LLAMA_R38_E1_SLOW_MS: a layer slower than this (median of the pass so far) is slow
+        float (*timer)(ggml_backend_t, int, int, int) = nullptr;
+        int64_t t_prev  = 0;    // the last gate's exit (us), this pass
+        int64_t cpu0    = 0;    // the decode thread's CPU time (100 ns) at the pass start
+        int64_t t0      = 0;    // the pass start (us)
+        bool    warned  = false;
+        std::vector<int64_t> host_us; // per layer: gate exit -> next gate entry (the layer's work as the decode thread saw it)
+        std::vector<int64_t> wait_us; // per layer: the gate's own wait for its bank
+        uint64_t n_reports = 0;
+    } r38;
+
     // [TAG_FN_R1_PFS_LEND] LLAMA_PREFILL_STREAM_LEND=1: the banks are a range of the hot set's buffer, borrowed while
     // ubatches stream (lent) and returned before a decode; the aliases are placed there at the first lend
     bool                  lend        = false;
@@ -1379,6 +1396,179 @@ void pfs_ubatch_begin(pfs_state * s, int64_t t0) {
     }
 }
 
+// ---------------------------------------------------------------------------------------------------------------------
+// [TAG_R38_E1] slow-pass diagnostics (see pfs_state::r38_diag). The gates and releases run on the decode thread after the
+// host has synchronized the device, so gate exit -> next gate entry is the layer's device work as the host saw it.
+
+static int64_t r38_thread_cpu() {
+#ifdef _WIN32
+    FILETIME c, e, k, u;
+    if (GetThreadTimes(GetCurrentThread(), &c, &e, &k, &u)) {
+        return (int64_t) ((((uint64_t) k.dwHighDateTime << 32) | k.dwLowDateTime) + (((uint64_t) u.dwHighDateTime << 32) | u.dwLowDateTime));
+    }
+#endif
+    return 0;
+}
+
+static int64_t r38_median(std::vector<int64_t> v) {
+    v.erase(std::remove_if(v.begin(), v.end(), [](int64_t x) { return x < 0; }), v.end());
+    if (v.empty()) {
+        return -1;
+    }
+    std::nth_element(v.begin(), v.begin() + v.size()/2, v.end());
+    return v[v.size()/2];
+}
+
+// one line: where the pass's time went (host per layer, device per layer from the timing events) and the memory picture
+static void r38_report(pfs_state * s, const char * why, int upto) {
+    auto & d = s->r38;
+    if (d.n_reports >= 64) {
+        return;
+    }
+    d.n_reports++;
+    const int n = std::min<int>(upto, (int) d.host_us.size());
+    std::vector<int64_t> h(d.host_us.begin(), d.host_us.begin() + n);
+    int64_t h_sum = 0, h_max = 0, w_sum = 0;
+    for (int l = 0; l < n; ++l) {
+        h_sum += std::max<int64_t>(0, d.host_us[l]);
+        h_max  = std::max<int64_t>(h_max, d.host_us[l]);
+        w_sum += std::max<int64_t>(0, d.wait_us[l]);
+    }
+    // device: A(l) = layer l's bank ready on the compute stream, B(l) = its release; A->B the MoE part, B(l-1)->A(l) the rest
+    double g_moe = 0.0, g_pre = 0.0, g_max = 0.0;
+    int    n_moe = 0, n_pre = 0;
+    if (d.timer) {
+        for (int l = 0; l < n; ++l) {
+            const float m = d.timer(s->compute, 1, 2*l, 2*l + 1);
+            if (m >= 0.0f) {
+                g_moe += m;
+                n_moe++;
+                g_max = std::max<double>(g_max, m);
+            }
+            if (l > 0) {
+                const float p = d.timer(s->compute, 1, 2*(l - 1) + 1, 2*l);
+                if (p >= 0.0f) {
+                    g_pre += p;
+                    n_pre++;
+                    g_max = std::max<double>(g_max, p);
+                }
+            }
+        }
+    }
+    const int64_t now = ggml_time_us();
+    const double  cpu_share = now > d.t0 ? (double) (r38_thread_cpu() - d.cpu0)/10.0/(double) (now - d.t0) : 0.0;
+    double avail = -1, commit = -1, climit = -1, kpaged = -1, knp = -1, cache = -1, ws = -1, priv = -1, io_rb = -1;
+    uint64_t faults = 0, io_ops = 0;
+#ifdef _WIN32
+    {
+        MEMORYSTATUSEX ms = {};
+        ms.dwLength = sizeof(ms);
+        if (GlobalMemoryStatusEx(&ms)) {
+            avail = ms.ullAvailPhys/1073741824.0;
+        }
+        PERFORMANCE_INFORMATION pi = {};
+        pi.cb = sizeof(pi);
+        if (K32GetPerformanceInfo(&pi, sizeof(pi))) {
+            const double pg = (double) pi.PageSize/1073741824.0;
+            commit = pi.CommitTotal*pg;
+            climit = pi.CommitLimit*pg;
+            kpaged = pi.KernelPaged*pg;
+            knp    = pi.KernelNonpaged*pg;
+            cache  = pi.SystemCache*pg;
+        }
+        PROCESS_MEMORY_COUNTERS_EX pm = {};
+        pm.cb = sizeof(pm);
+        if (K32GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS *) &pm, sizeof(pm))) {
+            ws     = pm.WorkingSetSize/1073741824.0;
+            priv   = pm.PrivateUsage/1073741824.0;
+            faults = pm.PageFaultCount;
+        }
+        IO_COUNTERS io = {};
+        if (GetProcessIoCounters(GetCurrentProcess(), &io)) {
+            io_rb  = io.ReadTransferCount/1073741824.0;
+            io_ops = io.ReadOperationCount;
+        }
+    }
+#endif
+    uint64_t lb = 0, lu = 0, nb = 0, nu = 0;
+    const bool dx_l  = llama_fn_dxgi_query(0, 0, &lb, &lu);
+    const bool dx_nl = llama_fn_dxgi_query(0, 1, &nb, &nu);
+    size_t vfree = 0, vtotal = 0;
+    if (s->dev) {
+        ggml_backend_dev_memory(s->dev, &vfree, &vtotal);
+    }
+    const double GiB = 1073741824.0;
+    LLAMA_LOG_WARN("prefill-stream: [TAG_R38_E1] slow pass (%s, %d of %zu layers, %lld rows): host per layer median %.0f ms, max %.0f "
+            "ms, sum %.1f s, gate waits %.1f s; device per layer (timing events, %d+%d of %d) MoE part %.1f s, rest %.1f s, max %.0f ms; "
+            "decode thread on a CPU %.0f %% of the pass; streamed %.2f GiB (%.2f GiB direct I/O) | RAM avail %.2f GiB, commit %.1f/%.1f GiB, "
+            "kernel paged %.2f nonpaged %.2f GiB, cache %.2f GiB; process ws %.2f GiB, private %.2f GiB, faults %llu, reads %.2f GiB / %llu | "
+            "VRAM free %.0f of %.0f MiB; DXGI local %s %.0f/%.0f MiB, non-local %s %.0f/%.0f MiB (usage/budget)\n",
+            why, n, d.host_us.size(), (long long) s->cur_rows, r38_median(h)/1e3, h_max/1e3, h_sum/1e6, w_sum/1e6, n_moe, n_pre, n,
+            g_moe/1e3, g_pre/1e3, g_max, 100.0*cpu_share, s->ub_bytes/GiB, s->ub_ssd/GiB, avail, commit, climit, kpaged, knp, cache, ws,
+            priv, (unsigned long long) faults, io_rb, (unsigned long long) io_ops, vfree/1048576.0, vtotal/1048576.0,
+            dx_l ? "" : "(n/a)", lu/1048576.0, lb/1048576.0, dx_nl ? "" : "(n/a)", nu/1048576.0, nb/1048576.0);
+}
+
+static void r38_gate_enter(pfs_state * s, const pfs_layer * L, int64_t t0) {
+    auto & d = s->r38;
+    if (!d.on) {
+        return;
+    }
+    const size_t n = s->layers.size();
+    if (d.host_us.size() != n) {
+        d.host_us.assign(n, -1);
+        d.wait_us.assign(n, -1);
+    }
+    if (L->pos == 0) {
+        std::fill(d.host_us.begin(), d.host_us.end(), -1);
+        std::fill(d.wait_us.begin(), d.wait_us.end(), -1);
+        d.t0     = t0;
+        d.cpu0   = r38_thread_cpu();
+        d.t_prev = 0;
+        d.warned = false;
+    } else if (d.t_prev > 0) {
+        d.host_us[L->pos - 1] = t0 - d.t_prev;
+    }
+}
+
+static void r38_gate_exit(pfs_state * s, const pfs_layer * L, int64_t t0) {
+    auto & d = s->r38;
+    if (!d.on || (size_t) L->pos >= d.host_us.size()) {
+        return;
+    }
+    const int64_t t1 = ggml_time_us();
+    d.wait_us[L->pos] = t1 - t0;
+    d.t_prev = t1;
+    if (d.timer) {
+        d.timer(s->compute, 0, 2*L->pos, 0); // A: the bank is ready on the compute stream
+    }
+    // early: the first 6 layers already slow (a prompt the user may cancel still leaves its line)
+    if (!d.warned && L->pos == 6) {
+        const int64_t m = r38_median(std::vector<int64_t>(d.host_us.begin(), d.host_us.begin() + 6));
+        if (m > (int64_t) d.slow_ms*1000) {
+            d.warned = true;
+            r38_report(s, "early", 6);
+        }
+    }
+}
+
+static void r38_release(pfs_state * s, const pfs_layer * L) {
+    auto & d = s->r38;
+    if (!d.on || (size_t) L->pos >= d.host_us.size()) {
+        return;
+    }
+    if (d.timer) {
+        d.timer(s->compute, 0, 2*L->pos + 1, 0); // B: the layer's work on the compute stream
+    }
+    if (L->pos + 1 == (int) d.host_us.size() && d.t_prev > 0) {
+        d.host_us[L->pos] = ggml_time_us() - d.t_prev;
+        const int64_t m = r38_median(d.host_us);
+        if (m > (int64_t) d.slow_ms*1000) {
+            r38_report(s, "pass", (int) d.host_us.size());
+        }
+    }
+}
+
 // wait until the layer's bank holds it, then claim the bank. s->mtx held (lk)
 void pfs_layer_wait(pfs_state * s, pfs_layer * L, std::unique_lock<std::mutex> & lk) {
     pfs_bank & B = s->banks[L->bank];
@@ -1433,6 +1623,7 @@ void pfs_gate_op(ggml_tensor * dst, int ith, int nth, void * ud) {
     pfs_layer * L = (pfs_layer *) ud;
     pfs_state * s = pfs_gate_state(L);
     const int64_t t0 = ggml_time_us();
+    r38_gate_enter(s, L, t0); // [TAG_R38_E1]
     {
         std::unique_lock<std::mutex> lk(s->mtx);
         if (L->pos == 0) {
@@ -1442,6 +1633,7 @@ void pfs_gate_op(ggml_tensor * dst, int ith, int nth, void * ud) {
         pfs_layer_wait(s, L, lk);
     }
     pfs_gate_end(s, L, t0);
+    r38_gate_exit(s, L, t0); // [TAG_R38_E1]
 }
 
 // [TAG_FN_L22_CPUSHARE] the gate of a share layer: the new-ubatch work ran in the first share layer's plan
@@ -1456,12 +1648,14 @@ void pfs_gate_share_op(ggml_tensor * dst, int ith, int nth, void * ud) {
     pfs_layer * L = (pfs_layer *) ud;
     pfs_state * s = pfs_gate_state(L);
     const int64_t t0 = ggml_time_us();
+    r38_gate_enter(s, L, t0); // [TAG_R38_E1]
     {
         std::unique_lock<std::mutex> lk(s->mtx);
         s->cv.notify_all();
         pfs_layer_wait(s, L, lk);
     }
     pfs_gate_end(s, L, t0);
+    r38_gate_exit(s, L, t0); // [TAG_R38_E1]
 }
 
 void pfs_release_op(ggml_tensor * dst, int ith, int nth, void * ud) {
@@ -1526,6 +1720,7 @@ void pfs_release_op(ggml_tensor * dst, int ith, int nth, void * ud) {
         }
     }
     s->cv.notify_all();
+    r38_release(s, L); // [TAG_R38_E1]
 }
 
 void pfs_destroy(pfs_state * s) {
@@ -1971,6 +2166,17 @@ bool llama_prefill_stream_init_layers(const std::vector<llama_moe_gen5_layer_des
         if (ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(d.dev)) {
             s->poke = (void (*)(ggml_backend_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_stream_poke");
             s->ev_done = (bool (*)(ggml_backend_event_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_fn_event_done");
+            // [TAG_R38_E1] slow-pass diagnostics, on unless LLAMA_R38_E1_DIAG=0
+            {
+                const char * e = getenv("LLAMA_R38_E1_DIAG");
+                s->r38.on = e == nullptr || atoi(e) != 0;
+                if (const char * v = getenv("LLAMA_R38_E1_SLOW_MS")) {
+                    s->r38.slow_ms = std::max(50, atoi(v));
+                }
+                if (s->r38.on) {
+                    s->r38.timer = (float (*)(ggml_backend_t, int, int, int)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_fn_gpu_timer");
+                }
+            }
             if (gen5::env_flag("LLAMA_PREFILL_STREAM_D2D")) { // [TAG_FN_L14_PFSD2D]
                 s->d2d = (bool (*)(ggml_backend_t, int, void * const *, const void * const *, const size_t *))
                         ggml_backend_reg_get_proc_address(reg, "ggml_backend_copy_d2d_batch_async");
