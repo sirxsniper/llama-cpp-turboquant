@@ -321,12 +321,12 @@ static void common_params_fit_impl(
                 // Fall back to the weight file on disk: it is the dominant term and is always
                 // available. A draft model's context and compute are small next to it.
                 size_t est = 0;
-                {
-                    std::ifstream f(extra->path_model, std::ios::binary | std::ios::ate);
+                for (const auto & path : extra->paths_model) { // [TAG_R38_SYNC] #31185: the model may span several files
+                    std::ifstream f(path, std::ios::binary | std::ios::ate);
                     if (f) {
                         const std::streamoff sz = f.tellg();
                         if (sz > 0) {
-                            est = (size_t) sz;
+                            est += (size_t) sz;
                         }
                     }
                 }

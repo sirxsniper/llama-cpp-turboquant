@@ -5077,24 +5077,6 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         ggml_backend_sched_set_tail_async(sched.get(), true);
     }
 
-    // ordering for the layer input device buffer
-    llama_context * inject_src     = has_embd_row ? cparams.ctx_other : nullptr;
-    ggml_backend_t  inject_backend = nullptr;
-    if (inject_src) {
-        inject_backend = inject_src->ev_layer_inp_written ? backend_from_dev(inject_src->layer_inp_dev_dev) : nullptr;
-        if (inject_backend) {
-            // wait on the host: a device-side wait would stall our queue for the whole target batch,
-            // which trips the Metal command buffer timeout on long prompts
-            ggml_backend_event_synchronize(inject_src->ev_layer_inp_written.get());
-        } else {
-            inject_src->synchronize();
-        }
-    }
-    if (layer_inp_dev && ev_layer_inp_read && ev_layer_inp_read_recorded) {
-        // do not overwrite rows the reader has not consumed yet
-        ggml_backend_event_wait(layer_inp_backend, ev_layer_inp_read.get());
-    }
-
     // ordering for the h_nextn device buffer, as for the layer input buffer
     llama_context * state_src     = has_state_row ? cparams.ctx_state_src : nullptr;
     ggml_backend_t  state_backend = nullptr;

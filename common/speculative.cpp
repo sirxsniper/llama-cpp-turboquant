@@ -5526,28 +5526,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         std::memcpy(pending_h[seq_id].data(), verify_h[seq_id].data() + (size_t) i_h * n_embd, row_bytes);
     }
 
-    bool get_state(llama_seq_id seq_id, std::vector<uint8_t> & data) const override {
-        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
-            return false;
-        }
-
-        const size_t row_bytes = (size_t) n_embd * sizeof(float);
-        data.resize(row_bytes);
-        std::memcpy(data.data(), pending_h[seq_id].data(), row_bytes);
-        return true;
-    }
-
-    void set_state(llama_seq_id seq_id, const std::vector<uint8_t> & data) override {
-        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
-            return;
-        }
-
-        const size_t row_bytes = (size_t) n_embd * sizeof(float);
-        if (data.size() != row_bytes) {
-            return;
-        }
-        std::memcpy(pending_h[seq_id].data(), data.data(), row_bytes);
-    }
+    // [TAG_R38_SYNC] upstream #30141 get_state / set_state (boundary h row) not taken: the fork keeps [TAG_FN_L21_MTP_STATE]
 };
 
 // state of self-speculation (simple implementation, not ngram-map)
