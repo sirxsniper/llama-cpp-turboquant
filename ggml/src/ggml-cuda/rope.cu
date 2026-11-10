@@ -1147,7 +1147,7 @@ bool ggml_cuda_fn_l4_qsa_pool_launch(ggml_backend_cuda_context & ctx, ggml_cuda_
     a.attn_factor = attn_factor;
 
     rope_corr_dims corr_dims;
-    ggml_rope_yarn_corr_dims(n_dims, n_ctx_orig, freq_base, beta_fast, beta_slow, corr_dims.v);
+    ggml_rope_yarn_corr_dims(n_dims, n_ctx_orig, freq_base, beta_fast, beta_slow, ggml_rope_get_truncate(rope), corr_dims.v); // [TAG_R38_SYNC] #30206
 
     k_fn_l4_qsa_pool<<<1, FN_L4_POOL_THREADS, 0, ctx.stream()>>>(a, corr_dims, sections);
     CUDA_CHECK(cudaGetLastError());

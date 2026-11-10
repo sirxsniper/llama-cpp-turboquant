@@ -173,7 +173,6 @@ public:
     ggml_tensor * embd   = nullptr; // F32 [n_embd, n_batch]
     ggml_tensor * h      = nullptr; // F32 [n_embd_state, n_batch]
     bool          h_zero = false;   // [TAG_FN_L21_MTPH_ZERO] h reads 0 since the last ubatch without embd
-    ggml_tensor * h      = nullptr; // F32 [n_embd_state, n_batch], the host input or the rows gathered with h_rows
     ggml_tensor * h_rows = nullptr; // I32 [n_batch], rows of the h_nextn device buffer of ctx_state_src, nullptr on the host path
 
     const int64_t n_embd       = 0;

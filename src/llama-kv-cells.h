@@ -433,14 +433,6 @@ public:
         return -1;
     }
 
-    // number of cells that contain seq_id
-    uint32_t seq_n_cells(llama_seq_id seq_id) const {
-        assert(seq_id >= 0);
-        assert(seq_id < LLAMA_MAX_SEQ);
-
-        return seq_pos[seq_id].size();
-    }
-
     // number of cells that contain seq_id at a position >= p_min
     uint32_t seq_n_cells(llama_seq_id seq_id, llama_pos p_min) const {
         assert(seq_id >= 0);

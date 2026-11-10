@@ -329,13 +329,8 @@ private:
     // (false: block copies + output_reorder() permutation, for tensor split or LLAMA_LAYER_INP_SCATTER=0)
     bool layer_inp_scatter() const;
 
-    // (re)allocate the device buffer for cparams.embeddings_layer_inp_dev
-    void layer_inp_dev_alloc();
-
     // (re)allocate the device buffer for cparams.embeddings_nextn_dev, false if it does not fit
     bool h_nextn_dev_alloc();
-
-    ggml_backend_t backend_from_dev(ggml_backend_dev_t dev) const;
 
     //
     // graph

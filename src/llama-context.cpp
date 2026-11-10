@@ -1589,10 +1589,8 @@ llama_context::llama_context(
         const char * LLAMA_KV_ROWS_DISABLE = getenv("LLAMA_KV_ROWS_DISABLE");
         cparams.auto_fkvr = cparams.kv_unified && e_up != nullptr && atoi(e_up) != 0 && !LLAMA_KV_ROWS_DISABLE;
         if (LLAMA_KV_ROWS_DISABLE) {
-            LLAMA_LOG_INFO("%s: LLAMA_KV_ROWS_DISABLE set, disabling kv_rows
-", __func__);
+            LLAMA_LOG_INFO("%s: LLAMA_KV_ROWS_DISABLE set, disabling kv_rows\n", __func__);
         }
-    }
     }
 
     // initialized later

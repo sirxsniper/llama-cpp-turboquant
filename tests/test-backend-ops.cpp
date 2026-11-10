@@ -12324,7 +12324,7 @@ struct test_flash_attn_ext_large_logits : public test_flash_attn_ext {
 };
 
 // GGML_OP_FLASH_ATTN_EXT with kv_rows: each q slice attends to its own list of K/V cache rows
-struct test_flash_attn_ext_kv_rows : public test_case {
+struct test_flash_attn_ext_rows_up : public test_case {
     const int64_t hs;
     const int64_t nh;       // K/V heads
     const int64_t gqa;
@@ -12344,7 +12344,7 @@ struct test_flash_attn_ext_kv_rows : public test_case {
         return 5e-4;
     }
 
-    test_flash_attn_ext_kv_rows(int64_t hs = 256, int64_t nh = 2, int64_t gqa = 8, int64_t n_cells = 2048, int64_t kv = 512,
+    test_flash_attn_ext_rows_up(int64_t hs = 256, int64_t nh = 2, int64_t gqa = 8, int64_t n_cells = 2048, int64_t kv = 512,
                                 int64_t nb = 8, int64_t n_slices = 4, ggml_type type_KV = GGML_TYPE_F16)
         : hs(hs), nh(nh), gqa(gqa), n_cells(n_cells), kv(kv), nb(nb), n_slices(n_slices), type_KV(type_KV) {}
 
@@ -17474,12 +17474,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // flash attention over a list of K/V rows per slice (unified KV cache)
     for (int64_t nb : {1, 3, 8, 64, 512}) {
         for (int64_t n_slices : {1, 4}) {
-            test_cases.emplace_back(new test_flash_attn_ext_kv_rows(256, 2, 8, 4096, 1024, nb, n_slices));
-            test_cases.emplace_back(new test_flash_attn_ext_kv_rows(128, 8, 4, 4096, 512,  nb, n_slices));
-            test_cases.emplace_back(new test_flash_attn_ext_kv_rows(128, 4, 1, 1000, 256,  nb, n_slices));
-            test_cases.emplace_back(new test_flash_attn_ext_kv_rows( 64, 4, 2, 3000, 768,  nb, n_slices, GGML_TYPE_Q8_0));
-            test_cases.emplace_back(new test_flash_attn_ext_kv_rows(512, 2, 8, 4096, 1024, nb, n_slices));
-            test_cases.emplace_back(new test_flash_attn_ext_kv_rows(256, 8, 2, 4096, 1280, nb, n_slices));
+            test_cases.emplace_back(new test_flash_attn_ext_rows_up(256, 2, 8, 4096, 1024, nb, n_slices));
+            test_cases.emplace_back(new test_flash_attn_ext_rows_up(128, 8, 4, 4096, 512,  nb, n_slices));
+            test_cases.emplace_back(new test_flash_attn_ext_rows_up(128, 4, 1, 1000, 256,  nb, n_slices));
+            test_cases.emplace_back(new test_flash_attn_ext_rows_up( 64, 4, 2, 3000, 768,  nb, n_slices, GGML_TYPE_Q8_0));
+            test_cases.emplace_back(new test_flash_attn_ext_rows_up(512, 2, 8, 4096, 1024, nb, n_slices));
+            test_cases.emplace_back(new test_flash_attn_ext_rows_up(256, 8, 2, 4096, 1280, nb, n_slices));
         }
     }
 

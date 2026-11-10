@@ -2837,7 +2837,7 @@ struct llama_model_qwen4exp : public llama_model_base {
     void load_arch_tensors(llama_model_loader & ml) override;
 
     struct graph : public llm_build_delta_net_base {
-        graph(const llm_graph_params & params);
+        graph(const llama_model & model, const llm_graph_params & params);
     protected:
         // the helpers alone, graph_mtp builds its own body
         struct no_build {};
@@ -2963,6 +2963,7 @@ struct llama_model_qwen4exp : public llama_model_base {
           llm_graph_input_kpool * inp_kpool,
                     ggml_tensor * cur,
                     ggml_tensor * inp_pos,
+                            int * sections,
                             int   il);
 
         // [TAG_FN_R4_QSA_POS] what build_qsa_sel hands to build_attn_qsa: the finished additive mask (explicit KQ mask),
@@ -3084,11 +3085,13 @@ struct llama_model_qwen4exp : public llama_model_base {
         std::pair<ggml_tensor *, ggml_tensor *> build_qkvz(
                     ggml_tensor * input,
                             int   il);
+
+        const llama_model & model;
     };
 
     // MTP draft head: one QSA block after the trunk, fed by the trunk's hc-wide residual
     struct graph_mtp : public graph {
-        graph_mtp(const llm_graph_params & params);
+        graph_mtp(const llama_model & model, const llm_graph_params & params);
     };
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;

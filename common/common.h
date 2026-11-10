@@ -1420,8 +1420,8 @@ struct common_prompt_checkpoint {
     llama_pos pos_min;
     llama_pos pos_max;
 
-    common_state_data data_tgt;
-    common_state_data data_dft;
+    std::vector<uint8_t> data_tgt; // [TAG_R38_SYNC] not #30137 common_state_data: the fork server moves these buffers
+    std::vector<uint8_t> data_dft;
 
     // (optional) speculative-decoding implementation state stashed with the checkpoint
     // (e.g. eagle3's deferred-boundary g_embd row)
