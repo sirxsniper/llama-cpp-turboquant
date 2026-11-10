@@ -5828,7 +5828,7 @@ private:
             }
         }
 
-        // the device clip_ctx::clip_ctx() (tools/mtmd/clip.cpp) runs the projector on, for these params
+        // the device mtmd_select_device() (tools/mtmd/mtmd-subcontext.cpp) runs the projector on, for these params
         ggml_backend_dev_t dev = nullptr;
         if (mparams.use_gpu) {
             dev = mparams.device;

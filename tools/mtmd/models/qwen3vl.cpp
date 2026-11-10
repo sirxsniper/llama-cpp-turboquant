@@ -355,7 +355,7 @@ ggml_cgraph * mtmd_graph_qwen3vl::build_fn_l22_batch() {
         embeddings = ggml_concat(ctx0, embeddings, deepstack_features, 0);
     }
 
-    // per-image tokens in ne[1]: the output check of clip_encode_impl compares ne[1] with one image
+    // per-image tokens in ne[1]: the output check of mtmd_subcontext::encode_impl compares ne[1] with one image
     embeddings = ggml_reshape_3d(ctx0, embeddings, embeddings->ne[0], n_pos / 4, B);
 
     ggml_build_forward_expand(gf, embeddings);
