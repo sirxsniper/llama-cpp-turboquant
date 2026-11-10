@@ -85,7 +85,7 @@ public:
         for (uint32_t s = 0; s < LLAMA_MAX_SEQ; ++s) {
             seq_pos[s].clear();
             seq_n[s] = 0;   // [TAG_TURBOT]
-            std::fill(seq_bits[s].begin(), seq_bits[s].end(), 0);
+            std::fill(seq_cbits[s].begin(), seq_cbits[s].end(), 0);
         }
     }
 
@@ -108,7 +108,7 @@ public:
         seq.resize(n);
 
         for (uint32_t s = 0; s < LLAMA_MAX_SEQ; ++s) {
-            seq_bits[s].clear();
+            seq_cbits[s].clear();
         }
 
         reset();
@@ -471,7 +471,7 @@ public:
             for (uint32_t w = 0; w < n_words; ++w) {
                 uint64_t word = 0;
                 for (const llama_seq_id seq_id : slices[s].seq_ids) {
-                    const auto & bits = seq_bits[seq_id];
+                    const auto & bits = seq_cbits[seq_id];
                     if (w < bits.size()) {
                         word |= bits[w];
                     }
@@ -657,9 +657,9 @@ private:
     uint32_t seq_n[LLAMA_MAX_SEQ] = {};
 
     // helper functions for updating `seq_pos`, once cell at a time:
-    // bit i of seq_bits[s] is set if cell i carries sequence s (the transpose of `seq`), used to build the cell lists
+    // bit i of seq_cbits[s] is set if cell i carries sequence s (the transpose of `seq`), used to build the cell lists
     // allocated on the first cell of the sequence, so the copies made by cp() never allocate it
-    std::vector<uint64_t> seq_bits[LLAMA_MAX_SEQ];
+    std::vector<uint64_t> seq_cbits[LLAMA_MAX_SEQ];
 
     // helper functions for updating `seq_pos` and `seq_bits`, once cell at a time:
 
@@ -672,17 +672,17 @@ private:
         seq_n[s]--;   // [TAG_TURBOT]
         assert(seq_n[s] == seq_pos[s].size());
 
-        seq_bits[s][i/64] &= ~(1ull << (i%64));
+        seq_cbits[s][i/64] &= ~(1ull << (i%64));
     }
 
     void seq_pos_inc(llama_seq_id s, uint32_t i) {
         seq_pos[s].insert({ pos[i], i });
 
-        if (seq_bits[s].empty()) {
-            seq_bits[s].assign((pos.size() + 63)/64, 0);
+        if (seq_cbits[s].empty()) {
+            seq_cbits[s].assign((pos.size() + 63)/64, 0);
         }
 
-        seq_bits[s][i/64] |= 1ull << (i%64);
+        seq_cbits[s][i/64] |= 1ull << (i%64);
 
         seq_n[s]++;   // [TAG_TURBOT]
         assert(seq_n[s] == seq_pos[s].size());

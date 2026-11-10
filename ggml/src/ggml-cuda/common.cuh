@@ -1710,8 +1710,7 @@ struct ggml_backend_cuda_context {
     // when the computation is split across CPU/GPU (e.g., with --n-cpu-moe)
     std::unordered_map<const void *, std::unique_ptr<ggml_cuda_graph>> cuda_graphs;
 
-    int64_t next_graph_eviction_time = 0;
-    int64_t last_graph_use_time = 0;
+    int64_t last_graph_eviction_sweep = 0;
 
     // [TAG_FN_L22_GRAPHKEEP] graphs wider than GGML_CUDA_FN_L22_GRAPH_MAXROWS rows run eagerly on this object (never mapped)
     ggml_cuda_graph fn_l22_eager;
@@ -1857,7 +1856,6 @@ struct ggml_cuda_mm_fusion_args_host {
     const ggml_tensor * gate_scale = nullptr;
     ggml_glu_op glu_op;
     float glu_limit = 0.0f;
-    ggml_prec prec_src1 = GGML_PREC_UNDEFINED; // src1 precision requested by the fused MUL_MATs (MMQ)
     const ggml_tensor * shared_up = nullptr;
     const ggml_tensor * shared_gate = nullptr;
     ggml_tensor * shared_dst = nullptr;

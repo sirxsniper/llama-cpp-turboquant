@@ -3779,8 +3779,8 @@ int llama_model_qwen4exp::graph::tbo_decide(llm_graph_input_mem_hybrid * inp, ll
     const llm_graph_input_attn_kv * a = inp ? inp->get_attn() : nullptr;
     bool ok = a != nullptr && inp->get_recr() != nullptr && inp->get_recr()->s_copy_r == nullptr;
     if (ok) {
-        ok = per_row(a->self_k_idxs) && per_row(a->self_v_idxs) && per_col(a->self_kq_mask) &&
-             a->self_kq_mask_cnv == a->self_kq_mask && per_row(a->self_turbot_young) &&
+        ok = per_row(a->self_k_idxs) && per_row(a->self_v_idxs) && per_col(a->self_attn_mask.raw) &&
+             a->self_attn_mask.rows == nullptr && per_row(a->self_turbot_young) &&
              (a->self_q_pos == nullptr || (a->self_q_pos->ne[0] == nt_all && a->self_q_pos->ne[2] == 1 && a->self_q_pos->ne[3] == 1));
     }
     if (ok && inp_kpool) {
@@ -3970,8 +3970,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_tbo_trunk(
         auto av = std::make_unique<llm_graph_input_attn_kv>(a->hparams, a->cparams, a->mctx);
         av->self_k_idxs = rows1(a->self_k_idxs, ch.r0);
         av->self_v_idxs = rows1(a->self_v_idxs, ch.r0);
-        av->self_kq_mask     = fn_tbo::mask_rows(ctx0, a->self_kq_mask, ch.r0, T);
-        av->self_kq_mask_cnv = av->self_kq_mask;
+        av->self_attn_mask      = a->self_attn_mask; // [TAG_R38_SYNC_KVROWS] (rows == nullptr: checked above)
+        av->self_attn_mask.raw  = fn_tbo::mask_rows(ctx0, a->self_attn_mask.raw, ch.r0, T);
         av->self_kv_pos      = a->self_kv_pos;
         av->self_q_pos       = fn_tbo::qpos_rows(ctx0, a->self_q_pos, ch.r0, T);
         if (av->self_q_pos) {

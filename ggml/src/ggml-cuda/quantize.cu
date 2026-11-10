@@ -84,8 +84,10 @@ static __global__ void quantize_q8_1(
     ggml_cuda_pdl_sync();
     const float xi = i0 < ne00 ? x[i03*s03 + i02*s02 + i01*s01 + i00] : 0.0f;
     float amax = fabsf(xi);
+    float sum = xi;
 
     amax = warp_reduce_max<QK8_1>(amax);
+    sum  = warp_reduce_sum<QK8_1>(sum);
 
     const float  d0 = amax / 127.0f;
     // [TAG_FN_L21_Q8CLAMP] an overflowing fp16 scale quantizes against 65504 (same ops as before for every other block)
@@ -96,8 +98,6 @@ static __global__ void quantize_q8_1(
         qf = fminf(fmaxf(qf, -127.0f), 127.0f);
     }
     const int8_t q = qf;
-
-    const int sum = warp_reduce_sum<QK8_1>((int) q);
 
     y[ib].qs[iqs] = q;
 

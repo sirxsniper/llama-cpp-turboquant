@@ -1433,7 +1433,7 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
         res &= mctx->get_attn()->get_turbot_n_stream() == 1;   // [TAG_SYNC_POSMASK_STREAMS]
     }
     // [TAG_FN_L22_IMGPASS_MASK] keyed vectors only for a ubatch the keys can describe, and the reverse
-    res &= inp_attn->fn_imgkeys == llm_fn_l22_imgkeys_want(params.arch, params.cparams, params.ubatch, mctx->get_attn());
+    res &= inp_attn->fn_imgkeys == llm_fn_l22_imgkeys_want(params.model->arch, params.cparams, params.ubatch, mctx->get_attn());
 
     // [TAG_TURBOT] this check re-implements the attention input's instead of delegating, so the turbot conditions go
     // here as well: a reused graph without the fill tensor would never run a queued fill

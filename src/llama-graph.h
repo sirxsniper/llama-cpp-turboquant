@@ -830,7 +830,6 @@ class llm_graph_result;
 
 struct llm_graph_params {
     const llama_model * model = nullptr;
-    llm_arch arch = LLM_ARCH_UNKNOWN; // [TAG_R38_SYNC] kept for the fork code (upstream #31683 reads model->arch)
 
     llama_hparams hparams;
     llama_cparams cparams;
@@ -968,7 +967,6 @@ struct llm_graph_params {
             cparams.causal_attn             == other.cparams.causal_attn             &&
             layer_inp_dev == other.layer_inp_dev &&
             layer_inp_src == other.layer_inp_src &&
-            arch  == other.arch  &&
             h_nextn_dev   == other.h_nextn_dev   &&
             h_nextn_src   == other.h_nextn_src   &&
             model == other.model &&
