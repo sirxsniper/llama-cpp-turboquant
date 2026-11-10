@@ -1054,8 +1054,6 @@ size_t llama_memory_recurrent::size_ring_bytes() const {
 }
 
 void llama_memory_recurrent::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
-    GGML_UNUSED(flags);
-
     std::vector<std::pair<uint32_t, uint32_t>> cell_ranges; // ranges, from inclusive, to exclusive
     std::vector<std::pair<uint32_t, uint32_t>> cell_ranges_data; // logical source row ranges
     std::vector<std::pair<uint32_t, uint32_t>> cell_ranges_data0; // [TAG_4C_GDN_REPLAY] group-0 rows of C and the ring
@@ -1145,7 +1143,7 @@ void llama_memory_recurrent::state_write(llama_io_write_i & io, llama_seq_id seq
     io.write(&cell_count, sizeof(cell_count));
 
     state_write_meta(io, cell_ranges, seq_id);
-    state_write_data(io, cell_ranges_data, cell_ranges_data0, ring_live);
+    state_write_data(io, cell_ranges_data, cell_ranges_data0, ring_live, flags);
 }
 
 void llama_memory_recurrent::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
@@ -1199,24 +1197,31 @@ void llama_memory_recurrent::state_write_meta(llama_io_write_i & io, const std::
 }
 
 void llama_memory_recurrent::state_write_data(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges,
-        const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges0, const std::vector<uint32_t> & ring_live) const {
+        const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges0, const std::vector<uint32_t> & ring_live,
+        llama_state_seq_flags flags) const {
     const uint32_t s_trans = 0;
     const uint32_t n_layer = hparams.n_layer();
 
-    // [TAG_R35_NP2PARK] the cells this state reads are mapped first (a parked one comes back from host RAM)
-    if (r35_on) {
+    // [TAG_NP2PARK_HOSTREAD] a parked cell stays parked: a save reads its granules from its host copy
+    // (llama_rs_write_tensor_parked). An on-device save maps the cells first. A row id is group*size + cell (a pending
+    // rollback reads a snapshot group). A size query reads no data, so it maps nothing.
+    const bool on_device = (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) != 0;
+    const bool r35_host  = r35_on && !on_device && io.reads_tensors();
+    if (r35_on && on_device && io.reads_tensors()) {
         std::vector<uint32_t> need;
-        for (const auto * rs : { &cell_ranges, &cell_ranges0 }) {
-            for (const auto & range : *rs) {
-                for (uint32_t i = range.first; i < range.second && i < size; ++i) {
-                    need.push_back(i);
-                }
-            }
-        }
+        llama_rs_cells_of_rows(need, cell_ranges,  size);
+        llama_rs_cells_of_rows(need, cell_ranges0, size);
         if (!r35_ensure(need)) {
             throw std::runtime_error("[TAG_R35_NP2PARK] a parked recurrent cell could not be mapped for a state save");
         }
     }
+    auto write_tensor = [&](ggml_tensor * t, size_t off, size_t n) {
+        if (r35_host) {
+            llama_rs_write_tensor_parked(io, t, off, n, r35_cells, r35_g);
+        } else {
+            io.write_tensor(t, off, n);
+        }
+    };
 
     // [TAG_4C_GDN_REPLAY] the ring format takes the s_trans word, so a reader without replay rejects it
     const uint32_t s_fmt = replay ? LLAMA_RS_STATE_FMT_RING : s_trans;
@@ -1251,7 +1256,7 @@ void llama_memory_recurrent::state_write_data(llama_io_write_i & io, const std::
         for (const auto & range : cell_ranges) {
             const size_t range_size = range.second - range.first;
             const size_t buf_size = range_size * r_size_row;
-            io.write_tensor(r_l[il], range.first * r_size_row, buf_size);
+            write_tensor(r_l[il], range.first * r_size_row, buf_size);
         }
 
         // the PLE conv history is a second recurrent row, so it has to travel with the first
@@ -1261,7 +1266,7 @@ void llama_memory_recurrent::state_write_data(llama_io_write_i & io, const std::
 
             for (const auto & range : cell_ranges) {
                 const size_t range_size = range.second - range.first;
-                io.write_tensor(p_l[il], range.first * p_size_row, range_size * p_size_row);
+                write_tensor(p_l[il], range.first * p_size_row, range_size * p_size_row);
             }
         }
     }
@@ -1285,7 +1290,7 @@ void llama_memory_recurrent::state_write_data(llama_io_write_i & io, const std::
             for (const auto & range : (replay ? cell_ranges0 : cell_ranges)) {
                 const size_t range_size = range.second - range.first;
                 const size_t buf_size = range_size * s_size_row;
-                io.write_tensor(s_l[il], range.first * s_size_row, buf_size);
+                write_tensor(s_l[il], range.first * s_size_row, buf_size);
             }
         }
 
@@ -1301,7 +1306,7 @@ void llama_memory_recurrent::state_write_data(llama_io_write_i & io, const std::
 
             for (const auto & range : cell_ranges0) {
                 const size_t range_size = range.second - range.first;
-                io.write_tensor(ring_l[il], range.first * ring_size_row, range_size * ring_size_row);
+                write_tensor(ring_l[il], range.first * ring_size_row, range_size * ring_size_row);
             }
         }
     } else {
@@ -1330,7 +1335,7 @@ void llama_memory_recurrent::state_write_data(llama_io_write_i & io, const std::
                     const size_t range_size = range.second - range.first;
                     const size_t src_offset = (range.first + j * mem_size) * s_size_el;
                     const size_t buf_size = range_size * s_size_el;
-                    io.write_tensor(s_l[il], src_offset, buf_size);
+                    write_tensor(s_l[il], src_offset, buf_size);
                 }
             }
         }
@@ -1889,8 +1894,10 @@ int32_t llama_memory_recurrent_context::s_copy_plane(int i, uint32_t plane) cons
 // is mapped and the bytes are copied back. The cell's bytes outside those granules never move. Exact: the data is back
 // bit for bit before anything reads it.
 // Guards (each read or write of cell data maps the cell first): apply() of every ubatch (its range, the sources and the
-// zeroed cell), state_write_data / state_read_data (slot save / restore, checkpoints, the conversation store); clear()
-// zeroes the host bytes. The owner parks at batch starts only (r35_park_except) and drives the hot set side.
+// zeroed cell), state_read_data (slot restore, checkpoints, the conversation store) and an on-device state_write_data;
+// clear() zeroes the host bytes. [TAG_NP2PARK_HOSTREAD] Other state saves leave a parked cell parked and read its granules
+// from the host copy (nothing writes a parked cell). The owner parks at batch starts only (r35_park_except) and drives the
+// hot set side.
 // LLAMA_R35_NP2PARK=0: one plain buffer as in v0.27.0.
 
 ggml_backend_buffer_t llama_memory_recurrent::r35_alloc(const llama_model & model, ggml_context * ctx, ggml_backend_buffer_type_t buft) {

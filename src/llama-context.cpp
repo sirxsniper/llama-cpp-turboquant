@@ -6520,6 +6520,10 @@ public:
         return size_written;
     }
 
+    bool reads_tensors() const override {
+        return false;
+    }
+
 private:
     const bool skip_tensors;
 

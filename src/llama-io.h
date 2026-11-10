@@ -17,6 +17,9 @@ public:
     // bytes written so far
     virtual size_t n_bytes() = 0;
 
+    // false: the writer never reads tensor data (a size query, a buffer walk), so the data need not be readable
+    virtual bool reads_tensors() const { return true; }
+
     void write_string(const std::string & str);
 };
 

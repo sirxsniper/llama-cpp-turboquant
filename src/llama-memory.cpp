@@ -129,6 +129,10 @@ struct llama_memory_buffers_writer : public llama_io_write_i {
     size_t n_bytes() override {
         return size;
     }
+
+    bool reads_tensors() const override {
+        return false;
+    }
 };
 
 std::vector<ggml_backend_buffer_t> llama_memory_get_buffers(const llama_memory_t mem) {
