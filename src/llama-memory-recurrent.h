@@ -169,6 +169,7 @@ public:
     size_t   r35_cell_bytes(uint32_t c) const;              // the bytes a parked cell gives back
     size_t   r35_parked_bytes() const;                      // the bytes all parked cells give back now
     uint32_t r35_n_parked() const;
+    uint64_t r38_n_moves() const { return r35_n_park + r35_n_unpark; } // [TAG_R38_E3] parks + maps so far
     // the fit: park every cell but `keep` (they are empty there; their VRAM is free for the fit, the hot set lends it), then
     // later parks / maps take and give through `h`. false: nothing parked (the layout cannot)
     bool     r35_start(const r35_hooks & h, uint32_t keep);

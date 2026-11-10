@@ -8083,8 +8083,61 @@ size_t llama_context::r35_hold(size_t target) {
     if (target == llama_moe_hot_np2_out()) {
         return target;
     }
+    // [TAG_R38_E3] nothing would move (whole groups coarser than the target): no synchronize of every context
+    if (r38_settle_skip < 0) {
+        const char * e = getenv("LLAMA_R38_NP2SETTLE");
+        r38_settle_skip = (e && e[0] == '0' && e[1] == '\0') ? 0 : 1;
+    }
+    if (r38_settle_skip > 0 && llama_moe_hot_np2_settled(target)) {
+        r38_n_skip++;
+        return llama_moe_hot_np2_out();
+    }
     r35_hook_sync(this);
     return llama_moe_hot_np2_hold(this, target);
+}
+
+// [TAG_R38_E3] the share's bytes the hot set holds now: the fit counted rs_fit + small_extra as hot slots; the share takes
+// whole groups back out of them (np2_out). Negative: the share holds more than the fit's want (whole groups)
+int64_t llama_context::r35_lent_now() const {
+    if (!r35_on || !r35_carry) {
+        return 0;
+    }
+    return (int64_t) (r35_rs_fit + r35_small_extra) - (int64_t) llama_moe_hot_np2_out();
+}
+
+void llama_context::r38_account(int64_t now) {
+    static int64_t period_us = 600000000LL; // LLAMA_R38_NP2LOG_S: the summary period (default 600 s of batches)
+    if (r38_log < 0) {
+        const char * e = getenv("LLAMA_R38_NP2LOG");
+        r38_log = (e && e[0] == '0' && e[1] == '\0') ? 0 : 1;
+        if (const char * p = getenv("LLAMA_R38_NP2LOG_S"); p && atoi(p) > 0) {
+            period_us = (int64_t) atoi(p) * 1000000LL;
+        }
+    }
+    if (r38_log <= 0 || !r35_on) {
+        return;
+    }
+    if (r38_t_prev > 0) {
+        const double dt   = std::min(60.0, (now - r38_t_prev)/1e6); // an idle server's hours do not count
+        const int64_t lent = r35_lent_now();
+        r38_mib_s  += dt * (double) lent / 1048576.0;
+        r38_full_s += lent >= (int64_t) (r35_rs_fit + r35_small_extra) ? dt : 0.0;
+        r38_span_s += dt;
+    } else {
+        r38_t_rep = now;
+    }
+    r38_t_prev = now;
+    if (now - r38_t_rep >= period_us && r38_span_s > 0.0) {
+        LLAMA_LOG_WARN("%s: [TAG_R38_E3] [TAG_R35_NP2PARK] lend summary over %.0f s of batches: the hot set held %.0f MiB of the idle "
+                "slot's %.0f MiB on average (all of it %.0f %% of the time), %.0f MiB now; %u cell(s) parked; %" PRIu64 " wide / %" PRIu64
+                " narrow switches, %" PRIu64 " settles without a move skipped their synchronize\n", __func__, r38_span_s,
+                r38_mib_s / r38_span_s, (r35_rs_fit + r35_small_extra)/1048576.0, 100.0 * r38_full_s / r38_span_s,
+                r35_lent_now()/1048576.0, r35_mem ? r35_mem->r35_n_parked() : 0u, r35_n_wide, r35_n_narrow, r38_n_skip);
+        r38_t_rep  = now;
+        r38_mib_s  = 0.0;
+        r38_full_s = 0.0;
+        r38_span_s = 0.0;
+    }
 }
 
 size_t llama_context::r35_hook_take(void * user, size_t bytes) {
@@ -8170,6 +8223,25 @@ void llama_context::r35_before_batch() {
     const int32_t busy = l24_seqs_busy;
     const bool    wide = busy < 0 || busy >= 2 || seqs.size() != 1;
     const int64_t now  = ggml_time_us();
+    r38_account(now); // [TAG_R38_E3] the lend of the period up to this batch
+    // [TAG_R38_E3] after this batch's moves: what the hot set holds of the idle slot's share now (first 8 changes, then 1/64)
+    struct r38_after {
+        llama_context * c; uint64_t m0; int64_t l0;
+        ~r38_after() {
+            if (c->r38_log <= 0) {
+                return;
+            }
+            const uint64_t m1 = c->r35_mem ? c->r35_mem->r38_n_moves() : 0;
+            const int64_t  l1 = c->r35_lent_now();
+            static uint64_t n_ch = 0;
+            if ((m1 != m0 || l1 != l0) && (++n_ch <= 8 || n_ch % 64 == 0)) {
+                LLAMA_LOG_WARN("r35_before_batch: [TAG_R38_E3] [TAG_R35_NP2PARK] change %" PRIu64 ": the hot set holds %.0f MiB of the "
+                        "idle slot's %.0f MiB now (was %.0f; %u cell(s) parked, share out %.0f MiB)\n", n_ch, l1/1048576.0,
+                        (c->r35_rs_fit + c->r35_small_extra)/1048576.0, l0/1048576.0, c->r35_mem ? c->r35_mem->r35_n_parked() : 0u,
+                        llama_moe_hot_np2_out()/1048576.0);
+            }
+        }
+    } r38_after_guard{this, r35_mem ? r35_mem->r38_n_moves() : 0, r35_lent_now()};
     if (wide) {
         r35_one_since = 0;
         if (!r35_all) {

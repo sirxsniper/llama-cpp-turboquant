@@ -2347,10 +2347,25 @@ void llama_memory_recurrent::r35_park_except(const std::vector<llama_seq_id> & k
         r35_h.give(r35_h.user, 0);
     }
     static uint64_t n_sw = 0;
+    // [TAG_R38_E3] LLAMA_R38_NP2LOG=0: the v0.28.1 line. The old "(0 MiB to the hot set, net)" of a swap read as "nothing
+    // lent": the parked cell stays parked (the other slot's now), its VRAM stays with the hot set; the owner prints the lend
+    static const bool r38_log = [] {
+        const char * e = getenv("LLAMA_R38_NP2LOG");
+        return !(e && e[0] == '0' && e[1] == '\0');
+    }();
     if (++n_sw <= 4 || n_sw % 64 == 0) {
+        if (r38_log) {
+            LLAMA_LOG_WARN("%s: [TAG_R35_NP2PARK] switch %llu: %zu cell(s) parked, %zu mapped again (%s: %.0f MiB of cells parked "
+                    "now, %+.0f MiB) in %.1f ms; %u parked now (parks %.1f ms, maps %.1f ms on average)\n", __func__,
+                    (unsigned long long) n_sw, to_park.size(), to_map.size(),
+                    to_park.size() == to_map.size() ? "a swap between the slots" : to_park.size() > to_map.size() ? "more parked" :
+                    "fewer parked", after/1048576.0, back/1048576.0, (ggml_time_us() - t0)/1000.0, r35_n_parked(),
+                    r35_n_park ? r35_park_ms/(double) r35_n_park : 0.0, r35_n_unpark ? r35_unpark_ms/(double) r35_n_unpark : 0.0);
+        } else {
         LLAMA_LOG_WARN("%s: [TAG_R35_NP2PARK] switch %llu: %zu cells parked, %zu mapped again (%.0f MiB to the hot set, net) in "
                 "%.1f ms; %u parked now (parks %.1f ms, maps %.1f ms on average)\n", __func__, (unsigned long long) n_sw,
                 to_park.size(), to_map.size(), back/1048576.0, (ggml_time_us() - t0)/1000.0, r35_n_parked(),
                 r35_n_park ? r35_park_ms/(double) r35_n_park : 0.0, r35_n_unpark ? r35_unpark_ms/(double) r35_n_unpark : 0.0);
+        }
     }
 }
