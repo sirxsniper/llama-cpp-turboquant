@@ -2793,9 +2793,22 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // NaN (CPUSHARE=2 PPL -nan; r22 end test T2, FAULT 2026-10-18 23:21:22). Pinned to the
     // stream's device here; the gate before the router (no CPUSHARE) leaves the scheduler's choice unchanged
     ggml_backend_t cs_dev = cs_defer_gate && sched ? llama_prefill_stream_device() : nullptr;
+    // [TAG_R38_E2] a matmul with per-expert scales comes back from build_lora_mm_id as MUL(MUL_MAT_ID, scale rows): the
+    // pin and the skip table belong on the MUL_MAT_ID too (v0.28.1 pinned only the MUL, so the matmul took the CPU after
+    // the deferred gate split and read the bank over device-to-host copies: a fresh 32K prompt ran at ~55 t/s)
+    const bool r38_mmid = llama_r38_fp4s() && (up_exps_s || gate_exps_s || down_exps_s);
+    auto r38_inner_mmid = [&](ggml_tensor * t) -> ggml_tensor * {
+        if (r38_mmid && t && t->op == GGML_OP_MUL && t->src[0] && t->src[0]->op == GGML_OP_MUL_MAT_ID) {
+            return t->src[0];
+        }
+        return nullptr;
+    };
     auto pin_cs_dev = [&](ggml_tensor * t) {
         if (cs_dev && t) {
             ggml_backend_sched_set_tensor_backend(sched, t, cs_dev);
+            if (ggml_tensor * mm = r38_inner_mmid(t)) {
+                ggml_backend_sched_set_tensor_backend(sched, mm, cs_dev);
+            }
         }
     };
 
@@ -3089,6 +3102,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     };
     // expert skip table of the CPU MUL_MAT_IDs: the DMA plan's (hot + DMA) or the hot set's
     auto set_skip = [&](ggml_tensor * t) {
+        if (ggml_tensor * mm = r38_inner_mmid(t)) { // [TAG_R38_E2] the skip table is the MUL_MAT_ID's (src[3])
+            t = mm;
+        }
         if (dma_tbl) {
             t->src[3] = dma_tbl;
             t->op_params[0] = 0;

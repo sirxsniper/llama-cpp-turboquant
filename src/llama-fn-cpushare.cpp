@@ -11,6 +11,7 @@
 #include "llama-model.h"
 #include "llama-moe-gen5.h"
 #include "llama-moecache.h"
+#include "llama-moe-bridge.h" // [TAG_R38_E2] llama_r38_fp4s
 
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
@@ -1334,9 +1335,14 @@ bool llama_fn_cpushare_plan(llm_graph_context * g, const llama_ubatch & ubatch, 
         return false;
     }
     const auto & layer = st->model->layers[il];
+    // [TAG_R38_E2] per-expert scales are fine for the skip-only mode (2: no expert runs on the host, the device matmuls
+    // keep their scales); the host share (mode 1) has no scales, so a scaled layer stays out of it
+    const bool no_scales = !layer.ffn_up_exps_s && !layer.ffn_gate_exps_s && !layer.ffn_down_exps_s;
+    const bool r38_skip_only = llama_r38_fp4s() && st->cfg.mode == 2 && layer.ffn_up_exps_s && layer.ffn_gate_exps_s &&
+        layer.ffn_down_exps_s;
     const bool chain_ok = layer.ffn_up_exps == io->up_host && layer.ffn_gate_exps == io->gate_host &&
         layer.ffn_down_exps == io->down_host && !layer.ffn_gate_up_exps && !layer.ffn_up_exps_b && !layer.ffn_gate_exps_b &&
-        !layer.ffn_down_exps_b && !layer.ffn_up_exps_s && !layer.ffn_gate_exps_s && !layer.ffn_down_exps_s &&
+        !layer.ffn_down_exps_b && (no_scales || r38_skip_only) &&
         !(g->hparams.swiglu_clamp_exp[il] > 1e-6f) && (!g->loras || g->loras->empty());
     return llama_fn_cpushare_build(g->ctx0, g->gf, g->sched, g->backend_cpu, il, io, chain_ok);
 }
