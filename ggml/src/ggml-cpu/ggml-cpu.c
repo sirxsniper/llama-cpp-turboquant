@@ -1327,11 +1327,13 @@ static ggml_vec_dot_mr_t ggml_cpu_fn_mr_kernel(enum ggml_type type) {
         case GGML_TYPE_Q5_1:   return ggml_vec_dot_q5_1_q8_1_mr;
         case GGML_TYPE_Q8_0:   return ggml_vec_dot_q8_0_q8_0_mr;
         case GGML_TYPE_IQ4_NL: return ggml_vec_dot_iq4_nl_q8_0_mr;
-        case GGML_TYPE_NVFP4: { // [TAG_R38_E2] GGML_CPU_R38_NVFP4_MR=0: none (v0.28.1: per-column vec_dot, the same values)
+        case GGML_TYPE_NVFP4: { // [TAG_R38_E2] GGML_CPU_R38_NVFP4_MR=1: the multi-row kernel (same values); default 0 =
+            // v0.28.1 (per-column vec_dot): no decode gain measured (130.2 off vs 125.6 on), and 3 of 3 FP4-Local fresh 32K
+            // prompts stalled with it on vs 0 of 1 off (not proven related)
             static int on = -1;
             if (on < 0) {
                 const char * e = getenv("GGML_CPU_R38_NVFP4_MR");
-                on = e == NULL || atoi(e) != 0;
+                on = e != NULL && atoi(e) != 0;
             }
             return on ? ggml_vec_dot_nvfp4_q8_0_mr : NULL;
         }
