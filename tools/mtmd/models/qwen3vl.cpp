@@ -1,6 +1,6 @@
 #include "models.h"
 
-ggml_cgraph * clip_graph_qwen3vl::build() {
+ggml_cgraph * mtmd_graph_qwen3vl::build() {
     if (fn_n_images > 1) {
         return build_fn_l22_batch(); // [TAG_FN_L22_VLBATCH]
     }
@@ -191,7 +191,7 @@ ggml_cgraph * clip_graph_qwen3vl::build() {
 // [TAG_FN_L22_VLBATCH] B independent still images of one size in one graph. Same math as build() per image: the
 // tokens are flat rows [n_embd, n_pos*B] (one GEMM per weight), attention runs per image (batch dim of q/k/v).
 // Output [n_mmproj, n_pos/4, B], image-major
-ggml_cgraph * clip_graph_qwen3vl::build_fn_l22_batch() {
+ggml_cgraph * mtmd_graph_qwen3vl::build_fn_l22_batch() {
     GGML_ASSERT(model.patch_bias != nullptr);
     GGML_ASSERT(model.position_embeddings != nullptr);
     GGML_ASSERT(model.class_embedding == nullptr);
@@ -355,7 +355,7 @@ ggml_cgraph * clip_graph_qwen3vl::build_fn_l22_batch() {
         embeddings = ggml_concat(ctx0, embeddings, deepstack_features, 0);
     }
 
-    // per-image tokens in ne[1]: the output check of clip_encode_impl compares ne[1] with one image
+    // per-image tokens in ne[1]: the output check of mtmd_subcontext::encode_impl compares ne[1] with one image
     embeddings = ggml_reshape_3d(ctx0, embeddings, embeddings->ne[0], n_pos / 4, B);
 
     ggml_build_forward_expand(gf, embeddings);

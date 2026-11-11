@@ -1672,6 +1672,7 @@ void llm_graph_result::reset() {
     t_sampled_probs.clear();
     t_sampled_logits.clear();
     t_candidates.clear();
+    t_sampling_all.clear();
 
     t_fn_topk_ids  = nullptr; // [TAG_R35_HOSTCHAIN]
     t_fn_topk_vals = nullptr;
@@ -1777,22 +1778,8 @@ void llm_graph_result::set_outputs(const llm_graph_params & params) {
             }
         }
     }
-    for (auto * tensor : t_sampled) {
-        if (tensor != nullptr) {
-            ggml_set_output(tensor);
-        }
-    }
-    for (auto * tensor : t_sampled_probs) {
-        if (tensor != nullptr) {
-            ggml_set_output(tensor);
-        }
-    }
-    for (auto * tensor : t_sampled_logits) {
-        if (tensor != nullptr) {
-            ggml_set_output(tensor);
-        }
-    }
-    for (auto * tensor : t_candidates) {
+    // the chains are read on the host after compute, so keep every one alive
+    for (auto * tensor : t_sampling_all) {
         if (tensor != nullptr) {
             ggml_set_output(tensor);
         }
@@ -4585,6 +4572,43 @@ ggml_tensor * llm_graph_context::build_attn_mha_kv(
     return res_mha;
 }
 
+static void build_attn_scale_kv_inputs(
+        ggml_context * ctx,
+        const llama_kv_cache_context * mctx,
+        ggml_tensor * & q,
+        ggml_tensor * & k,
+        ggml_tensor * & v,
+        int32_t il) {
+    if (ggml_tensor * scale = mctx->get_k_scale(il)) {
+        // Store K/s and move its dequant scale to Q: (Q*s) dot (K/s) = Q dot K.
+        q = ggml_mul(ctx, q, scale);
+        if (k) {
+            k = ggml_div(ctx, k, scale);
+        }
+    }
+
+    if (v) {
+        // Store V/s here and restore its dequant scale after the weighted sum.
+        ggml_tensor * scale = mctx->get_v_scale(il);
+        if (scale) {
+            v = ggml_div(ctx, v, scale);
+        }
+    }
+}
+
+static ggml_tensor * build_attn_scale_kv_output(
+        ggml_context * ctx,
+        const llama_kv_cache_context * mctx,
+        ggml_tensor * cur,
+        int32_t il) {
+    if (ggml_tensor * scale = mctx->get_v_scale(il)) {
+        // P*(V/s)*s = P*V.
+        cur = ggml_mul(ctx, cur, scale);
+    }
+
+    return cur;
+}
+
 ggml_tensor * llm_graph_context::build_attn(
         llm_graph_input_attn_kv * inp,
         ggml_tensor * wo,
@@ -4611,14 +4635,16 @@ ggml_tensor * llm_graph_context::build_attn(
         v_cur = llama_mul_mat_hadamard(ctx0, v_cur, inp->self_v_rot[il]);
     }
 
+    const auto * mctx_cur = inp->mctx;
+
+    build_attn_scale_kv_inputs(ctx0, mctx_cur, q_cur, k_cur, v_cur, il);
+
     // these nodes are added to the graph together so that they are not reordered
     // by doing so, the number of splits in the graph is reduced
     // expand k later to enable rope fusion which directly writes into k-v cache
     ggml_build_forward_expand(gf, q_cur);
     ggml_build_forward_expand(gf, v_cur);
     ggml_build_forward_expand(gf, k_cur);
-
-    const auto * mctx_cur = inp->mctx;
 
     ggml_tensor * q = q_cur;
     ggml_tensor * k;
@@ -4658,6 +4684,7 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * cur = build_attn_mha_kv(mctx_cur, q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il,
             inp->get_kv_pos(), inp->get_q_pos(),   // [TAG_FA_POS_MASK]
             inp->self_turbot_gtab, 0, kv_rows);   // [TAG_R38_SYNC_KVROWS]
+    cur = build_attn_scale_kv_output(ctx0, mctx_cur, cur, il);
     cb(cur, "kqv_out", il);
 
     // TurboQuant: if V was padded, the output has padded dimensions.
@@ -4976,6 +5003,11 @@ ggml_tensor * llm_graph_context::build_attn(
         }
     }
 
+    const auto * mctx_iswa = inp->mctx;
+    const auto * mctx_cur = is_swa ? mctx_iswa->get_swa() : mctx_iswa->get_base();
+
+    build_attn_scale_kv_inputs(ctx0, mctx_cur, q_cur, k_cur, v_cur, il);
+
     // these nodes are added to the graph together so that they are not reordered
     // by doing so, the number of splits in the graph is reduced
     ggml_build_forward_expand(gf, q_cur);
@@ -4987,10 +5019,6 @@ ggml_tensor * llm_graph_context::build_attn(
     if (v_cur) {
         ggml_build_forward_expand(gf, v_cur);
     }
-
-    const auto * mctx_iswa = inp->mctx;
-
-    const auto * mctx_cur = is_swa ? mctx_iswa->get_swa() : mctx_iswa->get_base();
 
     // [TAG_TURBOT_ANY_ISWA] turbot is only ever the base (full-attention) child; the SWA child keeps its own type
     const bool turbot = mctx_cur->is_turbot();
@@ -5038,6 +5066,7 @@ ggml_tensor * llm_graph_context::build_attn(
     // rotation and the FA with the young pool and the granule table of a turbot base child, shared with the kv overload
     ggml_tensor * cur = build_attn_mha_kv(mctx_cur, q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il,
             nullptr, nullptr, is_swa ? nullptr : inp->self_turbot_gtab, 0, kv_rows);   // [TAG_R38_SYNC_KVROWS]
+    cur = build_attn_scale_kv_output(ctx0, mctx_cur, cur, il);
     cb(cur, "kqv_out", il);
 
     // TurboQuant: if V was padded, extract original V head_dim after inverse WHT
@@ -5971,6 +6000,15 @@ void llm_graph_context::build_h_nextn_dev() const {
     res->add_input(std::move(inp));
 }
 
+// [TAG_R39_SMPL_ALIAS] see build_sampling
+static bool llama_r39_smpl_alias_on() {
+    static const bool v = [] {
+        const char * e = getenv("LLAMA_R39_SMPL_ALIAS");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    return v;
+}
+
 void llm_graph_context::build_sampling() const {
     if (samplers.empty() || !res->t_logits) {
         return;
@@ -6041,6 +6079,17 @@ void llm_graph_context::build_sampling() const {
 
             assert(sampler->iface->backend_apply);
             sampler->iface->backend_apply(sampler, ctx0, gf, &data);
+
+            // [TAG_R39_SMPL_ALIAS] upstream 40f4f4ac9 (#32015) keeps every chain as a graph output: a chain left unselected in
+            // the reserve graph was freed and its addresses reused, and a later graph that selects it reuses those addresses by
+            // node index (upstream: one sequence's draft acceptance collapsed at -np 2 with dflash / dspark / eagle3).
+            // LLAMA_R39_SMPL_ALIAS=1 only; the default 0 keeps the recorded chains only (the maps below), as v0.29.0.
+            if (record || llama_r39_smpl_alias_on()) {
+                if (data.sampled     != nullptr) { res->t_sampling_all.push_back(data.sampled);     }
+                if (data.probs       != nullptr) { res->t_sampling_all.push_back(data.probs);       }
+                if (data.logits      != nullptr) { res->t_sampling_all.push_back(data.logits);      }
+                if (data.candidates  != nullptr) { res->t_sampling_all.push_back(data.candidates);  }
+            }
 
             if (data.sampled != nullptr) {
                 if (record) {

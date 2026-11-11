@@ -2160,6 +2160,12 @@ static void test_lfm2_parser(const std::string & template_path, bool detailed_de
         })
         .run();
 
+    // Raw control characters in pythonic string arguments must be escaped into valid JSON.
+    tst.test("<|tool_call_start|>[python(code='a\nb')]<|tool_call_end|>")
+        .tools({ python_tool })
+        .expect_tool_calls({ { "python", R"#({"code": "a\nb"})#", "" } })
+        .run();
+
     // String escape sequences decode to their actual characters (newline + tab here),
     // so a "write a two line file" style call produces real line breaks, not literal "\n".
     tst.test("<|tool_call_start|>[python(code=\"First line\\nSecond line\\tindented\")]<|tool_call_end|>")
@@ -7014,6 +7020,22 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
             .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
             .expect_reasoning("Thinking.")
             .expect_content("Working on it.Hello!")
+            .run();
+
+        // Structured output, straight to the final answer
+        tst.test(" to=user<|message|>" R"({"amount": 123.45, "date": "2025-12-03"})")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .json_schema(invoice_schema)
+            .expect_content(R"({"amount": 123.45, "date": "2025-12-03"})")
+            .run();
+
+        // Structured output after a reasoning message: reasoning stays free-form
+        tst.test(" to=self<|message|>I need to output the invoice details in JSON<|eom|>"
+                 "<|start|>assistant to=user<|message|>" R"({"amount": 123.45, "date": "2025-12-03"})")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .json_schema(invoice_schema)
+            .expect_reasoning("I need to output the invoice details in JSON")
+            .expect_content(R"({"amount": 123.45, "date": "2025-12-03"})")
             .run();
     }
 
