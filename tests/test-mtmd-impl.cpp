@@ -1049,6 +1049,7 @@ MAKE_TEST(test_fn_l22_vlbatch_encode) {
             std::filesystem::remove(path);
         }
     }
+}
 
 //
 // mtmd_helper_resampler
