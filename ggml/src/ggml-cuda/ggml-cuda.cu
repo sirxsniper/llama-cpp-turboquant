@@ -684,6 +684,53 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
         return freed;
     }
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    // [TAG_R40_VGUARD] see ggml_cuda_pool::pregrow. Only an idle pool whose address range exists (it grew once before) and
+    // without peer access (the access list of alloc() below); every failure gives back what it took
+    size_t pregrow(size_t bytes) override {
+        if (pool_used != 0 || pool_addr == 0 || bytes <= pool_size) {
+            return 0;
+        }
+        bool use_peer_access = ggml_cuda_p2p_enabled();
+#if defined(GGML_USE_NCCL)
+        use_peer_access = true;
+#endif // defined(GGML_USE_NCCL)
+        if (use_peer_access) {
+            return 0;
+        }
+        const size_t reserve_size = granularity * ((bytes - pool_size + granularity - 1) / granularity);
+        if (pool_size + reserve_size > max_size) {
+            return 0;
+        }
+        CUmemAllocationProp prop = {};
+        prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+        prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+        prop.location.id = physical_device;
+        CUmemGenericAllocationHandle handle;
+        if (cuMemCreate(&handle, reserve_size, &prop, 0) != CUDA_SUCCESS) {
+            return 0;
+        }
+        const CUdeviceptr start_ptr = (CUdeviceptr)((char *)(pool_addr) + pool_size);
+        if (cuMemMap(start_ptr, reserve_size, 0, handle, 0) != CUDA_SUCCESS) {
+            (void) cuMemRelease(handle);
+            return 0;
+        }
+        CUmemAccessDesc access = {};
+        access.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+        access.location.id = physical_device;
+        access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+        if (cuMemSetAccess(start_ptr, reserve_size, &access, 1) != CUDA_SUCCESS) {
+            (void) cuMemUnmap(start_ptr, reserve_size);
+            (void) cuMemRelease(handle);
+            return 0;
+        }
+        (void) cuMemRelease(handle);
+        mappings.push_back({start_ptr, reserve_size});
+        pool_size += reserve_size;
+        return reserve_size;
+    }
+#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+
     void * alloc(size_t size, size_t * actual_size) override {
         // round up the allocation size to the alignment to ensure that all allocations are aligned for all data types
         const size_t alignment = 128;
@@ -9390,6 +9437,39 @@ size_t ggml_backend_cuda_pool_trim(ggml_backend_t backend, size_t keep) {
     return freed;
 }
 
+// [TAG_R40_VGUARD] proc "ggml_backend_pool_pregrow": the backend's current pool maps at least `bytes` now (see
+// ggml_cuda_pool::pregrow); the caller's graphs are synchronized. Returns the bytes added
+static size_t ggml_backend_cuda_pool_pregrow(ggml_backend_t backend, size_t bytes) {
+    if (!ggml_backend_is_cuda(backend) || bytes == 0) {
+        return 0;
+    }
+    auto * ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_set_device(ctx->device);
+    return ctx->pool(ctx->device).pregrow(bytes);
+}
+
+// [TAG_R40_VGUARD] proc "ggml_backend_fn_stream_idle": true when no stream of the backend has work pending (cudaStreamQuery,
+// never waits); a backend of another kind: true
+static bool ggml_backend_cuda_fn_stream_idle(ggml_backend_t backend) {
+    if (!ggml_backend_is_cuda(backend)) {
+        return true;
+    }
+    auto * ctx = (ggml_backend_cuda_context *) backend->context;
+    for (int d = 0; d < GGML_CUDA_MAX_DEVICES; ++d) {
+        for (int s = 0; s < GGML_CUDA_MAX_STREAMS; ++s) {
+            if (ctx->streams[d][s] == nullptr) {
+                continue;
+            }
+            const cudaError_t e = cudaStreamQuery(ctx->streams[d][s]);
+            if (e != cudaSuccess) {
+                (void) cudaGetLastError(); // cudaErrorNotReady (busy) is not sticky
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 // [TAG_FN_L22_GRAPHKEEP] proc "ggml_backend_pool_mark": the next trim keeps, per pool, what the period since the last mark
 // handed out at most and what the captured instances use
 static void ggml_backend_cuda_pool_mark(ggml_backend_t backend) {
@@ -10787,6 +10867,12 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_pool_trim") == 0) {
         return (void *)ggml_backend_cuda_pool_trim;
+    }
+    if (strcmp(name, "ggml_backend_pool_pregrow") == 0) { // [TAG_R40_VGUARD]
+        return (void *)ggml_backend_cuda_pool_pregrow;
+    }
+    if (strcmp(name, "ggml_backend_fn_stream_idle") == 0) { // [TAG_R40_VGUARD]
+        return (void *)ggml_backend_cuda_fn_stream_idle;
     }
     // [TAG_FN_L22_GRAPHKEEP] [TAG_FN_L22_GRAPHKEY] [TAG_FN_L22_PIN] [TAG_FN_L22_XOVER] [TAG_FN_L22_OOMHOOK] round 22 P7 procs
     if (strcmp(name, "ggml_backend_pool_mark") == 0) {

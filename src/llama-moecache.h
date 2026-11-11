@@ -187,6 +187,18 @@ bool   llama_moe_hot_np2_settled(size_t target);
 size_t llama_moe_hot_kv_release_kvside(const void * owner, size_t need);
 size_t llama_moe_hot_kv_restore_kvside(const void * owner, size_t keep);
 
+// [TAG_R40_VGUARD] the VRAM guard's share of the KV lend (src/llama-fn-vguard.h): whole KV groups given back to the driver
+// while another process needs VRAM, taken from the bottom like the idle slot's share and kept apart from it, the KV cache's
+// and the projector's. _vg_hold (the owner's graphs synchronized, or the prefill-stream gate with the device idle): holds at
+// least `target` bytes out (whole groups), groups it no longer needs come back (mapped, cleared, their slots fill from the
+// routing); returns what it holds. The KV cache, the projector and the idle slot's share take the guard's groups over (no
+// VRAM moves) when no mapped group is left. Only with the slot lend (else 0). _vg_group: the largest KV group's bytes (0: no
+// slot lend), _vg_free: the bytes of the KV groups mapped now (what a hold can still take)
+size_t llama_moe_hot_vg_hold(const void * owner, size_t target);
+size_t llama_moe_hot_vg_out();
+size_t llama_moe_hot_vg_group();
+size_t llama_moe_hot_vg_free();
+
 // [TAG_FN_AUTO] a hot set is configured for this model (LLAMA_MOE_HOT_PROFILE names a file or "even")
 bool llama_moe_hot_wanted(const llama_model & model);
 

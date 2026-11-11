@@ -6,6 +6,7 @@
 #include "llama-moe-decay.h" // [TAG_FN_R4_ADAPT_DECAY]
 #include "llama-moe-bridge.h" // [TAG_FN_L3_HOST_QUIET]
 #include "llama-fn-l22.h"     // [TAG_FN_L22_P4] pins, PASSLOG
+#include "llama-fn-vguard.h"  // [TAG_R40_VGUARD] LLAMA_R40_VGUARD_CHECK
 #include "llama-impl.h"
 #include "llama-model.h"
 
@@ -334,6 +335,7 @@ struct moe_cache {
     std::vector<size_t>   sl_given;        // per group: bytes given to the KV cache now (0: mapped)
     // [TAG_R35_NP2PARK] per KV group: 1 while the idle slot's share holds it (taken from the bottom; the KV cache's and the
     // projector's restores skip it). Empty until that share takes a group (then every old path is as before)
+    // [TAG_R40_VGUARD] the share id of the group: 1 = the idle slot's (np2), 2 = the VRAM guard's (vg), 0 = none
     std::vector<uint8_t>  sl_np2;
     // [TAG_FN_L21_BIGUB] the groups [0, sl_n_kv) go to the KV cache; group sl_n_kv (when there is one) is the borrow group:
     // its sb_bytes go to the compute reserve of a 16K prompt ubatch (sb_out: out now), its residents come back after it
@@ -353,6 +355,10 @@ struct moe_cache {
     size_t                np2_out   = 0;
     uint64_t              np2_n_take = 0, np2_n_give = 0;
     double                np2_take_ms = 0.0, np2_give_ms = 0.0;
+    // [TAG_R40_VGUARD] the VRAM guard's share of the KV lend (groups given back to the driver while another process needs
+    // VRAM): held out now, groups handed over to the KV cache / projector / idle-slot share when they found none mapped
+    size_t                vg_out     = 0;
+    uint64_t              vg_n_retag = 0;
     // [TAG_FN_L4_MEM_UPLOAD] LLAMA_FN_L4_UPLOAD=1 (qwen4exp): the tail's refill first (no swap is queued behind it for up to
     // l4_hold_ms after a restore), and the pinned halves (LLAMA_MOE_HOT_UP_PIPE) unless the environment says otherwise
     bool                  l4_upload  = false;
@@ -884,6 +890,22 @@ bool llama_moe_hot_slots(const ggml_tensor * up_exps, int32_t * slot, int64_t n_
         const bool ok = s >= 0 && s < n_cap && (ls.slot_out.empty() || !ls.slot_out[s]) && !(ls.sl_base >= 0 && s >= ls.sl_base);
         slot[e] = ok ? s : -1;
         any = any || ok;
+        // [TAG_R40_VGUARD] LLAMA_R40_VGUARD_CHECK=1: a source slot's bytes lie in no KV group (any group can be unmapped by
+        // the guard at a gate or by a KV growth while the copy waits)
+        if (ok && ls.sl_base >= 0 && llama_fn_vg_check()) {
+            for (int k = 0; k < 3; ++k) {
+                const size_t lo = ls.sl_toff[k] + (size_t) s*ls.sl_sb[k];
+                const size_t hi = lo + ls.sl_sb[k];
+                for (size_t g = 0; g < mc->sl_n_kv && g < mc->sl_grp.size(); ++g) {
+                    for (const auto & r : mc->sl_grp[g]) {
+                        if (r.first < hi && lo < r.second) {
+                            GGML_ABORT("[TAG_R40_VGUARD] CHECK: blk.%d slot %d (expert %d) is a stream source inside KV group %zu",
+                                    ls.pub.il, (int) s, (int) e, g);
+                        }
+                    }
+                }
+            }
+        }
     }
     slots3[0] = ls.pub.up_c;
     slots3[1] = ls.pub.gate_c;
@@ -6270,6 +6292,35 @@ size_t llama_moe_hot_kv_restore(const void * owner, size_t keep) {
     return mc->kv_out;
 }
 
+// [TAG_R40_VGUARD] ----------------------------------------------------------------------------------------------------
+// The guard's groups are unmapped already: a user that finds no mapped group left (the KV cache growing, the projector, the
+// idle slot's share) takes them over instead (no VRAM moves; highest first), so none of them ever waits on the guard or maps
+// VRAM the guard gave back for another process. Returns the bytes handed over. to_id: 0 (the KV cache / projector), 1 (np2).
+// Caller holds step_mtx.
+static size_t hot_sl_vg_retag(moe_cache * mc, size_t want, uint8_t to_id, const char * who) {
+    size_t got = 0;
+    size_t n   = 0;
+    for (size_t g = std::min(mc->sl_n_kv, mc->sl_np2.size()); g-- > 0 && got < want; ) {
+        if (mc->sl_np2[g] != 2 || mc->sl_given[g] == 0) {
+            continue;
+        }
+        const size_t b = mc->sl_given[g];
+        mc->sl_np2[g] = to_id;
+        mc->vg_out   -= std::min(mc->vg_out, b);
+        if (to_id == 1) {
+            mc->np2_out += b;
+        }
+        got += b;
+        n++;
+    }
+    if (n > 0) {
+        mc->vg_n_retag++;
+        LLAMA_LOG_WARN("moe-hot: [TAG_R40_VGUARD] %s found no mapped group: it took %zu of the guard's (%.0f MiB, no VRAM moved); "
+                "the guard holds %.0f MiB now (%" PRIu64 " hand-overs)\n", who, n, got/1048576.0, mc->vg_out/1048576.0, mc->vg_n_retag);
+    }
+    return got;
+}
+
 // [TAG_FN_L17_VISION_LEND] -------------------------------------------------------------------------------------------
 // The KV cache takes groups (layers) from the top and gives back the lowest first, so the projector's share is the
 // range just below the KV cache's: its give maps exactly what its take unmapped (an encode runs between two graphs,
@@ -6295,6 +6346,10 @@ size_t llama_moe_hot_vis_take(size_t bytes) {
     const size_t  before = mc->kv_out;
     const size_t  after  = llama_moe_hot_kv_release(mc->owner, before + bytes);
     mc->vis_out = after > before ? after - before : 0;
+    if (mc->vis_out < bytes && mc->vg_out > 0 && mc->sl_on) {
+        std::lock_guard<std::mutex> slk(mc->step_mtx);
+        mc->vis_out += hot_sl_vg_retag(mc, bytes - mc->vis_out, 0, "the projector"); // [TAG_R40_VGUARD]
+    }
     mc->vis_n++;
     const double ms = (ggml_time_us() - t0)/1000.0;
     mc->vis_take_ms += ms;
@@ -6341,28 +6396,35 @@ void llama_moe_hot_vis_give() {
 // holds at least that group more than `target`. The release and the restore of a group run as in hot_sl_release /
 // hot_sl_restore (the owner's graphs synchronized; slots out, residents evicted, tables written; a group mapped again is
 // cleared and its slots fill from the routing).
-static size_t hot_sl_np2_hold(moe_cache * mc, const void * owner, size_t target) {
+// [TAG_R40_VGUARD] the same for every share: id 1 = the idle slot's (np2_out), id 2 = the VRAM guard's (vg_out); a group
+// belongs to the share whose id it carries (sl_np2[g]). The idle slot's share takes the guard's groups over when no mapped
+// group is left (hot_sl_vg_retag). Without a guard share (vg_out 0) id 1 runs exactly as before
+static size_t hot_sl_share_hold(moe_cache * mc, const void * owner, uint8_t id, size_t target) {
+    size_t & sh = id == 2 ? mc->vg_out : mc->np2_out;
     if (!mc->cb_buf || (mc->adapt && owner != mc->owner)) {
-        return mc->np2_out;
+        return sh;
     }
     std::lock_guard<std::mutex> slk(mc->step_mtx);
     hot_turn_join(mc); // [TAG_FN_L18_FIRSTANS_OVERLAP] a pass in flight lands first
     if (mc->sl_np2.size() != mc->sl_n_kv) {
         mc->sl_np2.assign(mc->sl_n_kv, 0);
     }
-    if (mc->np2_out < target) {
+    if (sh < target) {
         std::vector<size_t> rel;
-        size_t held = mc->np2_out;
+        size_t held = sh;
         for (size_t g = 0; g < mc->sl_n_kv && held < target; ++g) {
             if (mc->sl_given[g] == 0 && mc->sl_grp_bytes[g] > 0) {
                 mc->sl_given[g] = mc->sl_grp_bytes[g];
-                mc->sl_np2[g]   = 1;
+                mc->sl_np2[g]   = id;
                 rel.push_back(g);
                 held += mc->sl_grp_bytes[g];
             }
         }
+        if (id == 1 && held < target && mc->vg_out > 0) {
+            held += hot_sl_vg_retag(mc, target - held, 1, "the idle slot's share"); // [TAG_R40_VGUARD]
+        }
         if (rel.empty()) {
-            return mc->np2_out;
+            return sh;
         }
         for (auto & ls : mc->layers) {
             if (ls.sl_base >= 0) {
@@ -6403,17 +6465,17 @@ static size_t hot_sl_np2_hold(moe_cache * mc, const void * owner, size_t target)
                 mc->sl_given[g] = 1; // out, a token amount (its restore maps it again)
             }
             mc->kv_out  += mc->sl_given[g];
-            mc->np2_out += mc->sl_given[g];
+            sh          += mc->sl_given[g];
         }
-        return mc->np2_out;
+        return sh;
     }
     size_t n_res = 0;
     for (size_t g = mc->sl_n_kv; g-- > 0; ) {
-        if (!mc->sl_np2[g] || mc->sl_given[g] == 0) {
+        if (mc->sl_np2[g] != id || mc->sl_given[g] == 0) {
             continue;
         }
         const size_t b = mc->sl_given[g];
-        if (mc->np2_out < target + b) {
+        if (sh < target + b) {
             continue;
         }
         bool   ok   = true;
@@ -6440,7 +6502,7 @@ static size_t hot_sl_np2_hold(moe_cache * mc, const void * owner, size_t target)
         mc->sl_given[g] = 0;
         mc->sl_np2[g]   = 0;
         mc->kv_out  -= b;
-        mc->np2_out -= b;
+        sh          -= b;
         n_res++;
     }
     if (n_res > 0) {
@@ -6450,7 +6512,7 @@ static size_t hot_sl_np2_hold(moe_cache * mc, const void * owner, size_t target)
             }
         }
     }
-    return mc->np2_out;
+    return sh;
 }
 
 size_t llama_moe_hot_np2_hold(const void * owner, size_t target) {
@@ -6461,7 +6523,7 @@ size_t llama_moe_hot_np2_hold(const void * owner, size_t target) {
     const int64_t t0     = ggml_time_us();
     const size_t  before = mc->np2_out;
     if (mc->sl_on) {
-        (void) hot_sl_np2_hold(mc, owner, target);
+        (void) hot_sl_share_hold(mc, owner, 1, target);
     } else if (target > mc->np2_out) {
         // the layer lend (no slot groups): bytes on top of what is out
         const size_t k0 = mc->kv_out;
@@ -6496,7 +6558,7 @@ bool llama_moe_hot_np2_settled(size_t target) {
         return false; // a take, or the layer lend's byte path
     }
     for (size_t g = 0; g < mc->sl_np2.size() && g < mc->sl_given.size(); ++g) {
-        if (mc->sl_np2[g] && mc->sl_given[g] > 0 && mc->np2_out >= target + mc->sl_given[g]) {
+        if (mc->sl_np2[g] == 1 && mc->sl_given[g] > 0 && mc->np2_out >= target + mc->sl_given[g]) {
             return false; // this group can go back
         }
     }
@@ -6508,18 +6570,64 @@ size_t llama_moe_hot_np2_out() {
     return mc ? mc->np2_out : 0;
 }
 
+// [TAG_R40_VGUARD] the shares (idle slot + guard) are not the KV cache's: its absolute need / keep goes on top of them. A
+// growth that finds no mapped group left takes the guard's unmapped groups over (the KV cache never starves)
 size_t llama_moe_hot_kv_release_kvside(const void * owner, size_t need) {
-    const moe_cache * mc = g_cache;
-    const size_t np2 = mc ? mc->np2_out : 0;
-    const size_t out = llama_moe_hot_kv_release(owner, need + np2);
-    return out > np2 ? out - np2 : 0;
+    moe_cache * mc = g_cache;
+    const size_t sh  = mc ? mc->np2_out + mc->vg_out : 0;
+    size_t       out = llama_moe_hot_kv_release(owner, need + sh);
+    if (mc && mc->sl_on && mc->vg_out > 0 && out < need + sh && (!mc->adapt || owner == mc->owner)) {
+        std::lock_guard<std::mutex> slk(mc->step_mtx);
+        (void) hot_sl_vg_retag(mc, need + sh - out, 0, "the KV cache");
+        out = mc->kv_out;
+    }
+    const size_t sh2 = mc ? mc->np2_out + mc->vg_out : 0;
+    return out > sh2 ? out - sh2 : 0;
 }
 
 size_t llama_moe_hot_kv_restore_kvside(const void * owner, size_t keep) {
     const moe_cache * mc = g_cache;
-    const size_t np2 = mc ? mc->np2_out : 0;
-    const size_t out = llama_moe_hot_kv_restore(owner, keep + np2);
-    return out > np2 ? out - np2 : 0;
+    const size_t sh  = mc ? mc->np2_out + mc->vg_out : 0;
+    const size_t out = llama_moe_hot_kv_restore(owner, keep + sh);
+    return out > sh ? out - sh : 0;
+}
+
+// [TAG_R40_VGUARD] the guard's share (see llama-moecache.h)
+size_t llama_moe_hot_vg_hold(const void * owner, size_t target) {
+    moe_cache * mc = g_cache;
+    if (!mc || !mc->sl_on || mc->kv_bytes == 0 || target == mc->vg_out) {
+        return mc ? mc->vg_out : 0;
+    }
+    return hot_sl_share_hold(mc, owner, 2, target);
+}
+
+size_t llama_moe_hot_vg_out() {
+    const moe_cache * mc = g_cache;
+    return mc ? mc->vg_out : 0;
+}
+
+size_t llama_moe_hot_vg_group() {
+    const moe_cache * mc = g_cache;
+    if (!mc || !mc->sl_on || mc->kv_bytes == 0 || !mc->cb_buf) {
+        return 0;
+    }
+    size_t b = 0;
+    for (size_t g = 0; g < mc->sl_n_kv && g < mc->sl_grp_bytes.size(); ++g) {
+        b = std::max(b, mc->sl_grp_bytes[g]);
+    }
+    return b;
+}
+
+size_t llama_moe_hot_vg_free() {
+    const moe_cache * mc = g_cache;
+    if (!mc || !mc->sl_on) {
+        return 0;
+    }
+    size_t b = 0;
+    for (size_t g = 0; g < mc->sl_n_kv && g < mc->sl_given.size(); ++g) {
+        b += mc->sl_given[g] == 0 ? mc->sl_grp_bytes[g] : 0;
+    }
+    return b;
 }
 
 // [TAG_FN_L4_EXIT] ---------------------------------------------------------------------------------------------------

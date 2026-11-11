@@ -52,6 +52,7 @@ set(LLAMA_CORE_SOURCES
     llama-fn-resident.cpp    # [TAG_FN_L22_RESSET] fork-only: P5
     llama-fn-dio.cpp         # [TAG_FN_L22_SSDTIER] fork-only: P5
     llama-fn-pin.cpp         # [TAG_FN_L22_PIN] fork-only: P6
+    llama-fn-vguard.cpp      # [TAG_R40_VGUARD] fork-only: round 40 WDDM paging guard
     llama-fn-cvec.cpp        # [TAG_FN_L22_X_CVEC] fork-only: P12c
     llama-fn-prior.cpp       # [TAG_FN_L22_X_PRIOR] fork-only: P12
     llama-fn-cpushare.cpp    # [TAG_FN_L22_CPUSHARE] fork-only: P16

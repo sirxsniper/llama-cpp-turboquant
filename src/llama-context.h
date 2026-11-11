@@ -795,6 +795,11 @@ private:
     static void   r35_hook_give(void * user, size_t bytes);
     static void   r35_hook_sync(void * user);
     static bool   r35_hook_idle(void * user);
+    // [TAG_R40_VGUARD] the WDDM paging guard (llama-fn-vguard.h): tried once after the hot set's fit, on for its owner only
+    bool     vg_tried = false;
+    bool     vg_on    = false;
+    void     vg_arm_try();
+    void     vg_pregrow(ggml_backend_dev_t dev); // after the FULL reserve: the pool's growth of the last FULL period, now
     // [TAG_FN_L22_ENDOVERLAP] a prompt ended in FULL without the eager switch: the next narrow batch goes SMALL, async
     bool     l22_end_pending = false;
     int      l22_first_n     = 0;    // decode calls still counted after a prompt's switch (first 8)
