@@ -497,10 +497,11 @@ bool llama_fn_vg_switch_pre() {
     const bool act = g.cur.H < g.k.hact || g.cur.F < g.k.fact;
     if (g.mode == 2 || act || g.n_sw <= 8 || g.n_sw % 64 == 0) {
         LLAMA_LOG_WARN("%s: [TAG_R40_VGUARD] FULL switch %" PRIu64 ": H %.0f F %.0f D %.0f MiB (budget %.0f, usage %.0f, resident %.0f)%s%s; "
-                "share %.0f MiB, %.0f MiB of the lend mapped; %" PRIu64 " polls (max %.1f us), %" PRIu64 " actions\n", __func__,
+                "share %.0f MiB, %.0f MiB of the lend mapped; %" PRIu64 " polls (max %.1f us), %" PRIu64 " actions, gates %" PRIu64
+                " (%" PRIu64 " deferred)\n", __func__,
                 g.n_sw, g.cur.H, g.cur.F, g.D, g.cur.budget, g.cur.usage, g.cur.resident, act ? " ACT" : "",
                 g.demoted ? " DEMOTED" : g.pressure ? " PRESSURE" : "", llama_moe_hot_vg_out()/VG_MIB,
-                llama_moe_hot_vg_free()/VG_MIB, g.n_poll, g.poll_us_max, g.n_act);
+                llama_moe_hot_vg_free()/VG_MIB, g.n_poll, g.poll_us_max, g.n_act, g.n_gate, g.n_defer);
     }
     if (g.mode != 1) {
         return false;
@@ -539,9 +540,10 @@ void llama_fn_vg_small() {
         return;
     }
     (void) vg_poll(true);
-    if (g.cur.H - g.sw_part/VG_MIB < 512.0) {
-        LLAMA_LOG_WARN("%s: [TAG_R40_VGUARD] SMALL: the switch share of %.0f MiB stays out (H %.0f MiB: mapping it now would leave "
-                "< 512 MiB); the decode-entry regrow brings it back\n", __func__, g.sw_part/VG_MIB, g.cur.H);
+    // mapping it is a new commit: both the budget headroom and the card's free VRAM keep 512 MiB after it
+    if (std::min(g.cur.H, g.cur.F) - g.sw_part/VG_MIB < 512.0) {
+        LLAMA_LOG_WARN("%s: [TAG_R40_VGUARD] SMALL: the switch share of %.0f MiB stays out (H %.0f F %.0f MiB: mapping it now would "
+                "leave < 512 MiB); the decode-entry regrow brings it back\n", __func__, g.sw_part/VG_MIB, g.cur.H, g.cur.F);
         g.sw_part = 0; // the regrow's from here on
         return;
     }
@@ -578,7 +580,7 @@ void llama_fn_vg_decode(bool small) {
     }
     const size_t out = llama_moe_hot_vg_out();
     if (small && out > 0 && !g.demoted && !g.pressure && g.t_d_low > 0 && t - g.t_d_low >= 3000000 &&
-        (g.t_press == 0 || t - g.t_press >= (int64_t) (g.k.calm_s*1e6)) && g.cur.H - g.group/VG_MIB >= 512.0 &&
+        (g.t_press == 0 || t - g.t_press >= (int64_t) (g.k.calm_s*1e6)) && std::min(g.cur.H, g.cur.F) - g.group/VG_MIB >= 512.0 &&
         t - g.t_regrow >= 2000000) {
         g.t_regrow = t;
         const size_t target = out > g.group ? out - g.group : 0;
