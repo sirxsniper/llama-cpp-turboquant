@@ -2415,6 +2415,22 @@ static bool ggml_backend_sched_input_sync_forced(void) {
     return forced;
 }
 
+// [TAG_R39_UP_SKIPIN] upstream #31419: LLAMA_R39_UP_SKIPIN=1 skips the copy of a split input that no computed node reads
+// (only nodes outside GGML_TENSOR_FLAG_COMPUTE read it, e.g. the unselected branches of ggml_build_forward_select: an
+// inactive backend sampler chain, the token / embd path not taken). The input stays in the split, so the allocation does
+// not change. 0 (default) = v0.29.0: every split input is copied.
+static bool ggml_backend_sched_r39_skipin(void) {
+    static const bool on = [] {
+        const char * e = getenv("LLAMA_R39_UP_SKIPIN");
+        const bool v = e != NULL && atoi(e) != 0;
+        if (v) {
+            GGML_LOG_INFO("%s: [TAG_R39_UP_SKIPIN] on: split inputs no computed node reads are not copied\n", __func__);
+        }
+        return v;
+    }();
+    return on;
+}
+
 // [TAG_FN_SCHED_SPLIT_ASYNC] GGML_SCHED_SPLIT_ASYNC=1: split inputs that cross between a host split and a device split
 // are copied with async gets/sets on the device backend's own stream, and one synchronize per host split waits for them,
 // instead of synchronize + synchronize + blocking copy per input. Off by default.
@@ -2533,6 +2549,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
     int prev_backend_id = -1;
 
+    // [TAG_R39_UP_SKIPIN] skipped input copies of this graph
+    const bool r39_skipin = ggml_backend_sched_r39_skipin();
+    int    r39_n_skip = 0;
+    size_t r39_b_skip = 0;
+
     // [TAG_FN_SCHED_SPLIT_ASYNC] backends with a queued host -> device input copy: its host source must not be written
     // (by a host split, a host input copy, or the caller's next set_inputs) before that backend has synchronized
     const bool split_async = ggml_backend_sched_split_async_enabled();
@@ -2562,9 +2583,18 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
         prof(GGML_SCHED_PROF_SYNC); // [TAG_FN_L4_HOST]
 
+        // [TAG_R39_UP_SKIPIN] a split whose inputs are all skipped synchronizes like a split without inputs
+        bool r39_copies = true;
+        if (r39_skipin && split->n_inputs > 0) {
+            r39_copies = false;
+            for (int j = 0; j < split->n_inputs && !r39_copies; j++) {
+                r39_copies = sched->hv_tensor_requires_copy[hash_id(split->inputs[j])];
+            }
+        }
+
         // ensure the previous split's async work has completed before we start
         // this split, the allocator may have reused buffer regions across splits
-        if (split->n_inputs == 0 && prev_backend_id >= 0 && prev_backend_id != split_backend_id) {
+        if ((split->n_inputs == 0 || !r39_copies) && prev_backend_id >= 0 && prev_backend_id != split_backend_id) {
             if (sched->events[prev_backend_id][sched->cur_copy] != NULL) {
                 ggml_backend_event_synchronize(sched->events[prev_backend_id][sched->cur_copy]);
             } else {
@@ -2633,6 +2663,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[input_id]);
             struct ggml_tensor * input = split->inputs[input_id];
             struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
+
+            if (r39_skipin && !sched->hv_tensor_requires_copy[hash_id(input)]) { // [TAG_R39_UP_SKIPIN]
+                r39_n_skip++;
+                r39_b_skip += ggml_nbytes(input);
+                continue;
+            }
 
             if (input->flags & GGML_TENSOR_FLAG_INPUT) {
                 if (split_is_host && pending_h2d != 0) {
@@ -2910,6 +2946,20 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
     prof(GGML_SCHED_PROF_END); // [TAG_FN_L4_HOST]
 
+    // [TAG_R39_UP_SKIPIN] graphs 1, 2, 4, 8, ... with a skipped copy: the running totals
+    if (r39_n_skip > 0) {
+        static std::atomic<uint64_t> r39_graphs{0};
+        static std::atomic<uint64_t> r39_inputs{0};
+        static std::atomic<uint64_t> r39_bytes{0};
+        const uint64_t g = ++r39_graphs;
+        const uint64_t n = r39_inputs += (uint64_t) r39_n_skip;
+        const uint64_t b = r39_bytes  += (uint64_t) r39_b_skip;
+        if ((g & (g - 1)) == 0) {
+            GGML_LOG_INFO("%s: [TAG_R39_UP_SKIPIN] graphs with skipped input copies %llu: %llu copies, %.3f MiB skipped (this graph %d, %zu B)\n",
+                    __func__, (unsigned long long) g, (unsigned long long) n, b / 1048576.0, r39_n_skip, r39_b_skip);
+        }
+    }
+
     return GGML_STATUS_SUCCESS;
 }
 
@@ -3055,6 +3105,7 @@ struct ggml_backend_sched_snap {
     std::vector<ggml_tensor *>  h_key;
     std::vector<int>            h_bid;
     std::vector<ggml_tensor *>  h_cpy; // n_backends per entry
+    std::vector<uint8_t>        h_req; // [TAG_R39_UP_SKIPIN] hv_tensor_requires_copy per entry (empty: switch off)
     // graph copy and its backend ids
     std::vector<ggml_tensor *>  nodes;
     std::vector<ggml_tensor *>  leafs;
@@ -3097,6 +3148,9 @@ ggml_backend_sched_snap_t ggml_backend_sched_snap_save(ggml_backend_sched_t sche
         s->h_bid.push_back(sched->hv_tensor_backend_ids[i]);
         for (int b = 0; b < sched->n_backends; ++b) {
             s->h_cpy.push_back(sched->hv_tensor_copies[i * sched->n_backends + b]);
+        }
+        if (ggml_backend_sched_r39_skipin()) {
+            s->h_req.push_back(sched->hv_tensor_requires_copy[i] ? 1 : 0); // [TAG_R39_UP_SKIPIN]
         }
     }
 
@@ -3145,6 +3199,7 @@ bool ggml_backend_sched_snap_restore(ggml_backend_sched_t sched, ggml_backend_sc
             for (int b = 0; b < sched->n_backends; ++b) {
                 sched->hv_tensor_copies[i * sched->n_backends + b] = NULL;
             }
+            sched->hv_tensor_requires_copy[i] = false; // [TAG_R39_UP_SKIPIN]
         }
     }
     std::copy(s->used.begin(), s->used.end(), sched->hash_set.used);
@@ -3154,6 +3209,9 @@ bool ggml_backend_sched_snap_restore(ggml_backend_sched_t sched, ggml_backend_sc
         sched->hv_tensor_backend_ids[i]  = s->h_bid[e];
         for (int b = 0; b < sched->n_backends; ++b) {
             sched->hv_tensor_copies[i * sched->n_backends + b] = s->h_cpy[e * sched->n_backends + b];
+        }
+        if (!s->h_req.empty()) {
+            sched->hv_tensor_requires_copy[i] = s->h_req[e] != 0; // [TAG_R39_UP_SKIPIN]
         }
     }
 
