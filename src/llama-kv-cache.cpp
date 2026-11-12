@@ -428,6 +428,67 @@ bool llama_kv_lend_map_all() {
     return ok;
 }
 
+// [TAG_R40_LEND_PARTIAL] the first cells of every lend (the same count in each, whole chunks) mapped for at least `bytes`
+// more; they become the lend's initial cells (a shrink keeps them, the hot set's hooks never see their bytes). Returns the
+// bytes newly mapped, 0 when a map failed (what was mapped stays, as the initial cells).
+size_t llama_kv_lend_map_upto(size_t bytes) {
+    if (bytes == 0) {
+        return 0;
+    }
+    kvl_state * const cur0 = kvl_cur;
+    uint32_t kv_size = 0;
+    uint32_t chunk   = 1;
+    for (const auto & s : g_kvls) {
+        if (s.kv && !s.whole) {
+            kv_size = std::max(kv_size, s.kv_size);
+            chunk   = std::max(chunk, s.chunk);
+        }
+    }
+    if (kv_size == 0) {
+        return 0;
+    }
+    auto add_at = [&](uint32_t c) {
+        size_t add = 0;
+        for (auto & s : g_kvls) {
+            if (!s.kv || s.whole) {
+                continue;
+            }
+            kvl_cur = &s;
+            for (const auto & r : s.regs) {
+                const size_t b = kvl_bytes_for(r, std::min(c, s.kv_size));
+                add += b > r.mapped ? b - r.mapped : 0;
+            }
+        }
+        return add;
+    };
+    uint32_t c = chunk;
+    while (c < kv_size && add_at(c) < bytes) {
+        c = std::min(kv_size, c + chunk);
+    }
+    const int64_t t0 = ggml_time_us();
+    size_t before = 0;
+    size_t after  = 0;
+    bool   ok     = true;
+    for (auto & s : g_kvls) {
+        if (!s.kv || s.whole) {
+            continue;
+        }
+        kvl_cur = &s;
+        before += kvl_mapped_of(s);
+        if (!kvl_map_to(std::min(c, s.kv_size))) {
+            LLAMA_LOG_ERROR("%s: [TAG_R40_LEND_PARTIAL] mapping the first %u cells failed (%u mapped)\n", __func__, c, g_kvl.cells);
+            ok = false;
+        }
+        s.init_cells = std::max(s.init_cells, std::min(g_kvl.cells, std::min(c, s.kv_size)));
+        s.init_bytes = kvl_mapped_of(s);
+        after += s.init_bytes;
+    }
+    kvl_cur = cur0;
+    LLAMA_LOG_INFO("%s: [TAG_R40_LEND_PARTIAL] the first %u cells of every KV lend stay mapped: %.0f MiB more (%.0f asked) in "
+            "%.1f ms\n", __func__, c, (after - before)/1048576.0, bytes/1048576.0, (ggml_time_us() - t0)/1000.0);
+    return ok ? after - before : 0;
+}
+
 bool llama_kv_cache::kvl_update(uint32_t need) const {
     kvl_state * ks = kvl_find(this); // [TAG_FN_L10_KVLEND2]
     if (ks == nullptr || ks->whole) {

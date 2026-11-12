@@ -2614,6 +2614,10 @@ bool   g_kv_borrow_1seq = false; // [TAG_FN_L22_BIGUB2] the borrow is the 1-sequ
 // [TAG_R34_F_VISFLAT] the parked projector's part of g_kv_want for the next hot set init (llama_moe_hot_set_vis_part): with the
 // slot lend its slots come out of the lend layers' own counts instead of lying on top of a base cut for them
 size_t g_vis_part   = 0;
+// [TAG_R40_LEND_PARTIAL] the next hot set init may hold less than g_kv_want (llama_moe_hot_set_kv_partial): when the lend
+// layers' segments still fall short at the last retry (every lend layer at all of its experts, so a retry adds nothing),
+// the placement keeps what they hold instead of failing; the caller maps the rest of the KV cache up front
+bool   g_kv_partial = false;
 
 // [TAG_FN_L10_SLOTLEND] a usable slot keeps this many bytes after it mapped (a kernel that reads a little past a slot's end
 // never reaches a segment the KV cache holds)
@@ -2769,9 +2773,22 @@ ggml_backend_buffer_t hot_vmm_place(moe_cache * mc, ggml_context * ctx_d, ggml_b
                 sum += r.second - r.first;
             }
         }
-        if (sum < g_kv_want) {
+        if (sum < g_kv_want && !(g_kv_partial && mc->sl_extra >= 4 && sum > 0)) {
             mc->sl_retry = true; // the caller sizes one slot more per lend layer
             return nullptr;
+        }
+        if (sum < g_kv_want) {
+            // [TAG_R40_LEND_PARTIAL] the last retry (sl_extra 4) still falls short: keep what the segments hold
+            int n_ll = 0, n_full = 0;
+            for (size_t i = 0; i < n; ++i) {
+                const layer_state & ls = mc->layers[li0 + i];
+                if (ls.sl_base >= 0) {
+                    n_ll++;
+                    n_full += ls.pub.n_slots >= (int32_t) ls.pub.up_src->ne[2] ? 1 : 0;
+                }
+            }
+            LLAMA_LOG_INFO("moe-hot: [TAG_R40_LEND_PARTIAL] the %d lend layers' segments hold %.0f of the %.0f MiB wanted (%d of "
+                    "them at all of their experts): a partial lend\n", n_ll, sum/1048576.0, g_kv_want/1048576.0, n_full);
         }
         if (g_kv_borrow > 0) {
             // [TAG_FN_L21_BIGUB] the borrow group after the KV groups (short of its want: one slot more, as for the KV)
@@ -6081,6 +6098,10 @@ void llama_moe_hot_set_cb_borrow(size_t bytes) { // [TAG_FN_L21_BIGUB]
 
 void llama_moe_hot_set_vis_part(size_t bytes) { // [TAG_R34_F_VISFLAT]
     g_vis_part = bytes;
+}
+
+void llama_moe_hot_set_kv_partial(bool on) { // [TAG_R40_LEND_PARTIAL]
+    g_kv_partial = on;
 }
 
 // [TAG_FN_L22_BIGUB2] see llama-moecache.h

@@ -687,3 +687,6 @@ private:
 size_t llama_kv_lend_unmapped_bytes();
 void   llama_kv_lend_set_hooks(size_t (*release)(const void *, size_t), size_t (*restore)(const void *, size_t), const void * owner);
 bool   llama_kv_lend_map_all();
+// [TAG_R40_LEND_PARTIAL] the first cells mapped for at least `bytes` more (they stay: the lend's initial cells); returns the
+// bytes newly mapped (0: a map failed)
+size_t llama_kv_lend_map_upto(size_t bytes);
