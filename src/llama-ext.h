@@ -300,7 +300,10 @@ LLAMA_API size_t llama_state_seq_read_stream_ext(struct llama_context * ctx, lla
 // prompt). LLAMA_STATE_SEQ_FLAGS_ATTN_ONLY_EXT: a state write / read of llama_memory_hybrid(_idx) skips the recurrent part
 // (the attention cache and, qwen4exp, the indexer cache that mirrors it); a plain llama_kv_cache ignores the flag. A failed
 // ATTN_ONLY read clears only the attention cells it was restoring, the recurrent cell stays. The same byte format otherwise.
-#define LLAMA_STATE_SEQ_FLAGS_ATTN_ONLY_EXT 4
+// Bit 30, far from the low bits upstream hands out in order (1 SWA/PARTIAL_ONLY, 2 ON_DEVICE): a new upstream flag cannot
+// alias it silently (llama-context.cpp static_asserts it against the known ones; llama-memory.h defines the same tokens, so
+// a different value is a macro redefinition).
+#define LLAMA_STATE_SEQ_FLAGS_ATTN_ONLY_EXT 0x40000000u
 // true when ctx's memory supports the calls below: a llama_kv_cache or a llama_memory_hybrid(_idx) with one stream
 // (--kv-unified, or one sequence)
 LLAMA_API bool    llama_memory_attn_park_ok_ext(struct llama_context * ctx);

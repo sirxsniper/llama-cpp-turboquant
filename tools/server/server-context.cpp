@@ -1243,8 +1243,10 @@ private:
     }
 };
 
-// [TAG_R40_NP2KVPARK] the host bytes every slot's attention park holds now (the server thread only)
+// [TAG_R40_NP2KVPARK] the host bytes every slot's attention park holds now (the server thread only), and whether the park
+// is on (the /slots JSON shows its counters only then: with the switch at 0 the JSON is v0.30.0's)
 static size_t g_r40_kvpark_bytes = 0;
+static bool   g_r40_kvpark_on    = false;
 
 struct server_slot {
     bool l23_busy = false; // [TAG_FN_L23_PINFIX] R-L23-8: counted in llama_fn_pin_server_busy from launch to release
@@ -1616,6 +1618,7 @@ struct server_slot {
     uint64_t kvp_n_restore = 0;
     uint64_t kvp_n_reloc   = 0;
     uint64_t kvp_n_drop    = 0;
+    uint64_t kvp_n_wait    = 0; // launches deferred because the cells could not come back beside a running answer
     std::function<bool(server_slot &, const char *)> callback_kvp_unpark;
 
     // the parked cells are not needed any more (the slot's tokens go, or its sequence is replaced)
@@ -2087,16 +2090,19 @@ struct server_slot {
         // [TAG_POOL_PREEMPT]
         res["parked"]        = parked;
         res["n_parks_total"] = n_parks_total;
-        // [TAG_R40_NP2KVPARK]
-        res["kvpark"] = {
-            {"on",        kvp.on},
-            {"cells",     kvp.on ? kvp.cells : 0},
-            {"mib",       kvp.on ? kvp.blob.size() / 1048576.0 : 0.0},
-            {"n_park",    kvp_n_park},
-            {"n_restore", kvp_n_restore},
-            {"n_reloc",   kvp_n_reloc},
-            {"n_drop",    kvp_n_drop},
-        };
+        // [TAG_R40_NP2KVPARK] only with LLAMA_R40_NP2KVPARK on (off: the v0.30.0 JSON)
+        if (g_r40_kvpark_on) {
+            res["kvpark"] = {
+                {"on",        kvp.on},
+                {"cells",     kvp.on ? kvp.cells : 0},
+                {"mib",       kvp.on ? kvp.blob.size() / 1048576.0 : 0.0},
+                {"n_park",    kvp_n_park},
+                {"n_restore", kvp_n_restore},
+                {"n_reloc",   kvp_n_reloc},
+                {"n_drop",    kvp_n_drop},
+                {"n_wait",    kvp_n_wait},
+            };
+        }
         res["park_cells"]    = parked ? park_cells : 0;
 
         if (l22_pause_json) {
@@ -2647,6 +2653,15 @@ private:
         }
         media_encoder.stop();
         media_async = false;
+
+        // [TAG_R40_NP2KVPARK] the parked attention cells belong to these contexts: a resumed server has no sequence to put
+        // them back into (load_model clears the slots), so their host memory goes now, not after the sleep
+        for (auto & slot : slots) {
+            slot.kvp_drop("server sleeps");
+        }
+        g_r40_kvpark_bytes = 0;
+        g_r40_kvpark_on    = false;
+        kvpk.on            = false;
 
         keepctx.reset(); // [TAG_FN_L18_KEEPCTX] its states belong to these contexts
 
@@ -3692,14 +3707,6 @@ private:
                 const size_t lcp_len = tokens.get_common_prefix(task.tokens);
                 const float f_sim_cur = task.tokens.empty() ? 0.0f : float(lcp_len) / task.tokens.size();
 
-                // [TAG_R40_NP2KVPARK] a parked slot is taken by similarity only when the task goes on with most of it
-                // (f_keep >= 0.5): for another conversation its cells would come back into VRAM (taking hot experts) only
-                // to be stored by keepctx and dropped (r40 turn 3: t1 restored 30708 cells, 253 residents evicted)
-                if (kvpk.on && slot.kvp.on && task.id_slot == -1 && 2*lcp_len < tokens.size()) {
-                    SLT_TRC(slot, " - skipping, parked and the task keeps %zu of its %zu tokens\n", lcp_len, tokens.size());
-                    continue;
-                }
-
                 SLT_TRC(slot, " - checking sim = %.3f (%zu/%zu) > %.3f\n", f_sim_cur, lcp_len, task.tokens.size(), slot_prompt_similarity);
 
                 // select the current slot if the criteria match
@@ -3744,20 +3751,12 @@ private:
 
         // find the slot that has been least recently used
         if (ret == nullptr) {
-            // [TAG_R40_NP2KVPARK] the least recently used slot that is not parked (a parked slot keeps its conversation in
-            // host memory, it costs no VRAM): its cells would come back only to be stored and dropped
-            const auto free_slots = get_free_slots(kvpk.on ? slots.size() : 1, -1);
+            // [TAG_R40_NP2KVPARK] v0.30.0's choice with the park on too: the least recently used conversation goes (parked or
+            // not), the most recently used one, the likelier to come back, keeps its cells
+            const auto free_slots = get_free_slots(1, -1);
 
             if (!free_slots.empty()) {
                 ret = free_slots[0];
-                if (kvpk.on) {
-                    for (server_slot * s : free_slots) {
-                        if (!s->kvp.on) {
-                            ret = s;
-                            break;
-                        }
-                    }
-                }
 
                 SLT_INF(*ret, "selected slot by LRU, n_tokens = %d, t_last = %" PRId64 "\n", ret->prompt.n_tokens(), ret->t_last_used);
 
@@ -3785,8 +3784,11 @@ private:
 
             // [TAG_R40_NP2KVPARK] T2: the other idle slots' attention cells go to host memory, then this slot's cells come back
             // (into the bottom of the pool), before keepctx, the attach and the prompt cache read this slot's sequence
-            if (kvpk.on) {
-                kvpark_compact(ret, /*launch =*/ true, l22_leader ? l22_leader->id : -1, l24_pre.donor, task.params.n_predict);
+            if (kvpk.on && !kvpark_compact(ret, /*launch =*/ true, l22_leader ? l22_leader->id : -1, l24_pre.donor, task.params.n_predict)) {
+                // its cells cannot come back while another slot's answer holds the pool: the task waits for that answer
+                // (the caller defers it; a slot release runs it again) and the parked context stays
+                ret->kvp_n_wait++;
+                return nullptr;
             }
 
             // [TAG_R35_NP2PARK] the state reads of this launch (keepctx store / restore, checkpoints) see how many other slots
@@ -5367,10 +5369,20 @@ private:
     //   T1, every slot idle for _IDLE_MS (the queue's idle tick): the same around the most recently used slot, then the lend
     //       shrinks at once (llama_kv_lend_trim_ext), so the next prompt starts with the groups back.
     // A busy slot is never parked. Every path that reads an idle slot's sequence restores it first (prompt_save through
-    // callback_kvp_unpark, /slots save + restore, launch); prompt_clear and the copies drop it. A restore that fails (the pool
-    // filled meanwhile) clears the slot's tokens: its next prompt is processed from the start (exact, only slower).
+    // callback_kvp_unpark, /slots save + restore, launch); prompt_clear and the copies drop it. A restore that finds no room
+    // parks the other idle slots and tries once more; when it still fails beside a running answer, the launch waits for that
+    // answer (the task is deferred, the parked context stays); otherwise the slot's tokens are cleared and its next prompt
+    // is processed from the start (exact, only slower). The cells come back into the lowest free run that holds them.
+    // Host RAM: a park uses only memory above the residency's floor (LLAMA_FN_L15_WARM_FREE_MIB, 4096: the warm pass and the
+    // SSD tier keep that much available, so a park never pushes mapped experts out) and above a commit floor. The static RAM
+    // fit ([TAG_FN_RAM_FIT]) is over for a model bigger than RAM (it gives the prompt cache 0), so the park reads the
+    // available RAM at each park instead of taking a fixed share of that plan.
+    // Stall: the copies run on the server thread, so another slot's answer waits for them. A park whose copy would take
+    // more than _STALL_MS at the slowest measured rate (park or restore, 4 GB/s until measured) is not made: the slot keeps
+    // its cells as in v0.30.0. A move down (park + restore) gets half of that.
     // Switches: LLAMA_R40_NP2KVPARK_MIN_CELLS (4096), _RELOC (16384, 0 = never move a slot), _IDLE_MS (1500, 0 = no T1),
-    // _MAX_MIB (4096: host bytes of all parks together).
+    // _MAX_MIB (4096: host bytes of all parks together), _STALL_MS (250, 0 = no bound), _RAM_FLOOR_MIB (the residency's
+    // floor), _COMMIT_FLOOR_MIB (4096).
     struct kvpk_cfg_t {
         bool     on        = false;
         int32_t  min_cells = 4096;
@@ -5378,14 +5390,56 @@ private:
         int64_t  idle_us   = 1500000;
         int32_t  min_predict = 256;
         size_t   max_bytes = (size_t) 4096 << 20;
+        int64_t  stall_us  = 250000;
+        size_t   ram_floor = (size_t) 4096 << 20;
+        size_t   commit_floor = (size_t) 4096 << 20;
+        double   rate_park    = 4000.0; // bytes per microsecond (EWMA of parks of >= 64 MiB)
+        double   rate_restore = 4000.0; // the same for restores
         int64_t  t1_last   = 0;   // the newest t_last_used T1 already ran for
         uint64_t n_t1      = 0;
-        uint64_t n_ram     = 0;   // parks refused by _MAX_MIB
+        uint64_t n_ram     = 0;   // parks refused by _MAX_MIB or the RAM / commit floors
+        uint64_t n_stall   = 0;   // parks refused by _STALL_MS
     } kvpk;
+
+    // the most bytes one park may hold: its copy (and the restore after it) stays under _STALL_MS at the slowest rate seen
+    size_t kvpark_cap() const {
+        if (kvpk.stall_us <= 0) {
+            return SIZE_MAX;
+        }
+        return (size_t) (std::min(kvpk.rate_park, kvpk.rate_restore) * (double) kvpk.stall_us);
+    }
+
+    // host memory for size more bytes of parks, credit of which another park frees right after (a restore's own blob): the
+    // RAM available stays above the floor and the commit above its floor; always room for the transient copy
+    bool kvpark_ram_ok(size_t size, size_t credit, size_t * avail_out) const {
+        const size_t net = size > credit ? size - credit : 0;
+        size_t avail  = SIZE_MAX;
+        size_t commit = SIZE_MAX;
+#if defined(_WIN32)
+        MEMORYSTATUSEX ms;
+        ms.dwLength = sizeof(ms);
+        if (GlobalMemoryStatusEx(&ms)) {
+            avail  = (size_t) ms.ullAvailPhys;
+            commit = (size_t) ms.ullAvailPageFile;
+        }
+#else
+        if (ggml_backend_dev_t cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU)) {
+            size_t total = 0;
+            ggml_backend_dev_memory(cpu, &avail, &total);
+        }
+#endif
+        if (avail_out) {
+            *avail_out = avail;
+        }
+        const size_t slack = (size_t) 256 << 20;
+        return avail  >= net + kvpk.ram_floor    && avail  >= size + slack &&
+               commit >= net + kvpk.commit_floor && commit >= size + slack;
+    }
 
     void kvpark_init() {
         kvpk = kvpk_cfg_t();
         g_r40_kvpark_bytes = 0; // the slots (and their blobs) are new
+        g_r40_kvpark_on    = false;
         const char * e = getenv("LLAMA_R40_NP2KVPARK");
         if (!(e && atoi(e) > 0)) {
             return;
@@ -5408,22 +5462,37 @@ private:
             SRV_WRN("[TAG_R40_NP2KVPARK] LLAMA_R40_NP2KVPARK=%s: off (%s)\n", e, why);
             return;
         }
-        kvpk.on        = true;
         kvpk.min_cells = (int32_t) std::max<long long>(1, num("LLAMA_R40_NP2KVPARK_MIN_CELLS", 4096));
         kvpk.reloc     = (int32_t) std::max<long long>(0, num("LLAMA_R40_NP2KVPARK_RELOC", 16384));
         kvpk.idle_us   = std::max<long long>(0, num("LLAMA_R40_NP2KVPARK_IDLE_MS", 1500)) * 1000;
         kvpk.min_predict = (int32_t) std::max<long long>(0, num("LLAMA_R40_NP2KVPARK_MIN_PREDICT", 256));
         kvpk.max_bytes = (size_t) std::max<long long>(0, num("LLAMA_R40_NP2KVPARK_MAX_MIB", 4096)) << 20;
+        kvpk.stall_us  = std::max<long long>(0, num("LLAMA_R40_NP2KVPARK_STALL_MS", 250)) * 1000;
+        long long floor_mib = 4096;
+        if (const char * w = llama_model_fn_env(model_tgt, "LLAMA_FN_L15_WARM_FREE_MIB"); w && *w) {
+            floor_mib = std::max<long long>(0, strtoll(w, nullptr, 10));
+        }
+        kvpk.ram_floor    = (size_t) std::max<long long>(0, num("LLAMA_R40_NP2KVPARK_RAM_FLOOR_MIB", floor_mib)) << 20;
+        kvpk.commit_floor = (size_t) std::max<long long>(0, num("LLAMA_R40_NP2KVPARK_COMMIT_FLOOR_MIB", 4096)) << 20;
+        kvpk.on         = true;
+        g_r40_kvpark_on = true;
         queue_tasks.on_idle([this]() { kvpark_idle_tick(); });
+        size_t avail = 0;
+        (void) kvpark_ram_ok(0, 0, &avail);
         SRV_INF("[TAG_R40_NP2KVPARK] idle slots' attention cells go to host memory: at a launch the other idle slots with >= %d "
                 "cells, a slot whose cells start at >= %d moves down%s; after %.1f s with every slot idle the same around the most "
-                "recently used slot; at most %.0f MiB of host memory; a launch asking for fewer than %d tokens parks nothing "
-                "(LLAMA_R40_NP2KVPARK=0: off)\n", kvpk.min_cells, kvpk.reloc, kvpk.reloc > 0 ? "" : " (off)", kvpk.idle_us / 1e6,
-                kvpk.max_bytes / 1048576.0, kvpk.min_predict);
+                "recently used slot; at most %.0f MiB of host memory, only RAM above %.0f MiB available (now %.0f) and commit "
+                "above %.0f MiB; one park at most %.0f ms of copying (%.0f MiB until a rate is measured); a launch asking for "
+                "fewer than %d tokens parks nothing (LLAMA_R40_NP2KVPARK=0: off)\n", kvpk.min_cells, kvpk.reloc,
+                kvpk.reloc > 0 ? "" : " (off)", kvpk.idle_us / 1e6, kvpk.max_bytes / 1048576.0, kvpk.ram_floor / 1048576.0,
+                avail == SIZE_MAX ? -1.0 : avail / 1048576.0, kvpk.commit_floor / 1048576.0, kvpk.stall_us / 1000.0,
+                kvpark_cap() == SIZE_MAX ? -1.0 : kvpark_cap() / 1048576.0, kvpk.min_predict);
     }
 
-    // the attention cells of an idle slot go to the host; false: nothing changed (the slot keeps its cells)
-    bool kvpark_park(server_slot & s, const char * why) {
+    // the attention cells of an idle slot go to the host; false: nothing changed (the slot keeps its cells). credit: bytes
+    // of another park that go right after this one (a restore's own blob, for _MAX_MIB and the RAM floor); cap_div: the
+    // stall bound divided (2: a move down copies twice; 0: no stall bound, nothing else runs)
+    bool kvpark_park(server_slot & s, const char * why, size_t credit = 0, int cap_div = 1) {
         if (!kvpk.on || s.kvp.on || s.parked || s.is_processing() || s.prompt.tokens.empty()) {
             return false; // an idle slot only (no rows in flight): its memory ends where its tokens end (checked below)
         }
@@ -5445,10 +5514,24 @@ private:
         if (size == 0) {
             return false;
         }
-        if (g_r40_kvpark_bytes + size > kvpk.max_bytes) {
+        const size_t cap = cap_div > 0 ? kvpark_cap() / (size_t) cap_div : SIZE_MAX;
+        if (size > cap) {
+            if (kvpk.n_stall++ < 8) {
+                SLT_WRN(s, "[TAG_R40_NP2KVPARK] not parking (%s): %.1f MiB would take more than %.0f ms to copy (%.0f MiB at "
+                        "%.1f GB/s; LLAMA_R40_NP2KVPARK_STALL_MS): the slot keeps its cells\n", why, size / 1048576.0,
+                        kvpk.stall_us / 1000.0 / std::max(1, cap_div), cap / 1048576.0,
+                        std::min(kvpk.rate_park, kvpk.rate_restore) / 1000.0);
+            }
+            return false;
+        }
+        const size_t parked_after = g_r40_kvpark_bytes - std::min(g_r40_kvpark_bytes, credit) + size;
+        size_t avail = 0;
+        if (parked_after > kvpk.max_bytes || !kvpark_ram_ok(size, credit, &avail)) {
             if (kvpk.n_ram++ < 8) {
-                SLT_WRN(s, "[TAG_R40_NP2KVPARK] not parking (%s): %.1f MiB more than LLAMA_R40_NP2KVPARK_MAX_MIB (%.0f MiB, %.1f "
-                        "parked)\n", why, size / 1048576.0, kvpk.max_bytes / 1048576.0, g_r40_kvpark_bytes / 1048576.0);
+                SLT_WRN(s, "[TAG_R40_NP2KVPARK] not parking (%s): %.1f MiB (%.1f parked, LLAMA_R40_NP2KVPARK_MAX_MIB %.0f; RAM "
+                        "available %.0f MiB, floor %.0f): the slot keeps its cells\n", why, size / 1048576.0,
+                        g_r40_kvpark_bytes / 1048576.0, kvpk.max_bytes / 1048576.0, avail == SIZE_MAX ? -1.0 : avail / 1048576.0,
+                        kvpk.ram_floor / 1048576.0);
             }
             return false;
         }
@@ -5482,29 +5565,39 @@ private:
         s.kvp.t_us     = ggml_time_us();
         s.kvp_n_park++;
         g_r40_kvpark_bytes += size;
+        if (size >= ((size_t) 64 << 20) && s.kvp.t_us > t0) {
+            kvpk.rate_park = 0.7*kvpk.rate_park + 0.3*(double) size / (double) (s.kvp.t_us - t0);
+        }
         SLT_INF(s, "__TEST_TAG_R40_KVPARK__ %s: %zu tokens, %d cells [%d, %d], %.1f MiB to host memory (%.1f MiB parked in all) "
                 "in %.1f ms (read %.1f, remove %.1f)\n", why, s.kvp.n_tokens, n, cmin, cmax, size / 1048576.0,
                 g_r40_kvpark_bytes / 1048576.0, (s.kvp.t_us - t0) / 1000.0, (t1 - t0) / 1000.0, (s.kvp.t_us - t1) / 1000.0);
         return true;
     }
 
-    // the parked cells come back (into the lowest free cells); false: they could not, and the slot's tokens are gone
-    bool kvpark_unpark(server_slot & s, const char * why) {
+    // the parked cells come back (into the lowest free run of cells); false: they could not. may_wait (a launch): when the
+    // pool has no room for them while another slot's answer runs, the slot stays parked (its context kept) and the caller
+    // defers the task until that answer ends; otherwise the slot's tokens are gone (its next prompt is processed again)
+    bool kvpark_unpark(server_slot & s, const char * why, bool may_wait = false) {
         if (!s.kvp.on) {
             return true;
         }
         const int64_t t0   = ggml_time_us();
         const size_t  size = s.kvp.blob.size();
+        bool other_busy = false;
+        for (const auto & o : slots) {
+            other_busy = other_busy || (&o != &s && o.is_processing() && !o.parked);
+        }
         size_t put = 0;
         for (int k = 0; k < 2; ++k) {
             put = llama_state_seq_set_data_ext(ctx_tgt, s.kvp.blob.data(), size, s.id, LLAMA_STATE_SEQ_FLAGS_ATTN_ONLY_EXT);
             if (put == size || k > 0) {
                 break;
             }
-            // no room in the pool: the other idle slots' cells go to the host too, then once more
+            // no room in the pool: the other idle slots' cells go to the host too, then once more (this blob goes after the
+            // restore: it counts as credit; with no answer running the copy stalls nobody, so no stall bound)
             bool any = false;
             for (auto & o : slots) {
-                if (&o != &s && kvpark_park(o, "room for a restore")) {
+                if (&o != &s && kvpark_park(o, "room for a restore", size, other_busy ? 1 : 0)) {
                     any = true;
                 }
             }
@@ -5520,6 +5613,14 @@ private:
         const bool    ok = put == size && n == s.kvp.cells && s.prompt.tokens.size() == s.kvp.n_tokens &&
                            llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), s.id) + 1 == s.prompt.tokens.pos_next();
         if (!ok) {
+            const int32_t n_free = put != size ? llama_memory_attn_n_free_ext(ctx_tgt, s.id) : -1;
+            if (may_wait && put != size && other_busy && n_free >= 0 && n_free < s.kvp.cells &&
+                s.prompt.tokens.size() == s.kvp.n_tokens) {
+                // a failed ATTN_ONLY read restored nothing (it clears what it placed); the blob and the recurrent cell stay
+                SLT_WRN(s, "__TEST_TAG_R40_KVPARK_WAIT__ restore (%s): %d free cells for its %d while another slot answers: the "
+                        "task waits for that answer, the parked context stays\n", why, (int) n_free, s.kvp.cells);
+                return false;
+            }
             SLT_ERR(s, "[TAG_R40_NP2KVPARK] the parked cells did not come back (%s: %zu of %zu bytes, %d of %d cells): the slot's "
                     "%zu tokens are dropped, its next prompt is processed from the start\n", why, put, size, n, s.kvp.cells,
                     s.prompt.tokens.size());
@@ -5527,6 +5628,9 @@ private:
             return false;
         }
         const int64_t now = ggml_time_us();
+        if (size >= ((size_t) 64 << 20) && now > t0) {
+            kvpk.rate_restore = 0.7*kvpk.rate_restore + 0.3*(double) size / (double) (now - t0);
+        }
         SLT_INF(s, "__TEST_TAG_R40_KVRESTORE__ %s: %zu tokens, %d cells at [%d, %d] (were [%d, %d]) after %.1f s, %.1f MiB in %.1f ms\n",
                 why, s.kvp.n_tokens, n, cmin, cmax, s.kvp.cell_min, s.kvp.cell_max, (t0 - s.kvp.t_us) / 1e6, size / 1048576.0,
                 (now - t0) / 1000.0);
@@ -5537,11 +5641,12 @@ private:
         return true;
     }
 
-    // T2 (launch: `keep` takes a task now) and T1 (idle: keep = the most recently used slot). excl_*: donor slots whose cells
-    // the launch takes ([TAG_FN_L22_SHAREKV] leader, [TAG_FN_L24_ATTACH] donor) stay
-    void kvpark_compact(server_slot * keep, bool launch, int excl_a = -1, int excl_b = -1, int32_t n_predict = -1) {
+    // T2 (launch: keep takes a task now) and T1 (idle: keep = the most recently used slot). excl_*: donor slots whose cells
+    // the launch takes ([TAG_FN_L22_SHAREKV] leader, [TAG_FN_L24_ATTACH] donor) stay. false: the launching slot is still
+    // parked (no room beside a running answer): the caller defers the task
+    bool kvpark_compact(server_slot * keep, bool launch, int excl_a = -1, int excl_b = -1, int32_t n_predict = -1) {
         if (!kvpk.on) {
-            return;
+            return true;
         }
         bool other_busy = false;
         for (const auto & o : slots) {
@@ -5572,23 +5677,24 @@ private:
             }
         }
         if (keep == nullptr || keep->is_processing() || keep->parked) {
-            return;
+            return true;
         }
         if (keep->kvp.on) {
             if (launch) {
-                kvpark_unpark(*keep, "launch");
+                return kvpark_unpark(*keep, "launch", /*may_wait =*/ true) || !keep->kvp.on;
             }
-            return;
+            return true;
         }
         if (!other_busy && !short_task && kvpk.reloc > 0 && !keep->prompt.tokens.empty()) {
             int32_t cmin = -1;
             int32_t cmax = -1;
             const int32_t n = llama_memory_attn_seq_cells_ext(ctx_tgt, keep->id, &cmin, &cmax);
-            if (n > 0 && cmin >= kvpk.reloc && kvpark_park(*keep, "move down")) {
+            if (n > 0 && cmin >= kvpk.reloc && kvpark_park(*keep, "move down", 0, /*cap_div =*/ 2)) {
                 keep->kvp_n_reloc++;
                 kvpark_unpark(*keep, "move down");
             }
         }
+        return true;
     }
 
     // T1: the queue's idle tick (every 250 ms while no task waits)

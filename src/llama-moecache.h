@@ -144,8 +144,10 @@ bool   llama_moe_hot_cbuf_restore(const void * owner);
 // _generation changes with every release / restore: a graph built before must not be reused.
 void     llama_moe_hot_set_kv_lend(size_t want, size_t keep, int n_trunk);
 // [TAG_R40_LEND_PARTIAL] before the init (with _set_kv_lend): a slot lend whose segments still fall short at the last retry
-// keeps what they hold (llama_moe_hot_kv_bytes() < want) instead of failing; false (default): it fails, as v0.30.0
-void     llama_moe_hot_set_kv_partial(bool on);
+// keeps what they hold (llama_moe_hot_kv_bytes() < want) instead of failing; false (default): it fails, as v0.30.0.
+// round: the most the caller's up-front map of the unheld KV part rounds up (llama_kv_lend_chunk_bytes); a partial lend's
+// hot set leaves the bytes it cannot hold plus `round` of the budget free, so the VRAM adds up as with the whole lend
+void     llama_moe_hot_set_kv_partial(bool on, size_t round = 0);
 // [TAG_R40_LEND_SPREAD] before the init (with _set_kv_lend): every layer's count from the whole budget, the lend out of the
 // lend layers' own slots (more lend layers, each as big as the others); false (default): base cut + lend on top, as v0.30.0
 void     llama_moe_hot_set_kv_spread(bool on);

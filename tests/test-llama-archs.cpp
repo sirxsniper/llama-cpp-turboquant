@@ -2370,13 +2370,40 @@ static std::vector<uint8_t> kv_park_save(llama_context * lctx, llama_seq_id seq,
     return buf;
 }
 
-static void kv_park_restore(llama_context * lctx, llama_seq_id seq, const std::vector<uint8_t> & buf, int32_t n_cells) {
+// the restore lands in the lowest run of free cells that holds the whole sequence, in one piece ([TAG_R40_NP2KVPARK]
+// r40_place_low): low_start is that run's first cell as the caller computed it from the other sequence's cells
+static void kv_park_restore(llama_context * lctx, llama_seq_id seq, const std::vector<uint8_t> & buf, int32_t n_cells,
+                            int32_t low_start = -1) {
     if (llama_state_seq_set_data_ext(lctx, buf.data(), buf.size(), seq, LLAMA_STATE_SEQ_FLAGS_ATTN_ONLY_EXT) != buf.size()) {
         throw std::runtime_error("attention-only state restore failed");
     }
-    if (llama_memory_attn_seq_cells_ext(lctx, seq, nullptr, nullptr) != n_cells) {
+    int32_t cmin = -1;
+    int32_t cmax = -1;
+    if (llama_memory_attn_seq_cells_ext(lctx, seq, &cmin, &cmax) != n_cells) {
         throw std::runtime_error("restored cell count differs");
     }
+    if (cmax - cmin + 1 != n_cells) {
+        throw std::runtime_error("restored cells not contiguous ([" + std::to_string(cmin) + ", " + std::to_string(cmax) + "] for " +
+                                 std::to_string(n_cells) + ")");
+    }
+    if (low_start >= 0 && cmin != low_start) {
+        throw std::runtime_error("restored cells start at " + std::to_string(cmin) + ", the lowest free run at " +
+                                 std::to_string(low_start));
+    }
+}
+
+// the first cell of the lowest free run of n cells when the only other sequence holds the contiguous cells [o_min, o_max]
+static int32_t kv_park_low_start(llama_context * lctx, llama_seq_id other, int32_t n) {
+    int32_t omin = -1;
+    int32_t omax = -1;
+    const int32_t no = llama_memory_attn_seq_cells_ext(lctx, other, &omin, &omax);
+    if (no <= 0) {
+        return 0;
+    }
+    if (omax - omin + 1 != no) {
+        return -1; // not contiguous: no expectation
+    }
+    return omin >= n ? 0 : omax + 1;
 }
 
 static int test_kv_park(const std::string & arch_filter, const size_t seed, const float stdev, const int verbosity) {
@@ -2505,7 +2532,7 @@ static int test_kv_park(const std::string & arch_filter, const size_t seed, cons
                 size_t full_a = 0;
                 const std::vector<uint8_t> blob_a = kv_park_save(lctx.get(), 0, &full_a);
                 const std::vector<uint8_t> blob_b = kv_park_save(lctx.get(), 1, nullptr);
-                kv_park_restore(lctx.get(), 1, blob_b, n_cells_b);
+                kv_park_restore(lctx.get(), 1, blob_b, n_cells_b, 0); // nothing else holds cells: from cell 0
                 int32_t b_min1 = -1;
                 llama_memory_attn_seq_cells_ext(lctx.get(), 1, &b_min1, nullptr);
                 if (!(b_min1 < b_min0)) {
@@ -2516,7 +2543,7 @@ static int test_kv_park(const std::string & arch_filter, const size_t seed, cons
                 }
                 decode_range(lctx.get(), tok_pb, n_p, n_b, 1, true);
                 const std::vector<float> park_b = kv_park_logits(lctx.get(), n_vocab, n_p);
-                kv_park_restore(lctx.get(), 0, blob_a, n_cells_a);
+                kv_park_restore(lctx.get(), 0, blob_a, n_cells_a, kv_park_low_start(lctx.get(), 1, n_cells_a));
                 if (llama_memory_seq_pos_max(mem, 0) != (llama_pos) n_a - 1) {
                     throw std::runtime_error("A's memory does not end at its last position");
                 }

@@ -489,6 +489,19 @@ size_t llama_kv_lend_map_upto(size_t bytes) {
     return ok ? after - before : 0;
 }
 
+size_t llama_kv_lend_chunk_bytes() {
+    size_t b = 0;
+    for (const auto & s : g_kvls) {
+        if (!s.kv || s.whole) {
+            continue;
+        }
+        for (const auto & r : s.regs) {
+            b += kvl_round_up((size_t) std::max<uint32_t>(1, s.chunk) * r.row, std::max<size_t>(1, s.gran));
+        }
+    }
+    return b;
+}
+
 bool llama_kv_cache::kvl_update(uint32_t need) const {
     kvl_state * ks = kvl_find(this); // [TAG_FN_L10_KVLEND2]
     if (ks == nullptr || ks->whole) {
@@ -4037,6 +4050,13 @@ const slot_info_vec_t *   sinfos_in) {
 
         slot_info sinfo;
 
+        // [TAG_R40_NP2KVPARK] an ATTN_ONLY read of one sequence (a parked slot's cells): the lowest free run, in order
+        struct r40_low_scope {
+            bool & f;
+            r40_low_scope(bool & f, bool on) : f(f) { f = on; }
+            ~r40_low_scope() { f = false; }
+        } r40_low { r40_low_place, (flags & LLAMA_STATE_SEQ_FLAGS_ATTN_ONLY_EXT) != 0 && seq_id >= 0 };
+
         bool res = true;
         res = res && state_read_meta(io, strm, cell_count, sinfo, seq_id, sinfos_in ? &(*sinfos_in)[s] : nullptr);
         res = res && kvl_update(kvl_need()); // [TAG_FN_L8_KVLEND] the restored cells mapped before their data lands
@@ -4199,6 +4219,52 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
     }
 }
 
+// [TAG_R40_NP2KVPARK] the cells for a parked sequence that comes back: the lowest run of cell_count free cells (the saved
+// order kept, the KV lend's mapped prefix as low as it can be); with no such run the lowest free cells in index order (the
+// saved order kept, no wrap); empty when fewer cells are free (the caller tries find_slot)
+llama_kv_cache::slot_info llama_kv_cache::r40_place_low(uint32_t strm, uint32_t cell_count) const {
+    const auto & cells = v_cells[strm];
+    if (cell_count == 0 || cell_count > cells.size()) {
+        return slot_info{};
+    }
+    std::vector<uint32_t> idxs;
+    idxs.reserve(cell_count);
+    uint32_t run   = 0;
+    uint32_t start = 0;
+    for (uint32_t i = 0; i < cells.size(); ++i) {
+        if (!cells.is_empty(i)) {
+            run = 0;
+            continue;
+        }
+        if (run++ == 0) {
+            start = i;
+        }
+        if (run == cell_count) {
+            for (uint32_t k = 0; k < cell_count; ++k) {
+                idxs.push_back(start + k);
+            }
+            break;
+        }
+    }
+    if (idxs.empty()) {
+        for (uint32_t i = 0; i < cells.size() && idxs.size() < cell_count; ++i) {
+            if (cells.is_empty(i)) {
+                idxs.push_back(i);
+            }
+        }
+        if (idxs.size() < cell_count) {
+            return slot_info{};
+        }
+    }
+    slot_info r = {};
+    r.s0 = strm;
+    r.s1 = strm;
+    r.resize(1);
+    r.strm[0] = (llama_seq_id) strm;
+    r.idxs[0] = std::move(idxs);
+    return r;
+}
+
 bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, slot_info & sinfo, llama_seq_id dest_seq_id, const slot_info * sinfo_in) {
     auto & cells = v_cells[strm];
     auto & head  = v_heads[strm];
@@ -4288,7 +4354,11 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
                 }
             }
         } else {
-            sinfo = find_slot(ubatch, false);
+            // [TAG_R40_NP2KVPARK] a parked sequence comes back into the lowest free run that holds it (find_slot when none)
+            sinfo = r40_low_place ? r40_place_low(strm, cell_count) : slot_info{};
+            if (sinfo.empty()) {
+                sinfo = find_slot(ubatch, false);
+            }
             if (sinfo.empty()) {
                 LLAMA_LOG_ERROR("%s: failed to find %d available cells in kv cache\n", __func__,  cell_count);
                 return false;
