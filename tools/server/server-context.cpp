@@ -3692,6 +3692,14 @@ private:
                 const size_t lcp_len = tokens.get_common_prefix(task.tokens);
                 const float f_sim_cur = task.tokens.empty() ? 0.0f : float(lcp_len) / task.tokens.size();
 
+                // [TAG_R40_NP2KVPARK] a parked slot is taken by similarity only when the task goes on with most of it
+                // (f_keep >= 0.5): for another conversation its cells would come back into VRAM (taking hot experts) only
+                // to be stored by keepctx and dropped (r40 turn 3: t1 restored 30708 cells, 253 residents evicted)
+                if (kvpk.on && slot.kvp.on && task.id_slot == -1 && 2*lcp_len < tokens.size()) {
+                    SLT_TRC(slot, " - skipping, parked and the task keeps %zu of its %zu tokens\n", lcp_len, tokens.size());
+                    continue;
+                }
+
                 SLT_TRC(slot, " - checking sim = %.3f (%zu/%zu) > %.3f\n", f_sim_cur, lcp_len, task.tokens.size(), slot_prompt_similarity);
 
                 // select the current slot if the criteria match
@@ -3736,10 +3744,20 @@ private:
 
         // find the slot that has been least recently used
         if (ret == nullptr) {
-            const auto free_slots = get_free_slots(1, -1);
+            // [TAG_R40_NP2KVPARK] the least recently used slot that is not parked (a parked slot keeps its conversation in
+            // host memory, it costs no VRAM): its cells would come back only to be stored and dropped
+            const auto free_slots = get_free_slots(kvpk.on ? slots.size() : 1, -1);
 
             if (!free_slots.empty()) {
                 ret = free_slots[0];
+                if (kvpk.on) {
+                    for (server_slot * s : free_slots) {
+                        if (!s->kvp.on) {
+                            ret = s;
+                            break;
+                        }
+                    }
+                }
 
                 SLT_INF(*ret, "selected slot by LRU, n_tokens = %d, t_last = %" PRId64 "\n", ret->prompt.n_tokens(), ret->t_last_used);
 
