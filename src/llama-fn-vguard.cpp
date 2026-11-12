@@ -347,8 +347,7 @@ bool vg_poll(bool force) {
         // observe (T0): one line per second, D next to the harness's PDH d
         g.t_obs = t;
         LLAMA_LOG_WARN("%s: [TAG_R40_VGUARD] observe: H %.0f F %.0f D %.1f (usage %.1f - PDH dedicated %.1f - offset %.1f) MiB, budget "
-                "%.0f solo %.0f deficit %.0f%s%s, share %.0f MiB, stash %.0f MiB
-", __func__, s.H, s.F, g.D, s.usage, s.ded, g.d_off,
+                "%.0f solo %.0f deficit %.0f%s%s, share %.0f MiB, stash %.0f MiB\n", __func__, s.H, s.F, g.D, s.usage, s.ded, g.d_off,
                 s.budget, g.solo, g.deficit, g.demoted ? " DEMOTED" : "", g.pressure ? " PRESSURE" : "",
                 llama_moe_hot_vg_out()/VG_MIB, llama_fn_zc_stash_bytes()/VG_MIB);
     }

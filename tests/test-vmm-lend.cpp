@@ -479,8 +479,7 @@ int main() {
             st(s3);
             size_t res = 0, hwm = 0;
             stats_f(backend, &res, &hwm);
-            printf("test-vmm-lend: (5) pool %.1f MiB (high-water %.1f), %" PRIu64 " growth(s) from the stash (%.1f MiB)
-",
+            printf("test-vmm-lend: (5) pool %.1f MiB (high-water %.1f), %" PRIu64 " growth(s) from the stash (%.1f MiB)\n",
                     res/1048576.0, hwm/1048576.0, s3[ZC_N_POOL] - s2[ZC_N_POOL], (s3[ZC_B_POOL] - s2[ZC_B_POOL])/1048576.0);
             ggml_backend_buffer_free(bw);
             ggml_free(cw);
@@ -517,8 +516,7 @@ int main() {
         std::vector<float> r5 = g_all.run(backend, xv, iv);
         TCHECK(same_bytes(r5, r_ref, r_ref.size()), "(5) the chain gives the reference bytes after the zero-commit moves");
         printf("test-vmm-lend: (5) zero-commit: %" PRIu64 " parks, %" PRIu64 " handles reused (%.1f MiB), %" PRIu64 " arena buffers, "
-                "%.1f MiB new, %" PRIu64 " failures
-", s5[ZC_N_PARK] - s0[ZC_N_PARK], s5[ZC_N_REUSE] - s0[ZC_N_REUSE],
+                "%.1f MiB new, %" PRIu64 " failures\n", s5[ZC_N_PARK] - s0[ZC_N_PARK], s5[ZC_N_REUSE] - s0[ZC_N_REUSE],
                 (s5[ZC_B_REUSE] - s0[ZC_B_REUSE])/1048576.0, s5[ZC_N_ARENA] - s0[ZC_N_ARENA], (s5[ZC_B_NEW] - s0[ZC_B_NEW])/1048576.0,
                 s5[ZC_N_FAIL] - s0[ZC_N_FAIL]);
         TCHECK(s5[ZC_N_FAIL] == s0[ZC_N_FAIL], "(5) no zero-commit failure");
@@ -526,8 +524,7 @@ int main() {
         ggml_backend_buffer_free(zb);
         ggml_free(cz);
     } else {
-        printf("test-vmm-lend: (5) zero-commit SKIPPED (not offered on %s)
-", ggml_backend_dev_name(dev));
+        printf("test-vmm-lend: (5) zero-commit SKIPPED (not offered on %s)\n", ggml_backend_dev_name(dev));
     }
 
     // the buffer goes, and its VRAM with it
