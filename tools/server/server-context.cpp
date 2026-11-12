@@ -2657,7 +2657,7 @@ private:
         // [TAG_R40_NP2KVPARK] the parked attention cells belong to these contexts: a resumed server has no sequence to put
         // them back into (load_model clears the slots), so their host memory goes now, not after the sleep
         for (auto & slot : slots) {
-            slot.kvp_drop("server sleeps");
+            slot.kvp_drop("contexts freed (sleep or exit)");
         }
         g_r40_kvpark_bytes = 0;
         g_r40_kvpark_on    = false;
