@@ -1,4 +1,4 @@
-// [TAG_R40_VGUARD] the WDDM paging guard: see llama-fn-vguard.h
+// [TAG_R40_VGUARD] the WDDM paging guard and its zero-commit glue: see llama-fn-vguard.h
 #include "llama-fn-vguard.h"
 
 #include "llama-impl.h"
@@ -12,6 +12,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <cwchar>
 
 #if defined(_WIN32)
 #    ifndef NOMINMAX
@@ -21,6 +22,8 @@
 #        define WIN32_LEAN_AND_MEAN
 #    endif
 #    include <windows.h>
+#    include <pdh.h>
+#    include <pdhmsg.h>
 #endif
 
 namespace {
@@ -33,18 +36,20 @@ constexpr double VG_MIB = 1048576.0;
 }
 
 struct vg_knobs {
-    double hact = 2304, fact = 2560, htgt = 2944, ftgt = 3200; // MiB
-    double dem = 64, drop = 256, max = 2048;                    // MiB
+    double htgt = 2944, ftgt = 3200;   // MiB: the switch / encode levels and the regrow floor (a switch that commits)
+    double zhtgt = 2304, zftgt = 2560; // MiB: the same for a zero-commit switch (it commits nothing)
+    double dem = 64, drop = 256, max = 2048, react_f = 3800; // MiB
     int    poll_ms = 20;
-    double calm_s  = 10;
-    int    react = 1, pregrow = 1, force = 0;
+    double calm_s = 10, quiet_s = 2, regrow_s = 2;
+    int    press = 1, react = 0, force = 0;
 };
 
 // one poll's numbers (MiB)
 struct vg_sample {
     int64_t t      = 0;
-    double  budget = 0, usage = 0, resident = 0, limit = 0, seg_res = 0;
-    double  H = 0, F = 0, draw = 0;
+    double  budget = 0, usage = 0, limit = 0, seg_res = 0;
+    double  ded    = -1.0; // our PDH dedicated usage (-1: not read)
+    double  H = 0, F = 0, raw = 0;
 };
 
 #if defined(_WIN32)
@@ -56,7 +61,6 @@ using vg_kmt_qs_fn = LONG (APIENTRY *)(void *);
 enum : uint32_t {
     VG_QS_ADAPTER               = 0,
     VG_QS_SEGMENT               = 3,
-    VG_QS_PROCESS_SEGMENT       = 4,
     VG_QS_PROCESS_SEGMENT_GROUP = 9,
 };
 
@@ -91,14 +95,6 @@ struct vg_kmt {
         }
         s.budget = u64(24)/VG_MIB;
         s.usage  = u64(40)/VG_MIB;
-        if (query(VG_QS_PROCESS_SEGMENT, proc, seg) != 0) {
-            return false;
-        }
-        uint64_t r = u64(152); // AllocsResidentInNonPreferred.Bytes
-        for (int i = 0; i < 5; ++i) {
-            r += u64(72 + 16*(size_t) i); // AllocsResidentInP[i].Bytes
-        }
-        s.resident = r/VG_MIB;
         if (query(VG_QS_SEGMENT, nullptr, seg) != 0) {
             return false;
         }
@@ -107,7 +103,85 @@ struct vg_kmt {
         return true;
     }
 };
+
+// our process's "GPU Process Memory(pid_<pid>_luid_0x<high>_0x<low>_phys_0)\Dedicated Usage" (pdh.dll loaded at arm; one
+// counter, ~1.9 us per collect + read on an idle GPU, r40 understand latency table)
+struct vg_pdh {
+    using open_fn    = PDH_STATUS (WINAPI *)(LPCWSTR, DWORD_PTR, PDH_HQUERY *);
+    using add_fn     = PDH_STATUS (WINAPI *)(PDH_HQUERY, LPCWSTR, DWORD_PTR, PDH_HCOUNTER *);
+    using collect_fn = PDH_STATUS (WINAPI *)(PDH_HQUERY);
+    using fmt_fn     = PDH_STATUS (WINAPI *)(PDH_HCOUNTER, DWORD, LPDWORD, PPDH_FMT_COUNTERVALUE);
+    using close_fn   = PDH_STATUS (WINAPI *)(PDH_HQUERY);
+    collect_fn   collect = nullptr;
+    fmt_fn       fmt     = nullptr;
+    close_fn     close   = nullptr;
+    PDH_HQUERY   q       = nullptr;
+    PDH_HCOUNTER c       = nullptr;
+    wchar_t      path[160] = {};
+
+    // false: why says what failed
+    bool open(uint64_t luid, const char ** why) {
+        HMODULE dll = LoadLibraryA("pdh.dll");
+        auto * o  = dll ? (open_fn) (void *) GetProcAddress(dll, "PdhOpenQueryW") : nullptr;
+        auto * a  = dll ? (add_fn) (void *) GetProcAddress(dll, "PdhAddEnglishCounterW") : nullptr;
+        collect   = dll ? (collect_fn) (void *) GetProcAddress(dll, "PdhCollectQueryData") : nullptr;
+        fmt       = dll ? (fmt_fn) (void *) GetProcAddress(dll, "PdhGetFormattedCounterValue") : nullptr;
+        close     = dll ? (close_fn) (void *) GetProcAddress(dll, "PdhCloseQuery") : nullptr;
+        if (!o || !a || !collect || !fmt || !close) {
+            *why = "pdh.dll or its functions not found";
+            return false;
+        }
+        swprintf(path, sizeof(path)/sizeof(path[0]), L"\\GPU Process Memory(pid_%lu_luid_0x%08X_0x%08X_phys_0)\\Dedicated Usage",
+                (unsigned long) GetCurrentProcessId(), (unsigned) (luid >> 32), (unsigned) (luid & 0xffffffffu));
+        if (o(nullptr, 0, &q) != ERROR_SUCCESS) {
+            q    = nullptr;
+            *why = "PdhOpenQuery failed";
+            return false;
+        }
+        if (a(q, path, 0, &c) != ERROR_SUCCESS) {
+            close(q);
+            q    = nullptr;
+            *why = "PdhAddEnglishCounter failed (no such GPU Process Memory instance)";
+            return false;
+        }
+        return true;
+    }
+    bool read(double & mib) {
+        if (!q || collect(q) != ERROR_SUCCESS) {
+            return false;
+        }
+        PDH_FMT_COUNTERVALUE v = {};
+        if (fmt(c, PDH_FMT_LARGE, nullptr, &v) != ERROR_SUCCESS ||
+            (v.CStatus != PDH_CSTATUS_VALID_DATA && v.CStatus != PDH_CSTATUS_NEW_DATA)) {
+            return false;
+        }
+        mib = (double) v.largeValue/VG_MIB;
+        return true;
+    }
+};
 #endif
+
+// the zero-commit glue: ggml-cuda's procs on the hot set's device (stats order: ggml_cuda_zc_stat in ggml-cuda.cu)
+enum {
+    ZC_N_PARK, ZC_B_PARK, ZC_N_REUSE, ZC_B_REUSE, ZC_N_NEW, ZC_B_NEW, ZC_N_DROP, ZC_B_DROP, ZC_N_FAIL, ZC_N_ARENA, ZC_B_ARENA,
+    ZC_N_POOL, ZC_B_POOL, ZC_B_STASH, ZC_US, ZC_NST,
+};
+
+struct vg_zc {
+    bool               on     = false;
+    bool               tried  = false;
+    ggml_backend_dev_t dev    = nullptr;
+    bool   (*enable)(ggml_backend_dev_t, bool)            = nullptr;
+    int    (*scope)(ggml_backend_dev_t, int)              = nullptr;
+    int    (*window)(ggml_backend_dev_t, int)             = nullptr;
+    size_t (*drop)(ggml_backend_dev_t)                    = nullptr;
+    int    (*stats)(ggml_backend_dev_t, uint64_t *, int)  = nullptr;
+    uint64_t last[ZC_NST] = {};
+    uint64_t n_full = 0, n_small = 0;
+    double   ms_full = 0.0, ms_small = 0.0;
+};
+
+vg_zc g_zc;
 
 struct vg_state {
     int          mode   = -1;
@@ -118,31 +192,29 @@ struct vg_state {
     vg_knobs     k;
 #if defined(_WIN32)
     vg_kmt       K;
+    vg_pdh       P;
 #endif
     // the last poll and the rules' memory
     vg_sample cur;
-    bool      have      = false;
-    int       n_fail    = 0;
-    double    d_base    = 0.0;
-    bool      d_base_ok = false;
-    double    D         = 0.0;
-    int       dem_n     = 0;
-    int64_t   t_dem0    = 0;     // the first poll of the current D >= DEM run
-    int64_t   t_d_low   = 0;     // D <= 16 since (0: not now)
-    bool      demoted   = false;
-    double    calm_budget = 0.0;
-    bool      calm_ok   = false;
-    bool      pressure  = false;
-    int64_t   t_press   = 0;     // the last poll with PRESSURE
+    bool      have     = false;
+    int       n_fail   = 0;
+    bool      det      = false;  // DEMOTED detection armed (PDH read, |D| <= 32 MiB at arm)
+    double    d_off    = 0.0;    // the calm offset of usage - PDH dedicated
+    double    D        = 0.0;
+    int       dem_n    = 0;
+    int64_t   t_dem0   = 0;      // the first poll of the current D >= DEM run
+    bool      demoted  = false;
+    double    solo     = 0.0;    // the solo budget: at arm, raised when the budget rises, never lowered by an action
+    double    deficit  = 0.0;
+    bool      pressure = false;
+    int64_t   t_calm0  = 0;      // deficit < DROP and D <= 16 since (0: not now)
+    int64_t   t_prompt = 0;      // the last batch with prompt rows, FULL switch or encode
+    int64_t   t_regrow = 0;
+    int64_t   t_react  = 0;
     // the share
-    size_t    group     = 0;     // one KV group's bytes
-    size_t    sw_part   = 0;     // of the share: taken at a switch / an encode (returns at SMALL)
-    double    react_last = 0.0;  // the last reactive amount (MiB)
-    int64_t   t_react   = 0;
-    int64_t   t_regrow  = 0;
-    size_t    full_hwm  = 0;
+    size_t    group    = 0;      // one KV group's bytes
     // statistics
-    uint64_t  n_poll = 0, n_act = 0, n_sw = 0, n_dec = 0, n_gate = 0, n_defer = 0, n_trans = 0;
+    uint64_t  n_poll = 0, n_act = 0, n_sw = 0, n_dec = 0, n_gate = 0, n_defer = 0, n_trans = 0, n_pdh_fail = 0;
     double    poll_us_max = 0.0;
 };
 
@@ -178,13 +250,24 @@ void vg_off(const char * why) {
     }
 }
 
+// the zero-commit switch's H / F levels (a switch that commits: HTGT / FTGT)
+double vg_lvl_h() {
+    const vg_state & g = vg();
+    return g_zc.on ? g.k.zhtgt : g.k.htgt;
+}
+
+double vg_lvl_f() {
+    const vg_state & g = vg();
+    return g_zc.on ? g.k.zftgt : g.k.ftgt;
+}
+
 [[maybe_unused]] void vg_note(const char * what) {
     vg_state & g = vg();
     g.n_trans++;
     if (g.n_trans <= 32 || g.n_trans % 64 == 0) {
         const vg_sample & s = g.cur;
-        LLAMA_LOG_WARN("%s: [TAG_R40_VGUARD] %s: H %.0f F %.0f D %.0f MiB (budget %.0f usage %.0f resident %.0f, calm budget %.0f), "
-                "share %.0f MiB\n", __func__, what, s.H, s.F, g.D, s.budget, s.usage, s.resident, g.calm_budget,
+        LLAMA_LOG_WARN("%s: [TAG_R40_VGUARD] %s: H %.0f F %.0f D %.0f MiB (budget %.0f solo %.0f deficit %.0f, usage %.0f, PDH "
+                "dedicated %.0f), share %.0f MiB\n", __func__, what, s.H, s.F, g.D, s.budget, g.solo, g.deficit, s.usage, s.ded,
                 llama_moe_hot_vg_out()/VG_MIB);
     }
 }
@@ -205,49 +288,54 @@ bool vg_poll(bool force) {
         return false;
     }
     g.n_fail = 0;
+    if (g.det) {
+        double ded = 0.0;
+        if (g.P.read(ded)) {
+            s.ded = ded;
+        } else {
+            g.n_pdh_fail++;
+        }
+    }
     g.poll_us_max = std::max(g.poll_us_max, (double) (ggml_time_us() - t));
     g.n_poll++;
-    s.t    = t;
-    s.H    = s.budget - s.usage;
-    s.F    = s.limit - s.seg_res;
-    s.draw = s.usage - s.resident;
-    if (!g.d_base_ok) {
-        g.d_base    = s.draw;
-        g.d_base_ok = true;
+    s.t = t;
+    s.H = s.budget - s.usage;
+    s.F = s.limit - s.seg_res;
+    // PRESSURE: the budget below the solo budget (another process's commitment lowers it in the same second, r40 replay)
+    if (s.budget > g.solo) {
+        g.solo = s.budget;
     }
-    if (s.draw < g.d_base) {
-        g.d_base = s.draw;
-    }
-    g.D = s.draw - g.d_base;
-    if (g.D >= g.k.dem) {
-        if (g.dem_n++ == 0) {
-            g.t_dem0 = t;
-        }
-    } else {
-        g.dem_n = 0;
-    }
+    g.deficit = g.solo - s.budget;
+    const bool was_press = g.pressure;
+    g.pressure = g.deficit >= g.k.drop;
+    // DEMOTED: our usage above our PDH dedicated usage (a failed PDH read keeps the last D)
     const bool was_dem = g.demoted;
-    g.demoted = g.dem_n >= 2 && t - g.t_dem0 >= 20000;
-    if (g.D <= 16.0) {
-        if (g.t_d_low == 0) {
-            g.t_d_low = t;
+    if (s.ded >= 0.0) {
+        s.raw = s.usage - s.ded;
+        g.D   = s.raw - g.d_off;
+        if (g.D >= g.k.dem) {
+            if (g.dem_n++ == 0) {
+                g.t_dem0 = t;
+            }
+        } else {
+            g.dem_n = 0;
         }
-        g.d_base += 0.02*(s.draw - g.d_base); // a calm offset that creeps up is not a demotion
+        g.demoted = g.dem_n >= 2 && t - g.t_dem0 >= 20000;
+        if (g.D < 0.0) {
+            g.d_off = s.raw; // a smaller calm offset at once
+        } else if (g.D <= 16.0) {
+            g.d_off += 0.02*(s.raw - g.d_off); // a calm offset that creeps up is not a demotion
+        }
+    }
+    if (!g.pressure && g.D <= 16.0) {
+        if (g.t_calm0 == 0) {
+            g.t_calm0 = t;
+        }
     } else {
-        g.t_d_low = 0;
+        g.t_calm0 = 0;
     }
     g.cur  = s;
     g.have = true;
-    const bool calm = s.H >= g.k.hact && s.F >= g.k.fact && !g.demoted;
-    if (calm) {
-        g.calm_budget = s.budget;
-        g.calm_ok     = true;
-    }
-    const bool was_press = g.pressure;
-    g.pressure = g.calm_ok && g.calm_budget - s.budget >= g.k.drop && (s.H < g.k.htgt || s.F < g.k.ftgt);
-    if (g.pressure) {
-        g.t_press = t;
-    }
     if (g.demoted != was_dem) {
         vg_note(g.demoted ? "DEMOTED begins" : "DEMOTED ends");
     }
@@ -274,7 +362,8 @@ size_t vg_groups_for(double mib) {
     return (size_t) std::ceil(mib*VG_MIB/(double) g.group);
 }
 
-// the share to `target` bytes (whole groups, at most MAX); sync: the owner's graphs first (r35_hook_sync). One log line
+// the share to `target` bytes (whole groups, at most MAX); sync: the owner's graphs first (r35_hook_sync). A growing share
+// frees the zero-commit stash first (handles nothing maps). One log line
 size_t vg_hold(size_t target, bool sync, const char * why) {
     vg_state & g = vg();
     target = std::min(target, std::max(vg_max_b(), llama_moe_hot_vg_out()));
@@ -284,7 +373,12 @@ size_t vg_hold(size_t target, bool sync, const char * why) {
     }
     const vg_sample s0 = g.cur;
     const double    d0 = g.D;
+    const double    f0 = g.deficit;
     const int64_t   t0 = ggml_time_us();
+    size_t dropped = 0;
+    if (target > before && g_zc.on && g_zc.drop) {
+        dropped = g_zc.drop(g_zc.dev);
+    }
     if (sync && g.h.sync) {
         g.h.sync(g.h.user);
     }
@@ -293,69 +387,46 @@ size_t vg_hold(size_t target, bool sync, const char * why) {
     const double  ms      = vg_ms(t0);
     (void) vg_poll(true);
     g.n_act++;
-    LLAMA_LOG_WARN("%s: [TAG_R40_VGUARD] %s (%" PRIu64 "): H %.0f F %.0f D %.0f MiB (budget %.0f) -> the share %.0f -> %.0f MiB "
-            "(wanted %.0f, %zu groups) in %.1f ms (sync %.1f); now H %.0f F %.0f D %.0f, %.0f MiB of the lend mapped\n", __func__,
-            why, g.n_act, s0.H, s0.F, d0, s0.budget, before/VG_MIB, after/VG_MIB, target/VG_MIB,
-            g.group ? (size_t) (after/g.group) : (size_t) 0, ms, ms_sync, g.cur.H, g.cur.F, g.D, llama_moe_hot_vg_free()/VG_MIB);
+    LLAMA_LOG_WARN("%s: [TAG_R40_VGUARD] %s (%" PRIu64 "): H %.0f F %.0f D %.0f deficit %.0f MiB (budget %.0f) -> the share %.0f -> "
+            "%.0f MiB (wanted %.0f, %zu groups%s) in %.1f ms (sync %.1f, stash freed %.0f MiB); now H %.0f F %.0f D %.0f deficit "
+            "%.0f, %.0f MiB of the lend mapped\n", __func__, why, g.n_act, s0.H, s0.F, d0, f0, s0.budget, before/VG_MIB,
+            after/VG_MIB, target/VG_MIB, g.group ? (size_t) (after/g.group) : (size_t) 0, g_zc.on ? ", zero-commit" : "", ms,
+            ms_sync, dropped/VG_MIB, g.cur.H, g.cur.F, g.D, g.deficit, llama_moe_hot_vg_free()/VG_MIB);
     return after;
 }
 
-// what DEMOTED / PRESSURE asks for now (MiB, 0: nothing)
-double vg_react_mib(int64_t t) {
-    vg_state & g = vg();
-    const double grp = g.group/VG_MIB;
-    double a = 0.0;
-    if (g.demoted) {
-        a = std::max(2.0*grp, g.D + grp);
-        if (g.react_last > 0.0 && g.t_react > 0 && t - g.t_react <= 1500000) {
-            a = std::max(a, 2.0*g.react_last); // doubled per further second of demotion
-        }
+// PRESSURE's share: whole groups for the deficit (at most MAX), 0 without PRESSURE
+size_t vg_press_b() {
+    const vg_state & g = vg();
+    if (!g.k.press || !g.pressure) {
+        return 0;
     }
-    if (g.pressure) {
-        const double drop = g.calm_budget - g.cur.budget;
-        const double tgt  = std::max(g.k.htgt - g.cur.H, g.k.ftgt - g.cur.F);
-        a = std::max(a, std::min(drop, std::max(tgt, 0.0)));
-    }
-    return a;
+    return std::min(vg_groups_for(std::min(g.deficit, g.k.max))*g.group, std::max(vg_max_b(), llama_moe_hot_vg_out()));
 }
 
-void vg_react(bool sync, const char * why) {
+// the switch / encode rule: PRESSURE, or H / F below the levels -> groups until both are at the levels (+ extra MiB) and the
+// share covers the deficit; returns the MiB the share fell short of that (0: covered or nothing to do)
+double vg_make_room(const char * why, double extra) {
     vg_state & g = vg();
-    const int64_t t = ggml_time_us();
-    const double  a = vg_react_mib(t);
-    if (a <= 0.0) {
-        return;
-    }
+    const double lh  = vg_lvl_h();
+    const double lf  = vg_lvl_f();
+    const bool   low = g.cur.H < lh || g.cur.F < lf;
     const size_t before = llama_moe_hot_vg_out();
-    const size_t target = std::min(before + vg_groups_for(a)*g.group, std::max(vg_max_b(), before));
-    g.t_react    = t;
-    g.react_last = a;
-    if (target <= before) {
-        return; // at MAX: nothing more to give
+    double need = low ? std::max(lh - g.cur.H, lf - g.cur.F) + extra : 0.0;
+    const size_t press = vg_press_b();
+    if (press > before) {
+        need = std::max(need, (press - before)/VG_MIB);
     }
-    (void) vg_hold(target, sync, why);
-}
-
-// the switch / encode rule: ACT -> groups up to TARGET (+ extra MiB); returns true when the groups fell short of the need
-bool vg_make_room(const char * why, double extra) {
-    vg_state & g = vg();
-    const bool act   = g.cur.H < g.k.hact || g.cur.F < g.k.fact;
-    const bool force = g.k.force != 0;
-    if (!act && !force) {
-        return false;
-    }
-    double need = act ? std::max(g.k.htgt - g.cur.H, g.k.ftgt - g.cur.F) + extra : 0.0;
-    if (force) {
+    if (g.k.force) {
         need = std::max(need, 2.0*g.group/VG_MIB);
     }
     if (need <= 0.0) {
-        return false;
+        return 0.0;
     }
-    const size_t before = llama_moe_hot_vg_out();
     const size_t target = std::min(before + vg_groups_for(need)*g.group, std::max(vg_max_b(), before));
     const size_t after  = vg_hold(target, true, why);
-    g.sw_part += after > before ? after - before : 0;
-    return (double) (after > before ? after - before : 0) < need*VG_MIB;
+    const double got    = (after > before ? after - before : 0)/VG_MIB;
+    return got < need ? need - got : 0.0;
 }
 
 } // namespace
@@ -378,7 +449,7 @@ bool llama_fn_vg_arm(const void * owner, ggml_backend_device * dev, const llama_
         return g.owner == owner;
     }
     if (g.mode == 0) {
-        vg_off("LLAMA_R40_VGUARD=0 (v0.30.0 behaviour: no WDDM query, no pool pre-grow)");
+        vg_off("LLAMA_R40_VGUARD=0 (v0.30.0 behaviour: no WDDM query, no zero-commit)");
         return false;
     }
     if (why_not) {
@@ -445,7 +516,7 @@ bool llama_fn_vg_arm(const void * owner, ggml_backend_device * dev, const llama_
         return fail("no local (VRAM) segment", 0);
     }
     vg_sample s0;
-    if (!g.K.poll(s0) || s0.budget < 1024.0 || s0.resident < 64.0 || s0.limit < 1024.0) {
+    if (!g.K.poll(s0) || s0.budget < 1024.0 || s0.usage < 64.0 || s0.limit < 1024.0) {
         return fail("the per-process queries failed or look wrong", 0);
     }
     g.group = llama_moe_hot_vg_group();
@@ -453,28 +524,53 @@ bool llama_fn_vg_arm(const void * owner, ggml_backend_device * dev, const llama_
         return fail("no KV-lend slot groups (the slot lend on virtual memory)", 0);
     }
     vg_knobs & k = g.k;
-    k.hact    = vg_env("LLAMA_R40_VGUARD_HACT", k.hact);
-    k.fact    = vg_env("LLAMA_R40_VGUARD_FACT", k.fact);
-    k.htgt    = std::max(k.hact, vg_env("LLAMA_R40_VGUARD_HTGT", k.htgt));
-    k.ftgt    = std::max(k.fact, vg_env("LLAMA_R40_VGUARD_FTGT", k.ftgt));
-    k.dem     = vg_env("LLAMA_R40_VGUARD_DEM", k.dem);
-    k.drop    = vg_env("LLAMA_R40_VGUARD_DROP", k.drop);
-    k.max     = std::max(0.0, vg_env("LLAMA_R40_VGUARD_MAX", k.max));
-    k.poll_ms = std::max(1, (int) vg_env("LLAMA_R40_VGUARD_POLL_MS", k.poll_ms));
-    k.calm_s  = vg_env("LLAMA_R40_VGUARD_CALM_S", k.calm_s);
-    k.react   = (int) vg_env("LLAMA_R40_VGUARD_REACT", k.react);
-    k.pregrow = (int) vg_env("LLAMA_R40_VGUARD_PREGROW", k.pregrow);
-    k.force   = (int) vg_env("LLAMA_R40_VGUARD_FORCE", k.force);
+    k.htgt     = vg_env("LLAMA_R40_VGUARD_HTGT", k.htgt);
+    k.ftgt     = vg_env("LLAMA_R40_VGUARD_FTGT", k.ftgt);
+    k.zhtgt    = vg_env("LLAMA_R40_VGUARD_ZHTGT", k.zhtgt);
+    k.zftgt    = vg_env("LLAMA_R40_VGUARD_ZFTGT", k.zftgt);
+    k.dem      = vg_env("LLAMA_R40_VGUARD_DEM", k.dem);
+    k.drop     = vg_env("LLAMA_R40_VGUARD_DROP", k.drop);
+    k.max      = std::max(0.0, vg_env("LLAMA_R40_VGUARD_MAX", k.max));
+    k.react_f  = vg_env("LLAMA_R40_VGUARD_REACT_F", k.react_f);
+    k.poll_ms  = std::max(1, (int) vg_env("LLAMA_R40_VGUARD_POLL_MS", k.poll_ms));
+    k.calm_s   = vg_env("LLAMA_R40_VGUARD_CALM_S", k.calm_s);
+    k.quiet_s  = vg_env("LLAMA_R40_VGUARD_QUIET_S", k.quiet_s);
+    k.regrow_s = vg_env("LLAMA_R40_VGUARD_REGROW_S", k.regrow_s);
+    k.press    = (int) vg_env("LLAMA_R40_VGUARD_PRESS", k.press);
+    k.react    = (int) vg_env("LLAMA_R40_VGUARD_REACT", k.react);
+    k.force    = (int) vg_env("LLAMA_R40_VGUARD_FORCE", k.force);
+    // the demotion signal: usage - our PDH dedicated usage, armed only when it is calm now (|D| <= 32 MiB)
+    const char * pwhy = nullptr;
+    double       ded  = 0.0;
+    const int64_t tp  = ggml_time_us();
+    if (g.P.open(luid, &pwhy) && g.P.read(ded)) {
+        const double raw0 = s0.usage - ded;
+        if (std::fabs(raw0) <= 32.0) {
+            g.det   = true;
+            g.d_off = raw0;
+        } else {
+            LLAMA_LOG_WARN("%s: [TAG_R40_VGUARD] demotion detection off: usage %.0f - PDH dedicated %.0f = %.0f MiB at arm (more than "
+                    "32 MiB)\n", __func__, s0.usage, ded, raw0);
+        }
+    } else {
+        LLAMA_LOG_WARN("%s: [TAG_R40_VGUARD] demotion detection off: %s\n", __func__, pwhy ? pwhy : "the first PDH read failed");
+    }
+    const double pdh_ms = vg_ms(tp);
+    g.solo  = s0.budget;
     g.owner = owner;
     g.h     = hooks;
     g.armed = true;
     (void) vg_poll(true);
-    LLAMA_LOG_WARN("%s: [TAG_R40_VGUARD] %s (LLAMA_R40_VGUARD=%d): adapter LUID 0x%016" PRIx64 ", local segment %u (%.0f MiB); "
-            "now H %.0f F %.0f MiB (budget %.0f, usage %.0f, resident %.0f); ACT H < %.0f or F < %.0f -> TARGET H >= %.0f and "
-            "F >= %.0f; DEMOTED D >= %.0f, PRESSURE drop >= %.0f, share <= %.0f MiB in groups of %.0f MiB, react %d, pre-grow %d%s%s\n",
-            __func__, g.mode == 2 ? "observing" : "armed", g.mode, luid, g.K.seg, g.cur.limit, g.cur.H, g.cur.F, g.cur.budget,
-            g.cur.usage, g.cur.resident, k.hact, k.fact, k.htgt, k.ftgt, k.dem, k.drop, k.max, g.group/VG_MIB, k.react,
-            k.pregrow, llama_fn_vg_check() ? ", CHECK" : "", k.force ? ", FORCE (test)" : "");
+    char path[192] = {};
+    (void) WideCharToMultiByte(CP_UTF8, 0, g.P.path, -1, path, (int) sizeof(path) - 1, nullptr, nullptr);
+    LLAMA_LOG_WARN("%s: [TAG_R40_VGUARD] %s (LLAMA_R40_VGUARD=%d): adapter LUID 0x%016" PRIx64 ", local segment %u (%.0f MiB); now H %.0f "
+            "F %.0f MiB (budget %.0f = solo, usage %.0f, PDH dedicated %.0f, D offset %.1f%s; %s, open %.1f ms); levels H %.0f F %.0f "
+            "(zero-commit switch %.0f / %.0f), PRESSURE deficit >= %.0f, DEMOTED D >= %.0f (react %d to F %.0f), share <= %.0f MiB "
+            "in groups of %.0f MiB, regrow after %.0f s calm / %.0f s quiet, one per %.0f s%s%s%s\n", __func__,
+            g.mode == 2 ? "observing" : "armed", g.mode, luid, g.K.seg, g.cur.limit, g.cur.H, g.cur.F, g.cur.budget, g.cur.usage,
+            g.cur.ded, g.d_off, g.det ? "" : ", detection off", path, pdh_ms, k.htgt, k.ftgt, k.zhtgt, k.zftgt, k.drop, k.dem,
+            k.react, k.react_f, k.max, g.group/VG_MIB, k.calm_s, k.quiet_s, k.regrow_s, k.press ? "" : ", no PRESSURE share",
+            llama_fn_vg_check() ? ", CHECK" : "", k.force ? ", FORCE (test)" : "");
     return true;
 #else
     GGML_UNUSED(owner);
@@ -491,82 +587,49 @@ bool llama_fn_vg_switch_pre() {
         return false;
     }
     g.n_sw++;
+    g.t_prompt = ggml_time_us();
     if (!vg_poll(true)) {
         return false;
     }
-    const bool act = g.cur.H < g.k.hact || g.cur.F < g.k.fact;
+    const bool low = g.cur.H < vg_lvl_h() || g.cur.F < vg_lvl_f();
+    const bool act = low || vg_press_b() > llama_moe_hot_vg_out();
     if (g.mode == 2 || act || g.n_sw <= 8 || g.n_sw % 64 == 0) {
-        LLAMA_LOG_WARN("%s: [TAG_R40_VGUARD] FULL switch %" PRIu64 ": H %.0f F %.0f D %.0f MiB (budget %.0f, usage %.0f, resident %.0f)%s%s; "
-                "share %.0f MiB, %.0f MiB of the lend mapped; %" PRIu64 " polls (max %.1f us), %" PRIu64 " actions, gates %" PRIu64
-                " (%" PRIu64 " deferred)\n", __func__,
-                g.n_sw, g.cur.H, g.cur.F, g.D, g.cur.budget, g.cur.usage, g.cur.resident, act ? " ACT" : "",
-                g.demoted ? " DEMOTED" : g.pressure ? " PRESSURE" : "", llama_moe_hot_vg_out()/VG_MIB,
-                llama_moe_hot_vg_free()/VG_MIB, g.n_poll, g.poll_us_max, g.n_act, g.n_gate, g.n_defer);
+        LLAMA_LOG_WARN("%s: [TAG_R40_VGUARD] FULL switch %" PRIu64 ": H %.0f F %.0f D %.0f MiB (budget %.0f solo %.0f deficit %.0f, usage "
+                "%.0f, PDH dedicated %.0f)%s%s%s; share %.0f MiB, %.0f MiB of the lend mapped; %" PRIu64 " polls (max %.1f us, %" PRIu64
+                " PDH misses), %" PRIu64 " actions, gates %" PRIu64 " (%" PRIu64 " deferred)\n", __func__, g.n_sw, g.cur.H, g.cur.F,
+                g.D, g.cur.budget, g.solo, g.deficit, g.cur.usage, g.cur.ded, act ? " ACT" : "", low ? " (low)" : "",
+                g.demoted ? " DEMOTED" : g.pressure ? " PRESSURE" : "", llama_moe_hot_vg_out()/VG_MIB, llama_moe_hot_vg_free()/VG_MIB,
+                g.n_poll, g.poll_us_max, g.n_pdh_fail, g.n_act, g.n_gate, g.n_defer);
     }
     if (g.mode != 1) {
         return false;
     }
-    const bool short_ = vg_make_room("FULL switch: room before the tail goes", 0.0);
-    if (short_) {
-        LLAMA_LOG_WARN("%s: [TAG_R40_VGUARD] the groups did not cover the need: this prompt runs at the base width (no borrow)\n",
-                __func__);
+    const double short_ = vg_make_room("FULL switch: room before the tail goes", 0.0);
+    if (short_ > 0.0 && !g_zc.on) {
+        // the v0.30.0 switch commits the FULL reserve: the base width commits less (a zero-commit switch commits nothing)
+        LLAMA_LOG_WARN("%s: [TAG_R40_VGUARD] the groups fell %.0f MiB short: this prompt runs at the base width (no borrow)\n",
+                __func__, short_);
+        return true;
     }
-    return short_;
+    return false;
 }
 
-size_t llama_fn_vg_pregrow_bytes() {
-    const vg_state & g = vg();
-    if (!g.armed || g.mode != 1 || g.k.pregrow == 0) {
-        return 0;
-    }
-    return std::min(g.full_hwm, (size_t) 512 << 20);
-}
-
-void llama_fn_vg_full_hwm(size_t hwm) {
-    vg_state & g = vg();
-    if (g.armed) {
-        g.full_hwm = hwm;
-    }
-}
-
-void llama_fn_vg_small() {
-    vg_state & g = vg();
-    if (!g.armed || g.mode != 1) {
-        return;
-    }
-    const size_t out = llama_moe_hot_vg_out();
-    g.sw_part = std::min(g.sw_part, out); // the KV cache / projector may have taken some over
-    if (g.sw_part == 0) {
-        return;
-    }
-    (void) vg_poll(true);
-    // mapping it is a new commit: both the budget headroom and the card's free VRAM keep 512 MiB after it
-    if (std::min(g.cur.H, g.cur.F) - g.sw_part/VG_MIB < 512.0) {
-        LLAMA_LOG_WARN("%s: [TAG_R40_VGUARD] SMALL: the switch share of %.0f MiB stays out (H %.0f F %.0f MiB: mapping it now would "
-                "leave < 512 MiB); the decode-entry regrow brings it back\n", __func__, g.sw_part/VG_MIB, g.cur.H, g.cur.F);
-        g.sw_part = 0; // the regrow's from here on
-        return;
-    }
-    const size_t keep = out - g.sw_part;
-    g.sw_part = 0;
-    (void) vg_hold(keep, true, "SMALL: the switch share comes back");
-}
-
-void llama_fn_vg_decode(bool small) {
+void llama_fn_vg_decode(bool small, bool gen_only) {
     vg_state & g = vg();
     if (!g.armed) {
         return;
     }
     g.n_dec++;
+    if (!gen_only) {
+        g.t_prompt = ggml_time_us();
+    }
     const bool fresh = vg_poll(false);
     if (g.mode != 1) {
         return;
     }
-    const int64_t t = g.cur.t;
     if (g.k.force) {
         if (g.n_dec % 8 == 0) {
             const size_t out = llama_moe_hot_vg_out();
-            g.sw_part = 0;
             (void) vg_hold(out > 0 ? 0 : 2*g.group, true, "FORCE (test): decode entry");
         }
         return;
@@ -574,18 +637,24 @@ void llama_fn_vg_decode(bool small) {
     if (!fresh) {
         return;
     }
-    if (g.k.react && (g.demoted || g.pressure) && ggml_time_us() - g.t_react >= 1000000) {
-        vg_react(true, g.demoted ? "decode entry: DEMOTED" : "decode entry: PRESSURE");
+    const int64_t t   = g.cur.t;
+    const size_t  out = llama_moe_hot_vg_out();
+    const size_t  pb  = vg_press_b();
+    if (pb > out) {
+        (void) vg_hold(pb, true, "decode entry: PRESSURE");
         return;
     }
-    const size_t out = llama_moe_hot_vg_out();
-    if (small && out > 0 && !g.demoted && !g.pressure && g.t_d_low > 0 && t - g.t_d_low >= 3000000 &&
-        (g.t_press == 0 || t - g.t_press >= (int64_t) (g.k.calm_s*1e6)) && std::min(g.cur.H, g.cur.F) - g.group/VG_MIB >= 512.0 &&
-        t - g.t_regrow >= 2000000) {
+    if (g.demoted && g.k.react && g.cur.F < g.k.react_f && t - g.t_react >= 1000000) {
+        g.t_react = t;
+        (void) vg_hold(out + vg_groups_for(g.k.react_f - g.cur.F)*g.group, true, "decode entry: DEMOTED (REACT)");
+        return;
+    }
+    const double grp = g.group/VG_MIB;
+    if (small && gen_only && out > 0 && g.t_calm0 > 0 && t - g.t_calm0 >= (int64_t) (g.k.calm_s*1e6) &&
+        t - g.t_prompt >= (int64_t) (g.k.quiet_s*1e6) && t - g.t_regrow >= (int64_t) (g.k.regrow_s*1e6) &&
+        g.cur.H - grp >= vg_lvl_h() && g.cur.F - grp >= vg_lvl_f()) {
         g.t_regrow = t;
-        const size_t target = out > g.group ? out - g.group : 0;
-        g.sw_part = std::min(g.sw_part, target);
-        (void) vg_hold(target, true, "regrow: one group back");
+        (void) vg_hold(out > g.group ? out - g.group : 0, true, "regrow: one group back");
     }
 }
 
@@ -594,33 +663,38 @@ void llama_fn_vg_encode() {
     if (!g.armed) {
         return;
     }
+    g.t_prompt = ggml_time_us();
     if (!vg_poll(true)) {
         return;
     }
-    const bool act = g.cur.H < g.k.hact || g.cur.F < g.k.fact;
+    const bool low = g.cur.H < vg_lvl_h() || g.cur.F < vg_lvl_f();
+    const bool act = low || vg_press_b() > llama_moe_hot_vg_out();
     if (g.mode == 2 || act) {
-        LLAMA_LOG_WARN("%s: [TAG_R40_VGUARD] encode: H %.0f F %.0f D %.0f MiB%s, the projector needs %.0f MiB\n", __func__,
-                g.cur.H, g.cur.F, g.D, act ? " ACT" : "", llama_moe_hot_vis_bytes()/VG_MIB);
+        LLAMA_LOG_WARN("%s: [TAG_R40_VGUARD] encode: H %.0f F %.0f D %.0f deficit %.0f MiB%s, the projector needs %.0f MiB%s\n",
+                __func__, g.cur.H, g.cur.F, g.D, g.deficit, act ? " ACT" : "", llama_moe_hot_vis_bytes()/VG_MIB,
+                g_zc.on ? " (zero-commit take)" : "");
     }
     if (g.mode != 1) {
         return;
     }
-    (void) vg_make_room("encode: room before the projector maps", llama_moe_hot_vis_bytes()/VG_MIB);
+    // a zero-commit take maps the projector from the lend's own handles: no room needed for it
+    (void) vg_make_room("encode: room before the projector maps", g_zc.on ? 0.0 : llama_moe_hot_vis_bytes()/VG_MIB);
 }
 
 void llama_fn_vg_gate() {
     vg_state & g = vg();
-    if (!g.armed || g.mode != 1 || (!g.k.react && !g.k.force)) {
+    if (!g.armed || g.mode != 1) {
         return;
     }
     if (!vg_poll(false)) {
         return;
     }
-    const bool force = g.k.force && llama_moe_hot_vg_out() == 0;
-    if (!force && !(g.demoted || g.pressure)) {
-        return;
-    }
-    if (!force && ggml_time_us() - g.t_react < 1000000) {
+    const int64_t t     = g.cur.t;
+    const size_t  out   = llama_moe_hot_vg_out();
+    const bool    force = g.k.force && out == 0;
+    const size_t  pb    = vg_press_b();
+    const bool    react = g.demoted && g.k.react && g.cur.F < g.k.react_f && t - g.t_react >= 1000000;
+    if (!force && pb <= out && !react) {
         return;
     }
     g.n_gate++;
@@ -632,5 +706,123 @@ void llama_fn_vg_gate() {
         (void) vg_hold(g.group, false, "FORCE (test): prefill-stream gate");
         return;
     }
-    vg_react(false, g.demoted ? "prefill-stream gate: DEMOTED" : "prefill-stream gate: PRESSURE");
+    if (pb > out) {
+        (void) vg_hold(pb, false, "prefill-stream gate: PRESSURE");
+        return;
+    }
+    g.t_react = t;
+    (void) vg_hold(out + vg_groups_for(g.k.react_f - g.cur.F)*g.group, false, "prefill-stream gate: DEMOTED (REACT)");
+}
+
+// [TAG_R40_VGUARD] zero-commit glue ---------------------------------------------------------------------------------------
+
+bool llama_fn_zc_arm(ggml_backend_device * dev) {
+    if (g_zc.on || g_zc.tried) {
+        return g_zc.on;
+    }
+    g_zc.tried = true;
+    if (vg().mode == 0) {
+        return false; // LLAMA_R40_VGUARD=0: v0.30.0 (the guard's "off" line says so)
+    }
+    const char * e = getenv("LLAMA_R40_ZC");
+    if (e && *e && atoi(e) == 0) {
+        LLAMA_LOG_INFO("%s: [TAG_R40_VGUARD] zero-commit off: LLAMA_R40_ZC=0 (the v0.30.0 switch: frees and creates its memory)\n",
+                __func__);
+        return false;
+    }
+#if defined(_WIN32)
+    ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+    auto * luid_fn = reg ? (bool (*)(ggml_backend_dev_t, uint64_t *)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_fn_device_luid") : nullptr;
+    uint64_t luid = 0;
+    if (!luid_fn || !luid_fn(dev, &luid) || luid == 0) {
+        LLAMA_LOG_INFO("%s: [TAG_R40_VGUARD] zero-commit off: the hot set's device has no adapter LUID (not a CUDA device under WDDM)\n",
+                __func__);
+        return false;
+    }
+    g_zc.enable = (decltype(g_zc.enable)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_vmm_zc_enable");
+    g_zc.scope  = (decltype(g_zc.scope))  ggml_backend_reg_get_proc_address(reg, "ggml_backend_vmm_zc_scope");
+    g_zc.window = (decltype(g_zc.window)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_vmm_zc_window");
+    g_zc.drop   = (decltype(g_zc.drop))   ggml_backend_reg_get_proc_address(reg, "ggml_backend_vmm_zc_drop");
+    g_zc.stats  = (decltype(g_zc.stats))  ggml_backend_reg_get_proc_address(reg, "ggml_backend_vmm_zc_stats");
+    const bool park = ggml_backend_reg_get_proc_address(reg, "ggml_backend_vmm_buffer_unmap_park") != nullptr;
+    if (!g_zc.enable || !g_zc.scope || !g_zc.window || !g_zc.drop || !g_zc.stats || !park) {
+        LLAMA_LOG_INFO("%s: [TAG_R40_VGUARD] zero-commit off: the backend has no zero-commit procs\n", __func__);
+        return false;
+    }
+    if (!g_zc.enable(dev, true)) {
+        LLAMA_LOG_INFO("%s: [TAG_R40_VGUARD] zero-commit off: no virtual memory management on the device\n", __func__);
+        return false;
+    }
+    g_zc.dev = dev;
+    g_zc.on  = true;
+    (void) g_zc.stats(dev, g_zc.last, ZC_NST);
+    LLAMA_LOG_WARN("%s: [TAG_R40_VGUARD] zero-commit on (LLAMA_R40_ZC=1): the tail's and the borrow's handles carry the FULL reserve "
+            "and the compute pool's FULL growth and come back at SMALL; a KV growth and the projector take slot-group handles; no "
+            "new WDDM allocation at a switch unless the stash falls short (logged)\n", __func__);
+    return true;
+#else
+    GGML_UNUSED(dev);
+    LLAMA_LOG_INFO("%s: [TAG_R40_VGUARD] zero-commit off: not a Windows (WDDM) build\n", __func__);
+    return false;
+#endif
+}
+
+bool llama_fn_zc_on() {
+    return g_zc.on;
+}
+
+void llama_fn_zc_scope(int delta) {
+    if (g_zc.on) {
+        (void) g_zc.scope(g_zc.dev, delta);
+    }
+}
+
+void llama_fn_zc_window(int delta) {
+    if (g_zc.on) {
+        (void) g_zc.window(g_zc.dev, delta);
+    }
+}
+
+size_t llama_fn_zc_stash_bytes() {
+    if (!g_zc.on) {
+        return 0;
+    }
+    uint64_t now[ZC_NST] = {};
+    return g_zc.stats(g_zc.dev, now, ZC_NST) >= ZC_NST ? (size_t) now[ZC_B_STASH] : 0;
+}
+
+void llama_fn_zc_note(bool full, double ms) {
+    if (!g_zc.on) {
+        return;
+    }
+    uint64_t now[ZC_NST] = {};
+    if (g_zc.stats(g_zc.dev, now, ZC_NST) < ZC_NST) {
+        return;
+    }
+    uint64_t d[ZC_NST];
+    for (int i = 0; i < ZC_NST; ++i) {
+        d[i] = now[i] - g_zc.last[i];
+        g_zc.last[i] = now[i];
+    }
+    d[ZC_B_STASH] = now[ZC_B_STASH];
+    const uint64_t n = full ? ++g_zc.n_full : ++g_zc.n_small;
+    (full ? g_zc.ms_full : g_zc.ms_small) += ms;
+    if (n > 8 && n % 64 != 0 && d[ZC_B_NEW] == 0 && d[ZC_N_FAIL] == 0) {
+        return;
+    }
+    const double avg = (full ? g_zc.ms_full : g_zc.ms_small)/(double) n;
+    if (full) {
+        LLAMA_LOG_WARN("%s: [TAG_R40_VGUARD] zero-commit FULL %" PRIu64 " in %.1f ms (%.1f on average): %.0f MiB parked (%" PRIu64
+                " handles), the reserve %.0f MiB in %" PRIu64 " arena buffer(s) from %.0f MiB of them (%" PRIu64 " handles, %.1f ms), "
+                "new %.0f MiB (%" PRIu64 "), %.0f MiB stay for the pool, %" PRIu64 " failures\n", __func__, n, ms, avg,
+                d[ZC_B_PARK]/VG_MIB, d[ZC_N_PARK], d[ZC_B_ARENA]/VG_MIB, d[ZC_N_ARENA], d[ZC_B_REUSE]/VG_MIB, d[ZC_N_REUSE],
+                d[ZC_US]/1000.0, d[ZC_B_NEW]/VG_MIB, d[ZC_N_NEW], d[ZC_B_STASH]/VG_MIB, d[ZC_N_FAIL]);
+    } else {
+        LLAMA_LOG_WARN("%s: [TAG_R40_VGUARD] zero-commit SMALL %" PRIu64 " in %.1f ms (%.1f on average): the FULL period's pool took "
+                "%.0f MiB (%" PRIu64 " growths) from the stash; %.0f MiB parked (%" PRIu64 " handles: the reserve, the pool, KV), %.0f "
+                "MiB mapped from the stash (%" PRIu64 " handles: the tail, the borrow, KV), new %.0f MiB (%" PRIu64 "), %.0f MiB freed "
+                "(%" PRIu64 " handles left over), %" PRIu64 " failures\n", __func__, n, ms, avg, d[ZC_B_POOL]/VG_MIB, d[ZC_N_POOL],
+                d[ZC_B_PARK]/VG_MIB, d[ZC_N_PARK], d[ZC_B_REUSE]/VG_MIB, d[ZC_N_REUSE], d[ZC_B_NEW]/VG_MIB, d[ZC_N_NEW],
+                d[ZC_B_DROP]/VG_MIB, d[ZC_N_DROP], d[ZC_N_FAIL]);
+    }
 }

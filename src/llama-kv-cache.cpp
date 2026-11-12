@@ -14,6 +14,7 @@
 #include "llama-fn-auto.h"            // [TAG_FN_L8_KVLEND] llama_fn_l3_flag
 #include "llama-fn-l22.h"             // [TAG_FN_L22_KVGROW] pins on an out-of-memory grow
 #include "llama-fn-l22-img.h"         // [TAG_FN_L22_IMGPASS] predecessor rule, keyed masks
+#include "llama-fn-vguard.h"           // [TAG_R40_VGUARD] zero-commit scope around a KV growth
 
 #include "ggml-turbot.h"
 
@@ -456,6 +457,16 @@ bool llama_kv_cache::kvl_update(uint32_t need) const {
     }
     if (need > g_kvl.cells) {
         const int64_t t0 = ggml_time_us();
+        // [TAG_R40_VGUARD] zero-commit: the hot set's released group handles carry the new cells (no new WDDM allocation);
+        // what the maps did not take is freed when the scope ends (a no-op without zero-commit)
+        struct zc_grow_scope {
+            zc_grow_scope() {
+                llama_fn_zc_scope(+1);
+            }
+            ~zc_grow_scope() {
+                llama_fn_zc_scope(-1);
+            }
+        } zc_grow;
         size_t after = 0;
         for (const auto & r : g_kvl.regs) {
             after += std::max(r.mapped, kvl_bytes_for(r, want));

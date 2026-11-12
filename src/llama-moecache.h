@@ -198,6 +198,10 @@ size_t llama_moe_hot_vg_hold(const void * owner, size_t target);
 size_t llama_moe_hot_vg_out();
 size_t llama_moe_hot_vg_group();
 size_t llama_moe_hot_vg_free();
+// [TAG_R40_VGUARD] zero-commit on (src/llama-fn-vguard.h): the tail's, the borrow's and the KV lend's releases (the projector's
+// take included) use the device's parking unmap, so inside a zero-commit scope their handles stay for the next map, the
+// FULL reserve or the pool instead of going back to the driver; the guard's share always frees
+void   llama_moe_hot_zc_set(bool on);
 
 // [TAG_FN_AUTO] a hot set is configured for this model (LLAMA_MOE_HOT_PROFILE names a file or "even")
 bool llama_moe_hot_wanted(const llama_model & model);

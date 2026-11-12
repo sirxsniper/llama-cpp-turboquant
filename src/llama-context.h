@@ -799,7 +799,11 @@ private:
     bool     vg_tried = false;
     bool     vg_on    = false;
     void     vg_arm_try();
-    void     vg_pregrow(ggml_backend_dev_t dev); // after the FULL reserve: the pool's growth of the last FULL period, now
+    // [TAG_R40_VGUARD] zero-commit (R40-VGUARD-2): on for the hot set's owner with the compute-buffer switch; the FULL period's
+    // scope is open from the FULL switch's tail release to the end of the SMALL switch
+    bool     zc_on        = false;
+    bool     zc_full_open = false;
+    void     zc_full_close();
     // [TAG_FN_L22_ENDOVERLAP] a prompt ended in FULL without the eager switch: the next narrow batch goes SMALL, async
     bool     l22_end_pending = false;
     int      l22_first_n     = 0;    // decode calls still counted after a prompt's switch (first 8)

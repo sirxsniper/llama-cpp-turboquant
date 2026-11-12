@@ -1219,10 +1219,6 @@ struct ggml_cuda_pool {
     virtual size_t used_hwm() const { return 0; }
     virtual void   reset_hwm() {}
     virtual size_t trim(size_t keep) { GGML_UNUSED(keep); return 0; }
-    // [TAG_R40_VGUARD] map device memory at the pool's end until it holds at least `bytes` (nothing is handed out, the
-    // high-water marks stay): the growth a prompt's graph would make in the middle of its run happens now. Never aborts.
-    // Returns the bytes added (0: not supported, not idle, enough already, or the driver said no)
-    virtual size_t pregrow(size_t bytes) { GGML_UNUSED(bytes); return 0; }
 
     // [TAG_FN_L22_GRAPHKEEP] capture footprint: cap_begin() at a capture start, cap_hwm() the highest pool offset handed
     // out since then ((size_t) -1 = this pool does not track it: its graphs cannot survive a trim)

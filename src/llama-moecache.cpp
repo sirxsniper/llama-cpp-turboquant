@@ -318,6 +318,8 @@ struct moe_cache {
     int64_t               cb_async_t0   = 0;
     bool (*cb_map)(ggml_backend_buffer_t, size_t, size_t)   = nullptr;
     bool (*cb_unmap)(ggml_backend_buffer_t, size_t, size_t) = nullptr;
+    // [TAG_R40_VGUARD] zero-commit: the unmap that parks the handles inside a scope of the device (nullptr: not offered)
+    bool (*cb_unmap_park)(ggml_backend_buffer_t, size_t, size_t) = nullptr;
     // [TAG_FN_L8_KVLEND] the KV cache's share: the kv_tail layers' regions, what is given to the KV cache now, statistics
     size_t                kv_bytes = 0;   // sum of the kv_tail regions
     size_t                kv_out   = 0;   // of them given back now
@@ -2586,6 +2588,7 @@ struct hot_vmm_fns {
     ggml_backend_buffer_t (*alloc)(ggml_backend_buffer_type_t, size_t)      = nullptr;
     bool                  (*map)(ggml_backend_buffer_t, size_t, size_t)     = nullptr;
     bool                  (*unmap)(ggml_backend_buffer_t, size_t, size_t)   = nullptr;
+    bool                  (*unmap_park)(ggml_backend_buffer_t, size_t, size_t) = nullptr; // [TAG_R40_VGUARD] optional
 };
 
 hot_vmm_fns hot_vmm_lookup(ggml_backend_buffer_type_t buft) {
@@ -2601,6 +2604,8 @@ hot_vmm_fns hot_vmm_lookup(ggml_backend_buffer_type_t buft) {
     f.unmap = (decltype(f.unmap)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_vmm_buffer_unmap");
     if (!f.gran || !f.alloc || !f.map || !f.unmap) {
         f = hot_vmm_fns();
+    } else {
+        f.unmap_park = (decltype(f.unmap_park)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_vmm_buffer_unmap_park");
     }
     return f;
 }
@@ -2636,6 +2641,17 @@ bool   g_kv_borrow_1seq = false; // [TAG_FN_L22_BIGUB2] the borrow is the 1-sequ
 // [TAG_R34_F_VISFLAT] the parked projector's part of g_kv_want for the next hot set init (llama_moe_hot_set_vis_part): with the
 // slot lend its slots come out of the lend layers' own counts instead of lying on top of a base cut for them
 size_t g_vis_part   = 0;
+// [TAG_R40_VGUARD] zero-commit (llama_moe_hot_zc_set): the tail's, the borrow's and the KV lend's releases park their handles
+// inside a scope of the device (the next map / FULL reserve / pool growth takes them); the guard's share never parks
+std::atomic<bool> g_hot_zc{false};
+
+// [TAG_R40_VGUARD] a release's unmap: parking with zero-commit, else the plain one (v0.30.0)
+bool hot_unmap_rel(const moe_cache * mc, size_t off, size_t n) {
+    if (g_hot_zc.load(std::memory_order_relaxed) && mc->cb_unmap_park) {
+        return mc->cb_unmap_park(mc->cb_buf, off, n);
+    }
+    return mc->cb_unmap(mc->cb_buf, off, n);
+}
 
 // [TAG_FN_L10_SLOTLEND] a usable slot keeps this many bytes after it mapped (a kernel that reads a little past a slot's end
 // never reaches a segment the KV cache holds)
@@ -2999,6 +3015,7 @@ ggml_backend_buffer_t hot_vmm_place(moe_cache * mc, ggml_context * ctx_d, ggml_b
     mc->cb_seg   = std::max(gran, ((size_t) 1 << 30) / gran * gran);    // the segments vmm.map makes (ggml-cuda: <= 1 GiB)
     mc->cb_map   = vmm.map;
     mc->cb_unmap = vmm.unmap;
+    mc->cb_unmap_park = vmm.unmap_park; // [TAG_R40_VGUARD]
     if (const char * e = getenv("LLAMA_FN_CBUF_ASYNC")) {
         mc->cb_async = atoi(e) != 0;
     }
@@ -4109,7 +4126,7 @@ size_t hot_sl_release(moe_cache * mc, const void * owner, size_t need) {
     for (size_t g : rel) {
         bool ok = true;
         for (const auto & r : mc->sl_grp[g]) {
-            ok = mc->cb_unmap(mc->cb_buf, r.first, r.second - r.first) && ok;
+            ok = hot_unmap_rel(mc, r.first, r.second - r.first) && ok; // [TAG_R40_VGUARD]
         }
         if (!ok) {
             // its slots stay out; what could not be unmapped holds VRAM, so the group counts nothing given
@@ -4242,7 +4259,7 @@ size_t hot_sb_release(moe_cache * mc, const void * owner) {
     }
     bool ok = true;
     for (const auto & r : mc->sl_grp[g]) {
-        ok = mc->cb_unmap(mc->cb_buf, r.first, r.second - r.first) && ok;
+        ok = hot_unmap_rel(mc, r.first, r.second - r.first) && ok; // [TAG_R40_VGUARD]
     }
     if (!ok) {
         LLAMA_LOG_WARN("moe-hot: [TAG_FN_L21_BIGUB] the borrow group could not give all of its VRAM back\n");
@@ -5976,7 +5993,7 @@ size_t llama_moe_hot_cbuf_release(const void * owner, size_t need) {
     }
     const size_t bytes = prev - a;
     const bool   more  = mc->cb_out;
-    if (!mc->cb_unmap(mc->cb_buf, a, bytes)) {
+    if (!hot_unmap_rel(mc, a, bytes)) { // [TAG_R40_VGUARD]
         // nothing was given back: the lent layers stay out until the restore (which then maps nothing new)
         LLAMA_LOG_WARN("moe-hot: [TAG_FN_L3_VRAM_CBUF] the tail could not give its VRAM back - its layers sit out this prompt\n");
         mc->cb_out = true;
@@ -6050,7 +6067,7 @@ size_t llama_moe_hot_cbuf_release2(const void * owner, size_t need_hide, size_t 
     }
     size_t bytes = 0;
     if (prev > a_u) {
-        if (!mc->cb_unmap(mc->cb_buf, a_u, prev - a_u)) {
+        if (!hot_unmap_rel(mc, a_u, prev - a_u)) { // [TAG_R40_VGUARD]
             LLAMA_LOG_WARN("moe-hot: [TAG_FN_L22_LENDCLASS] the tail could not give its VRAM back - its layers sit out this prompt\n");
             mc->cb_out = true;
             mc->cb_rel = std::min(prev, a_u);
@@ -6209,7 +6226,7 @@ size_t llama_moe_hot_kv_release(const void * owner, size_t need) {
     size_t n_ok  = 0;
     size_t given = 0;
     for (auto * ls : rel) {
-        if (!mc->cb_unmap(mc->cb_buf, ls->kv_lo, ls->kv_hi - ls->kv_lo)) {
+        if (!hot_unmap_rel(mc, ls->kv_lo, ls->kv_hi - ls->kv_lo)) { // [TAG_R40_VGUARD]
             LLAMA_LOG_WARN("moe-hot: [TAG_FN_L8_KVLEND] blk.%d could not give its VRAM back - it sits out\n", ls->pub.il);
             continue; // out (the host computes it), nothing given back
         }
@@ -6616,6 +6633,10 @@ size_t llama_moe_hot_vg_group() {
         b = std::max(b, mc->sl_grp_bytes[g]);
     }
     return b;
+}
+
+void llama_moe_hot_zc_set(bool on) {
+    g_hot_zc.store(on, std::memory_order_relaxed);
 }
 
 size_t llama_moe_hot_vg_free() {
