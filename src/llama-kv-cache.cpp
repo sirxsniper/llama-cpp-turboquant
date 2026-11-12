@@ -457,14 +457,12 @@ bool llama_kv_cache::kvl_update(uint32_t need) const {
     }
     if (need > g_kvl.cells) {
         const int64_t t0 = ggml_time_us();
-        // [TAG_R40_VGUARD] zero-commit: the hot set's released group handles carry the new cells (no new WDDM allocation);
-        // what the maps did not take is freed when the scope ends (a no-op without zero-commit)
+        // [TAG_R40_VGUARD] zero-commit: the hot set's released group handles carry the new cells where their sizes fit (no new
+        // WDDM allocation); what the maps did not take is freed when this scope ends (a no-op without zero-commit)
         struct zc_grow_scope {
-            zc_grow_scope() {
-                llama_fn_zc_scope(+1);
-            }
+            int id = llama_fn_zc_open();
             ~zc_grow_scope() {
-                llama_fn_zc_scope(-1);
+                llama_fn_zc_close(id);
             }
         } zc_grow;
         size_t after = 0;

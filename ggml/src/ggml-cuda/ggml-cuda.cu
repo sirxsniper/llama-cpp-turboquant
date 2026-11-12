@@ -628,9 +628,10 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
 // demoted part of the new ones to system memory when another process allocated in the same seconds (r40 redesign: 20 of
 // 20 demoted prompts began -0.4..2.9 s from the switch, with 2.9-3.6 GB of the card free). Per device, off until
 // ggml_backend_vmm_zc_enable (the llama side, Windows only):
-//   scope  > 0: the parkable unmaps (ggml_backend_vmm_buffer_unmap_park, an arena buffer's free, an adopted pool chunk's
-//               trim) keep their handles (cuMemRetainAllocationHandle + cuMemUnmap) in the device's stash; the end of the
-//               last scope frees what is left (cuMemRelease)
+//   scope open: the parkable unmaps (ggml_backend_vmm_buffer_unmap_park, an arena buffer's free, an adopted pool chunk's
+//               trim) keep their handles (cuMemRetainAllocationHandle + cuMemUnmap) in the device's stash, tagged with the
+//               newest open scope; a scope's end frees what it parked and nobody took (cuMemRelease), the end of the last
+//               one everything left (a KV growth inside the FULL period gives its rest back at once, as v0.30.0 did)
 //   window > 0: a device buffer of >= 32 MiB from the CUDA buffer type is built from stashed handles in one reserved
 //               address range (the arena: whole handles back to back, cuMemMap offset 0); new memory only for a rest
 //   any ggml_backend_vmm_buffer_map takes stashed handles (the exact segment size first, else the largest that fits) before
@@ -647,11 +648,13 @@ enum ggml_cuda_zc_stat {
 struct ggml_cuda_zc_hnd {
     CUmemGenericAllocationHandle h; // one reference held by the stash (the handle is mapped nowhere)
     size_t                       n;
+    int                          tag; // the scope it was parked in
 };
 struct ggml_cuda_zc_dev {
     std::atomic<bool>             on{false};
     std::mutex                    mtx;
-    int                           scope   = 0;
+    std::vector<int>              open;    // the open scopes' ids, oldest first
+    int                           next_id = 1;
     int                           window  = 0;
     std::vector<ggml_cuda_zc_hnd> stash;
     size_t                        stash_b = 0;
@@ -673,7 +676,7 @@ static CUresult ggml_cuda_zc_access(CUdeviceptr p, size_t n, int phys) {
 }
 // the one whole mapping [p, p + n) goes: its handle into the stash (park, inside a scope) or freed. z.mtx held
 static CUresult ggml_cuda_zc_unmap_locked(ggml_cuda_zc_dev & z, CUdeviceptr p, size_t n, bool park) {
-    if (park && z.on.load(std::memory_order_relaxed) && z.scope > 0) {
+    if (park && z.on.load(std::memory_order_relaxed) && !z.open.empty()) {
         CUmemGenericAllocationHandle h;
         if (cuMemRetainAllocationHandle(&h, (void *) p) == CUDA_SUCCESS) {
             const CUresult r = cuMemUnmap(p, n);
@@ -681,7 +684,7 @@ static CUresult ggml_cuda_zc_unmap_locked(ggml_cuda_zc_dev & z, CUdeviceptr p, s
                 (void) cuMemRelease(h);
                 return r;
             }
-            z.stash.push_back({ h, n });
+            z.stash.push_back({ h, n, z.open.back() });
             z.stash_b += n;
             z.st[GGML_CUDA_ZC_N_PARK]++;
             z.st[GGML_CUDA_ZC_B_PARK] += n;
@@ -783,7 +786,7 @@ static bool ggml_cuda_zc_pool_grow(int device, int phys, CUdeviceptr at, size_t 
         return false;
     }
     std::lock_guard<std::mutex> lk(z.mtx);
-    if (z.scope <= 0) {
+    if (z.open.empty()) {
         return false;
     }
     if (z.stash_b < need) {
@@ -1923,7 +1926,7 @@ bool ggml_backend_cuda_vmm_buffer_map(ggml_backend_buffer_t buffer, size_t offse
                 }
                 ggml_cuda_zc_put_back(z, one);
             }
-            if (z.scope > 0) {
+            if (!z.open.empty()) {
                 z.st[GGML_CUDA_ZC_N_NEW]++; // inside a scope: new memory although the stash was meant to carry it
                 z.st[GGML_CUDA_ZC_B_NEW] += n;
             }
@@ -11041,7 +11044,9 @@ static void * ggml_backend_cuda_fn_host_dev_ptr(const void * host) {
 }
 
 // [TAG_R40_VGUARD] zero-commit procs (see ggml_cuda_zc): "ggml_backend_vmm_zc_enable" (false: no VMM on the device or not
-// built), "ggml_backend_vmm_zc_scope" / "_window" (+1 / -1, return the depth; the last scope's end frees the stash),
+// built), "ggml_backend_vmm_zc_scope" (0: opens a scope, returns its id > 0; id: ends that scope - the handles it parked and
+// nobody took are freed, all of them when it was the last one - returns the scope count left), "_window" (+1 / -1, returns
+// the depth),
 // "ggml_backend_vmm_zc_drop" (frees the stash now, returns its bytes), "ggml_backend_vmm_zc_stats" (cumulative counters in
 // the order of ggml_cuda_zc_stat, returns their count)
 #ifdef GGML_CUDA_ZC
@@ -11074,23 +11079,58 @@ static bool ggml_backend_cuda_vmm_zc_enable(ggml_backend_dev_t dev, bool on) {
 #endif
 }
 
-static int ggml_backend_cuda_vmm_zc_scope(ggml_backend_dev_t dev, int delta) {
+static int ggml_backend_cuda_vmm_zc_scope(ggml_backend_dev_t dev, int id) {
 #ifdef GGML_CUDA_ZC
     const int d = ggml_backend_cuda_zc_index(dev);
-    if (d < 0) {
+    if (d < 0 || id < 0) {
         return 0;
     }
     ggml_cuda_zc_dev & z = ggml_cuda_zc(d);
     std::lock_guard<std::mutex> lk(z.mtx);
-    z.scope = std::max(0, z.scope + delta);
-    if (z.scope == 0 && delta < 0 && !z.stash.empty()) {
-        ggml_cuda_set_device(d);
-        (void) ggml_cuda_zc_drop_locked(z);
+    if (id == 0) {
+        const int nid = z.next_id++;
+        if (z.next_id <= 0) {
+            z.next_id = 1;
+        }
+        z.open.push_back(nid);
+        return nid;
     }
-    return z.scope;
+    const auto it = std::find(z.open.begin(), z.open.end(), id);
+    if (it == z.open.end()) {
+        return (int) z.open.size();
+    }
+    z.open.erase(it);
+    if (z.open.empty()) {
+        if (!z.stash.empty()) {
+            ggml_cuda_set_device(d);
+            (void) ggml_cuda_zc_drop_locked(z);
+        }
+        return 0;
+    }
+    // what this scope parked and nobody took goes back to the driver now (a KV growth's rest inside the FULL period)
+    bool any = false;
+    for (const auto & e : z.stash) {
+        any = any || e.tag == id;
+    }
+    if (any) {
+        ggml_cuda_set_device(d);
+        std::vector<ggml_cuda_zc_hnd> keep;
+        for (const auto & e : z.stash) {
+            if (e.tag == id) {
+                (void) cuMemRelease(e.h);
+                z.stash_b -= e.n;
+                z.st[GGML_CUDA_ZC_N_DROP]++;
+                z.st[GGML_CUDA_ZC_B_DROP] += e.n;
+            } else {
+                keep.push_back(e);
+            }
+        }
+        z.stash.swap(keep);
+    }
+    return (int) z.open.size();
 #else
     GGML_UNUSED(dev);
-    GGML_UNUSED(delta);
+    GGML_UNUSED(id);
     return 0;
 #endif
 }

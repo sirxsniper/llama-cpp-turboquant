@@ -172,7 +172,7 @@ struct vg_zc {
     bool               tried  = false;
     ggml_backend_dev_t dev    = nullptr;
     bool   (*enable)(ggml_backend_dev_t, bool)            = nullptr;
-    int    (*scope)(ggml_backend_dev_t, int)              = nullptr;
+    int    (*scope)(ggml_backend_dev_t, int)              = nullptr; // 0: open (returns the id), id: close
     int    (*window)(ggml_backend_dev_t, int)             = nullptr;
     size_t (*drop)(ggml_backend_dev_t)                    = nullptr;
     int    (*stats)(ggml_backend_dev_t, uint64_t *, int)  = nullptr;
@@ -208,6 +208,8 @@ struct vg_state {
     double    deficit  = 0.0;
     bool      pressure = false;
     int64_t   t_calm0  = 0;      // deficit < DROP and D <= 16 since (0: not now)
+    double    dref     = 0.0;    // the deficit's level since t_dstab (within 64 MiB)
+    int64_t   t_dstab  = 0;
     int64_t   t_prompt = 0;      // the last batch with prompt rows, FULL switch or encode
     int64_t   t_regrow = 0;
     int64_t   t_react  = 0;
@@ -307,6 +309,10 @@ bool vg_poll(bool force) {
         g.solo = s.budget;
     }
     g.deficit = g.solo - s.budget;
+    if (g.t_dstab == 0 || std::fabs(g.deficit - g.dref) > 64.0) {
+        g.dref    = g.deficit; // the other process's footprint moved: a new level
+        g.t_dstab = t;
+    }
     const bool was_press = g.pressure;
     g.pressure = g.deficit >= g.k.drop;
     // DEMOTED: our usage above our PDH dedicated usage (a failed PDH read keeps the last D)
@@ -658,12 +664,18 @@ void llama_fn_vg_decode(bool small, bool gen_only) {
         (void) vg_hold(out + vg_groups_for(g.k.react_f - g.cur.F)*g.group, true, "decode entry: DEMOTED (REACT)");
         return;
     }
-    const double grp = g.group/VG_MIB;
-    if (small && gen_only && out > 0 && g.t_calm0 > 0 && t - g.t_calm0 >= (int64_t) (g.k.calm_s*1e6) &&
-        t - g.t_prompt >= (int64_t) (g.k.quiet_s*1e6) && t - g.t_regrow >= (int64_t) (g.k.regrow_s*1e6) &&
-        g.cur.H - grp >= vg_lvl_h() && g.cur.F - grp >= vg_lvl_f()) {
+    // regrow: the other process left (deficit < DROP and D <= 16 for CALM_S), or it stays with a smaller footprint than the
+    // share covers (the deficit level steady for CALM_S, D <= 16, the share still >= the deficit after the group)
+    const double grp   = g.group/VG_MIB;
+    const int64_t calm = (int64_t) (g.k.calm_s*1e6);
+    const bool gone = g.t_calm0 > 0 && t - g.t_calm0 >= calm;
+    const bool trim = !gone && g.pressure && !g.demoted && g.D <= 16.0 && g.t_dstab > 0 && t - g.t_dstab >= calm &&
+                      (out > g.group ? out - g.group : 0)/VG_MIB >= g.deficit;
+    if (small && gen_only && out > 0 && (gone || trim) && t - g.t_prompt >= (int64_t) (g.k.quiet_s*1e6) &&
+        t - g.t_regrow >= (int64_t) (g.k.regrow_s*1e6) && g.cur.H - grp >= vg_lvl_h() && g.cur.F - grp >= vg_lvl_f()) {
         g.t_regrow = t;
-        (void) vg_hold(out > g.group ? out - g.group : 0, true, "regrow: one group back");
+        (void) vg_hold(out > g.group ? out - g.group : 0, true,
+                gone ? "regrow: one group back" : "regrow: one group back (the share stays above the steady deficit)");
     }
 }
 
@@ -780,9 +792,13 @@ bool llama_fn_zc_on() {
     return g_zc.on;
 }
 
-void llama_fn_zc_scope(int delta) {
-    if (g_zc.on) {
-        (void) g_zc.scope(g_zc.dev, delta);
+int llama_fn_zc_open() {
+    return g_zc.on ? g_zc.scope(g_zc.dev, 0) : 0;
+}
+
+void llama_fn_zc_close(int id) {
+    if (g_zc.on && id > 0) {
+        (void) g_zc.scope(g_zc.dev, id);
     }
 }
 

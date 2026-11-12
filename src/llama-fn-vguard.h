@@ -23,7 +23,9 @@
 //            first switch of every undisturbed prompt: HTGT 2944 / FTGT 3200 would hold a group for good)
 //   DEMOTED  D >= DEM on 2 polls >= 20 ms apart: always logged; REACT=1 also gives groups until F >= REACT_F
 //   regrow   one group per REGROW_S, only in a SMALL generation step without prompt rows, >= QUIET_S after the last batch
-//            with prompt rows, after deficit < DROP and D <= 16 for CALM_S, while H - group and F - group stay at the levels
+//            with prompt rows, after deficit < DROP and D <= 16 for CALM_S (or, with the other process still there, its
+//            deficit steady within 64 MiB for CALM_S and the share >= the deficit after the group), while H - group and
+//            F - group stay at the levels
 // Windows only (a CUDA device with a LUID, SupportsDemotion, the queries working, the slot lend on virtual memory); every
 // other build or model (the 27B, Linux, Vulkan, HIP, MUSA) logs "off" once and each hook is one bool test.
 //   LLAMA_R40_VGUARD=1 (default) on, 0 = off (no WDDM call, no zero-commit: v0.30.0), 2 = observe (poll + log, zero-commit on)
@@ -58,12 +60,15 @@ void llama_fn_vg_encode();                          // before the projector's ta
 void llama_fn_vg_gate();                            // a prefill-stream gate (ith 0, the decode thread between two layers)
 
 // [TAG_R40_VGUARD] zero-commit glue (owner thread). _arm: once, the hot set's device with the compute-buffer switch; true =
-// on (LLAMA_R40_VGUARD != 0, LLAMA_R40_ZC != 0, a Windows CUDA device with VMM). _scope / _window: +1 / -1 around a release
-// and the maps or buffers that take its handles (the end of the last scope frees what is left); no-ops while off.
+// on (LLAMA_R40_VGUARD != 0, LLAMA_R40_ZC != 0, a Windows CUDA device with VMM). _open / _close: a scope around a release
+// and the maps or buffers that take its handles (_open returns its id, 0 while off; _close(id) frees what the scope parked
+// and nobody took, everything left when it was the last open one). _window: +1 / -1 around buffer allocations that may be
+// built from parked handles. No-ops while off.
 // _note: one line per FULL / SMALL switch (the first 8, then every 64th, and every switch that needed new memory)
 bool llama_fn_zc_arm(ggml_backend_device * dev);
 bool llama_fn_zc_on();
-void llama_fn_zc_scope(int delta);
+int  llama_fn_zc_open();
+void llama_fn_zc_close(int id);
 void llama_fn_zc_window(int delta);
 void llama_fn_zc_note(bool full, double ms);
 size_t llama_fn_zc_stash_bytes(); // the handles parked now (0 while off): free memory a FULL reserve can be built from

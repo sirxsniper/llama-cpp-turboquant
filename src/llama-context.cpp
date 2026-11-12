@@ -7781,7 +7781,7 @@ void llama_fn_vision_lend_register(const llama_model * model, size_t bytes) {
     g_vis_parked.store(bytes);
 }
 
-static bool g_vis_zc = false; // [TAG_R40_VGUARD] a projector take's zero-commit scope is open
+static int g_vis_zc = 0; // [TAG_R40_VGUARD] a projector take's zero-commit scope (0: none open)
 
 size_t llama_fn_vision_take(const llama_model * model, size_t bytes) {
     if (!model || model != g_vis_model || llama_moe_hot_vis_bytes() == 0) {
@@ -7794,9 +7794,8 @@ size_t llama_fn_vision_take(const llama_model * model, size_t bytes) {
     if (llama_fn_zc_on() && !g_vis_zc) {
         // [TAG_R40_VGUARD] zero-commit: the take parks the groups' handles, the projector's weights and compute buffers are built
         // from them, their frees park them again and the give maps them back (llama_fn_vision_give ends it)
-        llama_fn_zc_scope(+1);
+        g_vis_zc = llama_fn_zc_open();
         llama_fn_zc_window(+1);
-        g_vis_zc = true;
     }
     const size_t got = llama_moe_hot_vis_take(bytes);
     // [TAG_FN_L22_OOMHOOK] with pins: the projector's buffers come next; DXGI LOCAL headroom first (plan 3.6). Checked after
@@ -7821,10 +7820,10 @@ void llama_fn_vision_give(const llama_model * model) {
     if (model && model == g_vis_model) {
         llama_moe_hot_vis_give();
     }
-    if (g_vis_zc) {
+    if (g_vis_zc > 0) {
         llama_fn_zc_window(-1); // [TAG_R40_VGUARD] the take's zero-commit scope ends (what is left over is freed)
-        llama_fn_zc_scope(-1);
-        g_vis_zc = false;
+        llama_fn_zc_close(g_vis_zc);
+        g_vis_zc = 0;
     }
 }
 
@@ -8413,9 +8412,9 @@ void llama_context::vg_arm_try() {
 
 // [TAG_R40_VGUARD] the FULL period's zero-commit scope ends (the stash's rest is freed)
 void llama_context::zc_full_close() {
-    if (zc_full_open) {
-        llama_fn_zc_scope(-1);
-        zc_full_open = false;
+    if (zc_full_id > 0) {
+        llama_fn_zc_close(zc_full_id);
+        zc_full_id = 0;
     }
 }
 
@@ -8745,9 +8744,8 @@ bool llama_context::cbuf_set(bool full, uint32_t width, uint32_t cls) {
         const bool vg_base = vg_on && llama_fn_vg_switch_pre();
         // [TAG_R40_VGUARD] zero-commit: from here to the end of the SMALL switch the tail's, the borrow's and a KV growth's
         // handles are parked for the FULL reserve, the pool and the tail's return instead of going back to the driver
-        if (zc_on && !zc_full_open) {
-            llama_fn_zc_scope(+1);
-            zc_full_open = true;
+        if (zc_on && zc_full_id == 0) {
+            zc_full_id = llama_fn_zc_open();
         }
         // [TAG_FN_L22_GRAPHKEEP] the pools' high-water of the SMALL period is the decode graphs' footprint: the trim at the
         // return to SMALL keeps it mapped (P7's proc; nothing without GGML_CUDA_FN_L22_GRAPHKEEP)

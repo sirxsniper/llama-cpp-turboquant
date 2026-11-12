@@ -425,7 +425,8 @@ int main() {
         trim_f(backend, 0);
         st(s0);
         // inside a scope: parked, the free memory stays
-        TCHECK(zc_scope(dev, +1) == 1, "(5) scope open");
+        const int sid = zc_scope(dev, 0);
+        TCHECK(sid > 0, "(5) scope open");
         f_a = dev_free(dev);
         TCHECK(unpark_f(zb, 0, zsz), "(5) park the three segments");
         f_b = dev_free(dev);
@@ -504,15 +505,29 @@ int main() {
             all = all && v == 0x5a;
         }
         TCHECK(all, "(5) the remapped lend buffer holds data");
+        // a nested scope frees at its end what it parked and nobody took; the outer scope's handles stay
+        TCHECK(unpark_f(zb, 2*a, c), "(5) park the third segment in the outer scope");
+        {
+            const int sid2 = zc_scope(dev, 0);
+            TCHECK(sid2 > 0 && sid2 != sid, "(5) nested scope open");
+            TCHECK(unpark_f(zb, a, a), "(5) park the second segment in the nested scope");
+            const size_t f_n0 = dev_free(dev);
+            TCHECK(zc_scope(dev, sid2) == 1, "(5) the nested scope closed, the outer one stays");
+            const size_t f_n1 = dev_free(dev);
+            uint64_t s6[ZC_NST] = {};
+            st(s6);
+            TCHECK(s6[ZC_B_STASH] == c && f_n1 + gran >= f_n0 + a, "(5) the nested scope freed its %.1f MiB (stash %.1f MiB, free "
+                    "%.1f -> %.1f MiB)", a/1048576.0, s6[ZC_B_STASH]/1048576.0, f_n0/1048576.0, f_n1/1048576.0);
+        }
         // a rest in the stash is freed at the scope's end
-        TCHECK(unpark_f(zb, 2*a, c), "(5) park the third segment once more");
         f_a = dev_free(dev);
-        TCHECK(zc_scope(dev, -1) == 0, "(5) scope closed");
+        TCHECK(zc_scope(dev, sid) == 0, "(5) scope closed");
         f_b = dev_free(dev);
         uint64_t s5[ZC_NST] = {};
         st(s5);
         TCHECK(s5[ZC_B_STASH] == 0 && f_b + gran >= f_a + c, "(5) the scope's end frees the rest (free %.1f -> %.1f MiB)",
                 f_a/1048576.0, f_b/1048576.0);
+        TCHECK(map_f(zb, a, a) && map_f(zb, 2*a, c), "(5) the parked segments mapped again (new memory, no scope)");
         std::vector<float> r5 = g_all.run(backend, xv, iv);
         TCHECK(same_bytes(r5, r_ref, r_ref.size()), "(5) the chain gives the reference bytes after the zero-commit moves");
         printf("test-vmm-lend: (5) zero-commit: %" PRIu64 " parks, %" PRIu64 " handles reused (%.1f MiB), %" PRIu64 " arena buffers, "

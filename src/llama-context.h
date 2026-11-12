@@ -801,8 +801,8 @@ private:
     void     vg_arm_try();
     // [TAG_R40_VGUARD] zero-commit (R40-VGUARD-2): on for the hot set's owner with the compute-buffer switch; the FULL period's
     // scope is open from the FULL switch's tail release to the end of the SMALL switch
-    bool     zc_on        = false;
-    bool     zc_full_open = false;
+    bool     zc_on      = false;
+    int      zc_full_id = 0; // the FULL period's scope (0: none open)
     void     zc_full_close();
     // [TAG_FN_L22_ENDOVERLAP] a prompt ended in FULL without the eager switch: the next narrow batch goes SMALL, async
     bool     l22_end_pending = false;
