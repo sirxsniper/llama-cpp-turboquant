@@ -83,6 +83,9 @@ public:
     llama_kv_cache * get_mem_attn() const;
     llama_memory_recurrent * get_mem_recr() const;
 
+    // [TAG_R40_NP2KVPARK] removes every attention cell of seq_id, the recurrent cell stays (llama_memory_attn_seq_rm_ext)
+    virtual bool seq_rm_attn_only(llama_seq_id seq_id);
+
 private:
     const llama_hparams & hparams;
 

@@ -379,11 +379,17 @@ void server_queue::start_loop(int64_t idle_sleep_ms) {
                 break; // process new tasks
             } else {
                 // wait for new tasks or timeout for checking sleeping condition
-                bool res = condition_tasks.wait_for(lock, max_wait_time, [&]{
+                // [TAG_R40_NP2KVPARK] with an idle callback every 250 ms, and the callback runs without the lock
+                const auto wait = callback_idle ? std::chrono::milliseconds(250) : std::chrono::milliseconds(max_wait_time);
+                bool res = condition_tasks.wait_for(lock, wait, [&]{
                     return (!queue_tasks.empty() || !running);
                 });
                 if (res) {
                     break; // new task arrived or terminate
+                }
+                if (callback_idle) {
+                    lock.unlock();
+                    callback_idle();
                 }
                 // otherwise, loop again to check sleeping condition
             }

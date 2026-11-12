@@ -520,6 +520,12 @@ private:
     bool state_read_meta(llama_io_read_i & io, uint32_t strm, uint32_t cell_count,       slot_info & sinfo, llama_seq_id dest_seq_id = -1, const slot_info * sinfo_in = nullptr);
     bool state_read_data(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, const slot_info & sinfo);
 
+    // [TAG_R40_NP2KVPARK] set by state_read_sinfo for an ATTN_ONLY single-sequence read (the server's parked attention
+    // cells coming back): state_read_meta places the cells in the lowest run of free cells that holds them all, in the
+    // saved order, instead of find_slot from the head (which can split them over gaps and wrap past the end)
+    bool r40_low_place = false;
+    slot_info r40_place_low(uint32_t strm, uint32_t cell_count) const;
+
     // [TAG_TURBOT] the v2 section that follows the data section of a turbot cache (SPEC 9.10)
     void state_write_turbot(llama_io_write_i & io, const cell_ranges_t & cr, uint32_t cell_count, llama_seq_id seq_id) const;
     bool state_read_turbot (llama_io_read_i  & io, uint32_t strm, uint32_t cell_count, const slot_info & sinfo, llama_seq_id seq_id);
@@ -687,3 +693,9 @@ private:
 size_t llama_kv_lend_unmapped_bytes();
 void   llama_kv_lend_set_hooks(size_t (*release)(const void *, size_t), size_t (*restore)(const void *, size_t), const void * owner);
 bool   llama_kv_lend_map_all();
+// [TAG_R40_LEND_PARTIAL] the first cells mapped for at least `bytes` more (they stay: the lend's initial cells); returns the
+// bytes newly mapped (0: a map failed)
+size_t llama_kv_lend_map_upto(size_t bytes);
+// [TAG_R40_LEND_PARTIAL] the bytes one map step of every lend adds (a chunk of cells, rounded to granules): the most
+// llama_kv_lend_map_upto maps past what it is asked for. 0: no lend
+size_t llama_kv_lend_chunk_bytes();

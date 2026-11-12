@@ -42,6 +42,7 @@
 #include <condition_variable>
 #include <cstdio>
 #include <cstring>
+#include <typeinfo> // [TAG_R40_NP2KVPARK]
 #include <functional>
 #include <limits>
 #include <mutex>
@@ -7940,7 +7941,21 @@ void llama_context::moe_hot_fit_try() {
     }
     // [TAG_FN_L8_KVLEND] the KV cache's unmapped cells are free VRAM in the fit above: the hot set holds them in layers that
     // give them back as the context grows (none: the hot set fails, the KV cache maps whole and the fit runs again)
-    const size_t kv_want = cbuf_tail > 0 ? llama_kv_lend_unmapped_bytes() : 0;
+    size_t kv_want = cbuf_tail > 0 ? llama_kv_lend_unmapped_bytes() : 0;
+    // [TAG_R40_LEND_PARTIAL] LLAMA_R40_LEND_PARTIAL=1: a lend the lend layers cannot hold whole (512K: 6192 MiB of KV + the
+    // projector + the idle slots' share, about 7 GB of room) keeps what they hold instead of mapping the KV cache whole and
+    // fitting again without any lend (0: as v0.30.0)
+    const int r40_partial = [] {
+        const char * e = getenv("LLAMA_R40_LEND_PARTIAL");
+        return e ? atoi(e) : 0;
+    }();
+    // [TAG_R40_LEND_SPREAD] LLAMA_R40_LEND_SPREAD=1: the slot lend sizes every layer from the whole budget and lends out of
+    // the lend layers' own slots, so the lend spreads over every trunk layer below the tail and the stream's range (0: a
+    // base cut for the lend and its slots on top of the lowest layers, as v0.30.0)
+    const bool r40_spread = [] {
+        const char * e = getenv("LLAMA_R40_LEND_SPREAD");
+        return e && atoi(e) > 0;
+    }();
     // [TAG_FN_L17_VISION_LEND] the parked projector's VRAM is free in the fit above too: it rides on the same lend (the hot
     // set gives it back for each encode); with no lend to carry it, the budget leaves it free (the projector's own VRAM)
     const size_t vis      = vis_lend_parked_bytes(model);
@@ -7963,9 +7978,19 @@ void llama_context::moe_hot_fit_try() {
     // [TAG_R35_NP2PARK] the idle slots' share (recurrent cells parked above, the SMALL reserve's part for n_seq_max sequences)
     // is free VRAM in the fit too: it rides on the same lend
     const size_t np2_want  = r35_want && cbuf_tail > 0 ? r35_rs_fit + r35_small_extra : 0;
-    const size_t lend_want = kv_want + vis_want + np2_want;
+    size_t lend_want = kv_want + vis_want + np2_want;
+    bool   r40_no_np2 = false; // [TAG_R40_LEND_PARTIAL] a partial lend left this share out
+    bool   r40_no_vis = false;
+    size_t r40_upfront = 0;    // [TAG_R40_LEND_PARTIAL] KV bytes mapped up front (device use beside the hot set)
     if (lend_want > 0) {
         llama_moe_hot_set_kv_lend(lend_want, llama_prefill_stream_lend_bytes(this), (int) model.hparams.n_layer());
+        // [TAG_R40_LEND_PARTIAL] with the up-front map's rounding (one map step), so a partial lend leaves its VRAM free
+        llama_moe_hot_set_kv_partial(r40_partial >= 1 && kv_want > 0, llama_kv_lend_chunk_bytes());
+        llama_moe_hot_set_kv_spread(r40_spread && kv_want > 0); // [TAG_R40_LEND_SPREAD]
+        if (r40_spread && kv_want > 0) {
+            LLAMA_LOG_INFO("moe-hot: [TAG_R40_LEND_SPREAD] if the plain sizing cannot hold the %.0f MiB lend, it comes out of the "
+                    "lend layers' own slots (every layer sized from the whole budget)\n", lend_want/MiB);
+        }
         llama_moe_hot_set_cb_borrow(cbuf_tail > 0 ? l21_extra : 0); // [TAG_FN_L21_BIGUB]
         // [TAG_R34_F_VISFLAT] the projector's slots out of the lend layers' own counts (LLAMA_R34_VISFLAT=0: on top, v0.26.6)
         const char * vf = getenv("LLAMA_R34_VISFLAT");
@@ -7979,15 +8004,65 @@ void llama_context::moe_hot_fit_try() {
     bool hot_ok = budget > 0 && llama_moe_hot_init(model, this, budget, cbuf_tail);
     if (lend_want > 0) {
         llama_moe_hot_set_kv_lend(0, 0, 0);
+        llama_moe_hot_set_kv_partial(false); // [TAG_R40_LEND_PARTIAL]
+        llama_moe_hot_set_kv_spread(false); // [TAG_R40_LEND_SPREAD]
         llama_moe_hot_set_cb_borrow(0); // [TAG_FN_L21_BIGUB]
         llama_moe_hot_set_vis_part(0); // [TAG_R34_F_VISFLAT]
+        if (hot_ok && r40_partial >= 1 && kv_want > 0 && llama_moe_hot_kv_bytes() < lend_want) {
+            // [TAG_R40_LEND_PARTIAL] the lend holds `held` < lend_want: the idle slots' share, then the projector's, whole
+            // when they fit (each all or nothing; the projector only with the idle slots' share, as the checks below rank
+            // them), the KV cache's part from the rest; the KV cells the lend cannot carry are mapped now as the KV cache's
+            // initial cells. The VRAM adds up as with the whole lend: the init sized the hot set with the bytes not held plus
+            // one map step left out of the budget (llama_moe_hot_set_kv_partial's round; the plain sizing through its capped
+            // lend layers, the spread one by sizing again with that cut), and those bytes are the KV cells mapped now plus a
+            // share's own VRAM (the projector's allocation at an encode, the idle slot's recurrent cell and SMALL part)
+            const size_t held  = llama_moe_hot_kv_bytes();
+            size_t       rest  = held;
+            const bool   np2_h = np2_want > 0 && rest >= np2_want;
+            rest -= np2_h ? np2_want : 0;
+            const bool   vis_h = vis_want > 0 && (np2_want == 0 || np2_h) && rest >= vis_want;
+            rest -= vis_h ? vis_want : 0;
+            r40_no_np2 = np2_want > 0 && !np2_h;
+            r40_no_vis = vis_want > 0 && !vis_h;
+            const size_t kv_h  = std::min(rest, kv_want);
+            const size_t kv0   = kv_want;
+            const size_t got   = kv_h < kv_want ? llama_kv_lend_map_upto(kv_want - kv_h) : 0;
+            r40_upfront = got;
+            kv_want   = llama_kv_lend_unmapped_bytes();
+            lend_want = kv_want + vis_want + np2_want;
+            if (kv_want > kv_h) {
+                // a map failed: the lend groups go out for good and the KV cache maps whole (the hot set keeps its base
+                // slots; no hooks and no shares below, as kv_want stays over what the hot set holds). The hot set was sized
+                // with the bytes not held left out, so its base slots + the whole KV + the shares' own VRAM add up to the
+                // budget as v0.30.0's refit does (the init runs once per process: no second fit here)
+                LLAMA_LOG_ERROR("moe-hot: [TAG_R40_LEND_PARTIAL] mapping %.0f MiB of KV cells up front failed (%.0f mapped): the "
+                        "lend's %.0f MiB go out for good and the KV cache maps whole\n", (kv0 - kv_h)/MiB, got/MiB, held/MiB);
+                llama_moe_hot_kv_release(this, held);
+                if (!llama_kv_lend_map_all()) {
+                    LLAMA_LOG_ERROR("moe-hot: [TAG_R40_LEND_PARTIAL] mapping the whole KV cache failed too: long prompts may not "
+                            "find their cells\n");
+                }
+                r40_upfront = 0;
+                kv_want    = kv0 + 1;
+                lend_want  = kv_want + vis_want + np2_want;
+                r40_no_np2 = true;
+                r40_no_vis = true;
+            } else {
+                LLAMA_LOG_INFO("moe-hot: [TAG_R40_LEND_PARTIAL] the lend holds %.0f of %.0f MiB (KV %.0f + projector %.0f + idle "
+                        "slots %.0f): projector %s, idle slots %s, KV %.0f MiB lent and %.0f MiB of its cells mapped up front "
+                        "(LLAMA_R40_LEND_PARTIAL=0: the KV cache maps whole and the hot set fits again without any lend)\n",
+                        held/MiB, (kv0 + vis_want + np2_want)/MiB, kv0/MiB, vis_want/MiB, np2_want/MiB,
+                        vis_want == 0 ? "-" : vis_h ? "held" : "not held (its own VRAM)",
+                        np2_want == 0 ? "-" : np2_h ? "held" : "not held (maps again)", kv_want/MiB, got/MiB);
+            }
+        }
         if (hot_ok && llama_moe_hot_kv_bytes() >= kv_want) {
             if (kv_want > 0) {
                 llama_kv_lend_set_hooks(llama_moe_hot_kv_release, llama_moe_hot_kv_restore, this);
                 LLAMA_LOG_INFO("moe-hot: [TAG_FN_L8_KVLEND] %.0f MiB of unused KV cells lent to the hot set (%.0f MiB of KV layers)\n",
                         kv_want/MiB, llama_moe_hot_kv_bytes()/MiB);
             }
-            if (vis_want > 0 && llama_moe_hot_kv_bytes() >= lend_want) {
+            if (vis_want > 0 && !r40_no_vis && llama_moe_hot_kv_bytes() >= lend_want) {
                 llama_moe_hot_vis_set(vis_want);
                 LLAMA_LOG_INFO("moe-hot: [TAG_FN_L17_VISION_LEND] the parked projector's %.0f MiB are hot slots between encodes "
                         "(lend %.0f MiB = KV %.0f + projector %.0f wanted)\n", vis_want/MiB, llama_moe_hot_kv_bytes()/MiB,
@@ -8018,7 +8093,7 @@ void llama_context::moe_hot_fit_try() {
     // [TAG_R35_NP2PARK] the share goes on when the hot set holds it with the KV cache's want; else everything maps again (the
     // VRAM then comes from the headroom, as v0.27.0 had it allocated)
     if (r35_rs_fit > 0 || r35_small_one) {
-        const bool carry = np2_want > 0 && hot_ok && cbuf_state != CBUF_OFF && llama_moe_hot_kv_bytes() >= kv_want + np2_want;
+        const bool carry = np2_want > 0 && !r40_no_np2 && hot_ok && cbuf_state != CBUF_OFF && llama_moe_hot_kv_bytes() >= kv_want + np2_want;
         // LLAMA_R35_NP2PARK=2 (tests): the parking runs even when the hot set does not carry it (the VRAM is just free)
         const char * fe    = getenv("LLAMA_R35_NP2PARK");
         const bool   force = fe && fe[0] == '2' && cbuf_state != CBUF_OFF;
@@ -8060,8 +8135,14 @@ void llama_context::moe_hot_fit_try() {
     if (hot_ok) {
         sched_need_reserve = true;
         const size_t hot = llama_moe_hot_device_bytes();
-        LLAMA_LOG_INFO("moe-hot: VRAM fit: hot set %.0f MiB, device use about %.0f MiB with it (ceiling %.0f MiB)\n",
-                hot/MiB, (used + hot)/MiB, ceiling/MiB);
+        if (r40_upfront > 0) {
+            // [TAG_R40_LEND_PARTIAL] the KV cells mapped up front are device use beside the hot set
+            LLAMA_LOG_INFO("moe-hot: VRAM fit: hot set %.0f MiB + %.0f MiB of KV cells mapped up front, device use about %.0f MiB "
+                    "with them (ceiling %.0f MiB)\n", hot/MiB, r40_upfront/MiB, (used + hot + r40_upfront)/MiB, ceiling/MiB);
+        } else {
+            LLAMA_LOG_INFO("moe-hot: VRAM fit: hot set %.0f MiB, device use about %.0f MiB with it (ceiling %.0f MiB)\n",
+                    hot/MiB, (used + hot)/MiB, ceiling/MiB);
+        }
         if (cbuf_tail > 0) {
             LLAMA_LOG_INFO("moe-hot: [TAG_FN_L3_VRAM_CBUF] between prompts the compute reserve is %.0f MiB (graphs of <= %u "
                     "tokens) instead of %.0f MiB; the hot set's %.0f MiB tail gives its VRAM back to a wider batch\n",
@@ -11379,6 +11460,96 @@ bool llama_moe_hot_counts_get_ext(llama_context * ctx, std::vector<float> & out)
 
 bool llama_moe_hot_counts_set_ext(llama_context * ctx, const std::vector<float> & in) {
     return ctx != nullptr && llama_moe_hot_counts_set(ctx, in);
+}
+
+// [TAG_R40_NP2KVPARK] the attention-only flag is a bit of its own: never one upstream already uses (a sync that adds a flag
+// with this value fails here instead of skipping the recurrent state of every hybrid state read and write)
+static_assert((LLAMA_STATE_SEQ_FLAGS_ATTN_ONLY_EXT & (LLAMA_STATE_SEQ_FLAGS_SWA_ONLY | LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY |
+                                                      LLAMA_STATE_SEQ_FLAGS_ON_DEVICE)) == 0,
+              "LLAMA_STATE_SEQ_FLAGS_ATTN_ONLY_EXT aliases an upstream llama_state_seq_flags bit");
+static_assert(LLAMA_STATE_SEQ_FLAGS_ATTN_ONLY_EXT == 0x40000000u, "llama-ext.h and llama-memory.h must agree");
+
+// [TAG_R40_NP2KVPARK] see llama-ext.h. Only the exact types whose attention half is known to stand alone: a plain
+// llama_kv_cache, llama_memory_hybrid and llama_memory_hybrid_idx (attention + recurrent [+ the indexer that mirrors the
+// attention cells]); one stream, so a restore lands in the pool the other sequences share.
+static llama_kv_cache * llama_r40_park_attn(llama_context * ctx, llama_memory_hybrid ** hyb_out) {
+    llama_memory_i * mem = ctx ? ctx->get_memory() : nullptr;
+    if (hyb_out) {
+        *hyb_out = nullptr;
+    }
+    if (mem == nullptr) {
+        return nullptr;
+    }
+    llama_kv_cache * kv = nullptr;
+    if (typeid(*mem) == typeid(llama_kv_cache)) {
+        kv = static_cast<llama_kv_cache *>(mem);
+    } else if (typeid(*mem) == typeid(llama_memory_hybrid) || typeid(*mem) == typeid(llama_memory_hybrid_idx)) {
+        auto * hyb = static_cast<llama_memory_hybrid *>(mem);
+        kv = hyb->get_mem_attn();
+        if (hyb_out) {
+            *hyb_out = hyb;
+        }
+    }
+    if (kv == nullptr || kv->get_n_stream() != 1) {
+        return nullptr;
+    }
+    return kv;
+}
+
+bool llama_memory_attn_park_ok_ext(llama_context * ctx) {
+    return llama_r40_park_attn(ctx, nullptr) != nullptr;
+}
+
+bool llama_memory_attn_seq_rm_ext(llama_context * ctx, llama_seq_id seq_id) {
+    llama_memory_hybrid * hyb = nullptr;
+    llama_kv_cache *      kv  = llama_r40_park_attn(ctx, &hyb);
+    if (kv == nullptr || seq_id < 0 || seq_id >= (llama_seq_id) ctx->get_cparams().n_seq_max) {
+        return false;
+    }
+    ctx->synchronize();
+    return hyb ? hyb->seq_rm_attn_only(seq_id) : kv->seq_rm(seq_id, -1, -1);
+}
+
+int32_t llama_memory_attn_seq_cells_ext(llama_context * ctx, llama_seq_id seq_id, int32_t * cell_min, int32_t * cell_max) {
+    if (cell_min) {
+        *cell_min = -1;
+    }
+    if (cell_max) {
+        *cell_max = -1;
+    }
+    llama_kv_cache * kv = llama_r40_park_attn(ctx, nullptr);
+    if (kv == nullptr || seq_id < 0 || seq_id >= (llama_seq_id) ctx->get_cparams().n_seq_max) {
+        return -1;
+    }
+    const llama_kv_cells & cells = kv->get_cells(seq_id);
+    int32_t n = 0;
+    for (uint32_t i = 0; i < cells.size(); ++i) {
+        if (!cells.is_empty(i) && cells.seq_has(i, seq_id)) {
+            if (n == 0 && cell_min) {
+                *cell_min = (int32_t) i;
+            }
+            if (cell_max) {
+                *cell_max = (int32_t) i;
+            }
+            n++;
+        }
+    }
+    return n;
+}
+
+void llama_kv_lend_trim_ext(llama_context * ctx) {
+    llama_memory_hybrid * hyb = nullptr;
+    llama_kv_cache *      kv  = llama_r40_park_attn(ctx, &hyb);
+    if (kv == nullptr) {
+        return;
+    }
+    ctx->synchronize();
+    // the indexer's lend first (its cells mirror the attention cells), then the attention cache's: each maps what its cells
+    // need now, a shrink gives the groups above that back to the hot set ([TAG_FN_L10_SLOTLEND] hot_sl_restore)
+    if (auto * idx = dynamic_cast<llama_memory_hybrid_idx *>(hyb); idx && idx->get_mem_idx()) {
+        (void) idx->get_mem_idx()->kvl_update(idx->get_mem_idx()->kvl_need());
+    }
+    (void) kv->kvl_update(kv->kvl_need());
 }
 
 uint32_t llama_memory_attn_swa_ext(llama_context * ctx) {

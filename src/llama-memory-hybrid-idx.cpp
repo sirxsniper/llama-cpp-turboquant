@@ -354,7 +354,10 @@ void llama_memory_hybrid_idx::state_write(llama_io_write_i & io, llama_seq_id se
     if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
         get_mem_attn()->state_write(io, seq_id, flags);
     }
-    get_mem_recr()->state_write(io, seq_id, flags);
+    // [TAG_R40_NP2KVPARK] ATTN_ONLY: the attention and the indexer sections, no recurrent one
+    if ((flags & LLAMA_STATE_SEQ_FLAGS_ATTN_ONLY_EXT) == 0) {
+        get_mem_recr()->state_write(io, seq_id, flags);
+    }
 
     // [TAG_HYBRID_IDX_STATE] the indexer section goes last, so it is a pure suffix: an old reader stops early instead of misparsing it
     // The indexer mirrors the attention cache, so it uses the same PARTIAL_ONLY gate.
@@ -380,7 +383,9 @@ void llama_memory_hybrid_idx::state_read(llama_io_read_i & io, llama_seq_id seq_
             get_mem_attn()->state_read_sinfo(io, seq_id, flags, mem_idx ? &sinfos_attn : nullptr, nullptr);
         }
 
-        get_mem_recr()->state_read(io, seq_id, flags);
+        if ((flags & LLAMA_STATE_SEQ_FLAGS_ATTN_ONLY_EXT) == 0) { // [TAG_R40_NP2KVPARK]
+            get_mem_recr()->state_read(io, seq_id, flags);
+        }
 
         // [TAG_HYBRID_IDX_STATE] must mirror the write order in state_write
         if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
@@ -396,12 +401,42 @@ void llama_memory_hybrid_idx::state_read(llama_io_read_i & io, llama_seq_id seq_
         }
 
     } catch (...) {
+        // [TAG_R40_NP2KVPARK] an ATTN_ONLY read restored no recurrent state: the attention and indexer cells go, the recurrent
+        // cell stays (the caller may try again from its blob)
+        if ((flags & LLAMA_STATE_SEQ_FLAGS_ATTN_ONLY_EXT) && seq_id >= 0) {
+            get_mem_attn()->state_clear(seq_id);
+            if (mem_idx) {
+                mem_idx->state_clear(seq_id);
+                mem_idx_stale_set(seq_id, 0);
+                if (kpool_layout_shared()) {
+                    mem_idx_stale_set(-1, 0);
+                }
+            }
+            throw;
+        }
+
         // a half-restored context is the one state the indexer cannot fix by itself: attention holds new cells, the indexer old ones
         // drop what was being restored from all of them, which is a state they do agree on.
         state_drop(seq_id);
 
         throw;
     }
+}
+
+// [TAG_R40_NP2KVPARK] seq_rm(seq_id, -1, -1) without the recurrent cache: the indexer as in seq_rm, then the attention cache
+bool llama_memory_hybrid_idx::seq_rm_attn_only(llama_seq_id seq_id) {
+    if (seq_id < 0) {
+        return false;
+    }
+    if (mem_idx) {
+        const bool rm_shared = !sharepfx || !kpool_layout_shared() || kpool_rm_takes_shared(seq_id, -1, -1);
+        mem_idx->seq_rm(seq_id, -1, -1);
+        mem_idx_stale_set(seq_id, 0);
+        if (kpool_layout_shared() && rm_shared) {
+            mem_idx_stale_set(-1, 0);
+        }
+    }
+    return get_mem_attn()->seq_rm(seq_id, -1, -1);
 }
 
 void llama_memory_hybrid_idx::state_drop(llama_seq_id seq_id) {

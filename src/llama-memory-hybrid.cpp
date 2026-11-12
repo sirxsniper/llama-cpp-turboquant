@@ -211,11 +211,18 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_memory_hybrid::memory_breakdo
 
 void llama_memory_hybrid::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
     mem_attn->state_write(io, seq_id, flags);
+    if (flags & LLAMA_STATE_SEQ_FLAGS_ATTN_ONLY_EXT) {
+        return; // [TAG_R40_NP2KVPARK] the attention half only
+    }
     mem_recr->state_write(io, seq_id, flags);
 }
 
 void llama_memory_hybrid::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
     mem_attn->state_read(io, seq_id, flags);
+
+    if (flags & LLAMA_STATE_SEQ_FLAGS_ATTN_ONLY_EXT) {
+        return; // [TAG_R40_NP2KVPARK] the attention half only (a failed read cleared its own cells), the recurrent cell stays
+    }
 
     try {
         mem_recr->state_read(io, seq_id, flags);
@@ -233,6 +240,11 @@ llama_kv_cache * llama_memory_hybrid::get_mem_attn() const {
 
 llama_memory_recurrent * llama_memory_hybrid::get_mem_recr() const {
     return mem_recr.get();
+}
+
+// [TAG_R40_NP2KVPARK]
+bool llama_memory_hybrid::seq_rm_attn_only(llama_seq_id seq_id) {
+    return mem_attn->seq_rm(seq_id, -1, -1);
 }
 
 llama_memory_hybrid_context::llama_memory_hybrid_context(llama_memory_status status) : status(status) {}

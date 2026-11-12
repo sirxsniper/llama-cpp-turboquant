@@ -44,6 +44,7 @@ private:
     // callback functions
     std::function<bool(server_task &&, bool)> callback_new_task;
     std::function<void(void)>                 callback_update_slots;
+    std::function<void(void)>                 callback_idle; // [TAG_R40_NP2KVPARK]
     std::vector<std::function<void(bool)>>    callback_sleeping_state;
 
 public:
@@ -125,6 +126,12 @@ public:
     // Register the function to be called when all slots data is ready to be processed
     void on_update_slots(std::function<void(void)> callback) {
         callback_update_slots = std::move(callback);
+    }
+
+    // [TAG_R40_NP2KVPARK] Register a function called on the start_loop() thread every 250 ms while no task waits (not while
+    // sleeping); without one the loop checks every second as before
+    void on_idle(std::function<void(void)> callback) {
+        callback_idle = std::move(callback);
     }
 
     // Register callback for sleeping state change; multiple callbacks are allowed

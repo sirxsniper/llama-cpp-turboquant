@@ -8,6 +8,10 @@
 #include <functional>
 #include <vector>
 
+// [TAG_R40_NP2KVPARK] see llama-ext.h: a state write / read of the attention half of a sequence only (the hybrid memories
+// skip their recurrent part). Exactly the tokens of llama-ext.h (an identical redefinition is allowed, a different one is not).
+#define LLAMA_STATE_SEQ_FLAGS_ATTN_ONLY_EXT 0x40000000u
+
 struct llama_ubatch;
 
 class llama_batch_allocr;

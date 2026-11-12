@@ -328,6 +328,15 @@ struct moe_cache {
     bool                  sl_fail = false; // the placement could not lend: the init fails, the KV cache maps whole
     bool                  sl_retry = false; // the segments came out short of the KV cache's want: one slot more per lend layer
     int32_t               sl_extra = 0;
+    // [TAG_R40_LEND_SPREAD] 0: the plain sizing; 1: the lend spreads (the plain one fell short); 2: the spread one failed, the
+    // plain one's last retry again (its partial lend)
+    int                   sl_spread_st = 0;
+    bool                  sl_spread = false; // sl_spread_st == 1
+    // [TAG_R40_LEND_PARTIAL] a partial lend: the bytes the sizing leaves out of the budget (what it cannot hold, which the
+    // caller maps or the shares take as their own VRAM, plus the up-front map's rounding), found by sizing again
+    size_t                sl_cut = 0;
+    int                   sl_cut_n = 0;
+    bool                  sl_cut_retry = false;
     bool                  sl_on   = false;
     std::vector<std::vector<std::pair<size_t, size_t>>> sl_grp; // per group: [lo, hi) byte ranges of the buffer
     std::vector<size_t>   sl_grp_bytes;
@@ -2614,6 +2623,17 @@ bool   g_kv_borrow_1seq = false; // [TAG_FN_L22_BIGUB2] the borrow is the 1-sequ
 // [TAG_R34_F_VISFLAT] the parked projector's part of g_kv_want for the next hot set init (llama_moe_hot_set_vis_part): with the
 // slot lend its slots come out of the lend layers' own counts instead of lying on top of a base cut for them
 size_t g_vis_part   = 0;
+// [TAG_R40_LEND_PARTIAL] the next hot set init may hold less than g_kv_want (llama_moe_hot_set_kv_partial): when the lend
+// layers' segments still fall short at the last retry (every lend layer at all of its experts, so a retry adds nothing),
+// the placement keeps what they hold instead of failing; the caller maps the rest of the KV cache up front
+bool   g_kv_partial = false;
+// [TAG_R40_LEND_SPREAD] the next hot set init sizes every layer from the whole budget and takes the lend out of the lend
+// layers' own counts (llama_moe_hot_set_kv_spread), instead of a base cut for the lend plus the lend's slots on top: the
+// lend layers are then as big as the others, so more trunk layers lie below the tail and the stream's range and the
+// lend spreads over them (512K: 5 layers at all 512 experts and 43 at ~85 slots -> ~20 lend layers, ~140 slots each)
+bool   g_kv_spread  = false;
+// [TAG_R40_LEND_PARTIAL] the most the caller's up-front KV map rounds past the bytes the lend cannot hold (one map step)
+size_t g_kv_round   = 0;
 
 // [TAG_FN_L10_SLOTLEND] a usable slot keeps this many bytes after it mapped (a kernel that reads a little past a slot's end
 // never reaches a segment the KV cache holds)
@@ -2769,9 +2789,44 @@ ggml_backend_buffer_t hot_vmm_place(moe_cache * mc, ggml_context * ctx_d, ggml_b
                 sum += r.second - r.first;
             }
         }
-        if (sum < g_kv_want) {
+        if (sum < g_kv_want && !(g_kv_partial && mc->sl_extra >= 4 && sum > 0 && (!g_kv_spread || mc->sl_spread_st != 0))) {
             mc->sl_retry = true; // the caller sizes one slot more per lend layer
             return nullptr;
+        }
+        if (sum < g_kv_want) {
+            // [TAG_R40_LEND_PARTIAL] the VRAM must add up as with the whole lend: the caller maps the KV part the segments do
+            // not hold (rounded up to a map step) and an unheld share takes its own VRAM, so the hot set leaves that much of
+            // its budget free. The plain sizing already does for the bytes not held (its lend layers stop at all of their
+            // experts, the lend lies on top of a base cut), the spread one does not (every layer from the whole budget):
+            // size again with the shortfall cut, until the cut covers what the new placement cannot hold (3 tries)
+            const size_t need_cut = (mc->sl_spread ? g_kv_want - sum : 0) + g_kv_round;
+            if (need_cut > mc->sl_cut && mc->sl_cut_n < 3) {
+                const size_t mib = (size_t) 1 << 20;
+                mc->sl_cut = (need_cut + mib - 1)/mib*mib;
+                mc->sl_cut_n++;
+                mc->sl_cut_retry = true;
+                LLAMA_LOG_INFO("moe-hot: [TAG_R40_LEND_PARTIAL] the %s lend's segments hold %.0f of the %.0f MiB wanted: sized again "
+                        "with %.0f MiB of the budget left free (the bytes not held + one KV map step of %.0f MiB)\n",
+                        mc->sl_spread ? "spread" : "plain", sum/1048576.0, g_kv_want/1048576.0, mc->sl_cut/1048576.0,
+                        g_kv_round/1048576.0);
+                return nullptr;
+            }
+            if (need_cut > mc->sl_cut) {
+                LLAMA_LOG_WARN("moe-hot: [TAG_R40_LEND_PARTIAL] after %d sizings the cut %.0f MiB is %.0f MiB short of the bytes the "
+                        "lend cannot hold: that much of the headroom is used\n", mc->sl_cut_n, mc->sl_cut/1048576.0,
+                        (need_cut - mc->sl_cut)/1048576.0);
+            }
+            // [TAG_R40_LEND_PARTIAL] the last retry (sl_extra 4) still falls short: keep what the segments hold
+            int n_ll = 0, n_full = 0;
+            for (size_t i = 0; i < n; ++i) {
+                const layer_state & ls = mc->layers[li0 + i];
+                if (ls.sl_base >= 0) {
+                    n_ll++;
+                    n_full += ls.pub.n_slots >= (int32_t) ls.pub.up_src->ne[2] ? 1 : 0;
+                }
+            }
+            LLAMA_LOG_INFO("moe-hot: [TAG_R40_LEND_PARTIAL] the %d lend layers' segments hold %.0f of the %.0f MiB wanted (%d of "
+                    "them at all of their experts): a partial lend\n", n_ll, sum/1048576.0, g_kv_want/1048576.0, n_full);
         }
         if (g_kv_borrow > 0) {
             // [TAG_FN_L21_BIGUB] the borrow group after the KV groups (short of its want: one slot more, as for the KV)
@@ -3362,7 +3417,10 @@ bool llama_moe_hot_init(const llama_model & model, const void * owner, size_t bu
                     }
                     std::sort(trunk.begin(), trunk.end(), [&](int a, int b) { return layers[a].il < layers[b].il; });
                     // [TAG_R34_F_VISFLAT] the projector's part is not cut from the counts (its slots come out of the lend layers')
-                    const size_t n0_cut = vis_part > 0 && vis_part < g_kv_want ? g_kv_want - vis_part : g_kv_want;
+                    // [TAG_R40_LEND_SPREAD] spread: nothing is cut, the whole lend comes out of the lend layers' own counts
+                    // [TAG_R40_LEND_PARTIAL] sl_cut: a partial lend's bytes not held stay out of the budget (0 otherwise)
+                    const size_t n0_cut = mc->sl_cut + (mc->sl_spread ? 0 :
+                                          vis_part > 0 && vis_part < g_kv_want ? g_kv_want - vis_part : g_kv_want);
                     const std::vector<int32_t> n0 = slots_for(budget_slots > n0_cut ? budget_slots - n0_cut : 0);
                     // one more layer: the final even count may come out a little lower than n0
                     const size_t need_above = tail_bytes + g_kv_keep + 4*vmm_gran +
@@ -3384,7 +3442,9 @@ bool llama_moe_hot_init(const llama_model & model, const void * owner, size_t bu
                         // granule); a placement that comes out short asks for one slot more (sl_extra)
                         const size_t waste = sl_layers.size()*3*(vmm_gran + SL_SLACK);
                         sl_e = (int32_t) ((g_kv_want + waste + per - 1)/per) + mc->sl_extra;
-                        if (vis_part > 0 && vis_part < g_kv_want) {
+                        if (mc->sl_spread) {
+                            sl_ev = sl_e; // [TAG_R40_LEND_SPREAD] all of it from the layers' own slots, none on top
+                        } else if (vis_part > 0 && vis_part < g_kv_want) {
                             sl_ev = std::min<int32_t>((int32_t) (vis_part/per), sl_e); // [TAG_R34_F_VISFLAT]
                         }
                         if (g_kv_borrow > 0) {
@@ -3395,8 +3455,11 @@ bool llama_moe_hot_init(const llama_model & model, const void * owner, size_t bu
                     }
                 }
                 // [TAG_R34_F_VISFLAT] without the projector's carved slots: the cut and the counts are those of its hot set without them
-                sl_base_cut = sl_e > 0 ? g_kv_want - (size_t) sl_ev*sl_per : 0;
+                sl_base_cut = mc->sl_cut + (mc->sl_spread ? 0 : sl_e > 0 ? g_kv_want - (size_t) sl_ev*sl_per : 0); // [TAG_R40_LEND_SPREAD]
                 nv = slots_for(budget_slots > sl_base_cut ? budget_slots - sl_base_cut : 0);
+                if (mc->sl_spread) {
+                    break; // [TAG_R40_LEND_SPREAD] the counts of the whole budget; no projector refit, no wait-aware move
+                }
                 if (!r35_w.empty()) {
                     // [TAG_R35_SLOTBAL] base + lend slots by the wait-aware weights, the same bytes; a lend layer keeps the
                     // projector's share of its own slots and its 16K-ubatch borrow slots below its lend range
@@ -3439,7 +3502,19 @@ bool llama_moe_hot_init(const llama_model & model, const void * owner, size_t bu
                 n_slots_of[li] = nv[li];
                 used += (size_t) nv[li]*layers[li].bytes;
             }
-            if (sl_e > 0) {
+            if (sl_e > 0 && mc->sl_spread) {
+                for (int li : sl_layers) {
+                    // [TAG_R40_LEND_SPREAD] the top ev of the layer's own count lie over the lend (one slot always stays); the
+                    // count itself is that of the whole budget, so with the lend in every layer has its weighted share
+                    const int32_t ev = std::min<int32_t>(sl_e, nv[li] - 1);
+                    if (ev <= 0) {
+                        continue;
+                    }
+                    const int32_t base = nv[li] - ev;
+                    sl_base_of[li]  = base;
+                    sl_bbase_of[li] = sl_bx > 0 && base > sl_bx ? base - sl_bx : -1; // [TAG_FN_L21_BIGUB]
+                }
+            } else if (sl_e > 0) {
                 for (int li : sl_layers) {
                     // [TAG_R34_F_VISFLAT] ev of the layer's own slots can go too: e - ev on top of its count, the base ev lower
                     const int32_t ev = std::min<int32_t>(sl_ev, nv[li] - 1);
@@ -3668,6 +3743,11 @@ bool llama_moe_hot_init(const llama_model & model, const void * owner, size_t bu
                 mc->bufs.push_back(buf);
             }
         }
+        if (!ok && mc->sl_cut_retry) {
+            // [TAG_R40_LEND_PARTIAL] a partial lend sizes again with its cut (logged), the same retry count
+            mc->sl_cut_retry = false;
+            continue;
+        }
         if (!ok && mc->sl_retry) {
             // [TAG_FN_L10_SLOTLEND] the segments fell short: one slot more per lend layer, the same budget
             mc->sl_retry = false;
@@ -3676,7 +3756,29 @@ bool llama_moe_hot_init(const llama_model & model, const void * owner, size_t bu
                         "%d slot(s) more per lend layer\n", mc->sl_extra);
                 continue;
             }
+            if (g_kv_spread && mc->sl_spread_st == 0) {
+                // [TAG_R40_LEND_SPREAD] the plain lend cannot hold it: size again with the lend out of every lend layer's own
+                // slots (the counts of the whole budget), which puts more trunk layers below the tail and the stream's range
+                mc->sl_spread_st = 1;
+                mc->sl_spread    = true;
+                mc->sl_extra     = 0;
+                LLAMA_LOG_INFO("moe-hot: [TAG_R40_LEND_SPREAD] the plain lend falls short: the lend spreads over the lend layers' "
+                        "own slots, every layer sized from the whole budget\n");
+                continue;
+            }
             mc->sl_fail = true;
+        }
+        if (!ok && mc->sl_fail && mc->sl_spread_st == 1 && g_kv_partial) {
+            // [TAG_R40_LEND_SPREAD] the spread sizing failed: the plain one's last retry again, which keeps its partial lend
+            LLAMA_LOG_WARN("moe-hot: [TAG_R40_LEND_SPREAD] the spread lend could not be placed: the plain partial lend instead\n");
+            mc->sl_spread_st = 2;
+            mc->sl_spread    = false;
+            mc->sl_fail      = false;
+            mc->sl_retry     = false;
+            mc->sl_extra     = 4;
+            mc->sl_cut       = 0; // [TAG_R40_LEND_PARTIAL] the plain sizing finds its own
+            mc->sl_cut_n     = 0;
+            continue;
         }
         if (!ok && mc->sl_fail) {
             break; // [TAG_FN_L10_SLOTLEND] logged: the caller maps the KV cache whole and fits again
@@ -6081,6 +6183,15 @@ void llama_moe_hot_set_cb_borrow(size_t bytes) { // [TAG_FN_L21_BIGUB]
 
 void llama_moe_hot_set_vis_part(size_t bytes) { // [TAG_R34_F_VISFLAT]
     g_vis_part = bytes;
+}
+
+void llama_moe_hot_set_kv_partial(bool on, size_t round) { // [TAG_R40_LEND_PARTIAL]
+    g_kv_partial = on;
+    g_kv_round   = on ? round : 0;
+}
+
+void llama_moe_hot_set_kv_spread(bool on) { // [TAG_R40_LEND_SPREAD]
+    g_kv_spread = on;
 }
 
 // [TAG_FN_L22_BIGUB2] see llama-moecache.h
