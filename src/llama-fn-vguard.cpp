@@ -211,6 +211,7 @@ struct vg_state {
     int64_t   t_prompt = 0;      // the last batch with prompt rows, FULL switch or encode
     int64_t   t_regrow = 0;
     int64_t   t_react  = 0;
+    int64_t   t_obs    = 0;      // observe mode: the last 1 Hz line
     // the share
     size_t    group    = 0;      // one KV group's bytes
     // statistics
@@ -341,6 +342,15 @@ bool vg_poll(bool force) {
     }
     if (g.pressure != was_press) {
         vg_note(g.pressure ? "PRESSURE begins" : "PRESSURE ends");
+    }
+    if (g.mode == 2 && t - g.t_obs >= 1000000) {
+        // observe (T0): one line per second, D next to the harness's PDH d
+        g.t_obs = t;
+        LLAMA_LOG_WARN("%s: [TAG_R40_VGUARD] observe: H %.0f F %.0f D %.1f (usage %.1f - PDH dedicated %.1f - offset %.1f) MiB, budget "
+                "%.0f solo %.0f deficit %.0f%s%s, share %.0f MiB, stash %.0f MiB
+", __func__, s.H, s.F, g.D, s.usage, s.ded, g.d_off,
+                s.budget, g.solo, g.deficit, g.demoted ? " DEMOTED" : "", g.pressure ? " PRESSURE" : "",
+                llama_moe_hot_vg_out()/VG_MIB, llama_fn_zc_stash_bytes()/VG_MIB);
     }
     return true;
 #else
