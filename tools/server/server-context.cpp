@@ -5380,7 +5380,7 @@ private:
             why = "needs --kv-unified";
         } else if (slots.size() < 2) {
             why = "needs 2 or more slots";
-        } else if (params_base.cache_idle_slots) {
+        } else if (params_base.cache_idle_slots && prompt_cache) { // init() turns it off later without a prompt cache
             why = "--cache-idle-slots already clears the idle slots";
         } else if (!llama_memory_attn_park_ok_ext(ctx_tgt)) {
             why = "the model's memory has no attention-only state";
