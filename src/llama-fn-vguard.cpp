@@ -837,7 +837,8 @@ size_t llama_fn_zc_new_bytes() {
 }
 
 // [TAG_R40_VGUARD] R40-VGUARD-3 C1 knobs: LLAMA_R40_ZC_PREWARM (default 1; 0 skips the prewarm), LLAMA_R40_ZC_PREWARM_WAIT_MS
-// (default 3000: the longest wait for the saved state's uploads before the prewarm's release)
+// (default 0: one look; how long the prewarm may wait for the upload worker to be idle before it leaves the borrow group out -
+// the smoke of 19c51134b waited 3 s at a cold start in vain)
 bool llama_fn_zc_prewarm_wanted() {
     static const bool on = [] {
         const char * e = getenv("LLAMA_R40_ZC_PREWARM");
@@ -849,7 +850,7 @@ bool llama_fn_zc_prewarm_wanted() {
 int llama_fn_zc_prewarm_wait_ms() {
     static const int ms = [] {
         const char * e = getenv("LLAMA_R40_ZC_PREWARM_WAIT_MS");
-        return (e && *e) ? std::max(0, atoi(e)) : 3000;
+        return (e && *e) ? std::max(0, atoi(e)) : 0;
     }();
     return ms;
 }

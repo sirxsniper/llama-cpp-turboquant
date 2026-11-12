@@ -6897,34 +6897,20 @@ bool llama_moe_hot_cbuf_restore_ex(const void * owner, bool async_req) {
     return true;
 }
 
-// [TAG_R40_VGUARD] R40-VGUARD-3 C1: the prewarm's wait for the saved state (its read-ahead queued the uploads and the worker
-// landed them all; then they are published as a step would), so the release that follows drops none of them. At most max_ms;
-// true: nothing in flight any more
-static bool hot_prewarm_settle(moe_cache * mc, int max_ms) {
+// [TAG_R40_VGUARD] R40-VGUARD-3 C1: no upload is queued or running (the borrow group's release would drop those that go into its
+// slots: they come back empty; a tail slot keeps its expert named and the restore refills it; finished ones are published by
+// the release's drain; the saved state's jobs still in its read-ahead are queued later, after the return). Waits at most max_ms
+// (0: one look; the smoke of 19c51134b waited 3 s for the whole saved state at a cold start and it was not done - its
+// read-ahead reads GBs of pages). Nothing is changed here: the worker keeps its own pace
+static bool hot_prewarm_settled(moe_cache * mc, int max_ms) {
     if (!mc->adapt) {
         return true;
     }
     const int64_t t_end = ggml_time_us() + (int64_t) max_ms*1000;
     for (;;) {
-        bool idle = false;
         {
-            std::lock_guard<std::mutex> slk(mc->step_mtx);
-            {
-                std::lock_guard<std::mutex> lk(mc->wmtx);
-                idle = mc->fa18_st_jobs.empty() && mc->todo.empty() && !mc->worker_busy;
-                if (!idle && mc->paused && !mc->todo.empty()) {
-                    // an idle pause holds the queue until the next step: the owner computes again (as a step would say)
-                    mc->paused = false;
-                    hot_set_yield(mc);
-                    mc->wcv.notify_all();
-                }
-            }
-            if (idle) {
-                hot_adapt_publish(mc);
-                if (mc->tbl_dirty && mc->tbl_all) {
-                    ggml_backend_tensor_set(mc->tbl_all, mc->tbl_mirror.data(), 0, mc->tbl_mirror.size()*sizeof(int32_t));
-                    mc->tbl_dirty = false;
-                }
+            std::lock_guard<std::mutex> lk(mc->wmtx);
+            if (mc->todo.empty() && !mc->worker_busy) {
                 return true;
             }
         }
@@ -6952,8 +6938,11 @@ bool llama_moe_hot_zc_prewarm(const void * owner, bool borrow, bool (*map)(void 
         t = now;
         return ms;
     };
-    inf.settled   = hot_prewarm_settle(mc, wait_ms);
+    // the borrow group only when no upload is in flight (none of them is dropped then); the tail always (its slots keep the
+    // experts they were getting and its restore refills them)
+    inf.settled   = hot_prewarm_settled(mc, wait_ms);
     inf.settle_ms = lap();
+    borrow        = borrow && inf.settled;
     // what a real switch would add to the hot set's counters, logs and burst window is put back afterwards
     const int      burst0 = mc->dc_burst_left;
     const bool     pfs0   = mc->l22_pf_stop.load();

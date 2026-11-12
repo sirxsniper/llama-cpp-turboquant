@@ -8480,12 +8480,12 @@ void llama_context::zc_prewarm_try() {
     }
     // the guard's switch notes start after it (the prewarm's parks and maps are not the first switch's)
     llama_fn_zc_rebase();
-    LLAMA_LOG_WARN("%s: [TAG_R40_VGUARD] zero-commit prewarm in %.1f ms: wait for the saved state %.1f ms (%s), tail release %.1f "
-            "ms (%.0f MiB), borrow %.1f ms (%.0f MiB), arena map %.1f ms (%.0f MiB; reserve %.1f, map + access %.1f, sync %.1f, "
-            "park %.1f), tail back + refill %.1f ms, borrow back + refill %.1f ms; %.0f MiB new, %.0f MiB left over (freed)\n",
-            __func__, ms, hi.settle_ms, hi.settled ? "settled" : "timed out: its in-flight uploads into the borrow group were "
-            "dropped as at a switch", hi.release_ms, hi.tail_b/MiB, hi.borrow_ms, hi.borrow_b/MiB, hi.map_ms, pw.map_b/MiB,
-            pw.reserve_ms, pw.map_ms, pw.sync_ms, pw.unmap_ms, hi.restore_ms, hi.unborrow_ms, made/MiB, left/MiB);
+    LLAMA_LOG_WARN("%s: [TAG_R40_VGUARD] zero-commit prewarm in %.1f ms: upload worker %s (%.1f ms), tail release %.1f ms (%.0f MiB), "
+            "borrow %.1f ms (%.0f MiB%s), arena map %.1f ms (%.0f MiB; reserve %.1f, map + access %.1f, sync %.1f, park %.1f), tail "
+            "back + refill %.1f ms, borrow back + refill %.1f ms; %.0f MiB new, %.0f MiB left over (freed)\n", __func__, ms,
+            hi.settled ? "idle" : "busy", hi.settle_ms, hi.release_ms, hi.tail_b/MiB, hi.borrow_ms, hi.borrow_b/MiB,
+            borrow && !hi.settled ? ", left out: uploads in flight" : "", hi.map_ms, pw.map_b/MiB, pw.reserve_ms, pw.map_ms,
+            pw.sync_ms, pw.unmap_ms, hi.restore_ms, hi.unborrow_ms, made/MiB, left/MiB);
 }
 
 // [TAG_R40_VGUARD] the FULL period's zero-commit scope ends (the stash's rest is freed)

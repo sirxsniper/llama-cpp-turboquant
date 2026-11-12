@@ -40,8 +40,9 @@
 //   tail's and the borrow's release park their handles (the tables evicted as at a FULL switch), every parked handle is mapped
 //   into the arena from offset 0 with its access set, the context syncs, the handles park again, the tail and the borrow map
 //   them back and are refilled synchronously (the SMALL switch's restore), the scope ends. The first prompt's FULL switch then
-//   builds on an arena range used once. It waits up to LLAMA_R40_ZC_PREWARM_WAIT_MS (3000) for the saved state's uploads first
-//   (so its release drops none). If anything fails, zero-commit and the guard go off for the process (v0.30.0) and say why.
+//   builds on an arena range used once. The borrow group takes part only when no upload is queued or running (its release
+//   would drop those: LLAMA_R40_ZC_PREWARM_WAIT_MS, default 0 = one look); the tail always (its slots keep the experts they
+//   were getting). If anything fails, zero-commit and the guard go off for the process (v0.30.0) and say why.
 // C2 the switch notes split the time: FULL park / map / staging (pinned host buffers) / device allocs / sched_reserve / other,
 //   SMALL ret / free / trim / restore / unborrow / reserve / other, and count the switch's own memory apart from the period's.
 // C3 new memory: a KV growth's chunk takes a handle its own scope parked (the hot set's released group range) whole when it is
