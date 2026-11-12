@@ -42,6 +42,7 @@
 #include <condition_variable>
 #include <cstdio>
 #include <cstring>
+#include <typeinfo> // [TAG_R40_NP2KVPARK]
 #include <functional>
 #include <limits>
 #include <mutex>
@@ -11379,6 +11380,89 @@ bool llama_moe_hot_counts_get_ext(llama_context * ctx, std::vector<float> & out)
 
 bool llama_moe_hot_counts_set_ext(llama_context * ctx, const std::vector<float> & in) {
     return ctx != nullptr && llama_moe_hot_counts_set(ctx, in);
+}
+
+// [TAG_R40_NP2KVPARK] see llama-ext.h. Only the exact types whose attention half is known to stand alone: a plain
+// llama_kv_cache, llama_memory_hybrid and llama_memory_hybrid_idx (attention + recurrent [+ the indexer that mirrors the
+// attention cells]); one stream, so a restore lands in the pool the other sequences share.
+static llama_kv_cache * llama_r40_park_attn(llama_context * ctx, llama_memory_hybrid ** hyb_out) {
+    llama_memory_i * mem = ctx ? ctx->get_memory() : nullptr;
+    if (hyb_out) {
+        *hyb_out = nullptr;
+    }
+    if (mem == nullptr) {
+        return nullptr;
+    }
+    llama_kv_cache * kv = nullptr;
+    if (typeid(*mem) == typeid(llama_kv_cache)) {
+        kv = static_cast<llama_kv_cache *>(mem);
+    } else if (typeid(*mem) == typeid(llama_memory_hybrid) || typeid(*mem) == typeid(llama_memory_hybrid_idx)) {
+        auto * hyb = static_cast<llama_memory_hybrid *>(mem);
+        kv = hyb->get_mem_attn();
+        if (hyb_out) {
+            *hyb_out = hyb;
+        }
+    }
+    if (kv == nullptr || kv->get_n_stream() != 1) {
+        return nullptr;
+    }
+    return kv;
+}
+
+bool llama_memory_attn_park_ok_ext(llama_context * ctx) {
+    return llama_r40_park_attn(ctx, nullptr) != nullptr;
+}
+
+bool llama_memory_attn_seq_rm_ext(llama_context * ctx, llama_seq_id seq_id) {
+    llama_memory_hybrid * hyb = nullptr;
+    llama_kv_cache *      kv  = llama_r40_park_attn(ctx, &hyb);
+    if (kv == nullptr || seq_id < 0 || seq_id >= (llama_seq_id) ctx->get_cparams().n_seq_max) {
+        return false;
+    }
+    ctx->synchronize();
+    return hyb ? hyb->seq_rm_attn_only(seq_id) : kv->seq_rm(seq_id, -1, -1);
+}
+
+int32_t llama_memory_attn_seq_cells_ext(llama_context * ctx, llama_seq_id seq_id, int32_t * cell_min, int32_t * cell_max) {
+    if (cell_min) {
+        *cell_min = -1;
+    }
+    if (cell_max) {
+        *cell_max = -1;
+    }
+    llama_kv_cache * kv = llama_r40_park_attn(ctx, nullptr);
+    if (kv == nullptr || seq_id < 0 || seq_id >= (llama_seq_id) ctx->get_cparams().n_seq_max) {
+        return -1;
+    }
+    const llama_kv_cells & cells = kv->get_cells(seq_id);
+    int32_t n = 0;
+    for (uint32_t i = 0; i < cells.size(); ++i) {
+        if (!cells.is_empty(i) && cells.seq_has(i, seq_id)) {
+            if (n == 0 && cell_min) {
+                *cell_min = (int32_t) i;
+            }
+            if (cell_max) {
+                *cell_max = (int32_t) i;
+            }
+            n++;
+        }
+    }
+    return n;
+}
+
+void llama_kv_lend_trim_ext(llama_context * ctx) {
+    llama_memory_hybrid * hyb = nullptr;
+    llama_kv_cache *      kv  = llama_r40_park_attn(ctx, &hyb);
+    if (kv == nullptr) {
+        return;
+    }
+    ctx->synchronize();
+    // the indexer's lend first (its cells mirror the attention cells), then the attention cache's: each maps what its cells
+    // need now, a shrink gives the groups above that back to the hot set ([TAG_FN_L10_SLOTLEND] hot_sl_restore)
+    if (auto * idx = dynamic_cast<llama_memory_hybrid_idx *>(hyb); idx && idx->get_mem_idx()) {
+        (void) idx->get_mem_idx()->kvl_update(idx->get_mem_idx()->kvl_need());
+    }
+    (void) kv->kvl_update(kv->kvl_need());
 }
 
 uint32_t llama_memory_attn_swa_ext(llama_context * ctx) {

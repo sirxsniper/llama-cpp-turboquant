@@ -77,6 +77,9 @@ public:
     // llama_memory_hybrid_idx specific API
     //
 
+    // [TAG_R40_NP2KVPARK] the attention and indexer cells of seq_id go, the recurrent cell stays
+    bool seq_rm_attn_only(llama_seq_id seq_id) override;
+
     llama_kv_cache * get_mem_idx() const;   // nullptr when the model carries no indexer
 
     // The model's indexer pool size.

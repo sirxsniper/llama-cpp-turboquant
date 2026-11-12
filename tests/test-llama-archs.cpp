@@ -184,6 +184,7 @@ static void usage(char ** argv) {
     LOG("  -b, --backend <backend>  Run only on the given backend device\n");
     LOG("  --mtp                    Test the in-model MTP head instead (archs with an MTP fixture: qwen4exp)\n");
     LOG("  --kv-shift               Check K-shift against a decode at the shifted positions (CPU only)\n");
+    LOG("  --kv-park                Check an attention-only park / restore / move-down against no park (CPU only)\n");
     LOG("  -h, --help               Show this help message\n\n");
     LOG("Examples:\n");
     LOG("  %s\n", argv[0]);
@@ -2339,6 +2340,222 @@ static int test_kv_shift(const std::string & arch_filter, const size_t seed, con
     return n_failed == 0 ? 0 : 1;
 }
 
+// [TAG_R40_NP2KVPARK] --kv-park: an idle sequence's attention half goes to host memory and comes back, the other one moves down
+// (llama_state ATTN_ONLY + llama_memory_attn_seq_rm_ext), against the same decodes with nothing parked. Two sequences in one
+// unified cache: A (seq 0) first, B (seq 1) above it. Park A, move B to the bottom (park + restore), probe B, restore A, probe A.
+// The recurrent part of a hybrid memory never leaves (the blob must be smaller than a whole-sequence state) and the probes
+// read it, so a lost or a stale recurrent cell shows in their logits. CPU only.
+static std::vector<float> kv_park_logits(llama_context * lctx, uint32_t n_vocab, uint32_t n) {
+    std::vector<float> ret;
+    ret.reserve((size_t) n*n_vocab);
+    for (uint32_t i = 0; i < n; i++) {
+        const float * l = llama_get_logits_ith(lctx, i);
+        ret.insert(ret.end(), l, l + n_vocab);
+    }
+    return ret;
+}
+
+static std::vector<uint8_t> kv_park_save(llama_context * lctx, llama_seq_id seq, size_t * full_size) {
+    const size_t n = llama_state_seq_get_size_ext(lctx, seq, LLAMA_STATE_SEQ_FLAGS_ATTN_ONLY_EXT);
+    if (full_size) {
+        *full_size = llama_state_seq_get_size_ext(lctx, seq, LLAMA_STATE_SEQ_FLAGS_NONE);
+    }
+    std::vector<uint8_t> buf(n);
+    if (n == 0 || llama_state_seq_get_data_ext(lctx, buf.data(), n, seq, LLAMA_STATE_SEQ_FLAGS_ATTN_ONLY_EXT) != n) {
+        throw std::runtime_error("attention-only state read failed");
+    }
+    if (!llama_memory_attn_seq_rm_ext(lctx, seq) || llama_memory_attn_seq_cells_ext(lctx, seq, nullptr, nullptr) != 0) {
+        throw std::runtime_error("attention-only removal failed");
+    }
+    return buf;
+}
+
+static void kv_park_restore(llama_context * lctx, llama_seq_id seq, const std::vector<uint8_t> & buf, int32_t n_cells) {
+    if (llama_state_seq_set_data_ext(lctx, buf.data(), buf.size(), seq, LLAMA_STATE_SEQ_FLAGS_ATTN_ONLY_EXT) != buf.size()) {
+        throw std::runtime_error("attention-only state restore failed");
+    }
+    if (llama_memory_attn_seq_cells_ext(lctx, seq, nullptr, nullptr) != n_cells) {
+        throw std::runtime_error("restored cell count differs");
+    }
+}
+
+static int test_kv_park(const std::string & arch_filter, const size_t seed, const float stdev, const int verbosity) {
+    struct user_data_t {
+        struct {
+            ggml_log_callback callback;
+            void * user_data;
+        } log_old;
+
+        int verbosity;
+
+        user_data_t(int verbosity) : verbosity(verbosity) {
+            llama_log_get(&log_old.callback, &log_old.user_data);
+        }
+    };
+    user_data_t ud(verbosity);
+
+    llama_log_set([](ggml_log_level level, const char * text, void * user_data) {
+        const user_data_t * ud = (const user_data_t *) user_data;
+        int verbosity = common_log_get_verbosity(level);
+        if (verbosity <= ud->verbosity) {
+            ud->log_old.callback(level, text, ud->log_old.user_data);
+        }
+    }, &ud);
+
+    const uint32_t n_a = 24;
+    const uint32_t n_b = 12;
+    const uint32_t n_p = 6;
+    const std::vector<llama_token> tokens = get_tokens(n_a + n_b + 2*n_p, 128, seed);
+    const llama_token * tok_a  = tokens.data();
+    const llama_token * tok_b  = tok_a + n_a;
+    const llama_token * tok_pb = tok_b + n_b;
+    const llama_token * tok_pa = tok_pb + n_p;
+    const double thold = 1e-6;
+
+    size_t max_arch_name_length = 0;
+    for (const llm_arch & arch : llama_arch_all()) {
+        max_arch_name_length = std::max(max_arch_name_length, strlen(llama_arch_name(arch)));
+    }
+    const std::string template_row = "|%" + std::to_string(max_arch_name_length) + "s|%6s|%10s|%10s|%12s|%s\n";
+
+    size_t n_tests  = 0;
+    size_t n_failed = 0;
+    common_log_flush(common_log_main());
+    LOG(template_row.c_str(), "Model arch.", "Config", "B moved", "A back", "blob / full", "Status");
+
+    for (const llm_arch & arch : llama_arch_all()) {
+        if (arch == LLM_ARCH_UNKNOWN || !arch_matches(arch_filter, arch) || !arch_supported(arch)) {
+            continue;
+        }
+        if (arch == LLM_ARCH_EAGLE3 || arch == LLM_ARCH_DFLASH || arch == LLM_ARCH_GEMMA4_ASSISTANT) {
+            continue;
+        }
+        const bool encode = arch == LLM_ARCH_T5 || arch == LLM_ARCH_DREAM || arch == LLM_ARCH_LLADA || arch == LLM_ARCH_LLADA_MOE || arch == LLM_ARCH_RND1;
+        if (encode) {
+            continue;
+        }
+        for (bool moe : {false, true}) {
+            if (moe && !moe_implemented(arch)) {
+                continue;
+            }
+            if (!moe && moe_mandatory(arch)) {
+                continue;
+            }
+            const char * config_name = moe ? "MoE" : "Dense";
+
+            const uint32_t n_layer_min = arch == LLM_ARCH_EXAONE4 ? 64 : arch == LLM_ARCH_SMALLTHINKER ? 8 : 4;
+            gguf_context_ptr gguf_ctx = get_gguf_ctx(arch, moe, n_layer_min);
+
+            llama_model_ptr model;
+            try {
+                model = get_model(gguf_ctx.get(), nullptr, seed, stdev, {});
+            } catch (const std::exception & err) {
+                LOG(template_row.c_str(), llama_arch_name(arch), config_name, "", "", "", "\033[1;31mERROR\033[0m (model load)");
+                n_tests++;
+                n_failed++;
+                continue;
+            }
+
+            llama_context_params ctx_params = llama_context_default_params();
+            ctx_params.n_ctx           = 0;
+            ctx_params.n_threads       = 4;
+            ctx_params.n_threads_batch = 4;
+            ctx_params.n_seq_max       = 2;
+            ctx_params.kv_unified      = true;
+            ctx_params.type_k          = GGML_TYPE_F32;
+            ctx_params.type_v          = GGML_TYPE_F32;
+            ctx_params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+
+            ud.verbosity = LOG_LEVEL_OUTPUT;
+            llama_context_ptr lctx(llama_init_from_model(model.get(), ctx_params));
+            ud.verbosity = verbosity;
+            if (!lctx) {
+                LOG(template_row.c_str(), llama_arch_name(arch), config_name, "", "", "", "\033[1;33mSKIP\033[0m (context)");
+                continue;
+            }
+            if (!llama_memory_attn_park_ok_ext(lctx.get())) {
+                LOG(template_row.c_str(), llama_arch_name(arch), config_name, "", "", "", "\033[1;33mSKIP\033[0m (memory type)");
+                continue;
+            }
+            const uint32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model.get()));
+            llama_memory_t mem = llama_get_memory(lctx.get());
+
+            std::string status;
+            char b_str[16]  = "";
+            char a_str[16]  = "";
+            char sz_str[32] = "";
+            n_tests++;
+            try {
+                // reference: nothing parked
+                llama_memory_clear(mem, true);
+                decode_range(lctx.get(), tok_a, n_a, 0, 0, false);
+                decode_range(lctx.get(), tok_b, n_b, 0, 1, false);
+                decode_range(lctx.get(), tok_pb, n_p, n_b, 1, true);
+                const std::vector<float> ref_b = kv_park_logits(lctx.get(), n_vocab, n_p);
+                decode_range(lctx.get(), tok_pa, n_p, n_a, 0, true);
+                const std::vector<float> ref_a = kv_park_logits(lctx.get(), n_vocab, n_p);
+
+                // parked: A to the host, B moved to the bottom, probe B, A back, probe A
+                llama_memory_clear(mem, true);
+                decode_range(lctx.get(), tok_a, n_a, 0, 0, false);
+                decode_range(lctx.get(), tok_b, n_b, 0, 1, false);
+                int32_t b_min0 = -1;
+                const int32_t n_cells_a = llama_memory_attn_seq_cells_ext(lctx.get(), 0, nullptr, nullptr);
+                const int32_t n_cells_b = llama_memory_attn_seq_cells_ext(lctx.get(), 1, &b_min0, nullptr);
+                size_t full_a = 0;
+                const std::vector<uint8_t> blob_a = kv_park_save(lctx.get(), 0, &full_a);
+                const std::vector<uint8_t> blob_b = kv_park_save(lctx.get(), 1, nullptr);
+                kv_park_restore(lctx.get(), 1, blob_b, n_cells_b);
+                int32_t b_min1 = -1;
+                llama_memory_attn_seq_cells_ext(lctx.get(), 1, &b_min1, nullptr);
+                if (!(b_min1 < b_min0)) {
+                    throw std::runtime_error("B did not move down (" + std::to_string(b_min0) + " -> " + std::to_string(b_min1) + ")");
+                }
+                if (llama_memory_seq_pos_max(mem, 1) != (llama_pos) n_b - 1) {
+                    throw std::runtime_error("B's memory does not end at its last position");
+                }
+                decode_range(lctx.get(), tok_pb, n_p, n_b, 1, true);
+                const std::vector<float> park_b = kv_park_logits(lctx.get(), n_vocab, n_p);
+                kv_park_restore(lctx.get(), 0, blob_a, n_cells_a);
+                if (llama_memory_seq_pos_max(mem, 0) != (llama_pos) n_a - 1) {
+                    throw std::runtime_error("A's memory does not end at its last position");
+                }
+                decode_range(lctx.get(), tok_pa, n_p, n_a, 0, true);
+                const std::vector<float> park_a = kv_park_logits(lctx.get(), n_vocab, n_p);
+
+                const double d_b = nmse(ref_b, park_b);
+                const double d_a = nmse(ref_a, park_a);
+                snprintf(b_str,  sizeof(b_str),  "%.2e", d_b);
+                snprintf(a_str,  sizeof(a_str),  "%.2e", d_a);
+                snprintf(sz_str, sizeof(sz_str), "%zu/%zu", blob_a.size(), full_a);
+                const bool hybrid = blob_a.size() < full_a;
+                if (!(d_b <= thold) || !(d_a <= thold)) {
+                    n_failed++;
+                    status = "\033[1;31mFAIL\033[0m";
+                } else {
+                    status = std::string("\033[1;32mOK\033[0m") + (hybrid ? " (the recurrent part stayed)" : "") +
+                             (d_b == 0.0 && d_a == 0.0 ? " bitwise" : "");
+                }
+            } catch (const std::exception & err) {
+                n_failed++;
+                status = std::string("\033[1;31mERROR\033[0m (") + err.what() + ")";
+            }
+            LOG(template_row.c_str(), llama_arch_name(arch), config_name, b_str, a_str, sz_str, status.c_str());
+        }
+    }
+
+    if (n_tests == 0) {
+        LOG("Summary: no tests executed\n");
+    } else if (n_failed == 0) {
+        LOG("Summary: all %zu test(s) passed\n", n_tests);
+    } else {
+        LOG("Summary: %zu test(s) executed, %zu failed\n", n_tests, n_failed);
+    }
+
+    llama_log_set(ud.log_old.callback, ud.log_old.user_data);
+    return n_failed == 0 ? 0 : 1;
+}
+
 int main(int argc, char ** argv) {
     // init the logger at max verbosity. filter with a custom callback respecting the user-configure verbosity
     common_log_set_verbosity_thold(LOG_LEVEL_DEBUG);
@@ -2353,6 +2570,7 @@ int main(int argc, char ** argv) {
     std::string out;
     const char * target_backend = nullptr;
     bool kv_shift = false;
+    bool kv_park  = false; // [TAG_R40_NP2KVPARK]
 
     int verbosity = LOG_LEVEL_ERROR;
     bool mtp = false;
@@ -2425,6 +2643,8 @@ int main(int argc, char ** argv) {
             }
         } else if (strcmp(argv[i], "--kv-shift") == 0) {
             kv_shift = true;
+        } else if (strcmp(argv[i], "--kv-park") == 0) {
+            kv_park = true; // [TAG_R40_NP2KVPARK]
         } else {
             LOG_ERR("%s: unknown argument: %s\n", __func__, argv[i]);
             usage(argv);
@@ -2448,6 +2668,9 @@ int main(int argc, char ** argv) {
         }
         if (kv_shift) {
             return test_kv_shift(arch_filter, seed, stdev, verbosity);
+        }
+        if (kv_park) {
+            return test_kv_park(arch_filter, seed, stdev, verbosity);
         }
         return test_backends(arch_filter, seed, stdev, verbosity, target_backend);
     } catch (const std::exception & err) {

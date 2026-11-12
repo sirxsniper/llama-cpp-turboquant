@@ -295,6 +295,23 @@ LLAMA_API size_t llama_state_seq_write_stream_ext(struct llama_context * ctx, ll
 LLAMA_API size_t llama_state_seq_read_stream_ext(struct llama_context * ctx, llama_seq_id seq_id, llama_state_seq_flags flags,
                                                  llama_state_stream_read_fn fn, void * user_data);
 
+// [TAG_R40_NP2KVPARK] the attention half of a sequence on its own (the server parks an idle slot's attention cells in host
+// RAM, so the unified KV cache's mapped prefix and the hot set's KV lend shrink, and puts them back before the slot's next
+// prompt). LLAMA_STATE_SEQ_FLAGS_ATTN_ONLY_EXT: a state write / read of llama_memory_hybrid(_idx) skips the recurrent part
+// (the attention cache and, qwen4exp, the indexer cache that mirrors it); a plain llama_kv_cache ignores the flag. A failed
+// ATTN_ONLY read clears only the attention cells it was restoring, the recurrent cell stays. The same byte format otherwise.
+#define LLAMA_STATE_SEQ_FLAGS_ATTN_ONLY_EXT 4
+// true when ctx's memory supports the calls below: a llama_kv_cache or a llama_memory_hybrid(_idx) with one stream
+// (--kv-unified, or one sequence)
+LLAMA_API bool    llama_memory_attn_park_ok_ext(struct llama_context * ctx);
+// removes every attention (and indexer) cell of seq_id, the recurrent cell stays; false when unsupported
+LLAMA_API bool    llama_memory_attn_seq_rm_ext(struct llama_context * ctx, llama_seq_id seq_id);
+// the attention cells of seq_id: their count (-1 when unsupported), the lowest and the highest cell index (-1 for none)
+LLAMA_API int32_t llama_memory_attn_seq_cells_ext(struct llama_context * ctx, llama_seq_id seq_id, int32_t * cell_min, int32_t * cell_max);
+// the KV lend ([TAG_FN_L8_KVLEND]) maps what the cells need now instead of at the next ubatch: a shrink gives its groups back
+// to the hot set while the server is idle. The context's graphs end first. No-op without a lend. Outputs never change.
+LLAMA_API void    llama_kv_lend_trim_ext(struct llama_context * ctx);
+
 // [TAG_FN_L18_KEEPCTX_HOT] The decayed counts of the MoE hot set ctx owns (qwen4exp adaptive set): get copies them, set
 // puts them back (the same process and model). false when ctx owns no decayed adaptive set or the layout differs.
 LLAMA_API bool llama_moe_hot_counts_get_ext(struct llama_context * ctx, std::vector<float> & out);
