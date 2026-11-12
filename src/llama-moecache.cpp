@@ -2644,6 +2644,8 @@ size_t g_vis_part   = 0;
 // [TAG_R40_VGUARD] zero-commit (llama_moe_hot_zc_set): the tail's, the borrow's and the KV lend's releases park their handles
 // inside a scope of the device (the next map / FULL reserve / pool growth takes them); the guard's share never parks
 std::atomic<bool> g_hot_zc{false};
+// [TAG_R40_VGUARD] R40-VGUARD-3 C1: the prewarm's borrow return refills at once (owner thread, inside llama_moe_hot_zc_prewarm)
+bool g_hot_sb_force_sync = false;
 
 // [TAG_R40_VGUARD] a release's unmap: parking with zero-commit, else the plain one (v0.30.0)
 bool hot_unmap_rel(const moe_cache * mc, size_t off, size_t n) {
@@ -4396,8 +4398,9 @@ void hot_sb_restore(moe_cache * mc, const void * owner) {
     size_t bytes = 0;
     // [TAG_FN_R25_REFILL] a small borrow return lands here at once (the copy pool), so the answer's first steps find the whole
     // set instead of the CPU computing these experts while the upload worker brings them back
-    bool sb_sync = !mc->adapt;
-    if (mc->adapt && mc->r25_on && mc->r25_sb_max > 0 && mc->pools.empty()) {
+    // [TAG_R40_VGUARD] R40-VGUARD-3 C1: the prewarm's return always lands here at once (the set as it was before its release)
+    bool sb_sync = !mc->adapt || g_hot_sb_force_sync;
+    if (!g_hot_sb_force_sync && mc->adapt && mc->r25_on && mc->r25_sb_max > 0 && mc->pools.empty()) {
         size_t need = 0;
         for (const auto & r : mc->sb_res) {
             const layer_state & ls = mc->layers[(size_t) r[0]];
@@ -6892,6 +6895,107 @@ bool llama_moe_hot_cbuf_restore_ex(const void * owner, bool async_req) {
                 mc->cb_n_rel ? mc->cb_rel_ms/mc->cb_n_rel : 0.0, mc->cb_res_ms/mc->cb_n_res);
     }
     return true;
+}
+
+// [TAG_R40_VGUARD] R40-VGUARD-3 C1: the prewarm's wait for the saved state (its read-ahead queued the uploads and the worker
+// landed them all; then they are published as a step would), so the release that follows drops none of them. At most max_ms;
+// true: nothing in flight any more
+static bool hot_prewarm_settle(moe_cache * mc, int max_ms) {
+    if (!mc->adapt) {
+        return true;
+    }
+    const int64_t t_end = ggml_time_us() + (int64_t) max_ms*1000;
+    for (;;) {
+        bool idle = false;
+        {
+            std::lock_guard<std::mutex> slk(mc->step_mtx);
+            {
+                std::lock_guard<std::mutex> lk(mc->wmtx);
+                idle = mc->fa18_st_jobs.empty() && mc->todo.empty() && !mc->worker_busy;
+                if (!idle && mc->paused && !mc->todo.empty()) {
+                    // an idle pause holds the queue until the next step: the owner computes again (as a step would say)
+                    mc->paused = false;
+                    hot_set_yield(mc);
+                    mc->wcv.notify_all();
+                }
+            }
+            if (idle) {
+                hot_adapt_publish(mc);
+                if (mc->tbl_dirty && mc->tbl_all) {
+                    ggml_backend_tensor_set(mc->tbl_all, mc->tbl_mirror.data(), 0, mc->tbl_mirror.size()*sizeof(int32_t));
+                    mc->tbl_dirty = false;
+                }
+                return true;
+            }
+        }
+        if (ggml_time_us() >= t_end) {
+            return false;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+}
+
+bool llama_moe_hot_zc_prewarm(const void * owner, bool borrow, bool (*map)(void * ud), void * ud, int wait_ms,
+        llama_moe_hot_prewarm_info * info) {
+    llama_moe_hot_prewarm_info inf;
+    moe_cache * mc = g_cache;
+    if (!mc || !mc->cb_buf || mc->cb_out || (mc->adapt && owner != mc->owner) || !g_hot_zc.load(std::memory_order_relaxed)) {
+        if (info) {
+            *info = inf;
+        }
+        return false;
+    }
+    int64_t t = ggml_time_us();
+    auto lap = [&t]() {
+        const int64_t now = ggml_time_us();
+        const double  ms  = (now - t)/1000.0;
+        t = now;
+        return ms;
+    };
+    inf.settled   = hot_prewarm_settle(mc, wait_ms);
+    inf.settle_ms = lap();
+    // what a real switch would add to the hot set's counters, logs and burst window is put back afterwards
+    const int      burst0 = mc->dc_burst_left;
+    const bool     pfs0   = mc->l22_pf_stop.load();
+    const uint64_t n_rel0 = mc->cb_n_rel, n_res0 = mc->cb_n_res, n_part0 = mc->cb_n_part, sb_n0 = mc->sb_n;
+    const double   rel_ms0 = mc->cb_rel_ms, res_ms0 = mc->cb_res_ms, sb_rel_ms0 = mc->sb_rel_ms, sb_res_ms0 = mc->sb_res_ms;
+    const double   l22_res_ms0 = mc->l22_res_ms;
+    const size_t   res_b0 = mc->cb_res_b, l22_res_b0 = mc->l22_res_b, l22_rel_b0 = mc->l22_rel_b;
+    inf.tail_b     = llama_moe_hot_cbuf_release(owner, 0); // the whole tail, as a 16K prompt's switch (tables evicted)
+    inf.release_ms = lap();
+    if (borrow) {
+        inf.borrow_b = hot_sb_release(mc, owner);
+    }
+    inf.borrow_ms = lap();
+    const bool mapped = inf.tail_b > 0 && map(ud);
+    inf.map_ms = lap();
+    inf.restored = llama_moe_hot_cbuf_restore_ex(owner, false); // mapped from the stash, refilled by the copy threads now
+    inf.restore_ms = lap();
+    if (inf.borrow_b > 0) {
+        g_hot_sb_force_sync = true;
+        hot_sb_restore(mc, owner);
+        g_hot_sb_force_sync = false;
+    }
+    inf.unborrow_ms = lap();
+    const bool sb_back = mc->sb_out == 0;
+    mc->dc_burst_left = burst0;
+    mc->l22_pf_stop.store(pfs0);
+    mc->cb_n_rel = n_rel0;
+    mc->cb_n_res = n_res0;
+    mc->cb_n_part = n_part0;
+    mc->sb_n = sb_n0;
+    mc->cb_rel_ms = rel_ms0;
+    mc->cb_res_ms = res_ms0;
+    mc->sb_rel_ms = sb_rel_ms0;
+    mc->sb_res_ms = sb_res_ms0;
+    mc->l22_res_ms = l22_res_ms0;
+    mc->cb_res_b = res_b0;
+    mc->l22_res_b = l22_res_b0;
+    mc->l22_rel_b = l22_rel_b0;
+    if (info) {
+        *info = inf;
+    }
+    return inf.tail_b > 0 && mapped && inf.restored && sb_back;
 }
 
 

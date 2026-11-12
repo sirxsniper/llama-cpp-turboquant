@@ -2752,6 +2752,7 @@ void llama_context::fn_ready() {
         return;
     }
     if (!fa18_fit || !moe_hot_pending) {
+        zc_prewarm_try(); // [TAG_R40_VGUARD] R40-VGUARD-3 C1 (when the hot set was fit already; a no-op otherwise)
         llama_fn_warm_go(true); // [TAG_FN_L18_FIRSTANS_WARMLATE]
         return;
     }
@@ -2780,6 +2781,9 @@ void llama_context::fn_ready() {
     llama_fn_stall_op(false);
     LLAMA_LOG_WARN("%s: [TAG_FN_L18_FIRSTANS_FIT] the hot set was sized before the first request: %.0f ms (fit + reserve%s)\n",
             __func__, (ggml_time_us() - t0)/1000.0, reserved ? "" : " failed");
+    if (reserved) {
+        zc_prewarm_try(); // [TAG_R40_VGUARD] R40-VGUARD-3 C1: before the warm pass and the first request
+    }
     llama_fn_warm_go(true); // [TAG_FN_L18_FIRSTANS_WARMLATE] a pass held back for the load's end starts now
 }
 
@@ -8403,11 +8407,85 @@ void llama_context::vg_arm_try() {
         return true;
     };
     vg_on = llama_fn_vg_arm(this, dev, h, why);
-    // zero-commit: the compute-buffer switch on a Windows CUDA device (the guard itself need not be armed)
+    zc_arm_try(); // zero-commit: the compute-buffer switch on a Windows CUDA device (the guard itself need not be armed)
+}
+
+// [TAG_R40_VGUARD] zero-commit arms once (fn_ready's prewarm or the guard's arm at the first decode, whichever comes first)
+void llama_context::zc_arm_try() {
+    if (zc_tried) {
+        return;
+    }
+    zc_tried = true;
+    if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP || llama_fn_vg_mode() == 0) {
+        return;
+    }
+    ggml_backend_dev_t dev = llama_moe_hot_device(model);
     if (cbuf_state != CBUF_OFF && dev != nullptr && llama_fn_zc_arm(dev)) {
         zc_on = true;
         llama_moe_hot_zc_set(true);
     }
+}
+
+// [TAG_R40_VGUARD] R40-VGUARD-3 C1: the zero-commit prewarm at the load's end (fn_ready on the caller's thread, which runs the
+// decodes: the owner). One dry cycle of the FULL switch's handle moves and the SMALL switch's return (see llama-fn-vguard.h),
+// before the warm pass and the first request. The FULL width of a 16K prompt gives the whole tail and, with the 16K reserve's
+// borrow, the borrow group: the same handles a fresh 32K prompt's switch moves. A failure turns zero-commit and the guard off
+// for the process (v0.30.0). LLAMA_R40_ZC_PREWARM=0: skipped (the first switch pays the first use, as in iteration 2)
+void llama_context::zc_prewarm_try() {
+    if (zc_pw_tried) {
+        return;
+    }
+    zc_pw_tried = true;
+    if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP || llama_fn_vg_mode() == 0 || moe_hot_pending || cbuf_state != CBUF_SMALL) {
+        return; // no hot set with the switch yet: zero-commit arms with the guard at the first decode, without a prewarm
+    }
+    zc_arm_try();
+    if (!zc_on) {
+        return;
+    }
+    if (!llama_fn_zc_prewarm_wanted()) {
+        LLAMA_LOG_INFO("%s: [TAG_R40_VGUARD] zero-commit prewarm skipped (LLAMA_R40_ZC_PREWARM=0)\n", __func__);
+        return;
+    }
+    const int64_t t0 = ggml_time_us();
+    synchronize();
+    step_join();
+    const bool   borrow = l21_extra > 0 && l20_base_ub > 0;
+    const size_t new0   = llama_fn_zc_new_bytes();
+    const int    sid    = llama_fn_zc_open();
+    llama_fn_zc_prewarm_info pw;
+    struct map_ud {
+        llama_fn_zc_prewarm_info * pw;
+        bool                       ok;
+    } ud = { &pw, false };
+    llama_moe_hot_prewarm_info hi;
+    const bool ok = llama_moe_hot_zc_prewarm(this, borrow, [](void * u) -> bool {
+        auto * m = (map_ud *) u;
+        m->ok = llama_fn_zc_prewarm_map(*m->pw);
+        return m->ok;
+    }, &ud, llama_fn_zc_prewarm_wait_ms(), &hi);
+    const size_t left = llama_fn_zc_stash_bytes(); // what the return did not take (freed by the scope's end)
+    llama_fn_zc_close(sid);
+    const size_t made = llama_fn_zc_new_bytes() - new0; // what the return had to create (handle sizes that did not match)
+    const double ms   = (ggml_time_us() - t0)/1000.0;
+    constexpr double MiB = 1048576.0;
+    if (!ok) {
+        LLAMA_LOG_WARN("%s: [TAG_R40_VGUARD] zero-commit prewarm FAILED in %.1f ms (tail %.0f MiB %s, borrow %.0f MiB, arena map %s, "
+                "%.0f MiB new, %.0f MiB left in the stash)\n", __func__, ms, hi.tail_b/MiB, hi.restored ? "back" : "NOT mapped",
+                hi.borrow_b/MiB, ud.ok ? "ok" : "failed", made/MiB, left/MiB);
+        zc_on = false;
+        llama_moe_hot_zc_set(false);
+        llama_fn_zc_off("the prewarm failed");
+        return;
+    }
+    // the guard's switch notes start after it (the prewarm's parks and maps are not the first switch's)
+    llama_fn_zc_rebase();
+    LLAMA_LOG_WARN("%s: [TAG_R40_VGUARD] zero-commit prewarm in %.1f ms: wait for the saved state %.1f ms (%s), tail release %.1f "
+            "ms (%.0f MiB), borrow %.1f ms (%.0f MiB), arena map %.1f ms (%.0f MiB; reserve %.1f, map + access %.1f, sync %.1f, "
+            "park %.1f), tail back + refill %.1f ms, borrow back + refill %.1f ms; %.0f MiB new, %.0f MiB left over (freed)\n",
+            __func__, ms, hi.settle_ms, hi.settled ? "settled" : "timed out: its in-flight uploads into the borrow group were "
+            "dropped as at a switch", hi.release_ms, hi.tail_b/MiB, hi.borrow_ms, hi.borrow_b/MiB, hi.map_ms, pw.map_b/MiB,
+            pw.reserve_ms, pw.map_ms, pw.sync_ms, pw.unmap_ms, hi.restore_ms, hi.unborrow_ms, made/MiB, left/MiB);
 }
 
 // [TAG_R40_VGUARD] the FULL period's zero-commit scope ends (the stash's rest is freed)
@@ -8698,6 +8776,11 @@ bool llama_context::cbuf_set(bool full, uint32_t width, uint32_t cls) {
     llama_fn_stall_scope st_scope(full ? "cbuf -> FULL begins" : "cbuf -> SMALL begins", "cbuf switch ends"); // [TAG_FN_L18_FIRSTANS_STALL]
     constexpr double MiB = 1024.0*1024.0;
     const int64_t t0 = ggml_time_us();
+    // [TAG_R40_VGUARD] R40-VGUARD-3 C2: the switch's own counters start here; its parts for the zero-commit note
+    llama_fn_zc_parts zc_parts;
+    if (zc_on) {
+        llama_fn_zc_mark();
+    }
     ggml_backend_dev_t dev = llama_moe_hot_device(model);
     llama_perf_hold hold(n_queued_tokens, t_compute_start_us);
     synchronize();
@@ -8765,6 +8848,7 @@ bool llama_context::cbuf_set(bool full, uint32_t width, uint32_t cls) {
                 need_unmap = it->second;
             }
         }
+        const int64_t t_zc_park = ggml_time_us(); // [TAG_R40_VGUARD] C2: the release and the borrow
         released           = cls_now > 0 && need_unmap < l20_base_need ? llama_moe_hot_cbuf_release2(this, l20_base_need, need_unmap) :
                              llama_moe_hot_cbuf_release(this, base_w ? l20_base_need : 0);
         cbuf_full_t        = l20_base_ub > 0 ? (cls_now > 0 ? cls_now : base_w ? l20_base_ub : cparams.n_ubatch) : 0;
@@ -8794,6 +8878,7 @@ bool llama_context::cbuf_set(bool full, uint32_t width, uint32_t cls) {
                 l21_n_borrow++;
             }
         }
+        zc_parts.park = (ggml_time_us() - t_zc_park)/1000.0; // [TAG_R40_VGUARD] C2
         (base_w ? l20_n_base : l20_n_big) += l20_base_ub > 0 ? 1 : 0;
         // [TAG_FN_L22_SMALLKEEP] G3: the SMALL scheduler stays through this FULL period when the device has room for both
         // (before the pin check below: the SMALL buffers are not freed by this reserve)
@@ -8833,6 +8918,7 @@ bool llama_context::cbuf_set(bool full, uint32_t width, uint32_t cls) {
             }
         } zc_win(zc_on);
         bool l22_ok = false;
+        const int64_t t_zc_res = ggml_time_us(); // [TAG_R40_VGUARD] C2: the reserve (with a class retry)
         try {
             sched_reserve();
             l22_ok = true;
@@ -8862,6 +8948,7 @@ bool llama_context::cbuf_set(bool full, uint32_t width, uint32_t cls) {
                 return false;
             }
         }
+        zc_parts.reserve = (ggml_time_us() - t_zc_res)/1000.0; // [TAG_R40_VGUARD] C2
         // [TAG_FN_L22_LENDCLASS] the first use of a class measures its reserve: later uses give back only its need
         if (l22_class > 0 && l22_class_need.find(l22_class) == l22_class_need.end()) {
             const size_t cls_full = cbuf_compute_bytes(dev);
@@ -8884,7 +8971,9 @@ bool llama_context::cbuf_set(bool full, uint32_t width, uint32_t cls) {
         // [TAG_FN_L20_BIGPROMPT_DFTUB] a big prompt: the draft context's wide reserve in the tail's room (it stays narrow if not)
         if (l20_dft_extra > 0 && cbuf_full_t == cparams.n_ubatch) {
             if (llama_context * dft = l20_draft()) {
+                const int64_t t_zc_dft = ggml_time_us(); // [TAG_R40_VGUARD] C2
                 dft->dft_set_wide(true);
+                zc_parts.draft = (ggml_time_us() - t_zc_dft)/1000.0;
             }
         }
         zc_win.close(); // [TAG_R40_VGUARD]
@@ -8926,7 +9015,16 @@ bool llama_context::cbuf_set(bool full, uint32_t width, uint32_t cls) {
     const double ms = (ggml_time_us() - t0)/1000.0;
     (full ? cbuf_ms_full : cbuf_ms_small) += ms;
     if (zc_on) {
-        llama_fn_zc_note(full, ms); // [TAG_R40_VGUARD] what the switch parked, took from the stash and created
+        // [TAG_R40_VGUARD] what the switch parked, took from the stash and created; C2: where its time went
+        if (!full) {
+            zc_parts.ret      = r25_sw_ms[0];
+            zc_parts.free     = r25_sw_ms[1];
+            zc_parts.trim     = r25_sw_ms[2];
+            zc_parts.restore  = r25_sw_ms[3];
+            zc_parts.unborrow = r25_sw_ms[4];
+            zc_parts.sreserve = r25_sw_ms[5];
+        }
+        llama_fn_zc_note(full, ms, zc_parts);
     }
     // [TAG_FN_L22_PASSLOG] kind=switch: the parts; the prompt's record after its SMALL switch
     if (l22.passlog >= 1) {

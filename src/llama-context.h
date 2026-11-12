@@ -804,6 +804,12 @@ private:
     bool     zc_on      = false;
     int      zc_full_id = 0; // the FULL period's scope (0: none open)
     void     zc_full_close();
+    // [TAG_R40_VGUARD] R40-VGUARD-3 C1: zero-commit arms at the load's end (fn_ready) for its prewarm, else with the guard at the
+    // first decode after the fit
+    bool     zc_tried    = false;
+    bool     zc_pw_tried = false;
+    void     zc_arm_try();
+    void     zc_prewarm_try();
     // [TAG_FN_L22_ENDOVERLAP] a prompt ended in FULL without the eager switch: the next narrow batch goes SMALL, async
     bool     l22_end_pending = false;
     int      l22_first_n     = 0;    // decode calls still counted after a prompt's switch (first 8)

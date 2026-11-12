@@ -206,7 +206,15 @@ bool kvl_map_to(uint32_t cells) {
         // one map per chunk: a shrink can give back any chunk boundary (an unmap takes whole earlier maps)
         const size_t step = std::max(g_kvl.gran, kvl_round_up((size_t) std::max<uint32_t>(1, g_kvl.chunk) * r.row, g_kvl.gran));
         while (r.mapped < b) {
-            const size_t e = std::min(b, kvl_round_up(r.mapped + 1, step));
+            size_t e = std::min(b, kvl_round_up(r.mapped + 1, step));
+            // [TAG_R40_VGUARD] R40-VGUARD-3 C3: inside a growth's zero-commit scope, a handle that scope parked (a released group's
+            // range of the hot set) that is larger than this chunk is mapped whole (more cells of this region mapped early)
+            // instead of new memory for the chunk while the larger handle is freed at the scope's end; never past what the whole
+            // context maps (kvl_bytes_for at kv_size: the guard granule stays). 0 outside a scope / without zero-commit
+            if (const size_t hn = llama_fn_zc_fit(e - r.mapped, kvl_bytes_for(r, g_kvl.kv_size) - std::min(r.mapped,
+                    kvl_bytes_for(r, g_kvl.kv_size))); hn > e - r.mapped) {
+                e = r.mapped + hn;
+            }
             if (!g_kvl.map(g_kvl.buf, r.start + r.mapped, e - r.mapped)) {
                 kvl_set_cells();
                 return false;

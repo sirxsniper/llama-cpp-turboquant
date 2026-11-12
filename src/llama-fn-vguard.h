@@ -33,6 +33,20 @@
 //   LLAMA_R40_VGUARD_HTGT 2944, _FTGT 3200, _ZHTGT 2304, _ZFTGT 2560, _DEM 64, _DROP 256, _MAX 2048, _REACT_F 3800 (MiB),
 //   _POLL_MS 20, _CALM_S 10, _QUIET_S 2, _REGROW_S 2, _PRESS 1 (0: no PRESSURE share), _REACT 0 (1: the DEMOTED reaction),
 //   _CHECK 0 (1: assert no stream D2D source lies in a KV group), _FORCE 0 (tests: act at every switch / gate / 8th decode)
+//
+// R40-VGUARD-3 (iteration 3):
+// C1 PREWARM (LLAMA_R40_ZC_PREWARM, default 1; zero-commit only): at the load's end (fn_ready, after the hot set's fit and the
+//   reserve, before the warm pass and the first request) the owner thread runs one dry zero-commit cycle - a scope opens, the
+//   tail's and the borrow's release park their handles (the tables evicted as at a FULL switch), every parked handle is mapped
+//   into the arena from offset 0 with its access set, the context syncs, the handles park again, the tail and the borrow map
+//   them back and are refilled synchronously (the SMALL switch's restore), the scope ends. The first prompt's FULL switch then
+//   builds on an arena range used once. It waits up to LLAMA_R40_ZC_PREWARM_WAIT_MS (3000) for the saved state's uploads first
+//   (so its release drops none). If anything fails, zero-commit and the guard go off for the process (v0.30.0) and say why.
+// C2 the switch notes split the time: FULL park / map / staging (pinned host buffers) / device allocs / sched_reserve / other,
+//   SMALL ret / free / trim / restore / unborrow / reserve / other, and count the switch's own memory apart from the period's.
+// C3 new memory: a KV growth's chunk takes a handle its own scope parked (the hot set's released group range) whole when it is
+//   larger than the chunk (more cells mapped in that region) instead of creating new memory; the share no longer frees the
+//   stash (a FULL period's stash is the tail's return). "new at SMALL" (the SMALL switch's own) is counted in every note
 
 #include <cstddef>
 #include <cstdint>
@@ -70,5 +84,32 @@ bool llama_fn_zc_on();
 int  llama_fn_zc_open();
 void llama_fn_zc_close(int id);
 void llama_fn_zc_window(int delta);
-void llama_fn_zc_note(bool full, double ms);
 size_t llama_fn_zc_stash_bytes(); // the handles parked now (0 while off): free memory a FULL reserve can be built from
+
+// [TAG_R40_VGUARD] R40-VGUARD-3 C2: a switch's parts (ms). FULL: park = the tail's release and the borrow, reserve = the
+// sched_reserve calls (the map, the staging and device allocations inside are taken from ggml-cuda's clocks), draft = the draft
+// context's wide reserve. SMALL: cbuf_to_small's parts (ret = the stream's return before it)
+struct llama_fn_zc_parts {
+    double park = 0.0, reserve = 0.0, draft = 0.0;
+    double ret = 0.0, free = 0.0, trim = 0.0, restore = 0.0, unborrow = 0.0, sreserve = 0.0;
+};
+void llama_fn_zc_mark();  // a switch begins: its own counters start here (the period before it ends)
+void llama_fn_zc_note(bool full, double ms, const llama_fn_zc_parts & parts);
+
+// [TAG_R40_VGUARD] R40-VGUARD-3 C1 (see above): _prewarm_wanted (LLAMA_R40_ZC_PREWARM), _prewarm_wait_ms, _prewarm_map (the
+// arena part inside the prewarm's scope: true = mapped, synced and parked again), _off (zero-commit and the guard off for the
+// process, one WARN line), _rebase (the notes' counters restart now)
+struct llama_fn_zc_prewarm_info {
+    size_t map_b      = 0;
+    double reserve_ms = 0.0, map_ms = 0.0, sync_ms = 0.0, unmap_ms = 0.0;
+};
+bool llama_fn_zc_prewarm_wanted();
+int  llama_fn_zc_prewarm_wait_ms();
+bool llama_fn_zc_prewarm_map(llama_fn_zc_prewarm_info & info);
+void llama_fn_zc_off(const char * why);
+void llama_fn_zc_rebase();
+
+// [TAG_R40_VGUARD] R40-VGUARD-3 C3: the size a KV region's chunk of `need` bytes should map when it may grow to `room`: a
+// handle of the newest scope (the growth's own release) of exactly `need`, else its smallest one up to `room`; 0: none / off
+size_t llama_fn_zc_fit(size_t need, size_t room);
+size_t llama_fn_zc_new_bytes(); // the new memory created inside scopes so far (0 while off)

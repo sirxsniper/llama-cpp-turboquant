@@ -164,7 +164,8 @@ struct vg_pdh {
 // the zero-commit glue: ggml-cuda's procs on the hot set's device (stats order: ggml_cuda_zc_stat in ggml-cuda.cu)
 enum {
     ZC_N_PARK, ZC_B_PARK, ZC_N_REUSE, ZC_B_REUSE, ZC_N_NEW, ZC_B_NEW, ZC_N_DROP, ZC_B_DROP, ZC_N_FAIL, ZC_N_ARENA, ZC_B_ARENA,
-    ZC_N_POOL, ZC_B_POOL, ZC_B_STASH, ZC_US, ZC_NST,
+    ZC_N_POOL, ZC_B_POOL, ZC_B_STASH, ZC_US,
+    ZC_HOST_US, ZC_HOST_B, ZC_HOST_N, ZC_HFREE_US, ZC_DEV_US, ZC_DEV_B, ZC_DEV_N, ZC_DFREE_US, ZC_NST, // R40-VGUARD-3 C2
 };
 
 struct vg_zc {
@@ -176,9 +177,15 @@ struct vg_zc {
     int    (*window)(ggml_backend_dev_t, int)             = nullptr;
     size_t (*drop)(ggml_backend_dev_t)                    = nullptr;
     int    (*stats)(ggml_backend_dev_t, uint64_t *, int)  = nullptr;
+    bool   (*prewarm)(ggml_backend_dev_t, uint64_t *)     = nullptr; // R40-VGUARD-3 C1 (optional: no prewarm without it)
+    size_t (*fit)(ggml_backend_dev_t, size_t, size_t)     = nullptr; // R40-VGUARD-3 C3 (optional)
     uint64_t last[ZC_NST] = {};
+    uint64_t mark[ZC_NST] = {}; // the counters at the current switch's start (C2/C3: the period's part vs the switch's own)
+    bool     marked       = false;
     uint64_t n_full = 0, n_small = 0;
     double   ms_full = 0.0, ms_small = 0.0;
+    uint64_t new_small_b = 0, new_small_n = 0; // C3: new memory made by SMALL switches themselves (the pass metric)
+    uint64_t new_period_b = 0;                 // C3: new memory made inside FULL periods (a KV growth's rest, ...)
 };
 
 vg_zc g_zc;
@@ -377,8 +384,10 @@ size_t vg_groups_for(double mib) {
     return (size_t) std::ceil(mib*VG_MIB/(double) g.group);
 }
 
-// the share to `target` bytes (whole groups, at most MAX); sync: the owner's graphs first (r35_hook_sync). A growing share
-// frees the zero-commit stash first (handles nothing maps). One log line
+// the share to `target` bytes (whole groups, at most MAX); sync: the owner's graphs first (r35_hook_sync). One log line.
+// R40-VGUARD-3 C3: the zero-commit stash is kept (iteration 2 freed it here). Inside a FULL period it holds the tail's and the
+// borrow's handles that the SMALL switch maps back: freeing them made that switch create the same bytes new while the other
+// process was still there (m22: 216 MiB freed by a hold, 764 MiB new at the next SMALL). The whole groups cover the need alone
 size_t vg_hold(size_t target, bool sync, const char * why) {
     vg_state & g = vg();
     target = std::min(target, std::max(vg_max_b(), llama_moe_hot_vg_out()));
@@ -390,10 +399,7 @@ size_t vg_hold(size_t target, bool sync, const char * why) {
     const double    d0 = g.D;
     const double    f0 = g.deficit;
     const int64_t   t0 = ggml_time_us();
-    size_t dropped = 0;
-    if (target > before && g_zc.on && g_zc.drop) {
-        dropped = g_zc.drop(g_zc.dev);
-    }
+    const size_t    kept = llama_fn_zc_stash_bytes();
     if (sync && g.h.sync) {
         g.h.sync(g.h.user);
     }
@@ -403,10 +409,10 @@ size_t vg_hold(size_t target, bool sync, const char * why) {
     (void) vg_poll(true);
     g.n_act++;
     LLAMA_LOG_WARN("%s: [TAG_R40_VGUARD] %s (%" PRIu64 "): H %.0f F %.0f D %.0f deficit %.0f MiB (budget %.0f) -> the share %.0f -> "
-            "%.0f MiB (wanted %.0f, %zu groups%s) in %.1f ms (sync %.1f, stash freed %.0f MiB); now H %.0f F %.0f D %.0f deficit "
+            "%.0f MiB (wanted %.0f, %zu groups%s) in %.1f ms (sync %.1f, stash kept %.0f MiB); now H %.0f F %.0f D %.0f deficit "
             "%.0f, %.0f MiB of the lend mapped\n", __func__, why, g.n_act, s0.H, s0.F, d0, f0, s0.budget, before/VG_MIB,
             after/VG_MIB, target/VG_MIB, g.group ? (size_t) (after/g.group) : (size_t) 0, g_zc.on ? ", zero-commit" : "", ms,
-            ms_sync, dropped/VG_MIB, g.cur.H, g.cur.F, g.D, g.deficit, llama_moe_hot_vg_free()/VG_MIB);
+            ms_sync, kept/VG_MIB, g.cur.H, g.cur.F, g.D, g.deficit, llama_moe_hot_vg_free()/VG_MIB);
     return after;
 }
 
@@ -765,6 +771,8 @@ bool llama_fn_zc_arm(ggml_backend_device * dev) {
     g_zc.window = (decltype(g_zc.window)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_vmm_zc_window");
     g_zc.drop   = (decltype(g_zc.drop))   ggml_backend_reg_get_proc_address(reg, "ggml_backend_vmm_zc_drop");
     g_zc.stats  = (decltype(g_zc.stats))  ggml_backend_reg_get_proc_address(reg, "ggml_backend_vmm_zc_stats");
+    g_zc.prewarm = (decltype(g_zc.prewarm)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_vmm_zc_prewarm"); // R40-VGUARD-3
+    g_zc.fit     = (decltype(g_zc.fit))     ggml_backend_reg_get_proc_address(reg, "ggml_backend_vmm_zc_fit");
     const bool park = ggml_backend_reg_get_proc_address(reg, "ggml_backend_vmm_buffer_unmap_park") != nullptr;
     if (!g_zc.enable || !g_zc.scope || !g_zc.window || !g_zc.drop || !g_zc.stats || !park) {
         LLAMA_LOG_INFO("%s: [TAG_R40_VGUARD] zero-commit off: the backend has no zero-commit procs\n", __func__);
@@ -816,7 +824,80 @@ size_t llama_fn_zc_stash_bytes() {
     return g_zc.stats(g_zc.dev, now, ZC_NST) >= ZC_NST ? (size_t) now[ZC_B_STASH] : 0;
 }
 
-void llama_fn_zc_note(bool full, double ms) {
+size_t llama_fn_zc_fit(size_t need, size_t room) {
+    return g_zc.on && g_zc.fit ? g_zc.fit(g_zc.dev, need, room) : 0;
+}
+
+size_t llama_fn_zc_new_bytes() {
+    if (!g_zc.on) {
+        return 0;
+    }
+    uint64_t now[ZC_NST] = {};
+    return g_zc.stats(g_zc.dev, now, ZC_NST) >= ZC_NST ? (size_t) now[ZC_B_NEW] : 0;
+}
+
+// [TAG_R40_VGUARD] R40-VGUARD-3 C1 knobs: LLAMA_R40_ZC_PREWARM (default 1; 0 skips the prewarm), LLAMA_R40_ZC_PREWARM_WAIT_MS
+// (default 3000: the longest wait for the saved state's uploads before the prewarm's release)
+bool llama_fn_zc_prewarm_wanted() {
+    static const bool on = [] {
+        const char * e = getenv("LLAMA_R40_ZC_PREWARM");
+        return !(e && *e && atoi(e) == 0);
+    }();
+    return on;
+}
+
+int llama_fn_zc_prewarm_wait_ms() {
+    static const int ms = [] {
+        const char * e = getenv("LLAMA_R40_ZC_PREWARM_WAIT_MS");
+        return (e && *e) ? std::max(0, atoi(e)) : 3000;
+    }();
+    return ms;
+}
+
+bool llama_fn_zc_prewarm_map(llama_fn_zc_prewarm_info & info) {
+    if (!g_zc.on || !g_zc.prewarm) {
+        return false;
+    }
+    uint64_t out[5] = {};
+    const bool ok = g_zc.prewarm(g_zc.dev, out);
+    info.map_b      = (size_t) out[0];
+    info.reserve_ms = out[1]/1000.0;
+    info.map_ms     = out[2]/1000.0;
+    info.sync_ms    = out[3]/1000.0;
+    info.unmap_ms   = out[4]/1000.0;
+    return ok;
+}
+
+void llama_fn_zc_off(const char * why) {
+    vg_state & g = vg();
+    if (g_zc.on) {
+        (void) g_zc.enable(g_zc.dev, false); // the stash is freed, nothing parks from now on
+        g_zc.on = false;
+    }
+    g_zc.tried    = true;
+    g.armed       = false;
+    g.mode        = 0;    // the guard's arm takes LLAMA_R40_VGUARD=0's path (no WDDM call)
+    g.logged_off  = true; // this line says why (not the env's "off" line)
+    LLAMA_LOG_WARN("%s: [TAG_R40_VGUARD] zero-commit and the guard off for this process: %s (the v0.30.0 switch)\n", __func__, why);
+}
+
+void llama_fn_zc_rebase() {
+    if (g_zc.on) {
+        (void) g_zc.stats(g_zc.dev, g_zc.last, ZC_NST);
+        g_zc.marked = false;
+    }
+}
+
+void llama_fn_zc_mark() {
+    if (g_zc.on && g_zc.stats(g_zc.dev, g_zc.mark, ZC_NST) >= ZC_NST) {
+        g_zc.marked = true;
+    }
+}
+
+// [TAG_R40_VGUARD] one line per switch (the first 8 of each kind, every 64th, and every switch with new memory or a failure).
+// R40-VGUARD-3 C2: the switch's time in parts (FULL: park / map / staging / device allocs / reserve / other; SMALL: cbuf_to_small's
+// parts) and its own counters apart from the period before it (C3: "new at SMALL" is the SMALL switch's own new memory)
+void llama_fn_zc_note(bool full, double ms, const llama_fn_zc_parts & p) {
     if (!g_zc.on) {
         return;
     }
@@ -824,30 +905,54 @@ void llama_fn_zc_note(bool full, double ms) {
     if (g_zc.stats(g_zc.dev, now, ZC_NST) < ZC_NST) {
         return;
     }
-    uint64_t d[ZC_NST];
+    const uint64_t * mk = g_zc.marked ? g_zc.mark : g_zc.last;
+    uint64_t sw[ZC_NST]; // the switch's own
+    uint64_t pd[ZC_NST]; // the period before it (from the last note to this switch's start)
     for (int i = 0; i < ZC_NST; ++i) {
-        d[i] = now[i] - g_zc.last[i];
+        sw[i] = now[i] - mk[i];
+        pd[i] = mk[i] - g_zc.last[i];
         g_zc.last[i] = now[i];
     }
-    d[ZC_B_STASH] = now[ZC_B_STASH];
+    g_zc.marked = false;
     const uint64_t n = full ? ++g_zc.n_full : ++g_zc.n_small;
     (full ? g_zc.ms_full : g_zc.ms_small) += ms;
-    if (n > 8 && n % 64 != 0 && d[ZC_B_NEW] == 0 && d[ZC_N_FAIL] == 0) {
+    if (!full) {
+        g_zc.new_small_b  += sw[ZC_B_NEW];
+        g_zc.new_small_n  += sw[ZC_B_NEW] > 0 ? 1 : 0;
+        g_zc.new_period_b += pd[ZC_B_NEW];
+    }
+    if (n > 8 && n % 64 != 0 && sw[ZC_B_NEW] == 0 && pd[ZC_B_NEW] == 0 && sw[ZC_N_FAIL] == 0 && pd[ZC_N_FAIL] == 0) {
         return;
     }
-    const double avg = (full ? g_zc.ms_full : g_zc.ms_small)/(double) n;
+    const double avg     = (full ? g_zc.ms_full : g_zc.ms_small)/(double) n;
+    const double map     = sw[ZC_US]/1000.0;
+    const double staging = sw[ZC_HOST_US]/1000.0;
+    const double devall  = sw[ZC_DEV_US]/1000.0;
     if (full) {
-        LLAMA_LOG_WARN("%s: [TAG_R40_VGUARD] zero-commit FULL %" PRIu64 " in %.1f ms (%.1f on average): %.0f MiB parked (%" PRIu64
-                " handles), the reserve %.0f MiB in %" PRIu64 " arena buffer(s) from %.0f MiB of them (%" PRIu64 " handles, %.1f ms), "
-                "new %.0f MiB (%" PRIu64 "), %.0f MiB stay for the pool, %" PRIu64 " failures\n", __func__, n, ms, avg,
-                d[ZC_B_PARK]/VG_MIB, d[ZC_N_PARK], d[ZC_B_ARENA]/VG_MIB, d[ZC_N_ARENA], d[ZC_B_REUSE]/VG_MIB, d[ZC_N_REUSE],
-                d[ZC_US]/1000.0, d[ZC_B_NEW]/VG_MIB, d[ZC_N_NEW], d[ZC_B_STASH]/VG_MIB, d[ZC_N_FAIL]);
+        const double rest  = std::max(0.0, p.reserve + p.draft - map - staging - devall);
+        const double other = std::max(0.0, ms - p.park - p.reserve - p.draft);
+        LLAMA_LOG_WARN("%s: [TAG_R40_VGUARD] zero-commit FULL %" PRIu64 " in %.1f ms (%.1f on average): park %.1f ms (%.0f MiB, %" PRIu64
+                " handles), map %.1f ms (the reserve %.0f MiB in %" PRIu64 " arena buffer(s) from %.0f MiB, %" PRIu64 " handles), "
+                "staging %.1f ms (%.0f MiB pinned host in %" PRIu64 "), device allocs %.1f ms (%.0f MiB in %" PRIu64 "), sched_reserve "
+                "%.1f ms (graph + allocator, without the map / staging / device allocs; the draft's wide reserve %.1f ms of it), other "
+                "%.1f ms; new %.0f MiB (%" PRIu64 "), %.0f MiB stay for the pool, %" PRIu64 " failures; the SMALL period before: new "
+                "%.0f MiB (%" PRIu64 "), %.0f MiB parked, %.0f MiB freed\n", __func__, n, ms, avg, p.park, sw[ZC_B_PARK]/VG_MIB,
+                sw[ZC_N_PARK], map, sw[ZC_B_ARENA]/VG_MIB, sw[ZC_N_ARENA], sw[ZC_B_REUSE]/VG_MIB, sw[ZC_N_REUSE], staging,
+                sw[ZC_HOST_B]/VG_MIB, sw[ZC_HOST_N], devall, sw[ZC_DEV_B]/VG_MIB, sw[ZC_DEV_N], rest, p.draft, other,
+                sw[ZC_B_NEW]/VG_MIB, sw[ZC_N_NEW], now[ZC_B_STASH]/VG_MIB, sw[ZC_N_FAIL] + pd[ZC_N_FAIL], pd[ZC_B_NEW]/VG_MIB,
+                pd[ZC_N_NEW], pd[ZC_B_PARK]/VG_MIB, pd[ZC_B_DROP]/VG_MIB);
     } else {
-        LLAMA_LOG_WARN("%s: [TAG_R40_VGUARD] zero-commit SMALL %" PRIu64 " in %.1f ms (%.1f on average): the FULL period's pool took "
-                "%.0f MiB (%" PRIu64 " growths) from the stash; %.0f MiB parked (%" PRIu64 " handles: the reserve, the pool, KV), %.0f "
-                "MiB mapped from the stash (%" PRIu64 " handles: the tail, the borrow, KV), new %.0f MiB (%" PRIu64 "), %.0f MiB freed "
-                "(%" PRIu64 " handles left over), %" PRIu64 " failures\n", __func__, n, ms, avg, d[ZC_B_POOL]/VG_MIB, d[ZC_N_POOL],
-                d[ZC_B_PARK]/VG_MIB, d[ZC_N_PARK], d[ZC_B_REUSE]/VG_MIB, d[ZC_N_REUSE], d[ZC_B_NEW]/VG_MIB, d[ZC_N_NEW],
-                d[ZC_B_DROP]/VG_MIB, d[ZC_N_DROP], d[ZC_N_FAIL]);
+        const double other = std::max(0.0, ms - p.ret - p.free - p.trim - p.restore - p.unborrow - p.sreserve);
+        LLAMA_LOG_WARN("%s: [TAG_R40_VGUARD] zero-commit SMALL %" PRIu64 " in %.1f ms (%.1f on average): ret %.1f, free %.1f (unpin %.1f, "
+                "cudaFree %.1f), trim %.1f, restore %.1f, unborrow %.1f, reserve %.1f, other %.1f ms; the switch: %.0f MiB parked (%"
+                PRIu64 " handles), %.0f MiB mapped from the stash (%" PRIu64 " handles), new %.0f MiB (%" PRIu64 ") [new at SMALL, %.0f "
+                "MiB in %" PRIu64 " SMALL switches so far], %.0f MiB freed (%" PRIu64 " left over); the FULL period: the pool took %.0f MiB "
+                "(%" PRIu64 " growths), %.0f MiB parked (%" PRIu64 "), %.0f MiB mapped (%" PRIu64 "), new %.0f MiB (%" PRIu64 "), %.0f "
+                "MiB freed (%" PRIu64 "); %" PRIu64 " failures\n", __func__, n, ms, avg, p.ret, p.free, sw[ZC_HFREE_US]/1000.0,
+                sw[ZC_DFREE_US]/1000.0, p.trim, p.restore, p.unborrow, p.sreserve, other, sw[ZC_B_PARK]/VG_MIB, sw[ZC_N_PARK],
+                sw[ZC_B_REUSE]/VG_MIB, sw[ZC_N_REUSE], sw[ZC_B_NEW]/VG_MIB, sw[ZC_N_NEW], g_zc.new_small_b/VG_MIB, g_zc.new_small_n,
+                sw[ZC_B_DROP]/VG_MIB, sw[ZC_N_DROP], (pd[ZC_B_POOL] + sw[ZC_B_POOL])/VG_MIB, pd[ZC_N_POOL] + sw[ZC_N_POOL],
+                pd[ZC_B_PARK]/VG_MIB, pd[ZC_N_PARK], pd[ZC_B_REUSE]/VG_MIB, pd[ZC_N_REUSE], pd[ZC_B_NEW]/VG_MIB, pd[ZC_N_NEW],
+                pd[ZC_B_DROP]/VG_MIB, pd[ZC_N_DROP], sw[ZC_N_FAIL] + pd[ZC_N_FAIL]);
     }
 }
