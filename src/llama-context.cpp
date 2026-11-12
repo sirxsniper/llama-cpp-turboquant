@@ -7942,19 +7942,19 @@ void llama_context::moe_hot_fit_try() {
     // [TAG_FN_L8_KVLEND] the KV cache's unmapped cells are free VRAM in the fit above: the hot set holds them in layers that
     // give them back as the context grows (none: the hot set fails, the KV cache maps whole and the fit runs again)
     size_t kv_want = cbuf_tail > 0 ? llama_kv_lend_unmapped_bytes() : 0;
-    // [TAG_R40_LEND_PARTIAL] LLAMA_R40_LEND_PARTIAL=1: a lend the lend layers cannot hold whole (512K: 6192 MiB of KV + the
+    // [TAG_R40_LEND_PARTIAL] LLAMA_R40_LEND_PARTIAL=1 (default since v0.31.0): a lend the lend layers cannot hold whole (512K: 6192 MiB of KV + the
     // projector + the idle slots' share, about 7 GB of room) keeps what they hold instead of mapping the KV cache whole and
     // fitting again without any lend (0: as v0.30.0)
     const int r40_partial = [] {
         const char * e = getenv("LLAMA_R40_LEND_PARTIAL");
-        return e ? atoi(e) : 0;
+        return e ? atoi(e) : 1; // [TAG_R40_REL] v0.31.0: on by default
     }();
-    // [TAG_R40_LEND_SPREAD] LLAMA_R40_LEND_SPREAD=1: the slot lend sizes every layer from the whole budget and lends out of
+    // [TAG_R40_LEND_SPREAD] LLAMA_R40_LEND_SPREAD=1 (default since v0.31.0): the slot lend sizes every layer from the whole budget and lends out of
     // the lend layers' own slots, so the lend spreads over every trunk layer below the tail and the stream's range (0: a
     // base cut for the lend and its slots on top of the lowest layers, as v0.30.0)
     const bool r40_spread = [] {
         const char * e = getenv("LLAMA_R40_LEND_SPREAD");
-        return e && atoi(e) > 0;
+        return e ? atoi(e) > 0 : true; // [TAG_R40_REL] v0.31.0: on by default
     }();
     // [TAG_FN_L17_VISION_LEND] the parked projector's VRAM is free in the fit above too: it rides on the same lend (the hot
     // set gives it back for each encode); with no lend to carry it, the budget leaves it free (the projector's own VRAM)
