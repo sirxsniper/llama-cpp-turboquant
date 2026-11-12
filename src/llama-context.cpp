@@ -7949,6 +7949,13 @@ void llama_context::moe_hot_fit_try() {
         const char * e = getenv("LLAMA_R40_LEND_PARTIAL");
         return e ? atoi(e) : 0;
     }();
+    // [TAG_R40_LEND_SPREAD] LLAMA_R40_LEND_SPREAD=1: the slot lend sizes every layer from the whole budget and lends out of
+    // the lend layers' own slots, so the lend spreads over every trunk layer below the tail and the stream's range (0: a
+    // base cut for the lend and its slots on top of the lowest layers, as v0.30.0)
+    const bool r40_spread = [] {
+        const char * e = getenv("LLAMA_R40_LEND_SPREAD");
+        return e && atoi(e) > 0;
+    }();
     // [TAG_FN_L17_VISION_LEND] the parked projector's VRAM is free in the fit above too: it rides on the same lend (the hot
     // set gives it back for each encode); with no lend to carry it, the budget leaves it free (the projector's own VRAM)
     const size_t vis      = vis_lend_parked_bytes(model);
@@ -7977,6 +7984,11 @@ void llama_context::moe_hot_fit_try() {
     if (lend_want > 0) {
         llama_moe_hot_set_kv_lend(lend_want, llama_prefill_stream_lend_bytes(this), (int) model.hparams.n_layer());
         llama_moe_hot_set_kv_partial(r40_partial >= 1 && kv_want > 0); // [TAG_R40_LEND_PARTIAL]
+        llama_moe_hot_set_kv_spread(r40_spread && kv_want > 0); // [TAG_R40_LEND_SPREAD]
+        if (r40_spread && kv_want > 0) {
+            LLAMA_LOG_INFO("moe-hot: [TAG_R40_LEND_SPREAD] the %.0f MiB lend comes out of the lend layers' own slots (every layer "
+                    "sized from the whole budget)\n", lend_want/MiB);
+        }
         llama_moe_hot_set_cb_borrow(cbuf_tail > 0 ? l21_extra : 0); // [TAG_FN_L21_BIGUB]
         // [TAG_R34_F_VISFLAT] the projector's slots out of the lend layers' own counts (LLAMA_R34_VISFLAT=0: on top, v0.26.6)
         const char * vf = getenv("LLAMA_R34_VISFLAT");
@@ -7991,6 +8003,7 @@ void llama_context::moe_hot_fit_try() {
     if (lend_want > 0) {
         llama_moe_hot_set_kv_lend(0, 0, 0);
         llama_moe_hot_set_kv_partial(false); // [TAG_R40_LEND_PARTIAL]
+        llama_moe_hot_set_kv_spread(false); // [TAG_R40_LEND_SPREAD]
         llama_moe_hot_set_cb_borrow(0); // [TAG_FN_L21_BIGUB]
         llama_moe_hot_set_vis_part(0); // [TAG_R34_F_VISFLAT]
         if (hot_ok && r40_partial >= 1 && kv_want > 0 && llama_moe_hot_kv_bytes() < lend_want) {

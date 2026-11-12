@@ -146,6 +146,9 @@ void     llama_moe_hot_set_kv_lend(size_t want, size_t keep, int n_trunk);
 // [TAG_R40_LEND_PARTIAL] before the init (with _set_kv_lend): a slot lend whose segments still fall short at the last retry
 // keeps what they hold (llama_moe_hot_kv_bytes() < want) instead of failing; false (default): it fails, as v0.30.0
 void     llama_moe_hot_set_kv_partial(bool on);
+// [TAG_R40_LEND_SPREAD] before the init (with _set_kv_lend): every layer's count from the whole budget, the lend out of the
+// lend layers' own slots (more lend layers, each as big as the others); false (default): base cut + lend on top, as v0.30.0
+void     llama_moe_hot_set_kv_spread(bool on);
 // [TAG_FN_L21_BIGUB] with the slot lend: the next init also puts `bytes` of the lend layers' base slots over segments of
 // their own (the slots per layer unchanged); _cb_borrow_bytes: what it placed (0: none); _cb_borrow (the owner's graphs
 // synchronized, its switch to FULL): those segments go out for a wide compute reserve, returns the bytes out (0: none);
