@@ -3786,7 +3786,7 @@ private:
             // [TAG_R40_NP2KVPARK] T2: the other idle slots' attention cells go to host memory, then this slot's cells come back
             // (into the bottom of the pool), before keepctx, the attach and the prompt cache read this slot's sequence
             if (kvpk.on) {
-                kvpark_compact(ret, /*launch =*/ true, l22_leader ? l22_leader->id : -1, l24_pre.donor);
+                kvpark_compact(ret, /*launch =*/ true, l22_leader ? l22_leader->id : -1, l24_pre.donor, task.params.n_predict);
             }
 
             // [TAG_R35_NP2PARK] the state reads of this launch (keepctx store / restore, checkpoints) see how many other slots
@@ -5376,6 +5376,7 @@ private:
         int32_t  min_cells = 4096;
         int32_t  reloc     = 16384;
         int64_t  idle_us   = 1500000;
+        int32_t  min_predict = 256;
         size_t   max_bytes = (size_t) 4096 << 20;
         int64_t  t1_last   = 0;   // the newest t_last_used T1 already ran for
         uint64_t n_t1      = 0;
@@ -5411,12 +5412,14 @@ private:
         kvpk.min_cells = (int32_t) std::max<long long>(1, num("LLAMA_R40_NP2KVPARK_MIN_CELLS", 4096));
         kvpk.reloc     = (int32_t) std::max<long long>(0, num("LLAMA_R40_NP2KVPARK_RELOC", 16384));
         kvpk.idle_us   = std::max<long long>(0, num("LLAMA_R40_NP2KVPARK_IDLE_MS", 1500)) * 1000;
+        kvpk.min_predict = (int32_t) std::max<long long>(0, num("LLAMA_R40_NP2KVPARK_MIN_PREDICT", 256));
         kvpk.max_bytes = (size_t) std::max<long long>(0, num("LLAMA_R40_NP2KVPARK_MAX_MIB", 4096)) << 20;
         queue_tasks.on_idle([this]() { kvpark_idle_tick(); });
         SRV_INF("[TAG_R40_NP2KVPARK] idle slots' attention cells go to host memory: at a launch the other idle slots with >= %d "
                 "cells, a slot whose cells start at >= %d moves down%s; after %.1f s with every slot idle the same around the most "
-                "recently used slot; at most %.0f MiB of host memory (LLAMA_R40_NP2KVPARK=0: off)\n", kvpk.min_cells, kvpk.reloc,
-                kvpk.reloc > 0 ? "" : " (off)", kvpk.idle_us / 1e6, kvpk.max_bytes / 1048576.0);
+                "recently used slot; at most %.0f MiB of host memory; a launch asking for fewer than %d tokens parks nothing "
+                "(LLAMA_R40_NP2KVPARK=0: off)\n", kvpk.min_cells, kvpk.reloc, kvpk.reloc > 0 ? "" : " (off)", kvpk.idle_us / 1e6,
+                kvpk.max_bytes / 1048576.0, kvpk.min_predict);
     }
 
     // the attention cells of an idle slot go to the host; false: nothing changed (the slot keeps its cells)
@@ -5536,7 +5539,7 @@ private:
 
     // T2 (launch: `keep` takes a task now) and T1 (idle: keep = the most recently used slot). excl_*: donor slots whose cells
     // the launch takes ([TAG_FN_L22_SHAREKV] leader, [TAG_FN_L24_ATTACH] donor) stay
-    void kvpark_compact(server_slot * keep, bool launch, int excl_a = -1, int excl_b = -1) {
+    void kvpark_compact(server_slot * keep, bool launch, int excl_a = -1, int excl_b = -1, int32_t n_predict = -1) {
         if (!kvpk.on) {
             return;
         }
@@ -5546,7 +5549,13 @@ private:
                 other_busy = true;
             }
         }
+        // a short answer (LLAMA_R40_NP2KVPARK_MIN_PREDICT, 256 tokens) does not pay for a park and the restore after it
+        // (r40 turn 3: ~60-100 ms each way at 28K, about 1 ms per step back): the other slots stay, this slot still comes back
+        const bool short_task = launch && n_predict >= 0 && n_predict < kvpk.min_predict;
         for (auto & o : slots) {
+            if (short_task) {
+                break;
+            }
             if (&o == keep || o.id == excl_a || o.id == excl_b || o.kvp.on || o.parked || o.is_processing() || o.prompt.tokens.empty()) {
                 continue;
             }
@@ -5571,7 +5580,7 @@ private:
             }
             return;
         }
-        if (!other_busy && kvpk.reloc > 0 && !keep->prompt.tokens.empty()) {
+        if (!other_busy && !short_task && kvpk.reloc > 0 && !keep->prompt.tokens.empty()) {
             int32_t cmin = -1;
             int32_t cmax = -1;
             const int32_t n = llama_memory_attn_seq_cells_ext(ctx_tgt, keep->id, &cmin, &cmax);
