@@ -7986,8 +7986,8 @@ void llama_context::moe_hot_fit_try() {
         llama_moe_hot_set_kv_partial(r40_partial >= 1 && kv_want > 0); // [TAG_R40_LEND_PARTIAL]
         llama_moe_hot_set_kv_spread(r40_spread && kv_want > 0); // [TAG_R40_LEND_SPREAD]
         if (r40_spread && kv_want > 0) {
-            LLAMA_LOG_INFO("moe-hot: [TAG_R40_LEND_SPREAD] the %.0f MiB lend comes out of the lend layers' own slots (every layer "
-                    "sized from the whole budget)\n", lend_want/MiB);
+            LLAMA_LOG_INFO("moe-hot: [TAG_R40_LEND_SPREAD] if the plain sizing cannot hold the %.0f MiB lend, it comes out of the "
+                    "lend layers' own slots (every layer sized from the whole budget)\n", lend_want/MiB);
         }
         llama_moe_hot_set_cb_borrow(cbuf_tail > 0 ? l21_extra : 0); // [TAG_FN_L21_BIGUB]
         // [TAG_R34_F_VISFLAT] the projector's slots out of the lend layers' own counts (LLAMA_R34_VISFLAT=0: on top, v0.26.6)
