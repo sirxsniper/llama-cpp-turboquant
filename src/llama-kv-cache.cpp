@@ -3603,7 +3603,7 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
             if (mask_check) {
                 const size_t esz = dst->type == GGML_TYPE_F16 ? sizeof(ggml_fp16_t) : sizeof(float);
                 std::vector<uint8_t> ref((size_t) n_kv*n_tokens*esz);
-                const args_set_input_attn_mask a2 = { hparams, ubatch, v_cells, seq_to_stream, n_swa, swa_type, n_kv, n_stream, (int64_t) n_tokens };
+                const args_set_input_attn_mask a2 = { hparams, ubatch, v_cells, seq_to_stream, n_swa, swa_type, n_kv, n_stream, (int64_t) n_tokens, nullptr, false };
                 if (dst->type == GGML_TYPE_F16) {
                     set_input_attn_mask_impl<ggml_fp16_t>(a2, (ggml_fp16_t *) ref.data(), causal_attn);
                 } else {
@@ -3640,6 +3640,8 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
         /*.n_kv             =*/ n_kv,
         /*.n_stream         =*/ n_stream,
         /*.n_tps            =*/ n_tps,
+        /*.rows             =*/ nullptr,
+        /*.block_uniform    =*/ false,
     };
 
     if (dst->type == GGML_TYPE_F16) {
@@ -4147,8 +4149,6 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
     // Iterate and write all the keys first, each row is a cell
     // Get whole range at a time
     for (const auto & layer : layers) {
-        const uint32_t il = layer.il;
-
         auto * k = layer.k_stream[cr.strm];
 
         // Use actual tensor width (may be padded for turbo types: e.g. 576→640)
@@ -4172,8 +4172,6 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
 
     if (!v_trans) {
         for (const auto & layer : layers) {
-            const uint32_t il = layer.il;
-
             auto * v = layer.v_stream[cr.strm];
             if (!v) {
                 continue;

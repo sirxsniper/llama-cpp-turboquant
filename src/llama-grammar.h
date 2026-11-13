@@ -171,13 +171,13 @@ struct llama_grammar {
     // bytes (n_remain == 0), the overwhelmingly common case, so it is computed once per id.
     // cp_cache is sized once up front so it never reallocates and the pointers handed to
     // llama_grammar_reject_candidates stay valid for the whole call.
-    mutable std::vector<std::vector<uint32_t>> cp_cache;
-    mutable std::vector<llama_partial_utf8>    cp_cache_tail;
-    mutable std::vector<bool>                  cp_cached;
+    mutable std::vector<std::vector<uint32_t>> cp_cache {};
+    mutable std::vector<llama_partial_utf8>    cp_cache_tail {};
+    mutable std::vector<bool>                  cp_cached {};
 
     // Scratch reused across calls so the per-call reserve() stops re-allocating.
-    mutable std::vector<std::pair<std::vector<uint32_t>, llama_partial_utf8>> scratch_decoded;
-    mutable llama_grammar_candidates                                          scratch_candidates;
+    mutable std::vector<std::pair<std::vector<uint32_t>, llama_partial_utf8>> scratch_decoded {};
+    mutable llama_grammar_candidates                                          scratch_candidates {};
 };
 
 //

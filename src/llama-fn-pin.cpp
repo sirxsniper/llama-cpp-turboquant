@@ -1092,7 +1092,7 @@ bool fn_ranges_run(fn_pin_state * st) {
             }
             const int64_t tr = fn_now_us();
             uint64_t dev = 0;
-            const bool done = fn_register(st, (void *) r.p, r.n, &dev);
+            const bool done = fn_register(st, const_cast<uint8_t *>(r.p), r.n, &dev);
             const int64_t dt = fn_now_us() - tr;
             if (!done) {
                 st->n_refused.fetch_add(1);
@@ -1658,7 +1658,7 @@ void llama_fn_pin_on_ready(const llama_model * model) {
             LLAMA_LOG_WARN("%s: [TAG_FN_L22_PIN] overlapping ranges in the plan were dropped\n", __func__);
         }
         for (int i = 0; i < n_rng; ++i) {
-            st->reg.set_unit(i, (void *) st->plan.ranges[i].p, st->plan.ranges[i].n);
+            st->reg.set_unit(i, const_cast<uint8_t *>(st->plan.ranges[i].p), st->plan.ranges[i].n);
         }
         // [TAG_FN_L23_PINFIX] no marks before registration: the warm pass reads every streamed expert as without pins, the
         // thread pins what is resident after it (fn_ranges_run marks complete groups)

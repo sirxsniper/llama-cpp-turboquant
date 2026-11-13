@@ -3275,6 +3275,7 @@ struct llama_model_kimi_k31 : public llama_model_base {
 
 struct llama_model_glm5_next : public llama_model_base {
     llama_model_glm5_next(const struct llama_model_params & params) : llama_model_base(params) {}
+    [[noreturn]]
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
 

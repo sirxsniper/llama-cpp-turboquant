@@ -1348,6 +1348,8 @@ void hot_copy(const moe_cache * mc, void * dst, const void * src, size_t n) {
         _mm_sfence(); // the streamed lines are in memory before the DMA is queued
         return;
     }
+#else
+    GGML_UNUSED(mc);
 #endif
     memcpy(dst, src, n);
 }

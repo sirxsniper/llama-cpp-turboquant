@@ -20,14 +20,16 @@
 #include "ggml-cuda.h"   // GPU scoring: triattention_gpu_init, _score_head, etc.
 
 #ifndef GGML_USE_CUDA
-// [TAG_TRIATT_NOCUDA] builds without the CUDA backend: GPU init fails and scoring stays on the CPU
-#define triattention_gpu_init(...)           ((triattention_gpu_state *) nullptr)
-#define triattention_gpu_alloc_scores(...)   ((float *) nullptr)
-#define triattention_gpu_free(...)           ((void) 0)
-#define triattention_gpu_free_dev(...)       ((void) 0)
-#define triattention_gpu_upload_cells(...)   ((void) 0)
-#define triattention_gpu_score_head(...)     ((void) 0)
-#define triattention_gpu_scores_to_host(...) ((void) 0)
+// [TAG_TRIATT_NOCUDA] builds without the CUDA backend: GPU init fails and scoring stays on the CPU. The stubs take
+// their arguments, so the GPU path's locals count as used
+template <typename... T> static inline void triattention_nocuda(const T &...) {}
+#define triattention_gpu_init(...)           (triattention_nocuda(__VA_ARGS__), (triattention_gpu_state *) nullptr)
+#define triattention_gpu_alloc_scores(...)   (triattention_nocuda(__VA_ARGS__), (float *) nullptr)
+#define triattention_gpu_free(...)           triattention_nocuda(__VA_ARGS__)
+#define triattention_gpu_free_dev(...)       triattention_nocuda(__VA_ARGS__)
+#define triattention_gpu_upload_cells(...)   triattention_nocuda(__VA_ARGS__)
+#define triattention_gpu_score_head(...)     triattention_nocuda(__VA_ARGS__)
+#define triattention_gpu_scores_to_host(...) triattention_nocuda(__VA_ARGS__)
 #endif
 
 // Block types and dequant declarations are in ggml-common.h (ggml/src/)
@@ -558,6 +560,8 @@ static void triattention_dequant_kv_head(
     uint32_t             n_kv_heads,
     bool                 need_wht_inv)
 {
+    (void)n_kv_heads;
+
     const ggml_type k_type = k_tensor->type;
     const uint64_t  n_embd_k_gqa = k_tensor->ne[0];  // total K embedding (all KV heads)
     const size_t    row_bytes = ggml_row_size(k_type, n_embd_k_gqa);
@@ -1034,6 +1038,9 @@ int32_t triattention_prune(
     // Get K tensor type from the first layer (assume uniform type)
     // We access the cache's layers array through the public interface
     const uint32_t n_kv_heads = cal->num_kv_heads;
+    (void)fc;
+    (void)padded_hd;
+    (void)n_kv_heads;
 
     // Determine if inverse WHT is needed for this cache type
     // turbo2_0, turbo3_0: dequant output is in WHT-rotated space → need R^T

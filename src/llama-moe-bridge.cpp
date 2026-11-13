@@ -648,7 +648,7 @@ static bool br_run(const ggml_moe_bridge_job * j, void * ud) {
             t.nb[1] = sizeof(int32_t)*j->n_used;
             t.nb[2] = t.nb[1]*j->n_tokens;
             t.nb[3] = t.nb[2];
-            t.data  = (void *) obs_ids;
+            t.data  = const_cast<int32_t *>(obs_ids);
             obs(c.gate_name.c_str(), &t, obs_ud);
         }
 
@@ -728,7 +728,7 @@ static bool br_run(const ggml_moe_bridge_job * j, void * ud) {
         br->disp_ns.fetch_add((uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(t0 - t_take).count(), std::memory_order_relaxed);
         br->n_disp.fetch_add(1, std::memory_order_relaxed);
     }
-    ggml_cpu_moe_job job = { layer, j->n_tokens, j->n_used, j->x, j->ids, j->w, j->out };
+    ggml_cpu_moe_job job = { layer, j->n_tokens, j->n_used, j->x, j->ids, j->w, j->out, 0, 0.0f, 0.0f, 0, 0, nullptr };
     if ((j->flags & GGML_MOE_BRIDGE_JOB_TAIL) && (br->tail_rank > 0 || br->tail_w > 0.0f)) {
         // [TAG_FN_L22_X_TAILSKIP] the graph flagged a decode window: the pool drops the tail of its cold experts (the
         // observer above saw every id, so the hot set learns as before)

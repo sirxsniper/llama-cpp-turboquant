@@ -589,6 +589,7 @@ void res_ssd_plan(res_table * t, int stage, size_t lw_room = SIZE_MAX) {
 #else
     GGML_UNUSED(t);
     GGML_UNUSED(stage);
+    GGML_UNUSED(lw_room);
 #endif
 }
 
