@@ -2293,7 +2293,9 @@ llama_pfs_counters llama_prefill_stream_get_counters() {
         return {};
     }
     std::lock_guard<std::mutex> lk(s->mtx);
-    return s->ctr;
+    llama_pfs_counters ctr = s->ctr;
+    ctr.pending = s->queue.size(); // the running job stays at the front until it is done
+    return ctr;
 }
 
 size_t llama_prefill_stream_lend_bytes(const void * owner) {

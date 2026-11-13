@@ -872,6 +872,16 @@ static void test_pfs(t_model & m, int n_bufs, bool wrap, bool partial, int cache
             all_same = all_same && s;
             TCHECK(s, "[%s] ubatch %d layer %d: bank chain == host chain", name, ub, l);
         }
+        // a wrap copy that is still running when the next ubatch begins is kept and one still queued is replaced, but only
+        // a finished one counts as reused. On a busy machine none may have finished in time, so before the last ubatch
+        // wait for the streamer: the check of the wrap copy below then does not depend on the timing. The earlier
+        // ubatches keep theirs
+        if (wrap && !partial && ub == n_ub - 2) {
+            for (int i = 0; i < 10000 && llama_prefill_stream_get_counters().pending > 0; ++i) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            TCHECK(llama_prefill_stream_get_counters().pending == 0, "[%s] the streamer finished the wrap copy", name);
+        }
     }
     const llama_pfs_counters k = llama_prefill_stream_get_counters();
     printf("  [%s] %llu ubatches, %llu layer copies, %.1f MiB, %llu reused, gates waited %.1f ms, bitwise %s\n", name,
