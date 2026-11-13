@@ -141,6 +141,9 @@ struct kvl_state {
 // work on kvl_cur, which each entry point points at its cache's state; the hot set sees the sum of both
 kvl_state   g_kvls[2];
 kvl_state * kvl_cur = &g_kvls[0];
+// a lend was made in this entry: one per entry and process, as the hot set's fit that sets the hooks runs once per process
+// (a later context's KV cache is allocated whole)
+bool        g_kvls_used[2] = {};
 #define g_kvl (*kvl_cur)
 
 size_t kvl_round_up(size_t x, size_t g) {
@@ -284,7 +287,7 @@ static ggml_backend_buffer_t kvl_alloc(const llama_kv_cache * kv, ggml_context *
         const std::set<const ggml_tensor *> & base, uint32_t kv_size, uint32_t init_cells, uint32_t chunk) {
     kvl_state * fs = nullptr; // [TAG_FN_L10_KVLEND2] a free state
     for (auto & s : g_kvls) {
-        if (s.kv == nullptr && s.buf == nullptr) {
+        if (s.kv == nullptr && s.buf == nullptr && !g_kvls_used[&s - g_kvls]) {
             fs = &s;
             break;
         }
@@ -387,6 +390,7 @@ static ggml_backend_buffer_t kvl_alloc(const llama_kv_cache * kv, ggml_context *
         return fail();
     }
     g_kvl.kv         = kv;
+    g_kvls_used[kvl_cur - g_kvls] = true;
     g_kvl.init_bytes = kvl_mapped_total();
     for (const auto & r : g_kvl.regs) {
         g_kvl.full_bytes += kvl_bytes_for(r, kv_size);
@@ -621,6 +625,11 @@ uint32_t llama_kv_cache::kvl_need() const {
 bool llama_kv_cache::kvl_owns(ggml_backend_buffer_t buf) const {
     const kvl_state * ks = kvl_find(this); // [TAG_FN_L10_KVLEND2]
     return ks != nullptr && ks->buf == buf;
+}
+
+uint32_t llama_kv_cache::kvl_cells() const {
+    const kvl_state * ks = kvl_find(this);
+    return ks == nullptr || ks->whole ? std::numeric_limits<uint32_t>::max() : ks->cells;
 }
 
 void llama_kv_cache::kvl_clear() const {
@@ -1409,6 +1418,12 @@ llama_kv_cache::llama_kv_cache(
 }
 
 llama_kv_cache::~llama_kv_cache() {
+    // [TAG_FN_L8_KVLEND] the lend's state goes with its cache: no later kvl_find (a cache at this address) reaches the
+    // freed buffer or tensors, and the hooks' owner goes too
+    if (kvl_state * ks = kvl_find(this)) {
+        *ks = kvl_state();
+    }
+
     triattention_free(triattention_st);
     triattention_st = nullptr;
 }
@@ -4673,7 +4688,7 @@ void llama_kv_cache::state_clear(llama_seq_id seq_id) {
 }
 
 // the cleared ranges mirror the write pattern of state_read_data() - keep both in sync
-void llama_kv_cache::state_clear(llama_seq_id seq_id, uint32_t strm, const slot_info & sinfo) {
+void llama_kv_cache::state_clear(llama_seq_id seq_id, uint32_t strm, const slot_info & sinfo_all) {
     if (seq_id == -1) {
         clear(true);
         return;
@@ -4682,9 +4697,23 @@ void llama_kv_cache::state_clear(llama_seq_id seq_id, uint32_t strm, const slot_
     seq_rm(seq_id, -1, -1);
 
     // zero the K/V data of the failed restore attempt - the attention can still read the data of free cells
-    if (sinfo.empty() || sinfo.size() == 0) {
+    if (sinfo_all.empty() || sinfo_all.size() == 0) {
         return;
     }
+
+    // [TAG_FN_L8_KVLEND] a refused lend map (kvl_update in state_read_sinfo) leaves placed cells at or past the mapped
+    // cells: they have no memory, no write may reach them, and kvl_map_to clears them when they are mapped again
+    const uint32_t n_mapped = kvl_cells();
+    slot_info sinfo_mapped;
+    if (n_mapped < v_cells[strm].size()) {
+        sinfo_mapped = sinfo_all;
+        auto & idxs = sinfo_mapped.idxs[0];
+        idxs.erase(std::remove_if(idxs.begin(), idxs.end(), [n_mapped](uint32_t i) { return i >= n_mapped; }), idxs.end());
+        if (idxs.empty()) {
+            return;
+        }
+    }
+    const slot_info & sinfo = sinfo_mapped.empty() ? sinfo_all : sinfo_mapped;
 
     const auto & cells = v_cells[strm];
 
