@@ -795,6 +795,21 @@ private:
     static void   r35_hook_give(void * user, size_t bytes);
     static void   r35_hook_sync(void * user);
     static bool   r35_hook_idle(void * user);
+    // [TAG_R40_VGUARD] the WDDM paging guard (llama-fn-vguard.h): tried once after the hot set's fit, on for its owner only
+    bool     vg_tried = false;
+    bool     vg_on    = false;
+    void     vg_arm_try();
+    // [TAG_R40_VGUARD] zero-commit (R40-VGUARD-2): on for the hot set's owner with the compute-buffer switch; the FULL period's
+    // scope is open from the FULL switch's tail release to the end of the SMALL switch
+    bool     zc_on      = false;
+    int      zc_full_id = 0; // the FULL period's scope (0: none open)
+    void     zc_full_close();
+    // [TAG_R40_VGUARD] R40-VGUARD-3 C1: zero-commit arms at the load's end (fn_ready) for its prewarm, else with the guard at the
+    // first decode after the fit
+    bool     zc_tried    = false;
+    bool     zc_pw_tried = false;
+    void     zc_arm_try();
+    void     zc_prewarm_try();
     // [TAG_FN_L22_ENDOVERLAP] a prompt ended in FULL without the eager switch: the next narrow batch goes SMALL, async
     bool     l22_end_pending = false;
     int      l22_first_n     = 0;    // decode calls still counted after a prompt's switch (first 8)

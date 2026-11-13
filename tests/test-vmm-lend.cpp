@@ -7,6 +7,12 @@
 //      free memory moves by the tail each time (the VRAM really goes back);
 //   4. the pool trim between CUDA-graph runs of one graph: the pool gives its memory back, the captured graphs are dropped,
 //      the next runs give the same bytes.
+//   5. [TAG_R40_VGUARD] zero-commit: segments unmapped with the parking unmap inside a scope stay with the driver (free memory
+//      unchanged) and carry an ordinary buffer allocated in a window (the arena) and the pool's growth, come back into the
+//      VMM buffer by the next map (no new memory), and the end of the scope frees the rest; the chain's bytes stay the same.
+//   6. [TAG_R40_VGUARD] R40-VGUARD-3: the prewarm proc maps every parked handle into the arena, syncs and parks them again
+//      (the stash and the free memory unchanged, the handles map back with no new memory and hold data); the fit proc names a
+//      handle of the newest scope only; a map inside a nested scope takes the nested scope's handle before the outer one's.
 // Run it under compute-sanitizer memcheck first (a read of an unmapped range is reported there). Built, not registered with
 // ctest: it needs the GPU. Exit code 0 iff every check passes; prints SKIPPED without a CUDA device with these functions.
 
@@ -44,6 +50,15 @@ typedef bool                  (*vmm_map_t)(ggml_backend_buffer_t, size_t, size_t
 typedef size_t                (*vmm_mapped_t)(ggml_backend_buffer_t);
 typedef void                  (*pool_stats_t)(ggml_backend_t, size_t *, size_t *);
 typedef size_t                (*pool_trim_t)(ggml_backend_t, size_t);
+typedef bool                  (*zc_enable_t)(ggml_backend_dev_t, bool);   // [TAG_R40_VGUARD]
+typedef int                   (*zc_delta_t)(ggml_backend_dev_t, int);
+typedef int                   (*zc_stats_t)(ggml_backend_dev_t, uint64_t *, int);
+typedef bool                  (*zc_prewarm_t)(ggml_backend_dev_t, uint64_t *);      // [TAG_R40_VGUARD] R40-VGUARD-3
+typedef size_t                (*zc_fit_t)(ggml_backend_dev_t, size_t, size_t);
+// the stats order of ggml-cuda.cu's ggml_cuda_zc_stat
+enum { ZC_N_PARK, ZC_B_PARK, ZC_N_REUSE, ZC_B_REUSE, ZC_N_NEW, ZC_B_NEW, ZC_N_DROP, ZC_B_DROP, ZC_N_FAIL, ZC_N_ARENA, ZC_B_ARENA,
+       ZC_N_POOL, ZC_B_POOL, ZC_B_STASH, ZC_US,
+       ZC_HOST_US, ZC_HOST_B, ZC_HOST_N, ZC_HFREE_US, ZC_DEV_US, ZC_DEV_B, ZC_DEV_N, ZC_DFREE_US, ZC_NST };
 
 static constexpr int64_t N_EMBD  = 512;
 static constexpr int64_t N_FF    = 256;
@@ -385,6 +400,230 @@ int main() {
         TCHECK(same_bytes(yw0, yw1, yw0.size()), "the wide product gives the same bytes after the trim");
         ggml_backend_buffer_free(bw);
         ggml_free(cw);
+    }
+
+    // (5) [TAG_R40_VGUARD] zero-commit
+    auto zc_enable = (zc_enable_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_vmm_zc_enable");
+    auto zc_scope  = (zc_delta_t)  ggml_backend_reg_get_proc_address(reg, "ggml_backend_vmm_zc_scope");
+    auto zc_window = (zc_delta_t)  ggml_backend_reg_get_proc_address(reg, "ggml_backend_vmm_zc_window");
+    auto zc_stats  = (zc_stats_t)  ggml_backend_reg_get_proc_address(reg, "ggml_backend_vmm_zc_stats");
+    auto unpark_f  = (vmm_map_t)   ggml_backend_reg_get_proc_address(reg, "ggml_backend_vmm_buffer_unmap_park");
+    if (zc_enable && zc_scope && zc_window && zc_stats && unpark_f && zc_enable(dev, true)) {
+        const size_t MiB = 1048576;
+        auto st = [&](uint64_t * s) { TCHECK(zc_stats(dev, s, ZC_NST) >= ZC_NST, "zero-commit stats"); };
+        uint64_t s0[ZC_NST] = {}, s1[ZC_NST] = {}, s2[ZC_NST] = {}, s3[ZC_NST] = {}, s4[ZC_NST] = {};
+        // a lend buffer of three separately mapped segments (64 + 64 + 32 MiB, rounded to the granularity)
+        const size_t a = (64*MiB + gran - 1) / gran * gran, c = (32*MiB + gran - 1) / gran * gran;
+        const size_t zsz = 2*a + c;
+        ggml_backend_buffer_t zb = alloc_f(buft, zsz);
+        TCHECK(zb && map_f(zb, 0, a) && map_f(zb, a, a) && map_f(zb, 2*a, c), "(5) the lend buffer");
+        ggml_init_params ipz = { ggml_tensor_overhead() * 2, nullptr, true };
+        ggml_context * cz = ggml_init(ipz);
+        ggml_tensor * zr = ggml_new_tensor_1d(cz, GGML_TYPE_I8, (int64_t) zsz);
+        TCHECK(ggml_backend_tensor_alloc(zb, zr, ggml_backend_buffer_get_base(zb)) == GGML_STATUS_SUCCESS, "(5) raw view");
+        // outside a scope the parking unmap frees (v0.30.0)
+        ggml_backend_synchronize(backend);
+        size_t f_a = dev_free(dev);
+        TCHECK(unpark_f(zb, 2*a, c), "(5) unmap_park without a scope");
+        size_t f_b = dev_free(dev);
+        TCHECK(f_b + gran >= f_a + c, "(5) without a scope the memory goes back (free %.1f -> %.1f MiB)", f_a/1048576.0, f_b/1048576.0);
+        TCHECK(map_f(zb, 2*a, c), "(5) map the third segment again");
+        trim_f(backend, 0);
+        st(s0);
+        // inside a scope: parked, the free memory stays
+        const int sid = zc_scope(dev, 0);
+        TCHECK(sid > 0, "(5) scope open");
+        f_a = dev_free(dev);
+        TCHECK(unpark_f(zb, 0, zsz), "(5) park the three segments");
+        f_b = dev_free(dev);
+        st(s1);
+        TCHECK(s1[ZC_N_PARK] - s0[ZC_N_PARK] == 3 && s1[ZC_B_STASH] == zsz, "(5) 3 handles parked (%" PRIu64 "), stash %.1f MiB",
+                s1[ZC_N_PARK] - s0[ZC_N_PARK], s1[ZC_B_STASH]/1048576.0);
+        TCHECK(f_b <= f_a + gran, "(5) parked memory stays with us (free %.1f -> %.1f MiB)", f_a/1048576.0, f_b/1048576.0);
+        // an ordinary buffer in a window: from the stash (64 + 64 for 100 MiB), no new memory
+        TCHECK(zc_window(dev, +1) == 1, "(5) window open");
+        ggml_backend_buffer_t ab = ggml_backend_buft_alloc_buffer(buft, 100*MiB);
+        TCHECK(zc_window(dev, -1) == 0, "(5) window closed");
+        const size_t f_c = dev_free(dev);
+        st(s2);
+        TCHECK(ab != nullptr && s2[ZC_N_ARENA] - s1[ZC_N_ARENA] == 1 && s2[ZC_B_NEW] == s1[ZC_B_NEW] && s2[ZC_B_STASH] == c,
+                "(5) the arena buffer from 2 handles (arena +%" PRIu64 ", new %.1f MiB, stash %.1f MiB left)",
+                s2[ZC_N_ARENA] - s1[ZC_N_ARENA], (s2[ZC_B_NEW] - s1[ZC_B_NEW])/1048576.0, s2[ZC_B_STASH]/1048576.0);
+        TCHECK(f_c + gran >= f_b && f_c <= f_b + gran, "(5) the arena buffer needed no new memory (free %.1f -> %.1f MiB)",
+                f_b/1048576.0, f_c/1048576.0);
+        if (ab) {
+            // the arena buffer holds data like any buffer
+            ggml_context * ca = ggml_init(ipz);
+            ggml_tensor * at = ggml_new_tensor_1d(ca, GGML_TYPE_F32, (int64_t) (100*MiB/sizeof(float)));
+            TCHECK(ggml_backend_tensor_alloc(ab, at, ggml_backend_buffer_get_base(ab)) == GGML_STATUS_SUCCESS, "(5) arena tensor");
+            std::vector<float> pat(1 << 20), back(1 << 20);
+            for (size_t i = 0; i < pat.size(); ++i) {
+                pat[i] = (float) i * 0.5f;
+            }
+            const size_t last = ggml_nbytes(at) - pat.size()*sizeof(float);
+            ggml_backend_tensor_set(at, pat.data(), 0, pat.size()*sizeof(float));
+            ggml_backend_tensor_set(at, pat.data(), last, pat.size()*sizeof(float));
+            ggml_backend_tensor_get(at, back.data(), last, back.size()*sizeof(float));
+            TCHECK(memcmp(pat.data(), back.data(), pat.size()*sizeof(float)) == 0, "(5) arena buffer data round trip");
+            ggml_free(ca);
+        }
+        // the pool's growth inside the scope takes the 32 MiB handle when it covers it
+        {
+            ggml_init_params ipw = { ggml_tensor_overhead() * 8 + ggml_graph_overhead(), nullptr, true };
+            ggml_context * cw = ggml_init(ipw);
+            ggml_tensor * w  = ggml_new_tensor_2d(cw, GGML_TYPE_Q4_K, N_EMBD, 1024);
+            ggml_tensor * xw = ggml_new_tensor_2d(cw, GGML_TYPE_F32, N_EMBD, 1024);
+            ggml_tensor * yw = ggml_mul_mat(cw, w, xw);
+            ggml_cgraph * gw = ggml_new_graph(cw);
+            ggml_build_forward_expand(gw, yw);
+            ggml_backend_buffer_t bw = ggml_backend_alloc_ctx_tensors_from_buft(cw, buft); // outside a window: cudaMalloc
+            std::vector<uint8_t> wq(ggml_nbytes(w), 0);
+            std::vector<float> xf((size_t) (N_EMBD * 1024), 0.25f);
+            ggml_backend_tensor_set(w,  wq.data(), 0, wq.size());
+            ggml_backend_tensor_set(xw, xf.data(), 0, xf.size() * sizeof(float));
+            TCHECK(ggml_backend_graph_compute(backend, gw) == GGML_STATUS_SUCCESS, "(5) the pool grows in the scope");
+            ggml_backend_synchronize(backend);
+            st(s3);
+            size_t res = 0, hwm = 0;
+            stats_f(backend, &res, &hwm);
+            printf("test-vmm-lend: (5) pool %.1f MiB (high-water %.1f), %" PRIu64 " growth(s) from the stash (%.1f MiB)\n",
+                    res/1048576.0, hwm/1048576.0, s3[ZC_N_POOL] - s2[ZC_N_POOL], (s3[ZC_B_POOL] - s2[ZC_B_POOL])/1048576.0);
+            ggml_backend_buffer_free(bw);
+            ggml_free(cw);
+        }
+        // back: the arena buffer and the pool's adopted chunk park again, the lend buffer's map takes them (no new memory)
+        if (ab) {
+            ggml_backend_buffer_free(ab);
+        }
+        trim_f(backend, 0);
+        st(s3);
+        TCHECK(s3[ZC_B_STASH] == zsz, "(5) every handle parked again (stash %.1f MiB)", s3[ZC_B_STASH]/1048576.0);
+        TCHECK(map_f(zb, 0, a) && map_f(zb, a, a) && map_f(zb, 2*a, c), "(5) the lend buffer mapped again");
+        st(s4);
+        TCHECK(s4[ZC_B_NEW] == s3[ZC_B_NEW] && s4[ZC_B_STASH] == 0 && mapped_f(zb) == zsz,
+                "(5) its segments came from the stash (new %.1f MiB, stash %.1f MiB)", (s4[ZC_B_NEW] - s3[ZC_B_NEW])/1048576.0,
+                s4[ZC_B_STASH]/1048576.0);
+        ggml_backend_tensor_memset(zr, 0x5a, 0, zsz);
+        std::vector<uint8_t> zz(1 << 16);
+        ggml_backend_tensor_get(zr, zz.data(), zsz - zz.size(), zz.size());
+        bool all = true;
+        for (uint8_t v : zz) {
+            all = all && v == 0x5a;
+        }
+        TCHECK(all, "(5) the remapped lend buffer holds data");
+        // a nested scope frees at its end what it parked and nobody took; the outer scope's handles stay
+        TCHECK(unpark_f(zb, 2*a, c), "(5) park the third segment in the outer scope");
+        {
+            const int sid2 = zc_scope(dev, 0);
+            TCHECK(sid2 > 0 && sid2 != sid, "(5) nested scope open");
+            TCHECK(unpark_f(zb, a, a), "(5) park the second segment in the nested scope");
+            const size_t f_n0 = dev_free(dev);
+            TCHECK(zc_scope(dev, sid2) == 1, "(5) the nested scope closed, the outer one stays");
+            const size_t f_n1 = dev_free(dev);
+            uint64_t s6[ZC_NST] = {};
+            st(s6);
+            TCHECK(s6[ZC_B_STASH] == c && f_n1 + gran >= f_n0 + a, "(5) the nested scope freed its %.1f MiB (stash %.1f MiB, free "
+                    "%.1f -> %.1f MiB)", a/1048576.0, s6[ZC_B_STASH]/1048576.0, f_n0/1048576.0, f_n1/1048576.0);
+        }
+        // a rest in the stash is freed at the scope's end
+        f_a = dev_free(dev);
+        TCHECK(zc_scope(dev, sid) == 0, "(5) scope closed");
+        f_b = dev_free(dev);
+        uint64_t s5[ZC_NST] = {};
+        st(s5);
+        TCHECK(s5[ZC_B_STASH] == 0 && f_b + gran >= f_a + c, "(5) the scope's end frees the rest (free %.1f -> %.1f MiB)",
+                f_a/1048576.0, f_b/1048576.0);
+        TCHECK(map_f(zb, a, a) && map_f(zb, 2*a, c), "(5) the parked segments mapped again (new memory, no scope)");
+        std::vector<float> r5 = g_all.run(backend, xv, iv);
+        TCHECK(same_bytes(r5, r_ref, r_ref.size()), "(5) the chain gives the reference bytes after the zero-commit moves");
+        printf("test-vmm-lend: (5) zero-commit: %" PRIu64 " parks, %" PRIu64 " handles reused (%.1f MiB), %" PRIu64 " arena buffers, "
+                "%.1f MiB new, %" PRIu64 " failures\n", s5[ZC_N_PARK] - s0[ZC_N_PARK], s5[ZC_N_REUSE] - s0[ZC_N_REUSE],
+                (s5[ZC_B_REUSE] - s0[ZC_B_REUSE])/1048576.0, s5[ZC_N_ARENA] - s0[ZC_N_ARENA], (s5[ZC_B_NEW] - s0[ZC_B_NEW])/1048576.0,
+                s5[ZC_N_FAIL] - s0[ZC_N_FAIL]);
+        TCHECK(s5[ZC_N_FAIL] == s0[ZC_N_FAIL], "(5) no zero-commit failure");
+        zc_enable(dev, false);
+        ggml_backend_buffer_free(zb);
+        ggml_free(cz);
+    } else {
+        printf("test-vmm-lend: (5) zero-commit SKIPPED (not offered on %s)\n", ggml_backend_dev_name(dev));
+    }
+
+    // (6) [TAG_R40_VGUARD] R40-VGUARD-3: the prewarm, the fit, the newest scope first
+    auto zc_prewarm = (zc_prewarm_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_vmm_zc_prewarm");
+    auto zc_fit     = (zc_fit_t)     ggml_backend_reg_get_proc_address(reg, "ggml_backend_vmm_zc_fit");
+    if (zc_enable && zc_scope && zc_stats && unpark_f && zc_prewarm && zc_fit && zc_enable(dev, true)) {
+        const size_t MiB = 1048576;
+        auto st = [&](uint64_t * s) { TCHECK(zc_stats(dev, s, ZC_NST) >= ZC_NST, "(6) zero-commit stats"); };
+        const size_t a = (64*MiB + gran - 1) / gran * gran, c = (32*MiB + gran - 1) / gran * gran;
+        const size_t zsz = 2*a + c;
+        ggml_backend_buffer_t zb = alloc_f(buft, zsz);
+        TCHECK(zb && map_f(zb, 0, a) && map_f(zb, a, a) && map_f(zb, 2*a, c), "(6) the lend buffer");
+        ggml_init_params ipz = { ggml_tensor_overhead() * 2, nullptr, true };
+        ggml_context * cz = ggml_init(ipz);
+        ggml_tensor * zr = ggml_new_tensor_1d(cz, GGML_TYPE_I8, (int64_t) zsz);
+        TCHECK(ggml_backend_tensor_alloc(zb, zr, ggml_backend_buffer_get_base(zb)) == GGML_STATUS_SUCCESS, "(6) raw view");
+        uint64_t s0[ZC_NST] = {}, s1[ZC_NST] = {}, s2[ZC_NST] = {}, s3[ZC_NST] = {};
+        uint64_t out[5] = {};
+        TCHECK(!zc_prewarm(dev, out), "(6) no prewarm outside a scope");
+        TCHECK(zc_fit(dev, gran, zsz) == 0, "(6) no fit outside a scope");
+        ggml_backend_synchronize(backend);
+        st(s0);
+        const int sid = zc_scope(dev, 0);
+        TCHECK(sid > 0, "(6) scope open");
+        TCHECK(unpark_f(zb, 0, zsz), "(6) park the three segments");
+        const size_t f0 = dev_free(dev);
+        const bool   pw = zc_prewarm(dev, out);
+        const size_t f1 = dev_free(dev);
+        st(s1);
+        TCHECK(pw && out[0] == zsz, "(6) the prewarm mapped %.1f of %.1f MiB (reserve %.3f, map %.3f, sync %.3f, park %.3f ms)",
+                out[0]/1048576.0, zsz/1048576.0, out[1]/1000.0, out[2]/1000.0, out[3]/1000.0, out[4]/1000.0);
+        TCHECK(s1[ZC_B_STASH] == zsz && s1[ZC_B_NEW] == s0[ZC_B_NEW] && s1[ZC_N_FAIL] == s0[ZC_N_FAIL],
+                "(6) the stash holds the same bytes after it (%.1f MiB), new %.1f MiB, failures %" PRIu64, s1[ZC_B_STASH]/1048576.0,
+                (s1[ZC_B_NEW] - s0[ZC_B_NEW])/1048576.0, s1[ZC_N_FAIL] - s0[ZC_N_FAIL]);
+        TCHECK(f1 + gran >= f0 && f1 <= f0 + gran, "(6) free memory unchanged by the prewarm (%.1f -> %.1f MiB)", f0/1048576.0,
+                f1/1048576.0);
+        TCHECK(zc_fit(dev, c, zsz) == c, "(6) fit: the exact size");
+        TCHECK(zc_fit(dev, gran, zsz) == c, "(6) fit: the smallest larger handle");
+        TCHECK(zc_fit(dev, c + gran, a - gran) == 0, "(6) fit: none within the room");
+        TCHECK(map_f(zb, 0, a), "(6) the first segment back from the stash");
+        {
+            const int sid2 = zc_scope(dev, 0);
+            TCHECK(sid2 > 0 && zc_fit(dev, gran, zsz) == 0, "(6) fit: a new nested scope offers no outer handle");
+            TCHECK(unpark_f(zb, 0, a), "(6) the first segment parked in the nested scope");
+            TCHECK(zc_fit(dev, c, zsz) == a, "(6) fit: the nested scope's handle, not the outer exact one");
+            TCHECK(zc_fit(dev, gran, c) == 0, "(6) fit: none of the nested scope's within the room");
+            TCHECK(map_f(zb, 0, a), "(6) the first segment mapped in the nested scope");
+            const size_t f2 = dev_free(dev);
+            TCHECK(zc_scope(dev, sid2) == 1, "(6) the nested scope closed");
+            const size_t f3 = dev_free(dev);
+            st(s2);
+            TCHECK(s2[ZC_B_STASH] == a + c && f3 + gran >= f2 && f3 <= f2 + gran, "(6) the map took the nested scope's handle (the "
+                    "outer ones stay: stash %.1f MiB, free %.1f -> %.1f MiB)", s2[ZC_B_STASH]/1048576.0, f2/1048576.0,
+                    f3/1048576.0);
+        }
+        TCHECK(map_f(zb, a, a) && map_f(zb, 2*a, c), "(6) the other segments back");
+        st(s3);
+        TCHECK(s3[ZC_B_NEW] == s0[ZC_B_NEW] && s3[ZC_B_STASH] == 0 && mapped_f(zb) == zsz, "(6) all from the stash (new %.1f MiB)",
+                (s3[ZC_B_NEW] - s0[ZC_B_NEW])/1048576.0);
+        ggml_backend_tensor_memset(zr, 0x6b, 0, zsz);
+        std::vector<uint8_t> zz(1 << 16);
+        bool all = true;
+        for (size_t at : { (size_t) 0, a, 2*a, zsz - zz.size() }) {
+            ggml_backend_tensor_get(zr, zz.data(), at, zz.size());
+            for (uint8_t v : zz) {
+                all = all && v == 0x6b;
+            }
+        }
+        TCHECK(all, "(6) the buffer holds data after the prewarm and the moves");
+        TCHECK(zc_scope(dev, sid) == 0, "(6) scope closed");
+        printf("test-vmm-lend: (6) prewarm %.1f MiB: reserve %.3f, map %.3f, sync %.3f, park %.3f ms; %" PRIu64 " failures\n",
+                out[0]/1048576.0, out[1]/1000.0, out[2]/1000.0, out[3]/1000.0, out[4]/1000.0, s3[ZC_N_FAIL] - s0[ZC_N_FAIL]);
+        TCHECK(s3[ZC_N_FAIL] == s0[ZC_N_FAIL], "(6) no zero-commit failure");
+        zc_enable(dev, false);
+        ggml_backend_buffer_free(zb);
+        ggml_free(cz);
+    } else {
+        printf("test-vmm-lend: (6) prewarm / fit SKIPPED (not offered on %s)\n", ggml_backend_dev_name(dev));
     }
 
     // the buffer goes, and its VRAM with it

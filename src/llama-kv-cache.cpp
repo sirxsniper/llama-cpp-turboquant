@@ -14,6 +14,7 @@
 #include "llama-fn-auto.h"            // [TAG_FN_L8_KVLEND] llama_fn_l3_flag
 #include "llama-fn-l22.h"             // [TAG_FN_L22_KVGROW] pins on an out-of-memory grow
 #include "llama-fn-l22-img.h"         // [TAG_FN_L22_IMGPASS] predecessor rule, keyed masks
+#include "llama-fn-vguard.h"           // [TAG_R40_VGUARD] zero-commit scope around a KV growth
 
 #include "ggml-turbot.h"
 
@@ -205,7 +206,15 @@ bool kvl_map_to(uint32_t cells) {
         // one map per chunk: a shrink can give back any chunk boundary (an unmap takes whole earlier maps)
         const size_t step = std::max(g_kvl.gran, kvl_round_up((size_t) std::max<uint32_t>(1, g_kvl.chunk) * r.row, g_kvl.gran));
         while (r.mapped < b) {
-            const size_t e = std::min(b, kvl_round_up(r.mapped + 1, step));
+            size_t e = std::min(b, kvl_round_up(r.mapped + 1, step));
+            // [TAG_R40_VGUARD] R40-VGUARD-3 C3: inside a growth's zero-commit scope, a handle that scope parked (a released group's
+            // range of the hot set) that is larger than this chunk is mapped whole (more cells of this region mapped early)
+            // instead of new memory for the chunk while the larger handle is freed at the scope's end; never past what the whole
+            // context maps (kvl_bytes_for at kv_size: the guard granule stays). 0 outside a scope / without zero-commit
+            if (const size_t hn = llama_fn_zc_fit(e - r.mapped, kvl_bytes_for(r, g_kvl.kv_size) - std::min(r.mapped,
+                    kvl_bytes_for(r, g_kvl.kv_size))); hn > e - r.mapped) {
+                e = r.mapped + hn;
+            }
             if (!g_kvl.map(g_kvl.buf, r.start + r.mapped, e - r.mapped)) {
                 kvl_set_cells();
                 return false;
@@ -530,6 +539,14 @@ bool llama_kv_cache::kvl_update(uint32_t need) const {
     }
     if (need > g_kvl.cells) {
         const int64_t t0 = ggml_time_us();
+        // [TAG_R40_VGUARD] zero-commit: the hot set's released group handles carry the new cells where their sizes fit (no new
+        // WDDM allocation); what the maps did not take is freed when this scope ends (a no-op without zero-commit)
+        struct zc_grow_scope {
+            int id = llama_fn_zc_open();
+            ~zc_grow_scope() {
+                llama_fn_zc_close(id);
+            }
+        } zc_grow;
         size_t after = 0;
         for (const auto & r : g_kvl.regs) {
             after += std::max(r.mapped, kvl_bytes_for(r, want));

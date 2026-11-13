@@ -195,6 +195,36 @@ bool   llama_moe_hot_np2_settled(size_t target);
 size_t llama_moe_hot_kv_release_kvside(const void * owner, size_t need);
 size_t llama_moe_hot_kv_restore_kvside(const void * owner, size_t keep);
 
+// [TAG_R40_VGUARD] the VRAM guard's share of the KV lend (src/llama-fn-vguard.h): whole KV groups given back to the driver
+// while another process needs VRAM, taken from the bottom like the idle slot's share and kept apart from it, the KV cache's
+// and the projector's. _vg_hold (the owner's graphs synchronized, or the prefill-stream gate with the device idle): holds at
+// least `target` bytes out (whole groups), groups it no longer needs come back (mapped, cleared, their slots fill from the
+// routing); returns what it holds. The KV cache, the projector and the idle slot's share take the guard's groups over (no
+// VRAM moves) when no mapped group is left. Only with the slot lend (else 0). _vg_group: the largest KV group's bytes (0: no
+// slot lend), _vg_free: the bytes of the KV groups mapped now (what a hold can still take)
+size_t llama_moe_hot_vg_hold(const void * owner, size_t target);
+size_t llama_moe_hot_vg_out();
+size_t llama_moe_hot_vg_group();
+size_t llama_moe_hot_vg_free();
+// [TAG_R40_VGUARD] zero-commit on (src/llama-fn-vguard.h): the tail's, the borrow's and the KV lend's releases (the projector's
+// take included) use the device's parking unmap, so inside a zero-commit scope their handles stay for the next map, the
+// FULL reserve or the pool instead of going back to the driver; the guard's share always frees
+void   llama_moe_hot_zc_set(bool on);
+// [TAG_R40_VGUARD] R40-VGUARD-3 C1, the zero-commit prewarm's dry cycle (the owner at the load's end: its graphs synchronized,
+// the hot set fit, the tail in, zero-commit on, a scope open): the whole tail's release (tables evicted, handles parked) and,
+// with `borrow` and the upload worker idle (no queued or running upload; at most wait_ms; settled), the borrow group's (its
+// release would drop uploads into its slots: it is left out while any is in flight), then map(ud) (the arena part),
+// then the tail's restore and the borrow's return, both refilled synchronously from the parked handles. The hot set's counters,
+// its burst window and the refill read-ahead flag are put back as they were. true: every part worked (false: zero-commit should
+// go off; a tail that could not map again stays out as after a failed SMALL restore and the next batch retries it)
+struct llama_moe_hot_prewarm_info {
+    double settle_ms = 0.0, release_ms = 0.0, borrow_ms = 0.0, map_ms = 0.0, restore_ms = 0.0, unborrow_ms = 0.0;
+    size_t tail_b = 0, borrow_b = 0;
+    bool   settled = false, restored = false;
+};
+bool   llama_moe_hot_zc_prewarm(const void * owner, bool borrow, bool (*map)(void * ud), void * ud, int wait_ms,
+        llama_moe_hot_prewarm_info * info);
+
 // [TAG_FN_AUTO] a hot set is configured for this model (LLAMA_MOE_HOT_PROFILE names a file or "even")
 bool llama_moe_hot_wanted(const llama_model & model);
 

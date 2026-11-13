@@ -22,6 +22,7 @@
 #include "llama-fn-l22-p10.h" // [TAG_FN_L22_P10]
 #include "llama-fn-auto.h"    // [TAG_FN_L22_STAGERS] llama_fn_l22_stagers
 #include "llama-fn-l22-p16.h" // [TAG_FN_L22_CPUSHARE]
+#include "llama-fn-vguard.h"  // [TAG_R40_VGUARD]
 
 #include "llama-impl.h"
 #include "llama-mmap.h" // [TAG_FN_L15_PFSAHEAD]
@@ -1620,6 +1621,9 @@ void pfs_gate_op(ggml_tensor * dst, int ith, int nth, void * ud) {
     if (ith != 0) {
         return;
     }
+    // [TAG_R40_VGUARD] (c) the decode thread between two layers (the earlier splits are done, the next not launched): when our
+    // VRAM is being demoted, the guard's groups go out here (release only, every stream idle, else the next gate)
+    llama_fn_vg_gate();
     pfs_layer * L = (pfs_layer *) ud;
     pfs_state * s = pfs_gate_state(L);
     const int64_t t0 = ggml_time_us();
