@@ -8620,6 +8620,7 @@ void llama_context::cbuf_free_compute() {
     }
     gf_res_prev_active = nullptr;
     const size_t max_nodes = graph_max_nodes(reserve_n_tokens());
+    sched.reset(); // [TAG_R39_SCHED_REUSE] a new scheduler with LLAMA_R39_SCHED_REUSE=1 too: a reused one keeps its buffers
     sched_new({ /*.max_nodes =*/ max_nodes, /*.parallel =*/ cparams.pipeline_parallel, /*.op_offload =*/ cparams.op_offload }); // [TAG_SYNC_1025] upstream's callbacks registered as well
     sched_hooks(); // [TAG_FN_L4_HOST_BATCHCPY] [TAG_FN_L4_HOST]
     sched_need_reserve = true;
@@ -8729,7 +8730,7 @@ size_t llama_context::cbuf_prepare(ggml_backend_dev_t dev) {
     }
     llama_moe_hot_l22_borrow_1seq(l22p_bg2_on);
     cbuf_state         = CBUF_SMALL;
-    sched_need_reserve = true;
+    cbuf_free_compute(); // [TAG_R39_SCHED_REUSE] SMALL measured in buffers of its own, not in the FULL ones
     sched_reserve();
     size_t small = cbuf_compute_bytes(dev);
     // [TAG_R35_NP2PARK] a multi-slot context reserves SMALL for one sequence while one is busy: the tail and the fit see the
