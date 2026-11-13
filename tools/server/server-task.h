@@ -213,6 +213,8 @@ struct server_task {
         std::string filepath;
         // [TAG_R34_KYROCACHE] save only: "" (as before), "empty" or "replace" (see SERVER_TASK_TYPE_SLOT_SAVE)
         std::string recall;
+        // [TAG_R40_NP2KVPARK] save only: deferred because the slot's parked cells could not come back beside an answer
+        bool kvp_wait = false;
     };
     slot_action slot_action;
 
