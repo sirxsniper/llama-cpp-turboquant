@@ -233,6 +233,15 @@ LLAMA_API uint32_t llama_fn_l22_ubplan(const llama_fn_l22_cost & c, int b, uint3
 // device bytes are at least the n_seq_max-sequence base-width bytes (a 2-prompt batch then splits at the base width and
 // never grows the buffers)
 LLAMA_API bool     llama_fn_l22_bigub2_ok(uint32_t n_seq_max, size_t full_big_1seq, size_t full_base_nseq);
+// [TAG_FN_STARTSMALL] LLAMA_FN_STARTSMALL=mode: the constructor releases its worst-case reserve and holds one of start_t
+// tokens: mode 1 with an allocating context whose hot set fit is deferred and that has the compute-buffer lend, mode >= 2
+// with any allocating context; never when start_t is 0 or not below the worst-case width n_tokens
+LLAMA_API bool     llama_fn_startsmall_on(int mode, bool alloc, bool fit_deferred, bool cbuf_on, uint32_t start_t, uint32_t n_tokens);
+// a batch of n_tokens ends the start-up reserve of start_t tokens (0: none) when it is wider than that
+LLAMA_API bool     llama_fn_startsmall_end(uint32_t start_t, uint32_t n_tokens);
+// the compute bytes the memory breakdown reports for a backend while the start-up reserve is held: the larger of the held
+// and the measured worst-case bytes
+LLAMA_API size_t   llama_fn_startsmall_report(size_t held, size_t measured);
 // the sequences of a batch with more than small_t rows (prompt rows; decode / verify rows stay below)
 LLAMA_API uint32_t llama_fn_l22_prompt_seqs(const uint32_t * rows_per_seq, int n_seq, uint32_t small_t);
 // [TAG_FN_L22_SMALLKEEP] the kept SMALL reserve fits beside FULL: free_now >= expect_full + pool + margin (no overflow);

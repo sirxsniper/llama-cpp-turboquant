@@ -2011,6 +2011,7 @@ llama_context::llama_context(
                 sched_need_reserve = true;
                 sched_reserve();
             }
+            fs_start_try(); // [TAG_FN_STARTSMALL]
         }
 
         if (!cparams.flash_attn) {
@@ -4682,6 +4683,15 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     if (moe_hot_pending) {
         moe_hot_fit_try();
     }
+    // [TAG_FN_STARTSMALL] a batch wider than the start-up reserve before the fit (an MTP draft context still expected, or
+    // LLAMA_FN_STARTSMALL=2): the worst-case reserve again, made by the sched_reserve below
+    uint32_t fs_held_t = 0; // the width this batch ended (0: none)
+    std::vector<std::pair<ggml_backend_t, size_t>> fs_held_b;
+    if (llama_fn_startsmall_end(fs_start_t, n_tokens_all)) {
+        fs_held_t = fs_start_t;
+        fs_held_b = fs_start_b;
+        fs_start_end("a wider batch");
+    }
 
     // [TAG_R35_NP2PARK] one busy sequence: the idle slots' cells and the wide SMALL part go to the hot set; more: back first
     if (r35_on) {
@@ -4982,6 +4992,22 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             sched_reserve();
         } catch (const std::exception & err) {
             LLAMA_LOG_ERROR("%s: [TAG_FN_L3_VRAM_CBUF] the compute reserve failed (%s): this batch fails\n", __func__, err.what());
+            sched_need_reserve = true;
+            return -2;
+        }
+    } else if (fs_held_t > 0 || fs_start_t > 0) {
+        // [TAG_FN_STARTSMALL] the worst case again after the start-up reserve ended here (before the fit nothing else holds
+        // it), or the held one made again: one that does not fit fails this batch, not the process, and the start-up
+        // reserve stays held (the next narrow batch reserves it again, the next wider one tries the worst case again)
+        try {
+            sched_reserve();
+        } catch (const std::exception & err) {
+            LLAMA_LOG_ERROR("%s: [TAG_FN_STARTSMALL] the compute reserve failed (%s): this batch fails, the start-up reserve "
+                    "stays\n", __func__, err.what());
+            if (fs_held_t > 0) {
+                fs_start_t = fs_held_t;
+                fs_start_b = std::move(fs_held_b);
+            }
             sched_need_reserve = true;
             return -2;
         }
@@ -7750,7 +7776,13 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
         for (const auto & backend_ptr : backends) {
             ggml_backend_t             backend = backend_ptr.get();
             ggml_backend_buffer_type_t buft    = ggml_backend_sched_get_buffer_type(sched.get(), backend);
-            ret[buft].compute += ggml_backend_sched_get_buffer_size(sched.get(), backend);
+            size_t                     b       = ggml_backend_sched_get_buffer_size(sched.get(), backend);
+            for (const auto & [be, measured] : fs_start_b) { // [TAG_FN_STARTSMALL] the released worst case while it is held
+                if (be == backend) {
+                    b = llama_fn_startsmall_report(b, measured);
+                }
+            }
+            ret[buft].compute += b;
         }
     }
     return ret;
@@ -7852,6 +7884,9 @@ void llama_context::moe_hot_fit_try() {
         return;
     }
     moe_hot_pending = false;
+    // [TAG_FN_STARTSMALL] the start-up reserve ends before anything below reserves or measures (cbuf_prepare's first
+    // reserve is the worst case again)
+    const bool fs_ended = fs_start_end("hot set fit");
     if (llama_moe_hot_max_t() > 0) {
         return; // another context of the process owns the hot set
     }
@@ -7866,6 +7901,9 @@ void llama_context::moe_hot_fit_try() {
     if (cbuf_wanted()) {
         cbuf_tail = cbuf_prepare(dev);
         vram_account("fit SMALL");
+    }
+    if (fs_ended && sched_need_reserve) {
+        sched_reserve(); // [TAG_FN_STARTSMALL] cbuf_prepare made no reserve (no virtual memory): the fit sees the worst case
     }
     // [TAG_R35_NP2PARK] the recurrent cells of the other slots park before the fit measures: their VRAM is free for it, and
     // the hot set lends it back when a batch needs those cells (with the compute lend below)
@@ -8590,6 +8628,9 @@ uint32_t llama_context::reserve_n_tokens() const {
     if (dft_narrow > 0 && !dft_wide) {
         return std::min(n, dft_narrow); // [TAG_FN_L20_BIGPROMPT_DFTUB]
     }
+    if (fs_start_t > 0) {
+        return std::min(n, fs_start_t); // [TAG_FN_STARTSMALL] the start-up reserve (the state is CBUF_OFF until the fit)
+    }
     if (cbuf_state == CBUF_FULL && l20_base_ub > 0 && cbuf_full_t > 0) {
         return std::min(n, cbuf_full_t); // [TAG_FN_L20_BIGPROMPT_UB] the FULL reserve's width now
     }
@@ -8656,16 +8697,8 @@ void llama_context::cbuf_off() {
     sched_reserve();
 }
 
-// at the VRAM fit (no hot set yet, the FULL reserve): reserve SMALL, so the fit sees the difference as free VRAM, and
-// return the tail the hot set must keep for it (0: stay FULL)
-size_t llama_context::cbuf_prepare(ggml_backend_dev_t dev) {
-    constexpr double MiB = 1024.0*1024.0;
-    const size_t gran = llama_moe_hot_vmm_granularity(model);
-    if (gran == 0) {
-        LLAMA_LOG_WARN("%s: [TAG_FN_L3_VRAM_CBUF] LLAMA_FN_CBUF=1 needs virtual-memory buffers on the hot set's device - off\n",
-                __func__);
-        return 0;
-    }
+// [TAG_FN_L3_VRAM_CBUF] the SMALL width (LLAMA_FN_CBUF_SMALL_T, GGML_OP_OFFLOAD_MIN_BATCH)
+static uint32_t llama_cbuf_small_t_env(uint32_t n_seq_max) {
     uint32_t small_t = 31;
     if (const char * e = getenv("LLAMA_FN_CBUF_SMALL_T"); e && atoi(e) > 0) {
         small_t = (uint32_t) atoi(e);
@@ -8677,7 +8710,80 @@ size_t llama_context::cbuf_prepare(ggml_backend_dev_t dev) {
     if (const char * e = getenv("GGML_OP_OFFLOAD_MIN_BATCH"); e && atoi(e) > 0) {
         offload_min = atoi(e);
     }
-    cbuf_small_t = llama_fn_cbuf_small_t(small_t, offload_min, cparams.n_seq_max);
+    return llama_fn_cbuf_small_t(small_t, offload_min, n_seq_max);
+}
+
+// [TAG_FN_STARTSMALL] see llama-context.h. Called once at the end of the constructor, after its worst-case reserve.
+void llama_context::fs_start_try() {
+    const int      mode    = llama_fn_l3_int(model, "LLAMA_FN_STARTSMALL", 0);
+    const uint32_t start_t = llama_cbuf_small_t_env(cparams.n_seq_max);
+    const uint32_t full_t  = reserve_n_tokens();
+    if (!llama_fn_startsmall_on(mode, !model.no_alloc() && sched != nullptr, moe_hot_pending, cbuf_wanted(), start_t, full_t)) {
+        return;
+    }
+    constexpr double MiB = 1024.0*1024.0;
+    size_t dev_b = 0, host_b = 0;
+    fs_start_b.clear();
+    for (ggml_backend_t backend : backend_ptrs) {
+        const size_t b = ggml_backend_sched_get_buffer_size(sched.get(), backend);
+        fs_start_b.emplace_back(backend, b);
+        ggml_backend_buffer_type_t buft = ggml_backend_sched_get_buffer_type(sched.get(), backend);
+        if (buft && ggml_backend_buft_is_host(buft)) {
+            host_b += b;
+        } else {
+            dev_b += b;
+        }
+    }
+    fs_start_t = start_t;
+    cbuf_free_compute(); // the worst-case buffers go back now; sched_need_reserve is set
+    sched_reserve();
+    size_t dev_s = 0, host_s = 0;
+    for (ggml_backend_t backend : backend_ptrs) {
+        ggml_backend_buffer_type_t buft = ggml_backend_sched_get_buffer_type(sched.get(), backend);
+        const size_t b = ggml_backend_sched_get_buffer_size(sched.get(), backend);
+        if (buft && ggml_backend_buft_is_host(buft)) {
+            host_s += b;
+        } else {
+            dev_s += b;
+        }
+    }
+    LLAMA_LOG_INFO("%s: [TAG_FN_STARTSMALL] the %u-token compute reserve (devices %.2f MiB, host %.2f MiB) is released until %s; "
+            "held now: %u tokens (devices %.2f MiB, host %.2f MiB)\n", __func__, full_t, dev_b/MiB, host_b/MiB,
+            mode >= 2 && !(moe_hot_pending && cbuf_wanted()) ? "a wider batch" : "the hot set fit", start_t, dev_s/MiB, host_s/MiB);
+    vram_account("start held"); // [TAG_FN_L3_VRAM_ACCOUNT] free VRAM with the start-up reserve released
+    if (dev_s + host_s >= dev_b + host_b && dev_b + host_b > 0) {
+        // the scheduler kept its buffers: LLAMA_R39_SCHED_REUSE=1 reuses it for the smaller graph (sched_new) and the
+        // allocator never shrinks, so nothing went back
+        LLAMA_LOG_WARN("%s: [TAG_FN_STARTSMALL] nothing was released (the scheduler kept its buffers, as with LLAMA_R39_SCHED_REUSE=1)\n",
+                __func__);
+    }
+}
+
+// [TAG_FN_STARTSMALL] the start-up reserve ends: the next reserve is made at the width it would have without the switch.
+// true: it was held
+bool llama_context::fs_start_end(const char * why) {
+    if (fs_start_t == 0) {
+        return false;
+    }
+    fs_start_t = 0;
+    fs_start_b.clear();
+    sched_need_reserve = true;
+    LLAMA_LOG_INFO("%s: [TAG_FN_STARTSMALL] the start-up reserve ends (%s): the next reserve is made at %u tokens\n", __func__,
+            why, reserve_n_tokens());
+    return true;
+}
+
+// at the VRAM fit (no hot set yet, the FULL reserve): reserve SMALL, so the fit sees the difference as free VRAM, and
+// return the tail the hot set must keep for it (0: stay FULL)
+size_t llama_context::cbuf_prepare(ggml_backend_dev_t dev) {
+    constexpr double MiB = 1024.0*1024.0;
+    const size_t gran = llama_moe_hot_vmm_granularity(model);
+    if (gran == 0) {
+        LLAMA_LOG_WARN("%s: [TAG_FN_L3_VRAM_CBUF] LLAMA_FN_CBUF=1 needs virtual-memory buffers on the hot set's device - off\n",
+                __func__);
+        return 0;
+    }
+    cbuf_small_t = llama_cbuf_small_t_env(cparams.n_seq_max);
     if (const char * e = getenv("LLAMA_FN_CBUF_POOL_MIB"); e && atoi(e) >= 0) {
         cbuf_pool_mib = (size_t) atoi(e);
     }
