@@ -789,6 +789,9 @@ static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const ch
     if (strcmp(name, "ggml_cpu_fn_set_switch") == 0) {
         return (void *)ggml_cpu_fn_set_switch;
     }
+    if (strcmp(name, "ggml_cpu_fn_switch_env") == 0) {
+        return (void *)ggml_cpu_fn_switch_env;
+    }
     // [TAG_FN_CPU_MOE_FUSE] the CPU MoE worker pool and the fused-op counter
     if (strcmp(name, "ggml_cpu_moe_pool_params_default") == 0) {
         return (void *)ggml_cpu_moe_pool_params_default;

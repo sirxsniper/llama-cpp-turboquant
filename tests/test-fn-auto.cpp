@@ -433,10 +433,13 @@ static void test_inject() {
     c.opts.push_back({ "GGML_CPU_MMID_MR", "1", true });
     llama_fn_state_inject(c);
     TCHECK(get(GGML_CPU_FN_MMID_MR) == 1, "CPU switch set");
+    // [TAG_FN_CPU_SWITCHES] the line a server log shows after a model load names the switch with its value
+    TCHECK(llama_fn_cpu_switches_on().find("GGML_CPU_MMID_MR=1") != std::string::npos, "CPU switch in the list of switches that are on");
     TCHECK(getenv("GGML_CPU_MMID_MR") == nullptr, "CPU switch not through the environment");
     TCHECK(c.cpu_set.size() == 1, "CPU switch recorded");
     llama_fn_state_undo(c);
     TCHECK(get(GGML_CPU_FN_MMID_MR) == 0 && before == 0, "CPU switch back to off");
+    TCHECK(llama_fn_cpu_switches_on().find("GGML_CPU_MMID_MR") == std::string::npos, "a switch that is off is not listed");
 
     // [TAG_FN_SHIP1] GGML_CPU_VNNI goes the same way (the switch; its kernels act only on a CPU with AVX512-VNNI)
     if (!getenv("GGML_CPU_VNNI")) {

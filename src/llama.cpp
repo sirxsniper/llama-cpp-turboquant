@@ -596,6 +596,8 @@ static struct llama_model * llama_model_load_from_file_impl(
         return nullptr;
     }
 
+    llama_fn_cpu_switches_log(); // [TAG_FN_CPU_SWITCHES] after the profile of this model set its own
+
     return model;
 }
 

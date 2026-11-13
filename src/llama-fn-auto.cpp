@@ -690,6 +690,30 @@ void llama_fn_state_inject(llama_fn_auto_state & st) {
     }
 }
 
+std::string llama_fn_cpu_switches_on() {
+    ggml_backend_reg_t reg = ggml_backend_reg_by_name("CPU");
+    using get_t = int (*)(enum ggml_cpu_fn_switch);
+    using env_t = const char * (*)(enum ggml_cpu_fn_switch);
+    const get_t get = reg ? (get_t) ggml_backend_reg_get_proc_address(reg, "ggml_cpu_fn_get_switch") : nullptr;
+    const env_t env = reg ? (env_t) ggml_backend_reg_get_proc_address(reg, "ggml_cpu_fn_switch_env") : nullptr;
+    std::string on;
+    if (!get || !env) {
+        return on;
+    }
+    for (int i = 0; i < GGML_CPU_FN_SWITCH_COUNT; i++) {
+        const int v = get((enum ggml_cpu_fn_switch) i);
+        if (v != 0) {
+            on += (on.empty() ? "" : " ") + std::string(env((enum ggml_cpu_fn_switch) i)) + "=" + std::to_string(v);
+        }
+    }
+    return on;
+}
+
+void llama_fn_cpu_switches_log() {
+    const std::string on = llama_fn_cpu_switches_on();
+    LLAMA_LOG_INFO("%s: [TAG_FN_CPU_SWITCHES] CPU switches on: %s\n", __func__, on.empty() ? "none" : on.c_str());
+}
+
 void llama_fn_state_undo(llama_fn_auto_state & st) {
     std::lock_guard<std::mutex> lk(g_env_mtx);
     for (const auto & n : st.injected) {
