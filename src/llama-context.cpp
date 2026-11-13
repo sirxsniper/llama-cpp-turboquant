@@ -8100,8 +8100,8 @@ void llama_context::moe_hot_fit_try() {
                         np2_want == 0 ? "-" : np2_h ? "held" : "not held (maps again)", kv_want/MiB, got/MiB);
             }
         }
-        if (hot_ok && !r40_gone && llama_moe_hot_kv_bytes() >= kv_want) {
-            if (kv_want > 0) {
+        if (hot_ok && (r40_gone || llama_moe_hot_kv_bytes() >= kv_want)) {
+            if (kv_want > 0 && !r40_gone) {
                 // [TAG_R40_VGUARD] the kvside wrappers: the same as the plain hooks while no share holds a group; with the
                 // guard's share they keep its groups apart from the KV cache's
                 llama_kv_lend_set_hooks(llama_moe_hot_kv_release_kvside, llama_moe_hot_kv_restore_kvside, this);
