@@ -8022,6 +8022,7 @@ void llama_context::moe_hot_fit_try() {
     size_t lend_want = kv_want + vis_want + np2_want;
     bool   r40_no_np2 = false; // [TAG_R40_LEND_PARTIAL] a partial lend left this share out
     bool   r40_no_vis = false;
+    bool   r40_gone   = false; // [TAG_R40_LEND_PARTIAL] the up-front map failed: no lend (no hooks, no shares)
     size_t r40_upfront = 0;    // [TAG_R40_LEND_PARTIAL] KV bytes mapped up front (device use beside the hot set)
     if (lend_want > 0) {
         llama_moe_hot_set_kv_lend(lend_want, llama_prefill_stream_lend_bytes(this), (int) model.hparams.n_layer());
@@ -8073,7 +8074,8 @@ void llama_context::moe_hot_fit_try() {
             lend_want = kv_want + vis_want + np2_want;
             if (kv_want > kv_h) {
                 // a map failed: the lend groups go out for good and the KV cache maps whole (the hot set keeps its base
-                // slots; no hooks and no shares below, as kv_want stays over what the hot set holds). The hot set was sized
+                // slots; no hooks and no shares below: r40_gone, as the lend's capacity can still pass the checks against
+                // kv_want when the shares made it larger than the KV part). The hot set was sized
                 // with the bytes not held left out, so its base slots + the whole KV + the shares' own VRAM add up to the
                 // budget as v0.30.0's refit does (the init runs once per process: no second fit here)
                 LLAMA_LOG_ERROR("moe-hot: [TAG_R40_LEND_PARTIAL] mapping %.0f MiB of KV cells up front failed (%.0f mapped): the "
@@ -8088,6 +8090,7 @@ void llama_context::moe_hot_fit_try() {
                 lend_want  = kv_want + vis_want + np2_want;
                 r40_no_np2 = true;
                 r40_no_vis = true;
+                r40_gone   = true;
             } else {
                 LLAMA_LOG_INFO("moe-hot: [TAG_R40_LEND_PARTIAL] the lend holds %.0f of %.0f MiB (KV %.0f + projector %.0f + idle "
                         "slots %.0f): projector %s, idle slots %s, KV %.0f MiB lent and %.0f MiB of its cells mapped up front "
@@ -8097,7 +8100,7 @@ void llama_context::moe_hot_fit_try() {
                         np2_want == 0 ? "-" : np2_h ? "held" : "not held (maps again)", kv_want/MiB, got/MiB);
             }
         }
-        if (hot_ok && llama_moe_hot_kv_bytes() >= kv_want) {
+        if (hot_ok && !r40_gone && llama_moe_hot_kv_bytes() >= kv_want) {
             if (kv_want > 0) {
                 // [TAG_R40_VGUARD] the kvside wrappers: the same as the plain hooks while no share holds a group; with the
                 // guard's share they keep its groups apart from the KV cache's
@@ -8144,7 +8147,7 @@ void llama_context::moe_hot_fit_try() {
             r35_on    = true;
             r35_carry = carry;
             r35_all = false;
-            if (kv_want > 0 && hot_ok && llama_moe_hot_kv_bytes() >= kv_want) {
+            if (kv_want > 0 && hot_ok && !r40_gone && llama_moe_hot_kv_bytes() >= kv_want) {
                 llama_kv_lend_set_hooks(llama_moe_hot_kv_release_kvside, llama_moe_hot_kv_restore_kvside, this);
             }
             if (!carry) {
