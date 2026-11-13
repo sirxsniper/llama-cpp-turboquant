@@ -141,6 +141,9 @@ struct kvl_state {
 // work on kvl_cur, which each entry point points at its cache's state; the hot set sees the sum of both
 kvl_state   g_kvls[2];
 kvl_state * kvl_cur = &g_kvls[0];
+// a lend was made in this entry: one per entry and process, as the hot set's fit that sets the hooks runs once per process
+// (a later context's KV cache is allocated whole)
+bool        g_kvls_used[2] = {};
 #define g_kvl (*kvl_cur)
 
 size_t kvl_round_up(size_t x, size_t g) {
@@ -284,7 +287,7 @@ static ggml_backend_buffer_t kvl_alloc(const llama_kv_cache * kv, ggml_context *
         const std::set<const ggml_tensor *> & base, uint32_t kv_size, uint32_t init_cells, uint32_t chunk) {
     kvl_state * fs = nullptr; // [TAG_FN_L10_KVLEND2] a free state
     for (auto & s : g_kvls) {
-        if (s.kv == nullptr && s.buf == nullptr) {
+        if (s.kv == nullptr && s.buf == nullptr && !g_kvls_used[&s - g_kvls]) {
             fs = &s;
             break;
         }
@@ -387,6 +390,7 @@ static ggml_backend_buffer_t kvl_alloc(const llama_kv_cache * kv, ggml_context *
         return fail();
     }
     g_kvl.kv         = kv;
+    g_kvls_used[kvl_cur - g_kvls] = true;
     g_kvl.init_bytes = kvl_mapped_total();
     for (const auto & r : g_kvl.regs) {
         g_kvl.full_bytes += kvl_bytes_for(r, kv_size);
@@ -1414,6 +1418,12 @@ llama_kv_cache::llama_kv_cache(
 }
 
 llama_kv_cache::~llama_kv_cache() {
+    // [TAG_FN_L8_KVLEND] the lend's state goes with its cache: no later kvl_find (a cache at this address) reaches the
+    // freed buffer or tensors, and the hooks' owner goes too
+    if (kvl_state * ks = kvl_find(this)) {
+        *ks = kvl_state();
+    }
+
     triattention_free(triattention_st);
     triattention_st = nullptr;
 }
