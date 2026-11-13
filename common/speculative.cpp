@@ -3623,6 +3623,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     float                           draft2 = 0.0f;
     uint64_t                        d2_cut = 0; // tokens the p_min rule alone would have kept
 
+    // [TAG_FN_DRAFTFIT] draft calls in which a sequence stopped at the server's bridge-fit cap (n_fit), and the draft
+    // positions those stops left out at most (up to the loop's own cap; p_min may have stopped earlier), since the load
+    uint64_t                        fit_steps = 0;
+    uint64_t                        fit_cut   = 0;
+
     // [TAG_FN_L13_SPEC_EQUAL] SPEC_MTP_EQUAL_SEQS=1, a recurrent or hybrid target, 2+ sequences: the sequences that draft
     // together keep drafting while one of them passes the p_min rule. Their verify rows match, so split_equal keeps them in
     // one ubatch (a 3 + 2 row step ran as two graphs: the recurrent ring needs each sequence's rows in one ubatch)
@@ -3891,6 +3896,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         if (draft2 > 0.0f) {
             LOG_INF("%s: [TAG_FN_L22_DRAFT2] p_min %.2f from draft position 2 with 2+ drafting sequences: %llu tokens cut\n", __func__,
                     draft2, (unsigned long long) d2_cut);
+        }
+        if (fit_steps > 0) {
+            LOG_INF("%s: [TAG_FN_DRAFTFIT] since the model was loaded: %llu draft steps stopped at the bridge-fit length, at most %llu "
+                    "draft positions not drafted\n", __func__, (unsigned long long) fit_steps, (unsigned long long) fit_cut);
         }
     }
 
@@ -5069,6 +5078,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         int i = 0;
 
+        bool fit_hit = false; // [TAG_FN_DRAFTFIT]
+
         while (n_drafting > 0) {
             // each step decodes under a different head, i.e. a different decoder layer, and
             // KV is per layer. process() filled this layer's KV only for positions < pos0
@@ -5289,6 +5300,21 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     dp.result_q->emplace_back(cur_p->data, cur_p->data + cur_p->size);
                 }
 
+                // [TAG_FN_DRAFTFIT] the server's cap for this step: its verify rows fit the bridge, no further draft decode
+                if (dp.n_fit > 0 && dp.n_fit <= (int) result.size()) {
+                    int n_base = ad_on ? ad_cap : params.n_max;
+                    if (dp.n_max > 0) {
+                        n_base = std::min(n_base, dp.n_max);
+                    }
+                    if (dp.n_fit < n_base) {
+                        fit_cut += (uint64_t) (n_base - dp.n_fit);
+                        fit_hit  = true;
+                        drafting[seq_id] = false;
+                        n_drafting--;
+                        continue;
+                    }
+                }
+
                 // [TAG_FN_L19_DRAFT_ADAPT] this round's cap instead of n_max
                 if ((ad_on ? ad_cap : params.n_max) <= (int) result.size()) {
                     drafting[seq_id] = false;
@@ -5360,6 +5386,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             ++i;
         }
+
+        fit_steps += fit_hit ? 1 : 0; // [TAG_FN_DRAFTFIT]
 
         if (chain_heads) {
             llama_set_nextn_layer_offset(ctx_dft, 0); // restore default for non-draft decodes
@@ -7025,10 +7053,12 @@ void common_speculative_draft(common_speculative * spec) {
             if (dp.drafting && !result.empty()) {
                 dp.drafting = false;
 
-                if (dp.n_max > 0) {
-                    if (!result.empty() && (int) result.size() > dp.n_max) {
-                        SPC_DBG("truncating draft to %d tokens\n", dp.n_max);
-                        result.resize(dp.n_max);
+                // [TAG_FN_DRAFTFIT] the bridge-fit cap of the step, when it is the lower one
+                const int32_t n_cap = dp.n_fit > 0 && (dp.n_max <= 0 || dp.n_fit < dp.n_max) ? dp.n_fit : dp.n_max;
+                if (n_cap > 0) {
+                    if (!result.empty() && (int) result.size() > n_cap) {
+                        SPC_DBG("truncating draft to %d tokens\n", n_cap);
+                        result.resize(n_cap);
 
                         // [TAG_SPEC_DISTS_TRUNC] dists is filled in lockstep with the draft, so it
                         // must be truncated with it. The server gates the residual rejection sampler
@@ -7043,7 +7073,7 @@ void common_speculative_draft(common_speculative * spec) {
                         // upstream #27694 (#29924): trim the candidates only if the drafter produced them (n-gram
                         // drafters do not)
                         if (dp.result_q && !dp.result_q->empty()) {
-                            dp.result_q->resize(dp.n_max);
+                            dp.result_q->resize(n_cap);
                         }
                     }
                 }

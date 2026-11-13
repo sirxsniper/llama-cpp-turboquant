@@ -477,6 +477,10 @@ LLAMA_API int32_t llama_fn_prompt_ubatch_width_ext(struct llama_context * ctx);
 // a speculative caller can roll back n_rs_seq - 1 drafts
 LLAMA_API bool llama_fn_bridge_rb_ext(const struct llama_context * ctx);
 
+// [TAG_FN_DRAFTFIT] the widest decode ubatch that takes both the context's MoE bridge (llama_moe_bridge_fits: max_t) and the
+// hot chain once the hot set is on (llama_moe_hot_graph_max_t); 0 without a bridge
+LLAMA_API int32_t llama_fn_bridge_max_t_ext(const struct llama_context * ctx);
+
 // [TAG_FN_L22_PHASE] P0: the decode-phase flag (plan 3.8). The caller sets GEN before a decode whose batch holds only
 // generation / verify rows; every other decode runs as PROMPT. The flag goes back to PROMPT when the decode returns.
 // Only the answer-changing levers (LLAMA_FN_L22_X_*) read it, and only in ubatches whose rows are all output rows.

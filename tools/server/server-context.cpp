@@ -2620,6 +2620,11 @@ private:
     } l24;
     int l24_claim_task = -1; // [TAG_FN_L24_OPFAIR] the task that claimed the last prompt batch
 
+    // [TAG_FN_DRAFTFIT] LLAMA_FN_DRAFTFIT (default 0), read once per model load by draftfit_init(): 1 = a step's drafts are
+    // capped so that its verify rows fit the MoE bridge and the hot chain (llama_fn_bridge_max_t_ext, read at every step),
+    // <n> (2..16) = so that they fit n rows
+    int32_t draftfit_t = 0;
+
     server_metrics metrics;
 
     // queued prompt stats - llama_decode() is async, so the timing is only valid after a sync
@@ -3301,6 +3306,7 @@ private:
         keepctx_init(); // [TAG_FN_L18_KEEPCTX] after the prompt cache: it stays off beside one
         l22two_init();  // [TAG_FN_L22] P9: after the slots and the prompt cache
         l24_init();     // [TAG_FN_L24]
+        draftfit_init(); // [TAG_FN_DRAFTFIT]
         if (const char * e = llama_model_fn_env(model_tgt, "LLAMA_FN_L19_TTFT_CKPT_TAIL"); e && *e) { // [TAG_FN_L19_TTFT_CKPT]
             ckpt_tail_min = std::max<long long>(0, strtoll(e, nullptr, 10));
             SRV_WRN("[TAG_FN_L19_TTFT_CKPT] a prompt batch of >= %lld tokens leaves its last 4 tokens to their own batch with a "
@@ -3985,6 +3991,25 @@ private:
                     "checkpoint split %d, keep-lend hint %d\n", l22.vlend_hold, l22.mtp_keep, l22.spec_mtp, l22.anchor,
                     l22.ckpt_keep, l22.ckpt_split, l22.keeplend);
         }
+    }
+
+    // [TAG_FN_DRAFTFIT] the switch (0 = off, 1 = the bridge's width at every step, <n> = n rows)
+    void draftfit_init() {
+        draftfit_t = 0;
+        const char * e = llama_model_fn_env(model_tgt, "LLAMA_FN_DRAFTFIT");
+        const int    v = e && *e ? atoi(e) : 0;
+        if (v <= 0 || !spec) {
+            return;
+        }
+        const int32_t w = v == 1 ? llama_fn_bridge_max_t_ext(ctx_tgt) : std::min(16, v);
+        if (w <= 1) {
+            SRV_WRN("[TAG_FN_DRAFTFIT] LLAMA_FN_DRAFTFIT=%d: no MoE bridge width, the drafts stay as they are\n", v);
+            return;
+        }
+        draftfit_t = v == 1 ? 1 : w;
+        SRV_INF("[TAG_FN_DRAFTFIT] a step's drafts are capped so that its verify rows fit T <= %d (%s, draft n_max %d, %zu slots)\n",
+                w, v == 1 ? "the MoE bridge and the hot chain, read at every step" : "LLAMA_FN_DRAFTFIT",
+                common_speculative_n_max(spec.get()), slots.size());
     }
 
     // [TAG_FN_L24] round 24's switches (l24_cfg_t)
@@ -9268,6 +9293,26 @@ private:
             iterate("l24_genckpt", generating, [&](server_slot & slot) {
                 l24_gen_checkpoint(slot);
             });
+        }
+
+        // [TAG_FN_DRAFTFIT] the drafts of this step at most k long, so that its verify rows fit the bridge: decided before
+        // the draft decodes (draft-mtp stops at k), the same k for every drafting slot, only when every generating slot
+        // drafts (equal rows: split_equal keeps the step in one ubatch)
+        if (draftfit_t > 0 && drafting.size() >= 2 && drafting.size() == generating.size()) {
+            const int32_t w = draftfit_t == 1 ? llama_fn_bridge_max_t_ext(ctx_tgt) : draftfit_t;
+            std::vector<fn_draftfit_slot> fs(generating.size());
+            for (size_t i = 0; i < generating.size(); ++i) {
+                const server_slot * s = generating[i];
+                const auto & dp = common_speculative_get_draft_params(spec.get(), s->id);
+                fs[i].n_replay = (int32_t) s->spec_draft.size();
+                fs[i].n_cap    = dp.drafting ? dp.n_max : 0;
+            }
+            const int32_t k = fn_draftfit_step(fs, common_speculative_n_max(spec.get()), params_base.speculative.draft.n_min, w);
+            if (k > 0) {
+                for (const server_slot * s : drafting) {
+                    common_speculative_get_draft_params(spec.get(), s->id).n_fit = k;
+                }
+            }
         }
 
         // generate the actual drafts (if any)

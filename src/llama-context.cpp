@@ -10701,6 +10701,14 @@ bool llama_fn_bridge_rb_ext(const llama_context * ctx) {
     return ctx != nullptr && ctx->fn_bridge_rb();
 }
 
+// [TAG_FN_DRAFTFIT] a wider graph that fits the bridge builds no hot chain (src/llama-graph.cpp: n_tokens <= hot_max_t, or
+// llama_moe_hot_graph_max_t), so the CPU would compute every routed expert of it
+int32_t llama_fn_bridge_max_t_ext(const llama_context * ctx) {
+    const int32_t t_br  = ctx != nullptr && ctx->get_moe_bridge() != nullptr ? llama_moe_bridge_max_t(ctx->get_moe_bridge()) : 0;
+    const int32_t t_hot = llama_moe_hot_graph_max_t();
+    return t_br > 0 && t_hot > 0 ? std::min(t_br, t_hot) : t_br;
+}
+
 // [TAG_FN_L22_GENSHARE2] round 22 P4: the width the context will use for its next prompt ubatch given the current hint
 int32_t llama_fn_prompt_ubatch_width_ext(llama_context * ctx) {
     return ctx ? (int32_t) ctx->fn_prompt_ubatch_width() : 0;
