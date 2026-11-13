@@ -623,6 +623,11 @@ bool llama_kv_cache::kvl_owns(ggml_backend_buffer_t buf) const {
     return ks != nullptr && ks->buf == buf;
 }
 
+uint32_t llama_kv_cache::kvl_cells() const {
+    const kvl_state * ks = kvl_find(this);
+    return ks == nullptr || ks->whole ? std::numeric_limits<uint32_t>::max() : ks->cells;
+}
+
 void llama_kv_cache::kvl_clear() const {
     kvl_state * ks = kvl_find(this); // [TAG_FN_L10_KVLEND2]
     if (ks == nullptr) {
@@ -4673,7 +4678,7 @@ void llama_kv_cache::state_clear(llama_seq_id seq_id) {
 }
 
 // the cleared ranges mirror the write pattern of state_read_data() - keep both in sync
-void llama_kv_cache::state_clear(llama_seq_id seq_id, uint32_t strm, const slot_info & sinfo) {
+void llama_kv_cache::state_clear(llama_seq_id seq_id, uint32_t strm, const slot_info & sinfo_all) {
     if (seq_id == -1) {
         clear(true);
         return;
@@ -4682,9 +4687,23 @@ void llama_kv_cache::state_clear(llama_seq_id seq_id, uint32_t strm, const slot_
     seq_rm(seq_id, -1, -1);
 
     // zero the K/V data of the failed restore attempt - the attention can still read the data of free cells
-    if (sinfo.empty() || sinfo.size() == 0) {
+    if (sinfo_all.empty() || sinfo_all.size() == 0) {
         return;
     }
+
+    // [TAG_FN_L8_KVLEND] a refused lend map (kvl_update in state_read_sinfo) leaves placed cells at or past the mapped
+    // cells: they have no memory, no write may reach them, and kvl_map_to clears them when they are mapped again
+    const uint32_t n_mapped = kvl_cells();
+    slot_info sinfo_mapped;
+    if (n_mapped < v_cells[strm].size()) {
+        sinfo_mapped = sinfo_all;
+        auto & idxs = sinfo_mapped.idxs[0];
+        idxs.erase(std::remove_if(idxs.begin(), idxs.end(), [n_mapped](uint32_t i) { return i >= n_mapped; }), idxs.end());
+        if (idxs.empty()) {
+            return;
+        }
+    }
+    const slot_info & sinfo = sinfo_mapped.empty() ? sinfo_all : sinfo_mapped;
 
     const auto & cells = v_cells[strm];
 

@@ -256,11 +256,12 @@ public:
 
     // [TAG_FN_L8_KVLEND] the lend (llama-kv-cache.cpp): map every cell below `need` (grow in chunks, the hot set giving its
     // VRAM back first) or give whole chunks back far above it; the cells the used range needs; this cache's lend buffer;
-    // clear the mapped cells
+    // clear the mapped cells; the cells with memory (all without a lend)
     bool     kvl_update(uint32_t need) const;
     uint32_t kvl_need() const;
     bool     kvl_owns(ggml_backend_buffer_t buf) const;
     void     kvl_clear() const;
+    uint32_t kvl_cells() const;
 
     // find a slot of kv cells that can hold the ubatch
     // if cont == true, then the slot must be continuous
