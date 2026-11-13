@@ -3948,6 +3948,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_qsa_mask(params, tensor);
             } break;
+        case GGML_OP_KPOOL_MASK: // [TAG_QSA_POOL_RANGE]
+            {
+                ggml_compute_forward_kpool_mask(params, tensor);
+            } break;
         case GGML_OP_MOE_HOST_POST: // [TAG_MOE_BRIDGE] device backends only; the CPU supports_op is false
         case GGML_OP_MOE_HOST_WAIT:
         case GGML_OP_MOE_HOST_FETCH: // [TAG_FN_R4_BRIDGE_DMA]
@@ -4319,6 +4323,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
                 n_tasks = 1;
             } break;
         case GGML_OP_QSA_MASK: // [TAG_FN_R4_QSA_POS] rows split over the threads
+        case GGML_OP_KPOOL_MASK: // [TAG_QSA_POOL_RANGE]
             {
                 n_tasks = MIN(n_threads, (int) node->ne[1]);
             } break;

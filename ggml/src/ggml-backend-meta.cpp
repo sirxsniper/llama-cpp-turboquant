@@ -1115,6 +1115,7 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                 split_state = handle_generic(src_ss, /*scalar_only =*/ false);
             } break;
             case GGML_OP_QSA_MASK: // [TAG_FN_R4_QSA_POS] positions and indexer picks in, one mask out: never split
+            case GGML_OP_KPOOL_MASK: // [TAG_QSA_POOL_RANGE] ranges in, one mask out: never split
             case GGML_OP_MAP_CUSTOM1:
             case GGML_OP_MAP_CUSTOM2:
             case GGML_OP_MAP_CUSTOM3:

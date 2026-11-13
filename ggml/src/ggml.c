@@ -1241,9 +1241,11 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "MOE_HOST_FETCH",
 
     "MOE_HOST_SUM",
+
+    "KPOOL_MASK",
 };
 
-static_assert(GGML_OP_COUNT == 110, "GGML_OP_COUNT != 110");  // upstream 102 (incl. TOP_K_MASK) + 8 fork ops: +1 GGML_OP_TURBO_WHT (TurboQuant fork), +1 GGML_OP_LIGHTNING_INDEXER, +1 GGML_OP_TURBOT_SET_ROWS [TAG_TURBOT], +1 GGML_OP_GATED_DELTA_NET_REPLAY [TAG_4C_GDN_REPLAY], +2 GGML_OP_MOE_HOST_POST/WAIT [TAG_MOE_BRIDGE], +1 GGML_OP_QSA_MASK [TAG_FN_R4_QSA_POS], +1 GGML_OP_MOE_HOST_FETCH [TAG_FN_R4_BRIDGE_DMA], +1 GGML_OP_MOE_HOST_SUM [TAG_FN_R2_BRIDGE_SYNC]
+static_assert(GGML_OP_COUNT == 111, "GGML_OP_COUNT != 111");  // upstream 102 (incl. TOP_K_MASK) + 9 fork ops: +1 GGML_OP_TURBO_WHT (TurboQuant fork), +1 GGML_OP_LIGHTNING_INDEXER, +1 GGML_OP_TURBOT_SET_ROWS [TAG_TURBOT], +1 GGML_OP_GATED_DELTA_NET_REPLAY [TAG_4C_GDN_REPLAY], +2 GGML_OP_MOE_HOST_POST/WAIT [TAG_MOE_BRIDGE], +1 GGML_OP_QSA_MASK [TAG_FN_R4_QSA_POS], +1 GGML_OP_MOE_HOST_FETCH [TAG_FN_R4_BRIDGE_DMA], +1 GGML_OP_MOE_HOST_SUM [TAG_FN_R2_BRIDGE_SYNC], +1 GGML_OP_KPOOL_MASK [TAG_QSA_POOL_RANGE]
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1370,9 +1372,11 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "moe_host_fetch(ticket, up, gate, down, dep)",
 
     "moe_host_sum(x, ids, w, up, gate, down, table)",
+
+    "kpool_mask(range)",
 };
 
-static_assert(GGML_OP_COUNT == 110, "GGML_OP_COUNT != 110");  // upstream 102 (incl. TOP_K_MASK) + 8 fork ops: +1 GGML_OP_TURBO_WHT (TurboQuant fork), +1 GGML_OP_LIGHTNING_INDEXER, +1 GGML_OP_TURBOT_SET_ROWS [TAG_TURBOT], +1 GGML_OP_GATED_DELTA_NET_REPLAY [TAG_4C_GDN_REPLAY], +2 GGML_OP_MOE_HOST_POST/WAIT [TAG_MOE_BRIDGE], +1 GGML_OP_QSA_MASK [TAG_FN_R4_QSA_POS], +1 GGML_OP_MOE_HOST_FETCH [TAG_FN_R4_BRIDGE_DMA], +1 GGML_OP_MOE_HOST_SUM [TAG_FN_R2_BRIDGE_SYNC]
+static_assert(GGML_OP_COUNT == 111, "GGML_OP_COUNT != 111");  // upstream 102 (incl. TOP_K_MASK) + 9 fork ops: +1 GGML_OP_TURBO_WHT (TurboQuant fork), +1 GGML_OP_LIGHTNING_INDEXER, +1 GGML_OP_TURBOT_SET_ROWS [TAG_TURBOT], +1 GGML_OP_GATED_DELTA_NET_REPLAY [TAG_4C_GDN_REPLAY], +2 GGML_OP_MOE_HOST_POST/WAIT [TAG_MOE_BRIDGE], +1 GGML_OP_QSA_MASK [TAG_FN_R4_QSA_POS], +1 GGML_OP_MOE_HOST_FETCH [TAG_FN_R4_BRIDGE_DMA], +1 GGML_OP_MOE_HOST_SUM [TAG_FN_R2_BRIDGE_SYNC], +1 GGML_OP_KPOOL_MASK [TAG_QSA_POOL_RANGE]
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -7127,6 +7131,27 @@ struct ggml_tensor * ggml_qsa_mask(
     result->src[1] = q_pos;
     result->src[2] = sel;
     result->src[3] = live;
+
+    return result;
+}
+
+// [TAG_QSA_POOL_RANGE]
+struct ggml_tensor * ggml_kpool_mask(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * range,
+        int64_t               n_pool,
+        int64_t               row0,
+        int64_t               n_rows) {
+    GGML_ASSERT(range->type == GGML_TYPE_I32 && range->ne[0] == 2 && range->ne[2] == 1 && range->ne[3] == 1);
+    GGML_ASSERT(range->nb[0] == sizeof(int32_t));
+    GGML_ASSERT(n_pool >= 1 && n_pool <= INT32_MAX && n_rows >= 1 && row0 >= 0 && row0 + n_rows <= range->ne[1]);
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n_pool, n_rows);
+
+    ggml_set_op_params_i32(result, 0, (int32_t) row0);
+
+    result->op     = GGML_OP_KPOOL_MASK;
+    result->src[0] = range;
 
     return result;
 }

@@ -1321,6 +1321,19 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
         if (l6_l2pf && !noted.exchange(true)) {
             LLAMA_LOG_INFO("qwen4exp: [TAG_FN_L6_L2PF] bridge waits prefetch the next layer's weights into L2\n");
         }
+        // [TAG_QSA_POOL_RANGE] environment only. The default bound is GGML_CUDA_FN_L22_GRAPH_MAXROWS (128): with
+        // GGML_CUDA_FN_L22_GRAPHKEEP (the profile) CUDA captures no wider graph, so the captured decode and verify graphs
+        // keep the mask input
+        const char * pr = llama_model_fn_env(&model, "LLAMA_QSA_POOL_RANGE");
+        qsa_pool_range = pr && pr[0] && pr[0] != '0';
+        const char * pm = llama_model_fn_env(&model, "LLAMA_QSA_POOL_RANGE_MIN");
+        const char * gm = llama_model_fn_env(&model, "GGML_CUDA_FN_L22_GRAPH_MAXROWS");
+        qsa_pool_range_min = pm && pm[0] ? std::max(0, atoi(pm)) : gm && atoi(gm) > 0 ? atoi(gm) : 128;
+        static std::atomic<bool> pr_noted{false};
+        if (qsa_pool_range && !pr_noted.exchange(true)) {
+            LLAMA_LOG_INFO("qwen4exp: [TAG_QSA_POOL_RANGE] graphs of more than %lld rows take the QSA pool mask as ranges, "
+                    "its rows are made next to the indexer\n", (long long) qsa_pool_range_min);
+        }
         // [TAG_FN_L6_PRESYNC] environment only
         const char * ps = llama_model_fn_env(&model, "LLAMA_FN_L6_PRESYNC");
         l6_presync = ps && ps[0] && ps[0] != '0';
@@ -2076,7 +2089,7 @@ public:
     ggml_tensor * k_idxs        = nullptr; // I64 [n_tokens]
     ggml_tensor * pool_cells    = nullptr; // I32 [n_pool]         cell caching each block's pooled key
     ggml_tensor * pool_idxs     = nullptr; // I32 [kpool, n_pool]  member cells per block, n_kv sentinel for the padded blocks
-    ggml_tensor * pool_mask     = nullptr; // F16 [n_pool, n_tokens]
+    ggml_tensor * pool_mask     = nullptr; // F16 [n_pool, n_tokens], or I32 [2, n_tokens]: a range per token [TAG_QSA_POOL_RANGE]
     ggml_tensor * tail_idxs     = nullptr; // I32 [kpool - 1, n_tokens]
     ggml_tensor * new_pool_idxs = nullptr; // I32 [kpool, n_new]   members of the blocks to re-pool this ubatch
     ggml_tensor * new_pool_rep  = nullptr; // I64 [n_new]          cell to write each new pooled key into
@@ -2102,7 +2115,9 @@ llama_model_qwen4exp::llm_graph_input_kpool * llama_model_qwen4exp::graph::build
     inp->k_idxs     = mctx_idx->build_input_k_idxs(ctx0, ubatch);
     inp->pool_cells = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_pool);
     inp->pool_idxs  = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, kpool, n_pool);
-    inp->pool_mask  = ggml_new_tensor_2d(ctx0, GGML_TYPE_F16, n_pool, n_tokens);
+    // [TAG_QSA_POOL_RANGE] the first visible pool and the visible count of each token; build_qsa_sel makes the mask rows
+    inp->pool_mask  = qsa_pool_range && n_tokens > qsa_pool_range_min ?
+        ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, 2, n_tokens) : ggml_new_tensor_2d(ctx0, GGML_TYPE_F16, n_pool, n_tokens);
     inp->tail_idxs  = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, kpool - 1, n_tokens);
     ggml_set_input(inp->pool_cells);
     ggml_set_input(inp->pool_idxs);
@@ -2280,19 +2295,23 @@ llama_model_qwen4exp::graph::qsa_sel llama_model_qwen4exp::graph::build_qsa_sel(
 
     ggml_tensor * top_k     = nullptr;
     ggml_tensor * top_score = nullptr;
+    // [TAG_QSA_POOL_RANGE] a range input: the mask rows of each chunk are made right before its indexer and freed after it
+    const bool pool_range = inp_kpool->pool_mask->type == GGML_TYPE_I32;
     if (qsa_chunk > 0 && n_rows > qsa_chunk) {
         ggml_tensor * pool_mask = inp_kpool->pool_mask;
         for (int64_t c0 = 0; c0 < n_rows; c0 += qsa_chunk) {
             const int64_t nc = std::min<int64_t>(qsa_chunk, n_rows - c0);
             ggml_tensor * q_c    = ggml_view_3d(ctx0, q, idx_dim, n_idx_h, nc, q->nb[1], q->nb[2], c0*q->nb[2]);
-            ggml_tensor * mask_c = ggml_view_2d(ctx0, pool_mask, n_pool, nc, pool_mask->nb[1], c0*pool_mask->nb[1]);
+            ggml_tensor * mask_c = pool_range ? ggml_kpool_mask(ctx0, pool_mask, n_pool, c0, nc) :
+                ggml_view_2d(ctx0, pool_mask, n_pool, nc, pool_mask->nb[1], c0*pool_mask->nb[1]);
             ggml_tensor * ts_c   = nullptr;
             ggml_tensor * tk_c   = score_top_k(q_c, mask_c, nc, &ts_c);
             top_k     = top_k     ? ggml_concat(ctx0, top_k,     tk_c, 1) : tk_c;
             top_score = top_score ? ggml_concat(ctx0, top_score, ts_c, 2) : ts_c;
         }
     } else {
-        top_k = score_top_k(q, inp_kpool->pool_mask, n_rows, &top_score);
+        top_k = score_top_k(q, pool_range ? ggml_kpool_mask(ctx0, inp_kpool->pool_mask, n_pool, 0, n_rows) : inp_kpool->pool_mask,
+                n_rows, &top_score);
     }
 
     // the top blocks, then the incomplete tail with n_kv for missing cells

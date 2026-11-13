@@ -582,6 +582,8 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
         case GGML_OP_QSA_MASK: // [TAG_FN_R4_QSA_POS]
             return op->type == GGML_TYPE_F16 && op->src[0]->type == GGML_TYPE_I32 && op->src[1]->type == GGML_TYPE_I32 &&
                 op->src[2]->type == GGML_TYPE_I32 && (op->src[3] == nullptr || op->src[3]->type == GGML_TYPE_F32);
+        case GGML_OP_KPOOL_MASK: // [TAG_QSA_POOL_RANGE]
+            return op->type == GGML_TYPE_F16 && op->src[0]->type == GGML_TYPE_I32;
         default:
             return true;
     }

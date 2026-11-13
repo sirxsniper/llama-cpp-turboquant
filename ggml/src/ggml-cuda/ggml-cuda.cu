@@ -38,6 +38,7 @@
 #include "ggml-cuda/moe-bridge.cuh" // [TAG_MOE_BRIDGE]
 #include "ggml-fn-l4-gpumoe.h"          // [TAG_FN_L4_POST]
 #include "ggml-cuda/qsa-mask.cuh"   // [TAG_FN_R4_QSA_POS]
+#include "ggml-cuda/kpool-mask.cuh" // [TAG_QSA_POOL_RANGE]
 #include "ggml-cuda/mmqsn.cuh"  // [TAG_MMQSN]
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
@@ -3580,6 +3581,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             if (!ggml_cuda_fn_l4_qsa_list_mask(ctx, dst)) { // [TAG_FN_L4_QSA_LIST] the mask at the selection + the FA's lists
                 ggml_cuda_op_qsa_mask(ctx, dst);
             }
+            break;
+        case GGML_OP_KPOOL_MASK: // [TAG_QSA_POOL_RANGE]
+            ggml_cuda_op_kpool_mask(ctx, dst);
             break;
         case GGML_OP_DSV4_HC_COMB:
             ggml_cuda_op_dsv4_hc_comb(ctx, dst);
@@ -10239,6 +10243,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return ggml_cuda_moe_bridge_supports_op(dev_ctx->device, op);
         case GGML_OP_QSA_MASK: // [TAG_FN_R4_QSA_POS]
             return ggml_cuda_qsa_mask_supported(op);
+        case GGML_OP_KPOOL_MASK: // [TAG_QSA_POOL_RANGE]
+            return ggml_cuda_kpool_mask_supported(op);
         case GGML_OP_DSV4_HC_COMB:
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                 op->src[2]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;

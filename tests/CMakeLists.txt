@@ -412,6 +412,19 @@ if (NOT GGML_BACKEND_DL AND GGML_CPU)
     llama_build_and_test(test-qsa-pos.cpp)
 endif()
 
+# [TAG_QSA_POOL_RANGE] ggml_kpool_mask (the QSA pool mask rows from one range per token) bit for bit against the rows of
+# the explicit mask input, whole, in row chunks and through views, on the CPU backend; then whole decodes of the generated
+# qwen4exp model with LLAMA_QSA_POOL_RANGE=1 against the mask input (without the model file that part is skipped)
+if (NOT GGML_BACKEND_DL AND GGML_CPU)
+    llama_build(test-qsa-pool-range.cpp)
+    if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
+        llama_test(test-qsa-pool-range LABEL "main behavior backend" ARGS "${CMAKE_CURRENT_BINARY_DIR}/test-models/qwen4exp-moe.gguf" 2)
+        set_tests_properties(test-qsa-pool-range PROPERTIES FIXTURES_REQUIRED generate-models)
+    else()
+        llama_test(test-qsa-pool-range LABEL "main behavior backend")
+    endif()
+endif()
+
 # [TAG_FN_R4_ADAPT_DECAY] the decayed-count admission policy of the adaptive hot set (src/llama-moe-decay.h, header only):
 # pairing rules, prompt seed, and replays (steady experts vs bursts, a shifted working set, a skewed stream). CPU only.
 llama_build_and_test(test-moe-decay.cpp)

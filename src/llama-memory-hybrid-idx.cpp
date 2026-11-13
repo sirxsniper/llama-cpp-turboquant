@@ -1261,7 +1261,11 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
 
     GGML_ASSERT(n_pool == st.n_pool_g); // [TAG_FN_L22_QSA_SEQPOOLS] kpool_pad(n_pool_real) unless one sequence is listed
     GGML_ASSERT(st.is_new.size() == st.n_pool_real);
-    GGML_ASSERT(pool_mask->ne[0] == (int64_t) n_pool && pool_mask->ne[1] == (int64_t) n_tokens);
+    // [TAG_QSA_POOL_RANGE] an I32 [2, n_tokens] mask tensor takes the rows as ranges: the first visible pool and the
+    // visible count of each token (ggml_kpool_mask makes the rows from them)
+    const bool mask_range = pool_mask->type == GGML_TYPE_I32;
+    GGML_ASSERT(pool_mask->ne[0] == (mask_range ? 2 : (int64_t) n_pool) && pool_mask->ne[1] == (int64_t) n_tokens);
+    GGML_ASSERT(!mask_range || gather_mask == nullptr);
     GGML_ASSERT(tail_idxs->ne[0] == (int64_t) kpool - 1 && tail_idxs->ne[1] == (int64_t) n_tokens);
     GGML_ASSERT(pool_idxs->ne[0] == (int64_t) kpool && pool_idxs->ne[1] == (int64_t) n_pool);
     GGML_ASSERT(st.cache_safe == (new_pool_rep != nullptr));
@@ -1466,24 +1470,29 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
         }
     }
 
-    // a pool is visible when it belongs to the token's sequence and ends at or before it
+    // a pool is visible when it belongs to the token's sequence and ends at or before it: the pools [r0, r0 + nv)
+    auto vis = [&](uint32_t i, uint32_t & r0, uint32_t & nv) {
+        const llama_seq_id s = ubatch->seq_id[i][0];
+        const llama_pos    p = ubatch->pos[i];
+
+        const uint32_t p0 = seq_pool_start[s];
+        const uint32_t p1 = p0 + (uint32_t) lay.seqs[s].pools.size();
+        nv = by_order ? std::min(p1 - p0, (uint32_t) ((rank[i] + 1)/kpool)) :
+            (uint32_t) (std::upper_bound(pool_end.begin() + p0, pool_end.begin() + p1, p) - (pool_end.begin() + p0));
+        r0 = listed ? 0 : p0;   // [TAG_FN_L22_QSA_SEQPOOLS] the listed sequence's pools come first
+    };
     auto fill_mask = [&](auto * data) {
         using T = std::remove_pointer_t<decltype(data)>;
         const T keep = llama_cast<T>(0.0f);
         const T drop = llama_cast<T>(-INFINITY);
 
         for (uint32_t i = 0; i < n_tokens; ++i) {
-            const llama_seq_id s = ubatch->seq_id[i][0];
-            const llama_pos    p = ubatch->pos[i];
-
             T * row = data + (size_t) i*n_pool_w;
             std::fill(row, row + n_pool_w, drop);
 
-            const uint32_t p0 = seq_pool_start[s];
-            const uint32_t p1 = p0 + (uint32_t) lay.seqs[s].pools.size();
-            const uint32_t nv = by_order ? std::min(p1 - p0, (uint32_t) ((rank[i] + 1)/kpool)) :
-                (uint32_t) (std::upper_bound(pool_end.begin() + p0, pool_end.begin() + p1, p) - (pool_end.begin() + p0));
-            const uint32_t r0 = listed ? 0 : p0;   // [TAG_FN_L22_QSA_SEQPOOLS] the listed sequence's pools come first
+            uint32_t r0 = 0;
+            uint32_t nv = 0;
+            vis(i, r0, nv);
             std::fill(row + r0, row + r0 + nv, keep);
 
             // Finite visible pools occupy the first min(nv, n_top) ranked slots.
@@ -1495,7 +1504,19 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
             }
         }
     };
-    if (pool_mask->type == GGML_TYPE_F16) {
+    // [TAG_QSA_POOL_RANGE] the same rows, each as its range
+    auto fill_range = [&](int32_t * data) {
+        for (uint32_t i = 0; i < n_tokens; ++i) {
+            uint32_t r0 = 0;
+            uint32_t nv = 0;
+            vis(i, r0, nv);
+            data[2*(size_t) i + 0] = (int32_t) r0;
+            data[2*(size_t) i + 1] = (int32_t) nv;
+        }
+    };
+    if (mask_range) {
+        fill_range((int32_t *) mask_w);
+    } else if (pool_mask->type == GGML_TYPE_F16) {
         fill_mask((ggml_fp16_t *) mask_w);
     } else {
         fill_mask((float *) mask_w);
@@ -1610,20 +1631,25 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
         }
         std::fill(pidx + (size_t) ipw*kpool, pidx + (size_t) n_pool_w*kpool, sentinel);
 
-        // the masks: each row written once (dropped, the visible pools of the token's sequence, dropped)
+        // the masks: each row written once (dropped, the visible pools [p0, p0 + nv) of the token's sequence, dropped)
+        auto vis_inc = [&](uint32_t i, uint32_t & p0, uint32_t & nv) {
+            const llama_seq_id si = ubatch->seq_id[i][0];
+            const llama_pos    p  = ubatch->pos[i];
+            const auto &       ce = lay.inc[si].end;
+
+            p0 = listed ? 0 : seq_pool_start[si];   // [TAG_FN_L22_QSA_SEQPOOLS]
+            nv = by_order ? std::min((uint32_t) ce.size(), (uint32_t) ((rank[i] + 1)/kpool)) :
+                (uint32_t) (std::upper_bound(ce.begin(), ce.end(), p) - ce.begin());
+        };
         auto fill_mask_inc = [&](auto * data) {
             using T = std::remove_pointer_t<decltype(data)>;
             const T keep = llama_cast<T>(0.0f);
             const T drop = llama_cast<T>(-INFINITY);
 
             for (uint32_t i = 0; i < n_tokens; ++i) {
-                const llama_seq_id si = ubatch->seq_id[i][0];
-                const llama_pos    p  = ubatch->pos[i];
-                const auto &       ce = lay.inc[si].end;
-
-                const uint32_t p0 = listed ? 0 : seq_pool_start[si];   // [TAG_FN_L22_QSA_SEQPOOLS]
-                const uint32_t nv = by_order ? std::min((uint32_t) ce.size(), (uint32_t) ((rank[i] + 1)/kpool)) :
-                    (uint32_t) (std::upper_bound(ce.begin(), ce.end(), p) - ce.begin());
+                uint32_t p0 = 0;
+                uint32_t nv = 0;
+                vis_inc(i, p0, nv);
 
                 T * row = data + (size_t) i*n_pool_w;
                 std::fill(row,           row + p0,     drop);
@@ -1638,7 +1664,19 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
                 }
             }
         };
-        if (pool_mask->type == GGML_TYPE_F16) {
+        // [TAG_QSA_POOL_RANGE] the same rows, each as its range
+        auto fill_range_inc = [&](int32_t * data) {
+            for (uint32_t i = 0; i < n_tokens; ++i) {
+                uint32_t p0 = 0;
+                uint32_t nv = 0;
+                vis_inc(i, p0, nv);
+                data[2*(size_t) i + 0] = (int32_t) p0;
+                data[2*(size_t) i + 1] = (int32_t) nv;
+            }
+        };
+        if (mask_range) {
+            fill_range_inc((int32_t *) mask_w);
+        } else if (pool_mask->type == GGML_TYPE_F16) {
             fill_mask_inc((ggml_fp16_t *) mask_w);
         } else {
             fill_mask_inc((float *) mask_w);
@@ -1682,7 +1720,7 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
         std::vector<int32_t> f_pcell(n_full), f_pidx((size_t) n_full*kpool), f_nidx((size_t) kpool*n_new_g);
         std::vector<int64_t> f_nrep(n_new_g);
         std::vector<int32_t> f_npos((size_t) 4*n_new_g, 0);
-        std::vector<uint8_t> f_mask((size_t) n_full*n_tokens*esz);
+        std::vector<uint8_t> f_mask(mask_range ? (size_t) 2*n_tokens*esz : (size_t) n_full*n_tokens*esz);
 
         int32_t * t_pcell = pcell;
         int32_t * t_pidx  = pidx;
@@ -1714,7 +1752,16 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
         if (s_list >= 0) {
             auto to_f32 = [&](const void * src, size_t n) {
                 std::vector<float> v(n);
-                if (pool_mask->type == GGML_TYPE_F16) {
+                if (mask_range) {
+                    // [TAG_QSA_POOL_RANGE] the rows the ranges stand for
+                    const size_t    n_p = n/n_tokens;
+                    const int32_t * rg  = (const int32_t *) src;
+                    std::fill(v.begin(), v.end(), -INFINITY);
+                    for (uint32_t i = 0; i < n_tokens; ++i) {
+                        const auto row = v.begin() + (size_t) i*n_p;
+                        std::fill(row + rg[2*(size_t) i], row + rg[2*(size_t) i] + rg[2*(size_t) i + 1], 0.0f);
+                    }
+                } else if (pool_mask->type == GGML_TYPE_F16) {
                     const ggml_fp16_t * h = (const ggml_fp16_t *) src;
                     for (size_t i = 0; i < n; ++i) {
                         v[i] = ggml_fp16_to_fp32(h[i]);
