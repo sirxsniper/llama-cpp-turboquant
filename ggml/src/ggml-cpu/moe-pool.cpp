@@ -30,8 +30,10 @@
 #else
 #    include <pthread.h>
 #    include <sched.h>
-#    include <sys/mman.h> // [TAG_FN_L22_JOBPF] madvise
-#    include <sys/resource.h> // [TAG_FN_L7_FAULTS] getrusage
+#    if !defined(__wasi__) // WASI has no mmap and no getrusage
+#        include <sys/mman.h> // [TAG_FN_L22_JOBPF] madvise
+#        include <sys/resource.h> // [TAG_FN_L7_FAULTS] getrusage
+#    endif
 #    include <unistd.h>
 #endif
 
@@ -75,6 +77,8 @@ uint64_t moe_proc_faults() {
     memset(&pmc, 0, sizeof(pmc));
     pmc.cb = sizeof(pmc);
     return K32GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc)) ? (uint64_t) pmc.PageFaultCount : 0;
+#elif defined(__wasi__)
+    return 0;
 #else
     struct rusage ru;
     memset(&ru, 0, sizeof(ru));

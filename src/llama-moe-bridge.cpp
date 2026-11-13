@@ -46,7 +46,7 @@
 #    endif
 #    include <windows.h>
 #    include <psapi.h>
-#else
+#elif !defined(__wasi__) // WASI has no getrusage
 #    include <sys/resource.h>
 #endif
 
@@ -120,6 +120,8 @@ uint64_t br_page_faults() {
     memset(&pmc, 0, sizeof(pmc));
     pmc.cb = sizeof(pmc);
     return GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc)) ? (uint64_t) pmc.PageFaultCount : 0;
+#elif defined(__wasi__)
+    return 0;
 #else
     struct rusage ru;
     memset(&ru, 0, sizeof(ru));

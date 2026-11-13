@@ -66,7 +66,9 @@
 #    include <psapi.h>
 #    include <dxgi1_4.h>
 #else
-#    include <sys/mman.h>
+#    if !defined(__wasi__) // WASI has no mmap
+#        include <sys/mman.h>
+#    endif
 #    include <unistd.h>
 #    include <fstream>
 #endif
@@ -225,6 +227,8 @@ void fn_prefetch(const uint8_t * p, size_t n) {
 void * fn_commit_alloc(size_t n) {
 #if defined(_WIN32)
     return VirtualAlloc(nullptr, n, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+#elif defined(__wasi__)
+    return calloc(1, n);
 #else
     void * p = mmap(nullptr, n, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     return p == MAP_FAILED ? nullptr : p;
@@ -238,6 +242,9 @@ void fn_commit_free(void * p, size_t n) {
 #if defined(_WIN32)
     (void) n;
     VirtualFree(p, 0, MEM_RELEASE);
+#elif defined(__wasi__)
+    (void) n;
+    free(p);
 #else
     munmap(p, n);
 #endif
