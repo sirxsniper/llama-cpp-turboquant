@@ -1,6 +1,7 @@
 #include "llama-kv-cache.h"
 #include "llama-model.h"
 
+#include <cstdlib>
 #include <numeric>
 #include <string>
 
@@ -15,10 +16,29 @@ static void init_model(llama_model & model, uint32_t n_layer) {
     model.layers.resize(n_layer);
 }
 
+static void set_env(const char * name, const char * value) {
+#ifdef _WIN32
+    _putenv_s(name, value ? value : "");
+#else
+    if (value) {
+        setenv(name, value, 1);
+    } else {
+        unsetenv(name);
+    }
+#endif
+}
+
 int main() {
     llama_backend_init();
 
     {
+        // [TAG_KV_RESOLVE] the refusals below are those of the context without the resolver, which would make K and V
+        // equal before the checks
+        const char *      resolve_env = getenv("LLAMA_KV_RESOLVE");
+        const bool        resolve_set = resolve_env != nullptr;
+        const std::string resolve_old = resolve_set ? resolve_env : "";
+        set_env("LLAMA_KV_RESOLVE", "0");
+
         std::string errors;
         llama_log_set([](ggml_log_level level, const char * text, void * user_data) {
             if (level == GGML_LOG_LEVEL_ERROR) {
@@ -58,6 +78,7 @@ int main() {
         }
 
         llama_log_set(nullptr, nullptr);
+        set_env("LLAMA_KV_RESOLVE", resolve_set ? resolve_old.c_str() : nullptr);
     }
 
     {
