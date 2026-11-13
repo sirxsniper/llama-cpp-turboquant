@@ -679,6 +679,89 @@ static int test_fn_mmid_mr(bool verbose) {
     return num_failed;
 }
 
+// [TAG_FN_CPU_Q8_K_SIMD] GGML_CPU_Q8_K_SIMD must not change a single byte: the q8_K from_float with the switch on against
+// the same call with it off (quantize_row_q8_K_ref), on rows of 10 blocks. Each block draws one of: uniform values, any
+// scale, any bit pattern (NaN, infinities, denormals), halves under a largest value of +-127 (ties of the rounding), the
+// largest magnitude several times with both signs, zeros with a few values, one special value, scales at the bounds
+static int test_fn_q8_K_simd(bool verbose) {
+    const auto * q8k = ggml_get_type_traits_cpu(GGML_TYPE_Q8_K);
+    const int saved = ggml_cpu_fn_get_switch(GGML_CPU_FN_Q8_K_SIMD);
+
+    const int    qk  = 256;
+    const int    n   = 10 * qk;
+    const size_t nby = ggml_row_size(GGML_TYPE_Q8_K, n);
+    const uint32_t special[] = { 0x7fc00000u, 0xffc00000u, 0x7f800000u, 0xff800000u, 0x7f800001u, 0x00000001u,
+                                 0x80000001u, 0x007fffffu, 0x00800000u, 0x7f7fffffu, 0xff7fffffu };
+    const float bounds[] = { 1e-37f, 1e-31f, 0.9e-30f, 1e-30f, 1.1e-30f, 1e-29f, 1e30f, 1e37f, 3e38f };
+
+    std::mt19937 rng(8256);
+    std::uniform_real_distribution<float> uni(-1.0f, 1.0f);
+    auto pick = [&](int m) { return (int) (rng() % (uint32_t) m); };
+    auto from_bits = [](uint32_t b) { float f; memcpy(&f, &b, sizeof(f)); return f; };
+
+    std::vector<float>   x(n);
+    std::vector<uint8_t> y[2] = { std::vector<uint8_t>(nby), std::vector<uint8_t>(nby) };
+    int num_failed = 0;
+    const int n_rows = 20000;
+    for (int row = 0; row < n_rows; ++row) {
+        for (int b = 0; b < n / qk; ++b) {
+            float * xb = x.data() + b * qk;
+            switch (pick(8)) {
+                case 0:
+                    for (int j = 0; j < qk; ++j) { xb[j] = uni(rng); }
+                    break;
+                case 1: {
+                    const float sc = expf(uni(rng) * 60.0f);
+                    for (int j = 0; j < qk; ++j) { xb[j] = uni(rng) * sc; }
+                } break;
+                case 2:
+                    for (int j = 0; j < qk; ++j) { xb[j] = from_bits((uint32_t) rng()); }
+                    break;
+                case 3:
+                    for (int j = 0; j < qk; ++j) { xb[j] = (float) (pick(509) - 254) * 0.5f; }
+                    xb[pick(qk)] = pick(2) ? 127.0f : -127.0f;
+                    break;
+                case 4: {
+                    const float a = 1.0f + 100.0f * fabsf(uni(rng));
+                    for (int j = 0; j < qk; ++j) { xb[j] = uni(rng) * a * 0.999f; }
+                    for (int i = 2 + pick(4); i > 0; --i) { xb[pick(qk)] = pick(2) ? a : -a; }
+                } break;
+                case 5:
+                    for (int j = 0; j < qk; ++j) { xb[j] = pick(2) ? 0.0f : -0.0f; }
+                    for (int i = pick(4); i > 0; --i) { xb[pick(qk)] = uni(rng); }
+                    break;
+                case 6:
+                    for (int j = 0; j < qk; ++j) { xb[j] = uni(rng); }
+                    xb[pick(qk)] = from_bits(special[pick(11)]);
+                    break;
+                default: {
+                    const float sc = bounds[pick(9)];
+                    for (int j = 0; j < qk; ++j) { xb[j] = uni(rng) * sc; }
+                } break;
+            }
+        }
+        const uint8_t fill = (uint8_t) rng(); // a block of zeros leaves its bsums as they were
+        for (int v = 0; v < 2; ++v) {
+            std::fill(y[v].begin(), y[v].end(), fill);
+            ggml_cpu_fn_set_switch(GGML_CPU_FN_Q8_K_SIMD, v);
+            q8k->from_float(x.data(), y[v].data(), n);
+        }
+        const bool failed = memcmp(y[0].data(), y[1].data(), nby) != 0;
+        num_failed += failed;
+        if (failed && num_failed <= 4) {
+            size_t at = 0;
+            while (y[0][at] == y[1][at]) { at++; }
+            printf(" q8_K from_float row %d: FAILED, byte %zu of block %zu\n", row, at % (nby / 10), at / (nby / 10));
+        }
+    }
+    ggml_cpu_fn_set_switch(GGML_CPU_FN_Q8_K_SIMD, saved);
+
+    if (num_failed || verbose) {
+        printf(" q8_K from_float: %d rows of %d values, %d not bitwise equal to the reference\n", n_rows, n, num_failed);
+    }
+    return num_failed;
+}
+
 int main(int argc, char * argv[]) {
     bool verbose = false;
 
@@ -704,6 +787,7 @@ int main(int argc, char * argv[]) {
     num_failed += test_quantize_imatrix_degenerate(verbose);
     num_failed += test_fn_q5_1_avx512(verbose); // [TAG_FN_CPU_Q5_1_AVX512]
     num_failed += test_fn_mmid_mr(verbose);     // [TAG_FN_CPU_MMID_MR]
+    num_failed += test_fn_q8_K_simd(verbose);   // [TAG_FN_CPU_Q8_K_SIMD]
 
     if (num_failed || verbose) {
         printf("%d tests failed\n", num_failed);

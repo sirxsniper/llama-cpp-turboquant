@@ -1240,6 +1240,7 @@ static const char * const ggml_cpu_fn_sw_env[] = {
     /* GGML_CPU_FN_MMID_MR     */ "GGML_CPU_MMID_MR",
     /* GGML_CPU_FN_MOE_FUSE    */ "GGML_CPU_MOE_FUSE",
     /* GGML_CPU_FN_VNNI        */ "GGML_CPU_VNNI",       // [TAG_FN_R4_VNNI]
+    /* GGML_CPU_FN_Q8_K_SIMD   */ "GGML_CPU_Q8_K_SIMD",  // [TAG_FN_CPU_Q8_K_SIMD]
 };
 static_assert(sizeof(ggml_cpu_fn_sw_env)/sizeof(ggml_cpu_fn_sw_env[0]) == GGML_CPU_FN_SWITCH_COUNT, "one name per switch");
 

@@ -139,6 +139,8 @@ extern "C" {
                                     //   iq4_nl use AVX512-VNNI (vpdpwssd / vpdpbusd) when the CPU has it, also in a build
                                     //   that was not compiled for it (MSVC: no /arch flag defines __AVX512VNNI__); it turns
                                     //   the multi-row path on as GGML_CPU_MMID_MR=1 does (bitwise equal to the AVX2 dots)
+        GGML_CPU_FN_Q8_K_SIMD,      // [TAG_FN_CPU_Q8_K_SIMD] GGML_CPU_Q8_K_SIMD=1: the q8_K from_float (the input rows of the
+                                    //   q4_K / q5_K / q6_K dots) with AVX2 (bitwise equal to quantize_row_q8_K_ref)
         GGML_CPU_FN_SWITCH_COUNT,
     };
 

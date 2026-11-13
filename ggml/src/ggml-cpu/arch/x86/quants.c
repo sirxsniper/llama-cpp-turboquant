@@ -9,6 +9,7 @@
 #include "../../ggml-cpu-impl.h"
 
 #include <math.h>
+#include <float.h>
 #include <string.h>
 #include <assert.h>
 #include <stdlib.h> // for qsort
@@ -501,9 +502,81 @@ void quantize_row_q8_1(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, i
 #endif
 }
 
-// placeholder implementation for Apple targets
-void quantize_row_q8_K(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
-    quantize_row_q8_K_ref(x, y, k);
+#if defined(GGML_CPU_FN_X86)
+// [TAG_FN_CPU_Q8_K_SIMD] one block of quantize_row_q8_K_ref with AVX2, the same bytes. Returns false and writes nothing
+// for a block with a NaN, an infinity or no value of at least 1e-30f: the caller runs the reference on it.
+static bool ggml_fn_q8_K_block_avx2(const float * GGML_RESTRICT x, block_q8_K * GGML_RESTRICT y) {
+    const __m256 sign = _mm256_set1_ps(-0.0f);
+    __m256 vmax = _mm256_setzero_ps();
+    __m256 vnan = _mm256_setzero_ps();
+    for (int j = 0; j < QK_K; j += 8) {
+        const __m256 v = _mm256_loadu_ps(x + j);
+        vmax = _mm256_max_ps(_mm256_andnot_ps(sign, v), vmax);
+        vnan = _mm256_or_ps(vnan, _mm256_cmp_ps(v, v, _CMP_UNORD_Q));
+    }
+    __m128 max4 = _mm_max_ps(_mm256_extractf128_ps(vmax, 1), _mm256_castps256_ps128(vmax));
+    max4 = _mm_max_ps(max4, _mm_movehl_ps(max4, max4));
+    max4 = _mm_max_ss(max4, _mm_movehdup_ps(max4));
+    const float amax = _mm_cvtss_f32(max4);
+    if (_mm256_movemask_ps(vnan) != 0 || !(amax >= 1e-30f && amax <= FLT_MAX)) {
+        return false;
+    }
+
+    // the reference keeps the first value that reaches the largest magnitude: its sign is the sign of the scale
+    const __m256 va = _mm256_set1_ps(amax);
+    int jmax = 0;
+    for (int j = 0; j < QK_K; j += 8) {
+        int m = _mm256_movemask_ps(_mm256_cmp_ps(_mm256_andnot_ps(sign, _mm256_loadu_ps(x + j)), va, _CMP_EQ_OQ));
+        if (m != 0) {
+            jmax = j;
+            while ((m & 1) == 0) {
+                m >>= 1;
+                jmax++;
+            }
+            break;
+        }
+    }
+    const float iscale = -127.f/x[jmax];
+
+    // nearest_int() of the reference rounds to nearest even below 2^22, as the conversion does (|iscale*x| < 128 here)
+    const __m256  mul  = _mm256_set1_ps(iscale);
+    const __m256i perm = _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7);
+    const __m256i bias = _mm256_set1_epi8((char) 0x80);
+    for (int j = 0; j < QK_K; j += 32) {
+        __m256i i0 = _mm256_cvtps_epi32(_mm256_mul_ps(mul, _mm256_loadu_ps(x + j)));
+        __m256i i1 = _mm256_cvtps_epi32(_mm256_mul_ps(mul, _mm256_loadu_ps(x + j + 8)));
+        __m256i i2 = _mm256_cvtps_epi32(_mm256_mul_ps(mul, _mm256_loadu_ps(x + j + 16)));
+        __m256i i3 = _mm256_cvtps_epi32(_mm256_mul_ps(mul, _mm256_loadu_ps(x + j + 24)));
+        i0 = _mm256_packs_epi32(i0, i1);
+        i2 = _mm256_packs_epi32(i2, i3);
+        i0 = _mm256_permutevar8x32_epi32(_mm256_packs_epi16(i0, i2), perm);
+        _mm256_storeu_si256((__m256i *) (y->qs + j), i0);
+
+        // the two sums of 16 signed bytes: unsigned sums of the bytes + 128, less 16*128
+        __m256i s = _mm256_sad_epu8(_mm256_xor_si256(i0, bias), _mm256_setzero_si256());
+        s = _mm256_add_epi64(s, _mm256_srli_si256(s, 8));
+        y->bsums[j/16]     = (int16_t) (_mm_cvtsi128_si32(_mm256_castsi256_si128(s)) - 2048);
+        y->bsums[j/16 + 1] = (int16_t) (_mm_cvtsi128_si32(_mm256_extracti128_si256(s, 1)) - 2048);
+    }
+    y->d = 1/iscale;
+    return true;
+}
+#endif
+
+void quantize_row_q8_K(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k) {
+#if defined(GGML_CPU_FN_X86)
+    if (ggml_cpu_fn_sw[GGML_CPU_FN_Q8_K_SIMD]) { // [TAG_FN_CPU_Q8_K_SIMD]
+        assert(k % QK_K == 0);
+        block_q8_K * GGML_RESTRICT y = vy;
+        for (int64_t i = 0; i < k/QK_K; ++i) {
+            if (!ggml_fn_q8_K_block_avx2(x + i*QK_K, y + i)) {
+                quantize_row_q8_K_ref(x + i*QK_K, y + i, QK_K);
+            }
+        }
+        return;
+    }
+#endif
+    quantize_row_q8_K_ref(x, vy, k);
 }
 
 //===================================== Dot products =================================
