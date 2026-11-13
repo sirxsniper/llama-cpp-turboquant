@@ -5,6 +5,7 @@
 #include "llama-io.h"
 #include "llama-batch.h"
 #include "llama-model.h"
+#include "llama-fn-auto.h" // [TAG_FN_GDN_REPLAY] llama_fn_l3_flag
 
 #include <algorithm>
 #include <atomic>
@@ -89,11 +90,14 @@ static bool llama_gdn_replay_env() {
 }
 
 // archs whose recurrent layers are scalar-gate gated delta nets built by llm_build_delta_net_base
-static bool llama_gdn_replay_arch(llm_arch arch) {
-    switch (arch) {
+static bool llama_gdn_replay_arch(const llama_model & model) {
+    switch (model.arch) {
         case LLM_ARCH_QWEN35:
         case LLM_ARCH_QWEN35MOE:
             return true;
+        case LLM_ARCH_QWEN4EXP:
+            // [TAG_FN_GDN_REPLAY] Flash-Next: LLAMA_FN_GDN_REPLAY=1 opts in (default 0: the snapshot groups of v0.31.0)
+            return llama_fn_l3_flag(model, "LLAMA_FN_GDN_REPLAY");
         default:
             return false;
     }
@@ -207,7 +211,7 @@ llama_memory_recurrent::llama_memory_recurrent(
     // [TAG_4C_GDN_REPLAY] decided before any tensor is created, because it sets the s_l row count
     rs_pre_state = llama_rs_pre_state_arch(model.arch);
 
-    replay = n_rs_seq > 0 && llama_gdn_replay_env() && llama_gdn_replay_arch(model.arch) &&
+    replay = n_rs_seq > 0 && llama_gdn_replay_env() && llama_gdn_replay_arch(model) &&
         type_s == GGML_TYPE_F32 && model.split_mode() != LLAMA_SPLIT_MODE_TENSOR && llama_gdn_replay_shape_ok(hparams);
     if (replay) {
         for (int i = 0; i < n_layer && replay; i++) {

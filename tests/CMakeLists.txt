@@ -513,6 +513,18 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build(test-recurrent-state-rollback.cpp)
     llama_test(test-recurrent-state-rollback LABEL "main behavior backend" ARGS --models "${CMAKE_CURRENT_BINARY_DIR}/test-models/")
     set_tests_properties(test-recurrent-state-rollback PROPERTIES FIXTURES_REQUIRED generate-models)
+
+    # [TAG_FN_GDN_REPLAY] the GDN replay layout on qwen4exp (LLAMA_FN_GDN_REPLAY=1) against the snapshot groups (=0): the
+    # same bits for prefill, decode, verify, rollbacks, state saves (full, PARTIAL_ONLY, ATTN_ONLY_EXT) and seq_cp, on the
+    # generated qwen4exp model. CPU only.
+    llama_build(test-fn-gdn-replay.cpp)
+    target_include_directories(test-fn-gdn-replay PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+    llama_test(test-fn-gdn-replay LABEL "main behavior backend" ARGS "${CMAKE_CURRENT_BINARY_DIR}/test-models/qwen4exp-moe.gguf" 2)
+    set_tests_properties(test-fn-gdn-replay PROPERTIES FIXTURES_REQUIRED generate-models)
+    # the same with the ring of the MoE bridge, which keeps every token of a ubatch (llama_rs_set_nw_full): a whole verify
+    # ubatch is rolled back and computed again
+    llama_test(test-fn-gdn-replay NAME test-fn-gdn-replay-nwfull LABEL "main behavior backend" ARGS "${CMAKE_CURRENT_BINARY_DIR}/test-models/qwen4exp-moe.gguf" 2)
+    set_tests_properties(test-fn-gdn-replay-nwfull PROPERTIES FIXTURES_REQUIRED generate-models ENVIRONMENT "GDN_NW_CAP=0")
 endif()
 
 # [TAG_NP2PARK_HOSTREAD] a state save of a parked recurrent cell reads the cell's granules from its host copy: the bytes and
