@@ -292,6 +292,14 @@ set_tests_properties(test-llama-context PROPERTIES
     FIXTURES_REQUIRED generate-models
     ENVIRONMENT "GGML_SCHED_DEBUG_REALLOC=1"
 )
+
+# the per-layer recurrent flags of a 3-layer hybrid model survive the model saver
+llama_test(
+    test-llama-archs
+    NAME test-llama-archs-recr-layers
+    LABEL main
+    ARGS --recr-layers -s 1234
+)
 endif() # [TAG_R34_SYNC] test-llama-archs block
 
 llama_build(test-fusion.cpp)
