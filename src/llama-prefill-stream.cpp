@@ -155,6 +155,12 @@ struct pfs_state {
     ggml_backend_buffer_t lend_buf    = nullptr;
     uint8_t *             lend_base   = nullptr;
 
+    // [TAG_PFS_LEND_RESERVE] the reserve views of a lending stream (llama_prefill_stream_reserve_begin): per layer the
+    // aliases' types and shapes in rsv_buf, a buffer of the bank buffer type with no memory
+    bool                   rsv_on  = false;
+    ggml_backend_buffer_t  rsv_buf = nullptr;
+    std::vector<pfs_layer> rsv;
+
     int64_t min_tokens = 32;
     int     n_bufs     = 2;
     bool    wrap       = true;
@@ -1774,6 +1780,9 @@ void pfs_destroy(pfs_state * s) {
     for (auto * c : s->ctxs) {
         ggml_free(c);
     }
+    if (s->rsv_buf) {
+        ggml_backend_buffer_free(s->rsv_buf); // [TAG_PFS_LEND_RESERVE]
+    }
     if (s->own_copy && s->copy) {
         ggml_backend_free(s->copy);
     }
@@ -1938,6 +1947,48 @@ static void pfs_return(pfs_state * s) {
     } else {
         llama_moe_hot_unlend(s->owner);
     }
+}
+
+// [TAG_PFS_LEND_RESERVE] the reserve views of a lending stream: per layer a copy of the layer record whose aliases are new
+// tensors of the same types and shapes in a buffer of the bank buffer type without memory. The scheduler places a node by
+// its tensors' buffer type (the device, as for the lent aliases, whose hot set buffer has the same default usage), the
+// allocator skips a tensor that has data, and no init_tensor runs (on CUDA it zeroes the padding of a quantized tensor).
+// The data address is never read or written: a reserve graph is not computed, and if one ever ran its first gate would
+// abort (pfs_gate_state: the record is not one of the stream's layers)
+static bool pfs_rsv_init(pfs_state * s, ggml_backend_buffer_type_t buft) {
+    s->rsv_buf = ggml_backend_buft_alloc_buffer(buft, 0);
+    if (!s->rsv_buf) {
+        return false;
+    }
+    ggml_init_params ip = { ggml_tensor_overhead()*(6*s->layers.size() + 8), nullptr, true };
+    ggml_context * ctx = ggml_init(ip);
+    if (!ctx) {
+        return false;
+    }
+    s->ctxs.push_back(ctx);
+    void * const mark = (void *) (uintptr_t) std::max<size_t>(256, ggml_backend_buft_get_alignment(buft));
+    static const char * nm[3] = { "up", "gate", "down" };
+    s->rsv = s->layers;
+    for (auto & R : s->rsv) {
+        for (int k = 0; k < 3; ++k) {
+            for (int z = 0; z < 2; ++z) {
+                ggml_tensor *& t = z ? R.zdev[k] : R.dev[k];
+                if (!t) {
+                    continue;
+                }
+                ggml_tensor * c = ggml_new_tensor(ctx, t->type, GGML_MAX_DIMS, t->ne);
+                ggml_format_name(c, "pfs_rsv%s.%d.%s", z ? "z" : "", R.il, nm[k]);
+                c->buffer = s->rsv_buf;
+                c->data   = mark;
+                t = c;
+            }
+        }
+        R.view.up     = R.dev[0];
+        R.view.gate   = R.dev[1];
+        R.view.down   = R.dev[2];
+        R.view.handle = &R;
+    }
+    return true;
 }
 
 bool llama_prefill_stream_init_layers(const std::vector<llama_moe_gen5_layer_desc> & layers, const llama_moe_gen5_device & d, const void * owner) {
@@ -2141,6 +2192,12 @@ bool llama_prefill_stream_init_layers(const std::vector<llama_moe_gen5_layer_des
         }
     }
 
+    // [TAG_PFS_LEND_RESERVE] LLAMA_PREFILL_STREAM_LEND_RESERVE (default 1): the reserve views of a lending stream
+    if (s->lend && gen5::env_int("LLAMA_PREFILL_STREAM_LEND_RESERVE", 1, 0, 1) != 0 && !pfs_rsv_init(s, d.buft)) {
+        LLAMA_LOG_WARN("prefill-stream: [TAG_PFS_LEND_RESERVE] no reserve views: the reserve keeps the op-offload form only\n");
+        s->rsv.clear();
+    }
+
     // staging ring (only for sources that are not pinned already)
     bool need_ring = false;
     for (const auto & L : s->layers) {
@@ -2233,6 +2290,11 @@ bool llama_prefill_stream_init_layers(const std::vector<llama_moe_gen5_layer_des
                 s->cp_pin == 1 ? "one physical core each, the L3 domains in turn" : "one CCD each, in turn",
                 al.empty() ? "no topology - not pinned" : al.c_str());
     }
+    if (!s->rsv.empty()) {
+        LLAMA_LOG_INFO("prefill-stream: [TAG_PFS_LEND_RESERVE] prompt reserves of >= %" PRId64 " tokens also reserve the streamed "
+                "graph, the buffers keep the larger need (LLAMA_PREFILL_STREAM_LEND_RESERVE=0: the op-offload graph only)\n",
+                s->min_tokens);
+    }
     if (s->cps_mode > 0) {
         if (s->cps_nowait) {
             LLAMA_LOG_INFO("prefill-stream: [TAG_R35_ROUTED] share mode %d, no wait: every expert not copied yet that no row "
@@ -2263,7 +2325,12 @@ const llama_pfs_view * llama_prefill_stream_lookup(ggml_backend_sched_t sched, c
         return nullptr;
     }
     if (s->lend && !s->lent) {
-        return nullptr; // [TAG_FN_R1_PFS_LEND] not borrowed (also at the reserve): the scheduler's op offload
+        if (s->rsv_on) {
+            // [TAG_PFS_LEND_RESERVE] a reserve between begin and end: the streamed form with the reserve views
+            auto it = s->by_up.find(up_exps);
+            return it != s->by_up.end() ? &s->rsv[it->second].view : nullptr;
+        }
+        return nullptr; // [TAG_FN_R1_PFS_LEND] not borrowed: the scheduler's op offload
     }
     auto it = s->by_up.find(up_exps);
     return it != s->by_up.end() ? &s->layers[it->second].view : nullptr;
@@ -2460,6 +2527,22 @@ bool llama_prefill_stream_set_min(const void * owner, int64_t n) {
         s->min_tokens = std::max<int64_t>(9, n);
     }
     return true;
+}
+
+bool llama_prefill_stream_reserve_begin(const void * owner, int64_t n_tokens) {
+    pfs_state * s = g_pfs;
+    if (!s || s->owner != owner || !s->lend || s->lent || s->rsv.empty() || n_tokens < s->min_tokens) {
+        return false; // [TAG_PFS_LEND_RESERVE] (a stream turned off has min_tokens INT64_MAX)
+    }
+    s->rsv_on = true;
+    return true;
+}
+
+void llama_prefill_stream_reserve_end(const void * owner) {
+    pfs_state * s = g_pfs;
+    if (s && s->owner == owner) {
+        s->rsv_on = false;
+    }
 }
 
 int64_t llama_prefill_stream_get_min(const void * owner) {

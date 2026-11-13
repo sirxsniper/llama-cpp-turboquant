@@ -6321,18 +6321,27 @@ ggml_cgraph * llama_context::graph_reserve(
 
     const auto gparams = graph_params(res, ubatch, mctx, ctx_type_to_graph_type(cparams.ctx_type));
 
-    res->reset();
+    // streamed: [TAG_PFS_LEND_RESERVE] built after llama_prefill_stream_reserve_begin returned true, ends the reserve views
+    auto build = [&](bool streamed) {
+        this->n_outputs = n_outputs;
+        res->reset();
+        auto * g = model.build_graph(gparams);
+        if (streamed) {
+            llama_prefill_stream_reserve_end(this);
+        }
 
-    auto * gf = model.build_graph(gparams);
+        // check the graph before scheduling: cross-backend copies break the producer chain that the check follows
+        if (!hadamard_verified && g && (!model.hdmd.rot.empty() || !model.hdmd.inv.empty())) {
+            llama_verify_hadamard_graph(g, model.hdmd.rot, model.hdmd.inv, moe_cache.get());
+            hadamard_verified = true;
+        }
 
-    // check the graph before scheduling: cross-backend copies break the producer chain that the check follows
-    if (!hadamard_verified && gf && (!model.hdmd.rot.empty() || !model.hdmd.inv.empty())) {
-        llama_verify_hadamard_graph(gf, model.hdmd.rot, model.hdmd.inv, moe_cache.get());
-        hadamard_verified = true;
-    }
+        this->n_input_tensors = llama_graph_n_input_tensors(g);
+        this->n_outputs = save_n_outputs;
+        return g;
+    };
 
-    this->n_input_tensors = llama_graph_n_input_tensors(gf);
-    this->n_outputs = save_n_outputs;
+    auto * gf = build(false);
 
     // initialize scheduler with the specified graph
     if (split_only) {
@@ -6345,6 +6354,35 @@ ggml_cgraph * llama_context::graph_reserve(
         GGML_ASSERT(!sizes);
         LLAMA_LOG_ERROR("%s: failed to allocate compute buffers\n", __func__);
         return nullptr;
+    }
+
+    // [TAG_PFS_LEND_RESERVE] a lending prefill stream: the graph above has the op-offload form (the banks are returned at a
+    // reserve), which a prompt that cannot borrow them runs; a prompt that borrows them runs the streamed form. The streamed
+    // graph is reserved as well: the allocator only grows a buffer, so the buffers end at the larger need of the two (per
+    // buffer), and the splits and nodes read after this call are the streamed graph's. If the streamed graph cannot be
+    // allocated, the op-offload reserve is made again and kept (as v0.32.0). Split-only probes keep the op-offload graph
+    if (gf && (!split_only || sizes) && llama_prefill_stream_reserve_begin(this, ubatch.n_tokens)) {
+        auto * gs = build(true);
+        if (split_only) {
+            const int n_b = ggml_backend_sched_get_n_backends(sched.get());
+            std::vector<size_t> sizes_s((size_t) n_b, 0);
+            ggml_backend_sched_reserve_size(sched.get(), gs, sizes_s.data());
+            for (int i = 0; i < n_b; ++i) {
+                sizes[i] = std::max(sizes[i], sizes_s[i]);
+            }
+            return gs;
+        }
+        if (ggml_backend_sched_reserve(sched.get(), gs)) {
+            return gs;
+        }
+        LLAMA_LOG_WARN("%s: [TAG_PFS_LEND_RESERVE] the streamed prompt graph of %u tokens does not fit: the op-offload reserve "
+                "is kept, a prompt that borrows the banks may fail to allocate\n", __func__, ubatch.n_tokens);
+        ggml_backend_sched_reset(sched.get()); // the failed reserve left the streamed graph's assignments
+        gf = build(false);
+        if (!ggml_backend_sched_reserve(sched.get(), gf)) {
+            LLAMA_LOG_ERROR("%s: failed to allocate compute buffers\n", __func__);
+            return nullptr;
+        }
     }
 
     return gf;
