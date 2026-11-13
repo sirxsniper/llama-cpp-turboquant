@@ -932,6 +932,241 @@ static test_status test_seq_keep_rollback(const common_params & params, llama_mo
     return ok_all ? test_status::PASS : test_status::FAIL;
 }
 
+// [TAG_RS_IDX_SHARE] seq_cp from a sequence whose rollback is pending: the copy shares the cell and must share the pending
+// rollback too. Seq 0 decodes 10 tokens and rolls back 3, seq_cp(0, 1); then the copy and the source continue (copy
+// first, source first, one batch) and must match a context where seq 0 decoded only the 7 kept tokens before the
+// seq_cp. A save of the copy must restore like a save of the source, a whole-context save must work and restore both,
+// and both must still continue right after a ubatch of other sequences moved the shared cell. Archs with the replay
+// layout run both layouts.
+static test_status test_seq_cp_rollback(const common_params & params, llama_model * model, uint8_t fill) {
+    const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+
+    constexpr uint32_t n_rs_seq = 3;
+
+    char arch[64] = {};
+    llama_model_meta_val_str(model, "general.architecture", arch, sizeof(arch));
+    const bool has_replay = strcmp(arch, "qwen35") == 0 || strcmp(arch, "qwen35moe") == 0;
+
+    // DSV4 keeps its rollback in its own cache (llama-kv-cache-dsv4.cpp), not in the recurrent memory
+    if (strcmp(arch, "deepseek4") == 0 || strcmp(arch, "deepseek41") == 0) {
+        LOG_INF("%s: skipping for %s\n", __func__, arch);
+        return test_status::SKIP;
+    }
+
+    const char * env_old = getenv("GDN_REPLAY");
+    const std::string env_old_s = env_old ? env_old : "";
+
+    const auto make = [&](const char * replay, uint32_t n_seq_max = 2) {
+        set_env_gdn_replay(replay);
+        auto cparams = common_context_params_to_llama(params);
+        cparams.n_seq_max  = n_seq_max;
+        cparams.n_rs_seq   = n_rs_seq;
+        cparams.n_ctx      = 256;
+        cparams.n_batch    = 256;
+        cparams.n_ubatch   = 64;
+        cparams.kv_unified = true;
+        auto ctx = init_ctx(model, cparams, fill);
+        set_env_gdn_replay(env_old ? env_old_s.c_str() : nullptr);
+        return ctx;
+    };
+
+    // stream 0 is the history of seq 0, stream 1 the copy's continuation, stream 2 the source's
+    const auto tok = [&](uint32_t stream, llama_pos pos) {
+        return (llama_token) ((7*(uint32_t) pos + 31*stream + 1) % (uint32_t) n_vocab);
+    };
+
+    struct part {
+        llama_seq_id seq;
+        uint32_t     stream;
+        llama_pos    p_begin;
+        llama_pos    p_end;
+    };
+
+    // decode the parts in one batch, every row an output
+    const auto decode_parts = [&](llama_context * ctx, const std::vector<part> & parts) {
+        common_batch batch(ctx);
+        for (const auto & pt : parts) {
+            for (llama_pos pos = pt.p_begin; pos < pt.p_end; ++pos) {
+                batch.add(tok(pt.stream, pos), pos, pt.seq, true);
+            }
+        }
+        return llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get()) == 0;
+    };
+
+    // seq 0 decodes 10 tokens and rolls back 3 (pending), then seq_cp(0, 1)
+    const auto prep_cp = [&](llama_context * ctx) {
+        llama_memory_t mem = llama_get_memory(ctx);
+        bool ok = decode_parts(ctx, { { 0, 0, 0, 10 } }) && llama_memory_seq_rm(mem, 0, 7, -1);
+        ok = ok && llama_memory_seq_rm(mem, 1, -1, -1);
+        llama_memory_seq_cp(mem, 0, 1, -1, -1);
+        return ok && llama_memory_seq_pos_max(mem, 1) == 6;
+    };
+    // the reference: seq 0 decodes the 7 kept tokens, then seq_cp(0, 1)
+    const auto prep_ref = [&](llama_context * ctx) {
+        llama_memory_t mem = llama_get_memory(ctx);
+        bool ok = decode_parts(ctx, { { 0, 0, 0, 7 } }) && llama_memory_seq_rm(mem, 1, -1, -1);
+        llama_memory_seq_cp(mem, 0, 1, -1, -1);
+        return ok;
+    };
+
+    const part cont_cp  = { 1, 1, 7, 10 };
+    const part cont_src = { 0, 2, 7, 10 };
+
+    bool ok_all = true;
+    for (const char * replay : { "0", "1" }) {
+        if (!has_replay && strcmp(replay, "1") == 0) {
+            break;
+        }
+        const std::string tag = std::string(" (GDN_REPLAY=") + replay + ")";
+
+        // the copy and the source continue: copy first, source first, one batch
+        for (int order = 0; order < 3; ++order) {
+            llama_context_ptr ctx_cp_ptr  = make(replay);
+            llama_context_ptr ctx_ref_ptr = make(replay);
+            llama_context * ctx_cp  = ctx_cp_ptr.get();
+            llama_context * ctx_ref = ctx_ref_ptr.get();
+            if (ctx_cp == nullptr || ctx_ref == nullptr) {
+                LOG_ERR("%s: failed to init contexts\n", __func__);
+                return test_status::FAIL;
+            }
+            if (llama_n_rs_seq(ctx_cp) < n_rs_seq) {
+                LOG_INF("%s: skipping because n_rs_seq is too small\n", __func__);
+                return test_status::SKIP;
+            }
+            bool ok = prep_cp(ctx_cp) && prep_ref(ctx_ref);
+            if (!ok) {
+                fprintf(stderr, "%s : decode, rollback or seq_cp failed%s\n", __func__, tag.c_str());
+                ok_all = false;
+                continue;
+            }
+            const char * what[3] = { "copy first", "source first", "one batch" };
+            const std::string w = std::string(what[order]) + tag;
+            if (order == 2) {
+                ok = ok && decode_parts(ctx_cp, { cont_src, cont_cp }) && decode_parts(ctx_ref, { cont_src, cont_cp });
+                ok = ok && same_logits(__func__, ("both after seq_cp, " + w).c_str(), ctx_cp, ctx_ref, 6);
+            } else {
+                const part first  = order == 0 ? cont_cp  : cont_src;
+                const part second = order == 0 ? cont_src : cont_cp;
+                const std::string w_cp  = "copy after seq_cp, "   + w;
+                const std::string w_src = "source after seq_cp, " + w;
+                ok = ok && decode_parts(ctx_cp, { first }) && decode_parts(ctx_ref, { first });
+                ok = ok && same_logits(__func__, (order == 0 ? w_cp : w_src).c_str(), ctx_cp, ctx_ref, 3);
+                ok = ok && decode_parts(ctx_cp, { second }) && decode_parts(ctx_ref, { second });
+                ok = ok && same_logits(__func__, (order == 0 ? w_src : w_cp).c_str(), ctx_cp, ctx_ref, 3);
+            }
+            ok_all = ok_all && ok;
+        }
+
+        // a save of the copy restores like a save of the source
+        {
+            llama_context_ptr ctx_cp_ptr   = make(replay);
+            llama_context_ptr ctx_src_ptr  = make(replay);
+            llama_context_ptr ctx_load_ptr = make(replay);
+            llama_context_ptr ctx_ref_ptr  = make(replay);
+            llama_context * ctx_cp   = ctx_cp_ptr.get();
+            llama_context * ctx_src  = ctx_src_ptr.get();
+            llama_context * ctx_load = ctx_load_ptr.get();
+            llama_context * ctx_ref  = ctx_ref_ptr.get();
+            if (ctx_cp == nullptr || ctx_src == nullptr || ctx_load == nullptr || ctx_ref == nullptr) {
+                LOG_ERR("%s: failed to init contexts\n", __func__);
+                return test_status::FAIL;
+            }
+            bool ok = prep_cp(ctx_cp);
+            ok = ok && decode_parts(ctx_src, { { 0, 0, 0, 10 } });
+            ok = ok && llama_memory_seq_rm(llama_get_memory(ctx_src), 0, 7, -1);
+
+            const auto save_load = [&](llama_context * from, llama_seq_id seq, llama_context * to) {
+                std::vector<uint8_t> buf(llama_state_seq_get_size(from, seq));
+                return llama_state_seq_get_data(from, buf.data(), buf.size(), seq) == buf.size() &&
+                       llama_state_seq_set_data(to, buf.data(), buf.size(), 0) == buf.size();
+            };
+            ok = ok && save_load(ctx_cp, 1, ctx_load) && save_load(ctx_src, 0, ctx_ref);
+            if (!ok) {
+                fprintf(stderr, "%s : save or load failed%s\n", __func__, tag.c_str());
+                ok_all = false;
+            } else {
+                const part cont = { 0, 1, 7, 10 };
+                ok = decode_parts(ctx_load, { cont }) && decode_parts(ctx_ref, { cont });
+                ok = ok && same_logits(__func__, ("saved copy" + tag).c_str(), ctx_load, ctx_ref, 3);
+                ok_all = ok_all && ok;
+            }
+        }
+
+        // a whole-context save after the seq_cp works and restores both sequences
+        {
+            llama_context_ptr ctx_cp_ptr    = make(replay);
+            llama_context_ptr ctx_whole_ptr = make(replay);
+            llama_context_ptr ctx_ref_ptr   = make(replay);
+            llama_context * ctx_cp    = ctx_cp_ptr.get();
+            llama_context * ctx_whole = ctx_whole_ptr.get();
+            llama_context * ctx_ref   = ctx_ref_ptr.get();
+            if (ctx_cp == nullptr || ctx_whole == nullptr || ctx_ref == nullptr) {
+                LOG_ERR("%s: failed to init contexts\n", __func__);
+                return test_status::FAIL;
+            }
+            bool ok = prep_cp(ctx_cp) && prep_ref(ctx_ref);
+            std::vector<uint8_t> buf;
+            if (ok) {
+                buf.resize(llama_state_get_size(ctx_cp));
+                ok = llama_state_get_data(ctx_cp, buf.data(), buf.size()) == buf.size() &&
+                     llama_state_set_data(ctx_whole, buf.data(), buf.size()) == buf.size();
+            }
+            if (!ok) {
+                fprintf(stderr, "%s : whole-context save or load failed%s\n", __func__, tag.c_str());
+                ok_all = false;
+            } else {
+                ok = decode_parts(ctx_whole, { cont_src, cont_cp }) && decode_parts(ctx_ref, { cont_src, cont_cp });
+                ok = ok && same_logits(__func__, ("whole-context save after seq_cp" + tag).c_str(), ctx_whole, ctx_ref, 6);
+                ok_all = ok_all && ok;
+            }
+        }
+
+        // the shared cell as an extra: seq 2 and seq 3 hold the cells on both sides of it and decode together, which moves
+        // it and consumes its pending rollback; then the copy and the source continue. A rollback of 2 of the 3 ring
+        // tokens leaves 1 in the replay layout, so a second use of the index would drop it.
+        {
+            llama_context_ptr ctx_cp_ptr  = make(replay, 4);
+            llama_context_ptr ctx_ref_ptr = make(replay, 4);
+            llama_context * ctx_cp  = ctx_cp_ptr.get();
+            llama_context * ctx_ref = ctx_ref_ptr.get();
+            if (ctx_cp == nullptr || ctx_ref == nullptr) {
+                LOG_ERR("%s: failed to init contexts\n", __func__);
+                return test_status::FAIL;
+            }
+            const auto prep_extra = [&](llama_context * ctx, llama_pos n_src, bool rollback) {
+                llama_memory_t mem = llama_get_memory(ctx);
+                // recurrent cells 0, 1, 2 for seq 2, 0, 3; the rolled back tokens are the last attention cells; the
+                // reference's last ubatch has 2 tokens (with 1 token its logits were not bit for bit equal on CPU)
+                bool ok = decode_parts(ctx, { { 2, 3, 0, 5 } }) && decode_parts(ctx, { { 0, 0, 0, 5 } }) &&
+                          decode_parts(ctx, { { 3, 4, 0, 5 } }) && decode_parts(ctx, { { 0, 0, 5, n_src } });
+                if (rollback) {
+                    ok = ok && llama_memory_seq_rm(mem, 0, 8, -1);
+                }
+                ok = ok && llama_memory_seq_rm(mem, 1, -1, -1);
+                llama_memory_seq_cp(mem, 0, 1, -1, -1);
+                return ok;
+            };
+            const std::vector<part> sides = { { 2, 3, 5, 7 }, { 3, 4, 5, 7 } };
+            const part next_cp  = { 1, 1, 8, 11 };
+            const part next_src = { 0, 2, 8, 11 };
+
+            bool ok = prep_extra(ctx_cp, 10, true) && prep_extra(ctx_ref, 8, false);
+            ok = ok && decode_parts(ctx_cp, sides) && decode_parts(ctx_ref, sides);
+            ok = ok && same_logits(__func__, ("seq 2 and 3 next to the shared cell" + tag).c_str(), ctx_cp, ctx_ref, 4);
+            ok = ok && decode_parts(ctx_cp, { next_cp }) && decode_parts(ctx_ref, { next_cp });
+            ok = ok && same_logits(__func__, ("copy after the shared cell moved" + tag).c_str(), ctx_cp, ctx_ref, 3);
+            ok = ok && decode_parts(ctx_cp, { next_src }) && decode_parts(ctx_ref, { next_src });
+            ok = ok && same_logits(__func__, ("source after the shared cell moved" + tag).c_str(), ctx_cp, ctx_ref, 3);
+            ok_all = ok_all && ok;
+        }
+    }
+
+    if (ok_all) {
+        LOG_INF("%s: the copy shared the pending rollback of its source\n", __func__);
+    }
+    return ok_all ? test_status::PASS : test_status::FAIL;
+}
+
 // [TAG_RS_IDX_SHARE] seq_rm(s, 0, p1) with a finite p1 past the last position removes the whole sequence, as
 // seq_rm(s, -1, -1) does, and must drop its pending rollback too. Seq 0 decodes 10 tokens, rolls back 3 (pending), then
 // seq_rm(0, 0, 1000); a new seq 0 from position 0 must match a fresh context. Archs with the replay layout run both layouts.
@@ -1041,6 +1276,7 @@ static test_results run_tests(const common_params & params, llama_model * model)
         test_status rb = merge_status(test_rollback(params, model, fill), test_displaced_extra_rollback(params, model, fill));
         // [TAG_RS_IDX_SHARE]
         rb = merge_status(rb, test_seq_keep_rollback(params, model, fill));
+        rb = merge_status(rb, test_seq_cp_rollback(params, model, fill));
         rb = merge_status(rb, test_seq_rm_all_rollback(params, model, fill));
         const test_status rp = merge_status(test_multi_seq_split_replay(params, model, fill),
                                             test_replay_vs_snapshot(params, model, fill));

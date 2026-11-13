@@ -525,6 +525,8 @@ void llama_memory_recurrent::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id
             cell_src.seq_id.insert(seq_id_dst);
             tail_dst.tail = tail_src.tail;
         }
+        // [TAG_RS_IDX_SHARE] dst continues from src's state, a pending rollback of src included (none without a cell)
+        set_rs_idx(seq_id_dst, tail_src.tail >= 0 ? rs_idx[seq_id_src] : 0);
     }
 }
 
@@ -1812,8 +1814,13 @@ int32_t llama_memory_recurrent_context::s_copy(int i) const {
         const llama_seq_id seq = *mem->cells[cell_idx].seq_id.begin();
         if (seq >= 0 && (size_t) seq < mem->rs_idx.size()) {
             idx = mem->rs_idx[seq];
-            // reset rollback idx
-            mem->rs_idx[seq] = 0;
+        }
+        // reset rollback idx
+        // [TAG_RS_IDX_SHARE] of every sharer: they agree on it, and after this ubatch none of them may read it again
+        for (const llama_seq_id s : mem->cells[cell_idx].seq_id) {
+            if (s >= 0 && (size_t) s < mem->rs_idx.size()) {
+                mem->rs_idx[s] = 0;
+            }
         }
     }
 

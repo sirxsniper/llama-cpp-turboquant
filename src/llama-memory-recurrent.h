@@ -164,6 +164,9 @@ public:
     uint32_t n_rs_seq = 0;
 
     // per-seq rollback index
+    // [TAG_RS_IDX_SHARE] rs_idx[s] != 0 only while s has a tail cell whose group 0 still holds the state before the rollback.
+    //   seq_cp gives dst the index of src (0 when src has no cell), an operation that drops the tail of s resets it (seq_rm
+    //   of the whole sequence, seq_keep), and s_copy consumes it for every sharer of the cell.
     std::vector<uint32_t> rs_idx;
 
     void set_rs_idx(llama_seq_id seq_id, uint32_t idx);
