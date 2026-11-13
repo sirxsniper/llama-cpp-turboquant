@@ -965,24 +965,24 @@ struct common_sampler {
     // [TAG_FN_L4_HOST_TOPK] LLAMA_FN_L4_HOST_TOPK (qwen4exp): K of the fast candidate path, 0 = off; the ids the
     // logit-bias sampler sets to -inf (sorted)
     int                      fast_k = 0;
-    std::vector<llama_token> fast_excl;
+    std::vector<llama_token> fast_excl {};
 
     // [TAG_R28_PENFAST] the fast candidate path with penalties / a logit bias (top_k 0: off) and its scratch
     // [TAG_R29_GRAMFAST] with a grammar and/or a reasoning budget penfast drives the candidate-set path instead
-    common_penfast_cfg       penfast;
-    std::vector<llama_token> penfast_excl;
+    common_penfast_cfg       penfast {};
+    std::vector<llama_token> penfast_excl {};
 
     // [TAG_R29_GRAMFAST] the candidate-set path's scratch, and what its last run saw
-    common_gramfast_scratch  gramfast_sc;
+    common_gramfast_scratch  gramfast_sc {};
 
     // [TAG_FN_L21_NANGUARD] rows seen with NaN / +inf logits since the last take (last: the aggregate inits above)
     uint32_t n_nonfinite = 0;
 
     // [TAG_V0261_PRETRIM] the wider second trim (null: none), the trim rule, and per-position scratch
     struct llama_sampler *   grmr_pretrim_wide = nullptr;
-    common_pretrim_cfg       pretrim;
-    std::vector<llama_token> pretrim_hist;
-    std::vector<llama_token> pretrim_touched;
+    common_pretrim_cfg       pretrim {};
+    std::vector<llama_token> pretrim_hist {};
+    std::vector<llama_token> pretrim_touched {};
     size_t                   pretrim_bound = 0;
 };
 
