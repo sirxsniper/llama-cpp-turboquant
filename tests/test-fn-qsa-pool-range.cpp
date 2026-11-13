@@ -6,7 +6,7 @@
 // empty, the whole row, at both edges, and values outside the row (the op clamps them).
 //
 // Part 2 (with a model file): whole decodes of a tiny qwen4exp model with the switch on against off.
-// Usage: test-qsa-pool-range <qwen4exp-moe.gguf> [threads]   (make the file with: test-llama-archs -a qwen4exp -o <dir>)
+// Usage: test-fn-qsa-pool-range <qwen4exp-moe.gguf> [threads]   (make the file with: test-llama-archs -a qwen4exp -o <dir>)
 // Two sequences: two long prompts (several ubatches), a batch with prompt rows of both, joint decode steps with a
 // rollback, a removed conversation and a new one in its cells, a last joint step. Every eighth prompt row and every
 // decode row is an output, and all of their logits must have the same bits with the switch on as with it off, for
@@ -350,10 +350,10 @@ int main(int argc, char ** argv) {
         }
     }
     op_case(131584, 64, 24, false, seed++, n_threads); // the pool count of a 262K, 2-sequence reserve
-    printf("test-qsa-pool-range: the op: %d checks, %d failed\n", g_checks, g_fail);
+    printf("test-fn-qsa-pool-range: the op: %d checks, %d failed\n", g_checks, g_fail);
 
     if (argc < 2) {
-        printf("test-qsa-pool-range: whole decodes SKIPPED (no model file; make one with test-llama-archs -a qwen4exp -o <dir>)\n");
+        printf("test-fn-qsa-pool-range: whole decodes SKIPPED (no model file; make one with test-llama-archs -a qwen4exp -o <dir>)\n");
         return g_fail == 0 ? 0 : 1;
     }
     const char * path = argv[1];
@@ -389,6 +389,6 @@ int main(int argc, char ** argv) {
     }
 
     llama_backend_free();
-    printf("test-qsa-pool-range: %d whole-decode comparisons, %d checks, %d failed\n", n_pairs, g_checks, g_fail);
+    printf("test-fn-qsa-pool-range: %d whole-decode comparisons, %d checks, %d failed\n", n_pairs, g_checks, g_fail);
     return g_fail == 0 ? 0 : 1;
 }
