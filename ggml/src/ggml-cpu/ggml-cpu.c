@@ -1361,7 +1361,7 @@ bool ggml_cpu_fn_vec_dot_mr(enum ggml_type type, int n, float * s, size_t bs, co
 void * ggml_cpu_fn_mr_kernel_get(enum ggml_type type);
 void * ggml_cpu_fn_mr_kernel_get(enum ggml_type type) {
     ggml_cpu_init();
-    return (void *) ggml_cpu_fn_mr_kernel(type);
+    return (void *) (uintptr_t) ggml_cpu_fn_mr_kernel(type);
 }
 
 // [TAG_Q2_0_CPU] the use_ref backend (the reference of test-backend-ops -b CPU) runs the scalar Q2_0 dot product, so the
@@ -3366,7 +3366,7 @@ static bool ggml_fn_moe_tiled_idle(const struct ggml_fn_moe_match * m) {
     const struct ggml_tensor * mm[3] = { m->up, m->gate, m->down };
     bool tiled = false;
     for (int k = 0; k < 3; ++k) {
-        tiled = tiled || ggml_tiled_wdata_size(1, (struct ggml_tensor *) mm[k]) > 0;
+        tiled = tiled || ggml_tiled_wdata_size(1, (struct ggml_tensor *) (uintptr_t) mm[k]) > 0;
     }
     if (!tiled) {
         return true;

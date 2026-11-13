@@ -3722,7 +3722,7 @@ void ggml_gemv_q2_0_8x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
                 const __m256i i0 = ggml_q2_0x8_gemv_half(b_ptr[l].qs,      a_ptr[2 * l + 0].qs, ysum[c + 0]);
                 const __m256i i1 = ggml_q2_0x8_gemv_half(b_ptr[l].qs + 64, a_ptr[2 * l + 1].qs, ysum[c + 1]);
 
-                const __m256 d0 = GGML_F32Cx8_LOAD((ggml_fp16_t *) b_ptr[l].d);
+                const __m256 d0 = GGML_F32Cx8_LOAD(const_cast<ggml_fp16_t *>(b_ptr[l].d));
                 const __m256 sumi = ggml_q2_0x8_sumi_next(ggml_q2_0x8_sumi_first(yd[c + 0], i0), yd[c + 1], i1);
                 acc = ggml_q2_0x8_acc(acc, d0, sumi);
             }
@@ -3798,7 +3798,7 @@ void ggml_gemm_q2_0_8x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
                     sumi2 = ggml_q2_0x8_sumi_next(sumi2, yd[c + 6], i2);
                     sumi3 = ggml_q2_0x8_sumi_next(sumi3, yd[c + 7], i3);
 
-                    const __m256 d0 = GGML_F32Cx8_LOAD((ggml_fp16_t *) b_ptr[l].d);
+                    const __m256 d0 = GGML_F32Cx8_LOAD(const_cast<ggml_fp16_t *>(b_ptr[l].d));
                     acc0 = ggml_q2_0x8_acc(acc0, d0, sumi0);
                     acc1 = ggml_q2_0x8_acc(acc1, d0, sumi1);
                     acc2 = ggml_q2_0x8_acc(acc2, d0, sumi2);
