@@ -106,6 +106,31 @@ static float logit_diff(float a, float b) {
     return std::isfinite(a) && std::isfinite(b) ? std::fabs(a - b) : std::numeric_limits<float>::infinity();
 }
 
+// [TAG_RS_IDX_SHARE] every logit of the first n_rows output rows, bit for bit
+static bool same_logits(const char * test, const char * what, llama_context * ctx_a, llama_context * ctx_b, uint32_t n_rows) {
+    const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx_a)));
+    uint32_t n_diff = 0;
+    for (uint32_t i = 0; i < n_rows; ++i) {
+        const float * l_a = llama_get_logits_ith(ctx_a, i);
+        const float * l_b = llama_get_logits_ith(ctx_b, i);
+        if (l_a == nullptr || l_b == nullptr) {
+            fprintf(stderr, "%s : %s: missing logits at row %u\n", test, what, i);
+            return false;
+        }
+        for (int t = 0; t < n_vocab; ++t) {
+            if (logit_diff(l_a[t], l_b[t]) > 0.0f) {
+                n_diff++;
+                break;
+            }
+        }
+    }
+    if (n_diff != 0) {
+        fprintf(stderr, "%s : %s: %u of %u rows differ\n", test, what, n_diff, n_rows);
+        return false;
+    }
+    return true;
+}
+
 static double nmse(const float * a, const float * b, int n) {
     double mse_ab = 0.0;
     double mse_a0 = 0.0;
@@ -809,6 +834,104 @@ static test_status test_replay_vs_snapshot(const common_params & params, llama_m
     return ok ? test_status::PASS : test_status::FAIL;
 }
 
+// seq_keep must drop the pending rollback of every sequence it drops, as seq_rm(s, -1, -1) does, and keep the one of the
+// kept sequence. Seq 0 and seq 1 decode, both roll back (rs_idx pending), seq_keep(1); then seq 1 continues and must
+// match a context that dropped seq 0 with seq_rm(0, -1, -1), and a new seq 0 from position 0 must match a fresh context.
+// Archs with the replay layout run both layouts.
+static test_status test_seq_keep_rollback(const common_params & params, llama_model * model, uint8_t fill) {
+    const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+
+    constexpr uint32_t n_rs_seq = 3;
+    constexpr uint32_t n_new    = 10;
+
+    char arch[64] = {};
+    llama_model_meta_val_str(model, "general.architecture", arch, sizeof(arch));
+    const bool has_replay = strcmp(arch, "qwen35") == 0 || strcmp(arch, "qwen35moe") == 0;
+
+    const char * env_old = getenv("GDN_REPLAY");
+    const std::string env_old_s = env_old ? env_old : "";
+
+    const auto make = [&](const char * replay) {
+        set_env_gdn_replay(replay);
+        auto cparams = common_context_params_to_llama(params);
+        cparams.n_seq_max  = 2;
+        cparams.n_rs_seq   = n_rs_seq;
+        cparams.n_ctx      = 256;
+        cparams.n_batch    = 256;
+        cparams.n_ubatch   = 64;
+        cparams.kv_unified = true;
+        auto ctx = init_ctx(model, cparams, fill);
+        set_env_gdn_replay(env_old ? env_old_s.c_str() : nullptr);
+        return ctx;
+    };
+
+    const auto tok = [&](llama_seq_id seq, llama_pos pos) {
+        return (llama_token) ((7*(uint32_t) pos + 31*(uint32_t) seq + 1) % (uint32_t) n_vocab);
+    };
+
+    // decode tokens [p_begin, p_end) of seq, every row an output
+    const auto decode_range = [&](llama_context * ctx, llama_seq_id seq, llama_pos p_begin, llama_pos p_end) {
+        common_batch batch(ctx);
+        for (llama_pos pos = p_begin; pos < p_end; ++pos) {
+            batch.add(tok(seq, pos), pos, seq, true);
+        }
+        return llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get()) == 0;
+    };
+
+    bool ok_all = true;
+    for (const char * replay : { "0", "1" }) {
+        if (!has_replay && strcmp(replay, "1") == 0) {
+            break;
+        }
+
+        llama_context_ptr ctx_keep_ptr  = make(replay);
+        llama_context_ptr ctx_rm_ptr    = make(replay);
+        llama_context_ptr ctx_fresh_ptr = make(replay);
+        llama_context * ctx_keep  = ctx_keep_ptr.get();
+        llama_context * ctx_rm    = ctx_rm_ptr.get();
+        llama_context * ctx_fresh = ctx_fresh_ptr.get();
+        if (ctx_keep == nullptr || ctx_rm == nullptr || ctx_fresh == nullptr) {
+            LOG_ERR("%s: failed to init contexts\n", __func__);
+            return test_status::FAIL;
+        }
+        if (llama_n_rs_seq(ctx_keep) < n_rs_seq) {
+            LOG_INF("%s: skipping because n_rs_seq is too small\n", __func__);
+            return test_status::SKIP;
+        }
+
+        const std::string tag = std::string(" (GDN_REPLAY=") + replay + ")";
+        bool ok = true;
+
+        for (llama_context * ctx : { ctx_keep, ctx_rm }) {
+            llama_memory_t mem = llama_get_memory(ctx);
+            ok = ok && decode_range(ctx, 0, 0, 10) && decode_range(ctx, 1, 0, 7);
+            // rollbacks of 3 and 2 tokens, both pending
+            ok = ok && llama_memory_seq_rm(mem, 0, 7, -1) && llama_memory_seq_rm(mem, 1, 5, -1);
+        }
+        if (!ok) {
+            fprintf(stderr, "%s : decode or rollback failed%s\n", __func__, tag.c_str());
+            ok_all = false;
+            continue;
+        }
+        llama_memory_seq_keep(llama_get_memory(ctx_keep), 1);
+        ok = ok && llama_memory_seq_rm(llama_get_memory(ctx_rm), 0, -1, -1);
+
+        // the kept sequence consumes its own pending rollback
+        ok = ok && decode_range(ctx_keep, 1, 5, 8) && decode_range(ctx_rm, 1, 5, 8);
+        ok = ok && same_logits(__func__, ("seq 1 after seq_keep" + tag).c_str(), ctx_keep, ctx_rm, 3);
+
+        // a dropped id starts from position 0 with a clean state
+        ok = ok && decode_range(ctx_keep, 0, 0, n_new) && decode_range(ctx_fresh, 0, 0, n_new);
+        ok = ok && same_logits(__func__, ("new seq 0 after seq_keep" + tag).c_str(), ctx_keep, ctx_fresh, n_new);
+        ok_all = ok_all && ok;
+    }
+
+    if (ok_all) {
+        LOG_INF("%s: seq_keep dropped the pending rollbacks of the dropped sequences\n", __func__);
+    }
+    return ok_all ? test_status::PASS : test_status::FAIL;
+}
+
 static test_status merge_status(test_status a, test_status b) {
     if (a == test_status::FAIL || b == test_status::FAIL) {
         return test_status::FAIL;
@@ -829,9 +952,10 @@ static test_results run_tests(const common_params & params, llama_model * model)
     test_results res;
     for (uint8_t fill : { 0, 0x3e }) {
         LOG_INF("%s: testing with cache fill 0x%02x\n", __func__, fill);
-        // [TAG_XSEQ_PLANES] [TAG_4C_GDN_REPLAY] the fork's two checks report in the rollback and replay columns
-        const test_status rb = merge_status(test_rollback(params, model, fill),
-                                            test_displaced_extra_rollback(params, model, fill));
+        // [TAG_XSEQ_PLANES] [TAG_4C_GDN_REPLAY] the fork's checks report in the rollback and replay columns
+        const test_status rb = merge_status(merge_status(test_rollback(params, model, fill),
+                                                         test_displaced_extra_rollback(params, model, fill)),
+                                            test_seq_keep_rollback(params, model, fill));
         const test_status rp = merge_status(test_multi_seq_split_replay(params, model, fill),
                                             test_replay_vs_snapshot(params, model, fill));
         res.rollback = merge_status(res.rollback, rb);

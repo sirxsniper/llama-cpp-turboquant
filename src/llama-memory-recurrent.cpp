@@ -529,6 +529,13 @@ void llama_memory_recurrent::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id
 void llama_memory_recurrent::seq_keep(llama_seq_id seq_id) {
     uint32_t new_head = size;
 
+    // [TAG_RS_IDX_SHARE] a dropped sequence loses its pending rollback, as in seq_rm(s, -1, -1)
+    for (llama_seq_id s = 0; s < (llama_seq_id) n_seq_max; ++s) {
+        if (s != seq_id) {
+            set_rs_idx(s, 0);
+        }
+    }
+
     for (uint32_t i = 0; i < size; ++i) {
         if ((llama_seq_id) i != seq_id) {
             cells[i].tail = -1;
