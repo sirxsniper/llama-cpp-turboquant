@@ -444,6 +444,8 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
             // invalidate tails which will be cleared
             if (p0 <= cell.pos && cell.pos < p1) {
                 tail_id = -1;
+                // [TAG_RS_IDX_SHARE] the whole sequence goes (p0 == 0 here), so does its pending rollback
+                set_rs_idx(seq_id, 0);
             }
         }
     } else {
