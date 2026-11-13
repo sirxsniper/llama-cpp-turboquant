@@ -5,6 +5,7 @@
 #include "llama-fn-l22.h" // [TAG_FN_L22_DMASHARE] round 22 hooks
 #include "llama-fn-prior.h" // [TAG_FN_L22_X_PRIOR]
 #include "llama-fn-tbo.h" // [TAG_FN_L22_TBO] two-chain decode: the channel layout
+#include "llama-fn-wide.h" // [TAG_FN_WIDE_DECODE]
 
 #include "llama-impl.h"
 #include "llama-model.h"
@@ -258,6 +259,9 @@ struct llama_moe_bridge {
     int     mode       = GGML_MOE_BRIDGE_WAIT_SPIN;
     int     max_t      = 8;
     int     seq_t      = 0;    // [TAG_FN_L13_BRIDGE_SEQS] most tokens of one sequence per graph (0: max_t)
+    int     wide_t     = 0;    // [TAG_FN_WIDE_DECODE] widest decode ubatch of 2+ sequences on the bridge (0: off)
+    int     job_t      = 8;    // [TAG_FN_WIDE_DECODE] widest job and buffers: max(max_t, wide_t)
+    bool    wide_obs   = false; // [TAG_FN_WIDE_DECODE] =1: the hot-set observer counts a wide step as a decode step
     bool    sync_on    = true; // [TAG_FN_R2_BRIDGE_SYNC] LLAMA_MOE_BRIDGE_SYNC
     int     n_used     = 0;
     int64_t n_embd     = 0;
@@ -687,7 +691,8 @@ static bool br_run(const ggml_moe_bridge_job * j, void * ud) {
             c.layer_dma.table_miss = 0;
             layer = &c.layer_dma;
         } else if ((j->flags & GGML_MOE_BRIDGE_JOB_DMA) && j->plan) {
-            if (!c.dma || !br->dma_on || j->n_used*j->n_tokens > br->max_t*br->n_used) {
+            // [TAG_FN_WIDE_DECODE] the plan area holds job_t tokens
+            if (!c.dma || !br->dma_on || j->n_used*j->n_tokens > br->job_t*br->n_used) {
                 return false; // the graph asked for a fetch this bridge cannot plan: fail the job (and with it the ubatch)
             }
             const int64_t n_exp = c.up->ne[2];
@@ -851,7 +856,7 @@ static bool br_run_light(llama_moe_bridge * br, const ggml_moe_bridge_job & a, c
 // layer's input (still in the channel's mapped memory: the device posts to this channel again only in the next step)
 // and let the pool's workers pull the cold ones into the caches until the next job comes (ggml_cpu_moe_run stops them)
 static void br_prefetch_next(llama_moe_bridge * br, ggml_cpu_moe_pool * pool, const ggml_moe_bridge_job & j) {
-    if (j.chan < 0 || j.chan >= (int) br->pf_next.size() || j.x == nullptr || j.n_tokens < 1 || j.n_tokens > br->max_t) {
+    if (j.chan < 0 || j.chan >= (int) br->pf_next.size() || j.x == nullptr || j.n_tokens < 1 || j.n_tokens > br->job_t) {
         return;
     }
     if (j.flags & GGML_MOE_BRIDGE_JOB_NOPF) {
@@ -1313,6 +1318,14 @@ llama_moe_bridge * llama_moe_bridge_create(const llama_model & model, int n_thre
         br->max_t = max_t_cap;
     }
     br->seq_t      = seq_t_cap > 0 && seq_t_cap < br->max_t ? seq_t_cap : 0;
+    // [TAG_FN_WIDE_DECODE] LLAMA_FN_WIDE_DECODE=1 / 2: decode ubatches of 2+ sequences up to what the ring rolls back (n_seq_max
+    // sequences of at most seq_t rows, at most 16) take the bridge as well; max_t, and with it every other ubatch, stays as above
+    // (LLAMA_MOE_BRIDGE_MAX_T set as wide or wider: those graphs fit already, the switch adds the hot chain and the observer)
+    const int wide_mode = fn_wide::mode_from_int(llama_fn_l3_int(model, "LLAMA_FN_WIDE_DECODE", 0)); // qwen4exp only
+    const int wide_rows = fn_wide::ring_rows(max_t_cap, seq_t_cap, br->seq_t > 0 ? br->seq_t : br->max_t);
+    br->wide_t     = fn_wide::width(wide_mode, wide_rows);
+    br->job_t      = fn_wide::job_t(br->max_t, br->wide_t);
+    br->wide_obs   = br->wide_t > 0 && wide_mode == 1;
     br->spin_us    = std::max(0, env_int("LLAMA_MOE_BRIDGE_SPIN_US", 2000));
     br->timeout_ms = std::min(1200, std::max(1, env_int("LLAMA_MOE_BRIDGE_TIMEOUT_MS", 500))); // [TAG_FN_R1_BRIDGE_RETRY]
     br->job_max_ms = std::min(1200, std::max(br->timeout_ms, env_int("LLAMA_MOE_BRIDGE_JOB_MAX_MS", 1000)));
@@ -1566,7 +1579,7 @@ llama_moe_bridge * llama_moe_bridge_create(const llama_model & model, int n_thre
     }
     bp.n_embd     = br->n_embd;
     bp.n_used     = br->n_used;
-    bp.max_tokens = br->max_t;
+    bp.max_tokens = br->job_t; // [TAG_FN_WIDE_DECODE]
     bp.wait_mode  = br->mode;
     bp.timeout_ms = br->timeout_ms;
     bp.job_max_ms = br->job_max_ms;
@@ -1779,6 +1792,15 @@ llama_moe_bridge * llama_moe_bridge_create(const llama_model & model, int n_thre
         LLAMA_LOG_INFO("%s: [TAG_FN_L13_BRIDGE_SEQS] graphs of up to %d tokens with at most %d of one sequence (the ring each "
                 "sequence rolls back)\n", __func__, br->max_t, br->seq_t);
     }
+    if (br->wide_t > 0) {
+        LLAMA_LOG_INFO("%s: [TAG_FN_WIDE_DECODE] decode ubatches of %d..%d rows (2 or more sequences of the same 1..%d rows) take "
+                "the bridge and the hot chain; the hot set counts them as %s; other graphs stay at T <= %d\n", __func__,
+                fn_wide::BASE_T + 1, br->wide_t, br->seq_t > 0 ? br->seq_t : br->max_t,
+                br->wide_obs ? "decode steps" : "prompts (LLAMA_FN_WIDE_DECODE=2)", br->max_t);
+    } else if (wide_mode > 0) {
+        LLAMA_LOG_INFO("%s: [TAG_FN_WIDE_DECODE] nothing to widen: a decode ubatch the ring rolls back has at most %d rows "
+                "(n_seq_max x the rows per sequence), no more than %d\n", __func__, wide_rows, fn_wide::BASE_T);
+    }
     if (br->ple_chan >= 0) {
         LLAMA_LOG_INFO("%s: [TAG_FN_L16_PLEGATE] channel %d: bridged decode graphs launch without their PLE rows and wait for "
                 "them on the device before the PLE layer%s\n", __func__, br->ple_chan,
@@ -1976,6 +1998,25 @@ bool llama_moe_bridge_fits(const llama_moe_bridge * br, int n_tokens, int n_seq_
 
 bool llama_moe_bridge_ring_ok(const llama_moe_bridge * br, int n_seq_tokens) {
     return br && n_seq_tokens <= (br->seq_t > 0 ? br->seq_t : br->max_t);
+}
+
+// [TAG_FN_WIDE_DECODE]
+int llama_moe_bridge_wide_t(const llama_moe_bridge * br) {
+    return br ? br->wide_t : 0;
+}
+
+int llama_moe_bridge_seq_lim(const llama_moe_bridge * br) {
+    return br ? (br->seq_t > 0 ? br->seq_t : br->max_t) : 0;
+}
+
+bool llama_moe_bridge_wide_ub(const llama_moe_bridge * br, int n_tokens, bool equal_seqs, int n_seqs, int n_seq_tokens,
+        int n_outputs) {
+    return br && fn_wide::decode_ub(br->wide_t, n_tokens, equal_seqs, n_seqs, n_seq_tokens, br->seq_t > 0 ? br->seq_t : br->max_t,
+            n_outputs);
+}
+
+bool llama_moe_bridge_wide_obs(const llama_moe_bridge * br) {
+    return br && br->wide_obs;
 }
 
 // [TAG_FN_L3_MTP_COST2]

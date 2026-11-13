@@ -4,6 +4,7 @@
 #include "llama-fn-stall.h" // [TAG_FN_L18_FIRSTANS_STALL]
 #include "llama-fn-tier.h"  // [TAG_FN_L18_FIRSTANS_STATE] llama_fn_prefetch_ranges
 #include "llama-moe-decay.h" // [TAG_FN_R4_ADAPT_DECAY]
+#include "llama-fn-wide.h"   // [TAG_FN_WIDE_DECODE]
 #include "llama-moe-bridge.h" // [TAG_FN_L3_HOST_QUIET]
 #include "llama-fn-l22.h"     // [TAG_FN_L22_P4] pins, PASSLOG
 #include "llama-fn-vguard.h"  // [TAG_R40_VGUARD] LLAMA_R40_VGUARD_CHECK
@@ -1022,13 +1023,17 @@ struct hot_stats {
 
 hot_stats g_hot_stats;
 
+// [TAG_FN_WIDE_DECODE] the rows of the wide decode graph in flight (llama_moe_hot_obs_wide; 0: none)
+std::atomic<int> g_obs_wide_t{0};
+
 // LLAMA_MOE_HOT_STATS: the CPU MUL_MAT_ID of every host-resident ffn_gate_exps reports its routed ids here (the
 // observer hook of the LRU cache, ggml-cpu.c); decode ubatches only, counted against the fixed host table
 void hot_obs_cb(const char * name, const struct ggml_tensor * ids, void * ud) {
     moe_cache * mc = (moe_cache *) ud;
     const int64_t n_used   = ids->ne[0];
     const int64_t n_tokens = ids->ne[1];
-    if (n_tokens > mc->hot_max_t) {
+    // [TAG_FN_WIDE_DECODE] wider than hot_max_t: a prompt, unless it is the wide decode graph in flight (LLAMA_FN_WIDE_DECODE=1)
+    if (!fn_wide::obs_decode((int) n_tokens, mc->hot_max_t, g_obs_wide_t.load(std::memory_order_acquire))) {
         // [TAG_FN_L19_TTFT_PHOT] LLAMA_FN_L19_TTFT_PHOT_STATS: the share of a prompt graph's routed experts the hot set holds
         // (the CPU skips those with PHOT); one line per graph, at its last host layer
         if (mc->phot_stats) {
@@ -2510,6 +2515,11 @@ void hot_adapt_init(moe_cache * mc, const llama_model & model, const void * owne
 int llama_moe_hot_max_t() {
     const moe_cache * mc = g_cache;
     return mc && mc->hot ? mc->hot_max_t : 0;
+}
+
+// [TAG_FN_WIDE_DECODE]
+void llama_moe_hot_obs_wide(int n_rows) {
+    g_obs_wide_t.store(std::max(0, n_rows), std::memory_order_release);
 }
 
 // [TAG_FN_L4_MEM_PROMPT]

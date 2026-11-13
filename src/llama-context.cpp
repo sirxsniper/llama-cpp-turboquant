@@ -11,6 +11,7 @@
 #include "llama-fn-l22-p4.h" // [TAG_FN_L22_P4]
 #include "llama-fn-l22-p16.h" // [TAG_FN_L22_CPUSHARE]
 #include "llama-fn-vguard.h" // [TAG_R40_VGUARD]
+#include "llama-fn-wide.h" // [TAG_FN_WIDE_DECODE]
 
 #include "ggml.h"
 #include "llama-arch.h"
@@ -2543,6 +2544,37 @@ void llama_context::sched_reserve() {
             }
             n_nodes_tg = std::max(n_nodes_tg, ggml_graph_n_nodes(gf1));
         }
+
+        // [TAG_FN_WIDE_DECODE] LLAMA_FN_WIDE_DECODE: every wide decode shape of this width (2..n_seqs sequences of the same rows,
+        // every row an output, as the verify step) is reserved too, as a GEN-phase graph like the tg graph above. The buffers
+        // keep the largest size, the node budget the largest count; process_ubatch logs the buffer size around the first steps
+        const auto wide_shapes = fn_wide::reserve_shapes(llama_moe_bridge_wide_t(moe_bridge), (int) n_seqs,
+                llama_moe_bridge_seq_lim(moe_bridge), (int) n_tokens, (int) cparams.n_outputs_max);
+        int wide_nodes = 0;
+        for (const auto & ws : wide_shapes) {
+            const uint32_t rows = (uint32_t) (ws.first*ws.second);
+            if (fn_l22_x.any()) {
+                fn_phase = LLAMA_FN_PHASE_GEN;
+            }
+            auto * gfw = graph_reserve(rows, (uint32_t) ws.first, rows, mctx.get(), model.no_alloc());
+            fn_phase = phase0;
+            if (!gfw) {
+                throw std::runtime_error("failed to allocate compute wide decode buffers");
+            }
+            wide_nodes = std::max(wide_nodes, ggml_graph_n_nodes(gfw));
+        }
+        if (!wide_shapes.empty()) {
+            n_nodes_tg = std::max(n_nodes_tg, wide_nodes);
+            std::string list;
+            for (const auto & ws : wide_shapes) {
+                list += (list.empty() ? "" : ", ") + std::to_string(ws.first) + "x" + std::to_string(ws.second);
+            }
+            static std::atomic<int> n_wide_log{0};
+            if (n_wide_log.fetch_add(1) < 16) {
+                LLAMA_LOG_INFO("%s: [TAG_FN_WIDE_DECODE] wide decode graphs reserved at a reserve width of %u rows: %s (sequences x "
+                        "rows, at most %d nodes)\n", __func__, n_tokens, list.c_str(), wide_nodes);
+            }
+        }
     }
 
     // reserve again with pp graph to avoid ggml-alloc reallocations during inference
@@ -3946,8 +3978,23 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     // [TAG_FN_L3_HOST_LAUNCH2] the split boundary the scheduler uses if it splits this ubatch's graph below
     // (a paused or turned-off bridge: the graph runs the CPU split and is not cut)
-    const bool launch2_decode = llama_moe_bridge_active(moe_bridge) && llama_moe_bridge_fits(moe_bridge, (int) ubatch.n_tokens,
-            (int) (ubatch.equal_seqs() ? ubatch.n_seq_tokens : ubatch.n_tokens));
+    // [TAG_FN_WIDE_DECODE] a wide decode ubatch takes the bridge too
+    const bool wide_ub = llama_moe_bridge_wide_ub(moe_bridge, (int) ubatch.n_tokens, ubatch.equal_seqs(), (int) ubatch.n_seqs,
+            (int) ubatch.n_seq_tokens, (int) n_outputs);
+    const bool launch2_decode = llama_moe_bridge_active(moe_bridge) && (llama_moe_bridge_fits(moe_bridge, (int) ubatch.n_tokens,
+            (int) (ubatch.equal_seqs() ? ubatch.n_seq_tokens : ubatch.n_tokens)) || wide_ub);
+    // [TAG_FN_WIDE_DECODE] the compute buffers before this graph is allocated, for the proof line of the first wide steps
+    static std::atomic<uint64_t> n_wide_seen{0};
+    const uint64_t wide_idx  = wide_ub ? n_wide_seen.fetch_add(1) + 1 : 0;
+    const bool     wide_log  = wide_idx > 0 && (wide_idx <= 2 || wide_idx % 1024 == 0);
+    auto           cbuf_all  = [&]() {
+        size_t b = 0;
+        for (auto * be : backend_ptrs) {
+            b += ggml_backend_sched_get_buffer_size(sched.get(), be);
+        }
+        return b;
+    };
+    const size_t   wide_cb0  = wide_log ? cbuf_all() : 0;
 
     // the new graph parameters
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
@@ -4099,6 +4146,21 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     hp(LLAMA_HP_DEC_LAUNCH); // [TAG_FN_L4_HOST]
 
+    // [TAG_FN_WIDE_DECODE] LLAMA_FN_WIDE_DECODE=1: the hot-set observer counts a wide decode graph's routing as a decode step,
+    // from here until this call returns (after the bridge's end below: its late jobs observe too)
+    struct wide_obs_scope {
+        bool on = false;
+        ~wide_obs_scope() {
+            if (on) {
+                llama_moe_hot_obs_wide(0);
+            }
+        }
+    } wide_obs;
+    if (wide_ub && llama_moe_bridge_wide_obs(moe_bridge)) {
+        wide_obs.on = true;
+        llama_moe_hot_obs_wide((int) ubatch.n_tokens);
+    }
+
     // [TAG_MOE_BRIDGE] wake the host executor for a graph that posts to it, or park it (a CPU split may run)
     const bool moe_bridge_used = res->n_moe_bridge > 0;
     llama_moe_bridge_begin(moe_bridge, moe_bridge_used);
@@ -4139,6 +4201,24 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             moe_bridge_failed = true; // [TAG_FN_R1_BRIDGE_RETRY]
             ret = GGML_STATUS_FAILED;
             return nullptr;
+        }
+    }
+
+    // [TAG_FN_WIDE_DECODE] the proof line: wide decode graphs that posted to the bridge, and those that ran without it (a
+    // paused bridge: the sync op; or no layer could post), and the compute buffers (all backends) before this graph was
+    // allocated and now: equal = the reserve covered it
+    if (wide_ub) {
+        static std::atomic<uint64_t> n_wide_br{0};
+        static std::atomic<uint64_t> n_wide_nobr{0};
+        const uint64_t nb = moe_bridge_used ? n_wide_br.fetch_add(1) + 1 : n_wide_br.load();
+        const uint64_t nn = moe_bridge_used ? n_wide_nobr.load() : n_wide_nobr.fetch_add(1) + 1;
+        if (wide_log) {
+            const size_t wide_cb1 = cbuf_all();
+            LLAMA_LOG_INFO("%s: [TAG_FN_WIDE_DECODE] wide decode graph %" PRIu64 ": %" PRIu64 " on the bridge, %" PRIu64 " without "
+                    "it; this one %u rows (%u sequences of %u), hot chain in pieces of %d rows%s; compute buffers %.1f MiB before "
+                    "it, %.1f MiB after%s\n", __func__, wide_idx, nb, nn, ubatch.n_tokens, ubatch.n_seqs, ubatch.n_seq_tokens,
+                    llama_moe_hot_max_t(), llama_moe_hot_max_t() > 0 ? "" : " (no hot set yet: none)", wide_cb0/1048576.0,
+                    wide_cb1/1048576.0, wide_cb1 > wide_cb0 ? " (the buffers grew)" : "");
         }
     }
 

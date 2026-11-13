@@ -155,6 +155,15 @@ int  llama_moe_bridge_max_t (const llama_moe_bridge * br);
 bool llama_moe_bridge_fits  (const llama_moe_bridge * br, int n_tokens, int n_seq_tokens);
 // [TAG_FN_L13_BRIDGE_RING] the ring rolls back a ubatch whose largest sequence has n_seq_tokens tokens
 bool llama_moe_bridge_ring_ok(const llama_moe_bridge * br, int n_seq_tokens);
+// [TAG_FN_WIDE_DECODE] LLAMA_FN_WIDE_DECODE: the widest decode ubatch the bridge takes beside llama_moe_bridge_fits (0: off);
+// seq_lim: the most rows of one sequence the ring rolls back; wide_ub: this ubatch is one (fn_wide::decode_ub: 2+ sequences
+// of the same rows, the ring rolls each back, every row an output), so it takes the bridge and the hot chain; wide_obs:
+// the hot-set observer counts it as a decode step (=1; =2 keeps the old count)
+int  llama_moe_bridge_wide_t (const llama_moe_bridge * br);
+int  llama_moe_bridge_seq_lim(const llama_moe_bridge * br);
+bool llama_moe_bridge_wide_ub(const llama_moe_bridge * br, int n_tokens, bool equal_seqs, int n_seqs, int n_seq_tokens,
+        int n_outputs);
+bool llama_moe_bridge_wide_obs(const llama_moe_bridge * br);
 int  llama_moe_bridge_n_used(const llama_moe_bridge * br);
 // the bridge id and channel for this layer's up_exps, false if the layer is not bridged
 bool llama_moe_bridge_layer (const llama_moe_bridge * br, const ggml_tensor * up_exps, int32_t * id, int32_t * chan);

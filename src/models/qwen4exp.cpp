@@ -3568,8 +3568,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_inp_ple(
     const auto & qm = static_cast<const llama_model_qwen4exp &>(model);
     int32_t gate_id   = -1;
     int32_t gate_chan = -1;
+    // [TAG_FN_WIDE_DECODE] a wide decode ubatch (LLAMA_FN_WIDE_DECODE) is a bridged decode graph too
     if (qm.ple_dio && moe_bridge && model.per_layer_tok_embd && model.per_layer_tok_embd->ne[0] == (int64_t) hparams.ple_head_dim &&
-            llama_moe_bridge_fits(moe_bridge, (int) n_tokens, (int) (ubatch.equal_seqs() ? ubatch.n_seq_tokens : ubatch.n_tokens)) &&
+            (llama_moe_bridge_fits(moe_bridge, (int) n_tokens, (int) (ubatch.equal_seqs() ? ubatch.n_seq_tokens : ubatch.n_tokens)) ||
+             llama_moe_bridge_wide_ub(moe_bridge, (int) n_tokens, ubatch.equal_seqs(), (int) ubatch.n_seqs, (int) ubatch.n_seq_tokens,
+                     (int) n_outputs)) &&
             llama_fn_l3_flag(model, "LLAMA_FN_L16_PLE_GATE") &&
             llama_moe_bridge_ple_chan(moe_bridge, (int64_t) hparams.ple_head_dim * n_heads, &gate_id, &gate_chan)) {
         ple_inp->ticket = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 1);
