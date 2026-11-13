@@ -94,10 +94,11 @@ int main() {
         assistant->layers[0].v_cache_s = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, 1);
         assistant->layers[1].k_cache_s = assistant->layers[0].k_cache_s;
         assistant->layers[1].v_cache_s = assistant->layers[0].v_cache_s;
-        ggml_set_f32(target->layers[2].k_cache_s, 0.5f);
-        ggml_set_f32(target->layers[2].v_cache_s, 0.25f);
-        ggml_set_f32(assistant->layers[0].k_cache_s, 2.0f);
-        ggml_set_f32(assistant->layers[0].v_cache_s, 4.0f);
+        // host memory of ctx: written directly, ggml_set_f32 lives in the CPU backend (not linked with GGML_BACKEND_DL)
+        *(float *) target->layers[2].k_cache_s->data    = 0.5f;
+        *(float *) target->layers[2].v_cache_s->data    = 0.25f;
+        *(float *) assistant->layers[0].k_cache_s->data = 2.0f;
+        *(float *) assistant->layers[0].v_cache_s->data = 4.0f;
 
         for (ggml_type type_k : { GGML_TYPE_F16, GGML_TYPE_F8_E4M3 }) {
             for (ggml_type type_v : { GGML_TYPE_F16, GGML_TYPE_F8_E4M3 }) {
