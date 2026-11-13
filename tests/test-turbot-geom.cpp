@@ -914,7 +914,7 @@ static void test_fa() {
         };
         const float scale = 1.0f / std::sqrt((float) c.hd);
         ggml_tensor * out = ggml_flash_attn_ext(ctx, q, view(kc), view(vc), m, scale, 0.0f, c.softcap);
-        ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32);
+        ggml_prec_set_acc(out, GGML_PREC_F32);
         ggml_turbot_op_params p;
         ggml_turbot_op_params_make(&p, &l, GGML_TURBOT_SIDE_BOTH);
         ggml_flash_attn_ext_set_turbot(out, pl, gt, &p);

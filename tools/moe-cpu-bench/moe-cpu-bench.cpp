@@ -397,9 +397,9 @@ bool make_random_weights(const bench_params & p, ggml_type up_t, ggml_type gate_
         uint8_t * lp = base + (size_t) l * b_layer;
         layer_ptrs lw = { lp, lp + GGML_PAD(b_up, 64), lp + GGML_PAD(b_up, 64) + GGML_PAD(b_gate, 64), l };
         ws.layers.push_back(lw);
-        jobs.push_back({ (uint8_t *) lw.up,   b_up,   up_t });
-        jobs.push_back({ (uint8_t *) lw.gate, b_gate, gate_t });
-        jobs.push_back({ (uint8_t *) lw.down, b_down, down_t });
+        jobs.push_back({ const_cast<uint8_t *>(lw.up),   b_up,   up_t });
+        jobs.push_back({ const_cast<uint8_t *>(lw.gate), b_gate, gate_t });
+        jobs.push_back({ const_cast<uint8_t *>(lw.down), b_down, down_t });
     }
     ws.regions.emplace_back(base, pool.bytes);
 
@@ -482,7 +482,7 @@ struct mapped_file {
         }
 #else
         if (base) {
-            munmap((void *) base, size);
+            munmap(const_cast<uint8_t *>(base), size);
         }
         if (fd >= 0) {
             close(fd);
@@ -708,7 +708,7 @@ struct split_graphs {
     double run_pool(ggml_cpu_moe_pool * pool, int n_expert, int n_used, bool fixed, int pf_window_us = 0, double precision = 1.0,
                     int pf_k = 0, std::mt19937 * rng = nullptr) {
         ggml_cpu_moe_layer layer = { w_up, w_gate, w_down, fixed ? (const int32_t *) tbl->data : nullptr, n_expert };
-        ggml_cpu_moe_job job = { &layer, T, n_used, (const float *) x->data, (const int32_t *) ids->data, nullptr, pool_out.data() };
+        ggml_cpu_moe_job job = { &layer, T, n_used, (const float *) x->data, (const int32_t *) ids->data, nullptr, pool_out.data(), 0, 0.0f, 0.0f, 0, 0, nullptr };
         if (pf_window_us > 0 && rng) {
             const int k = pf_k > 0 ? pf_k : n_used + 2;
             std::vector<int32_t> pred((size_t) T*k);
@@ -740,9 +740,9 @@ struct split_graphs {
     }
 
     void set_layer(const layer_ptrs & l) {
-        w_up->data   = (void *) l.up;
-        w_gate->data = (void *) l.gate;
-        w_down->data = (void *) l.down;
+        w_up->data   = const_cast<uint8_t *>(l.up);
+        w_gate->data = const_cast<uint8_t *>(l.gate);
+        w_down->data = const_cast<uint8_t *>(l.down);
     }
 
     // new random top-n_used ids per token (distinct within a token); returns the number of distinct experts
