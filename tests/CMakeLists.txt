@@ -496,6 +496,10 @@ if (NOT GGML_BACKEND_DL AND GGML_CPU)
     llama_build_and_test(test-fn-pfs-reserve.cpp)
 endif()
 
+# [TAG_FN_R41] round 41's rules (src/llama-fn-r41.h, header only): the MoE bridge's error policy with and without
+# LLAMA_FN_R41_SLOWJOB, the free-RAM floor's gate, the priority raise (on Windows this process's own). CPU only, no model.
+llama_build_and_test(test-fn-r41.cpp)
+
 # [TAG_FN_L19_CONVSTORE] the policy of the agent conversation store (tools/server/server-convstore.h, header only): the
 # checkpoint a full ring drops, the eviction value of a stored conversation, the thinning on disk. CPU only, no model.
 llama_build_and_test(test-fn-convstore.cpp)
