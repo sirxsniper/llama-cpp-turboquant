@@ -311,7 +311,8 @@ static const l22_row k_l22_rows[] = {
     { "LLAMA_FN_R41_FLOATSTR", "1", false }, // [TAG_FN_R41_FLOATSTR] on from v0.33.1
     { "LLAMA_FN_R41_BORROW", "0", false }, // [TAG_R41_PP_BORROW] 0 = v0.33.1 (16 turns it on)
     { "LLAMA_FN_R41_MTPKV", "0", false }, // [TAG_R41_PP_MTPKV] 0 = v0.33.1 (1 turns it on)
-    { "LLAMA_FN_R41_SYSKEEP", "0", false }, // [TAG_R41_PP_SYSKEEP] 0 = v0.33.1 (1 turns it on)
+    { "LLAMA_FN_R41_SYSKEEP", "0", false }, // [TAG_R41_PP_SYSKEEP] 0 = v0.33.1 (1 turns it on, 2 also on disk)
+    { "LLAMA_FN_R41_CONVKEEP", "0", false }, // [TAG_R41_PP_CONVKEEP] 0 = v0.33.1 (1 turns it on)
 };
 static const size_t k_n_l22_rows = sizeof(k_l22_rows)/sizeof(k_l22_rows[0]);
 const size_t k_n_l22_rows_decl = k_n_l22_rows;

@@ -200,7 +200,15 @@ public:
             close(fd);
         }
 #endif
+        // [TAG_R41_PP_CONVKEEP] a kept conversation file that left the store goes with it
+        if (!unlink_on_close.empty()) {
+            std::error_code ec_rm;
+            std::filesystem::remove(std::filesystem::path(unlink_on_close), ec_rm);
+        }
     }
+
+    // [TAG_R41_PP_CONVKEEP] a kept file deleted when its last holder lets it go (cleared when the server ends: it stays)
+    std::string unlink_on_close;
 
     // n and off are multiples of KC_ALIGN, buf is KC_ALIGN aligned
     bool pwrite(const void * buf, size_t n, uint64_t off) {
@@ -573,13 +581,20 @@ static bool kc_read_cb(void * dst, size_t size, void * ud) {
     return ((kc_pipe *) ud)->get(dst, size);
 }
 
-// [TAG_R41_PP_SYSKEEP] the first sector of a system-block file (params.sys_persist). It is written last, so a file whose
-// writing stopped has no valid header and is deleted by the next scan. Then: the block's tokens (int32) at tok_off, the
-// drafter's carry at carry_off, the stored bytes of the entry (as save() writes them) at base; each part at a sector offset.
+// [TAG_R41_PP_SYSKEEP] [TAG_R41_PP_CONVKEEP] the first sector of a kept file (a system block of params.sys_persist, a
+// conversation of params.conv_persist). It is written last, so a file whose writing stopped has no valid header and is
+// deleted by the next scan. Then: the tokens (int32) at tok_off, the drafter's carry at carry_off, the stored bytes of the
+// entry (as save() writes them) at base; each part at a sector offset.
+static constexpr uint32_t KC_SYS_CKPT = 32;  // checkpoints a kept file can describe
 struct kc_sys_header {
-    char     magic[8];      // "R41SYSK1"
+    char     magic[8];      // "R41KEPT1"
     uint32_t version;       // 1
     uint32_t n_ckpt;        // checkpoints (at most KC_SYS_CKPT)
+    uint32_t kind;          // 1 a system block, 2 a conversation
+    uint32_t conv_rerender;
+    int64_t  conv_hits;
+    int32_t  conv_sys_end;
+    int32_t  conv_n_prompt;
     uint64_t fp;            // params.sys_fp of the server that wrote it
     uint64_t sys_hash;      // keepctx_prefix_hash of the tokens
     int64_t  n_tokens;
@@ -599,14 +614,22 @@ struct kc_sys_header {
         uint64_t size_tgt;
         uint64_t size_dft;
         uint64_t size_spec;
-    } ck[4];
+    } ck[KC_SYS_CKPT];
     uint64_t check;         // kc_hash of every byte above
 };
-static constexpr uint32_t KC_SYS_CKPT = 4;
 static_assert(sizeof(kc_sys_header) <= KC_ALIGN, "the header is one sector");
 
 static uint64_t kc_sys_check(const kc_sys_header & h) {
     return kc_hash(KC_HASH_SEED, &h, offsetof(kc_sys_header, check));
+}
+
+// [TAG_R41_PP_CONVKEEP] tokens a kept file can hold: text only (no picture or sound chunk)
+static bool kc_text_only(const server_tokens & t, size_t n) {
+    if (n == 0 || t.size() < n || t[0] == LLAMA_TOKEN_NULL) {
+        return false;
+    }
+    const auto m = t.find_next_media_chunk(0);
+    return m.first == nullptr || m.second >= n;
 }
 
 //
@@ -1209,7 +1232,10 @@ bool server_keepctx::save(const server_prompt & prompt, llama_context * ctx_tgt,
 
     e.id = ++n_next_;
     // [TAG_R41_PP_SYSKEEP] a kept system-block file: the stored bytes start after the header, the tokens and the carry
-    const bool persist = sys && params_.sys_persist && prompt.checkpoints.size() <= KC_SYS_CKPT;
+    // [TAG_R41_PP_CONVKEEP] a kept conversation file the same way (text only; not with the lazy layout)
+    const bool persist = (sys ? params_.sys_persist : (params_.conv_persist && !params_.lazy)) &&
+                         prompt.checkpoints.size() <= KC_SYS_CKPT && kc_text_only(prompt.tokens, (size_t) prompt.n_tokens());
+    const uint64_t kept_hash = persist && !sys ? keepctx_prefix_hash(prompt.tokens, (size_t) prompt.n_tokens()) : sys_hash;
     std::vector<int32_t> sys_toks;
     uint64_t tok_off = 0, carry_off = 0;
     if (persist) {
@@ -1223,7 +1249,8 @@ bool server_keepctx::save(const server_prompt & prompt, llama_context * ctx_tgt,
         e.base    = carry_off + kc_round_up(e.carry.size());
     }
     const auto path = std::filesystem::path(params_.dir) /
-            (persist ? string_format("sysblock-%016llx-%016llx.kcs", (unsigned long long) params_.sys_fp, (unsigned long long) sys_hash)
+            (persist && sys ? string_format("sysblock-%016llx-%016llx.kcs", (unsigned long long) params_.sys_fp, (unsigned long long) sys_hash)
+           : persist ? string_format("conv-%016llx-%lu-%llu.kcs", (unsigned long long) params_.sys_fp, kc_pid(), (unsigned long long) e.id)
                      : string_format(sys ? "keepctx-%lu-sys%llu.kc" : "keepctx-%lu-%llu.kc", kc_pid(), (unsigned long long) e.id));
     std::string err;
     e.file = persist ? server_keepctx_file::open_kept(path, true, err) : server_keepctx_file::create(path, err);
@@ -1233,6 +1260,9 @@ bool server_keepctx::save(const server_prompt & prompt, llama_context * ctx_tgt,
     }
     if (persist) {
         e.sys_path = path.string();
+        if (!sys) {
+            e.file->unlink_on_close = path.string(); // [TAG_R41_PP_CONVKEEP] deleted when it leaves the store
+        }
     }
 
     bool ok = true;
@@ -1327,11 +1357,18 @@ bool server_keepctx::save(const server_prompt & prompt, llama_context * ctx_tgt,
         }
         kc_sys_header h;
         std::memset(&h, 0, sizeof(h));
-        std::memcpy(h.magic, "R41SYSK1", 8);
+        std::memcpy(h.magic, "R41KEPT1", 8);
         h.version     = 1;
         h.n_ckpt      = (uint32_t) prompt.checkpoints.size();
+        h.kind        = sys ? 1 : 2;
+        if (conv) {
+            h.conv_rerender = conv->rerender ? 1 : 0;
+            h.conv_hits     = conv->hits;
+            h.conv_sys_end  = conv->sys_end;
+            h.conv_n_prompt = conv->n_prompt;
+        }
         h.fp          = params_.sys_fp;
-        h.sys_hash    = sys_hash;
+        h.sys_hash    = kept_hash;
         h.n_tokens    = prompt.n_tokens();
         h.size_tgt    = e.size_tgt;
         h.size_dft    = e.size_dft;
@@ -1359,6 +1396,7 @@ bool server_keepctx::save(const server_prompt & prompt, llama_context * ctx_tgt,
             ok = ph.finish(n_w) && ok;
         }
         if (!ok) {
+            e.file->unlink_on_close.clear();
             e.file.reset();
             std::error_code ec_rm;
             std::filesystem::remove(path, ec_rm);
@@ -1368,6 +1406,7 @@ bool server_keepctx::save(const server_prompt & prompt, llama_context * ctx_tgt,
     }
     if (!ok || e.n_bytes != need) {
         if (persist) {
+            e.file->unlink_on_close.clear();
             e.file.reset();
             std::error_code ec_rm;
             std::filesystem::remove(path, ec_rm);
@@ -1432,6 +1471,10 @@ bool server_keepctx::save(const server_prompt & prompt, llama_context * ctx_tgt,
                               "touched %.1f MiB", kc_part(mk_s, mk_p).c_str(), kc_part(mk[0], mk[1]).c_str(), kc_part(mk[1], mk[2]).c_str(),
                               kc_part(mk[2], mk[3]).c_str(), kc_part(mk[3], mk[4]).c_str(), ck_out/1048576.0, ck_bytes/1048576.0,
                               ck_q_ms, pipe_st.c_str(), (llama_fn_res_touched_ext() - res0)/1048576.0);
+    }
+    if (persist) {
+        info += string_format(" [TAG_R41_PP_CONVKEEP] kept after the server ends: %s", path.filename().string().c_str());
+        e.sys_hash = kept_hash;
     }
     entries.push_back(std::move(e));
     return true;
@@ -1689,7 +1732,8 @@ void server_keepctx::sys_drop_front() {
     }
 }
 
-int server_keepctx::sys_scan(bool has_mtmd, std::string & info) {
+int server_keepctx::scan_kept(const char * prefix, uint32_t kind, int32_t max_files, uint64_t max_bytes, bool has_mtmd,
+                             std::string & info) {
     std::error_code ec;
     struct cand {
         std::filesystem::path           path;
@@ -1699,7 +1743,7 @@ int server_keepctx::sys_scan(bool has_mtmd, std::string & info) {
     std::vector<cand> files;
     for (const auto & de : std::filesystem::directory_iterator(params_.dir, ec)) {
         const std::string name = de.path().filename().string();
-        if (name.rfind("sysblock-", 0) == 0 && de.path().extension() == ".kcs") {
+        if (name.rfind(prefix, 0) == 0 && de.path().extension() == ".kcs") {
             std::error_code e1, e2;
             const auto t  = std::filesystem::last_write_time(de.path(), e1);
             const auto sz = std::filesystem::file_size(de.path(), e2);
@@ -1714,11 +1758,17 @@ int server_keepctx::sys_scan(bool has_mtmd, std::string & info) {
         std::error_code ec_rm;
         std::filesystem::remove(p, ec_rm);
     };
-    while ((int32_t) files.size() > params_.sys_files_max) {
+    uint64_t total = 0;
+    for (const auto & c : files) {
+        total += c.size;
+    }
+    while (!files.empty() && ((int32_t) files.size() > max_files || total > max_bytes)) {
+        total -= files.front().size;
         drop(files.front().path);
         files.erase(files.begin());
         n_old++;
     }
+    std::list<server_keepctx_entry> & into = kind == 1 ? sys_entries : entries;
     for (const auto & c : files) {
         std::string err;
         auto f = server_keepctx_file::open_kept(c.path, false, err);
@@ -1733,7 +1783,7 @@ int server_keepctx::sys_scan(bool has_mtmd, std::string & info) {
             kc_pipe pr(*f, false, KC_ALIGN, 0, io_mem_, false);
             ok = pr.get(&h, sizeof(h));
         }
-        ok = ok && std::memcmp(h.magic, "R41SYSK1", 8) == 0 && h.version == 1 && h.check == kc_sys_check(h);
+        ok = ok && std::memcmp(h.magic, "R41KEPT1", 8) == 0 && h.version == 1 && h.check == kc_sys_check(h) && h.kind == kind;
         if (!ok) {
             f.reset();
             drop(c.path); // unfinished or not one of ours
@@ -1787,6 +1837,8 @@ int server_keepctx::sys_scan(bool has_mtmd, std::string & info) {
             n_bad++;
             continue;
         }
+        // the file's age stands for the time since its store or last restore
+        const double age_s = std::max(0.0, std::chrono::duration<double>(std::filesystem::file_time_type::clock::now() - c.t).count());
         e.id       = ++n_next_;
         e.size_tgt = h.size_tgt;
         e.size_dft = h.size_dft;
@@ -1795,15 +1847,46 @@ int server_keepctx::sys_scan(bool has_mtmd, std::string & info) {
         e.file     = f;
         e.sys_hash = h.sys_hash;
         e.sys_path = c.path.string();
-        e.conv.sys_end  = (int32_t) h.n_tokens;
-        e.conv.n_prompt = (int32_t) h.n_tokens;
-        e.t_use    = kc_now_s();
-        sys_entries.push_back(std::move(e));
+        e.t_use    = kc_now_s() - age_s;
+        if (kind == 1) {
+            e.conv.sys_end  = (int32_t) h.n_tokens;
+            e.conv.n_prompt = (int32_t) h.n_tokens;
+        } else {
+            e.conv.hits     = h.conv_hits;
+            e.conv.sys_end  = h.conv_sys_end;
+            e.conv.n_prompt = h.conv_n_prompt;
+            e.conv.rerender = h.conv_rerender != 0;
+            e.value = convstore_gdsf(gdsf_L_, e.conv.hits, (int) h.n_tokens, e.n_bytes_all(), params_.fixed_tokens,
+                                     params_.budget / (uint64_t) std::max(1, params_.n_max));
+            if (params_.val) {
+                e.value = convstore_val((int) h.n_tokens, e.conv.hits, age_s, params_.fixed_tokens, params_.val_half_s);
+            }
+            e.file->unlink_on_close = c.path.string(); // deleted when it leaves the store
+        }
+        into.push_back(std::move(e));
         n_read++;
     }
-    info = string_format("%d system blocks read back (%d of other settings left alone, %d unreadable or unfinished deleted, %d "
-                         "past the %d newest deleted)", n_read, n_other, n_bad, n_old, params_.sys_files_max);
+    info = string_format("%d %s read back (%d of other settings left alone, %d unreadable or unfinished deleted, %d old "
+                         "ones deleted beyond %d files)", n_read, kind == 1 ? "system blocks" : "conversations", n_other, n_bad,
+                         n_old, max_files);
     return n_read;
+}
+
+int server_keepctx::sys_scan(bool has_mtmd, std::string & info) {
+    return scan_kept("sysblock-", 1, params_.sys_files_max, UINT64_MAX, has_mtmd, info);
+}
+
+// [TAG_R41_PP_CONVKEEP]
+int server_keepctx::conv_scan(bool has_mtmd, std::string & info) {
+    return scan_kept("conv-", 2, params_.n_max, params_.budget, has_mtmd, info);
+}
+
+void server_keepctx::keep_files_on_disk() {
+    for (auto & e : entries) {
+        if (e.file) {
+            e.file->unlink_on_close.clear();
+        }
+    }
 }
 
 // [TAG_FN_V0254_STORE] the volume of a path ("D:\"), its physical disk number, its drive type and whether it is an SSD (no

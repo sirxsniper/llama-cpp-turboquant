@@ -2542,6 +2542,7 @@ private:
         int32_t  on       = 0;    // 0 off (v0.33.1), 1 on
         int32_t  min      = 2048; // LLAMA_FN_R41_SYSKEEP_MIN: blocks of at least this many tokens
         int32_t  max      = 4;    // LLAMA_FN_R41_SYSKEEP_N: blocks kept (least recently used out)
+        bool     conv     = false; // [TAG_R41_PP_CONVKEEP] LLAMA_FN_R41_CONVKEEP: the stored conversations survive a restart
         uint64_t n_saved   = 0;
         uint64_t n_reused  = 0;
         uint64_t n_failed  = 0;
@@ -2689,6 +2690,11 @@ private:
         g_r40_kvpark_on    = false;
         kvpk.on            = false;
 
+        // [TAG_R41_PP_CONVKEEP] each idle slot's conversation goes to the store (kept files), and the store's files stay
+        if (keepctx && r41sys.conv && ctx_tgt) {
+            r41_conv_store_slots();
+            keepctx->keep_files_on_disk();
+        }
         keepctx.reset(); // [TAG_FN_L18_KEEPCTX] its states belong to these contexts
 
         // [TAG_R27_TOKVERIFY] the tokenizer caches' verify threads read the vocabulary
@@ -4808,6 +4814,9 @@ private:
     //                                 stored again without a write); needs LLAMA_FN_L19_CONVSTORE, not with _CKPT + _SPILL
     //   LLAMA_FN_L20_CONVFIX_TRACE=1  [_TRACE] the parts of a store / restore in its log line
     void keepctx_init() {
+        if (keepctx && r41sys.conv) {
+            keepctx->keep_files_on_disk(); // [TAG_R41_PP_CONVKEEP] a store made again keeps the kept files of the old one
+        }
         keepctx.reset();
         r41sys = r41_sys_cfg_t(); // [TAG_R41_PP_SYSKEEP] set below once the store is there (it needs the store)
         auto env_ll = [&](const char * name, long long def) {
@@ -4906,6 +4915,15 @@ private:
             kp.sys_fp        = r41_sys_fingerprint(r41_fp_what);
             kp.sys_files_max = (int32_t) std::max<long long>(1, env_ll("LLAMA_FN_R41_SYSKEEP_FILES", 8));
         }
+        // [TAG_R41_PP_CONVKEEP] LLAMA_FN_R41_CONVKEEP=1: the stored conversations survive a server restart, and a graceful stop
+        // stores each idle slot's conversation first (0 = v0.33.1)
+        r41sys.conv = env_ll("LLAMA_FN_R41_CONVKEEP", 0) > 0;
+        if (r41sys.conv) {
+            kp.conv_persist = true;
+            if (kp.sys_fp == 0) {
+                kp.sys_fp = r41_sys_fingerprint(r41_fp_what);
+            }
+        }
         auto kc = std::make_unique<server_keepctx>(kp);
         if (!kc->ok()) {
             SRV_WRN("%s", "[TAG_FN_L18_KEEPCTX] off: no store folder\n");
@@ -4914,6 +4932,14 @@ private:
         }
         keepctx = std::move(kc);
         cs.lazy = kp.lazy;
+        // [TAG_R41_PP_CONVKEEP]
+        if (r41sys.conv) {
+            std::string scan;
+            keepctx->conv_scan(mctx != nullptr, scan);
+            SRV_INF("[TAG_R41_PP_CONVKEEP] on: the stored conversations stay on disk after the server ends and a graceful stop "
+                    "stores each idle slot's conversation of >= %d tokens first (fingerprint %016llx: %s); %s "
+                    "(LLAMA_FN_R41_CONVKEEP=0: off)\n", keepctx_min, (unsigned long long) kp.sys_fp, r41_fp_what.c_str(), scan.c_str());
+        }
         // [TAG_R41_PP_SYSKEEP]
         if (r41sys.on) {
             std::string scan;
@@ -7832,6 +7858,31 @@ private:
         } else {
             r41sys.n_failed++;
             SLT_WRN(slot, "[TAG_R41_PP_SYSKEEP] the system block at n_tokens = %lld is not stored: %s\n", (long long) n, info.c_str());
+        }
+    }
+
+    // [TAG_R41_PP_CONVKEEP] a graceful stop (or the sleep): every idle slot's conversation of at least keepctx_min tokens goes
+    // to the store the way a prompt that takes the slot stores it, so the next server (same fingerprint) takes it back; a slot
+    // in the middle of a request, or whose cells are parked in host memory, is left as it is
+    void r41_conv_store_slots() {
+        for (auto & slot : slots) {
+            if (slot.is_processing() || slot.kvp.on || slot.prompt.n_tokens() < keepctx_min) {
+                continue;
+            }
+            if (cs.lazy && !cs.spill) {
+                convfix_trim_disk(slot);
+            }
+            const int64_t t0 = ggml_time_us();
+            std::string info;
+            const bool ok = keepctx->save(slot.prompt, ctx_tgt, ctx_dft, spec.get(), slot.id, nullptr, info,
+                                          cs.on ? &slot.kc_spill : nullptr, &slot.kc_conv, cs.on ? keepctx_min : 0);
+            if (ok) {
+                SLT_INF(slot, "[TAG_R41_PP_CONVKEEP] the slot's conversation (%d tokens) is stored for the next server in %.1f ms: %s\n",
+                        slot.prompt.n_tokens(), (ggml_time_us() - t0) / 1000.0, info.c_str());
+            } else {
+                SLT_WRN(slot, "[TAG_R41_PP_CONVKEEP] the slot's conversation (%d tokens) is not stored: %s\n", slot.prompt.n_tokens(),
+                        info.c_str());
+            }
         }
     }
 

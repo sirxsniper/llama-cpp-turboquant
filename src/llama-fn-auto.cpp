@@ -393,7 +393,8 @@ const fn_item k_items[] = {
     // its comment
     { "LLAMA_FN_R41_BORROW",                "0",       P_ALL }, // [TAG_R41_PP_BORROW] 16 = where the 16K prompt ubatch's borrow falls short (512K, 2 slots), the lend layers with few base slots give all but one, then up to 16 more slots per lend layer
     { "LLAMA_FN_R41_MTPKV",                 "0",       P_ALL }, // [TAG_R41_PP_MTPKV] 1 = the MTP draft's prompt catch-up (no output rows) writes its K/V without the attention block's query, attention and output projection
-    { "LLAMA_FN_R41_SYSKEEP",               "0",       P_ALL }, // [TAG_R41_PP_SYSKEEP] 1 = the state at the end of a system + tools block is stored once, and a new chat whose slot keeps less of the block takes it back
+    { "LLAMA_FN_R41_SYSKEEP",               "0",       P_ALL }, // [TAG_R41_PP_SYSKEEP] 1 = the state at the end of a system + tools block is stored once, and a new chat whose slot keeps less of the block takes it back; 2 = also kept on disk for the next server
+    { "LLAMA_FN_R41_CONVKEEP",              "0",       P_ALL }, // [TAG_R41_PP_CONVKEEP] 1 = the stored conversations survive a server restart, and a graceful stop stores each idle slot's conversation first
 };
 
 } // namespace
