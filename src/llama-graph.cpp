@@ -2663,6 +2663,14 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     }
     // [TAG_FN_L22_CPUSHARE] R-P16-1: with the CPU share hook the stream gate is built after the routing (at the hook)
     const bool cs_defer_gate = pfs && (fn_hooks & LLAMA_FN_L22_HOOK_CPUSHARE) && il >= 0;
+    // [TAG_FN_WIDE_DECODE] LLAMA_FN_WIDE_DECODE: a decode ubatch of 2+ sequences wider than 8 rows, every row an output (the
+    // verify step of 3 or 4 drafting slots), takes the bridge and the hot chain below, like a narrower one; with =1 it is no
+    // prompt for the seed node
+    const llama_moe_bridge * br_wide_br = moe_bridge ? moe_bridge : moe_bridge_sync;
+    const bool br_wide     = !pfs && il >= 0 && n_tokens == (int64_t) ubatch.n_tokens &&
+        llama_moe_bridge_wide_ub(br_wide_br, (int) n_tokens, ubatch.equal_seqs(), (int) ubatch.n_seqs, (int) ubatch.n_seq_tokens,
+                (int) n_outputs);
+    const bool br_wide_obs = br_wide && llama_moe_bridge_wide_obs(br_wide_br);
     if (pfs) {
         if (!cs_defer_gate) {
             pin_cpu(llama_prefill_stream_build_gate(ctx0, gf, pfs, cur));
@@ -2792,7 +2800,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     // [TAG_FN_L3_POLICY_SEED] a prompt ubatch copies its ids here (device, next to the router) for the seed node below
     ggml_tensor * seed_ids = nullptr;
-    if (arch == LLM_ARCH_QWEN4EXP && il >= 0 && llama_moe_hot_seed_node_wanted(up_exps_host, n_tokens)) {
+    if (arch == LLM_ARCH_QWEN4EXP && il >= 0 && !br_wide_obs && llama_moe_hot_seed_node_wanted(up_exps_host, n_tokens)) {
         seed_ids = ggml_cont(ctx0, selected_experts);
         ggml_format_name(seed_ids, "moe_hot_seed_ids-%d", il);
         ggml_build_forward_expand(gf, seed_ids);
@@ -2921,7 +2929,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         (r38_scaled || (!up_exps_s && !gate_exps_s && !down_exps_s)) &&
         type_op == LLM_FFN_SILU && !weight_before_ffn && loras->empty();
     // [TAG_FN_L4_MEM_PROMPT] llama_moe_hot_graph_max_t: also the short prompt path's ubatches with LLAMA_FN_L4_PROMPT_HOT
-    if ((n_tokens == 1 || n_tokens <= hot_max_t || (hot_max_t > 0 && n_tokens <= llama_moe_hot_graph_max_t())) && slot_chain_ok) {
+    // [TAG_FN_WIDE_DECODE] and a wide decode ubatch (chunks of hot_max_t rows, build_cache_chain)
+    if ((n_tokens == 1 || n_tokens <= hot_max_t || (hot_max_t > 0 && (n_tokens <= llama_moe_hot_graph_max_t() || br_wide))) &&
+        slot_chain_ok) {
         mcache = llama_moe_cache_lookup(up_exps);
     }
     // [TAG_FN_L19_TTFT_PHOT] a wider prompt graph on the CPU path (no prefill stream for this layer, below the op offload, no
@@ -2960,7 +2970,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // [TAG_FN_L13_BRIDGE_RING] a layer cut to its output rows (the last one without MTP) can fit while its ubatch holds
     // more tokens of one sequence than the ring rolls back: it runs the host job as the sync op (same values, no deadline)
     const bool br_ring = llama_moe_bridge_ring_ok(br_any, (int) (ubatch.equal_seqs() ? ubatch.n_seq_tokens : ubatch.n_tokens));
-    if (br_any && il >= 0 && llama_moe_bridge_fits(br_any, (int) n_tokens, 1) &&
+    if (br_any && il >= 0 && (llama_moe_bridge_fits(br_any, (int) n_tokens, 1) || br_wide) && // [TAG_FN_WIDE_DECODE]
         n_expert_used <= llama_moe_bridge_n_used(br_any) &&
         !gate_up_exps && gate_exps && down_exps && !up_exps_b && !gate_exps_b && !down_exps_b &&
         (r38_scaled || (!up_exps_s && !gate_exps_s && !down_exps_s)) && type_op == LLM_FFN_SILU && !weight_before_ffn &&

@@ -506,6 +506,11 @@ llama_build_and_test(test-fn-l24-time.cpp)
 # [TAG_FN_L24_TOPK_TIES] the bitonic argsort rule on rows with ties (ggml-cuda/fn-bitonic-rule.h). CPU only, no model.
 llama_build_and_test(test-fn-l24-topk.cpp)
 
+# [TAG_FN_WIDE_DECODE] the wide decode rules of the MoE bridge, the hot chain, the hot-set observer and the reserve
+# (src/llama-fn-wide.h, header only). CPU only, no model.
+llama_build_and_test(test-fn-wide.cpp)
+target_include_directories(test-fn-wide PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+
 # [TAG_FN_V0254_STOP] a server stop while requests wait for their results (tools/server/server-queue.cpp): every waiting
 # reader gets the shutdown error at once. CPU only, no model.
 if (LLAMA_BUILD_TOOLS AND LLAMA_BUILD_SERVER AND NOT EMSCRIPTEN)

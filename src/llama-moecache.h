@@ -275,6 +275,10 @@ void llama_moe_hot_save_now(const void * owner);
 // max graph width for the hot chain, 0 when hot mode is off
 int llama_moe_hot_max_t();
 
+// [TAG_FN_WIDE_DECODE] LLAMA_FN_WIDE_DECODE=1: the owner context sets the rows of a wide decode graph before it runs and 0
+// after it ended (its bridge jobs included); the observer then counts that graph's routing as a decode step, not a prompt
+void llama_moe_hot_obs_wide(int n_rows);
+
 // [TAG_FN_L4_MEM_PROMPT] the widest graph that builds the hot chain: llama_moe_hot_max_t, or 31 with LLAMA_FN_L4_PROMPT_HOT=1
 // (qwen4exp: the short prompt path's ubatches); 0 when hot mode is off
 int llama_moe_hot_graph_max_t();
