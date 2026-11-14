@@ -299,6 +299,8 @@ static const l22_row k_l22_rows[] = {
     { "LLAMA_FN_R35_SBBG", "1", false }, // [TAG_R35_X_PPH]
     { "LLAMA_FN_R35_HOSTCHAIN", "3", false }, // [TAG_R35_HOSTCHAIN]
     { "GGML_CUDA_R35_POKE1", "1", false }, // [TAG_R35_HOSTCHAIN]
+    { "LLAMA_FN_DRAFTFIT", "1", false }, // [TAG_FN_DRAFTFIT] on by default from v0.33.0
+    { "LLAMA_QSA_POOL_RANGE", "1", false }, // [TAG_QSA_POOL_RANGE] on by default from v0.33.0
 };
 static const size_t k_n_l22_rows = sizeof(k_l22_rows)/sizeof(k_l22_rows[0]);
 const size_t k_n_l22_rows_decl = k_n_l22_rows;

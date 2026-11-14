@@ -371,6 +371,9 @@ const fn_item k_items[] = {
     // the rows, 2 no input synchronize for a split whose uploads were all staged; 0 = v0.27.0
     { "LLAMA_FN_R35_HOSTCHAIN",             "3",       P_ALL },
     { "GGML_CUDA_R35_POKE1",                "1",       P_ALL }, // [TAG_R35_HOSTCHAIN] flush after the first chunk of a replay
+    // v0.33.0: the two measured switches of this release are on for Flash-Next (each one =0 restores v0.32.0)
+    { "LLAMA_FN_DRAFTFIT",                  "1",       P_ALL }, // [TAG_FN_DRAFTFIT] 3 or 4 connections: a step's drafts are capped so that its verify rows fit the MoE bridge
+    { "LLAMA_QSA_POOL_RANGE",               "1",       P_ALL }, // [TAG_QSA_POOL_RANGE] the QSA pool mask as one range per token, its rows made next to the indexer
 };
 
 } // namespace
