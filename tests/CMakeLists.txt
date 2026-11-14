@@ -481,6 +481,13 @@ if (NOT GGML_BACKEND_DL AND GGML_CPU)
     endforeach()
 endif()
 
+# [TAG_PFS_LEND_RESERVE] the lending prefill stream's reserve views (src/llama-prefill-stream.cpp): the reserve graph in the
+# streamed form, node for node the graph of a stream with its own banks, and the scheduler keeping the larger of two
+# reserves. Two CPU backends stand for the device and the host. CPU only, no model; static backends only.
+if (NOT GGML_BACKEND_DL AND GGML_CPU)
+    llama_build_and_test(test-fn-pfs-reserve.cpp)
+endif()
+
 # [TAG_FN_L19_CONVSTORE] the policy of the agent conversation store (tools/server/server-convstore.h, header only): the
 # checkpoint a full ring drops, the eviction value of a stored conversation, the thinning on disk. CPU only, no model.
 llama_build_and_test(test-fn-convstore.cpp)

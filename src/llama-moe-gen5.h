@@ -209,3 +209,14 @@ LLAMA_API bool llama_prefill_stream_before_ubatch(const void * owner, ggml_backe
 
 // [TAG_FN_L3_VRAM_CBUF] the bytes a lending stream of this owner borrows from the hot set per prompt (0: none)
 LLAMA_API size_t llama_prefill_stream_lend_bytes(const void * owner);
+
+// [TAG_PFS_LEND_RESERVE] a lending stream's reserve graphs in the streamed form. A reserve runs with the banks returned,
+// so its lookups find no bank and the graph keeps the op offload; a prompt that borrows the banks runs the streamed graph
+// (CPU gate / release nodes, the experts read from the banks), which can need a larger compute buffer. Between begin and
+// end the owner's lookups return reserve views instead: the aliases' types and shapes in a buffer of the bank buffer type
+// with no memory, so a graph built now has the streamed form, the scheduler places its experts on the device and the
+// allocator reserves nothing for them. Such a graph is only reserved, never computed (its gate aborts if it runs).
+// begin returns false (and changes nothing) unless the stream lends, has not borrowed its banks now, and n_tokens is at
+// least its minimum. LLAMA_PREFILL_STREAM_LEND_RESERVE=0: begin always returns false (v0.32.0: op-offload form only)
+LLAMA_API bool llama_prefill_stream_reserve_begin(const void * owner, int64_t n_tokens);
+LLAMA_API void llama_prefill_stream_reserve_end(const void * owner);
