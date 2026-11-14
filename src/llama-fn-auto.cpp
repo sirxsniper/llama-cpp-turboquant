@@ -376,6 +376,7 @@ const fn_item k_items[] = {
     { "LLAMA_QSA_POOL_RANGE",               "1",       P_ALL }, // [TAG_QSA_POOL_RANGE] the QSA pool mask as one range per token, its rows made next to the indexer
     // r41 prompt lane (each one =0 restores v0.33.0)
     { "LLAMA_FN_R41_BORROW",                "16",      P_ALL }, // [TAG_R41_PP_BORROW] where the 16K prompt ubatch's borrow falls short (512K, 2 slots), the lend layers with few base slots give all but one, then up to 16 more slots per lend layer
+    { "LLAMA_FN_R41_MTPKV",                 "1",       P_ALL }, // [TAG_R41_PP_MTPKV] the MTP draft's prompt catch-up (no output rows) writes its K/V without the attention block's query, attention and output projection
 };
 
 } // namespace

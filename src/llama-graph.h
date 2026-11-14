@@ -1552,6 +1552,14 @@ struct llm_graph_context {
                   float   kq_scale,
                     int   il) const;
 
+    // [TAG_R41_PP_MTPKV] the K/V cache stores of the build_attn above alone (the same rotations, scales and writer ops, in
+    // the same order), no attention: for a graph whose rows' attention output nothing reads
+    void build_attn_store_kv(
+            llm_graph_input_attn_kv * inp,
+            ggml_tensor * k_cur, // [n_embd_head_k, n_head_k, n_tokens]
+            ggml_tensor * v_cur, // [n_embd_head_v, n_head_v, n_tokens]
+                    int   il) const;
+
     llm_graph_input_attn_k  * build_attn_inp_k() const;
 
     ggml_tensor * build_attn(
