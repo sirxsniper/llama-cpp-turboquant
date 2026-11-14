@@ -4896,6 +4896,16 @@ private:
         // file keeps the whole file on disk; with the ring of before the two together keep only the newest few
         kp.lazy     = cs.on && !cs.spill && env_ll("LLAMA_FN_L20_CONVFIX_LAZY", 0) != 0;
         keepctx_min = (int32_t) std::max<long long>(1, env_ll("LLAMA_FN_L18_KEEPCTX_MIN", 512));
+        // [TAG_R41_PP_SYSKEEP] 2: the system blocks stay on disk after the server ends, for a server with the same fingerprint
+        r41sys.on  = (int32_t) std::max<long long>(0, env_ll("LLAMA_FN_R41_SYSKEEP", 0));
+        r41sys.min = (int32_t) std::max<long long>(1, env_ll("LLAMA_FN_R41_SYSKEEP_MIN", 2048));
+        r41sys.max = (int32_t) std::max<long long>(1, env_ll("LLAMA_FN_R41_SYSKEEP_N", 4));
+        std::string r41_fp_what;
+        if (r41sys.on >= 2) {
+            kp.sys_persist   = true;
+            kp.sys_fp        = r41_sys_fingerprint(r41_fp_what);
+            kp.sys_files_max = (int32_t) std::max<long long>(1, env_ll("LLAMA_FN_R41_SYSKEEP_FILES", 8));
+        }
         auto kc = std::make_unique<server_keepctx>(kp);
         if (!kc->ok()) {
             SRV_WRN("%s", "[TAG_FN_L18_KEEPCTX] off: no store folder\n");
@@ -4905,13 +4915,20 @@ private:
         keepctx = std::move(kc);
         cs.lazy = kp.lazy;
         // [TAG_R41_PP_SYSKEEP]
-        r41sys.on  = (int32_t) std::max<long long>(0, env_ll("LLAMA_FN_R41_SYSKEEP", 0));
-        r41sys.min = (int32_t) std::max<long long>(1, env_ll("LLAMA_FN_R41_SYSKEEP_MIN", 2048));
-        r41sys.max = (int32_t) std::max<long long>(1, env_ll("LLAMA_FN_R41_SYSKEEP_N", 4));
         if (r41sys.on) {
+            std::string scan;
+            if (kp.sys_persist) {
+                keepctx->sys_scan(mctx != nullptr, scan);
+                while ((int32_t) keepctx->sys_entries.size() > r41sys.max) {
+                    keepctx->sys_drop_front();
+                }
+            }
             SRV_INF("[TAG_R41_PP_SYSKEEP] on: the state at the end of a system + tools block of >= %d tokens is stored once, beside "
-                    "the conversations (up to %d blocks), and a new chat whose slot keeps less of the block takes it back "
-                    "(LLAMA_FN_R41_SYSKEEP=0: off)\n", r41sys.min, r41sys.max);
+                    "the conversations (up to %d blocks), and a new chat whose slot keeps less of the block takes it back%s%s%s%s "
+                    "(LLAMA_FN_R41_SYSKEEP=0: off)\n", r41sys.min, r41sys.max,
+                    kp.sys_persist ? "; the blocks stay on disk after the server ends (fingerprint " : "",
+                    kp.sys_persist ? string_format("%016llx: %s)", (unsigned long long) kp.sys_fp, r41_fp_what.c_str()).c_str() : "",
+                    kp.sys_persist ? "; " : "", kp.sys_persist ? scan.c_str() : "");
         }
         std::string st_extra = ", [TAG_FN_V0254_STORE] folder: " + dir_why;
         st_extra += kp.trace ? ", [TAG_FN_L20_CONVFIX_TRACE]" : "";
@@ -7796,7 +7813,7 @@ private:
         while (!keepctx->sys_entries.empty() && (int32_t) keepctx->sys_entries.size() >= r41sys.max) {
             SLT_INF(slot, "[TAG_R41_PP_SYSKEEP] the least recently used system block (%d tokens, %lld restores) leaves the store\n",
                     keepctx->sys_entries.front().prompt.n_tokens(), (long long) keepctx->sys_entries.front().sys_hits);
-            keepctx->sys_entries.pop_front();
+            keepctx->sys_drop_front();
         }
         // the block's tokens and its checkpoint (moved over and back, not copied)
         server_prompt p;
@@ -7807,16 +7824,72 @@ private:
         conv.sys_end  = (int32_t) n;
         conv.n_prompt = (int32_t) n;
         std::string info;
-        const bool ok = keepctx->save(p, ctx_tgt, ctx_dft, spec.get(), slot.id, nullptr, info, nullptr, &conv, 0, /*sys =*/ true);
+        const bool ok = keepctx->save(p, ctx_tgt, ctx_dft, spec.get(), slot.id, nullptr, info, nullptr, &conv, 0, /*sys =*/ true, h);
         slot.prompt.checkpoints.splice(slot.prompt.checkpoints.end(), p.checkpoints);
         if (ok) {
-            keepctx->sys_entries.back().sys_hash = h;
             r41sys.n_saved++;
             SLT_INF(slot, "[TAG_R41_PP_SYSKEEP] stored the system block at n_tokens = %lld: %s\n", (long long) n, info.c_str());
         } else {
             r41sys.n_failed++;
             SLT_WRN(slot, "[TAG_R41_PP_SYSKEEP] the system block at n_tokens = %lld is not stored: %s\n", (long long) n, info.c_str());
         }
+    }
+
+    // [TAG_R41_PP_SYSKEEP] LLAMA_FN_R41_SYSKEEP=2: what a system block kept on disk depends on, so a server reads back only the
+    // blocks a server with the same weights file, context, batch and draft settings, build and engine environment wrote (the
+    // environment: every LLAMA_ / GGML_ / TURBO_ / SPEC_ / MTMD_ variable but the folders and the log levels). what: the parts
+    uint64_t r41_sys_fingerprint(std::string & what) const {
+        uint64_t h = 0xcbf29ce484222325ull;
+        auto mix = [&](const std::string & s) {
+            for (unsigned char c : s) {
+                h = (h ^ c) * 0x100000001b3ull;
+            }
+            h = (h ^ 0xffu) * 0x100000001b3ull;
+        };
+        std::error_code ec1, ec2;
+        const auto mp = std::filesystem::u8path(params_base.model.path);
+        const auto sz = std::filesystem::file_size(mp, ec1);
+        const auto mt = std::filesystem::last_write_time(mp, ec2);
+        mix(params_base.model.path);
+        mix(std::to_string(ec1 ? 0 : (unsigned long long) sz) + "/" + std::to_string(ec2 ? 0LL : (long long) mt.time_since_epoch().count()));
+        mix(params_base.speculative.draft.mparams.path);
+        mix(string_format("ctx %d seq %d unified %d k %d v %d fa %d batch %d ubatch %d swa_full %d", (int) llama_n_ctx(ctx_tgt),
+                          params_base.n_parallel, (int) params_base.kv_unified, (int) params_base.cache_type_k,
+                          (int) params_base.cache_type_v, (int) params_base.flash_attn_type, (int) llama_n_batch(ctx_tgt),
+                          (int) llama_n_ubatch(ctx_tgt), (int) params_base.swa_full));
+        std::string sp;
+        for (const auto t : params_base.speculative.types) {
+            sp += std::to_string((int) t) + ",";
+        }
+        mix("spec " + sp + " n_max " + std::to_string(common_speculative_n_max(&params_base.speculative)));
+        mix(llama_build_info());
+        std::vector<std::string> ev;
+#if defined(_WIN32)
+        char ** envp = _environ;
+#else
+        extern char ** environ;
+        char ** envp = environ;
+#endif
+        for (char ** e = envp; e && *e; ++e) {
+            const std::string kv = *e;
+            const std::string k  = kv.substr(0, kv.find('='));
+            const bool ours = k.rfind("LLAMA_", 0) == 0 || k.rfind("GGML_", 0) == 0 || k.rfind("TURBO_", 0) == 0 ||
+                              k.rfind("SPEC_", 0) == 0 || k.rfind("MTMD_", 0) == 0;
+            const bool skip = k == "LLAMA_CACHE" || k == "LLAMA_FN_L18_KEEPCTX_DIR" || k == "LLAMA_FN_L18_KEEPCTX_DISK_MIB" ||
+                              k == "LLAMA_FN_L22_PASSLOG" || k == "LLAMA_R38_E1_SLOW_MS" || k == "LLAMA_LOG_VERBOSITY" ||
+                              k.find("_LOG") != std::string::npos || k.find("_DIR") != std::string::npos;
+            if (ours && !skip) {
+                ev.push_back(kv);
+            }
+        }
+        std::sort(ev.begin(), ev.end());
+        for (const auto & s : ev) {
+            mix(s);
+        }
+        what = string_format("%s, %s, ctx %d, %d slots, %s, %zu engine variables", mp.filename().string().c_str(),
+                             llama_build_info(), (int) llama_n_ctx(ctx_tgt), params_base.n_parallel,
+                             params_base.kv_unified ? "unified" : "per slot", ev.size());
+        return h;
     }
 
     // [TAG_R41_PP_SYSKEEP] the stored system block the task's prompt starts with (all of the block, and the prompt goes on

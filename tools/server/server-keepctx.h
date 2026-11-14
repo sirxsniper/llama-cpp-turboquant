@@ -60,6 +60,15 @@ struct server_keepctx_params {
     // [TAG_FN_L19_CONVSTORE_SPILL] list: read back when a prompt resumes at one of them, stored with the conversation
     // again without a write). A restore moves ~half the bytes (4 checkpoints of 112.6 MiB beside a ~420 MiB state).
     bool        lazy     = false;
+
+    // [TAG_R41_PP_SYSKEEP] LLAMA_FN_R41_SYSKEEP=2: the system blocks are files that stay after the server ends
+    // (sysblock-<fingerprint>-<hash>.kcs, a header with the fingerprint, the block's tokens, the drafter's carry, then the
+    // same bytes as a stored conversation) and a server with the same fingerprint (the model file, the context and batch
+    // settings, the build, the engine environment) reads them back at its start; at most sys_files_max such files are kept
+    // in the folder (the oldest go)
+    bool        sys_persist   = false;
+    uint64_t    sys_fp        = 0;
+    int32_t     sys_files_max = 8;
 };
 
 class server_keepctx_file;
@@ -132,9 +141,12 @@ struct server_keepctx_entry {
     double                              value = 0.0;
     double                              t_use = 0.0; // [TAG_FN_L24_KEEPVAL] steady-clock seconds of the store or the last restore
 
-    // [TAG_R41_PP_SYSKEEP] a system-block entry (sys_entries): keepctx_prefix_hash of its tokens, the restores it served
-    uint64_t sys_hash = 0;
-    int64_t  sys_hits = 0;
+    // [TAG_R41_PP_SYSKEEP] a system-block entry (sys_entries): keepctx_prefix_hash of its tokens, the restores it served; with
+    // params.sys_persist its file (kept after the server ends) and where the stored bytes start in it
+    uint64_t    sys_hash = 0;
+    int64_t     sys_hits = 0;
+    std::string sys_path;
+    uint64_t    base     = 0;
 
     uint64_t n_bytes_all() const;       // n_bytes + the spilled checkpoints' bytes
 };
@@ -191,11 +203,20 @@ struct server_keepctx {
     // never `keep`. false: nothing stored (too big, no room beside `keep`, or an I/O error).
     // [TAG_FN_L19_CONVSTORE] spill (may be null): the slot's checkpoints on disk, kept with the entry (shared files);
     // conv (may be null): what is known about the conversation; supersede_tol: see drop_prefixes_of
-    // [TAG_R41_PP_SYSKEEP] sys: into sys_entries, with no eviction of any entry (only the budget check of its own size)
+    // [TAG_R41_PP_SYSKEEP] sys: into sys_entries, with no eviction of any entry (only the budget check of its own size);
+    // sys_hash: keepctx_prefix_hash of the block's tokens (the entry's key, and its file's name with params.sys_persist)
     bool save(const server_prompt & prompt, llama_context * ctx_tgt, llama_context * ctx_dft, common_speculative * spec,
               llama_seq_id seq_id, const server_keepctx_entry * keep, std::string & info,
               const server_keepctx_spill * spill = nullptr, const server_keepctx_conv * conv = nullptr, int32_t supersede_tol = 0,
-              bool sys = false);
+              bool sys = false, uint64_t sys_hash = 0);
+
+    // [TAG_R41_PP_SYSKEEP] params.sys_persist: read the headers of the system-block files in the folder; the ones with this
+    // server's fingerprint become sys_entries (oldest first). Files past sys_files_max (the oldest) and unreadable or
+    // unfinished ones are deleted. The number of entries read; info: what was found
+    int sys_scan(bool has_mtmd, std::string & info);
+
+    // [TAG_R41_PP_SYSKEEP] drop the least recently used system block (and its file with params.sys_persist)
+    void sys_drop_front();
 
     // restore the entry into seq_id and prompt. The entry is removed, unless keep (the prompt continues only a part of
     // it: the rest stays stored for a later continuation) and the restore worked. false: the sequence and prompt are in
