@@ -335,6 +335,12 @@ struct moe_cache {
     // plain one's last retry again (its partial lend)
     int                   sl_spread_st = 0;
     bool                  sl_spread = false; // sl_spread_st == 1
+    // [TAG_R41_SPREAD_FIRST] LLAMA_FN_R41_SPREAD_FIRST=1: the spread sizing comes first (sl_spread_st 1 from the start); when it
+    // cannot hold the whole lend the plain sizing runs from its first try (0 = v0.33.0: the plain sizing first)
+    bool                  r41_sf = false;
+    // [TAG_R41_BORROW_FILL] LLAMA_FN_R41_BORROW_FILL=1: lend layers too small for the 16K-ubatch borrow give what they have and
+    // the others more (0 = v0.33.0: such a layer gives nothing)
+    bool                  r41_fill = false;
     // [TAG_R40_LEND_PARTIAL] a partial lend: the bytes the sizing leaves out of the budget (what it cannot hold, which the
     // caller maps or the shares take as their own VRAM, plus the up-front map's rounding), found by sizing again
     size_t                sl_cut = 0;
@@ -2831,7 +2837,9 @@ ggml_backend_buffer_t hot_vmm_place(moe_cache * mc, ggml_context * ctx_d, ggml_b
                 sum += r.second - r.first;
             }
         }
-        if (sum < g_kv_want && !(g_kv_partial && mc->sl_extra >= 4 && sum > 0 && (!g_kv_spread || mc->sl_spread_st != 0))) {
+        // [TAG_R41_SPREAD_FIRST] the spread sizing tried first keeps no partial lend: short at its last retry, the plain sizing runs
+        const bool r41_sf_try = mc->r41_sf && mc->sl_spread_st == 1;
+        if (sum < g_kv_want && !(g_kv_partial && mc->sl_extra >= 4 && sum > 0 && (!g_kv_spread || mc->sl_spread_st != 0) && !r41_sf_try)) {
             mc->sl_retry = true; // the caller sizes one slot more per lend layer
             return nullptr;
         }
@@ -2881,6 +2889,15 @@ ggml_backend_buffer_t hot_vmm_place(moe_cache * mc, ggml_context * ctx_d, ggml_b
                 return nullptr;
             }
             if (bsum < g_kv_borrow) {
+                // [TAG_R41_BORROW_FILL] which lend layers held their share (base slots / borrow slots; -1: none)
+                std::string bl;
+                for (size_t i = 0; i < n; ++i) {
+                    const layer_state & ls = mc->layers[li0 + i];
+                    if (ls.sl_base >= 0) {
+                        bl += format(" %d:%d/%d", ls.pub.il, ls.sl_base, ls.sl_bbase >= 0 ? ls.sl_base - ls.sl_bbase : -1);
+                    }
+                }
+                LLAMA_LOG_INFO("moe-hot: [TAG_R41_BORROW_FILL] the borrow's lend layers (blk:base/borrow slots):%s\n", bl.c_str());
                 // the borrow never costs the KV lend: none this time (the 16K prompt ubatches stay off)
                 LLAMA_LOG_WARN("moe-hot: [TAG_FN_L21_BIGUB] the borrow segments come to %.0f of %.0f MiB%s: no borrow\n",
                         bsum/1048576.0, g_kv_borrow/1048576.0, g_kv_borrow_1seq ? " (1-seq reserve) [TAG_FN_L22_BIGUB2]" : "");
@@ -3039,12 +3056,22 @@ ggml_backend_buffer_t hot_vmm_place(moe_cache * mc, ggml_context * ctx_d, ggml_b
                 il_b, n_lend, mc->kv_bytes/1048576.0, mc->sl_n_kv, g_kv_want/1048576.0);
         if (mc->sb_bytes > 0) {
             int n_b = 0;
+            int b_min = INT32_MAX, b_max = 0, n_bl = 0, n_bnone = 0; // [TAG_R41_BORROW_FILL]
             for (size_t i = 0; i < n; ++i) {
                 const layer_state & ls = mc->layers[li0 + i];
                 if (ls.sl_bbase >= 0 && ls.sl_base > ls.sl_bbase) {
-                    n_b = ls.sl_base - ls.sl_bbase;
-                    break;
+                    n_b = n_b > 0 ? n_b : ls.sl_base - ls.sl_bbase;
+                    b_min = std::min(b_min, ls.sl_base - ls.sl_bbase);
+                    b_max = std::max(b_max, ls.sl_base - ls.sl_bbase);
+                    n_bl++;
+                } else if (ls.sl_base >= 0) {
+                    n_bnone++;
                 }
+            }
+            if (mc->r41_fill) {
+                LLAMA_LOG_INFO("moe-hot: [TAG_R41_BORROW_FILL] the 16K-ubatch borrow lies over %d..%d base slots of %d lend layers (%d "
+                        "without), %.0f MiB for %.0f MiB wanted\n", b_min == INT32_MAX ? 0 : b_min, b_max, n_bl, n_bnone,
+                        mc->sb_bytes/1048576.0, g_kv_borrow/1048576.0);
             }
             LLAMA_LOG_INFO("moe-hot: [TAG_FN_L21_BIGUB] the same layers' %d slots below those (%.0f MiB, %.0f MiB wanted%s) give their "
                     "VRAM to a 16K prompt ubatch's compute reserve while it runs; the slots per layer are as without it\n", n_b,
@@ -3355,6 +3382,16 @@ bool llama_moe_hot_init(const llama_model & model, const void * owner, size_t bu
     mc->hot       = true;
     mc->hot_max_t = max_t;
     mc->sl_req    = sl_req; // [TAG_FN_L10_SLOTLEND]
+    // [TAG_R41_BORROW_FILL] [TAG_R41_SPREAD_FIRST] the r41 placement switches (each =0 restores v0.33.0)
+    mc->r41_fill = sl_req && g_kv_borrow > 0 && llama_fn_l3_flag(model, "LLAMA_FN_R41_BORROW_FILL");
+    if (sl_req && g_kv_spread && llama_fn_l3_flag(model, "LLAMA_FN_R41_SPREAD_FIRST")) {
+        mc->r41_sf       = true;
+        mc->sl_spread_st = 1;
+        mc->sl_spread    = true;
+        LLAMA_LOG_INFO("moe-hot: [TAG_R41_SPREAD_FIRST] the lend spreads over the lend layers' own slots from the first sizing (every "
+                "layer sized from the whole budget); the plain sizing only if that cannot hold the whole lend "
+                "(LLAMA_FN_R41_SPREAD_FIRST=0: the plain sizing first, as v0.33.0)\n");
+    }
     // [TAG_FN_R25_REFILL] the cache-resident copy pool for the synchronous refills (static and adaptive sets)
     mc->r25_on    = llama_fn_l3_flag(model, "LLAMA_FN_R25_REFILL");
     mc->r25_owner = owner;
@@ -3571,6 +3608,44 @@ bool llama_moe_hot_init(const llama_model & model, const void * owner, size_t bu
                     sl_bbase_of[li] = sl_bx > 0 && base > sl_bx ? base - sl_bx : -1; // [TAG_FN_L21_BIGUB]
                     n_slots_of[li] += e;
                     used += (size_t) e*layers[li].bytes;
+                }
+            }
+            if (mc->r41_fill && sl_bx > 0 && g_kv_borrow > 0) {
+                // [TAG_R41_BORROW_FILL] a lend layer whose base holds sl_bx slots or fewer gives what it has (one slot stays) and
+                // the other lend layers give more, until the borrow holds what sl_bx slots of every lend layer would hold. The
+                // =0 rule above leaves such a layer out, so its share is missing: v0.33.0 at 512K with 2 slots had 2946 of 3049
+                // MiB, no borrow, and prompts of more than 16384 tokens ran in 8192-token ubatches. When every lend layer
+                // holds sl_bx the borrow is the same as with =0.
+                const size_t w_t = 3*(2*vmm_gran + SL_SLACK); // what a layer's three segments can lose to the granule ends
+                auto held = [&](int32_t t, bool every) {
+                    size_t s = 0;
+                    for (int li : sl_layers) {
+                        if (sl_base_of[li] < 0) {
+                            continue;
+                        }
+                        const int32_t bx = every ? t : std::min<int32_t>(t, sl_base_of[li] - 1);
+                        const size_t  b  = bx > 0 ? (size_t) bx*layers[li].bytes : 0;
+                        s += b > w_t ? b - w_t : 0;
+                    }
+                    return s;
+                };
+                const size_t want_b = held(sl_bx, true);
+                int32_t t_max = 0;
+                for (int li : sl_layers) {
+                    if (sl_base_of[li] > 1) {
+                        t_max = std::max<int32_t>(t_max, sl_base_of[li] - 1);
+                    }
+                }
+                int32_t t = sl_bx;
+                while (t < t_max && held(t, false) < want_b) {
+                    ++t;
+                }
+                for (int li : sl_layers) {
+                    if (sl_base_of[li] < 0) {
+                        continue;
+                    }
+                    const int32_t bx = std::min<int32_t>(t, sl_base_of[li] - 1);
+                    sl_bbase_of[li] = bx > 0 ? sl_base_of[li] - bx : -1;
                 }
             }
             if (!r35_nv0.empty() && r35_nv0.size() == nv.size()) {
@@ -3811,14 +3886,19 @@ bool llama_moe_hot_init(const llama_model & model, const void * owner, size_t bu
             }
             mc->sl_fail = true;
         }
-        if (!ok && mc->sl_fail && mc->sl_spread_st == 1 && g_kv_partial) {
+        if (!ok && mc->sl_fail && mc->sl_spread_st == 1 && (g_kv_partial || mc->r41_sf)) {
             // [TAG_R40_LEND_SPREAD] the spread sizing failed: the plain one's last retry again, which keeps its partial lend
-            LLAMA_LOG_WARN("moe-hot: [TAG_R40_LEND_SPREAD] the spread lend could not be placed: the plain partial lend instead\n");
+            // [TAG_R41_SPREAD_FIRST] (spread first: the plain sizing from its first try, as v0.33.0 runs it)
+            if (mc->r41_sf) {
+                LLAMA_LOG_WARN("moe-hot: [TAG_R41_SPREAD_FIRST] the spread lend cannot hold the whole lend: the plain sizing instead\n");
+            } else {
+                LLAMA_LOG_WARN("moe-hot: [TAG_R40_LEND_SPREAD] the spread lend could not be placed: the plain partial lend instead\n");
+            }
             mc->sl_spread_st = 2;
             mc->sl_spread    = false;
             mc->sl_fail      = false;
             mc->sl_retry     = false;
-            mc->sl_extra     = 4;
+            mc->sl_extra     = mc->r41_sf ? 0 : 4;
             mc->sl_cut       = 0; // [TAG_R40_LEND_PARTIAL] the plain sizing finds its own
             mc->sl_cut_n     = 0;
             continue;
