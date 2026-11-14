@@ -390,7 +390,7 @@ private:
         ggml_tensor * pool = nullptr;
 
         // [TAG_TURBOT_ANY_STREAMS] rows [s*POOL_s, (s+1)*POOL_s) of the pool, one view per stream; empty with one stream
-        std::vector<ggml_tensor *> pool_stream;
+        std::vector<ggml_tensor *> pool_stream {};
         ggml_tensor * k_rot = nullptr;
         ggml_tensor * v_rot = nullptr;
     };

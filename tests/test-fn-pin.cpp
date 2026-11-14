@@ -342,7 +342,7 @@ static void test_lifo() {
     }
     TCHECK(r.build(rs, 4), "build");
     for (int i = 0; i < 4; ++i) {
-        r.set_unit(i, (void *) rs[i].p, rs[i].n);
+        r.set_unit(i, const_cast<uint8_t *>(rs[i].p), rs[i].n);
     }
     r.activate(0);
     r.activate(2);
@@ -381,7 +381,7 @@ static void test_concurrent() {
     }
     TCHECK(r.build(rs, n_u), "build");
     for (int i = 0; i < n_u; ++i) {
-        r.set_unit(i, (void *) rs[i].p, rs[i].n);
+        r.set_unit(i, const_cast<uint8_t *>(rs[i].p), rs[i].n);
         r.activate(i);
     }
     std::atomic<bool> stop{false};

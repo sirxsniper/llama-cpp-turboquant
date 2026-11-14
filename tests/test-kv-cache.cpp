@@ -1,6 +1,7 @@
 #include "llama-kv-cache.h"
 #include "llama-model.h"
 
+#include <cstdlib>
 #include <numeric>
 #include <string>
 
@@ -15,10 +16,29 @@ static void init_model(llama_model & model, uint32_t n_layer) {
     model.layers.resize(n_layer);
 }
 
+static void set_env(const char * name, const char * value) {
+#ifdef _WIN32
+    _putenv_s(name, value ? value : "");
+#else
+    if (value) {
+        setenv(name, value, 1);
+    } else {
+        unsetenv(name);
+    }
+#endif
+}
+
 int main() {
     llama_backend_init();
 
     {
+        // [TAG_KV_RESOLVE] the refusals below are those of the context without the resolver, which would make K and V
+        // equal before the checks
+        const char *      resolve_env = getenv("LLAMA_KV_RESOLVE");
+        const bool        resolve_set = resolve_env != nullptr;
+        const std::string resolve_old = resolve_set ? resolve_env : "";
+        set_env("LLAMA_KV_RESOLVE", "0");
+
         std::string errors;
         llama_log_set([](ggml_log_level level, const char * text, void * user_data) {
             if (level == GGML_LOG_LEVEL_ERROR) {
@@ -58,6 +78,7 @@ int main() {
         }
 
         llama_log_set(nullptr, nullptr);
+        set_env("LLAMA_KV_RESOLVE", resolve_set ? resolve_old.c_str() : nullptr);
     }
 
     {
@@ -73,10 +94,11 @@ int main() {
         assistant->layers[0].v_cache_s = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, 1);
         assistant->layers[1].k_cache_s = assistant->layers[0].k_cache_s;
         assistant->layers[1].v_cache_s = assistant->layers[0].v_cache_s;
-        ggml_set_f32(target->layers[2].k_cache_s, 0.5f);
-        ggml_set_f32(target->layers[2].v_cache_s, 0.25f);
-        ggml_set_f32(assistant->layers[0].k_cache_s, 2.0f);
-        ggml_set_f32(assistant->layers[0].v_cache_s, 4.0f);
+        // host memory of ctx: written directly, ggml_set_f32 lives in the CPU backend (not linked with GGML_BACKEND_DL)
+        *(float *) target->layers[2].k_cache_s->data    = 0.5f;
+        *(float *) target->layers[2].v_cache_s->data    = 0.25f;
+        *(float *) assistant->layers[0].k_cache_s->data = 2.0f;
+        *(float *) assistant->layers[0].v_cache_s->data = 4.0f;
 
         for (ggml_type type_k : { GGML_TYPE_F16, GGML_TYPE_F8_E4M3 }) {
             for (ggml_type type_v : { GGML_TYPE_F16, GGML_TYPE_F8_E4M3 }) {

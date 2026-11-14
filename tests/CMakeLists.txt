@@ -234,7 +234,7 @@ endif()
 # models stay static / non-Windows only, as before the sync
 if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
 llama_build(test-llama-archs.cpp)
-if (GGML_CPU AND (NOT WIN32 OR NOT BUILD_SHARED_LIBS))
+if (GGML_CPU AND NOT GGML_BACKEND_DL AND (NOT WIN32 OR NOT BUILD_SHARED_LIBS))
     llama_build(test-fp8.cpp)
     set(FP8_MODEL_DIR "${CMAKE_CURRENT_BINARY_DIR}/test-models-fp8")
     file(MAKE_DIRECTORY "${FP8_MODEL_DIR}")

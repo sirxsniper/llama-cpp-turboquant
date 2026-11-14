@@ -2352,7 +2352,6 @@ static int encode_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch,
 //       some pointers are allowed to be used, they are not used by to_json()
 static int process_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch, size_t idx, size_t & n_tokens_out) {
     GGML_ASSERT(slot.mctx);
-    const auto & mctx = slot.mctx;
     const auto & input_tokens = slot.task->tokens;
     const auto & chunk = input_tokens.find_chunk(idx);
     int32_t res = 0;
@@ -5804,7 +5803,7 @@ private:
         pool_gen_rows_max = n_gen_max;
         pool_preempt = params_base.kv_unified && params_base.n_parallel > 1
                     && env_i64("TURBO_POOL_PREEMPT", 1) != 0
-                    && n_free >= 0 && n_gen_max <= llama_n_batch(ctx_tgt);
+                    && n_free >= 0 && (uint32_t) n_gen_max <= llama_n_batch(ctx_tgt);
         pool_park_margin = (int32_t) env_i64("TURBO_POOL_PARK_MARGIN", 8192);
         pool_min_run_us  = 1000 * env_i64("TURBO_POOL_MIN_RUN_MS", 20000);
         pool_dbg_hold_us = 1000 * env_i64("TURBO_POOL_DEBUG_HOLD_MS", 0);

@@ -2051,10 +2051,10 @@ void llama_memory_recurrent::r35_copy_out(const r35_cell & pc) const {
     for (size_t k0 = 0; k0 < n; ) {
         const size_t k1 = st ? std::min(n, k0 + r35_stage_n) : n;
         for (size_t k = k0; k < k1; ++k) {
-            ggml_backend_tensor_get(pc.grans[k].t, st ? st + (k - k0)*g : (uint8_t *) pc.host.data() + k*g, pc.grans[k].off_t, g);
+            ggml_backend_tensor_get(pc.grans[k].t, st ? st + (k - k0)*g : const_cast<uint8_t *>(pc.host.data()) + k*g, pc.grans[k].off_t, g);
         }
         if (st) {
-            memcpy((uint8_t *) pc.host.data() + k0*g, st, (k1 - k0)*g);
+            memcpy(const_cast<uint8_t *>(pc.host.data()) + k0*g, st, (k1 - k0)*g);
         }
         k0 = k1;
     }

@@ -395,7 +395,7 @@ void test_fa(int64_t T, bool explicit_mask) {
         if (qp) {
             ggml_flash_attn_ext_set_pos(r, kv_pos, qp);
         }
-        ggml_flash_attn_ext_set_prec(r, GGML_PREC_F32);
+        ggml_prec_set_acc(r, GGML_PREC_F32);
         return r;
     };
 

@@ -1721,6 +1721,8 @@ bool llama_model_loader::load_all_data(
             }
         }
     } mp_guard { mp_set, mp_old, trimmed };
+#else
+    GGML_UNUSED(trimmed);
 #endif
 
     std::vector<std::future<std::pair<ggml_tensor *, bool>>> validation_result;

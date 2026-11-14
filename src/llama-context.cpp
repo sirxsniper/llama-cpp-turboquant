@@ -4611,6 +4611,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     // non-causal attention needs the whole sequence in one ubatch
     const bool embd_all     = output_all || !cparams.causal_attn;
     const bool has_samplers = !sampling.samplers.empty();
+    GGML_UNUSED(embd_all); // init_batch below is called with output_all
 
     const uint32_t n_seq_max = cparams.kv_unified ? LLAMA_MAX_SEQ : cparams.n_seq_max;
 

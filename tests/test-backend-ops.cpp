@@ -10687,7 +10687,7 @@ struct test_flash_attn_ext_pos : public test_case {
 
         ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, nullptr, 1.0f/sqrtf(hs), 0.0f, 0.0f);
         ggml_flash_attn_ext_set_pos(out, kv_pos, q_pos);
-        ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32);
+        ggml_prec_set_acc(out, GGML_PREC_F32);
         ggml_set_name(out, "out");
 
         return out;
@@ -10999,7 +10999,7 @@ struct test_flash_attn_ext_split_plane : public test_case {
             ggml_set_name(q_pos, "q_pos");
             ggml_flash_attn_ext_set_pos(out, kv_pos, q_pos);
         }
-        ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32);
+        ggml_prec_set_acc(out, GGML_PREC_F32);
         ggml_set_name(out, "out");
 
         return out;
@@ -11530,7 +11530,7 @@ struct test_flash_attn_ext_turbot : public test_case {
             ggml_set_name(q_pos, "q_pos");
             ggml_flash_attn_ext_set_pos(out, kv_pos, q_pos);
         }
-        ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32);
+        ggml_prec_set_acc(out, GGML_PREC_F32);
         ggml_turbot_op_params p;
         ggml_turbot_op_params_make(&p, &l, GGML_TURBOT_SIDE_BOTH);
         ggml_flash_attn_ext_set_turbot(out, pool, gtab, &p);
@@ -11635,7 +11635,7 @@ struct test_flash_attn_ext_turbo5p_ref : public test_case {
         const float scale = d == 256 ? 1.0f/16.0f : 1.0f/sqrtf((float) d);
         ggml_tensor * out = ggml_flash_attn_ext(ctx, q, turbot_test_fa_view(ctx, kc, kv, d, hkv), turbot_test_fa_view(ctx, vc, kv, d, hkv), m,
                                                 scale, 0.0f, 0.0f);
-        ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32);
+        ggml_prec_set_acc(out, GGML_PREC_F32);
         ggml_set_name(out, "out");
         return out;
     }
@@ -11891,7 +11891,7 @@ struct test_flash_attn_ext_pos_ms : public test_case {
             if (positional) {
                 ggml_flash_attn_ext_set_pos(fa, kv_pos, q_pos);
             }
-            ggml_flash_attn_ext_set_prec(fa, GGML_PREC_F32);
+            ggml_prec_set_acc(fa, GGML_PREC_F32);
             if (turbot) {
                 ggml_turbot_op_params p;
                 ggml_turbot_op_params_make(&p, &cache.layer, GGML_TURBOT_SIDE_BOTH);
@@ -12115,7 +12115,7 @@ struct test_flash_attn_ext_kv_rows : public test_case {
 
             ggml_tensor * fa = ggml_flash_attn_ext(ctx, q_s, k, v, nullptr, scale, 0.0f, 0.0f);
             ggml_flash_attn_ext_set_pos(fa, kv_pos, p_s);
-            ggml_flash_attn_ext_set_prec(fa, GGML_PREC_F32);
+            ggml_prec_set_acc(fa, GGML_PREC_F32);
             ggml_flash_attn_ext_set_turbot(fa, pool, gtab, &p);
             ggml_flash_attn_ext_set_kv_rows(fa, r_s);
 
@@ -12383,7 +12383,7 @@ struct test_turbot_set_rows : public test_case {
         const float scale = d == 256 ? 1.0f/16.0f : 1.0f/sqrtf((float) d);
         ggml_tensor * out = ggml_flash_attn_ext(ctx, q, turbot_test_fa_view(ctx, wk, cache.kv_size, d, hkv),
                                                 turbot_test_fa_view(ctx, wv, cache.kv_size, d, hkv), m, scale, 0.0f, 0.0f);
-        ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32);
+        ggml_prec_set_acc(out, GGML_PREC_F32);
         ggml_flash_attn_ext_set_turbot(out, pool, gtab, &pb);
         ggml_set_name(out, "out");
 
@@ -14154,7 +14154,7 @@ struct test_fn_l4_qsa_list : public test_case {
         ggml_tensor * out = ggml_flash_attn_ext(ctx, q, turbot_test_fa_view(ctx, kc, kv, d, hkv), turbot_test_fa_view(ctx, vc, kv, d, hkv),
                                                 m, 1.0f/16.0f, 0.0f, 0.0f);
         ggml_flash_attn_ext_set_n_kv_max(out, (int32_t) n_sel);
-        ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32);
+        ggml_prec_set_acc(out, GGML_PREC_F32);
         ggml_turbot_op_params p;
         ggml_turbot_op_params_make(&p, &l, GGML_TURBOT_SIDE_BOTH);
         ggml_flash_attn_ext_set_turbot(out, pool, gtab, &p);
@@ -20734,9 +20734,9 @@ static bool run_cpu_fn_moe_fuse(ggml_backend_t backend, ggml_backend_t backend_r
                     ggml_tensor * a_u = ggml_new_tensor_3d(ctx.get(), c.tu, c.n_embd, c.n_ff, c.n_exp);
                     ggml_tensor * a_g = ggml_new_tensor_3d(ctx.get(), c.tg, c.n_embd, c.n_ff, c.n_exp);
                     ggml_tensor * a_d = ggml_new_tensor_3d(ctx.get(), c.td, c.n_ff, c.n_embd, c.n_exp);
-                    a_u->data = (void *) wu.data();
-                    a_g->data = (void *) wg.data();
-                    a_d->data = (void *) wd.data();
+                    a_u->data = const_cast<uint8_t *>(wu.data());
+                    a_g->data = const_cast<uint8_t *>(wg.data());
+                    a_d->data = const_cast<uint8_t *>(wd.data());
 
                     ggml_cpu_moe_layer layer = { a_u, a_g, a_d, with_tbl ? tbl.data() : nullptr, c.n_exp };
                     ggml_cpu_moe_pool_params pp = pp_def(4);
@@ -20744,7 +20744,7 @@ static bool run_cpu_fn_moe_fuse(ggml_backend_t backend, ggml_backend_t backend_r
                     ggml_cpu_moe_pool * pool = pool_new(&pp);
 
                     std::vector<float> out_p(ref.size(), 12345.0f);
-                    ggml_cpu_moe_job job = { &layer, (int32_t) T, c.n_used, x.data(), ids.data(), nullptr, out_p.data() };
+                    ggml_cpu_moe_job job = { &layer, (int32_t) T, c.n_used, x.data(), ids.data(), nullptr, out_p.data(), 0, 0.0f, 0.0f, 0, 0, nullptr };
                     const bool ran_p = pool && pool_run(pool, &job) == GGML_STATUS_SUCCESS;
 
                     std::vector<float> out_w((size_t) c.n_embd * T, 12345.0f);
@@ -20791,7 +20791,7 @@ static bool run_cpu_fn_moe_fuse(ggml_backend_t backend, ggml_backend_t backend_r
                         }
                         uint64_t pj0 = 0, pj1 = 0;
                         pool_pf_stats(pool, &pj0, nullptr, nullptr, nullptr);
-                        const ggml_cpu_moe_prefetch_job pjob = { &layer, router.data(), (int32_t) T, x.data(), 4, (int32_t) (T % 2) };
+                        const ggml_cpu_moe_prefetch_job pjob = { &layer, router.data(), (int32_t) T, x.data(), 4, (int32_t) (T % 2), nullptr };
                         const bool p1 = pool_pf(pool, &pjob) == GGML_STATUS_SUCCESS;
                         std::this_thread::sleep_for(std::chrono::milliseconds(2));
                         job.w   = w.data();
@@ -20826,7 +20826,7 @@ static bool run_cpu_fn_moe_fuse(ggml_backend_t backend, ggml_backend_t backend_r
                         for (ggml_fp16_t & v : router) {
                             v = ggml_fp32_to_fp16(uni(gen));
                         }
-                        const ggml_cpu_moe_prefetch_job pjob = { &layer, router.data(), (int32_t) T, x.data(), 6, (int32_t) (T % 2) };
+                        const ggml_cpu_moe_prefetch_job pjob = { &layer, router.data(), (int32_t) T, x.data(), 6, (int32_t) (T % 2), nullptr };
                         uint64_t pc0 = 0, pc1 = 0;
                         pool_pfc_stats(pool, &pc0, nullptr, nullptr);
                         volatile int32_t stop = 0;
@@ -21025,9 +21025,9 @@ static bool run_cpu_fn_moe_pool_l3(ggml_backend_t backend, ggml_backend_t backen
         ggml_tensor * a_u = ggml_new_tensor_3d(ctx.get(), c.tu, c.n_embd, c.n_ff, c.n_exp);
         ggml_tensor * a_g = ggml_new_tensor_3d(ctx.get(), c.tg, c.n_embd, c.n_ff, c.n_exp);
         ggml_tensor * a_d = ggml_new_tensor_3d(ctx.get(), c.td, c.n_ff, c.n_embd, c.n_exp);
-        a_u->data = (void *) wu.data();
-        a_g->data = (void *) wg.data();
-        a_d->data = (void *) wd.data();
+        a_u->data = const_cast<uint8_t *>(wu.data());
+        a_g->data = const_cast<uint8_t *>(wg.data());
+        a_d->data = const_cast<uint8_t *>(wd.data());
 
         std::vector<int32_t> tbl(c.n_exp);
         for (int e = 0; e < c.n_exp; e++) {
@@ -21078,7 +21078,7 @@ static bool run_cpu_fn_moe_pool_l3(ggml_backend_t backend, ggml_backend_t backen
                 ggml_cpu_moe_layer layer = { a_u, a_g, a_d, with_tbl ? tbl.data() : nullptr, c.n_exp };
 
                 std::vector<float> out0((size_t) c.n_embd * T, 12345.0f);
-                ggml_cpu_moe_job job0 = { &layer, (int32_t) T, c.n_used, x.data(), ids.data(), w.data(), out0.data() };
+                ggml_cpu_moe_job job0 = { &layer, (int32_t) T, c.n_used, x.data(), ids.data(), w.data(), out0.data(), 0, 0.0f, 0.0f, 0, 0, nullptr };
                 const bool ran0 = pool0 && pool_run(pool0, &job0) == GGML_STATUS_SUCCESS;
                 std::vector<float> outp0(ref.size(), 12345.0f);
                 job0.w   = nullptr;
@@ -21131,7 +21131,7 @@ static bool run_cpu_fn_moe_pool_l3(ggml_backend_t backend, ggml_backend_t backen
 
                             // plain jobs: weighted and graph layout
                             std::vector<float> o1(out0.size(), 12345.0f);
-                            ggml_cpu_moe_job job = { &layer, (int32_t) T, c.n_used, x.data(), ids.data(), w.data(), o1.data() };
+                            ggml_cpu_moe_job job = { &layer, (int32_t) T, c.n_used, x.data(), ids.data(), w.data(), o1.data(), 0, 0.0f, 0.0f, 0, 0, nullptr };
                             pool_run(pool, &job);
                             check(o1, out0, "weighted");
                             std::vector<float> o2(ref.size(), 12345.0f);
@@ -21230,7 +21230,7 @@ static bool run_cpu_fn_moe_pool_l3(ggml_backend_t backend, ggml_backend_t backen
                                 for (int r = 0; r < 6; r++) {
                                     const int64_t Tr = r % 2 ? 1 : T;
                                     std::vector<float> o7((size_t) c.n_embd * Tr, 12345.0f);
-                                    ggml_cpu_moe_job jr = { &layer, (int32_t) Tr, c.n_used, x.data(), ids.data(), w.data(), o7.data() };
+                                    ggml_cpu_moe_job jr = { &layer, (int32_t) Tr, c.n_used, x.data(), ids.data(), w.data(), o7.data(), 0, 0.0f, 0.0f, 0, 0, nullptr };
                                     pool_run(pool, &jr);
                                     if (Tr == T) {
                                         check(o7, out0, "repeated");
@@ -21270,7 +21270,7 @@ static bool run_cpu_fn_moe_pool_l3(ggml_backend_t backend, ggml_backend_t backen
                             return;
                         }
                         made = true;
-                        ggml_cpu_moe_job job = { &layer, (int32_t) T, c.n_used, x.data(), ids.data(), w.data(), o8.data() };
+                        ggml_cpu_moe_job job = { &layer, (int32_t) T, c.n_used, x.data(), ids.data(), w.data(), o8.data(), 0, 0.0f, 0.0f, 0, 0, nullptr };
                         pool_run(pool, &job);
                         pool_run(pool, &job); // the pool sums a job's records when the next job starts
                         pool_stats(pool, &st8, true);
@@ -21329,7 +21329,7 @@ static bool moe_bridge_test_run(const ggml_moe_bridge_job * j, void * ud) {
         std::this_thread::sleep_for(std::chrono::milliseconds(ms)); // a slow job: taken, so its wait allows job_max_ms
     }
     const ggml_cpu_moe_job job = { (j->flags & GGML_MOE_BRIDGE_JOB_TABLE) ? &r->layer_tbl : &r->layer,
-                                   j->n_tokens, j->n_used, j->x, j->ids, j->w, j->out };
+                                   j->n_tokens, j->n_used, j->x, j->ids, j->w, j->out, 0, 0.0f, 0.0f, 0, 0, nullptr };
     return r->pool_run(r->pool, &job) == GGML_STATUS_SUCCESS;
 }
 
@@ -21786,9 +21786,9 @@ static bool run_moe_bridge(ggml_backend_t backend, ggml_backend_t backend_ref, c
         ggml_tensor * a_u = ggml_new_tensor_3d(wctx.get(), c.tu, c.n_embd, c.n_ff, c.n_exp);
         ggml_tensor * a_g = ggml_new_tensor_3d(wctx.get(), c.tg, c.n_embd, c.n_ff, c.n_exp);
         ggml_tensor * a_d = ggml_new_tensor_3d(wctx.get(), c.td, c.n_ff, c.n_embd, c.n_exp);
-        a_u->data = (void *) wu.data();
-        a_g->data = (void *) wg.data();
-        a_d->data = (void *) wd.data();
+        a_u->data = const_cast<uint8_t *>(wu.data());
+        a_g->data = const_cast<uint8_t *>(wg.data());
+        a_d->data = const_cast<uint8_t *>(wd.data());
 
         // [TAG_FN_L3_HOST_EXEC] mode 2: spin with the ring watch on
         for (int mode_x : { 0, 2, 1 }) {
@@ -22551,9 +22551,9 @@ static bool run_moe_bridge_hint(ggml_backend_t backend, ggml_backend_t backend_r
     ggml_tensor * a_u = ggml_new_tensor_3d(wctx.get(), c.tu, c.n_embd, c.n_ff, c.n_exp);
     ggml_tensor * a_g = ggml_new_tensor_3d(wctx.get(), c.tg, c.n_embd, c.n_ff, c.n_exp);
     ggml_tensor * a_d = ggml_new_tensor_3d(wctx.get(), c.td, c.n_ff, c.n_embd, c.n_exp);
-    a_u->data = (void *) wu.data();
-    a_g->data = (void *) wg.data();
-    a_d->data = (void *) wd.data();
+    a_u->data = const_cast<uint8_t *>(wu.data());
+    a_g->data = const_cast<uint8_t *>(wg.data());
+    a_d->data = const_cast<uint8_t *>(wd.data());
 
     int n_run  = 0;
     int n_fail = 0;
@@ -22853,9 +22853,9 @@ static bool run_moe_bridge_fetch(ggml_backend_t backend, ggml_backend_t backend_
     ggml_tensor * a_u = ggml_new_tensor_3d(wctx.get(), c.tu, c.n_embd, c.n_ff, c.n_exp);
     ggml_tensor * a_g = ggml_new_tensor_3d(wctx.get(), c.tg, c.n_embd, c.n_ff, c.n_exp);
     ggml_tensor * a_d = ggml_new_tensor_3d(wctx.get(), c.td, c.n_ff, c.n_embd, c.n_exp);
-    a_u->data = (void *) wu.data();
-    a_g->data = (void *) wg.data();
-    a_d->data = (void *) wd.data();
+    a_u->data = const_cast<uint8_t *>(wu.data());
+    a_g->data = const_cast<uint8_t *>(wg.data());
+    a_d->data = const_cast<uint8_t *>(wd.data());
 
     ggml_moe_bridge_params bp = {};
     bp.device     = dev_index;
@@ -22927,7 +22927,7 @@ static bool run_moe_bridge_fetch(ggml_backend_t backend, ggml_backend_t backend_
                 last_plan = d;
             }
             const ggml_cpu_moe_layer layer = { a_u, a_g, a_d, skip.data(), 0 };
-            const ggml_cpu_moe_job cj = { &layer, job.n_tokens, job.n_used, job.x, job.ids, job.w, job.out };
+            const ggml_cpu_moe_job cj = { &layer, job.n_tokens, job.n_used, job.x, job.ids, job.w, job.out, 0, 0.0f, 0.0f, 0, 0, nullptr };
             br_complete(br, &job, pool_run(pool, &cj) == GGML_STATUS_SUCCESS);
         }
     });

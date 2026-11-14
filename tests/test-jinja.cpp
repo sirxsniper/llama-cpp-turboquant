@@ -68,6 +68,10 @@ int main(int argc, char *argv[]) {
         }
     }
 
+    // [TAG_FN_L22_JSONFLOAT] the upstream cases expect Python floats and a scope per loop iteration;
+    // test_l22_jsonfloat sets both states itself
+    jinja::set_l22_jsonfloat(true);
+
     t.test("whitespace control", test_whitespace_control);
     t.test("conditionals", test_conditionals);
     t.test("loops", test_loops);

@@ -97,6 +97,9 @@ static const ggml_backend_buffer_i fake_buf_iface = {
     /* .cpy_tensor    = */ fake_buf_cpy,
     /* .clear         = */ fake_buf_clear,
     /* .reset         = */ nullptr,
+    /* .set_tensor_n  = */ nullptr,
+    /* .get_tensor_n  = */ nullptr,
+    /* .cpy_tensor_n  = */ nullptr,
 };
 
 static const char * fake_buft_name(ggml_backend_buffer_type_t) {

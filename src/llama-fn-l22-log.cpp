@@ -30,7 +30,9 @@
 #    include <windows.h>
 #    include <psapi.h>
 #else
-#    include <sys/resource.h>
+#    if !defined(__wasi__) // WASI has no getrusage
+#        include <sys/resource.h>
+#    endif
 #    include <unistd.h>
 #endif
 
@@ -280,10 +282,12 @@ llama_fn_l22_counters llama_fn_l22_counters_now() {
         }
     }
 #else
+#    if !defined(__wasi__)
     struct rusage ru;
     if (getrusage(RUSAGE_SELF, &ru) == 0) {
         c.faults = (uint64_t) ru.ru_majflt + (uint64_t) ru.ru_minflt;
     }
+#    endif
 #    if defined(_SC_AVPHYS_PAGES) && defined(_SC_PAGESIZE)
     const long av = sysconf(_SC_AVPHYS_PAGES);
     const long pg = sysconf(_SC_PAGESIZE);

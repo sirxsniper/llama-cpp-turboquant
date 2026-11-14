@@ -66,7 +66,9 @@
 #    include <psapi.h>
 #    include <dxgi1_4.h>
 #else
-#    include <sys/mman.h>
+#    if !defined(__wasi__) // WASI has no mmap
+#        include <sys/mman.h>
+#    endif
 #    include <unistd.h>
 #    include <fstream>
 #endif
@@ -225,6 +227,8 @@ void fn_prefetch(const uint8_t * p, size_t n) {
 void * fn_commit_alloc(size_t n) {
 #if defined(_WIN32)
     return VirtualAlloc(nullptr, n, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+#elif defined(__wasi__)
+    return calloc(1, n);
 #else
     void * p = mmap(nullptr, n, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     return p == MAP_FAILED ? nullptr : p;
@@ -238,6 +242,9 @@ void fn_commit_free(void * p, size_t n) {
 #if defined(_WIN32)
     (void) n;
     VirtualFree(p, 0, MEM_RELEASE);
+#elif defined(__wasi__)
+    (void) n;
+    free(p);
 #else
     munmap(p, n);
 #endif
@@ -1092,7 +1099,7 @@ bool fn_ranges_run(fn_pin_state * st) {
             }
             const int64_t tr = fn_now_us();
             uint64_t dev = 0;
-            const bool done = fn_register(st, (void *) r.p, r.n, &dev);
+            const bool done = fn_register(st, const_cast<uint8_t *>(r.p), r.n, &dev);
             const int64_t dt = fn_now_us() - tr;
             if (!done) {
                 st->n_refused.fetch_add(1);
@@ -1658,7 +1665,7 @@ void llama_fn_pin_on_ready(const llama_model * model) {
             LLAMA_LOG_WARN("%s: [TAG_FN_L22_PIN] overlapping ranges in the plan were dropped\n", __func__);
         }
         for (int i = 0; i < n_rng; ++i) {
-            st->reg.set_unit(i, (void *) st->plan.ranges[i].p, st->plan.ranges[i].n);
+            st->reg.set_unit(i, const_cast<uint8_t *>(st->plan.ranges[i].p), st->plan.ranges[i].n);
         }
         // [TAG_FN_L23_PINFIX] no marks before registration: the warm pass reads every streamed expert as without pins, the
         // thread pins what is resident after it (fn_ranges_run marks complete groups)

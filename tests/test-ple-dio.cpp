@@ -132,7 +132,7 @@ struct file_map {
         return true;
     }
     ~file_map() {
-        if (addr) { munmap((void *) addr, size); }
+        if (addr) { munmap(const_cast<uint8_t *>(addr), size); }
         if (fd >= 0) { close(fd); }
     }
 #endif

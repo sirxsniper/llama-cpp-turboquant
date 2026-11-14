@@ -2029,7 +2029,7 @@ static void test_any_plan_parser() {
     const llama_turbot_cache_shape qwen   = shape_of(layers, 256, 4, 262144);
 
     // the built-in plan: hash 0x56c3503c949a7749 and the same layers through the old and the shape parser
-    for (const std::string text : { std::string(DEFAULT_PLAN_TEXT), std::string(llama_turbot_default_plan_text()) }) {
+    for (const std::string & text : { std::string(DEFAULT_PLAN_TEXT), std::string(llama_turbot_default_plan_text()) }) {
         llama_turbot_plan a, b;
         std::string       ea, eb;
         const bool oka = llama_turbot_plan_parse_text(text, layers, 262144, a, ea);
