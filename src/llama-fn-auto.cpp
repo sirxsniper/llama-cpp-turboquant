@@ -388,7 +388,7 @@ const fn_item k_items[] = {
     // generated for those bytes instead of a fresh tokenization (common/ownids.h); 0 restores v0.33.0
     { "LLAMA_FN_R41_OWNIDS",                "1",       P_ALL }, // [TAG_FN_R41_OWNIDS] on from v0.33.1 (an agent loop: no re-read of a replayed answer)
     // a float printed as text by the chat template ({{ x }}, ~): 1 = as Python's str(), 0 restores v0.33.0 (six decimals)
-    { "LLAMA_FN_R41_FLOATSTR",              "0",       P_ALL }, // [TAG_FN_R41_FLOATSTR]
+    { "LLAMA_FN_R41_FLOATSTR",              "1",       P_ALL }, // [TAG_FN_R41_FLOATSTR] on from v0.33.1
 };
 
 } // namespace
