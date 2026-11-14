@@ -530,6 +530,11 @@ llama_build_and_test(test-r28-penfast.cpp)
 # a stand-in grammar over random vocabularies, then a real GBNF tool-call grammar over the Qwen3.5 vocabulary. CPU only.
 llama_build_and_test(test-r29-gramfast.cpp ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-qwen35.gguf)
 
+# [TAG_FN_R41_OWNIDS] common/ownids.h on the 248K Qwen vocabulary (no weights, no GPU); [TAG_FN_R41_FLOATSTR] the chat
+# template's floats against Python's repr
+llama_build_and_test(test-fn-r41-ownids.cpp ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-qwen35.gguf)
+llama_build_and_test(test-fn-r41-floatrepr.cpp)
+
 # [TAG_FN_L3_VRAM_CBUF] [TAG_FN_L3_VRAM_TRIM] CUDA virtual-memory buffers (a tail given back and mapped again under the hot
 # set's MUL_MAT_ID chain) and the pool trim between CUDA-graph runs. Built, not registered with ctest: it needs the GPU (run
 # it under compute-sanitizer memcheck first); without one it prints SKIPPED.

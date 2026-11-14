@@ -374,6 +374,11 @@ const fn_item k_items[] = {
     // v0.33.0: the two measured switches of this release are on for Flash-Next (each one =0 restores v0.32.0)
     { "LLAMA_FN_DRAFTFIT",                  "1",       P_ALL }, // [TAG_FN_DRAFTFIT] 3 or 4 connections: a step's drafts are capped so that its verify rows fit the MoE bridge
     { "LLAMA_QSA_POOL_RANGE",               "1",       P_ALL }, // [TAG_QSA_POOL_RANGE] the QSA pool mask as one range per token, its rows made next to the indexer
+    // r41 "tok" (E:/r40/kyro-light/eng-tok.md): a prompt that brings a slot's answer back byte for byte takes the ids the slot
+    // generated for those bytes instead of a fresh tokenization (common/ownids.h); 0 restores v0.33.0
+    { "LLAMA_FN_R41_OWNIDS",                "0",       P_ALL }, // [TAG_FN_R41_OWNIDS]
+    // a float printed as text by the chat template ({{ x }}, ~): 1 = as Python's str(), 0 restores v0.33.0 (six decimals)
+    { "LLAMA_FN_R41_FLOATSTR",              "0",       P_ALL }, // [TAG_FN_R41_FLOATSTR]
 };
 
 } // namespace
