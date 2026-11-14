@@ -652,7 +652,9 @@ static test_status test_replay_vs_snapshot(const common_params & params, llama_m
     // only these archs have the replay layout; elsewhere both contexts would be the same
     char arch[64] = {};
     llama_model_meta_val_str(model, "general.architecture", arch, sizeof(arch));
-    if (strcmp(arch, "qwen35") != 0 && strcmp(arch, "qwen35moe") != 0) {
+    // [TAG_FN_GDN_REPLAY] qwen4exp has it with LLAMA_FN_GDN_REPLAY=1 (set for both contexts, GDN_REPLAY decides)
+    const bool fn_replay = strcmp(arch, "qwen4exp") == 0;
+    if (strcmp(arch, "qwen35") != 0 && strcmp(arch, "qwen35moe") != 0 && !fn_replay) {
         LOG_INF("%s: skipping for arch %s\n", __func__, arch);
         return test_status::SKIP;
     }
@@ -674,9 +676,17 @@ static test_status test_replay_vs_snapshot(const common_params & params, llama_m
         return init_ctx(model, cparams, fill);
     };
 
+    const char * fn_old = getenv("LLAMA_FN_GDN_REPLAY");
+    const std::string fn_old_s = fn_old ? fn_old : "";
+    if (fn_replay) {
+        set_env_var("LLAMA_FN_GDN_REPLAY", "1");
+    }
     llama_context_ptr ctx_snap_ptr = make("0");
     llama_context_ptr ctx_rpl_ptr  = make("1");
     set_env_gdn_replay(env_old ? env_old_s.c_str() : nullptr);
+    if (fn_replay) {
+        set_env_var("LLAMA_FN_GDN_REPLAY", fn_old ? fn_old_s.c_str() : nullptr);
+    }
     llama_context * ctx_snap = ctx_snap_ptr.get();
     llama_context * ctx_rpl  = ctx_rpl_ptr.get();
 
@@ -785,6 +795,11 @@ static test_status test_replay_vs_snapshot(const common_params & params, llama_m
 
     bool ok = true;
     ok = ok && step("prefill",  { { 0, { 10, 0 } }, { 1, {  7, 0 } } });
+    // [TAG_FN_GDN_REPLAY] the GDN_REPLAY=1 context must hold the replay layout: its state carries the ring
+    if (ok && llama_state_seq_get_size(ctx_rpl, 0) <= llama_state_seq_get_size(ctx_snap, 0)) {
+        fprintf(stderr, "%s : the GDN_REPLAY=1 context has no replay ring\n", __func__);
+        ok = false;
+    }
     ok = ok && step("verify 1", { { 0, {  4, 3 } }, { 1, {  4, 2 } } });
     ok = ok && rollback(0, 3) && rollback(1, 2);
     ok = ok && step("verify 2", { { 0, {  4, 1 } }, { 1, {  4, 0 } } });
