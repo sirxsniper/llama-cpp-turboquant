@@ -1341,6 +1341,22 @@ bool llama_fn_l22_bigub2_ok(uint32_t n_seq_max, size_t full_big_1seq, size_t ful
     return n_seq_max >= 2 && full_big_1seq > 0 && full_big_1seq >= full_base_nseq;
 }
 
+// [TAG_FN_STARTSMALL] see llama-fn-auto.h
+bool llama_fn_startsmall_on(int mode, bool alloc, bool fit_deferred, bool cbuf_on, uint32_t start_t, uint32_t n_tokens) {
+    if (mode <= 0 || !alloc || start_t == 0 || start_t >= n_tokens) {
+        return false;
+    }
+    return mode >= 2 || (fit_deferred && cbuf_on);
+}
+
+bool llama_fn_startsmall_end(uint32_t start_t, uint32_t n_tokens) {
+    return start_t > 0 && n_tokens > start_t;
+}
+
+size_t llama_fn_startsmall_report(size_t held, size_t measured) {
+    return std::max(held, measured);
+}
+
 uint32_t llama_fn_l22_prompt_seqs(const uint32_t * rows_per_seq, int n_seq, uint32_t small_t) {
     uint32_t n = 0;
     for (int s = 0; rows_per_seq && s < n_seq; ++s) {

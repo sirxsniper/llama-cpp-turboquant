@@ -771,6 +771,52 @@ static void test_cbuf() {
 
 // [TAG_FN_V0254_NARROWFULL] the narrow-part rule judges the rest batch alone (the owner's rows: small_t 30 on 2 slots,
 // LLAMA_FN_L4_PROMPT 160, LLAMA_FN_L19_TTFT_EARLY 256, -b 4096)
+// [TAG_FN_STARTSMALL] the start-up compute reserve rules (LLAMA_FN_STARTSMALL) by enumeration against the cases written out
+static void test_startsmall() {
+    // on: every combination against the cases written out
+    for (int mode : { -1, 0, 1, 2, 3 }) {
+        for (int alloc = 0; alloc < 2; ++alloc) {
+            for (int fit = 0; fit < 2; ++fit) {
+                for (int cbuf = 0; cbuf < 2; ++cbuf) {
+                    for (uint32_t st : { 0u, 1u, 28u, 30u, 31u }) {
+                        for (uint32_t nt : { 0u, 1u, 28u, 30u, 512u, 16384u }) {
+                            bool want = false;
+                            if (mode == 1) {
+                                want = alloc && fit && cbuf && st > 0 && st < nt;
+                            } else if (mode == 2 || mode == 3) {
+                                want = alloc && st > 0 && st < nt;
+                            }
+                            const bool got = llama_fn_startsmall_on(mode, alloc, fit, cbuf, st, nt);
+                            TCHECK(got == want, "on(mode %d, alloc %d, fit %d, cbuf %d, start %u, full %u) = %d, want %d", mode,
+                                    alloc, fit, cbuf, st, nt, (int) got, (int) want);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // end: a batch wider than the held width ends it; nothing ends when none is held
+    for (uint32_t st = 0; st <= 40; ++st) {
+        for (uint32_t n = 0; n <= 64; ++n) {
+            const bool want = st != 0 && n > st;
+            TCHECK(llama_fn_startsmall_end(st, n) == want, "end(start %u, n %u)", st, n);
+        }
+    }
+    TCHECK(!llama_fn_startsmall_end(28, 28), "a batch as wide as the reserve keeps it");
+    TCHECK(llama_fn_startsmall_end(28, 16384), "a 16K prompt ends it");
+    // report: the larger of held and measured
+    const size_t MiB = 1024*1024;
+    TCHECK(llama_fn_startsmall_report(352*MiB, 21909*MiB) == 21909*MiB, "held below measured");
+    TCHECK(llama_fn_startsmall_report(22*MiB, 16755*MiB) == 16755*MiB, "host held below measured");
+    TCHECK(llama_fn_startsmall_report(500*MiB, 400*MiB) == 500*MiB, "held above measured (a reserve that grew)");
+    TCHECK(llama_fn_startsmall_report(0, 0) == 0, "nothing");
+    // the start width is the SMALL width of the compute-buffer lend (llama_fn_cbuf_small_t with the defaults 31 / 32, and
+    // with the profile's op-offload minimum 768)
+    TCHECK(llama_fn_cbuf_small_t(31, 32, 1) == 31, "1 slot");
+    TCHECK(llama_fn_cbuf_small_t(31, 32, 2) == 30, "2 slots");
+    TCHECK(llama_fn_cbuf_small_t(31, 768, 4) == 28, "4 slots");
+}
+
 static void test_v0254_narrowfull() {
     const uint32_t st = 30, sm = 160, early = 256, nb = 4096;
     // the verifier's case: 20 rows + 150 rows. The 150-row rest takes the short path (150 <= 160) and stays SMALL, so the
@@ -1053,6 +1099,7 @@ int main() {
     test_weighted_slots();
     test_vram_fit();
     test_cbuf();
+    test_startsmall(); // [TAG_FN_STARTSMALL]
     test_v0254_narrowfull(); // [TAG_FN_V0254_NARROWFULL]
     test_ram_fit();
     test_l22_p10(); // [TAG_FN_L22_P10]

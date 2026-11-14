@@ -625,6 +625,20 @@ private:
     uint64_t cbuf_n_tailfull = 0;
     void     moe_hot_fit_try();
 
+    // [TAG_FN_STARTSMALL] LLAMA_FN_STARTSMALL=1 (qwen4exp, default 0): with the deferred hot set fit and the compute-buffer
+    // lend, the constructor's worst-case reserve is made and measured as before, then released; until the fit (whose
+    // cbuf_prepare frees it and measures it again) the scheduler holds a reserve of the SMALL width, so the MTP draft
+    // context and the projector load next to that one. The memory breakdown reports the measured bytes meanwhile (the
+    // server's RAM fit sees what it saw before). A batch wider than that width ends it too (FULL as before).
+    // =2: also without the deferred fit and the lend (any target context), for the CPU tests only: on a GPU build the hot set
+    // would be sized next to the held reserve. A worst-case reserve after a wider batch ended it that does not fit fails
+    // that batch (decode returns -2) and the start-up reserve stays held. With LLAMA_R39_SCHED_REUSE=1 the scheduler is
+    // reused for the smaller graph and keeps its buffers: nothing is released (a warning says so)
+    uint32_t fs_start_t = 0; // the width held now (0: off or over)
+    std::vector<std::pair<ggml_backend_t, size_t>> fs_start_b; // per backend: the bytes of the measured worst-case reserve
+    void     fs_start_try();
+    bool     fs_start_end(const char * why);
+
     // [TAG_FN_L3_HOST_STEP] LLAMA_FN_HOST_STEP=1 (qwen4exp): the owner's moe-cache / DMA step after a decode runs on a
     // helper thread; step_join() waits for it before anything that may read or change that state again
     struct step_worker;
