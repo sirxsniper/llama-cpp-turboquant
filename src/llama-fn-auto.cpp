@@ -378,6 +378,7 @@ const fn_item k_items[] = {
     { "LLAMA_FN_R41_BORROW_FILL",           "1",       P_ALL }, // [TAG_R41_BORROW_FILL] lend layers too small for the 16K-ubatch borrow give what they have, the others more
     { "LLAMA_FN_R41_SPREAD_FIRST",          "1",       P_ALL }, // [TAG_R41_SPREAD_FIRST] the KV lend spreads over the lend layers' own slots from the first sizing
     { "LLAMA_R41_VG_FOLLOW",                "0",       P_ALL }, // [TAG_R41_VG_FOLLOW] the VRAM guard's zero-commit levels follow the free VRAM at arm (floor 900 MiB)
+    { "LLAMA_FN_R41_LEND_OWN",              "0",       P_ALL }, // [TAG_R41_LEND_OWN] percent of the KV lend the plain sizing takes from the lend layers' own slots (0 = v0.33.0)
 };
 
 } // namespace

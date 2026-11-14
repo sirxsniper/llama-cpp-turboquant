@@ -341,6 +341,9 @@ struct moe_cache {
     // [TAG_R41_BORROW_FILL] LLAMA_FN_R41_BORROW_FILL=1: lend layers too small for the 16K-ubatch borrow give what they have and
     // the others more (0 = v0.33.0: such a layer gives nothing)
     bool                  r41_fill = false;
+    // [TAG_R41_LEND_OWN] LLAMA_FN_R41_LEND_OWN: the percentage of the lend the plain sizing takes from the lend layers' own
+    // slots (0 = v0.33.0: the projector's share only)
+    int                   r41_own = 0;
     // [TAG_R40_LEND_PARTIAL] a partial lend: the bytes the sizing leaves out of the budget (what it cannot hold, which the
     // caller maps or the shares take as their own VRAM, plus the up-front map's rounding), found by sizing again
     size_t                sl_cut = 0;
@@ -3384,7 +3387,13 @@ bool llama_moe_hot_init(const llama_model & model, const void * owner, size_t bu
     mc->sl_req    = sl_req; // [TAG_FN_L10_SLOTLEND]
     // [TAG_R41_BORROW_FILL] [TAG_R41_SPREAD_FIRST] the r41 placement switches (each =0 restores v0.33.0)
     mc->r41_fill = sl_req && g_kv_borrow > 0 && llama_fn_l3_flag(model, "LLAMA_FN_R41_BORROW_FILL");
-    if (sl_req && g_kv_spread && llama_fn_l3_flag(model, "LLAMA_FN_R41_SPREAD_FIRST")) {
+    // [TAG_R41_LEND_OWN] the mix of plain and spread; it replaces the spread-first sizing when both are asked for
+    mc->r41_own = sl_req && g_kv_want > 0 ? std::max(0, std::min(99, llama_fn_l3_int(model, "LLAMA_FN_R41_LEND_OWN", 0))) : 0;
+    if (mc->r41_own > 0) {
+        LLAMA_LOG_INFO("moe-hot: [TAG_R41_LEND_OWN] the plain sizing takes %d %% of the lend out of the lend layers' own slots, the "
+                "rest on top (LLAMA_FN_R41_LEND_OWN=0: the projector's share only, as v0.33.0)\n", mc->r41_own);
+    }
+    if (sl_req && g_kv_spread && mc->r41_own == 0 && llama_fn_l3_flag(model, "LLAMA_FN_R41_SPREAD_FIRST")) {
         mc->r41_sf       = true;
         mc->sl_spread_st = 1;
         mc->sl_spread    = true;
@@ -3477,6 +3486,15 @@ bool llama_moe_hot_init(const llama_model & model, const void * owner, size_t bu
             size_t           sl_per = 0; // one slot of every lend layer, in bytes
             // [TAG_R34_F_VISFLAT_FIT] the projector's part for this sizing: 0 after a fallback (then all of it is v0.26.6's)
             size_t           vis_part = g_vis_part;
+            // [TAG_R41_LEND_OWN] LLAMA_FN_R41_LEND_OWN=<p>: the plain sizing takes p % of the lend out of the lend layers' own
+            // slots (or the projector's share, whichever is more, the path VISFLAT already takes for that share) and puts the
+            // rest on top of a base cut, a mix of the plain and the spread layouts: most of the spread's gain while the context
+            // is small, half of its loss when the KV cache holds most of the lend. 0 = v0.33.0 (the projector's share only)
+            if (mc->r41_own > 0 && !mc->sl_spread && g_kv_want > 0) {
+                const size_t mib = (size_t) 1 << 20;
+                const size_t own = (size_t) ((double) g_kv_want*mc->r41_own/100.0);
+                vis_part = std::max(vis_part, std::min(own, g_kv_want > mib ? g_kv_want - mib : (size_t) 0));
+            }
             // the base slots from the budget without the KV cache's unmapped bytes: what a fit with the KV cache mapped
             // whole would give (the lend's few granules of waste come out of the headroom)
             size_t               sl_base_cut = 0;

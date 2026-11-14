@@ -304,6 +304,7 @@ static const l22_row k_l22_rows[] = {
     { "LLAMA_FN_R41_BORROW_FILL", "1", false }, // [TAG_R41_BORROW_FILL] 0 = v0.33.0
     { "LLAMA_FN_R41_SPREAD_FIRST", "1", false }, // [TAG_R41_SPREAD_FIRST] 0 = v0.33.0
     { "LLAMA_R41_VG_FOLLOW", "0", false }, // [TAG_R41_VG_FOLLOW] 0 = v0.33.0
+    { "LLAMA_FN_R41_LEND_OWN", "0", false }, // [TAG_R41_LEND_OWN] 0 = v0.33.0
 };
 static const size_t k_n_l22_rows = sizeof(k_l22_rows)/sizeof(k_l22_rows[0]);
 const size_t k_n_l22_rows_decl = k_n_l22_rows;
