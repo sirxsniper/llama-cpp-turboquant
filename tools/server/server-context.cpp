@@ -1618,7 +1618,7 @@ struct server_slot {
     uint64_t kvp_n_restore = 0;
     uint64_t kvp_n_reloc   = 0;
     uint64_t kvp_n_drop    = 0;
-    uint64_t kvp_n_wait    = 0; // launches deferred because the cells could not come back beside a running answer
+    uint64_t kvp_n_wait    = 0; // launches and /slots saves deferred because the cells could not come back beside a running answer
     std::function<bool(server_slot &, const char *)> callback_kvp_unpark;
 
     // the parked cells are not needed any more (the slot's tokens go, or its sequence is replaced)
@@ -5394,9 +5394,10 @@ private:
     //       shrinks at once (llama_kv_lend_trim_ext), so the next prompt starts with the groups back.
     // A busy slot is never parked. Every path that reads an idle slot's sequence restores it first (prompt_save through
     // callback_kvp_unpark, /slots save + restore, launch); prompt_clear and the copies drop it. A restore that finds no room
-    // parks the other idle slots and tries once more; when it still fails beside a running answer, the launch waits for that
-    // answer (the task is deferred, the parked context stays); otherwise the slot's tokens are cleared and its next prompt
-    // is processed from the start (exact, only slower). The cells come back into the lowest free run that holds them.
+    // parks the other idle slots and tries once more; when it still fails beside a running answer, the launch or the /slots
+    // save waits for that answer (the task is deferred, the parked context stays); otherwise the slot's tokens are cleared
+    // and its next prompt is processed from the start (exact, only slower). The cells come back into the lowest free run
+    // that holds them.
     // Host RAM: a park uses only memory above the residency's floor (LLAMA_FN_L15_WARM_FREE_MIB, 4096: the warm pass and the
     // SSD tier keep that much available, so a park never pushes mapped experts out) and above a commit floor. The static RAM
     // fit ([TAG_FN_RAM_FIT]) is over for a model bigger than RAM (it gives the prompt cache 0), so the park reads the
@@ -5598,9 +5599,10 @@ private:
         return true;
     }
 
-    // the parked cells come back (into the lowest free run of cells); false: they could not. may_wait (a launch): when the
-    // pool has no room for them while another slot's answer runs, the slot stays parked (its context kept) and the caller
-    // defers the task until that answer ends; otherwise the slot's tokens are gone (its next prompt is processed again)
+    // the parked cells come back (into the lowest free run of cells); false: they could not. may_wait (a launch, a /slots
+    // save): when the pool has no room for them while another slot's answer runs, the slot stays parked (its context kept)
+    // and the caller defers the task until that answer ends; otherwise the slot's tokens are gone (its next prompt is
+    // processed again)
     bool kvpark_unpark(server_slot & s, const char * why, bool may_wait = false) {
         if (!s.kvp.on) {
             return true;
@@ -8207,7 +8209,19 @@ private:
                         break;
                     }
 
-                    kvpark_unpark(*slot, "slot save"); // [TAG_R40_NP2KVPARK] the file holds the whole sequence
+                    // [TAG_R40_NP2KVPARK] the file holds the whole sequence: the parked cells come back first. With no room
+                    // beside a running answer the save waits for that answer, as a launch does (the parked context stays)
+                    const bool kvp_ok = kvpark_unpark(*slot, "slot save", /*may_wait =*/ true);
+                    if (!kvp_ok && slot->kvp.on) {
+                        SRV_DBG("parked slot cannot come back yet, defer task, id_task = %d\n", task.id);
+                        slot->kvp_n_wait++;
+                        task.slot_action.kvp_wait = true;
+                        queue_tasks.defer(std::move(task));
+                        break;
+                    }
+                    if (task.slot_action.kvp_wait) {
+                        queue_tasks.pop_deferred_task(slot->id); // the release that ran this save takes no slot: wake a task for this slot first
+                    }
 
                     const int64_t t_start = ggml_time_us();
 
@@ -8222,6 +8236,13 @@ private:
                         if (slot->prompt.n_tokens() == 0 || task.slot_action.recall == "replace") {
                             n_recalled = (int64_t) slot_recall(*slot);
                         }
+                    }
+
+                    if (!kvp_ok && slot->prompt.n_tokens() == 0) {
+                        // [TAG_R40_NP2KVPARK] the parked cells did not come back, the slot's tokens are gone and nothing was
+                        // recalled in their place: never write an empty file for them
+                        send_error(task, "Unable to save slot: its parked context could not be restored", ERROR_TYPE_SERVER);
+                        break;
                     }
 
                     std::vector<char> packed;
