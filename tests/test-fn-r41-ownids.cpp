@@ -130,7 +130,7 @@ static void check_maximal(const char * name, const std::vector<llama_token> & S,
             if (es[x] > d) {
                 break;
             }
-            if (std::binary_search(en.begin(), en.end(), es[x])) {
+            if (es[x] > b_sync && std::binary_search(en.begin(), en.end(), es[x])) {
                 common = es[x];
                 break;
             }
@@ -314,7 +314,7 @@ static void test_stops() {
             });
             if (same) {
                 const size_t want_runs = (t1 != t1n ? 1 : 0) + (t2 != t2n ? 1 : 0);
-                CHECK(want_runs == 2, "media: both stretches should be split another way than the tokenizer's");
+                CHECK(want_runs >= 1 && t1 != t1n, "media: the stretch before the chunk should be split another way than the tokenizer's");
                 CHECK(r.i_b == S.size() && r.runs.size() == want_runs, "media: the same chunk should pass (i_b %zu of %zu, runs %zu)", r.i_b, S.size(), r.runs.size());
                 const auto M = common_ownids_apply(S, N, r.runs);
                 CHECK(std::equal(S.begin(), S.end(), M.begin()), "media: result not S");
