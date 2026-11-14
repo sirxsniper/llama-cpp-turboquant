@@ -374,6 +374,16 @@ const fn_item k_items[] = {
     // v0.33.0: the two measured switches of this release are on for Flash-Next (each one =0 restores v0.32.0)
     { "LLAMA_FN_DRAFTFIT",                  "1",       P_ALL }, // [TAG_FN_DRAFTFIT] 3 or 4 connections: a step's drafts are capped so that its verify rows fit the MoE bridge
     { "LLAMA_QSA_POOL_RANGE",               "1",       P_ALL }, // [TAG_QSA_POOL_RANGE] the QSA pool mask as one range per token, its rows made next to the indexer
+    // [TAG_FN_R41] round 41, stalls when RAM is short (src/llama-fn-r41.h); 0 = v0.33.0. Off until the GPU plan's identity
+    // and RAM-squeeze turns have measured them (the values to measure follow each row)
+    { "LLAMA_FN_R41_SLOWJOB",               "0",       P_BR  }, // [TAG_FN_R41_SLOWJOB] 1 = a bridge wait timeout whose late job the host answers is not an error (at most 3 within 1024 bridged graphs)
+    { "LLAMA_FN_R41_FLOOR_MIB",             "0",       P_ALL }, // [TAG_FN_R41_FLOOR] 1536 = the engine keeps this much RAM available itself: the coldest experts go first, not Windows' random trim
+    { "LLAMA_FN_R41_PRIO",                  "0",       P_ALL }, // [TAG_FN_R41_PRIO] 1 = an I/O or page priority below normal from the launcher is raised to normal
+    // [TAG_FN_R41B] round 41, the learned hot set and the answer's start (src/llama-fn-r41b.h); 0 = v0.33.0, off until the
+    // GPU plan's state turn has run them
+    { "LLAMA_FN_R41_STATEKEY",              "0",       P_ALL }, // [TAG_FN_R41_STATEKEY] 1 = the learned set is keyed by the weights file: its hard-linked names share one state
+    { "LLAMA_FN_R41_STATEMERGE",            "0",       P_ALL }, // [TAG_FN_R41_STATEMERGE] 65536 = a save merges the run into the stored state by its steps (the horizon), keeps <state>.prev
+    { "LLAMA_FN_R41_PASSPRIO",              "0",       P_ALL }, // [TAG_FN_R41_PASSPRIO] 2 = the prompt stream reads at page priority 2 (its pages leave RAM first); off until measured
 };
 
 } // namespace

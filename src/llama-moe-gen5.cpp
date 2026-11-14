@@ -4,6 +4,7 @@
 #include "llama-moe-gen5.h"
 #include "llama-moe-gen5-impl.h"
 #include "llama-fn-stall.h" // [TAG_FN_L18_FIRSTANS_STALL]
+#include "llama-fn-r41b.h"  // [TAG_FN_R41_PASSPRIO] the copy workers' page priority
 
 #include "llama-impl.h"
 #include "llama-model.h"
@@ -432,6 +433,7 @@ static void spin_until(F done, int us) {
 
 void copy_pool::run(int idx) {
     uint64_t seen = 0;
+    fn_r41b::page_prio_follow pp; // [TAG_FN_R41_PASSPRIO]
     for (;;) {
         const copy_seg * sg;
         int n_sg;
@@ -455,6 +457,7 @@ void copy_pool::run(int idx) {
             base  = job_base;
             parts = job_parts;
         }
+        pp.apply(page_prio.load(std::memory_order_relaxed)); // [TAG_FN_R41_PASSPRIO] before the pages are read
         if (grain > 0) {
             copy_units(sg, n_sg, n); // [TAG_FN_R25_PIN]
         } else {
