@@ -2623,6 +2623,11 @@ private:
     // capped so that its verify rows fit the MoE bridge and the hot chain (llama_fn_bridge_max_t_ext, read at every step),
     // <n> (2..16) = so that they fit n rows
     int32_t draftfit_t = 0;
+    // [TAG_FN_R41_DRAFTFIT2] LLAMA_FN_R41_DRAFTFIT2 (a lookup, read by draftfit_init(); 0 = v0.33.0): <k> = while two or more
+    // slots generate and every one drafts, a step drafts at most k tokens per slot (its verify rows <= n_slots * (1 + k)),
+    // with the bridge-fit cap above when that is lower. Two conversations at 512K, 1 draft each: 30 ms per step against
+    // 41 ms with 2 (r41 multi turn 1). One generating slot is never capped.
+    int32_t r41_df2 = 0;
 
     server_metrics metrics;
 
@@ -3995,6 +4000,13 @@ private:
     // [TAG_FN_DRAFTFIT] the switch (0 = off, 1 = the bridge's width at every step, <n> = n rows)
     void draftfit_init() {
         draftfit_t = 0;
+        r41_df2    = 0;
+        if (const char * e2 = llama_model_fn_env(model_tgt, "LLAMA_FN_R41_DRAFTFIT2"); spec && e2 && *e2 && atoi(e2) > 0) {
+            r41_df2 = std::min(8, atoi(e2)); // [TAG_FN_R41_DRAFTFIT2]
+            SRV_INF("[TAG_FN_R41_DRAFTFIT2] while two or more slots generate, a step drafts at most %d token(s) per slot "
+                    "(draft n_max %d, %zu slots; LLAMA_FN_R41_DRAFTFIT2=0 restores v0.33.0)\n", r41_df2,
+                    common_speculative_n_max(spec.get()), slots.size());
+        }
         const char * e = llama_model_fn_env(model_tgt, "LLAMA_FN_DRAFTFIT");
         const int    v = e && *e ? atoi(e) : 0;
         if (v <= 0 || !spec) {
@@ -9297,8 +9309,12 @@ private:
         // [TAG_FN_DRAFTFIT] the drafts of this step at most k long, so that its verify rows fit the bridge: decided before
         // the draft decodes (draft-mtp stops at k), the same k for every drafting slot, only when every generating slot
         // drafts (equal rows: split_equal keeps the step in one ubatch)
-        if (draftfit_t > 0 && drafting.size() >= 2 && drafting.size() == generating.size()) {
-            const int32_t w = draftfit_t == 1 ? llama_fn_bridge_max_t_ext(ctx_tgt) : draftfit_t;
+        if ((draftfit_t > 0 || r41_df2 > 0) && drafting.size() >= 2 && drafting.size() == generating.size()) {
+            int32_t w = draftfit_t == 1 ? llama_fn_bridge_max_t_ext(ctx_tgt) : draftfit_t;
+            if (r41_df2 > 0) { // [TAG_FN_R41_DRAFTFIT2] the per-slot cap as a row width (the lower one wins)
+                const int32_t w2 = (int32_t) generating.size()*(1 + r41_df2);
+                w = w > 1 ? std::min(w, w2) : w2;
+            }
             std::vector<fn_draftfit_slot> fs(generating.size());
             for (size_t i = 0; i < generating.size(); ++i) {
                 const server_slot * s = generating[i];

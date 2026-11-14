@@ -374,6 +374,9 @@ const fn_item k_items[] = {
     // v0.33.0: the two measured switches of this release are on for Flash-Next (each one =0 restores v0.32.0)
     { "LLAMA_FN_DRAFTFIT",                  "1",       P_ALL }, // [TAG_FN_DRAFTFIT] 3 or 4 connections: a step's drafts are capped so that its verify rows fit the MoE bridge
     { "LLAMA_QSA_POOL_RANGE",               "1",       P_ALL }, // [TAG_QSA_POOL_RANGE] the QSA pool mask as one range per token, its rows made next to the indexer
+    // [TAG_FN_R41_DRAFTFIT2] r41 multi: while two or more slots generate, at most this many drafts per slot (two conversations
+    // at 512K: 30 ms per step with 1 draft each against 41 ms with 2); LLAMA_FN_R41_DRAFTFIT2=0 restores v0.33.0
+    { "LLAMA_FN_R41_DRAFTFIT2",             "1",       P_ALL },
 };
 
 } // namespace

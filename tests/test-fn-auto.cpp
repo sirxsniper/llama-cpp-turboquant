@@ -301,6 +301,7 @@ static const l22_row k_l22_rows[] = {
     { "GGML_CUDA_R35_POKE1", "1", false }, // [TAG_R35_HOSTCHAIN]
     { "LLAMA_FN_DRAFTFIT", "1", false }, // [TAG_FN_DRAFTFIT] on by default from v0.33.0
     { "LLAMA_QSA_POOL_RANGE", "1", false }, // [TAG_QSA_POOL_RANGE] on by default from v0.33.0
+    { "LLAMA_FN_R41_DRAFTFIT2", "1", false }, // [TAG_FN_R41_DRAFTFIT2] r41 multi; 0 restores v0.33.0
 };
 static const size_t k_n_l22_rows = sizeof(k_l22_rows)/sizeof(k_l22_rows[0]);
 const size_t k_n_l22_rows_decl = k_n_l22_rows;
