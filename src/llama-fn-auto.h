@@ -96,6 +96,13 @@ LLAMA_API const char * llama_fn_state_env(const llama_fn_auto_state * st, const 
 LLAMA_API void llama_fn_state_inject(llama_fn_auto_state & st);
 LLAMA_API void llama_fn_state_undo  (llama_fn_auto_state & st);
 
+// [TAG_FN_CPU_SWITCHES] the GGML_CPU_* switches that are on, "NAME=VALUE NAME=VALUE" (empty: none, or no CPU backend), and
+// one log line with them ("none" when all are off, so an A/B arm without a switch shows it too). ggml_cpu_init() logs each switch it reads from the environment, but a program reaches it before
+// its log level is set, so that line is lost in a llama-server log; this one comes after a model load, with the profile's
+// switches in it as well
+LLAMA_API std::string llama_fn_cpu_switches_on();
+LLAMA_API void        llama_fn_cpu_switches_log();
+
 // slots per layer when the budget is spread evenly (no routing profile): every layer also holds its zero slot, so
 // budget / sum of the layers' bytes per expert - 1, at most n_expert
 LLAMA_API int32_t llama_fn_even_slots(const std::vector<size_t> & bytes_per_expert, size_t budget, int32_t n_expert);
