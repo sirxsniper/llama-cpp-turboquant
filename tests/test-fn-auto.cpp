@@ -307,6 +307,8 @@ static const l22_row k_l22_rows[] = {
     { "LLAMA_FN_R41_STATEKEY", "0", false }, // [TAG_FN_R41_STATEKEY] off (v0.33.0) until the GPU state turn runs it
     { "LLAMA_FN_R41_STATEMERGE", "0", false }, // [TAG_FN_R41_STATEMERGE] off (v0.33.0) until the GPU state turn runs it
     { "LLAMA_FN_R41_PASSPRIO", "0", false }, // [TAG_FN_R41_PASSPRIO] off (v0.33.0) until the GPU arm measures it
+    { "LLAMA_FN_R41_OWNIDS", "0", false }, // [TAG_FN_R41_OWNIDS] 0 = v0.33.0
+    { "LLAMA_FN_R41_FLOATSTR", "0", false }, // [TAG_FN_R41_FLOATSTR] 0 = v0.33.0
 };
 static const size_t k_n_l22_rows = sizeof(k_l22_rows)/sizeof(k_l22_rows[0]);
 const size_t k_n_l22_rows_decl = k_n_l22_rows;

@@ -384,6 +384,11 @@ const fn_item k_items[] = {
     { "LLAMA_FN_R41_STATEKEY",              "0",       P_ALL }, // [TAG_FN_R41_STATEKEY] 1 = the learned set is keyed by the weights file: its hard-linked names share one state
     { "LLAMA_FN_R41_STATEMERGE",            "0",       P_ALL }, // [TAG_FN_R41_STATEMERGE] 65536 = a save merges the run into the stored state by its steps (the horizon), keeps <state>.prev
     { "LLAMA_FN_R41_PASSPRIO",              "0",       P_ALL }, // [TAG_FN_R41_PASSPRIO] 2 = the prompt stream reads at page priority 2 (its pages leave RAM first); off until measured
+    // r41 "tok" (E:/r40/kyro-light/eng-tok.md): a prompt that brings a slot's answer back byte for byte takes the ids the slot
+    // generated for those bytes instead of a fresh tokenization (common/ownids.h); 0 restores v0.33.0
+    { "LLAMA_FN_R41_OWNIDS",                "0",       P_ALL }, // [TAG_FN_R41_OWNIDS]
+    // a float printed as text by the chat template ({{ x }}, ~): 1 = as Python's str(), 0 restores v0.33.0 (six decimals)
+    { "LLAMA_FN_R41_FLOATSTR",              "0",       P_ALL }, // [TAG_FN_R41_FLOATSTR]
 };
 
 } // namespace

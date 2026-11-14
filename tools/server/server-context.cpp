@@ -16,6 +16,7 @@
 #include "server-fn-l22-dump.h" // [TAG_FN_L22_LOGITDUMP]
 #include "server-fn-l22-p3.h"   // [TAG_FN_L22] P3's pure policies (merged image turns, anchors, ring victim, phase)
 #include "server-fn-l22-two.h"  // [TAG_FN_L22] P9's pure policies (one prompt per batch, D2 windows, pause, SHAREKV)
+#include "ownids.h"             // [TAG_FN_R41_OWNIDS] common/ownids.h
 
 #include "build-info.h"
 #include "common.h"
@@ -2524,6 +2525,15 @@ private:
 
     // [TAG_FN_L18_KEEPCTX] conversations a prompt with another prefix took the slot from (LLAMA_FN_L18_KEEPCTX=1)
     std::unique_ptr<server_keepctx> keepctx;
+
+    // [TAG_FN_R41_OWNIDS] LLAMA_FN_R41_OWNIDS (l22_init reads it; 0 = v0.33.0): r41_own_ids at the start of a completion task
+    struct r41_cfg_t {
+        bool     ownids    = false;
+        std::shared_ptr<const common_ownids_vocab> vocab;
+        uint64_t n_tasks   = 0; // completion tasks looked at
+        uint64_t n_spliced = 0; // tasks that took a slot's own ids
+        uint64_t n_refused = 0; // a splice that failed its checks (never applied)
+    } r41;
     // [TAG_FN_L19_TTFT_CKPT] LLAMA_FN_L19_TTFT_CKPT_TAIL (also from the model's automatic profile): the tail split (the last 4
     // prompt tokens as their own batch, a context checkpoint before them) from this many tokens in the batch; upstream
     // [TAG_CKPT_TURN_MERGE] value 512 when unset. With thinking, the next turn's prompt drops this turn's reasoning, so it
@@ -3984,6 +3994,19 @@ private:
         }
         // [TAG_FN_L22] P2's server_fn_l22_init (server-common) reads the jinja / tokenizer switches from the profile
         server_fn_l22_init(model_tgt);
+
+        // [TAG_FN_R41_OWNIDS] LLAMA_FN_R41_OWNIDS=1: a prompt that brings a slot's answer back takes the slot's own ids for the
+        // bytes they share (0 = v0.33.0)
+        r41 = r41_cfg_t();
+        r41.ownids = on("LLAMA_FN_R41_OWNIDS");
+        if (r41.ownids) {
+            const int64_t t_v0 = ggml_time_us();
+            r41.vocab = common_ownids_vocab_get(vocab);
+            r41.ownids = r41.vocab && r41.vocab->ok();
+            SRV_INF("[TAG_FN_R41_OWNIDS] the slot's own ids for a replayed answer: %s (piece table of %d tokens in %.1f ms)\n",
+                    r41.ownids ? "on" : "off (no piece table)", r41.vocab ? r41.vocab->n_vocab : 0, (ggml_time_us() - t_v0) / 1000.0);
+        }
+        llama_fn_l22_log("switch", "[TAG_FN_R41_OWNIDS] OWNIDS=%d", r41.ownids ? 1 : 0);
 
         if (l22.vlend_hold || l22.mtp_keep || l22.anchor || l22.ckpt_keep || l22.ckpt_split || l22.keeplend) {
             SRV_INF("[TAG_FN_L22] P3 switches: vlend hold %d, MTP keep %d (MTP draft %d), media anchors %d, checkpoint keep %d, "
@@ -7952,6 +7975,184 @@ private:
     }
 
     // returns false to decline the task, it is offered again after the decode is done
+    // [TAG_FN_R41_OWNIDS] the pieces of ids[a, b) for the log, at most n of them
+    std::string r41_pieces(const llama_tokens & ids, size_t a, size_t b, size_t n = 8) const {
+        std::string out;
+        for (size_t x = a; x < b && x < a + n; ++x) {
+            const llama_token t = ids[x];
+            if (!r41.vocab || !r41.vocab->valid(t)) {
+                out += " <media>";
+                continue;
+            }
+            out += out.empty() ? "'" : " '";
+            const char * p = r41.vocab->piece(t);
+            for (size_t q = 0; q < r41.vocab->len(t); ++q) {
+                const unsigned char ch = (unsigned char) p[q];
+                if (ch == '\n') {
+                    out += "\\n";
+                } else if (ch < 0x20 || ch >= 0x7f || ch == '\'' || ch == '\\') {
+                    out += string_format("\\x%02x", ch);
+                } else {
+                    out += (char) ch;
+                }
+            }
+            out += "'";
+        }
+        if (b > a + n) {
+            out += " ...";
+        }
+        return out;
+    }
+
+    // [TAG_FN_R41_OWNIDS] a completion prompt that brings back what a slot (or a stored conversation) holds, byte for byte,
+    // but with other ids (the model generated a split the tokenizer does not make) takes the holder's ids for those bytes
+    // (common/ownids.h). Then the token match covers the holder's whole answer and no checkpoint is restored. Runs on the
+    // main loop before the slot is chosen, so the slot choice, keepctx, the prompt cache, the checkpoints and the draft
+    // context all see the same ids. A prompt from the client's own ids (r41_text false) is never changed.
+    void r41_own_ids(server_task & task) {
+        if (!r41.ownids || !r41.vocab || task.type != SERVER_TASK_TYPE_COMPLETION || !task.r41_text || !task.params.cache_prompt ||
+                task.is_parent() || task.tokens.empty() || slots.empty()) {
+            return;
+        }
+        const int64_t t0 = ggml_time_us();
+        r41.n_tasks++;
+        const llama_tokens & N = task.tokens.raw_tokens();
+
+        // candidates: every slot, the keepctx store, the RAM prompt cache
+        struct cand_t {
+            const server_tokens * t    = nullptr;
+            const char *          kind = "";
+            int                   id   = -1;
+        };
+        std::vector<cand_t> cands;
+        for (const auto & s : slots) {
+            if (!s.prompt.tokens.empty()) {
+                cands.push_back({ &s.prompt.tokens, "slot", s.id });
+            }
+        }
+        if (keepctx) {
+            int n = 0;
+            for (const auto & e : keepctx->entries) {
+                cands.push_back({ &e.prompt.tokens, "stored", n++ });
+            }
+        }
+        if (prompt_cache) {
+            int n = 0;
+            for (const auto & st : prompt_cache->states) {
+                cands.push_back({ &st.prompt.tokens, "cached", n++ });
+            }
+        }
+        if (cands.empty()) {
+            return;
+        }
+
+        const int  id_req = task.id_slot >= 0 ? (int) (task.id_slot % (int) slots.size()) : -1;
+        int        best   = -1;
+        common_ownids_result rb;
+        size_t     k_max  = 0; // the longest plain token match of any candidate
+        for (size_t c = 0; c < cands.size(); ++c) {
+            const server_tokens & S  = *cands[c].t;
+            const llama_tokens  & St = S.raw_tokens();
+            size_t k = 0;
+            try {
+                k = S.get_common_prefix(task.tokens);
+            } catch (const std::exception &) {
+                continue;
+            }
+            k_max = std::max(k_max, k);
+            common_ownids_result r;
+            if (k >= St.size() || k >= N.size()) {
+                r.k = r.i_b = r.j_b = k;
+                r.stop = k >= St.size() ? COMMON_OWNIDS_END_S : COMMON_OWNIDS_END_N;
+            } else {
+                r = common_ownids_walk(*r41.vocab, St.data(), St.size(), N.data(), N.size(), k, [&](size_t i, size_t j) -> size_t {
+                    try {
+                        const auto & ca = S.find_chunk(i);
+                        const auto & cb = task.tokens.find_chunk(j);
+                        const size_t na = mtmd_input_chunk_get_n_tokens(ca.get());
+                        const size_t nb = mtmd_input_chunk_get_n_tokens(cb.get());
+                        if (na == nb && na > 0 && std::string(mtmd_input_chunk_get_id(ca.get())) == mtmd_input_chunk_get_id(cb.get())) {
+                            return na;
+                        }
+                    } catch (const std::exception &) {
+                    }
+                    return 0;
+                });
+            }
+            const bool req  = std::strcmp(cands[c].kind, "slot") == 0 && cands[c].id == id_req;
+            bool       take = best < 0 || r.i_b > rb.i_b;
+            if (!take && r.i_b == rb.i_b) {
+                const bool best_req = std::strcmp(cands[best].kind, "slot") == 0 && cands[best].id == id_req;
+                take = (req && !best_req) || (req == best_req && r.runs.size() < rb.runs.size());
+            }
+            if (take) {
+                best = (int) c;
+                rb   = std::move(r);
+            }
+        }
+        if (best < 0) {
+            return;
+        }
+        static const char * stop_s[] = { "end-of-holder", "end-of-prompt", "bytes-differ", "special-token", "media" };
+        const char * why = stop_s[std::clamp(rb.stop, 0, 4)];
+        const cand_t & B  = cands[best];
+        const llama_tokens & St = B.t->raw_tokens();
+        if (rb.runs.empty() || rb.i_b <= k_max) {
+            // nothing to gain: say why when the prompt leaves the best holder inside its tokens (a cut ahead)
+            if (rb.i_b < St.size() && rb.i_b >= 64 && llama_fn_l22_passlog_level() >= 1) {
+                llama_fn_l22_log("turn", "[TAG_FN_R41_OWNIDS] task=%d no own ids: the best match (%s %d) stops at %zu of its %zu tokens "
+                        "(token match %zu, %s; prompt %zu tokens), %.2f ms", task.id, B.kind, B.id, rb.i_b, St.size(), rb.k, why,
+                        N.size(), (ggml_time_us() - t0) / 1000.0);
+            }
+            return;
+        }
+
+        // the new list, checked before anything changes: S's ids up to the sync point, the same bytes as the prompt
+        std::vector<common_ownids_run> runs = rb.runs;
+        const std::vector<llama_token> Nn = common_ownids_apply(St, N, runs);
+        bool ok = Nn.size() >= rb.i_b && std::equal(St.begin(), St.begin() + rb.i_b, Nn.begin());
+        if (ok) {
+            // the same bytes (pieces) and the same media places as the prompt
+            std::string ba, bb;
+            for (const llama_token t : N)  { if (t != LLAMA_TOKEN_NULL) { ba.append(r41.vocab->piece(t), r41.vocab->len(t)); } else { ba += '\0'; } }
+            for (const llama_token t : Nn) { if (t != LLAMA_TOKEN_NULL) { bb.append(r41.vocab->piece(t), r41.vocab->len(t)); } else { bb += '\0'; } }
+            ok = ba == bb;
+        }
+        const size_t n_new = Nn.size();
+        if (ok && (int64_t) n_new + 1 >= (int64_t) slots.front().n_ctx) {
+            llama_fn_l22_log("turn", "[TAG_FN_R41_OWNIDS] task=%d own ids not taken: the prompt would grow to %zu tokens (context %d)",
+                    task.id, n_new, slots.front().n_ctx);
+            return;
+        }
+        std::vector<std::array<size_t, 4>> ra;
+        ra.reserve(runs.size());
+        for (const auto & r : runs) {
+            ra.push_back({ r.s0, r.s1, r.n0, r.n1 });
+        }
+        const size_t n_old = N.size();
+        std::string ex;
+        for (size_t x = 0; x < runs.size() && x < 3; ++x) {
+            ex += string_format("%s [%s] -> [%s]", x ? ";" : "", r41_pieces(N, runs[x].n0, runs[x].n1).c_str(),
+                    r41_pieces(St, runs[x].s0, runs[x].s1).c_str());
+        }
+        if (!ok || !task.tokens.replace_text_runs(St, ra) || task.tokens.raw_tokens() != Nn) {
+            r41.n_refused++;
+            SRV_WRN("[TAG_FN_R41_OWNIDS] task %d: the own-ids splice failed its checks and was not used (%s %d, %zu stretches)\n",
+                    task.id, B.kind, B.id, runs.size());
+            llama_fn_l22_log("turn", "[TAG_FN_R41_OWNIDS] task=%d REFUSED: the splice failed its checks (%s %d)", task.id, B.kind, B.id);
+            return;
+        }
+        r41.n_spliced++;
+        const double ms = (ggml_time_us() - t0) / 1000.0;
+        const size_t k_after = B.t->get_common_prefix(task.tokens);
+        SRV_INF("[TAG_FN_R41_OWNIDS] task %d: own ids of %s %d: token match %zu -> %zu of its %zu tokens (%zu bytes by bytes, %s), "
+                "%zu stretches, %zu prompt ids -> %zu, prompt %zu -> %zu tokens, %.2f ms\n", task.id, B.kind, B.id, rb.k, k_after,
+                St.size(), rb.bytes, why, runs.size(), rb.n_from_n(), rb.n_from_s(), n_old, n_new, ms);
+        llama_fn_l22_log("turn", "[TAG_FN_R41_OWNIDS] task=%d holder=%s:%d match=%zu->%zu of=%zu bytes=%zu stop=%s runs=%zu ids=%zu->%zu "
+                "prompt=%zu->%zu ms=%.2f first:%s", task.id, B.kind, B.id, rb.k, k_after, St.size(), rb.bytes, why, runs.size(),
+                rb.n_from_n(), rb.n_from_s(), n_old, n_new, ms, ex.c_str());
+    }
+
     bool process_single_task(server_task && task, bool is_yielding) {
         // while yielding, an encode / decode is running and only reading the server state is safe
         if (is_yielding && task.type != SERVER_TASK_TYPE_METRICS && task.type != SERVER_TASK_TYPE_SLOT_GET) {
@@ -7981,6 +8182,9 @@ private:
                             break;
                         }
                     }
+
+                    // [TAG_FN_R41_OWNIDS] a replayed answer takes its holder's own ids, before any prefix is compared
+                    r41_own_ids(task);
 
                     // [TAG_SHARED_PREFIX_FANOUT] wait for a slot that is already processing this
                     // same prefix rather than processing all of it again on another slot
@@ -11666,6 +11870,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             task.l22_t_req_us  = l22_t_req; // [TAG_FN_L22_PASSLOG]
             task.l22_t_tmpl_us = l22_t_tmpl;
             task.l22_t_tok_us  = l22_t_tok;
+            task.r41_text      = prompt.is_string(); // [TAG_FN_R41_OWNIDS]
 
             task.tokens = std::move(inputs[i]);
             task.params = server_schema::eval_llama_cmpl_schema(

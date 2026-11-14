@@ -198,6 +198,10 @@ struct server_task {
     int64_t l22_t_tmpl_us = 0;
     int64_t l22_t_tok_us  = 0;
 
+    // [TAG_FN_R41_OWNIDS] the prompt was text the server tokenized (a string prompt or a chat), not ids from the client:
+    // only such a prompt may take a slot's own ids for the bytes it shares with the slot
+    bool r41_text = false;
+
     // only used by CLI, this allow tokenizing CLI inputs on server side
     // we need this because mtmd_context and vocab are not accessible outside of server_context
     bool                    cli = false;
