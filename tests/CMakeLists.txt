@@ -496,6 +496,15 @@ if (NOT GGML_BACKEND_DL AND GGML_CPU)
     llama_build_and_test(test-fn-pfs-reserve.cpp)
 endif()
 
+# [TAG_FN_R41] round 41's rules (src/llama-fn-r41.h, header only): the MoE bridge's error policy with and without
+# LLAMA_FN_R41_SLOWJOB, the free-RAM floor's gate, the priority raise (on Windows this process's own). CPU only, no model.
+llama_build_and_test(test-fn-r41.cpp)
+
+# [TAG_FN_R41B] round 41's hot-set state and answer-start rules (src/llama-fn-r41b.h, header only): the merge of a run into
+# the stored state, its files, the weights' key and the adoption of an old state; on Windows the page priority rules of
+# LLAMA_FN_R41_PASSPRIO on this system. CPU only, no model.
+llama_build_and_test(test-fn-r41b.cpp)
+
 # [TAG_FN_L19_CONVSTORE] the policy of the agent conversation store (tools/server/server-convstore.h, header only): the
 # checkpoint a full ring drops, the eviction value of a stored conversation, the thinning on disk. CPU only, no model.
 llama_build_and_test(test-fn-convstore.cpp)
@@ -529,6 +538,11 @@ llama_build_and_test(test-r28-penfast.cpp)
 # [TAG_R29_GRAMFAST] the candidate-set path with a grammar (common/sampling.cpp) against the full path with the real samplers:
 # a stand-in grammar over random vocabularies, then a real GBNF tool-call grammar over the Qwen3.5 vocabulary. CPU only.
 llama_build_and_test(test-r29-gramfast.cpp ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-qwen35.gguf)
+
+# [TAG_FN_R41_OWNIDS] common/ownids.h on the 248K Qwen vocabulary (no weights, no GPU); [TAG_FN_R41_FLOATSTR] the chat
+# template's floats against Python's repr
+llama_build_and_test(test-fn-r41-ownids.cpp ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-qwen35.gguf)
+llama_build_and_test(test-fn-r41-floatrepr.cpp)
 
 # [TAG_FN_L3_VRAM_CBUF] [TAG_FN_L3_VRAM_TRIM] CUDA virtual-memory buffers (a tail given back and mapped again under the hot
 # set's MUL_MAT_ID chain) and the pool trim between CUDA-graph runs. Built, not registered with ctest: it needs the GPU (run

@@ -96,6 +96,9 @@ public:
     // [TAG_FN_R25_PIN] call before start(): > 0 the threads take units of this many bytes from a shared counter instead of a
     // fixed part each (a worker that the scheduler stops holds one unit, not 1/n of the chunk); 0: fixed parts (as before)
     void set_grain(size_t bytes);
+    // [TAG_FN_R41_PASSPRIO] the workers' page priority (1-4, below normal: the pages they read in are the first the system
+    // takes back; 0: as they were made), taken by each worker before its next copy; any time
+    void set_page_prio(int prio) { page_prio.store(prio, std::memory_order_relaxed); }
     void start(int n_threads);
     void stop();
     void copy(void * dst, const void * src, size_t n);
@@ -131,6 +134,7 @@ private:
     std::vector<cpu_mask>    affs;             // [TAG_FN_R25_PIN]
     size_t                   grain = 0;        // [TAG_FN_R25_PIN] 0: fixed parts
     std::atomic<size_t>      next_unit{0};     // the next unit of the job (grain > 0)
+    std::atomic<int>         page_prio{0};     // [TAG_FN_R41_PASSPRIO]
     void copy_units(const copy_seg * segs, int n_sg, size_t n);
 };
 

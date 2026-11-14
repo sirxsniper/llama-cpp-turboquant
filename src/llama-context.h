@@ -814,6 +814,13 @@ private:
     bool     l22_end_pending = false;
     int      l22_first_n     = 0;    // decode calls still counted after a prompt's switch (first 8)
     int64_t  l22_first_t0    = 0;
+    // [TAG_FN_R41_START] the answer's first 256 decode calls after a prompt's switch: wall time, this process's page faults
+    // and the system's page reads (from the disk) over them, for the PASSLOG line what=first256
+    int      r41_first_n      = 0;
+    int64_t  r41_first_t0     = 0;
+    uint64_t r41_first_faults = 0;
+    uint64_t r41_first_reads  = 0;
+    uint64_t r41_first_tokens = 0;
     // [TAG_FN_R25_REFILL] the parts of the last switch to SMALL (ms): stream return + unlend, compute free, pool trim, tail
     // restore, borrow return, reserve / swap
     double   r25_sw_ms[6]    = { 0, 0, 0, 0, 0, 0 };

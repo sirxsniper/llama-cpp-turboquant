@@ -5647,6 +5647,17 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     if (l22_first_n > 0 && n_tokens_all <= cbuf_small_t && --l22_first_n == 0) {
         llama_fn_l22_log("switch", "what=first8 ms=%.1f", (ggml_time_us() - l22_first_t0)/1000.0);
     }
+    // [TAG_FN_R41_START] the first 256 decode calls after it: how much of the answer's slow start is page faults
+    if (r41_first_n > 0 && n_tokens_all <= cbuf_small_t) {
+        r41_first_tokens += n_tokens_all;
+        if (--r41_first_n == 0) {
+            const llama_fn_l22_counters c = llama_fn_l22_counters_now();
+            llama_fn_l22_log("switch", "what=first256 [TAG_FN_R41_START] ms=%.1f rows=%llu faults=%llu page_reads=%llu avail_mib=%.0f",
+                    (ggml_time_us() - r41_first_t0)/1000.0, (unsigned long long) r41_first_tokens,
+                    (unsigned long long) (c.faults - r41_first_faults), (unsigned long long) (c.sys_page_reads - r41_first_reads),
+                    c.avail_ram/1048576.0);
+        }
+    }
     // [TAG_FN_L22_PASSLOG] a short-path prompt batch (SMALL, no switch): its own record
     if (cbuf_short && l22.passlog >= 1) {
         llama_fn_l22_log("pass", "path=short rows=%u ms=%.1f", n_tokens_all, (ggml_time_us() - t_short0)/1000.0);
@@ -9130,6 +9141,13 @@ bool llama_context::cbuf_set(bool full, uint32_t width, uint32_t cls) {
             l22_first_n  = 8;
             l22_first_t0 = ggml_time_us();
             l22_graph_procs(false, 16);
+            // [TAG_FN_R41_START] and 256 decode calls with their page faults
+            const llama_fn_l22_counters c = llama_fn_l22_counters_now();
+            r41_first_n      = 256;
+            r41_first_t0     = l22_first_t0;
+            r41_first_faults = c.faults;
+            r41_first_reads  = c.sys_page_reads;
+            r41_first_tokens = 0;
         }
     }
     const double ms = (ggml_time_us() - t0)/1000.0;

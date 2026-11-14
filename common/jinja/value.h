@@ -188,6 +188,14 @@ std::string value_to_json(const value & val, int indent = -1, const std::string_
 void set_l22_jsonfloat(bool on);
 bool l22_jsonfloat();
 
+// [TAG_FN_R41_FLOATSTR] a float printed as text ({{ x }}, ~ and + with a string): on = as Python's str() writes it (the
+// shortest digits that read back, the same as tojson with JSONFLOAT); off (default) = v0.33.0 (std::to_string: six decimals,
+// trailing zeros dropped, so 1e-07 prints 0.0 and 51.5073514 prints 51.507351). set: the server's value (model profile,
+// LLAMA_FN_R41_FLOATSTR); unset: that environment variable, read once
+void set_r41_floatstr(bool on);
+bool r41_floatstr();
+std::string float_as_text(double v);
+
 // Note: only used for debugging purposes
 std::string value_to_string_repr(const value & val);
 
@@ -265,10 +273,7 @@ struct value_float_t : public value_t {
     virtual double as_float() const override { return val_flt; }
     virtual int64_t as_int() const override { return val_int; }
     virtual string as_string() const override {
-        std::string out = std::to_string(val_flt);
-        out.erase(out.find_last_not_of('0') + 1, std::string::npos); // remove trailing zeros
-        if (out.back() == '.') out.push_back('0'); // leave one zero if no decimals
-        return out;
+        return float_as_text(val_flt); // [TAG_FN_R41_FLOATSTR]
     }
     virtual bool as_bool() const override {
         return val_flt != 0.0;
