@@ -374,8 +374,23 @@ const fn_item k_items[] = {
     // v0.33.0: the two measured switches of this release are on for Flash-Next (each one =0 restores v0.32.0)
     { "LLAMA_FN_DRAFTFIT",                  "1",       P_ALL }, // [TAG_FN_DRAFTFIT] 3 or 4 connections: a step's drafts are capped so that its verify rows fit the MoE bridge
     { "LLAMA_QSA_POOL_RANGE",               "1",       P_ALL }, // [TAG_QSA_POOL_RANGE] the QSA pool mask as one range per token, its rows made next to the indexer
+    // [TAG_FN_R41] round 41, stalls when RAM is short (src/llama-fn-r41.h); 0 = v0.33.0. v0.33.1: SLOWJOB, FLOOR_MIB and PRIO on
+    // (measured with a RAM squeeze in the middle of a session and without it; identity kept)
+    { "LLAMA_FN_R41_SLOWJOB",               "1",       P_BR  }, // [TAG_FN_R41_SLOWJOB] 1 = a bridge wait timeout whose late job the host answers is not an error (at most 3 within 1024 bridged graphs)
+    { "LLAMA_FN_R41_FLOOR_MIB",             "1536",    P_ALL }, // [TAG_FN_R41_FLOOR] 1536 = the engine keeps this much RAM available itself: the coldest experts go first, not Windows' random trim
+    { "LLAMA_FN_R41_PRIO",                  "1",       P_ALL }, // [TAG_FN_R41_PRIO] 1 = an I/O or page priority below normal from the launcher is raised to normal
+    // [TAG_FN_R41B] round 41, the learned hot set and the answer's start (src/llama-fn-r41b.h); 0 = v0.33.0. v0.33.1: STATEKEY and
+    // STATEMERGE on (three names of one weights file shared one state; a short run kept every stored resident); PASSPRIO off
+    { "LLAMA_FN_R41_STATEKEY",              "1",       P_ALL }, // [TAG_FN_R41_STATEKEY] 1 = the learned set is keyed by the weights file: its hard-linked names share one state
+    { "LLAMA_FN_R41_STATEMERGE",            "65536",   P_ALL }, // [TAG_FN_R41_STATEMERGE] 65536 = a save merges the run into the stored state by its steps (the horizon), keeps <state>.prev
+    { "LLAMA_FN_R41_PASSPRIO",              "0",       P_ALL }, // [TAG_FN_R41_PASSPRIO] 2 = the prompt stream reads at page priority 2 (its pages leave RAM first); off until measured
+    // r41 "tok" (E:/r40/kyro-light/eng-tok.md): a prompt that brings a slot's answer back byte for byte takes the ids the slot
+    // generated for those bytes instead of a fresh tokenization (common/ownids.h); 0 restores v0.33.0
+    { "LLAMA_FN_R41_OWNIDS",                "1",       P_ALL }, // [TAG_FN_R41_OWNIDS] on from v0.33.1 (an agent loop: no re-read of a replayed answer)
+    // a float printed as text by the chat template ({{ x }}, ~): 1 = as Python's str(), 0 restores v0.33.0 (six decimals)
+    { "LLAMA_FN_R41_FLOATSTR",              "1",       P_ALL }, // [TAG_FN_R41_FLOATSTR] on from v0.33.1
     // [TAG_FN_R41_DRAFTFIT2] r41 multi: while two or more slots generate, at most this many drafts per slot (two conversations
-    // at 512K: 30 ms per step with 1 draft each against 41 ms with 2); LLAMA_FN_R41_DRAFTFIT2=0 restores v0.33.0
+    // at 512K: 30 ms per step with 1 draft each against 41 ms with 2); LLAMA_FN_R41_DRAFTFIT2=0 restores v0.33.1
     { "LLAMA_FN_R41_DRAFTFIT2",             "1",       P_ALL },
 };
 

@@ -1740,6 +1740,37 @@ static std::string float_repr(double val) {
     return out;
 }
 
+// [TAG_FN_R41_FLOATSTR] ------------------------------------------------------------------------------------------------
+
+static std::atomic<int> g_r41_floatstr{-1}; // -1: not set, read the environment once
+
+void set_r41_floatstr(bool on) {
+    g_r41_floatstr.store(on ? 1 : 0);
+}
+
+bool r41_floatstr() {
+    int v = g_r41_floatstr.load(std::memory_order_relaxed);
+    if (v < 0) {
+        const char * e = std::getenv("LLAMA_FN_R41_FLOATSTR");
+        const bool on = e != nullptr && *e != '\0' && std::strcmp(e, "0") != 0 && std::strcmp(e, "off") != 0 &&
+                        std::strcmp(e, "false") != 0 && std::strcmp(e, "no") != 0;
+        int expected = -1;
+        g_r41_floatstr.compare_exchange_strong(expected, on ? 1 : 0);
+        v = g_r41_floatstr.load();
+    }
+    return v == 1;
+}
+
+std::string float_as_text(double val) {
+    if (r41_floatstr()) {
+        return float_repr(val);
+    }
+    std::string out = std::to_string(val);
+    out.erase(out.find_last_not_of('0') + 1, std::string::npos); // remove trailing zeros
+    if (out.back() == '.') out.push_back('0'); // leave one zero if no decimals
+    return out;
+}
+
 // a float as json.dumps writes it: nan and inf as NaN and Infinity, which are not valid JSON (upstream #30483)
 static std::string float_json(double val) {
     if (std::isnan(val)) {

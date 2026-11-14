@@ -5,6 +5,7 @@
 #include "llama-fn-l22.h" // [TAG_FN_L22_DMASHARE] round 22 hooks
 #include "llama-fn-prior.h" // [TAG_FN_L22_X_PRIOR]
 #include "llama-fn-tbo.h" // [TAG_FN_L22_TBO] two-chain decode: the channel layout
+#include "llama-fn-r41.h" // [TAG_FN_R41_SLOWJOB] the error policy
 
 #include "llama-impl.h"
 #include "llama-model.h"
@@ -350,21 +351,12 @@ struct llama_moe_bridge {
     uint32_t last_cold[LLAMA_MOE_BRIDGE_TRACK_T] = {};
 
     // state, owning context's thread
-    bool     active     = true;
-    bool     disabled   = false;
-    int      n_errors   = 0;
-    int      pause_left = 0;
     uint64_t n_graphs   = 0;
-    uint64_t err_graph  = 0; // [TAG_FN_R1_BRIDGE_RB] n_graphs at the last error
-
-    // [TAG_FN_L3_HOST_REARM] LLAMA_FN_HOST_REARM=1|N: a bridge that 3 errors turned off comes back after a cool-down of
-    // rearm_steps << k steps or rearm_ms << k ms (k = turn-offs so far - 1, at most 6), whichever ends first; 0: off for good
-    int      rearm_steps = 0;
-    int64_t  rearm_ms    = 0;
-    int      n_off       = 0;  // turn-offs so far
-    int64_t  off_steps   = 0;  // steps left in this cool-down
-    int64_t  off_until   = 0;  // ggml_time_ms() at which this cool-down ends
-    uint64_t off_graph   = 0;  // n_graphs at the last turn-off
+    // [TAG_FN_R1_BRIDGE_RB] [TAG_FN_L7_PAUSE1] the pause / turn-off rules after an error, and [TAG_FN_L3_HOST_REARM]
+    // LLAMA_FN_HOST_REARM=1|N: a bridge that 3 errors turned off comes back after a cool-down of rearm_steps << k steps or
+    // rearm_ms << k ms (k = turn-offs so far - 1, at most 6), whichever ends first; 0: off for good. [TAG_FN_R41_SLOWJOB]
+    // LLAMA_FN_R41_SLOWJOB: a timeout waits for the host's late answer first (src/llama-fn-r41.h)
+    fn_r41::bridge_policy pol;
 
     // job statistics (runner thread)
     std::atomic<uint64_t> n_jobs{0};
@@ -1744,10 +1736,21 @@ llama_moe_bridge * llama_moe_bridge_create(const llama_model & model, int n_thre
                 "runs and copy between graphs\n", __func__);
     }
     if (const int rv = llama_fn_l3_int(model, "LLAMA_FN_HOST_REARM", 0); rv > 0) { // [TAG_FN_L3_HOST_REARM]
-        br->rearm_steps = rv > 1 ? rv : 256;
-        br->rearm_ms    = rv > 1 ? std::max<int64_t>(1000, (int64_t) rv * 125) : 30000;
+        br->pol.rearm_steps = rv > 1 ? rv : 256;
+        br->pol.rearm_ms    = rv > 1 ? std::max<int64_t>(1000, (int64_t) rv * 125) : 30000;
         LLAMA_LOG_INFO("%s: [TAG_FN_L3_HOST_REARM] a bridge that 3 errors turn off comes back after %d steps or %.0f s, "
-                "doubled at every further turn-off (up to 64x)\n", __func__, br->rearm_steps, br->rearm_ms/1e3);
+                "doubled at every further turn-off (up to 64x)\n", __func__, br->pol.rearm_steps, br->pol.rearm_ms/1e3);
+    }
+    if (llama_fn_l3_flag(model, "LLAMA_FN_R41_SLOWJOB") && br->mode == GGML_MOE_BRIDGE_WAIT_SPIN) { // [TAG_FN_R41_SLOWJOB]
+        br->pol.slow_on      = true;
+        br->pol.slow_ceil_ms = std::max(1000, llama_fn_l3_int(model, "LLAMA_FN_R41_SLOWJOB_MS", 20000));
+        br->pol.slow_gap     = (uint64_t) std::max(1, llama_fn_l3_int(model, "LLAMA_FN_R41_SLOWJOB_GAP", 32));
+        br->pol.slow_max     = std::max(1, std::min((int) fn_r41::bridge_policy::SLOW_RING,
+                llama_fn_l3_int(model, "LLAMA_FN_R41_SLOWJOB_MAX", 3)));
+        LLAMA_LOG_INFO("%s: [TAG_FN_R41_SLOWJOB] a wait timeout waits for the host's late answer (up to %lld ms) and then "
+                "re-arms the bridge without counting an error; a timeout within %llu bridged graphs of the last one counts, "
+                "and so does one after %d slow jobs within %llu bridged graphs\n", __func__, (long long) br->pol.slow_ceil_ms,
+                (unsigned long long) br->pol.slow_gap, br->pol.slow_max, (unsigned long long) br->pol.slow_win);
     }
     if (!br->pf_on && br->hint_k > 0) {
         br->hint_k = 0; // [TAG_FN_L3_CPU_DEVPRED] the graphs then build no hint (the device areas stay unused)
@@ -1946,7 +1949,7 @@ void llama_moe_bridge_l22_dma_off(const llama_moe_bridge * br) {
 }
 
 bool llama_moe_bridge_active(const llama_moe_bridge * br) {
-    return br != nullptr && br->active && !br->disabled;
+    return br != nullptr && br->pol.active && !br->pol.disabled;
 }
 
 // [TAG_FN_R2_BRIDGE_SYNC]
@@ -2096,29 +2099,35 @@ void llama_moe_bridge_defer_params(const llama_moe_bridge * br, float * w, int *
 }
 
 void llama_moe_bridge_step(llama_moe_bridge * br) {
-    if (br == nullptr || br->active) {
+    if (br == nullptr || br->pol.active) {
         return;
     }
-    if (br->disabled) {
-        // [TAG_FN_L3_HOST_REARM] the cool-down ends after its steps or its time, then the re-arm below runs as after a pause
-        if (br->rearm_steps <= 0 || (--br->off_steps > 0 && ggml_time_ms() < br->off_until)) {
-            return;
-        }
-        br->disabled   = false;
-        br->n_errors   = 0;
-        br->pause_left = 0;
+    // [TAG_FN_R1_BRIDGE_RB] [TAG_FN_L3_HOST_REARM] [TAG_FN_R41_SLOWJOB] pause, cool-down, re-arm (src/llama-fn-r41.h)
+    const unsigned ev = br->pol.on_step([br]() { return br->fn_reset(br->gb); }, br->n_graphs, ggml_time_ms());
+    if (ev & fn_r41::bridge_policy::EV_COOLED) {
         LLAMA_LOG_INFO("%s: MoE bridge %d: [TAG_FN_L3_HOST_REARM] cool-down over (turn-off %d), re-arming\n", __func__,
-                br->bid, br->n_off);
+                br->bid, br->pol.n_off);
     }
-    if (br->pause_left > 0) {
-        br->pause_left--;
-        return;
+    if (ev & fn_r41::bridge_policy::EV_SLOW_OK) {
+        LLAMA_LOG_WARN("%s: MoE bridge %d: [TAG_FN_R41_SLOWJOB] the host answered the late job %lld ms after the timeout: a "
+                "slow job, not an error (%llu so far); re-armed\n", __func__, br->bid, (long long) br->pol.slow_ms,
+                (unsigned long long) br->pol.n_slow);
+    } else if (ev & fn_r41::bridge_policy::EV_REARMED) {
+        LLAMA_LOG_INFO("%s: MoE bridge %d re-armed\n", __func__, br->bid);
     }
-    if (!br->fn_reset(br->gb)) {
-        return; // the executor still owes the stalled job: try again next step
+    if (ev & fn_r41::bridge_policy::EV_HANG) {
+        const auto & p = br->pol;
+        char then[160];
+        if (p.hang_kind == fn_r41::bridge_policy::E_OFF_REARM) {
+            snprintf(then, sizeof(then), "3 errors, [TAG_FN_L3_HOST_REARM] the bridge is off for %" PRId64 " steps or %.0f s "
+                    "(turn-off %d)", p.off_steps, p.off_ms/1e3, p.n_off);
+        } else {
+            snprintf(then, sizeof(then), "%s", p.disabled ? "3 errors, the bridge stays off for this context" :
+                    p.pause_left > 1 ? "the bridge pauses for 16 steps" : "it re-arms once the host has answered");
+        }
+        LLAMA_LOG_WARN("%s: MoE bridge %d: [TAG_FN_R41_SLOWJOB] the host has not answered the late job within %lld ms: "
+                "counted as an error; %s\n", __func__, br->bid, (long long) p.slow_ceil_ms, then);
     }
-    br->active = true;
-    LLAMA_LOG_INFO("%s: MoE bridge %d re-armed\n", __func__, br->bid);
 }
 
 void llama_moe_bridge_begin(llama_moe_bridge * br, bool used) {
@@ -2589,37 +2598,33 @@ bool llama_moe_bridge_end(llama_moe_bridge * br) {
                 __func__, br->bid, br->chans[s.error_chan - br->xd_base].il);
     }
     // [TAG_FN_R1_BRIDGE_RB] errors far apart are transient stalls whose ubatch was computed again: only 3 within 1024
-    // bridged graphs turn the bridge off for the rest of the context (a host side that keeps failing)
-    if (br->n_graphs - br->err_graph > 1024) {
-        br->n_errors = 0;
-    }
-    br->err_graph = br->n_graphs;
-    br->n_errors++;
-    br->active     = false;
+    // bridged graphs turn the bridge off for the rest of the context (a host side that keeps failing).
     // [TAG_FN_L7_PAUSE1] a first error (none within 1024 graphs) pauses only the retried ubatch: the stall was transient (a
     // cold first job after an idle gap - its pages are in now) and every paused step runs the slow CPU path (16 paused
-    // steps cost 7 s in l4/int7/conf7_L7_r1.log); a second error within 1024 graphs pauses 16 steps as before
-    br->pause_left = br->n_errors <= 1 ? 1 : 16;
-    if (br->n_errors >= 3) {
-        br->disabled = true;
-        if (br->rearm_steps > 0) { // [TAG_FN_L3_HOST_REARM] back-off; a long clean run since the last turn-off starts over
-            if (br->n_off > 0 && br->n_graphs - br->off_graph > 65536) {
-                br->n_off = 0;
-            }
-            const int k = std::min(br->n_off, 6);
-            br->n_off++;
-            br->off_graph = br->n_graphs;
-            br->off_steps = (int64_t) br->rearm_steps << k;
-            br->off_until = ggml_time_ms() + (br->rearm_ms << k);
-            LLAMA_LOG_WARN("%s: MoE bridge %d: %s at layer %d: this ubatch fails; 3 errors, [TAG_FN_L3_HOST_REARM] the bridge "
-                    "is off for %" PRId64 " steps or %.0f s (turn-off %d)\n", __func__, br->bid,
-                    err == GGML_MOE_BRIDGE_ERR_TIMEOUT ? "wait timeout" : "host job failed", il, br->off_steps,
-                    (br->rearm_ms << k)/1e3, br->n_off);
-            return false;
-        }
+    // steps cost 7 s in l4/int7/conf7_L7_r1.log); a second error within 1024 graphs pauses 16 steps as before.
+    // [TAG_FN_R41_SLOWJOB] with the switch a wait timeout counts only if the host does not answer the late job in time
+    // (llama_moe_bridge_step decides), comes within the gap of the last one, or after slow_max slow jobs within slow_win
+    // bridged graphs. The rules: src/llama-fn-r41.h
+    const bool timeout = err == GGML_MOE_BRIDGE_ERR_TIMEOUT;
+    const auto k = br->pol.on_error(timeout, br->n_graphs, ggml_time_ms());
+    if (k == fn_r41::bridge_policy::E_SLOW) {
+        LLAMA_LOG_WARN("%s: MoE bridge %d: wait timeout at layer %d: this ubatch fails; [TAG_FN_R41_SLOWJOB] only the retry runs "
+                "without the bridge, which re-arms once the host has answered the late job (a slow job is not an error)\n",
+                __func__, br->bid, il);
+        return false;
+    }
+    if (br->pol.slow_capped) {
+        LLAMA_LOG_WARN("%s: MoE bridge %d: [TAG_FN_R41_SLOWJOB] %d slow jobs within the last %llu bridged graphs: this wait "
+                "timeout counts as an error\n", __func__, br->bid, br->pol.slow_max, (unsigned long long) br->pol.slow_win);
+    }
+    if (k == fn_r41::bridge_policy::E_OFF_REARM) {
+        LLAMA_LOG_WARN("%s: MoE bridge %d: %s at layer %d: this ubatch fails; 3 errors, [TAG_FN_L3_HOST_REARM] the bridge "
+                "is off for %" PRId64 " steps or %.0f s (turn-off %d)\n", __func__, br->bid,
+                timeout ? "wait timeout" : "host job failed", il, br->pol.off_steps, br->pol.off_ms/1e3, br->pol.n_off);
+        return false;
     }
     LLAMA_LOG_WARN("%s: MoE bridge %d: %s at layer %d: this ubatch fails; %s\n", __func__, br->bid,
-            err == GGML_MOE_BRIDGE_ERR_TIMEOUT ? "wait timeout" : "host job failed", il,
-            br->disabled ? "3 errors, the bridge stays off for this context" : br->pause_left > 1 ? "the bridge pauses for 16 steps" : "only the retry runs without the bridge");
+            timeout ? "wait timeout" : "host job failed", il,
+            br->pol.disabled ? "3 errors, the bridge stays off for this context" : br->pol.pause_left > 1 ? "the bridge pauses for 16 steps" : "only the retry runs without the bridge");
     return false;
 }

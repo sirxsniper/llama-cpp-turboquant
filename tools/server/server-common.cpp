@@ -13,6 +13,8 @@
 namespace jinja { // [TAG_FN_L22_JSONFLOAT] common/jinja/value.h
 void set_l22_jsonfloat(bool on);
 bool l22_jsonfloat();
+void set_r41_floatstr(bool on); // [TAG_FN_R41_FLOATSTR]
+bool r41_floatstr();
 }
 
 #include "server-common.h"
@@ -937,6 +939,56 @@ bool server_tokens::validate(const struct llama_context * ctx) const {
     return n_media == map_idx_to_media.size();
 }
 
+// [TAG_FN_R41_OWNIDS]
+bool server_tokens::replace_text_runs(const llama_tokens & src, const std::vector<std::array<size_t, 4>> & runs) {
+    if (runs.empty()) {
+        return true;
+    }
+    size_t prev = 0;
+    for (const auto & r : runs) {
+        const size_t s0 = r[0], s1 = r[1], n0 = r[2], n1 = r[3];
+        if (s0 > s1 || s1 > src.size() || n0 > n1 || n1 > tokens.size() || n0 < prev) {
+            return false;
+        }
+        for (size_t x = s0; x < s1; ++x) {
+            if (src[x] == LLAMA_TOKEN_NULL) {
+                return false;
+            }
+        }
+        for (size_t x = n0; x < n1; ++x) {
+            if (tokens[x] == LLAMA_TOKEN_NULL) {
+                return false;
+            }
+        }
+        prev = n1;
+    }
+    llama_tokens out;
+    out.reserve(tokens.size() + 64);
+    size_t p = 0;
+    for (const auto & r : runs) {
+        out.insert(out.end(), tokens.begin() + p, tokens.begin() + r[2]);
+        out.insert(out.end(), src.begin() + r[0], src.begin() + r[1]);
+        p = r[3];
+    }
+    out.insert(out.end(), tokens.begin() + p, tokens.end());
+    if (has_mtmd && !map_idx_to_media.empty()) {
+        // a chunk at index m moves by what the runs that end at or before m added
+        std::map<size_t, mtmd::input_chunk_ptr> moved;
+        size_t   ri    = 0;
+        int64_t  shift = 0;
+        for (auto & it : map_idx_to_media) {
+            while (ri < runs.size() && runs[ri][3] <= it.first) {
+                shift += (int64_t) (runs[ri][1] - runs[ri][0]) - (int64_t) (runs[ri][3] - runs[ri][2]);
+                ++ri;
+            }
+            moved[(size_t) ((int64_t) it.first + shift)] = std::move(it.second);
+        }
+        map_idx_to_media = std::move(moved);
+    }
+    tokens = std::move(out);
+    return true;
+}
+
 server_tokens server_tokens::clone() const {
     server_tokens res;
     res.has_mtmd = has_mtmd;
@@ -1042,6 +1094,7 @@ void server_l22_apply(const llama_model * model, bool with_jsonfloat) {
     g_l22_tokcache.reset_verify(tc && vf ? 32 : 0, common_tokcache_verify_mode_from(llama_model_fn_env(model, "LLAMA_R27_TOKVERIFY")));
     if (with_jsonfloat) {
         jinja::set_l22_jsonfloat(llama_fn_l22_switch_on(llama_model_fn_env(model, "LLAMA_FN_L22_JSONFLOAT")));
+        jinja::set_r41_floatstr(llama_fn_l22_switch_on(llama_model_fn_env(model, "LLAMA_FN_R41_FLOATSTR"))); // [TAG_FN_R41_FLOATSTR]
     }
 }
 
@@ -1076,6 +1129,7 @@ void server_fn_l22_init(const llama_model * model) {
     llama_fn_l22_log("switch", "server text tools: JSONFLOAT=%d TOKCACHE=%d TOKCACHE_VERIFY=%d TOKVERIFY_MODE=%d PASSLOG=%d",
             jinja::l22_jsonfloat() ? 1 : 0, g_l22.tokcache.load() ? 1 : 0, g_l22_tokcache.n_verify.load() > 0 ? 1 : 0,
             g_l22_tokcache.verify_mode.load(), g_l22.passlog.load());
+    llama_fn_l22_log("switch", "[TAG_FN_R41_FLOATSTR] a float printed as text: %s", jinja::r41_floatstr() ? "as Python's str() (FLOATSTR=1)" : "six decimals as v0.33.0 (FLOATSTR=0)");
 }
 
 void server_fn_l22_drain() {
