@@ -331,6 +331,14 @@ struct moe_cache {
     bool                  sl_fail = false; // the placement could not lend: the init fails, the KV cache maps whole
     bool                  sl_retry = false; // the segments came out short of the KV cache's want: one slot more per lend layer
     int32_t               sl_extra = 0;
+    // [TAG_R41_PP_BORROW] LLAMA_FN_R41_BORROW=<n> (the Flash-Next profile sets 16; 0 restores v0.33.0): when the 16K prompt
+    // ubatch's borrow segments still fall short after the lend's own retries (v0.33.0 then drops the borrow, and every prompt
+    // runs at 8192 tokens per ubatch: 512K with 2 slots, 2946 of 3049 MiB), up to n more base slots of each lend layer lie over
+    // the borrow, in steps sized from the shortfall. Only which base slots go out while a 16K ubatch runs changes: the slots
+    // per layer, the KV lend and the routing stay as they are
+    int32_t               r41_borrow = 0;
+    int32_t               sb_extra   = 0;     // the borrow slots per lend layer on top of the v0.33.0 sizing
+    bool                  sb_retry   = false; // the borrow fell short: the same sizing again with sb_extra
     // [TAG_R40_LEND_SPREAD] 0: the plain sizing; 1: the lend spreads (the plain one fell short); 2: the spread one failed, the
     // plain one's last retry again (its partial lend)
     int                   sl_spread_st = 0;
@@ -2880,6 +2888,35 @@ ggml_backend_buffer_t hot_vmm_place(moe_cache * mc, ggml_context * ctx_d, ggml_b
                 mc->sl_retry = true;
                 return nullptr;
             }
+            if (bsum < g_kv_borrow && mc->sb_extra < mc->r41_borrow) {
+                // [TAG_R41_PP_BORROW] where v0.33.0 gives up: more borrow slots per lend layer, as many as the shortfall needs
+                // at the bytes one borrow slot of every lend layer holds now (+2 for the granule ends), within the switch's cap
+                int n_ll = 0, n_bl = 0, n_b = 0, base_min = INT32_MAX;
+                for (size_t i = 0; i < n; ++i) {
+                    const layer_state & ls = mc->layers[li0 + i];
+                    if (ls.sl_base < 0) {
+                        continue;
+                    }
+                    n_ll++;
+                    if (ls.sl_bbase >= 0 && ls.sl_bbase < ls.sl_base) {
+                        n_bl++;
+                        n_b = ls.sl_base - ls.sl_bbase;
+                    } else {
+                        base_min = std::min<int>(base_min, ls.sl_base);
+                    }
+                }
+                const double per_slot = n_b > 0 && bsum > 0 ? (double) bsum/n_b : 0.0;
+                int32_t add = per_slot > 0.0 ? (int32_t) ((double) (g_kv_borrow - bsum)/per_slot) + 2 : 1;
+                add = std::max<int32_t>(1, std::min<int32_t>(add, mc->r41_borrow - mc->sb_extra));
+                mc->sb_extra += add;
+                mc->sb_retry  = true;
+                const std::string others = base_min < INT32_MAX ? format(", the others %d base slots or fewer", base_min) : "";
+                LLAMA_LOG_WARN("moe-hot: [TAG_R41_PP_BORROW] the borrow segments come to %.0f of %.0f MiB (%d of %d lend layers hold "
+                        "%d borrow slots each%s): sized again with %d borrow slot(s) more per lend layer (%d of at most %d)\n",
+                        bsum/1048576.0, g_kv_borrow/1048576.0, n_bl, n_ll, n_b, others.c_str(), add, mc->sb_extra,
+                        mc->r41_borrow);
+                return nullptr;
+            }
             if (bsum < g_kv_borrow) {
                 // the borrow never costs the KV lend: none this time (the 16K prompt ubatches stay off)
                 LLAMA_LOG_WARN("moe-hot: [TAG_FN_L21_BIGUB] the borrow segments come to %.0f of %.0f MiB%s: no borrow\n",
@@ -3355,6 +3392,7 @@ bool llama_moe_hot_init(const llama_model & model, const void * owner, size_t bu
     mc->hot       = true;
     mc->hot_max_t = max_t;
     mc->sl_req    = sl_req; // [TAG_FN_L10_SLOTLEND]
+    mc->r41_borrow = std::max(0, std::min(64, llama_fn_l3_int(model, "LLAMA_FN_R41_BORROW", 0))); // [TAG_R41_PP_BORROW] 0 = v0.33.0
     // [TAG_FN_R25_REFILL] the cache-resident copy pool for the synchronous refills (static and adaptive sets)
     mc->r25_on    = llama_fn_l3_flag(model, "LLAMA_FN_R25_REFILL");
     mc->r25_owner = owner;
@@ -3493,7 +3531,8 @@ bool llama_moe_hot_init(const llama_model & model, const void * owner, size_t bu
                         if (g_kv_borrow > 0) {
                             // [TAG_FN_L21_BIGUB] the borrow: that many of each lend layer's base slots more lie over segments
                             // of their own (the slots per layer stay as they are: the learned set and the routing see no change)
-                            sl_bx = (int32_t) ((g_kv_borrow + waste + sl_layers.size()*3*vmm_gran + per - 1)/per) + mc->sl_extra;
+                            sl_bx = (int32_t) ((g_kv_borrow + waste + sl_layers.size()*3*vmm_gran + per - 1)/per) + mc->sl_extra +
+                                    mc->sb_extra; // [TAG_R41_PP_BORROW] 0 unless LLAMA_FN_R41_BORROW asked for more
                         }
                     }
                 }
@@ -3791,6 +3830,11 @@ bool llama_moe_hot_init(const llama_model & model, const void * owner, size_t bu
             mc->sl_cut_retry = false;
             continue;
         }
+        if (!ok && mc->sb_retry) {
+            // [TAG_R41_PP_BORROW] the borrow fell short where v0.33.0 drops it: the same sizing with more borrow slots (logged)
+            mc->sb_retry = false;
+            continue;
+        }
         if (!ok && mc->sl_retry) {
             // [TAG_FN_L10_SLOTLEND] the segments fell short: one slot more per lend layer, the same budget
             mc->sl_retry = false;
@@ -3805,6 +3849,7 @@ bool llama_moe_hot_init(const llama_model & model, const void * owner, size_t bu
                 mc->sl_spread_st = 1;
                 mc->sl_spread    = true;
                 mc->sl_extra     = 0;
+                mc->sb_extra     = 0; // [TAG_R41_PP_BORROW]
                 LLAMA_LOG_INFO("moe-hot: [TAG_R40_LEND_SPREAD] the plain lend falls short: the lend spreads over the lend layers' "
                         "own slots, every layer sized from the whole budget\n");
                 continue;
@@ -3819,6 +3864,7 @@ bool llama_moe_hot_init(const llama_model & model, const void * owner, size_t bu
             mc->sl_fail      = false;
             mc->sl_retry     = false;
             mc->sl_extra     = 4;
+            mc->sb_extra     = 0; // [TAG_R41_PP_BORROW]
             mc->sl_cut       = 0; // [TAG_R40_LEND_PARTIAL] the plain sizing finds its own
             mc->sl_cut_n     = 0;
             continue;

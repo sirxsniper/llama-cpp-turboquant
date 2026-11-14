@@ -374,6 +374,8 @@ const fn_item k_items[] = {
     // v0.33.0: the two measured switches of this release are on for Flash-Next (each one =0 restores v0.32.0)
     { "LLAMA_FN_DRAFTFIT",                  "1",       P_ALL }, // [TAG_FN_DRAFTFIT] 3 or 4 connections: a step's drafts are capped so that its verify rows fit the MoE bridge
     { "LLAMA_QSA_POOL_RANGE",               "1",       P_ALL }, // [TAG_QSA_POOL_RANGE] the QSA pool mask as one range per token, its rows made next to the indexer
+    // r41 prompt lane (each one =0 restores v0.33.0)
+    { "LLAMA_FN_R41_BORROW",                "16",      P_ALL }, // [TAG_R41_PP_BORROW] the 16K prompt ubatch's borrow takes up to 16 more base slots per lend layer instead of falling short (512K, 2 slots)
 };
 
 } // namespace
