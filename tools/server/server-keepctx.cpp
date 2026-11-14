@@ -1042,7 +1042,7 @@ int server_keepctx::drop_prefixes_of(const server_tokens & tokens, const server_
 bool server_keepctx::save(const server_prompt & prompt, llama_context * ctx_tgt, llama_context * ctx_dft,
                           common_speculative * spec, llama_seq_id seq_id, const server_keepctx_entry * keep,
                           std::string & info, const server_keepctx_spill * spill, const server_keepctx_conv * conv,
-                          int32_t supersede_tol) {
+                          int32_t supersede_tol, bool sys) {
     const auto t0 = std::chrono::steady_clock::now();
     const kc_mark mk_s = params_.trace ? kc_mark::now() : kc_mark(); // [TAG_FN_V0254_STORE]
 
@@ -1096,8 +1096,11 @@ bool server_keepctx::save(const server_prompt & prompt, llama_context * ctx_tgt,
 
     // room: older states of this conversation, then the oldest entries (or [TAG_FN_L19_CONVSTORE_EVICT] the lowest
     // value per byte), never `keep`
-    int n_evicted = drop_prefixes_of(prompt.tokens, keep, supersede_tol);
-    if (params_.val) {
+    // [TAG_R41_PP_SYSKEEP] a system-block entry takes no room from the conversations (the caller keeps the count)
+    int n_evicted = sys ? 0 : drop_prefixes_of(prompt.tokens, keep, supersede_tol);
+    if (sys) {
+        // nothing to evict
+    } else if (params_.val) {
         // [TAG_FN_L24_KEEPVAL] the disk first (budget and free space, the protected entry last), then the count (never the
         // protected entry: the count may then pass n_max by the protected and the keep entry)
         // the margin only drives evictions; the store fails on the disk only when the bytes do not fit at all
@@ -1140,7 +1143,7 @@ bool server_keepctx::save(const server_prompt & prompt, llama_context * ctx_tgt,
 
     e.id = ++n_next_;
     const auto path = std::filesystem::path(params_.dir) /
-            string_format("keepctx-%lu-%llu.kc", kc_pid(), (unsigned long long) e.id);
+            string_format(sys ? "keepctx-%lu-sys%llu.kc" : "keepctx-%lu-%llu.kc", kc_pid(), (unsigned long long) e.id);
     std::string err;
     e.file = server_keepctx_file::create(path, err);
     if (!e.file) {
@@ -1261,6 +1264,14 @@ bool server_keepctx::save(const server_prompt & prompt, llama_context * ctx_tgt,
     }
 
     const double ms = kc_ms_since(t0);
+    if (sys) {
+        // [TAG_R41_PP_SYSKEEP]
+        info = string_format("%d tokens, %u checkpoints, %.1f MiB (target %.1f, draft %.1f) in %.0f ms = %.2f GB/s, %zu system blocks",
+                             prompt.n_tokens(), (unsigned) prompt.checkpoints.size(), need/1048576.0, e.size_tgt/1048576.0,
+                             e.size_dft/1048576.0, ms, need/(ms*1e6), sys_entries.size() + 1);
+        sys_entries.push_back(std::move(e));
+        return true;
+    }
     info = string_format("%d tokens, %u checkpoints, %.1f MiB (target %.1f, draft %.1f) in %.0f ms = %.2f GB/s, %d older evicted, "
                          "store %zu conversations / %.1f MiB", prompt.n_tokens(), (unsigned) prompt.checkpoints.size(),
                          need/1048576.0, e.size_tgt/1048576.0, e.size_dft/1048576.0, ms, need/(ms*1e6), n_evicted,
@@ -1286,13 +1297,17 @@ bool server_keepctx::save(const server_prompt & prompt, llama_context * ctx_tgt,
 bool server_keepctx::load(std::list<server_keepctx_entry>::iterator it, server_prompt & prompt, llama_context * ctx_tgt,
                           llama_context * ctx_dft, common_speculative * spec, llama_seq_id seq_id, bool keep, std::string & info,
                           server_keepctx_spill * spill, server_keepctx_conv * conv,
-                          std::list<common_prompt_checkpoint> * reuse) {
+                          std::list<common_prompt_checkpoint> * reuse, bool sys) {
     const auto t0 = std::chrono::steady_clock::now();
+
+    // [TAG_R41_PP_SYSKEEP] a system-block entry stays in its own list
+    std::list<server_keepctx_entry> & from = sys ? sys_entries : entries;
+    keep = keep || sys;
 
     server_keepctx_entry e_own;
     if (!keep) {
         e_own = std::move(*it);
-        entries.erase(it);
+        from.erase(it);
     }
     server_keepctx_entry & e = keep ? *it : e_own;
 
@@ -1300,7 +1315,7 @@ bool server_keepctx::load(std::list<server_keepctx_entry>::iterator it, server_p
     auto fail = [&](const char * why) {
         info = why;
         if (keep) {
-            entries.erase(it);
+            from.erase(it);
         }
         return false;
     };
@@ -1453,7 +1468,10 @@ bool server_keepctx::load(std::list<server_keepctx_entry>::iterator it, server_p
         *conv = e.conv;
         conv->hits++;
     }
-    if (keep) {
+    if (sys) {
+        e.sys_hits++; // [TAG_R41_PP_SYSKEEP]
+        e.t_use = kc_now_s();
+    } else if (keep) {
         e.conv.hits++;
         e.value = convstore_gdsf(gdsf_L_, e.conv.hits, e.prompt.n_tokens(), e.n_bytes_all(), params_.fixed_tokens,
                                  params_.budget / (uint64_t) std::max(1, params_.n_max));
@@ -1487,6 +1505,7 @@ bool server_keepctx::load(std::list<server_keepctx_entry>::iterator it, server_p
     const uint64_t n_read_bytes = lazy ? e.size_tgt + e.size_dft : e.n_bytes;
     info = string_format("%d tokens, %zu checkpoints, %.1f MiB in %.0f ms = %.2f GB/s, %s, store %zu conversations / %.1f MiB%s%s",
                          prompt.n_tokens(), prompt.checkpoints.size(), n_read_bytes/1048576.0, ms, n_read_bytes/(ms*1e6),
+                         sys ? "a system block (it stays stored)" :
                          keep ? "kept in the store (the prompt continues a part of it)" : "taken from the store",
                          entries.size(), n_bytes()/1048576.0, hot.c_str(), ver.c_str());
     if (!e.spilled.empty()) {
@@ -1504,7 +1523,7 @@ bool server_keepctx::load(std::list<server_keepctx_entry>::iterator it, server_p
                               kc_part(mk[2], mk[3]).c_str(), pipe_st.c_str(), (llama_fn_res_touched_ext() - res0)/1048576.0);
     }
     if (keep) {
-        entries.splice(entries.end(), entries, it); // the most recently used
+        from.splice(from.end(), from, it); // the most recently used
     }
     return true;
 }

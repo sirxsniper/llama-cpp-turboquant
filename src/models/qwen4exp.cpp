@@ -1842,7 +1842,7 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     static const bool rows_on = llama_fn_l3_int(model, "LLAMA_FN_L21_MTP_ROWS", 0) > 0;
     const bool rows_cut = rows_on && inp_out_ids && cparams.embeddings_nextn_masked;
 
-    // [TAG_R41_PP_MTPKV] LLAMA_FN_R41_MTPKV (the Flash-Next profile sets 1; 0 restores v0.33.0): a draft graph without any
+    // [TAG_R41_PP_MTPKV] LLAMA_FN_R41_MTPKV (1 turns it on; the Flash-Next profile keeps 0 = v0.33.1 until measured): a draft graph without any
     // output row (the catch-up of the prompt's last 32K rows, in chunks) builds the dense attention block as its K/V writes
     // alone. The query, the attention over the window, its gate and the output projection of every row were computed and
     // then dropped by the row cut; the K/V written are the same nodes on the same rows, so later drafts read the same cache.

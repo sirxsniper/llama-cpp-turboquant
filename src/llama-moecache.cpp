@@ -348,7 +348,7 @@ struct moe_cache {
     bool                  sl_fail = false; // the placement could not lend: the init fails, the KV cache maps whole
     bool                  sl_retry = false; // the segments came out short of the KV cache's want: one slot more per lend layer
     int32_t               sl_extra = 0;
-    // [TAG_R41_PP_BORROW] LLAMA_FN_R41_BORROW=<n> (the Flash-Next profile sets 16; 0 restores v0.33.0): when the 16K prompt
+    // [TAG_R41_PP_BORROW] LLAMA_FN_R41_BORROW=<n> (16 turns it on; the Flash-Next profile keeps 0 = v0.33.1 until measured): when the 16K prompt
     // ubatch's borrow segments still fall short after the lend's own retries (v0.33.0 then drops the borrow, and every prompt
     // runs at 8192 tokens per ubatch: 512K with 2 slots, 2946 of 3049 MiB, because the lend layers with fewer base slots
     // than the borrow's count give none), the sizing runs again with those layers giving all of their base slots but one

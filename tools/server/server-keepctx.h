@@ -132,6 +132,10 @@ struct server_keepctx_entry {
     double                              value = 0.0;
     double                              t_use = 0.0; // [TAG_FN_L24_KEEPVAL] steady-clock seconds of the store or the last restore
 
+    // [TAG_R41_PP_SYSKEEP] a system-block entry (sys_entries): keepctx_prefix_hash of its tokens, the restores it served
+    uint64_t sys_hash = 0;
+    int64_t  sys_hits = 0;
+
     uint64_t n_bytes_all() const;       // n_bytes + the spilled checkpoints' bytes
 };
 
@@ -175,6 +179,11 @@ struct server_keepctx {
 
     std::list<server_keepctx_entry> entries; // least recently stored first
 
+    // [TAG_R41_PP_SYSKEEP] the states of system + tools blocks (LLAMA_FN_R41_SYSKEEP): each one the sequence at the end of a
+    // block, stored once when a prompt reaches it, never evicted by the conversations (the caller keeps their count),
+    // least recently used first
+    std::list<server_keepctx_entry> sys_entries;
+
     uint64_t n_bytes() const;
 
     // store the sequence seq_id with its prompt (tokens and checkpoints). Older states of the same conversation (entries
@@ -182,9 +191,11 @@ struct server_keepctx {
     // never `keep`. false: nothing stored (too big, no room beside `keep`, or an I/O error).
     // [TAG_FN_L19_CONVSTORE] spill (may be null): the slot's checkpoints on disk, kept with the entry (shared files);
     // conv (may be null): what is known about the conversation; supersede_tol: see drop_prefixes_of
+    // [TAG_R41_PP_SYSKEEP] sys: into sys_entries, with no eviction of any entry (only the budget check of its own size)
     bool save(const server_prompt & prompt, llama_context * ctx_tgt, llama_context * ctx_dft, common_speculative * spec,
               llama_seq_id seq_id, const server_keepctx_entry * keep, std::string & info,
-              const server_keepctx_spill * spill = nullptr, const server_keepctx_conv * conv = nullptr, int32_t supersede_tol = 0);
+              const server_keepctx_spill * spill = nullptr, const server_keepctx_conv * conv = nullptr, int32_t supersede_tol = 0,
+              bool sys = false);
 
     // restore the entry into seq_id and prompt. The entry is removed, unless keep (the prompt continues only a part of
     // it: the rest stays stored for a later continuation) and the restore worked. false: the sequence and prompt are in
@@ -193,10 +204,11 @@ struct server_keepctx {
     // it (its restores counting this one)
     // [TAG_FN_L20_CONVFIX_IO] reuse (may be null): checkpoints whose buffers the restored checkpoints take (the slot's
     // outgoing ring); the ones left over are given back in it
+    // [TAG_R41_PP_SYSKEEP] sys: it is in sys_entries (keep must be true)
     bool load(std::list<server_keepctx_entry>::iterator it, server_prompt & prompt, llama_context * ctx_tgt,
               llama_context * ctx_dft, common_speculative * spec, llama_seq_id seq_id, bool keep, std::string & info,
               server_keepctx_spill * spill = nullptr, server_keepctx_conv * conv = nullptr,
-              std::list<common_prompt_checkpoint> * reuse = nullptr);
+              std::list<common_prompt_checkpoint> * reuse = nullptr, bool sys = false);
 
     // remove the entries whose tokens are a prefix of tokens (an older state of the same conversation), except keep
     // [TAG_FN_L19_CONVSTORE] tol > 0: also the entries that leave tokens within their last tol tokens (a conversation

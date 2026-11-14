@@ -389,9 +389,11 @@ const fn_item k_items[] = {
     { "LLAMA_FN_R41_OWNIDS",                "1",       P_ALL }, // [TAG_FN_R41_OWNIDS] on from v0.33.1 (an agent loop: no re-read of a replayed answer)
     // a float printed as text by the chat template ({{ x }}, ~): 1 = as Python's str(), 0 restores v0.33.0 (six decimals)
     { "LLAMA_FN_R41_FLOATSTR",              "1",       P_ALL }, // [TAG_FN_R41_FLOATSTR] on from v0.33.1
-    // r41 prompt lane (each one =0 restores v0.33.0)
-    { "LLAMA_FN_R41_BORROW",                "16",      P_ALL }, // [TAG_R41_PP_BORROW] where the 16K prompt ubatch's borrow falls short (512K, 2 slots), the lend layers with few base slots give all but one, then up to 16 more slots per lend layer
-    { "LLAMA_FN_R41_MTPKV",                 "1",       P_ALL }, // [TAG_R41_PP_MTPKV] the MTP draft's prompt catch-up (no output rows) writes its K/V without the attention block's query, attention and output projection
+    // r41 prompt lane: each one 0 (= v0.33.1) in the profile until its GPU arms are measured; the value that turns it on is in
+    // its comment
+    { "LLAMA_FN_R41_BORROW",                "0",       P_ALL }, // [TAG_R41_PP_BORROW] 16 = where the 16K prompt ubatch's borrow falls short (512K, 2 slots), the lend layers with few base slots give all but one, then up to 16 more slots per lend layer
+    { "LLAMA_FN_R41_MTPKV",                 "0",       P_ALL }, // [TAG_R41_PP_MTPKV] 1 = the MTP draft's prompt catch-up (no output rows) writes its K/V without the attention block's query, attention and output projection
+    { "LLAMA_FN_R41_SYSKEEP",               "0",       P_ALL }, // [TAG_R41_PP_SYSKEEP] 1 = the state at the end of a system + tools block is stored once, and a new chat whose slot keeps less of the block takes it back
 };
 
 } // namespace
