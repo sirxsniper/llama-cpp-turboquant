@@ -301,13 +301,13 @@ static const l22_row k_l22_rows[] = {
     { "GGML_CUDA_R35_POKE1", "1", false }, // [TAG_R35_HOSTCHAIN]
     { "LLAMA_FN_DRAFTFIT", "1", false }, // [TAG_FN_DRAFTFIT] on by default from v0.33.0
     { "LLAMA_QSA_POOL_RANGE", "1", false }, // [TAG_QSA_POOL_RANGE] on by default from v0.33.0
-    { "LLAMA_FN_R41_SLOWJOB", "0", true }, // [TAG_FN_R41_SLOWJOB] off (v0.33.0) until the GPU plan measures it
-    { "LLAMA_FN_R41_FLOOR_MIB", "0", false }, // [TAG_FN_R41_FLOOR] off (v0.33.0) until the GPU plan measures it
-    { "LLAMA_FN_R41_PRIO", "0", false }, // [TAG_FN_R41_PRIO] off (v0.33.0) until the GPU plan measures it
-    { "LLAMA_FN_R41_STATEKEY", "0", false }, // [TAG_FN_R41_STATEKEY] off (v0.33.0) until the GPU state turn runs it
-    { "LLAMA_FN_R41_STATEMERGE", "0", false }, // [TAG_FN_R41_STATEMERGE] off (v0.33.0) until the GPU state turn runs it
+    { "LLAMA_FN_R41_SLOWJOB", "1", true }, // [TAG_FN_R41_SLOWJOB] on from v0.33.1
+    { "LLAMA_FN_R41_FLOOR_MIB", "1536", false }, // [TAG_FN_R41_FLOOR] on from v0.33.1
+    { "LLAMA_FN_R41_PRIO", "1", false }, // [TAG_FN_R41_PRIO] on from v0.33.1
+    { "LLAMA_FN_R41_STATEKEY", "1", false }, // [TAG_FN_R41_STATEKEY] on from v0.33.1
+    { "LLAMA_FN_R41_STATEMERGE", "65536", false }, // [TAG_FN_R41_STATEMERGE] on from v0.33.1
     { "LLAMA_FN_R41_PASSPRIO", "0", false }, // [TAG_FN_R41_PASSPRIO] off (v0.33.0) until the GPU arm measures it
-    { "LLAMA_FN_R41_OWNIDS", "0", false }, // [TAG_FN_R41_OWNIDS] 0 = v0.33.0
+    { "LLAMA_FN_R41_OWNIDS", "1", false }, // [TAG_FN_R41_OWNIDS] on from v0.33.1
     { "LLAMA_FN_R41_FLOATSTR", "0", false }, // [TAG_FN_R41_FLOATSTR] 0 = v0.33.0
 };
 static const size_t k_n_l22_rows = sizeof(k_l22_rows)/sizeof(k_l22_rows[0]);
