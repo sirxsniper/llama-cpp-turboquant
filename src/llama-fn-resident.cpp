@@ -6,6 +6,7 @@
 #include "llama-fn-l22.h"
 #include "llama-fn-l22-p5.h"
 #include "llama-fn-res-core.h"
+#include "llama-fn-r41.h" // [TAG_FN_R41_FLOOR]
 
 #include "llama-fn-auto.h"
 #include "llama-fn-stall.h"
@@ -93,6 +94,11 @@ struct res_table {
     std::mutex              lmtx;        // the log line's interval state
     uint64_t                dio_b0 = 0;
     uint64_t                dio_r0 = 0;
+    // [TAG_FN_R41_FLOOR] LLAMA_FN_R41_FLOOR_MIB: the free-RAM floor (service thread), its actions and bytes for the log
+    fn_r41::floor_gate      floor;
+    std::atomic<uint64_t>   n_floor{0};
+    std::atomic<uint64_t>   b_floor{0};
+    uint64_t                n_floor_told = 0; // service thread: actions logged one by one so far
 };
 
 std::atomic<res_table *> g_res{nullptr};
@@ -716,6 +722,10 @@ void res_log(res_table * t, const char * when) {
             t->b_rewarm.exchange(0)/1073741824.0, t->n_ssd_mark.exchange(0), t->n_ssd_unmark.exchange(0),
             (db - t->dio_b0)/1073741824.0, dr - t->dio_r0, df, t->gen.load(), t->probe_state.load(), t->n_probe.load(),
             t->n_probe_ok.load(), t->n_probe_lost.load(), t->b_probe.exchange(0)/1073741824.0);
+    if (t->floor.floor_b > 0) { // [TAG_FN_R41_FLOOR] its own line: the res line stays as it was
+        llama_fn_l22_log("floor", "when=%s [TAG_FN_R41_FLOOR] floor_gib=%.2f floor_acts=%" PRIu64 " floor_gib_given=%.2f", when,
+                t->floor.floor_b/1073741824.0, t->n_floor.exchange(0), t->b_floor.exchange(0)/1073741824.0);
+    }
     t->dio_b0 = db;
     t->dio_r0 = dr;
 }
@@ -970,12 +980,12 @@ void res_probe_step(res_table * t, int64_t now, int64_t act, probe_ctx & p) {
 constexpr size_t GIVE_CUSHION = (size_t) 2 << 30;
 constexpr size_t GIVE_TARGET  = (size_t) 3 << 30;
 
-size_t res_give_back(res_table * t, size_t lw, probe_ctx & p, int64_t now) {
+// the least-routed cold experts in RAM join the SSD set until their bytes reach `need`; their pages leave the working set
+// now (when = 1), at the next quiet moment (0), or now if no decode or prompt runs (-1, decided at the drop). Returns the
+// bytes marked, *n_out the experts
+size_t res_give_back_core(res_table * t, size_t need, int when, size_t * n_out) {
 #ifdef _WIN32
-    const size_t need = lw < GIVE_TARGET ? GIVE_TARGET - lw : 0;
-    if (need == 0) {
-        return 0;
-    }
+    *n_out = 0;
     std::lock_guard<std::mutex> lk(t->mtx);
     std::lock_guard<std::mutex> plk(t->pmtx); // the counts
     const auto S = res_streamed(t, false);
@@ -1011,12 +1021,31 @@ size_t res_give_back(res_table * t, size_t lw, probe_ctx & p, int64_t now) {
     if (!drop.empty()) {
         t->n_ssd_mark.fetch_add(drop.size());
         t->gen.fetch_add(1);
-        if (res_quiet()) {
+        if (when > 0 || (when < 0 && res_quiet())) {
             res_drop(t, drop);
         } else {
             t->dropq.insert(t->dropq.end(), drop.begin(), drop.end()); // t->mtx is held
         }
     }
+    *n_out = drop.size();
+    return marked;
+#else
+    GGML_UNUSED(t);
+    GGML_UNUSED(need);
+    GGML_UNUSED(when);
+    *n_out = 0;
+    return 0;
+#endif
+}
+
+size_t res_give_back(res_table * t, size_t lw, probe_ctx & p, int64_t now) {
+#ifdef _WIN32
+    const size_t need = lw < GIVE_TARGET ? GIVE_TARGET - lw : 0;
+    if (need == 0) {
+        return 0;
+    }
+    size_t n_drop = 0;
+    const size_t marked = res_give_back_core(t, need, -1, &n_drop);
     p.lw_cur   = SIZE_MAX;
     p.lw_prev  = SIZE_MAX;
     p.act_cur  = false;
@@ -1026,12 +1055,69 @@ size_t res_give_back(res_table * t, size_t lw, probe_ctx & p, int64_t now) {
     p.next     = std::max(p.next, now + p.wait);
     LLAMA_LOG_INFO("%s: [TAG_FN_L22_SSDFIX] give-back: available RAM fell to %.2f GiB in the last prompts (cushion %.1f GiB): "
             "%.2f GiB of %zu least-routed cold experts in RAM go to direct I/O, their pages to standby\n", __func__,
-            lw/1073741824.0, GIVE_CUSHION/1073741824.0, marked/1073741824.0, drop.size());
+            lw/1073741824.0, GIVE_CUSHION/1073741824.0, marked/1073741824.0, n_drop);
     return marked;
 #else
     GGML_UNUSED(t);
     GGML_UNUSED(lw);
     GGML_UNUSED(p);
+    GGML_UNUSED(now);
+    return 0;
+#endif
+}
+
+// [TAG_FN_R41_FLOOR] the floor's action: `want` bytes leave the working set now, also while answers and prompts run
+// (Windows trims at random below ~1 GiB available, hot expert pages too; this picks the coldest). First the queued drops
+// (host copies of VRAM-held experts, SSD-marked ones: the CPU does not read them), then the least-routed resident cold
+// experts join the SSD set (the prompt stream reads them by direct I/O, an answer step that routes one faults it in).
+// A probe reading the SSD set in is left alone: it stops by itself at its own floor. Returns the bytes
+size_t res_floor_act(res_table * t, size_t want, int64_t now) {
+#ifdef _WIN32
+    std::vector<std::pair<int, int>> q;
+    {
+        std::lock_guard<std::mutex> lk(t->mtx);
+        q.swap(t->dropq);
+    }
+    // as the quiet drain: pinned meanwhile, or no longer VRAM-held / SSD (the eviction prefetch wants it back): skip
+    q.erase(std::remove_if(q.begin(), q.end(), [&](const std::pair<int, int> & x) {
+        const uint8_t f = t->L[x.first].fl[x.second].load();
+        return (f & F_PIN) || !(f & (F_VRAM | F_SSD));
+    }), q.end());
+    std::sort(q.begin(), q.end());
+    q.erase(std::unique(q.begin(), q.end()), q.end());
+    size_t got = 0;
+    size_t n_q = 0;
+    for (; n_q < q.size() && got < want; ++n_q) {
+        got += t->L[q[n_q].first].eb;
+    }
+    if (n_q < q.size()) {
+        std::lock_guard<std::mutex> lk(t->mtx); // the rest at the next action or quiet moment
+        t->dropq.insert(t->dropq.end(), q.begin() + (std::ptrdiff_t) n_q, q.end());
+    }
+    q.resize(n_q);
+    const size_t b_q = res_drop(t, q);
+    size_t b_g = 0;
+    size_t n_g = 0;
+    // the cold experts within what the floor may still mark before the next idle plan
+    const size_t ask = t->floor.give_back_ask(want, b_q);
+    if (ask > 0 && t->ssd >= 1 && t->probe_state.load() != 1) {
+        b_g = res_give_back_core(t, ask, 1, &n_g);
+        t->floor.on_marked(b_g);
+    }
+    t->n_floor.fetch_add(1);
+    t->b_floor.fetch_add((uint64_t) (b_q + b_g));
+    if (++t->n_floor_told <= 3 || t->n_floor_told % 64 == 0) {
+        LLAMA_LOG_WARN("%s: [TAG_FN_R41_FLOOR] available RAM under the floor (%.0f MiB): %.0f MiB of %zu queued drops and %.0f "
+                "MiB of %zu least-routed cold experts (to direct I/O) leave the working set (action %" PRIu64 "; %.0f of the "
+                "%.0f MiB for cold experts until the next idle plan used)\n", __func__, t->floor.floor_b/1048576.0,
+                b_q/1048576.0, n_q, b_g/1048576.0, n_g, t->n_floor_told, t->floor.marked_b/1048576.0,
+                t->floor.mark_cap_b/1048576.0);
+    }
+    GGML_UNUSED(now);
+    return b_q + b_g;
+#else
+    GGML_UNUSED(t);
+    GGML_UNUSED(want);
     GGML_UNUSED(now);
     return 0;
 #endif
@@ -1087,6 +1173,11 @@ void res_service(res_table * t) {
         const bool busy = llama_fn_p5_busy(&act);
         if (t->ssd >= 1) {
             res_probe_sample(probe, now, busy); // [TAG_FN_L22_SSDFIX] the available RAM's low-water, every 100 ms
+        }
+        if (t->floor.floor_b > 0 && t->warm_done.load()) { // [TAG_FN_R41_FLOOR] busy or not
+            if (const size_t want = t->floor.sample(fn_avail(), now); want > 0) {
+                res_floor_act(t, want, now);
+            }
         }
         if (!busy && now - act >= 50000) {
             std::vector<std::pair<int, int>> q;
@@ -1191,6 +1282,7 @@ void res_service(res_table * t) {
                     }
                 }
                 res_ssd_plan(t, 1, lw_room);
+                t->floor.on_idle_plan(); // [TAG_FN_R41_FLOOR] the plan has sized the SSD set again: the floor's cap starts over
             }
         }
     }
@@ -1293,6 +1385,9 @@ bool llama_fn_p5_ready(const llama_model & model) {
     t->borrow_ram = llama_fn_l22_switch_on(llama_fn_env(model, "LLAMA_FN_L22_UBPLAN")) ||
                     llama_fn_l22_switch_on(llama_fn_env(model, "LLAMA_FN_L22_BIGUB2")); // [TAG_FN_L22_UBPLAN] P10 R2
     t->floor_b = (size_t) std::max(0, llama_fn_l3_int(model, "LLAMA_FN_L15_WARM_FREE_MIB", 4096)) << 20;
+    // [TAG_FN_R41_FLOOR] 0 (the code default) = v0.33.0: no floor of its own
+    t->floor.floor_b = (size_t) std::max(0, llama_fn_l3_int(model, "LLAMA_FN_R41_FLOOR_MIB", 0)) << 20;
+    t->floor.mark_cap_b = (size_t) std::max(0, llama_fn_l3_int(model, "LLAMA_FN_R41_FLOOR_MARK_MIB", 1024)) << 20;
     SYSTEM_INFO si;
     GetSystemInfo(&si);
     t->page = si.dwPageSize ? si.dwPageSize : 4096;
@@ -1355,6 +1450,12 @@ bool llama_fn_p5_ready(const llama_model & model) {
     LLAMA_LOG_INFO("%s: [TAG_FN_L22_RESSET] residency table: %zu layers, %.2f GiB streamed from the host, %.2f GiB held in VRAM "
             "(resset %d, rewarm %d, ssdtier %d, pin %d)\n", __func__, t->L.size(), cls[0]/1073741824.0, cls[1]/1073741824.0,
             resset ? 1 : 0, rewarm ? 1 : 0, ssd, pin ? 1 : 0);
+    if (t->floor.floor_b > 0) {
+        LLAMA_LOG_INFO("%s: [TAG_FN_R41_FLOOR] below %.0f MiB of available RAM the engine gives back VRAM-held host copies, then "
+                "the least-routed cold experts (%.0f MiB at most per second, until %.0f MiB are available; at most %.0f MiB of "
+                "cold experts between two idle plans)\n", __func__, t->floor.floor_b/1048576.0, t->floor.chunk_b/1048576.0,
+                (t->floor.floor_b + t->floor.margin_b)/1048576.0, t->floor.mark_cap_b/1048576.0);
+    }
     // the pin planner starts (its own thread): it marks its experts PIN, the warm pass skips them
     llama_fn_pin_on_ready(&model);
     // R-P6-3: with pins planned (PIN-marked experts, or pins already active) the warm, SSD and re-warm floors stay at least

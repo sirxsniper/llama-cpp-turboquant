@@ -38,6 +38,7 @@
 #    endif
 #    include <windows.h>
 #endif
+#include "llama-fn-r41.h" // [TAG_FN_R41_PRIO]
 
 #if defined(_MSC_VER)
 #pragma warning(disable: 4244 4267) // possible loss of data
@@ -237,6 +238,26 @@ void llama_fn_l3_host_on_load(const llama_model & model) {
     // [TAG_FN_L4_HOST] LLAMA_FN_L4_HOSTPROF=1|N: the host profile of the decode loop (src/llama-fn-hostprof.cpp)
     if (const int every = llama_fn_l3_int(model, "LLAMA_FN_L4_HOSTPROF", 0); every > 0) {
         llama_hp_enable(every);
+    }
+    // [TAG_FN_R41_PRIO] LLAMA_FN_R41_PRIO: the I/O and page priority this process got from its launcher, raised to normal
+    // when lower (src/llama-fn-r41.h). Before the pools and the residency service start: their threads take the new values
+    if (llama_fn_l3_flag(model, "LLAMA_FN_R41_PRIO")) {
+#if defined(_WIN32)
+        const auto r = fn_r41::prio_fix();
+        if (!r.before.ok) {
+            LLAMA_LOG_WARN("%s: [TAG_FN_R41_PRIO] the I/O and page priority could not be read: left as they are\n", __func__);
+        } else if (!r.raised) {
+            LLAMA_LOG_INFO("%s: [TAG_FN_R41_PRIO] I/O priority %u, page priority %u (normal, as launched)\n", __func__,
+                    r.before.io, r.before.page);
+        } else {
+            LLAMA_LOG_WARN("%s: [TAG_FN_R41_PRIO] launched with I/O priority %u and page priority %u (this thread %u / %u), below "
+                    "normal (%u / %u): raised to %u / %u%s\n", __func__, r.before.io, r.before.page, r.thread_before.io,
+                    r.thread_before.page, fn_r41::IO_NORMAL, fn_r41::PAGE_NORMAL, r.after.io, r.after.page,
+                    r.ok ? "" : " (a raise failed)");
+        }
+#else
+        LLAMA_LOG_INFO("%s: [TAG_FN_R41_PRIO] Windows only: nothing to do here\n", __func__);
+#endif
     }
 }
 

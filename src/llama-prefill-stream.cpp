@@ -23,6 +23,7 @@
 #include "llama-fn-auto.h"    // [TAG_FN_L22_STAGERS] llama_fn_l22_stagers
 #include "llama-fn-l22-p16.h" // [TAG_FN_L22_CPUSHARE]
 #include "llama-fn-vguard.h"  // [TAG_R40_VGUARD]
+#include "llama-fn-r41b.h"    // [TAG_FN_R41_PASSPRIO]
 
 #include "llama-impl.h"
 #include "llama-mmap.h" // [TAG_FN_L15_PFSAHEAD]
@@ -234,6 +235,9 @@ struct pfs_state {
     int            cp_pin   = 0;          // [TAG_FN_R25_PIN] LLAMA_PREFILL_STREAM_PIN: 0 free, 1 one core each, 2 one CCD each
     std::vector<gen5::cpu_mask> cp_affs;  // [TAG_FN_R25_PIN] the copy workers' affinities (empty: free)
     size_t         cp_grain = 0;          // [TAG_FN_R25_PIN] LLAMA_PREFILL_STREAM_GRAIN_KIB (0: fixed parts)
+    // [TAG_FN_R41_PASSPRIO] LLAMA_FN_R41_PASSPRIO: the page priority of the streamer, its copy workers and the read-ahead
+    // thread (1-4; 0: as made), so the pages a prompt pass reads into RAM are the first the system takes back
+    std::atomic<int> r41_pp{0};
     int            stagers_mode  = 0;     // [TAG_FN_L22_STAGERS] 0 off, -1 auto, n >= 2 fixed
     double         stg_share     = -1.0;  // EWMA (alpha 0.5) of staged / host bytes per pass (-1: none since a pin change)
     bool           stg_pin       = false; // pins were live at the last lend
@@ -407,6 +411,7 @@ void pfs_ra_run(pfs_state * s) {
     uint64_t done = 0;
     std::vector<int>    miss;
     std::vector<uint8_t> dio;
+    fn_r41b::page_prio_follow pp; // [TAG_FN_R41_PASSPRIO]
     for (;;) {
         uint64_t g = 0;
         {
@@ -418,6 +423,7 @@ void pfs_ra_run(pfs_state * s) {
             g = s->ra_gen;
             done = g;
         }
+        pp.apply(s->r41_pp.load(std::memory_order_relaxed)); // [TAG_FN_R41_PASSPRIO] before this ubatch's prefetches
         const int np = (int) s->layers.size();
         miss.clear();
         double sum = 0.0;
@@ -607,6 +613,7 @@ void pfs_run(pfs_state * s) {
     std::vector<uint8_t>                     late_l;
     std::vector<uint8_t>                     skip_l;
     std::vector<uint8_t>                     wr[3]; // [TAG_R35_CPSGUARD] the experts of tensor k a share job writes from the host
+    fn_r41b::page_prio_follow                pp;    // [TAG_FN_R41_PASSPRIO] this thread copies part 0 of a list itself
 
     for (;;) {
         pfs_job job;
@@ -652,6 +659,7 @@ void pfs_run(pfs_state * s) {
         const pfs_layer & L = s->layers[job.pos];
         pfs_bank &        B = s->banks[L.bank];
         const int64_t t_job0 = share ? ggml_time_us() : 0; // [TAG_FN_L22_CPUSHARE]
+        pp.apply(s->r41_pp.load(std::memory_order_relaxed)); // [TAG_FN_R41_PASSPRIO] before this job's pages are read
         llama_fn_warm_wait_layer(L.il); // [TAG_FN_L15_WARM] the warm pass brings this layer in first
         // [TAG_FN_L15_PFSAHEAD] the next layers' pages: read ahead of the copies (positions wrap to 0 for the next ubatch)
         // [TAG_FN_L22_READAHEAD] not while the round-22 read-ahead thread runs (it covers every layer of the pass)
@@ -1834,6 +1842,7 @@ static void pfs_stagers_apply(pfs_state * s) {
     np->set_mode(s->cp_tmp, s->cp_pf, s->cp_spin); // [TAG_FN_R25_STAGE]
     np->set_affinities(s->cp_affs);                // [TAG_FN_R25_PIN]
     np->set_grain(s->cp_grain);
+    np->set_page_prio(s->r41_pp.load(std::memory_order_relaxed)); // [TAG_FN_R41_PASSPRIO]
     np->start(target);
     s->pool.swap(np); // the old pool's workers stop and join here (~1-3 ms)
     s->stg_restarts++;
@@ -2441,6 +2450,24 @@ void llama_prefill_stream_l22_config(const void * owner, const llama_model * mod
             s->l_map[p].store(0);
         }
         s->ra_thr = std::thread(pfs_ra_run, s);
+    }
+    // [TAG_FN_R41_PASSPRIO] LLAMA_FN_R41_PASSPRIO=<1-4> (0 = v0.33.0): the streamer, its copy workers and the read-ahead
+    // thread take this page priority before their next pages: what a prompt pass reads in from the disk (cold for the
+    // answers) is the first the system repurposes once it leaves the working set; an answer step that faults such a page
+    // back in gives it the normal priority, and a page that was in RAM before keeps its own (a soft fault by a lower
+    // thread never lowers it; tests/test-fn-r41b.cpp checks these rules on this system)
+    if (model) {
+        const int pp = fn_r41b::passprio_value(llama_fn_l3_int(*model, "LLAMA_FN_R41_PASSPRIO", 0));
+        if (pp != s->r41_pp.load(std::memory_order_relaxed)) {
+            s->r41_pp.store(pp, std::memory_order_relaxed);
+            if (s->pool) {
+                s->pool->set_page_prio(pp);
+            }
+            if (pp > 0) {
+                LLAMA_LOG_WARN("prefill-stream: [TAG_FN_R41_PASSPRIO] the prompt stream's threads read at page priority %d "
+                        "(normal 5): the pages a prompt pass reads in leave RAM first, the answers' pages stay\n", pp);
+            }
+        }
     }
     if (s->l22.keeplend || s->l22.endoverlap || s->l22.prestage || s->l22.readahead || s->l22.ssdtier > 0 || s->l22.pin) {
         LLAMA_LOG_INFO("prefill-stream: [TAG_FN_L22_P4] round 22:%s%s%s%s%s%s\n",

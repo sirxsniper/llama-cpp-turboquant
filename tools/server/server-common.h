@@ -10,6 +10,7 @@
 
 #include "json.h"
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -267,6 +268,14 @@ public:
 
     // check text token IDs and the mapping between media chunks and token ranges
     bool validate(const struct llama_context * ctx) const;
+
+    // [TAG_FN_R41_OWNIDS] put src[s0, s1) in place of tokens [n0, n1) for each run {s0, s1, n0, n1} (ascending, disjoint,
+    // text tokens on both sides); the media chunks after a run move with it. false (nothing changed) when a run is out of
+    // range, out of order or covers a media token
+    bool replace_text_runs(const llama_tokens & src, const std::vector<std::array<size_t, 4>> & runs);
+
+    // [TAG_FN_R41_OWNIDS] the token list as it is (LLAMA_TOKEN_NULL where media sits), read only
+    const llama_tokens & raw_tokens() const { return tokens; }
 
     server_tokens clone() const;
 };
