@@ -10835,6 +10835,75 @@ struct test_qsa_mask : public test_case {
     }
 };
 
+// [TAG_QSA_POOL_RANGE] ggml_kpool_mask: the pool mask rows [row0, row0 + n_rows) of the lightning indexer from one range
+// per query. Ranges: empty, the whole row, at both edges and, with wild, outside the row (the op clamps them). The output
+// is 0 / -inf only, so the comparison is exact (err() counts the elements that differ).
+struct test_kpool_mask : public test_case {
+    const int64_t n_pool;
+    const int64_t n_batch;
+    const int64_t row0;
+    const int64_t n_rows;
+    const bool    wild;
+
+    std::string vars() override {
+        return VARS_TO_STR5(n_pool, n_batch, row0, n_rows, wild);
+    }
+
+    double max_nmse_err() override {
+        return 0.0;
+    }
+
+    double err(const float * a, const float * b, size_t n) override {
+        size_t bad = 0;
+        for (size_t i = 0; i < n; ++i) {
+            bad += !(a[i] == b[i]);
+        }
+        return (double) bad;
+    }
+
+    test_kpool_mask(int64_t n_pool, int64_t n_batch, int64_t row0, int64_t n_rows, bool wild)
+        : n_pool(n_pool), n_batch(n_batch), row0(row0), n_rows(n_rows), wild(wild) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * range = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 2, n_batch);
+        ggml_set_name(range, "range");
+        ggml_tensor * out = ggml_kpool_mask(ctx, range, n_pool, row0, n_rows);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 rng(4321 + (int) n_pool + 7*(int) n_batch + (wild ? 1 : 0));
+        std::vector<int32_t> rg(2*n_batch);
+        for (int64_t i = 0; i < n_batch; ++i) {
+            int32_t p0 = (int32_t) (rng() % (uint64_t) (n_pool + 1));
+            int32_t nv = (int32_t) (rng() % (uint64_t) (n_pool - p0 + 1));
+            switch (rng() % 8) {
+                case 0: nv = 0; break;
+                case 1: p0 = 0; nv = (int32_t) n_pool; break;
+                case 2: p0 = 0; break;
+                case 3: nv = (int32_t) n_pool - p0; break;
+                default: break;
+            }
+            if (wild && i % 5 == 0) {
+                p0 = (int32_t) (rng() % 3 == 0 ? -7 : n_pool + 3);
+                nv = (int32_t) (rng() % 2 == 0 ? -1 : 2*n_pool);
+            } else if (wild && i % 5 == 1) {
+                nv = (int32_t) (2*n_pool);
+            }
+            rg[2*i]     = p0;
+            rg[2*i + 1] = nv;
+        }
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "range") == 0) {
+                ggml_backend_tensor_set(t, rg.data(), 0, ggml_nbytes(t));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // ==== [TAG_TURBO5P512_MMA] split-plane turbo K/V at the real head geometry (begin) ====================================
 // test_flash_attn_ext and test_flash_attn_ext_pos pad the head to the type's block (GGML_PAD(hs, blck)), so their
 // split-plane cases ask for a 512- or 1024-wide head that no FA kernel takes and report "not supported"
@@ -17682,6 +17751,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_qsa_mask(8192,   9,  128, 4, 3000, true,  true));
     test_cases.emplace_back(new test_qsa_mask(8192,   5,  128, 4, 3000, false, false));
     test_cases.emplace_back(new test_qsa_mask(1000,   3,  16,  8, 0,    true,  true));
+
+    // [TAG_QSA_POOL_RANGE] the pool mask from ranges: a whole prompt chunk at the pool counts of a 262K reserve (one and
+    // two sequences) and of a 512K one, a chunk in the middle of a 16K ubatch, small and odd shapes, ranges outside the row
+    for (int64_t n_pool : { 66048, 131584, 262656 }) {
+        test_cases.emplace_back(new test_kpool_mask(n_pool, 512,   0,     512, false));
+        test_cases.emplace_back(new test_kpool_mask(n_pool, 16384, 15872, 512, false));
+    }
+    test_cases.emplace_back(new test_kpool_mask(131584, 300,  0,   300, true));
+    test_cases.emplace_back(new test_kpool_mask(8191,   129,  0,   129, false));
+    test_cases.emplace_back(new test_kpool_mask(8193,   700,  512, 188, true));
+    test_cases.emplace_back(new test_kpool_mask(512,    7,    3,   4,   true));
+    test_cases.emplace_back(new test_kpool_mask(1,      1,    0,   1,   false));
 
     // [TAG_FA_POS_MASK] positional-mask FA in the deployed geometry (head 256, 4 KV heads x 6 query repeats),
     // sequence starting mid-tile inside a unified pool (see test_flash_attn_ext_pos). kv >= 4096 is where the

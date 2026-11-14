@@ -2943,6 +2943,10 @@ struct llama_model_qwen4exp : public llama_model_base {
         };
         static l4qsa_flags l4qsa_read(const llama_model & model);
         l4qsa_flags l4qsa;
+        // [TAG_QSA_POOL_RANGE] LLAMA_QSA_POOL_RANGE=1: graphs of more than qsa_pool_range_min rows take the QSA pool mask as
+        // one range per token, and ggml_kpool_mask makes its rows next to the indexer
+        bool    qsa_pool_range     = false;
+        int64_t qsa_pool_range_min = 128;
 
         // [TAG_FN_L3_GPU_DEFER] nodes the next layer does not read: build_layer_ffn puts them into the graph right after
         // the bridge post, so the device computes them while the host computes the layer's experts

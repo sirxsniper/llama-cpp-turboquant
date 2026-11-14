@@ -672,6 +672,8 @@ extern "C" {
 
         GGML_OP_MOE_HOST_SUM,   // [TAG_FN_R2_BRIDGE_SYNC] appended last so that no existing op value moves
 
+        GGML_OP_KPOOL_MASK,     // [TAG_QSA_POOL_RANGE] appended last so that no existing op value moves
+
         GGML_OP_COUNT,
     };
 
@@ -2976,6 +2978,17 @@ extern "C" {
             struct ggml_tensor  * sel,
             struct ggml_tensor  * live,
             int32_t               group);
+
+    // [TAG_QSA_POOL_RANGE] the pool mask of the lightning indexer for n_rows queries, from one range per query, instead of
+    // an explicit [n_pool, n_batch] mask input:
+    //   range:  I32 [2, n_batch]: the first visible pool and the number of visible pools of each query
+    //   result: F16 [n_pool, n_rows], row r for query row0 + r: 0 at the pools [first, first + count), -INF elsewhere
+    GGML_API struct ggml_tensor * ggml_kpool_mask(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * range,
+            int64_t               n_pool,
+            int64_t               row0,
+            int64_t               n_rows);
 
     // DSA lightning indexer
     //

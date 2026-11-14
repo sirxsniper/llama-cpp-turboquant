@@ -11,7 +11,7 @@ extern "C" {
 #define RPC_PROTO_PATCH_VERSION    0
 
 #ifdef  __cplusplus
-static_assert(GGML_OP_COUNT == 110, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");  // upstream 102 + 8 fork ops (TURBO_WHT, TURBOT_SET_ROWS, GATED_DELTA_NET_REPLAY, MOE_HOST_POST/WAIT/FETCH/SUM, QSA_MASK)
+static_assert(GGML_OP_COUNT == 111, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");  // upstream 102 + 9 fork ops (TURBO_WHT, TURBOT_SET_ROWS, GATED_DELTA_NET_REPLAY, MOE_HOST_POST/WAIT/FETCH/SUM, QSA_MASK, KPOOL_MASK)
 #endif
 
 #define GGML_RPC_MAX_SERVERS       16

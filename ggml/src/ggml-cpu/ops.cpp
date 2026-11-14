@@ -13265,3 +13265,30 @@ void ggml_compute_forward_qsa_mask(const ggml_compute_params * params, ggml_tens
         }
     }
 }
+
+// [TAG_QSA_POOL_RANGE] ggml_kpool_mask: the pool mask rows of the queries [row0, row0 + n_rows) from their ranges. The same
+// bytes as the mask input it replaces: -INF, 0 over the visible pools, -INF. Rows are split over the threads.
+void ggml_compute_forward_kpool_mask(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * range = dst->src[0];
+
+    GGML_ASSERT(dst->type == GGML_TYPE_F16 && range->type == GGML_TYPE_I32);
+    GGML_ASSERT(dst->nb[0] == sizeof(ggml_fp16_t) && range->nb[0] == sizeof(int32_t));
+
+    const int64_t n_pool = dst->ne[0];
+    const int64_t n_rows = dst->ne[1];
+    const int64_t row0   = ggml_get_op_params_i32(dst, 0);
+
+    const ggml_fp16_t ninf = GGML_CPU_FP32_TO_FP16(-INFINITY);
+    const ggml_fp16_t zero = GGML_CPU_FP32_TO_FP16(0.0f);
+
+    for (int64_t ir = params->ith; ir < n_rows; ir += params->nth) {
+        const int32_t * rg = (const int32_t *) ((const char *) range->data + (row0 + ir)*range->nb[1]);
+        const int64_t   p0 = std::min<int64_t>(std::max<int64_t>(rg[0], 0), n_pool);
+        const int64_t   p1 = p0 + std::min<int64_t>(std::max<int64_t>(rg[1], 0), n_pool - p0);
+
+        ggml_fp16_t * row = (ggml_fp16_t *) ((char *) dst->data + ir*dst->nb[1]);
+        std::fill(row,      row + p0,     ninf);
+        std::fill(row + p0, row + p1,     zero);
+        std::fill(row + p1, row + n_pool, ninf);
+    }
+}
