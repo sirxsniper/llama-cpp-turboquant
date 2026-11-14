@@ -4,6 +4,7 @@
 #include "llama-fn-stall.h" // [TAG_FN_L18_FIRSTANS_STALL]
 #include "llama-fn-tier.h"  // [TAG_FN_L18_FIRSTANS_STATE] llama_fn_prefetch_ranges
 #include "llama-moe-decay.h" // [TAG_FN_R4_ADAPT_DECAY]
+#include "llama-fn-r41b.h"    // [TAG_FN_R41_STATEKEY] [TAG_FN_R41_STATEMERGE]
 #include "llama-moe-bridge.h" // [TAG_FN_L3_HOST_QUIET]
 #include "llama-fn-l22.h"     // [TAG_FN_L22_P4] pins, PASSLOG
 #include "llama-fn-vguard.h"  // [TAG_R40_VGUARD] LLAMA_R40_VGUARD_CHECK
@@ -137,6 +138,9 @@ struct layer_state {
     // [TAG_FN_L22_LENDCLASS] slot_expert names an expert whose bytes never reached the slot (an upload dropped while the
     // layer was out keeps its expert for the next refill): a restore that skips intact slots must refill these
     std::vector<uint8_t>              slot_dirty;
+
+    // [TAG_FN_R41_STATEMERGE] the decode steps of this run that routed each expert (since the stored state was read)
+    std::vector<uint32_t>             r41_routed;
 };
 
 // [TAG_FN_L3_POLICY_POOL] one dynamic slot pool per expert shape class (LLAMA_MOE_HOT_POOL=1): any layer of the class can
@@ -266,6 +270,19 @@ struct moe_cache {
     uint64_t    st_every  = 0;
     uint64_t    st_saves  = 0;
     bool        st_load   = true;
+
+    // [TAG_FN_R41_STATEKEY] st_path is the weights' key (LLAMA_FN_R41_STATEKEY): the file's names, the old states' keys
+    bool                     r41_keyed = false;
+    std::vector<std::string> r41_names;
+    // [TAG_FN_R41_STATEMERGE] LLAMA_FN_R41_STATEMERGE: the horizon in decode steps (0: the run's set replaces the file); the
+    // stored state as this run read it, the file as this run last read or wrote it, ad_steps at that read
+    uint64_t                 r41_merge     = 0;
+    bool                     r41_base_read = false;
+    fn_r41b::state_file      r41_base;
+    std::string              r41_known_header;
+    int64_t                  r41_known_size = -1;
+    uint64_t                 r41_n0        = 0;
+    bool                     r41_prev      = false; // <state>.prev holds the generation before this run's first write
 
     // [TAG_FN_L3_POLICY_UPLOAD] two small pinned halves (one fills while the other uploads) and a per-step byte bucket
     bool                  up_pipe     = false;
@@ -515,7 +532,9 @@ moe_cache * g_cache = nullptr;
 void hot_adapt_step(moe_cache * mc); // [TAG_FN_MOE_HOT_ADAPT]
 void hot_state_save(moe_cache * mc); // [TAG_FN_L3_POLICY_STATE]
 void hot_state_load(moe_cache * mc);
-std::string hot_state_cache_path(const std::string & model_path); // [TAG_FN_L18_FIRSTANS_STATE]
+void hot_state_prepare(moe_cache * mc); // [TAG_FN_R41_STATEKEY] [TAG_FN_R41_STATEMERGE]
+std::string hot_state_cache_path(const std::string & model_path, bool key = false, const std::string & model_name = "",
+        std::vector<std::string> * names = nullptr, bool * keyed = nullptr); // [TAG_FN_L18_FIRSTANS_STATE]
 void hot_turn_join(moe_cache * mc, bool wait = true); // [TAG_FN_L18_FIRSTANS_OVERLAP]
 void hot_state_queue(moe_cache * mc); // [TAG_FN_L18_FIRSTANS_STATE]
 std::mutex g_init_mtx;
@@ -2025,6 +2044,13 @@ void hot_adapt_step_impl(moe_cache * mc) {
                 if (!ls.dcnt.empty()) {
                     llama_moe_decay_count(ls.dcnt, ls.cur_ids.data(), (int64_t) ls.cur_ids.size());
                 }
+                if (!ls.r41_routed.empty()) { // [TAG_FN_R41_STATEMERGE] what the run learned, for the save's merge
+                    for (const int32_t e : ls.cur_ids) {
+                        if (e >= 0 && (size_t) e < ls.r41_routed.size()) {
+                            ls.r41_routed[e]++;
+                        }
+                    }
+                }
                 for (const int32_t e : ls.cur_ids) {
                     ls.cur_seen[e] = 0;
                 }
@@ -2403,8 +2429,13 @@ void hot_adapt_init(moe_cache * mc, const llama_model & model, const void * owne
             const std::string mpath = model.fn_auto ? model.fn_auto->model_path : std::string();
             mc->st_path = strcmp(e, "auto") == 0 ? (mpath.empty() ? std::string() : mpath + ".hotstate") : std::string(e);
             if (strcmp(e, "cache") == 0) { // [TAG_FN_L18_FIRSTANS_STATE] the user's cache folder, one file per model file
-                mc->st_path = mpath.empty() ? std::string() : hot_state_cache_path(mpath);
+                // [TAG_FN_R41_STATEKEY] LLAMA_FN_R41_STATEKEY=1: one file per weights file (its hard links share it)
+                const bool key = llama_fn_l3_flag(model, "LLAMA_FN_R41_STATEKEY");
+                mc->st_path = mpath.empty() ? std::string() : hot_state_cache_path(mpath, key, model.name, &mc->r41_names,
+                        &mc->r41_keyed);
             }
+            // [TAG_FN_R41_STATEMERGE] LLAMA_FN_R41_STATEMERGE=<H>: a save merges the run into the stored state (0: v0.33.0)
+            mc->r41_merge = (uint64_t) std::max(0, llama_fn_l3_int(model, "LLAMA_FN_R41_STATEMERGE", 0));
             if (mc->st_path.empty()) {
                 LLAMA_LOG_WARN("moe-hot: [TAG_FN_L3_POLICY_STATE] LLAMA_MOE_HOT_STATE=auto needs the model path (the qwen4exp "
                         "profile keeps it) - no saved state; give a file name\n");
@@ -3929,6 +3960,7 @@ bool llama_moe_hot_init(const llama_model & model, const void * owner, size_t bu
         if (adapt_req) {
             hot_adapt_init(mc, model, owner, groups.size() == 1 ? ggml_backend_buft_get_device(groups.begin()->first) : nullptr);
             if (mc->adapt) {
+                hot_state_prepare(mc); // [TAG_FN_R41_STATEKEY] the old names' best state adopted, [TAG_FN_R41_STATEMERGE] read
                 hot_state_load(mc); // [TAG_FN_L3_POLICY_STATE] LLAMA_MOE_HOT_STATE: the saved residents into the empty slots
             }
         }
@@ -5423,7 +5455,10 @@ size_t hot_layer_bytes(const layer_state & ls) {
 // [TAG_FN_L18_FIRSTANS_STATE] LLAMA_MOE_HOT_STATE=cache: <LLAMA_CACHE, else %LOCALAPPDATA%\llama.cpp (Windows) or
 // $XDG_CACHE_HOME/llama.cpp or ~/.cache/llama.cpp>/hotstate/<model file name>.hotstate - one file per model file, nothing
 // written next to the model; the folder is made when missing ("" when there is no such folder)
-std::string hot_state_cache_path(const std::string & model_path) {
+// [TAG_FN_R41_STATEKEY] key: <model name>-<volume>-<file index>.hotstate, one file per weights file (*names: the file names
+// of its hard links, *keyed: true); the file name as before when the identity cannot be read
+std::string hot_state_cache_path(const std::string & model_path, bool key, const std::string & model_name,
+        std::vector<std::string> * names, bool * keyed) {
     namespace fs = std::filesystem;
     fs::path dir;
     if (const char * c = getenv("LLAMA_CACHE"); c && c[0]) {
@@ -5453,7 +5488,164 @@ std::string hot_state_cache_path(const std::string & model_path) {
                 ec.message().c_str());
         return std::string();
     }
+    if (key) {
+        const fn_r41b::file_id id = fn_r41b::file_identity(model_path);
+        if (id.ok) {
+            if (names) {
+                *names = fn_r41b::link_names(model_path);
+            }
+            if (keyed) {
+                *keyed = true;
+            }
+            return (dir / fs::u8path(fn_r41b::key_name(model_name, id))).u8string();
+        }
+        LLAMA_LOG_WARN("moe-hot: [TAG_FN_R41_STATEKEY] the identity of %s cannot be read: the learned set stays keyed by the file "
+                "name\n", model_path.c_str());
+    }
     return (dir / (fs::u8path(model_path).filename().u8string() + ".hotstate")).u8string();
+}
+
+// [TAG_FN_R41_STATEMERGE] the stored state as this run reads it (the base of every save's merge); the file's header and
+// size are what a later save compares with to see another writer
+void hot_state_base(moe_cache * mc, int64_t n_exp) {
+    mc->r41_base         = fn_r41b::read_state(mc->st_path, n_exp, mc->st_model);
+    mc->r41_base_read    = true;
+    mc->r41_known_header = mc->r41_base.header;
+    mc->r41_known_size   = mc->r41_base.size;
+    mc->r41_n0           = mc->ad_steps;
+    for (auto & ls : mc->layers) {
+        ls.r41_routed.assign((size_t) n_exp, 0);
+    }
+    if (!mc->r41_base.ok && mc->r41_base.size >= 0) {
+        LLAMA_LOG_WARN("moe-hot: [TAG_FN_R41_STATEMERGE] %s holds no usable state (%s): the first save keeps it as %s.prev\n",
+                mc->st_path.c_str(), mc->r41_base.why.c_str(), mc->st_path.c_str());
+    }
+}
+
+// [TAG_FN_R41_STATEKEY] the first load under the weights' key: the best state among the file's old names and the keys of
+// earlier files of the same model name (the one learned over the most decode steps) is copied to the key; the old files
+// stay as they are
+void hot_state_adopt(moe_cache * mc, int64_t n_exp) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    if (fs::exists(fs::u8path(mc->st_path), ec)) {
+        LLAMA_LOG_WARN("moe-hot: [TAG_FN_R41_STATEKEY] the learned set of these weights: %s (%zu names are hard links of the "
+                "file)\n", mc->st_path.c_str(), mc->r41_names.size());
+        return;
+    }
+    const std::string dir   = fs::u8path(mc->st_path).parent_path().u8string();
+    std::vector<std::string> names = mc->r41_names;
+    for (const auto & k : fn_r41b::key_peers(dir, mc->st_path)) {
+        names.push_back(k); // a key of an earlier file of this name (another identity)
+    }
+    std::vector<size_t> layer_bytes; // a state of another quantization of the model is not adopted (the load skips it)
+    for (const auto & ls : mc->layers) {
+        if (ls.pub.il >= 0) {
+            layer_bytes.resize(std::max(layer_bytes.size(), (size_t) ls.pub.il + 1), 0);
+            layer_bytes[(size_t) ls.pub.il] = hot_layer_bytes(ls);
+        }
+    }
+    const auto        cands = fn_r41b::adopt_scan(dir, names, n_exp, mc->st_model, &layer_bytes);
+    const int         best  = fn_r41b::adopt_pick(cands);
+    std::string seen;
+    for (const auto & c : cands) {
+        seen += format("%s%s (%s)", seen.empty() ? "" : ", ", fs::u8path(c.path).filename().u8string().c_str(),
+                c.ok ? format("%llu steps, %zu residents", (unsigned long long) c.learned, c.n_res).c_str() : c.why.c_str());
+    }
+    if (best < 0) {
+        LLAMA_LOG_WARN("moe-hot: [TAG_FN_R41_STATEKEY] the learned set of these weights: %s, new (no usable state under the "
+                "file's %zu names and %zu earlier keys%s%s)\n", mc->st_path.c_str(), mc->r41_names.size(),
+                names.size() - mc->r41_names.size(), seen.empty() ? "" : ": ", seen.c_str());
+        return;
+    }
+    std::string text, err;
+    if (!fn_r41b::read_all(cands[(size_t) best].path, text) || !fn_r41b::write_atomic(mc->st_path, text, err)) {
+        LLAMA_LOG_WARN("moe-hot: [TAG_FN_R41_STATEKEY] cannot copy %s to %s (%s): the set starts empty\n",
+                cands[(size_t) best].path.c_str(), mc->st_path.c_str(), err.c_str());
+        return;
+    }
+    LLAMA_LOG_WARN("moe-hot: [TAG_FN_R41_STATEKEY] the learned set of these weights: %s, adopted from %s (the most decode "
+            "steps of the file's %zu names and %zu earlier keys: %s; the old files stay)\n", mc->st_path.c_str(),
+            fs::u8path(cands[(size_t) best].path).filename().u8string().c_str(), mc->r41_names.size(),
+            names.size() - mc->r41_names.size(), seen.c_str());
+}
+
+void hot_state_prepare(moe_cache * mc) {
+    if (mc->st_path.empty() || mc->layers.empty() || !mc->dc_on) {
+        return;
+    }
+    const int64_t n_exp = mc->layers.front().pub.host_table->ne[1];
+    if (mc->r41_keyed) {
+        hot_state_adopt(mc, n_exp);
+    }
+    if (mc->r41_merge > 0) {
+        hot_state_base(mc, n_exp);
+    }
+}
+
+// [TAG_FN_R41_STATEMERGE] the save with LLAMA_FN_R41_STATEMERGE: the run's set and its routing over the run, merged into the
+// stored state read at the start with the weight n / (n + min(L, H)); the stored file stays as <state>.prev at this run's
+// first write; a run without a decode step writes nothing
+void hot_state_save_r41(moe_cache * mc) {
+    const int64_t n_exp = mc->layers.front().pub.host_table->ne[1];
+    if (!mc->r41_base_read) {
+        hot_state_base(mc, n_exp);
+    }
+    int64_t size = -1;
+    const std::string hdr = fn_r41b::read_header(mc->st_path, &size);
+    if (hdr != mc->r41_known_header || size != mc->r41_known_size) {
+        // another writer replaced the file since this run read or wrote it (a second engine on these weights): its state
+        // is the stored state now; this run's steps before it are not merged (they may be in it already)
+        LLAMA_LOG_WARN("moe-hot: [TAG_FN_R41_STATEMERGE] %s changed since this run read it (another engine on these weights?): "
+                "its state is the stored one now, the %llu decode steps of this run before it are left out\n",
+                mc->st_path.c_str(), (unsigned long long) (mc->ad_steps - mc->r41_n0));
+        hot_state_base(mc, n_exp);
+        mc->r41_prev = false;
+    }
+    const uint64_t n = mc->ad_steps - mc->r41_n0;
+    if (n == 0) {
+        return; // nothing learned: the stored state stays as it is
+    }
+    const fn_r41b::state_file & B = mc->r41_base;
+    std::vector<llama_moe_hotstate_layer> run;
+    for (const auto & ls : mc->layers) {
+        llama_moe_hotstate_layer l;
+        l.il    = ls.pub.il;
+        l.bytes = hot_layer_bytes(ls);
+        for (int32_t s = 0; s < ls.pub.n_slots; ++s) {
+            if (ls.slot_expert[s] >= 0) {
+                l.res.push_back(ls.slot_expert[s]);
+            }
+        }
+        std::stable_sort(l.res.begin(), l.res.end(), [&](int32_t a, int32_t b) { return ls.dcnt[a] > ls.dcnt[b]; });
+        fn_r41b::run_profile(ls.r41_routed, n, mc->dc.every, mc->dc.decay, l.cnt);
+        l.cnt.resize((size_t) n_exp, 0.0f);
+        run.push_back(std::move(l));
+    }
+    const double w = fn_r41b::merge_weight(n, B.ok, B.meta.learned, mc->r41_merge);
+    std::vector<llama_moe_hotstate_layer> out;
+    fn_r41b::merge_layers(B.ok ? B.layers : std::vector<llama_moe_hotstate_layer>(), run, w, out);
+    const uint64_t    learned = (B.ok ? B.meta.learned : 0) + n;
+    const std::string text    = fn_r41b::format(n_exp, learned, fn_r41b::new_gen(), mc->st_model, out);
+    std::string err;
+    if (!mc->r41_prev) {
+        (void) fn_r41b::keep_prev(mc->st_path, err); // no file yet: nothing to keep
+        mc->r41_prev = true;
+    }
+    if (!fn_r41b::write_atomic(mc->st_path, text, err)) {
+        LLAMA_LOG_WARN("moe-hot: [TAG_FN_R41_STATEMERGE] %s: the stored state stays as it was\n", err.c_str());
+        return;
+    }
+    mc->r41_known_header = text.substr(0, text.find('\n'));
+    mc->r41_known_size   = (int64_t) text.size();
+    size_t n_res = 0, n_kept = 0, n_base = 0;
+    fn_r41b::merge_counts(B.ok ? B.layers : std::vector<llama_moe_hotstate_layer>(), out, n_res, n_kept, n_base);
+    if (mc->st_saves++ < 3 || mc->st_saves % 64 == 0) {
+        LLAMA_LOG_WARN("moe-hot: [TAG_FN_R41_STATEMERGE] saved %s: %zu residents in %zu layers, %zu of the stored %zu kept; this "
+                "run's %llu decode steps merged with the weight %.4f into a state of %llu steps (now %llu)\n",
+                mc->st_path.c_str(), n_res, out.size(), n_kept, n_base, (unsigned long long) n, w,
+                (unsigned long long) (B.ok ? B.meta.learned : 0), (unsigned long long) learned);
+    }
 }
 
 // [TAG_FN_L18_FIRSTANS_STATE] the saved residents' uploads into the worker's queue (their pages are in by now); a layer or slot
@@ -5494,6 +5686,10 @@ void hot_state_queue(moe_cache * mc) {
 // the file format is llama_moe_hotstate_format / _parse (llama-moe-decay.h, tests/test-moe-decay.cpp)
 void hot_state_save(moe_cache * mc) {
     if (mc->st_path.empty() || mc->layers.empty() || !mc->dc_on) {
+        return;
+    }
+    if (mc->r41_merge > 0) {
+        hot_state_save_r41(mc); // [TAG_FN_R41_STATEMERGE]
         return;
     }
     const int64_t n_exp = mc->layers.front().pub.host_table->ne[1];
@@ -5544,8 +5740,13 @@ void hot_state_load(moe_cache * mc) {
     if (mc->st_path.empty() || !mc->st_load || !mc->dc_on || mc->layers.empty() || !mc->tbl_all) {
         return;
     }
-    std::ifstream f(mc->st_path);
-    if (!f) {
+    // [TAG_FN_R41_STATEMERGE] the stored state hot_state_prepare read (the base of the saves) is the one loaded
+    const bool r41 = mc->r41_base_read;
+    std::ifstream f;
+    if (!r41) {
+        f.open(mc->st_path);
+    }
+    if (r41 ? mc->r41_base.size < 0 : !f) {
         LLAMA_LOG_INFO("moe-hot: [TAG_FN_L3_POLICY_STATE] no saved state %s yet - the set starts empty\n", mc->st_path.c_str());
         return;
     }
@@ -5555,7 +5756,15 @@ void hot_state_load(moe_cache * mc) {
     uint64_t steps = 0;
     std::string why;
     size_t n_bad = 0;
-    if (!llama_moe_hotstate_parse(f, n_exp, mc->st_model, saved, steps, why, &n_bad)) {
+    if (r41) {
+        if (!mc->r41_base.ok) {
+            LLAMA_LOG_WARN("moe-hot: [TAG_FN_L3_POLICY_STATE] %s not used: %s\n", mc->st_path.c_str(), mc->r41_base.why.c_str());
+            return;
+        }
+        saved = mc->r41_base.layers;
+        steps = mc->r41_base.meta.learned;
+        n_bad = mc->r41_base.n_bad;
+    } else if (!llama_moe_hotstate_parse(f, n_exp, mc->st_model, saved, steps, why, &n_bad)) {
         LLAMA_LOG_WARN("moe-hot: [TAG_FN_L3_POLICY_STATE] %s not used: %s\n", mc->st_path.c_str(), why.c_str());
         return;
     }

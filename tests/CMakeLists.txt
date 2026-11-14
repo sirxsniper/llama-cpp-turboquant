@@ -500,6 +500,11 @@ endif()
 # LLAMA_FN_R41_SLOWJOB, the free-RAM floor's gate, the priority raise (on Windows this process's own). CPU only, no model.
 llama_build_and_test(test-fn-r41.cpp)
 
+# [TAG_FN_R41B] round 41's hot-set state and answer-start rules (src/llama-fn-r41b.h, header only): the merge of a run into
+# the stored state, its files, the weights' key and the adoption of an old state; on Windows the page priority rules of
+# LLAMA_FN_R41_PASSPRIO on this system. CPU only, no model.
+llama_build_and_test(test-fn-r41b.cpp)
+
 # [TAG_FN_L19_CONVSTORE] the policy of the agent conversation store (tools/server/server-convstore.h, header only): the
 # checkpoint a full ring drops, the eviction value of a stored conversation, the thinning on disk. CPU only, no model.
 llama_build_and_test(test-fn-convstore.cpp)
