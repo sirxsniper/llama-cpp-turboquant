@@ -343,8 +343,10 @@ void llama_model_saver::add_kv_from_model() {
         if (n_all > 0 && all_same) {
             add_kv(LLM_KV_ATTENTION_RECURRENT_LAYERS, hparams.is_recr_impl[0]);
         } else if (n_all > 0) {
+            // GGUF bools are one byte, is_recr_impl holds uint32_t
+            const std::vector<int8_t> is_recr(hparams.is_recr_impl.begin(), hparams.is_recr_impl.begin() + n_all);
             gguf_set_arr_data(gguf_ctx, llm_kv(LLM_KV_ATTENTION_RECURRENT_LAYERS).c_str(), GGUF_TYPE_BOOL,
-                    hparams.is_recr_impl.data(), n_all);
+                    is_recr.data(), n_all);
         }
     }
     add_kv(LLM_KV_ATTENTION_OUTPUT_GROUP_COUNT,      hparams.dsv4_o_group_count);

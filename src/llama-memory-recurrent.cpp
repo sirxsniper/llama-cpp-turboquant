@@ -448,6 +448,8 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
             // invalidate tails which will be cleared
             if (p0 <= cell.pos && cell.pos < p1) {
                 tail_id = -1;
+                // [TAG_RS_IDX_SHARE] the whole sequence goes (p0 == 0 here), so does its pending rollback
+                set_rs_idx(seq_id, 0);
             }
         }
     } else {
@@ -527,11 +529,20 @@ void llama_memory_recurrent::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id
             cell_src.seq_id.insert(seq_id_dst);
             tail_dst.tail = tail_src.tail;
         }
+        // [TAG_RS_IDX_SHARE] dst continues from src's state, a pending rollback of src included (none without a cell)
+        set_rs_idx(seq_id_dst, tail_src.tail >= 0 ? rs_idx[seq_id_src] : 0);
     }
 }
 
 void llama_memory_recurrent::seq_keep(llama_seq_id seq_id) {
     uint32_t new_head = size;
+
+    // [TAG_RS_IDX_SHARE] a dropped sequence loses its pending rollback, as in seq_rm(s, -1, -1)
+    for (llama_seq_id s = 0; s < (llama_seq_id) n_seq_max; ++s) {
+        if (s != seq_id) {
+            set_rs_idx(s, 0);
+        }
+    }
 
     for (uint32_t i = 0; i < size; ++i) {
         if ((llama_seq_id) i != seq_id) {
@@ -1807,8 +1818,13 @@ int32_t llama_memory_recurrent_context::s_copy(int i) const {
         const llama_seq_id seq = *mem->cells[cell_idx].seq_id.begin();
         if (seq >= 0 && (size_t) seq < mem->rs_idx.size()) {
             idx = mem->rs_idx[seq];
-            // reset rollback idx
-            mem->rs_idx[seq] = 0;
+        }
+        // reset rollback idx
+        // [TAG_RS_IDX_SHARE] of every sharer: they agree on it, and after this ubatch none of them may read it again
+        for (const llama_seq_id s : mem->cells[cell_idx].seq_id) {
+            if (s >= 0 && (size_t) s < mem->rs_idx.size()) {
+                mem->rs_idx[s] = 0;
+            }
         }
     }
 

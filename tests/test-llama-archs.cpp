@@ -185,6 +185,7 @@ static void usage(char ** argv) {
     LOG("  --mtp                    Test the in-model MTP head instead (archs with an MTP fixture: qwen4exp); with -o: save it as <arch>-mtp.gguf\n");
     LOG("  --kv-shift               Check K-shift against a decode at the shifted positions (CPU only)\n");
     LOG("  --kv-park                Check an attention-only park / restore / move-down against no park (CPU only)\n");
+    LOG("  --recr-layers            Check the saved per-layer recurrent flags of 3-layer hybrid models (CPU only)\n");
     LOG("  -h, --help               Show this help message\n\n");
     LOG("Examples:\n");
     LOG("  %s\n", argv[0]);
@@ -2600,6 +2601,113 @@ static int test_kv_park(const std::string & arch_filter, const size_t seed, cons
     return n_failed == 0 ? 0 : 1;
 }
 
+// the saver writes the per-layer recurrent flags as GGUF bools (one byte each): a 3-layer model with full attention
+// interval 2 is [true, false, true] in the file and loads again. Archs whose loader reads the key back.
+static int test_recr_layers(const std::string & arch_filter, const size_t seed, const float stdev, const int verbosity) {
+    struct user_data_t {
+        struct {
+            ggml_log_callback callback;
+            void * user_data;
+        } log_old;
+
+        int verbosity;
+
+        user_data_t(int verbosity) : verbosity(verbosity) {
+            llama_log_get(&log_old.callback, &log_old.user_data);
+        }
+    };
+    user_data_t ud(verbosity);
+
+    llama_log_set([](ggml_log_level level, const char * text, void * user_data) {
+        const user_data_t * ud = (const user_data_t *) user_data;
+        int verbosity = common_log_get_verbosity(level);
+        if (verbosity <= ud->verbosity) {
+            ud->log_old.callback(level, text, ud->log_old.user_data);
+        }
+    }, &ud);
+
+    const llm_arch archs[] = {
+        LLM_ARCH_QWEN35, LLM_ARCH_QWEN35MOE, LLM_ARCH_QWEN3NEXT, LLM_ARCH_QWEN4EXP, LLM_ARCH_CLOVER_MOE, LLM_ARCH_MINIMAX_01,
+    };
+    const uint32_t n_layer = 3;
+
+    size_t n_tests  = 0;
+    size_t n_failed = 0;
+    for (const llm_arch arch : archs) {
+        if (!arch_matches(arch_filter, arch) || !llama_arch_supports_save(arch) || !arch_supported(arch)) {
+            continue;
+        }
+        for (bool moe : {false, true}) {
+            if (moe && !moe_implemented(arch)) {
+                continue;
+            }
+            if (!moe && moe_mandatory(arch)) {
+                continue;
+            }
+            n_tests++;
+
+            std::string expected;
+            for (uint32_t il = 0; il < n_layer; il++) {
+                expected += (il + 1) % 2 != 0 ? "1" : "0";
+            }
+            std::string saved;
+            std::string reload = "no";
+
+            const std::string path = get_tmp_gguf_path();
+            try {
+                gguf_context_ptr gguf_ctx = get_gguf_ctx(arch, moe, n_layer);
+                llama_model_ptr model = get_model(gguf_ctx.get(), nullptr, seed, stdev, {});
+                llama_model_save_to_file(model.get(), path.c_str());
+                model.reset();
+
+                gguf_init_params params = { /*no_alloc =*/ true, /*ctx =*/ nullptr };
+                gguf_context_ptr file_ctx(gguf_init_from_file(path.c_str(), params));
+                const std::string key = llama_arch_kv_name(arch, LLM_KV_ATTENTION_RECURRENT_LAYERS);
+                const int64_t kid = file_ctx ? gguf_find_key(file_ctx.get(), key.c_str()) : -1;
+                if (kid >= 0 && gguf_get_kv_type(file_ctx.get(), kid) == GGUF_TYPE_ARRAY &&
+                        gguf_get_arr_type(file_ctx.get(), kid) == GGUF_TYPE_BOOL) {
+                    const int8_t * data = (const int8_t *) gguf_get_arr_data(file_ctx.get(), kid);
+                    for (size_t i = 0; i < gguf_get_arr_n(file_ctx.get(), kid); i++) {
+                        saved += data[i] != 0 ? "1" : "0";
+                    }
+                }
+
+                FILE * file = fopen(path.c_str(), "rb");
+                if (file != nullptr) {
+                    try {
+                        get_model(nullptr, file, seed, stdev, {});
+                        reload = "yes";
+                    } catch (const std::exception & err) {
+                        reload = std::string("no (") + err.what() + ")";
+                    }
+                    fclose(file);
+                }
+            } catch (const std::exception & err) {
+                reload = std::string("no (") + err.what() + ")";
+            }
+            std::filesystem::remove(path);
+
+            const bool ok = saved == expected && reload == "yes";
+            if (!ok) {
+                n_failed++;
+            }
+            LOG("%s %s: recurrent_layers [%s], expected [%s], reload %s: %s\n", llama_arch_name(arch), moe ? "MoE" : "dense",
+                saved.c_str(), expected.c_str(), reload.c_str(), ok ? "\033[1;32mOK\033[0m" : "\033[1;31mFAIL\033[0m");
+        }
+    }
+
+    if (n_tests == 0) {
+        LOG("Summary: no tests executed\n");
+    } else if (n_failed == 0) {
+        LOG("Summary: all %zu test(s) passed\n", n_tests);
+    } else {
+        LOG("Summary: %zu test(s) executed, %zu failed\n", n_tests, n_failed);
+    }
+
+    llama_log_set(ud.log_old.callback, ud.log_old.user_data);
+    return n_failed == 0 ? 0 : 1;
+}
+
 int main(int argc, char ** argv) {
     // init the logger at max verbosity. filter with a custom callback respecting the user-configure verbosity
     common_log_set_verbosity_thold(LOG_LEVEL_DEBUG);
@@ -2615,6 +2723,7 @@ int main(int argc, char ** argv) {
     const char * target_backend = nullptr;
     bool kv_shift = false;
     bool kv_park  = false; // [TAG_R40_NP2KVPARK]
+    bool recr_layers = false;
 
     int verbosity = LOG_LEVEL_ERROR;
     bool mtp = false;
@@ -2689,6 +2798,8 @@ int main(int argc, char ** argv) {
             kv_shift = true;
         } else if (strcmp(argv[i], "--kv-park") == 0) {
             kv_park = true; // [TAG_R40_NP2KVPARK]
+        } else if (strcmp(argv[i], "--recr-layers") == 0) {
+            recr_layers = true;
         } else {
             LOG_ERR("%s: unknown argument: %s\n", __func__, argv[i]);
             usage(argv);
@@ -2715,6 +2826,9 @@ int main(int argc, char ** argv) {
         }
         if (kv_park) {
             return test_kv_park(arch_filter, seed, stdev, verbosity);
+        }
+        if (recr_layers) {
+            return test_recr_layers(arch_filter, seed, stdev, verbosity);
         }
         return test_backends(arch_filter, seed, stdev, verbosity, target_backend);
     } catch (const std::exception & err) {

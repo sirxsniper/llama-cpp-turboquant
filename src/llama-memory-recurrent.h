@@ -164,6 +164,11 @@ public:
     uint32_t n_rs_seq = 0;
 
     // per-seq rollback index
+    // [TAG_RS_IDX_SHARE] rs_idx[s] != 0 means: the cell of s still holds the state before the rollback in group 0.
+    //   seq_cp gives dst the index of src (0 when src has no cell), seq_rm of the whole sequence and seq_keep reset it when
+    //   they drop the tail of s, and s_copy consumes it for every sharer of the cell. find_slot's branch for tokens with
+    //   several sequence ids drops the tail of the other ids without a reset; s_copy clears their index in that ubatch,
+    //   since they then share the cell of the first id.
     std::vector<uint32_t> rs_idx;
 
     void set_rs_idx(llama_seq_id seq_id, uint32_t idx);
