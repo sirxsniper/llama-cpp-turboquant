@@ -164,7 +164,7 @@ static void test_profile_opts() {
            find_opt(tdma, "LLAMA_MOE_BRIDGE_PF") == nullptr && find_opt(tdma, "LLAMA_MOE_BRIDGE_PF_SOLO") == nullptr,
            "trial-dma has no bridge (and none of its switches)");
     TCHECK(find_opt(tdma, "LLAMA_MOE_DMA_SHARE") && find_opt(tdma, "LLAMA_MOE_DMA_SHARE")->value == "auto", "trial-dma DMA share");
-    TCHECK(find_opt(tdma, "GGML_CPU_MOE_FUSE") != nullptr && tdma.size() == safe.size() - 15 - 3, "trial-dma keeps the rest"); // [TAG_FN_L22] - the 3 round 22 pool rows // [TAG_FN_L4_ADOPT] + POOLBAR, PFDEV, [TAG_FN_L9_ADOPT] HINTTOPK (bridge only)
+    TCHECK(find_opt(tdma, "GGML_CPU_MOE_FUSE") != nullptr && tdma.size() == safe.size() - 15 - 3 - 1, "trial-dma keeps the rest"); // [TAG_FN_L22] - the 3 round 22 pool rows // [TAG_FN_L4_ADOPT] + POOLBAR, PFDEV, [TAG_FN_L9_ADOPT] HINTTOPK (bridge only) // [TAG_FN_R41_SLOWJOB] - its bridge row
 
     // safe ignores LLAMA_FLASHNEXT_FAST
     const auto safe_c = llama_fn_profile_opts(LLAMA_FN_PROFILE_SAFE, "GGML_CPU_MOE_FUSE=0,LLAMA_FN_TEST_X=1");
@@ -301,6 +301,12 @@ static const l22_row k_l22_rows[] = {
     { "GGML_CUDA_R35_POKE1", "1", false }, // [TAG_R35_HOSTCHAIN]
     { "LLAMA_FN_DRAFTFIT", "1", false }, // [TAG_FN_DRAFTFIT] on by default from v0.33.0
     { "LLAMA_QSA_POOL_RANGE", "1", false }, // [TAG_QSA_POOL_RANGE] on by default from v0.33.0
+    { "LLAMA_FN_R41_SLOWJOB", "0", true }, // [TAG_FN_R41_SLOWJOB] off (v0.33.0) until the GPU plan measures it
+    { "LLAMA_FN_R41_FLOOR_MIB", "0", false }, // [TAG_FN_R41_FLOOR] off (v0.33.0) until the GPU plan measures it
+    { "LLAMA_FN_R41_PRIO", "0", false }, // [TAG_FN_R41_PRIO] off (v0.33.0) until the GPU plan measures it
+    { "LLAMA_FN_R41_STATEKEY", "0", false }, // [TAG_FN_R41_STATEKEY] off (v0.33.0) until the GPU state turn runs it
+    { "LLAMA_FN_R41_STATEMERGE", "0", false }, // [TAG_FN_R41_STATEMERGE] off (v0.33.0) until the GPU state turn runs it
+    { "LLAMA_FN_R41_PASSPRIO", "0", false }, // [TAG_FN_R41_PASSPRIO] off (v0.33.0) until the GPU arm measures it
 };
 static const size_t k_n_l22_rows = sizeof(k_l22_rows)/sizeof(k_l22_rows[0]);
 const size_t k_n_l22_rows_decl = k_n_l22_rows;
