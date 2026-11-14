@@ -273,24 +273,39 @@ static void test_stops() {
                 "bytes differ: expected a partial match with runs, stop bytes (i_b %zu of %zu, k %zu, stop %d)", r.i_b, S.size(), r.k, r.stop);
         printf("  %-44s token match %zu -> %zu of %zu, stop %d\n", "bytes differ after the split", r.k, r.i_b, S.size(), r.stop);
     }
-    // the model wrote <tool_call> as plain pieces: the next prompt has the special token there, the walk stops before it
-    {
+    // the model wrote a tag as plain pieces where the next prompt has the special token: the walk stops right before it.
+    // Whether a tag is a special token depends on the vocabulary: in the Flash-Next GGUF <tool_call> is user-defined (type 4)
+    // and <|im_start|> is control (type 3); the 151,936-token models/ggml-vocab-qwen35.gguf has no <tool_call> token at all
+    // (both sides then hold the same plain bytes there and the walk rightly goes through). So the expectation follows the
+    // vocabulary: a stop when the tag tokenizes to one special token, else the whole slot.
+    for (const auto & tag : std::vector<std::vector<std::string>>{ { "<", "tool", "_call", ">" }, { "<", "|", "im", "_start", "|", ">" } }) {
+        const std::string text = join(tag);
+        const auto one = tok(text);
+        const bool is_special = one.size() == 1 && g_V->special[one[0]];
         std::vector<llama_token> S = tok(k_prompt);
         const auto A1 = pieces_ids({ "Call", " p", "==", "='", "\n</think>\n\n" });
-        // plain text pieces (tokenizing "<tool_call>" with parse_special off still gives the user-defined token: llama.cpp skips
-        // only control and unknown tokens then)
-        const auto A2 = pieces_ids({ "<", "tool", "_call", ">" });
-        const auto A3 = tok("\n<function=x>\n</function>\n</tool_call>");
+        // plain text pieces, each tokenized alone (tokenizing the whole tag with parse_special off would still give a
+        // user-defined token: llama.cpp skips only control and unknown tokens then)
+        const auto A2 = pieces_ids(tag);
+        const auto A3 = tok("\n<function=x>\n</function>\n");
         S.insert(S.end(), A1.begin(), A1.end());
         const size_t at = S.size();
         S.insert(S.end(), A2.begin(), A2.end());
         S.insert(S.end(), A3.begin(), A3.end());
-        const std::vector<llama_token> N = tok(k_prompt + "Call p==='\n</think>\n\n<tool_call>\n<function=x>\n</function>\n</tool_call>" + k_next);
+        const std::vector<llama_token> N = tok(k_prompt + "Call p==='\n</think>\n\n" + text + "\n<function=x>\n</function>\n" + k_next);
         const auto r = common_ownids_walk(*g_V, S, N);
-        check_result("plain <tool_call>", S, N, r);
-        CHECK(r.stop == COMMON_OWNIDS_SPECIAL && r.i_b == at, "plain <tool_call>: expected the stop right before it (i_b %zu, at %zu, stop %d)",
-                r.i_b, at, r.stop);
-        printf("  %-44s token match %zu -> %zu (stop before %zu), stop %d\n", "plain-text <tool_call> in the slot", r.k, r.i_b, at, r.stop);
+        const std::string name = "plain " + text;
+        check_result(name.c_str(), S, N, r);
+        check_maximal(name.c_str(), S, N, r);
+        if (is_special) {
+            CHECK(r.stop == COMMON_OWNIDS_SPECIAL && r.i_b == at, "%s: expected the stop right before it (i_b %zu, at %zu, stop %d)",
+                    name.c_str(), r.i_b, at, r.stop);
+        } else {
+            CHECK(r.stop == COMMON_OWNIDS_END_S && r.i_b == S.size(), "%s: not a special token here, the whole slot expected (i_b %zu of %zu, stop %d)",
+                    name.c_str(), r.i_b, S.size(), r.stop);
+        }
+        printf("  %-44s %s: token match %zu -> %zu (tag at %zu), stop %d\n", name.c_str(),
+                is_special ? "special token in this vocabulary" : "NOT a token in this vocabulary", r.k, r.i_b, at, r.stop);
     }
     // media: the same chunk on both sides passes, another chunk stops the walk there
     {
