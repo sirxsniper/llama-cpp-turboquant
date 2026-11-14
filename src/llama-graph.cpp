@@ -4736,8 +4736,7 @@ ggml_tensor * llm_graph_context::build_attn(
 }
 
 // [TAG_R41_PP_MTPKV] the store half of the build_attn above: the same K/V rotations, scales and cache writer ops, expanded
-// in the same order (v, then k, so a rope still fuses into the K write), and no attention. The attention's inputs (mask,
-// positions, turbot tables) stay in the graph as leaves, so set_inputs finds them allocated.
+// in the same order (v, then k, so a rope still fuses into the K write), and no attention (no mask is built for it).
 void llm_graph_context::build_attn_store_kv(
         llm_graph_input_attn_kv * inp,
         ggml_tensor * k_cur,
@@ -4775,11 +4774,11 @@ void llm_graph_context::build_attn_store_kv(
         ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
     }
 
-    for (ggml_tensor * t : { inp->self_attn_mask.raw, inp->self_attn_mask.rows, inp->get_kv_pos(), inp->get_q_pos(),
-                             inp->self_turbot_gtab }) {
-        if (t) {
-            ggml_build_forward_expand(gf, t);
-        }
+    // set_input fills the turbot granule table whenever it exists (and the writer ops read the young / fill rows it sets
+    // with it), so it stays in the graph; the mask, its rows and the positions are skipped by set_input while unallocated
+    // (as for DFlash's K/V-injection pass), which also saves building a mask nothing reads
+    if (inp->self_turbot_gtab) {
+        ggml_build_forward_expand(gf, inp->self_turbot_gtab);
     }
 }
 
