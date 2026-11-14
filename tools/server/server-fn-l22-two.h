@@ -13,6 +13,7 @@
 //   l22_sharekv_usable         a follower may take the leader's prefix by seq_cp        [TAG_FN_L22_SHAREKV]
 //   l22_park_cells             the cells a parked slot needs again                      [TAG_FN_L22_SHAREKV]
 //   l24_attach_best            the other slot whose cells a new prompt starts from      [TAG_FN_L24_ATTACH]
+//   fn_draftfit_step           the draft cap that fits a verify step to the bridge      [TAG_FN_DRAFTFIT]
 
 #include <algorithm>
 #include <cstdint>
@@ -253,4 +254,38 @@ static inline l24_attach_pick l24_attach_best(const std::vector<l24_donor_view> 
         return l24_attach_pick();
     }
     return best;
+}
+
+// [TAG_FN_DRAFTFIT] one generating slot of a step as the bridge-fit cap sees it: the rows of a draft it replays, and its own
+// draft cap (common_speculative_draft_params::n_max) when it drafts in this step, 0 when it does not
+struct fn_draftfit_slot {
+    int32_t n_replay = 0;
+    int32_t n_cap    = 0;
+};
+
+// The draft length k every drafting slot of the step stops at, or -1 (no cap). A cap is set only when it makes the verify
+// step one equal ubatch of at most width rows: every generating slot drafts (a slot with fewer rows makes split_equal cut
+// the step by sequence, src/llama-batch.cpp), 2+ slots, nothing replayed, the rows sum(1 + min(n_max, n_cap)) above width;
+// k = the largest length with n_slots * (1 + k) <= width that no slot's own cap is below (equal rows); none when k < 1 or
+// k < n_min (draft-mtp clears a draft shorter than n_min, common/speculative.cpp)
+static inline int32_t fn_draftfit_step(const std::vector<fn_draftfit_slot> & s, int32_t n_max, int32_t n_min, int32_t width) {
+    const int32_t n = (int32_t) s.size();
+    if (width <= 0 || n < 2) {
+        return -1;
+    }
+    int32_t n_rows  = 0;
+    int32_t cap_min = 0;
+    for (int32_t i = 0; i < n; ++i) {
+        if (s[i].n_replay != 0 || s[i].n_cap <= 0) {
+            return -1;
+        }
+        const int32_t c = n_max > 0 ? std::min(n_max, s[i].n_cap) : s[i].n_cap;
+        n_rows += 1 + c;
+        cap_min = i == 0 ? c : std::min(cap_min, c);
+    }
+    if (n_rows <= width) {
+        return -1;
+    }
+    const int32_t k = std::min(width/n - 1, cap_min);
+    return k >= 1 && k >= n_min ? k : -1;
 }

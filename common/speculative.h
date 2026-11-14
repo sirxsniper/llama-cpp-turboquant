@@ -99,6 +99,10 @@ struct common_speculative_draft_params {
     int32_t top_k = 0;
     float   top_p = 1.0f;
     float   min_p = 0.0f;
+
+    // [TAG_FN_DRAFTFIT] the step's draft cap so that its verify rows fit the MoE bridge (-1 = none): draft-mtp makes no
+    // draft decode past it, the others are cut to it
+    int32_t n_fit = -1;
 };
 
 common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);

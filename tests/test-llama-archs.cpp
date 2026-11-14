@@ -182,7 +182,7 @@ static void usage(char ** argv) {
     LOG("  -o, --out <dir>          Save generated test models to <dir> instead of running backend tests\n");
     LOG("  -v <N>                   Set log verbosity level\n");
     LOG("  -b, --backend <backend>  Run only on the given backend device\n");
-    LOG("  --mtp                    Test the in-model MTP head instead (archs with an MTP fixture: qwen4exp)\n");
+    LOG("  --mtp                    Test the in-model MTP head instead (archs with an MTP fixture: qwen4exp); with -o: save it as <arch>-mtp.gguf\n");
     LOG("  --kv-shift               Check K-shift against a decode at the shifted positions (CPU only)\n");
     LOG("  --kv-park                Check an attention-only park / restore / move-down against no park (CPU only)\n");
     LOG("  -h, --help               Show this help message\n\n");
@@ -1526,6 +1526,23 @@ static llama_model_ptr get_model_mtp(struct gguf_context * gguf_ctx, FILE * file
     return model;
 }
 
+// [TAG_FN_DRAFTFIT] -o <dir> --mtp: the MoE fixture with its nextn block as <dir>/<arch>-mtp.gguf (a target and its MTP
+// draft head in one file, for whole-run tests of the speculative paths)
+static int save_models_mtp(const std::string & arch_filter, const size_t seed, const float stdev, const std::string & dir) {
+    for (const llm_arch & arch : llama_arch_all()) {
+        if (arch == LLM_ARCH_UNKNOWN || !arch_matches(arch_filter, arch) || !mtp_fixture_supported(arch)) {
+            continue;
+        }
+        gguf_context_ptr gguf_ctx = get_gguf_ctx_mtp(arch);
+        llama_model_ptr  model    = get_model_mtp(gguf_ctx.get(), nullptr, seed, stdev, {}, /*load_mtp =*/ true);
+        const std::string path = dir + "/" + llama_arch_name(arch) + "-mtp.gguf";
+        llama_model_save_to_file(model.get(), path.c_str());
+        LOG_INF("%s: '%s MTP' -> %s (%.2f MB)\n", __func__, llama_arch_name(arch), path.c_str(),
+                (double) std::filesystem::file_size(path) / (1024.0 * 1024.0));
+    }
+    return 0;
+}
+
 // [TAG_FN_MTP_HEAD_IDS] [TAG_FN_MTP_ATTN_WINDOW] the switches are read at model load / context creation
 static void mtp_test_set_env(const char * name, const char * value) {
 #ifdef _WIN32
@@ -2688,7 +2705,7 @@ int main(int argc, char ** argv) {
 
     try {
         if (!out.empty()) {
-            return save_models(arch_filter, seed, stdev, verbosity, out);
+            return mtp ? save_models_mtp(arch_filter, seed, stdev, out) : save_models(arch_filter, seed, stdev, verbosity, out);
         }
         if (mtp) {
             return test_mtp(arch_filter, seed, stdev, verbosity, target_backend);

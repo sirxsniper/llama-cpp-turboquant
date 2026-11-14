@@ -1,11 +1,14 @@
 // [TAG_FN_L22] round 22, P9: the server's two-connection policies (tools/server/server-fn-l22-two.h, header only): one
 // prompt per batch (ONEPROMPT), the batch cap and window per stream pass (GENSHARE2), the priority pause (PAUSE), the
-// zero-copy prefix share (SHAREKV), and the joint draft rule's p_min (DRAFT2, common/speculative.h). CPU only, no model.
+// zero-copy prefix share (SHAREKV), the joint draft rule's p_min (DRAFT2, common/speculative.h) and the bridge-fit draft
+// cap of a step (DRAFTFIT). CPU only, no model.
 
 #include "../tools/server/server-fn-l22-two.h"
 #include "../common/speculative.h"
 
+#include <algorithm>
 #include <cstdio>
+#include <initializer_list>
 #include <vector>
 
 static int g_fail   = 0;
@@ -280,6 +283,145 @@ static void test_draft2() {
     TCHECK(common_speculative_pmin_draft2(0.85f, 2, 2, 0.6f) == 0.85f, "max: a higher position p_min stays");
 }
 
+// [TAG_FN_DRAFTFIT] the bridge-fit draft cap of a step (fn_draftfit_step) against the rule stated by enumeration: a cap
+// only when every generating slot drafts, 2+ slots, nothing replayed and the rows above width; then the largest k (tried
+// from 16 down) whose capped rows are equal for every slot and fit width, with k >= n_min; else none. Every slot list of
+// 1..8 slots from { replays 1 or 2, generates without a draft, drafts with its own cap 1..4 }, n_max 0..3, n_min 0..3,
+// widths 6 / 8 / 12 / 16
+static void test_draftfit() {
+    std::vector<fn_draftfit_slot> kinds;
+    kinds.push_back({ 1, 0 });
+    kinds.push_back({ 2, 0 });
+    kinds.push_back({ 0, 0 });
+    for (int c = 1; c <= 4; ++c) {
+        kinds.push_back({ 0, c });
+    }
+    const int n_kind = (int) kinds.size();
+
+    int n_bad   = 0;
+    int n_cases = 0;
+    int n_cut   = 0;
+    std::vector<int> pick;
+    for (int n = 1; n <= 8; ++n) {
+        pick.assign(n, 0);
+        while (true) {
+            std::vector<fn_draftfit_slot> s(n);
+            for (int i = 0; i < n; ++i) {
+                s[i] = kinds[pick[i]];
+            }
+            for (int width : { 6, 8, 12, 16 }) {
+                for (int n_max = 0; n_max <= 3; ++n_max) {
+                    for (int n_min = 0; n_min <= 3; ++n_min) {
+                        // the verify rows of slot i under a cap k (k <= 0: none)
+                        auto rows_of = [&](int i, int k) {
+                            if (s[i].n_cap <= 0) {
+                                return 1 + s[i].n_replay;
+                            }
+                            int c = n_max > 0 ? std::min(n_max, s[i].n_cap) : s[i].n_cap;
+                            if (k > 0) {
+                                c = std::min(c, k);
+                            }
+                            return 1 + c;
+                        };
+                        bool all_draft = n >= 2;
+                        int  rows      = 0;
+                        for (int i = 0; i < n; ++i) {
+                            all_draft = all_draft && s[i].n_cap > 0 && s[i].n_replay == 0;
+                            rows += rows_of(i, 0);
+                        }
+                        int want = -1;
+                        if (all_draft && rows > width) {
+                            for (int k = 16; k >= 1 && want < 0; --k) {
+                                int  sum   = 0;
+                                bool equal = true;
+                                for (int i = 0; i < n; ++i) {
+                                    sum  += rows_of(i, k);
+                                    equal = equal && rows_of(i, k) == rows_of(0, k);
+                                }
+                                if (equal && sum <= width && k >= n_min) {
+                                    want = k;
+                                }
+                            }
+                        }
+                        const int got = fn_draftfit_step(s, n_max, n_min, width);
+                        ++n_cases;
+                        n_cut += got > 0 ? 1 : 0;
+                        if (got != want && n_bad++ < 8) {
+                            fprintf(stderr, "draftfit: %d slots, first (%d, %d), n_max %d, n_min %d, width %d: %d, want %d\n",
+                                    n, s[0].n_replay, s[0].n_cap, n_max, n_min, width, got, want);
+                        }
+                        // a cap makes the step fit, equal, and leaves at least max(1, n_min) drafts per slot
+                        if (got > 0) {
+                            int sum = 0;
+                            for (int i = 0; i < n; ++i) {
+                                sum += rows_of(i, got);
+                                TCHECK(rows_of(i, got) == 1 + got, "capped rows equal (%d slots, width %d)", n, width);
+                            }
+                            TCHECK(sum <= width && sum < rows && got >= std::max(1, n_min), "a cap fits (%d slots, width %d)", n, width);
+                        }
+                    }
+                }
+            }
+            // the next non-decreasing slot list (the rule does not depend on the order)
+            int j = n - 1;
+            while (j >= 0 && pick[j] == n_kind - 1) {
+                --j;
+            }
+            if (j < 0) {
+                break;
+            }
+            ++pick[j];
+            for (int i = j + 1; i < n; ++i) {
+                pick[i] = pick[j];
+            }
+        }
+    }
+    TCHECK(n_bad == 0, "enumeration: %d mismatches of %d cases", n_bad, n_cases);
+    TCHECK(n_cut > 0, "some steps are cut");
+
+    auto drafting = [](std::initializer_list<int> caps) {
+        std::vector<fn_draftfit_slot> v;
+        for (int c : caps) {
+            v.push_back({ 0, c });
+        }
+        return v;
+    };
+    // one and two connections at n_max 2 or 3 and width 8 (3, 6 and 8 rows): never cut
+    for (int n_max = 2; n_max <= 3; ++n_max) {
+        TCHECK(fn_draftfit_step(drafting({ n_max }), n_max, 0, 8) == -1, "np1, n_max %d: unchanged", n_max);
+        TCHECK(fn_draftfit_step(drafting({ n_max, n_max }), n_max, 0, 8) == -1, "np2, n_max %d: unchanged", n_max);
+    }
+    // one drafting slot is never cut, whatever n_max (a 16-token block at width 8 too)
+    TCHECK(fn_draftfit_step(drafting({ 16 }), 16, 0, 8) == -1, "np1, n_max 16: unchanged");
+    // two connections at n_max 4: 10 rows, cut to 3 each (8 rows)
+    TCHECK(fn_draftfit_step(drafting({ 4, 4 }), 4, 0, 8) == 3, "np2, n_max 4: 8 rows");
+    // three and four connections, n_max 2, width 8: one draft each (9 and 12 rows become 6 and 8)
+    TCHECK(fn_draftfit_step(drafting({ 2, 2, 2 }), 2, 0, 8) == 1, "np3: 6 rows");
+    TCHECK(fn_draftfit_step(drafting({ 2, 2, 2, 2 }), 2, 0, 8) == 1, "np4: 8 rows");
+    // a slot near the end of its request drafts less: 3 + 2 + 2 + 1 = 8 rows fit, unchanged
+    TCHECK(fn_draftfit_step(drafting({ 2, 2, 1 }), 2, 0, 8) == -1, "np3, caps 2 2 1: 8 rows fit");
+    // the global n_max is the lower cap: 3 x (1 + 2) = 9 rows
+    TCHECK(fn_draftfit_step(drafting({ 5, 5, 5 }), 2, 0, 8) == 1, "np3, own caps 5, n_max 2: 6 rows");
+    // width 12, n_max 3, one slot capped at 1 by its request: 14 rows, equal rows only at k = 1 (8 rows)
+    TCHECK(fn_draftfit_step(drafting({ 3, 3, 3, 1 }), 3, 0, 12) == 1, "np4 at width 12, caps 3 3 3 1: 8 rows");
+    // a generating slot that does not draft, or one that replays a draft: unchanged (split_equal cuts the step by sequence)
+    {
+        std::vector<fn_draftfit_slot> v = drafting({ 2, 2, 2 });
+        v.push_back({ 0, 0 });
+        TCHECK(fn_draftfit_step(v, 2, 0, 8) == -1, "np4, three drafting: unchanged");
+        v.back() = { 2, 0 };
+        TCHECK(fn_draftfit_step(v, 2, 0, 8) == -1, "np4, one replaying: unchanged");
+    }
+    // --spec-draft-n-min 2: a cap of 1 would clear every draft, so none
+    TCHECK(fn_draftfit_step(drafting({ 2, 2, 2, 2 }), 2, 2, 8) == -1, "np4, n_min 2: unchanged");
+    // five and more drafting at width 8: not even one draft each fits, unchanged
+    TCHECK(fn_draftfit_step(drafting({ 2, 2, 2, 2, 2 }), 2, 0, 8) == -1, "np5: unchanged");
+    // width 12 (LLAMA_MOE_BRIDGE_MAX_T=12): np4 fits as is
+    TCHECK(fn_draftfit_step(drafting({ 2, 2, 2, 2 }), 2, 0, 12) == -1, "np4 at width 12: unchanged");
+    // off: width 0
+    TCHECK(fn_draftfit_step(drafting({ 2, 2, 2, 2 }), 2, 0, 0) == -1, "width 0: off");
+}
+
 // [TAG_FN_L24_OPFAIR] the fair order and the near-end rule; [TAG_FN_L24_GSCAP] the window cap
 static void test_l24() {
     auto first = [](const std::vector<l24_prompt_cand> & c) {
@@ -333,6 +475,7 @@ int main() {
     test_park_cells();
     test_attach();
     test_draft2();
+    test_draftfit();
 
     fprintf(stderr, "test-fn-l22-two: %d checks, %d failures\n", g_checks, g_fail);
     return g_fail == 0 ? 0 : 1;
