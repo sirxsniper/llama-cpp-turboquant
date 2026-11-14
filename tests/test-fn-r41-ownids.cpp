@@ -277,7 +277,9 @@ static void test_stops() {
     {
         std::vector<llama_token> S = tok(k_prompt);
         const auto A1 = pieces_ids({ "Call", " p", "==", "='", "\n</think>\n\n" });
-        const auto A2 = tok("<tool_call>", false); // plain text pieces
+        // plain text pieces (tokenizing "<tool_call>" with parse_special off still gives the user-defined token: llama.cpp skips
+        // only control and unknown tokens then)
+        const auto A2 = pieces_ids({ "<", "tool", "_call", ">" });
         const auto A3 = tok("\n<function=x>\n</function>\n</tool_call>");
         S.insert(S.end(), A1.begin(), A1.end());
         const size_t at = S.size();
