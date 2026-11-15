@@ -61,9 +61,10 @@ const fn_item k_items[] = {
 
     // [TAG_FN_SHIP1] lever round 1 (see above). Lookups (llama_fn_env), never put into the environment:
     // the 768 default went over 28,500 MiB at depth (28,622) in October, before the KV lend and the VRAM guard. [TAG_R41_RESERVE]
-    // r41 mem: 512 with LLAMA_FN_VRAM_KEEP_MIB 1536 and LLAMA_R41_VG_FOLLOW=1 (eng-mem.md turns 5-6: +1,033 MiB of hot set,
-    // least free VRAM 1,237-1,441 MiB at 44K and at 222K tokens, the guard never acted); 1280 restores v0.33.1
-    { "LLAMA_MOE_HOT_HEADROOM_MIB",   "512",   P_ALL },
+    // r41 mem: 512 with LLAMA_FN_VRAM_KEEP_MIB 1536 and LLAMA_R41_VG_FOLLOW=1 gave +1,033 MiB of hot set and +6.5 % plain
+    // coding, but with 1 GiB of VRAM taken by another program the answer fell to 59-64 t/s and the fresh 44K prompt to
+    // 39-52 s (v0.33.1: 98.5 t/s, 19.4 s; least free VRAM 856-859 against 1,447 MiB): 1280 stays the default in v0.33.2
+    { "LLAMA_MOE_HOT_HEADROOM_MIB",   "1280",  P_ALL },
     { "LLAMA_MOE_HOT_DECAY",          "0.95",  P_ALL }, // [TAG_FN_L3_ADOPT] 0.92 until lever round 3 (L3P_nopool) // decayed hot set (bs3: without it -2.5 % code, -3.4 % prose)
     { "LLAMA_MOE_HOT_SEED",           "0.03",  P_ALL },
     { "LLAMA_PLE_DIO_FILE",           "",      P_ALL }, // set at load: <model>.ple (the unmapped PLE table copy)
@@ -161,8 +162,9 @@ const fn_item k_items[] = {
     // [TAG_FN_L7_ADOPT] round 7: the VRAM ceiling keeps 2100 MiB free instead of total/8 (5090: 30,464 instead of 28,416
     // MiB): +2 GB of hot experts, A/B l7/ab7 (2 rounds, 262K) real use +7.2 % (32K +7.7, 131K +9.2, 245K +4.7 %), device use
     // 29.7 GB in decode
-    // [TAG_R41_RESERVE] r41 mem: 1536 (the floor of the switch) with HEADROOM 512 and VG_FOLLOW; 2100 restores v0.33.1
-    { "LLAMA_FN_VRAM_KEEP_MIB",      "1536",  P_ALL }, // [TAG_FN_L7_VRAMKEEP]
+    // [TAG_R41_RESERVE] r41 mem: 1536 (the floor of the switch) with HEADROOM 512 and VG_FOLLOW (see the HEADROOM row); 2100
+    // stays the default in v0.33.2
+    { "LLAMA_FN_VRAM_KEEP_MIB",      "2100",  P_ALL }, // [TAG_FN_L7_VRAMKEEP]
     // [TAG_FN_L8_GRAPHPAD] round 8: the indexer pool count and n_kv in 2048-token steps, so the decode graphs (and their
     // CUDA graphs) keep their shapes 8x longer
     { "LLAMA_KPOOL_PAD",             "512",   P_ALL },
@@ -393,12 +395,13 @@ const fn_item k_items[] = {
     { "LLAMA_FN_R41_OWNIDS",                "1",       P_ALL }, // [TAG_FN_R41_OWNIDS] on from v0.33.1 (an agent loop: no re-read of a replayed answer)
     // a float printed as text by the chat template ({{ x }}, ~): 1 = as Python's str(), 0 restores v0.33.0 (six decimals)
     { "LLAMA_FN_R41_FLOATSTR",              "1",       P_ALL }, // [TAG_FN_R41_FLOATSTR] on from v0.33.1
-    // r41 mem lane, placement (E:/r40/kyro-light/eng-mem.md); each one =0 restores v0.33.1. Measured on top of v0.33.1 at
-    // 512K with 2 slots (turns 5-6): plain coding +7.5 %, the fresh 44K prompt -12 to -16 %, 222K tokens -11 % and +4.7 %
-    // decode; static-hot-set identity kept. LEND_OWN stays 0 (the mix overshoots its budget and the guard takes it back)
-    { "LLAMA_FN_R41_BORROW_FILL",           "1",       P_ALL }, // [TAG_R41_BORROW_FILL] lend layers too small for the 16K-ubatch borrow give what they have, the others more
-    { "LLAMA_FN_R41_SPREAD_FIRST",          "1",       P_ALL }, // [TAG_R41_SPREAD_FIRST] the KV lend spreads over the lend layers' own slots from the first sizing
-    { "LLAMA_R41_VG_FOLLOW",                "1",       P_ALL }, // [TAG_R41_VG_FOLLOW] the VRAM guard's zero-commit levels follow the free VRAM at arm (floor 900 MiB)
+    // r41 mem lane, placement (E:/r40/kyro-light/eng-mem.md); 0 = v0.33.1. Measured on top of v0.33.1 at 512K with 2 slots:
+    // plain coding +6.5 to +7.5 %, the fresh 44K prompt -12 to -16 %, static-hot-set identity kept; but with 1 GiB of VRAM
+    // taken by another program the answer fell by a third (see the HEADROOM row), so all four stay 0 in v0.33.2; the value
+    // that turns each on is 1 (LEND_OWN: a percent)
+    { "LLAMA_FN_R41_BORROW_FILL",           "0",       P_ALL }, // [TAG_R41_BORROW_FILL] lend layers too small for the 16K-ubatch borrow give what they have, the others more
+    { "LLAMA_FN_R41_SPREAD_FIRST",          "0",       P_ALL }, // [TAG_R41_SPREAD_FIRST] the KV lend spreads over the lend layers' own slots from the first sizing
+    { "LLAMA_R41_VG_FOLLOW",                "0",       P_ALL }, // [TAG_R41_VG_FOLLOW] the VRAM guard's zero-commit levels follow the free VRAM at arm (floor 900 MiB)
     { "LLAMA_FN_R41_LEND_OWN",              "0",       P_ALL }, // [TAG_R41_LEND_OWN] percent of the KV lend the plain sizing takes from the lend layers' own slots
     // r41 prompt lane: BORROW and MTPKV 0 (= v0.33.1) in the profile until their GPU arms are measured, the value that turns
     // each on is in its comment; SYSKEEP 1 from v0.33.2 (a new chat on the other slot: first token 7.3 s -> 1.6 s at 512K, 2 slots)
