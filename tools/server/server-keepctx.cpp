@@ -1219,8 +1219,9 @@ bool server_keepctx::save(const server_prompt & prompt, llama_context * ctx_tgt,
     e.id = ++n_next_;
     // [TAG_R41_PP_SYSKEEP] a kept system-block file: the stored bytes start after the header, the tokens and the carry
     // [TAG_R41_PP_CONVKEEP] a kept conversation file the same way (text only; not with the lazy layout)
-    // a system block bigger than the folder's bound is stored like one of LLAMA_FN_R41_SYSKEEP=1 (not kept)
-    const bool persist = (sys ? (params_.sys_persist && need <= params_.sys_bytes_max) : (params_.conv_persist && !params_.lazy)) &&
+    // a system block bigger than the folder's bound is stored like one of LLAMA_FN_R41_SYSKEEP=1 (not kept), and so is
+    // every block with the lazy layout (a kept file has no room between its checkpoints)
+    const bool persist = (sys ? (params_.sys_persist && need <= params_.sys_bytes_max) : params_.conv_persist) && !params_.lazy &&
                          prompt.checkpoints.size() <= KC_SYS_CKPT && kc_text_only(prompt.tokens, (size_t) prompt.n_tokens());
     const uint64_t kept_hash = persist && !sys ? keepctx_prefix_hash(prompt.tokens, (size_t) prompt.n_tokens()) : sys_hash;
     std::vector<int32_t> sys_toks;
