@@ -314,7 +314,7 @@ static const l22_row k_l22_rows[] = {
     { "LLAMA_R41_VG_FOLLOW", "0", false }, // [TAG_R41_VG_FOLLOW] 0 = v0.33.1 (1 turns it on)
     { "LLAMA_FN_R41_LEND_OWN", "0", false }, // [TAG_R41_LEND_OWN] 0 = v0.33.1
     { "LLAMA_FN_R41_BORROW", "0", false }, // [TAG_R41_PP_BORROW] 0 = v0.33.1 (16 turns it on)
-    { "LLAMA_FN_R41_MTPKV", "1", false }, // [TAG_R41_PP_MTPKV] on from v0.33.3, 0 = v0.33.2
+    { "LLAMA_FN_R41_MTPKV", "0", false }, // [TAG_R41_PP_MTPKV] 0 = v0.33.2 (1 turns it on)
     { "LLAMA_FN_R41_READYNEED", "0", false }, // [TAG_R41_PP_READYNEED] 0 = v0.33.2 (1, 2 or 3 turn it on)
     { "LLAMA_FN_R41_SYSKEEP", "2", false }, // [TAG_R41_PP_SYSKEEP] 2 from v0.33.3 (1 = v0.33.2, 0 = v0.33.1)
     { "LLAMA_FN_R41_DRAFTFIT2", "1", false }, // [TAG_FN_R41_DRAFTFIT2] r41 multi; 0 restores v0.33.1
