@@ -1080,8 +1080,7 @@ static void rn_need(moe_cache * mc, const char * name, const struct ggml_tensor 
         // the pass is over (or has not begun): one line with what the window cost, then nothing
         if (mc->rn_calls.load(std::memory_order_relaxed) > 0 && !mc->rn_logged.exchange(true)) {
             LLAMA_LOG_INFO("moe-hot: [TAG_R41_PP_READYNEED] during the RAM warm pass %llu cold experts (%.1f MiB) were read ahead "
-                    "for %llu routed jobs in %.1f ms
-", (unsigned long long) mc->rn_n.load(), mc->rn_bytes.load()/1048576.0,
+                    "for %llu routed jobs in %.1f ms\n", (unsigned long long) mc->rn_n.load(), mc->rn_bytes.load()/1048576.0,
                     (unsigned long long) mc->rn_calls.load(), mc->rn_us.load()/1000.0);
         }
         return;
@@ -3592,8 +3591,7 @@ bool llama_moe_hot_init(const llama_model & model, const void * owner, size_t bu
     // CPU kernels while the RAM warm pass has not finished; bit 2 (llama-fn-tier.cpp) lets that pass go on during answer steps
     mc->rn_mode = std::max(0, llama_fn_l3_int(model, "LLAMA_FN_R41_READYNEED", 0));
     if (mc->rn_mode != 0) {
-        LLAMA_LOG_WARN("moe-hot: [TAG_R41_PP_READYNEED] LLAMA_FN_R41_READYNEED=%d: until the RAM warm pass ends%s%s
-", mc->rn_mode,
+        LLAMA_LOG_WARN("moe-hot: [TAG_R41_PP_READYNEED] LLAMA_FN_R41_READYNEED=%d: until the RAM warm pass ends%s%s\n", mc->rn_mode,
                 (mc->rn_mode & 1) ? ", the cold experts of a request are read ahead as whole slices before the CPU computes them" : "",
                 (mc->rn_mode & 2) ? ", the pass goes on during answer steps" : "");
     }
