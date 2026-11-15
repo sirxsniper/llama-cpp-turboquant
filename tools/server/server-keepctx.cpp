@@ -11,6 +11,7 @@
 #include <atomic>
 #include <cerrno>
 #include <chrono>
+#include <cstddef>
 #include <condition_variable>
 #include <cstdlib>
 #include <cstring>
@@ -156,6 +157,35 @@ public:
             return nullptr;
         }
         unlink(path.string().c_str()); // the file lives until the descriptor closes
+#endif
+        return f;
+    }
+
+    // [TAG_R41_PP_SYSKEEP] a file that stays after it is closed (a system block of params.sys_persist), no OS file cache;
+    // writable: a new file (an existing one is replaced), else an existing one opened for reading
+    static std::shared_ptr<server_keepctx_file> open_kept(const std::filesystem::path & path, bool writable, std::string & err) {
+        auto f = std::shared_ptr<server_keepctx_file>(new server_keepctx_file());
+#if defined(_WIN32)
+        f->h = CreateFileW(path.wstring().c_str(), writable ? (GENERIC_READ | GENERIC_WRITE) : GENERIC_READ,
+                           writable ? 0 : (FILE_SHARE_READ | FILE_SHARE_DELETE), nullptr, writable ? CREATE_ALWAYS : OPEN_EXISTING,
+                           FILE_ATTRIBUTE_NORMAL | FILE_FLAG_NO_BUFFERING, nullptr);
+        if (f->h == INVALID_HANDLE_VALUE) {
+            err = "CreateFileW failed, error " + std::to_string((unsigned long) GetLastError());
+            return nullptr;
+        }
+#else
+        int flags = writable ? (O_RDWR | O_CREAT | O_TRUNC) : O_RDONLY;
+#ifdef O_NOFOLLOW
+        flags |= O_NOFOLLOW;
+#endif
+#ifdef O_CLOEXEC
+        flags |= O_CLOEXEC;
+#endif
+        f->fd = open(path.string().c_str(), flags, 0600);
+        if (f->fd < 0) {
+            err = std::string("open failed: ") + strerror(errno);
+            return nullptr;
+        }
 #endif
         return f;
     }
@@ -541,6 +571,42 @@ static bool kc_write_cb(const void * src, size_t size, void * ud) {
 
 static bool kc_read_cb(void * dst, size_t size, void * ud) {
     return ((kc_pipe *) ud)->get(dst, size);
+}
+
+// [TAG_R41_PP_SYSKEEP] the first sector of a system-block file (params.sys_persist). It is written last, so a file whose
+// writing stopped has no valid header and is deleted by the next scan. Then: the block's tokens (int32) at tok_off, the
+// drafter's carry at carry_off, the stored bytes of the entry (as save() writes them) at base; each part at a sector offset.
+struct kc_sys_header {
+    char     magic[8];      // "R41SYSK1"
+    uint32_t version;       // 1
+    uint32_t n_ckpt;        // checkpoints (at most KC_SYS_CKPT)
+    uint64_t fp;            // params.sys_fp of the server that wrote it
+    uint64_t sys_hash;      // keepctx_prefix_hash of the tokens
+    int64_t  n_tokens;
+    uint64_t size_tgt;
+    uint64_t size_dft;
+    uint64_t n_bytes;       // the stored bytes from base
+    uint64_t base;
+    uint64_t tok_off;
+    uint64_t carry_off;
+    uint64_t carry_bytes;
+    struct {
+        int64_t  n_tokens;
+        int32_t  id_task;
+        int32_t  pos_min;
+        int32_t  pos_max;
+        int32_t  pad;
+        uint64_t size_tgt;
+        uint64_t size_dft;
+        uint64_t size_spec;
+    } ck[4];
+    uint64_t check;         // kc_hash of every byte above
+};
+static constexpr uint32_t KC_SYS_CKPT = 4;
+static_assert(sizeof(kc_sys_header) <= KC_ALIGN, "the header is one sector");
+
+static uint64_t kc_sys_check(const kc_sys_header & h) {
+    return kc_hash(KC_HASH_SEED, &h, offsetof(kc_sys_header, check));
 }
 
 //
@@ -1042,7 +1108,7 @@ int server_keepctx::drop_prefixes_of(const server_tokens & tokens, const server_
 bool server_keepctx::save(const server_prompt & prompt, llama_context * ctx_tgt, llama_context * ctx_dft,
                           common_speculative * spec, llama_seq_id seq_id, const server_keepctx_entry * keep,
                           std::string & info, const server_keepctx_spill * spill, const server_keepctx_conv * conv,
-                          int32_t supersede_tol) {
+                          int32_t supersede_tol, bool sys, uint64_t sys_hash) {
     const auto t0 = std::chrono::steady_clock::now();
     const kc_mark mk_s = params_.trace ? kc_mark::now() : kc_mark(); // [TAG_FN_V0254_STORE]
 
@@ -1096,8 +1162,11 @@ bool server_keepctx::save(const server_prompt & prompt, llama_context * ctx_tgt,
 
     // room: older states of this conversation, then the oldest entries (or [TAG_FN_L19_CONVSTORE_EVICT] the lowest
     // value per byte), never `keep`
-    int n_evicted = drop_prefixes_of(prompt.tokens, keep, supersede_tol);
-    if (params_.val) {
+    // [TAG_R41_PP_SYSKEEP] a system-block entry takes no room from the conversations (the caller keeps the count)
+    int n_evicted = sys ? 0 : drop_prefixes_of(prompt.tokens, keep, supersede_tol);
+    if (sys) {
+        // nothing to evict
+    } else if (params_.val) {
         // [TAG_FN_L24_KEEPVAL] the disk first (budget and free space, the protected entry last), then the count (never the
         // protected entry: the count may then pass n_max by the protected and the keep entry)
         // the margin only drives evictions; the store fails on the disk only when the bytes do not fit at all
@@ -1139,13 +1208,31 @@ bool server_keepctx::save(const server_prompt & prompt, llama_context * ctx_tgt,
     }
 
     e.id = ++n_next_;
+    // [TAG_R41_PP_SYSKEEP] a kept system-block file: the stored bytes start after the header, the tokens and the carry
+    const bool persist = sys && params_.sys_persist && prompt.checkpoints.size() <= KC_SYS_CKPT;
+    std::vector<int32_t> sys_toks;
+    uint64_t tok_off = 0, carry_off = 0;
+    if (persist) {
+        sys_toks.resize((size_t) prompt.n_tokens());
+        for (size_t i = 0; i < sys_toks.size(); ++i) {
+            sys_toks[i] = (int32_t) prompt.tokens[i];
+        }
+        common_speculative_get_carry(spec, seq_id, e.carry); // the server thread: the drafter does not change meanwhile
+        tok_off   = KC_ALIGN;
+        carry_off = tok_off + kc_round_up(sys_toks.size() * sizeof(int32_t));
+        e.base    = carry_off + kc_round_up(e.carry.size());
+    }
     const auto path = std::filesystem::path(params_.dir) /
-            string_format("keepctx-%lu-%llu.kc", kc_pid(), (unsigned long long) e.id);
+            (persist ? string_format("sysblock-%016llx-%016llx.kcs", (unsigned long long) params_.sys_fp, (unsigned long long) sys_hash)
+                     : string_format(sys ? "keepctx-%lu-sys%llu.kc" : "keepctx-%lu-%llu.kc", kc_pid(), (unsigned long long) e.id));
     std::string err;
-    e.file = server_keepctx_file::create(path, err);
+    e.file = persist ? server_keepctx_file::open_kept(path, true, err) : server_keepctx_file::create(path, err);
     if (!e.file) {
         info = "cannot create '" + path.string() + "': " + err;
         return false;
+    }
+    if (persist) {
+        e.sys_path = path.string();
     }
 
     bool ok = true;
@@ -1182,7 +1269,7 @@ bool server_keepctx::save(const server_prompt & prompt, llama_context * ctx_tgt,
     }
     std::string pipe_st;
     {
-        kc_pipe pipe(*e.file, true, 0, 0, io_mem_, params_.trace);
+        kc_pipe pipe(*e.file, true, 0, e.base, io_mem_, params_.trace); // [TAG_R41_PP_SYSKEEP] e.base: 0 but for a kept file
         pipe.hashing = params_.verify;
         ok = ok && llama_state_seq_write_stream_ext(ctx_tgt, seq_id, LLAMA_STATE_SEQ_FLAGS_NONE, kc_write_cb, &pipe) == e.size_tgt;
         tr_lap(tr_tgt);
@@ -1229,12 +1316,69 @@ bool server_keepctx::save(const server_prompt & prompt, llama_context * ctx_tgt,
     }
     tr_lap(tr_fin);
     mk[4] = params_.trace ? kc_mark::now() : kc_mark();
+    // [TAG_R41_PP_SYSKEEP] a kept file: the tokens and the carry, then the header (last, so an unfinished file has none)
+    if (ok && e.n_bytes == need && persist) {
+        {
+            kc_pipe pw(*e.file, true, 0, tok_off, io_mem_, false);
+            ok = pw.put(sys_toks.data(), sys_toks.size() * sizeof(int32_t)) && pw.align() &&
+                 pw.put(e.carry.data(), e.carry.size());
+            uint64_t n_w = 0;
+            ok = pw.finish(n_w) && ok;
+        }
+        kc_sys_header h;
+        std::memset(&h, 0, sizeof(h));
+        std::memcpy(h.magic, "R41SYSK1", 8);
+        h.version     = 1;
+        h.n_ckpt      = (uint32_t) prompt.checkpoints.size();
+        h.fp          = params_.sys_fp;
+        h.sys_hash    = sys_hash;
+        h.n_tokens    = prompt.n_tokens();
+        h.size_tgt    = e.size_tgt;
+        h.size_dft    = e.size_dft;
+        h.n_bytes     = e.n_bytes;
+        h.base        = e.base;
+        h.tok_off     = tok_off;
+        h.carry_off   = carry_off;
+        h.carry_bytes = e.carry.size();
+        uint32_t k = 0;
+        for (const auto & c : prompt.checkpoints) {
+            h.ck[k].n_tokens  = c.n_tokens;
+            h.ck[k].id_task   = c.id_task;
+            h.ck[k].pos_min   = c.pos_min;
+            h.ck[k].pos_max   = c.pos_max;
+            h.ck[k].size_tgt  = c.data_tgt.size();
+            h.ck[k].size_dft  = c.data_dft.size();
+            h.ck[k].size_spec = c.data_spec.size();
+            k++;
+        }
+        h.check = kc_sys_check(h);
+        if (ok) {
+            kc_pipe ph(*e.file, true, 0, 0, io_mem_, false);
+            ok = ph.put(&h, sizeof(h));
+            uint64_t n_w = 0;
+            ok = ph.finish(n_w) && ok;
+        }
+        if (!ok) {
+            e.file.reset();
+            std::error_code ec_rm;
+            std::filesystem::remove(path, ec_rm);
+            info = string_format("writing the header, tokens or carry of '%s' failed", path.string().c_str());
+            return false;
+        }
+    }
     if (!ok || e.n_bytes != need) {
+        if (persist) {
+            e.file.reset();
+            std::error_code ec_rm;
+            std::filesystem::remove(path, ec_rm);
+        }
         info = string_format("writing '%s' failed (%.1f of %.1f MiB)", path.string().c_str(), e.n_bytes/1048576.0, need/1048576.0);
         return false;
     }
 
-    common_speculative_get_carry(spec, seq_id, e.carry);
+    if (!persist) {
+        common_speculative_get_carry(spec, seq_id, e.carry);
+    }
 
     // [TAG_FN_L18_KEEPCTX_HOT] the counts before the new prompt fades them
     if (params_.hot) {
@@ -1261,6 +1405,16 @@ bool server_keepctx::save(const server_prompt & prompt, llama_context * ctx_tgt,
     }
 
     const double ms = kc_ms_since(t0);
+    if (sys) {
+        // [TAG_R41_PP_SYSKEEP]
+        e.sys_hash = sys_hash;
+        info = string_format("%d tokens, %u checkpoints, %.1f MiB (target %.1f, draft %.1f) in %.0f ms = %.2f GB/s, %zu system blocks%s%s",
+                             prompt.n_tokens(), (unsigned) prompt.checkpoints.size(), need/1048576.0, e.size_tgt/1048576.0,
+                             e.size_dft/1048576.0, ms, need/(ms*1e6), sys_entries.size() + 1, persist ? ", kept after the server ends: " : "",
+                             persist ? path.filename().string().c_str() : "");
+        sys_entries.push_back(std::move(e));
+        return true;
+    }
     info = string_format("%d tokens, %u checkpoints, %.1f MiB (target %.1f, draft %.1f) in %.0f ms = %.2f GB/s, %d older evicted, "
                          "store %zu conversations / %.1f MiB", prompt.n_tokens(), (unsigned) prompt.checkpoints.size(),
                          need/1048576.0, e.size_tgt/1048576.0, e.size_dft/1048576.0, ms, need/(ms*1e6), n_evicted,
@@ -1286,21 +1440,30 @@ bool server_keepctx::save(const server_prompt & prompt, llama_context * ctx_tgt,
 bool server_keepctx::load(std::list<server_keepctx_entry>::iterator it, server_prompt & prompt, llama_context * ctx_tgt,
                           llama_context * ctx_dft, common_speculative * spec, llama_seq_id seq_id, bool keep, std::string & info,
                           server_keepctx_spill * spill, server_keepctx_conv * conv,
-                          std::list<common_prompt_checkpoint> * reuse) {
+                          std::list<common_prompt_checkpoint> * reuse, bool sys) {
     const auto t0 = std::chrono::steady_clock::now();
+
+    // [TAG_R41_PP_SYSKEEP] a system-block entry stays in its own list
+    std::list<server_keepctx_entry> & from = sys ? sys_entries : entries;
+    keep = keep || sys;
 
     server_keepctx_entry e_own;
     if (!keep) {
         e_own = std::move(*it);
-        entries.erase(it);
+        from.erase(it);
     }
     server_keepctx_entry & e = keep ? *it : e_own;
 
-    // a kept entry that failed to restore is not offered again
+    // a kept entry that failed to restore is not offered again ([TAG_R41_PP_SYSKEEP] nor its file at the next start)
     auto fail = [&](const char * why) {
         info = why;
         if (keep) {
-            entries.erase(it);
+            const std::string sp = sys ? it->sys_path : std::string();
+            from.erase(it);
+            if (!sp.empty()) {
+                std::error_code ec_rm;
+                std::filesystem::remove(std::filesystem::path(sp), ec_rm);
+            }
         }
         return false;
     };
@@ -1375,7 +1538,7 @@ bool server_keepctx::load(std::list<server_keepctx_entry>::iterator it, server_p
         tr_t  = mk[0].t;
     }
     {
-        kc_pipe pipe(*e.file, false, lazy ? e.size_tgt + e.size_dft : e.n_bytes, 0, io_mem_, params_.trace);
+        kc_pipe pipe(*e.file, false, lazy ? e.size_tgt + e.size_dft : e.n_bytes, e.base, io_mem_, params_.trace);
         ok = ok && llama_state_seq_read_stream_ext(ctx_tgt, seq_id, LLAMA_STATE_SEQ_FLAGS_NONE, kc_read_cb, &pipe) == e.size_tgt;
         tr_lap(tr_tgt);
         mk[1] = params_.trace ? kc_mark::now() : kc_mark();
@@ -1453,7 +1616,10 @@ bool server_keepctx::load(std::list<server_keepctx_entry>::iterator it, server_p
         *conv = e.conv;
         conv->hits++;
     }
-    if (keep) {
+    if (sys) {
+        e.sys_hits++; // [TAG_R41_PP_SYSKEEP]
+        e.t_use = kc_now_s();
+    } else if (keep) {
         e.conv.hits++;
         e.value = convstore_gdsf(gdsf_L_, e.conv.hits, e.prompt.n_tokens(), e.n_bytes_all(), params_.fixed_tokens,
                                  params_.budget / (uint64_t) std::max(1, params_.n_max));
@@ -1487,6 +1653,7 @@ bool server_keepctx::load(std::list<server_keepctx_entry>::iterator it, server_p
     const uint64_t n_read_bytes = lazy ? e.size_tgt + e.size_dft : e.n_bytes;
     info = string_format("%d tokens, %zu checkpoints, %.1f MiB in %.0f ms = %.2f GB/s, %s, store %zu conversations / %.1f MiB%s%s",
                          prompt.n_tokens(), prompt.checkpoints.size(), n_read_bytes/1048576.0, ms, n_read_bytes/(ms*1e6),
+                         sys ? "a system block (it stays stored)" :
                          keep ? "kept in the store (the prompt continues a part of it)" : "taken from the store",
                          entries.size(), n_bytes()/1048576.0, hot.c_str(), ver.c_str());
     if (!e.spilled.empty()) {
@@ -1504,9 +1671,139 @@ bool server_keepctx::load(std::list<server_keepctx_entry>::iterator it, server_p
                               kc_part(mk[2], mk[3]).c_str(), pipe_st.c_str(), (llama_fn_res_touched_ext() - res0)/1048576.0);
     }
     if (keep) {
-        entries.splice(entries.end(), entries, it); // the most recently used
+        from.splice(from.end(), from, it); // the most recently used
     }
     return true;
+}
+
+// [TAG_R41_PP_SYSKEEP]
+void server_keepctx::sys_drop_front() {
+    if (sys_entries.empty()) {
+        return;
+    }
+    const std::string sp = sys_entries.front().sys_path;
+    sys_entries.pop_front(); // closes the file
+    if (!sp.empty()) {
+        std::error_code ec_rm;
+        std::filesystem::remove(std::filesystem::path(sp), ec_rm);
+    }
+}
+
+int server_keepctx::sys_scan(bool has_mtmd, std::string & info) {
+    std::error_code ec;
+    struct cand {
+        std::filesystem::path           path;
+        std::filesystem::file_time_type t;
+        uint64_t                        size;
+    };
+    std::vector<cand> files;
+    for (const auto & de : std::filesystem::directory_iterator(params_.dir, ec)) {
+        const std::string name = de.path().filename().string();
+        if (name.rfind("sysblock-", 0) == 0 && de.path().extension() == ".kcs") {
+            std::error_code e1, e2;
+            const auto t  = std::filesystem::last_write_time(de.path(), e1);
+            const auto sz = std::filesystem::file_size(de.path(), e2);
+            if (!e1 && !e2) {
+                files.push_back({ de.path(), t, (uint64_t) sz });
+            }
+        }
+    }
+    std::sort(files.begin(), files.end(), [](const cand & a, const cand & b) { return a.t < b.t; });
+    int n_old = 0, n_other = 0, n_bad = 0, n_read = 0;
+    auto drop = [&](const std::filesystem::path & p) {
+        std::error_code ec_rm;
+        std::filesystem::remove(p, ec_rm);
+    };
+    while ((int32_t) files.size() > params_.sys_files_max) {
+        drop(files.front().path);
+        files.erase(files.begin());
+        n_old++;
+    }
+    for (const auto & c : files) {
+        std::string err;
+        auto f = server_keepctx_file::open_kept(c.path, false, err);
+        if (!f) {
+            n_bad++;
+            continue;
+        }
+        kc_sys_header h;
+        std::memset(&h, 0, sizeof(h));
+        bool ok = c.size >= KC_ALIGN;
+        if (ok) {
+            kc_pipe pr(*f, false, KC_ALIGN, 0, io_mem_, false);
+            ok = pr.get(&h, sizeof(h));
+        }
+        ok = ok && std::memcmp(h.magic, "R41SYSK1", 8) == 0 && h.version == 1 && h.check == kc_sys_check(h);
+        if (!ok) {
+            f.reset();
+            drop(c.path); // unfinished or not one of ours
+            n_bad++;
+            continue;
+        }
+        if (h.fp != params_.sys_fp) {
+            n_other++; // another profile's (another context size, build or environment): left alone
+            continue;
+        }
+        const uint64_t tok_bytes = (uint64_t) h.n_tokens * sizeof(int32_t);
+        ok = h.n_tokens > 0 && h.n_ckpt <= KC_SYS_CKPT && h.tok_off == KC_ALIGN &&
+             h.carry_off == h.tok_off + kc_round_up((size_t) tok_bytes) && h.base == h.carry_off + kc_round_up((size_t) h.carry_bytes) &&
+             c.size >= h.base + kc_round_up((size_t) h.n_bytes) && h.size_tgt > 0;
+        std::vector<int32_t> toks;
+        server_keepctx_entry e;
+        if (ok) {
+            toks.resize((size_t) h.n_tokens);
+            e.carry.resize((size_t) h.carry_bytes);
+            kc_pipe pr(*f, false, h.base - h.tok_off, h.tok_off, io_mem_, false);
+            ok = pr.get(toks.data(), (size_t) tok_bytes) && pr.skip_to(h.carry_off - h.tok_off) &&
+                 pr.get(e.carry.data(), e.carry.size());
+        }
+        if (ok) {
+            llama_tokens lt(toks.begin(), toks.end());
+            e.prompt.tokens = server_tokens(lt, has_mtmd);
+            ok = keepctx_prefix_hash(e.prompt.tokens, (size_t) h.n_tokens) == h.sys_hash;
+        }
+        if (!ok) {
+            f.reset();
+            drop(c.path);
+            n_bad++;
+            continue;
+        }
+        uint64_t ck_bytes = 0;
+        for (uint32_t k = 0; k < h.n_ckpt; ++k) {
+            common_prompt_checkpoint m;
+            m.n_tokens = h.ck[k].n_tokens;
+            m.id_task  = h.ck[k].id_task;
+            m.pos_min  = h.ck[k].pos_min;
+            m.pos_max  = h.ck[k].pos_max;
+            e.prompt.checkpoints.push_back(std::move(m));
+            e.ckpt_sizes.push_back(h.ck[k].size_tgt);
+            e.ckpt_sizes.push_back(h.ck[k].size_dft);
+            e.ckpt_sizes.push_back(h.ck[k].size_spec);
+            ck_bytes += h.ck[k].size_tgt + h.ck[k].size_dft + h.ck[k].size_spec;
+        }
+        if (h.size_tgt + h.size_dft + ck_bytes != h.n_bytes) {
+            f.reset();
+            drop(c.path);
+            n_bad++;
+            continue;
+        }
+        e.id       = ++n_next_;
+        e.size_tgt = h.size_tgt;
+        e.size_dft = h.size_dft;
+        e.n_bytes  = h.n_bytes;
+        e.base     = h.base;
+        e.file     = f;
+        e.sys_hash = h.sys_hash;
+        e.sys_path = c.path.string();
+        e.conv.sys_end  = (int32_t) h.n_tokens;
+        e.conv.n_prompt = (int32_t) h.n_tokens;
+        e.t_use    = kc_now_s();
+        sys_entries.push_back(std::move(e));
+        n_read++;
+    }
+    info = string_format("%d system blocks read back (%d of other settings left alone, %d unreadable or unfinished deleted, %d "
+                         "past the %d newest deleted)", n_read, n_other, n_bad, n_old, params_.sys_files_max);
+    return n_read;
 }
 
 // [TAG_FN_V0254_STORE] the volume of a path ("D:\"), its physical disk number, its drive type and whether it is an SSD (no

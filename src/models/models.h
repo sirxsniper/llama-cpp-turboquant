@@ -2970,6 +2970,15 @@ struct llama_model_qwen4exp : public llama_model_base {
                             int * sections,
                             int   il);
 
+        // [TAG_R41_PP_MTPKV] the dense attention block's K/V cache writes alone (the K and V of build_layer_attn, the same
+        // nodes), for a draft graph whose rows have no output
+        void build_layer_attn_kv_store(
+              llm_graph_input_attn_kv * inp_attn,
+                    ggml_tensor * cur,
+                    ggml_tensor * inp_pos,
+                            int * sections,
+                            int   il);
+
         // [TAG_FN_R4_QSA_POS] what build_qsa_sel hands to build_attn_qsa: the finished additive mask (explicit KQ mask),
         // or, with the positional vectors (LLAMA_QSA_POS_MASK), the selection and the picked pool scores that
         // ggml_qsa_mask turns into the mask next to the attention

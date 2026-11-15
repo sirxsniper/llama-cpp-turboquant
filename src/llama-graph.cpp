@@ -4735,6 +4735,53 @@ ggml_tensor * llm_graph_context::build_attn(
     return cur;
 }
 
+// [TAG_R41_PP_MTPKV] the store half of the build_attn above: the same K/V rotations, scales and cache writer ops, expanded
+// in the same order (v, then k, so a rope still fuses into the K write), and no attention (no mask is built for it).
+void llm_graph_context::build_attn_store_kv(
+        llm_graph_input_attn_kv * inp,
+        ggml_tensor * k_cur,
+        ggml_tensor * v_cur,
+                int   il) const {
+    GGML_ASSERT(!cparams.training);
+
+    if (inp->self_k_rot[il]) {
+        k_cur = llama_mul_mat_hadamard(ctx0, k_cur, inp->self_k_rot[il]);
+    }
+    if (inp->self_v_rot[il]) {
+        v_cur = llama_mul_mat_hadamard(ctx0, v_cur, inp->self_v_rot[il]);
+    }
+
+    const auto * mctx_cur = inp->mctx;
+
+    // as build_attn_scale_kv_inputs, without a query
+    if (ggml_tensor * scale = mctx_cur->get_k_scale(il)) {
+        k_cur = ggml_div(ctx0, k_cur, scale);
+    }
+    if (ggml_tensor * scale = mctx_cur->get_v_scale(il)) {
+        v_cur = ggml_div(ctx0, v_cur, scale);
+    }
+
+    ggml_build_forward_expand(gf, v_cur);
+    ggml_build_forward_expand(gf, k_cur);
+
+    const auto & k_idxs = inp->get_k_idxs();
+    const auto & v_idxs = inp->get_v_idxs();
+    if (mctx_cur->is_turbot()) {
+        ggml_build_forward_expand(gf, mctx_cur->turbot_cpy_k(ctx0, k_cur, k_idxs, inp->self_turbot_young, inp->self_turbot_fill, il));
+        ggml_build_forward_expand(gf, mctx_cur->turbot_cpy_v(ctx0, v_cur, v_idxs, inp->self_turbot_young, inp->self_turbot_fill, il));
+    } else {
+        ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
+        ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
+    }
+
+    // set_input fills the turbot granule table whenever it exists (and the writer ops read the young / fill rows it sets
+    // with it), so it stays in the graph; the mask, its rows and the positions are skipped by set_input while unallocated
+    // (as for DFlash's K/V-injection pass), which also saves building a mask nothing reads
+    if (inp->self_turbot_gtab) {
+        ggml_build_forward_expand(gf, inp->self_turbot_gtab);
+    }
+}
+
 static std::unique_ptr<llm_graph_input_attn_k> build_attn_inp_k_impl(
            ggml_context * ctx0,
      const llama_ubatch & ubatch,

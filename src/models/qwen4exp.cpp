@@ -1834,7 +1834,6 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
 
     ggml_tensor * inject = nullptr;
     ggml_tensor * cur = build_hc_mix(res_hc, layer.hc_attn_norm, layer.hc_attn_down, layer.hc_attn_up, layer.hc_attn_inject, layer.hc_attn_down_inject, &inject, il);
-    cur    = build_layer_attn(inp_hyb->get_attn(), mctx_hyb, inp_kpool, cur, inp_pos, sections, il);
 
     // [TAG_FN_L21_MTP_ROWS] LLAMA_FN_L21_MTP_ROWS (qwen4exp profile: 1): with masked h (the draft context), only the output
     // rows go on past the attention, as in the main graph's last layer. A catch-up row (a prompt row, or an accepted row the
@@ -1842,6 +1841,25 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     // computed and dropped (Strata 3fd0460ba2). Drafts only: the rows kept get the same numbers up to kernel width.
     static const bool rows_on = llama_fn_l3_int(model, "LLAMA_FN_L21_MTP_ROWS", 0) > 0;
     const bool rows_cut = rows_on && inp_out_ids && cparams.embeddings_nextn_masked;
+
+    // [TAG_R41_PP_MTPKV] LLAMA_FN_R41_MTPKV (1 turns it on; the Flash-Next profile keeps 0 = v0.33.1 until measured): a draft graph without any
+    // output row (the catch-up of the prompt's last 32K rows, in chunks) builds the dense attention block as its K/V writes
+    // alone. The query, the attention over the window, its gate and the output projection of every row were computed and
+    // then dropped by the row cut; the K/V written are the same nodes on the same rows, so later drafts read the same cache.
+    // The attention input keeps the attention output's shape [n_embd, n_rows] for the row cut (0 rows) below.
+    static const bool kv_only_on = llama_fn_l3_int(model, "LLAMA_FN_R41_MTPKV", 0) > 0;
+    const bool kv_only = kv_only_on && rows_cut && n_outputs == 0 && inp_kpool == nullptr;
+    if (kv_only) {
+        static std::atomic<bool> kv_logged{false};
+        if (!kv_logged.exchange(true)) {
+            LLAMA_LOG_INFO("%s: [TAG_R41_PP_MTPKV] draft graphs without output rows (prompt catch-up) write the K/V of their rows "
+                    "and skip the attention block's query, attention and output projection\n", __func__);
+        }
+        build_layer_attn_kv_store(inp_hyb->get_attn(), cur, inp_pos, sections, il);
+    } else {
+        cur = build_layer_attn(inp_hyb->get_attn(), mctx_hyb, inp_kpool, cur, inp_pos, sections, il);
+    }
+
     if (rows_cut) {
         cur    = ggml_get_rows(ctx0, cur,    inp_out_ids);
         inject = ggml_get_rows(ctx0, inject, inp_out_ids);
@@ -2710,6 +2728,44 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
     cb(cur, "attn_output", il);
 
     return cur;
+}
+
+// [TAG_R41_PP_MTPKV] the K and V of build_layer_attn's dense path, node for node (projection, reshape, K norm, the rope of
+// K), written to the cache by the store half of build_attn. The query, the attention, its gate and the output projection
+// are not built: the caller has no output row to give them to.
+void llama_model_qwen4exp::graph::build_layer_attn_kv_store(
+        llm_graph_input_attn_kv * inp,
+        ggml_tensor *             cur,
+        ggml_tensor *             inp_pos,
+        int *                     sections,
+        int                       il) {
+    const int64_t n_embd_head = hparams.n_embd_head_v();
+    GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
+    const int64_t n_rows = nt();
+
+    ggml_tensor * Kcur = build_lora_mm(model.layers[il].wk, cur, model.layers[il].wk_s);
+    qwen4exp_l3_mark_mm(Kcur, l3.mmvd);
+    cb(Kcur, "Kcur", il);
+
+    ggml_tensor * Vcur = build_lora_mm(model.layers[il].wv, cur, model.layers[il].wv_s);
+    qwen4exp_l3_mark_mm(Vcur, l3.mmvd);
+    cb(Vcur, "Vcur", il);
+
+    Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_rows);
+    Kcur = build_norm(Kcur, model.layers[il].attn_k_norm, nullptr, LLM_NORM_RMS, il);
+    cb(Kcur, "Kcur_normed", il);
+
+    Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_rows);
+
+    Kcur = ggml_rope_multi(
+            ctx0, Kcur, inp_pos, nullptr,
+            n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
+            ext_factor, attn_factor, beta_fast, beta_slow
+            );
+    cb(Kcur, "Kcur", il);
+    cb(Vcur, "Vcur", il);
+
+    build_attn_store_kv(inp, Kcur, Vcur, il);
 }
 
 ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
