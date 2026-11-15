@@ -411,6 +411,7 @@ const fn_item k_items[] = {
     // [TAG_FN_R41_DRAFTFIT2] r41 multi: while two or more slots generate, at most this many drafts per slot (two conversations
     // at 512K: 30 ms per step with 1 draft each against 41 ms with 2); LLAMA_FN_R41_DRAFTFIT2=0 restores v0.33.1
     { "LLAMA_FN_R41_DRAFTFIT2",             "1",       P_ALL },
+    { "LLAMA_FN_R41_CONVKEEP",              "0",       P_ALL }, // [TAG_R41_PP_CONVKEEP] 1 = the stored conversations survive a server restart, and a graceful stop stores each idle slot's conversation first
 };
 
 } // namespace
