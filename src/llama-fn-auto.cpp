@@ -403,12 +403,13 @@ const fn_item k_items[] = {
     { "LLAMA_FN_R41_SPREAD_FIRST",          "0",       P_ALL }, // [TAG_R41_SPREAD_FIRST] the KV lend spreads over the lend layers' own slots from the first sizing
     { "LLAMA_R41_VG_FOLLOW",                "0",       P_ALL }, // [TAG_R41_VG_FOLLOW] the VRAM guard's zero-commit levels follow the free VRAM at arm (floor 900 MiB)
     { "LLAMA_FN_R41_LEND_OWN",              "0",       P_ALL }, // [TAG_R41_LEND_OWN] percent of the KV lend the plain sizing takes from the lend layers' own slots
-    // r41 prompt lane: BORROW and MTPKV 0 (= v0.33.1) in the profile until their GPU arms are measured, the value that turns
-    // each on is in its comment; SYSKEEP 1 from v0.33.2 (a new chat on the other slot: first token 7.3 s -> 1.6 s at 512K, 2 slots)
+    // r41 prompt lane: BORROW 0 (= v0.33.1) in the profile until its GPU arms are measured, the value that turns it on is in its
+    // comment; SYSKEEP 1 from v0.33.2 (a new chat on the other slot: first token 7.3 s -> 1.6 s at 512K, 2 slots); from v0.33.3
+    // SYSKEEP 2 (the block also survives a server restart, in a bounded and checked folder) and MTPKV 1
     { "LLAMA_FN_R41_BORROW",                "0",       P_ALL }, // [TAG_R41_PP_BORROW] 16 = where the 16K prompt ubatch's borrow falls short (512K, 2 slots), the lend layers with few base slots give all but one, then up to 16 more slots per lend layer
-    { "LLAMA_FN_R41_MTPKV",                 "0",       P_ALL }, // [TAG_R41_PP_MTPKV] 1 = the MTP draft's prompt catch-up (no output rows) writes its K/V without the attention block's query, attention and output projection
+    { "LLAMA_FN_R41_MTPKV",                 "1",       P_ALL }, // [TAG_R41_PP_MTPKV] on from v0.33.3, 0 restores v0.33.2; 1 = the MTP draft's prompt catch-up (no output rows) writes its K/V without the attention block's query, attention and output projection
     { "LLAMA_FN_R41_READYNEED",             "0",       P_ALL }, // [TAG_R41_PP_READYNEED] until the RAM warm pass ends: 1 = the cold experts a request routes to are read ahead as whole slices before the CPU computes them, 2 = the pass goes on during answer steps, 3 = both; 0 = v0.33.2
-    { "LLAMA_FN_R41_SYSKEEP",               "1",       P_ALL }, // [TAG_R41_PP_SYSKEEP] 1 = the state at the end of a system + tools block is stored once, and a new chat whose slot keeps less of the block takes it back; on from v0.33.2, 0 restores v0.33.1
+    { "LLAMA_FN_R41_SYSKEEP",               "2",       P_ALL }, // [TAG_R41_PP_SYSKEEP] 2 from v0.33.3 (1 restores v0.33.2): the stored blocks also stay on disk for the next server with the same weights, template and settings, at most LLAMA_FN_R41_SYSKEEP_FILES (8) files and LLAMA_FN_R41_SYSKEEP_DISK_MIB (3500) MiB; 1 = the state at the end of a system + tools block is stored once, and a new chat whose slot keeps less of the block takes it back; on from v0.33.2, 0 restores v0.33.1
     // [TAG_FN_R41_DRAFTFIT2] r41 multi: while two or more slots generate, at most this many drafts per slot (two conversations
     // at 512K: 30 ms per step with 1 draft each against 41 ms with 2); LLAMA_FN_R41_DRAFTFIT2=0 restores v0.33.1
     { "LLAMA_FN_R41_DRAFTFIT2",             "1",       P_ALL },
