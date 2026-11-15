@@ -1,6 +1,7 @@
 #include "server-keepctx.h"
 #include "server-common.h"
 #include "server-convstore.h" // [TAG_FN_L19_CONVSTORE]
+#include "server-keptfile.h"  // [TAG_R41_PP_SYSKEEP] [TAG_R41_PP_CONVKEEP] the kept files: header, sum, folder rules
 
 #include "llama.h"
 #include "log.h"
@@ -323,6 +324,8 @@ public:
 
     bool     hashing = false;
     uint64_t hash    = KC_HASH_SEED;
+    // [TAG_R41_PP_SYSKEEP] writing a kept file: every byte put (the padding of align() too) goes into this sum
+    kept_sum * summing = nullptr;
 
     // [TAG_FN_V0254_STORE] trace: the caller's wait for a block (write: the disk is behind; read: not read yet), its
     // copies of big pieces, and the thread's file I/O (sum, longest, count), in us
@@ -369,6 +372,9 @@ public:
     bool put(const void * src, size_t n) {
         if (hashing) {
             hash = kc_hash(hash, src, n);
+        }
+        if (summing) {
+            summing->add(src, n);
         }
         const uint8_t * p = (const uint8_t *) src;
         while (n > 0) {
@@ -585,43 +591,8 @@ static bool kc_read_cb(void * dst, size_t size, void * ud) {
 // conversation of params.conv_persist). It is written last, so a file whose writing stopped has no valid header and is
 // deleted by the next scan. Then: the tokens (int32) at tok_off, the drafter's carry at carry_off, the stored bytes of the
 // entry (as save() writes them) at base; each part at a sector offset.
-static constexpr uint32_t KC_SYS_CKPT = 32;  // checkpoints a kept file can describe
-struct kc_sys_header {
-    char     magic[8];      // "R41KEPT1"
-    uint32_t version;       // 1
-    uint32_t n_ckpt;        // checkpoints (at most KC_SYS_CKPT)
-    uint32_t kind;          // 1 a system block, 2 a conversation
-    uint32_t conv_rerender;
-    int64_t  conv_hits;
-    int32_t  conv_sys_end;
-    int32_t  conv_n_prompt;
-    uint64_t fp;            // params.sys_fp of the server that wrote it
-    uint64_t sys_hash;      // keepctx_prefix_hash of the tokens
-    int64_t  n_tokens;
-    uint64_t size_tgt;
-    uint64_t size_dft;
-    uint64_t n_bytes;       // the stored bytes from base
-    uint64_t base;
-    uint64_t tok_off;
-    uint64_t carry_off;
-    uint64_t carry_bytes;
-    struct {
-        int64_t  n_tokens;
-        int32_t  id_task;
-        int32_t  pos_min;
-        int32_t  pos_max;
-        int32_t  pad;
-        uint64_t size_tgt;
-        uint64_t size_dft;
-        uint64_t size_spec;
-    } ck[KC_SYS_CKPT];
-    uint64_t check;         // kc_hash of every byte above
-};
-static_assert(sizeof(kc_sys_header) <= KC_ALIGN, "the header is one sector");
-
-static uint64_t kc_sys_check(const kc_sys_header & h) {
-    return kc_hash(KC_HASH_SEED, &h, offsetof(kc_sys_header, check));
-}
+static constexpr uint32_t KC_SYS_CKPT = KEPT_CKPT;  // checkpoints a kept file can describe
+typedef kept_header kc_sys_header;                  // server-keptfile.h (with the sum of the stored bytes)
 
 // [TAG_R41_PP_CONVKEEP] tokens a kept file can hold: text only (no picture or sound chunk)
 static bool kc_text_only(const server_tokens & t, size_t n) {
@@ -692,6 +663,21 @@ server_keepctx::~server_keepctx() {
     wr_cv_.notify_all();
     if (wr_th_.joinable()) {
         wr_th_.join();
+    }
+    // [TAG_R41_PP_SYSKEEP] a kept system block that served a restore is the newest file again, so the bound of the folder
+    // drops the blocks that were not used for the longest time
+    if (params_.sys_persist) {
+        std::vector<std::string> used;
+        for (const auto & e : sys_entries) {
+            if (e.sys_hits > 0 && !e.sys_path.empty()) {
+                used.push_back(e.sys_path);
+            }
+        }
+        sys_entries.clear(); // closes the files
+        for (const auto & sp : used) {
+            std::error_code ec_t;
+            std::filesystem::last_write_time(std::filesystem::path(sp), std::filesystem::file_time_type::clock::now(), ec_t);
+        }
     }
     if (io_mem_) {
         kc_free_blocks(io_mem_); // [TAG_FN_L20_CONVFIX_IO]
@@ -1063,7 +1049,7 @@ bool server_keepctx::evict_one(const server_keepctx_entry * keep, bool budget, u
             v.n_tokens = it->prompt.n_tokens();
             v.hits     = it->conv.hits;
             v.age_s    = now - it->t_use;
-            v.keep     = &*it == keep;
+            v.keep     = &*it == keep || guarded(*it); // [TAG_R41_PP_CONVKEEP]
             es.push_back(v);
             its.push_back(it);
         }
@@ -1087,7 +1073,7 @@ bool server_keepctx::evict_one(const server_keepctx_entry * keep, bool budget, u
     }
     auto victim = entries.end();
     for (auto it = entries.begin(); it != entries.end(); ++it) {
-        if (&*it == keep) {
+        if (&*it == keep || guarded(*it)) { // [TAG_R41_PP_CONVKEEP]
             continue;
         }
         if (!params_.gdsf) {
@@ -1233,7 +1219,8 @@ bool server_keepctx::save(const server_prompt & prompt, llama_context * ctx_tgt,
     e.id = ++n_next_;
     // [TAG_R41_PP_SYSKEEP] a kept system-block file: the stored bytes start after the header, the tokens and the carry
     // [TAG_R41_PP_CONVKEEP] a kept conversation file the same way (text only; not with the lazy layout)
-    const bool persist = (sys ? params_.sys_persist : (params_.conv_persist && !params_.lazy)) &&
+    // a system block bigger than the folder's bound is stored like one of LLAMA_FN_R41_SYSKEEP=1 (not kept)
+    const bool persist = (sys ? (params_.sys_persist && need <= params_.sys_bytes_max) : (params_.conv_persist && !params_.lazy)) &&
                          prompt.checkpoints.size() <= KC_SYS_CKPT && kc_text_only(prompt.tokens, (size_t) prompt.n_tokens());
     const uint64_t kept_hash = persist && !sys ? keepctx_prefix_hash(prompt.tokens, (size_t) prompt.n_tokens()) : sys_hash;
     std::vector<int32_t> sys_toks;
@@ -1252,6 +1239,9 @@ bool server_keepctx::save(const server_prompt & prompt, llama_context * ctx_tgt,
             (persist && sys ? string_format("sysblock-%016llx-%016llx.kcs", (unsigned long long) params_.sys_fp, (unsigned long long) sys_hash)
            : persist ? string_format("conv-%016llx-%lu-%llu.kcs", (unsigned long long) params_.sys_fp, kc_pid(), (unsigned long long) e.id)
                      : string_format(sys ? "keepctx-%lu-sys%llu.kc" : "keepctx-%lu-%llu.kc", kc_pid(), (unsigned long long) e.id));
+    if (persist && sys) {
+        sys_make_room(e.base + need); // [TAG_R41_PP_SYSKEEP] the oldest kept blocks go beyond the count and the size
+    }
     std::string err;
     e.file = persist ? server_keepctx_file::open_kept(path, true, err) : server_keepctx_file::create(path, err);
     if (!e.file) {
@@ -1298,9 +1288,11 @@ bool server_keepctx::save(const server_prompt & prompt, llama_context * ctx_tgt,
         tr_t  = mk[0].t;
     }
     std::string pipe_st;
+    kept_sum ksum; // [TAG_R41_PP_SYSKEEP] the sum of the stored bytes of a kept file (its header keeps it)
     {
         kc_pipe pipe(*e.file, true, 0, e.base, io_mem_, params_.trace); // [TAG_R41_PP_SYSKEEP] e.base: 0 but for a kept file
         pipe.hashing = params_.verify;
+        pipe.summing = persist ? &ksum : nullptr;
         ok = ok && llama_state_seq_write_stream_ext(ctx_tgt, seq_id, LLAMA_STATE_SEQ_FLAGS_NONE, kc_write_cb, &pipe) == e.size_tgt;
         tr_lap(tr_tgt);
         mk[1] = params_.trace ? kc_mark::now() : kc_mark();
@@ -1358,7 +1350,7 @@ bool server_keepctx::save(const server_prompt & prompt, llama_context * ctx_tgt,
         kc_sys_header h;
         std::memset(&h, 0, sizeof(h));
         std::memcpy(h.magic, "R41KEPT1", 8);
-        h.version     = 1;
+        h.version     = KEPT_VERSION;
         h.n_ckpt      = (uint32_t) prompt.checkpoints.size();
         h.kind        = sys ? 1 : 2;
         if (conv) {
@@ -1388,7 +1380,8 @@ bool server_keepctx::save(const server_prompt & prompt, llama_context * ctx_tgt,
             h.ck[k].size_spec = c.data_spec.size();
             k++;
         }
-        h.check = kc_sys_check(h);
+        h.body_sum = ksum.done();
+        h.check    = kept_header_check(h);
         if (ok) {
             kc_pipe ph(*e.file, true, 0, 0, io_mem_, false);
             ok = ph.put(&h, sizeof(h));
@@ -1734,75 +1727,35 @@ void server_keepctx::sys_drop_front() {
 
 int server_keepctx::scan_kept(const char * prefix, uint32_t kind, int32_t max_files, uint64_t max_bytes, bool has_mtmd,
                              std::string & info) {
-    std::error_code ec;
-    struct cand {
-        std::filesystem::path           path;
-        std::filesystem::file_time_type t;
-        uint64_t                        size;
-    };
-    std::vector<cand> files;
-    for (const auto & de : std::filesystem::directory_iterator(params_.dir, ec)) {
-        const std::string name = de.path().filename().string();
-        if (name.rfind(prefix, 0) == 0 && de.path().extension() == ".kcs") {
-            std::error_code e1, e2;
-            const auto t  = std::filesystem::last_write_time(de.path(), e1);
-            const auto sz = std::filesystem::file_size(de.path(), e2);
-            if (!e1 && !e2) {
-                files.push_back({ de.path(), t, (uint64_t) sz });
-            }
-        }
-    }
-    std::sort(files.begin(), files.end(), [](const cand & a, const cand & b) { return a.t < b.t; });
-    int n_old = 0, n_other = 0, n_bad = 0, n_read = 0;
-    auto drop = [&](const std::filesystem::path & p) {
-        std::error_code ec_rm;
-        std::filesystem::remove(p, ec_rm);
-    };
-    uint64_t total = 0;
-    for (const auto & c : files) {
-        total += c.size;
-    }
-    while (!files.empty() && ((int32_t) files.size() > max_files || total > max_bytes)) {
-        total -= files.front().size;
-        drop(files.front().path);
-        files.erase(files.begin());
-        n_old++;
-    }
+    // the folder rules (server-keptfile.h): a file without a good header is deleted (unfinished, damaged, another version,
+    // not one of ours), then the oldest files beyond the count and the size, whatever their fingerprint
+    const auto t0 = std::chrono::steady_clock::now();
+    kept_scan_result sc = kept_scan_dir(params_.dir, prefix, kind, max_files, max_bytes);
+    int n_other = 0, n_bad = sc.n_bad, n_read = 0;
+    uint64_t n_checked = 0;
     std::list<server_keepctx_entry> & into = kind == 1 ? sys_entries : entries;
-    for (const auto & c : files) {
-        std::string err;
-        auto f = server_keepctx_file::open_kept(c.path, false, err);
-        if (!f) {
-            n_bad++;
+    std::vector<uint8_t> sum_buf;
+    for (const auto & c : sc.files) {
+        if (c.busy) {
             continue;
         }
-        kc_sys_header h;
-        std::memset(&h, 0, sizeof(h));
-        bool ok = c.size >= KC_ALIGN;
-        if (ok) {
-            kc_pipe pr(*f, false, KC_ALIGN, 0, io_mem_, false);
-            ok = pr.get(&h, sizeof(h));
-        }
-        ok = ok && std::memcmp(h.magic, "R41KEPT1", 8) == 0 && h.version == 1 && h.check == kc_sys_check(h) && h.kind == kind;
-        if (!ok) {
-            f.reset();
-            drop(c.path); // unfinished or not one of ours
-            n_bad++;
-            continue;
-        }
+        const kc_sys_header & h = c.h;
         if (h.fp != params_.sys_fp) {
-            n_other++; // another profile's (another context size, build or environment): left alone
+            n_other++; // other weights, another template, context size, build or environment: left alone
+            continue;
+        }
+        std::string err;
+        auto f = server_keepctx_file::open_kept(c.path.string(), false, err);
+        if (!f) {
+            sc.n_busy++;
             continue;
         }
         const uint64_t tok_bytes = (uint64_t) h.n_tokens * sizeof(int32_t);
-        ok = h.n_tokens > 0 && h.n_ckpt <= KC_SYS_CKPT && h.tok_off == KC_ALIGN &&
-             h.carry_off == h.tok_off + kc_round_up((size_t) tok_bytes) && h.base == h.carry_off + kc_round_up((size_t) h.carry_bytes) &&
-             c.size >= h.base + kc_round_up((size_t) h.n_bytes) && h.size_tgt > 0;
-        std::vector<int32_t> toks;
+        std::vector<int32_t> toks((size_t) h.n_tokens);
         server_keepctx_entry e;
-        if (ok) {
-            toks.resize((size_t) h.n_tokens);
-            e.carry.resize((size_t) h.carry_bytes);
+        e.carry.resize((size_t) h.carry_bytes);
+        bool ok = true;
+        {
             kc_pipe pr(*f, false, h.base - h.tok_off, h.tok_off, io_mem_, false);
             ok = pr.get(toks.data(), (size_t) tok_bytes) && pr.skip_to(h.carry_off - h.tok_off) &&
                  pr.get(e.carry.data(), e.carry.size());
@@ -1812,13 +1765,30 @@ int server_keepctx::scan_kept(const char * prefix, uint32_t kind, int32_t max_fi
             e.prompt.tokens = server_tokens(lt, has_mtmd);
             ok = keepctx_prefix_hash(e.prompt.tokens, (size_t) h.n_tokens) == h.sys_hash;
         }
+        // the stored bytes are whole: their sum is the one the header keeps (a damaged file is not read back)
+        if (ok) {
+            sum_buf.resize((size_t) 1 << 20);
+            kept_sum ks;
+            kc_pipe pb(*f, false, h.n_bytes, h.base, io_mem_, false);
+            uint64_t left = h.n_bytes;
+            while (ok && left > 0) {
+                const size_t k = (size_t) std::min<uint64_t>(sum_buf.size(), left);
+                ok = pb.get(sum_buf.data(), k);
+                if (ok) {
+                    ks.add(sum_buf.data(), k);
+                }
+                left -= k;
+            }
+            ok = ok && ks.done() == h.body_sum;
+            n_checked += h.n_bytes;
+        }
         if (!ok) {
             f.reset();
-            drop(c.path);
+            std::error_code ec_rm;
+            std::filesystem::remove(c.path, ec_rm);
             n_bad++;
             continue;
         }
-        uint64_t ck_bytes = 0;
         for (uint32_t k = 0; k < h.n_ckpt; ++k) {
             common_prompt_checkpoint m;
             m.n_tokens = h.ck[k].n_tokens;
@@ -1829,13 +1799,6 @@ int server_keepctx::scan_kept(const char * prefix, uint32_t kind, int32_t max_fi
             e.ckpt_sizes.push_back(h.ck[k].size_tgt);
             e.ckpt_sizes.push_back(h.ck[k].size_dft);
             e.ckpt_sizes.push_back(h.ck[k].size_spec);
-            ck_bytes += h.ck[k].size_tgt + h.ck[k].size_dft + h.ck[k].size_spec;
-        }
-        if (h.size_tgt + h.size_dft + ck_bytes != h.n_bytes) {
-            f.reset();
-            drop(c.path);
-            n_bad++;
-            continue;
         }
         // the file's age stands for the time since its store or last restore
         const double age_s = std::max(0.0, std::chrono::duration<double>(std::filesystem::file_time_type::clock::now() - c.t).count());
@@ -1867,13 +1830,40 @@ int server_keepctx::scan_kept(const char * prefix, uint32_t kind, int32_t max_fi
         n_read++;
     }
     info = string_format("%d %s read back (%d of other settings left alone, %d unreadable or unfinished deleted, %d old "
-                         "ones deleted beyond %d files)", n_read, kind == 1 ? "system blocks" : "conversations", n_other, n_bad,
-                         n_old, max_files);
+                         "ones deleted beyond %d files or %.0f MiB, %d in use elsewhere; the stored bytes of the ones read back "
+                         "were checked: %.1f MiB, all of it in %.0f ms)", n_read, kind == 1 ? "system blocks" : "conversations",
+                         n_other, n_bad, sc.n_old, max_files, max_bytes / 1048576.0, sc.n_busy, n_checked / 1048576.0,
+                         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
     return n_read;
 }
 
+// [TAG_R41_PP_SYSKEEP] room in the folder for one more kept system block of need bytes: the oldest files go, whatever
+// their fingerprint (one of this server's blocks leaves the store with its file); the number of files deleted
+int server_keepctx::sys_make_room(uint64_t need) {
+    const std::vector<kept_file> files = kept_list(params_.dir, "sysblock-");
+    int n = 0;
+    for (const size_t i : kept_plan_room(files, params_.sys_files_max, params_.sys_bytes_max, 1, need)) {
+        const std::string name = files[i].path.filename().string();
+        for (auto it = sys_entries.begin(); it != sys_entries.end(); ++it) {
+            if (!it->sys_path.empty() && std::filesystem::path(it->sys_path).filename().string() == name) {
+                sys_entries.erase(it); // closes the file
+                break;
+            }
+        }
+        std::error_code ec_rm;
+        if (std::filesystem::remove(files[i].path, ec_rm)) {
+            n++;
+        }
+    }
+    if (n > 0) {
+        LOG_INF("[TAG_R41_PP_SYSKEEP] %d kept system block%s (the oldest) left the folder to stay within %d files and %.0f MiB\n",
+                n, n == 1 ? "" : "s", params_.sys_files_max, params_.sys_bytes_max / 1048576.0);
+    }
+    return n;
+}
+
 int server_keepctx::sys_scan(bool has_mtmd, std::string & info) {
-    return scan_kept("sysblock-", 1, params_.sys_files_max, UINT64_MAX, has_mtmd, info);
+    return scan_kept("sysblock-", 1, params_.sys_files_max, params_.sys_bytes_max, has_mtmd, info);
 }
 
 // [TAG_R41_PP_CONVKEEP]

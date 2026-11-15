@@ -5,6 +5,7 @@
 #include "server-chat.h"
 #include "server-keepctx.h" // [TAG_FN_L18_KEEPCTX]
 #include "server-convstore.h" // [TAG_FN_L19_CONVSTORE]
+#include "server-keptfile.h"  // [TAG_R41_PP_SYSKEEP] what a kept file depends on
 #include "server-common.h"
 #include "server-decision.h"
 #include "server-http.h"
@@ -4926,6 +4927,8 @@ private:
             kp.sys_persist   = true;
             kp.sys_fp        = r41_sys_fingerprint(r41_fp_what);
             kp.sys_files_max = (int32_t) std::max<long long>(1, env_ll("LLAMA_FN_R41_SYSKEEP_FILES", 8));
+            // the bytes of all kept system blocks in the folder, whatever their fingerprint: the oldest files go
+            kp.sys_bytes_max = (uint64_t) std::max<long long>(1, env_ll("LLAMA_FN_R41_SYSKEEP_DISK_MIB", 3500)) * 1024 * 1024;
         }
         // [TAG_R41_PP_CONVKEEP] LLAMA_FN_R41_CONVKEEP=1: the stored conversations survive a server restart, and a graceful stop
         // stores each idle slot's conversation first (0 = v0.33.1)
@@ -4965,7 +4968,9 @@ private:
                     "the conversations (up to %d blocks), and a new chat whose slot keeps less of the block takes it back%s%s%s%s "
                     "(LLAMA_FN_R41_SYSKEEP=0: off)\n", r41sys.min, r41sys.max,
                     kp.sys_persist ? "; the blocks stay on disk after the server ends (fingerprint " : "",
-                    kp.sys_persist ? string_format("%016llx: %s)", (unsigned long long) kp.sys_fp, r41_fp_what.c_str()).c_str() : "",
+                    kp.sys_persist ? string_format("%016llx: %s; at most %d files and %.0f MiB in the folder, the oldest go)",
+                                                   (unsigned long long) kp.sys_fp, r41_fp_what.c_str(), kp.sys_files_max,
+                                                   kp.sys_bytes_max / 1048576.0).c_str() : "",
                     kp.sys_persist ? "; " : "", kp.sys_persist ? scan.c_str() : "");
         }
         std::string st_extra = ", [TAG_FN_V0254_STORE] folder: " + dir_why;
@@ -7877,7 +7882,18 @@ private:
     // to the store the way a prompt that takes the slot stores it, so the next server (same fingerprint) takes it back; a slot
     // in the middle of a request, or whose cells are parked in host memory, is left as it is
     void r41_conv_store_slots() {
+        // the biggest conversation first, and a store of this stop never evicts what an earlier slot of it stored (the
+        // free-space margin of the store's disk evicted the first slot's conversation for the second one)
+        std::vector<server_slot *> order;
         for (auto & slot : slots) {
+            order.push_back(&slot);
+        }
+        std::stable_sort(order.begin(), order.end(), [](const server_slot * a, const server_slot * b) {
+            return a->prompt.n_tokens() > b->prompt.n_tokens();
+        });
+        keepctx->stop_guard_begin();
+        for (server_slot * slot_p : order) {
+            server_slot & slot = *slot_p;
             if (slot.is_processing() || slot.kvp.on || slot.prompt.n_tokens() < keepctx_min) {
                 continue;
             }
@@ -7896,36 +7912,67 @@ private:
                         info.c_str());
             }
         }
+        keepctx->stop_guard_end();
     }
 
     // [TAG_R41_PP_SYSKEEP] LLAMA_FN_R41_SYSKEEP=2: what a system block kept on disk depends on, so a server reads back only the
     // blocks a server with the same weights file, context, batch and draft settings, build and engine environment wrote (the
     // environment: every LLAMA_ / GGML_ / TURBO_ / SPEC_ / MTMD_ variable but the folders and the log levels). what: the parts
     uint64_t r41_sys_fingerprint(std::string & what) const {
-        uint64_t h = 0xcbf29ce484222325ull;
-        auto mix = [&](const std::string & s) {
-            for (unsigned char c : s) {
-                h = (h ^ c) * 0x100000001b3ull;
-            }
-            h = (h ^ 0xffu) * 0x100000001b3ull;
+        kept_identity id;
+        auto file_line = [](const std::filesystem::path & p) {
+            std::error_code ec1, ec2;
+            const auto sz = std::filesystem::file_size(p, ec1);
+            const auto mt = std::filesystem::last_write_time(p, ec2);
+            return p.filename().string() + " " + std::to_string(ec1 ? 0 : (unsigned long long) sz) + "/" +
+                   std::to_string(ec2 ? 0LL : (long long) mt.time_since_epoch().count());
         };
-        std::error_code ec1, ec2;
+        // the weights: every shard of a split file (<name>-00001-of-0000N.gguf), size and write time each
         const auto mp = std::filesystem::u8path(params_base.model.path);
-        const auto sz = std::filesystem::file_size(mp, ec1);
-        const auto mt = std::filesystem::last_write_time(mp, ec2);
-        mix(params_base.model.path);
-        mix(std::to_string(ec1 ? 0 : (unsigned long long) sz) + "/" + std::to_string(ec2 ? 0LL : (long long) mt.time_since_epoch().count()));
-        mix(params_base.speculative.draft.mparams.path);
-        mix(string_format("ctx %d seq %d unified %d k %d v %d fa %d batch %d ubatch %d swa_full %d", (int) llama_n_ctx(ctx_tgt),
-                          params_base.n_parallel, (int) params_base.kv_unified, (int) params_base.cache_type_k,
-                          (int) params_base.cache_type_v, (int) params_base.flash_attn_type, (int) llama_n_batch(ctx_tgt),
-                          (int) llama_n_ubatch(ctx_tgt), (int) params_base.swa_full));
+        std::vector<std::filesystem::path> shards;
+        {
+            const std::string name = mp.filename().string();
+            const size_t      n    = name.size();
+            bool split = n > 20 && name.compare(n - 5, 5, ".gguf") == 0 && name.compare(n - 14, 4, "-of-") == 0 && name[n - 20] == '-';
+            for (size_t i = 0; split && i < 5; ++i) {
+                split = name[n - 19 + i] >= '0' && name[n - 19 + i] <= '9' && name[n - 10 + i] >= '0' && name[n - 10 + i] <= '9';
+            }
+            const int n_sh = split ? std::atoi(name.substr(n - 10, 5).c_str()) : 0;
+            if (n_sh > 1 && n_sh <= 512) {
+                for (int k = 1; k <= n_sh; ++k) {
+                    shards.push_back(mp.parent_path() / (name.substr(0, n - 19) + string_format("%05d-of-%05d.gguf", k, n_sh)));
+                }
+            } else {
+                shards.push_back(mp);
+            }
+        }
+        id.weights.push_back("path " + params_base.model.path);
+        for (const auto & sh : shards) {
+            id.weights.push_back(file_line(sh));
+        }
+        {
+            char desc[256] = { 0 };
+            llama_model_desc(model_tgt, desc, sizeof(desc));
+            id.weights.push_back(string_format("model %s, %llu parameters, %llu bytes", desc,
+                                               (unsigned long long) llama_model_n_params(model_tgt),
+                                               (unsigned long long) llama_model_size(model_tgt)));
+        }
+        const std::string & dpath = params_base.speculative.draft.mparams.path;
+        id.weights.push_back("draft " + dpath + (dpath.empty() ? "" : " " + file_line(std::filesystem::u8path(dpath))));
+        // the chat template: the text given to the server and the one in the weights file
+        const char * tmpl_model = llama_model_chat_template(model_tgt, nullptr);
+        id.tmpl = params_base.chat_template + "\n[weights file]\n" + (tmpl_model ? tmpl_model : "") +
+                  (params_base.use_jinja ? "\n[jinja]" : "\n[no jinja]");
         std::string sp;
         for (const auto t : params_base.speculative.types) {
             sp += std::to_string((int) t) + ",";
         }
-        mix("spec " + sp + " n_max " + std::to_string(common_speculative_n_max(&params_base.speculative)));
-        mix(llama_build_info());
+        id.settings = string_format("ctx %d seq %d unified %d k %d v %d fa %d batch %d ubatch %d swa_full %d", (int) llama_n_ctx(ctx_tgt),
+                                    params_base.n_parallel, (int) params_base.kv_unified, (int) params_base.cache_type_k,
+                                    (int) params_base.cache_type_v, (int) params_base.flash_attn_type, (int) llama_n_batch(ctx_tgt),
+                                    (int) llama_n_ubatch(ctx_tgt), (int) params_base.swa_full) +
+                      " spec " + sp + " n_max " + std::to_string(common_speculative_n_max(&params_base.speculative));
+        id.build = llama_build_info();
         std::vector<std::string> ev;
 #if defined(_WIN32)
         char ** envp = _environ;
@@ -7939,6 +7986,7 @@ private:
             const bool ours = k.rfind("LLAMA_", 0) == 0 || k.rfind("GGML_", 0) == 0 || k.rfind("TURBO_", 0) == 0 ||
                               k.rfind("SPEC_", 0) == 0 || k.rfind("MTMD_", 0) == 0;
             const bool skip = k == "LLAMA_CACHE" || k == "LLAMA_FN_L18_KEEPCTX_DIR" || k == "LLAMA_FN_L18_KEEPCTX_DISK_MIB" ||
+                              k == "LLAMA_FN_R41_SYSKEEP_FILES" || k == "LLAMA_FN_R41_SYSKEEP_DISK_MIB" ||
                               k == "LLAMA_FN_L22_PASSLOG" || k == "LLAMA_R38_E1_SLOW_MS" || k == "LLAMA_LOG_VERBOSITY" ||
                               k.find("_LOG") != std::string::npos || k.find("_DIR") != std::string::npos;
             if (ours && !skip) {
@@ -7946,13 +7994,12 @@ private:
             }
         }
         std::sort(ev.begin(), ev.end());
-        for (const auto & s : ev) {
-            mix(s);
-        }
-        what = string_format("%s, %s, ctx %d, %d slots, %s, %zu engine variables", mp.filename().string().c_str(),
-                             llama_build_info(), (int) llama_n_ctx(ctx_tgt), params_base.n_parallel,
+        id.env = ev;
+        what = string_format("%s (%zu weights file%s, size and write time each), chat template of %zu bytes, %s, ctx %d, %d slots, "
+                             "%s, %zu engine variables", mp.filename().string().c_str(), shards.size(), shards.size() == 1 ? "" : "s",
+                             id.tmpl.size(), llama_build_info(), (int) llama_n_ctx(ctx_tgt), params_base.n_parallel,
                              params_base.kv_unified ? "unified" : "per slot", ev.size());
-        return h;
+        return kept_fingerprint(id);
     }
 
     // [TAG_R41_PP_SYSKEEP] the stored system block the task's prompt starts with (all of the block, and the prompt goes on

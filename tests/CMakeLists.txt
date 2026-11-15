@@ -509,6 +509,10 @@ llama_build_and_test(test-fn-r41b.cpp)
 # checkpoint a full ring drops, the eviction value of a stored conversation, the thinning on disk. CPU only, no model.
 llama_build_and_test(test-fn-convstore.cpp)
 
+# [TAG_R41_PP_SYSKEEP] [TAG_R41_PP_CONVKEEP] the kept files of the conversation store (tools/server/server-keptfile.h, header
+# only): the bound of the folder, damaged and foreign files, the tie to the weights and the chat template. CPU only, no model.
+llama_build_and_test(test-fn-keptfile.cpp)
+
 # [TAG_UPSTREAM_30969] the Windows timer's tick conversion at long uptimes (ggml-impl.h). CPU only, no model.
 llama_build_and_test(test-fn-l24-time.cpp)
 
