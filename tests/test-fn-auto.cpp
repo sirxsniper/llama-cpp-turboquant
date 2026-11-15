@@ -316,6 +316,7 @@ static const l22_row k_l22_rows[] = {
     { "LLAMA_FN_R41_BORROW", "0", false }, // [TAG_R41_PP_BORROW] 0 = v0.33.1 (16 turns it on)
     { "LLAMA_FN_R41_MTPKV", "0", false }, // [TAG_R41_PP_MTPKV] 0 = v0.33.1 (1 turns it on)
     { "LLAMA_FN_R41_SYSKEEP", "0", false }, // [TAG_R41_PP_SYSKEEP] 0 = v0.33.1 (1 turns it on)
+    { "LLAMA_FN_R41_DRAFTFIT2", "1", false }, // [TAG_FN_R41_DRAFTFIT2] r41 multi; 0 restores v0.33.1
 };
 static const size_t k_n_l22_rows = sizeof(k_l22_rows)/sizeof(k_l22_rows[0]);
 const size_t k_n_l22_rows_decl = k_n_l22_rows;
