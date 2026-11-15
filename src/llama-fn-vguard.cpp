@@ -582,6 +582,24 @@ bool llama_fn_vg_arm(const void * owner, ggml_backend_device * dev, const llama_
     g.h     = hooks;
     g.armed = true;
     (void) vg_poll(true);
+    // [TAG_R41_VG_FOLLOW] LLAMA_R41_VG_FOLLOW=1: the zero-commit switch levels follow the VRAM this load left free. ZHTGT /
+    // ZFTGT sit just under the undisturbed state of the v0.33.0 reserve (H 2794-2808 / F 3174 at an undisturbed first
+    // switch); a smaller reserve (LLAMA_FN_VRAM_KEEP_MIB / LLAMA_MOE_HOT_HEADROOM_MIB) leaves less free, and fixed levels then
+    // hand hot-set groups back at every prompt and never regrow them (the regrow needs H - group >= ZHTGT). With the switch
+    // each level is min(its value, max(floor, the state at arm - slack)): the guard still acts when another program takes
+    // memory (PRESSURE as before, and the levels once the free VRAM falls by more than the slack) and never lets a switch run
+    // under the floor (LLAMA_R41_VG_FOLLOW_FLOOR, 900 MiB: the least free VRAM that kept WDDM from paging in Strata's
+    // measurement). The levels of a switch that commits (HTGT / FTGT, zero-commit off) stay. 0 = v0.33.0 (fixed levels)
+    if (vg_env("LLAMA_R41_VG_FOLLOW", 0.0) > 0.0) {
+        const double slack  = std::max(0.0, vg_env("LLAMA_R41_VG_FOLLOW_SLACK", 384.0));
+        const double floor_ = std::max(0.0, vg_env("LLAMA_R41_VG_FOLLOW_FLOOR", 900.0));
+        const double zh0 = k.zhtgt, zf0 = k.zftgt;
+        k.zhtgt = std::min(k.zhtgt, std::max(floor_, g.cur.H - slack));
+        k.zftgt = std::min(k.zftgt, std::max(floor_, g.cur.F - slack));
+        LLAMA_LOG_INFO("%s: [TAG_R41_VG_FOLLOW] the zero-commit levels follow the free VRAM at arm (H %.0f F %.0f MiB, slack %.0f, floor "
+                "%.0f): H %.0f -> %.0f, F %.0f -> %.0f MiB (LLAMA_R41_VG_FOLLOW=0: fixed, as v0.33.0)\n", __func__, g.cur.H, g.cur.F,
+                slack, floor_, zh0, k.zhtgt, zf0, k.zftgt);
+    }
     char path[192] = {};
     (void) WideCharToMultiByte(CP_UTF8, 0, g.P.path, -1, path, (int) sizeof(path) - 1, nullptr, nullptr);
     LLAMA_LOG_WARN("%s: [TAG_R40_VGUARD] %s (LLAMA_R40_VGUARD=%d): adapter LUID 0x%016" PRIx64 ", local segment %u (%.0f MiB); now H %.0f "

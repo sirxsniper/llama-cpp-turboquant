@@ -120,7 +120,7 @@ static void test_profile_opts() {
     // the values the lever-round-1 A/B measured (E:/turbot-gates/flashnext/test/BEST.json)
     struct { const char * name; const char * value; } want[] = {
         { "LLAMA_MOE_HOT_ADMIT", "2/32" }, { "LLAMA_MOE_HOT_MIB", "auto" }, { "LLAMA_MOE_HOT_ADAPT", "1" },
-        { "LLAMA_MOE_HOT_HEADROOM_MIB", "1280" }, { "LLAMA_MOE_HOT_DECAY", "0.95" }, { "LLAMA_MOE_HOT_SEED", "0.03" },
+        { "LLAMA_MOE_HOT_HEADROOM_MIB", "512" } /* [TAG_R41_RESERVE] 1280 = v0.33.1 */, { "LLAMA_MOE_HOT_DECAY", "0.95" }, { "LLAMA_MOE_HOT_SEED", "0.03" },
         { "LLAMA_MOE_BRIDGE", "1" }, { "LLAMA_MOE_BRIDGE_DMA", "1" }, { "LLAMA_MOE_DMA_SHARE", "auto" },
         { "LLAMA_MOE_BRIDGE_PF", "1" }, { "LLAMA_MOE_BRIDGE_PF_SOLO", "1" }, // [TAG_FN_R2_BRIDGE_PF] r2/ab4
         { "LLAMA_QSA_POS_MASK", "1" }, { "LLAMA_QSA_POS_CHUNK", "512" }, { "TURBO_QSA_CHUNK", "512" },
@@ -309,6 +309,10 @@ static const l22_row k_l22_rows[] = {
     { "LLAMA_FN_R41_PASSPRIO", "0", false }, // [TAG_FN_R41_PASSPRIO] off (v0.33.0) until the GPU arm measures it
     { "LLAMA_FN_R41_OWNIDS", "1", false }, // [TAG_FN_R41_OWNIDS] on from v0.33.1
     { "LLAMA_FN_R41_FLOATSTR", "1", false }, // [TAG_FN_R41_FLOATSTR] on from v0.33.1
+    { "LLAMA_FN_R41_BORROW_FILL", "1", false }, // [TAG_R41_BORROW_FILL] on from r41 mem, 0 = v0.33.1
+    { "LLAMA_FN_R41_SPREAD_FIRST", "1", false }, // [TAG_R41_SPREAD_FIRST] on from r41 mem, 0 = v0.33.1
+    { "LLAMA_R41_VG_FOLLOW", "1", false }, // [TAG_R41_VG_FOLLOW] on from r41 mem, 0 = v0.33.1
+    { "LLAMA_FN_R41_LEND_OWN", "0", false }, // [TAG_R41_LEND_OWN] 0 = v0.33.1
 };
 static const size_t k_n_l22_rows = sizeof(k_l22_rows)/sizeof(k_l22_rows[0]);
 const size_t k_n_l22_rows_decl = k_n_l22_rows;
