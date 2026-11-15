@@ -67,8 +67,16 @@ struct server_keepctx_params {
     // settings, the build, the engine environment) reads them back at its start; at most sys_files_max such files are kept
     // in the folder (the oldest go)
     bool        sys_persist   = false;
-    uint64_t    sys_fp        = 0;
+    uint64_t    sys_fp        = 0;       // the fingerprint of kept files (system blocks and conversations alike)
     int32_t     sys_files_max = 8;
+    // the bytes of all kept system-block files in the folder (the oldest go; a block bigger than this is not kept)
+    uint64_t    sys_bytes_max = (uint64_t) 3500 << 20;
+
+    // [TAG_R41_PP_CONVKEEP] LLAMA_FN_R41_CONVKEEP=1: the stored conversations are kept files too (conv-<fingerprint>-...kcs,
+    // the same layout): one that leaves the store (evicted, superseded, taken back by its prompt) deletes its file, the rest
+    // stay when the server ends and a server with the same fingerprint reads them back at its start. Not for conversations
+    // with pictures or sounds, nor with params.lazy
+    bool        conv_persist  = false;
 };
 
 class server_keepctx_file;
@@ -218,6 +226,22 @@ struct server_keepctx {
     // [TAG_R41_PP_SYSKEEP] drop the least recently used system block (and its file with params.sys_persist)
     void sys_drop_front();
 
+    // [TAG_R41_PP_SYSKEEP] room in the folder for one more kept system block of need bytes (sys_files_max, sys_bytes_max):
+    // the oldest files are deleted, an entry of this store among them leaves sys_entries; the number of files deleted
+    int sys_make_room(uint64_t need);
+
+    // [TAG_R41_PP_CONVKEEP] the stop of the server stores its slots one after the other: between the two calls a store
+    // never evicts an entry stored since stop_guard_begin (the disk margin evicted the first slot for the second)
+    void stop_guard_begin() { guard_from_ = n_next_ + 1; }
+    void stop_guard_end()   { guard_from_ = 0; }
+
+    // [TAG_R41_PP_CONVKEEP] params.conv_persist: read the conversation files with this server's fingerprint back as entries
+    // (oldest first), within the store's count and budget (the oldest files beyond them are deleted); the number read
+    int conv_scan(bool has_mtmd, std::string & info);
+
+    // [TAG_R41_PP_CONVKEEP] the server ends: every kept file of the store stays on disk (call before the store is destroyed)
+    void keep_files_on_disk();
+
     // restore the entry into seq_id and prompt. The entry is removed, unless keep (the prompt continues only a part of
     // it: the rest stays stored for a later continuation) and the restore worked. false: the sequence and prompt are in
     // an unknown state and the caller must clear them.
@@ -253,6 +277,10 @@ struct server_keepctx {
 
 private:
     bool selftest(std::string & err);
+    // [TAG_R41_PP_SYSKEEP] [TAG_R41_PP_CONVKEEP] read the kept files <prefix>*.kcs of one kind (1 system block, 2 conversation)
+    // with this server's fingerprint into sys_entries or entries (oldest first); beyond max_files or max_bytes (the oldest
+    // files, any fingerprint) and unreadable files are deleted
+    int scan_kept(const char * prefix, uint32_t kind, int32_t max_files, uint64_t max_bytes, bool has_mtmd, std::string & info);
     // drop the entry of the lowest value (or the oldest), never keep; false when only keep is left
     // [TAG_FN_L24_KEEPVAL] budget: the room is for the disk (the protected entry may go, last), else for the count;
     // freed: the bytes of the evicted entry
@@ -282,5 +310,7 @@ private:
     server_keepctx_params params_;
     bool                  ok_     = false;
     uint64_t              n_next_ = 0;
+    uint64_t              guard_from_ = 0; // [TAG_R41_PP_CONVKEEP] entries from this id on are not evicted (0: none)
+    bool guarded(const server_keepctx_entry & e) const { return guard_from_ != 0 && e.id >= guard_from_; }
     double                gdsf_L_ = 0.0; // [TAG_FN_L19_CONVSTORE_EVICT] the value of the last evicted entry
 };

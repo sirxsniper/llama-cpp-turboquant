@@ -839,6 +839,9 @@ static size_t fn_warm_l22(const llama_model & model, HANDLE stop, double * secs_
     std::atomic<bool>   full{false};
     std::atomic<const char *> why{nullptr};
     std::unique_ptr<std::atomic<uint8_t>[]> done(new std::atomic<uint8_t>[n_use + 1]());
+    // [TAG_R41_PP_READYNEED] LLAMA_FN_R41_READYNEED bit 2: answer steps no longer stop this pass (prompts and the first-token
+    // pause still do), so a chat that starts right after the load does not keep the rest of the experts on the SSD
+    const bool rn_keep = (llama_fn_l3_int(model, "LLAMA_FN_R41_READYNEED", 0) & 2) != 0;
     g_warm_layer_end = layer_end;
     g_warm_mark.store(0);
     g_warm_running.store(true, std::memory_order_release);
@@ -866,8 +869,8 @@ static size_t fn_warm_l22(const llama_model & model, HANDLE stop, double * secs_
                 // [TAG_FN_L15_WARMYIELD] 2 MiB at a time, each after 50 ms without an answer step
                 const size_t sub = (size_t) 2 << 20;
                 for (size_t o0 = 0; o0 < r.second; o0 += sub) {
-                    while ((g_warm_small_decodes.load(std::memory_order_relaxed) > 0 ||
-                            fn_warm_now_us() - g_warm_small_end_us.load(std::memory_order_relaxed) < 50000 ||
+                    while (((!rn_keep && (g_warm_small_decodes.load(std::memory_order_relaxed) > 0 ||
+                                          fn_warm_now_us() - g_warm_small_end_us.load(std::memory_order_relaxed) < 50000)) ||
                             (yield && fn_warm_prompt_busy()) || // [TAG_FN_L22_RESSET_YIELD] no budget
                             llama_fn_hushed()) && // [TAG_FN_L19_TTFT_HUSH]
                            WaitForSingleObject(stop, 0) != WAIT_OBJECT_0) {

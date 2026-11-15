@@ -28,6 +28,7 @@
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <sstream>
 #include <string>
@@ -193,6 +194,15 @@ struct moe_cache {
     int     hot_prompt_t = 0; // [TAG_FN_L19_TTFT_PHOT] LLAMA_FN_L19_TTFT_PHOT: wider CPU-path prompt graphs (up to this) too
     bool    phot_stats   = false; // [TAG_FN_L19_TTFT_PHOT] LLAMA_FN_L19_TTFT_PHOT_STATS=1: hit rate of each CPU-path prompt graph
     uint64_t phot_n = 0, phot_hit = 0, phot_lent = 0, phot_layers = 0;
+    // [TAG_R41_PP_READYNEED] LLAMA_FN_R41_READYNEED bit 1: while the RAM warm pass has not finished, the cold experts a
+    // CPU-path graph or a bridge job routes to are read ahead as whole slices before the kernels start (once per expert,
+    // rn_seen: one bit per expert of each host layer), instead of faulting in page by page under the kernels. 0 = off
+    int                   rn_mode = 0;
+    std::atomic<bool>     rn_ready { false };
+    std::mutex            rn_mtx;
+    std::vector<std::unique_ptr<std::atomic<uint64_t>[]>> rn_seen;
+    std::atomic<uint64_t> rn_n { 0 }, rn_bytes { 0 }, rn_us { 0 }, rn_calls { 0 };
+    std::atomic<bool>     rn_logged { false };
     uint64_t hot_steps = 0;
 
     // [TAG_FN_MOE_HOT_ADAPT] adaptive hot set: tables change only in step() of the owning context, after its compute
@@ -1063,8 +1073,83 @@ hot_stats g_hot_stats;
 
 // LLAMA_MOE_HOT_STATS: the CPU MUL_MAT_ID of every host-resident ffn_gate_exps reports its routed ids here (the
 // observer hook of the LRU cache, ggml-cpu.c); decode ubatches only, counted against the fixed host table
+// [TAG_R41_PP_READYNEED] see moe_cache::rn_mode. Called by the routing observer (thread 0 of the CPU op before its kernels,
+// the bridge before its pool runs), so the read-ahead of a layer ends before that layer's slices are computed.
+static void rn_need(moe_cache * mc, const char * name, const struct ggml_tensor * ids) {
+    if (!llama_fn_warm_running()) {
+        // the pass is over (or has not begun): one line with what the window cost, then nothing
+        if (mc->rn_calls.load(std::memory_order_relaxed) > 0 && !mc->rn_logged.exchange(true)) {
+            LLAMA_LOG_INFO("moe-hot: [TAG_R41_PP_READYNEED] during the RAM warm pass %llu cold experts (%.1f MiB) were read ahead "
+                    "for %llu routed jobs in %.1f ms\n", (unsigned long long) mc->rn_n.load(), mc->rn_bytes.load()/1048576.0,
+                    (unsigned long long) mc->rn_calls.load(), mc->rn_us.load()/1000.0);
+        }
+        return;
+    }
+    if (!mc->rn_ready.load(std::memory_order_acquire)) {
+        std::lock_guard<std::mutex> lk(mc->rn_mtx);
+        if (!mc->rn_ready.load(std::memory_order_relaxed)) {
+            mc->rn_seen.resize(mc->layers.size());
+            for (size_t i = 0; i < mc->layers.size(); ++i) {
+                const ggml_tensor * up = mc->layers[i].pub.up_src;
+                const size_t n_w = up ? ((size_t) up->ne[2] + 63)/64 : 0;
+                mc->rn_seen[i].reset(n_w ? new std::atomic<uint64_t>[n_w]() : nullptr);
+            }
+            mc->rn_ready.store(true, std::memory_order_release);
+        }
+    }
+    const int il = parse_layer_from_name(name);
+    for (size_t li = 0; li < mc->layers.size(); ++li) {
+        const layer_state & l = mc->layers[li];
+        if (l.pub.il != il) {
+            continue;
+        }
+        std::atomic<uint64_t> * seen = mc->rn_seen[li].get();
+        if (seen == nullptr || l.pub.up_src == nullptr || l.pub.gate_src == nullptr || l.pub.down_src == nullptr) {
+            return;
+        }
+        const int64_t   n_exp    = l.pub.up_src->ne[2];
+        const int64_t   n_used   = ids->ne[0];
+        const int64_t   n_tokens = ids->ne[1];
+        const int32_t * tbl      = l.pub.host_table && l.pub.host_table->data ? (const int32_t *) l.pub.host_table->data : nullptr;
+        const bool      all      = tbl == nullptr || l.out(); // no table or its slots are lent out: the CPU computes every expert
+        const ggml_tensor * srcs[3] = { l.pub.up_src, l.pub.gate_src, l.pub.down_src };
+        static thread_local std::vector<std::pair<const void *, size_t>> ranges;
+        ranges.clear();
+        size_t bytes = 0;
+        for (int64_t t = 0; t < n_tokens; ++t) {
+            for (int64_t i = 0; i < n_used; ++i) {
+                const int32_t e = *(const int32_t *) ((const char *) ids->data + t*ids->nb[1] + i*ids->nb[0]);
+                if (e < 0 || e >= n_exp || (!all && tbl[e] != l.pub.n_slots)) {
+                    continue; // hot: the device computes it from its slot
+                }
+                const uint64_t bit = (uint64_t) 1 << (e & 63);
+                if ((seen[e >> 6].load(std::memory_order_relaxed) & bit) || (seen[e >> 6].fetch_or(bit) & bit)) {
+                    continue;
+                }
+                for (int k = 0; k < 3; ++k) {
+                    const size_t sz = srcs[k]->nb[2];
+                    ranges.push_back({ (const char *) srcs[k]->data + (size_t) e*sz, sz });
+                    bytes += sz;
+                }
+            }
+        }
+        mc->rn_calls.fetch_add(1, std::memory_order_relaxed);
+        if (!ranges.empty()) {
+            const int64_t t0 = ggml_time_us();
+            llama_fn_prefetch_ranges(ranges);
+            mc->rn_us.fetch_add((uint64_t) (ggml_time_us() - t0), std::memory_order_relaxed);
+            mc->rn_n.fetch_add(ranges.size()/3, std::memory_order_relaxed);
+            mc->rn_bytes.fetch_add(bytes, std::memory_order_relaxed);
+        }
+        return;
+    }
+}
+
 void hot_obs_cb(const char * name, const struct ggml_tensor * ids, void * ud) {
     moe_cache * mc = (moe_cache *) ud;
+    if (mc->rn_mode & 1) {
+        rn_need(mc, name, ids); // [TAG_R41_PP_READYNEED]
+    }
     const int64_t n_used   = ids->ne[0];
     const int64_t n_tokens = ids->ne[1];
     if (n_tokens > mc->hot_max_t) {
@@ -3501,6 +3586,14 @@ bool llama_moe_hot_init(const llama_model & model, const void * owner, size_t bu
     // the CPU computes only the cold experts of a short prompt; the decode accounting (prompt seed above max_t) is unchanged
     if (llama_fn_l3_flag(model, "LLAMA_FN_L4_PROMPT_HOT")) {
         mc->hot_short_t = 31;
+    }
+    // [TAG_R41_PP_READYNEED] LLAMA_FN_R41_READYNEED (0 = off): bit 1 reads the cold experts a request routes to ahead of the
+    // CPU kernels while the RAM warm pass has not finished; bit 2 (llama-fn-tier.cpp) lets that pass go on during answer steps
+    mc->rn_mode = std::max(0, llama_fn_l3_int(model, "LLAMA_FN_R41_READYNEED", 0));
+    if (mc->rn_mode != 0) {
+        LLAMA_LOG_WARN("moe-hot: [TAG_R41_PP_READYNEED] LLAMA_FN_R41_READYNEED=%d: until the RAM warm pass ends%s%s\n", mc->rn_mode,
+                (mc->rn_mode & 1) ? ", the cold experts of a request are read ahead as whole slices before the CPU computes them" : "",
+                (mc->rn_mode & 2) ? ", the pass goes on during answer steps" : "");
     }
     // [TAG_FN_L19_TTFT_PHOT] LLAMA_FN_L19_TTFT_PHOT=1 (or =<n>: graphs of up to n tokens): a prompt graph on the CPU path
     // (wider than the graphs above, no prefill stream, below GGML_OP_OFFLOAD_MIN_BATCH) builds the hot chain as well, one
