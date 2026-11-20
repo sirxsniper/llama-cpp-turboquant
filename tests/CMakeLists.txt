@@ -462,6 +462,18 @@ target_include_directories(test-ple-dio PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../s
 # lookup and environment handling, expert placement detection, VRAM fit and RAM fit plans. CPU only, no model.
 llama_build_and_test(test-fn-auto.cpp)
 
+# [TAG_FN_STARTSMALL] the start-up compute reserve (LLAMA_FN_STARTSMALL): whole decodes of the generated qwen4exp model with
+# the switch against without it (logits, memory breakdown, no extra graph reallocation). Static / non-Windows only, like the
+# generated models; its rules are checked in test-fn-auto, which every build runs
+if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
+    llama_build(test-fn-startsmall.cpp)
+    llama_test(test-fn-startsmall LABEL "main behavior backend" ARGS "${CMAKE_CURRENT_BINARY_DIR}/test-models/qwen4exp-moe.gguf" 2)
+    set_tests_properties(test-fn-startsmall PROPERTIES
+        FIXTURES_REQUIRED generate-models
+        ENVIRONMENT "GGML_SCHED_DEBUG_REALLOC=1"
+    )
+endif()
+
 # [TAG_FN_L22] round 22 scaffold (src/llama-fn-l22.h): the tok_aux side channel through common_batch, the decode-phase
 # rule and the X lever bits, the sync op's flags, the stubs. CPU only, no model.
 llama_build_and_test(test-fn-l22-batch.cpp)

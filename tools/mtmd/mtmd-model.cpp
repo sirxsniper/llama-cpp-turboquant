@@ -3539,6 +3539,12 @@ struct mtmd_model_loader {
 
             // alloc memory and offload data
             model.buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(model.ctx_data.get(), buft));
+            if (!model.buf) {
+                // [TAG_FN_STARTSMALL] a failed allocation fails the load (mtmd_init_from_file returns null), no assert
+                throw std::runtime_error(mtmd_format("%s: failed to allocate %.2f MiB of projector weights in %s\n", __func__,
+                        ggml_backend_alloc_ctx_tensors_from_buft_size(model.ctx_data.get(), buft)/(1024.0*1024.0),
+                        ggml_backend_buft_name(buft)));
+            }
             ggml_backend_buffer_set_usage(model.buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
             // read the weight from file
             if (!no_alloc) {
